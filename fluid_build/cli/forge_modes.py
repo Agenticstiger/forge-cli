@@ -1640,6 +1640,7 @@ def _create_project_agent_loop(
         build_capability_matrix,
         discover_local_context,
     )
+    from fluid_build.util.workspace import find_workspace_root
 
     try:
         llm_config = copilot_options.get("llm_config")
@@ -1657,6 +1658,13 @@ def _create_project_agent_loop(
             except Exception:  # noqa: BLE001
                 pass
 
+        # SECURITY_REVIEW S-003/S-004: determine the workspace root at
+        # the CLI-invoked entry point (not in the agent loop) so it
+        # reflects the human operator's intent. find_workspace_root
+        # walks up from cwd looking for a fluid project marker; we
+        # fall back to cwd if nothing is found.
+        ws_root = find_workspace_root(Path.cwd()) or Path.cwd()
+
         result = run_copilot_agent_loop(
             context=context,
             llm_config=llm_config,
@@ -1664,6 +1672,7 @@ def _create_project_agent_loop(
             capability_matrix=copilot_options.get("capability_matrix"),
             console=console,
             perf_stats=perf_stats,
+            workspace_root=ws_root,
         )
 
         contract = result.get("contract")

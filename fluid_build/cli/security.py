@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import re
 import signal
 import threading
@@ -39,7 +40,51 @@ MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 # obviously suspiciously deep paths that are hard to reason about safely.
 MAX_PATH_DEPTH = 25
 ALLOWED_FILE_EXTENSIONS = {".yaml", ".yml", ".json", ".txt", ".md", ".html", ".dot", ".svg", ".png"}
-FORBIDDEN_PATHS = {"/etc", "/usr", "/bin", "/sbin", "/var", "/root"}
+
+
+def _build_forbidden_paths() -> Set[str]:
+    """Return the platform-specific set of system-path prefixes to deny.
+
+    SECURITY_REVIEW S-002: the previous hard-coded Linux-only set missed
+    macOS (``/etc`` resolves to ``/private/etc``, which has no prefix in
+    the Linux set) and Windows entirely. The check site uses
+    ``Path.is_relative_to`` for a proper domain-boundary comparison
+    rather than a naive string ``startswith`` — that fixes the
+    false-positive on siblings like ``/etcd/file.yaml``.
+    """
+    system = platform.system()
+    if system == "Darwin":
+        # macOS resolves ``/etc`` to ``/private/etc`` via symlink. Include
+        # ``/private/etc`` so paths that have already been through
+        # ``Path.resolve()`` — which all our validators do — still hit
+        # the deny. Deliberately NOT including ``/private/var`` or
+        # ``/private/tmp``: pytest's ``tmp_path`` fixture lives at
+        # ``/private/var/folders/…`` on macOS, and legitimate app code
+        # uses ``/tmp``. The review's concern is config + binary +
+        # password locations; ``/etc`` (and its ``/private/etc``
+        # resolved form) is the one that actually matters there.
+        return {
+            "/etc",
+            "/private/etc",
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/root",
+            "/System",
+            "/var",  # legacy entry; inert on macOS under .resolve() but kept for parity
+        }
+    if system == "Windows":
+        return {
+            "C:\\Windows",
+            "C:\\Program Files",
+            "C:\\Program Files (x86)",
+            "C:\\ProgramData",
+        }
+    # Linux and other Unix-likes
+    return {"/etc", "/usr", "/bin", "/sbin", "/var", "/root"}
+
+
+FORBIDDEN_PATHS = _build_forbidden_paths()
 
 # Timeout configuration
 DEFAULT_TIMEOUT = 300  # 5 minutes
@@ -72,6 +117,11 @@ class SecurePathValidator:
 
     def validate_input_path(self, path: Union[str, Path], file_type: str = "file") -> Path:
         """Validate an input file path for reading"""
+        # S-001: the traversal check must see ``..`` in the RAW input
+        # before ``Path.resolve()`` collapses it. Run the check on the
+        # original input up-front.
+        self._reject_raw_traversal(path, "read")
+
         path_obj = Path(path).resolve()
 
         # Check if path exists
@@ -87,7 +137,8 @@ class SecurePathValidator:
                 ],
             )
 
-        # Security validations
+        # Security validations (operate on the resolved path for
+        # canonical forbidden-path + depth checks).
         self._validate_path_security(path_obj, "read")
         self._validate_file_extension(path_obj)
         self._validate_file_size(path_obj)
@@ -96,6 +147,9 @@ class SecurePathValidator:
 
     def validate_output_path(self, path: Union[str, Path], file_type: str = "output") -> Path:
         """Validate an output file path for writing"""
+        # S-001: same pre-resolve traversal check as validate_input_path.
+        self._reject_raw_traversal(path, "write")
+
         path_obj = Path(path).resolve()
 
         # Security validations
@@ -104,15 +158,43 @@ class SecurePathValidator:
 
         return path_obj
 
+    def _reject_raw_traversal(self, raw_path: Union[str, Path], operation: str) -> None:
+        """Reject ``..`` segments in the raw user input.
+
+        ``Path.resolve()`` collapses ``..`` against the current working
+        directory, so by the time callers check ``path.parts`` the
+        traversal is invisible. Inspect the original string BEFORE
+        resolve so callers that type ``../../etc/passwd`` get rejected
+        here — not silently accepted because ``resolve()`` landed on
+        a legitimate-looking absolute path.
+        """
+        if not self.security_context.enable_path_validation:
+            return
+        raw_parts = Path(raw_path).parts
+        if ".." in raw_parts:
+            raise FluidCLIError(
+                1,
+                "path_traversal_detected",
+                f"Path traversal detected in {operation} path: {raw_path}",
+                context={"path": str(raw_path), "operation": operation},
+                suggestions=[
+                    "Use absolute paths instead of relative paths",
+                    "Avoid '..' in file paths",
+                    "Specify files within the current project directory",
+                ],
+            )
+
     def _validate_path_security(self, path: Path, operation: str) -> None:
         """Validate path for security issues"""
         if not self.security_context.enable_path_validation:
             return
 
         path_str = str(path)
-        normalized_path = re.sub(r"/+", "/", path_str.replace("\\", "/"))
 
-        # Check for path traversal attempts
+        # Belt-and-suspenders: ``Path.resolve()`` usually strips ``..``,
+        # but some callers construct Path objects directly without
+        # resolving. Keep this check so it at least catches hand-built
+        # adversarial inputs.
         if ".." in path.parts:
             raise FluidCLIError(
                 1,
@@ -138,10 +220,19 @@ class SecurePathValidator:
                 ],
             )
 
-        # Check for forbidden system paths
+        # Check for forbidden system paths.
+        # S-002: use ``Path.is_relative_to`` instead of a string prefix
+        # match so siblings like ``/etcd/file.yaml`` are not
+        # false-positive-denied. The forbidden set is platform-aware
+        # (see _build_forbidden_paths).
         for forbidden in self.security_context.forbidden_paths:
-            normalized_forbidden = re.sub(r"/+", "/", forbidden.replace("\\", "/"))
-            if normalized_path.startswith(normalized_forbidden):
+            try:
+                is_blocked = path.is_relative_to(Path(forbidden))
+            except (ValueError, OSError):
+                # Cross-drive comparisons on Windows can raise; treat
+                # as no match and continue.
+                continue
+            if is_blocked:
                 raise FluidCLIError(
                     1,
                     "forbidden_path_access",
