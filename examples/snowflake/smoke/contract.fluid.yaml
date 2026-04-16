@@ -1,0 +1,68 @@
+fluidVersion: "0.7.1"
+kind: "DataProduct"
+id: "silver.community.snowflake_smoke_v1"
+name: "Snowflake Smoke Table"
+description: "Minimal native-SQL Snowflake starter for first-time FLUID deployments."
+domain: "community"
+
+metadata:
+  layer: "Silver"
+  owner:
+    team: "data-platform"
+    email: "data-platform@example.com"
+  tags:
+    - "snowflake"
+    - "starter"
+    - "native-sql"
+
+builds:
+  - id: "seed_smoke_table"
+    description: "Create and seed the minimal Snowflake smoke table."
+    pattern: "embedded-logic"
+    engine: "sql"
+    properties:
+      sql: |
+        CREATE OR REPLACE TABLE "{{ env.SNOWFLAKE_DATABASE }}"."{{ env.SNOWFLAKE_SCHEMA }}"."SMOKE_TABLE" (
+          "ID" NUMBER(38,0) NOT NULL,
+          "MESSAGE" VARCHAR,
+          "CREATED_AT" TIMESTAMP_NTZ
+        );
+
+        INSERT INTO "{{ env.SNOWFLAKE_DATABASE }}"."{{ env.SNOWFLAKE_SCHEMA }}"."SMOKE_TABLE"
+        SELECT 1, 'ok', CURRENT_TIMESTAMP();
+    execution:
+      trigger:
+        type: "manual"
+      runtime:
+        platform: "snowflake"
+        resources:
+          warehouse: "{{ env.SNOWFLAKE_WAREHOUSE }}"
+          database: "{{ env.SNOWFLAKE_DATABASE }}"
+          schema: "{{ env.SNOWFLAKE_SCHEMA }}"
+          role: "{{ env.SNOWFLAKE_ROLE }}"
+
+exposes:
+  - exposeId: "smoke_table"
+    kind: "table"
+    title: "Snowflake Smoke Table"
+    binding:
+      platform: "snowflake"
+      format: "snowflake_table"
+      location:
+        account: "{{ env.SNOWFLAKE_ACCOUNT }}"
+        database: "{{ env.SNOWFLAKE_DATABASE }}"
+        schema: "{{ env.SNOWFLAKE_SCHEMA }}"
+        table: "SMOKE_TABLE"
+      properties:
+        cluster_by:
+          - "CREATED_AT"
+        comment: "Minimal native-SQL Snowflake smoke table managed by FLUID."
+    contract:
+      schema:
+        - name: "ID"
+          type: "INTEGER"
+          required: true
+        - name: "MESSAGE"
+          type: "STRING"
+        - name: "CREATED_AT"
+          type: "TIMESTAMP"

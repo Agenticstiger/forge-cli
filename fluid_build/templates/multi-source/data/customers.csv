@@ -1,0 +1,9 @@
+id,name,email,signup_date,status
+1,Alice Johnson,alice.johnson@email.com,2024-01-15,active
+2,Bob Smith,bob.smith@email.com,2024-02-20,active
+3,Carol Williams,carol.w@email.com,2024-03-10,inactive
+4,David Brown,david.brown@email.com,2024-04-05,active
+5,Eve Davis,eve.davis@email.com,2024-05-12,active
+6,Frank Miller,frank.m@email.com,2024-06-18,active
+7,Grace Lee,grace.lee@email.com,2024-07-22,inactive
+8,Henry Wilson,henry.w@email.com,2024-08-30,active

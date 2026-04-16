@@ -1,0 +1,7 @@
+customer_id,name,email,country,signup_date,subscription_tier
+1,Alice Johnson,alice@example.com,USA,2024-01-15,premium
+2,Bob Smith,bob@example.com,UK,2024-02-20,standard
+3,Charlie Brown,charlie@example.com,USA,2024-03-10,premium
+4,Diana Prince,diana@example.com,Canada,2024-04-05,enterprise
+5,Eve Davis,eve@example.com,USA,2024-05-12,standard
+6,Frank Miller,frank@example.com,UK,2024-06-01,premium

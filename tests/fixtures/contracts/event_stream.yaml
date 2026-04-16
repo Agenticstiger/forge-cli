@@ -1,0 +1,67 @@
+# FLUID 0.7.1 Contract - Event Streaming (Kafka)
+fluidVersion: "0.7.1"
+kind: DataContract
+id: user-events-stream-v1
+name: user-events-stream
+
+metadata:
+  version: "1.0.0"
+  name: "User Events Stream"
+  description: "Real-time user interaction events"
+  status: active
+  domain: events
+  environment: production
+  tags:
+    - events
+    - streaming
+    - real-time
+
+owner:
+  team: platform-engineering
+  name: Platform Team
+  email: platform@company.com
+
+exposes:
+  - id: user_events
+    version: "1.0.0"
+    description: "User interaction events stream"
+    provider: kafka
+    location:
+      cluster: prod-kafka-cluster
+      topic: user.events.v1
+      bootstrap_servers: kafka-prod.company.com:9092
+      schema_registry: http://schema-registry.company.com:8081
+    schema:
+      format: avro
+      fields:
+        - name: event_id
+          type: string
+          description: "Unique event identifier"
+          required: true
+          
+        - name: user_id
+          type: string
+          description: "User identifier"
+          required: true
+          
+        - name: event_type
+          type: string
+          description: "Type of event"
+          required: true
+          validations:
+            allowed_values:
+              - page_view
+              - button_click
+              - form_submit
+              - video_play
+              - purchase
+          
+        - name: timestamp
+          type: timestamp
+          description: "Event timestamp"
+          required: true
+          
+        - name: event_data
+          type: json
+          description: "Event payload"
+          required: false

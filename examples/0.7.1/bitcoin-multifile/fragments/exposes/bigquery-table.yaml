@@ -1,0 +1,97 @@
+# Expose: BigQuery table — owned by data engineering / platform team.
+# Includes schema contract, governance policies, and platform binding.
+
+exposeId: bitcoin_prices_table
+title: "Bitcoin Real-time Price Feed"
+version: "1.0.0"
+kind: table
+
+tags:
+  - financial-data
+  - real-time
+  - api-sourced
+
+labels:
+  sensitivity: "internal"
+  data_domain: "finance"
+  update_frequency: "realtime"
+
+binding:
+  platform: gcp
+  format: bigquery_table
+  location:
+    project: dust-labs-485011
+    dataset: crypto_data_labeled_1
+    table: bitcoin_prices
+    region: EU
+
+policy:
+  classification: Internal
+  authn: iam
+  authz:
+    readers:
+      - group:data-analytics@company.com
+      - group:finance-team@company.com
+    writers:
+      - serviceAccount:data-pipeline@testingsandbox.iam.gserviceaccount.com
+      - group:data-engineering@company.com
+  tags:
+    - gdpr-compliant
+    - soc2-compliant
+    - financial-data
+
+contract:
+  schema:
+    - name: price_timestamp
+      type: timestamp
+      required: true
+      description: "Timestamp when the price was recorded (UTC)"
+      sensitivity: cleartext
+
+    - name: price_usd
+      type: numeric
+      required: true
+      description: "Bitcoin price in US Dollars"
+      sensitivity: cleartext
+
+    - name: price_eur
+      type: numeric
+      required: true
+      description: "Bitcoin price in Euros"
+      sensitivity: cleartext
+
+    - name: price_gbp
+      type: numeric
+      required: true
+      description: "Bitcoin price in British Pounds"
+      sensitivity: cleartext
+
+    - name: market_cap_usd
+      type: numeric
+      required: false
+      description: "Total Bitcoin market capitalization in USD"
+      sensitivity: internal
+
+    - name: volume_24h_usd
+      type: numeric
+      required: false
+      description: "24-hour trading volume in USD"
+      sensitivity: internal
+
+    - name: price_change_24h
+      type: numeric
+      required: false
+      description: "Price change in last 24 hours (percentage)"
+      sensitivity: cleartext
+
+    - name: last_updated
+      type: timestamp
+      required: true
+      description: "Timestamp from CoinGecko API"
+      sensitivity: cleartext
+
+    - name: ingestion_timestamp
+      type: timestamp
+      required: true
+      description: "When FLUID ingested this record"
+      sensitivity: cleartext

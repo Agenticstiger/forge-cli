@@ -1,0 +1,51 @@
+name: "Customer 360 Analytics"
+id: "customer-360"
+version: "0.7.1"
+difficulty: "intermediate"
+time_to_complete: "10 minutes"
+learning_path_order: 13
+track: "intermediate"
+concepts:
+  - "Production-ready data products"
+  - "Customer 360 patterns"
+  - "Multi-source integration"
+  - "Complete analytics pipeline"
+  - "DAG deployment"
+  - "End-to-end workflow"
+prerequisites:
+  - "FLUID CLI installed"
+  - "Docker and Docker Compose installed"
+  - "Completed 001-003 and 011"
+quickstart_tutorial: "013-customer-360-analytics.md"
+related_tutorials:
+  - "003-multi-source-joins.md"
+  - "011-your-first-dag.md"
+  - "012-pipeline-orchestration.md"
+features:
+  local_execution: true
+  dag_generation: true
+  cloud_deployment: true
+  requires_docker: true
+tags:
+  - intermediate
+  - customer-360
+  - production
+  - analytics
+  - showcase
+  - end-to-end
+sample_data_included: true
+estimated_file_size: "40KB"
+description: |
+  Production-ready Customer 360 analytics pipeline - a complete showcase
+  of FLUID's capabilities in one template.
+  
+  This template demonstrates:
+  - Multi-source data integration (customers, orders, interactions)
+  - Complex business logic and KPIs
+  - Customer segmentation (RFM analysis)
+  - Lifetime value calculations
+  - Auto-generated Airflow DAG
+  - Data quality validations
+  - Ready for cloud deployment
+  
+  The perfect "copy-paste-customize" starting point for customer analytics.

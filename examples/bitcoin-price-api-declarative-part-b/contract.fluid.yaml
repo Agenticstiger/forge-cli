@@ -1,0 +1,230 @@
+fluidVersion: "0.5.7"
+kind: DataProduct
+id: crypto.bitcoin_prices_gcp_governed
+name: Bitcoin Price Index (FLUID Declarative + Governance)
+description: Real-time Bitcoin price data with comprehensive governance policies and compliance controls
+domain: finance
+
+# Standard metadata
+metadata:
+  layer: Gold
+  owner:
+    team: data-engineering
+    email: data-engineering@company.com
+
+# Optional tags (supported by schema)
+tags:
+  - cryptocurrency
+  - real-time
+  - governed
+  - gdpr-compliant
+
+# Optional labels (supported by schema)
+labels:
+  cost_center: "CC-1234"
+  business_criticality: "high"
+  compliance_gdpr: "true"
+  compliance_soc2: "true"
+
+# Build: API ingestion with execution configuration
+builds:
+  - id: bitcoin_price_ingestion
+    description: Fetch Bitcoin prices from CoinGecko API with data quality validation
+    pattern: hybrid-reference
+    engine: python
+    repository: ./runtime
+    properties:
+      model: ingest
+    
+    # Execution trigger configuration
+    execution:
+      trigger:
+        type: manual
+        iterations: 5  # Run 5 times for Part B demo
+        delaySeconds: 5  # 5 second delay
+      
+      runtime:
+        platform: gcp
+        resources:
+          cpu: "1"
+          memory: "2Gi"
+      
+      retries:
+        count: 3
+        backoff: exponential
+    
+    outputs:
+      - bitcoin_prices_table
+
+# Expose: BigQuery table with governance policies
+exposes:
+  - exposeId: bitcoin_prices_table
+    title: "Bitcoin Real-time Price Feed"
+    version: "1.0.0"
+    kind: table
+    
+    # Tags for discoverability and governance
+    tags:
+      - financial-data
+      - real-time
+      - api-sourced
+      - internal-use
+    
+    # Labels for automation and filtering
+    labels:
+      sensitivity: "internal"
+      data_domain: "finance"
+      update_frequency: "realtime"
+      retention_years: "7"
+      region: "eu"
+    
+    # Platform binding
+    binding:
+      platform: gcp
+      format: bigquery_table
+      location:
+        project: <<YOUR_PROJECT_HERE>>
+        dataset: crypto_data
+        table: bitcoin_prices
+        region: europe-west3  # GDPR-compliant EU region
+    
+    # GOVERNANCE POLICIES (schema-compliant)
+    policy:
+      # Data classification
+      classification: Internal  # Options: Public, Internal, Confidential, Restricted
+      
+      # Authentication method
+      authn: iam  # Options: oidc, oauth2, api_key, none, custom, iam, jwt
+      
+      # Authorization policies
+      authz:
+        readers:
+          - group:data-analytics@company.com
+          - group:finance-team@company.com
+          - group:trading-desk@company.com
+          - serviceAccount:looker@<<YOUR_PROJECT_HERE>>.iam.gserviceaccount.com
+        
+        writers:
+          - serviceAccount:data-pipeline@<<YOUR_PROJECT_HERE>>.iam.gserviceaccount.com
+          - group:data-engineering@company.com
+        
+        # Column-level access control (example - not enforced in free tier)
+        columnRestrictions:
+          - principal: "group:interns@company.com"
+            columns:
+              - market_cap_usd
+              - volume_24h_usd
+            access: deny
+            tags:
+              - sensitive-financial-data
+      
+      # Privacy controls
+      privacy:
+        # Data masking rules (if we had PII)
+        masking: []
+        
+        # Row-level security (example - not enforced in free tier)
+        rowLevelPolicy:
+          expression: "ingestion_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)"
+          tags:
+            - data-retention
+            - gdpr-compliance
+      
+      # Policy tags for governance
+      tags:
+        - gdpr-compliant
+        - soc2-compliant
+        - financial-data
+      
+      # Policy labels for automation
+      labels:
+        compliance_framework: "GDPR,SOC2,ISO27001"
+        audit_required: "true"
+        data_lineage_tracked: "true"
+    
+    # Schema contract with field-level metadata
+    contract:
+      schema:
+        - name: price_timestamp
+          type: timestamp
+          required: true
+          description: "Timestamp when the price was recorded (UTC)"
+          sensitivity: cleartext  # Schema-supported field
+          tags:
+            - temporal
+            - utc-timezone
+          
+        - name: price_usd
+          type: numeric
+          required: true
+          description: "Bitcoin price in US Dollars"
+          sensitivity: cleartext
+          tags:
+            - price-data
+            - usd-denominated
+            - business-critical
+          
+        - name: price_eur
+          type: numeric
+          required: true
+          description: "Bitcoin price in Euros"
+          sensitivity: cleartext
+          tags:
+            - price-data
+            - eur-denominated
+            - business-critical
+          
+        - name: price_gbp
+          type: numeric
+          required: true
+          description: "Bitcoin price in British Pounds"
+          sensitivity: cleartext
+          tags:
+            - price-data
+            - gbp-denominated
+            - business-critical
+          
+        - name: market_cap_usd
+          type: numeric
+          required: false
+          description: "Total Bitcoin market capitalization in USD"
+          sensitivity: cleartext
+          tags:
+            - market-data
+            - aggregated
+          
+        - name: volume_24h_usd
+          type: numeric
+          required: false
+          description: "24-hour trading volume in USD"
+          sensitivity: cleartext
+          tags:
+            - market-data
+            - volume
+          
+        - name: price_change_24h_percent
+          type: numeric
+          required: false
+          description: "24-hour price change percentage"
+          sensitivity: cleartext
+          tags:
+            - derived-metric
+            - percentage
+          
+        - name: last_updated
+          type: timestamp
+          required: false
+          description: "Last update timestamp from CoinGecko API"
+          sensitivity: cleartext
+          tags:
+            - metadata
+            - api-sourced
+          
+        - name: ingestion_timestamp
+          type: timestamp
+          required: true
+          description: "When this record was ingested into our system"
+          sensitivity: cleartext
+          tags:
+            - audit-trail
+            - system-generated

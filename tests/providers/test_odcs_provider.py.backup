@@ -1,0 +1,560 @@
+# tests/providers/test_odcs_provider.py
+"""
+Comprehensive unit tests for ODCS (Open Data Contract Standard) provider.
+"""
+
+import json
+import pytest
+import yaml
+from pathlib import Path
+from typing import Dict, Any
+
+from fluid_build.providers.odcs import OdcsProvider
+from fluid_build.providers.base import ProviderError
+
+
+@pytest.fixture
+def odcs_provider():
+    """Create ODCS provider instance."""
+    return OdcsProvider()
+
+
+@pytest.fixture
+def fixtures_dir():
+    """Get fixtures directory path."""
+    return Path(__file__).parent.parent / "fixtures" / "contracts"
+
+
+@pytest.fixture
+def customer_analytics_contract(fixtures_dir):
+    """Load customer analytics FLUID contract."""
+    with open(fixtures_dir / "customer_analytics.yaml") as f:
+        return yaml.safe_load(f)
+
+
+@pytest.fixture
+def sales_reporting_contract(fixtures_dir):
+    """Load sales reporting FLUID contract."""
+    with open(fixtures_dir / "sales_reporting.yaml") as f:
+        return yaml.safe_load(f)
+
+
+@pytest.fixture
+def event_stream_contract(fixtures_dir):
+    """Load event stream FLUID contract."""
+    with open(fixtures_dir / "event_stream.yaml") as f:
+        return yaml.safe_load(f)
+
+
+@pytest.fixture
+def minimal_contract(fixtures_dir):
+    """Load minimal FLUID contract."""
+    with open(fixtures_dir / "minimal.yaml") as f:
+        return yaml.safe_load(f)
+
+
+class TestOdcsProviderBasics:
+    """Test basic provider functionality."""
+    
+    def test_provider_name(self, odcs_provider):
+        """Test provider name."""
+        assert odcs_provider.name == "odcs"
+    
+    def test_provider_version(self, odcs_provider):
+        """Test ODCS version."""
+        assert odcs_provider.odcs_version == "v3.1.0"
+    
+    def test_capabilities(self, odcs_provider):
+        """Test provider capabilities."""
+        caps = odcs_provider.capabilities()
+        assert caps["render"] is True
+        assert caps["validate"] is True
+        assert caps["planning"] is False
+        assert caps["apply"] is False
+    
+    def test_schema_loaded(self, odcs_provider):
+        """Test ODCS schema is loaded."""
+        assert odcs_provider.schema is not None
+        assert isinstance(odcs_provider.schema, dict)
+    
+    def test_plan_not_supported(self, odcs_provider, minimal_contract):
+        """Test that plan() raises error."""
+        with pytest.raises(ProviderError, match="does not support plan"):
+            odcs_provider.plan(minimal_contract)
+    
+    def test_apply_not_supported(self, odcs_provider):
+        """Test that apply() raises error."""
+        with pytest.raises(ProviderError, match="does not support apply"):
+            odcs_provider.apply([])
+
+
+class TestOdcsExportBasic:
+    """Test basic ODCS export functionality."""
+    
+    def test_export_minimal_contract(self, odcs_provider, minimal_contract):
+        """Test export of minimal contract."""
+        odcs = odcs_provider.render(minimal_contract)
+        
+        # Verify required fields
+        assert odcs["version"] == "1.0.0"
+        assert odcs["apiVersion"] == "v3.1.0"
+        assert odcs["kind"] == "DataContract"
+        assert odcs["id"] == "minimal-contract"
+        assert odcs["status"] == "draft"
+    
+    def test_export_customer_analytics(self, odcs_provider, customer_analytics_contract):
+        """Test export of customer analytics contract."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        # Verify structure
+        assert odcs["version"] == "1.0.0"
+        assert odcs["apiVersion"] == "v3.1.0"
+        assert odcs["kind"] == "DataContract"
+        assert odcs["id"] == "customer-analytics-v1"
+        assert odcs["name"] == "Customer Analytics Data Product"
+        assert odcs["status"] == "active"
+        
+        # Verify description structure
+        assert "description" in odcs
+        assert "purpose" in odcs["description"]
+        assert odcs["description"]["purpose"] == "Comprehensive customer segmentation and churn risk analytics"
+        
+        # Verify team structure
+        assert "team" in odcs
+        assert odcs["team"]["name"] == "data-engineering"
+        assert "members" in odcs["team"]
+        
+        # Verify tags
+        assert "tags" in odcs
+    
+    def test_reject_batch_export(self, odcs_provider, minimal_contract):
+        """Test that batch export is rejected."""
+        with pytest.raises(ProviderError, match="does not support batch"):
+            odcs_provider.render([minimal_contract, minimal_contract])
+
+
+class TestOdcsSchemaExtraction:
+    """Test schema field extraction and mapping."""
+    
+    def test_schema_fields_count(self, odcs_provider, customer_analytics_contract):
+        """Test correct number of schema fields."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        assert "schema" in odcs
+        # Should have 10 fields from customer_segments
+        assert len(odcs["schema"]) == 10
+    
+    def test_field_mapping(self, odcs_provider, customer_analytics_contract):
+        """Test individual field mappings."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        # Find customer_id field
+        customer_id = next(f for f in odcs["schema"] if f["name"] == "customer_id")
+        
+        assert customer_id["logicalType"] == "string"
+        assert customer_id["physicalType"] == "STRING"  # BigQuery
+        assert customer_id["isNullable"] is False
+        assert customer_id["classification"] == "identifier"
+        assert "tags" in customer_id
+    
+    def test_required_field_mapping(self, odcs_provider, minimal_contract):
+        """Test required field maps to isNullable=false."""
+        odcs = odcs_provider.render(minimal_contract)
+        
+        id_field = next(f for f in odcs["schema"] if f["name"] == "id")
+        value_field = next(f for f in odcs["schema"] if f["name"] == "value")
+        
+        assert id_field["isNullable"] is False
+        assert value_field["isNullable"] is False
+    
+    def test_optional_field_mapping(self, odcs_provider, customer_analytics_contract):
+        """Test optional field maps to isNullable=true."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        # preferences field is not required
+        prefs = next(f for f in odcs["schema"] if f["name"] == "preferences")
+        assert prefs["isNullable"] is True
+
+
+class TestOdcsTypeMappings:
+    """Test type system mappings."""
+    
+    @pytest.mark.parametrize("fluid_type,logical_type", [
+        ("string", "string"),
+        ("text", "string"),
+        ("varchar", "string"),
+        ("int", "integer"),
+        ("integer", "integer"),
+        ("bigint", "long"),
+        ("long", "long"),
+        ("float", "float"),
+        ("double", "double"),
+        ("decimal", "decimal"),
+        ("numeric", "decimal"),
+        ("bool", "boolean"),
+        ("boolean", "boolean"),
+        ("date", "date"),
+        ("datetime", "timestamp"),
+        ("timestamp", "timestamp"),
+        ("time", "time"),
+        ("json", "object"),
+        ("object", "object"),
+        ("array", "array"),
+        ("binary", "binary"),
+        ("bytes", "binary"),
+    ])
+    def test_logical_type_mapping(self, odcs_provider, fluid_type, logical_type):
+        """Test FLUID type to ODCS logical type."""
+        result = odcs_provider._map_type_to_logical(fluid_type)
+        assert result == logical_type
+    
+    def test_bigquery_physical_types(self, odcs_provider, customer_analytics_contract):
+        """Test BigQuery physical type mappings."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        # Check various field types
+        type_map = {f["name"]: f for f in odcs["schema"]}
+        
+        assert type_map["customer_id"]["physicalType"] == "STRING"
+        assert type_map["segment"]["physicalType"] == "STRING"
+        assert type_map["total_purchases"]["physicalType"] == "INT64"
+        assert type_map["churn_risk_score"]["physicalType"] == "FLOAT64"
+        assert type_map["is_active"]["physicalType"] == "BOOL"
+        assert type_map["account_created_at"]["physicalType"] == "TIMESTAMP"
+        assert type_map["preferences"]["physicalType"] == "JSON"
+    
+    def test_snowflake_physical_types(self, odcs_provider, sales_reporting_contract):
+        """Test Snowflake physical type mappings."""
+        odcs = odcs_provider.render(sales_reporting_contract)
+        
+        type_map = {f["name"]: f for f in odcs["schema"]}
+        
+        assert type_map["region_id"]["physicalType"] == "VARCHAR"
+        assert type_map["total_orders"]["physicalType"] == "NUMBER"
+        assert type_map["average_order_value"]["physicalType"] == "FLOAT"
+
+
+class TestOdcsQualityExtraction:
+    """Test quality checks extraction."""
+    
+    def test_quality_from_validations(self, odcs_provider, customer_analytics_contract):
+        """Test quality checks from field validations."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        # Find segment field (has allowed_values)
+        segment = next(f for f in odcs["schema"] if f["name"] == "segment")
+        
+        assert "quality" in segment
+        quality_checks = segment["quality"]
+        
+        # Should have validation for allowed values
+        assert any(q["operator"] == "mustBeInList" for q in quality_checks)
+        
+        # Should have not null check (required=true)
+        assert any(q["operator"] == "mustBe" and q["value"] == "notNull" for q in quality_checks)
+    
+    def test_quality_min_max_values(self, odcs_provider, customer_analytics_contract):
+        """Test min/max value quality checks."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        # churn_risk_score has min/max validations
+        churn = next(f for f in odcs["schema"] if f["name"] == "churn_risk_score")
+        
+        assert "quality" in churn
+        quality_ops = [q["operator"] for q in churn["quality"]]
+        
+        # Should have range checks
+        assert "mustBeGreaterThan" in quality_ops or "mustBeLessThan" in quality_ops
+    
+    def test_quality_pattern_validation(self, odcs_provider, customer_analytics_contract):
+        """Test pattern/regex quality checks."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        # customer_email has pattern validation
+        email = next(f for f in odcs["schema"] if f["name"] == "customer_email")
+        
+        assert "quality" in email
+        pattern_check = next((q for q in email["quality"] if q["operator"] == "matchesPattern"), None)
+        assert pattern_check is not None
+        assert "@" in pattern_check["value"]  # Email pattern
+    
+    def test_quality_can_be_disabled(self, odcs_provider, customer_analytics_contract):
+        """Test quality checks can be disabled."""
+        odcs_provider.include_quality_checks = False
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        # No field should have quality
+        for field in odcs["schema"]:
+            assert "quality" not in field
+
+
+class TestOdcsServerExtraction:
+    """Test server definitions extraction."""
+    
+    def test_servers_from_exposes_and_expects(self, odcs_provider, customer_analytics_contract):
+        """Test servers extracted from both exposes and expects."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        assert "servers" in odcs
+        # 1 from exposes + 2 from expects
+        assert len(odcs["servers"]) == 3
+    
+    def test_bigquery_server_details(self, odcs_provider, customer_analytics_contract):
+        """Test BigQuery server details."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        # Find server from exposes
+        expose_server = next(s for s in odcs["servers"] if s["name"] == "customer_segments")
+        
+        assert expose_server["type"] == "bigquery"
+        assert expose_server["project"] == "analytics-prod-12345"
+        assert expose_server["dataset"] == "customer_analytics"
+        assert expose_server["table"] == "segments_v1"
+    
+    def test_snowflake_server_details(self, odcs_provider, sales_reporting_contract):
+        """Test Snowflake server details."""
+        odcs = odcs_provider.render(sales_reporting_contract)
+        
+        server = odcs["servers"][0]
+        
+        assert server["type"] == "snowflake"
+        assert server["account"] == "company-prod"
+        assert server["database"] == "ANALYTICS_DB"
+        assert server["schema"] == "SALES"
+        assert server["table"] == "DAILY_METRICS"
+    
+    @pytest.mark.parametrize("provider,server_type", [
+        ("gcp", "bigquery"),
+        ("bigquery", "bigquery"),
+        ("snowflake", "snowflake"),
+        ("aws", "s3"),
+        ("s3", "s3"),
+        ("redshift", "redshift"),
+        ("kafka", "kafka"),
+        ("postgres", "postgres"),
+        ("postgresql", "postgres"),
+    ])
+    def test_provider_to_server_type(self, odcs_provider, provider, server_type):
+        """Test provider to server type mapping."""
+        result = odcs_provider._map_provider_to_server_type(provider)
+        assert result == server_type
+
+
+class TestOdcsStatusMapping:
+    """Test status field mappings."""
+    
+    @pytest.mark.parametrize("fluid_status,odcs_status", [
+        ("draft", "draft"),
+        ("active", "active"),
+        ("deprecated", "deprecated"),
+        ("retired", "retired"),
+        ("development", "draft"),
+    ])
+    def test_status_to_odcs(self, odcs_provider, minimal_contract, fluid_status, odcs_status):
+        """Test FLUID status to ODCS status."""
+        minimal_contract["metadata"]["status"] = fluid_status
+        odcs = odcs_provider.render(minimal_contract)
+        assert odcs["status"] == odcs_status
+    
+    @pytest.mark.parametrize("odcs_status,fluid_status", [
+        ("draft", "draft"),
+        ("active", "active"),
+        ("deprecated", "deprecated"),
+        ("retired", "retired"),
+    ])
+    def test_status_from_odcs(self, odcs_provider, odcs_status, fluid_status):
+        """Test ODCS status to FLUID status."""
+        result = odcs_provider._map_status_from_odcs(odcs_status)
+        assert result == fluid_status
+
+
+class TestOdcsImport:
+    """Test ODCS to FLUID import/conversion."""
+    
+    def test_import_basic(self, odcs_provider, minimal_contract):
+        """Test basic import functionality."""
+        # Export to ODCS
+        odcs = odcs_provider.render(minimal_contract)
+        
+        # Import back to FLUID
+        fluid = odcs_provider._odcs_to_fluid(odcs)
+        
+        assert fluid["metadata"]["name"] == "Minimal Test Contract"
+        assert fluid["contract"]["id"] == "minimal-contract"
+        assert fluid["metadata"]["status"] == "draft"
+    
+    def test_roundtrip_conversion(self, odcs_provider, customer_analytics_contract):
+        """Test round-trip FLUID → ODCS → FLUID."""
+        # Export to ODCS
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        # Import back to FLUID
+        fluid = odcs_provider._odcs_to_fluid(odcs)
+        
+        # Verify key fields preserved
+        assert fluid["metadata"]["name"] == "Customer Analytics Data Product"
+        assert fluid["contract"]["id"] == "customer-analytics-v1"
+        assert fluid["metadata"]["status"] == "active"
+        assert len(fluid["exposes"]) >= 1
+    
+    def test_schema_to_exposes(self, odcs_provider, minimal_contract):
+        """Test ODCS schema converts to FLUID exposes."""
+        odcs = odcs_provider.render(minimal_contract)
+        fluid = odcs_provider._odcs_to_fluid(odcs)
+        
+        assert "exposes" in fluid
+        assert len(fluid["exposes"]) >= 1
+        
+        expose = fluid["exposes"][0]
+        assert "schema" in expose
+        assert "fields" in expose["schema"]
+    
+    def test_servers_to_expects(self, odcs_provider, customer_analytics_contract):
+        """Test ODCS servers convert to FLUID expects."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        fluid = odcs_provider._odcs_to_fluid(odcs)
+        
+        assert "expects" in fluid
+        # Should have expectations from servers
+        assert len(fluid["expects"]) >= 1
+
+
+class TestOdcsOutputFormats:
+    """Test different output formats."""
+    
+    def test_yaml_output(self, odcs_provider, minimal_contract, tmp_path):
+        """Test YAML output format."""
+        output_file = tmp_path / "output.yaml"
+        
+        odcs = odcs_provider.render(
+            minimal_contract,
+            out=output_file,
+            fmt="yaml"
+        )
+        
+        assert output_file.exists()
+        
+        with open(output_file) as f:
+            loaded = yaml.safe_load(f)
+        
+        assert loaded["id"] == "minimal-contract"
+        assert loaded["kind"] == "DataContract"
+    
+    def test_json_output(self, odcs_provider, minimal_contract, tmp_path):
+        """Test JSON output format."""
+        output_file = tmp_path / "output.json"
+        
+        odcs = odcs_provider.render(
+            minimal_contract,
+            out=output_file,
+            fmt="json"
+        )
+        
+        assert output_file.exists()
+        
+        with open(output_file) as f:
+            loaded = json.load(f)
+        
+        assert loaded["id"] == "minimal-contract"
+        assert loaded["kind"] == "DataContract"
+
+
+class TestOdcsEdgeCases:
+    """Test edge cases and error handling."""
+    
+    def test_missing_contract_id(self, odcs_provider):
+        """Test error when contract ID is missing."""
+        invalid_contract = {
+            "metadata": {
+                "name": "test",
+                "status": "active"
+            },
+            "contract": {},
+            "exposes": []
+        }
+        
+        with pytest.raises(ProviderError, match="missing required 'id' field"):
+            odcs_provider.render(invalid_contract)
+    
+    def test_no_schema_fields(self, odcs_provider):
+        """Test contract with no schema fields."""
+        contract = {
+            "metadata": {
+                "name": "test",
+                "status": "active",
+                "version": "1.0.0"
+            },
+            "contract": {
+                "id": "test-id"
+            },
+            "owner": {
+                "team": "test"
+            },
+            "exposes": [
+                {
+                    "id": "output",
+                    "provider": "local"
+                    # No schema
+                }
+            ]
+        }
+        
+        odcs = odcs_provider.render(contract)
+        # Should work, just empty schema
+        assert "schema" not in odcs or odcs["schema"] == []
+
+
+class TestOdcsIntegration:
+    """Integration tests with realistic scenarios."""
+    
+    def test_full_customer_analytics_export(self, odcs_provider, customer_analytics_contract):
+        """Test complete export of customer analytics contract."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        # Comprehensive validation
+        assert odcs["version"] == "1.0.0"
+        assert odcs["apiVersion"] == "v3.1.0"
+        assert odcs["kind"] == "DataContract"
+        assert odcs["id"] == "customer-analytics-v1"
+        assert len(odcs["schema"]) == 10
+        assert len(odcs["servers"]) == 3
+        assert odcs["team"]["name"] == "data-engineering"
+    
+    def test_multi_provider_contracts(self, odcs_provider, fixtures_dir):
+        """Test exports from different provider types."""
+        contracts = [
+            "customer_analytics.yaml",
+            "sales_reporting.yaml",
+            "event_stream.yaml",
+        ]
+        
+        for filename in contracts:
+            with open(fixtures_dir / filename) as f:
+                contract = yaml.safe_load(f)
+            
+            odcs = odcs_provider.render(contract)
+            
+            # All should have required fields
+            assert "version" in odcs
+            assert "apiVersion" in odcs
+            assert "kind" in odcs
+            assert "id" in odcs
+            assert "status" in odcs
+    
+    def test_bitol_standards_compliance(self, odcs_provider, customer_analytics_contract):
+        """Test export complies with Bitol.io ODCS standard."""
+        odcs = odcs_provider.render(customer_analytics_contract)
+        
+        # Required by ODCS v3.1.0
+        assert odcs["apiVersion"] == "v3.1.0"
+        assert odcs["kind"] == "DataContract"
+        assert "version" in odcs
+        assert "id" in odcs
+        assert "status" in odcs
+        
+        # Schema fields have correct structure
+        for field in odcs["schema"]:
+            assert "name" in field
+            assert "logicalType" in field
+            # isNullable is required
+            assert "isNullable" in field

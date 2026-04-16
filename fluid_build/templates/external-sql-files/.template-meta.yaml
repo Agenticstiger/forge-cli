@@ -1,0 +1,38 @@
+name: "External SQL Files"
+id: "external-sql-files"
+version: "0.7.1"
+difficulty: "beginner"
+time_to_complete: "5 minutes"
+learning_path_order: 4
+track: "foundation"
+
+concepts:
+  - "SQL file organization"
+  - "Modular transformations"
+  - "Reusable SQL patterns"
+  - "Code maintainability"
+
+prerequisites:
+  - "003-multi-source"
+
+quickstart_tutorial: "004-external-sql-files.md"
+
+features:
+  local_execution: true
+  dag_generation: false
+  cloud_deployment: true
+  requires_docker: false
+
+tags:
+  - beginner
+  - sql
+  - modularity
+  - best-practices
+
+sample_data_included: true
+estimated_file_size: "15KB"
+
+description: |
+  Learn how to organize your SQL transformations in external files for better
+  code organization, reusability, and team collaboration. This template demonstrates
+  best practices for structuring complex SQL logic across multiple files.

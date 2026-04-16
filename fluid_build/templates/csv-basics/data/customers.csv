@@ -1,0 +1,11 @@
+id,name,email,signup_date,status,total_purchases,last_purchase_date
+1,Alice Johnson,alice.johnson@email.com,2024-01-15,active,15,2026-01-10
+2,Bob Smith,bob.smith@email.com,2024-02-20,active,8,2026-01-12
+3,Carol Williams,carol.w@email.com,2024-03-10,inactive,3,2025-11-05
+4,David Brown,david.brown@email.com,2024-04-05,active,22,2026-01-18
+5,Eve Davis,eve.davis@email.com,2024-05-12,active,12,2026-01-15
+6,Frank Miller,frank.m@email.com,2024-06-18,active,6,2026-01-08
+7,Grace Lee,grace.lee@email.com,2024-07-22,inactive,2,2025-10-20
+8,Henry Wilson,henry.w@email.com,2024-08-30,active,18,2026-01-16
+9,Ivy Martinez,ivy.martinez@email.com,2024-09-14,active,9,2026-01-14
+10,Jack Anderson,jack.a@email.com,2024-10-25,churned,1,2025-12-01

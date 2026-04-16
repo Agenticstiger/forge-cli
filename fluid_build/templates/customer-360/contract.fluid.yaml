@@ -1,0 +1,260 @@
+fluidVersion: 0.7.2
+kind: DataProduct
+id: gold.customer.analytics_360_v1
+name: Customer 360 Analytics
+description: Production-ready Customer 360 with RFM analysis, CLV, and churn prediction
+domain: Customer Experience
+tags:
+- customer-360
+- rfm-analysis
+- clv
+- churn-prediction
+labels:
+  team: customer-analytics
+  criticality: high
+  layer: gold
+metadata:
+  layer: Gold
+  owner:
+    team: customer-analytics
+    email: customer-analytics@company.com
+  businessContext:
+    domain: Customer Experience
+    subdomain: Customer Intelligence
+consumes:
+- productId: bronze.customer.raw_customers_v1
+  exposeId: raw_customer_data
+  purpose: Customer master data from CRM
+- productId: bronze.sales.raw_orders_v1
+  exposeId: raw_order_data
+  purpose: Historical transaction data
+- productId: bronze.support.raw_interactions_v1
+  exposeId: raw_interaction_data
+  purpose: Customer support and engagement data
+exposes:
+- exposeId: customer_360_master
+  title: Customer 360 Master Table
+  version: 1.0.0
+  kind: table
+  tags:
+  - pii
+  - customer-master
+  - gold-layer
+  labels:
+    sensitivity: high
+    retention: 7-years
+    data-category: analytical
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/customer_360.parquet
+  contract:
+    schema:
+    - name: customer_id
+      type: INTEGER
+      required: true
+      description: Unique customer identifier
+      semanticType: identifier
+    - name: full_name
+      type: VARCHAR
+      required: true
+      sensitivity: pii
+      description: Customer full name
+    - name: email
+      type: VARCHAR
+      required: true
+      sensitivity: pii
+      semanticType: email
+    - name: country
+      type: VARCHAR
+      description: Customer country
+    - name: industry
+      type: VARCHAR
+      description: Customer industry segment
+    - name: recency_days
+      type: INTEGER
+      description: Days since last purchase
+    - name: frequency
+      type: INTEGER
+      description: Total number of orders
+    - name: monetary
+      type: DECIMAL
+      description: Total revenue from customer
+    - name: rfm_score
+      type: VARCHAR
+      description: RFM score (e.g., 555 for top customers)
+    - name: customer_segment
+      type: VARCHAR
+      description: Customer segment (Champions, Loyal, At Risk, etc.)
+    - name: customer_lifetime_value
+      type: DECIMAL
+      description: Predicted customer lifetime value
+    - name: avg_sentiment
+      type: DECIMAL
+      description: Average sentiment score from interactions
+    - name: engagement_level
+      type: VARCHAR
+      description: Customer engagement level (High, Medium, Low)
+    - name: churn_risk
+      type: VARCHAR
+      description: Churn risk category (High, Medium, Low)
+    dq:
+      rules:
+      - id: customer_id_uniqueness
+        type: uniqueness
+        selector: customer_id
+        severity: error
+        description: Customer IDs must be unique
+        threshold: 1.0
+        operator: '>='
+      - id: email_format
+        type: valid_values
+        selector: email
+        severity: error
+        description: Email must be valid format
+      - id: rfm_score_format
+        type: valid_values
+        selector: rfm_score
+        severity: error
+        description: RFM score must be 3 digits between 111-555
+      - id: monetary_positive
+        type: accuracy
+        selector: monetary
+        threshold: 0
+        operator: '>='
+        severity: error
+        description: Monetary value cannot be negative
+      - id: sentiment_range
+        type: accuracy
+        selector: avg_sentiment
+        threshold: 0
+        operator: '>='
+        severity: warn
+        description: Sentiment score should be between 0-10
+- exposeId: high_value_customers
+  title: High Value Customer Segment
+  version: 1.0.0
+  kind: view
+  tags:
+  - pii
+  - high-value
+  - gold-layer
+  labels:
+    sensitivity: high
+    retention: 7-years
+    business-name: Champions & Loyal Customers
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/high_value_customers.parquet
+  contract:
+    schema:
+    - name: customer_id
+      type: INTEGER
+      required: true
+    - name: full_name
+      type: VARCHAR
+      sensitivity: pii
+    - name: email
+      type: VARCHAR
+      sensitivity: pii
+    - name: customer_segment
+      type: VARCHAR
+    - name: customer_lifetime_value
+      type: DECIMAL
+    - name: churn_risk
+      type: VARCHAR
+builds:
+- id: customer_360_pipeline
+  description: Customer 360 data pipeline with RFM and CLV calculations
+  pattern: multi-stage
+  engine: sql
+  properties:
+    stages:
+    - outputs:
+      - customer_base
+      name: stage_1_customer_base
+      properties:
+        sql: "SELECT \n  customer_id,\n  CONCAT(first_name, ' ', last_name) AS full_name,\n  LOWER(TRIM(email))\
+          \ AS email,\n  country,\n  industry,\n  signup_date,\n  CAST(julianday('now') - julianday(signup_date)\
+          \ AS INTEGER) AS days_since_signup\nFROM read_csv_auto('data/customers.csv', header=true)\n"
+    - dependsOn:
+      - stage_1_customer_base
+      outputs:
+      - purchase_summary
+      name: stage_2_purchase_summary
+      properties:
+        sql: "SELECT \n  customer_id,\n  COUNT(*) AS total_orders,\n  ROUND(SUM(amount), 2) AS total_revenue,\n\
+          \  ROUND(AVG(amount), 2) AS avg_order_value,\n  MIN(order_date) AS first_purchase_date,\n  MAX(order_date)\
+          \ AS last_purchase_date,\n  CAST(julianday('now') - julianday(MAX(order_date)) AS INTEGER) AS\
+          \ days_since_last_purchase\nFROM read_csv_auto('data/orders.csv', header=true)\nGROUP BY customer_id\n"
+    - dependsOn:
+      - stage_1_customer_base
+      outputs:
+      - engagement_summary
+      name: stage_3_engagement_summary
+      properties:
+        sql: "SELECT \n  customer_id,\n  COUNT(*) AS total_interactions,\n  SUM(CASE WHEN interaction_type\
+          \ = 'support' THEN 1 ELSE 0 END) AS support_interactions,\n  SUM(CASE WHEN interaction_type\
+          \ = 'marketing' THEN 1 ELSE 0 END) AS marketing_interactions,\n  ROUND(AVG(sentiment_score),\
+          \ 1) AS avg_sentiment_score,\n  ROUND(AVG(CASE WHEN interaction_type = 'support' THEN resolution_time_hours\
+          \ END), 2) AS avg_resolution_time,\n  MAX(interaction_date) AS last_interaction_date\nFROM read_csv_auto('data/interactions.csv',\
+          \ header=true)\nGROUP BY customer_id\n"
+    - dependsOn:
+      - stage_2_purchase_summary
+      - stage_3_engagement_summary
+      outputs:
+      - customer_360_master
+      name: stage_4_rfm_calculation
+      properties:
+        sql: "WITH rfm_calc AS (\n  SELECT \n    c.customer_id,\n    c.full_name,\n    c.email,\n    c.country,\n\
+          \    c.industry,\n    COALESCE(p.days_since_last_purchase, 999) AS recency_days,\n    COALESCE(p.total_orders,\
+          \ 0) AS frequency,\n    COALESCE(p.total_revenue, 0) AS monetary,\n    COALESCE(e.avg_sentiment_score,\
+          \ 5.0) AS avg_sentiment,\n    COALESCE(e.total_interactions, 0) AS total_interactions\n  FROM\
+          \ customer_base c\n  LEFT JOIN purchase_summary p ON c.customer_id = p.customer_id\n  LEFT JOIN\
+          \ engagement_summary e ON c.customer_id = e.customer_id\n),\nrfm_scores AS (\n  SELECT \n  \
+          \  *,\n    CASE \n      WHEN recency_days <= 30 THEN 5\n      WHEN recency_days <= 60 THEN 4\n\
+          \      WHEN recency_days <= 90 THEN 3\n      WHEN recency_days <= 180 THEN 2\n      ELSE 1\n\
+          \    END AS r_score,\n    CASE \n      WHEN frequency >= 10 THEN 5\n      WHEN frequency >=\
+          \ 5 THEN 4\n      WHEN frequency >= 3 THEN 3\n      WHEN frequency >= 1 THEN 2\n      ELSE 1\n\
+          \    END AS f_score,\n    CASE \n      WHEN monetary >= 5000 THEN 5\n      WHEN monetary >=\
+          \ 2000 THEN 4\n      WHEN monetary >= 1000 THEN 3\n      WHEN monetary >= 500 THEN 2\n     \
+          \ ELSE 1\n    END AS m_score\n  FROM rfm_calc\n)\nSELECT \n  customer_id,\n  full_name,\n  email,\n\
+          \  country,\n  industry,\n  recency_days,\n  frequency,\n  monetary,\n  CAST(r_score AS VARCHAR)\
+          \ || CAST(f_score AS VARCHAR) || CAST(m_score AS VARCHAR) AS rfm_score,\n  CASE \n    WHEN r_score\
+          \ >= 4 AND f_score >= 4 AND m_score >= 4 THEN 'Champions'\n    WHEN r_score >= 3 AND f_score\
+          \ >= 3 AND m_score >= 3 THEN 'Loyal Customers'\n    WHEN r_score >= 4 AND f_score <= 2 THEN\
+          \ 'Promising'\n    WHEN r_score <= 2 AND f_score >= 3 THEN 'At Risk'\n    WHEN r_score <= 2\
+          \ AND f_score <= 2 THEN 'Lost'\n    ELSE 'Potential Loyalists'\n  END AS customer_segment,\n\
+          \  ROUND(monetary * (1 + (frequency * 0.1)) * (avg_sentiment / 10.0), 2) AS customer_lifetime_value,\n\
+          \  avg_sentiment,\n  CASE \n    WHEN total_interactions >= 5 THEN 'High'\n    WHEN total_interactions\
+          \ >= 2 THEN 'Medium'\n    ELSE 'Low'\n  END AS engagement_level,\n  CASE \n    WHEN recency_days\
+          \ > 180 AND frequency <= 2 THEN 'High'\n    WHEN recency_days > 90 AND frequency <= 3 THEN 'Medium'\n\
+          \    ELSE 'Low'\n  END AS churn_risk\nFROM rfm_scores\n"
+    - dependsOn:
+      - stage_4_rfm_calculation
+      outputs:
+      - high_value_customers
+      name: stage_5_high_value_filter
+      properties:
+        sql: "SELECT \n  customer_id,\n  full_name,\n  email,\n  country,\n  industry,\n  rfm_score,\n\
+          \  customer_segment,\n  customer_lifetime_value,\n  engagement_level,\n  churn_risk\nFROM customer_360_master\n\
+          WHERE customer_segment IN ('Champions', 'Loyal Customers')\n  AND churn_risk = 'Low'\nORDER\
+          \ BY customer_lifetime_value DESC\n"
+  execution:
+    trigger:
+      type: manual
+    runtime:
+      platform: local
+      resources:
+        cpu: '2'
+        memory: 4GB
+      timeout: PT30M
+lifecycle:
+  state: active
+  retention: P7Y
+docs:
+  homepage: https://docs.example.com/customer-360
+  runbook: https://wiki.example.com/customer-360-runbook

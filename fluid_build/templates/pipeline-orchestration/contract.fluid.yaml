@@ -1,0 +1,121 @@
+fluidVersion: 0.7.2
+kind: DataProduct
+id: orchestration.complex_pipeline_v1
+name: Complex Pipeline Orchestration
+description: Advanced orchestration with parallel execution and dependencies
+domain: Orchestration
+tags:
+- orchestration
+- production
+- multi-source
+- advanced
+metadata:
+  owner:
+    team: data-ops
+    email: dataops@example.com
+exposes:
+- exposeId: sales_cleaned
+  title: Cleaned Sales
+  version: 1.0.0
+  kind: table
+  labels:
+    taskGroup: extraction
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/sales_cleaned.parquet
+  contract:
+    schema:
+    - name: sale_id
+      type: INTEGER
+      required: true
+    - name: region
+      type: VARCHAR
+    - name: sale_date
+      type: DATE
+    - name: amount
+      type: DECIMAL
+    - name: category
+      type: VARCHAR
+- exposeId: inventory_cleaned
+  title: Cleaned Inventory
+  version: 1.0.0
+  kind: table
+  labels:
+    taskGroup: extraction
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/inventory_cleaned.parquet
+  contract:
+    schema:
+    - name: product_id
+      type: INTEGER
+      required: true
+    - name: product_name
+      type: VARCHAR
+    - name: category
+      type: VARCHAR
+    - name: quantity
+      type: INTEGER
+- exposeId: regional_summary
+  title: Regional Sales Summary
+  version: 1.0.0
+  kind: table
+  labels:
+    taskGroup: aggregation
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/regional_summary.parquet
+  contract:
+    schema:
+    - name: region
+      type: VARCHAR
+      required: true
+    - name: total_sales
+      type: INTEGER
+    - name: total_revenue
+      type: DECIMAL
+    - name: avg_sale_amount
+      type: DECIMAL
+builds:
+- id: orchestrated_pipeline
+  description: Multi-stage pipeline with parallel execution
+  pattern: multi-stage
+  engine: sql
+  properties:
+    stages:
+    - outputs:
+      - sales_cleaned
+      name: extract_sales
+      properties:
+        sql: "SELECT \n  sale_id, UPPER(region) as region,\n  sale_date, amount,\n  category\nFROM read_csv_auto('data/sales.csv',\
+          \ header=true)\n"
+    - outputs:
+      - inventory_cleaned
+      name: extract_inventory
+      properties:
+        sql: "SELECT \n  product_id, product_name,\n  UPPER(category) as category,\n  quantity\nFROM read_csv_auto('data/inventory.csv',\
+          \ header=true)\n"
+    - dependsOn:
+      - extract_sales
+      outputs:
+      - regional_summary
+      name: aggregate_by_region
+      properties:
+        sql: "SELECT \n  region,\n  COUNT(*) as total_sales,\n  SUM(amount) as total_revenue,\n  AVG(amount)\
+          \ as avg_sale_amount\nFROM sales_cleaned\nGROUP BY region\nORDER BY total_revenue DESC\n"
+  execution:
+    trigger:
+      type: schedule
+      schedule: 0 3 * * *
+    runtime:
+      platform: local
+      resources:
+        cpu: '4'
+        memory: 8GB
+      timeout: PT2H

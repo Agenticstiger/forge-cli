@@ -1,0 +1,10 @@
+customer360_profile:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('GCP_PROJECT') }}"
+      dataset: gold_demo
+      location: EU
+      threads: 4

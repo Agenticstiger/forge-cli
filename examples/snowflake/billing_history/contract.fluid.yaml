@@ -1,0 +1,82 @@
+fluidVersion: "0.5.7"
+kind: "DataProduct"
+id: "silver.ote.billing_history_v1"
+name: "OTE Billing History"
+description: "Curated billing history for OTE."
+domain: "Billing"
+
+metadata:
+  layer: Silver
+  owner:
+    team: "OTE Finance Data"
+    email: "ote-billing@ote.example"
+  businessContext:
+    domain: "Finance"
+    subdomain: "Billing Operations"
+
+consumes:
+  - productId: "bronze.ote.billing_accounts_raw_v1"
+    exposeId: "billing_accounts"
+    purpose: "Raw billing account data"
+  - productId: "bronze.ote.payments_raw_v1"
+    exposeId: "payments"
+    purpose: "Payment transaction records"
+
+builds:
+  - id: "billing_history_aggregation"
+    description: "Billing history data transformation"
+    pattern: "hybrid-reference"
+    engine: "dbt"
+    repository: "./models/billing_history"
+    properties:
+      model: "billing_history"
+      vars:
+        enforce_semantics: true
+    execution:
+      trigger:
+        type: "schedule"
+        cron: "0 2 * * *"
+      runtime:
+        platform: "snowflake"
+        resources:
+          cpu: "standard"
+          memory: "standard"
+      retries:
+        count: 2
+        delaySeconds: 120
+        backoff: "exponential"
+
+exposes:
+  - exposeId: "billing_history_table"
+    kind: "table"
+    binding:
+      platform: "snowflake"
+      format: "snowflake_table"
+      location:
+        account: "OTE_ACCT"
+        database: "OTE_ANALYTICS"
+        schema: "SILVER"
+        table: "BILLING_HISTORY_V1"
+    contract:
+      schema:
+        - name: "billing_account_id"
+          type: "STRING"
+          required: true
+        - name: "cycle_start"
+          type: "TIMESTAMP"
+        - name: "cycle_end"
+          type: "TIMESTAMP"
+        - name: "total_amount"
+          type: "DECIMAL"
+          required: true
+      dq:
+        rules:
+          - id: "billing_account_id_not_null"
+            type: "completeness"
+            selector: "billing_account_id"
+            threshold: 1.0
+            operator: ">="
+            severity: "error"
+    qos:
+      availability: "99.0%"
+      freshnessSLO: "PT2H"

@@ -1,0 +1,146 @@
+fluidVersion: 0.7.2
+kind: DataProduct
+id: tutorial.customer_revenue_analytics_v1
+name: Customer Revenue Analytics
+description: Join customers and orders to calculate revenue metrics
+domain: Tutorial
+tags:
+- analytics
+- revenue
+- customers
+- tutorial
+metadata:
+  owner:
+    team: analytics-team
+    email: analytics-team@company.com
+exposes:
+- exposeId: customer_revenue
+  title: Customer Revenue Metrics
+  version: 1.0.0
+  kind: table
+  description: Customer-level revenue analytics with purchase metrics
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/customer_revenue.parquet
+  contract:
+    schema:
+    - name: customer_id
+      type: INTEGER
+      required: true
+      description: Unique customer identifier
+    - name: customer_name
+      type: VARCHAR
+      description: Customer full name
+    - name: email
+      type: VARCHAR
+      description: Customer email
+    - name: signup_date
+      type: DATE
+      description: Date customer signed up
+    - name: status
+      type: VARCHAR
+      description: Customer status
+    - name: total_orders
+      type: INTEGER
+      description: Total number of orders placed
+    - name: total_revenue
+      type: DECIMAL
+      description: Total revenue from customer
+    - name: avg_order_value
+      type: DECIMAL
+      description: Average value per order
+    - name: first_order_date
+      type: DATE
+      description: Date of first order
+    - name: last_order_date
+      type: DATE
+      description: Date of most recent order
+    - name: days_as_customer
+      type: INTEGER
+      description: Days since signup
+    - name: customer_tier
+      type: VARCHAR
+      description: Customer tier based on revenue
+    dq:
+      rules:
+      - id: revenue_matches_orders
+        type: accuracy
+        description: Ensure revenue calculations are consistent
+        severity: error
+        threshold: 0
+        operator: ==
+      - id: valid_customer_tiers
+        type: valid_values
+        selector: customer_tier
+        description: Ensure all customer tiers are valid
+        severity: error
+      - id: avg_order_value_check
+        type: accuracy
+        description: Ensure avg order value is calculated correctly
+        severity: warn
+- exposeId: vip_customers
+  title: VIP Customers
+  version: 1.0.0
+  kind: view
+  description: High-value customers (Platinum and Gold tiers)
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/vip_customers.parquet
+  contract:
+    schema:
+    - name: customer_id
+      type: INTEGER
+    - name: customer_name
+      type: VARCHAR
+    - name: email
+      type: VARCHAR
+    - name: total_revenue
+      type: DECIMAL
+    - name: total_orders
+      type: INTEGER
+    - name: avg_order_value
+      type: DECIMAL
+    - name: customer_tier
+      type: VARCHAR
+builds:
+- id: customer_revenue_pipeline
+  description: Calculate customer revenue metrics from orders and customers
+  pattern: multi-stage
+  engine: sql
+  properties:
+    stages:
+    - outputs:
+      - customer_revenue
+      name: calculate_customer_revenue
+      properties:
+        sql: "WITH customer_orders AS (\n  SELECT\n    c.id AS customer_id,\n    c.name AS customer_name,\n\
+          \    c.email,\n    c.signup_date,\n    c.status,\n    COUNT(o.order_id) AS total_orders,\n \
+          \   COALESCE(SUM(o.total_amount), 0) AS total_revenue,\n    COALESCE(AVG(o.total_amount), 0)\
+          \ AS avg_order_value,\n    MIN(o.order_date) AS first_order_date,\n    MAX(o.order_date) AS\
+          \ last_order_date\n  FROM read_csv_auto('data/customers.csv', header=true) c\n  LEFT JOIN read_csv_auto('data/orders.csv',\
+          \ header=true) o\n    ON c.id = o.customer_id\n  GROUP BY\n    c.id, c.name, c.email, c.signup_date,\
+          \ c.status\n)\nSELECT\n  customer_id,\n  customer_name,\n  email,\n  signup_date,\n  status,\n\
+          \  total_orders,\n  total_revenue,\n  avg_order_value,\n  first_order_date,\n  last_order_date,\n\
+          \  CAST(julianday('now') - julianday(signup_date) AS INTEGER) AS days_as_customer,\n  CASE\n\
+          \    WHEN total_revenue >= 2000 THEN 'Platinum'\n    WHEN total_revenue >= 1000 THEN 'Gold'\n\
+          \    WHEN total_revenue >= 500 THEN 'Silver'\n    WHEN total_revenue > 0 THEN 'Bronze'\n   \
+          \ ELSE 'No Purchases'\n  END AS customer_tier\nFROM customer_orders\nORDER BY total_revenue\
+          \ DESC\n"
+    - dependsOn:
+      - calculate_customer_revenue
+      outputs:
+      - vip_customers
+      name: high_value_customers
+      properties:
+        sql: "SELECT\n  customer_id,\n  customer_name,\n  email,\n  total_revenue,\n  total_orders,\n\
+          \  avg_order_value,\n  customer_tier\nFROM customer_revenue\nWHERE customer_tier IN ('Platinum',\
+          \ 'Gold')\nORDER BY total_revenue DESC\n"
+  execution:
+    trigger:
+      type: manual
+    runtime:
+      platform: local

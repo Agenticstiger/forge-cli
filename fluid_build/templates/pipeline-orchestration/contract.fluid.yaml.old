@@ -1,0 +1,292 @@
+apiVersion: fluid.io/v1
+kind: DataContract
+metadata:
+  name: complex-orchestration
+  description: Advanced orchestration with parallel execution and task groups
+  version: 1.0.0
+  tags:
+    - orchestration
+    - production
+    - multi-source
+
+orchestration:
+  enabled: true
+  schedule: "0 3 * * *"  # Daily at 3 AM
+  start_date: "2024-01-01"
+  catchup: false
+  max_active_runs: 1
+  dagrun_timeout_minutes: 120
+  
+  default_args:
+    retries: 3
+    retry_delay_minutes: 10
+    retry_exponential_backoff: true
+    max_retry_delay_minutes: 60
+    email_on_failure: true
+    email_on_retry: false
+    email: ["dataops@example.com"]
+    sla_minutes: 60
+    execution_timeout_minutes: 30
+  
+  # Task groups for organization
+  task_groups:
+    - name: data_ingestion
+      description: "Parallel data ingestion from multiple sources"
+      parallel: true
+    
+    - name: data_transformation
+      description: "Sequential transformations with dependencies"
+      parallel: false
+      depends_on: [data_ingestion]
+    
+    - name: aggregations
+      description: "Parallel aggregations by dimension"
+      parallel: true
+      depends_on: [data_transformation]
+    
+    - name: quality_checks
+      description: "Data quality validations"
+      parallel: false
+      depends_on: [aggregations]
+
+inputs:
+  - name: raw_sales
+    type: csv
+    path: ./data/sales.csv
+    task_group: data_ingestion
+    schema:
+      - { name: sale_id, type: INTEGER }
+      - { name: region, type: VARCHAR }
+      - { name: sale_date, type: DATE }
+      - { name: amount, type: DECIMAL }
+      - { name: product_category, type: VARCHAR }
+  
+  - name: raw_inventory
+    type: csv
+    path: ./data/inventory.csv
+    task_group: data_ingestion
+    schema:
+      - { name: product_id, type: INTEGER }
+      - { name: product_name, type: VARCHAR }
+      - { name: category, type: VARCHAR }
+      - { name: quantity, type: INTEGER }
+      - { name: warehouse, type: VARCHAR }
+  
+  - name: raw_customers
+    type: csv
+    path: ./data/customers.csv
+    task_group: data_ingestion
+    schema:
+      - { name: customer_id, type: INTEGER }
+      - { name: name, type: VARCHAR }
+      - { name: region, type: VARCHAR }
+      - { name: segment, type: VARCHAR }
+
+outputs:
+  # EXTRACTION PHASE - Runs in parallel
+  - name: sales_cleaned
+    type: table
+    execution_phase: extract
+    task_group: data_ingestion
+    priority_weight: 10
+    schema:
+      - { name: sale_id, type: INTEGER }
+      - { name: region, type: VARCHAR }
+      - { name: sale_date, type: DATE }
+      - { name: amount, type: DECIMAL }
+      - { name: category, type: VARCHAR }
+    transformation: |
+      SELECT 
+        sale_id,
+        UPPER(region) as region,
+        sale_date,
+        amount,
+        product_category as category
+      FROM {{ ref('raw_sales') }}
+  
+  - name: inventory_cleaned
+    type: table
+    execution_phase: extract
+    task_group: data_ingestion
+    priority_weight: 10
+    transformation: |
+      SELECT 
+        product_id,
+        product_name,
+        UPPER(category) as category,
+        quantity,
+        UPPER(warehouse) as warehouse
+      FROM {{ ref('raw_inventory') }}
+  
+  - name: customers_cleaned
+    type: table
+    execution_phase: extract
+    task_group: data_ingestion
+    priority_weight: 10
+    transformation: |
+      SELECT 
+        customer_id,
+        name,
+        UPPER(region) as region,
+        segment
+      FROM {{ ref('raw_customers') }}
+  
+  # TRANSFORMATION PHASE - Sequential with dependencies
+  - name: sales_enriched
+    type: table
+    execution_phase: transform
+    task_group: data_transformation
+    depends_on: [sales_cleaned, inventory_cleaned]
+    priority_weight: 8
+    retries: 5  # Override default retries
+    retry_delay_minutes: 5
+    transformation: |
+      SELECT 
+        s.sale_id,
+        s.region,
+        s.sale_date,
+        s.amount,
+        s.category,
+        COALESCE(i.quantity, 0) as available_inventory
+      FROM {{ ref('sales_cleaned') }} s
+      LEFT JOIN {{ ref('inventory_cleaned') }} i 
+        ON s.category = i.category 
+        AND s.region = i.warehouse
+  
+  # AGGREGATION PHASE - Parallel by dimension
+  - name: sales_by_region
+    type: table
+    execution_phase: aggregate
+    task_group: aggregations
+    depends_on: [sales_enriched]
+    priority_weight: 5
+    pool: aggregation_pool  # Resource pool
+    transformation: |
+      SELECT 
+        region,
+        COUNT(*) as total_sales,
+        SUM(amount) as total_revenue,
+        AVG(amount) as avg_sale_amount,
+        COUNT(DISTINCT category) as categories_sold
+      FROM {{ ref('sales_enriched') }}
+      GROUP BY region
+  
+  - name: sales_by_category
+    type: table
+    execution_phase: aggregate
+    task_group: aggregations
+    depends_on: [sales_enriched]
+    priority_weight: 5
+    pool: aggregation_pool
+    transformation: |
+      SELECT 
+        category,
+        COUNT(*) as total_sales,
+        SUM(amount) as total_revenue,
+        AVG(amount) as avg_sale_amount
+      FROM {{ ref('sales_enriched') }}
+      GROUP BY category
+  
+  - name: sales_by_date
+    type: table
+    execution_phase: aggregate
+    task_group: aggregations
+    depends_on: [sales_enriched]
+    priority_weight: 5
+    pool: aggregation_pool
+    transformation: |
+      SELECT 
+        sale_date,
+        COUNT(*) as total_sales,
+        SUM(amount) as total_revenue
+      FROM {{ ref('sales_enriched') }}
+      GROUP BY sale_date
+  
+  # FINAL REPORTING - Depends on all aggregations
+  - name: executive_summary
+    type: table
+    execution_phase: publish
+    task_group: quality_checks
+    depends_on: [sales_by_region, sales_by_category, sales_by_date]
+    priority_weight: 1
+    transformation: |
+      SELECT 
+        'Overall' as metric_type,
+        (SELECT SUM(total_revenue) FROM {{ ref('sales_by_region') }}) as total_revenue,
+        (SELECT COUNT(*) FROM {{ ref('sales_by_region') }}) as regions_count,
+        (SELECT COUNT(*) FROM {{ ref('sales_by_category') }}) as categories_count,
+        CURRENT_TIMESTAMP as generated_at
+
+validations:
+  - name: revenue_reconciliation
+    execution_phase: validate
+    task_group: quality_checks
+    level: error
+    depends_on: [sales_by_region, sales_enriched]
+    query: |
+      WITH region_total AS (
+        SELECT SUM(total_revenue) as regional_sum
+        FROM {{ ref('sales_by_region') }}
+      ),
+      sales_total AS (
+        SELECT SUM(amount) as sales_sum
+        FROM {{ ref('sales_enriched') }}
+      )
+      SELECT 
+        CASE 
+          WHEN ABS(r.regional_sum - s.sales_sum) < 0.01 THEN 0
+          ELSE 1
+        END as reconciliation_error
+      FROM region_total r, sales_total s
+    expect:
+      reconciliation_error: 0
+  
+  - name: all_regions_present
+    execution_phase: validate
+    task_group: quality_checks
+    level: error
+    query: |
+      SELECT 
+        CASE WHEN COUNT(DISTINCT region) = 4 THEN 0 ELSE 1 END as missing_regions
+      FROM {{ ref('sales_by_region') }}
+    expect:
+      missing_regions: 0
+
+# Advanced orchestration features
+callbacks:
+  on_success:
+    - type: slack
+      webhook: ${SLACK_WEBHOOK}
+      message: "Pipeline {{dag_id}} completed successfully"
+  
+  on_failure:
+    - type: email
+      to: ["oncall@example.com"]
+      subject: "ALERT: Pipeline {{dag_id}} failed"
+    
+    - type: pagerduty
+      integration_key: ${PAGERDUTY_KEY}
+
+monitoring:
+  sla_hours: 2
+  alert_on_failure: true
+  alert_on_sla_miss: true
+  track_metrics:
+    - execution_time
+    - record_counts
+    - data_freshness
+  
+  # Custom metrics
+  custom_metrics:
+    - name: total_revenue_processed
+      query: "SELECT SUM(total_revenue) FROM {{ ref('sales_by_region') }}"
+    
+    - name: pipeline_efficiency
+      query: "SELECT COUNT(*) / (EXTRACT(EPOCH FROM (MAX(updated_at) - MIN(updated_at))) / 60) as records_per_minute FROM {{ ref('sales_enriched') }}"
+
+# Backfill configuration
+backfill:
+  enabled: true
+  max_backfill_days: 90
+  chunk_size_days: 7
+  parallel_backfills: 3

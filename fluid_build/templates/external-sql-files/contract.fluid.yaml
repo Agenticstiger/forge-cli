@@ -1,0 +1,117 @@
+fluidVersion: 0.7.2
+kind: DataProduct
+id: modular.sales_analytics_v1
+name: Sales Analytics - Modular SQL
+description: Sales analytics demonstrating modular SQL patterns
+domain: Sales
+tags:
+- sales
+- modular-sql
+- best-practices
+metadata:
+  owner:
+    team: sales-analytics
+    email: sales-analytics@company.com
+exposes:
+- exposeId: sales_with_revenue
+  title: Sales with Revenue Calculations
+  version: 1.0.0
+  kind: table
+  description: Sales data enriched with revenue calculations
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/sales_with_revenue.parquet
+  contract:
+    schema:
+    - name: sale_id
+      type: INTEGER
+      required: true
+    - name: product_id
+      type: INTEGER
+    - name: customer_id
+      type: INTEGER
+    - name: sale_date
+      type: DATE
+    - name: quantity
+      type: INTEGER
+    - name: unit_price
+      type: DECIMAL
+    - name: discount_pct
+      type: INTEGER
+    - name: gross_revenue
+      type: DECIMAL
+    - name: discount_amount
+      type: DECIMAL
+    - name: net_revenue
+      type: DECIMAL
+    dq:
+      rules:
+      - id: positive_revenue
+        type: accuracy
+        selector: net_revenue
+        severity: error
+        description: Net revenue must be non-negative
+        threshold: 0
+        operator: '>='
+- exposeId: daily_sales_summary
+  title: Daily Sales Summary
+  version: 1.0.0
+  kind: table
+  description: Aggregated daily sales metrics
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/daily_sales_summary.parquet
+  contract:
+    schema:
+    - name: sale_date
+      type: DATE
+      required: true
+    - name: total_transactions
+      type: INTEGER
+    - name: unique_customers
+      type: INTEGER
+    - name: total_units_sold
+      type: INTEGER
+    - name: total_gross_revenue
+      type: DECIMAL
+    - name: total_discounts
+      type: DECIMAL
+    - name: total_net_revenue
+      type: DECIMAL
+    - name: avg_transaction_value
+      type: DECIMAL
+builds:
+- id: sales_analytics_pipeline
+  description: Calculate revenue and daily summaries
+  pattern: multi-stage
+  engine: sql
+  properties:
+    stages:
+    - outputs:
+      - sales_with_revenue
+      name: calculate_revenue
+      properties:
+        sql: "SELECT \n  sale_id,\n  product_id,\n  customer_id,\n  sale_date,\n  quantity,\n  unit_price,\n\
+          \  discount_pct,\n  ROUND(quantity * unit_price, 2) as gross_revenue,\n  ROUND((quantity * unit_price\
+          \ * discount_pct) / 100.0, 2) as discount_amount,\n  ROUND(quantity * unit_price * (1 - discount_pct\
+          \ / 100.0), 2) as net_revenue\nFROM read_csv_auto('data/sales.csv', header=true)\n"
+    - dependsOn:
+      - calculate_revenue
+      outputs:
+      - daily_sales_summary
+      name: daily_summary
+      properties:
+        sql: "SELECT \n  sale_date,\n  COUNT(*) as total_transactions,\n  COUNT(DISTINCT customer_id)\
+          \ as unique_customers,\n  SUM(quantity) as total_units_sold,\n  ROUND(SUM(gross_revenue), 2)\
+          \ as total_gross_revenue,\n  ROUND(SUM(discount_amount), 2) as total_discounts,\n  ROUND(SUM(net_revenue),\
+          \ 2) as total_net_revenue,\n  ROUND(AVG(net_revenue), 2) as avg_transaction_value\nFROM sales_with_revenue\n\
+          GROUP BY sale_date\nORDER BY sale_date DESC\n"
+  execution:
+    trigger:
+      type: manual
+    runtime:
+      platform: local

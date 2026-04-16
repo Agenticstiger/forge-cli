@@ -1,0 +1,198 @@
+apiVersion: fluid.io/v1
+kind: DataContract
+metadata:
+  name: incremental-transactions
+  description: Incremental processing with watermark tracking
+  version: 1.0.0
+
+inputs:
+  - name: raw_transactions
+    type: csv
+    path: ./data/transactions.csv
+    schema:
+      - { name: transaction_id, type: INTEGER }
+      - { name: customer_id, type: INTEGER }
+      - { name: transaction_date, type: DATE }
+      - { name: amount, type: DECIMAL }
+      - { name: status, type: VARCHAR }
+      - { name: updated_at, type: TIMESTAMP }
+
+outputs:
+  # Watermark table to track last processed timestamp
+  - name: processing_watermark
+    type: table
+    materialization: table
+    schema:
+      - { name: table_name, type: VARCHAR }
+      - { name: last_processed_at, type: TIMESTAMP }
+      - { name: updated_at, type: TIMESTAMP }
+    transformation: |
+      -- Initialize watermark if not exists
+      SELECT 
+        'transactions' as table_name,
+        COALESCE(
+          (SELECT last_processed_at FROM {{ this }} WHERE table_name = 'transactions'),
+          TIMESTAMP '2024-01-01 00:00:00'
+        ) as last_processed_at,
+        CURRENT_TIMESTAMP as updated_at
+  
+  # Incremental load - only new/updated records
+  - name: transactions_incremental
+    type: table
+    materialization: incremental
+    unique_key: transaction_id
+    incremental_strategy: merge  # MERGE (upsert) strategy
+    depends_on: [processing_watermark]
+    schema:
+      - { name: transaction_id, type: INTEGER }
+      - { name: customer_id, type: INTEGER }
+      - { name: transaction_date, type: DATE }
+      - { name: amount, type: DECIMAL }
+      - { name: status, type: VARCHAR }
+      - { name: updated_at, type: TIMESTAMP }
+      - { name: processed_at, type: TIMESTAMP }
+    transformation: |
+      {% if is_incremental() %}
+        -- Incremental mode: only new/updated records
+        SELECT 
+          transaction_id,
+          customer_id,
+          transaction_date,
+          amount,
+          status,
+          updated_at,
+          CURRENT_TIMESTAMP as processed_at
+        FROM {{ ref('raw_transactions') }}
+        WHERE updated_at > (
+          SELECT last_processed_at 
+          FROM {{ ref('processing_watermark') }}
+          WHERE table_name = 'transactions'
+        )
+      {% else %}
+        -- Full refresh mode: all records
+        SELECT 
+          transaction_id,
+          customer_id,
+          transaction_date,
+          amount,
+          status,
+          updated_at,
+          CURRENT_TIMESTAMP as processed_at
+        FROM {{ ref('raw_transactions') }}
+      {% endif %}
+  
+  # Daily aggregates with incremental updates
+  - name: daily_transaction_summary
+    type: table
+    materialization: incremental
+    unique_key: summary_date
+    incremental_strategy: merge
+    depends_on: [transactions_incremental]
+    schema:
+      - { name: summary_date, type: DATE }
+      - { name: total_transactions, type: INTEGER }
+      - { name: total_amount, type: DECIMAL }
+      - { name: completed_count, type: INTEGER }
+      - { name: pending_count, type: INTEGER }
+      - { name: failed_count, type: INTEGER }
+      - { name: last_updated, type: TIMESTAMP }
+    transformation: |
+      {% if is_incremental() %}
+        -- Merge with existing daily summaries
+        WITH new_transactions AS (
+          SELECT 
+            transaction_date,
+            COUNT(*) as txn_count,
+            SUM(amount) as total_amt,
+            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+          FROM {{ ref('transactions_incremental') }}
+          WHERE processed_at > (
+            SELECT COALESCE(MAX(last_updated), TIMESTAMP '1970-01-01')
+            FROM {{ this }}
+          )
+          GROUP BY transaction_date
+        ),
+        existing_summaries AS (
+          SELECT *
+          FROM {{ this }}
+          WHERE summary_date IN (SELECT transaction_date FROM new_transactions)
+        )
+        SELECT 
+          COALESCE(n.transaction_date, e.summary_date) as summary_date,
+          COALESCE(e.total_transactions, 0) + COALESCE(n.txn_count, 0) as total_transactions,
+          COALESCE(e.total_amount, 0) + COALESCE(n.total_amt, 0) as total_amount,
+          COALESCE(e.completed_count, 0) + COALESCE(n.completed, 0) as completed_count,
+          COALESCE(e.pending_count, 0) + COALESCE(n.pending, 0) as pending_count,
+          COALESCE(e.failed_count, 0) + COALESCE(n.failed, 0) as failed_count,
+          CURRENT_TIMESTAMP as last_updated
+        FROM new_transactions n
+        FULL OUTER JOIN existing_summaries e 
+          ON n.transaction_date = e.summary_date
+      {% else %}
+        -- Full refresh: recalculate all summaries
+        SELECT 
+          transaction_date as summary_date,
+          COUNT(*) as total_transactions,
+          SUM(amount) as total_amount,
+          SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_count,
+          SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_count,
+          SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_count,
+          CURRENT_TIMESTAMP as last_updated
+        FROM {{ ref('transactions_incremental') }}
+        GROUP BY transaction_date
+      {% endif %}
+  
+  # Update watermark after successful processing
+  - name: update_watermark
+    type: operation
+    depends_on: [transactions_incremental, daily_transaction_summary]
+    sql: |
+      MERGE INTO {{ ref('processing_watermark') }} w
+      USING (
+        SELECT 
+          'transactions' as table_name,
+          MAX(updated_at) as last_processed_at,
+          CURRENT_TIMESTAMP as updated_at
+        FROM {{ ref('transactions_incremental') }}
+      ) s
+      ON w.table_name = s.table_name
+      WHEN MATCHED THEN 
+        UPDATE SET 
+          last_processed_at = s.last_processed_at,
+          updated_at = s.updated_at
+      WHEN NOT MATCHED THEN
+        INSERT (table_name, last_processed_at, updated_at)
+        VALUES (s.table_name, s.last_processed_at, s.updated_at)
+
+validations:
+  - name: no_duplicate_transactions
+    level: error
+    query: |
+      SELECT COUNT(*) - COUNT(DISTINCT transaction_id) as duplicate_count
+      FROM {{ ref('transactions_incremental') }}
+    expect:
+      duplicate_count: 0
+  
+  - name: watermark_moving_forward
+    level: warning
+    query: |
+      SELECT 
+        CASE 
+          WHEN last_processed_at >= LAG(last_processed_at) OVER (ORDER BY updated_at)
+          OR LAG(last_processed_at) OVER (ORDER BY updated_at) IS NULL
+          THEN 0 ELSE 1
+        END as watermark_regression
+      FROM {{ ref('processing_watermark') }}
+      WHERE table_name = 'transactions'
+      ORDER BY updated_at DESC
+      LIMIT 1
+    expect:
+      watermark_regression: 0
+
+orchestration:
+  enabled: true
+  schedule: "*/15 * * * *"  # Every 15 minutes for incremental
+  default_args:
+    retries: 3

@@ -1,0 +1,30 @@
+name: "Contract Documentation"
+id: "contract-documentation"
+version: "0.7.1"
+difficulty: "beginner"
+time_to_complete: "5 minutes"
+learning_path_order: 10
+track: "foundation"
+concepts:
+  - "Auto-generated docs"
+  - "Schema documentation"
+  - "Lineage tracking"
+  - "Data catalogs"
+prerequisites:
+  - "003-multi-source"
+quickstart_tutorial: "010-contract-documentation.md"
+features:
+  local_execution: true
+  dag_generation: false
+  cloud_deployment: true
+  requires_docker: false
+tags:
+  - beginner
+  - documentation
+  - metadata
+  - catalog
+sample_data_included: true
+estimated_file_size: "15KB"
+description: |
+  Auto-generate beautiful documentation from your FLUID contracts.
+  Create data catalogs, lineage diagrams, and schema docs automatically.

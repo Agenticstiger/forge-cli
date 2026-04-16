@@ -1,0 +1,254 @@
+name: healthcare
+domain: healthcare
+description: Expert in healthcare data products, HL7 FHIR interoperability, OMOP CDM analytics, and HIPAA compliance
+
+questions:
+  - key: product_type
+    question: What type of healthcare product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: Patient Analytics
+        value: patient_analytics
+        aliases: ["patient", "patient insights"]
+      - label: Clinical Research
+        value: clinical_research
+        aliases: ["research", "clinical studies"]
+      - label: Population Health
+        value: population_health
+        aliases: ["population", "public health"]
+      - label: EHR Integration
+        value: ehr_integration
+        aliases: ["ehr", "emr", "clinical integration"]
+      - label: Drug Discovery
+        value: drug_discovery
+        aliases: ["drug", "discovery", "r and d"]
+  - key: modeling_context
+    question: Which healthcare modeling context fits best?
+    type: choice
+    required: true
+    choices:
+      - label: Clinical Interoperability / EHR
+        value: clinical_interoperability
+        aliases: ["clinical interoperability", "fhir", "ehr", "emr", "hl7", "care coordination"]
+      - label: Analytics / Research
+        value: analytics_research
+        aliases: ["analytics", "research", "population health", "omop", "cohort", "secondary use"]
+  - key: data_sources
+    question: What data sources will you use?
+    type: text
+    required: true
+    default: EHR data, claims data, lab results
+  - key: hipaa_required
+    question: Is HIPAA compliance required?
+    type: choice
+    default: "yes"
+    choices:
+      - label: "Yes"
+        value: "yes"
+        aliases: ["y", "yeah", "yep", "sure", "required"]
+      - label: "No"
+        value: "no"
+        aliases: ["n", "nope", "not required"]
+  - key: phi_handling
+    question: Will you handle PHI (Protected Health Information)?
+    type: choice
+    default: "yes"
+    choices:
+      - label: "Yes"
+        value: "yes"
+        aliases: ["phi", "full phi"]
+      - label: "No"
+        value: "no"
+        aliases: ["no phi"]
+      - label: De-identified only
+        value: deidentified_only
+        aliases: ["deidentified", "de identified", "masked"]
+
+  - key: orchestration_pattern
+    question: What pipeline scheduling pattern fits best?
+    type: choice
+    required: false
+    choices:
+      - label: Daily batch with audit trail
+        value: daily_audited
+        aliases: ["daily", "batch", "nightly"]
+      - label: Near-real-time clinical updates
+        value: near_realtime
+        aliases: ["near real time", "nrt", "hourly", "clinical feeds"]
+      - label: Event-driven (HL7 messages, lab results)
+        value: event_driven
+        aliases: ["event", "hl7", "adt", "lab results", "message-driven"]
+      - label: Manual / research batch
+        value: manual
+        aliases: ["manual", "research", "ad hoc", "on demand"]
+
+resolver_defaults:
+  product_type: patient_analytics
+  hipaa_required: "yes"
+  phi_handling: "yes"
+  orchestration_pattern: daily_audited
+
+suggestion_defaults:
+  recommended_template: analytics-template
+  recommended_provider: gcp
+  canonical_model: omop_cdm
+  supporting_standards: []
+  recommended_patterns: []
+  architecture_suggestions:
+    - Use FHIR resources and profiles for operational interoperability and external exchange
+    - Use OMOP CDM for longitudinal analytics, cohorting, and research-grade evidence generation
+    - Keep source-to-canonical mappings explicit between clinical systems and analytics models
+    - Set up secure data sharing and terminology normalization pipelines
+  best_practices:
+    - Use standardized medical vocabularies such as SNOMED CT, LOINC, RxNorm, and ICD where appropriate
+    - Implement data quality checks for clinical, claims, and terminology data
+    - Document all source-to-canonical healthcare transformations
+    - Set up anomaly monitoring for patient, encounter, and coding data
+    - Version profiles, concept mappings, and analytic definitions with the project
+  technology_stack: []
+  security_requirements: []
+
+rules:
+  - when:
+      all:
+        - field: product_type
+          equals: clinical_research
+    actions:
+      - op: set
+        path: recommended_template
+        value: clinical-research-template
+      - op: set
+        path: canonical_model
+        value: omop_cdm
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - omop_common_data_model
+          - cohort_analysis
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "R", "Jupyter"]
+  - when:
+      all:
+        - field: product_type
+          equals: population_health
+    actions:
+      - op: set
+        path: recommended_template
+        value: population-health-template
+      - op: set
+        path: canonical_model
+        value: omop_cdm
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - cohort_analysis
+          - risk_stratification
+  - when:
+      all:
+        - field: product_type
+          equals: ehr_integration
+    actions:
+      - op: set
+        path: canonical_model
+        value: hl7_fhir
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - hl7_fhir_resource_model
+          - interoperability_profiles
+  - when:
+      all:
+        - field: modeling_context
+          equals: clinical_interoperability
+    actions:
+      - op: set
+        path: canonical_model
+        value: hl7_fhir
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - hl7_fhir_resource_model
+          - interoperability_profiles
+      - op: append_unique
+        path: architecture_suggestions
+        value:
+          - Model operational data with FHIR resources, references, and profile constraints
+          - Keep message and API boundaries aligned to FHIR exchange workflows before analytics curation
+  - when:
+      all:
+        - field: modeling_context
+          equals: analytics_research
+    actions:
+      - op: set
+        path: canonical_model
+        value: omop_cdm
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - omop_common_data_model
+          - standardized_clinical_vocabularies
+      - op: append_unique
+        path: architecture_suggestions
+        value:
+          - Model analytics-ready entities with OMOP person, visit, condition, procedure, drug, and measurement concepts
+          - Preserve an explicit ETL boundary between source clinical systems and the OMOP analytic layer
+  - when:
+      all:
+        - field: hipaa_required
+          equals: "yes"
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Implement HIPAA-compliant data encryption
+          - Set up BAA (Business Associate Agreement) tracking
+          - Enable comprehensive audit logging
+          - Implement access controls with MFA
+          - Set up breach notification procedures
+          - Regular HIPAA compliance audits
+  - when:
+      all:
+        - field: phi_handling
+          equals: "yes"
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Implement PHI data masking
+          - Use secure enclaves for PHI processing
+          - Enable data lineage for PHI
+          - Set up automatic PHI detection
+      - op: append_unique
+        path: architecture_suggestions
+        value: Separate PHI data into secure zones
+  - when:
+      all:
+        - field: phi_handling
+          equals: deidentified_only
+    actions:
+      - op: append_unique
+        path: architecture_suggestions
+        value: Implement de-identification pipeline at ingestion
+      - op: append_unique
+        path: best_practices
+        value: Validate de-identification meets Safe Harbor or Expert Determination
+
+next_step_tips:
+  - Ensure HIPAA compliance measures are in place
+  - Review PHI handling procedures
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: canonical_model
+          equals: hl7_fhir
+    tips:
+      - Confirm the target FHIR resources, profiles, and exchange workflows before implementation
+  - when:
+      all:
+        - field: canonical_model
+          equals: omop_cdm
+    tips:
+      - Confirm OMOP concept mappings, vocabulary strategy, and cohort definitions with analytics stakeholders

@@ -1,0 +1,90 @@
+fluidVersion: 0.7.2
+kind: DataProduct
+id: config.multi_env_pipeline_v1
+name: Multi-Environment Pipeline
+description: Environment-aware pipeline demonstrating configuration management
+domain: Platform
+tags:
+- environment-config
+- multi-env
+- deployment
+metadata:
+  owner:
+    team: platform-engineering
+    email: platform@company.com
+exposes:
+- exposeId: users_cleaned
+  title: Cleaned Users with Environment Tag
+  version: 1.0.0
+  kind: table
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/users_cleaned.parquet
+  contract:
+    schema:
+    - name: user_id
+      type: INTEGER
+      required: true
+    - name: username
+      type: VARCHAR
+    - name: email
+      type: VARCHAR
+    - name: signup_date
+      type: DATE
+    - name: country
+      type: VARCHAR
+    - name: environment
+      type: VARCHAR
+- exposeId: user_summary
+  title: User Summary by Environment
+  version: 1.0.0
+  kind: table
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/user_summary.parquet
+  contract:
+    schema:
+    - name: total_users
+      type: INTEGER
+    - name: countries
+      type: INTEGER
+    - name: first_signup
+      type: DATE
+    - name: last_signup
+      type: DATE
+    - name: environment
+      type: VARCHAR
+    - name: generated_at
+      type: TIMESTAMP
+builds:
+- id: multi_env_pipeline
+  description: Environment-aware user processing
+  pattern: multi-stage
+  engine: sql
+  properties:
+    stages:
+    - outputs:
+      - users_cleaned
+      name: clean_users
+      properties:
+        sql: "SELECT \n  user_id,\n  LOWER(username) as username,\n  LOWER(email) as email,\n  signup_date,\n\
+          \  UPPER(country) as country,\n  'development' as environment\nFROM read_csv_auto('data/users.csv',\
+          \ header=true)\n"
+    - dependsOn:
+      - clean_users
+      outputs:
+      - user_summary
+      name: summarize_users
+      properties:
+        sql: "SELECT \n  COUNT(*) as total_users,\n  COUNT(DISTINCT country) as countries,\n  MIN(signup_date)\
+          \ as first_signup,\n  MAX(signup_date) as last_signup,\n  'development' as environment,\n  CURRENT_TIMESTAMP\
+          \ as generated_at\nFROM users_cleaned\n"
+  execution:
+    trigger:
+      type: manual
+    runtime:
+      platform: local

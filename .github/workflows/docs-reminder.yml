@@ -1,0 +1,30 @@
+name: Docs Reminder
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize]
+    branches: [main]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  check-docs:
+    runs-on: ubuntu-latest
+    steps:
+      # Safe with pull_request_target because we only check out the trusted base
+      # revision and use it to read PR metadata plus update labels/comments
+      # through the GitHub API.
+      - name: Checkout base revision
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Check for documentation reference
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { runDocsReminder } = require('./scripts/docs_reminder.js');
+            await runDocsReminder({ github, context, core });

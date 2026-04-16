@@ -1,0 +1,189 @@
+# FLUID 0.7.1 Contract - Customer Analytics Data Product
+fluidVersion: "0.7.1"
+kind: DataContract
+id: customer-analytics-v1
+name: customer-analytics
+
+metadata:
+  version: "1.0.0"
+  name: "Customer Analytics Data Product"
+  description: "Comprehensive customer segmentation and churn risk analytics"
+  status: active
+  domain: customer-experience
+  subdomain: analytics
+  environment: production
+  created: "2026-01-15T10:00:00Z"
+  updated: "2026-01-20T12:00:00Z"
+  tags:
+    - customer
+    - analytics
+    - churn
+    - segmentation
+  quality_threshold: 0.95
+  update_frequency: daily
+  availability: 0.999
+
+owner:
+  team: data-engineering
+  name: Data Platform Team
+  email: data-platform@company.com
+  role: Product Owner
+  slack: "#data-platform"
+  contacts:
+    - name: Alice Johnson
+      email: alice.johnson@company.com
+      role: Tech Lead
+    - name: Bob Smith
+      email: bob.smith@company.com
+      role: Data Engineer
+
+exposes:
+  - id: customer_segments
+    version: "1.0.0"
+    description: "Customer segmentation with churn risk scores"
+    status: active
+    provider: gcp
+    location:
+      project: analytics-prod-12345
+      dataset: customer_analytics
+      table: segments_v1
+      region: us-central1
+    schema:
+      format: table
+      fields:
+        - name: customer_id
+          type: string
+          description: "Unique customer identifier"
+          required: true
+          classification: identifier
+          tags:
+            - primary-key
+            - customer
+          
+        - name: customer_email
+          type: string
+          description: "Customer email address"
+          required: true
+          classification: pii-email
+          tags:
+            - pii
+            - contact
+          validations:
+            pattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+          
+        - name: segment
+          type: string
+          description: "Customer value segment"
+          required: true
+          classification: business
+          tags:
+            - segment
+            - classification
+          validations:
+            allowed_values:
+              - high-value
+              - medium-value
+              - low-value
+              - at-risk
+              - dormant
+          
+        - name: lifetime_value
+          type: decimal
+          description: "Customer lifetime value in USD"
+          required: true
+          classification: financial
+          tags:
+            - revenue
+            - metrics
+          validations:
+            min_value: 0
+            max_value: 1000000
+          
+        - name: churn_risk_score
+          type: float
+          description: "Churn probability score (0-1)"
+          required: true
+          classification: prediction
+          tags:
+            - ml
+            - risk
+          validations:
+            min_value: 0.0
+            max_value: 1.0
+          
+        - name: total_purchases
+          type: int
+          description: "Total number of purchases"
+          required: true
+          classification: metrics
+          validations:
+            min_value: 0
+          
+        - name: last_purchase_date
+          type: date
+          description: "Date of last purchase"
+          required: false
+          classification: temporal
+          
+        - name: account_created_at
+          type: timestamp
+          description: "Account creation timestamp"
+          required: true
+          classification: temporal
+          
+        - name: is_active
+          type: bool
+          description: "Active account flag"
+          required: true
+          classification: status
+          
+        - name: preferences
+          type: json
+          description: "Customer preferences object"
+          required: false
+          classification: metadata
+
+expects:
+  - id: customer_master
+    description: "Master customer data"
+    provider: gcp
+    location:
+      project: data-warehouse-prod
+      dataset: master_data
+      table: customers
+    
+  - id: transaction_history
+    description: "Customer transaction history"
+    provider: gcp
+    location:
+      project: data-warehouse-prod
+      dataset: transactions
+      table: purchase_history
+
+quality:
+  type: SodaCL
+  specification: |
+    checks for customer_segments:
+      - row_count > 10000
+      - duplicate_count(customer_id) = 0
+      - missing_count(customer_id) = 0
+      - missing_count(segment) = 0
+      - invalid_percent(churn_risk_score) < 0.01
+
+sla:
+  freshness: "24h"
+  latency: "2h"
+  completeness: 0.99
+  accuracy: 0.95
+  uptime: 0.999
+
+access_control:
+  classification: internal
+  auto_approve: false
+  approval_workflow: data-governance-team
+  allowed_roles:
+    - data-analyst
+    - data-scientist
+    - product-manager
+  restricted_fields:
+    - customer_email

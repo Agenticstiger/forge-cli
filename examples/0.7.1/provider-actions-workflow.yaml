@@ -1,0 +1,198 @@
+---
+# FLUID 0.7.1 Example: Provider Actions Workflow
+# 
+# This contract demonstrates:
+# - Declarative provider actions (0.7.0+ feature)
+# - Multi-step orchestration workflow
+# - Action dependencies
+# - Dataset provisioning → Access grants → Scheduled tasks
+
+fluidVersion: "0.7.1"
+kind: DataProduct
+id: sales.analytics.pipeline_v1
+name: Sales Analytics Pipeline
+domain: sales
+description: End-to-end sales analytics with declarative orchestration
+
+metadata:
+  owner: data-engineering@example.com
+  steward: analytics-team@example.com
+  tags:
+    - sales
+    - analytics
+    - orchestration
+  classification: Internal
+
+# Provider Actions (NEW in 0.7.0) - Declarative orchestration
+providerActions:
+  # Step 1: Provision BigQuery dataset
+  - actionId: provision_sales_dataset
+    action: provisionDataset
+    provider: gcp
+    description: Create BigQuery dataset for sales data
+    params:
+      project: sales-analytics-prod
+      dataset: sales_analytics
+      region: us-central1
+      labels:
+        env: production
+        team: analytics
+
+  # Step 2: Provision staging table
+  - actionId: provision_staging_table
+    action: provisionDataset
+    provider: gcp
+    description: Create staging table for raw sales data
+    params:
+      project: sales-analytics-prod
+      dataset: sales_analytics
+      table: sales_staging
+      schema:
+        - name: transaction_id
+          type: STRING
+        - name: amount
+          type: FLOAT64
+        - name: timestamp
+          type: TIMESTAMP
+    dependsOn:
+      - provision_sales_dataset
+
+  # Step 3: Grant access to data engineering team
+  - actionId: grant_engineering_access
+    action: grantAccess
+    provider: gcp
+    description: Grant data engineers access to dataset
+    params:
+      dataset: sales_analytics
+      principal: group:data-engineering@example.com
+      role: roles/bigquery.dataEditor
+    dependsOn:
+      - provision_sales_dataset
+
+  # Step 4: Schedule daily ETL task
+  - actionId: schedule_daily_etl
+    action: scheduleTask
+    provider: gcp
+    description: Schedule daily sales data ETL
+    params:
+      name: sales_etl_daily
+      schedule: "0 2 * * *"  # 2 AM daily
+      engine: dbt
+      script: sales_daily_agg
+      location: us-central1
+    dependsOn:
+      - provision_staging_table
+      - grant_engineering_access
+
+  # Step 5: Create analytics view
+  - actionId: create_sales_summary_view
+    action: createView
+    provider: gcp
+    description: Create aggregated sales summary view
+    params:
+      project: sales-analytics-prod
+      dataset: sales_analytics
+      view: sales_summary_daily
+      query: |
+        SELECT
+          DATE(timestamp) as date,
+          COUNT(*) as transaction_count,
+          SUM(amount) as total_revenue,
+          AVG(amount) as avg_order_value
+        FROM `sales-analytics-prod.sales_analytics.sales_staging`
+        GROUP BY date
+    dependsOn:
+      - provision_staging_table
+
+# Exposes (compatible with 0.5.7 and 0.7.1)
+exposes:
+  - exposeId: sales_summary_daily
+    kind: table
+    description: Daily sales summary metrics
+    
+    binding:
+      provider: gcp
+      location:
+        project: sales-analytics-prod
+        dataset: sales_analytics
+        table: sales_summary_daily
+        region: us-central1
+    
+    schema:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        transaction_count:
+          type: integer
+        total_revenue:
+          type: number
+        avg_order_value:
+          type: number
+    
+    policy:
+      classification: Internal
+      
+      authz:
+        allowedRoles:
+          - data-analyst
+          - business-analyst
+      
+      # AI analytics allowed with restrictions
+      agentPolicy:
+        allowedModels:
+          - gpt-4
+          - claude-3-sonnet
+        allowedUseCases:
+          - inference
+          - analysis
+          - summarization
+        deniedUseCases:
+          - training
+          - fine_tuning
+        maxTokensPerDay: 500000
+        canReason: true
+
+# Orchestration configuration
+orchestration:
+  engine: airflow
+  schedule: "0 2 * * *"  # 2 AM daily
+  owner: data-engineering@example.com
+  retry_policy:
+    max_retries: 3
+    retry_delay_minutes: 5
+
+quality:
+  - dimension: completeness
+    assertion: date IS NOT NULL
+    severity: error
+  
+  - dimension: accuracy
+    assertion: total_revenue >= 0
+    severity: error
+  
+  - dimension: freshness
+    assertion: date >= CURRENT_DATE - 1
+    severity: warning
+
+observability:
+  metrics:
+    - name: daily_revenue
+      type: gauge
+      query: SELECT MAX(total_revenue) FROM {table} WHERE date = CURRENT_DATE - 1
+      
+    - name: transaction_volume
+      type: gauge
+      query: SELECT MAX(transaction_count) FROM {table} WHERE date = CURRENT_DATE - 1
+
+  alerts:
+    - name: revenue_drop
+      condition: daily_revenue < (7_day_avg * 0.7)
+      severity: high
+      action: notify_team
+    
+    - name: data_freshness
+      condition: MAX(date) < CURRENT_DATE - 1
+      severity: critical
+      action: page_on_call

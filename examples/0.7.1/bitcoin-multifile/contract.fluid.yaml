@@ -1,0 +1,38 @@
+fluidVersion: "0.7.1"
+kind: DataProduct
+id: crypto.bitcoin_prices_gcp_governed
+name: Bitcoin Price Index (Multi-File Example)
+description: >
+  Same Bitcoin price tracker as the single-file example, but split across
+  multiple files using $ref composition. Run `fluid compile contract.fluid.yaml`
+  to see the fully-resolved output.
+domain: finance
+
+metadata:
+  layer: Gold
+  owner:
+    team: data-engineering
+    email: data-engineering@company.com
+
+tags:
+  - cryptocurrency
+  - real-time
+  - governed
+
+labels:
+  cost_center: "CC-1234"
+  business_criticality: "high"
+
+# ── External fragments via $ref ───────────────────────────────
+
+sovereignty:
+  $ref: ./fragments/sovereignty.yaml
+
+accessPolicy:
+  $ref: ./fragments/access-policy.yaml
+
+builds:
+  - $ref: ./fragments/builds/ingestion.yaml
+
+exposes:
+  - $ref: ./fragments/exposes/bigquery-table.yaml

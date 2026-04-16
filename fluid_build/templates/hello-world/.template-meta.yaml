@@ -1,0 +1,42 @@
+name: "Hello FLUID"
+id: "hello-world"
+version: "0.7.1"
+difficulty: "beginner"
+time_to_complete: "2 minutes"
+learning_path_order: 1
+track: "foundation"
+concepts:
+  - "Basic contract structure"
+  - "Local execution with DuckDB"
+  - "Contract validation"
+  - "Simple SQL transformations"
+prerequisites:
+  - "FLUID CLI installed (pip install fluid-forge)"
+  - "Basic understanding of SQL"
+quickstart_tutorial: "001-hello-fluid.md"
+related_tutorials:
+  - "002-csv-to-data-product.md"
+  - "003-multi-source-joins.md"
+features:
+  local_execution: true
+  dag_generation: false
+  cloud_deployment: false
+  requires_docker: false
+tags:
+  - foundation
+  - beginner
+  - quick-start
+  - hello-world
+  - tutorial
+sample_data_included: false
+estimated_file_size: "3KB"
+description: |
+  The simplest possible FLUID contract. Perfect for absolute beginners.
+  Creates a single output with a "Hello, FLUID!" message using pure SQL.
+  
+  This template teaches:
+  - Contract anatomy (metadata, outputs, transformations)
+  - Local execution workflow
+  - Validation and testing
+  
+  No external data files needed - just pure SQL!

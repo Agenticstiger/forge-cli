@@ -1,0 +1,96 @@
+fluidVersion: "0.7.1"
+kind: DataProduct
+id: analytics.data_lake.sales_db
+name: Sales Data Lake (Glue Database + Table)
+description: Glue catalog database and standard Parquet table for sales data
+domain: Analytics
+
+tags:
+  - data-lake
+  - aws-glue
+  - parquet
+
+labels:
+  team: data-engineering
+  platform: aws
+
+metadata:
+  layer: Silver
+  owner:
+    team: data-engineering
+    email: data-eng@company.com
+
+# ─── Access Policy ────────────────────────────────────────────
+
+accessPolicy:
+  grants:
+    - principal: "role:data-analyst"
+      permissions: [read, select]
+    - principal: "role:data-engineer"
+      permissions: [read, write, create, delete]
+
+# ─── Expose: Glue Database + Table ───────────────────────────
+
+exposes:
+  - exposeId: sales_transactions
+    title: Sales Transactions
+    version: "1.0.0"
+    kind: table
+
+    binding:
+      platform: aws
+      format: parquet
+      location:
+        database: sales_db
+        table: transactions
+        bucket: "{{ env.DATA_LAKE_BUCKET }}"
+        path: curated/sales/transactions/
+        region: "{{ env.AWS_REGION }}"
+
+    contract:
+      schema:
+        - name: order_id
+          type: string
+          required: true
+          description: Unique order identifier
+
+        - name: order_date
+          type: date
+          required: true
+          description: Date the order was placed
+
+        - name: customer_id
+          type: string
+          required: true
+          description: Customer identifier
+          sensitivity: pseudonymized
+
+        - name: product_sku
+          type: string
+          required: true
+
+        - name: quantity
+          type: integer
+          required: true
+          description: Number of items
+
+        - name: unit_price
+          type: decimal(10,2)
+          required: true
+          description: Price per item in USD
+
+        - name: total_amount
+          type: decimal(12,2)
+          required: true
+          description: Total order amount in USD
+
+      quality:
+        - rule: total_amount_positive
+          expression: "total_amount > 0"
+          severity: error
+        - rule: quantity_positive
+          expression: "quantity > 0"
+          severity: error
+        - rule: order_date_not_future
+          expression: "order_date <= CURRENT_DATE"
+          severity: warning

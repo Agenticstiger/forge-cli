@@ -1,0 +1,96 @@
+name: Bug Report
+description: Report a bug in FLUID Forge CLI
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill out the sections below.
+
+  - type: input
+    id: version
+    attributes:
+      label: FLUID Forge Version
+      description: "Run `fluid version` to get this."
+      placeholder: "0.7.1"
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python Version
+      description: "Run `python3 --version`."
+      placeholder: "3.11.5"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - macOS
+        - Linux (Ubuntu/Debian)
+        - Linux (RHEL/CentOS)
+        - Linux (Other)
+        - Windows
+        - Docker/Container
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear description of what the bug is.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Step-by-step instructions to reproduce the behavior.
+      value: |
+        1. Create contract with ...
+        2. Run `fluid validate ...`
+        3. See error ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: contract
+    attributes:
+      label: Contract YAML (if applicable)
+      description: Paste your contract file (redact any secrets or account IDs).
+      render: yaml
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error Output / Logs
+      description: Paste the full error output. Run with `--log-level DEBUG` for verbose output.
+      render: shell
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      description: Which provider are you using?
+      options:
+        - local (DuckDB)
+        - gcp (BigQuery)
+        - snowflake
+        - aws
+        - odps
+        - N/A

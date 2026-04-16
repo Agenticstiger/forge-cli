@@ -1,0 +1,152 @@
+---
+# FLUID 0.7.1 Example: EU Customer Data with GDPR Compliance
+# 
+# This contract demonstrates:
+# - Data sovereignty constraints (EU-only)
+# - Strict enforcement mode (blocks non-EU deployments)
+# - GDPR regulatory framework
+# - Cross-border transfer restrictions
+
+fluidVersion: "0.7.1"
+kind: DataProduct
+id: gdpr.customer.profiles_v1
+name: EU Customer Profiles
+domain: customer_data
+description: Customer profile data with strict EU residency requirements
+
+# Sovereignty Declaration (NEW in 0.7.1)
+sovereignty:
+  jurisdiction: "EU"
+  allowedRegions:
+    - eu-west-1        # AWS Ireland
+    - eu-central-1     # AWS Frankfurt
+    - europe-west1     # GCP Belgium
+    - europe-west4     # GCP Netherlands
+  deniedRegions:
+    - us-east-1        # Explicitly block US regions
+    - us-west-2
+  dataResidency: true
+  crossBorderTransfer: false
+  transferMechanisms:
+    - SCCs              # Standard Contractual Clauses
+    - BCRs              # Binding Corporate Rules
+  regulatoryFramework:
+    - GDPR
+  enforcementMode: strict    # Block deployment if violated
+  validationRequired: true
+
+metadata:
+  owner: privacy-team@example.com
+  steward: data-governance@example.com
+  tags:
+    - gdpr
+    - pii
+    - eu-data
+    - customer-data
+  classification: Restricted
+  confidentiality: High
+
+exposes:
+  - exposeId: customer_profiles
+    kind: table
+    description: Customer profile master data
+    
+    binding:
+      provider: gcp
+      location:
+        project: eu-customer-data-prod
+        dataset: customers
+        table: profiles
+        region: europe-west1    # Must be in allowedRegions
+    
+    schema:
+      type: object
+      properties:
+        customer_id:
+          type: string
+          description: Unique customer identifier
+        email:
+          type: string
+          format: email
+          pii: true
+        first_name:
+          type: string
+          pii: true
+        last_name:
+          type: string
+          pii: true
+        country:
+          type: string
+          description: Must be EU country
+        gdpr_consent:
+          type: boolean
+          description: GDPR consent status
+        consent_date:
+          type: string
+          format: date-time
+    
+    policy:
+      classification: Restricted
+      
+      privacy:
+        piiFields:
+          - email
+          - first_name
+          - last_name
+        retentionDays: 2555    # 7 years for GDPR
+        deletionRequired: true
+      
+      authz:
+        allowedRoles:
+          - data-engineer
+          - privacy-officer
+        deniedPrincipals:
+          - external-contractors
+      
+      # AI/LLM restrictions for PII data
+      agentPolicy:
+        allowedModels:
+          - gpt-4              # Only specific approved models
+          - claude-3-opus
+        deniedUseCases:
+          - training           # Never use PII for model training
+          - fine_tuning
+        allowedUseCases:
+          - inference          # Read-only analysis OK
+          - summarization
+        canStore: false
+        canReason: false       # No multi-step reasoning with PII
+        retentionPolicy:
+          maxRetentionDays: 0  # Ephemeral processing only
+          requireDeletion: true
+        auditRequired: true
+        purposeLimitation: "Customer service inquiries only - no marketing"
+
+quality:
+  - dimension: completeness
+    assertion: customer_id IS NOT NULL
+    severity: error
+  
+  - dimension: validity
+    assertion: country IN ('DE', 'FR', 'IT', 'ES', 'NL', 'BE', 'AT', 'IE')
+    severity: error
+    description: Must be EU country
+  
+  - dimension: compliance
+    assertion: gdpr_consent = true
+    severity: error
+    description: GDPR consent required
+
+observability:
+  metrics:
+    - name: gdpr_consent_rate
+      type: gauge
+      query: SELECT AVG(CAST(gdpr_consent AS INT)) FROM {table}
+      threshold:
+        min: 0.95
+  
+  alerts:
+    - name: non_eu_data_detected
+      condition: country NOT IN ('DE', 'FR', 'IT', 'ES', 'NL', 'BE', 'AT', 'IE')
+      severity: critical
+      action: block_and_notify

@@ -1,0 +1,103 @@
+fluidVersion: "0.5.7"
+kind: "DataProduct"
+id: "example.customer_analytics_v1"
+name: "Customer Purchase Analytics"
+domain: "analytics"
+metadata:
+  layer: Silver
+  owner:
+    team: "analytics-team"
+    email: "analytics@example.com"
+
+builds:
+  - id: "customer_summary"
+    pattern: "embedded-logic"
+    engine: "sql"
+    properties:
+      sql: |
+        SELECT
+          c.customer_id,
+          c.name as customer_name,
+          c.email,
+          c.segment,
+          COUNT(o.order_id) as total_orders,
+          COUNT(CASE WHEN o.status = 'completed' THEN 1 END) as completed_orders,
+          COUNT(CASE WHEN o.status = 'pending' THEN 1 END) as pending_orders,
+          COALESCE(SUM(CASE WHEN o.status = 'completed' THEN o.amount ELSE 0 END), 0) as total_revenue,
+          COALESCE(AVG(CASE WHEN o.status = 'completed' THEN o.amount END), 0) as avg_order_value,
+          MIN(o.order_date) as first_order_date,
+          MAX(o.order_date) as last_order_date
+        FROM customers c
+        LEFT JOIN orders o ON c.customer_id = o.customer_id
+        GROUP BY c.customer_id, c.name, c.email, c.segment
+        ORDER BY total_revenue DESC
+      parameters:
+        inputs:
+          - name: "customers"
+            path: "examples/03-multi-source-join/customers.csv"
+            format: "csv"
+            schema:
+              - name: "customer_id"
+                type: "integer"
+                required: true
+              - name: "name"
+                type: "string"
+                required: true
+              - name: "email"
+                type: "string"
+                required: true
+              - name: "segment"
+                type: "string"
+                required: true
+          - name: "orders"
+            path: "examples/03-multi-source-join/orders.csv"
+            format: "csv"
+            schema:
+              - name: "order_id"
+                type: "integer"
+                required: true
+              - name: "customer_id"
+                type: "integer"
+                required: true
+              - name: "order_date"
+                type: "date"
+                required: true
+              - name: "amount"
+                type: "number"
+                required: true
+              - name: "status"
+                type: "string"
+                required: true
+
+exposes:
+  - exposeId: "customer_analytics"
+    kind: "table"
+    binding:
+      platform: "local"
+      format: "csv"
+      location:
+        path: "runtime/out/customer-analytics-v1.csv"
+    contract:
+      schema:
+        - name: "customer_id"
+          type: "integer"
+        - name: "customer_name"
+          type: "string"
+        - name: "email"
+          type: "string"
+        - name: "segment"
+          type: "string"
+        - name: "total_orders"
+          type: "integer"
+        - name: "completed_orders"
+          type: "integer"
+        - name: "pending_orders"
+          type: "integer"
+        - name: "total_revenue"
+          type: "number"
+        - name: "avg_order_value"
+          type: "number"
+        - name: "first_order_date"
+          type: "date"
+        - name: "last_order_date"
+          type: "date"

@@ -1,0 +1,94 @@
+name: Sync Labels
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/labels.json
+      - .github/workflows/sync-labels.yml
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Sync repository labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            const labels = JSON.parse(fs.readFileSync('.github/labels.json', 'utf8'));
+            const seen = new Set();
+
+            const normalizeColor = (color) => color.replace(/^#/, '').toLowerCase();
+            const normalizeDescription = (description) => description || '';
+
+            for (const label of labels) {
+              if (!label.name || !label.color) {
+                core.setFailed(`Invalid label entry: ${JSON.stringify(label)}`);
+                return;
+              }
+
+              if (seen.has(label.name)) {
+                core.setFailed(`Duplicate label name in .github/labels.json: ${label.name}`);
+                return;
+              }
+
+              seen.add(label.name);
+            }
+
+            const { owner, repo } = context.repo;
+            const existingLabels = await github.paginate(
+              github.rest.issues.listLabelsForRepo,
+              {
+                owner,
+                repo,
+                per_page: 100,
+              }
+            );
+
+            const existingByName = new Map(existingLabels.map((label) => [label.name, label]));
+
+            for (const label of labels) {
+              const desiredColor = normalizeColor(label.color);
+              const desiredDescription = normalizeDescription(label.description);
+              const existing = existingByName.get(label.name);
+
+              if (!existing) {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name: label.name,
+                  color: desiredColor,
+                  description: desiredDescription,
+                });
+                core.info(`Created label: ${label.name}`);
+                continue;
+              }
+
+              const currentColor = normalizeColor(existing.color);
+              const currentDescription = normalizeDescription(existing.description);
+
+              if (currentColor === desiredColor && currentDescription === desiredDescription) {
+                core.info(`Label already up to date: ${label.name}`);
+                continue;
+              }
+
+              await github.rest.issues.updateLabel({
+                owner,
+                repo,
+                name: existing.name,
+                new_name: label.name,
+                color: desiredColor,
+                description: desiredDescription,
+              });
+              core.info(`Updated label: ${label.name}`);
+            }

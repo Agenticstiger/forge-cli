@@ -1,0 +1,33 @@
+name: "Environment Configuration"
+id: "environment-configuration"
+version: "0.7.1"
+difficulty: "beginner"
+time_to_complete: "7 minutes"
+learning_path_order: 7
+track: "foundation"
+concepts:
+  - "Environment variables"
+  - "Multi-environment configs"
+  - "Secrets management"
+  - "Dev/staging/prod patterns"
+prerequisites:
+  - "002-csv-basics"
+  - "004-external-sql-files"
+quickstart_tutorial: "007-environment-configuration.md"
+features:
+  local_execution: true
+  dag_generation: true
+  cloud_deployment: true
+  requires_docker: false
+tags:
+  - beginner
+  - configuration
+  - environments
+  - secrets
+  - devops
+sample_data_included: true
+estimated_file_size: "18KB"
+description: |
+  Master environment-specific configuration with .env files, secrets management,
+  and multi-environment deployment patterns. Learn to build contracts that work
+  seamlessly across dev, staging, and production environments.

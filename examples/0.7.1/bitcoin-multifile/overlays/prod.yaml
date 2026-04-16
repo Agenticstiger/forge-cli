@@ -1,0 +1,8 @@
+# Production overlay — applied with: fluid compile contract.fluid.yaml --env prod
+# Overrides binding location for the production GCP project.
+
+exposes:
+  - binding:
+      location:
+        project: prod-gcp-project
+        dataset: crypto_data_prod

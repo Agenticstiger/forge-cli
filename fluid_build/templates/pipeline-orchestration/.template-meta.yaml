@@ -1,0 +1,35 @@
+name: "Pipeline Orchestration"
+id: "pipeline-orchestration"
+version: "0.7.1"
+difficulty: "intermediate"
+time_to_complete: "12 minutes"
+learning_path_order: 12
+track: "intermediate"
+concepts:
+  - "Complex DAG dependencies"
+  - "Parallel execution"
+  - "Task groups"
+  - "Dynamic task generation"
+  - "Backfill strategies"
+  - "SLA monitoring"
+prerequisites:
+  - "011-first-dag"
+  - "008-incremental-processing"
+quickstart_tutorial: "012-pipeline-orchestration.md"
+features:
+  local_execution: true
+  dag_generation: true
+  cloud_deployment: true
+  requires_docker: true
+tags:
+  - intermediate
+  - orchestration
+  - airflow
+  - scheduling
+  - production
+sample_data_included: true
+estimated_file_size: "35KB"
+description: |
+  Master advanced pipeline orchestration with complex DAG patterns, parallel execution,
+  dynamic task generation, and production-grade monitoring. Build enterprise-ready
+  data pipelines with sophisticated dependency management.

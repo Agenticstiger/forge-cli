@@ -1,0 +1,103 @@
+fluidVersion: "0.5.7"
+kind: DataProduct
+id: crypto.bitcoin_prices_gcp
+name: Bitcoin Price Index (FLUID Declarative)
+description: Real-time Bitcoin price data using FLUID's declarative framework with GCP provider
+domain: finance
+
+metadata:
+  layer: Gold
+  owner:
+    team: data-engineering
+    email: data-engineering@company.com
+
+# Build: API ingestion referencing external Python script
+builds:
+  - id: bitcoin_price_ingestion
+    description: Fetch Bitcoin prices from CoinGecko API and load to BigQuery
+    pattern: hybrid-reference
+    engine: python
+    repository: ./runtime
+    properties:
+      model: ingest
+    
+    # 🔄 Declarative execution configuration
+    execution:
+      trigger:
+        type: manual           # Trigger type: manual, schedule, event
+        iterations: 10         # Run 10 times when executed
+        delaySeconds: 5        # Wait 5 seconds between iterations
+      
+      runtime:
+        platform: gcp
+        resources:
+          cpu: "1"
+          memory: "2Gi"
+      
+      retries:
+        count: 3
+        backoff: exponential
+    
+    outputs:
+      - bitcoin_prices_table
+
+# Expose: BigQuery table with complete schema
+exposes:
+  - exposeId: bitcoin_prices_table
+    kind: table
+    binding:
+      platform: gcp
+      format: bigquery_table
+      location:
+        project: <<YOUR_PROJECT_HERE>>      # Replace with your GCP project
+        dataset: crypto_data
+        table: bitcoin_prices
+        region: europe-west3        # Belgium - GDPR compliant EU region
+    
+    # 📋 Schema contract - single source of truth
+    contract:
+      schema:
+        - name: price_timestamp
+          type: timestamp
+          required: true
+          description: "Timestamp of the price snapshot"
+          
+        - name: price_usd
+          type: numeric
+          required: true
+          description: "Bitcoin price in USD"
+          
+        - name: price_eur
+          type: numeric
+          required: true
+          description: "Bitcoin price in EUR"
+          
+        - name: price_gbp
+          type: numeric
+          required: true
+          description: "Bitcoin price in GBP"
+          
+        - name: market_cap_usd
+          type: numeric
+          required: false
+          description: "Total market capitalization in USD"
+          
+        - name: volume_24h_usd
+          type: numeric
+          required: false
+          description: "24-hour trading volume in USD"
+          
+        - name: price_change_24h_percent
+          type: numeric
+          required: false
+          description: "24-hour price change percentage"
+          
+        - name: last_updated
+          type: timestamp
+          required: false
+          description: "Last update timestamp from API"
+          
+        - name: ingestion_timestamp
+          type: timestamp
+          required: true
+          description: "When this record was ingested"

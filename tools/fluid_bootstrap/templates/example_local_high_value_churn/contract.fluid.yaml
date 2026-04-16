@@ -1,0 +1,40 @@
+
+fluidVersion: "0.4.0"
+kind: "DataProduct"
+id: "silver.high_value_churn_v1"
+name: "High Value Churn Risk"
+domain: "Customer"
+description: "Flags high-value customers with churn signals (local CSV demo)"
+metadata:
+  layer: "Silver"
+  owner:
+    team: "Demo"
+    email: "demo@example.org"
+  status: "Draft"
+  tags: ["customer", "silver", "local"]
+consumes:
+  - id: "hv_customers"
+    ref: "file://examples/local_high_value_churn/data/high_value_customers.csv"
+  - id: "bb_degradations"
+    ref: "file://examples/local_high_value_churn/data/broadband_degradations.csv"
+build:
+  transformation:
+    pattern: "embedded-sql"
+    engine: "duckdb"
+    properties:
+      model: "./models/transform.sql"
+  execution:
+    trigger: { type: "manual" }
+    runtime: { platform: "local" }
+    retries: { count: 1, delaySeconds: 60 }
+exposes:
+  - id: "silver.high_value_churn_tbl"
+    type: "table"
+    location:
+      format: "csv"
+      properties:
+        path: "runtime/out/high_value_churn.csv"
+    schema:
+      - { name: "customer_id", type: "STRING", nullable: false }
+      - { name: "reason", type: "STRING", nullable: true }
+      - { name: "updated_at", type: "TIMESTAMP", nullable: false }

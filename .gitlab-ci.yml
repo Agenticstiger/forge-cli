@@ -1,0 +1,36 @@
+stages: [validate, plan, apply]
+variables:
+  GCP_PROJECT: "YOUR_PROJ"
+  GCP_REGION: "europe-west3"
+
+validate:
+  stage: validate
+  script:
+    - python -m fluid_build.cli validate examples/customer360/contract.fluid.yaml
+
+plan:
+  stage: plan
+  script:
+    - python -m fluid_build.cli plan examples/customer360/contract.fluid.yaml --provider gcp --project $GCP_PROJECT --region $GCP_REGION --out runtime/plan.json
+  artifacts:
+    paths: [runtime/plan.json]
+
+apply:
+  stage: apply
+  when: manual
+  script:
+    - python -m fluid_build.cli apply examples/customer360/contract.fluid.yaml --provider gcp --project $GCP_PROJECT --region $GCP_REGION --auth adc
+
+cli-validate:
+  stage: validate
+  image: python:3.11
+  script:
+    - pip install -e .
+    - bash scripts/ccli_validate.sh --provider ${FLUID_PROVIDER:-local} --contracts examples/customer360/contract.fluid.yaml
+  artifacts:
+    when: always
+    paths:
+      - runtime/cli_validate/*/report.html
+      - runtime/cli_validate/*/summary.json
+      - runtime/cli_validate/*/*.out
+      - runtime/cli_validate/*/*.err

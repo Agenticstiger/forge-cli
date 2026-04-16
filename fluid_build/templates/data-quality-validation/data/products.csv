@@ -1,0 +1,11 @@
+product_id,product_name,category,price,stock_quantity,supplier_id,last_updated
+1,Laptop Pro 15,Electronics,1299.99,45,101,2024-01-15
+2,Wireless Mouse,Electronics,29.99,150,101,2024-01-14
+3,Office Chair,Furniture,299.99,30,102,2024-01-10
+4,Standing Desk,Furniture,499.99,12,102,2024-01-12
+5,USB-C Cable,Electronics,15.99,200,101,2024-01-16
+6,,Electronics,0,50,101,2024-01-15
+7,Monitor 27 inch,Electronics,-50,25,103,2024-01-13
+8,Keyboard Mechanical,Electronics,89.99,-5,101,2024-01-14
+9,Desk Lamp,Furniture,45.99,80,999,2024-01-11
+10,Notebook Set,Stationery,12.99,500,104,

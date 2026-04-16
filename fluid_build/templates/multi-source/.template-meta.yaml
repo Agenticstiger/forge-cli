@@ -1,0 +1,49 @@
+name: "Multi-Source Joins"
+id: "multi-source"
+version: "0.7.1"
+difficulty: "beginner"
+time_to_complete: "8 minutes"
+learning_path_order: 3
+track: "foundation"
+concepts:
+  - "Multiple input sources"
+  - "SQL JOIN operations"
+  - "Aggregations (COUNT, SUM, AVG)"
+  - "Customer analytics patterns"
+  - "Data relationships"
+prerequisites:
+  - "FLUID CLI installed"
+  - "Completed 001-hello-world and 002-csv-basics"
+  - "Basic SQL knowledge (JOINs)"
+quickstart_tutorial: "003-multi-source-joins.md"
+related_tutorials:
+  - "002-csv-to-data-product.md"
+  - "004-external-sql-files.md"
+  - "013-customer-360-analytics.md"
+features:
+  local_execution: true
+  dag_generation: false
+  cloud_deployment: false
+  requires_docker: false
+tags:
+  - foundation
+  - beginner
+  - joins
+  - multi-source
+  - aggregations
+  - analytics
+sample_data_included: true
+estimated_file_size: "15KB"
+description: |
+  Learn how to join multiple data sources (customers + orders) to create
+  comprehensive analytics. Includes realistic sample data demonstrating
+  common patterns like customer lifetime value and purchase frequency.
+  
+  This template teaches:
+  - Multiple input source definitions
+  - LEFT/INNER JOIN patterns
+  - Aggregation functions (COUNT, SUM, AVG)
+  - Customer revenue analytics
+  - Derived metrics and KPIs
+  
+  Perfect real-world example of data integration.

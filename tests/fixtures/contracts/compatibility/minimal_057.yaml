@@ -1,0 +1,39 @@
+fluidVersion: "0.5.7"
+kind: DataProduct
+id: compat.finance.orders_snapshot_057
+name: Orders Snapshot Compatibility 0.5.7
+description: Daily orders snapshot fixture used to protect FLUID 0.5.7 compatibility.
+domain: finance
+metadata:
+  layer: Silver
+  owner:
+    team: finance-platform
+    email: finance@example.com
+
+builds:
+  - id: orders_snapshot_sql
+    pattern: embedded-logic
+    engine: sql
+    properties:
+      sql: |
+        SELECT
+          'order-1' AS order_id,
+          CURRENT_TIMESTAMP AS captured_at
+
+exposes:
+  - exposeId: orders_snapshot
+    kind: table
+    version: "1.0.0"
+    binding:
+      platform: local
+      format: parquet
+      location:
+        path: runtime/compat/orders_snapshot_057.parquet
+    contract:
+      schema:
+        - name: order_id
+          type: string
+          required: true
+        - name: captured_at
+          type: timestamp
+          required: true

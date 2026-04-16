@@ -1,0 +1,57 @@
+# Example contract with policy violations (for testing)
+
+fluidVersion: "0.5.7"
+kind: DataProduct
+id: test.violations.example
+name: Contract With Policy Violations
+description: "Demonstrates various policy violations"
+
+metadata:
+  owner:
+    team: data-engineering
+    email: data-eng@company.com
+
+# Missing schema evolution policy
+
+exposes:
+  - exposeId: sensitive_data
+    kind: table
+    description: "Customer data with policy issues"
+    
+    contract:
+      schema:
+        # PII without privacy protection - VIOLATION
+        - name: email
+          type: STRING
+          sensitivity: pii
+        
+        # PHI without protection - VIOLATION
+        - name: medical_record_number
+          type: STRING
+          sensitivity: phi
+        
+        - name: customer_id
+          type: STRING
+      
+      # Critical DQ rule without monitoring - VIOLATION
+      dq:
+        rules:
+          - id: freshness
+            type: freshness
+            severity: critical
+            window: PT6H
+        
+        monitoring:
+          enabled: false  # Should be true for critical rules
+    
+    # Public classification with PII - VIOLATION
+    policy:
+      classification: Public
+    
+    binding:
+      platform: gcp
+      format: bigquery_table
+      location:
+        project: test-project
+        dataset: test
+        table: sensitive_data

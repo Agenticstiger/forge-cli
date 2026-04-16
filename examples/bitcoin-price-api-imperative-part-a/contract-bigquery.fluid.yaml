@@ -1,0 +1,69 @@
+fluidVersion: "0.5.7"
+kind: DataProduct
+id: crypto.bitcoin_prices
+name: Bitcoin Price Index
+description: Real-time Bitcoin price data from CoinGecko API ingested into BigQuery
+
+metadata:
+  layer: Gold
+  owner:
+    team: data-engineering
+    email: data-engineering@company.com
+
+exposes:
+  - exposeId: bitcoin_prices_table
+    kind: table
+    contract:
+      schema:
+        - name: price_timestamp
+          type: TIMESTAMP
+          required: true
+          description: Timestamp when the price was recorded by CoinGecko
+          
+        - name: price_usd
+          type: NUMERIC
+          required: true
+          description: Bitcoin price in USD
+          
+        - name: price_eur
+          type: NUMERIC
+          required: true
+          description: Bitcoin price in EUR
+          
+        - name: price_gbp
+          type: NUMERIC
+          required: true
+          description: Bitcoin price in GBP
+          
+        - name: market_cap_usd
+          type: NUMERIC
+          required: false
+          description: Total market capitalization in USD
+          
+        - name: volume_24h_usd
+          type: NUMERIC
+          required: false
+          description: 24-hour trading volume in USD
+          
+        - name: price_change_24h_percent
+          type: NUMERIC
+          required: false
+          description: Percentage change in price over 24 hours
+          
+        - name: last_updated
+          type: TIMESTAMP
+          required: true
+          description: Last update timestamp from API
+          
+        - name: ingestion_timestamp
+          type: TIMESTAMP
+          required: true
+          description: When the data was ingested into BigQuery
+    
+    binding:
+      platform: gcp
+      format: bigquery_table
+      location:
+        project: "${GCP_PROJECT_ID}"
+        dataset: crypto_data
+        table: bitcoin_prices

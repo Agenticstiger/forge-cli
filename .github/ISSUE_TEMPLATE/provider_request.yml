@@ -1,0 +1,54 @@
+name: Provider Request
+description: Request a new provider or report issues with an existing one
+title: "[Provider]: "
+labels: ["provider", "enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Want support for a new cloud/data platform, or have feedback on an existing provider?
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Request Type
+      options:
+        - New provider
+        - Enhancement to existing provider
+        - Bug in existing provider
+    validations:
+      required: true
+
+  - type: input
+    id: provider
+    attributes:
+      label: Provider / Platform
+      description: "e.g., Databricks, Azure Synapse, ClickHouse, Airbyte"
+      placeholder: "Databricks"
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use Case
+      description: How would you use this provider? What data products would you build?
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Technical Details
+      description: |
+        For new providers: links to APIs, SDKs, or docs.
+        For existing providers: which actions/features are missing or broken?
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Would you help build this?
+      options:
+        - label: I'm willing to contribute code for this provider
+        - label: I can help test against a real environment
+        - label: I can provide example contracts

@@ -1,0 +1,13 @@
+event_id,user_id,event_type,event_timestamp,device_type,page_url,session_id
+1,101,page_view,2024-01-15 10:23:15,mobile,/home,s1001
+2,101,click,2024-01-15 10:23:45,mobile,/products,s1001
+3,102,page_view,2024-01-15 10:25:00,desktop,/home,s1002
+4,103,page_view,2024-01-15 10:26:30,mobile,/about,s1003
+5,101,purchase,2024-01-15 10:28:00,mobile,/checkout,s1001
+6,102,click,2024-01-15 10:29:15,desktop,/products,s1002
+7,104,page_view,2024-01-15 10:30:00,tablet,/home,s1004
+8,102,purchase,2024-01-15 10:32:45,desktop,/checkout,s1002
+9,103,click,2024-01-15 10:35:00,mobile,/products,s1003
+10,105,page_view,2024-01-15 10:37:20,desktop,/home,s1005
+11,104,click,2024-01-15 10:38:00,tablet,/contact,s1004
+12,101,page_view,2024-01-15 11:15:30,mobile,/home,s1006

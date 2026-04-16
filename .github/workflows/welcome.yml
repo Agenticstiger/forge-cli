@@ -1,0 +1,38 @@
+name: Welcome New Contributors
+
+on:
+  pull_request_target:
+    types: [opened]
+  issues:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  welcome:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/first-interaction@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          issue_message: |
+            Welcome to FLUID Forge! Thanks for opening your first issue.
+
+            A maintainer will review this shortly. In the meantime:
+            - Check that you've filled in the issue template completely
+            - Look at the [docs](https://agenticstiger.github.io/forge_docs/) for answers to common questions
+            - Join the [discussion board](https://github.com/Agenticstiger/forge-cli/discussions) for general questions
+
+            We appreciate your contribution!
+          pr_message: |
+            Welcome to FLUID Forge! Thanks for opening your first pull request.
+
+            Before we review, please make sure:
+            - [ ] You've read the [Contributing Guide](https://github.com/Agenticstiger/forge-cli/blob/main/CONTRIBUTING.md)
+            - [ ] Tests pass locally (`pytest`)
+            - [ ] Code is formatted (`ruff check` and `black`)
+            - [ ] **Documentation:** If your change affects user-facing behaviour, please open a companion PR in the [docs repo](https://github.com/Agenticstiger/forge_docs) and link it in your PR description
+
+            A maintainer will review your PR soon. Thanks for contributing!

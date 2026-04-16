@@ -1,0 +1,58 @@
+name: Feature Request
+description: Suggest a new feature or enhancement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Help us understand what you need.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What problem does this feature solve? Describe the pain point.
+      placeholder: "I'm always frustrated when ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: How would you like this to work? Include example commands or YAML if possible.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What workarounds have you tried? What other approaches might work?
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of FLUID Forge does this affect?
+      options:
+        - CLI Commands
+        - Contract Specification
+        - Provider (Local/DuckDB)
+        - Provider (GCP/BigQuery)
+        - Provider (Snowflake)
+        - Provider (AWS)
+        - Airflow/DAG Generation
+        - Policy / Governance
+        - Documentation
+        - Other
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: How important is this to you?
+      options:
+        - Nice to have
+        - Important — affects my workflow
+        - Critical — blocking my adoption

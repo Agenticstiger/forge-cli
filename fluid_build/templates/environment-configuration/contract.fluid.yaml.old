@@ -1,0 +1,110 @@
+apiVersion: fluid.io/v1
+kind: DataContract
+metadata:
+  name: multi-env-pipeline
+  description: Environment-aware pipeline with configurable outputs
+  version: 1.0.0
+  environment: ${FLUID_ENV:-development}
+
+# Use environment variables for configuration
+connections:
+  postgres:
+    type: postgres
+    host: ${DB_HOST}
+    port: ${DB_PORT}
+    database: ${DB_NAME}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+
+inputs:
+  - name: raw_users
+    type: csv
+    path: ./data/users.csv
+    schema:
+      - { name: user_id, type: INTEGER }
+      - { name: username, type: VARCHAR }
+      - { name: email, type: VARCHAR }
+      - { name: signup_date, type: DATE }
+      - { name: country, type: VARCHAR }
+
+outputs:
+  # Table name includes environment prefix from env var
+  - name: ${OUTPUT_TABLE_PREFIX}users_cleaned
+    type: table
+    # In production, write to postgres; in dev, use local DuckDB
+    target: ${DB_TARGET:-local}
+    schema_name: ${OUTPUT_SCHEMA:-public}
+    schema:
+      - { name: user_id, type: INTEGER }
+      - { name: username, type: VARCHAR }
+      - { name: email, type: VARCHAR }
+      - { name: signup_date, type: DATE }
+      - { name: country, type: VARCHAR }
+      - { name: environment, type: VARCHAR }
+    transformation: |
+      SELECT 
+        user_id,
+        LOWER(username) as username,
+        LOWER(email) as email,
+        signup_date,
+        UPPER(country) as country,
+        '${FLUID_ENV:-development}' as environment
+      FROM {{ ref('raw_users') }}
+  
+  # Conditional output based on environment
+  - name: ${OUTPUT_TABLE_PREFIX}user_summary
+    type: table
+    target: ${DB_TARGET:-local}
+    schema_name: ${OUTPUT_SCHEMA:-public}
+    depends_on: 
+      - ${OUTPUT_TABLE_PREFIX}users_cleaned
+    transformation: |
+      SELECT 
+        COUNT(*) as total_users,
+        COUNT(DISTINCT country) as countries,
+        MIN(signup_date) as first_signup,
+        MAX(signup_date) as last_signup,
+        '${FLUID_ENV:-development}' as environment,
+        CURRENT_TIMESTAMP as generated_at
+      FROM {{ ref('${OUTPUT_TABLE_PREFIX}users_cleaned') }}
+
+# Conditional validations based on feature flags
+validations:
+  - name: no_duplicate_users
+    level: ${VALIDATION_LEVEL:-error}
+    enabled: ${ENABLE_DATA_QUALITY_CHECKS:-true}
+    query: |
+      SELECT COUNT(*) - COUNT(DISTINCT user_id) as duplicate_count
+      FROM {{ ref('raw_users') }}
+    expect:
+      duplicate_count: 0
+  
+  - name: valid_email_format
+    level: warning
+    enabled: ${ENABLE_DATA_QUALITY_CHECKS:-true}
+    query: |
+      SELECT COUNT(*) as invalid_count
+      FROM {{ ref('raw_users') }}
+      WHERE email NOT LIKE '%@%.%'
+    expect:
+      invalid_count: 0
+
+# Environment-specific orchestration
+orchestration:
+  enabled: ${ENABLE_ORCHESTRATION:-false}
+  schedule: ${SCHEDULE_CRON:-"0 2 * * *"}
+  default_args:
+    retries: ${MAX_RETRIES:-3}
+    retry_delay_minutes: ${RETRY_DELAY:-5}
+    email_on_failure: ${ENABLE_NOTIFICATIONS:-false}
+    email: ${ALERT_EMAIL:-devops@example.com}
+
+# Environment-specific monitoring
+monitoring:
+  enabled: ${ENABLE_MONITORING:-true}
+  metrics:
+    - total_users
+    - processing_time
+  alert_channels:
+    email: ${ALERT_EMAIL:-devops@example.com}
+    slack: ${SLACK_WEBHOOK:-}

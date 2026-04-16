@@ -1,0 +1,31 @@
+# Build: Bitcoin price ingestion — owned by data engineering.
+
+id: bitcoin_price_ingestion
+description: Fetch Bitcoin prices from CoinGecko API with data quality validation
+pattern: hybrid-reference
+engine: python
+repository: ./runtime
+properties:
+  model: ingest
+
+tags:
+  - api-ingestion
+  - real-time
+  - coingecko
+
+execution:
+  trigger:
+    type: manual
+    iterations: 1
+    delaySeconds: 5
+  runtime:
+    platform: gcp
+    resources:
+      cpu: "1"
+      memory: "2Gi"
+  retries:
+    count: 3
+    backoff: exponential
+
+outputs:
+  - bitcoin_prices_table

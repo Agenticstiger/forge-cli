@@ -1,0 +1,64 @@
+fluidVersion: 0.7.2
+kind: DataProduct
+id: testing.testable_orders_v1
+name: Testable Orders
+description: Example contract with comprehensive data quality tests
+domain: Testing
+tags:
+- testing
+- validation
+- tutorial
+metadata:
+  owner:
+    team: data-engineering
+    email: data-eng@company.com
+exposes:
+- exposeId: order_revenue
+  title: Order Revenue
+  version: 1.0.0
+  kind: table
+  description: Completed orders with positive revenue
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/order_revenue.parquet
+  contract:
+    schema:
+    - name: order_id
+      type: INTEGER
+      required: true
+    - name: customer_id
+      type: INTEGER
+    - name: revenue
+      type: DECIMAL
+      required: true
+    dq:
+      rules:
+      - id: positive_revenue
+        type: accuracy
+        selector: revenue
+        severity: error
+        description: Revenue must be positive
+        threshold: 0
+        operator: '>'
+      - id: no_null_revenue
+        type: completeness
+        selector: revenue
+        severity: error
+        description: Revenue cannot be null
+        threshold: 1.0
+        operator: '>='
+builds:
+- id: filter_completed_orders
+  description: Extract completed orders with positive revenue
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: "SELECT \n  order_id,\n  customer_id,\n  amount as revenue\nFROM read_csv_auto('data/orders.csv',\
+      \ header=true)\nWHERE status = 'completed'\n  AND amount > 0\n"
+  execution:
+    trigger:
+      type: manual
+    runtime:
+      platform: local

@@ -1,0 +1,162 @@
+# FLUID Build - Professional .gitignore
+
+# Development archive (internal notes, session logs, dev artifacts)
+.archive/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+fluid-env/
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Generated Files and Runtime Data
+runtime/
+*.log
+*.json.bak
+*.yaml.bak
+*.md.bak
+
+# FLUID Build Generated Files
+*.dot
+*.png
+# Allow documentation static assets
+!docs/docs/.vuepress/public/*.png
+# Allow repo branding assets
+!assets/*.png
+*.svg
+*_plan.json
+*_apply.json
+*_report.json
+workflow_*.json
+apply_*.json
+export_*.json
+bigquery_plan.json
+pubsub_plan.json
+simple_plan.json
+simple_graph.dot
+complex_graph.dot
+
+# Documentation Build Output
+docs/node_modules/
+docs/.vuepress/dist/
+docs/.vuepress/.cache/
+docs/.vuepress/.temp/
+
+# Temporary and Test Files
+tmp/
+temp/
+*.tmp
+/test_*.py
+/*_test.py
+TEST_*.md
+TESTING_*.md
+old.md
+
+# Development and Progress Documentation (keep only in docs/)
+*_SUMMARY.md
+*_COMPLETE.md
+*_REPORT.md
+*_GUIDE.md
+CLI_IMPROVEMENTS.md
+ENHANCED_*.md
+FLUID_*_ENHANCEMENT*.md
+
+# Generated and Archive Directories
+legacy_tests_backup/
+scripts_archive/
+debug/
+*-test-docs/
+cli_tests_*/
+test_runs/
+test_sessions/
+ultimate_test_runs/
+test_matrix/
+test_orchestration/
+cli_audit/
+cli_validate/
+diag/
+
+# CI/CD Generated Files
+.gitlab-ci.yml.bak
+gitlab-ci.yml
+bootstrap_fluid.py
+enhance_reports.py
+
+# OS Generated Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Node.js (for docs)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json.bak
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Local scratch / hand-edited FLUID contracts at the repo root.
+# Real contracts live under fluid_build/templates/ or tests/fixtures/ — any
+# *.fluid.yaml or my*-fluid.yaml sitting at the repo root is developer scratch
+# and must not be committed.
+/*-fluid.yaml
+/*.fluid.yaml
+fluid.workspace.yaml

@@ -1,0 +1,944 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-data-protocol.org/fluid/fluid.schema.v0.4.0.json",
+  "title": "FLUID (Federated Layered Unified Interchange Definition) Specification",
+  "description": "A comprehensive, production-ready schema for FLUID data product contracts. Version 0.4.0 replaces the oneOf in build.transformation.properties with conditional validation to remove ambiguity, while keeping the rest of v0.3.0 verbatim.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "fluidVersion",
+    "kind",
+    "id",
+    "name",
+    "description",
+    "domain",
+    "metadata",
+    "exposes"
+  ],
+  "properties": {
+    "fluidVersion": {
+      "type": "string",
+      "description": "Version of the FLUID spec this contract adheres to.",
+      "pattern": "^\\d+\\.\\d+(\\.\\d+)?$",
+      "examples": [
+        "0.4.0"
+      ]
+    },
+    "kind": {
+      "type": "string",
+      "description": "The type of data product definition.",
+      "examples": [
+        "DataProduct",
+        "VirtualDataProduct",
+        "EgressFlow",
+        "IngestFlow",
+        "MLModelProduct",
+        "FeatureStoreProduct"
+      ]
+    },
+    "id": {
+      "type": "string",
+      "description": "Globally-unique, versioned data product identifier. Should be machine-friendly.",
+      "pattern": "^[a-zA-Z0-9_.-]+$",
+      "minLength": 1
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable product name."
+    },
+    "description": {
+      "type": "string",
+      "description": "A brief, business-focused description of the product's purpose."
+    },
+    "domain": {
+      "type": "string",
+      "description": "The owning business domain (e.g., 'Marketing', 'Finance').",
+      "pattern": "^[a-zA-Z0-9_.-]+$"
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    },
+    "consumes": {
+      "description": "An optional list of input data sources required to build the product.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/consume"
+      }
+    },
+    "build": {
+      "type": "object",
+      "description": "Describes the logical transformation process and its operational details.",
+      "properties": {
+        "transformation": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "enum": [
+                "declarative",
+                "hybrid-reference",
+                "embedded-logic",
+                "logical-mapping"
+              ],
+              "default": "hybrid-reference",
+              "description": "The transformation build pattern used."
+            },
+            "engine": {
+              "type": "string",
+              "description": "The transformation engine used."
+            },
+            "properties": {
+              "type": "object",
+              "description": "Pattern-specific properties for the build transformation."
+            }
+          },
+          "required": [
+            "pattern",
+            "engine",
+            "properties"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "pattern": {
+                    "const": "hybrid-reference"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "properties": {
+                    "$ref": "#/$defs/hybridReferencePattern"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "pattern": {
+                    "const": "declarative"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "properties": {
+                    "$ref": "#/$defs/declarativePattern"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "pattern": {
+                    "const": "embedded-logic"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "properties": {
+                    "$ref": "#/$defs/embeddedLogicPattern"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "pattern": {
+                    "const": "logical-mapping"
+                  }
+                },
+                "required": [
+                  "pattern"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "properties": {
+                    "$ref": "#/$defs/logicalMappingPattern"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "execution": {
+          "type": "object",
+          "properties": {
+            "trigger": {
+              "$ref": "#/$defs/trigger"
+            },
+            "runtime": {
+              "$ref": "#/$defs/runtime"
+            },
+            "retries": {
+              "$ref": "#/$defs/retryPolicy"
+            },
+            "notifications": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/notification"
+              }
+            }
+          }
+        }
+      }
+    },
+    "exposes": {
+      "description": "The public output interfaces (ports) of the data product.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/expose"
+      }
+    },
+    "slo": {
+      "$ref": "#/$defs/sla"
+    },
+    "accessPolicy": {
+      "$ref": "#/$defs/accessPolicy"
+    },
+    "operations": {
+      "$ref": "#/$defs/operations"
+    },
+    "security": {
+      "$ref": "#/$defs/security"
+    },
+    "governance": {
+      "$ref": "#/$defs/governance"
+    }
+  },
+  "$defs": {
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "layer": {
+          "type": "string",
+          "enum": [
+            "Bronze",
+            "Silver",
+            "Gold",
+            "Platinum"
+          ],
+          "description": "The architectural layer of the data product."
+        },
+        "owner": {
+          "description": "The team or individual responsible for the data product.",
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "A contact email address for the owner.",
+              "format": "email"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "team": {
+                  "type": "string"
+                },
+                "email": {
+                  "type": "string",
+                  "format": "email"
+                },
+                "slack": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "team"
+              ]
+            }
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "Development",
+            "Published",
+            "Deprecated"
+          ],
+          "default": "Development"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "A list of arbitrary tags for categorization."
+        }
+      },
+      "required": [
+        "layer",
+        "owner"
+      ]
+    },
+    "consume": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "A local alias for the consumed data source.",
+          "pattern": "^[a-zA-Z0-9_.-]+$"
+        },
+        "ref": {
+          "type": "string",
+          "description": "A reference to another data product (e.g., URN)."
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "ref"
+      ]
+    },
+    "expose": {
+      "type": "object",
+      "description": "A single output port of the data product.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The unique identifier for this output port.",
+          "pattern": "^[a-zA-Z0-9_.-]+$"
+        },
+        "type": {
+          "type": "string",
+          "description": "The physical type of the output."
+        },
+        "description": {
+          "type": "string"
+        },
+        "location": {
+          "$ref": "#/$defs/location"
+        },
+        "tags": {
+          "type": "object",
+          "properties": {
+            "archetype": {
+              "type": "string",
+              "enum": [
+                "hub",
+                "satellite",
+                "link",
+                "view",
+                "table"
+              ]
+            },
+            "relationships": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/relationship"
+              }
+            }
+          }
+        },
+        "schema": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/column"
+          }
+        },
+        "mappings": {
+          "description": "OPTIONAL. Column-level lineage and rules for governance. SHOULD be generated from build.transformation, not manually maintained.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/mapping"
+          },
+          "readOnly": true
+        },
+        "quality": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/qualityRule"
+          }
+        },
+        "privacy": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/privacyRule"
+          }
+        },
+        "semantics": {
+          "$ref": "#/$defs/semantics"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "schema",
+        "location"
+      ]
+    },
+    "mapping": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_]+$"
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rule": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "sources",
+        "rule"
+      ]
+    },
+    "declarativePattern": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "joins": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/join"
+          }
+        },
+        "filters": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "select": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/select"
+          }
+        }
+      }
+    },
+    "hybridReferencePattern": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "vars": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "model"
+      ]
+    },
+    "embeddedLogicPattern": {
+      "type": "object",
+      "properties": {
+        "sql": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string",
+          "enum": [
+            "sql",
+            "flink_sql",
+            "pyspark",
+            "scala"
+          ]
+        }
+      },
+      "required": [
+        "sql"
+      ]
+    },
+    "logicalMappingPattern": {
+      "type": "object",
+      "properties": {
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/step"
+          }
+        }
+      }
+    },
+    "join": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "inner",
+            "left",
+            "right",
+            "full"
+          ]
+        },
+        "left": {
+          "type": "string"
+        },
+        "right": {
+          "type": "string"
+        },
+        "on": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "left",
+        "right",
+        "on"
+      ]
+    },
+    "select": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "expression": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "step": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "join",
+            "filter",
+            "project",
+            "aggregate"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "condition": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    "column": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_]+$"
+        },
+        "type": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "nullable": {
+          "type": "boolean",
+          "default": true
+        },
+        "semantic": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ]
+    },
+    "relationship": {
+      "type": "object",
+      "properties": {
+        "to": {
+          "type": "string"
+        },
+        "cardinality": {
+          "type": "string",
+          "enum": [
+            "one-to-one",
+            "one-to-many",
+            "many-to-one",
+            "many-to-many"
+          ]
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "to",
+        "cardinality"
+      ]
+    },
+    "qualityRule": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "rule": {
+          "type": "string"
+        },
+        "onFailure": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "reject_row",
+                "quarantine_row",
+                "fail_pipeline",
+                "alert"
+              ]
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "rule",
+        "onFailure"
+      ]
+    },
+    "privacyRule": {
+      "type": "object",
+      "properties": {
+        "classification": {
+          "type": "string",
+          "enum": [
+            "PII",
+            "SPI",
+            "Confidential"
+          ]
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "treatment": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "hashing",
+                "masking",
+                "encryption",
+                "tokenization"
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      },
+      "required": [
+        "columns",
+        "treatment"
+      ]
+    },
+    "semantics": {
+      "type": "object",
+      "properties": {
+        "ontology": {
+          "type": "string",
+          "format": "uri"
+        },
+        "classifications": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "location": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "type": "string"
+        },
+        "properties": {
+          "type": "object",
+          "description": "Technology-specific properties (e.g., dataset, table, bucket)."
+        }
+      },
+      "required": [
+        "properties"
+      ]
+    },
+    "trigger": {
+      "type": "object",
+      "description": "Defines how the build is initiated.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "const": "schedule"
+            },
+            "cron": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "cron"
+          ]
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "event"
+            },
+            "eventType": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "eventType"
+          ]
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "manual"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "platform": {
+          "type": "string"
+        },
+        "resources": {
+          "type": "object",
+          "properties": {
+            "cpu": {
+              "type": "string"
+            },
+            "memory": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "retryPolicy": {
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "delaySeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "backoff": {
+          "type": "string",
+          "enum": [
+            "none",
+            "exponential"
+          ],
+          "default": "none"
+        }
+      }
+    },
+    "notification": {
+      "type": "object",
+      "properties": {
+        "channel": {
+          "type": "string",
+          "enum": [
+            "email",
+            "slack",
+            "pagerduty",
+            "webhook"
+          ]
+        },
+        "target": {
+          "type": "string"
+        }
+      }
+    },
+    "accessPolicy": {
+      "type": "object",
+      "properties": {
+        "grants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/accessGrant"
+          }
+        }
+      }
+    },
+    "accessGrant": {
+      "type": "object",
+      "properties": {
+        "principal": {
+          "type": "string"
+        },
+        "permissions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "readData",
+              "readMetadata",
+              "manage"
+            ]
+          }
+        }
+      }
+    },
+    "operations": {
+      "type": "object",
+      "properties": {
+        "sla": {
+          "$ref": "#/$defs/sla"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/lifecycle"
+        }
+      }
+    },
+    "sla": {
+      "type": "object",
+      "properties": {
+        "latencyMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "freshnessMinutes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "availabilityPct": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "properties": {
+        "retentionPeriodDays": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deletionPolicy": {
+          "type": "string",
+          "enum": [
+            "hard-delete",
+            "soft-delete",
+            "anonymize"
+          ]
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "properties": {
+        "encryptionAtRest": {
+          "type": "string",
+          "default": "AES256"
+        },
+        "encryptionInTransit": {
+          "type": "string",
+          "default": "TLS1.2+"
+        }
+      }
+    },
+    "governance": {
+      "type": "object",
+      "properties": {
+        "lineage": {
+          "type": "string"
+        },
+        "regulatory": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "GDPR",
+              "CCPA",
+              "HIPAA",
+              "SOX"
+            ]
+          }
+        },
+        "stewardship": {
+          "type": "object",
+          "properties": {
+            "steward": {
+              "type": "string"
+            },
+            "email": {
+              "type": "string",
+              "format": "email"
+            }
+          }
+        }
+      }
+    }
+  }
+}

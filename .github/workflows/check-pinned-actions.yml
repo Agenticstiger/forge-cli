@@ -1,0 +1,77 @@
+# Check Pinned Actions — detect stale SHA pins in generated CI templates
+#
+# Runs monthly and on manual dispatch. Opens a GitHub issue when
+# PINNED_ACTIONS in pipeline_templates.py falls behind upstream releases.
+
+name: Check Pinned Actions
+
+on:
+  schedule:
+    - cron: "23 9 1 * *"  # 1st of each month at 09:23 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check-pins:
+    name: Verify action SHAs are current
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Check pinned action SHAs
+        id: check
+        run: |
+          python scripts/check_pinned_actions.py --strict > report.txt 2>&1 || true
+          echo "report<<REPORT_EOF" >> "$GITHUB_OUTPUT"
+          cat report.txt >> "$GITHUB_OUTPUT"
+          echo "REPORT_EOF" >> "$GITHUB_OUTPUT"
+          python scripts/check_pinned_actions.py --strict
+        continue-on-error: true
+
+      - name: Open issue if stale
+        if: steps.check.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if an open issue already exists
+          EXISTING=$(gh issue list --label "dependencies" --state open --search "Stale pinned GitHub Actions" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "Issue #${EXISTING} already open — adding comment"
+            gh issue comment "$EXISTING" --body "$(cat <<'BODY'
+Monthly check found stale pins (${{ github.event.schedule && 'scheduled' || 'manual' }}):
+
+```
+${{ steps.check.outputs.report }}
+```
+
+Run `python scripts/check_pinned_actions.py` locally for details.
+BODY
+)"
+          else
+            gh issue create \
+              --title "Stale pinned GitHub Actions in generated CI templates" \
+              --label "dependencies" \
+              --body "$(cat <<'BODY'
+The monthly SHA pin check found outdated actions in `PINNED_ACTIONS` (pipeline_templates.py).
+
+```
+${{ steps.check.outputs.report }}
+```
+
+### How to fix
+1. Run `python scripts/check_pinned_actions.py` to see which pins are stale
+2. Update the SHAs in `fluid_build/forge/core/pipeline_templates.py`
+3. Verify with `python scripts/check_pinned_actions.py --strict`
+
+This issue was created automatically by the [check-pinned-actions](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) workflow.
+BODY
+)"
+          fi

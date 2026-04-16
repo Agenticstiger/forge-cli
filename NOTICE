@@ -1,0 +1,29 @@
+FLUID Forge CLI
+Copyright 2025-2026 Agentics Transformation Pty Ltd
+
+This product includes software developed by
+Agentics Transformation Pty Ltd (https://fluidhq.io).
+
+FLUID Forge is a registered trademark of Agentics Transformation Pty Ltd.
+The FLUID name, logo, and associated branding may not be used to endorse
+or promote derivative products without prior written permission from
+Agentics Transformation Pty Ltd.
+
+---
+
+Third-Party Notices
+
+This software includes or depends on the following open-source components:
+
+- Click (BSD-3-Clause) — https://click.palletsprojects.com/
+- PyYAML (MIT) — https://pyyaml.org/
+- jsonschema (MIT) — https://python-jsonschema.readthedocs.io/
+- Rich (MIT) — https://rich.readthedocs.io/
+- Pydantic (MIT) — https://docs.pydantic.dev/
+- Jinja2 (BSD-3-Clause) — https://jinja.palletsprojects.com/
+- HTTPX (BSD-3-Clause) — https://www.python-httpx.org/
+
+OPDS export functionality references the Open Data Product Standard (ODPS)
+v4.1 schema, developed by the Open Data Product Initiative under the
+Creative Commons Attribution 4.0 International License.
+https://github.com/Open-Data-Product-Initiative/v4.1

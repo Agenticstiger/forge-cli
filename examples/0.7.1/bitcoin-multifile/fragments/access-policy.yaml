@@ -1,0 +1,27 @@
+# Access policy — owned by the security / IAM team.
+# Defines who can read and write the data product.
+
+grants:
+  - principal: "group:data-analytics@company.com"
+    permissions:
+      - read
+      - select
+      - query
+
+  - principal: "group:finance-team@company.com"
+    permissions:
+      - read
+      - select
+
+  - principal: "serviceAccount:data-pipeline@testingsandbox.iam.gserviceaccount.com"
+    permissions:
+      - write
+      - insert
+      - update
+      - delete
+
+  - principal: "group:data-engineering@company.com"
+    permissions:
+      - write
+      - insert
+      - update

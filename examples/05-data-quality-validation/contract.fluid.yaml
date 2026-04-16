@@ -1,0 +1,80 @@
+fluidVersion: "0.5.7"
+kind: "DataProduct"
+id: "example.validated_sales_v1"
+name: "Validated Sales Data"
+domain: "sales"
+metadata:
+  layer: Bronze
+  owner:
+    team: "data-quality-team"
+    email: "data-quality@example.com"
+
+builds:
+  - id: "clean_sales"
+    pattern: "embedded-logic"
+    engine: "sql"
+    properties:
+      sql: |
+        SELECT
+          order_id,
+          customer_id,
+          order_date,
+          amount,
+          region,
+          status,
+          CURRENT_TIMESTAMP as validated_at
+        FROM sales_raw
+        WHERE customer_id IS NOT NULL
+          AND order_date IS NOT NULL
+          AND amount > 0
+          AND region IN ('North', 'South', 'East', 'West')
+          AND status IN ('pending', 'completed', 'cancelled')
+      parameters:
+        inputs:
+          - name: "sales_raw"
+            path: "examples/05-data-quality-validation/sales_data.csv"
+            format: "csv"
+            schema:
+              - name: "order_id"
+                type: "integer"
+                required: true
+              - name: "customer_id"
+                type: "string"
+                required: false
+              - name: "order_date"
+                type: "date"
+                required: false
+              - name: "amount"
+                type: "number"
+                required: true
+              - name: "region"
+                type: "string"
+                required: true
+              - name: "status"
+                type: "string"
+                required: true
+
+exposes:
+  - exposeId: "clean_sales_data"
+    kind: "table"
+    binding:
+      platform: "local"
+      format: "csv"
+      location:
+        path: "runtime/out/validated-sales-v1.csv"
+    contract:
+      schema:
+        - name: "order_id"
+          type: "integer"
+        - name: "customer_id"
+          type: "string"
+        - name: "order_date"
+          type: "date"
+        - name: "amount"
+          type: "number"
+        - name: "region"
+          type: "string"
+        - name: "status"
+          type: "string"
+        - name: "validated_at"
+          type: "timestamp"

@@ -1,0 +1,14 @@
+environment: development
+database:
+  host: localhost
+  port: 5432
+  name: fluid_dev
+output:
+  schema: analytics_dev
+  table_prefix: dev_
+features:
+  enable_validations: true
+  enable_notifications: false
+performance:
+  max_workers: 2
+  batch_size: 500

@@ -1,0 +1,80 @@
+fluidVersion: "0.5.7"
+kind: "DataProduct"
+id: "silver.local.high_value_churn_v1"
+name: "High Value Churn (Local)"
+description: "Joins high-value customers with broadband degradations to flag churn risk. Local MVP using DuckDB."
+domain: "Customer"
+
+metadata:
+  layer: Silver
+  owner:
+    team: "Local Demo"
+    email: "demo@example.com"
+  businessContext:
+    domain: "Customer Experience"
+    subdomain: "Churn Management"
+
+consumes:
+  - productId: "bronze.local.high_value_customers_v1"
+    exposeId: "hv_customers"
+    purpose: "High-value customer data"
+  - productId: "bronze.local.broadband_degradations_v1"
+    exposeId: "bb_degradations"
+    purpose: "Broadband service degradation events"
+
+builds:
+  - id: "churn_analysis"
+    description: "Churn risk calculation for high-value customers"
+    pattern: "embedded-logic"
+    engine: "sql"
+    properties:
+      sql: |
+        SELECT
+          h.customer_id,
+          h.segment,
+          CAST(h.arpu AS DOUBLE) AS arpu,
+          CAST(d.degradations_30d AS BIGINT) AS degradations_30d,
+          CASE
+            WHEN h.segment = 'VIP' OR CAST(h.arpu AS DOUBLE) > 100 OR CAST(d.degradations_30d AS BIGINT) > 3
+              THEN 0.8
+            ELSE 0.2
+          END AS churn_risk
+        FROM hv AS h
+        JOIN deg AS d ON h.customer_id = d.customer_id;
+      parameters:
+        inputs:
+          - name: "hv"
+            path: "examples/local/high_value_churn/data/high_value_customers.csv"
+          - name: "deg"
+            path: "examples/local/high_value_churn/data/broadband_degradations.csv"
+    execution:
+      trigger:
+        type: "manual"
+      runtime:
+        platform: "local"
+        resources:
+          cpu: "1"
+          memory: "2GB"
+
+exposes:
+  - exposeId: "high_value_churn_results"
+    kind: "table"
+    binding:
+      platform: "local"
+      format: "parquet"
+      location:
+        path: "output/high_value_churn.parquet"
+    contract:
+      schema:
+        - name: "customer_id"
+          type: "string"
+          required: true
+        - name: "segment"
+          type: "string"
+        - name: "arpu"
+          type: "double"
+        - name: "degradations_30d"
+          type: "bigint"
+        - name: "churn_risk"
+          type: "double"
+          required: true

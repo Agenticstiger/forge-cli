@@ -1,0 +1,29 @@
+# CODEOWNERS — FLUID Forge CLI
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners for everything
+*                               @jeffwatson-ai
+
+# CLI commands
+fluid_build/cli/                @jeffwatson-ai
+
+# Provider implementations
+fluid_build/providers/aws/      @jeffwatson-ai
+fluid_build/providers/gcp/      @jeffwatson-ai
+fluid_build/providers/snowflake/ @jeffwatson-ai
+fluid_build/providers/local/    @jeffwatson-ai
+
+# Security-sensitive areas
+fluid_build/credentials/        @jeffwatson-ai
+fluid_build/secrets.py          @jeffwatson-ai
+fluid_build/auth.py             @jeffwatson-ai
+.secrets.baseline               @jeffwatson-ai
+
+# CI/CD and release
+.github/                        @jeffwatson-ai
+Jenkinsfile                     @jeffwatson-ai
+pyproject.toml                  @jeffwatson-ai
+
+# Documentation
+docs/                           @jeffwatson-ai
+README.md                       @jeffwatson-ai

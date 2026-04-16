@@ -1,0 +1,111 @@
+fluidVersion: "0.7.1"
+kind: DataProduct
+id: analytics.data_lake.sales_iceberg
+name: Sales Iceberg Table
+description: ACID-compliant Iceberg table with time-travel for curated sales data
+domain: Analytics
+
+tags:
+  - data-lake
+  - aws-glue
+  - iceberg
+  - acid
+
+labels:
+  team: data-engineering
+  platform: aws
+  table_format: iceberg
+
+metadata:
+  layer: Gold
+  owner:
+    team: data-engineering
+    email: data-eng@company.com
+
+# ─── Access Policy ────────────────────────────────────────────
+
+accessPolicy:
+  grants:
+    - principal: "role:data-analyst"
+      permissions: [read, select, query]
+    - principal: "role:data-engineer"
+      permissions: [read, write, create, update, delete]
+
+# ─── Expose: Iceberg Table ───────────────────────────────────
+
+exposes:
+  - exposeId: sales_iceberg_table
+    title: Sales (Iceberg — ACID)
+    version: "1.0.0"
+    kind: table
+
+    binding:
+      platform: aws
+      format: parquet
+      tableFormat: iceberg
+      location:
+        database: sales_db
+        table: curated_sales
+        bucket: "{{ env.DATA_LAKE_BUCKET }}"
+        path: iceberg/sales/curated/
+        region: "{{ env.AWS_REGION }}"
+
+    iceberg:
+      writeFormat: parquet
+      snapshotRetention:
+        maxSnapshotAgeMs: 432000000   # 5 days
+        minSnapshotsToKeep: 3
+      compaction:
+        targetFileSizeMb: 256
+        enabled: true
+
+    contract:
+      schema:
+        - name: order_id
+          type: string
+          required: true
+          description: Unique order identifier
+
+        - name: order_date
+          type: date
+          required: true
+          description: Partition key — order date
+
+        - name: customer_id
+          type: string
+          required: true
+          sensitivity: pseudonymized
+
+        - name: product_sku
+          type: string
+          required: true
+
+        - name: quantity
+          type: integer
+          required: true
+
+        - name: unit_price
+          type: decimal(10,2)
+          required: true
+
+        - name: total_amount
+          type: decimal(12,2)
+          required: true
+
+        - name: currency
+          type: string
+          required: true
+          description: ISO-4217 currency code
+
+        - name: ingested_at
+          type: timestamp
+          required: true
+          description: Pipeline ingestion timestamp (UTC)
+
+      quality:
+        - rule: total_amount_check
+          expression: "total_amount = quantity * unit_price"
+          severity: warning
+        - rule: valid_currency
+          expression: "LENGTH(currency) = 3"
+          severity: error

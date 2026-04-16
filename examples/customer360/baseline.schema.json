@@ -1,0 +1,3 @@
+{
+  "signature": "(('gold.customer360_tbl', (('customer_id', 'STRING', False), ('segment', 'STRING', True), ('arpu_30d', 'NUMERIC', True), ('updated_at', 'TIMESTAMP', False)),)),)"
+}

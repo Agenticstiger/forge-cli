@@ -1,0 +1,111 @@
+fluidVersion: 0.7.2
+kind: DataProduct
+id: incremental.transaction_processing_v1
+name: Incremental Transaction Processing
+description: Demonstrates incremental processing with watermark tracking for efficient updates
+domain: Transaction Processing
+tags:
+- incremental
+- watermark
+- efficient
+- advanced
+metadata:
+  owner:
+    team: data-platform
+    email: data-platform@company.com
+exposes:
+- exposeId: transactions_processed
+  title: Processed Transactions
+  version: 1.0.0
+  kind: table
+  description: Incrementally processed transactions with deduplication
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/transactions_processed.parquet
+  contract:
+    schema:
+    - name: transaction_id
+      type: INTEGER
+      required: true
+    - name: customer_id
+      type: INTEGER
+    - name: transaction_date
+      type: DATE
+    - name: amount
+      type: DECIMAL
+    - name: status
+      type: VARCHAR
+    - name: updated_at
+      type: TIMESTAMP
+    - name: processed_at
+      type: TIMESTAMP
+    dq:
+      rules:
+      - id: no_duplicates
+        type: uniqueness
+        selector: transaction_id
+        severity: error
+        description: Transaction IDs must be unique
+        threshold: 1.0
+        operator: '>='
+- exposeId: daily_summary
+  title: Daily Transaction Summary
+  version: 1.0.0
+  kind: table
+  description: Daily aggregated metrics with incremental updates
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/daily_summary.parquet
+  contract:
+    schema:
+    - name: summary_date
+      type: DATE
+      required: true
+    - name: total_transactions
+      type: INTEGER
+    - name: total_amount
+      type: DECIMAL
+    - name: completed_count
+      type: INTEGER
+    - name: pending_count
+      type: INTEGER
+    - name: last_updated
+      type: TIMESTAMP
+builds:
+- id: incremental_transaction_pipeline
+  description: Incremental processing with watermark tracking
+  pattern: multi-stage
+  engine: sql
+  properties:
+    stages:
+    - outputs:
+      - transactions_processed
+      name: process_transactions
+      properties:
+        sql: "SELECT \n  transaction_id,\n  customer_id,\n  transaction_date,\n  amount,\n  status,\n\
+          \  updated_at,\n  CURRENT_TIMESTAMP as processed_at\nFROM read_csv_auto('data/transactions.csv',\
+          \ header=true)\nWHERE status IN ('completed', 'pending')\n"
+    - dependsOn:
+      - process_transactions
+      outputs:
+      - daily_summary
+      name: aggregate_daily
+      properties:
+        sql: "SELECT \n  transaction_date as summary_date,\n  COUNT(*) as total_transactions,\n  SUM(amount)\
+          \ as total_amount,\n  SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_count,\n\
+          \  SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_count,\n  MAX(processed_at)\
+          \ as last_updated\nFROM transactions_processed\nGROUP BY transaction_date\nORDER BY summary_date\
+          \ DESC\n"
+  execution:
+    trigger:
+      type: schedule
+      schedule: '*/15 * * * *'
+    runtime:
+      platform: local
+      resources:
+        cpu: '2'
+        memory: 4GB

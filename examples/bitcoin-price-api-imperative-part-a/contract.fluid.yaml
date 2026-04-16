@@ -1,0 +1,58 @@
+fluidVersion: "0.5.7"
+kind: DataProduct
+id: crypto.bitcoin_prices
+name: Bitcoin Price Index
+description: Real-time Bitcoin price data from CoinGecko API
+
+metadata:
+  layer: Gold
+  owner:
+    team: data-engineering
+    email: data-engineering@company.com
+
+exposes:
+  - exposeId: bitcoin_prices_table
+    kind: table
+    contract:
+      schema:
+        - name: price_timestamp
+          type: TIMESTAMP
+          required: true
+          
+        - name: price_usd
+          type: NUMERIC
+          required: true
+          
+        - name: price_eur
+          type: NUMERIC
+          required: true
+          
+        - name: price_gbp
+          type: NUMERIC
+          required: true
+          
+        - name: market_cap_usd
+          type: NUMERIC
+          required: false
+          
+        - name: volume_24h_usd
+          type: NUMERIC
+          required: false
+          
+        - name: price_change_24h_percent
+          type: NUMERIC
+          required: false
+          
+        - name: last_updated
+          type: TIMESTAMP
+          required: true
+          
+        - name: ingestion_timestamp
+          type: TIMESTAMP
+          required: true
+    
+    binding:
+      platform: local
+      format: csv
+      location:
+        path: runtime/bitcoin_prices.csv

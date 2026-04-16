@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FLUID Forge — Declarative Data Products for the Agentic Era</title>
+<meta name="description" content="What Terraform did for infrastructure, FLUID Forge does for data products. One YAML contract. Any cloud. Full governance. Zero boilerplate.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #0a0a0f;
+  --bg-card: #12121a;
+  --bg-card-hover: #1a1a28;
+  --bg-code: #0d0d15;
+  --border: #1e1e2e;
+  --border-glow: #3b82f640;
+  --text: #e2e8f0;
+  --text-muted: #94a3b8;
+  --text-dim: #64748b;
+  --accent: #3b82f6;
+  --accent-bright: #60a5fa;
+  --accent2: #8b5cf6;
+  --accent3: #06b6d4;
+  --green: #22c55e;
+  --amber: #f59e0b;
+  --red: #ef4444;
+  --gradient-hero: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 50%, #06b6d4 100%);
+  --gradient-subtle: linear-gradient(135deg, #3b82f610, #8b5cf610);
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+html { scroll-behavior: smooth; }
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ─── Ambient glow ─── */
+.glow-orb {
+  position: fixed;
+  border-radius: 50%;
+  filter: blur(120px);
+  opacity: 0.15;
+  pointer-events: none;
+  z-index: 0;
+}
+.glow-orb-1 { width: 600px; height: 600px; top: -200px; left: -100px; background: #3b82f6; }
+.glow-orb-2 { width: 500px; height: 500px; top: 40%; right: -150px; background: #8b5cf6; }
+.glow-orb-3 { width: 400px; height: 400px; bottom: -100px; left: 30%; background: #06b6d4; }
+
+/* ─── Nav ─── */
+nav {
+  position: fixed; top: 0; width: 100%; z-index: 100;
+  background: #0a0a0fcc;
+  backdrop-filter: blur(20px) saturate(180%);
+  border-bottom: 1px solid var(--border);
+  padding: 0 2rem;
+}
+nav .inner {
+  max-width: 1200px; margin: 0 auto;
+  display: flex; align-items: center; justify-content: space-between;
+  height: 64px;
+}
+nav .logo {
+  font-weight: 800; font-size: 1.2rem;
+  background: var(--gradient-hero); -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  letter-spacing: -0.02em;
+}
+nav .logo span { font-weight: 400; opacity: .7; }
+nav .links { display: flex; gap: 2rem; }
+nav .links a {
+  color: var(--text-muted); text-decoration: none; font-size: 0.875rem; font-weight: 500;
+  transition: color 0.2s;
+}
+nav .links a:hover { color: var(--text); }
+nav .cta-sm {
+  background: var(--accent); color: #fff; border: none; padding: 0.5rem 1.2rem;
+  border-radius: 8px; font-size: 0.875rem; font-weight: 600; cursor: pointer;
+  transition: all 0.2s; text-decoration: none;
+}
+nav .cta-sm:hover { background: var(--accent-bright); transform: translateY(-1px); }
+
+/* ─── Section ─── */
+section { position: relative; z-index: 1; }
+.container { max-width: 1200px; margin: 0 auto; padding: 0 2rem; }
+
+/* ─── Hero ─── */
+.hero {
+  min-height: 100vh;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  text-align: center;
+  padding: 8rem 2rem 6rem;
+}
+.hero-badge {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  background: var(--gradient-subtle); border: 1px solid var(--border);
+  border-radius: 100px; padding: 0.4rem 1.2rem;
+  font-size: 0.8rem; color: var(--accent-bright); font-weight: 500;
+  margin-bottom: 2rem;
+}
+.hero-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+
+.hero h1 {
+  font-size: clamp(3rem, 7vw, 5.5rem);
+  font-weight: 900;
+  line-height: 1.05;
+  letter-spacing: -0.04em;
+  max-width: 900px;
+  margin-bottom: 1.5rem;
+}
+.hero h1 .gradient {
+  background: var(--gradient-hero);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.hero .subtitle {
+  font-size: clamp(1.1rem, 2vw, 1.35rem);
+  color: var(--text-muted);
+  max-width: 640px;
+  margin-bottom: 3rem;
+  line-height: 1.7;
+}
+.hero-actions { display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center; }
+.btn-primary {
+  background: var(--gradient-hero);
+  color: #fff; border: none; padding: 0.9rem 2rem;
+  border-radius: 12px; font-size: 1rem; font-weight: 600;
+  cursor: pointer; text-decoration: none;
+  transition: all 0.3s; box-shadow: 0 4px 20px #3b82f640;
+}
+.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 30px #3b82f660; }
+.btn-secondary {
+  background: transparent; color: var(--text); border: 1px solid var(--border);
+  padding: 0.9rem 2rem; border-radius: 12px; font-size: 1rem; font-weight: 500;
+  cursor: pointer; text-decoration: none; transition: all 0.3s;
+}
+.btn-secondary:hover { border-color: var(--accent); background: #3b82f608; }
+
+.hero-terminal {
+  margin-top: 4rem; width: 100%; max-width: 700px;
+  background: var(--bg-code); border: 1px solid var(--border);
+  border-radius: 16px; overflow: hidden;
+  box-shadow: 0 20px 60px #00000060;
+  text-align: left;
+}
+.terminal-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 16px; background: #0f0f18; border-bottom: 1px solid var(--border);
+}
+.terminal-dot { width: 12px; height: 12px; border-radius: 50%; }
+.terminal-dot.r { background: #ef4444; } .terminal-dot.y { background: #f59e0b; } .terminal-dot.g { background: #22c55e; }
+.terminal-title { flex: 1; text-align: center; font-size: 0.75rem; color: var(--text-dim); font-family: var(--mono); }
+.terminal-body { padding: 1.5rem; font-family: var(--mono); font-size: 0.85rem; line-height: 2; }
+.terminal-body .comment { color: var(--text-dim); }
+.terminal-body .cmd { color: var(--green); }
+.terminal-body .cmd::before { content: '$ '; color: var(--accent); }
+.terminal-body .output { color: var(--text-muted); font-size: 0.8rem; }
+.terminal-body .highlight { color: var(--accent-bright); }
+
+/* ─── Section headers ─── */
+.section-header {
+  text-align: center; margin-bottom: 4rem;
+}
+.section-header .eyebrow {
+  text-transform: uppercase; font-size: 0.75rem; font-weight: 700;
+  letter-spacing: 0.12em; color: var(--accent); margin-bottom: 1rem;
+}
+.section-header h2 {
+  font-size: clamp(2rem, 4vw, 3rem); font-weight: 800;
+  letter-spacing: -0.03em; margin-bottom: 1rem;
+}
+.section-header p { color: var(--text-muted); max-width: 600px; margin: 0 auto; font-size: 1.1rem; }
+
+/* ─── Pain / Solution ─── */
+.problem { padding: 8rem 0; }
+.comparison-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; max-width: 900px; margin: 0 auto;
+}
+.compare-card {
+  padding: 2.5rem; border-radius: 16px; border: 1px solid var(--border);
+}
+.compare-card.old { background: linear-gradient(135deg, #ef444408, #f59e0b05); border-color: #ef444430; }
+.compare-card.new { background: linear-gradient(135deg, #3b82f608, #22c55e05); border-color: #3b82f630; }
+.compare-card h3 { font-size: 1.2rem; font-weight: 700; margin-bottom: 1.5rem; display: flex; align-items: center; gap: 0.5rem; }
+.compare-card ul { list-style: none; display: flex; flex-direction: column; gap: 0.8rem; }
+.compare-card li {
+  display: flex; align-items: flex-start; gap: 0.6rem;
+  font-size: 0.95rem; color: var(--text-muted); line-height: 1.5;
+}
+.compare-card li .icon { flex-shrink: 0; margin-top: 2px; }
+.compare-card.old li .icon { color: var(--red); }
+.compare-card.new li .icon { color: var(--green); }
+
+/* ─── How It Works ─── */
+.how-it-works { padding: 8rem 0; }
+.steps {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.5rem;
+}
+.step {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 16px; padding: 2rem;
+  transition: all 0.3s; position: relative; overflow: hidden;
+}
+.step:hover { border-color: var(--accent); transform: translateY(-4px); box-shadow: 0 12px 40px #3b82f615; }
+.step-number {
+  font-size: 3rem; font-weight: 900;
+  background: var(--gradient-hero); -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  opacity: 0.3; line-height: 1; margin-bottom: 1rem;
+}
+.step h4 { font-size: 1.1rem; font-weight: 700; margin-bottom: 0.5rem; }
+.step code {
+  display: inline-block; background: var(--bg-code); border: 1px solid var(--border);
+  padding: 0.2rem 0.6rem; border-radius: 6px; font-family: var(--mono); font-size: 0.8rem;
+  color: var(--accent-bright); margin-top: 0.5rem;
+}
+.step p { color: var(--text-muted); font-size: 0.9rem; margin-top: 0.5rem; }
+
+/* ─── Providers ─── */
+.providers { padding: 8rem 0; }
+.provider-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.5rem;
+}
+.provider-card {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 16px; padding: 2rem; text-align: center;
+  transition: all 0.3s;
+}
+.provider-card:hover { border-color: var(--accent); transform: translateY(-4px); box-shadow: 0 12px 40px #3b82f615; }
+.provider-icon { font-size: 2.5rem; margin-bottom: 1rem; display: flex; justify-content: center; }
+.provider-icon svg { width: 48px; height: 48px; }
+.provider-card h4 { font-size: 1.1rem; font-weight: 700; margin-bottom: 0.3rem; }
+.provider-card .subtitle { color: var(--accent-bright); font-size: 0.8rem; font-weight: 500; margin-bottom: 1rem; }
+.provider-card ul { list-style: none; text-align: left; display: flex; flex-direction: column; gap: 0.4rem; }
+.provider-card li { font-size: 0.85rem; color: var(--text-muted); padding-left: 1.2rem; position: relative; }
+.provider-card li::before { content: '→'; position: absolute; left: 0; color: var(--text-dim); }
+
+/* ─── Features ─── */
+.features { padding: 8rem 0; }
+.feature-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.5rem;
+}
+.feature-card {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 16px; padding: 2rem;
+  transition: all 0.3s;
+}
+.feature-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.feature-card .icon { font-size: 1.5rem; margin-bottom: 1rem; }
+.feature-card h4 { font-size: 1rem; font-weight: 700; margin-bottom: 0.5rem; }
+.feature-card p { color: var(--text-muted); font-size: 0.9rem; }
+
+/* ─── Contract anatomy ─── */
+.anatomy { padding: 8rem 0; }
+.anatomy-content { display: grid; grid-template-columns: 1fr 1fr; gap: 3rem; align-items: start; }
+.anatomy-text h3 { font-size: 1.5rem; font-weight: 700; margin-bottom: 1.5rem; }
+.anatomy-text .anatomy-item { margin-bottom: 1.8rem; }
+.anatomy-text .anatomy-item h5 {
+  font-size: 0.9rem; font-weight: 600; margin-bottom: 0.3rem;
+  display: flex; align-items: center; gap: 0.5rem;
+}
+.anatomy-text .anatomy-item p { color: var(--text-muted); font-size: 0.88rem; }
+.anatomy-code {
+  background: var(--bg-code); border: 1px solid var(--border);
+  border-radius: 16px; padding: 2rem; overflow-x: auto;
+  font-family: var(--mono); font-size: 0.8rem; line-height: 1.8;
+  box-shadow: 0 20px 60px #00000040;
+}
+.anatomy-code .key { color: #7dd3fc; }
+.anatomy-code .str { color: #86efac; }
+.anatomy-code .comment { color: var(--text-dim); }
+.anatomy-code .special { color: #c4b5fd; }
+
+/* ─── Governance ─── */
+.governance { padding: 8rem 0; }
+.gov-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.5rem;
+}
+.gov-card {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 16px; padding: 2.5rem; position: relative; overflow: hidden;
+}
+.gov-card::before {
+  content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+}
+.gov-card:nth-child(1)::before { background: linear-gradient(90deg, #3b82f6, #60a5fa); }
+.gov-card:nth-child(2)::before { background: linear-gradient(90deg, #8b5cf6, #a78bfa); }
+.gov-card:nth-child(3)::before { background: linear-gradient(90deg, #06b6d4, #22d3ee); }
+.gov-card .icon { font-size: 1.5rem; margin-bottom: 1rem; }
+.gov-card h4 { font-size: 1.1rem; font-weight: 700; margin-bottom: 0.5rem; }
+.gov-card p { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1rem; }
+.gov-card code {
+  display: block; background: var(--bg-code); border: 1px solid var(--border);
+  padding: 1rem; border-radius: 8px; font-family: var(--mono); font-size: 0.75rem;
+  color: var(--text-muted); line-height: 1.7; white-space: pre; overflow-x: auto;
+}
+
+/* ─── CLI showcase ─── */
+.cli-showcase { padding: 8rem 0; }
+.cli-grid {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 1.5rem;
+}
+.cli-card {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 16px; padding: 2rem;
+}
+.cli-card h4 { font-size: 1rem; font-weight: 700; margin-bottom: 0.3rem; }
+.cli-card .tag { font-size: 0.7rem; color: var(--accent); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 0.8rem; }
+.cli-card code {
+  display: block; background: var(--bg-code); padding: 0.8rem 1rem;
+  border-radius: 8px; font-family: var(--mono); font-size: 0.8rem;
+  color: var(--green); margin-bottom: 0.5rem;
+}
+.cli-card p { color: var(--text-muted); font-size: 0.85rem; }
+
+/* ─── CTA ─── */
+.final-cta {
+  padding: 8rem 0; text-align: center;
+}
+.cta-box {
+  background: var(--gradient-subtle); border: 1px solid var(--border);
+  border-radius: 24px; padding: 5rem 3rem; max-width: 800px; margin: 0 auto;
+  position: relative; overflow: hidden;
+}
+.cta-box::before {
+  content: ''; position: absolute; inset: -1px;
+  background: var(--gradient-hero); border-radius: 24px;
+  z-index: -1; opacity: 0.1;
+}
+.cta-box h2 {
+  font-size: clamp(2rem, 4vw, 2.8rem); font-weight: 800;
+  letter-spacing: -0.03em; margin-bottom: 1rem;
+}
+.cta-box p { color: var(--text-muted); font-size: 1.1rem; margin-bottom: 2rem; max-width: 500px; margin-left: auto; margin-right: auto; }
+.cta-install {
+  display: inline-block; background: var(--bg-code); border: 1px solid var(--border);
+  padding: 1rem 2rem; border-radius: 12px; font-family: var(--mono); font-size: 1rem;
+  color: var(--green); margin-bottom: 2rem;
+  user-select: all; cursor: pointer;
+}
+.cta-install:hover { border-color: var(--accent); }
+
+/* ─── Footer ─── */
+footer {
+  border-top: 1px solid var(--border);
+  padding: 3rem 2rem; text-align: center;
+  color: var(--text-dim); font-size: 0.85rem;
+}
+footer a { color: var(--text-muted); text-decoration: none; }
+footer a:hover { color: var(--accent-bright); }
+
+/* ─── Responsive ─── */
+@media (max-width: 900px) {
+  .comparison-grid, .anatomy-content, .cli-grid { grid-template-columns: 1fr; }
+  .steps, .provider-grid { grid-template-columns: repeat(2, 1fr); }
+  .feature-grid, .gov-grid { grid-template-columns: 1fr; }
+  nav .links { display: none; }
+}
+@media (max-width: 600px) {
+  .steps, .provider-grid { grid-template-columns: 1fr; }
+  .hero { padding-top: 6rem; }
+}
+
+/* ─── Hero logo ─── */
+.hero-logo {
+  width: clamp(440px, 60vw, 760px);
+  mix-blend-mode: screen;
+  filter: brightness(1.2) contrast(1.3) saturate(1.2);
+  margin-bottom: 1rem;
+  user-select: none;
+  pointer-events: none;
+  animation: logo-float 6s ease-in-out infinite;
+  -webkit-mask-image: radial-gradient(ellipse 75% 70% at center 50%, black 30%, transparent 90%);
+  mask-image: radial-gradient(ellipse 75% 70% at center 50%, black 30%, transparent 90%);
+}
+@keyframes logo-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
+}
+
+/* ─── Animations ─── */
+.fade-in {
+  opacity: 0; transform: translateY(30px);
+  transition: opacity 0.7s ease, transform 0.7s ease;
+}
+.fade-in.visible { opacity: 1; transform: translateY(0); }
+</style>
+</head>
+<body>
+
+<div class="glow-orb glow-orb-1"></div>
+<div class="glow-orb glow-orb-2"></div>
+<div class="glow-orb glow-orb-3"></div>
+
+<!-- ─── NAV ─── -->
+<nav>
+  <div class="inner">
+    <div class="logo">FLUID FORGE <span>CLI</span></div>
+    <div class="links">
+      <a href="#how">How It Works</a>
+      <a href="#providers">Providers</a>
+      <a href="#features">Features</a>
+      <a href="#governance">Governance</a>
+      <a href="https://github.com/Agenticstiger/forge-cli" target="_blank">GitHub</a>
+    </div>
+    <a class="cta-sm" href="#install">Get Started</a>
+  </div>
+</nav>
+
+<!-- ─── HERO ─── -->
+<section class="hero">
+  <img src="../assets/fluid-logo.png" alt="Fluid Forge" class="hero-logo">
+  <div class="hero-badge"><span class="dot"></span> v0.7.7 — Now with Forge Copilot</div>
+  <h1>
+    <span class="gradient">Data Products</span><br>
+    Without the Chaos
+  </h1>
+  <p class="subtitle">
+    What Terraform did for infrastructure, FLUID Forge does for data products.
+    One YAML contract. Any cloud. Full governance. Zero boilerplate.
+  </p>
+  <div class="hero-actions">
+    <a class="btn-primary" href="#install">pip install fluid-forge</a>
+    <a class="btn-secondary" href="https://github.com/Agenticstiger/forge-cli" target="_blank">View on GitHub →</a>
+  </div>
+
+  <div class="hero-terminal">
+    <div class="terminal-bar">
+      <div class="terminal-dot r"></div>
+      <div class="terminal-dot y"></div>
+      <div class="terminal-dot g"></div>
+      <div class="terminal-title">~/my-data-product</div>
+    </div>
+    <div class="terminal-body">
+      <div class="comment"># Declare your data product in YAML</div>
+      <div class="cmd">fluid validate contract.fluid.yaml</div>
+      <div class="output">✓ Contract valid — 3 exposes, 2 builds, 1 access policy</div>
+      <br>
+      <div class="comment"># See exactly what will change</div>
+      <div class="cmd">fluid plan contract.fluid.yaml</div>
+      <div class="output">Plan: <span class="highlight">+3 tables</span>, <span class="highlight">+1 DAG</span>, <span class="highlight">+2 IAM grants</span>, <span class="highlight">+1 masking policy</span></div>
+      <br>
+      <div class="comment"># Deploy everything — infrastructure, logic, and governance</div>
+      <div class="cmd">fluid apply contract.fluid.yaml --yes</div>
+      <div class="output">✓ Applied 7 actions in 4.2s — 0 errors</div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── PROBLEM / SOLUTION ─── -->
+<section class="problem" id="why">
+  <div class="container">
+    <div class="section-header fade-in">
+      <div class="eyebrow">The Problem</div>
+      <h2>Data Engineering Is Stuck in the Dark Ages</h2>
+      <p>You're drowning in .tf files, schema.yml, .rego policies, and a web of Airflow DAGs. There has to be a better way.</p>
+    </div>
+    <div class="comparison-grid fade-in">
+      <div class="compare-card old">
+        <h3>🛑 The Old Way</h3>
+        <ul>
+          <li><span class="icon">✗</span> Weeks of boilerplate wiring IaC, SQL, and DAGs</li>
+          <li><span class="icon">✗</span> Vendor lock-in — your pipelines only work on one cloud</li>
+          <li><span class="icon">✗</span> Governance as an afterthought — manual compliance tickets</li>
+          <li><span class="icon">✗</span> "Works on my machine" — broken production deploys</li>
+          <li><span class="icon">✗</span> AI hallucinations — agents can't understand your tables</li>
+          <li><span class="icon">✗</span> Configuration sprawl across 6+ tools and formats</li>
+        </ul>
+      </div>
+      <div class="compare-card new">
+        <h3>✨ The FLUID Way</h3>
+        <ul>
+          <li><span class="icon">✓</span> Minutes to deploy — declare your intent and apply</li>
+          <li><span class="icon">✓</span> Provider-agnostic — switch clouds with one line of YAML</li>
+          <li><span class="icon">✓</span> Governance-as-Code — policies compile to native IAM</li>
+          <li><span class="icon">✓</span> Deterministic plans — see exactly what changes before it runs</li>
+          <li><span class="icon">✓</span> Built-in agent policies — LLMs query with semantic truth</li>
+          <li><span class="icon">✓</span> One contract is the single source of truth</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── HOW IT WORKS ─── -->
+<section class="how-it-works" id="how">
+  <div class="container">
+    <div class="section-header fade-in">
+      <div class="eyebrow">How It Works</div>
+      <h2>From Contract to Cloud in 4 Steps</h2>
+      <p>A deterministic, auditable pipeline that takes your declaration and makes it real.</p>
+    </div>
+    <div class="steps fade-in">
+      <div class="step">
+        <div class="step-number">01</div>
+        <h4>Declare</h4>
+        <p>Write a single <code>contract.fluid.yaml</code> that describes your data product — sources, transforms, schema, policies, and quality rules.</p>
+      </div>
+      <div class="step">
+        <div class="step-number">02</div>
+        <h4>Validate</h4>
+        <p>Schema validation, dependency resolution, policy checks, and provider-specific rules. Catch problems before they happen.</p>
+        <code>fluid validate</code>
+      </div>
+      <div class="step">
+        <div class="step-number">03</div>
+        <h4>Plan</h4>
+        <p>Generate a deterministic execution plan — see every table, IAM grant, DAG, and masking policy before a single resource is touched.</p>
+        <code>fluid plan</code>
+      </div>
+      <div class="step">
+        <div class="step-number">04</div>
+        <h4>Apply</h4>
+        <p>Execute the plan against your target provider. Infrastructure, transformations, governance, and orchestration — all at once.</p>
+        <code>fluid apply</code>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── PROVIDERS ─── -->
+<section class="providers" id="providers">
+  <div class="container">
+    <div class="section-header fade-in">
+      <div class="eyebrow">Multi-Cloud</div>
+      <h2>Bring Your Own Cloud</h2>
+      <p>Write once. Deploy anywhere. Switch providers by changing one line of YAML.</p>
+    </div>
+    <div class="provider-grid fade-in">
+      <div class="provider-card">
+        <div class="provider-icon"><img src="https://images.ctfassets.net/ct0aopd36mqt/5gViLtMI9HM9PfaRlj2Wz2/f45862ae56c4ac624462c5252b15760c/eyecatch_duckdb_1200x630.png?w=1920&fm=webp" alt="DuckDB" style="width:120px;height:auto;"></div>
+        <h4>Local</h4>
+        <div class="subtitle">DuckDB + Local FS</div>
+        <ul>
+          <li>In-memory SQL engine</li>
+          <li>CSV, Parquet, JSON I/O</li>
+          <li>Persistent mode (~/.fluid/local.db)</li>
+          <li>Zero-config — runs anywhere</li>
+          <li>Topological action ordering</li>
+        </ul>
+      </div>
+      <div class="provider-card">
+        <div class="provider-icon"><img src="https://1000logos.net/wp-content/uploads/2020/05/Logo-Google-Cloud.png" alt="Google Cloud" style="width:120px;height:auto;"></div>
+        <h4>Google Cloud</h4>
+        <div class="subtitle">BigQuery · GCS · Composer · IAM</div>
+        <ul>
+          <li>BigQuery datasets, tables, views, routines</li>
+          <li>Cloud Storage buckets + lifecycle</li>
+          <li>Composer/Airflow DAG deployment</li>
+          <li>Pub/Sub topics + subscriptions</li>
+          <li>Native IAM policy binding</li>
+        </ul>
+      </div>
+      <div class="provider-card">
+        <div class="provider-icon"><img src="https://download.logo.wine/logo/Amazon_Web_Services/Amazon_Web_Services-Logo.wine.png" alt="AWS" style="width:120px;height:auto;"></div>
+        <h4>AWS</h4>
+        <div class="subtitle">S3 · Glue · Athena · Lambda · IAM</div>
+        <ul>
+          <li>S3 buckets with versioning + lifecycle</li>
+          <li>Glue catalogs, crawlers, Iceberg tables</li>
+          <li>Athena workgroups + queries</li>
+          <li>Lambda, Step Functions, EventBridge</li>
+          <li>Circuit breaker pattern per service</li>
+        </ul>
+      </div>
+      <div class="provider-card">
+        <div class="provider-icon"><img src="https://upload.wikimedia.org/wikipedia/commons/thumb/f/ff/Snowflake_Logo.svg/1280px-Snowflake_Logo.svg.png" alt="Snowflake" style="width:120px;height:auto;"></div>
+        <h4>Snowflake</h4>
+        <div class="subtitle">RBAC · Masking · Streams · Tasks</div>
+        <ul>
+          <li>Databases, schemas, clustered tables</li>
+          <li>Column masking policies (hash, redact, email)</li>
+          <li>Row-level security + RBAC grants</li>
+          <li>Drift detection + cost monitoring</li>
+          <li>Key-pair, OAuth, and SSO auth</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── CONTRACT ANATOMY ─── -->
+<section class="anatomy" id="contract">
+  <div class="container">
+    <div class="section-header fade-in">
+      <div class="eyebrow">The Contract</div>
+      <h2>One File. Entire Lifecycle.</h2>
+      <p>Your contract.fluid.yaml is the single source of truth — logic, schema, governance, and observability.</p>
+    </div>
+    <div class="anatomy-content fade-in">
+      <div class="anatomy-text">
+        <div class="anatomy-item">
+          <h5>🏗️ Metadata</h5>
+          <p>Ownership, domain, data layer (Bronze/Silver/Gold), tags, and lineage context. The identity of your data product.</p>
+        </div>
+        <div class="anatomy-item">
+          <h5>⚙️ Builds</h5>
+          <p>Transformation steps — inline SQL, Python, dbt model references, Flink SQL, PySpark — with dependency ordering and engine selection.</p>
+        </div>
+        <div class="anatomy-item">
+          <h5>📤 Exposes</h5>
+          <p>Output artifacts with typed schema contracts, PII sensitivity tags (triggers auto-masking), and provider bindings that you can swap with one line.</p>
+        </div>
+        <div class="anatomy-item">
+          <h5>🔒 Access Policy</h5>
+          <p>RBAC grants that compile to native IAM — BigQuery Dataset roles, Snowflake GRANTs, AWS IAM policies. Declared once, enforced everywhere.</p>
+        </div>
+        <div class="anatomy-item">
+          <h5>🤖 Agent Policy</h5>
+          <p>Governs which AI models can access this data, for what purpose, with token limits, storage restrictions, and mandatory audit logging.</p>
+        </div>
+        <div class="anatomy-item">
+          <h5>🌍 Sovereignty</h5>
+          <p>Jurisdiction enforcement, data residency constraints, allowed regions. Violations are caught at plan time — before anything deploys.</p>
+        </div>
+      </div>
+      <div class="anatomy-code">
+<span class="key">fluidVersion</span>: <span class="str">"0.7.1"</span>
+<span class="key">kind</span>: <span class="str">DataProduct</span>
+<span class="key">id</span>: <span class="str">analytics.customer_360</span>
+<span class="key">name</span>: <span class="str">Customer 360</span>
+<span class="key">domain</span>: <span class="str">analytics</span>
+
+<span class="key">metadata</span>:
+  <span class="key">layer</span>: <span class="str">Gold</span>
+  <span class="key">owner</span>:
+    <span class="key">team</span>: <span class="str">data-platform</span>
+
+<span class="key">builds</span>:
+  - <span class="key">id</span>: <span class="str">transform</span>
+    <span class="key">engine</span>: <span class="str">sql</span>
+    <span class="key">properties</span>:
+      <span class="key">sql</span>: <span class="str">|</span>
+        <span class="str">SELECT user_id, email, SUM(ltv)</span>
+        <span class="str">FROM raw.users JOIN raw.orders</span>
+        <span class="str">USING (user_id) GROUP BY 1, 2</span>
+
+<span class="key">exposes</span>:
+  - <span class="key">exposeId</span>: <span class="str">profiles</span>
+    <span class="key">binding</span>:
+      <span class="key">platform</span>: <span class="special">snowflake</span>  <span class="comment"># ← swap to gcp or aws</span>
+    <span class="key">contract</span>:
+      <span class="key">schema</span>:
+        - <span class="key">name</span>: <span class="str">email</span>
+          <span class="key">sensitivity</span>: <span class="special">pii</span>  <span class="comment"># ← auto-masking</span>
+
+<span class="key">accessPolicy</span>:
+  <span class="key">grants</span>:
+    - <span class="key">principal</span>: <span class="str">"group:marketing"</span>
+      <span class="key">permissions</span>: [<span class="str">"read"</span>]
+
+<span class="key">agentPolicy</span>:
+  <span class="key">allowedModels</span>: [<span class="str">"gpt-4"</span>, <span class="str">"claude-3"</span>]
+  <span class="key">allowedUseCases</span>: [<span class="str">"analysis"</span>]
+  <span class="key">canStore</span>: <span class="special">false</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── FEATURES ─── -->
+<section class="features" id="features">
+  <div class="container">
+    <div class="section-header fade-in">
+      <div class="eyebrow">Capabilities</div>
+      <h2>Enterprise-Grade. Developer-Friendly.</h2>
+      <p>Everything you need to build, govern, and ship data products at scale.</p>
+    </div>
+    <div class="feature-grid fade-in">
+      <div class="feature-card">
+        <div class="icon">🤖</div>
+        <h4>AI-Powered Forge</h4>
+        <p>Domain-specific AI agents (Finance, Healthcare, Retail) generate complete projects from requirements. Templates for analytics, ML pipelines, ETL, streaming.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🔄</div>
+        <h4>Airflow DAG Codegen</h4>
+        <p>Compile your contract into a production-ready Airflow DAG, Dagster pipeline, or Prefect flow. Full orchestration from a single YAML.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🛡️</div>
+        <h4>Policy Compiler</h4>
+        <p>Access policies compile to native IAM for each cloud. BigQuery roles, Snowflake GRANTs, AWS IAM policies. Over-grant guardrails block ownership roles.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">📊</div>
+        <h4>Lineage Graphs</h4>
+        <p>Auto-generate Graphviz DAGs, interactive HTML visualizations, and SVG exports of your data product's internal lineage and build dependencies.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">✅</div>
+        <h4>Contract Tests</h4>
+        <p>Assertion suites validate your deployed data product — schema drift, row counts, null checks, uniqueness, custom SQL predicates.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🔍</div>
+        <h4>Drift Detection</h4>
+        <p>Compare deployed state against your contract. The Snowflake provider tracks schema drift, cost changes, and validation trend degradation over time.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">📦</div>
+        <h4>Open Standards Export</h4>
+        <p>Export to ODCS v3.1 (Bitol.io) and ODPS v4.1 (Linux Foundation) with bidirectional import. Publish to Data Mesh Manager catalogs.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">🏗️</div>
+        <h4>Blueprint Registry</h4>
+        <p>Enterprise blueprint library for approved patterns. Scaffold projects that comply with org-wide standards from day one.</p>
+      </div>
+      <div class="feature-card">
+        <div class="icon">⚡</div>
+        <h4>Environment Overlays</h4>
+        <p>Base contract + env-specific overlays (dev, staging, prod). Deep-merge semantics. One contract, multiple environments — no duplication.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── GOVERNANCE ─── -->
+<section class="governance" id="governance">
+  <div class="container">
+    <div class="section-header fade-in">
+      <div class="eyebrow">Governance</div>
+      <h2>Built for the Agentic Era</h2>
+      <p>FLUID Forge is the first data product framework with native AI agent governance.</p>
+    </div>
+    <div class="gov-grid fade-in">
+      <div class="gov-card">
+        <div class="icon">🔒</div>
+        <h4>Access Policy</h4>
+        <p>Declare RBAC grants once. They compile to native IAM on every provider.</p>
+        <code>accessPolicy:
+  grants:
+    - principal: "group:analysts"
+      permissions: ["read"]
+    - principal: "role:engineer"
+      permissions: ["read", "write"]</code>
+      </div>
+      <div class="gov-card">
+        <div class="icon">🤖</div>
+        <h4>Agent Policy</h4>
+        <p>Control which AI models can access your data, for what purpose, with token and storage limits.</p>
+        <code>agentPolicy:
+  allowedModels: ["gpt-4", "claude-3"]
+  deniedUseCases: ["training", "fine_tuning"]
+  maxTokensPerDay: 1000000
+  canStore: false
+  auditRequired: true</code>
+      </div>
+      <div class="gov-card">
+        <div class="icon">🌍</div>
+        <h4>Data Sovereignty</h4>
+        <p>Jurisdiction enforcement at plan time. Data never lands in a prohibited region.</p>
+        <code>sovereignty:
+  jurisdiction: EU
+  residency: strict
+  allowedRegions:
+    - europe-west1
+    - europe-west3
+  crossBorderTransfer: false</code>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── CLI SHOWCASE ─── -->
+<section class="cli-showcase" id="cli">
+  <div class="container">
+    <div class="section-header fade-in">
+      <div class="eyebrow">Developer Experience</div>
+      <h2>Feels Like Git. Works Like Terraform.</h2>
+      <p>A CLI designed to be muscle memory from day one.</p>
+    </div>
+    <div class="cli-grid fade-in">
+      <div class="cli-card">
+        <div class="tag">Scaffold</div>
+        <h4>AI-Powered Project Creation</h4>
+        <code>$ fluid forge --mode copilot</code>
+        <p>Answer 5 questions. Get a complete project — contract, tests, CI config, and documentation. Domain agents for Finance, Healthcare, Retail.</p>
+      </div>
+      <div class="cli-card">
+        <div class="tag">Validate</div>
+        <h4>Catch Problems Before They Deploy</h4>
+        <code>$ fluid validate contract.fluid.yaml --strict</code>
+        <p>Schema validation against versioned JSON Schemas (0.4.0 → 0.7.2). Provider-specific rules. Policy compliance. Dependency resolution.</p>
+      </div>
+      <div class="cli-card">
+        <div class="tag">Govern</div>
+        <h4>Compile Policies to Native IAM</h4>
+        <code>$ fluid policy-compile contract.fluid.yaml</code>
+        <p>Translates your access grants into BigQuery roles, Snowflake GRANTs, or AWS IAM policies. Over-grant guardrails refuse OWNERSHIP-level roles.</p>
+      </div>
+      <div class="cli-card">
+        <div class="tag">Generate</div>
+        <h4>Production Airflow DAGs</h4>
+        <code>$ fluid generate-airflow contract.fluid.yaml -o dags/</code>
+        <p>Compile your contract into a native Airflow DAG. Also supports Dagster and Prefect export. Cloud Composer deployment included.</p>
+      </div>
+      <div class="cli-card">
+        <div class="tag">Visualize</div>
+        <h4>Lineage You Can See</h4>
+        <code>$ fluid graph contract.fluid.yaml --format html --open</code>
+        <p>Interactive lineage graphs with dark/blueprint themes, plan integration, legend, and SVG/PNG/HTML export.</p>
+      </div>
+      <div class="cli-card">
+        <div class="tag">Diagnose</div>
+        <h4>Self-Healing Checks</h4>
+        <code>$ fluid doctor</code>
+        <p>System health diagnostics: Python version, provider SDK availability, config directory state, credential resolution, and feature flag status.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── INSTALL CTA ─── -->
+<section class="final-cta" id="install">
+  <div class="container">
+    <div class="cta-box fade-in">
+      <h2>Ship Your First Data Product in 60 Seconds</h2>
+      <p>Install the CLI, validate a contract, and deploy. It's that simple.</p>
+      <div class="cta-install">pip install fluid-forge</div>
+      <br><br>
+      <div class="hero-actions" style="justify-content: center;">
+        <a class="btn-primary" href="https://github.com/Agenticstiger/forge-cli" target="_blank">Star on GitHub</a>
+        <a class="btn-secondary" href="https://pypi.org/project/fluid-forge/" target="_blank">View on PyPI</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── FOOTER ─── -->
+<footer>
+  <div class="container">
+    <p style="margin-bottom: 0.5rem;">
+      <strong style="color: var(--text-muted);">FLUID Forge CLI</strong> — Declarative Data Products for the Agentic Era
+    </p>
+    <p>
+      <a href="https://github.com/Agenticstiger/forge-cli">GitHub</a> ·
+      <a href="https://pypi.org/project/fluid-forge/">PyPI</a> ·
+
+      Apache 2.0 License
+    </p>
+    <p style="margin-top: 1rem; font-size: 0.75rem;">
+      Copyright 2024–2026 Agentics Transformation Pty Ltd · Built with 🌊 by DustLabs
+    </p>
+  </div>
+</footer>
+
+<!-- ─── Scroll animation ─── -->
+<script>
+const observer = new IntersectionObserver(entries => {
+  entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('visible'); });
+}, { threshold: 0.1 });
+document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
+</script>
+</body>
+</html>

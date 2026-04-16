@@ -1,0 +1,385 @@
+apiVersion: fluid.io/v1
+kind: DataContract
+metadata:
+  name: customer-360-analytics
+  description: Production-ready Customer 360 analytics with RFM analysis and CLV
+  version: 1.0.0
+  tags:
+    - customer-360
+    - rfm-analysis
+    - clv
+    - production
+  
+orchestration:
+  enabled: true
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  start_date: "2024-01-01"
+  catchup: false
+  default_args:
+    retries: 3
+    retry_delay_minutes: 5
+    email_on_failure: true
+    email_on_retry: false
+    sla_minutes: 60
+
+inputs:
+  - name: raw_customers
+    type: csv
+    path: ./data/customers.csv
+    schema:
+      - name: customer_id
+        type: INTEGER
+        constraints:
+          - not_null
+          - unique
+      - name: first_name
+        type: VARCHAR
+      - name: last_name
+        type: VARCHAR
+      - name: email
+        type: VARCHAR
+        constraints:
+          - not_null
+      - name: phone
+        type: VARCHAR
+      - name: signup_date
+        type: DATE
+        constraints:
+          - not_null
+      - name: country
+        type: VARCHAR
+      - name: city
+        type: VARCHAR
+      - name: customer_source
+        type: VARCHAR
+      - name: industry
+        type: VARCHAR
+  
+  - name: raw_orders
+    type: csv
+    path: ./data/orders.csv
+    schema:
+      - name: order_id
+        type: INTEGER
+        constraints:
+          - not_null
+          - unique
+      - name: customer_id
+        type: INTEGER
+        constraints:
+          - not_null
+      - name: order_date
+        type: DATE
+        constraints:
+          - not_null
+      - name: product_category
+        type: VARCHAR
+      - name: quantity
+        type: INTEGER
+      - name: amount
+        type: DECIMAL
+  
+  - name: raw_interactions
+    type: csv
+    path: ./data/interactions.csv
+    schema:
+      - name: interaction_id
+        type: INTEGER
+        constraints:
+          - not_null
+          - unique
+      - name: customer_id
+        type: INTEGER
+        constraints:
+          - not_null
+      - name: interaction_date
+        type: DATE
+      - name: interaction_type
+        type: VARCHAR
+      - name: channel
+        type: VARCHAR
+      - name: sentiment_score
+        type: INTEGER
+      - name: resolution_time_hours
+        type: DECIMAL
+
+outputs:
+  - name: customer_base
+    type: table
+    execution_phase: extract
+    schema:
+      - name: customer_id
+        type: INTEGER
+      - name: full_name
+        type: VARCHAR
+      - name: email
+        type: VARCHAR
+      - name: country
+        type: VARCHAR
+      - name: industry
+        type: VARCHAR
+      - name: signup_date
+        type: DATE
+      - name: days_since_signup
+        type: INTEGER
+    transformation: |
+      SELECT 
+        customer_id,
+        CONCAT(first_name, ' ', last_name) AS full_name,
+        LOWER(TRIM(email)) AS email,
+        country,
+        industry,
+        signup_date,
+        CAST(julianday('now') - julianday(signup_date) AS INTEGER) AS days_since_signup
+      FROM {{ ref('raw_customers') }}
+  
+  - name: customer_purchase_summary
+    type: table
+    execution_phase: transform
+    depends_on:
+      - customer_base
+      - raw_orders
+    schema:
+      - name: customer_id
+        type: INTEGER
+      - name: total_orders
+        type: INTEGER
+      - name: total_revenue
+        type: DECIMAL
+      - name: avg_order_value
+        type: DECIMAL
+      - name: first_purchase_date
+        type: DATE
+      - name: last_purchase_date
+        type: DATE
+      - name: days_since_last_purchase
+        type: INTEGER
+    transformation: |
+      SELECT 
+        o.customer_id,
+        COUNT(o.order_id) AS total_orders,
+        ROUND(SUM(o.amount), 2) AS total_revenue,
+        ROUND(AVG(o.amount), 2) AS avg_order_value,
+        MIN(o.order_date) AS first_purchase_date,
+        MAX(o.order_date) AS last_purchase_date,
+        CAST(julianday('now') - julianday(MAX(o.order_date)) AS INTEGER) AS days_since_last_purchase
+      FROM {{ ref('raw_orders') }} o
+      GROUP BY o.customer_id
+  
+  - name: customer_engagement_summary
+    type: table
+    execution_phase: transform
+    depends_on:
+      - customer_base
+      - raw_interactions
+    schema:
+      - name: customer_id
+        type: INTEGER
+      - name: total_interactions
+        type: INTEGER
+      - name: support_interactions
+        type: INTEGER
+      - name: marketing_interactions
+        type: INTEGER
+      - name: avg_sentiment_score
+        type: DECIMAL
+      - name: avg_resolution_time_hours
+        type: DECIMAL
+      - name: last_interaction_date
+        type: DATE
+    transformation: |
+      SELECT 
+        i.customer_id,
+        COUNT(i.interaction_id) AS total_interactions,
+        SUM(CASE WHEN i.interaction_type = 'support' THEN 1 ELSE 0 END) AS support_interactions,
+        SUM(CASE WHEN i.interaction_type = 'marketing' THEN 1 ELSE 0 END) AS marketing_interactions,
+        ROUND(AVG(i.sentiment_score), 1) AS avg_sentiment_score,
+        ROUND(AVG(CASE WHEN i.interaction_type = 'support' THEN i.resolution_time_hours END), 2) AS avg_resolution_time_hours,
+        MAX(i.interaction_date) AS last_interaction_date
+      FROM {{ ref('raw_interactions') }} i
+      GROUP BY i.customer_id
+  
+  - name: customer_360_rfm
+    type: table
+    execution_phase: aggregate
+    depends_on:
+      - customer_base
+      - customer_purchase_summary
+      - customer_engagement_summary
+    schema:
+      - name: customer_id
+        type: INTEGER
+      - name: full_name
+        type: VARCHAR
+      - name: email
+        type: VARCHAR
+      - name: country
+        type: VARCHAR
+      - name: industry
+        type: VARCHAR
+      - name: recency_days
+        type: INTEGER
+      - name: frequency
+        type: INTEGER
+      - name: monetary
+        type: DECIMAL
+      - name: rfm_score
+        type: VARCHAR
+      - name: customer_segment
+        type: VARCHAR
+      - name: customer_lifetime_value
+        type: DECIMAL
+      - name: avg_sentiment
+        type: DECIMAL
+      - name: engagement_level
+        type: VARCHAR
+      - name: churn_risk
+        type: VARCHAR
+    transformation: |
+      WITH rfm_calc AS (
+        SELECT 
+          c.customer_id,
+          c.full_name,
+          c.email,
+          c.country,
+          c.industry,
+          COALESCE(p.days_since_last_purchase, 999) AS recency_days,
+          COALESCE(p.total_orders, 0) AS frequency,
+          COALESCE(p.total_revenue, 0) AS monetary,
+          COALESCE(e.avg_sentiment_score, 5.0) AS avg_sentiment,
+          COALESCE(e.total_interactions, 0) AS total_interactions
+        FROM {{ ref('customer_base') }} c
+        LEFT JOIN {{ ref('customer_purchase_summary') }} p ON c.customer_id = p.customer_id
+        LEFT JOIN {{ ref('customer_engagement_summary') }} e ON c.customer_id = e.customer_id
+      ),
+      rfm_scores AS (
+        SELECT 
+          *,
+          CASE 
+            WHEN recency_days <= 30 THEN 5
+            WHEN recency_days <= 60 THEN 4
+            WHEN recency_days <= 90 THEN 3
+            WHEN recency_days <= 180 THEN 2
+            ELSE 1
+          END AS r_score,
+          CASE 
+            WHEN frequency >= 10 THEN 5
+            WHEN frequency >= 5 THEN 4
+            WHEN frequency >= 3 THEN 3
+            WHEN frequency >= 1 THEN 2
+            ELSE 1
+          END AS f_score,
+          CASE 
+            WHEN monetary >= 5000 THEN 5
+            WHEN monetary >= 2000 THEN 4
+            WHEN monetary >= 1000 THEN 3
+            WHEN monetary >= 500 THEN 2
+            ELSE 1
+          END AS m_score
+        FROM rfm_calc
+      )
+      SELECT 
+        customer_id,
+        full_name,
+        email,
+        country,
+        industry,
+        recency_days,
+        frequency,
+        monetary,
+        CAST(r_score AS VARCHAR) || CAST(f_score AS VARCHAR) || CAST(m_score AS VARCHAR) AS rfm_score,
+        CASE 
+          WHEN r_score >= 4 AND f_score >= 4 AND m_score >= 4 THEN 'Champions'
+          WHEN r_score >= 3 AND f_score >= 3 AND m_score >= 3 THEN 'Loyal Customers'
+          WHEN r_score >= 4 AND f_score <= 2 THEN 'Promising'
+          WHEN r_score <= 2 AND f_score >= 3 THEN 'At Risk'
+          WHEN r_score <= 2 AND f_score <= 2 THEN 'Lost'
+          ELSE 'Potential Loyalists'
+        END AS customer_segment,
+        ROUND(monetary * (1 + (frequency * 0.1)) * (avg_sentiment / 10.0), 2) AS customer_lifetime_value,
+        avg_sentiment,
+        CASE 
+          WHEN total_interactions >= 5 THEN 'High'
+          WHEN total_interactions >= 2 THEN 'Medium'
+          ELSE 'Low'
+        END AS engagement_level,
+        CASE 
+          WHEN recency_days > 180 AND frequency <= 2 THEN 'High'
+          WHEN recency_days > 90 AND frequency <= 3 THEN 'Medium'
+          ELSE 'Low'
+        END AS churn_risk
+      FROM rfm_scores
+  
+  - name: high_value_customers
+    type: view
+    execution_phase: aggregate
+    depends_on:
+      - customer_360_rfm
+    transformation: |
+      SELECT 
+        customer_id,
+        full_name,
+        email,
+        country,
+        industry,
+        rfm_score,
+        customer_segment,
+        customer_lifetime_value,
+        engagement_level,
+        churn_risk
+      FROM {{ ref('customer_360_rfm') }}
+      WHERE customer_segment IN ('Champions', 'Loyal Customers')
+        AND churn_risk = 'Low'
+      ORDER BY customer_lifetime_value DESC
+
+validations:
+  - name: revenue_consistency
+    execution_phase: validate
+    level: error
+    query: |
+      SELECT COUNT(*) as invalid_count
+      FROM {{ ref('customer_purchase_summary') }}
+      WHERE total_revenue < 0
+        OR avg_order_value < 0
+        OR total_orders < 0
+    expect:
+      invalid_count: 0
+  
+  - name: valid_rfm_scores
+    execution_phase: validate
+    level: error
+    query: |
+      SELECT COUNT(*) as invalid_count
+      FROM {{ ref('customer_360_rfm') }}
+      WHERE LENGTH(rfm_score) != 3
+        OR rfm_score NOT GLOB '[1-5][1-5][1-5]'
+    expect:
+      invalid_count: 0
+  
+  - name: sentiment_range_check
+    execution_phase: validate
+    level: warning
+    query: |
+      SELECT COUNT(*) as invalid_count
+      FROM {{ ref('customer_360_rfm') }}
+      WHERE avg_sentiment < 0 OR avg_sentiment > 10
+    expect:
+      invalid_count: 0
+  
+  - name: clv_calculation_check
+    execution_phase: validate
+    level: warning
+    query: |
+      SELECT COUNT(*) as invalid_count
+      FROM {{ ref('customer_360_rfm') }}
+      WHERE customer_lifetime_value < monetary
+    expect:
+      invalid_count: 0
+
+monitoring:
+  sla_hours: 1
+  alert_on_failure: true
+  metrics:
+    - total_customers
+    - high_value_customer_count
+    - avg_customer_lifetime_value

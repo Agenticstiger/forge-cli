@@ -1,0 +1,9 @@
+sale_id,region,sale_date,amount,product_category
+1,NORTH,2024-01-15,150.00,Electronics
+2,SOUTH,2024-01-15,200.50,Apparel
+3,EAST,2024-01-15,300.00,Electronics
+4,WEST,2024-01-15,120.00,Home
+5,NORTH,2024-01-16,180.00,Apparel
+6,SOUTH,2024-01-16,250.00,Electronics
+7,EAST,2024-01-16,400.00,Home
+8,WEST,2024-01-16,175.00,Apparel

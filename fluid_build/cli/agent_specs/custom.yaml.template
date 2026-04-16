@@ -1,0 +1,122 @@
+# Custom Domain Spec Template for FLUID Forge
+#
+# Use this template to create your own industry/domain expertise pack.
+# Forge will auto-detect your domain from keywords in the interview,
+# or you can force it with: fluid forge --domain <your-domain-name>
+#
+# HOW TO USE:
+#   1. Copy this file to a new YAML file in this directory:
+#      cp custom.yaml.template my-domain.yaml
+#
+#   2. Fill in the fields below (see comments for guidance)
+#
+#   3. Add your domain keywords to domain_keywords.yaml:
+#      my-domain:
+#        - keyword1
+#        - keyword2
+#
+#   4. Run: fluid forge --domain my-domain
+#
+# For examples, see: finance.yaml, healthcare.yaml, retail.yaml, telco.yaml
+
+# Required: unique name for your domain (lowercase, no spaces)
+name: my-domain
+
+# Required: human-readable domain label
+domain: My Domain
+
+# Required: one-line description of this domain's expertise
+description: Expert in [your domain] data products and [your speciality]
+
+# Keywords for automatic domain detection (optional but recommended).
+# When a user mentions these words during the interview, this agent is
+# auto-selected without needing --domain. At least 2 keyword hits trigger detection.
+keywords:
+  - my-domain
+  - keyword1
+  - keyword2
+
+# Questions to ask during the interview.
+# These are suggested to the AI — it may use them or skip based on context.
+# type: "choice" (pick from list) or "text" (free-form answer)
+questions:
+  - key: product_type
+    question: What type of data product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: Analytics Dashboard
+        value: analytics
+        aliases: ["dashboard", "reporting"]
+      - label: Data Pipeline
+        value: pipeline
+        aliases: ["etl", "pipeline", "ingestion"]
+      - label: ML Features
+        value: ml_features
+        aliases: ["features", "feature store", "ml"]
+
+# Default values when the user doesn't specify
+resolver_defaults:
+  product_type: analytics
+
+# Suggestions injected into the AI prompt
+suggestion_defaults:
+  recommended_template: analytics-template
+  recommended_provider: local
+  recommended_patterns: []
+  architecture_suggestions:
+    - Use medallion architecture (bronze/silver/gold)
+    - Implement data validation at ingestion
+  best_practices:
+    - Use version control for all models
+    - Implement automated testing
+    - Document data lineage
+  technology_stack: []
+  security_requirements: []
+
+# Conditional rules: when a condition matches, apply actions
+# Available ops: "set" (overwrite), "append_unique" (add to list)
+rules: []
+
+next_step_tips: []
+conditional_next_step_tips: []
+
+# Data modeling standards (optional but recommended).
+# These guide the AI when generating semantic blocks and dbt models.
+# See finance.yaml for a complete example.
+data_modeling_standards:
+  naming_conventions:
+    staging_prefix: "stg_"
+    fact_prefix: "fct_"
+    dimension_prefix: "dim_"
+    column_style: "snake_case"
+
+  # Common entities in your domain (primary keys, foreign keys)
+  common_entities:
+    - name: example_entity
+      type: primary
+      description: "Primary entity in your domain"
+
+  # Common measures (aggregatable numeric values)
+  common_measures:
+    - name: total_count
+      agg: count
+      description: "Count of records"
+
+  # Common dimensions (grouping axes)
+  common_dimensions:
+    - name: created_date
+      type: time
+      description: "Record creation date"
+      time_granularity: day
+    - name: category
+      type: categorical
+      description: "Category grouping"
+
+  # Suggested dbt model patterns
+  dbt_model_patterns:
+    staging:
+      - "stg_source -- one row per record, cleaned from source"
+    marts:
+      - "fct_events -- grain: one row per event"
+      - "dim_entities -- entity dimension table"

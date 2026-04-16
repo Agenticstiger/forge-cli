@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install ruff "black==24.10.0"
+      - name: Ruff check
+        run: ruff check fluid_build/ tests/
+      - name: Black check
+        run: black --check fluid_build/ tests/
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,local]" || pip install -e ".[dev]"
+
+      # ── Tests (all Python versions) ─────────────────────────────
+      - name: Run tests
+        if: matrix.python-version != '3.12'
+        run: |
+          python -m pytest \
+            --junitxml=junit.xml \
+            -q
+
+      # ── Tests + Coverage (Python 3.12 only) ─────────────────────
+      - name: Run tests with coverage
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m pytest \
+            --cov=fluid_build \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --junitxml=junit.xml \
+            -q
+
+      # ── Coverage Gates (Python 3.12 only) ───────────────────────
+      - name: "Coverage gate: core framework (≥80%)"
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m coverage report --fail-under=80 \
+            --omit="fluid_build/providers/*,fluid_build/cli/provider_action_executor.py"
+
+      - name: "Coverage gate: local providers — no credentials (≥50%)"
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m coverage report --fail-under=50 \
+            --include="fluid_build/providers/__init__.py,fluid_build/providers/base.py,fluid_build/providers/common/*,fluid_build/providers/local/*,fluid_build/providers/catalogs/*,fluid_build/providers/odcs/*,fluid_build/providers/odps_standard/*,fluid_build/providers/quality_engine.py,fluid_build/providers/*_validation.py,fluid_build/providers/validation_*.py,fluid_build/cli/provider_action_executor.py"
+
+      - name: "Coverage gate: cloud providers — needs credentials (≥20%)"
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m coverage report --fail-under=20 \
+            --include="fluid_build/providers/aws/*,fluid_build/providers/gcp/*,fluid_build/providers/snowflake/*,fluid_build/providers/odps/*,fluid_build/providers/datamesh_manager/*,fluid_build/providers/bigquery_validation.py"
+
+      - name: "Coverage: total (informational)"
+        if: matrix.python-version == '3.12'
+        run: python -m coverage report || true
+
+      # ── Artifacts ───────────────────────────────────────────────
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-py${{ matrix.python-version }}
+          path: |
+            junit.xml
+            coverage.xml
+          retention-days: 14
+
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.12'
+        uses: codecov/codecov-action@v6
+        with:
+          files: coverage.xml
+          fail_ci_if_error: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+
+  build-check:
+    name: Build Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build wheel and sdist
+        run: |
+          pip install --upgrade pip build twine
+          python -m build
+      - name: Strict metadata check
+        run: twine check --strict dist/*
+      - name: Isolated wheel install and verify
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+
+          # Verify import resolves from site-packages, not checkout
+          INSTALL_PATH=$(/tmp/smoke/bin/python -I -c "import fluid_build; print(fluid_build.__file__)")
+          echo "Installed at: ${INSTALL_PATH}"
+          if [[ "$INSTALL_PATH" != */site-packages/* ]]; then
+            echo "::error::fluid_build resolved outside site-packages"
+            exit 1
+          fi
+
+          # Verify critical runtime assets exist in installed package
+          /tmp/smoke/bin/python -I -c "
+          from pathlib import Path
+          import fluid_build
+          pkg = Path(fluid_build.__file__).parent
+          assert (pkg / 'build-manifest.yaml').exists(), 'build-manifest.yaml missing'
+          assert (pkg / 'templates' / 'hello-world' / 'contract.fluid.yaml').exists(), 'template missing'
+          assert (pkg / 'schemas').is_dir(), 'schemas dir missing'
+          print('All runtime assets verified')
+          "
+
+          # Verify CLI entry point works
+          /tmp/smoke/bin/fluid --version
+
+          # Functional scaffold check
+          cd /tmp
+          /tmp/smoke/bin/fluid init smoke-test --template hello-world
+          test -f smoke-test/contract.fluid.yaml || { echo "::error::scaffold failed"; exit 1; }
+          echo "Scaffold verified"
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install bandit
+      - name: Bandit security scan
+        run: bandit -r fluid_build/ -c pyproject.toml --severity-level medium -q
+
+  license-check:
+    name: License Headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Check license headers
+        run: python scripts/check_license_headers.py

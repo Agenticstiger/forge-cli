@@ -1,0 +1,48 @@
+# Industry skills: Telecommunications
+# Merged with _tools.yaml at generation time to produce .fluid/skills.yaml
+
+industry:
+  name: "telecommunications"
+  agent: "telco"
+  label: "Telecommunications"
+  description: "Telecommunications, mobile networks, cable, ISP"
+
+canonical_model:
+  primary: "tmf_sid"
+  label: "TM Forum SID"
+  description: "Service Information Data Model — the canonical standard for telco data products"
+
+domains:
+  - name: "party_customer"
+    label: "Party / Customer"
+    description: "Customer identity, accounts, contacts, demographics"
+    key_entities: ["party", "customer", "account", "contact"]
+  - name: "product"
+    label: "Product"
+    description: "Product catalog, offers, pricing, bundles"
+    key_entities: ["product_offering", "product_spec", "price"]
+  - name: "service"
+    label: "Service"
+    description: "Service inventory, SLA monitoring, activation"
+    key_entities: ["service", "service_spec", "sla"]
+  - name: "resource"
+    label: "Resource"
+    description: "Network elements, physical/logical resources"
+    key_entities: ["resource", "network_element", "port"]
+  - name: "enterprise"
+    label: "Enterprise / Cross-domain"
+    description: "Revenue assurance, fraud, cross-domain analytics"
+    key_entities: ["usage_record", "billing_account", "payment"]
+
+compliance:
+  - "GDPR"
+  - "ePrivacy Directive"
+  - "Telecommunications Act"
+
+common_data_sources:
+  - "CDRs (Call Detail Records)"
+  - "xDRs (extended Detail Records)"
+  - "Billing data"
+  - "Service inventory"
+  - "Network telemetry"
+  - "TM Forum Open API feeds"

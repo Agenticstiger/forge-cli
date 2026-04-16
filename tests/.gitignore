@@ -1,0 +1,15 @@
+# Test Files .gitignore
+
+# Test Output
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Generated Test Files
+test_*.py.bak
+*_test_output/
+
+# Temporary Test Data
+test_data/
+*.tmp

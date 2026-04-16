@@ -1,0 +1,48 @@
+fluidVersion: 0.7.2
+kind: DataProduct
+id: tutorial.hello_world_v1
+name: Hello FLUID
+description: Your first FLUID data product - a simple Hello World example
+domain: Tutorial
+tags:
+- tutorial
+- beginner
+- hello-world
+metadata:
+  owner:
+    team: your-team
+    email: your-team@company.com
+exposes:
+- exposeId: hello_message
+  title: Hello Message
+  version: 1.0.0
+  kind: table
+  description: A simple greeting message from FLUID
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/hello_message.parquet
+  contract:
+    schema:
+    - name: message
+      type: VARCHAR
+      required: true
+      description: The greeting message
+    - name: created_at
+      type: TIMESTAMP
+      required: true
+      description: When this message was created
+builds:
+- id: generate_hello
+  description: Generate a simple hello message
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: "SELECT \n  'Hello, FLUID! Welcome to contract-driven data engineering.' AS message,\n  CURRENT_TIMESTAMP\
+      \ AS created_at\n"
+  execution:
+    trigger:
+      type: manual
+    runtime:
+      platform: local

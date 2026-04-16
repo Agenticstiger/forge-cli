@@ -1,0 +1,41 @@
+name: "Data Quality Validation"
+id: "data-quality-validation"
+version: "0.7.1"
+difficulty: "beginner"
+time_to_complete: "6 minutes"
+learning_path_order: 5
+track: "foundation"
+
+concepts:
+  - "Data quality checks"
+  - "Validation rules"
+  - "Error vs warning levels"
+  - "Data profiling"
+  - "Anomaly detection"
+
+prerequisites:
+  - "002-csv-basics"
+  - "003-multi-source"
+
+quickstart_tutorial: "005-data-quality-validation.md"
+
+features:
+  local_execution: true
+  dag_generation: false
+  cloud_deployment: true
+  requires_docker: false
+
+tags:
+  - beginner
+  - data-quality
+  - validation
+  - testing
+  - reliability
+
+sample_data_included: true
+estimated_file_size: "20KB"
+
+description: |
+  Master data quality validation with comprehensive checks for completeness,
+  accuracy, consistency, and validity. Learn to implement multi-level validation
+  strategies that catch data issues before they impact production.

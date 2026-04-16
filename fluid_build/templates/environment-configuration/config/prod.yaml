@@ -1,0 +1,14 @@
+environment: production
+database:
+  host: prod-db.example.com
+  port: 5432
+  name: fluid_prod
+output:
+  schema: analytics
+  table_prefix: ""
+features:
+  enable_validations: true
+  enable_notifications: true
+performance:
+  max_workers: 16
+  batch_size: 5000

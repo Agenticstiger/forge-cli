@@ -1,0 +1,32 @@
+name: "Multiple Outputs Pattern"
+id: "multiple-outputs"
+version: "0.7.1"
+difficulty: "beginner"
+time_to_complete: "6 minutes"
+learning_path_order: 6
+track: "foundation"
+concepts:
+  - "Multiple output tables"
+  - "Views vs tables"
+  - "Output dependencies"
+  - "Layered transformations"
+prerequisites:
+  - "003-multi-source"
+  - "004-external-sql-files"
+quickstart_tutorial: "006-multiple-outputs.md"
+features:
+  local_execution: true
+  dag_generation: true
+  cloud_deployment: true
+  requires_docker: false
+tags:
+  - beginner
+  - architecture
+  - outputs
+  - layered-design
+sample_data_included: true
+estimated_file_size: "25KB"
+description: |
+  Learn to create multiple output tables and views from a single contract.
+  Master layered data architectures with bronze/silver/gold patterns and
+  understand when to use tables vs views for optimal performance.

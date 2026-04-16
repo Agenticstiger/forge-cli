@@ -1,0 +1,210 @@
+---
+# FLUID 0.7.1 Example: AI-Restricted Data with AgentPolicy
+# 
+# This contract demonstrates:
+# - Comprehensive AI/LLM usage governance
+# - Model whitelisting and use case restrictions
+# - Token limits and retention policies
+# - Different policies per data exposure
+
+fluidVersion: "0.7.1"
+kind: DataProduct
+id: analytics.sales.restricted_v1
+name: Sales Analytics (AI-Restricted)
+domain: sales
+description: Sales data with strict AI/LLM usage controls
+
+metadata:
+  owner: sales-analytics@example.com
+  steward: ai-governance@example.com
+  tags:
+    - sales
+    - ai-restricted
+    - revenue-data
+  classification: Confidential
+
+exposes:
+  # Exposure 1: Raw sales transactions (NO AI allowed)
+  - exposeId: raw_transactions
+    kind: table
+    description: Raw sales transactions - NO AI/LLM access permitted
+    
+    binding:
+      provider: gcp
+      location:
+        project: sales-analytics-prod
+        dataset: sales
+        table: transactions
+        region: us-central1
+    
+    schema:
+      type: object
+      properties:
+        transaction_id:
+          type: string
+        customer_id:
+          type: string
+        amount:
+          type: number
+        product_id:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+    
+    policy:
+      classification: Confidential
+      
+      # STRICT: No AI access at all
+      agentPolicy:
+        allowedModels: []       # Empty = no models allowed
+        deniedUseCases:
+          - training
+          - fine_tuning
+          - inference
+          - reasoning
+          - embedding
+          - rag
+        canStore: false
+        canReason: false
+        auditRequired: true
+        purposeLimitation: "No AI/LLM access permitted - contains sensitive revenue data"
+
+  # Exposure 2: Aggregated sales metrics (Limited AI)
+  - exposeId: sales_metrics_daily
+    kind: table
+    description: Daily sales aggregates - Limited AI for reporting only
+    
+    binding:
+      provider: gcp
+      location:
+        project: sales-analytics-prod
+        dataset: sales
+        table: metrics_daily
+        region: us-central1
+    
+    schema:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        total_revenue:
+          type: number
+        transaction_count:
+          type: integer
+        avg_order_value:
+          type: number
+        region:
+          type: string
+    
+    policy:
+      classification: Internal
+      
+      # MODERATE: Specific models and use cases only
+      agentPolicy:
+        allowedModels:
+          - gpt-4              # Approved enterprise models
+          - gpt-4-turbo
+          - claude-3-opus
+          - claude-3-sonnet
+        deniedModels:
+          - llama-3-70b        # No open-source models
+          - mistral-large
+        allowedUseCases:
+          - inference          # Read-only analysis
+          - summarization      # Report generation
+          - analysis           # Trend analysis
+        deniedUseCases:
+          - training           # Never train on sales data
+          - fine_tuning
+          - embedding          # No embeddings for similarity search
+        maxTokensPerRequest: 8192
+        maxTokensPerDay: 1000000
+        canStore: true
+        canReason: true        # Allow multi-step analysis
+        retentionPolicy:
+          maxRetentionDays: 90
+          requireDeletion: true
+        auditRequired: true
+        purposeLimitation: "Sales reporting and forecasting only - no customer profiling"
+
+  # Exposure 3: Public market trends (Open AI access)
+  - exposeId: market_trends
+    kind: api
+    description: Public market trends - Permissive AI access
+    
+    binding:
+      provider: local
+      location:
+        type: api
+        endpoint: https://api.example.com/market-trends
+    
+    schema:
+      type: object
+      properties:
+        date:
+          type: string
+        industry:
+          type: string
+        trend_score:
+          type: number
+        forecast:
+          type: number
+    
+    policy:
+      classification: Public
+      
+      # PERMISSIVE: Most AI capabilities allowed
+      agentPolicy:
+        allowedUseCases:
+          - inference
+          - reasoning
+          - analysis
+          - summarization
+          - embedding
+          - rag
+          - code_generation    # Generate analysis scripts
+        deniedUseCases:
+          - training           # Still no training on any data
+          - fine_tuning
+        maxTokensPerRequest: 16384
+        maxTokensPerDay: 10000000
+        canStore: true
+        canReason: true
+        retentionPolicy:
+          maxRetentionDays: 365
+        auditRequired: false   # Public data, less strict auditing
+        purposeLimitation: "Market analysis and research - any non-training use"
+
+quality:
+  - dimension: freshness
+    assertion: timestamp > CURRENT_TIMESTAMP - INTERVAL '24 hours'
+    severity: warning
+  
+  - dimension: accuracy
+    assertion: amount > 0
+    severity: error
+
+observability:
+  metrics:
+    - name: ai_access_count
+      type: counter
+      description: Track AI model access attempts
+      query: SELECT COUNT(*) FROM ai_access_log WHERE expose_id = '{expose_id}'
+      
+    - name: token_usage_daily
+      type: gauge
+      description: Daily token consumption
+      query: SELECT SUM(tokens_used) FROM ai_access_log WHERE date = CURRENT_DATE
+
+  alerts:
+    - name: ai_policy_violation
+      condition: unauthorized_model_access = true
+      severity: critical
+      action: block_and_alert_security
+    
+    - name: token_limit_exceeded
+      condition: daily_tokens > agentPolicy.maxTokensPerDay
+      severity: high
+      action: throttle_and_notify

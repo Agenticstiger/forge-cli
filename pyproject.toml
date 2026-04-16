@@ -1,0 +1,250 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fluid-forge"
+version = "0.7.9"
+description = "FLUID Build System: plan/apply/visualize data products across providers (GCP, Snowflake, Local) with policy & contract tests."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Agentics Transformation Pty Ltd" }]
+keywords = ["data products", "FLUID", "opds", "gitops", "gcp", "snowflake", "duckdb", "composer", "dbt", "dataform"]
+
+# Optional but useful for PyPI/pipx users and internal catalogs
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Information Technology",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: System :: Systems Administration",
+]
+
+# Core runtime deps (keep lean; providers add heavy SDKs via extras)
+dependencies = [
+  "click>=8.1",
+  "pyyaml>=6.0",
+  "jsonschema>=4.22",
+  "rich>=13.7",
+  "pydantic>=2.7",
+  "typing-extensions>=4.8",
+  "jinja2>=3.1",
+  "httpx>=0.27",  # For FluidCommandCenter catalog provider
+  # Optional UX nicety on Windows; no-op elsewhere
+  "colorama>=0.4.6; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+# Provider SDK (install once published)
+sdk = [
+  "fluid-provider-sdk>=0.1.0",
+]
+
+# Local provider (DuckDB)
+local = [
+  "duckdb>=1.0",
+  "pandas>=2.2",
+]
+
+# GCP provider (install only when needed)
+gcp = [
+  "google-auth>=2.29",
+  "google-auth-oauthlib>=1.2",
+  "google-cloud-bigquery>=3.20",
+  "google-cloud-storage>=2.16",
+  # optional; gated for 3.10+ environments where wheel support exists
+  "google-cloud-iam>=2.15 ; python_version >= '3.10'",
+  # optional runtime helpers (dbt) — also 3.10+ where ecosystem is healthiest
+  "dbt-bigquery>=1.7 ; python_version >= '3.10'",
+]
+
+# Snowflake provider
+snowflake = [
+  "snowflake-connector-python>=4.4",
+  "snowflake-snowpark-python>=1.15 ; python_version >= '3.10'",
+  "dbt-snowflake>=1.7 ; python_version >= '3.10'",
+]
+
+# Visualizations (plan graph, HTML)
+viz = [
+  "graphviz>=0.20",
+]
+
+# OPDS export (spec conversion)
+opds = [
+  "ruamel.yaml>=0.18",
+]
+
+# Optional TUI extras
+tui = [
+  "textual>=0.58",
+]
+
+# Optional copilot discovery helpers for Parquet / Avro metadata inspection
+copilot = [
+  "pyarrow>=14",
+  "fastavro>=1.9",
+]
+
+# Docs toolchain (optional; if you’ll publish docs)
+docs = [
+  "mkdocs>=1.6",
+  "mkdocs-material>=9.5",
+]
+
+# Dev / QA
+dev = [
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+  "pytest-asyncio>=0.23",        # For async test support
+  "pytest-randomly>=3.15",       # Randomize test order to catch hidden deps
+  "mypy>=1.10",
+  "ruff>=0.5",
+  "types-PyYAML>=6.0.12",
+  "black==25.11.0",
+  "requests>=2.32.5",
+]
+
+# One-shot install for contributors
+all = [
+  "fluid-forge[local,gcp,snowflake,viz,opds,tui,copilot,docs,dev]"
+]
+
+[project.scripts]
+# Expose as a shell command (great with pipx)
+fluid = "fluid_build.cli:main"
+
+# Optional future plugin discovery (safe metadata; your code can adopt entrypoints later)
+[project.entry-points."fluid_build.providers"]
+local = "fluid_build.providers.local:LocalProvider"
+aws = "fluid_build.providers.aws:AwsProvider"
+gcp = "fluid_build.providers.gcp:GcpProvider"
+snowflake = "fluid_build.providers.snowflake:SnowflakeProvider"
+odps = "fluid_build.providers.odps:OdpsProvider"
+
+[project.urls]
+Homepage = "https://agenticstiger.github.io/forge_docs/"
+Repository = "https://github.com/Agenticstiger/forge-cli"
+Issues = "https://github.com/Agenticstiger/forge-cli/issues"
+Documentation = "https://agenticstiger.github.io/forge_docs/"
+Changelog = "https://github.com/Agenticstiger/forge-cli/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fluid_build*"]
+
+# Ensure non-.py assets ship in wheels (schemas, templates, static HTML, etc.)
+[tool.setuptools.package-data]
+fluid_build = [
+  "build-manifest.yaml",
+  "features.yaml",
+  "cli/agent_specs/**/*.yaml",
+  "cli/industry_skills/**/*.yaml",
+  "schemas/**/*.json",
+  "schemas/**/*.yaml",
+  "templates/**/*",
+  "assets/**/*",
+  "static/**/*",
+  "providers/**/templates/**/*",
+  "providers/**/assets/**/*",
+  "providers/**/*.json",
+  "providers/**/*.yaml",
+]
+# Avoid shipping compiled junk, stale backups, and test fixtures
+[tool.setuptools.exclude-package-data]
+"*" = ["*.pyc", "*.pyo", "*~", "*.bak", "*.old", "__pycache__/*"]
+fluid_build = ["providers/**/test_*"]
+
+# ---- Tooling configs consolidated here ----
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]  # basic errors, imports, bugbear
+ignore = [
+  "E203",   # whitespace before ':' — Black-compatible
+  "E501",   # line-too-long — handled by Black where possible
+  "E701",   # multiple statements on one line (colon)
+  "E702",   # multiple statements on one line (semicolon)
+  "E402",   # module-level import not at top — needed for conditional imports
+  "F401",   # unused import — many are re-exports
+  "F841",   # unused variable — some used in tests for assertions
+  "B904",   # raise-without-from — existing pattern in codebase
+  "B007",   # unused loop variable — common in iteration patterns
+  "B017",   # assert-raises-exception — existing test patterns
+  "B023",   # function-uses-loop-variable — existing patterns
+  "B027",   # empty-method-without-abstract-decorator — base class patterns
+  "E712",   # true-false-comparison — existing patterns
+  "E721",   # type-comparison — existing patterns
+  "E741",   # ambiguous-variable-name — existing patterns
+  "F402",   # import-shadowed-by-loop-var — existing patterns
+  "F403",   # undefined-local-with-import-star — existing patterns
+  "F811",   # redefined-while-unused — overload patterns
+]
+
+[tool.bandit]
+# B608: SQL query construction is expected — this is a pipeline/SQL code generator
+# B324: MD5 used for checksums, not security
+# B310: urlopen used for schema fetching with controlled URLs
+skips = ["B608", "B324", "B310", "B113"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_unused_ignores = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short --strict-markers --disable-warnings"
+markers = [
+    "unit: Unit tests (fast, no I/O)",
+    "integration: Integration tests (may need network/files)",
+    "slow: Tests that take significant time (>5s)",
+    "smoke: Quick smoke tests for basic functionality",
+    "aws: Tests requiring AWS credentials",
+    "gcp: Tests requiring GCP credentials",
+    "snowflake: Tests requiring Snowflake credentials",
+    "provider: Tests for provider implementations",
+    "datamesh: Tests for DataMesh Manager provider",
+    "policy: Tests for policy validators",
+    "runtime: Tests for runtime generators",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["fluid_build"]
+omit = ["fluid_build/**/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]

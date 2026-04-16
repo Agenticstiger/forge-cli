@@ -1,0 +1,29 @@
+# Shared FLUID tool catalog — merged into every skills file.
+# Update this file when FLUID CLI adds new integrations.
+tools:
+  platforms:
+    - { name: "snowflake", label: "Snowflake" }
+    - { name: "gcp", label: "Google Cloud (BigQuery)" }
+    - { name: "aws", label: "AWS (Redshift, S3)" }
+    - { name: "azure", label: "Azure (Synapse, ADLS)" }
+    - { name: "databricks", label: "Databricks (Delta Lake)" }
+    - { name: "local", label: "Local (DuckDB)" }
+    - { name: "kafka", label: "Apache Kafka" }
+    - { name: "kubernetes", label: "Kubernetes" }
+  transformations:
+    - { name: "dbt", label: "dbt (SQL-based transformations)" }
+    - { name: "spark", label: "Apache Spark (PySpark / Scala)" }
+    - { name: "embedded-sql", label: "Embedded SQL" }
+    - { name: "dataform", label: "Dataform" }
+  orchestration:
+    - { name: "airflow", label: "Apache Airflow" }
+    - { name: "dagster", label: "Dagster" }
+    - { name: "prefect", label: "Prefect" }
+    - { name: "kubeflow", label: "Kubeflow" }
+  formats:
+    - { name: "parquet", label: "Apache Parquet" }
+    - { name: "delta_table", label: "Delta Lake" }
+    - { name: "iceberg", label: "Apache Iceberg" }
+    - { name: "csv", label: "CSV" }
+    - { name: "json", label: "JSON / NDJSON" }
+    - { name: "avro", label: "Apache Avro" }

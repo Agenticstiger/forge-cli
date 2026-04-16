@@ -1,0 +1,293 @@
+name: finance
+domain: finance
+description: Expert in financial data products, regulatory compliance, and risk analytics
+
+questions:
+  - key: product_type
+    question: What type of financial product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: Risk Analytics
+        value: risk_analytics
+        aliases: ["risk", "market risk", "risk scoring"]
+      - label: Trading Platform
+        value: trading_platform
+        aliases: ["trading", "trades", "execution"]
+      - label: Fraud Detection
+        value: fraud_detection
+        aliases: ["fraud", "fraud analytics", "fraud monitoring"]
+      - label: Customer Analytics
+        value: customer_analytics
+        aliases: ["customer", "customer insights", "customer 360"]
+      - label: Compliance Reporting
+        value: compliance_reporting
+        aliases: ["compliance", "regulatory reporting", "sox reporting"]
+  - key: data_sources
+    question: What data sources will you use?
+    type: text
+    required: true
+    default: Transaction data, customer profiles, market data
+  - key: compliance_requirements
+    question: Any specific compliance requirements?
+    type: choice
+    required: false
+    choices:
+      - label: SOX
+        value: sox
+        aliases: ["sarbanes oxley"]
+      - label: GDPR
+        value: gdpr
+        aliases: ["privacy"]
+      - label: PCI DSS
+        value: pci_dss
+        aliases: ["pci", "card compliance"]
+      - label: Basel III
+        value: basel_iii
+        aliases: ["basel"]
+      - label: MiFID II
+        value: mifid_ii
+        aliases: ["mifid"]
+      - label: None / not sure
+        value: none
+        aliases: ["none", "not sure", "no compliance"]
+  - key: real_time
+    question: Do you need real-time processing?
+    type: choice
+    default: "no"
+    choices:
+      - label: "Yes"
+        value: "yes"
+        aliases: ["y", "yeah", "yep", "sure", "real time"]
+      - label: "No"
+        value: "no"
+        aliases: ["n", "nope", "batch", "not really"]
+
+  - key: orchestration_pattern
+    question: What pipeline scheduling pattern fits best?
+    type: choice
+    required: false
+    choices:
+      - label: End-of-day batch (T+1)
+        value: eod_batch
+        aliases: ["eod", "end of day", "t+1", "daily batch"]
+      - label: Intraday refresh
+        value: intraday
+        aliases: ["hourly", "every hour", "intraday"]
+      - label: Real-time streaming
+        value: streaming
+        aliases: ["real time", "streaming", "continuous"]
+      - label: Event-driven (trade settlement, file arrival)
+        value: event_driven
+        aliases: ["event", "settlement", "file arrival", "on arrival"]
+      - label: Manual / ad-hoc
+        value: manual
+        aliases: ["manual", "ad hoc", "on demand"]
+
+resolver_defaults:
+  product_type: customer_analytics
+  compliance_requirements: none
+  real_time: "no"
+  orchestration_pattern: eod_batch
+
+suggestion_defaults:
+  recommended_template: analytics-template
+  recommended_provider: gcp
+  recommended_patterns: []
+  architecture_suggestions:
+    - Use medallion architecture (bronze/silver/gold)
+    - Implement data validation at ingestion
+    - Set up monitoring and alerting
+    - Consider data mesh for multiple teams
+  best_practices:
+    - Implement data lineage tracking
+    - Use version control for all models and code
+    - Set up automated testing for data quality
+    - Implement disaster recovery procedures
+    - Document data governance policies
+  technology_stack: []
+  security_requirements: []
+
+rules:
+  - when:
+      all:
+        - field: product_type
+          equals: risk_analytics
+    actions:
+      - op: set
+        path: recommended_template
+        value: risk-analytics-template
+      - op: append_unique
+        path: recommended_patterns
+        value: ["monte_carlo", "stress_testing"]
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "pandas", "numpy", "scikit-learn"]
+  - when:
+      all:
+        - field: product_type
+          equals: trading_platform
+    actions:
+      - op: set
+        path: recommended_template
+        value: trading-platform-template
+      - op: append_unique
+        path: recommended_patterns
+        value: ["event_sourcing", "cqrs"]
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "Redis", "Kafka"]
+  - when:
+      all:
+        - field: product_type
+          equals: fraud_detection
+    actions:
+      - op: set
+        path: recommended_template
+        value: ml-pipeline-template
+      - op: append_unique
+        path: recommended_patterns
+        value: ["anomaly_detection", "real_time_scoring"]
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "TensorFlow", "Kafka"]
+  - when:
+      all:
+        - field: real_time
+          equals: "yes"
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: streaming_pipeline
+      - op: append_unique
+        path: technology_stack
+        value: ["Apache Kafka", "Apache Flink"]
+      - op: append_unique
+        path: architecture_suggestions
+        value: Implement stream processing with Kafka
+  - when:
+      all:
+        - field: compliance_requirements
+          in: ["sox", "gdpr", "pci_dss", "basel_iii", "mifid_ii"]
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Implement data encryption at rest and in transit
+          - Set up audit logging for all data access
+          - Implement role-based access control (RBAC)
+          - Enable data retention policies
+          - Set up compliance reporting dashboards
+  - when:
+      all:
+        - field: compliance_requirements
+          equals: sox
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value: Implement SOX-compliant audit trails
+  - when:
+      all:
+        - field: compliance_requirements
+          equals: gdpr
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Implement right-to-be-forgotten workflows
+          - Enable data portability
+          - Set up consent management
+  - when:
+      all:
+        - field: compliance_requirements
+          equals: pci_dss
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Tokenize credit card data
+          - Implement network segmentation
+          - Regular security scans
+
+next_step_tips: []
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: compliance_requirements
+          in: ["sox", "gdpr", "pci_dss", "basel_iii", "mifid_ii"]
+    tips:
+      - Review security and compliance requirements
+      - Set up audit logging and access controls
+
+# Data modeling standards for finance domain.
+# These guide the AI when generating semantic blocks (entities, measures, dimensions)
+# and dbt model structures for financial data products.
+data_modeling_standards:
+  naming_conventions:
+    staging_prefix: "stg_"
+    fact_prefix: "fct_"
+    dimension_prefix: "dim_"
+    snapshot_prefix: "snp_"
+    column_style: "snake_case"
+    id_suffix: "_id"
+    date_suffix: "_date"
+    amount_suffix: "_amount"
+    flag_suffix: "_flag"
+
+  common_entities:
+    - name: account
+      type: primary
+      description: "Financial account (checking, savings, investment, credit)"
+    - name: customer
+      type: primary
+      description: "Individual or corporate customer"
+    - name: transaction
+      type: primary
+      description: "Financial transaction (debit, credit, transfer, payment)"
+    - name: product
+      type: foreign
+      description: "Financial product (loan, card, fund, insurance policy)"
+    - name: counterparty
+      type: foreign
+      description: "Counterparty in a transaction or trade"
+
+  common_measures:
+    - name: total_amount
+      agg: sum
+      description: "Sum of transaction amounts"
+    - name: transaction_count
+      agg: count
+      description: "Number of transactions"
+    - name: avg_balance
+      agg: avg
+      description: "Average account balance"
+    - name: max_exposure
+      agg: max
+      description: "Maximum risk exposure"
+
+  common_dimensions:
+    - name: transaction_date
+      type: time
+      description: "Date of transaction"
+      time_granularity: day
+    - name: account_type
+      type: categorical
+      description: "Type of account (checking, savings, etc.)"
+    - name: currency
+      type: categorical
+      description: "Transaction currency (ISO 4217)"
+    - name: region
+      type: categorical
+      description: "Geographic region or jurisdiction"
+
+  dbt_model_patterns:
+    staging:
+      - "stg_accounts -- one row per account, cleaned from source"
+      - "stg_transactions -- one row per transaction, deduplicated"
+      - "stg_customers -- one row per customer, PII handled"
+    marts:
+      - "fct_transactions -- grain: one row per transaction with amounts, dates, types"
+      - "dim_accounts -- SCD2 account dimension with history"
+      - "dim_customers -- customer dimension with segmentation"
+      - "fct_daily_balances -- daily account balance snapshots"

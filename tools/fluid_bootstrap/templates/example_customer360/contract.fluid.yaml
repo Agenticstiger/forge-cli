@@ -1,0 +1,47 @@
+
+fluidVersion: "0.4.0"
+kind: "DataProduct"
+id: "gold.customer360_v1"
+name: "Customer 360"
+domain: "Customer"
+description: "Unified customer profile across channels (Snowflake example)"
+metadata:
+  layer: "Gold"
+  owner:
+    team: "Customer Analytics"
+    email: "cust-analytics@example.org"
+  status: "Draft"
+  tags: ["customer", "gold", "snowflake"]
+consumes:
+  - id: "crm_core"
+    ref: "silver.crm.core_v1"
+  - id: "billing_agg"
+    ref: "silver.billing.accounts_v1"
+  - id: "usage_agg"
+    ref: "silver.usage.last_30d_v1"
+build:
+  transformation:
+    pattern: "dbt-project"
+    engine: "dbt-snowflake"
+    properties:
+      model: "./models/customer360.sql"
+  execution:
+    trigger: { type: "schedule", cron: "15 2 * * *" }
+    runtime:
+      platform: "snowflake"
+      resources: { warehouse: "ANALYTICS_WH" }
+    retries: { count: 2, delaySeconds: 300 }
+exposes:
+  - id: "gold.customer360_tbl"
+    type: "table"
+    location:
+      format: "snowflake_table"
+      properties:
+        database: "ANALYTICS"
+        schema: "GOLD"
+        table: "CUSTOMER360_V1"
+    schema:
+      - { name: "customer_id", type: "STRING", nullable: false }
+      - { name: "segment", type: "STRING", nullable: true }
+      - { name: "arpu_30d", type: "NUMERIC", nullable: true }
+      - { name: "updated_at", type: "TIMESTAMP", nullable: false }

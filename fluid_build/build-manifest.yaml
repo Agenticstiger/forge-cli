@@ -1,0 +1,353 @@
+# FLUID Build Manifest
+# Control what commands and providers are included in each build profile
+# 
+# Build Strategy:
+# - alpha: Experimental builds (bleeding edge) - always runs
+# - beta: Preview builds (feature complete) - always runs, regardless of test results
+# - stable: Production builds (fully tested) - only runs when test coverage passes
+#
+# All builds increment PyPI version and publish with structured naming
+
+metadata:
+  version: "1.1"
+  last_updated: "2026-01-20"
+  
+  # PyPI Publishing Strategy
+  pypi:
+    repository: "fluid-mono-pypi"
+    base_version: "0.7.9"
+    
+    # Version naming convention per build type
+    # alpha: 0.7.1a{build_number}     (e.g., 0.7.1a42)
+    # beta:  0.7.1b{build_number}     (e.g., 0.7.1b42)
+    # stable: 0.7.1                   (e.g., 0.7.1, 0.7.2, 0.8.0)
+    
+    naming_format:
+      alpha: "{major}.{minor}.{patch}a{build}"
+      beta: "{major}.{minor}.{patch}b{build}"
+      stable: "{major}.{minor}.{patch}"
+    
+    # Artifact organization
+    # pypi/
+    #   ├── alpha/
+    #   │   ├── fluid-0.7.1a42-py3-none-any.whl
+    #   │   └── build-metadata/
+    #   │       └── 0.7.1a42.json
+    #   ├── beta/
+    #   │   ├── fluid-0.7.1b42-py3-none-any.whl
+    #   │   └── build-metadata/
+    #   │       └── 0.7.1b42.json
+    #   └── stable/
+    #       ├── fluid-0.7.1-py3-none-any.whl
+    #       └── build-metadata/
+    #           └── 0.7.1.json
+    
+    folder_structure:
+      root: "pypi"
+      alpha_path: "pypi/alpha"
+      beta_path: "pypi/beta"
+      stable_path: "pypi/stable"
+      metadata_subfolder: "build-metadata"
+  
+builds:
+  experimental:
+    description: "Kitchen sink build - ALL commands and providers (no filtering)"
+    
+    # Build triggers
+    trigger:
+      always_run: true
+      requires_tests_pass: false
+      requires_coverage: false
+    
+    # PyPI publishing
+    publish:
+      enabled: true
+      increment_build: true
+      version_suffix: "dev"  # experimental/development
+    
+    commands:
+      # Core workflow
+      - validate
+      - plan
+      - apply
+      - diff
+      - version
+      
+      # Diagnostics
+      - doctor
+      - debug
+      
+      # Project scaffolding
+      - forge
+      - init
+      - generate-airflow
+      
+      # Auth and market
+      - auth
+      - market
+      
+      # Policy
+      - policy-compile
+      - policy-apply
+      - policy-check
+      
+      # Visualization
+      - viz-graph
+      - viz-plan
+      
+      # Testing
+      - test
+      - smoke-test
+      
+      # Resource management
+      - resource-ls
+      - resource-show
+      - resource-rm
+      
+      # Dataset operations
+      - dataset-create
+      - dataset-update
+      - dataset-delete
+      - dataset-ls
+      
+      # Contract operations
+      - contract-test
+      - contract-validate
+      - contract-generate
+      
+      # Lineage
+      - lineage-trace
+      - lineage-impact
+      
+      # Catalog
+      - catalog-sync
+      - catalog-search
+      
+      # Governance
+      - govern-assess
+      - govern-report
+      
+      # CI/CD
+      - ci-validate
+      - ci-plan
+      - ci-apply
+      
+      # Advanced
+      - export
+      - import
+      - snapshot
+      - restore
+      - migrate
+      
+    providers:
+      # Stable providers
+      - local
+      - gcp
+      - odps_standard
+      - odcs
+      - datamesh_manager
+      
+      # Experimental providers
+      - snowflake
+      - aws
+      - odps
+      - azure
+      - databricks
+      - redshift
+      - bigquery
+      - athena
+      - synapse
+      - teradata
+      - oracle
+      - mysql
+      - postgres
+      - mongodb
+      - cassandra
+      
+  alpha:
+    description: "Experimental build - bleeding edge features"
+    
+    # Build triggers
+    trigger:
+      always_run: true
+      requires_tests_pass: false
+      requires_coverage: false
+    
+    # PyPI publishing
+    publish:
+      enabled: true
+      increment_build: true
+      version_suffix: "a"  # alpha
+    
+    commands:
+      # Core workflow (always include)
+      - validate
+      - plan
+      - apply
+      - diff
+      - version
+      
+      # Diagnostics
+      - doctor
+      - debug
+      
+      # Project scaffolding
+      - forge
+      - init
+
+      # Auth and market (experimental)
+      - auth
+      - market
+      
+    providers:
+      # Stable providers (safe to include)
+      - local
+      - gcp
+      - odps_standard
+      - odcs
+      - datamesh_manager
+      
+      # Experimental providers (test in alpha)
+      - snowflake
+      - aws
+      - odps
+      
+  beta:
+    description: "Preview build - feature complete, needs testing"
+    
+    # Build triggers - ALWAYS RUN regardless of test results
+    trigger:
+      always_run: true
+      requires_tests_pass: false  # Beta runs even if tests fail
+      requires_coverage: false
+    
+    # PyPI publishing
+    publish:
+      enabled: true
+      increment_build: true
+      version_suffix: "b"  # beta
+    
+    commands:
+      # Core workflow
+      - validate
+      - plan
+      - apply
+      - diff
+      - version
+      
+      # Stable features
+      - doctor
+      - debug
+      - policy-compile
+      - policy-apply
+      - policy-check
+      - viz-graph
+      - viz-plan
+      
+      # Preview features
+      - forge
+      - init
+      - auth
+      
+    providers:
+      # Production ready
+      - local
+      - gcp
+      - odps_standard
+      - odcs
+      - datamesh_manager
+      
+      # Ready for beta testing
+      - snowflake
+      
+  stable:
+    description: "Production build - fully tested and documented"
+    
+    # Build triggers - ONLY RUN when coverage passes
+    trigger:
+      always_run: false
+      requires_tests_pass: true
+      requires_coverage: true
+      minimum_coverage: 40  # Must meet 40% coverage threshold
+    
+    # PyPI publishing
+    publish:
+      enabled: true
+      increment_build: true
+      version_suffix: ""  # no suffix for stable (e.g., 0.7.1)
+      bump_strategy: "patch"  # patch, minor, or major
+    
+    commands:
+      # Core workflow
+      - validate
+      - plan
+      - apply
+      - diff
+      - version
+      
+      # Production features
+      - doctor
+      - debug
+      - policy-compile
+      - policy-apply
+      - policy-check
+      - viz-graph
+      - viz-plan
+      
+    providers:
+      # Production ready only
+      - local
+      - gcp
+      - odps_standard
+      - odcs
+      - datamesh_manager
+
+# Build Pipeline Strategy
+pipeline:
+  stages:
+    - name: "experimental"
+      condition: "always"
+      on_success: "continue"
+      on_failure: "continue"  # Always proceed to alpha
+    
+    - name: "alpha"
+      condition: "always"
+      on_success: "continue"
+      on_failure: "continue"  # Always proceed to beta
+    
+    - name: "beta"
+      condition: "always"
+      on_success: "check_coverage"  # Check if stable should run
+      on_failure: "skip_stable"     # Skip stable if beta fails
+    
+    - name: "stable"
+      condition: "coverage >= 40% AND tests_pass"
+      on_success: "complete"
+      on_failure: "alert"  # Notify but don't block
+  
+  # Build numbering
+  versioning:
+    build_counter_file: ".build_number"
+    auto_increment: true
+    reset_on_stable_release: false  # Keep incrementing across all builds
+
+# Promotion rules (guidelines only - you decide)
+promotion:
+  experimental_to_alpha:
+    - "Concept proven (feature actually works)"
+    - "Code compiles and runs (might be buggy)"
+    - "At least one smoke test passes"
+    - "Initial documentation or comments"
+    
+  alpha_to_beta:
+    - "Feature complete (all planned functionality works)"
+    - "Test coverage ≥30% (basic confidence)"
+    - "No critical bugs"
+    - "Basic documentation exists"
+    
+  beta_to_stable:
+    - "Battle tested (used in real scenarios)"
+    - "Test coverage ≥40% (baseline confidence)"
+    - "Zero known bugs"
+    - "Complete documentation with examples"
+    - "Performance acceptable"

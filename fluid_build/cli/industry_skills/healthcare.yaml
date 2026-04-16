@@ -1,0 +1,53 @@
+# Industry skills: Healthcare & Life Sciences
+# Merged with _tools.yaml at generation time to produce .fluid/skills.yaml
+
+industry:
+  name: "healthcare"
+  agent: "healthcare"
+  label: "Healthcare & Life Sciences"
+  description: "Healthcare, pharma, clinical research, life sciences"
+
+canonical_model:
+  primary: "hl7_fhir"
+  label: "HL7 FHIR"
+  description: "Fast Healthcare Interoperability Resources — the canonical standard for health data"
+  supporting:
+    - name: "omop_cdm"
+      label: "OMOP CDM"
+      description: "Observational Medical Outcomes Partnership — clinical analytics"
+
+domains:
+  - name: "patient"
+    label: "Patient"
+    description: "Patient demographics, identifiers, consent"
+    key_entities: ["patient", "person", "consent", "identifier"]
+  - name: "clinical"
+    label: "Clinical"
+    description: "Encounters, conditions, observations, procedures"
+    key_entities: ["encounter", "condition", "observation", "procedure"]
+  - name: "medication"
+    label: "Medication"
+    description: "Prescriptions, dispensing, formulary, adverse events"
+    key_entities: ["medication_request", "medication_dispense", "adverse_event"]
+  - name: "claims"
+    label: "Claims & Billing"
+    description: "Insurance claims, coverage, cost analysis"
+    key_entities: ["claim", "coverage", "explanation_of_benefit"]
+  - name: "research"
+    label: "Research & Analytics"
+    description: "Clinical trials, cohort studies, population health"
+    key_entities: ["research_study", "cohort", "measure", "outcome"]
+
+compliance:
+  - "HIPAA"
+  - "GDPR"
+  - "HITECH Act"
+  - "FDA 21 CFR Part 11"
+
+common_data_sources:
+  - "EHR / EMR systems (Epic, Cerner)"
+  - "Claims data (837/835 EDI)"
+  - "Lab information systems (LIS)"
+  - "FHIR API feeds"
+  - "Clinical trial databases"
+  - "Public health registries"

@@ -1,0 +1,29 @@
+# Minimal valid FLUID 0.7.1 contract
+fluidVersion: "0.7.1"
+kind: DataContract
+id: minimal-contract
+name: minimal
+
+metadata:
+  version: "1.0.0"
+  name: "Minimal Test Contract"
+  status: draft
+
+owner:
+  team: test-team
+  name: Test Team
+
+exposes:
+  - id: test_output
+    version: "1.0.0"
+    description: "Test output"
+    provider: local
+    schema:
+      format: table
+      fields:
+        - name: id
+          type: string
+          required: true
+        - name: value
+          type: int
+          required: true

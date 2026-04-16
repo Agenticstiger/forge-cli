@@ -1,0 +1,6 @@
+customer_id,name,email,segment
+1,Alice Johnson,alice@example.com,Premium
+2,Bob Smith,bob@example.com,Standard
+3,Charlie Brown,charlie@example.com,VIP
+4,Diana Prince,diana@example.com,Standard
+5,Eve Davis,eve@example.com,Premium

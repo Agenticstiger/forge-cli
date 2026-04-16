@@ -1,0 +1,311 @@
+fluidVersion: "0.5.7"
+kind: DataProduct
+id: crypto.bitcoin_prices_gcp_governed
+name: Bitcoin Price Index (FLUID Declarative + Governance)
+description: Real-time Bitcoin price data with comprehensive governance policies and compliance controls
+domain: finance
+
+metadata:
+  layer: Gold
+  owner:
+    team: data-engineering
+    email: data-engineering@company.com
+  tags:
+    - cryptocurrency
+    - real-time
+    - governed
+    - gdpr-compliant
+  cost_center: "CC-1234"
+  business_criticality: "high"
+  compliance_frameworks:
+    - GDPR
+    - SOC2
+    - ISO27001
+
+# 🛡️ GOVERNANCE POLICIES
+# These policies are validated via: fluid policy-check contract.fluid.yaml
+
+# Policy 1: Data Sensitivity Classification
+policy:
+  sensitivity:
+    classification: internal  # Options: public, internal, confidential, restricted
+    reason: "Contains financial market data - internal use only"
+    pii_fields: []  # No PII in Bitcoin price data
+    encryption_required: false  # Public market data
+    
+  # Policy 2: Access Control
+  access:
+    owners:
+      - email: data-engineering@company.com
+      - email: john.doe@company.com
+    
+    readers:
+      - group: data-analytics@company.com
+      - group: finance-team@company.com
+      - group: trading-desk@company.com
+      - serviceAccount: looker@<<YOUR_PROJECT_HERE>>.iam.gserviceaccount.com
+    
+    writers:
+      - serviceAccount: data-pipeline@<<YOUR_PROJECT_HERE>>.iam.gserviceaccount.com
+      - group: data-engineering@company.com
+    
+    admins:
+      - group: data-platform-admins@company.com
+    
+    # Row-level security (future enhancement)
+    row_level_security: false
+    
+  # Policy 3: Data Quality Standards
+  quality:
+    sla:
+      availability: 99.9  # 99.9% uptime
+      freshness_minutes: 15  # Data must be < 15 minutes old
+      completeness_threshold: 95  # 95% of expected rows
+    
+    validation_rules:
+      - rule: "price_usd > 0"
+        severity: error
+        description: "Bitcoin price must be positive"
+      
+      - rule: "price_timestamp <= CURRENT_TIMESTAMP()"
+        severity: error
+        description: "Price timestamp cannot be in the future"
+      
+      - rule: "ingestion_timestamp IS NOT NULL"
+        severity: error
+        description: "Ingestion timestamp is mandatory"
+      
+      - rule: "market_cap_usd >= 0 OR market_cap_usd IS NULL"
+        severity: warning
+        description: "Market cap should be non-negative"
+    
+    monitoring:
+      row_count_alert: true
+      null_count_threshold: 5  # Alert if > 5% nulls in required fields
+      staleness_alert_minutes: 30  # Alert if no new data in 30 min
+  
+  # Policy 4: Data Lifecycle Management
+  lifecycle:
+    retention_days: 2555  # 7 years for financial data compliance
+    archival_policy:
+      enabled: true
+      archive_after_days: 365  # Move to cold storage after 1 year
+      archive_location: "gs://<<YOUR_PROJECT_HERE>>-archive/crypto_data/"
+    
+    deletion_policy:
+      enabled: true
+      soft_delete: true  # Soft delete before permanent removal
+      permanent_delete_after_days: 30  # Permanent delete 30 days after soft delete
+    
+    backup_policy:
+      enabled: true
+      frequency: "daily"
+      retention_days: 90
+  
+  # Policy 5: Schema Evolution Rules
+  schema_evolution:
+    breaking_changes_allowed: false  # Prevent breaking changes
+    require_approval: true
+    allowed_operations:
+      - add_nullable_field
+      - add_description
+      - add_documentation
+    
+    forbidden_operations:
+      - drop_field
+      - change_field_type
+      - make_nullable_required
+    
+    approval_required_for:
+      - add_required_field
+      - rename_field
+  
+  # Policy 6: Compliance & Audit
+  compliance:
+    audit_log_enabled: true
+    data_lineage_required: true
+    change_tracking: true
+    
+    gdpr:
+      enabled: true
+      data_subject_rights: true  # Support GDPR data subject requests
+      right_to_erasure: false  # Not applicable (public market data)
+      data_processing_basis: "legitimate_interest"
+    
+    sox_compliance: false  # Not financial reporting data
+    hipaa_compliance: false  # Not healthcare data
+
+# Build: API ingestion with quality checks
+builds:
+  - id: bitcoin_price_ingestion
+    description: Fetch Bitcoin prices from CoinGecko API with data quality validation
+    pattern: hybrid-reference
+    engine: python
+    repository: ./runtime
+    properties:
+      model: ingest
+    
+    execution:
+      trigger:
+        type: manual
+        iterations: 5  # Run 5 times for Part B demo
+        delaySeconds: 5  # 5 second delay
+      
+      runtime:
+        platform: gcp
+        resources:
+          cpu: "1"
+          memory: "2Gi"
+      
+      retries:
+        count: 3
+        backoff: exponential
+    
+    # Quality checks run after ingestion
+    quality_checks:
+      - name: "positive_prices"
+        query: "SELECT COUNT(*) FROM `<<YOUR_PROJECT_HERE>>.crypto_data.bitcoin_prices` WHERE price_usd <= 0"
+        expected_value: 0
+        severity: error
+      
+      - name: "freshness_check"
+        query: "SELECT TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MAX(price_timestamp), MINUTE) as minutes_old FROM `<<YOUR_PROJECT_HERE>>.crypto_data.bitcoin_prices`"
+        threshold: 15  # Must be < 15 minutes old
+        severity: warning
+      
+      - name: "completeness_check"
+        query: "SELECT COUNT(*) FROM `<<YOUR_PROJECT_HERE>>.crypto_data.bitcoin_prices` WHERE price_usd IS NULL OR price_eur IS NULL OR price_gbp IS NULL"
+        expected_value: 0
+        severity: error
+    
+    outputs:
+      - bitcoin_prices_table
+
+# Expose: BigQuery table with complete governance
+exposes:
+  - exposeId: bitcoin_prices_table
+    kind: table
+    binding:
+      platform: gcp
+      format: bigquery_table
+      location:
+        project: <<YOUR_PROJECT_HERE>>
+        dataset: crypto_data
+        table: bitcoin_prices
+        region: europe-west3  # GDPR-compliant EU region
+    
+    # Schema contract with field-level governance
+    contract:
+      schema:
+        - name: price_timestamp
+          type: timestamp
+          required: true
+          description: "Timestamp when the price was recorded (UTC)"
+          pii: false
+          sensitive: false
+          
+        - name: price_usd
+          type: numeric
+          required: true
+          description: "Bitcoin price in US Dollars"
+          pii: false
+          sensitive: false
+          business_critical: true
+          
+        - name: price_eur
+          type: numeric
+          required: true
+          description: "Bitcoin price in Euros"
+          pii: false
+          sensitive: false
+          business_critical: true
+          
+        - name: price_gbp
+          type: numeric
+          required: true
+          description: "Bitcoin price in British Pounds"
+          pii: false
+          sensitive: false
+          business_critical: true
+          
+        - name: market_cap_usd
+          type: numeric
+          required: false
+          description: "Total Bitcoin market capitalization in USD"
+          pii: false
+          sensitive: false
+          
+        - name: volume_24h_usd
+          type: numeric
+          required: false
+          description: "24-hour trading volume in USD"
+          pii: false
+          sensitive: false
+          
+        - name: price_change_24h_percent
+          type: numeric
+          required: false
+          description: "24-hour price change percentage"
+          pii: false
+          sensitive: false
+          
+        - name: last_updated
+          type: timestamp
+          required: false
+          description: "Last update timestamp from CoinGecko API"
+          pii: false
+          sensitive: false
+          
+        - name: ingestion_timestamp
+          type: timestamp
+          required: true
+          description: "When this record was ingested into our system"
+          pii: false
+          sensitive: false
+    
+    # Governance metadata for this specific expose
+    sensitivity: internal
+    
+    access:
+      readers:
+        - group: data-analytics@company.com
+        - group: finance-team@company.com
+        - group: trading-desk@company.com
+      
+      writers:
+        - serviceAccount: data-pipeline@<<YOUR_PROJECT_HERE>>.iam.gserviceaccount.com
+    
+    # Documentation and discoverability
+    documentation:
+      description: "Real-time Bitcoin price feed from CoinGecko API"
+      use_cases:
+        - "Financial dashboards and reporting"
+        - "Trading strategy backtesting"
+        - "Market trend analysis"
+      
+      sla:
+        availability: "99.9%"
+        freshness: "< 15 minutes"
+        support_contact: "data-engineering@company.com"
+      
+      sample_queries:
+        - name: "Latest Bitcoin Price"
+          query: |
+            SELECT 
+              price_timestamp,
+              price_usd,
+              price_eur,
+              price_gbp
+            FROM `<<YOUR_PROJECT_HERE>>.crypto_data.bitcoin_prices`
+            ORDER BY price_timestamp DESC
+            LIMIT 1
+        
+        - name: "24-Hour Price Trend"
+          query: |
+            SELECT 
+              price_timestamp,
+              price_usd,
+              price_change_24h_percent
+            FROM `<<YOUR_PROJECT_HERE>>.crypto_data.bitcoin_prices`
+            WHERE price_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+            ORDER BY price_timestamp ASC

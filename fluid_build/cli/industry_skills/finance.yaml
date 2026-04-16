@@ -1,0 +1,51 @@
+# Industry skills: Finance & Banking
+# Merged with _tools.yaml at generation time to produce .fluid/skills.yaml
+
+industry:
+  name: "finance"
+  agent: "finance"
+  label: "Finance & Banking"
+  description: "Banking, insurance, capital markets, fintech"
+
+canonical_model:
+  primary: "iso_20022"
+  label: "ISO 20022"
+  description: "Universal financial industry message scheme — canonical for financial data products"
+
+domains:
+  - name: "customer_party"
+    label: "Customer / Party"
+    description: "KYC, customer onboarding, identity verification"
+    key_entities: ["party", "customer", "kyc_record", "beneficial_owner"]
+  - name: "account"
+    label: "Account"
+    description: "Deposit, loan, investment accounts and positions"
+    key_entities: ["account", "position", "balance", "statement"]
+  - name: "transaction"
+    label: "Transaction"
+    description: "Payments, transfers, trades, settlements"
+    key_entities: ["transaction", "payment", "trade", "settlement"]
+  - name: "risk"
+    label: "Risk & Compliance"
+    description: "Credit risk, market risk, AML, fraud detection"
+    key_entities: ["risk_assessment", "alert", "case", "sar"]
+  - name: "product"
+    label: "Product"
+    description: "Financial products, pricing, terms and conditions"
+    key_entities: ["product", "rate", "fee_schedule", "term"]
+
+compliance:
+  - "Basel III / IV"
+  - "PCI DSS"
+  - "SOX"
+  - "GDPR"
+  - "AML / KYC regulations"
+  - "MiFID II"
+
+common_data_sources:
+  - "Core banking systems"
+  - "Payment networks (SWIFT, SEPA)"
+  - "Market data feeds"
+  - "Credit bureaus"
+  - "Transaction monitoring systems"
+  - "Regulatory reporting (COREP, FINREP)"

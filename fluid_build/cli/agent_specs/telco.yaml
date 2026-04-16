@@ -1,0 +1,248 @@
+name: telco
+domain: telco
+description: Expert in telecom data products, TM Forum SID-aligned modeling, and secure OSS/BSS analytics
+
+questions:
+  - key: product_type
+    question: What type of telecom product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: Customer & Billing Intelligence
+        value: customer_billing_intelligence
+        aliases: ["billing", "customer intelligence", "subscriber analytics", "bss"]
+      - label: Service Assurance Analytics
+        value: service_assurance
+        aliases: ["service assurance", "sla analytics", "service quality"]
+      - label: Network Operations Intelligence
+        value: network_operations
+        aliases: ["network ops", "network operations", "network assurance", "telemetry", "oss"]
+      - label: Revenue Assurance
+        value: revenue_assurance
+        aliases: ["revenue leakage", "charging assurance"]
+      - label: Product Catalog & Offer Intelligence
+        value: product_catalog
+        aliases: ["catalog", "offer management", "product offering", "tmf620"]
+  - key: data_sources
+    question: What data sources will you use?
+    type: text
+    required: true
+    default: CDRs, billing data, service inventory, network telemetry, TM Forum Open API feeds
+  - key: sid_domain_focus
+    question: Which TM Forum SID area is the best fit?
+    type: choice
+    required: true
+    choices:
+      - label: Party / Customer
+        value: party_customer
+        aliases: ["party", "customer", "subscriber", "account"]
+      - label: Product
+        value: product
+        aliases: ["product", "product offering", "catalog", "offer"]
+      - label: Service
+        value: service
+        aliases: ["service", "service inventory", "activation", "fulfillment"]
+      - label: Resource
+        value: resource
+        aliases: ["resource", "network resource", "inventory", "topology"]
+      - label: Enterprise / Cross-domain
+        value: enterprise
+        aliases: ["enterprise", "cross domain", "shared", "common"]
+  - key: real_time_operations
+    question: Do you need near-real-time operational insights?
+    type: choice
+    default: "yes"
+    choices:
+      - label: "Yes"
+        value: "yes"
+        aliases: ["y", "yeah", "yep", "sure", "real time", "streaming"]
+      - label: "No"
+        value: "no"
+        aliases: ["n", "nope", "batch", "not really"]
+
+  - key: orchestration_pattern
+    question: What pipeline scheduling pattern fits best?
+    type: choice
+    required: false
+    choices:
+      - label: Real-time CDR/event processing
+        value: streaming
+        aliases: ["real time", "cdr", "streaming", "event stream"]
+      - label: Micro-batch (every 5-15 minutes)
+        value: micro_batch
+        aliases: ["micro batch", "5 min", "15 min", "frequent"]
+      - label: Daily batch (billing cycles, reports)
+        value: daily_batch
+        aliases: ["daily", "batch", "billing cycle", "nightly"]
+      - label: Event-driven (network alarms, provisioning)
+        value: event_driven
+        aliases: ["event", "alarm", "provisioning", "triggered"]
+
+resolver_defaults:
+  product_type: customer_billing_intelligence
+  sid_domain_focus: enterprise
+  real_time_operations: "yes"
+  orchestration_pattern: micro_batch
+
+suggestion_defaults:
+  recommended_template: analytics-template
+  recommended_provider: gcp
+  canonical_model: tmf_sid
+  supporting_standards: []
+  recommended_patterns:
+    - tm_forum_sid_canonical_model
+  architecture_suggestions:
+    - Use TM Forum SID as the canonical semantic model across Party, Product, Service, and Resource domains
+    - Align integration boundaries to TM Forum Open APIs where possible
+    - Keep source-to-SID mappings explicit between OSS/BSS systems and the canonical model
+    - Maintain canonical identifiers across customer, order, inventory, and assurance flows
+  best_practices:
+    - Model business entities using SID vocabulary instead of source-specific table names
+    - Version canonical SID mappings and semantic definitions with the project
+    - Trace lineage from telecom events, orders, and telemetry to exposed KPIs
+    - Validate privacy controls for subscriber, location, and usage data
+    - Keep every exposed semantic entity anchored to a specific SID concept or relationship
+  technology_stack: []
+  security_requirements: []
+
+rules:
+  - when:
+      all:
+        - field: product_type
+          equals: customer_billing_intelligence
+    actions:
+      - op: set
+        path: recommended_template
+        value: customer360-template
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - party_account_model
+          - billing_usage_aggregation
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: service_assurance
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - sla_monitoring
+          - service_quality_scorecards
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "Kafka", "Grafana"]
+  - when:
+      all:
+        - field: product_type
+          equals: network_operations
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - network_topology_analytics
+          - anomaly_detection
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "Kafka", "Apache Flink"]
+      - op: append_unique
+        path: architecture_suggestions
+        value: Model network and inventory telemetry with SID Resource entities and topology relationships
+  - when:
+      all:
+        - field: product_type
+          equals: revenue_assurance
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - usage_reconciliation
+          - leakage_detection
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "Great Expectations"]
+  - when:
+      all:
+        - field: product_type
+          equals: product_catalog
+    actions:
+      - op: set
+        path: recommended_template
+        value: customer360-template
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - product_offering_hierarchy
+          - catalog_governance
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "dbt", "JSON Schema"]
+  - when:
+      all:
+        - field: sid_domain_focus
+          equals: party_customer
+    actions:
+      - op: append_unique
+        path: architecture_suggestions
+        value: Center canonical keys on SID PartyRole, Customer, CustomerAccount, and Product relationships and preserve those names in exposed semantics
+  - when:
+      all:
+        - field: sid_domain_focus
+          equals: product
+    actions:
+      - op: append_unique
+        path: architecture_suggestions
+        value: Use SID ProductOffering, ProductSpecification, and Product entities as the commerce backbone for product and offer semantics
+  - when:
+      all:
+        - field: sid_domain_focus
+          equals: service
+    actions:
+      - op: append_unique
+        path: architecture_suggestions
+        value: Use SID ServiceSpecification, Service, and ServiceOrder entities as the fulfillment layer and semantic backbone
+  - when:
+      all:
+        - field: sid_domain_focus
+          equals: resource
+    actions:
+      - op: append_unique
+        path: architecture_suggestions
+        value: Model ResourceSpecification, Resource, and topology relationships as the network inventory layer and keep topology semantics SID-native
+  - when:
+      all:
+        - field: sid_domain_focus
+          equals: enterprise
+    actions:
+      - op: append_unique
+        path: best_practices
+        value: Publish a shared SID mapping catalog across BSS, OSS, and partner systems
+  - when:
+      all:
+        - field: real_time_operations
+          equals: "yes"
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: streaming_pipeline
+      - op: append_unique
+        path: technology_stack
+        value: ["Apache Kafka", "Apache Flink"]
+      - op: append_unique
+        path: architecture_suggestions
+        value: Use event-driven ingestion for alarms, telemetry, and order-state changes across OSS/BSS domains
+
+next_step_tips:
+  - Validate your canonical mappings against TM Forum SID entities before exposing products
+  - Confirm TM Forum Open API contracts and inventory boundaries with downstream teams
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: real_time_operations
+          equals: "yes"
+    tips:
+      - Plan streaming ingestion for alarms, telemetry, and assurance events early

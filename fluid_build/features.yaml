@@ -1,0 +1,383 @@
+# FLUID Build Feature Maturity Tracking
+# 
+# AUTO-UPDATED FIELDS (from CI/CD test results):
+#   - code_size: Actual lines of code
+#   - last_tested: Timestamp of last test run
+#   - tests: Pass/fail counts (overall, not per-provider)
+#
+# MANUAL FIELDS (you control - update when ready to promote):
+#   - status: alpha/beta/stable (promotion decision)
+#   - test_coverage: % of provider code with tests (MANUAL - see note below)
+#   - blockers: What's blocking promotion
+#   - note: Human-readable description
+#
+# NOTE ON COVERAGE:
+#   test_coverage is MANUAL because pytest --cov measures "code executed by all tests"
+#   not "provider test quality". Adding 200 CLI tests makes provider coverage DROP
+#   even though provider tests didn't change. So we keep coverage manual.
+#   Update it when you add/remove provider-specific tests.
+#
+# Promotion Guidelines:
+#   - alpha → beta: ≥30% coverage, 0 test failures
+#   - beta → stable: ≥80% coverage, 0 test failures, docs complete
+
+metadata:
+  version: "1.0"
+  current_release: "0.8.0"
+  last_updated: "2026-01-20"
+  updated_by: "manual"
+  schema: "features-v1"
+
+# Provider maturity levels
+providers:
+  local:
+    # MANUAL CONTROL (you decide when to promote)
+    status: stable
+    note: "DuckDB provider complete, well-tested, documented"
+    blockers: []
+    
+    # AUTO-UPDATED (from tests - DO NOT manually edit these)
+    test_coverage: 95  # Will be updated from real pytest-cov results
+    code_size: 3270    # Will be updated from actual LOC count
+    last_tested: "2026-01-20T00:00:00Z"
+    
+    # Provider metadata
+    docs_complete: true
+    resource_types: 3
+    architecture: "Optimized for local development (not 5-phase)"
+    
+  gcp:
+    # MANUAL CONTROL
+    status: stable
+    note: "BigQuery, GCS, Composer integration tested and documented"
+    blockers: []
+    
+    # AUTO-UPDATED
+    test_coverage: 90
+    code_size: 9783
+    last_tested: "2026-01-20T00:00:00Z"
+    
+    # Provider metadata
+    docs_complete: true
+    resource_types: 8
+    architecture: "Full BaseProvider with 5-phase planning"
+    features:
+      - BigQuery datasets and tables
+      - Cloud Storage buckets
+      - Cloud Composer (Airflow)
+      - Pub/Sub topics and subscriptions
+      - IAM integration
+      - Auth diagnostics
+    
+  snowflake:
+    # MANUAL CONTROL
+    status: beta
+    note: "Core features work well, documentation needs completion"
+    blockers:
+      - "Need provider README with setup instructions"
+      - "Complete user guide with step-by-step tutorials"
+    target_release: "0.9.0"
+    
+    # AUTO-UPDATED
+    test_coverage: 80
+    code_size: 5595
+    last_tested: "2026-01-20T00:00:00Z"
+    
+    # Provider metadata
+    docs_complete: false
+    resource_types: 11
+    architecture: "Enhanced provider with 5-phase planning"
+    
+  aws:
+    # MANUAL CONTROL
+    status: alpha
+    note: "Early development - S3 and Glue partially implemented"
+    blockers:
+      - "Increase test coverage to 70% (currently at ~40%)"
+      - "Add 1-2 more integration tests"
+      - "Add provider README"
+      - "Create 3 working example contracts"
+      - "Complete S3 bucket management"
+    target_release: "1.0.0"
+    
+    # AUTO-UPDATED
+    test_coverage: 40
+    code_size: 6288
+    last_tested: "2026-01-20T00:00:00Z"
+    
+    # Provider metadata
+    docs_complete: false
+    resource_types: 9
+    architecture: "Full BaseProvider with 5-phase planning"
+    
+  odps:
+    # MANUAL CONTROL
+    status: alpha
+    note: "Experimental - MaxCompute support in early stages"
+    blockers:
+      - "Very early stage - needs foundational work"
+      - "Increase test coverage from 30%"
+      - "Complete basic resource types"
+    target_release: "future"
+    
+    # AUTO-UPDATED
+    test_coverage: 30
+    code_size: 1351
+    last_tested: "2026-01-20T00:00:00Z"
+    
+    # Provider metadata
+    docs_complete: false
+    resource_types: 2
+    architecture: "Legacy pattern (needs refactor to BaseProvider)"
+    blockers:
+      - "Refactor to use BaseProvider pattern"
+      - "Implement proper plan() and apply() methods"
+      - "Add basic error handling and retry logic"
+      - "Write README with setup instructions"
+      - "Add at least 1 integration test"
+    target_release: "1.1.0"
+    
+  odps_standard:
+    # MANUAL CONTROL
+    status: beta
+    note: "ODPS v1.0.0 export provider - production ready, well tested"
+    blockers:
+      - "Complete documentation with real-world examples"
+      - "Add API integration tests (when backend available)"
+    target_release: "0.9.0"
+    
+    # AUTO-UPDATED
+    test_coverage: 100  # 25/25 tests passing
+    code_size: 479
+    last_tested: "2026-01-20T00:00:00Z"
+    
+    # Provider metadata
+    docs_complete: true
+    resource_types: 0  # Export-only provider
+    architecture: "Export provider (FLUID → ODPS Standard v1.0.0)"
+    features:
+      - "Export FLUID contracts to Bitol.io ODPS format"
+      - "Entropy Data marketplace integration"
+      - "PII detection and classification"
+      - "Team/owner extraction"
+      - "Unicode and special character support"
+    
+  odcs:
+    # MANUAL CONTROL
+    status: beta
+    note: "ODCS v3.1.0 bidirectional provider - production ready, comprehensive testing"
+    blockers:
+      - "Add more real-world round-trip test cases"
+      - "Complete documentation with examples"
+    target_release: "0.9.0"
+    
+    # AUTO-UPDATED
+    test_coverage: 100  # 34/34 tests passing (17 basic + 17 comprehensive)
+    code_size: 1026
+    last_tested: "2026-01-20T00:00:00Z"
+    
+    # Provider metadata
+    docs_complete: true
+    resource_types: 0  # Conversion provider
+    architecture: "Bidirectional conversion (FLUID ↔ ODCS v3.1.0)"
+    features:
+      - "Import ODCS contracts to FLUID"
+      - "Export FLUID contracts to ODCS"
+      - "BigQuery and Snowflake physical type mappings"
+      - "Quality check extraction from validations"
+      - "Server/location inference"
+      - "Round-trip conversion integrity"
+    
+  datamesh_manager:
+    # MANUAL CONTROL
+    status: beta
+    note: "Data Mesh Manager marketplace publisher - production ready"
+    blockers:
+      - "Requires API key for real API testing"
+      - "Add more examples in documentation"
+    target_release: "0.9.0"
+    
+    # AUTO-UPDATED
+    test_coverage: 100  # 17/17 tests passing (5 basic + 12 comprehensive)
+    code_size: 440
+    last_tested: "2026-01-20T00:00:00Z"
+    
+    # Provider metadata
+    docs_complete: true
+    resource_types: 0  # Publishing provider
+    architecture: "REST API publisher (FLUID → Data Mesh Manager)"
+    features:
+      - "Publish to Data Mesh Manager marketplace"
+      - "Support ODPS and DCS formats"
+      - "Dry-run preview mode"
+      - "Team ID normalization"
+      - "Location extraction (BigQuery/Snowflake)"
+      - "PII detection integration"
+
+# Command group maturity
+# Groups of related commands tracked together
+
+command_groups:
+  core:
+    status: stable
+    description: "Core workflow commands - the heart of FLUID"
+    commands:
+      - validate
+      - plan
+      - apply
+      - diff
+      - version
+    test_coverage: 95
+    docs_complete: true
+    
+  policy:
+    status: stable
+    description: "Data governance and policy management"
+    commands:
+      - policy-compile
+      - policy-apply
+      - policy-check
+    test_coverage: 90
+    docs_complete: true
+    
+  visualization:
+    status: stable
+    description: "Plan and graph visualization"
+    commands:
+      - viz-graph
+      - viz-plan
+    test_coverage: 85
+    docs_complete: true
+    
+  forge:
+    status: beta
+    description: "Project scaffolding and code generation"
+    commands:
+      - forge
+      - scaffold-ci
+      - scaffold-composer
+      - generate-airflow
+      - product-new
+      - product-add
+    test_coverage: 75
+    docs_complete: false
+    reason: "Works well but needs more real-world testing"
+    blockers:
+      - "Templates need validation"
+      - "More examples needed in docs"
+    
+  contracts:
+    status: beta
+    description: "Contract testing and validation"
+    commands:
+      - contract-tests
+      - contract-validation
+    test_coverage: 80
+    docs_complete: false
+    
+  marketplace:
+    status: alpha
+    description: "Blueprint marketplace (future feature)"
+    commands:
+      - market
+      - publish
+      - marketplace
+    blockers:
+      - "Backend API not deployed"
+      - "No authentication system"
+      - "Rating/review system needed"
+    target_release: "1.0.0"
+    
+  experimental:
+    status: alpha
+    description: "Experimental AI and advanced features"
+    commands:
+      - copilot
+      - analytics
+      - performance
+    reason: "Proof of concept - not production ready"
+    blockers:
+      - "Requires OpenAI/Anthropic API keys"
+      - "No error handling"
+      - "Incomplete implementation"
+    target_release: "TBD"
+    
+  standards:
+    status: beta
+    description: "Open data standards export and publishing"
+    commands:
+      - export-odps
+      - export-odcs
+      - import-odcs
+      - publish-datamesh
+    test_coverage: 100
+    docs_complete: true
+    reason: "All providers 100% tested, ready for beta testing"
+    blockers:
+      - "Need real-world validation with actual marketplaces"
+      - "API integration tests require credentials"
+    target_release: "0.9.0"
+
+# Build profiles - what goes in each release
+# These control which features are included in builds
+
+build_profiles:
+  stable:
+    description: "Production release - stable features only"
+    include_status: [stable]
+    target_audience: "Production users, enterprises"
+    quality_requirements:
+      min_test_coverage: 90
+      docs_required: true
+      security_scan: true
+    
+  beta:
+    description: "Public beta - stable + beta features for testing"
+    include_status: [stable, beta]
+    target_audience: "Early adopters, beta testers"
+    quality_requirements:
+      min_test_coverage: 30
+      docs_required: false  # Docs can be incomplete in beta
+      security_scan: true
+    
+  alpha:
+    description: "Development build - all features for internal testing"
+    include_status: [stable, beta, alpha]
+    target_audience: "Developers, internal team"
+    quality_requirements:
+      min_test_coverage: 10
+      docs_required: false
+      security_scan: false
+
+# Release notes (updated per version)
+release_history:
+  "0.8.0":
+    date: "2026-01-15"
+    profile: stable
+    highlights:
+      - "GCP provider stabilized"
+      - "Local provider complete"
+      - "Policy engine production ready"
+    providers: [local, gcp]
+    
+  "0.7.1":
+    date: "2025-12-20"
+    profile: beta
+    highlights:
+      - "Snowflake provider beta"
+      - "Enhanced CLI with init command"
+      - "Airflow DAG generation"
+      
+  "0.8.1":
+    date: "2026-01-20"
+    profile: beta
+    highlights:
+      - "ODPS Standard v1.0.0 export provider (100% coverage)"
+      - "ODCS v3.1.0 bidirectional conversion (100% coverage)"
+      - "Data Mesh Manager publisher (100% coverage)"
+      - "76 comprehensive tests across all standards providers"
+    providers: [local, gcp, odps_standard, odcs, datamesh_manager]
+    test_results:
+      total_tests: 76
+      passed: 76
+      coverage: 100

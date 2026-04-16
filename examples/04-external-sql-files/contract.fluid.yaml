@@ -1,0 +1,149 @@
+fluidVersion: "0.5.7"
+kind: "DataProduct"
+id: "example.customer_revenue_analysis_v1"
+name: "Customer Revenue Analysis"
+domain: "revenue"
+metadata:
+  layer: Silver
+  owner:
+    team: "revenue-ops-team"
+    email: "revenue-ops@example.com"
+
+builds:
+  - id: "customer_revenue_metrics"
+    pattern: "embedded-logic"
+    engine: "sql"
+    properties:
+      sql: |
+        -- Customer Revenue Analysis
+        WITH monthly_revenue AS (
+          SELECT
+            customer_id,
+            DATE_TRUNC('month', transaction_date) as revenue_month,
+            SUM(amount) as monthly_amount,
+            COUNT(*) as monthly_transactions
+          FROM transactions
+          WHERE status = 'completed'
+          GROUP BY customer_id, DATE_TRUNC('month', transaction_date)
+        ),
+        customer_lifetime_value AS (
+          SELECT
+            customer_id,
+            COUNT(DISTINCT revenue_month) as active_months,
+            SUM(monthly_amount) as total_revenue,
+            AVG(monthly_amount) as avg_monthly_revenue,
+            MIN(revenue_month) as first_revenue_month,
+            MAX(revenue_month) as last_revenue_month
+          FROM monthly_revenue
+          GROUP BY customer_id
+        )
+        SELECT
+          c.customer_id,
+          c.name as customer_name,
+          c.email,
+          c.country,
+          c.signup_date,
+          c.subscription_tier,
+          COALESCE(clv.total_revenue, 0) as lifetime_value,
+          COALESCE(clv.avg_monthly_revenue, 0) as avg_monthly_revenue,
+          COALESCE(clv.active_months, 0) as active_months,
+          CASE
+            WHEN clv.active_months >= 4 THEN 'Highly Engaged'
+            WHEN clv.active_months >= 2 THEN 'Engaged'
+            WHEN clv.active_months >= 1 THEN 'New'
+            ELSE 'No Activity'
+          END as engagement_level,
+          CASE
+            WHEN COALESCE(clv.total_revenue, 0) >= 500 THEN 'High Value'
+            WHEN COALESCE(clv.total_revenue, 0) >= 200 THEN 'Medium Value'
+            WHEN COALESCE(clv.total_revenue, 0) > 0 THEN 'Low Value'
+            ELSE 'No Revenue'
+          END as value_segment,
+          clv.first_revenue_month,
+          clv.last_revenue_month
+        FROM customers c
+        LEFT JOIN customer_lifetime_value clv ON c.customer_id = clv.customer_id
+        ORDER BY lifetime_value DESC, customer_name
+      parameters:
+        inputs:
+          - name: "customers"
+            path: "examples/04-external-sql-files/customers.csv"
+            format: "csv"
+            schema:
+              - name: "customer_id"
+                type: "integer"
+                required: true
+              - name: "name"
+                type: "string"
+                required: true
+              - name: "email"
+                type: "string"
+                required: true
+              - name: "country"
+                type: "string"
+                required: true
+              - name: "signup_date"
+                type: "date"
+                required: true
+              - name: "subscription_tier"
+                type: "string"
+                required: true
+          - name: "transactions"
+            path: "examples/04-external-sql-files/transactions.csv"
+            format: "csv"
+            schema:
+              - name: "transaction_id"
+                type: "integer"
+                required: true
+              - name: "customer_id"
+                type: "integer"
+                required: true
+              - name: "transaction_date"
+                type: "date"
+                required: true
+              - name: "amount"
+                type: "number"
+                required: true
+              - name: "category"
+                type: "string"
+                required: true
+              - name: "status"
+                type: "string"
+                required: true
+
+exposes:
+  - exposeId: "customer_revenue_data"
+    kind: "table"
+    binding:
+      platform: "local"
+      format: "csv"
+      location:
+        path: "runtime/out/customer-revenue-analysis-v1.csv"
+    contract:
+      schema:
+        - name: "customer_id"
+          type: "integer"
+        - name: "customer_name"
+          type: "string"
+        - name: "email"
+          type: "string"
+        - name: "country"
+          type: "string"
+        - name: "signup_date"
+          type: "date"
+        - name: "subscription_tier"
+          type: "string"
+        - name: "lifetime_value"
+          type: "number"
+        - name: "avg_monthly_revenue"
+          type: "number"
+        - name: "active_months"
+          type: "integer"
+        - name: "engagement_level"
+          type: "string"
+        - name: "value_segment"
+          type: "string"
+        - name: "first_revenue_month"
+          type: "date"
+        - name: "last_revenue_month"
+          type: "date"

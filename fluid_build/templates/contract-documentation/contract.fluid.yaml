@@ -1,0 +1,103 @@
+fluidVersion: 0.7.2
+kind: DataProduct
+id: docs.documented_products_v1
+name: Documented Product Analytics
+description: 'Product analytics pipeline with comprehensive inline documentation.
+
+
+  ## Purpose
+
+  Processes product catalog data and generates analytics.
+
+
+  ## Owners
+
+  - Team: Data Engineering
+
+  - Contact: dataeng@example.com
+
+
+  ## SLA
+
+  - Frequency: Daily
+
+  - Freshness: < 2 hours
+
+  '
+domain: Product Analytics
+tags:
+- products
+- analytics
+- documentation
+metadata:
+  owner:
+    team: data-engineering
+    email: dataeng@example.com
+exposes:
+- exposeId: product_catalog
+  title: Product Catalog with Price Tiers
+  version: 1.0.0
+  kind: table
+  description: 'Cleaned and enriched product catalog
+
+
+    ### Business Logic
+
+    - Standardizes category names
+
+    - Adds price tiers
+
+    - Normalizes product names
+
+
+    ### Usage
+
+    - Marketing dashboard
+
+    - Pricing engine
+
+    - Daily at 2 AM UTC
+
+    '
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/product_catalog.parquet
+  contract:
+    schema:
+    - name: product_id
+      type: INTEGER
+      required: true
+      description: Unique product identifier (primary key)
+    - name: product_name
+      type: VARCHAR
+      description: Standardized product name (lowercase, trimmed)
+    - name: category
+      type: VARCHAR
+      description: Standardized category name (uppercase)
+    - name: price
+      type: DECIMAL
+      description: Price in USD
+    - name: price_tier
+      type: VARCHAR
+      description: 'Price tier: Budget (<$25), Mid-Range ($25-$50), Premium (>$50)'
+builds:
+- id: product_enrichment
+  description: Enrich products with price tiers and standardization
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: "-- Product catalog with price tiers and standardization\n-- Standardizes names and categories\
+      \ for consistency\nSELECT \n  product_id,\n  LOWER(TRIM(name)) as product_name,\n  UPPER(category)\
+      \ as category,\n  price,\n  CASE \n    WHEN price < 25 THEN 'Budget'\n    WHEN price <= 50 THEN\
+      \ 'Mid-Range'\n    ELSE 'Premium'\n  END as price_tier\nFROM read_csv_auto('data/products.csv',\
+      \ header=true)\nWHERE product_id IS NOT NULL\n"
+  execution:
+    trigger:
+      type: manual
+    runtime:
+      platform: local
+docs:
+  homepage: https://docs.example.com/product-analytics
+  runbook: https://wiki.example.com/product-analytics-runbook

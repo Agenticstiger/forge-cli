@@ -1,0 +1,52 @@
+fluidVersion: "0.7.1"
+kind: DataProduct
+id: compat.telco.subscriber_health_071
+name: Subscriber Health Compatibility 0.7.1
+description: Gold telco mart fixture with upstream lineage for FLUID 0.7.1 compatibility.
+domain: telco
+metadata:
+  layer: Gold
+  owner:
+    team: bizlab
+    email: bizlab@example.com
+
+consumes:
+  - productId: compat.telco.subscriber_usage_071
+    exposeId: subscriber_usage
+    purpose: Supply daily subscriber usage features.
+  - productId: compat.telco.billing_health_071
+    exposeId: billing_health
+    purpose: Supply billing and overdue indicators.
+
+builds:
+  - id: subscriber_health_sql
+    pattern: embedded-logic
+    engine: sql
+    properties:
+      sql: |
+        SELECT
+          subscriber_id,
+          usage_score,
+          billing_score
+        FROM runtime.subscriber_health
+
+exposes:
+  - exposeId: subscriber_health
+    kind: table
+    version: "1.0.0"
+    binding:
+      platform: local
+      format: parquet
+      location:
+        path: runtime/compat/subscriber_health_071.parquet
+    contract:
+      schema:
+        - name: subscriber_id
+          type: string
+          required: true
+        - name: usage_score
+          type: integer
+          required: true
+        - name: billing_score
+          type: integer
+          required: true

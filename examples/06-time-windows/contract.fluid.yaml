@@ -1,0 +1,150 @@
+fluidVersion: "0.5.7"
+kind: "DataProduct"
+id: "example.sales_time_series_v1"
+name: "Sales Time Series Analysis"
+domain: "analytics"
+metadata:
+  layer: Silver
+  owner:
+    team: "analytics-team"
+    email: "analytics@example.com"
+
+builds:
+  - id: "sales_time_series"
+    pattern: "embedded-logic"
+    engine: "sql"
+    properties:
+      sql: |
+        WITH daily_metrics AS (
+          SELECT
+            sale_date,
+            SUM(quantity * unit_price) as daily_revenue,
+            SUM(quantity) as daily_units,
+            COUNT(DISTINCT product_id) as distinct_products,
+            AVG(unit_price) as avg_unit_price
+          FROM daily_sales
+          GROUP BY sale_date
+        ),
+        rolling_metrics AS (
+          SELECT
+            sale_date,
+            daily_revenue,
+            daily_units,
+            distinct_products,
+            AVG(daily_revenue) OVER (
+              ORDER BY sale_date
+              ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+            ) as revenue_3day_avg,
+            AVG(daily_revenue) OVER (
+              ORDER BY sale_date
+              ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+            ) as revenue_7day_avg,
+            SUM(daily_revenue) OVER (
+              ORDER BY sale_date
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) as revenue_running_total,
+            LAG(daily_revenue, 1) OVER (ORDER BY sale_date) as prev_day_revenue,
+            LAG(daily_revenue, 7) OVER (ORDER BY sale_date) as prev_week_revenue
+          FROM daily_metrics
+        )
+        SELECT
+          sale_date,
+          EXTRACT(year FROM sale_date) as year,
+          EXTRACT(month FROM sale_date) as month,
+          EXTRACT(day FROM sale_date) as day,
+          EXTRACT(dow FROM sale_date) as day_of_week,
+          CASE EXTRACT(dow FROM sale_date)
+            WHEN 0 THEN 'Sunday'
+            WHEN 1 THEN 'Monday'
+            WHEN 2 THEN 'Tuesday'
+            WHEN 3 THEN 'Wednesday'
+            WHEN 4 THEN 'Thursday'
+            WHEN 5 THEN 'Friday'
+            WHEN 6 THEN 'Saturday'
+          END as day_name,
+          ROUND(daily_revenue, 2) as daily_revenue,
+          daily_units,
+          distinct_products,
+          ROUND(revenue_3day_avg, 2) as revenue_3day_avg,
+          ROUND(revenue_7day_avg, 2) as revenue_7day_avg,
+          ROUND(revenue_running_total, 2) as cumulative_revenue,
+          CASE
+            WHEN prev_day_revenue IS NOT NULL THEN
+              ROUND(((daily_revenue - prev_day_revenue) / prev_day_revenue) * 100, 2)
+          END as day_over_day_pct,
+          CASE
+            WHEN prev_week_revenue IS NOT NULL THEN
+              ROUND(((daily_revenue - prev_week_revenue) / prev_week_revenue) * 100, 2)
+          END as week_over_week_pct,
+          CASE
+            WHEN daily_revenue > revenue_7day_avg THEN 'Above Average'
+            WHEN daily_revenue < revenue_7day_avg THEN 'Below Average'
+            ELSE 'At Average'
+          END as trend_indicator
+        FROM rolling_metrics
+        ORDER BY sale_date
+      parameters:
+        inputs:
+          - name: "daily_sales"
+            path: "examples/06-time-windows/daily_sales.csv"
+            format: "csv"
+            schema:
+              - name: "sale_date"
+                type: "date"
+                required: true
+              - name: "product_id"
+                type: "string"
+                required: true
+              - name: "product_name"
+                type: "string"
+                required: true
+              - name: "category"
+                type: "string"
+                required: true
+              - name: "quantity"
+                type: "integer"
+                required: true
+              - name: "unit_price"
+                type: "number"
+                required: true
+
+exposes:
+  - exposeId: "sales_time_series_output"
+    kind: "table"
+    binding:
+      platform: "local"
+      format: "csv"
+      location:
+        path: "runtime/out/sales-time-series-v1.csv"
+    contract:
+      schema:
+        - name: "sale_date"
+          type: "date"
+        - name: "year"
+          type: "integer"
+        - name: "month"
+          type: "integer"
+        - name: "day"
+          type: "integer"
+        - name: "day_of_week"
+          type: "integer"
+        - name: "day_name"
+          type: "string"
+        - name: "daily_revenue"
+          type: "number"
+        - name: "daily_units"
+          type: "integer"
+        - name: "distinct_products"
+          type: "integer"
+        - name: "revenue_3day_avg"
+          type: "number"
+        - name: "revenue_7day_avg"
+          type: "number"
+        - name: "cumulative_revenue"
+          type: "number"
+        - name: "day_over_day_pct"
+          type: "number"
+        - name: "week_over_week_pct"
+          type: "number"
+        - name: "trend_indicator"
+          type: "string"

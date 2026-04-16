@@ -1,0 +1,92 @@
+# FLUID Market Configuration
+# Configuration for connecting to enterprise data catalogs and marketplaces
+
+# Default catalogs to search when no specific catalogs are specified
+default_catalogs:
+  - google_cloud_data_catalog
+  - datahub
+
+# Google Cloud Data Catalog configuration
+google_cloud_data_catalog:
+  project_id: "${GCP_PROJECT_ID}"
+  location: "us-central1"
+  # Optional: service account key file
+  # credentials_file: "/path/to/service-account.json"
+
+# AWS Glue Data Catalog configuration  
+aws_glue_data_catalog:
+  region: "${AWS_REGION:-us-east-1}"
+  # Optional: AWS profile name
+  # profile: "default"
+  # Optional: specific credentials
+  # access_key_id: "${AWS_ACCESS_KEY_ID}"
+  # secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+
+# Azure Purview configuration
+azure_purview:
+  account_name: "${AZURE_PURVIEW_ACCOUNT}"
+  # tenant_id: "${AZURE_TENANT_ID}"
+  # client_id: "${AZURE_CLIENT_ID}"
+  # client_secret: "${AZURE_CLIENT_SECRET}"
+
+# DataHub configuration
+datahub:
+  server_url: "${DATAHUB_SERVER_URL:-http://localhost:8080}"
+  # Optional: authentication token
+  # token: "${DATAHUB_TOKEN}"
+
+# Apache Atlas configuration
+apache_atlas:
+  base_url: "${ATLAS_BASE_URL:-http://localhost:21000}"
+  username: "${ATLAS_USERNAME:-admin}"
+  password: "${ATLAS_PASSWORD:-admin}"
+
+# Confluent Schema Registry configuration
+confluent_schema_registry:
+  url: "${CONFLUENT_SCHEMA_REGISTRY_URL:-http://localhost:8081}"
+  # Optional: API credentials
+  # api_key: "${CONFLUENT_API_KEY}"
+  # api_secret: "${CONFLUENT_API_SECRET}"
+
+# Collibra configuration
+collibra:
+  base_url: "${COLLIBRA_BASE_URL}"
+  username: "${COLLIBRA_USERNAME}"
+  password: "${COLLIBRA_PASSWORD}"
+
+# Alation configuration  
+alation:
+  base_url: "${ALATION_BASE_URL}"
+  api_token: "${ALATION_API_TOKEN}"
+
+# Custom REST API catalog configuration
+custom_rest_api:
+  base_url: "${CUSTOM_CATALOG_URL}"
+  auth_type: "bearer"  # bearer, basic, api_key
+  auth_token: "${CUSTOM_CATALOG_TOKEN}"
+  # For basic auth:
+  # username: "${CUSTOM_CATALOG_USERNAME}"
+  # password: "${CUSTOM_CATALOG_PASSWORD}"
+  # For API key auth:
+  # api_key_header: "X-API-Key"
+  # api_key: "${CUSTOM_CATALOG_API_KEY}"
+
+# Default search settings
+defaults:
+  limit: 50
+  min_quality_score: 0.7
+  include_deprecated: false
+  timeout_seconds: 30
+
+# Output formatting preferences
+output:
+  default_format: "table"  # table, json, detailed
+  show_quality_scores: true
+  show_catalog_source: true
+  color_output: true
+
+# Cache settings for improved performance
+cache:
+  enabled: true
+  ttl_minutes: 15
+  max_entries: 1000

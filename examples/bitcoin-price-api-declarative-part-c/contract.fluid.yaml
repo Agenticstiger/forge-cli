@@ -1,0 +1,331 @@
+fluidVersion: "0.5.7"
+kind: DataProduct
+id: "crypto.bitcoin_prices_enhanced_v1"
+name: "Bitcoin Price Index - Enhanced Features (v0.5.7)"
+description: |
+  Bitcoin price data with MAXIMUM v0.5.7 features:
+  - Policy tags via column labels
+  - Default values via labels
+  - Constraint hints (PK/FK)
+  - Data masking via privacy.masking
+  - Column-level access control
+  
+  This showcases what's possible WITHOUT waiting for v0.6.0!
+
+domain: "Finance"
+
+# Root-level tags
+tags:
+  - cryptocurrency
+  - real-time
+  - governed
+  - gdpr-compliant
+  - enhanced-features
+
+# Root-level labels (for governance)
+labels:
+  cost_center: "CC-1234"
+  business_criticality: "high"
+  compliance_gdpr: "true"
+  compliance_soc2: "true"
+  features: "policy_tags,masking,defaults,constraints"
+
+metadata:
+  layer: "Gold"
+  owner:
+    team: "data-engineering"
+    email: "data-eng@company.com"
+  businessContext:
+    domain: "Finance"
+    subdomain: "Cryptocurrency Analytics"
+
+# Build configuration
+builds:
+  - id: bitcoin_price_ingestion
+    description: Fetch Bitcoin prices with enhanced governance
+    pattern: hybrid-reference
+    engine: python
+    repository: ./runtime
+    properties:
+      model: ingest
+    
+    execution:
+      trigger:
+        type: manual
+        iterations: 5
+        delaySeconds: 5
+
+# Data exposure with advanced features
+exposes:
+  - exposeId: bitcoin_prices_enhanced
+    title: "Bitcoin Prices - Enhanced Governance"
+    version: "1.2.0"
+    kind: table
+    
+    # Expose-level tags
+    tags:
+      - financial-data
+      - internal-use
+      - api-sourced
+      - enhanced
+    
+    # Expose-level labels
+    labels:
+      sensitivity: "internal"
+      data_domain: "finance"
+      update_frequency: "realtime"
+      retention_years: "7"
+      region: "eu"
+    
+    # POLICY: Using v0.5.7 advanced features
+    policy:
+      classification: Internal
+      authn: iam
+      
+      # Authorization with column-level restrictions
+      authz:
+        readers:
+          - "group:data-analysts@company.com"
+          - "group:data-engineers@company.com"
+        
+        writers:
+          - "serviceAccount:bitcoin-ingestion@<<YOUR_PROJECT_HERE>>.iam.gserviceaccount.com"
+        
+        # Column-level access control (v0.5.7 feature!)
+        columnRestrictions:
+          - principal: "group:external-contractors@company.com"
+            columns: ["market_cap_usd", "volume_24h_usd", "ingestion_metadata"]
+            access: "deny"
+            labels:
+              reason: "sensitive_financial_metrics"
+              policy: "external_data_restriction"
+          
+          - principal: "group:junior-analysts@company.com"
+            columns: ["price_change_24h_percent"]
+            access: "deny"
+            labels:
+              reason: "derived_metrics_restricted"
+        
+        labels:
+          access_pattern: "role_based"
+          review_frequency: "quarterly"
+      
+      # Privacy with masking rules (v0.5.7 feature!)
+      privacy:
+        masking:
+          - column: "ingestion_metadata"
+            strategy: "hash"
+            params:
+              algorithm: "SHA256"
+            labels:
+              pii_type: "operational_data"
+          
+          - column: "last_updated"
+            strategy: "tokenize"
+            params:
+              format: "masked_timestamp"
+            labels:
+              reason: "timestamp_obfuscation"
+        
+        labels:
+          privacy_framework: "gdpr_compliant"
+          data_residency: "eu"
+      
+      # Policy-level labels
+      labels:
+        compliance_framework: "gdpr_soc2_iso27001"
+        audit_required: "true"
+        data_lineage_tracked: "true"
+      
+      # Policy-level tags
+      tags:
+        - gdpr-compliant
+        - soc2-compliant
+        - financial-data
+    
+    # Binding to GCP BigQuery
+    binding:
+      platform: gcp
+      format: bigquery_table
+      location:
+        project: <<YOUR_PROJECT_HERE>>
+        dataset: crypto_data
+        table: bitcoin_prices_enhanced
+        region: EU  # Multi-region covers all European locations including Frankfurt
+    
+    # CONTRACT: Enhanced schema with v0.5.7 features
+    contract:
+      
+      # Schema with advanced features
+      schema:
+        # PRIMARY KEY with constraint hint
+        - name: price_id
+          type: string
+          required: true
+          description: "Unique identifier for each price snapshot"
+          semanticType: "identifier"
+          labels:
+            constraint: "primary_key"
+            unique: "true"
+            default: "GENERATE_UUID()"
+            index: "clustered"
+        
+        # Timestamp with default value
+        - name: price_timestamp
+          type: timestamp
+          required: true
+          description: "Timestamp when price was captured"
+          labels:
+            default: "CURRENT_TIMESTAMP()"
+            timezone: "UTC"
+            index: "partition_key"
+        
+        # Financial data with policy tag
+        - name: price_usd
+          type: numeric
+          required: true
+          description: "Bitcoin price in USD"
+          sensitivity: internal
+          semanticType: "currency"
+          labels:
+            policyTag: "financial_metrics"
+            taxonomy: "financial_data"
+            datacatalog_project: "<<YOUR_PROJECT_HERE>>"
+            datacatalog_location: "us"
+            currency: "USD"
+            precision: "2"
+        
+        - name: price_eur
+          type: numeric
+          required: true
+          description: "Bitcoin price in EUR"
+          sensitivity: internal
+          semanticType: "currency"
+          labels:
+            policyTag: "financial_metrics"
+            taxonomy: "financial_data"
+            currency: "EUR"
+        
+        - name: price_gbp
+          type: numeric
+          required: true
+          description: "Bitcoin price in GBP"
+          sensitivity: internal
+          semanticType: "currency"
+          labels:
+            policyTag: "financial_metrics"
+            taxonomy: "financial_data"
+            currency: "GBP"
+        
+        # Market cap with policy tag
+        - name: market_cap_usd
+          type: numeric
+          required: false
+          description: "Total Bitcoin market capitalization in USD"
+          sensitivity: internal
+          labels:
+            policyTag: "market_metrics"
+            taxonomy: "financial_data"
+            metric_type: "market_cap"
+        
+        # Volume with policy tag
+        - name: volume_24h_usd
+          type: numeric
+          required: false
+          description: "24-hour trading volume in USD"
+          sensitivity: internal
+          labels:
+            policyTag: "market_metrics"
+            taxonomy: "financial_data"
+            metric_type: "volume"
+        
+        # Derived metric with constraint
+        - name: price_change_24h_percent
+          type: numeric
+          required: false
+          description: "24-hour price change percentage"
+          sensitivity: internal
+          semanticType: "percentage"
+          labels:
+            metric_type: "derived"
+            calculation: "percentage_change"
+          validationRules:
+            - type: range
+              constraint: ">= -100 AND <= 1000"
+              message: "Price change must be between -100% and 1000%"
+        
+        # API timestamp
+        - name: last_updated
+          type: timestamp
+          required: false
+          description: "Last update timestamp from CoinGecko API"
+          labels:
+            source: "coingecko_api"
+            masked: "true"
+        
+        # Ingestion timestamp with default
+        - name: ingestion_timestamp
+          type: timestamp
+          required: true
+          description: "When this record was ingested into our system"
+          labels:
+            default: "CURRENT_TIMESTAMP()"
+            system_generated: "true"
+            audit_field: "true"
+        
+        # Ingestion metadata (masked)
+        - name: ingestion_metadata
+          type: string
+          required: false
+          description: "Metadata about the ingestion process (hashed for privacy)"
+          sensitivity: internal
+          labels:
+            masked: "true"
+            hash_algorithm: "SHA256"
+        
+        # Status with default value
+        - name: status
+          type: string
+          required: true
+          description: "Record status"
+          labels:
+            default: "'active'"
+            allowed_values: "active,archived,deleted"
+          validationRules:
+            - type: enum
+              constraint: "active,archived,deleted"
+              message: "Status must be one of: active, archived, deleted"
+        
+        # Audit field with default
+        - name: created_by
+          type: string
+          required: true
+          description: "User or service account that created this record"
+          semanticType: "user_identifier"
+          labels:
+            default: "SESSION_USER()"
+            audit_field: "true"
+        
+        # Foreign key reference
+        - name: source_id
+          type: string
+          required: true
+          description: "Reference to data source configuration"
+          semanticType: "identifier"
+          labels:
+            foreign_key_table: "data_sources"
+            foreign_key_column: "source_id"
+            default: "'coingecko_api'"
+      
+      # Contract-level labels
+      labels:
+        schema_version: "1.2.0"
+        compatibility: "backward_compatible"
+        breaking_changes: "false"
+      
+      # Contract-level tags
+      tags:
+        - enhanced-schema
+        - policy-tags
+        - default-values
+        - constraints

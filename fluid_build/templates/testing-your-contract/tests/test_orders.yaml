@@ -1,0 +1,32 @@
+# Test suite for orders contract
+tests:
+  - name: test_revenue_calculation
+    description: Verify revenue is calculated correctly
+    model: order_revenue
+    given:
+      raw_orders:
+        - {order_id: 1, customer_id: 100, amount: 100.00, status: 'completed'}
+        - {order_id: 2, customer_id: 101, amount: 50.00, status: 'completed'}
+    expect:
+      - {order_id: 1, revenue: 100.00}
+      - {order_id: 2, revenue: 50.00}
+  
+  - name: test_only_completed_orders
+    description: Only completed orders should have revenue
+    model: order_revenue
+    given:
+      raw_orders:
+        - {order_id: 1, amount: 100.00, status: 'completed'}
+        - {order_id: 2, amount: 50.00, status: 'pending'}
+        - {order_id: 3, amount: 75.00, status: 'cancelled'}
+    expect:
+      row_count: 1
+  
+  - name: test_negative_amount_rejected
+    description: Negative amounts should fail validation
+    model: order_revenue
+    given:
+      raw_orders:
+        - {order_id: 1, amount: -10.00, status: 'completed'}
+    expect:
+      validation_error: true

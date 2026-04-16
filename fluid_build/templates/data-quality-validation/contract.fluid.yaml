@@ -1,0 +1,148 @@
+fluidVersion: 0.7.2
+kind: DataProduct
+id: quality.product_validation_v1
+name: Product Quality Validation
+description: Comprehensive data quality validation for product catalog
+domain: Data Quality
+tags:
+- data-quality
+- validation
+- products
+metadata:
+  owner:
+    team: data-quality-team
+    email: dq@company.com
+exposes:
+- exposeId: validated_products
+  title: Validated Products with Quality Scores
+  version: 1.0.0
+  kind: table
+  description: Product catalog with data quality scores
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/validated_products.parquet
+  contract:
+    schema:
+    - name: product_id
+      type: INTEGER
+      required: true
+    - name: product_name
+      type: VARCHAR
+    - name: category
+      type: VARCHAR
+    - name: price
+      type: DECIMAL
+    - name: stock_quantity
+      type: INTEGER
+    - name: supplier_id
+      type: INTEGER
+    - name: last_updated
+      type: DATE
+    - name: data_quality_score
+      type: INTEGER
+      description: Quality score 0-100
+    dq:
+      rules:
+      - id: no_null_product_ids
+        type: completeness
+        selector: product_id
+        severity: error
+        description: Product ID is required for all products
+        threshold: 1.0
+        operator: '>='
+      - id: unique_product_ids
+        type: uniqueness
+        selector: product_id
+        severity: error
+        description: Product IDs must be unique
+        threshold: 1.0
+        operator: '>='
+      - id: valid_categories
+        type: valid_values
+        selector: category
+        severity: error
+        description: Categories must be valid
+      - id: check_missing_names
+        type: completeness
+        selector: product_name
+        severity: warn
+        description: Products should have names
+        threshold: 0.95
+        operator: '>='
+      - id: check_negative_prices
+        type: accuracy
+        selector: price
+        severity: warn
+        description: Prices must be positive
+        threshold: 0
+        operator: '>='
+- exposeId: data_quality_report
+  title: Data Quality Summary Report
+  version: 1.0.0
+  kind: view
+  description: Summary of data quality metrics
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/data_quality_report.parquet
+  contract:
+    schema:
+    - name: total_records
+      type: INTEGER
+    - name: perfect_records
+      type: INTEGER
+    - name: good_quality_records
+      type: INTEGER
+    - name: poor_quality_records
+      type: INTEGER
+    - name: avg_quality_score
+      type: DECIMAL
+    - name: worst_quality_score
+      type: INTEGER
+    - name: missing_names
+      type: INTEGER
+    - name: invalid_prices
+      type: INTEGER
+    - name: negative_stock
+      type: INTEGER
+    - name: missing_dates
+      type: INTEGER
+builds:
+- id: product_quality_pipeline
+  description: Validate product data and generate quality reports
+  pattern: multi-stage
+  engine: sql
+  properties:
+    stages:
+    - outputs:
+      - validated_products
+      name: calculate_quality_scores
+      properties:
+        sql: "SELECT \n  product_id,\n  product_name,\n  category,\n  price,\n  stock_quantity,\n  supplier_id,\n\
+          \  last_updated,\n  CAST(\n    (CASE WHEN product_name IS NOT NULL THEN 20 ELSE 0 END +\n  \
+          \   CASE WHEN price > 0 THEN 20 ELSE 0 END +\n     CASE WHEN stock_quantity >= 0 THEN 20 ELSE\
+          \ 0 END +\n     CASE WHEN supplier_id BETWEEN 100 AND 200 THEN 20 ELSE 0 END +\n     CASE WHEN\
+          \ last_updated IS NOT NULL THEN 20 ELSE 0 END)\n  AS INTEGER) AS data_quality_score\nFROM read_csv_auto('data/products.csv',\
+          \ header=true)\n"
+    - dependsOn:
+      - calculate_quality_scores
+      outputs:
+      - data_quality_report
+      name: generate_quality_report
+      properties:
+        sql: "SELECT \n  COUNT(*) AS total_records,\n  SUM(CASE WHEN data_quality_score = 100 THEN 1 ELSE\
+          \ 0 END) AS perfect_records,\n  SUM(CASE WHEN data_quality_score >= 80 THEN 1 ELSE 0 END) AS\
+          \ good_quality_records,\n  SUM(CASE WHEN data_quality_score < 80 THEN 1 ELSE 0 END) AS poor_quality_records,\n\
+          \  ROUND(AVG(data_quality_score), 2) AS avg_quality_score,\n  MIN(data_quality_score) AS worst_quality_score,\n\
+          \  SUM(CASE WHEN product_name IS NULL THEN 1 ELSE 0 END) AS missing_names,\n  SUM(CASE WHEN\
+          \ price <= 0 THEN 1 ELSE 0 END) AS invalid_prices,\n  SUM(CASE WHEN stock_quantity < 0 THEN\
+          \ 1 ELSE 0 END) AS negative_stock,\n  SUM(CASE WHEN last_updated IS NULL THEN 1 ELSE 0 END)\
+          \ AS missing_dates\nFROM validated_products\n"
+  execution:
+    trigger:
+      type: manual
+    runtime:
+      platform: local

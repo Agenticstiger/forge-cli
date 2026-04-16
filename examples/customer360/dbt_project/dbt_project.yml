@@ -1,0 +1,8 @@
+name: 'customer360_demo'
+version: '1.0'
+config-version: 2
+profile: 'customer360_profile'
+
+models:
+  customer360_demo:
+    +materialized: table

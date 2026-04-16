@@ -1,0 +1,44 @@
+fluidVersion: "0.7.1"
+kind: DataProduct
+id: compat.retail.customer_orders_071
+name: Customer Orders Compatibility 0.7.1
+description: Batch customer orders fixture used to protect FLUID 0.7.1 compatibility.
+domain: retail
+metadata:
+  layer: Silver
+  owner:
+    team: retail-platform
+    email: retail@example.com
+
+builds:
+  - id: customer_orders_sql
+    pattern: embedded-logic
+    engine: sql
+    properties:
+      sql: |
+        SELECT
+          customer_id,
+          order_id,
+          order_total
+        FROM analytics.customer_orders
+
+exposes:
+  - exposeId: customer_orders
+    kind: table
+    version: "1.0.0"
+    binding:
+      platform: local
+      format: parquet
+      location:
+        path: runtime/compat/customer_orders_071.parquet
+    contract:
+      schema:
+        - name: customer_id
+          type: string
+          required: true
+        - name: order_id
+          type: string
+          required: true
+        - name: order_total
+          type: number
+          required: true

@@ -1,0 +1,78 @@
+# Domain keyword mappings for auto-detection.
+# Detection requires at least 2 keyword hits to avoid false positives.
+min_keyword_hits: 2
+
+domains:
+  finance:
+    - bank
+    - banking
+    - trading
+    - financial
+    - fintech
+    - payment
+    - payments
+    - fraud
+    - risk
+    - compliance
+    - regulatory
+    - sox
+    - pci
+    - basel
+    - mifid
+    - credit
+    - loan
+    - portfolio
+    - investment
+
+  healthcare:
+    - patient
+    - clinical
+    - hospital
+    - medical
+    - health
+    - hipaa
+    - ehr
+    - hl7
+    - fhir
+    - pharma
+    - diagnosis
+    - treatment
+    - claims
+    - provider
+    - genomic
+    - lab
+    - radiology
+
+  retail:
+    - ecommerce
+    - e-commerce
+    - retail
+    - inventory
+    - product catalog
+    - shopping
+    - cart
+    - customer loyalty
+    - merchandising
+    - pos
+    - point of sale
+    - store
+    - order
+    - fulfillment
+    - recommendation
+
+  telco:
+    - telecom
+    - telco
+    - subscriber
+    - network
+    - cdr
+    - call detail
+    - billing
+    - roaming
+    - oss
+    - bss
+    - sid
+    - tm forum
+    - spectrum
+    - cell tower
+    - mobile

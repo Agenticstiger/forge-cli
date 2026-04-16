@@ -1,0 +1,157 @@
+apiVersion: fluid.io/v1
+kind: DataContract
+metadata:
+  name: web-analytics-multi-output
+  description: Multi-layered analytics with bronze/silver/gold pattern
+  version: 1.0.0
+
+inputs:
+  - name: raw_events
+    type: csv
+    path: ./data/events.csv
+
+outputs:
+  # BRONZE LAYER - Raw data with minimal transformation
+  - name: bronze_events
+    type: table
+    schema:
+      - { name: event_id, type: INTEGER }
+      - { name: user_id, type: INTEGER }
+      - { name: event_type, type: VARCHAR }
+      - { name: event_timestamp, type: TIMESTAMP }
+      - { name: device_type, type: VARCHAR }
+      - { name: page_url, type: VARCHAR }
+      - { name: session_id, type: VARCHAR }
+      - { name: loaded_at, type: TIMESTAMP }
+    transformation: |
+      SELECT 
+        *,
+        CURRENT_TIMESTAMP as loaded_at
+      FROM {{ ref('raw_events') }}
+  
+  # SILVER LAYER - Cleaned and standardized
+  - name: silver_events_cleaned
+    type: table
+    depends_on: [bronze_events]
+    transformation: |
+      SELECT 
+        event_id,
+        user_id,
+        LOWER(event_type) as event_type,
+        event_timestamp,
+        LOWER(device_type) as device_type,
+        LOWER(TRIM(page_url)) as page_url,
+        session_id
+      FROM {{ ref('bronze_events') }}
+  
+  - name: silver_sessions
+    type: table
+    depends_on: [silver_events_cleaned]
+    transformation: |
+      SELECT 
+        session_id,
+        user_id,
+        MIN(event_timestamp) as session_start,
+        MAX(event_timestamp) as session_end,
+        COUNT(*) as event_count,
+        COUNT(DISTINCT event_type) as event_types_count
+      FROM {{ ref('silver_events_cleaned') }}
+      GROUP BY session_id, user_id
+  
+  - name: silver_user_activity
+    type: table
+    depends_on: [silver_events_cleaned]
+    transformation: |
+      SELECT 
+        user_id,
+        COUNT(*) as total_events,
+        COUNT(DISTINCT session_id) as total_sessions,
+        SUM(CASE WHEN event_type = 'purchase' THEN 1 ELSE 0 END) as purchases,
+        MIN(event_timestamp) as first_seen,
+        MAX(event_timestamp) as last_seen
+      FROM {{ ref('silver_events_cleaned') }}
+      GROUP BY user_id
+  
+  # GOLD LAYER - Business metrics and aggregates
+  - name: gold_daily_metrics
+    type: table
+    depends_on: [silver_events_cleaned]
+    transformation: |
+      SELECT 
+        DATE(event_timestamp) as metric_date,
+        COUNT(*) as total_events,
+        COUNT(DISTINCT user_id) as unique_users,
+        COUNT(DISTINCT session_id) as unique_sessions,
+        SUM(CASE WHEN event_type = 'purchase' THEN 1 ELSE 0 END) as purchases,
+        ROUND(COUNT(*) * 1.0 / COUNT(DISTINCT user_id), 2) as avg_events_per_user
+      FROM {{ ref('silver_events_cleaned') }}
+      GROUP BY DATE(event_timestamp)
+  
+  - name: gold_device_metrics
+    type: table
+    depends_on: [silver_events_cleaned]
+    transformation: |
+      SELECT 
+        device_type,
+        COUNT(*) as event_count,
+        COUNT(DISTINCT user_id) as user_count,
+        SUM(CASE WHEN event_type = 'purchase' THEN 1 ELSE 0 END) as purchase_count,
+        ROUND(100.0 * SUM(CASE WHEN event_type = 'purchase' THEN 1 ELSE 0 END) / COUNT(*), 2) as conversion_rate
+      FROM {{ ref('silver_events_cleaned') }}
+      GROUP BY device_type
+  
+  # VIEWS - Quick access patterns (not materialized)
+  - name: high_value_users
+    type: view
+    depends_on: [silver_user_activity]
+    transformation: |
+      SELECT *
+      FROM {{ ref('silver_user_activity') }}
+      WHERE purchases >= 1
+      ORDER BY purchases DESC, total_events DESC
+  
+  - name: active_sessions
+    type: view
+    depends_on: [silver_sessions]
+    transformation: |
+      SELECT 
+        *,
+        ROUND((julianday(session_end) - julianday(session_start)) * 86400, 0) as duration_seconds
+      FROM {{ ref('silver_sessions') }}
+      WHERE event_count >= 3
+      ORDER BY event_count DESC
+  
+  - name: conversion_funnel
+    type: view
+    depends_on: [silver_events_cleaned]
+    transformation: |
+      WITH funnel_steps AS (
+        SELECT 
+          COUNT(DISTINCT CASE WHEN page_url LIKE '%home%' THEN user_id END) as visitors,
+          COUNT(DISTINCT CASE WHEN page_url LIKE '%product%' THEN user_id END) as product_viewers,
+          COUNT(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) as purchasers
+        FROM {{ ref('silver_events_cleaned') }}
+      )
+      SELECT 
+        'Homepage' as step, visitors as users, 100.0 as conversion_pct FROM funnel_steps
+      UNION ALL
+      SELECT 
+        'Products' as step, product_viewers as users, 
+        ROUND(100.0 * product_viewers / visitors, 2) as conversion_pct 
+      FROM funnel_steps
+      UNION ALL
+      SELECT 
+        'Purchase' as step, purchasers as users,
+        ROUND(100.0 * purchasers / visitors, 2) as conversion_pct
+      FROM funnel_steps
+
+validations:
+  - name: no_orphan_silver_events
+    level: error
+    query: |
+      SELECT COUNT(*) as orphan_count
+      FROM {{ ref('silver_events_cleaned') }} s
+      LEFT JOIN {{ ref('bronze_events') }} b ON s.event_id = b.event_id
+      WHERE b.event_id IS NULL
+    expect:
+      orphan_count: 0

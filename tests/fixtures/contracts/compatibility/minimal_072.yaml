@@ -1,0 +1,44 @@
+fluidVersion: "0.7.2"
+kind: DataProduct
+id: compat.ops.pipeline_health_072
+name: Pipeline Health Compatibility 0.7.2
+description: Operational health fixture used to protect FLUID 0.7.2 compatibility.
+domain: ops
+metadata:
+  layer: Gold
+  owner:
+    team: platform-ops
+    email: ops@example.com
+
+builds:
+  - id: pipeline_health_sql
+    pattern: embedded-logic
+    engine: sql
+    properties:
+      sql: |
+        SELECT
+          pipeline_id,
+          health_score,
+          event_ts
+        FROM runtime.pipeline_health
+
+exposes:
+  - exposeId: pipeline_health
+    kind: table
+    version: "1.0.0"
+    binding:
+      platform: local
+      format: parquet
+      location:
+        path: runtime/compat/pipeline_health_072.parquet
+    contract:
+      schema:
+        - name: pipeline_id
+          type: string
+          required: true
+        - name: health_score
+          type: integer
+          required: true
+        - name: event_ts
+          type: timestamp
+          required: true

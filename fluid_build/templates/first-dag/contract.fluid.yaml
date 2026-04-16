@@ -1,0 +1,177 @@
+fluidVersion: 0.7.2
+kind: DataProduct
+id: tutorial.sales_analytics_pipeline_v1
+name: Sales Analytics Pipeline
+description: Sales analytics pipeline with auto-generated Airflow DAG
+domain: Tutorial
+tags:
+- sales
+- analytics
+- airflow
+- tutorial
+metadata:
+  owner:
+    team: analytics-team
+    email: analytics-team@company.com
+exposes:
+- exposeId: customers_cleaned
+  title: Cleaned Customer Data
+  version: 1.0.0
+  kind: table
+  description: Cleaned customer data
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/customers_cleaned.parquet
+  contract:
+    schema:
+    - name: customer_id
+      type: INTEGER
+      required: true
+    - name: name
+      type: VARCHAR
+    - name: email
+      type: VARCHAR
+    - name: signup_date
+      type: DATE
+    - name: country
+      type: VARCHAR
+- exposeId: orders_cleaned
+  title: Cleaned Order Data
+  version: 1.0.0
+  kind: table
+  description: Cleaned order data
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/orders_cleaned.parquet
+  contract:
+    schema:
+    - name: order_id
+      type: INTEGER
+      required: true
+    - name: customer_id
+      type: INTEGER
+      required: true
+    - name: order_date
+      type: DATE
+    - name: product_category
+      type: VARCHAR
+    - name: amount
+      type: DECIMAL
+- exposeId: customer_order_summary
+  title: Customer Order Summary
+  version: 1.0.0
+  kind: table
+  description: Customer order aggregations
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/customer_order_summary.parquet
+  contract:
+    schema:
+    - name: customer_id
+      type: INTEGER
+      required: true
+    - name: customer_name
+      type: VARCHAR
+    - name: country
+      type: VARCHAR
+    - name: total_orders
+      type: INTEGER
+    - name: total_revenue
+      type: DECIMAL
+    - name: avg_order_value
+      type: DECIMAL
+    dq:
+      rules:
+      - id: revenue_consistency
+        type: accuracy
+        description: Ensure revenue calculations are consistent
+        severity: error
+        threshold: 0
+        operator: ==
+- exposeId: sales_by_country
+  title: Sales by Country
+  version: 1.0.0
+  kind: table
+  description: Revenue aggregated by country
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/sales_by_country.parquet
+  contract:
+    schema:
+    - name: country
+      type: VARCHAR
+      required: true
+    - name: total_customers
+      type: INTEGER
+    - name: total_orders
+      type: INTEGER
+    - name: total_revenue
+      type: DECIMAL
+builds:
+- id: sales_analytics_pipeline
+  description: Multi-stage sales analytics with DAG orchestration
+  pattern: multi-stage
+  engine: sql
+  properties:
+    stages:
+    - outputs:
+      - customers_cleaned
+      name: clean_customers
+      properties:
+        sql: "SELECT\n  customer_id,\n  TRIM(name) AS name,\n  LOWER(TRIM(email)) AS email,\n  signup_date,\n\
+          \  UPPER(country) AS country\nFROM read_csv_auto('data/customers.csv', header=true)\nWHERE email\
+          \ IS NOT NULL\n"
+    - outputs:
+      - orders_cleaned
+      name: clean_orders
+      properties:
+        sql: "SELECT\n  order_id,\n  customer_id,\n  order_date,\n  product_category,\n  amount\nFROM\
+          \ read_csv_auto('data/orders.csv', header=true)\nWHERE amount > 0\n"
+    - dependsOn:
+      - clean_customers
+      - clean_orders
+      outputs:
+      - customer_order_summary
+      name: summarize_customer_orders
+      properties:
+        sql: "SELECT\n  c.customer_id,\n  c.name AS customer_name,\n  c.country,\n  COUNT(o.order_id)\
+          \ AS total_orders,\n  SUM(o.amount) AS total_revenue,\n  AVG(o.amount) AS avg_order_value\n\
+          FROM customers_cleaned c\nLEFT JOIN orders_cleaned o\n  ON c.customer_id = o.customer_id\nGROUP\
+          \ BY c.customer_id, c.name, c.country\n"
+    - dependsOn:
+      - summarize_customer_orders
+      outputs:
+      - sales_by_country
+      name: aggregate_sales_by_country
+      properties:
+        sql: "SELECT\n  country,\n  COUNT(DISTINCT customer_id) AS total_customers,\n  SUM(total_orders)\
+          \ AS total_orders,\n  SUM(total_revenue) AS total_revenue\nFROM customer_order_summary\nGROUP\
+          \ BY country\nORDER BY total_revenue DESC\n"
+    - dependsOn:
+      - clean_customers
+      name: validate_customers
+      properties:
+        sql: "SELECT \n  CASE \n    WHEN COUNT(*) = 0 THEN 'PASS: No duplicate customers'\n    ELSE 'FAIL:\
+          \ Found ' || COUNT(*) || ' duplicate customers'\n  END AS validation_result\nFROM (\n  SELECT\
+          \ customer_id, COUNT(*) as cnt\n  FROM customers_cleaned\n  GROUP BY customer_id\n  HAVING COUNT(*)\
+          \ > 1\n) duplicates\n"
+  execution:
+    trigger:
+      type: schedule
+      schedule: 0 2 * * *
+    runtime:
+      platform: local
+      resources:
+        cpu: '2'
+        memory: 4GB
+      timeout: PT1H
+lifecycle:
+  state: active

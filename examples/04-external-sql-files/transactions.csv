@@ -1,0 +1,11 @@
+transaction_id,customer_id,transaction_date,amount,category,status
+1001,1,2024-01-20,99.99,subscription,completed
+1002,1,2024-02-20,99.99,subscription,completed
+1003,2,2024-02-25,49.99,subscription,completed
+1004,3,2024-03-15,99.99,subscription,completed
+1005,4,2024-04-10,299.99,subscription,completed
+1006,1,2024-03-20,25.00,addon,completed
+1007,5,2024-05-20,49.99,subscription,completed
+1008,6,2024-06-05,99.99,subscription,completed
+1009,2,2024-03-25,49.99,subscription,completed
+1010,4,2024-05-10,299.99,subscription,completed

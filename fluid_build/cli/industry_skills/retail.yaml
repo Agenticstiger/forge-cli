@@ -1,0 +1,55 @@
+# Industry skills: Retail & E-commerce
+# Merged with _tools.yaml at generation time to produce .fluid/skills.yaml
+
+industry:
+  name: "retail"
+  agent: "retail"
+  label: "Retail & E-commerce"
+  description: "Retail, e-commerce, supply chain, point-of-sale"
+
+canonical_model:
+  primary: "nrf_arts"
+  label: "NRF ARTS"
+  description: "Association for Retail Technology Standards — canonical for retail data products"
+  supporting:
+    - name: "gs1_gdm"
+      label: "GS1 Global Data Model"
+      description: "Product identification, barcodes, supply chain"
+    - name: "adobe_xdm"
+      label: "Adobe XDM"
+      description: "Experience Data Model — digital customer journeys"
+
+domains:
+  - name: "customer"
+    label: "Customer"
+    description: "Customer profiles, loyalty, segmentation, lifetime value"
+    key_entities: ["customer", "loyalty_member", "segment", "household"]
+  - name: "product_catalog"
+    label: "Product Catalog"
+    description: "Product master data, categories, attributes, pricing"
+    key_entities: ["product", "category", "sku", "price_list"]
+  - name: "transaction"
+    label: "Transaction"
+    description: "Point-of-sale, e-commerce orders, returns, payments"
+    key_entities: ["transaction", "order", "line_item", "payment"]
+  - name: "supply_chain"
+    label: "Supply Chain"
+    description: "Inventory, warehousing, fulfillment, suppliers"
+    key_entities: ["inventory", "warehouse", "shipment", "supplier"]
+  - name: "digital"
+    label: "Digital & Omnichannel"
+    description: "Web analytics, app events, campaign attribution"
+    key_entities: ["session", "page_view", "event", "campaign"]
+
+compliance:
+  - "GDPR"
+  - "PCI DSS"
+  - "CCPA"
+
+common_data_sources:
+  - "POS transaction logs"
+  - "E-commerce order feeds"
+  - "Loyalty / CRM systems"
+  - "Product Information Management (PIM)"
+  - "Warehouse Management Systems (WMS)"
+  - "Web / app analytics (Adobe, GA4)"

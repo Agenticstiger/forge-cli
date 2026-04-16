@@ -1,0 +1,77 @@
+---
+# FLUID 0.7.1 Example: Backward Compatible Contract
+# 
+# This contract demonstrates backward compatibility:
+# - Works with both 0.5.7 and 0.7.1 CLI
+# - 0.7.1 features are optional and additive
+# - Can be validated and deployed with older tooling
+
+fluidVersion: "0.7.1"
+kind: DataProduct
+id: demo.analytics.pageviews_v1
+name: Web Page Views Analytics
+domain: web_analytics
+description: Website page view metrics
+
+metadata:
+  owner: analytics-team@example.com
+  steward: data-team@example.com
+  tags:
+    - analytics
+    - web
+    - pageviews
+  classification: Internal
+
+exposes:
+  - exposeId: pageviews_daily
+    kind: table
+    description: Daily page view aggregates
+    
+    binding:
+      provider: gcp
+      location:
+        project: web-analytics-prod
+        dataset: analytics
+        table: pageviews_daily
+        region: us-central1
+    
+    schema:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        page_url:
+          type: string
+        views:
+          type: integer
+        unique_visitors:
+          type: integer
+    
+    policy:
+      classification: Internal
+      
+      authz:
+        allowedRoles:
+          - data-analyst
+          - data-scientist
+
+quality:
+  - dimension: completeness
+    assertion: date IS NOT NULL AND page_url IS NOT NULL
+    severity: error
+  
+  - dimension: accuracy
+    assertion: views >= unique_visitors
+    severity: warning
+
+# Optional 0.7.1 features - gracefully ignored by 0.5.7 CLI
+sovereignty:
+  jurisdiction: "US"
+  enforcementMode: advisory    # Warn but don't block
+
+observability:
+  metrics:
+    - name: daily_pageviews
+      type: gauge
+      query: SELECT SUM(views) FROM {table} WHERE date = CURRENT_DATE

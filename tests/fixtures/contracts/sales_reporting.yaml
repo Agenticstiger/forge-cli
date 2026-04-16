@@ -1,0 +1,94 @@
+# FLUID 0.7.1 Contract - Sales Reporting (Snowflake)
+fluidVersion: "0.7.1"
+kind: DataContract
+id: sales-reporting-v2
+name: sales-reporting
+
+metadata:
+  version: "2.1.0"
+  name: "Sales Performance Reporting"
+  description: "Daily sales performance metrics and KPIs"
+  status: active
+  domain: sales
+  subdomain: reporting
+  environment: production
+  tags:
+    - sales
+    - reporting
+    - kpi
+
+owner:
+  team: sales-analytics
+  name: Sales Analytics Team
+  email: sales-analytics@company.com
+
+exposes:
+  - id: daily_sales_metrics
+    version: "2.1.0"
+    description: "Daily aggregated sales metrics by region and product"
+    provider: snowflake
+    location:
+      account: company-prod
+      database: ANALYTICS_DB
+      schema: SALES
+      table: DAILY_METRICS
+      warehouse: ANALYTICS_WH
+    schema:
+      format: table
+      fields:
+        - name: report_date
+          type: date
+          description: "Date of the sales metrics"
+          required: true
+          
+        - name: region_id
+          type: string
+          description: "Sales region identifier"
+          required: true
+          
+        - name: product_category
+          type: string
+          description: "Product category"
+          required: true
+          validations:
+            allowed_values:
+              - electronics
+              - clothing
+              - home-goods
+              - sports
+              - other
+          
+        - name: total_revenue
+          type: decimal
+          description: "Total revenue in USD"
+          required: true
+          validations:
+            min_value: 0
+          
+        - name: total_orders
+          type: bigint
+          description: "Total number of orders"
+          required: true
+          
+        - name: average_order_value
+          type: float
+          description: "Average order value"
+          required: true
+          
+        - name: conversion_rate
+          type: float
+          description: "Conversion rate percentage"
+          required: false
+          validations:
+            min_value: 0.0
+            max_value: 100.0
+
+expects:
+  - id: orders_raw
+    description: "Raw orders data"
+    provider: snowflake
+    location:
+      account: company-prod
+      database: RAW_DB
+      schema: ORDERS
+      table: ORDERS_RAW

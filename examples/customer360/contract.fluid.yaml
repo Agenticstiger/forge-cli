@@ -1,0 +1,81 @@
+fluidVersion: "0.5.7"
+kind: "DataProduct"
+id: "gold.customer360_v1"
+name: "Customer 360 (Demo)"
+description: "Unified Customer 360 table on BigQuery; runs locally via DuckDB."
+domain: "Customer"
+
+metadata:
+  layer: Gold
+  owner:
+    team: "Customer Platform"
+    email: "cust-platform@example.com"
+  businessContext:
+    domain: "Customer Experience"
+    subdomain: "Customer Intelligence"
+
+consumes:
+  - productId: "silver.crm.core_v1"
+    exposeId: "crm_core"
+    purpose: "Customer master data from CRM system"
+  - productId: "silver.billing.accounts_v1"
+    exposeId: "billing_accounts"
+    purpose: "Billing account information"
+
+builds:
+  - id: "customer360_build"
+    description: "Customer 360 aggregation pipeline"
+    pattern: "hybrid-reference"
+    engine: "dbt"
+    repository: "./examples/customer360/dbt_project"
+    properties:
+      model: "customer360"
+      vars: 
+        materialization: "table"
+    execution:
+      trigger: 
+        type: "schedule"
+        cron: "15 2 * * *"
+      runtime: 
+        platform: "gcp"
+        resources: 
+          cpu: "2"
+          memory: "8Gi"
+      retries: 
+        count: 2
+        delaySeconds: 60
+        backoff: "exponential"
+
+exposes:
+  - exposeId: "customer360_table"
+    kind: "table"
+    binding:
+      platform: "gcp"
+      format: "bigquery_table"
+      location:
+        project: "YOUR_PROJECT"
+        dataset: "gold_demo"
+        table: "customer360_v1"
+    contract:
+      schema:
+        - name: "customer_id"
+          type: "STRING"
+          required: true
+        - name: "segment"
+          type: "STRING"
+        - name: "arpu_30d"
+          type: "NUMERIC"
+        - name: "updated_at"
+          type: "TIMESTAMP"
+          required: true
+      dq:
+        rules:
+          - id: "customer_id_not_null"
+            type: "completeness"
+            selector: "customer_id"
+            threshold: 1.0
+            operator: ">="
+            severity: "error"
+    qos:
+      availability: "99.5%"
+      freshnessSLO: "PT2H"

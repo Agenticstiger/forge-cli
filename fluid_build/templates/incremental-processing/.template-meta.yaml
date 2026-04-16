@@ -1,0 +1,34 @@
+name: "Incremental Processing"
+id: "incremental-processing"
+version: "0.7.1"
+difficulty: "intermediate"
+time_to_complete: "10 minutes"
+learning_path_order: 8
+track: "foundation"
+concepts:
+  - "Incremental loading"
+  - "Watermark tracking"
+  - "Merge strategies"
+  - "Change data capture"
+  - "Upsert patterns"
+prerequisites:
+  - "003-multi-source"
+  - "006-multiple-outputs"
+quickstart_tutorial: "008-incremental-processing.md"
+features:
+  local_execution: true
+  dag_generation: true
+  cloud_deployment: true
+  requires_docker: false
+tags:
+  - intermediate
+  - incremental
+  - performance
+  - cdc
+  - upsert
+sample_data_included: true
+estimated_file_size: "30KB"
+description: |
+  Master incremental data processing with watermark tracking, merge strategies,
+  and upsert patterns. Learn to process only new/changed data for efficient
+  large-scale pipelines.

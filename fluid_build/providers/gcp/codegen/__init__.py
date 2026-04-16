@@ -1,0 +1,32 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+GCP Code Generation for Orchestration Engines.
+
+Generates executable DAG/pipeline code from FLUID contracts for:
+- Apache Airflow (Cloud Composer)
+- Dagster
+- Prefect
+"""
+
+from .airflow import generate_airflow_dag
+from .dagster import generate_dagster_pipeline
+from .prefect import generate_prefect_flow
+
+__all__ = [
+    "generate_airflow_dag",
+    "generate_dagster_pipeline",
+    "generate_prefect_flow",
+]

@@ -1,0 +1,52 @@
+name: "Your First DAG"
+id: "first-dag"
+version: "0.7.1"
+difficulty: "intermediate"
+time_to_complete: "15 minutes"
+learning_path_order: 11
+track: "intermediate"
+concepts:
+  - "Airflow DAG auto-generation"
+  - "Contract-to-DAG conversion"
+  - "Pipeline orchestration basics"
+  - "Task dependencies"
+  - "Local Airflow deployment"
+  - "Monitoring and execution"
+prerequisites:
+  - "FLUID CLI installed"
+  - "Docker and Docker Compose installed"
+  - "Completed Foundation track (001-003)"
+  - "Basic understanding of data pipelines"
+quickstart_tutorial: "011-your-first-dag.md"
+related_tutorials:
+  - "012-pipeline-orchestration.md"
+  - "013-customer-360-analytics.md"
+  - "019-scheduling-triggers.md"
+features:
+  local_execution: true
+  dag_generation: true
+  cloud_deployment: false
+  requires_docker: true
+tags:
+  - intermediate
+  - airflow
+  - dag
+  - orchestration
+  - pipeline
+  - flagship
+sample_data_included: true
+estimated_file_size: "25KB"
+description: |
+  🌟 FLAGSHIP FEATURE: Auto-generate Airflow DAGs from FLUID contracts!
+  
+  This template showcases FLUID 0.7.1's killer feature: automatic DAG generation.
+  Write your contract once, get a production-ready Airflow DAG automatically.
+  
+  You'll learn:
+  - How FLUID converts contracts to Airflow DAGs
+  - Zero Airflow code required - just define your contract
+  - Automatic task dependency resolution
+  - One command deployment to local Airflow
+  - Pipeline monitoring and execution
+  
+  From contract to running DAG in under 15 minutes!

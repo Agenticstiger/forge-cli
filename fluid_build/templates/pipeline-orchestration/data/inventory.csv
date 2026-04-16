@@ -1,0 +1,6 @@
+product_id,product_name,category,quantity,warehouse
+101,Laptop,Electronics,50,NORTH
+102,Shirt,Apparel,200,SOUTH
+103,Desk,Home,30,EAST
+104,Phone,Electronics,100,WEST
+105,Pants,Apparel,150,NORTH

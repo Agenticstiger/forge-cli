@@ -1,0 +1,12 @@
+include LICENSE
+include NOTICE
+include README.md
+include pyproject.toml
+recursive-include fluid_build *.yaml *.json *.j2 *.html *.csv *.sql *.md *.example
+global-exclude *.pyc *.pyo __pycache__ *.old *.bak *~
+prune tests
+prune docs
+prune examples
+prune scripts
+prune tools
+prune runtime

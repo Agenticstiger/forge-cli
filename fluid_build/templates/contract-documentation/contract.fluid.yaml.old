@@ -1,0 +1,94 @@
+apiVersion: fluid.io/v1
+kind: DataContract
+metadata:
+  name: documented-pipeline
+  description: |
+    Product analytics pipeline with comprehensive documentation.
+    
+    ## Purpose
+    This pipeline processes product data and generates analytics.
+    
+    ## Owners
+    - Team: Data Engineering
+    - Contact: dataeng@example.com
+    
+    ## SLA
+    - Frequency: Daily
+    - Freshness: < 2 hours
+  version: 1.0.0
+  tags:
+    - products
+    - analytics
+  documentation_url: https://docs.example.com/pipelines/products
+
+inputs:
+  - name: raw_products
+    type: csv
+    path: ./data/products.csv
+    description: Raw product catalog from e-commerce platform
+    schema:
+      - name: product_id
+        type: INTEGER
+        description: Unique product identifier
+      - name: name
+        type: VARCHAR
+        description: Product display name
+      - name: category
+        type: VARCHAR
+        description: Product category (Electronics, Hardware, etc)
+      - name: price
+        type: DECIMAL
+        description: Current product price in USD
+
+outputs:
+  - name: product_catalog
+    type: table
+    description: |
+      Cleaned and enriched product catalog
+      
+      ### Business Logic
+      - Standardizes category names
+      - Adds price tiers
+      - Calculates discount eligibility
+      
+      ### Usage
+      Used by: Marketing dashboard, Pricing engine
+      Update frequency: Daily at 2 AM UTC
+    schema:
+      - name: product_id
+        type: INTEGER
+        description: Unique product identifier (primary key)
+      - name: product_name
+        type: VARCHAR
+        description: Standardized product name (lowercase, trimmed)
+      - name: category
+        type: VARCHAR
+        description: Standardized category name
+      - name: price
+        type: DECIMAL
+        description: Price in USD
+      - name: price_tier
+        type: VARCHAR
+        description: Price tier (Budget < $25, Mid $25-$50, Premium > $50)
+    transformation: |
+      -- Product catalog with price tiers
+      SELECT 
+        product_id,
+        LOWER(TRIM(name)) as product_name,
+        UPPER(category) as category,
+        price,
+        CASE 
+          WHEN price < 25 THEN 'Budget'
+          WHEN price <= 50 THEN 'Mid-Range'
+          ELSE 'Premium'
+        END as price_tier
+      FROM {{ ref('raw_products') }}
+
+documentation:
+  auto_generate: true
+  output_format: [markdown, html]
+  include:
+    - schema
+    - lineage
+    - examples
+    - metrics

@@ -1,0 +1,197 @@
+# Example: Fully Compliant Customer Profiles Data Product
+# Demonstrates all 5 policy categories
+
+fluidVersion: "0.5.7"
+kind: DataProduct
+id: gold.customer.profiles_v1
+name: Customer Profiles
+description: "Gold-tier customer profiles with comprehensive governance"
+
+metadata:
+  owner:
+    team: data-engineering
+    email: data-eng@company.com
+  layer: Gold
+  domain: Customer
+  governance:
+    piiProtectionStrategy: "Mask all PII in non-prod, encrypt sensitive fields in prod"
+    retentionRationale: "7 years per regulatory requirements"
+    classificationReason: "Contains customer PII and financial data"
+
+# Schema Evolution Policies
+schemaEvolution:
+  compatibility: backward_compatible
+  changePolicy:
+    approvalRequired: true
+    approvers:
+      - data-steward@company.com
+      - team-lead@company.com
+    changeWindowDays: 30
+    allowedChanges:
+      - add_column
+      - add_optional_field
+    breakingChanges:
+      requiresApproval: true
+      minimumApprovers: 2
+
+# Lifecycle Policies
+lifecycle:
+  state: active
+  retention: P7Y  # 7 years
+
+exposes:
+  - exposeId: customer_profiles
+    kind: table
+    version: "1.0.0"
+    description: "Customer profile data with privacy protections"
+    
+    contract:
+      schema:
+        # Non-sensitive fields
+        - name: customer_id
+          type: STRING
+          required: true
+          description: "Unique customer identifier"
+          sensitivity: cleartext
+        
+        - name: account_created_at
+          type: TIMESTAMP
+          required: true
+          sensitivity: cleartext
+        
+        # PII fields with sensitivity markers
+        - name: email
+          type: STRING
+          required: true
+          description: "Customer email address"
+          sensitivity: pii  # Triggers privacy policy requirement
+        
+        - name: phone
+          type: STRING
+          sensitivity: pii
+        
+        - name: full_name
+          type: STRING
+          sensitivity: pii
+        
+        # Financial data
+        - name: account_balance
+          type: DECIMAL
+          sensitivity: confidential
+        
+        - name: credit_score
+          type: INTEGER
+          sensitivity: confidential
+      
+      # Data Quality Policies
+      dq:
+        rules:
+          # Freshness: Data must be updated within 6 hours
+          - id: freshness_check
+            type: freshness
+            severity: critical
+            window: PT6H  # ISO 8601: 6 hours
+            description: "Customer data must be refreshed every 6 hours"
+          
+          # Completeness: 95% of records must have email
+          - id: email_completeness
+            type: completeness
+            severity: error
+            selector: email
+            threshold: 0.95
+            description: "95% of profiles must have email"
+          
+          # Uniqueness: customer_id must be unique
+          - id: customer_id_unique
+            type: uniqueness
+            severity: critical
+            selector: customer_id
+            description: "Customer IDs must be unique"
+          
+          # Anomaly Detection: Detect unusual patterns
+          - id: anomaly_detection
+            type: anomaly_detection
+            severity: warning
+            description: "Alert on anomalous data patterns"
+        
+        # Monitoring is required for critical rules
+        monitoring:
+          enabled: true
+          interval: PT1H  # Check every hour
+          alerting:
+            channels:
+              - slack
+              - email
+            recipients:
+              - data-eng@company.com
+    
+    # Access Control Policies
+    policy:
+      # Classification level
+      classification: Confidential
+      
+      # Authorization
+      authz:
+        readers:
+          - group:data-analysts@company.com
+          - group:data-scientists@company.com
+        writers:
+          - group:data-engineers@company.com
+        
+        # Column-level access restrictions
+        columnRestrictions:
+          # Contractors cannot see financial data
+          - principal: group:contractors@company.com
+            columns:
+              - account_balance
+              - credit_score
+            access: deny
+          
+          # External analysts cannot see PII
+          - principal: group:external-analysts@company.com
+            columns:
+              - email
+              - phone
+              - full_name
+            access: deny
+      
+      # Privacy Policies (for PII protection)
+      privacy:
+        masking:
+          # Email: Mask in non-prod environments
+          - column: email
+            strategy: mask  # e***@***.com
+            environments: [dev, staging]
+          
+          # Phone: Hash in all environments
+          - column: phone
+            strategy: hash
+          
+          # Full name: Mask in non-prod
+          - column: full_name
+            strategy: mask
+            environments: [dev, staging]
+          
+          # Financial data: Encrypt in prod
+          - column: account_balance
+            strategy: encrypt
+            environments: [prod]
+          
+          - column: credit_score
+            strategy: encrypt
+            environments: [prod]
+    
+    # Lifecycle Policies (Expose-level)
+    lifecycle:
+      retention: P90D  # 90 days for operational data
+      archival:
+        enabled: true
+        destination: "gs://company-archive/customer-profiles"
+    
+    binding:
+      platform: gcp
+      format: bigquery_table
+      location:
+        project: company-data-prod
+        dataset: gold
+        table: customer_profiles

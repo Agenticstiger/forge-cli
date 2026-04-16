@@ -1,0 +1,27 @@
+# Data sovereignty rules — owned by the compliance team.
+# This fragment can be $ref'd by any EU-regulated data product.
+
+jurisdiction: "EU"
+dataResidency: true
+allowedRegions:
+  - EU
+  - europe-west3
+  - europe-west1
+deniedRegions:
+  - us-east-1
+  - us-west-2
+crossBorderTransfer: false
+transferMechanisms:
+  - SCCs
+regulatoryFramework:
+  - GDPR
+enforcementMode: advisory
+validationRequired: true
+
+tags:
+  - gdpr-compliant
+  - eu-residency
+
+labels:
+  compliance_region: "EU"
+  data_classification: "regulated"

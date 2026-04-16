@@ -1,0 +1,6 @@
+customer_id,name,region,segment
+1,Alice,NORTH,Premium
+2,Bob,SOUTH,Standard
+3,Carol,EAST,Premium
+4,Dave,WEST,Standard
+5,Eve,NORTH,Premium

@@ -1,0 +1,86 @@
+{
+  "id": "financial_analytics",
+  "name": "Financial Analytics Pipeline",
+  "version": "1.0.0",
+  "description": "Daily financial data processing and analytics pipeline",
+  "sovereignty": {
+    "region": "us-east-1",
+    "residency": ["us-east-1"]
+  },
+  "orchestration": {
+    "engine": "airflow",
+    "schedule": "0 2 * * *",
+    "timezone": "UTC",
+    "tasks": [
+      {
+        "taskId": "create_bucket",
+        "type": "provider_action",
+        "action": "aws.s3.ensure_bucket",
+        "params": {
+          "bucket": "financial-data-lake-{{account_id}}",
+          "region": "us-east-1",
+          "versioning": true,
+          "encryption": "AES256"
+        }
+      },
+      {
+        "taskId": "create_database",
+        "type": "provider_action",
+        "action": "aws.glue.ensure_database",
+        "dependsOn": ["create_bucket"],
+        "params": {
+          "database": "financial_analytics",
+          "description": "Financial analytics data catalog"
+        }
+      },
+      {
+        "taskId": "create_transactions_table",
+        "type": "provider_action",
+        "action": "aws.glue.ensure_table",
+        "dependsOn": ["create_database"],
+        "params": {
+          "database": "financial_analytics",
+          "table": "transactions",
+          "s3_location": "s3://financial-data-lake-{{account_id}}/transactions/",
+          "format": "parquet",
+          "schema": {
+            "columns": [
+              {"name": "transaction_id", "type": "string"},
+              {"name": "customer_id", "type": "string"},
+              {"name": "amount", "type": "double"},
+              {"name": "currency", "type": "string"},
+              {"name": "timestamp", "type": "timestamp"},
+              {"name": "category", "type": "string"}
+            ],
+            "partition_keys": [
+              {"name": "year", "type": "int"},
+              {"name": "month", "type": "int"},
+              {"name": "day", "type": "int"}
+            ]
+          }
+        }
+      },
+      {
+        "taskId": "run_daily_summary",
+        "type": "provider_action",
+        "action": "aws.athena.execute_query",
+        "dependsOn": ["create_transactions_table"],
+        "params": {
+          "database": "financial_analytics",
+          "query": "SELECT category, SUM(amount) as total_amount, COUNT(*) as transaction_count FROM transactions WHERE year = YEAR(CURRENT_DATE) AND month = MONTH(CURRENT_DATE) AND day = DAY(CURRENT_DATE) GROUP BY category",
+          "workgroup": "primary",
+          "output_location": "s3://financial-data-lake-{{account_id}}/results/daily_summary/"
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "id": "new_data_trigger",
+        "type": "s3",
+        "bucket": "financial-data-lake-{{account_id}}",
+        "prefix": "transactions/",
+        "events": ["s3:ObjectCreated:*"]
+      }
+    ]
+  }
+}

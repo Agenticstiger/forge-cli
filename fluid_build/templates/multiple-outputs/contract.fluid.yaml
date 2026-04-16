@@ -1,0 +1,136 @@
+fluidVersion: 0.7.2
+kind: DataProduct
+id: analytics.web_multi_layer_v1
+name: Web Analytics - Medallion Architecture
+description: Multi-layered analytics demonstrating Bronze/Silver/Gold pattern
+domain: Web Analytics
+tags:
+- medallion-architecture
+- bronze-silver-gold
+- multi-output
+metadata:
+  owner:
+    team: analytics-platform
+    email: analytics@company.com
+  layer: Multi-Layer
+exposes:
+- exposeId: bronze_events
+  title: 'Bronze: Raw Events'
+  version: 1.0.0
+  kind: table
+  labels:
+    layer: bronze
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/bronze_events.parquet
+  contract:
+    schema:
+    - name: event_id
+      type: INTEGER
+    - name: user_id
+      type: INTEGER
+    - name: event_type
+      type: VARCHAR
+    - name: event_timestamp
+      type: TIMESTAMP
+    - name: device_type
+      type: VARCHAR
+    - name: page_url
+      type: VARCHAR
+    - name: session_id
+      type: VARCHAR
+    - name: loaded_at
+      type: TIMESTAMP
+- exposeId: silver_events_cleaned
+  title: 'Silver: Cleaned Events'
+  version: 1.0.0
+  kind: table
+  labels:
+    layer: silver
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/silver_events_cleaned.parquet
+  contract:
+    schema:
+    - name: event_id
+      type: INTEGER
+      required: true
+    - name: user_id
+      type: INTEGER
+    - name: event_type
+      type: VARCHAR
+    - name: event_timestamp
+      type: TIMESTAMP
+    - name: device_type
+      type: VARCHAR
+    - name: page_url
+      type: VARCHAR
+    - name: session_id
+      type: VARCHAR
+- exposeId: gold_daily_metrics
+  title: 'Gold: Daily Metrics'
+  version: 1.0.0
+  kind: table
+  labels:
+    layer: gold
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: output/gold_daily_metrics.parquet
+  contract:
+    schema:
+    - name: metric_date
+      type: DATE
+      required: true
+    - name: total_events
+      type: INTEGER
+    - name: unique_users
+      type: INTEGER
+    - name: unique_sessions
+      type: INTEGER
+    - name: purchases
+      type: INTEGER
+builds:
+- id: medallion_pipeline
+  description: Multi-layer analytics following medallion architecture
+  pattern: multi-stage
+  engine: sql
+  properties:
+    stages:
+    - outputs:
+      - bronze_events
+      name: bronze_ingest
+      properties:
+        sql: 'SELECT *, CURRENT_TIMESTAMP as loaded_at
+
+          FROM read_csv_auto(''data/events.csv'', header=true)
+
+          '
+    - dependsOn:
+      - bronze_ingest
+      outputs:
+      - silver_events_cleaned
+      name: silver_clean
+      properties:
+        sql: "SELECT event_id, user_id,\n  LOWER(event_type) as event_type,\n  event_timestamp,\n  LOWER(device_type)\
+          \ as device_type,\n  LOWER(TRIM(page_url)) as page_url,\n  session_id\nFROM bronze_events\n"
+    - dependsOn:
+      - silver_clean
+      outputs:
+      - gold_daily_metrics
+      name: gold_daily
+      properties:
+        sql: "SELECT \n  CAST(event_timestamp AS DATE) as metric_date,\n  COUNT(*) as total_events,\n\
+          \  COUNT(DISTINCT user_id) as unique_users,\n  COUNT(DISTINCT session_id) as unique_sessions,\n\
+          \  SUM(CASE WHEN event_type = 'purchase' THEN 1 ELSE 0 END) as purchases\nFROM silver_events_cleaned\n\
+          GROUP BY CAST(event_timestamp AS DATE)\n"
+  execution:
+    trigger:
+      type: manual
+    runtime:
+      platform: local

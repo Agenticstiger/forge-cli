@@ -1,0 +1,69 @@
+fluidVersion: "0.7.1"
+kind: DataProduct
+id: analytics.data_lake.sales_crawler
+name: Sales Raw Data Crawler
+description: Glue crawler that scans raw CSV uploads and populates the catalog
+domain: Analytics
+
+tags:
+  - data-lake
+  - aws-glue
+  - crawler
+
+labels:
+  team: data-engineering
+  platform: aws
+
+metadata:
+  layer: Bronze
+  owner:
+    team: data-engineering
+    email: data-eng@company.com
+
+# ─── Expose: Crawler-managed table ──────────────────────────
+
+exposes:
+  - exposeId: raw_sales_crawled
+    title: Raw Sales (Crawler-Managed)
+    version: "1.0.0"
+    kind: table
+
+    binding:
+      platform: aws
+      format: csv
+      location:
+        database: sales_db
+        table: raw_sales
+        bucket: "{{ env.DATA_LAKE_BUCKET }}"
+        path: raw/sales/
+        region: "{{ env.AWS_REGION }}"
+
+    # Crawler configuration — fluid generates a glue.ensure_crawler action
+    crawler:
+      name: sales-raw-crawler
+      role: "{{ env.GLUE_CRAWLER_ROLE }}"
+      schedule: "cron(0 6 * * ? *)"   # 06:00 UTC daily
+      classifiers: []                  # rely on built-in classifiers
+      schemaChangePolicy:
+        updateBehavior: UPDATE_IN_DATABASE
+        deleteBehavior: LOG
+
+    contract:
+      schema:
+        - name: order_id
+          type: string
+          required: true
+        - name: order_date
+          type: string
+          required: true
+        - name: customer_id
+          type: string
+          required: true
+        - name: product_sku
+          type: string
+        - name: quantity
+          type: string
+        - name: unit_price
+          type: string
+        - name: total_amount
+          type: string

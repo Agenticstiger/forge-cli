@@ -1,0 +1,45 @@
+name: "CSV to Data Product"
+id: "csv-basics"
+version: "0.7.1"
+difficulty: "beginner"
+time_to_complete: "5 minutes"
+learning_path_order: 2
+track: "foundation"
+concepts:
+  - "Input sources (CSV files)"
+  - "Schema definition and validation"
+  - "Data type mapping"
+  - "SQL transformations and filters"
+  - "Working with sample data"
+prerequisites:
+  - "FLUID CLI installed"
+  - "Completed 001-hello-world"
+quickstart_tutorial: "002-csv-to-data-product.md"
+related_tutorials:
+  - "001-hello-fluid.md"
+  - "003-multi-source-joins.md"
+  - "004-external-sql-files.md"
+features:
+  local_execution: true
+  dag_generation: false
+  cloud_deployment: false
+  requires_docker: false
+tags:
+  - foundation
+  - beginner
+  - csv
+  - data-ingestion
+  - schema
+sample_data_included: true
+estimated_file_size: "8KB"
+description: |
+  Learn how to ingest CSV files and transform them into data products.
+  Includes realistic sample customer data with proper schema definitions.
+  
+  This template teaches:
+  - Defining input sources (CSV files)
+  - Schema validation and type mapping
+  - Filtering and transforming data
+  - Data quality best practices
+  
+  Perfect for understanding how FLUID handles structured data files.

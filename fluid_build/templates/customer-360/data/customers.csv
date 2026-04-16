@@ -1,0 +1,11 @@
+customer_id,first_name,last_name,email,phone,signup_date,country,city,customer_source,industry
+1,Alice,Johnson,alice.johnson@email.com,+1-555-0101,2023-01-15,USA,New York,organic,Technology
+2,Bob,Smith,bob.smith@email.com,+1-555-0102,2023-02-20,USA,San Francisco,referral,Finance
+3,Carol,Williams,carol.w@email.com,+44-555-0103,2023-03-10,UK,London,paid_search,Retail
+4,David,Brown,david.brown@email.com,+1-555-0104,2023-04-05,USA,Chicago,organic,Healthcare
+5,Eve,Davis,eve.davis@email.com,+49-555-0105,2023-05-12,Germany,Berlin,social_media,Manufacturing
+6,Frank,Miller,frank.m@email.com,+33-555-0106,2023-06-18,France,Paris,email_campaign,Consulting
+7,Grace,Lee,grace.lee@email.com,+81-555-0107,2023-07-22,Japan,Tokyo,partner,Technology
+8,Henry,Wilson,henry.w@email.com,+61-555-0108,2023-08-30,Australia,Sydney,organic,Retail
+9,Ivy,Martinez,ivy.m@email.com,+34-555-0109,2023-09-14,Spain,Madrid,paid_search,Finance
+10,Jack,Anderson,jack.a@email.com,+39-555-0110,2023-10-25,Italy,Rome,referral,Healthcare

@@ -1,0 +1,11 @@
+customer_id,name,email,signup_date,country,total_spent
+1,Alice Johnson,alice@example.com,2024-01-15,USA,1250.00
+2,Bob Smith,bob@example.com,2024-02-20,Canada,890.50
+3,Carol Davis,carol@example.com,2024-03-10,UK,2100.75
+4,David Wilson,david@example.com,2024-04-05,USA,450.00
+5,Emma Brown,emma@example.com,2024-05-12,Germany,1800.25
+6,Frank Miller,frank@example.com,2024-06-18,France,320.00
+7,Grace Lee,grace@example.com,2024-07-22,Japan,1550.50
+8,Henry Clark,henry@example.com,2024-08-30,Australia,2250.00
+9,Ivy Martinez,ivy@example.com,2024-09-14,Spain,980.75
+10,Jack Taylor,jack@example.com,2024-10-25,Italy,1450.00

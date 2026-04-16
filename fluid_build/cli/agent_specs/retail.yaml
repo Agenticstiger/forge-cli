@@ -1,0 +1,295 @@
+name: retail
+domain: retail
+description: Expert in retail data products, NRF ARTS and GS1-aligned modeling, and Adobe XDM for digital retail experiences
+
+questions:
+  - key: product_type
+    question: What type of retail product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: Customer 360
+        value: customer_360
+        aliases: ["customer 360", "cdp", "customer profile"]
+      - label: Recommendation Engine
+        value: recommendation_engine
+        aliases: ["recommendations", "rec engine", "personalization"]
+      - label: Inventory Optimization
+        value: inventory_optimization
+        aliases: ["inventory", "stock optimization", "replenishment"]
+      - label: Price Optimization
+        value: price_optimization
+        aliases: ["pricing", "price"]
+      - label: Demand Forecasting
+        value: demand_forecasting
+        aliases: ["forecasting", "demand"]
+  - key: modeling_context
+    question: Which retail modeling context fits best?
+    type: choice
+    required: true
+    choices:
+      - label: Core Omnichannel Retail
+        value: core_omnichannel
+        aliases: ["omnichannel", "core retail", "arts", "pos", "orders", "store operations"]
+      - label: Digital Experience / CDP
+        value: digital_experience
+        aliases: ["digital", "digital experience", "cdp", "xdm", "adobe", "journey", "profile"]
+      - label: Supply Chain / Traceability
+        value: supply_chain_traceability
+        aliases: ["traceability", "supply chain", "epcis", "cbv", "gs1", "lot", "serial"]
+  - key: data_sources
+    question: What data sources will you use?
+    type: text
+    required: true
+    default: Transaction data, customer profiles, inventory data
+  - key: real_time_personalization
+    question: Do you need real-time personalization?
+    type: choice
+    default: "yes"
+    choices:
+      - label: "Yes"
+        value: "yes"
+        aliases: ["y", "yeah", "yep", "sure", "real time"]
+      - label: "No"
+        value: "no"
+        aliases: ["n", "nope", "batch", "not really"]
+  - key: scale
+    question: Expected data scale?
+    type: choice
+    required: true
+    choices:
+      - label: Small (<1M records)
+        value: small (<1m records)
+        aliases: ["small", "<1m", "under 1m"]
+      - label: Medium (1M-100M)
+        value: medium (1m-100m)
+        aliases: ["medium", "mid", "1m to 100m", "10m"]
+      - label: Large (>100M)
+        value: large (>100m)
+        aliases: ["large", "huge", "100m+", "enterprise scale"]
+
+  - key: orchestration_pattern
+    question: What pipeline scheduling pattern fits best?
+    type: choice
+    required: false
+    choices:
+      - label: Near-real-time inventory sync
+        value: near_realtime
+        aliases: ["near real time", "nrt", "inventory sync", "continuous"]
+      - label: Daily batch (overnight refresh)
+        value: daily_batch
+        aliases: ["daily", "batch", "overnight", "nightly"]
+      - label: Event-driven (POS transactions, clickstream)
+        value: event_driven
+        aliases: ["event", "pos", "clickstream", "transaction"]
+      - label: Micro-batch (every 15 minutes)
+        value: micro_batch
+        aliases: ["micro batch", "15 min", "frequent"]
+
+resolver_defaults:
+  product_type: customer_360
+  real_time_personalization: "yes"
+  scale: medium (1m-100m)
+  orchestration_pattern: daily_batch
+
+suggestion_defaults:
+  recommended_template: analytics-template
+  recommended_provider: gcp
+  canonical_model: nrf_arts
+  supporting_standards:
+    - gs1_gdm
+  recommended_patterns:
+    - retail_canonical_modeling
+  architecture_suggestions:
+    - Use NRF ARTS entities for transactions, baskets, customers, products, stores, and inventory positions
+    - Align retail product and location master data to GS1 identifiers where possible
+    - Keep event-driven transaction and inventory flows separate from analytical marts
+    - Version canonical retail-to-source mappings with the project
+  best_practices:
+    - Prefer canonical retail business entities over source-specific table names
+    - Track customer privacy, consent, and identity-resolution rules explicitly
+    - Publish shared retail metrics definitions for orders, baskets, inventory, and promotions
+    - Implement data quality monitoring for product, location, and customer identifiers
+    - Separate digital experience events from operational transaction facts unless a curated model unifies them
+  technology_stack: []
+  performance_optimization: []
+
+rules:
+  - when:
+      all:
+        - field: modeling_context
+          equals: core_omnichannel
+    actions:
+      - op: set
+        path: canonical_model
+        value: nrf_arts
+      - op: set
+        path: supporting_standards
+        value:
+          - gs1_gdm
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - arts_operational_model
+          - gs1_master_data_alignment
+      - op: append_unique
+        path: architecture_suggestions
+        value:
+          - Model retail transactions, order lines, promotions, stores, and inventory using ARTS-aligned vocabulary
+          - Use GS1 product and location identifiers to stabilize cross-channel master data joins
+  - when:
+      all:
+        - field: modeling_context
+          equals: digital_experience
+    actions:
+      - op: set
+        path: canonical_model
+        value: adobe_xdm
+      - op: set
+        path: supporting_standards
+        value: []
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - adobe_xdm_experience_events
+          - profile_identity_resolution
+      - op: append_unique
+        path: architecture_suggestions
+        value:
+          - Model customer profiles and behavioral events with Adobe XDM classes and field groups
+          - Separate profile, identity, and experience-event streams before curating downstream metrics
+      - op: append_unique
+        path: best_practices
+        value:
+          - Keep XDM identity namespaces and profile merge rules explicit in the project
+          - Use experience-event semantics for journeys, campaigns, and digital touchpoints
+  - when:
+      all:
+        - field: modeling_context
+          equals: supply_chain_traceability
+    actions:
+      - op: set
+        path: canonical_model
+        value: gs1_gdm
+      - op: set
+        path: supporting_standards
+        value:
+          - gs1_epcis_cbv
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - gs1_global_data_model
+          - epcis_event_modeling
+      - op: append_unique
+        path: architecture_suggestions
+        value:
+          - Use GS1 master data for trade items, locations, parties, lots, and serials
+          - Model chain-of-custody and movement events with EPCIS business steps and dispositions
+      - op: append_unique
+        path: best_practices
+        value:
+          - Keep traceability events append-only and separate from snapshot inventory positions
+          - Preserve GS1 identifiers and event timestamps without source-specific renaming
+  - when:
+      all:
+        - field: product_type
+          equals: recommendation_engine
+    actions:
+      - op: set
+        path: recommended_template
+        value: ml-pipeline-template
+      - op: append_unique
+        path: recommended_patterns
+        value: ["collaborative_filtering", "content_based"]
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "TensorFlow", "Redis"]
+  - when:
+      all:
+        - field: product_type
+          equals: inventory_optimization
+    actions:
+      - op: set
+        path: recommended_template
+        value: optimization-template
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - demand_forecasting
+          - inventory_position_planning
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "OR-Tools", "Prophet"]
+  - when:
+      all:
+        - field: product_type
+          equals: customer_360
+    actions:
+      - op: set
+        path: recommended_template
+        value: customer360-template
+      - op: append_unique
+        path: recommended_patterns
+        value: customer_segmentation
+  - when:
+      all:
+        - field: real_time_personalization
+          equals: "yes"
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: streaming_pipeline
+      - op: append_unique
+        path: technology_stack
+        value: ["Redis", "Kafka"]
+      - op: append_unique
+        path: architecture_suggestions
+        value:
+          - Implement feature or profile serving only on top of canonical retail entities and identities
+          - Use caching layers for frequently accessed profile, offer, and inventory context
+          - Set up A/B testing or journey experimentation against curated business entities
+  - when:
+      all:
+        - field: scale
+          equals: large (>100m)
+    actions:
+      - op: set
+        path: recommended_provider
+        value: gcp
+      - op: append_unique
+        path: performance_optimization
+        value:
+          - Use partitioning for large tables
+          - Implement incremental processing
+          - Consider distributed processing (Spark)
+          - Set up data lake architecture
+          - Use columnar storage (Parquet)
+  - when:
+      all:
+        - field: scale
+          equals: small (<1m records)
+    actions:
+      - op: set
+        path: recommended_provider
+        value: local
+      - op: append_unique
+        path: performance_optimization
+        value: PostgreSQL sufficient for this scale
+
+next_step_tips:
+  - Validate your canonical retail mappings before exposing metrics or APIs
+  - Confirm which identifiers are authoritative for product, customer, location, and order data
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: modeling_context
+          equals: digital_experience
+    tips:
+      - Confirm Adobe XDM classes, identity namespaces, and experience event boundaries early
+  - when:
+      all:
+        - field: modeling_context
+          equals: supply_chain_traceability
+    tips:
+      - Confirm GS1 master-data ownership and EPCIS event boundaries with supply chain teams

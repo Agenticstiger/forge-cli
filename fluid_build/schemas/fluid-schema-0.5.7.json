@@ -1,0 +1,2195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-data-protocol.github.io/fluid/schema/fluid-schema-0.5.7.json",
+  "title": "FLUID 0.5.7 — Data Product Contract",
+  "description": "FLUID Data Product contract (v0.5.7). Enhanced build section with:\n• Multiple build objects for multi-modal concerns (batch + streaming, SQL + ML, etc.)\n• Improved build patterns from v0.4.0: declarative, hybrid-reference, embedded-logic, logical-mapping\n• NEW multi-stage pattern for complex orchestration\n• Pattern-specific properties with conditional validation\n• Build execution configuration with triggers and runtime\n• Build dependencies and orchestration for complex pipelines\n• Simplified tagging from v0.5.4 maintained throughout\n\nDesigned for complex data products with multiple transformation paradigms.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "fluidVersion",
+    "kind",
+    "id",
+    "name",
+    "metadata",
+    "exposes"
+  ],
+  "examples": [
+    {
+      "fluidVersion": "0.5.7",
+      "kind": "DataProduct",
+      "id": "gold.customer.analytics_360_v1",
+      "name": "Customer 360 Analytics",
+      "description": "Unified customer profiles with ML-driven insights",
+      "domain": "Customer Experience",
+      "tags": [
+        "customer-data",
+        "analytics",
+        "gold-layer"
+      ],
+      "labels": {
+        "team": "customer-analytics",
+        "criticality": "high",
+        "cost-center": "engineering"
+      },
+      "metadata": {
+        "layer": "Gold",
+        "owner": {
+          "team": "customer-analytics",
+          "email": "customer-analytics@company.com"
+        },
+        "businessContext": {
+          "domain": "Customer Experience",
+          "subdomain": "Customer Intelligence"
+        }
+      },
+      "exposes": [
+        {
+          "exposeId": "customer_profiles",
+          "title": "Unified Customer Profiles",
+          "version": "2.1.0",
+          "kind": "table",
+          "tags": [
+            "pii",
+            "customer-facing",
+            "real-time"
+          ],
+          "labels": {
+            "sensitivity": "high",
+            "retention": "7-years",
+            "region": "us-central1"
+          },
+          "contract": {
+            "schema": [
+              {
+                "name": "customer_id",
+                "type": "STRING",
+                "required": true,
+                "description": "Unique customer identifier",
+                "sensitivity": "cleartext",
+                "tags": [
+                  "identifier",
+                  "primary-key"
+                ],
+                "labels": {
+                  "business-name": "Customer ID",
+                  "data-category": "identifier"
+                }
+              }
+            ]
+          },
+          "binding": {
+            "platform": "gcp",
+            "format": "bigquery_table",
+            "location": {
+              "project": "company-data",
+              "dataset": "gold_customer",
+              "table": "profiles_v1"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "properties": {
+    "fluidVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+(\\.\\d+)?$",
+      "const": "0.5.7",
+      "description": "Contract schema version. Must be exactly '0.5.7' for this schema.",
+      "examples": [
+        "0.5.7"
+      ]
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "DataProduct",
+        "MLPipeline"
+      ],
+      "description": "Kind of contract. 'MLPipeline' added for basic ML support."
+    },
+    "id": {
+      "$ref": "#/$defs/identifier",
+      "description": "Stable product identifier, e.g. 'gold.hr.employee_360_v1'."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "domain": {
+      "type": "string",
+      "description": "Business domain/mesh domain (e.g., 'HR', 'Finance')."
+    },
+    "tags": {
+      "$ref": "#/$defs/tags",
+      "description": "Product-level tags for categorization and discovery."
+    },
+    "labels": {
+      "$ref": "#/$defs/labels",
+      "description": "Product-level labels for metadata and automation."
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owner"
+      ],
+      "properties": {
+        "layer": {
+          "type": "string",
+          "description": "Data layer label (e.g., Bronze/Silver/Gold). Free-form."
+        },
+        "owner": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "team": {
+              "type": "string"
+            },
+            "email": {
+              "type": "string",
+              "format": "email"
+            },
+            "slack": {
+              "type": "string"
+            },
+            "oncall": {
+              "type": "string",
+              "description": "Oncall rotation or contact for operational issues."
+            }
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "businessContext": {
+          "type": "object",
+          "description": "Business alignment information for data mesh organization.",
+          "additionalProperties": false,
+          "properties": {
+            "domain": {
+              "type": "string",
+              "description": "Business domain this product belongs to."
+            },
+            "subdomain": {
+              "type": "string",
+              "description": "Business subdomain for more granular organization."
+            },
+            "businessCapability": {
+              "type": "string",
+              "description": "Business capability this product supports."
+            },
+            "valueStream": {
+              "type": "string",
+              "description": "Value stream this product participates in."
+            }
+          }
+        }
+      }
+    },
+    "exposes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/expose"
+      }
+    },
+    "consumes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/consumeRef"
+      }
+    },
+    "builds": {
+      "type": "array",
+      "description": "NEW in v0.5.5: Multiple build configurations for multi-modal data products (e.g., batch + streaming, SQL + ML).",
+      "items": {
+        "$ref": "#/$defs/build"
+      }
+    },
+    "build": {
+      "$ref": "#/$defs/build",
+      "description": "Single build configuration (legacy). Use 'builds' array for multi-modal."
+    },
+    "lineage": {
+      "$ref": "#/$defs/lineage",
+      "description": "Optional lineage tracking for better data governance."
+    },
+    "schemaEvolution": {
+      "$ref": "#/$defs/schemaEvolution",
+      "description": "Optional schema evolution strategy for managing changes."
+    },
+    "machineLearning": {
+      "$ref": "#/$defs/machineLearning",
+      "description": "Optional ML model specifications for MLPipeline kind."
+    },
+    "environments": {
+      "type": "object",
+      "description": "Optional environment-specific overrides (dev, staging, prod).",
+      "additionalProperties": {
+        "$ref": "#/$defs/environmentConfig"
+      }
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/lifecycle"
+    },
+    "docs": {
+      "$ref": "#/$defs/docs"
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9_][a-z0-9_.-]*[a-z0-9_]$|^[a-z0-9_]$",
+      "description": "Unified identifier pattern: starts/ends with alphanumeric or underscore, allows dots and hyphens in middle."
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$",
+      "description": "Semantic version (semver.org)."
+    },
+    "semverRange": {
+      "type": "string",
+      "description": "Semver range (e.g., ^1.2, ~1.4, >=1.0.0). Not strictly validated by regex; tooling enforces."
+    },
+    "isoDuration": {
+      "type": "string",
+      "pattern": "^P(?!$)(\\d+Y)?(\\d+M)?(\\d+W)?(\\d+D)?(T(\\d+H)?(\\d+M)?(\\d+S)?)?$",
+      "description": "ISO-8601 duration (e.g., P1D, PT15M, P2Y6M)."
+    },
+    "availabilityPct": {
+      "type": "string",
+      "pattern": "^(100(\\.0+)?|\\d{2}(\\.\\d+)?|\\d{1}\\d(\\.\\d+)?)%$",
+      "description": "Availability percentage (e.g., 99.9%)."
+    },
+    "lifecycleState": {
+      "type": "string",
+      "enum": [
+        "preview",
+        "active",
+        "deprecated",
+        "retired"
+      ],
+      "description": "Unified lifecycle state vocabulary."
+    },
+    "sensitivityLevel": {
+      "type": "string",
+      "enum": [
+        "none",
+        "internal",
+        "confidential",
+        "restricted",
+        "pii",
+        "phi",
+        "cleartext",
+        "treated",
+        "anonymized",
+        "tokenized",
+        "encrypted"
+      ],
+      "description": "Unified data sensitivity classification."
+    },
+    "tags": {
+      "type": "array",
+      "description": "Simple string tags for categorization, discovery, and automation. Consistent pattern used throughout FLUID objects.",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$",
+        "description": "Tag format: lowercase alphanumeric with hyphens, e.g., 'customer-data', 'pii', 'real-time'"
+      },
+      "uniqueItems": true
+    },
+    "labels": {
+      "type": "object",
+      "description": "Key-value labels for structured metadata and automation. Consistent pattern used throughout FLUID objects.",
+      "additionalProperties": {
+        "type": "string",
+        "description": "Label values are always strings for consistency and tooling compatibility."
+      },
+      "examples": [
+        {
+          "team": "customer-analytics",
+          "criticality": "high",
+          "cost-center": "engineering",
+          "retention": "7-years",
+          "region": "us-central1",
+          "business-name": "Customer Profiles",
+          "data-category": "analytical"
+        }
+      ]
+    },
+    "expose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exposeId",
+        "kind",
+        "binding",
+        "contract"
+      ],
+      "examples": [
+        {
+          "exposeId": "customer_profiles",
+          "title": "Customer Profiles Table",
+          "kind": "table",
+          "tags": [
+            "pii",
+            "customer-facing",
+            "analytical"
+          ],
+          "labels": {
+            "sensitivity": "high",
+            "retention": "7-years",
+            "team": "customer-analytics"
+          },
+          "contract": {
+            "schema": [
+              {
+                "name": "customer_id",
+                "type": "STRING",
+                "required": true,
+                "sensitivity": "cleartext",
+                "tags": [
+                  "identifier",
+                  "primary-key"
+                ],
+                "labels": {
+                  "business-name": "Customer ID",
+                  "data-category": "identifier"
+                }
+              }
+            ]
+          },
+          "binding": {
+            "platform": "gcp",
+            "format": "bigquery_table",
+            "location": {
+              "project": "company-data",
+              "dataset": "customer",
+              "table": "profiles"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "exposeId": {
+          "$ref": "#/$defs/identifier",
+          "description": "Stable interface handle (used by consumers & build.outputs)."
+        },
+        "title": {
+          "type": "string"
+        },
+        "version": {
+          "$ref": "#/$defs/semver"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "table",
+            "view",
+            "api",
+            "file",
+            "stream",
+            "topic",
+            "feature_store",
+            "model",
+            "vector",
+            "graph",
+            "time_series",
+            "other"
+          ]
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Expose-level tags for categorization and routing."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Expose-level labels for metadata and automation."
+        },
+        "contract": {
+          "$ref": "#/$defs/exposeContract"
+        },
+        "qos": {
+          "$ref": "#/$defs/exposeQoS"
+        },
+        "policy": {
+          "$ref": "#/$defs/exposePolicy"
+        },
+        "binding": {
+          "$ref": "#/$defs/binding"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/lifecycle"
+        },
+        "observability": {
+          "$ref": "#/$defs/observability"
+        },
+        "docs": {
+          "$ref": "#/$defs/docs"
+        }
+      }
+    },
+    "exposeContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaSignature": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-fA-F]{64}$",
+          "description": "Hash of canonical schema/OpenAPI. Used by contract-tests gates."
+        },
+        "schema": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/column"
+          },
+          "description": "Tabular schema (for table/view/file)."
+        },
+        "openapiRef": {
+          "type": "string",
+          "format": "uri",
+          "description": "OpenAPI document URL (for APIs)."
+        },
+        "guarantees": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "compatibility": {
+              "type": "string",
+              "enum": [
+                "none",
+                "patch",
+                "minor",
+                "backward",
+                "forward",
+                "strict"
+              ],
+              "description": "Compatibility promise for non-breaking evolution."
+            },
+            "evolution": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "additive_columns",
+                  "additive_fields",
+                  "additive_endpoints",
+                  "nullable_to_required_disallowed",
+                  "field_removal_with_notice",
+                  "type_widening_allowed"
+                ]
+              }
+            }
+          }
+        },
+        "dq": {
+          "$ref": "#/$defs/dqSpec",
+          "description": "Enhanced data quality rules including anomaly detection."
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Contract-level tags for data quality and governance."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Contract-level labels for automation and metadata."
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "schema"
+          ]
+        },
+        {
+          "required": [
+            "openapiRef"
+          ]
+        }
+      ]
+    },
+    "column": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string"
+        },
+        "sensitivity": {
+          "$ref": "#/$defs/sensitivityLevel",
+          "description": "Field-level sensitivity classification for improved policy ergonomics."
+        },
+        "semanticType": {
+          "type": "string",
+          "description": "Semantic meaning (e.g., 'email', 'phone', 'identifier')."
+        },
+        "businessName": {
+          "type": "string",
+          "description": "Business-friendly name for this field."
+        },
+        "businessDefinition": {
+          "type": "string",
+          "description": "Business definition and meaning of this field."
+        },
+        "validationRules": {
+          "type": "array",
+          "description": "Field-level validation constraints.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "range",
+                  "regex",
+                  "enum",
+                  "custom"
+                ]
+              },
+              "constraint": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Field-level tags for categorization and data governance."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Field-level labels for metadata and automation."
+        }
+      }
+    },
+    "dqSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dqRule"
+          }
+        },
+        "monitoring": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "window": {
+              "$ref": "#/$defs/isoDuration"
+            },
+            "owner": {
+              "type": "string"
+            }
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Data quality specification tags."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Data quality specification labels."
+        }
+      }
+    },
+    "dqRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "type",
+        "severity"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "freshness",
+            "completeness",
+            "uniqueness",
+            "valid_values",
+            "accuracy",
+            "schema",
+            "anomaly_detection",
+            "drift_detection"
+          ]
+        },
+        "selector": {
+          "type": "string"
+        },
+        "threshold": {
+          "type": "number"
+        },
+        "operator": {
+          "type": "string",
+          "enum": [
+            ">=",
+            ">",
+            "<=",
+            "<",
+            "==",
+            "!="
+          ]
+        },
+        "window": {
+          "$ref": "#/$defs/isoDuration"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warn",
+            "error",
+            "critical"
+          ]
+        },
+        "description": {
+          "type": "string"
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "DQ rule tags for categorization and automation."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "DQ rule labels for metadata and routing."
+        }
+      }
+    },
+    "exposeQoS": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "availability": {
+          "$ref": "#/$defs/availabilityPct"
+        },
+        "freshnessSLO": {
+          "$ref": "#/$defs/isoDuration"
+        },
+        "dataLossSLO": {
+          "type": "string",
+          "description": "e.g., '0 rows'"
+        },
+        "latencyP95": {
+          "$ref": "#/$defs/isoDuration"
+        },
+        "completenessTarget": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Target completeness ratio (0.0 to 1.0)."
+        },
+        "errorBudget": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Acceptable error rate (0.0 to 1.0)."
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "QoS-level tags for SLA management."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "QoS-level labels for automation and reporting."
+        }
+      }
+    },
+    "exposePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "authn": {
+          "type": "string",
+          "enum": [
+            "oidc",
+            "oauth2",
+            "api_key",
+            "none",
+            "custom",
+            "iam",
+            "jwt"
+          ]
+        },
+        "authz": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "readers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "writers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "columnRestrictions": {
+              "type": "array",
+              "description": "Column-level access control.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "principal": {
+                    "type": "string"
+                  },
+                  "columns": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "access": {
+                    "type": "string",
+                    "enum": [
+                      "allow",
+                      "deny"
+                    ]
+                  },
+                  "tags": {
+                    "$ref": "#/$defs/tags",
+                    "description": "Access control rule tags."
+                  },
+                  "labels": {
+                    "$ref": "#/$defs/labels",
+                    "description": "Access control rule labels."
+                  }
+                }
+              }
+            },
+            "tags": {
+              "$ref": "#/$defs/tags",
+              "description": "Authorization policy tags."
+            },
+            "labels": {
+              "$ref": "#/$defs/labels",
+              "description": "Authorization policy labels."
+            }
+          }
+        },
+        "privacy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "masking": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "column",
+                  "strategy"
+                ],
+                "properties": {
+                  "column": {
+                    "type": "string"
+                  },
+                  "strategy": {
+                    "type": "string",
+                    "enum": [
+                      "mask",
+                      "hash",
+                      "tokenize",
+                      "encrypt",
+                      "k_anonymity"
+                    ]
+                  },
+                  "params": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "tags": {
+                    "$ref": "#/$defs/tags",
+                    "description": "Privacy masking rule tags."
+                  },
+                  "labels": {
+                    "$ref": "#/$defs/labels",
+                    "description": "Privacy masking rule labels."
+                  }
+                }
+              }
+            },
+            "rowLevelPolicy": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "expression"
+              ],
+              "properties": {
+                "expression": {
+                  "type": "string",
+                  "description": "Provider-specific predicate"
+                },
+                "tags": {
+                  "$ref": "#/$defs/tags",
+                  "description": "Row-level policy tags."
+                },
+                "labels": {
+                  "$ref": "#/$defs/labels",
+                  "description": "Row-level policy labels."
+                }
+              }
+            },
+            "tags": {
+              "$ref": "#/$defs/tags",
+              "description": "Privacy policy tags."
+            },
+            "labels": {
+              "$ref": "#/$defs/labels",
+              "description": "Privacy policy labels."
+            }
+          }
+        },
+        "classification": {
+          "type": "string",
+          "enum": [
+            "Public",
+            "Internal",
+            "Confidential",
+            "Restricted"
+          ]
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Policy-level tags for governance."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Policy-level labels for automation."
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform",
+        "format",
+        "location"
+      ],
+      "properties": {
+        "platform": {
+          "type": "string",
+          "enum": [
+            "gcp",
+            "aws",
+            "azure",
+            "snowflake",
+            "databricks",
+            "kafka",
+            "local",
+            "kubernetes",
+            "other"
+          ]
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "bigquery_table",
+            "snowflake_table",
+            "gcs_file",
+            "s3_file",
+            "http_api",
+            "grpc_api",
+            "pubsub_topic",
+            "kafka_topic",
+            "delta_table",
+            "parquet",
+            "csv",
+            "json",
+            "other"
+          ]
+        },
+        "location": {
+          "$ref": "#/$defs/bindingLocation"
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Binding configuration tags for infrastructure."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Binding configuration labels for automation."
+        }
+      }
+    },
+    "bindingLocation": {
+      "type": "object",
+      "description": "Provider-native addressing with tightened structure for better interop.",
+      "additionalProperties": false,
+      "properties": {
+        "account": {
+          "type": "string",
+          "description": "Cloud account ID"
+        },
+        "project": {
+          "type": "string",
+          "description": "GCP project ID"
+        },
+        "dataset": {
+          "type": "string",
+          "description": "BigQuery dataset or database name"
+        },
+        "database": {
+          "type": "string",
+          "description": "Database name"
+        },
+        "schema": {
+          "type": "string",
+          "description": "Schema name"
+        },
+        "table": {
+          "type": "string",
+          "description": "Table name"
+        },
+        "bucket": {
+          "type": "string",
+          "description": "Storage bucket name"
+        },
+        "path": {
+          "type": "string",
+          "description": "File or object path"
+        },
+        "gateway": {
+          "type": "string",
+          "description": "API gateway endpoint"
+        },
+        "baseUrl": {
+          "type": "string",
+          "format": "uri",
+          "description": "Base URL for API endpoints"
+        },
+        "topic": {
+          "type": "string",
+          "description": "Pub/Sub or Kafka topic name"
+        },
+        "subscription": {
+          "type": "string",
+          "description": "Pub/Sub subscription name"
+        },
+        "region": {
+          "type": "string",
+          "description": "Cloud region"
+        },
+        "zone": {
+          "type": "string",
+          "description": "Cloud zone"
+        }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "source"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "sli": {
+                "type": "string",
+                "description": "Human/machine-readable SLI check description"
+              }
+            }
+          }
+        },
+        "onBreach": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "slack",
+                  "email",
+                  "webhook",
+                  "pagerduty",
+                  "custom"
+                ]
+              },
+              "channel": {
+                "type": "string"
+              },
+              "target": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string",
+                "format": "uri"
+              },
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "info",
+                  "warning",
+                  "critical"
+                ]
+              },
+              "tags": {
+                "$ref": "#/$defs/tags",
+                "description": "Alert configuration tags."
+              },
+              "labels": {
+                "$ref": "#/$defs/labels",
+                "description": "Alert configuration labels."
+              }
+            }
+          }
+        },
+        "defaultSLIs": {
+          "$ref": "#/$defs/defaultSLIs",
+          "description": "Default SLI trio (freshness, completeness, latency) by kind."
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Observability configuration tags."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Observability configuration labels."
+        }
+      }
+    },
+    "defaultSLIs": {
+      "type": "object",
+      "description": "Default SLI trio that CLI can auto-generate based on expose kind.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable auto-generation of default SLIs."
+        },
+        "freshness": {
+          "type": "object",
+          "description": "Default freshness SLI configuration.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "threshold": {
+              "$ref": "#/$defs/isoDuration",
+              "description": "Freshness threshold (auto-set by kind: table=PT6H, stream=PT1M, api=PT1S)"
+            },
+            "severity": {
+              "type": "string",
+              "enum": [
+                "info",
+                "warning",
+                "critical"
+              ],
+              "default": "warning"
+            },
+            "tags": {
+              "$ref": "#/$defs/tags",
+              "description": "Freshness SLI tags."
+            },
+            "labels": {
+              "$ref": "#/$defs/labels",
+              "description": "Freshness SLI labels."
+            }
+          }
+        },
+        "completeness": {
+          "type": "object",
+          "description": "Default completeness SLI configuration.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "threshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.95,
+              "description": "Completeness threshold (auto-set by kind: table=0.95, stream=0.99)"
+            },
+            "severity": {
+              "type": "string",
+              "enum": [
+                "info",
+                "warning",
+                "critical"
+              ],
+              "default": "warning"
+            },
+            "tags": {
+              "$ref": "#/$defs/tags",
+              "description": "Completeness SLI tags."
+            },
+            "labels": {
+              "$ref": "#/$defs/labels",
+              "description": "Completeness SLI labels."
+            }
+          }
+        },
+        "latency": {
+          "type": "object",
+          "description": "Default latency SLI configuration.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "threshold": {
+              "$ref": "#/$defs/isoDuration",
+              "description": "P95 latency threshold (auto-set by kind: api=PT200MS, table=PT5S, stream=PT100MS)"
+            },
+            "percentile": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100,
+              "default": 95,
+              "description": "Latency percentile to measure."
+            },
+            "severity": {
+              "type": "string",
+              "enum": [
+                "info",
+                "warning",
+                "critical"
+              ],
+              "default": "warning"
+            },
+            "tags": {
+              "$ref": "#/$defs/tags",
+              "description": "Latency SLI tags."
+            },
+            "labels": {
+              "$ref": "#/$defs/labels",
+              "description": "Latency SLI labels."
+            }
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Default SLI configuration tags."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Default SLI configuration labels."
+        }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/lifecycleState",
+          "description": "Unified lifecycle state vocabulary."
+        },
+        "retention": {
+          "$ref": "#/$defs/isoDuration"
+        },
+        "deprecationPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "noticePeriod": {
+              "$ref": "#/$defs/isoDuration"
+            },
+            "contact": {
+              "type": "string"
+            },
+            "replacement": {
+              "type": "string",
+              "description": "Reference to replacement data product or expose."
+            },
+            "tags": {
+              "$ref": "#/$defs/tags",
+              "description": "Deprecation policy tags."
+            },
+            "labels": {
+              "$ref": "#/$defs/labels",
+              "description": "Deprecation policy labels."
+            }
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Lifecycle tags for automation."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Lifecycle labels for governance."
+        }
+      }
+    },
+    "docs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "homepage": {
+          "type": "string",
+          "format": "uri"
+        },
+        "runbook": {
+          "type": "string",
+          "format": "uri"
+        },
+        "dictionary": {
+          "type": "string",
+          "format": "uri"
+        },
+        "changeLog": {
+          "type": "string",
+          "format": "uri"
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Documentation tags for organization."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Documentation labels for automation."
+        }
+      }
+    },
+    "consumeRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "productId",
+        "exposeId"
+      ],
+      "$comment": "productId identifies data product (renamed from 'provider' for clarity)",
+      "properties": {
+        "productId": {
+          "$ref": "#/$defs/identifier",
+          "description": "Upstream data product identifier (e.g., 'silver.hr.people_v2'). Renamed from 'provider' for clarity."
+        },
+        "exposeId": {
+          "$ref": "#/$defs/identifier",
+          "description": "The upstream exposeId being consumed."
+        },
+        "versionConstraint": {
+          "$ref": "#/$defs/semverRange"
+        },
+        "qosExpectations": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "freshnessMax": {
+              "$ref": "#/$defs/isoDuration"
+            },
+            "maxStaleness": {
+              "$ref": "#/$defs/isoDuration",
+              "description": "Maximum acceptable staleness for consumed data."
+            },
+            "minCompleteness": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Minimum completeness expectation."
+            },
+            "tags": {
+              "$ref": "#/$defs/tags",
+              "description": "QoS expectation tags."
+            },
+            "labels": {
+              "$ref": "#/$defs/labels",
+              "description": "QoS expectation labels."
+            }
+          }
+        },
+        "requiredPolicies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "purpose": {
+          "type": "string",
+          "description": "Business purpose for consuming this data."
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Consumption relationship tags."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Consumption relationship labels."
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "description": "Enhanced build configuration supporting v0.4.0 patterns with v0.5.5 improvements.",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier",
+          "description": "Build identifier for multi-build scenarios (e.g., 'batch-processing', 'ml-training')."
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of this build configuration."
+        },
+        "pattern": {
+          "type": "string",
+          "enum": [
+            "hybrid-reference",
+            "embedded-logic",
+            "multi-stage"
+          ],
+          "default": "hybrid-reference",
+          "description": "Build pattern: hybrid-reference (dbt-style), embedded-logic (raw SQL/code), or multi-stage (complex pipelines)."
+        },
+        "engine": {
+          "type": "string",
+          "enum": [
+            "dbt",
+            "sql",
+            "python",
+            "spark",
+            "custom"
+          ],
+          "default": "dbt"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "properties": {
+          "$ref": "#/$defs/buildProperties",
+          "description": "Pattern-specific build properties with conditional validation."
+        },
+        "execution": {
+          "$ref": "#/$defs/buildExecution",
+          "description": "Build execution configuration (triggers, runtime, retries)."
+        },
+        "outputs": {
+          "type": "array",
+          "description": "List of exposeIds produced by this build.",
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "description": "Dependencies on other builds (for multi-build orchestration).",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "buildId": {
+                "$ref": "#/$defs/identifier"
+              },
+              "condition": {
+                "type": "string",
+                "enum": [
+                  "success",
+                  "completion",
+                  "always"
+                ]
+              }
+            }
+          }
+        },
+        "transformations": {
+          "type": "array",
+          "description": "Legacy transformations array for backward compatibility.",
+          "items": {
+            "$ref": "#/$defs/transformation"
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags"
+        },
+        "labels": {
+          "$ref": "#/$defs/labels"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "pattern": {
+                "const": "hybrid-reference"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "properties": {
+                "$ref": "#/$defs/hybridReferencePattern"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "pattern": {
+                "const": "embedded-logic"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "properties": {
+                "$ref": "#/$defs/embeddedLogicPattern"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "pattern": {
+                "const": "multi-stage"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "properties": {
+                "$ref": "#/$defs/multiStagePattern"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "buildProperties": {
+      "type": "object",
+      "description": "Base properties for all build patterns."
+    },
+    "hybridReferencePattern": {
+      "type": "object",
+      "description": "Hybrid-reference pattern from v0.4.0 (dbt-style).",
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "vars": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "materializations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "enum": [
+              "table",
+              "view",
+              "incremental",
+              "ephemeral"
+            ]
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags"
+        },
+        "labels": {
+          "$ref": "#/$defs/labels"
+        }
+      },
+      "required": [
+        "model"
+      ]
+    },
+    "embeddedLogicPattern": {
+      "type": "object",
+      "description": "Embedded logic pattern from v0.4.0.",
+      "additionalProperties": false,
+      "properties": {
+        "sql": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string",
+          "enum": [
+            "sql",
+            "flink_sql",
+            "pyspark",
+            "scala",
+            "python",
+            "r"
+          ]
+        },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "tags": {
+          "$ref": "#/$defs/tags"
+        },
+        "labels": {
+          "$ref": "#/$defs/labels"
+        }
+      },
+      "required": [
+        "sql"
+      ]
+    },
+    "multiStagePattern": {
+      "type": "object",
+      "description": "NEW in v0.5.5: Multi-stage orchestration pattern.",
+      "additionalProperties": false,
+      "properties": {
+        "stages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "pattern": {
+                "type": "string",
+                "enum": [
+                  "hybrid-reference",
+                  "embedded-logic"
+                ],
+                "default": "hybrid-reference"
+              },
+              "properties": {
+                "$ref": "#/$defs/buildProperties"
+              },
+              "dependsOn": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "outputs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/identifier"
+                }
+              },
+              "tags": {
+                "$ref": "#/$defs/tags"
+              },
+              "labels": {
+                "$ref": "#/$defs/labels"
+              }
+            }
+          }
+        },
+        "orchestration": {
+          "type": "object",
+          "properties": {
+            "parallelism": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "retryPolicy": {
+              "$ref": "#/$defs/retryPolicy"
+            }
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags"
+        },
+        "labels": {
+          "$ref": "#/$defs/labels"
+        }
+      }
+    },
+    "buildExecution": {
+      "type": "object",
+      "description": "Build execution configuration from v0.4.0 enhanced.",
+      "additionalProperties": false,
+      "properties": {
+        "trigger": {
+          "$ref": "#/$defs/trigger"
+        },
+        "runtime": {
+          "$ref": "#/$defs/runtime"
+        },
+        "retries": {
+          "$ref": "#/$defs/retryPolicy"
+        },
+        "notifications": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/notification"
+          }
+        }
+      }
+    },
+    "trigger": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "schedule",
+            "event",
+            "manual",
+            "dependency"
+          ]
+        },
+        "schedule": {
+          "type": "string"
+        },
+        "event": {
+          "type": "string"
+        },
+        "condition": {
+          "type": "string"
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "resources": {
+          "type": "object",
+          "properties": {
+            "cpu": {
+              "type": "string"
+            },
+            "memory": {
+              "type": "string"
+            },
+            "disk": {
+              "type": "string"
+            }
+          }
+        },
+        "timeout": {
+          "type": "string"
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "retryPolicy": {
+      "type": "object",
+      "properties": {
+        "maxAttempts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "backoffStrategy": {
+          "type": "string",
+          "enum": [
+            "fixed",
+            "exponential",
+            "linear"
+          ]
+        },
+        "initialDelay": {
+          "type": "string"
+        },
+        "maxDelay": {
+          "type": "string"
+        }
+      }
+    },
+    "notification": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "email",
+            "slack",
+            "webhook",
+            "pagerduty"
+          ]
+        },
+        "target": {
+          "type": "string"
+        },
+        "condition": {
+          "type": "string",
+          "enum": [
+            "success",
+            "failure",
+            "always"
+          ]
+        }
+      }
+    },
+    "transformation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string",
+          "description": "Path/script identifier (dbt model, sql file, etc.)"
+        },
+        "outputs": {
+          "type": "array",
+          "description": "List of exposeIds materialized by this step. VALIDATION: Tools must validate that every output exists in exposes[].exposeId.",
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Transformation step tags."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Transformation step labels."
+        }
+      }
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "granularity": {
+          "type": "string",
+          "enum": [
+            "table_level",
+            "field_level"
+          ],
+          "default": "table_level",
+          "description": "Level of lineage tracking granularity."
+        },
+        "upstream": {
+          "type": "array",
+          "description": "Upstream dependencies and their field mappings.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "productId",
+              "exposeId"
+            ],
+            "properties": {
+              "productId": {
+                "$ref": "#/$defs/identifier",
+                "description": "Upstream data product ID."
+              },
+              "exposeId": {
+                "$ref": "#/$defs/identifier",
+                "description": "Upstream expose ID being consumed."
+              },
+              "fieldMappings": {
+                "type": "array",
+                "description": "Field-level lineage mappings (optional).",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "sourceField",
+                    "targetField"
+                  ],
+                  "properties": {
+                    "sourceField": {
+                      "type": "string"
+                    },
+                    "targetField": {
+                      "type": "string"
+                    },
+                    "transformation": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "direct_mapping",
+                            "aggregation",
+                            "calculation",
+                            "lookup"
+                          ]
+                        },
+                        "expression": {
+                          "type": "string",
+                          "description": "Transformation logic or SQL expression."
+                        },
+                        "tags": {
+                          "$ref": "#/$defs/tags",
+                          "description": "Transformation tags."
+                        },
+                        "labels": {
+                          "$ref": "#/$defs/labels",
+                          "description": "Transformation labels."
+                        }
+                      }
+                    },
+                    "tags": {
+                      "$ref": "#/$defs/tags",
+                      "description": "Field mapping tags."
+                    },
+                    "labels": {
+                      "$ref": "#/$defs/labels",
+                      "description": "Field mapping labels."
+                    }
+                  }
+                }
+              },
+              "relationship": {
+                "type": "string",
+                "enum": [
+                  "direct_consumption",
+                  "lookup_enrichment",
+                  "aggregation"
+                ],
+                "description": "Type of data relationship."
+              },
+              "tags": {
+                "$ref": "#/$defs/tags",
+                "description": "Upstream relationship tags."
+              },
+              "labels": {
+                "$ref": "#/$defs/labels",
+                "description": "Upstream relationship labels."
+              }
+            }
+          }
+        },
+        "downstream": {
+          "type": "array",
+          "description": "Known downstream consumers (optional).",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "consumer": {
+                "$ref": "#/$defs/identifier",
+                "description": "Downstream data product ID."
+              },
+              "impact": {
+                "type": "string",
+                "enum": [
+                  "critical",
+                  "high",
+                  "medium",
+                  "low"
+                ],
+                "description": "Impact level if this data product changes."
+              },
+              "tags": {
+                "$ref": "#/$defs/tags",
+                "description": "Downstream relationship tags."
+              },
+              "labels": {
+                "$ref": "#/$defs/labels",
+                "description": "Downstream relationship labels."
+              }
+            }
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Lineage configuration tags."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Lineage configuration labels."
+        }
+      }
+    },
+    "schemaEvolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": [
+            "semantic_versioning",
+            "date_based",
+            "sequential"
+          ],
+          "description": "Versioning strategy for schema changes."
+        },
+        "compatibility": {
+          "type": "string",
+          "enum": [
+            "backward_compatible",
+            "forward_compatible",
+            "full_compatible",
+            "breaking"
+          ],
+          "description": "Compatibility approach for schema evolution."
+        },
+        "changePolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "changeWindowDays": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Advance notice period for breaking changes."
+            },
+            "approvalRequired": {
+              "type": "boolean",
+              "description": "Whether schema changes require approval."
+            },
+            "approvers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "List of approvers for schema changes."
+            },
+            "tags": {
+              "$ref": "#/$defs/tags",
+              "description": "Change policy tags."
+            },
+            "labels": {
+              "$ref": "#/$defs/labels",
+              "description": "Change policy labels."
+            }
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Schema evolution tags."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Schema evolution labels."
+        }
+      }
+    },
+    "machineLearning": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "framework": {
+          "type": "string",
+          "enum": [
+            "mlflow",
+            "kubeflow",
+            "sagemaker",
+            "vertex_ai",
+            "custom"
+          ]
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "version",
+              "type"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "version": {
+                "$ref": "#/$defs/semver"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "classification",
+                  "regression",
+                  "clustering",
+                  "recommendation",
+                  "other"
+                ]
+              },
+              "algorithm": {
+                "type": "string"
+              },
+              "features": {
+                "type": "array",
+                "description": "List of feature names used by this model.",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "target": {
+                "type": "string",
+                "description": "Target variable for supervised learning."
+              },
+              "validation": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "metrics": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Validation metrics (e.g., accuracy, auc_roc)."
+                  },
+                  "thresholds": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "number"
+                    },
+                    "description": "Minimum acceptable metric values."
+                  },
+                  "tags": {
+                    "$ref": "#/$defs/tags",
+                    "description": "Model validation tags."
+                  },
+                  "labels": {
+                    "$ref": "#/$defs/labels",
+                    "description": "Model validation labels."
+                  }
+                }
+              },
+              "tags": {
+                "$ref": "#/$defs/tags",
+                "description": "ML model tags."
+              },
+              "labels": {
+                "$ref": "#/$defs/labels",
+                "description": "ML model labels."
+              }
+            }
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "ML configuration tags."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "ML configuration labels."
+        }
+      }
+    },
+    "environmentConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "metadata": {
+          "type": "object",
+          "description": "Environment-specific metadata overrides.",
+          "additionalProperties": false,
+          "properties": {
+            "owner": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "team": {
+                  "type": "string"
+                },
+                "email": {
+                  "type": "string"
+                },
+                "slack": {
+                  "type": "string"
+                }
+              }
+            },
+            "tags": {
+              "$ref": "#/$defs/tags",
+              "description": "Environment-specific metadata tags."
+            },
+            "labels": {
+              "$ref": "#/$defs/labels",
+              "description": "Environment-specific metadata labels."
+            }
+          }
+        },
+        "exposes": {
+          "type": "array",
+          "description": "Environment-specific expose overrides.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "exposeId": {
+                "$ref": "#/$defs/identifier"
+              },
+              "binding": {
+                "$ref": "#/$defs/binding"
+              },
+              "qos": {
+                "$ref": "#/$defs/exposeQoS"
+              },
+              "tags": {
+                "$ref": "#/$defs/tags",
+                "description": "Environment-specific expose tags."
+              },
+              "labels": {
+                "$ref": "#/$defs/labels",
+                "description": "Environment-specific expose labels."
+              }
+            }
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Environment configuration tags."
+        },
+        "labels": {
+          "$ref": "#/$defs/labels",
+          "description": "Environment configuration labels."
+        }
+      }
+    }
+  }
+}

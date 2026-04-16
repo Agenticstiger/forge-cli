@@ -1,0 +1,30 @@
+cli:
+  - changed-files:
+      - any-glob-to-any-file: 'fluid_build/cli/**'
+
+provider:
+  - changed-files:
+      - any-glob-to-any-file: 'fluid_build/providers/**'
+
+docs:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'docs/**'
+          - 'README.md'
+          - 'CONTRIBUTING.md'
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file: 'tests/**'
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file: '.github/**'
+
+security:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'fluid_build/credentials/**'
+          - 'fluid_build/auth.py'
+          - 'SECURITY.md'
+          - '.secrets.baseline'

@@ -1,0 +1,31 @@
+name: "Testing Your Contract"
+id: "testing-your-contract"
+version: "0.7.1"
+difficulty: "intermediate"
+time_to_complete: "8 minutes"
+learning_path_order: 9
+track: "foundation"
+concepts:
+  - "Unit testing contracts"
+  - "Test data fixtures"
+  - "Assertion patterns"
+  - "Test-driven development"
+prerequisites:
+  - "005-data-quality-validation"
+quickstart_tutorial: "009-testing-your-contract.md"
+features:
+  local_execution: true
+  dag_generation: false
+  cloud_deployment: false
+  requires_docker: false
+tags:
+  - intermediate
+  - testing
+  - quality
+  - tdd
+sample_data_included: true
+estimated_file_size: "22KB"
+description: |
+  Learn to write comprehensive tests for your FLUID contracts with unit tests,
+  integration tests, and test data fixtures. Build confidence in your pipelines
+  with test-driven development practices.

@@ -1,0 +1,71 @@
+fluidVersion: "0.5.7"
+kind: "DataProduct"
+id: "example.customer_clean_v1"
+name: "Clean Customer Data"
+domain: "customer"
+metadata:
+  layer: Bronze
+  owner:
+    team: "data-team"
+    email: "data@example.com"
+
+builds:
+  - id: "clean_customers"
+    pattern: "embedded-logic"
+    engine: "sql"
+    properties:
+      sql: |
+        SELECT
+          customer_id,
+          UPPER(name) as customer_name,
+          LOWER(email) as email,
+          signup_date,
+          status,
+          CURRENT_TIMESTAMP as processed_at
+        FROM customers_raw
+        WHERE status = 'active'
+        ORDER BY signup_date
+      parameters:
+        inputs:
+          - name: "customers_raw"
+            path: "examples/02-csv-to-data-product/customers.csv"
+            format: "csv"
+            schema:
+              - name: "customer_id"
+                type: "integer"
+                required: true
+              - name: "name"
+                type: "string"
+                required: true
+              - name: "email"
+                type: "string"
+                required: true
+              - name: "signup_date"
+                type: "date"
+                required: true
+              - name: "status"
+                type: "string"
+                required: true
+
+exposes:
+  - exposeId: "clean_customer_data"
+    kind: "table"
+    binding:
+      platform: "local"
+      format: "csv"
+      location:
+        path: "runtime/out/customer-clean-v1.csv"
+    contract:
+      schema:
+        - name: "customer_id"
+          type: "integer"
+        - name: "customer_name"
+          type: "string"
+        - name: "email"
+          type: "string"
+        - name: "signup_date"
+          type: "date"
+        - name: "status"
+          type: "string"
+        - name: "processed_at"
+          type: "timestamp"

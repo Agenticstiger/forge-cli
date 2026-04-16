@@ -1,0 +1,36 @@
+fluidVersion: "0.5.7"
+kind: "DataProduct"
+id: "example.hello_world_v1"
+name: "Hello World"
+description: "Your first FLUID data product"
+domain: "example"
+metadata:
+  layer: Bronze
+  owner:
+    team: "learning-team"
+    email: "team@example.com"
+
+builds:
+  - id: "hello_transformation"
+    pattern: "embedded-logic"
+    engine: "sql"
+    properties:
+      sql: |
+        SELECT
+          'Hello, FLUID!' as message,
+          CURRENT_TIMESTAMP as created_at
+
+exposes:
+  - exposeId: "hello_output"
+    kind: "table"
+    binding:
+      platform: "local"
+      format: "csv"
+      location:
+        path: "runtime/out/hello-world-v1.csv"
+    contract:
+      schema:
+        - name: "message"
+          type: "string"
+        - name: "created_at"
+          type: "timestamp"
