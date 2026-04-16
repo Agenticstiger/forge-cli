@@ -134,9 +134,7 @@ class ArtifactWriter:
         sha = _sha256_hex(data)
 
         if self.dry_run:
-            self._record(
-                p, action="would-create", size=len(data), sha256=sha
-            )
+            self._record(p, action="would-create", size=len(data), sha256=sha)
             return p
 
         existing_sha: Optional[str] = None
@@ -169,9 +167,7 @@ class ArtifactWriter:
 
         Thin wrapper around :meth:`write_bytes` that encodes first.
         """
-        return self.write_bytes(
-            path, text.encode(encoding), action_hint=action_hint
-        )
+        return self.write_bytes(path, text.encode(encoding), action_hint=action_hint)
 
     # ------------------------------------------------------------------
     # Bookkeeping

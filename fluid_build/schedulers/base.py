@@ -28,7 +28,6 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from fluid_build.engines.base import Severity, ValidationIssue
 
-
 # ---------------------------------------------------------------------------
 # Supporting types
 # ---------------------------------------------------------------------------

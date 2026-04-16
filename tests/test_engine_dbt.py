@@ -4,27 +4,34 @@
 
 """Tests for the dbt transformation engine."""
 
-import yaml
 import pytest
+import yaml
 
 from fluid_build.engines import get_engine
-from fluid_build.engines.base import TransformationIntent, Severity
-from fluid_build.engines.dbt.project_yml import generate_project_yml, _sanitize_project_name
-from fluid_build.engines.dbt.sources import generate_sources
+from fluid_build.engines.base import Severity, TransformationIntent
 from fluid_build.engines.dbt.models import generate_models
-from fluid_build.engines.dbt.schema_yml import generate_schema_yml
 from fluid_build.engines.dbt.profiles import generate_profiles
-
+from fluid_build.engines.dbt.project_yml import _sanitize_project_name, generate_project_yml
+from fluid_build.engines.dbt.schema_yml import generate_schema_yml
+from fluid_build.engines.dbt.sources import generate_sources
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def customer_360_contract():
     """Load the real customer-360 example contract."""
     from pathlib import Path
-    contract_path = Path(__file__).parent.parent / "fluid_build" / "templates" / "customer-360" / "contract.fluid.yaml"
+
+    contract_path = (
+        Path(__file__).parent.parent
+        / "fluid_build"
+        / "templates"
+        / "customer-360"
+        / "contract.fluid.yaml"
+    )
     if not contract_path.exists():
         pytest.skip("customer-360 example contract not found")
     with contract_path.open() as f:
@@ -45,7 +52,11 @@ def minimal_contract():
         "name": "Test Product",
         "consumes": [
             {"exposeId": "orders", "productId": "silver.sales.orders_v1", "purpose": "Order data"},
-            {"exposeId": "customers", "productId": "silver.crm.customers_v1", "purpose": "Customer data"},
+            {
+                "exposeId": "customers",
+                "productId": "silver.crm.customers_v1",
+                "purpose": "Customer data",
+            },
         ],
         "builds": [
             {
@@ -71,7 +82,14 @@ def minimal_contract():
                     ],
                     "dq": {
                         "rules": [
-                            {"id": "cid_complete", "type": "completeness", "selector": "customer_id", "threshold": 1.0, "operator": ">=", "severity": "error"},
+                            {
+                                "id": "cid_complete",
+                                "type": "completeness",
+                                "selector": "customer_id",
+                                "threshold": 1.0,
+                                "operator": ">=",
+                                "severity": "error",
+                            },
                             {"id": "cid_unique", "type": "uniqueness", "selector": "customer_id"},
                         ]
                     },
@@ -84,6 +102,7 @@ def minimal_contract():
 # ---------------------------------------------------------------------------
 # Project name sanitization
 # ---------------------------------------------------------------------------
+
 
 class TestSanitizeProjectName:
     def test_dotted_id(self):
@@ -105,6 +124,7 @@ class TestSanitizeProjectName:
 # ---------------------------------------------------------------------------
 # dbt_project.yml generation
 # ---------------------------------------------------------------------------
+
 
 class TestProjectYml:
     def test_basic(self, minimal_contract):
@@ -128,6 +148,7 @@ class TestProjectYml:
 # sources.yml generation
 # ---------------------------------------------------------------------------
 
+
 class TestSources:
     def test_basic(self, minimal_contract):
         content = generate_sources(minimal_contract)
@@ -146,7 +167,9 @@ class TestSources:
     def test_with_schema_context(self, minimal_contract):
         schema_context = {
             "schemas": {
-                "orders": {"columns": {"order_id": "integer", "customer_id": "string", "amount": "number"}},
+                "orders": {
+                    "columns": {"order_id": "integer", "customer_id": "string", "amount": "number"}
+                },
             }
         }
         content = generate_sources(minimal_contract, schema_context=schema_context)
@@ -160,6 +183,7 @@ class TestSources:
 # ---------------------------------------------------------------------------
 # Model generation
 # ---------------------------------------------------------------------------
+
 
 class TestModels:
     def test_skeleton_generation(self, minimal_contract):
@@ -188,7 +212,13 @@ class TestModels:
     def test_embedded_logic(self):
         contract = {
             "id": "test",
-            "builds": [{"id": "my_query", "pattern": "embedded-logic", "properties": {"sql": "SELECT 1 AS id"}}],
+            "builds": [
+                {
+                    "id": "my_query",
+                    "pattern": "embedded-logic",
+                    "properties": {"sql": "SELECT 1 AS id"},
+                }
+            ],
             "exposes": [],
         }
         build = contract["builds"][0]
@@ -199,16 +229,26 @@ class TestModels:
     def test_multi_stage(self):
         contract = {
             "id": "test",
-            "builds": [{
-                "id": "pipeline",
-                "pattern": "multi-stage",
-                "properties": {
-                    "stages": [
-                        {"name": "stg_raw", "properties": {"sql": "SELECT * FROM raw_data"}, "dependsOn": []},
-                        {"name": "mart_output", "properties": {"sql": "SELECT * FROM stg_raw"}, "dependsOn": ["stg_raw"]},
-                    ]
-                },
-            }],
+            "builds": [
+                {
+                    "id": "pipeline",
+                    "pattern": "multi-stage",
+                    "properties": {
+                        "stages": [
+                            {
+                                "name": "stg_raw",
+                                "properties": {"sql": "SELECT * FROM raw_data"},
+                                "dependsOn": [],
+                            },
+                            {
+                                "name": "mart_output",
+                                "properties": {"sql": "SELECT * FROM stg_raw"},
+                                "dependsOn": ["stg_raw"],
+                            },
+                        ]
+                    },
+                }
+            ],
             "exposes": [],
         }
         build = contract["builds"][0]
@@ -219,8 +259,16 @@ class TestModels:
     def test_with_transformation_intent(self, minimal_contract):
         intent = TransformationIntent(
             stages=[
-                {"name": "stg_orders", "sql": "SELECT order_id, amount FROM {{ source('raw', 'orders') }}", "layer": "staging"},
-                {"name": "customer_orders", "sql": "SELECT customer_id, count(*) as total FROM {{ ref('stg_orders') }} GROUP BY 1", "layer": "marts"},
+                {
+                    "name": "stg_orders",
+                    "sql": "SELECT order_id, amount FROM {{ source('raw', 'orders') }}",
+                    "layer": "staging",
+                },
+                {
+                    "name": "customer_orders",
+                    "sql": "SELECT customer_id, count(*) as total FROM {{ ref('stg_orders') }} GROUP BY 1",
+                    "layer": "marts",
+                },
             ]
         )
         build = minimal_contract["builds"][0]
@@ -233,6 +281,7 @@ class TestModels:
 # ---------------------------------------------------------------------------
 # schema.yml generation
 # ---------------------------------------------------------------------------
+
 
 class TestSchemaYml:
     def test_dq_rules(self, minimal_contract):
@@ -256,6 +305,7 @@ class TestSchemaYml:
 # ---------------------------------------------------------------------------
 # profiles.yml generation
 # ---------------------------------------------------------------------------
+
 
 class TestProfiles:
     def test_local_platform(self, minimal_contract):
@@ -287,6 +337,7 @@ class TestProfiles:
 # DbtEngine validation
 # ---------------------------------------------------------------------------
 
+
 class TestDbtEngineValidation:
     def test_valid_contract(self, minimal_contract):
         engine = get_engine("dbt")
@@ -302,7 +353,10 @@ class TestDbtEngineValidation:
         assert any(i.severity == Severity.ERROR for i in issues)
 
     def test_no_exposes_warning(self):
-        contract = {"exposes": [], "builds": [{"id": "x", "engine": "dbt", "pattern": "hybrid-reference"}]}
+        contract = {
+            "exposes": [],
+            "builds": [{"id": "x", "engine": "dbt", "pattern": "hybrid-reference"}],
+        }
         engine = get_engine("dbt")
         issues = engine.validate(contract, contract["builds"][0])
         assert any(i.severity == Severity.WARNING for i in issues)
@@ -311,6 +365,7 @@ class TestDbtEngineValidation:
 # ---------------------------------------------------------------------------
 # End-to-end: customer-360 contract
 # ---------------------------------------------------------------------------
+
 
 class TestCustomer360:
     def test_generates_expected_files(self, customer_360_contract):

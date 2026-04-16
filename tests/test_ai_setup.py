@@ -18,8 +18,10 @@ class TestSaveAndLoadConfig:
         from fluid_build.cli.ai_setup import _load_ai_config, _save_ai_config
 
         config_file = tmp_path / "ai_config.json"
-        with patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file), \
-             patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path):
+        with (
+            patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file),
+            patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path),
+        ):
             assert _save_ai_config("openai", "gpt-4o", api_key="sk-test123")
             loaded = _load_ai_config()
             assert loaded is not None
@@ -31,8 +33,10 @@ class TestSaveAndLoadConfig:
         from fluid_build.cli.ai_setup import _save_ai_config
 
         config_file = tmp_path / "ai_config.json"
-        with patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file), \
-             patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path):
+        with (
+            patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file),
+            patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path),
+        ):
             _save_ai_config("gemini", "gemini-2.5-flash", api_key="AIzaFake")
             mode = config_file.stat().st_mode
             assert mode & stat.S_IRUSR  # owner read
@@ -67,8 +71,10 @@ class TestSaveAndLoadConfig:
         from fluid_build.cli.ai_setup import _clear_ai_config, _save_ai_config
 
         config_file = tmp_path / "ai_config.json"
-        with patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file), \
-             patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path):
+        with (
+            patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file),
+            patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path),
+        ):
             _save_ai_config("openai", "gpt-4o")
             assert config_file.exists()
             _clear_ai_config()
@@ -78,10 +84,13 @@ class TestSaveAndLoadConfig:
         from fluid_build.cli.ai_setup import _load_ai_config, _save_ai_config
 
         config_file = tmp_path / "ai_config.json"
-        with patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file), \
-             patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path):
+        with (
+            patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file),
+            patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path),
+        ):
             _save_ai_config(
-                "ollama", "llama3.1",
+                "ollama",
+                "llama3.1",
                 endpoint="http://localhost:11434/v1/chat/completions",
                 ollama_host="http://localhost:11434",
             )
@@ -125,6 +134,7 @@ class TestSetSessionEnv:
         with patch.dict("os.environ", {}, clear=False):
             set_session_env("openai", "sk-test")
             import os
+
             assert os.environ.get("OPENAI_API_KEY") == "sk-test"
 
     def test_sets_anthropic_env(self):
@@ -133,6 +143,7 @@ class TestSetSessionEnv:
         with patch.dict("os.environ", {}, clear=False):
             set_session_env("anthropic", "sk-ant-test")
             import os
+
             assert os.environ.get("ANTHROPIC_API_KEY") == "sk-ant-test"
 
     def test_sets_gemini_env(self):
@@ -141,6 +152,7 @@ class TestSetSessionEnv:
         with patch.dict("os.environ", {}, clear=False):
             set_session_env("gemini", "AIzaTest")
             import os
+
             assert os.environ.get("GOOGLE_API_KEY") == "AIzaTest"
 
 
@@ -149,7 +161,9 @@ class TestCheckLlmReadiness:
         from fluid_build.cli.forge_copilot_llm_providers import check_llm_readiness
 
         with patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None):
-            result = check_llm_readiness({"OPENAI_API_KEY": "sk-test", "FLUID_LLM_PROVIDER": "openai"})
+            result = check_llm_readiness(
+                {"OPENAI_API_KEY": "sk-test", "FLUID_LLM_PROVIDER": "openai"}
+            )
         assert result.ready
         assert result.provider == "openai"
         assert result.auth_available
@@ -159,9 +173,14 @@ class TestCheckLlmReadiness:
 
         # Patch the inline import target so the real config file is not read
         # Also patch _infer_provider_from_env to avoid detecting local Ollama
-        with patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None), \
-             patch("fluid_build.cli.ai_setup._CONFIG_FILE", Path("/nonexistent/ai_config.json")), \
-             patch("fluid_build.cli.forge_copilot_llm_providers._infer_provider_from_env", return_value=None):
+        with (
+            patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None),
+            patch("fluid_build.cli.ai_setup._CONFIG_FILE", Path("/nonexistent/ai_config.json")),
+            patch(
+                "fluid_build.cli.forge_copilot_llm_providers._infer_provider_from_env",
+                return_value=None,
+            ),
+        ):
             result = check_llm_readiness({})
             assert not result.ready
             assert result.error is not None
@@ -197,7 +216,10 @@ class TestShowAiStatus:
         from fluid_build.cli.forge_copilot_llm_providers import LlmReadinessCheck
 
         mock_readiness.return_value = LlmReadinessCheck(
-            ready=True, provider="openai", model="gpt-4o", auth_available=True,
+            ready=True,
+            provider="openai",
+            model="gpt-4o",
+            auth_available=True,
         )
         console = MagicMock()
         show_ai_status(console)
@@ -244,9 +266,9 @@ class TestModelCatalogIntegrity:
             entry = catalog["providers"][name]
             flagship = entry["flagship"]
             model_ids = [m["id"] for m in entry.get("models", [])]
-            assert flagship in model_ids, (
-                f"{name} flagship '{flagship}' not in models list {model_ids}"
-            )
+            assert (
+                flagship in model_ids
+            ), f"{name} flagship '{flagship}' not in models list {model_ids}"
 
     def test_class_defaults_match_catalog_flagship(self):
         """After _sync_provider_defaults_from_catalog runs, every
@@ -274,9 +296,9 @@ class TestModelCatalogIntegrity:
                 caps = m.get("capabilities", {})
                 for key in ("structured_output", "tool_use", "streaming"):
                     if key in caps:
-                        assert isinstance(caps[key], bool), (
-                            f"{name}/{m['id']}.capabilities.{key} is not bool"
-                        )
+                        assert isinstance(
+                            caps[key], bool
+                        ), f"{name}/{m['id']}.capabilities.{key} is not bool"
 
     def test_model_supports_structured_output_reads_catalog(self):
         from fluid_build.cli.forge_copilot_llm_providers import (
@@ -299,19 +321,23 @@ class TestModelCatalogIntegrity:
         fluid_dir = tmp_path / ".fluid"
         fluid_dir.mkdir()
         user_catalog = fluid_dir / "llm_models.json"
-        user_catalog.write_text(json.dumps({
-            "schema_version": 2,
-            "default_provider": "openai",
-            "providers": {
-                "openai": {
-                    "flagship": "test-flagship-model",
-                    "balanced": "test-balanced-model",
-                    "routing": "test-balanced-model",
-                    "default": "test-flagship-model",
-                    "models": [],
+        user_catalog.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "default_provider": "openai",
+                    "providers": {
+                        "openai": {
+                            "flagship": "test-flagship-model",
+                            "balanced": "test-balanced-model",
+                            "routing": "test-balanced-model",
+                            "default": "test-flagship-model",
+                            "models": [],
+                        }
+                    },
                 }
-            },
-        }))
+            )
+        )
 
         # Reset the catalog cache and patch Path.home to return tmp_path
         original_cache = mod._model_catalog_cache
@@ -346,7 +372,9 @@ class TestQueryOllamaModels:
         with patch.dict("sys.modules", {"httpx": None}):
             # Force reimport to hit ImportError
             import importlib
+
             import fluid_build.cli.ai_setup as mod
+
             # The function catches ImportError internally
             result = _query_ollama_models("http://localhost:11434")
             assert isinstance(result, list)

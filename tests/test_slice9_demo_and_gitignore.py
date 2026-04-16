@@ -96,6 +96,7 @@ class TestEnsureGitignoreTemplate:
         # Read-only parent dir — write will fail
         # Use monkeypatch to force Path.write_text to raise
         import builtins
+
         original_write_text = Path.write_text
 
         def raising(self, *a, **kw):
@@ -115,9 +116,7 @@ class TestEnsureGitignoreTemplate:
 
 
 class TestInitCreatesGitignore:
-    def test_blank_init_drops_gitignore_template(
-        self, fluid_home, empty_workspace, monkeypatch
-    ):
+    def test_blank_init_drops_gitignore_template(self, fluid_home, empty_workspace, monkeypatch):
         logger = logging.getLogger("test.slice9")
         args = Namespace(
             name="ws",
@@ -179,9 +178,7 @@ class TestInitCreatesGitignore:
 
 
 class TestDemoReceipt:
-    def test_demo_writes_init_receipt_with_flow_demo(
-        self, fluid_home, tmp_path, monkeypatch
-    ):
+    def test_demo_writes_init_receipt_with_flow_demo(self, fluid_home, tmp_path, monkeypatch):
         """fluid demo must produce the same receipt shape as fluid init,
         tagged with flow="demo" so consumers can tell them apart."""
         from fluid_build.cli import demo as demo_module
@@ -200,9 +197,7 @@ class TestDemoReceipt:
         assert demo_root.exists()
 
         receipt_path = workspace_init_receipt_path(demo_root)
-        assert receipt_path.exists(), (
-            f"demo receipt not written at {receipt_path}"
-        )
+        assert receipt_path.exists(), f"demo receipt not written at {receipt_path}"
 
         doc = json.loads(receipt_path.read_text())
         assert doc["kind"] == "InitReceipt"
@@ -215,9 +210,7 @@ class TestDemoReceipt:
         # Command string carries the demo invocation
         assert "fluid demo" in doc["generated_by"]["command"]
 
-    def test_demo_dry_run_does_not_write_receipt(
-        self, fluid_home, tmp_path, monkeypatch
-    ):
+    def test_demo_dry_run_does_not_write_receipt(self, fluid_home, tmp_path, monkeypatch):
         """Dry run must not leave any files behind — including the receipt."""
         from fluid_build.cli import demo as demo_module
 

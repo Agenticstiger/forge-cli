@@ -118,9 +118,11 @@ class TestGoogleCloudAuthProvider:
     def test_check_auth_gcloud_not_installed(self):
         """When neither SDK nor CLI is available, check_auth returns NOT_AUTHENTICATED."""
         p = self._make()
-        with patch.object(p, "_run_command", side_effect=CLIError(1, "cmd_not_found")), \
-             patch.object(p, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(p, "_run_command", side_effect=CLIError(1, "cmd_not_found")),
+            patch.object(p, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run_async(p.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -130,9 +132,11 @@ class TestGoogleCloudAuthProvider:
         mock_cp.returncode = 0
         mock_cp.stdout = "user@example.com\n"
 
-        with patch.object(p, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/gcloud"), \
-             patch.object(p, "_run_command", return_value=mock_cp):
+        with (
+            patch.object(p, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/gcloud"),
+            patch.object(p, "_run_command", return_value=mock_cp),
+        ):
             result = _run_async(p.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -146,9 +150,11 @@ class TestGoogleCloudAuthProvider:
     def test_login_non_interactive_no_creds_returns_not_authenticated(self):
         """In non-interactive mode with no credentials, login returns NOT_AUTHENTICATED."""
         p = self._make()
-        with patch.object(p, "_is_interactive", return_value=False), \
-             patch.object(p, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(p, "_is_interactive", return_value=False),
+            patch.object(p, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run_async(p.login())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -173,8 +179,10 @@ class TestAWSAuthProvider:
     def test_check_auth_cli_not_installed(self):
         """When neither SDK nor CLI is available, check_auth returns NOT_AUTHENTICATED."""
         p = self._make()
-        with patch.object(p, "_has_boto3", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(p, "_has_boto3", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run_async(p.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -189,9 +197,11 @@ class TestAWSAuthProvider:
         }
         mock_identity = MagicMock(returncode=0, stdout=json.dumps(identity))
 
-        with patch.object(p, "_has_boto3", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/aws"), \
-             patch.object(p, "_run_command", return_value=mock_identity):
+        with (
+            patch.object(p, "_has_boto3", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/aws"),
+            patch.object(p, "_run_command", return_value=mock_identity),
+        ):
             result = _run_async(p.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
         assert result.user_info["account"] == "123456789"
@@ -205,9 +215,11 @@ class TestAWSAuthProvider:
     def test_login_exception_returns_not_authenticated(self):
         """In non-interactive mode with no credentials, login returns NOT_AUTHENTICATED."""
         p = self._make()
-        with patch.object(p, "_is_interactive", return_value=False), \
-             patch.object(p, "_has_boto3", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(p, "_is_interactive", return_value=False),
+            patch.object(p, "_has_boto3", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run_async(p.login())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -231,8 +243,10 @@ class TestAzureAuthProvider:
     def test_check_auth_cli_not_installed(self):
         """When neither SDK nor CLI is available, check_auth returns NOT_AUTHENTICATED."""
         p = self._make()
-        with patch.object(p, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(p, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run_async(p.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -248,9 +262,11 @@ class TestAzureAuthProvider:
         }
         mock_acct = MagicMock(returncode=0, stdout=json.dumps(account_data))
 
-        with patch.object(p, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/az"), \
-             patch.object(p, "_run_command", return_value=mock_acct):
+        with (
+            patch.object(p, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/az"),
+            patch.object(p, "_run_command", return_value=mock_acct),
+        ):
             result = _run_async(p.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
         assert result.user_info["user"] == "user@example.com"
@@ -263,8 +279,10 @@ class TestAzureAuthProvider:
             called.append(cmd)
             return MagicMock(returncode=0)
 
-        with patch("shutil.which", return_value="/usr/bin/az"), \
-             patch.object(p, "_run_command", side_effect=_side):
+        with (
+            patch("shutil.which", return_value="/usr/bin/az"),
+            patch.object(p, "_run_command", side_effect=_side),
+        ):
             result = _run_async(p.logout())
         assert result is True
         assert any("logout" in str(c) for c in called)
@@ -327,9 +345,11 @@ class TestDatabricksAuthProvider:
     def test_login_cli_not_installed_returns_not_authenticated(self):
         """In non-interactive mode with no credentials, login returns NOT_AUTHENTICATED."""
         p = self._make()
-        with patch.object(p, "_is_interactive", return_value=False), \
-             patch("shutil.which", return_value=None), \
-             patch("os.path.exists", return_value=False):
+        with (
+            patch.object(p, "_is_interactive", return_value=False),
+            patch("shutil.which", return_value=None),
+            patch("os.path.exists", return_value=False),
+        ):
             result = _run_async(p.login())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 

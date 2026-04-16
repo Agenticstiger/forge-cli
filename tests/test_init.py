@@ -83,9 +83,7 @@ class TestDemoMode:
         mock_copy.assert_called_once()
 
     @patch("fluid_build.cli.init.copy_template", return_value=False)
-    def test_copy_template_fails_returns_1(
-        self, _mock_copy, tmp_path, logger, monkeypatch
-    ):
+    def test_copy_template_fails_returns_1(self, _mock_copy, tmp_path, logger, monkeypatch):
         from fluid_build.cli.init import demo_mode
 
         monkeypatch.chdir(tmp_path)
@@ -270,6 +268,7 @@ class TestBlankMode:
         metadata.provenance and the new shape (top-level domain,
         metadata.layer: Bronze, SQL embedded-logic build)."""
         import yaml as _yaml
+
         from fluid_build.cli.init import blank_mode
 
         monkeypatch.chdir(tmp_path)
@@ -291,8 +290,8 @@ class TestBlankMode:
     def test_writes_forge_receipt_inside_product(self, tmp_path, logger, monkeypatch):
         """Slice UX-F: blank_mode also writes .fluid/forge-receipt.json
         inside the new product so fluid status finds it."""
-        from fluid_build.cli.init import blank_mode
         from fluid_build.cli.artifact_paths import product_forge_receipt_path
+        from fluid_build.cli.init import blank_mode
 
         monkeypatch.chdir(tmp_path)
         args = _make_args(name="blank-receipt-check", provider="local", dry_run=False)

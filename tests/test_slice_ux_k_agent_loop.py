@@ -25,7 +25,6 @@ from fluid_build.cli.forge_copilot_tools import (
     get_tool_definitions,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -194,9 +193,7 @@ class TestProviderToolUse:
         assert calls[0]["id"] == "call_1"
 
     def test_openai_extract_no_tool_calls(self):
-        response = {
-            "choices": [{"message": {"content": "final answer"}}]
-        }
+        response = {"choices": [{"message": {"content": "final answer"}}]}
         calls = OpenAIProvider().extract_tool_calls(response)
         assert calls == []
 
@@ -289,9 +286,7 @@ class TestAgentLoopRunner:
         from fluid_build.cli.forge_copilot_agent_loop import run_copilot_agent_loop
 
         final_json = json.dumps(_final_response())
-        fake_response = {
-            "choices": [{"message": {"content": final_json}}]
-        }
+        fake_response = {"choices": [{"message": {"content": final_json}}]}
 
         with patch(
             "fluid_build.cli.forge_copilot_agent_loop._call_llm_with_tools",
@@ -326,9 +321,7 @@ class TestAgentLoopRunner:
             ]
         }
         # Round 2: model returns final text
-        round2_response = {
-            "choices": [{"message": {"content": json.dumps(_final_response())}}]
-        }
+        round2_response = {"choices": [{"message": {"content": json.dumps(_final_response())}}]}
 
         call_count = {"n": 0}
 
@@ -407,7 +400,11 @@ class TestAgentLoopRunner:
 
         tool_calls = [
             {"id": "c1", "name": "list_templates", "arguments": {}},
-            {"id": "c2", "name": "validate_contract", "arguments": {"contract": _minimal_contract()}},
+            {
+                "id": "c2",
+                "name": "validate_contract",
+                "arguments": {"contract": _minimal_contract()},
+            },
         ]
         results = _dispatch_tools(tool_calls)
         assert len(results) == 2

@@ -23,6 +23,12 @@ Public API::
         files = scheduler.generate(contract, provider="gcp")
 """
 
+# Auto-discover and register all scheduler subpackages.
+# Each scheduler subpackage uses @register_scheduler on its class.
+# New schedulers are picked up automatically — no need to edit this file.
+import importlib
+import pkgutil
+
 from .base import (
     ScheduleEngine,
     ScheduleGenerationResult,
@@ -35,12 +41,6 @@ from .registry import (
     list_schedulers_for_platform,
     register_scheduler,
 )
-
-# Auto-discover and register all scheduler subpackages.
-# Each scheduler subpackage uses @register_scheduler on its class.
-# New schedulers are picked up automatically — no need to edit this file.
-import importlib
-import pkgutil
 
 for _finder, _name, _ispkg in pkgutil.iter_modules(__path__):
     if _ispkg:

@@ -22,7 +22,7 @@ import pytest
 
 from fluid_build.cli.generate_ci import run as generate_ci_run
 from fluid_build.cli.pipeline_generator import _comment_prefix_for
-from fluid_build.cli.scaffold_ci import GITHUB, GITLAB, JENKINS, _DEFAULT_PATHS, _TEMPLATES
+from fluid_build.cli.scaffold_ci import _DEFAULT_PATHS, _TEMPLATES, GITHUB, GITLAB, JENKINS
 from fluid_build.forge.core.pipeline_templates import (
     PipelineComplexity,
     PipelineConfig,
@@ -155,7 +155,9 @@ class TestGenerateCIStaticSystems:
         ("system", "default_path", "template", "_tokens"),
         _STATIC_SYSTEM_CASES,
     )
-    def test_generate_ci_writes_default_output(self, tmp_path, monkeypatch, system, default_path, template, _tokens):
+    def test_generate_ci_writes_default_output(
+        self, tmp_path, monkeypatch, system, default_path, template, _tokens
+    ):
         monkeypatch.chdir(tmp_path)
         rc = generate_ci_run(_make_args(system=system), _logger)
         assert rc == 0
@@ -167,7 +169,9 @@ class TestGenerateCIStaticSystems:
         ("system", "_default_path", "template", "tokens"),
         _STATIC_SYSTEM_CASES,
     )
-    def test_generate_ci_supports_custom_output(self, tmp_path, monkeypatch, system, _default_path, template, tokens):
+    def test_generate_ci_supports_custom_output(
+        self, tmp_path, monkeypatch, system, _default_path, template, tokens
+    ):
         monkeypatch.chdir(tmp_path)
         suffix = "Jenkinsfile" if system == "jenkins" else f"{system}.yml"
         custom = tmp_path / "generated" / suffix
@@ -416,12 +420,8 @@ class TestJenkinsSimulatedRun:
         assert "fluid" in cmds or "fluid_build" in cmds
         # Validate should come before plan/apply
         cmd_list = runner.executed_commands
-        validate_idx = next(
-            (i for i, c in enumerate(cmd_list) if "validate" in c.lower()), None
-        )
-        plan_idx = next(
-            (i for i, c in enumerate(cmd_list) if "plan" in c.lower()), None
-        )
+        validate_idx = next((i for i, c in enumerate(cmd_list) if "validate" in c.lower()), None)
+        plan_idx = next((i for i, c in enumerate(cmd_list) if "plan" in c.lower()), None)
         assert validate_idx is not None
         assert plan_idx is not None
         assert validate_idx < plan_idx
@@ -430,7 +430,10 @@ class TestJenkinsSimulatedRun:
         runner = _SimulatedJenkinsRunner(pipeline, branch="main")
         runner.run()
         # First executed command should be from Setup (pip install)
-        assert "pip install" in runner.executed_commands[0] or "requirements" in runner.executed_commands[0]
+        assert (
+            "pip install" in runner.executed_commands[0]
+            or "requirements" in runner.executed_commands[0]
+        )
 
     def test_deploy_stages_present(self, pipeline):
         runner = _SimulatedJenkinsRunner(pipeline, branch="main")
@@ -447,16 +450,15 @@ class TestJenkinsSimulatedRun:
     # -- stage failure halts pipeline --------------------------------------
 
     def test_failure_halts_pipeline(self, pipeline):
-        runner = _SimulatedJenkinsRunner(
-            pipeline, branch="main", fail_command="validate"
-        )
+        runner = _SimulatedJenkinsRunner(pipeline, branch="main", fail_command="validate")
         assert runner.run() is False
         assert runner.failed_stage is not None
         # Commands after the failing one should NOT have been executed
         cmds_after_failure = runner.executed_commands[
             runner.executed_commands.index(
                 next(c for c in runner.executed_commands if "validate" in c)
-            ) + 1 :
+            )
+            + 1 :
         ]
         # No apply or plan commands after validate failure
         assert not any("apply" in c for c in cmds_after_failure)
@@ -482,9 +484,7 @@ class TestJenkinsSimulatedRun:
     # -- approval gate -----------------------------------------------------
 
     def test_approval_denied_skips_stage(self, pipeline):
-        runner = _SimulatedJenkinsRunner(
-            pipeline, branch="main", approve_inputs=False
-        )
+        runner = _SimulatedJenkinsRunner(pipeline, branch="main", approve_inputs=False)
         runner.run()
         # Stages with input gates should be skipped
         for stage in pipeline.stages:
@@ -492,9 +492,7 @@ class TestJenkinsSimulatedRun:
                 assert stage.name in runner.skipped_stages
 
     def test_approval_granted_runs_stage(self, pipeline):
-        runner = _SimulatedJenkinsRunner(
-            pipeline, branch="main", approve_inputs=True
-        )
+        runner = _SimulatedJenkinsRunner(pipeline, branch="main", approve_inputs=True)
         runner.run()
         input_stages = [s for s in pipeline.stages if s.has_input]
         for stage in input_stages:
@@ -520,9 +518,7 @@ class TestJenkinsSimulatedRun:
         assert runner.cleanup_ran is True
 
     def test_cleanup_always_runs_on_failure(self, pipeline):
-        runner = _SimulatedJenkinsRunner(
-            pipeline, branch="main", fail_command="validate"
-        )
+        runner = _SimulatedJenkinsRunner(pipeline, branch="main", fail_command="validate")
         runner.run()
         assert runner.cleanup_ran is True
 
@@ -582,9 +578,7 @@ class TestStaticJenkinsSimulatedRun:
         assert "Apply" in runner.skipped_stages
 
     def test_apply_requires_approval(self, pipeline):
-        runner = _SimulatedJenkinsRunner(
-            pipeline, branch="main", approve_inputs=False
-        )
+        runner = _SimulatedJenkinsRunner(pipeline, branch="main", approve_inputs=False)
         runner.run()
         assert "Apply" in runner.skipped_stages
 
@@ -594,8 +588,6 @@ class TestStaticJenkinsSimulatedRun:
         assert runner.cleanup_ran is True
 
     def test_validate_failure_halts_pipeline(self, pipeline):
-        runner = _SimulatedJenkinsRunner(
-            pipeline, branch="main", fail_command="validate"
-        )
+        runner = _SimulatedJenkinsRunner(pipeline, branch="main", fail_command="validate")
         assert runner.run() is False
         assert not any("apply" in c for c in runner.executed_commands)

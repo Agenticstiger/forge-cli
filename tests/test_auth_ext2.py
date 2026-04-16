@@ -188,8 +188,10 @@ class TestGoogleCloudExt2:
     def test_check_auth_gcloud_not_installed(self):
         """When neither SDK nor CLI is available, check_auth returns NOT_AUTHENTICATED."""
         provider = GoogleCloudAuthProvider({}, LOG)
-        with patch.object(provider, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(provider, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -197,8 +199,10 @@ class TestGoogleCloudExt2:
     def test_check_auth_authenticated(self, mock_cmd):
         mock_cmd.return_value = MagicMock(returncode=0, stdout="test@example.com")
         provider = GoogleCloudAuthProvider({"project_id": "proj"}, LOG)
-        with patch.object(provider, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/gcloud"):
+        with (
+            patch.object(provider, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/gcloud"),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -206,9 +210,11 @@ class TestGoogleCloudExt2:
         """In non-interactive mode with no credentials, login returns NOT_AUTHENTICATED."""
         provider = GoogleCloudAuthProvider({}, LOG)
         provider.console = None
-        with patch.object(provider, "_is_interactive", return_value=False), \
-             patch.object(provider, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(provider, "_is_interactive", return_value=False),
+            patch.object(provider, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run(provider.login())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -244,8 +250,10 @@ class TestAWSExt2:
     def test_check_auth_not_installed(self):
         """When neither SDK nor CLI is available, check_auth returns NOT_AUTHENTICATED."""
         provider = AWSAuthProvider({}, LOG)
-        with patch.object(provider, "_has_boto3", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(provider, "_has_boto3", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -256,8 +264,10 @@ class TestAWSExt2:
         )
         mock_cmd.return_value = MagicMock(returncode=0, stdout=identity_json)
         provider = AWSAuthProvider({}, LOG)
-        with patch.object(provider, "_has_boto3", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/aws"):
+        with (
+            patch.object(provider, "_has_boto3", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/aws"),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
         assert result.user_info["account"] == "123456"
@@ -266,8 +276,10 @@ class TestAWSExt2:
     def test_check_auth_called_process_error(self, mock_cmd):
         mock_cmd.side_effect = subprocess.CalledProcessError(1, "aws")
         provider = AWSAuthProvider({}, LOG)
-        with patch.object(provider, "_has_boto3", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/aws"):
+        with (
+            patch.object(provider, "_has_boto3", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/aws"),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -275,9 +287,11 @@ class TestAWSExt2:
         """In non-interactive mode with no credentials, login returns NOT_AUTHENTICATED."""
         provider = AWSAuthProvider({}, LOG)
         provider.console = None
-        with patch.object(provider, "_is_interactive", return_value=False), \
-             patch.object(provider, "_has_boto3", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(provider, "_is_interactive", return_value=False),
+            patch.object(provider, "_has_boto3", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run(provider.login())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -302,15 +316,19 @@ class TestAzureExt2:
     def test_logout_failure(self):
         """Logout fails when shutil.which finds az but _run_command raises."""
         provider = AzureAuthProvider({}, LOG)
-        with patch("shutil.which", return_value="/usr/bin/az"), \
-             patch.object(provider, "_run_command", side_effect=Exception("fail")):
+        with (
+            patch("shutil.which", return_value="/usr/bin/az"),
+            patch.object(provider, "_run_command", side_effect=Exception("fail")),
+        ):
             assert _run(provider.logout()) is False
 
     def test_check_auth_not_installed(self):
         """When neither SDK nor CLI is available, check_auth returns NOT_AUTHENTICATED."""
         provider = AzureAuthProvider({}, LOG)
-        with patch.object(provider, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(provider, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -319,8 +337,10 @@ class TestAzureExt2:
         account_json = '{"name": "sub1", "id": "123", "tenantId": "t1", "user": {"name": "u@test.com", "type": "user"}}'
         mock_cmd.return_value = MagicMock(returncode=0, stdout=account_json)
         provider = AzureAuthProvider({}, LOG)
-        with patch.object(provider, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/az"):
+        with (
+            patch.object(provider, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/az"),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -328,8 +348,10 @@ class TestAzureExt2:
     def test_check_auth_called_process_error(self, mock_cmd):
         mock_cmd.side_effect = subprocess.CalledProcessError(1, "az")
         provider = AzureAuthProvider({}, LOG)
-        with patch.object(provider, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/az"):
+        with (
+            patch.object(provider, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/az"),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -337,9 +359,11 @@ class TestAzureExt2:
         """In non-interactive mode with no credentials, login returns NOT_AUTHENTICATED."""
         provider = AzureAuthProvider({}, LOG)
         provider.console = None
-        with patch.object(provider, "_is_interactive", return_value=False), \
-             patch.object(provider, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(provider, "_is_interactive", return_value=False),
+            patch.object(provider, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run(provider.login())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -438,9 +462,11 @@ class TestDatabricksExt2:
         """In non-interactive mode with no credentials, login returns NOT_AUTHENTICATED."""
         provider = DatabricksAuthProvider({}, LOG)
         provider.console = None
-        with patch.object(provider, "_is_interactive", return_value=False), \
-             patch("shutil.which", return_value=None), \
-             patch("os.path.exists", return_value=False):
+        with (
+            patch.object(provider, "_is_interactive", return_value=False),
+            patch("shutil.which", return_value=None),
+            patch("os.path.exists", return_value=False),
+        ):
             result = _run(provider.login())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -459,8 +485,7 @@ class TestDatabricksExt2:
     def test_check_auth_not_installed(self):
         """When no credentials or CLI available, returns NOT_AUTHENTICATED."""
         provider = DatabricksAuthProvider({}, LOG)
-        with patch("shutil.which", return_value=None), \
-             patch("os.path.exists", return_value=False):
+        with patch("shutil.which", return_value=None), patch("os.path.exists", return_value=False):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -468,8 +493,10 @@ class TestDatabricksExt2:
     def test_check_auth_authenticated(self, mock_cmd):
         mock_cmd.return_value = MagicMock(returncode=0, stdout='{"userName":"test"}')
         provider = DatabricksAuthProvider({"host": "h"}, LOG)
-        with patch("shutil.which", return_value="/usr/bin/databricks"), \
-             patch("os.path.exists", return_value=False):
+        with (
+            patch("shutil.which", return_value="/usr/bin/databricks"),
+            patch("os.path.exists", return_value=False),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -645,9 +672,11 @@ class TestGoogleCloudAdditional:
         mock_cmd.return_value = check_result
         provider = GoogleCloudAuthProvider({"project_id": "my-project"}, LOG)
         provider.console = None
-        with patch.object(provider, "_is_interactive", return_value=True), \
-             patch("shutil.which", return_value="/usr/bin/gcloud"), \
-             patch.object(provider, "_has_sdk", return_value=False):
+        with (
+            patch.object(provider, "_is_interactive", return_value=True),
+            patch("shutil.which", return_value="/usr/bin/gcloud"),
+            patch.object(provider, "_has_sdk", return_value=False),
+        ):
             result = _run(provider.login())
         # login calls _run_command and then check_auth, which also calls _run_command
         assert mock_cmd.called
@@ -686,8 +715,10 @@ class TestGoogleCloudAdditional:
             project_result,
         ]
         provider = GoogleCloudAuthProvider({"project_id": "fallback"}, LOG)
-        with patch.object(provider, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/gcloud"):
+        with (
+            patch.object(provider, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/gcloud"),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
         # project should fall back to self.project_id
@@ -705,11 +736,17 @@ class TestGoogleCloudAdditional:
 
         mock_cmd.side_effect = _side_effects
         provider = GoogleCloudAuthProvider({}, LOG)
-        with patch.object(provider, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/gcloud"):
+        with (
+            patch.object(provider, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/gcloud"),
+        ):
             result = _run(provider.check_auth())
         # Inner exception after access token is caught, falls through to NOT_AUTHENTICATED
-        assert result.status in (AuthStatus.AUTHENTICATED, AuthStatus.NOT_AUTHENTICATED, AuthStatus.ERROR)
+        assert result.status in (
+            AuthStatus.AUTHENTICATED,
+            AuthStatus.NOT_AUTHENTICATED,
+            AuthStatus.ERROR,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -725,13 +762,16 @@ class TestAWSAdditional:
         provider = AWSAuthProvider({"profile": "test"}, LOG)
         provider.console = None
         sdk_result = AuthResult(
-            provider="aws", status=AuthStatus.AUTHENTICATED,
+            provider="aws",
+            status=AuthStatus.AUTHENTICATED,
             user_info={"account": "123"},
         )
-        with patch.object(provider, "_is_interactive", return_value=True), \
-             patch("shutil.which", return_value="/usr/bin/aws"), \
-             patch.object(provider, "_has_boto3", return_value=False), \
-             patch.object(provider, "_validate_via_sdk", return_value=sdk_result):
+        with (
+            patch.object(provider, "_is_interactive", return_value=True),
+            patch("shutil.which", return_value="/usr/bin/aws"),
+            patch.object(provider, "_has_boto3", return_value=False),
+            patch.object(provider, "_validate_via_sdk", return_value=sdk_result),
+        ):
             result = _run(provider.login())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -746,13 +786,16 @@ class TestAWSAdditional:
         provider = AWSAuthProvider({}, LOG)
         provider.console = None
         sdk_result = AuthResult(
-            provider="aws", status=AuthStatus.AUTHENTICATED,
+            provider="aws",
+            status=AuthStatus.AUTHENTICATED,
             user_info={"account": "acc"},
         )
-        with patch.object(provider, "_is_interactive", return_value=True), \
-             patch("shutil.which", return_value="/usr/bin/aws"), \
-             patch.object(provider, "_has_boto3", return_value=False), \
-             patch.object(provider, "_validate_via_sdk", return_value=sdk_result):
+        with (
+            patch.object(provider, "_is_interactive", return_value=True),
+            patch("shutil.which", return_value="/usr/bin/aws"),
+            patch.object(provider, "_has_boto3", return_value=False),
+            patch.object(provider, "_validate_via_sdk", return_value=sdk_result),
+        ):
             result = _run(provider.login())
         assert result.status in (AuthStatus.AUTHENTICATED, AuthStatus.ERROR)
 
@@ -761,8 +804,10 @@ class TestAWSAdditional:
         """Line 415-419: STS returns non-zero."""
         mock_cmd.return_value = MagicMock(returncode=1)  # sts call fails
         provider = AWSAuthProvider({}, LOG)
-        with patch.object(provider, "_has_boto3", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/aws"):
+        with (
+            patch.object(provider, "_has_boto3", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/aws"),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -786,9 +831,11 @@ class TestAzureAdditional:
         mock_cmd.return_value = MagicMock(returncode=0, stdout=account_json)
         provider = AzureAuthProvider({}, LOG)
         provider.console = None
-        with patch.object(provider, "_is_interactive", return_value=True), \
-             patch("shutil.which", return_value="/usr/bin/az"), \
-             patch.object(provider, "_has_sdk", return_value=False):
+        with (
+            patch.object(provider, "_is_interactive", return_value=True),
+            patch("shutil.which", return_value="/usr/bin/az"),
+            patch.object(provider, "_has_sdk", return_value=False),
+        ):
             result = _run(provider.login())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -799,9 +846,11 @@ class TestAzureAdditional:
         mock_cmd.return_value = MagicMock(returncode=0, stdout=account_json)
         provider = AzureAuthProvider({"tenant_id": "my-tenant", "subscription_id": "my-sub"}, LOG)
         provider.console = None
-        with patch.object(provider, "_is_interactive", return_value=True), \
-             patch("shutil.which", return_value="/usr/bin/az"), \
-             patch.object(provider, "_has_sdk", return_value=False):
+        with (
+            patch.object(provider, "_is_interactive", return_value=True),
+            patch("shutil.which", return_value="/usr/bin/az"),
+            patch.object(provider, "_has_sdk", return_value=False),
+        ):
             result = _run(provider.login())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -810,8 +859,10 @@ class TestAzureAdditional:
         """Lines 546-551: az account show returns non-zero."""
         mock_cmd.return_value = MagicMock(returncode=1)  # az account show
         provider = AzureAuthProvider({}, LOG)
-        with patch.object(provider, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/az"):
+        with (
+            patch.object(provider, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/az"),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -870,9 +921,11 @@ class TestDatabricksAdditional:
         mock_cmd.return_value = MagicMock(returncode=0, stdout="OK")
         provider = DatabricksAuthProvider({"host": "https://my.databricks.com"}, LOG)
         provider.console = None
-        with patch.object(provider, "_is_interactive", return_value=True), \
-             patch("shutil.which", return_value="/usr/bin/databricks"), \
-             patch("os.path.exists", return_value=False):
+        with (
+            patch.object(provider, "_is_interactive", return_value=True),
+            patch("shutil.which", return_value="/usr/bin/databricks"),
+            patch("os.path.exists", return_value=False),
+        ):
             result = _run(provider.login())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -882,9 +935,11 @@ class TestDatabricksAdditional:
         mock_cmd.return_value = MagicMock(returncode=0, stdout="OK")
         provider = DatabricksAuthProvider({}, LOG)
         provider.console = None
-        with patch.object(provider, "_is_interactive", return_value=True), \
-             patch("shutil.which", return_value="/usr/bin/databricks"), \
-             patch("os.path.exists", return_value=False):
+        with (
+            patch.object(provider, "_is_interactive", return_value=True),
+            patch("shutil.which", return_value="/usr/bin/databricks"),
+            patch("os.path.exists", return_value=False),
+        ):
             result = _run(provider.login())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -897,9 +952,11 @@ class TestDatabricksAdditional:
         ]
         provider = DatabricksAuthProvider({}, LOG)
         provider.console = None
-        with patch.object(provider, "_is_interactive", return_value=True), \
-             patch("shutil.which", return_value="/usr/bin/databricks"), \
-             patch("os.path.exists", return_value=False):
+        with (
+            patch.object(provider, "_is_interactive", return_value=True),
+            patch("shutil.which", return_value="/usr/bin/databricks"),
+            patch("os.path.exists", return_value=False),
+        ):
             result = _run(provider.login())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -908,8 +965,10 @@ class TestDatabricksAdditional:
         """Lines 852-882: check_auth parses current-user response via CLI fallback."""
         mock_cmd.return_value = MagicMock(returncode=0, stdout="OK")  # workspace list
         provider = DatabricksAuthProvider({"host": "h", "workspace_id": "w"}, LOG)
-        with patch("shutil.which", return_value="/usr/bin/databricks"), \
-             patch("os.path.exists", return_value=False):
+        with (
+            patch("shutil.which", return_value="/usr/bin/databricks"),
+            patch("os.path.exists", return_value=False),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -918,8 +977,10 @@ class TestDatabricksAdditional:
         """Lines 884-889: workspace list fails in check_auth."""
         mock_cmd.return_value = MagicMock(returncode=1)  # workspace list
         provider = DatabricksAuthProvider({}, LOG)
-        with patch("shutil.which", return_value="/usr/bin/databricks"), \
-             patch("os.path.exists", return_value=False):
+        with (
+            patch("shutil.which", return_value="/usr/bin/databricks"),
+            patch("os.path.exists", return_value=False),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -928,8 +989,10 @@ class TestDatabricksAdditional:
         """Lines 858-872: workspace list succeeds in check_auth via CLI fallback."""
         mock_cmd.return_value = MagicMock(returncode=0)  # workspace list
         provider = DatabricksAuthProvider({}, LOG)
-        with patch("shutil.which", return_value="/usr/bin/databricks"), \
-             patch("os.path.exists", return_value=False):
+        with (
+            patch("shutil.which", return_value="/usr/bin/databricks"),
+            patch("os.path.exists", return_value=False),
+        ):
             result = _run(provider.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 

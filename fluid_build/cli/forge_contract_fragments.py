@@ -70,8 +70,15 @@ def split_contract_to_fragments(
         value = root.get(key)
         if not isinstance(value, dict) or not value:
             continue
-        content = header + "\n" + yaml.dump(
-            value, default_flow_style=False, sort_keys=False, allow_unicode=True,
+        content = (
+            header
+            + "\n"
+            + yaml.dump(
+                value,
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
+            )
         )
         fragments[rel_path] = content
         root[key] = {"$ref": f"./{rel_path}"}
@@ -91,8 +98,15 @@ def split_contract_to_fragments(
             slug = _slugify(item_id) if item_id else f"unnamed-{len(ref_list)}"
             rel_path = f"{directory}/{slug}.yaml"
             header = f"{comment_prefix}{item_id or slug}\n"
-            content = header + "\n" + yaml.dump(
-                item, default_flow_style=False, sort_keys=False, allow_unicode=True,
+            content = (
+                header
+                + "\n"
+                + yaml.dump(
+                    item,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
             )
             fragments[rel_path] = content
             ref_list.append({"$ref": f"./{rel_path}"})

@@ -68,6 +68,7 @@ class TestInitParserAdvancedIntegration:
         with patch.object(sys, "argv", ["fluid", "init", "--help"]):
             # Re-import init so mark_advanced reads the patched argv.
             import importlib
+
             import fluid_build.cli.init as init_module
 
             importlib.reload(init_module)
@@ -87,6 +88,7 @@ class TestInitParserAdvancedIntegration:
         """--use-case should appear when --advanced is in argv."""
         with patch.object(sys, "argv", ["fluid", "init", "--help", "--advanced"]):
             import importlib
+
             import fluid_build.cli.init as init_module
 
             importlib.reload(init_module)
@@ -104,6 +106,7 @@ class TestInitParserAdvancedIntegration:
         """Hidden flags must still parse at the command line."""
         with patch.object(sys, "argv", ["fluid", "init", "--help"]):
             import importlib
+
             import fluid_build.cli.init as init_module
 
             importlib.reload(init_module)
@@ -113,8 +116,6 @@ class TestInitParserAdvancedIntegration:
             init_module.register(sp)
 
             # Even though --use-case is hidden, passing it should still work.
-            args = parser.parse_args(
-                ["init", "--use-case", "analytics", "--yes"]
-            )
+            args = parser.parse_args(["init", "--use-case", "analytics", "--yes"])
             assert args.use_case == "analytics"
             assert args.yes is True

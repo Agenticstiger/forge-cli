@@ -37,8 +37,8 @@ from fluid_build.cli.artifact_paths import workspace_init_receipt_path
 from fluid_build.cli.artifact_receipts import ReceiptBuilder
 from fluid_build.cli.artifact_scan import diff_snapshots, snapshot_workspace
 from fluid_build.cli.console import cprint, success, warning
-from fluid_build.cli.next_steps import print_next_steps
 from fluid_build.cli.console import error as console_error
+from fluid_build.cli.next_steps import print_next_steps
 from fluid_build.cli.workspace_config import (
     WORKSPACE_FILENAME,
     discover_workspace_products,
@@ -107,6 +107,8 @@ def _print_templates_list() -> int:
         from fluid_build.forge.core.simple_registry import (
             get_template,
             initialize_registries,
+        )
+        from fluid_build.forge.core.simple_registry import (
             list_templates as registry_list_templates,
         )
 
@@ -126,6 +128,7 @@ def _print_templates_list() -> int:
                 "display_name": getattr(metadata, "display_name", template_name),
                 "description": getattr(metadata, "description", "No description"),
             }
+
     if not names:
         if RICH_AVAILABLE:
             console.print("[yellow]No templates are installed.[/yellow]")
@@ -150,8 +153,7 @@ def _print_templates_list() -> int:
             table.add_row(name, desc)
         console.print(table)
         console.print(
-            "\n[dim]Use one with:[/dim] "
-            "[cyan]fluid init my-project --template <name>[/cyan]\n"
+            "\n[dim]Use one with:[/dim] " "[cyan]fluid init my-project --template <name>[/cyan]\n"
         )
     else:
         cprint("Available templates:")
@@ -247,10 +249,7 @@ def register(subparsers: argparse._SubParsersAction):
         p.add_argument(
             "--no-dag",
             action="store_true",
-            help=(
-                "Don't auto-generate Airflow DAG "
-                "(even if contract has orchestration config)"
-            ),
+            help=("Don't auto-generate Airflow DAG " "(even if contract has orchestration config)"),
         )
     )
 
@@ -274,7 +273,7 @@ def run(args, logger: logging.Logger) -> int:
             target_path = Path(target).resolve() if target else None
             path = scaffold_user_agent(agent_name, target_dir=target_path)
             print(f"Created {path}")
-            print(f"Edit the file to customize questions, rules, and suggestions.")
+            print("Edit the file to customize questions, rules, and suggestions.")
             print(f"Then run: fluid forge --domain {agent_name}")
 
         # If --dir is specified, switch to that directory first.
@@ -397,10 +396,10 @@ def _offer_first_forge(args, logger: logging.Logger) -> None:
 
         if forge_now:
             cprint("")
-            from .forge import run as forge_run
-
             # Build minimal args for forge
             import argparse as _argparse
+
+            from .forge import run as forge_run
 
             forge_args = _argparse.Namespace(
                 target_dir=getattr(args, "target_dir", None) or getattr(args, "name", "."),
@@ -650,6 +649,7 @@ def _ai_mode(args, logger: logging.Logger) -> int:
         else:
             if RICH_AVAILABLE:
                 from .forge_dialogs import print_dialog_status
+
                 print_dialog_status(
                     console,
                     status="info",
@@ -1099,7 +1099,7 @@ def generate_dag_for_project(
         # Strict identifier validation: only alphanumeric + underscore
         dag_id = re.sub(r"[^a-zA-Z0-9_]", "", dag_id) or "fluid_dag"
         # Validate schedule is a plausible cron/preset string
-        if not re.match(r'^[@a-zA-Z0-9_ */,-]+$', schedule):
+        if not re.match(r"^[@a-zA-Z0-9_ */,-]+$", schedule):
             schedule = "@daily"
 
         # Call generate-airflow command
@@ -1434,13 +1434,13 @@ def blank_mode(args, logger: logging.Logger) -> int:
     contract formats (blank / forge-blank / template).  This slice
     unifies them.
     """
+    from fluid_build.cli.artifact_envelope import dump_json_with_envelope
+    from fluid_build.cli.artifact_paths import product_forge_receipt_path
+    from fluid_build.cli.artifact_receipts import ReceiptBuilder
     from fluid_build.cli.forge_contract_factory import (
         build_minimal_contract,
         create_and_validate_contract,
     )
-    from fluid_build.cli.artifact_envelope import dump_json_with_envelope
-    from fluid_build.cli.artifact_paths import product_forge_receipt_path
-    from fluid_build.cli.artifact_receipts import ReceiptBuilder
 
     project_name = slugify_identifier(args.name, fallback="my-project")
     project_dir = Path(project_name)
@@ -1633,7 +1633,7 @@ def _finalise_template_product(
     """
     import hashlib
 
-    from fluid_build.cli.artifact_envelope import dump_json_with_envelope, build_envelope
+    from fluid_build.cli.artifact_envelope import build_envelope, dump_json_with_envelope
     from fluid_build.cli.artifact_paths import product_forge_receipt_path
     from fluid_build.cli.artifact_receipts import ReceiptBuilder
 

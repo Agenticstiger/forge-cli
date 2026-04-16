@@ -29,9 +29,9 @@ from fluid_build.cli.forge_contract_factory import (
     write_contract,
 )
 from fluid_build.cli.forge_copilot_memory import (
+    MEMORY_SCHEMA_VERSION,
     CopilotMemoryStore,
     CopilotProjectMemory,
-    MEMORY_SCHEMA_VERSION,
 )
 from fluid_build.cli.workspace_config import (
     load_workspace_config,
@@ -74,9 +74,7 @@ class TestWorkspaceConfigEnvelope:
     def test_load_still_handles_legacy_no_envelope_files(self, tmp_path: Path):
         """A pre-envelope file must still load."""
         legacy = {"workspace": {"name": "legacy", "domain": "other"}}
-        (tmp_path / "fluid.workspace.yaml").write_text(
-            yaml.dump(legacy), encoding="utf-8"
-        )
+        (tmp_path / "fluid.workspace.yaml").write_text(yaml.dump(legacy), encoding="utf-8")
         ws = load_workspace_config(tmp_path)
         assert ws.name == "legacy"
         assert ws.domain == "other"

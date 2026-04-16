@@ -153,9 +153,7 @@ class TestWritePipelineFilesWithHeader:
             on_disk = path.read_text()
             # The original content must appear after the header
             rel = str(path.relative_to(tmp_path))
-            assert originals[rel] in on_disk, (
-                f"{provider} ({rel}): body not preserved"
-            )
+            assert originals[rel] in on_disk, f"{provider} ({rel}): body not preserved"
 
 
 class TestWritePipelineFilesHeaderOptOut:
@@ -210,9 +208,7 @@ class TestBuildCIStatePayload:
     def test_paths_are_relative_to_product_root(self, tmp_path: Path):
         config = build_pipeline_config(provider="github_actions")
         files = PipelineTemplateGenerator().generate_pipeline(config)
-        written = write_pipeline_files(
-            files, tmp_path, command="fluid forge", tool_version="0.7.9"
-        )
+        written = write_pipeline_files(files, tmp_path, command="fluid forge", tool_version="0.7.9")
 
         doc = build_ci_state_payload(
             provider="github_actions",
@@ -226,7 +222,9 @@ class TestBuildCIStatePayload:
         for entry in doc.files:
             assert not Path(entry["path"]).is_absolute()
             # GitHub Actions lives under .github/workflows/ (plus ancillary files like .env.ci.example)
-            assert entry["path"].startswith(".github/workflows/") or entry["path"] == ".env.ci.example"
+            assert (
+                entry["path"].startswith(".github/workflows/") or entry["path"] == ".env.ci.example"
+            )
 
 
 class TestWriteCIState:

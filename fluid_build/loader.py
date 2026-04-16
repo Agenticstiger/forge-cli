@@ -225,16 +225,13 @@ def _resolve_refs(
         # Relative refs (including ../sibling/) are allowed for monorepo layouts,
         # but absolute paths like /etc/passwd are rejected.
         if file_part.startswith("/"):
-            raise RefResolutionError(
-                f"$ref must be a relative path, got absolute: {ref_value}"
-            )
+            raise RefResolutionError(f"$ref must be a relative path, got absolute: {ref_value}")
         # Block common system directories even via traversal
         _ref_str = str(ref_path)
         _BLOCKED_PREFIXES = ("/etc/", "/var/", "/usr/", "/proc/", "/sys/", "/dev/")
         if any(_ref_str.startswith(p) for p in _BLOCKED_PREFIXES):
             raise RefResolutionError(
-                f"$ref resolves to a blocked system path: {ref_value} "
-                f"(resolved to {ref_path})"
+                f"$ref resolves to a blocked system path: {ref_value} " f"(resolved to {ref_path})"
             )
 
         # Circular detection keyed on absolute path + pointer.

@@ -31,7 +31,6 @@ from fluid_build.cli.auth import (
     handle_doctor,
 )
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # CI Environment Detection
 # ──────────────────────────────────────────────────────────────────────────────
@@ -85,7 +84,9 @@ class TestDetectCIEnvironment:
 
 class TestHasOIDCAvailable:
     def test_gcp_oidc(self, monkeypatch):
-        monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://token.actions.githubusercontent.com")
+        monkeypatch.setenv(
+            "ACTIONS_ID_TOKEN_REQUEST_URL", "https://token.actions.githubusercontent.com"
+        )
         result = _has_oidc_available()
         assert result["gcp"] is True
         assert result["aws"] is True  # GitHub OIDC also works for AWS
@@ -212,7 +213,9 @@ class TestHandleDoctor:
         # Warnings don't cause failure
         assert result == 0
 
-    def test_doctor_checks_env_file_perms(self, mock_auth_manager, mock_logger, tmp_path, monkeypatch):
+    def test_doctor_checks_env_file_perms(
+        self, mock_auth_manager, mock_logger, tmp_path, monkeypatch
+    ):
         """Doctor should flag insecure .env file permissions."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv("CI", raising=False)

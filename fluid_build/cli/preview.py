@@ -41,9 +41,7 @@ def register(subparsers: argparse._SubParsersAction):
 
 
 def run(args, logger: logging.Logger) -> int:
-    cprint(
-        "Note: 'fluid preview' is deprecated. Use 'fluid plan --html' instead.\n"
-    )
+    cprint("Note: 'fluid preview' is deprecated. Use 'fluid plan --html' instead.\n")
 
     # Translate preview args to plan args
     args.html_output = args.html

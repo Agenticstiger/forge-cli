@@ -476,9 +476,7 @@ _CI_COMPLEXITY_CHOICES = [
 ]
 
 _CI_COMPLEXITY_VALUES = {c["value"] for c in _CI_COMPLEXITY_CHOICES}
-_CI_PROVIDER_VALUES = {
-    c["value"] for c in _CI_PROVIDER_CHOICES if c["value"] != "none"
-}
+_CI_PROVIDER_VALUES = {c["value"] for c in _CI_PROVIDER_CHOICES if c["value"] != "none"}
 _CI_PROVIDER_ALIASES = {
     "circle_ci": "circleci",
     "circleci": "circleci",
@@ -521,15 +519,11 @@ def _prompt_ci_menu(
         try:
             console.print("\n[bold blue]🛠  CI/CD pipeline[/bold blue]")
             if memory_default:
-                console.print(
-                    f"[dim]Default from your preferences: {memory_default}[/dim]"
-                )
+                console.print(f"[dim]Default from your preferences: {memory_default}[/dim]")
         except Exception:  # noqa: BLE001
             pass
 
-    effective_default = (
-        memory_default if memory_default in _CI_PROVIDER_VALUES else None
-    )
+    effective_default = memory_default if memory_default in _CI_PROVIDER_VALUES else None
 
     provider_question = InterviewQuestion(
         id="ci_provider",
@@ -601,9 +595,7 @@ def _resolve_ci_choice(
         return (None, "standard")
 
     raw_complexity = (
-        get_cli_arg_fn(args, "ci_complexity", None)
-        or context.get("ci_complexity")
-        or "standard"
+        get_cli_arg_fn(args, "ci_complexity", None) or context.get("ci_complexity") or "standard"
     )
     complexity = raw_complexity if raw_complexity in _CI_COMPLEXITY_VALUES else "standard"
 
@@ -704,8 +696,7 @@ def _scaffold_ci_pipeline(
         # Surface an explicit acknowledgement only when the user actively
         # opted out; silent skips (non-interactive without flag) stay quiet.
         explicit_skip = (
-            get_cli_arg_fn(args, "no_ci", False)
-            or get_cli_arg_fn(args, "ci", None) == "none"
+            get_cli_arg_fn(args, "no_ci", False) or get_cli_arg_fn(args, "ci", None) == "none"
         )
         if explicit_skip and console:
             try:
@@ -723,9 +714,7 @@ def _scaffold_ci_pipeline(
     except ImportError as exc:
         if console:
             try:
-                console.print(
-                    f"[yellow]Could not load pipeline generator: {exc}[/yellow]"
-                )
+                console.print(f"[yellow]Could not load pipeline generator: {exc}[/yellow]")
             except Exception:  # noqa: BLE001
                 pass
         return (None, None)
@@ -1095,8 +1084,7 @@ def run_ai_copilot_mode(
                 _show_existing_products(console, existing_contracts)
                 # Pass to interview so LLM can detect duplicates
                 context["existing_products"] = [
-                    {"id": c.get("id", ""), "name": c.get("name", "")}
-                    for c in existing_contracts
+                    {"id": c.get("id", ""), "name": c.get("name", "")} for c in existing_contracts
                 ]
 
             # Resolve preliminary target_dir for early scaffold (samples/ + models/).
@@ -1104,10 +1092,7 @@ def run_ai_copilot_mode(
             # temporary name; the final target_dir is resolved after the
             # interview when we know the project_goal.
             explicit_target = get_cli_arg_fn(args, "target_dir")
-            _prelim_target = (
-                Path(explicit_target).expanduser() if explicit_target
-                else None
-            )
+            _prelim_target = Path(explicit_target).expanduser() if explicit_target else None
 
             interview_state = run_adaptive_copilot_interview(
                 initial_context=context,
@@ -1278,9 +1263,9 @@ def run_ai_copilot_mode(
         # .env.example, README.md, …) runs only when the user explicitly
         # opts in via --scaffold <template>.
         scaffold_template = get_cli_arg_fn(args, "scaffold", None)
-        use_agent_loop = bool(
-            get_cli_arg_fn(args, "agent_loop", False)
-        ) or bool(os.environ.get("FLUID_COPILOT_AGENT_LOOP"))
+        use_agent_loop = bool(get_cli_arg_fn(args, "agent_loop", False)) or bool(
+            os.environ.get("FLUID_COPILOT_AGENT_LOOP")
+        )
 
         if scaffold_template:
             success_result = copilot.create_project(
@@ -1667,8 +1652,7 @@ def _create_project_agent_loop(
         if console:
             try:
                 console.print(
-                    "[cyan]Running in agent-loop mode[/cyan] "
-                    "[dim](multi-turn tool use)[/dim]\n"
+                    "[cyan]Running in agent-loop mode[/cyan] " "[dim](multi-turn tool use)[/dim]\n"
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -1708,9 +1692,7 @@ def _create_project_agent_loop(
 
         if console:
             try:
-                console.print(
-                    f"\n[green]Wrote[/green] [cyan]{contract_path}[/cyan]"
-                )
+                console.print(f"\n[green]Wrote[/green] [cyan]{contract_path}[/cyan]")
             except Exception:  # noqa: BLE001
                 pass
         return True
@@ -1912,18 +1894,14 @@ def _create_project_minimal(
         # ── Tell the user what happened ──────────────────────────
         if console:
             try:
-                console.print(
-                    f"\n[green]✅ Wrote[/green] [cyan]{contract_path}[/cyan]"
-                )
+                console.print(f"\n[green]✅ Wrote[/green] [cyan]{contract_path}[/cyan]")
                 if fragment_files:
                     console.print(
                         f"[green]   + {len(fragment_files)} fragments under fragments/[/green]"
                     )
                     for rel_path in sorted(fragment_files):
                         console.print(f"[dim]     {rel_path}[/dim]")
-                    console.print(
-                        "\n[bold]📦 Layout: Fragment-first (modular)[/bold]"
-                    )
+                    console.print("\n[bold]📦 Layout: Fragment-first (modular)[/bold]")
                     console.print(
                         "[dim]   Your contract was split into composable fragments under fragments/.[/dim]"
                     )
@@ -1934,9 +1912,7 @@ def _create_project_minimal(
                         "[dim]   • --no-fragments      — next forge will produce a single file instead[/dim]"
                     )
                 elif not force_flat and is_complex_enough_for_fragments(contract):
-                    console.print(
-                        "\n[bold]📦 Layout: Single file[/bold]"
-                    )
+                    console.print("\n[bold]📦 Layout: Single file[/bold]")
                     console.print(
                         "[dim]   For larger contracts, fragments help with reuse and team collaboration.[/dim]"
                     )
@@ -1948,9 +1924,7 @@ def _create_project_minimal(
                     )
                 if additional_files:
                     n = len(additional_files)
-                    console.print(
-                        f"[green]   + {n} additional file{'s' if n != 1 else ''}[/green]"
-                    )
+                    console.print(f"[green]   + {n} additional file{'s' if n != 1 else ''}[/green]")
                 if engine_files:
                     console.print(
                         "[dim]   Tip: use 'fluid generate transformation' to re-generate transformations.[/dim]"
@@ -2011,8 +1985,8 @@ def _generate_engine_artifacts(
         return {}
 
     try:
-        from fluid_build.util.contract import get_build_engine, get_builds
         from fluid_build.engines import get_engine, has_engine
+        from fluid_build.util.contract import get_build_engine, get_builds
 
         builds = get_builds(contract)
         if not builds:
@@ -2101,7 +2075,8 @@ def _generate_engine_artifacts(
             repository = repository[2:]
 
         files = engine.generate(
-            contract, build,
+            contract,
+            build,
             schema_context=schema_context,
             transformation_intent=transformation_intent,
         )
@@ -2163,7 +2138,9 @@ def _generate_schedule_artifacts(
             from fluid_build.schedulers.synthesis import synthesize_orchestration_from_builds
 
             synthesized = synthesize_orchestration_from_builds(
-                contract, scheduler_name, provider=context.get("provider", ""),
+                contract,
+                scheduler_name,
+                provider=context.get("provider", ""),
             )
             if synthesized:
                 contract = {**contract, "orchestration": synthesized}
@@ -2183,9 +2160,7 @@ def _generate_schedule_artifacts(
             if console:
                 try:
                     byos = context["byos_path"]
-                    console.print(
-                        f"\n[green]Using existing schedule:[/green] [dim]{byos}[/dim]"
-                    )
+                    console.print(f"\n[green]Using existing schedule:[/green] [dim]{byos}[/dim]")
                 except Exception:  # noqa: BLE001
                     pass
             return {}
@@ -2312,9 +2287,9 @@ def _scaffold_data_folder(target_dir: Path, context: dict, console: Any) -> None
             if console and RICH_AVAILABLE:
                 console.print(
                     "\n[green]Created dbt project scaffolding:[/green]\n"
-                    f"  dbt/models/staging/  [dim](stg_ source models)[/dim]\n"
-                    f"  dbt/models/marts/    [dim](fct_ and dim_ tables)[/dim]\n"
-                    f"  dbt/dbt_project.yml\n\n"
+                    "  dbt/models/staging/  [dim](stg_ source models)[/dim]\n"
+                    "  dbt/models/marts/    [dim](fct_ and dim_ tables)[/dim]\n"
+                    "  dbt/dbt_project.yml\n\n"
                     "[dim]Add sample data to data/ and re-run forge for richer contracts.[/dim]"
                 )
         elif console and RICH_AVAILABLE:
@@ -2432,7 +2407,9 @@ def run_guided_mode(
             owner = os.getenv("USER", "data-team")
             description = f"{product_id.replace('-', ' ').title()} data product"
         else:
-            product_id = input("Step 1/3 -- Product name [my-data-product]: ").strip() or "my-data-product"
+            product_id = (
+                input("Step 1/3 -- Product name [my-data-product]: ").strip() or "my-data-product"
+            )
 
             print("\nStep 2/3 -- What area does this belong to?")
             print("  1. Analytics")
@@ -2440,7 +2417,9 @@ def run_guided_mode(
             print("  3. Machine Learning")
             print("  4. Governance")
             d = input("Enter number [1]: ").strip() or "1"
-            domain = {"1": "analytics", "2": "data-engineering", "3": "ml", "4": "governance"}.get(d, "analytics")
+            domain = {"1": "analytics", "2": "data-engineering", "3": "ml", "4": "governance"}.get(
+                d, "analytics"
+            )
 
             print("\nStep 3/3 -- Where will it run?")
             print("  1. Local (DuckDB)")
@@ -2525,5 +2504,3 @@ def run_guided_mode(
         if console:
             console.print(f"[red]Guided mode failed: {exc}[/red]")
         return 1
-
-

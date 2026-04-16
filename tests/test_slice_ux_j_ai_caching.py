@@ -34,7 +34,6 @@ from fluid_build.cli.forge_copilot_skills_cache import (
 )
 from fluid_build.cli.industry_skills import compile_skill, load_industry_skills
 
-
 # ---------------------------------------------------------------------------
 # J.1 — Model routing
 # ---------------------------------------------------------------------------
@@ -99,9 +98,9 @@ class TestModelRouting:
             expected_routing = entry.get("routing")
             if flagship and expected_routing and expected_routing != flagship:
                 result = _default_routing_model(provider, flagship)
-                assert result == expected_routing, (
-                    f"{provider}: expected routing '{expected_routing}', got '{result}'"
-                )
+                assert (
+                    result == expected_routing
+                ), f"{provider}: expected routing '{expected_routing}', got '{result}'"
 
     def test_default_routing_model_returns_none_when_same_as_strong(self):
         """When routing == strong, returns None (no point routing to self)."""

@@ -36,9 +36,7 @@ class TestBuildEnvelope:
         }
 
     def test_defaults_generated_at_to_utc_now_iso(self):
-        env = build_envelope(
-            kind="InitReceipt", command="fluid init", tool_version="0.7.9"
-        )
+        env = build_envelope(kind="InitReceipt", command="fluid init", tool_version="0.7.9")
         # Must parse as an ISO string ending in Z
         assert env["generated_at"].endswith("Z")
         assert "T" in env["generated_at"]

@@ -349,9 +349,7 @@ class TestWritePipelineFiles(unittest.TestCase):
             self.assertEqual(len(written), 2)
             self.assertTrue((out / ".github/workflows/a.yml").is_file())
             self.assertTrue((out / "Jenkinsfile").is_file())
-            self.assertEqual(
-                (out / ".github/workflows/a.yml").read_text(), "a\n"
-            )
+            self.assertEqual((out / ".github/workflows/a.yml").read_text(), "a\n")
 
     def test_creates_parent_dirs(self):
         with tempfile.TemporaryDirectory() as tmp:

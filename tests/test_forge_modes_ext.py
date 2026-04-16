@@ -1066,9 +1066,7 @@ class TestPrintInterviewPhase:
 
         console = MagicMock()
         with patch("fluid_build.cli.forge_ui.RICH_AVAILABLE", True):
-            print_interview_phase(
-                console, phase=1, total=3, label="Understanding your project"
-            )
+            print_interview_phase(console, phase=1, total=3, label="Understanding your project")
         console.print.assert_called()
         printed = " ".join(str(c) for c in console.print.call_args_list)
         assert "Phase 1/3" in printed

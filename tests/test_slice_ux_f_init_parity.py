@@ -97,9 +97,7 @@ class TestBlankModeParity:
         args = _build_args(name="test-blank", blank=True)
         blank_mode(args, logging.getLogger("test"))
 
-        doc = yaml.safe_load(
-            (tmp_path / "test-blank" / "contract.fluid.yaml").read_text()
-        )
+        doc = yaml.safe_load((tmp_path / "test-blank" / "contract.fluid.yaml").read_text())
         assert "metadata" in doc
         assert "provenance" in doc["metadata"]
         prov = doc["metadata"]["provenance"]
@@ -114,9 +112,7 @@ class TestBlankModeParity:
         args = _build_args(name="test-blank", blank=True)
         blank_mode(args, logging.getLogger("test"))
 
-        doc = yaml.safe_load(
-            (tmp_path / "test-blank" / "contract.fluid.yaml").read_text()
-        )
+        doc = yaml.safe_load((tmp_path / "test-blank" / "contract.fluid.yaml").read_text())
         assert doc["fluidVersion"] in {"0.7.2", 0.7}
         assert doc.get("domain") == "analytics"
         assert doc["metadata"]["layer"] == "Bronze"
@@ -134,9 +130,7 @@ class TestBlankModeParity:
         doc = json.loads(receipt_path.read_text())
         assert doc["kind"] == "ForgeReceipt"
         assert doc["flow"] == "blank"
-        assert any(
-            a["path"] == "contract.fluid.yaml" for a in doc["artifacts"]
-        )
+        assert any(a["path"] == "contract.fluid.yaml" for a in doc["artifacts"])
 
     def test_dry_run_writes_nothing(self, tmp_path: Path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -187,15 +181,15 @@ class TestTemplatePickerFilesystemSource:
             f"crash on them"
         )
 
-    def test_picker_default_falls_back_when_customer_360_missing(
-        self, tmp_path: Path, monkeypatch
-    ):
+    def test_picker_default_falls_back_when_customer_360_missing(self, tmp_path: Path, monkeypatch):
         """If customer-360 isn't installed, the picker must pick the
         first alphabetical real template as its default instead of
         handing back a non-existent directory name."""
         import fluid_build.cli.init as im
 
-        with patch.object(im, "_list_filesystem_templates", return_value=["aardvark", "hello-world"]):
+        with patch.object(
+            im, "_list_filesystem_templates", return_value=["aardvark", "hello-world"]
+        ):
             with patch.object(im, "RICH_AVAILABLE", False):
                 # Non-Rich path returns the default directly
                 result = im._ask_template_name()
@@ -239,8 +233,15 @@ class TestCopyTemplateIntegration:
         fake_template_root = tmp_path / "fake-templates" / "fake-template"
         fake_template_root.mkdir(parents=True)
         (fake_template_root / "contract.fluid.yaml").write_text(
-            yaml.dump({"fluidVersion": "0.7.2", "kind": "DataProduct",
-                       "id": "x", "name": "X", "metadata": {"owner": {"team": "t"}}})
+            yaml.dump(
+                {
+                    "fluidVersion": "0.7.2",
+                    "kind": "DataProduct",
+                    "id": "x",
+                    "name": "X",
+                    "metadata": {"owner": {"team": "t"}},
+                }
+            )
         )
         (fake_template_root / "contract.fluid.yaml.old").write_text("# stale\n")
         (fake_template_root / "README.md").write_text("# fake")
@@ -248,6 +249,7 @@ class TestCopyTemplateIntegration:
         # Monkey-patch copy_template's template resolution to look here.
         def fake_copy_template(project_dir, template_name, logger):
             import shutil
+
             from fluid_build.cli.init import _should_copy_template_entry
 
             project_dir.mkdir(parents=True, exist_ok=True)
@@ -298,9 +300,9 @@ class TestTemplateModeParity:
 
         doc = yaml.safe_load(contract_path.read_text())
         assert isinstance(doc.get("metadata"), dict)
-        assert "provenance" in doc["metadata"], (
-            "slice UX-F must inject metadata.provenance into template contracts"
-        )
+        assert (
+            "provenance" in doc["metadata"]
+        ), "slice UX-F must inject metadata.provenance into template contracts"
         prov = doc["metadata"]["provenance"]
         assert prov["schema_version"] == 1
         assert prov["kind"] == "ContractMetadata"

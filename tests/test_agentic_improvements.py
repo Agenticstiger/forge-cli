@@ -18,7 +18,6 @@ from unittest.mock import patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # _compact_message_history
 # ---------------------------------------------------------------------------
@@ -29,6 +28,7 @@ class TestCompactMessageHistory:
 
     def _import(self):
         from fluid_build.cli.forge_copilot_agent_loop import _compact_message_history
+
         return _compact_message_history
 
     def test_short_history_passes_through(self):
@@ -120,6 +120,7 @@ class TestBuildStructuredRepairFeedback:
         from fluid_build.cli.forge_copilot_contract_helpers import (
             build_structured_repair_feedback,
         )
+
         return build_structured_repair_feedback
 
     def test_known_pattern_categorized(self):
@@ -155,11 +156,13 @@ class TestBuildStructuredRepairFeedback:
 
     def test_multiple_errors(self):
         build = self._import()
-        result = build([
-            "binding.platform is missing",
-            "must include sql in properties",
-            "totally unknown error",
-        ])
+        result = build(
+            [
+                "binding.platform is missing",
+                "must include sql in properties",
+                "totally unknown error",
+            ]
+        )
         assert len(result) == 3
         assert result[0]["category"] == "missing_field"
         assert result[1]["category"] == "missing_field"
@@ -182,10 +185,12 @@ class TestExtractUsage:
         from fluid_build.cli.forge_copilot_llm_providers import OpenAIProvider
 
         provider = OpenAIProvider()
-        usage = provider.extract_usage({
-            "choices": [{"message": {"content": "hi"}}],
-            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
-        })
+        usage = provider.extract_usage(
+            {
+                "choices": [{"message": {"content": "hi"}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+            }
+        )
         assert usage == {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150}
 
     def test_openai_missing_usage(self):
@@ -199,24 +204,28 @@ class TestExtractUsage:
         from fluid_build.cli.forge_copilot_llm_providers import AnthropicProvider
 
         provider = AnthropicProvider()
-        usage = provider.extract_usage({
-            "content": [{"type": "text", "text": "hi"}],
-            "usage": {"input_tokens": 200, "output_tokens": 80},
-        })
+        usage = provider.extract_usage(
+            {
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input_tokens": 200, "output_tokens": 80},
+            }
+        )
         assert usage == {"input_tokens": 200, "output_tokens": 80, "total_tokens": 280}
 
     def test_gemini_usage(self):
         from fluid_build.cli.forge_copilot_llm_providers import GeminiProvider
 
         provider = GeminiProvider()
-        usage = provider.extract_usage({
-            "candidates": [{"content": {"parts": [{"text": "hi"}]}}],
-            "usageMetadata": {
-                "promptTokenCount": 300,
-                "candidatesTokenCount": 120,
-                "totalTokenCount": 420,
-            },
-        })
+        usage = provider.extract_usage(
+            {
+                "candidates": [{"content": {"parts": [{"text": "hi"}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 300,
+                    "candidatesTokenCount": 120,
+                    "totalTokenCount": 420,
+                },
+            }
+        )
         assert usage == {"input_tokens": 300, "output_tokens": 120, "total_tokens": 420}
 
     def test_gemini_missing_usage(self):
@@ -230,10 +239,12 @@ class TestExtractUsage:
         from fluid_build.cli.forge_copilot_llm_providers import OllamaProvider
 
         provider = OllamaProvider()
-        usage = provider.extract_usage({
-            "choices": [{"message": {"content": "hi"}}],
-            "usage": {"prompt_tokens": 50, "completion_tokens": 25, "total_tokens": 75},
-        })
+        usage = provider.extract_usage(
+            {
+                "choices": [{"message": {"content": "hi"}}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 25, "total_tokens": 75},
+            }
+        )
         assert usage == {"input_tokens": 50, "output_tokens": 25, "total_tokens": 75}
 
     def test_base_provider_returns_zeros(self):
@@ -241,7 +252,9 @@ class TestExtractUsage:
 
         # LlmProvider is abstract, but extract_usage has a concrete default
         assert LlmProvider.extract_usage(None, {}) == {
-            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
         }
 
 
@@ -257,13 +270,17 @@ class TestTruncateContractForEval:
         from fluid_build.cli.forge_copilot_prompts import _truncate_contract_for_eval
 
         contract = {
-            "exposes": [{
-                "exposeId": "out",
-                "contract": {"schema": [
-                    {"name": "id", "type": "integer"},
-                    {"name": "name", "type": "string"},
-                ]},
-            }],
+            "exposes": [
+                {
+                    "exposeId": "out",
+                    "contract": {
+                        "schema": [
+                            {"name": "id", "type": "integer"},
+                            {"name": "name", "type": "string"},
+                        ]
+                    },
+                }
+            ],
         }
         result = _truncate_contract_for_eval(contract)
         assert len(result["exposes"][0]["contract"]["schema"]) == 2
@@ -273,10 +290,12 @@ class TestTruncateContractForEval:
 
         columns = [{"name": f"col_{i}", "type": "string"} for i in range(20)]
         contract = {
-            "exposes": [{
-                "exposeId": "out",
-                "contract": {"schema": columns},
-            }],
+            "exposes": [
+                {
+                    "exposeId": "out",
+                    "contract": {"schema": columns},
+                }
+            ],
         }
         result = _truncate_contract_for_eval(contract)
         schema = result["exposes"][0]["contract"]["schema"]
@@ -295,10 +314,12 @@ class TestTruncateContractForEval:
 
         columns = [{"name": f"col_{i}", "type": "string"} for i in range(10)]
         contract = {
-            "exposes": [{
-                "exposeId": "out",
-                "contract": {"schema": list(columns)},
-            }],
+            "exposes": [
+                {
+                    "exposeId": "out",
+                    "contract": {"schema": list(columns)},
+                }
+            ],
         }
         _truncate_contract_for_eval(contract)
         assert len(contract["exposes"][0]["contract"]["schema"]) == 10

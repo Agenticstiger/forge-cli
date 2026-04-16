@@ -74,11 +74,19 @@ Examples:
         default=None,
         help="Path to FLUID contract file (default: discover contract.fluid.yaml in CWD)",
     )
-    p.add_argument("--output", "-o", help="Output directory (default: from builds[].repository or ./<engine>_project)")
-    p.add_argument("--build-index", type=int, default=0, help="Which build to generate for (default: 0)")
+    p.add_argument(
+        "--output",
+        "-o",
+        help="Output directory (default: from builds[].repository or ./<engine>_project)",
+    )
+    p.add_argument(
+        "--build-index", type=int, default=0, help="Which build to generate for (default: 0)"
+    )
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing output directory")
     p.add_argument("--env", help="Environment overlay to apply (dev/test/prod)")
-    p.add_argument("--list", dest="list_engines", action="store_true", help="List available engines and exit")
+    p.add_argument(
+        "--list", dest="list_engines", action="store_true", help="List available engines and exit"
+    )
     p.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
 
     p.set_defaults(generate_sub=SUBCOMMAND, func=run)
@@ -96,7 +104,9 @@ def run(args: Any, logger: logging.Logger) -> int:
         if args.verbose:
             info(logger, f"Loading contract from {contract_path}")
 
-        contract = load_contract_with_overlay(str(contract_path), getattr(args, "env", None), logger)
+        contract = load_contract_with_overlay(
+            str(contract_path), getattr(args, "env", None), logger
+        )
 
         # --- Resolve build ---
         from fluid_build.util.contract import get_build_engine, get_builds
@@ -108,9 +118,14 @@ def run(args: Any, logger: logging.Logger) -> int:
             raise CLIError(1, "no_builds", {"path": str(contract_path)})
 
         if build_index >= len(builds):
-            raise CLIError(1, "build_index_out_of_range", {
-                "index": build_index, "count": len(builds),
-            })
+            raise CLIError(
+                1,
+                "build_index_out_of_range",
+                {
+                    "index": build_index,
+                    "count": len(builds),
+                },
+            )
 
         build = builds[build_index]
         engine_name = get_build_engine(build)
@@ -188,6 +203,7 @@ def run(args: Any, logger: logging.Logger) -> int:
         error(logger, f"Error generating artifacts: {e}")
         if getattr(args, "verbose", False):
             import traceback
+
             traceback.print_exc()
         return 1
 
@@ -206,10 +222,14 @@ def _resolve_contract_path(args: Any) -> Path:
         if candidate.exists():
             return candidate
 
-    raise CLIError(1, "no_contract_found", {
-        "cwd": str(Path.cwd()),
-        "hint": "Specify a contract path or run from a directory with contract.fluid.yaml",
-    })
+    raise CLIError(
+        1,
+        "no_contract_found",
+        {
+            "cwd": str(Path.cwd()),
+            "hint": "Specify a contract path or run from a directory with contract.fluid.yaml",
+        },
+    )
 
 
 def _resolve_output_dir(args: Any, build: Dict[str, Any], engine_name: str) -> Path:
@@ -238,6 +258,7 @@ def _list_engines() -> int:
     cprint("Available transformation engines:\n")
     for name in engines:
         from fluid_build.engines import get_engine
+
         engine = get_engine(name)
         patterns = ", ".join(engine.supported_patterns) if engine else ""
         cprint(f"  {name:12s} patterns: {patterns}")
@@ -270,4 +291,4 @@ def _print_summary(output_dir: Path, files: Dict[str, str], engine_name: str) ->
             for f in file_names:
                 cprint(f"    {f}")
 
-    cprint(f"\nTip: To regenerate after editing the contract: fluid generate transformation")
+    cprint("\nTip: To regenerate after editing the contract: fluid generate transformation")

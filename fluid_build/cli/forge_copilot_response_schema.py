@@ -52,7 +52,6 @@ __all__ = [
 
 from typing import Any, Dict, Tuple
 
-
 # The field set below mirrors
 # ``forge_copilot_contract_helpers.normalize_generation_payload`` so
 # that the LLM, provider, and normalizer all agree on the same shape.

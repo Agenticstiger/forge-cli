@@ -156,8 +156,12 @@ class TestAdaptiveCopilotInterview:
         assert "primary_entity" not in state.normalized_context
         # Filter for dynamic-question user turns (skip bootstrap turns)
         user_turns = [
-            turn for turn in state.transcript
-            if turn["role"] == "user" and turn.get("question_id", "").startswith(("use_case", "output_kind", "primary_entity"))
+            turn
+            for turn in state.transcript
+            if turn["role"] == "user"
+            and turn.get("question_id", "").startswith(
+                ("use_case", "output_kind", "primary_entity")
+            )
         ]
         assert user_turns[0]["raw_input"] == "dashboards"
         assert user_turns[0]["resolved_value"] == "analytics"
@@ -294,7 +298,8 @@ class TestAdaptiveCopilotInterview:
         # Note: bootstrap may set a default engine; we check the dynamic
         # transcript turn specifically.
         dynamic_turns = [
-            turn for turn in state.transcript
+            turn
+            for turn in state.transcript
             if turn["role"] == "user" and turn.get("question_id") == "build_engine"
         ]
         assert len(dynamic_turns) == 1

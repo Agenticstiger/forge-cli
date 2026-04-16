@@ -79,6 +79,7 @@ from fluid_build.cli.artifact_paths import user_personal_memory_path
 
 LOG = logging.getLogger("fluid.cli.forge.personal_memory")
 
+
 #: Resolved lazily so tests can override ``FLUID_HOME`` after import.
 def _memory_file() -> Path:
     return user_personal_memory_path()

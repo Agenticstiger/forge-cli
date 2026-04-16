@@ -84,7 +84,9 @@ class TestLoadCIState:
     def test_rejects_wrong_kind(self, tmp_path: Path):
         product_ci_state_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
         product_ci_state_path(tmp_path).write_text(
-            json.dumps({"kind": "NotCIState", "provider": "github_actions", "complexity": "standard"})
+            json.dumps(
+                {"kind": "NotCIState", "provider": "github_actions", "complexity": "standard"}
+            )
         )
         assert load_ci_state(tmp_path) is None
 

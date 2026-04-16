@@ -92,6 +92,7 @@ def is_context_sufficient(context: Mapping[str, Any]) -> bool:
             return False
     return True
 
+
 SOURCE_PRECEDENCE = {
     "default": 0,
     "clarifier": 1,
@@ -472,11 +473,12 @@ def run_adaptive_copilot_interview(
     )
 
     if console:
-        print_interview_phase(
-            console, phase=1, total=3, label="Tell us about your project"
-        )
+        print_interview_phase(console, phase=1, total=3, label="Tell us about your project")
     _ask_bootstrap_questions(
-        state, console, discovery_report=discovery_report, target_dir=target_dir,
+        state,
+        console,
+        discovery_report=discovery_report,
+        target_dir=target_dir,
     )
 
     # Slice UX-I: short-circuit the clarification LLM round if the
@@ -531,9 +533,7 @@ def run_adaptive_copilot_interview(
             break
 
     if console:
-        print_interview_phase(
-            console, phase=3, total=3, label="Building your contract"
-        )
+        print_interview_phase(console, phase=3, total=3, label="Building your contract")
 
     state.normalized_context = state.finalize()
     return state
@@ -638,7 +638,10 @@ def _ask_bootstrap_questions(
     # ── Early scaffold: create samples/ and models/ dirs ────────────
     if target_dir is not None:
         _scaffold_data_dirs_and_prompt(
-            state, console, target_dir=target_dir, discovery_report=discovery_report,
+            state,
+            console,
+            target_dir=target_dir,
+            discovery_report=discovery_report,
         )
 
     if not state.normalized_context.get("data_sources") and _discovery_is_thin(discovery_report):
@@ -664,19 +667,22 @@ def _ask_bootstrap_questions(
         _ask_byot_question(state, console)
 
     # ── Engine selection (ask once, remember via copilot memory) ─────
-    if (
-        not state.normalized_context.get("build_engine")
-        and not state.normalized_context.get("byot_path")
+    if not state.normalized_context.get("build_engine") and not state.normalized_context.get(
+        "byot_path"
     ):
         _ask_engine_selection(state, console, discovery_report=discovery_report)
 
     # ── Schedule selection ────────────────────────────────────────────
-    if not state.normalized_context.get("schedule_engine") and not state.normalized_context.get("byos_path"):
+    if not state.normalized_context.get("schedule_engine") and not state.normalized_context.get(
+        "byos_path"
+    ):
         _ask_schedule_question(state, console, discovery_report=discovery_report)
 
     # Ask about data modeling if domain expertise has modeling standards
     domain_expertise = state.normalized_context.get("domain_expertise") or {}
-    if domain_expertise.get("data_modeling_standards") and not state.normalized_context.get("data_modeling"):
+    if domain_expertise.get("data_modeling_standards") and not state.normalized_context.get(
+        "data_modeling"
+    ):
         answer = ask_friendly_text(
             console,
             "Do you want data modeling (entities, measures, dimensions + dbt models)? (yes/no)",
@@ -720,7 +726,12 @@ def _scaffold_data_dirs_and_prompt(
 
     # If sample data already exists (user pre-populated), skip the prompt
     existing_samples = list(samples_dir.glob("*"))
-    data_files = [f for f in existing_samples if f.is_file() and f.suffix.lower() in {".csv", ".json", ".jsonl", ".parquet", ".pq", ".avro"}]
+    data_files = [
+        f
+        for f in existing_samples
+        if f.is_file()
+        and f.suffix.lower() in {".csv", ".json", ".jsonl", ".parquet", ".pq", ".avro"}
+    ]
     if data_files:
         # Already have data — just rescan
         from .forge_copilot_discovery import rescan_sample_data
@@ -763,9 +774,7 @@ def _print_discovered_data(console: Any, discovery_report: DiscoveryReport) -> N
                 if len(cols) > 4:
                     col_preview += ", ..."
                 path_name = Path(sample["path"]).name
-                console.print(
-                    f"  [cyan]{path_name}[/cyan] — {len(cols)} columns ({col_preview})"
-                )
+                console.print(f"  [cyan]{path_name}[/cyan] — {len(cols)} columns ({col_preview})")
         if discovery_report.user_data_models:
             for model in discovery_report.user_data_models:
                 path_name = Path(model["path"]).name
@@ -817,7 +826,7 @@ def _ask_engine_selection(
 ) -> None:
     """Ask which transformation engine to use, filtered by platform."""
     try:
-        from fluid_build.engines import list_engines_for_platform, list_engines
+        from fluid_build.engines import list_engines, list_engines_for_platform
 
         # Filter by platform if known
         provider = state.normalized_context.get("provider", "")
@@ -914,7 +923,7 @@ def _ask_scheduler_selection(
 ) -> None:
     """Ask which schedule engine to use, filtered by platform."""
     try:
-        from fluid_build.schedulers import list_schedulers_for_platform, list_schedulers
+        from fluid_build.schedulers import list_schedulers, list_schedulers_for_platform
 
         # Filter by platform if known
         provider = state.normalized_context.get("provider", "")

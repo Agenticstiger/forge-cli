@@ -137,9 +137,7 @@ class TestDetectMode:
         with (
             patch("fluid_build.cli.init.Path") as mock_path_cls,
             patch("fluid_build.cli.init.find_workspace_root", return_value=None),
-            patch(
-                "fluid_build.cli.init._ask_creation_mode", return_value="quickstart"
-            ),
+            patch("fluid_build.cli.init._ask_creation_mode", return_value="quickstart"),
         ):
             mock_cwd = MagicMock()
             mock_cwd.__truediv__ = lambda self, x: tmp_path / x
@@ -162,12 +160,15 @@ class TestPrintTemplatesList:
     def test_lists_templates_when_available(self, capsys):
         from fluid_build.cli.init import _print_templates_list
 
-        with patch(
-            "fluid_build.forge.simple_forge.list_templates",
-            return_value=["customer-360", "hello-world"],
-        ), patch(
-            "fluid_build.forge.simple_forge.get_template_info",
-            return_value={"description": "Example description"},
+        with (
+            patch(
+                "fluid_build.forge.simple_forge.list_templates",
+                return_value=["customer-360", "hello-world"],
+            ),
+            patch(
+                "fluid_build.forge.simple_forge.get_template_info",
+                return_value={"description": "Example description"},
+            ),
         ):
             rc = _print_templates_list()
         assert rc == 0
@@ -193,12 +194,15 @@ class TestPrintTemplatesList:
         """
         from fluid_build.cli import init as init_mod
 
-        with patch(
-            "fluid_build.forge.simple_forge.list_templates",
-            return_value=["t1"],
-        ), patch(
-            "fluid_build.forge.simple_forge.get_template_info",
-            return_value={"description": "d"},
+        with (
+            patch(
+                "fluid_build.forge.simple_forge.list_templates",
+                return_value=["t1"],
+            ),
+            patch(
+                "fluid_build.forge.simple_forge.get_template_info",
+                return_value={"description": "d"},
+            ),
         ):
             init_mod._print_templates_list()
         # After the call, `info` at module level should still be the callable helper.

@@ -108,7 +108,12 @@ def list_agents() -> List[Dict[str, str]]:
     for name, agent_class in DOMAIN_AGENTS.items():
         agent = agent_class()
         agents.append(
-            {"name": agent.name, "domain": agent.domain, "description": agent.description, "source": "built-in"}
+            {
+                "name": agent.name,
+                "domain": agent.domain,
+                "description": agent.description,
+                "source": "built-in",
+            }
         )
         seen.add(agent.name)
 
@@ -118,7 +123,12 @@ def list_agents() -> List[Dict[str, str]]:
         for name, spec in discover_all_agent_specs().items():
             if name not in seen:
                 agents.append(
-                    {"name": spec.name, "domain": spec.domain, "description": spec.description, "source": "user"}
+                    {
+                        "name": spec.name,
+                        "domain": spec.domain,
+                        "description": spec.description,
+                        "source": "user",
+                    }
                 )
     except Exception:  # noqa: BLE001
         pass

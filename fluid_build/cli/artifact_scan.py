@@ -215,6 +215,7 @@ def _iter_contracts(root: Path, *, max_depth: int) -> Iterator[Path]:
     collected because the blank-init path historically writes JSON
     while forge writes YAML.
     """
+
     def walk(current: Path, depth: int) -> Iterator[Path]:
         if depth > max_depth:
             return

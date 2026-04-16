@@ -31,6 +31,7 @@ from .scripts import generate_scripts
 try:
     from fluid_build.util.contract import get_build_engine
 except ImportError:  # pragma: no cover
+
     def get_build_engine(build):
         return build.get("engine") or build.get("type")
 
@@ -52,7 +53,8 @@ class SqlEngine(TransformationEngine):
         transformation_intent: Optional[TransformationIntent] = None,
     ) -> GenerationResult:
         return generate_scripts(
-            contract, build,
+            contract,
+            build,
             transformation_intent=transformation_intent,
         )
 
@@ -65,18 +67,22 @@ class SqlEngine(TransformationEngine):
 
         engine = get_build_engine(build)
         if engine and engine != "sql":
-            issues.append(ValidationIssue(
-                message=f"Engine '{engine}' is not 'sql'",
-                severity=Severity.ERROR,
-                field="builds[].engine",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message=f"Engine '{engine}' is not 'sql'",
+                    severity=Severity.ERROR,
+                    field="builds[].engine",
+                )
+            )
 
         pattern = build.get("pattern", "embedded-logic")
         if pattern not in self.supported_patterns:
-            issues.append(ValidationIssue(
-                message=f"Pattern '{pattern}' is not supported by the sql engine",
-                severity=Severity.WARNING,
-                field="builds[].pattern",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message=f"Pattern '{pattern}' is not supported by the sql engine",
+                    severity=Severity.WARNING,
+                    field="builds[].pattern",
+                )
+            )
 
         return issues

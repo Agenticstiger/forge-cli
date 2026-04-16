@@ -457,7 +457,9 @@ def print_forge_performance_summary(
     if stats.get("agent_loop_rounds"):
         rounds = stats["agent_loop_rounds"]
         tool_calls = stats.get("agent_loop_tool_calls", 0)
-        lines.append(f"  [bold]Mode[/bold]        agent-loop ({rounds} rounds, {tool_calls} tool calls)")
+        lines.append(
+            f"  [bold]Mode[/bold]        agent-loop ({rounds} rounds, {tool_calls} tool calls)"
+        )
     else:
         # Streaming
         streaming = stats.get("streaming")
@@ -471,7 +473,9 @@ def print_forge_performance_summary(
         cache_label = "cache hit" if cache_hit else "fresh scan"
         scan_ms = stats.get("discovery_scan_ms", 0)
         time_part = f", {scan_ms}ms" if scan_ms and not cache_hit else ""
-        lines.append(f"  [bold]Discovery[/bold]   {cache_label} ({discovery_files} files{time_part})")
+        lines.append(
+            f"  [bold]Discovery[/bold]   {cache_label} ({discovery_files} files{time_part})"
+        )
 
     # Skills
     skills_loaded = stats.get("skills_loaded", False)
@@ -520,7 +524,9 @@ def print_forge_performance_summary(
     if total_tokens > 0:
         input_t = stats.get("input_tokens", 0)
         output_t = stats.get("output_tokens", 0)
-        lines.append(f"  [bold]Tokens[/bold]      {input_t:,} in / {output_t:,} out ({total_tokens:,} total)")
+        lines.append(
+            f"  [bold]Tokens[/bold]      {input_t:,} in / {output_t:,} out ({total_tokens:,} total)"
+        )
 
     # Tips (contextual suggestions)
     tips = []

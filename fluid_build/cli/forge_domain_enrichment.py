@@ -164,8 +164,7 @@ def enrich_context_with_domain(
     # Extract domain questions for the LLM to use during interview
     if spec.questions:
         expertise["domain_questions"] = [
-            {"key": q.get("key", ""), "question": q.get("question", "")}
-            for q in spec.questions[:5]
+            {"key": q.get("key", ""), "question": q.get("question", "")} for q in spec.questions[:5]
         ]
 
     # Load data_modeling_standards directly from YAML (not in AgentSpec dataclass).

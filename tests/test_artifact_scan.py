@@ -67,9 +67,7 @@ class TestSnapshotWorkspace:
         snapshot = snapshot_workspace(tmp_path)
         # The skills file path under .fluid is explicitly tracked, but
         # contracts under .fluid/ are not.
-        assert not any(
-            "subproduct" in str(p) for p in snapshot.files
-        )
+        assert not any("subproduct" in str(p) for p in snapshot.files)
 
 
 class TestDiffSnapshots:

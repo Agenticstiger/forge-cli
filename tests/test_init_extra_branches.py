@@ -91,66 +91,50 @@ class TestMarkFirstRunComplete:
 class TestDetectMode:
     def test_explicit_quickstart(self, logger):
         """--quickstart is now an alias for --template customer-360."""
-        args = SimpleNamespace(
-            quickstart=True, blank=False, template=False, name=None
-        )
+        args = SimpleNamespace(quickstart=True, blank=False, template=False, name=None)
         assert detect_mode(args, logger) == "template"
         assert args.template == "customer-360"
 
     def test_explicit_blank(self, logger):
-        args = SimpleNamespace(
-            quickstart=False, blank=True, template=False, name=None
-        )
+        args = SimpleNamespace(quickstart=False, blank=True, template=False, name=None)
         assert detect_mode(args, logger) == "blank"
 
     def test_explicit_template(self, logger):
-        args = SimpleNamespace(
-            quickstart=False, blank=False, template="x", name=None
-        )
+        args = SimpleNamespace(quickstart=False, blank=False, template="x", name=None)
         assert detect_mode(args, logger) == "template"
 
     def test_existing_contract_returns_none(self, logger, tmp_path, monkeypatch):
         (tmp_path / "contract.fluid.yaml").write_text("test")
         monkeypatch.chdir(tmp_path)
-        args = SimpleNamespace(
-            quickstart=False, blank=False, template=False, name=None
-        )
+        args = SimpleNamespace(quickstart=False, blank=False, template=False, name=None)
         assert detect_mode(args, logger) is None
 
     def test_dbt_project_falls_through(self, logger, tmp_path, monkeypatch):
         """dbt/terraform/sql auto-detect removed; falls through to creation menu."""
         (tmp_path / "dbt_project.yml").write_text("name: test")
         monkeypatch.chdir(tmp_path)
-        args = SimpleNamespace(
-            quickstart=False, blank=False, template=False, name=None
-        )
+        args = SimpleNamespace(quickstart=False, blank=False, template=False, name=None)
         with patch("fluid_build.cli.init._ask_creation_mode", return_value="ai"):
             assert detect_mode(args, logger) == "ai"
 
     def test_terraform_falls_through(self, logger, tmp_path, monkeypatch):
         (tmp_path / "main.tf").write_text("resource {}")
         monkeypatch.chdir(tmp_path)
-        args = SimpleNamespace(
-            quickstart=False, blank=False, template=False, name=None
-        )
+        args = SimpleNamespace(quickstart=False, blank=False, template=False, name=None)
         with patch("fluid_build.cli.init._ask_creation_mode", return_value="template"):
             assert detect_mode(args, logger) == "template"
 
     def test_sql_files_fall_through(self, logger, tmp_path, monkeypatch):
         (tmp_path / "query.sql").write_text("SELECT 1")
         monkeypatch.chdir(tmp_path)
-        args = SimpleNamespace(
-            quickstart=False, blank=False, template=False, name=None
-        )
+        args = SimpleNamespace(quickstart=False, blank=False, template=False, name=None)
         with patch("fluid_build.cli.init._ask_creation_mode", return_value="blank"):
             assert detect_mode(args, logger) == "blank"
 
     def test_first_time_user_shows_menu(self, logger, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "nohome")
-        args = SimpleNamespace(
-            quickstart=False, blank=False, template=False, name=None
-        )
+        args = SimpleNamespace(quickstart=False, blank=False, template=False, name=None)
         with patch("fluid_build.cli.init._ask_creation_mode", return_value="ai") as m:
             assert detect_mode(args, logger) == "ai"
             m.assert_called_once()
@@ -159,9 +143,7 @@ class TestDetectMode:
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".fluid").mkdir()
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        args = SimpleNamespace(
-            quickstart=False, blank=False, template=False, name=None
-        )
+        args = SimpleNamespace(quickstart=False, blank=False, template=False, name=None)
         with patch("fluid_build.cli.init._ask_creation_mode", return_value="template") as m:
             assert detect_mode(args, logger) == "template"
             m.assert_called_once()

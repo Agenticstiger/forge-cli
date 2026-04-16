@@ -22,7 +22,11 @@ from typing import Any, Dict, List, Optional
 
 from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
-from fluid_build.cli.forge_agent_specs import AgentSpec, load_builtin_agent_spec, load_user_or_builtin_spec
+from fluid_build.cli.forge_agent_specs import (
+    AgentSpec,
+    load_builtin_agent_spec,
+    load_user_or_builtin_spec,
+)
 from fluid_build.cli.forge_dialogs import normalize_choice_value
 from fluid_build.cli.forge_ui import show_domain_analysis, show_next_steps_panel
 

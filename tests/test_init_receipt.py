@@ -60,9 +60,7 @@ def _build_args(**overrides) -> Namespace:
 
 
 class TestInitBlankReceipt:
-    def test_blank_mode_writes_init_receipt(
-        self, fluid_home, empty_workspace, monkeypatch
-    ):
+    def test_blank_mode_writes_init_receipt(self, fluid_home, empty_workspace, monkeypatch):
         logger = logging.getLogger("test.init_receipt")
         args = _build_args()
 
@@ -122,9 +120,7 @@ class TestInitBlankReceipt:
         # fluid.workspace.yaml is the minimum artifact a blank init creates
         assert "fluid.workspace.yaml" in paths
 
-    def test_receipt_inputs_include_blank_flag(
-        self, fluid_home, empty_workspace, monkeypatch
-    ):
+    def test_receipt_inputs_include_blank_flag(self, fluid_home, empty_workspace, monkeypatch):
         logger = logging.getLogger("test.init_receipt")
         args = _build_args()
 
@@ -137,9 +133,7 @@ class TestInitBlankReceipt:
         assert doc["inputs"].get("blank") is True
         assert "template" not in doc["inputs"]  # None-valued, should be dropped
 
-    def test_command_string_preserved_in_envelope(
-        self, fluid_home, empty_workspace, monkeypatch
-    ):
+    def test_command_string_preserved_in_envelope(self, fluid_home, empty_workspace, monkeypatch):
         logger = logging.getLogger("test.init_receipt")
         args = _build_args()
 

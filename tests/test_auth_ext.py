@@ -196,9 +196,11 @@ class TestGCPAuthProvider:
 
         side_effects = [token_cp, account_cp, project_cp]
         p = self._provider()
-        with patch.object(p, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/gcloud"), \
-             patch("subprocess.run", side_effect=side_effects):
+        with (
+            patch.object(p, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/gcloud"),
+            patch("subprocess.run", side_effect=side_effects),
+        ):
             result = _run_coro(p.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
         assert result.user_info.get("account") == "user@example.com"
@@ -206,8 +208,10 @@ class TestGCPAuthProvider:
     def test_check_auth_not_installed(self):
         """When neither SDK nor CLI is available, check_auth returns NOT_AUTHENTICATED."""
         p = self._provider()
-        with patch.object(p, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(p, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run_coro(p.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -220,9 +224,11 @@ class TestGCPAuthProvider:
     def test_login_exception_returns_not_authenticated(self):
         """In non-interactive mode with no credentials, login returns NOT_AUTHENTICATED."""
         p = self._provider()
-        with patch.object(p, "_is_interactive", return_value=False), \
-             patch.object(p, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(p, "_is_interactive", return_value=False),
+            patch.object(p, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run_coro(p.login())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -241,9 +247,11 @@ class TestAWSAuthProvider:
         identity_cp = _make_completed_process(0, identity_json)
 
         p = self._provider()
-        with patch.object(p, "_has_boto3", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/aws"), \
-             patch("subprocess.run", return_value=identity_cp):
+        with (
+            patch.object(p, "_has_boto3", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/aws"),
+            patch("subprocess.run", return_value=identity_cp),
+        ):
             result = _run_coro(p.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -251,17 +259,21 @@ class TestAWSAuthProvider:
         fail_cp = _make_completed_process(255, "", "Unable to locate credentials")
 
         p = self._provider()
-        with patch.object(p, "_has_boto3", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/aws"), \
-             patch("subprocess.run", return_value=fail_cp):
+        with (
+            patch.object(p, "_has_boto3", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/aws"),
+            patch("subprocess.run", return_value=fail_cp),
+        ):
             result = _run_coro(p.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
     def test_check_auth_cli_not_installed(self):
         """When neither SDK nor CLI is available, check_auth returns NOT_AUTHENTICATED."""
         p = self._provider()
-        with patch.object(p, "_has_boto3", return_value=False), \
-             patch("shutil.which", return_value=None):
+        with (
+            patch.object(p, "_has_boto3", return_value=False),
+            patch("shutil.which", return_value=None),
+        ):
             result = _run_coro(p.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
@@ -286,9 +298,11 @@ class TestAzureAuthProvider:
         account_cp = _make_completed_process(0, account_json)
 
         p = self._provider()
-        with patch.object(p, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/az"), \
-             patch("subprocess.run", return_value=account_cp):
+        with (
+            patch.object(p, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/az"),
+            patch("subprocess.run", return_value=account_cp),
+        ):
             result = _run_coro(p.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -296,9 +310,11 @@ class TestAzureAuthProvider:
         fail_cp = _make_completed_process(1, "[]", "Please run az login")
 
         p = self._provider()
-        with patch.object(p, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/az"), \
-             patch("subprocess.run", return_value=fail_cp):
+        with (
+            patch.object(p, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/az"),
+            patch("subprocess.run", return_value=fail_cp),
+        ):
             result = _run_coro(p.check_auth())
         assert result.status in (AuthStatus.NOT_AUTHENTICATED, AuthStatus.ERROR)
 
@@ -359,17 +375,18 @@ class TestDatabricksAuthProvider:
         workspace_cp = _make_completed_process(0, "/Shared\n/Users")
 
         p = self._provider()
-        with patch("shutil.which", return_value="/usr/bin/databricks"), \
-             patch("os.path.exists", return_value=False), \
-             patch("subprocess.run", return_value=workspace_cp):
+        with (
+            patch("shutil.which", return_value="/usr/bin/databricks"),
+            patch("os.path.exists", return_value=False),
+            patch("subprocess.run", return_value=workspace_cp),
+        ):
             result = _run_coro(p.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 
     def test_check_auth_not_authenticated(self):
         """When no credentials or CLI available, returns NOT_AUTHENTICATED."""
         p = DatabricksAuthProvider({}, logger)
-        with patch("shutil.which", return_value=None), \
-             patch("os.path.exists", return_value=False):
+        with patch("shutil.which", return_value=None), patch("os.path.exists", return_value=False):
             result = _run_coro(p.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 

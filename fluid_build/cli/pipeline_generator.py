@@ -25,8 +25,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fluid_build.cli.artifact_paths import CI_HEADER_SCHEMA
 from fluid_build.cli.artifact_envelope import utc_now_iso
+from fluid_build.cli.artifact_paths import CI_HEADER_SCHEMA
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.cli.console import error as console_error
 
@@ -135,7 +135,9 @@ def _render_header(
         f"{prefix} Command: {command}",
     ]
     if sha256_prefix:
-        lines.append(f"{prefix} Provenance: {sha256_prefix}  (do not edit — regenerate with `fluid forge --ci <provider>`)")
+        lines.append(
+            f"{prefix} Provenance: {sha256_prefix}  (do not edit — regenerate with `fluid forge --ci <provider>`)"
+        )
     else:
         lines.append(f"{prefix} Do not edit — regenerate with `fluid forge --ci <provider>`")
     lines.append(f"{prefix} Schema: {CI_HEADER_SCHEMA}")

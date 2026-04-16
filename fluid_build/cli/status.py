@@ -185,17 +185,13 @@ def _gather_authoring_mode(product_root: Path, summary: StatusSummary) -> None:
     overlays_dir = product_root / "overlays"
 
     if fragments_dir.is_dir():
-        fragment_files = [
-            p for p in fragments_dir.rglob("*.yaml") if p.is_file()
-        ]
+        fragment_files = [p for p in fragments_dir.rglob("*.yaml") if p.is_file()]
         summary.fragment_count = len(fragment_files)
         if fragment_files:
             summary.authoring_mode = "fragment-first"
 
     if overlays_dir.is_dir():
-        summary.overlay_count = sum(
-            1 for p in overlays_dir.glob("*.yaml") if p.is_file()
-        )
+        summary.overlay_count = sum(1 for p in overlays_dir.glob("*.yaml") if p.is_file())
 
 
 def _gather_forge_receipt(product_root: Path, summary: StatusSummary) -> None:
@@ -392,10 +388,12 @@ def _render_rich(summary: StatusSummary) -> None:
     table.add_row("Owner", _format_owner(summary))
     table.add_row(
         "Workspace",
-        f"[bold]{_format_scalar(summary.workspace_name)}[/bold]    "
-        f"[dim]{summary.workspace_root}[/dim]"
-        if summary.workspace_root
-        else "—",
+        (
+            f"[bold]{_format_scalar(summary.workspace_name)}[/bold]    "
+            f"[dim]{summary.workspace_root}[/dim]"
+            if summary.workspace_root
+            else "—"
+        ),
     )
     table.add_row("Authoring", _format_authoring(summary))
     table.add_row(

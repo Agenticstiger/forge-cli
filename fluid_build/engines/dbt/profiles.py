@@ -41,7 +41,9 @@ def generate_profiles(
     if not profile:
         return None
 
-    return _HEADER + yaml.dump(profile, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    return _HEADER + yaml.dump(
+        profile, default_flow_style=False, sort_keys=False, allow_unicode=True
+    )
 
 
 def _profile_for_platform(platform: str, profile_name: str) -> Dict[str, Any]:

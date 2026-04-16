@@ -65,13 +65,12 @@ from fluid_build.cli.forge_copilot_response_schema import (
     openai_response_format,
 )
 from fluid_build.cli.forge_copilot_runtime import (
+    _call_llm_with_optional_streaming,
+    _system_prompt_cache_key,
     build_system_prompt,
     clear_capability_matrix_cache,
     clear_system_prompt_cache,
-    _call_llm_with_optional_streaming,
-    _system_prompt_cache_key,
 )
-
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -211,18 +210,9 @@ class TestStreamingLlmCalls:
 
     def test_gemini_stream_parses_candidates(self):
         lines = [
+            "data: " + json.dumps({"candidates": [{"content": {"parts": [{"text": "gemini "}]}}]}),
             "data: "
-            + json.dumps(
-                {
-                    "candidates": [
-                        {"content": {"parts": [{"text": "gemini "}]}}
-                    ]
-                }
-            ),
-            "data: "
-            + json.dumps(
-                {"candidates": [{"content": {"parts": [{"text": "streaming"}]}}]}
-            ),
+            + json.dumps({"candidates": [{"content": {"parts": [{"text": "streaming"}]}}]}),
         ]
         chunks = list(GeminiProvider().iter_stream_chunks(_FakeStreamResponse(lines)))
         assert "".join(chunks) == "gemini streaming"
@@ -323,9 +313,7 @@ class TestStreamingLlmCalls:
             "fluid_build.cli.forge_copilot_runtime.call_llm",
             return_value='{"ok": true}',
         ) as blocking:
-            with patch(
-                "fluid_build.cli.forge_copilot_runtime.call_llm_streaming"
-            ) as streaming:
+            with patch("fluid_build.cli.forge_copilot_runtime.call_llm_streaming") as streaming:
                 result = _call_llm_with_optional_streaming(provider, cfg, "sys", "usr")
         assert result == '{"ok": true}'
         blocking.assert_called_once()
@@ -506,17 +494,19 @@ class TestStructuredOutputs:
         # so no model is marked as structured_output capable.
         assert ollama_supports_structured_output("some-random-model") is False
 
-    def test_ollama_build_request_drops_response_format_for_unknown_models(
-        self, monkeypatch
-    ):
+    def test_ollama_build_request_drops_response_format_for_unknown_models(self, monkeypatch):
         monkeypatch.delenv("FLUID_LLM_STRUCTURED_OUTPUTS", raising=False)
-        cfg = _base_config("ollama", "some-random-model", "http://localhost:11434/v1/chat/completions")
+        cfg = _base_config(
+            "ollama", "some-random-model", "http://localhost:11434/v1/chat/completions"
+        )
         _, payload = OllamaProvider().build_request(cfg, "sys", "usr")
         # Ollama catalog has an empty models list, so no model is
         # recognized as structured-output-capable → format dropped.
         assert "response_format" not in payload
 
-    def test_ollama_build_request_also_drops_for_known_names_without_catalog_entry(self, monkeypatch):
+    def test_ollama_build_request_also_drops_for_known_names_without_catalog_entry(
+        self, monkeypatch
+    ):
         """Even well-known model names like llama3.1 don't get
         structured output unless the catalog explicitly lists them
         with the structured_output capability flag."""
@@ -613,7 +603,9 @@ class TestInterviewSkipWhenContextSufficient:
         # branch; the interview short-circuit check must still beat
         # that.
         console = MagicMock()
-        llm_config = _base_config("openai", "gpt-4o-mini", "https://api.openai.com/v1/chat/completions")
+        llm_config = _base_config(
+            "openai", "gpt-4o-mini", "https://api.openai.com/v1/chat/completions"
+        )
         discovery = MagicMock()
         discovery.existing_contracts = []
         discovery.provider_hints = []
@@ -631,9 +623,7 @@ class TestInterviewSkipWhenContextSufficient:
             "use_case": "analytics",
         }
 
-        with patch(
-            "fluid_build.cli.forge_copilot_interview._ask_bootstrap_questions"
-        ):
+        with patch("fluid_build.cli.forge_copilot_interview._ask_bootstrap_questions"):
             with patch(
                 "fluid_build.cli.forge_copilot_interview.request_interview_decision"
             ) as clarifier:
@@ -661,7 +651,9 @@ class TestInterviewSkipWhenContextSufficient:
         monkeypatch.setenv("FLUID_COPILOT_FORCE_INTERVIEW", "1")
 
         console = MagicMock()
-        llm_config = _base_config("openai", "gpt-4o-mini", "https://api.openai.com/v1/chat/completions")
+        llm_config = _base_config(
+            "openai", "gpt-4o-mini", "https://api.openai.com/v1/chat/completions"
+        )
         discovery = MagicMock()
         discovery.existing_contracts = []
         discovery.provider_hints = []
@@ -687,9 +679,7 @@ class TestInterviewSkipWhenContextSufficient:
             questions=[],
         )
 
-        with patch(
-            "fluid_build.cli.forge_copilot_interview._ask_bootstrap_questions"
-        ):
+        with patch("fluid_build.cli.forge_copilot_interview._ask_bootstrap_questions"):
             with patch(
                 "fluid_build.cli.forge_copilot_interview.request_interview_decision",
                 return_value=fake_decision,

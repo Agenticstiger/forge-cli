@@ -129,7 +129,9 @@ def _format_description(fmt: str) -> str:
 def _export_format(fmt: str, contract_path: str, args, logger: logging.Logger) -> int:
     """Delegate to the appropriate exporter."""
     env = getattr(args, "env", None)
-    out = getattr(args, "out", None) or DEFAULT_OUTPUTS.get(fmt, f"runtime/exports/product.{fmt}.yaml")
+    out = getattr(args, "out", None) or DEFAULT_OUTPUTS.get(
+        fmt, f"runtime/exports/product.{fmt}.yaml"
+    )
 
     if fmt == "opds":
         return _export_opds(contract_path, env, out, logger)

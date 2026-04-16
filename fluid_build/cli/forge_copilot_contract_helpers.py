@@ -41,7 +41,6 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 import yaml
 
 from fluid_build.cli.forge_copilot_memory import CopilotMemorySnapshot
-from fluid_build.schema_manager import FluidSchemaManager
 from fluid_build.cli.forge_copilot_taxonomy import (
     CANONICAL_MODEL_LABELS,
     SUPPORTING_STANDARD_LABELS,
@@ -51,6 +50,7 @@ from fluid_build.cli.forge_copilot_taxonomy import (
     normalize_supporting_standards,
     normalize_use_case,
 )
+from fluid_build.schema_manager import FluidSchemaManager
 
 SAFE_ADDITIONAL_FILE_EXTENSIONS = {
     ".py",
@@ -610,10 +610,7 @@ def build_seed_contract(
         ),
     }
 
-    data_sensitivity = (
-        context.get("data_sensitivity")
-        or interview_summary.get("data_sensitivity")
-    )
+    data_sensitivity = context.get("data_sensitivity") or interview_summary.get("data_sensitivity")
     if data_sensitivity in ("confidential", "restricted"):
         expose["policy"] = {
             "agentPolicy": {
@@ -641,13 +638,9 @@ def build_seed_contract(
     }
 
     # --- Optional sovereignty stub ---
-    jurisdiction = (
-        context.get("jurisdiction")
-        or interview_summary.get("jurisdiction")
-    )
-    regulatory = (
-        context.get("regulatory_framework")
-        or interview_summary.get("regulatory_framework")
+    jurisdiction = context.get("jurisdiction") or interview_summary.get("jurisdiction")
+    regulatory = context.get("regulatory_framework") or interview_summary.get(
+        "regulatory_framework"
     )
     if jurisdiction or regulatory:
         sovereignty: Dict[str, Any] = {

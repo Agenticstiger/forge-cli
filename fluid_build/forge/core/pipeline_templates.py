@@ -67,6 +67,7 @@ def _pin_action(action_ref: str) -> str:
     """Pin a GitHub Action reference to its SHA for supply chain security."""
     return PINNED_ACTIONS.get(action_ref, action_ref)
 
+
 try:
     import yaml
 except ImportError:
@@ -382,7 +383,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         *self._get_oidc_steps(config.oidc_provider),
                         {"name": "FLUID Doctor Check", "run": commands["doctor"]},
                         {"name": "Validate Configuration", "run": commands["validate"]},
-                        {"name": "Generate Transformations", "run": commands["generate_transformation"]},
+                        {
+                            "name": "Generate Transformations",
+                            "run": commands["generate_transformation"],
+                        },
                         {"name": "Generate Schedules", "run": commands["generate_schedule"]},
                         {"name": "Generate Plan", "run": commands["plan"]},
                         {
@@ -855,9 +859,7 @@ class GitLabCITemplate(BasePipelineTemplate):
             # GitLab native OIDC token injection
             if config.oidc_provider:
                 deploy_job["id_tokens"] = {
-                    "FLUID_OIDC_TOKEN": {
-                        "aud": "https://YOUR_IDENTITY_POOL_AUDIENCE"
-                    }
+                    "FLUID_OIDC_TOKEN": {"aud": "https://YOUR_IDENTITY_POOL_AUDIENCE"}
                 }
 
             if env == "prod":
@@ -955,8 +957,14 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                         },
                         {"script": commands["doctor"], "displayName": "FLUID Doctor Check"},
                         {"script": commands["validate"], "displayName": "Validate configuration"},
-                        {"script": commands["generate_transformation"], "displayName": "Generate transformations"},
-                        {"script": commands["generate_schedule"], "displayName": "Generate schedules"},
+                        {
+                            "script": commands["generate_transformation"],
+                            "displayName": "Generate transformations",
+                        },
+                        {
+                            "script": commands["generate_schedule"],
+                            "displayName": "Generate schedules",
+                        },
                         {"script": commands["plan"], "displayName": "Generate plan"},
                         {
                             "task": "PublishBuildArtifacts@1",

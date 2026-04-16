@@ -411,9 +411,7 @@ class TestCiTaxonomyNormalization(unittest.TestCase):
         from fluid_build.cli.forge_copilot_taxonomy import normalize_ci_provider
 
         for alias in ("gh", "github", "github_actions", "github-actions", "ghactions"):
-            self.assertEqual(
-                normalize_ci_provider(alias), "github_actions", f"alias={alias!r}"
-            )
+            self.assertEqual(normalize_ci_provider(alias), "github_actions", f"alias={alias!r}")
 
     def test_gitlab_aliases_normalize(self):
         from fluid_build.cli.forge_copilot_taxonomy import normalize_ci_provider
@@ -445,18 +443,14 @@ class TestCiTaxonomyNormalization(unittest.TestCase):
     def test_normalize_copilot_context_canonicalizes_ci_fields(self):
         from fluid_build.cli.forge_copilot_taxonomy import normalize_copilot_context
 
-        result = normalize_copilot_context(
-            {"ci_provider": "gh", "ci_complexity": "ADVANCED"}
-        )
+        result = normalize_copilot_context({"ci_provider": "gh", "ci_complexity": "ADVANCED"})
         self.assertEqual(result["ci_provider"], "github_actions")
         self.assertEqual(result["ci_complexity"], "advanced")
 
     def test_normalize_copilot_context_drops_invalid_ci_values(self):
         from fluid_build.cli.forge_copilot_taxonomy import normalize_copilot_context
 
-        result = normalize_copilot_context(
-            {"ci_provider": "bogus", "ci_complexity": "bogus"}
-        )
+        result = normalize_copilot_context({"ci_provider": "bogus", "ci_complexity": "bogus"})
         self.assertNotIn("ci_provider", result)
         self.assertNotIn("ci_complexity", result)
 
@@ -473,8 +467,8 @@ class TestCiConstants(unittest.TestCase):
         entry (``circleci`` vs ``circle_ci``).  Slice UX-E added an
         alias map so both spellings flow through ``_resolve_ci_choice``
         — this assertion normalises the enum side before comparing."""
-        from fluid_build.forge.core.pipeline_templates import PipelineProvider
         from fluid_build.cli.forge_modes import _CI_PROVIDER_ALIASES
+        from fluid_build.forge.core.pipeline_templates import PipelineProvider
 
         def _normalise(value: str) -> str:
             return _CI_PROVIDER_ALIASES.get(value, value)

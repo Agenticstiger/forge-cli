@@ -40,11 +40,13 @@ from fluid_build.schema_manager import FluidSchemaManager
 LOG = logging.getLogger("fluid.cli.forge_copilot.agent_loop")
 
 # Read-only tools that can safely run in parallel.
-_PARALLELIZABLE_TOOLS = frozenset({
-    "discover_workspace",
-    "read_sample_schema",
-    "list_templates",
-})
+_PARALLELIZABLE_TOOLS = frozenset(
+    {
+        "discover_workspace",
+        "read_sample_schema",
+        "list_templates",
+    }
+)
 
 # Maximum number of LLM round-trips before we give up.
 MAX_AGENT_ITERATIONS = 12
@@ -75,7 +77,9 @@ def _compact_message_history(messages: List[Dict[str, Any]]) -> List[Dict[str, A
         content = msg.get("content", "")
         if isinstance(content, str) and len(content) > _COMPACT_MAX_CHARS:
             msg = dict(msg)
-            msg["content"] = content[:_COMPACT_MAX_CHARS] + f" [truncated — {len(content)} chars total]"
+            msg["content"] = (
+                content[:_COMPACT_MAX_CHARS] + f" [truncated — {len(content)} chars total]"
+            )
         elif isinstance(content, list):
             # Anthropic-style content blocks — truncate text blocks.
             new_blocks = []
@@ -84,7 +88,9 @@ def _compact_message_history(messages: List[Dict[str, Any]]) -> List[Dict[str, A
                     text = block.get("text", "")
                     if len(text) > _COMPACT_MAX_CHARS:
                         block = dict(block)
-                        block["text"] = text[:_COMPACT_MAX_CHARS] + f" [truncated — {len(text)} chars total]"
+                        block["text"] = (
+                            text[:_COMPACT_MAX_CHARS] + f" [truncated — {len(text)} chars total]"
+                        )
                 new_blocks.append(block)
             msg = dict(msg)
             msg["content"] = new_blocks
@@ -95,7 +101,9 @@ def _compact_message_history(messages: List[Dict[str, Any]]) -> List[Dict[str, A
     after = sum(len(json.dumps(m.get("content", ""))) for m in result)
     LOG.debug(
         "Compacted message history: %d messages, %d→%d chars",
-        len(result), before, after,
+        len(result),
+        before,
+        after,
     )
     return result
 
@@ -202,6 +210,7 @@ def run_copilot_agent_loop(
             if text:
                 try:
                     from fluid_build.cli.forge_copilot_runtime import extract_json_object
+
                     payload = extract_json_object(text)
                     # Slice UX-L: record final stats.
                     if perf_stats is not None:
@@ -212,20 +221,24 @@ def run_copilot_agent_loop(
                     # The model returned text that isn't valid JSON.
                     # Ask it to try again.
                     messages.append({"role": "assistant", "content": text})
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "Your response was not valid JSON. Please return "
-                            "the final response as a strict JSON object with "
-                            "the required keys."
-                        ),
-                    })
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your response was not valid JSON. Please return "
+                                "the final response as a strict JSON object with "
+                                "the required keys."
+                            ),
+                        }
+                    )
                     continue
             # Empty response — unusual but recoverable.
-            messages.append({
-                "role": "user",
-                "content": "I didn't receive a response. Please continue.",
-            })
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "I didn't receive a response. Please continue.",
+                }
+            )
             continue
 
         # Slice UX-L: show which tools are being called.
@@ -233,9 +246,7 @@ def run_copilot_agent_loop(
         tool_list = " → ".join(tc["name"] for tc in tool_calls)
         if console:
             try:
-                console.print(
-                    f"  [bold cyan]Round {iteration + 1}[/bold cyan]  {tool_list}"
-                )
+                console.print(f"  [bold cyan]Round {iteration + 1}[/bold cyan]  {tool_list}")
             except Exception:  # noqa: BLE001
                 pass
 
@@ -243,9 +254,7 @@ def run_copilot_agent_loop(
         results = _dispatch_tools(tool_calls)
 
         # Feed tool results back to the LLM.
-        result_msgs = provider_adapter.build_tool_result_messages(
-            tool_calls, results
-        )
+        result_msgs = provider_adapter.build_tool_result_messages(tool_calls, results)
         messages.extend(result_msgs)
 
     # Slice UX-L: update perf stats even on failure.
@@ -308,9 +317,7 @@ def _call_llm_with_tools(
     tools: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Make one LLM call with tool definitions and return the raw response."""
-    url, headers, payload = provider.build_tool_request(
-        config, system_prompt, messages, tools
-    )
+    url, headers, payload = provider.build_tool_request(config, system_prompt, messages, tools)
     try:
         with httpx.Client(timeout=config.timeout_seconds) as client:
             response = client.post(url, headers=headers, json=payload)
@@ -342,9 +349,7 @@ def _dispatch_tools(
         return [dispatch_tool_call(tc["name"], tc["arguments"])]
 
     # Check if ALL calls are parallelizable.
-    all_parallel = all(
-        tc["name"] in _PARALLELIZABLE_TOOLS for tc in tool_calls
-    )
+    all_parallel = all(tc["name"] in _PARALLELIZABLE_TOOLS for tc in tool_calls)
 
     if all_parallel and len(tool_calls) > 1:
         # Submit all futures in parallel but collect results in input
@@ -352,14 +357,10 @@ def _dispatch_tools(
         # deterministic across runs.
         with ThreadPoolExecutor(max_workers=min(len(tool_calls), 4)) as pool:
             futures = [
-                pool.submit(dispatch_tool_call, tc["name"], tc["arguments"])
-                for tc in tool_calls
+                pool.submit(dispatch_tool_call, tc["name"], tc["arguments"]) for tc in tool_calls
             ]
             results = [f.result() for f in futures]
         return results
 
     # Sequential fallback for mixed read/write calls.
-    return [
-        dispatch_tool_call(tc["name"], tc["arguments"])
-        for tc in tool_calls
-    ]
+    return [dispatch_tool_call(tc["name"], tc["arguments"]) for tc in tool_calls]

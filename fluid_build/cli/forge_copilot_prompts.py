@@ -318,7 +318,9 @@ def build_clarification_user_prompt(
 
     # Inject domain-specific context if available in interview state
     interview_ctx = interview_state.get("normalized_context") or interview_state
-    domain_expertise = interview_ctx.get("domain_expertise") if isinstance(interview_ctx, dict) else None
+    domain_expertise = (
+        interview_ctx.get("domain_expertise") if isinstance(interview_ctx, dict) else None
+    )
     if domain_expertise:
         payload["domain_expertise"] = domain_expertise
         # Surface domain questions as suggested topics

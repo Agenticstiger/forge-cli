@@ -566,7 +566,10 @@ def _parse_ddl_model(path: Path) -> Optional[Dict[str, Any]]:
         if current_table:
             stripped = line.strip().lower()
             # Skip constraint lines (PRIMARY KEY, FOREIGN KEY, UNIQUE, CHECK, CONSTRAINT)
-            if any(stripped.startswith(kw) for kw in ("primary", "foreign", "unique", "check", "constraint", "index")):
+            if any(
+                stripped.startswith(kw)
+                for kw in ("primary", "foreign", "unique", "check", "constraint", "index")
+            ):
                 continue
             col_match = _COLUMN_DEF_RE.match(line)
             if col_match:
@@ -614,7 +617,9 @@ def _parse_yaml_model(path: Path) -> Optional[Dict[str, Any]]:
                 tables[model_name] = {}
                 for col in cols:
                     if isinstance(col, dict) and col.get("name"):
-                        tables[model_name][col["name"]] = col.get("data_type") or col.get("type", "string")
+                        tables[model_name][col["name"]] = col.get("data_type") or col.get(
+                            "type", "string"
+                        )
 
     # Simple format: {table_name: {col: type}}
     if not tables:
