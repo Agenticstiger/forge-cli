@@ -632,3 +632,74 @@ class TestRegister:
         register(sp)
         args = p.parse_args(["auth", "logout"])
         assert args.verb == "logout"
+
+
+# ── S-011: _sanitize_argv redacts credential-bearing flag values ────
+
+
+class TestSanitizeArgv:
+    """SECURITY_REVIEW S-011: AuthProvider._run_command logs full argv at
+    DEBUG. Credential-bearing flag values (e.g. ``--password hunter2``,
+    ``--key-file /path/to/key.json``, ``--client-secret=xxx``) must be
+    redacted before the string reaches the formatter."""
+
+    def _redact(self, argv):
+        from fluid_build.cli.auth import _sanitize_argv
+
+        return _sanitize_argv(argv)
+
+    def test_space_separated_password_value_redacted(self):
+        out = self._redact(["gcloud", "auth", "activate", "--password", "hunter2"])
+        assert "hunter2" not in out
+        assert "***REDACTED***" in out
+        assert out[:-1] == ["gcloud", "auth", "activate", "--password"]
+
+    def test_equals_separated_password_redacted(self):
+        out = self._redact(["gcloud", "--password=hunter2"])
+        assert "hunter2" not in " ".join(out)
+        assert "--password=***REDACTED***" in out
+
+    def test_key_file_argument_redacted(self):
+        out = self._redact(
+            ["gcloud", "auth", "activate-service-account", "--key-file", "/tmp/k.json"]
+        )
+        assert "/tmp/k.json" not in out
+        assert "***REDACTED***" in out
+
+    def test_provider_specific_secret_flag_matches_suffix(self):
+        """--client-secret isn't in the exact-match set but must match
+        via the ``-secret`` suffix rule."""
+        out = self._redact(["gh", "auth", "login", "--client-secret", "shh"])
+        assert "shh" not in out
+        assert "***REDACTED***" in out
+
+    def test_non_sensitive_flag_unchanged(self):
+        out = self._redact(["gcloud", "--project", "my-project", "--region", "us"])
+        assert out == ["gcloud", "--project", "my-project", "--region", "us"]
+
+    def test_mixed_sensitive_and_non_sensitive(self):
+        out = self._redact(
+            [
+                "gcloud",
+                "auth",
+                "activate-service-account",
+                "--project",
+                "p1",
+                "--key-file",
+                "/path/to/key.json",
+                "--verbose",
+            ]
+        )
+        assert "p1" in out
+        assert "--verbose" in out
+        assert "/path/to/key.json" not in out
+        assert out[out.index("--key-file") + 1] == "***REDACTED***"
+
+    def test_empty_argv(self):
+        assert self._redact([]) == []
+
+    def test_short_password_flag_redacts_next(self):
+        """The short ``-p`` flag is in the exact-match set; next arg redacted."""
+        out = self._redact(["mysql", "-p", "mypassword"])
+        assert "mypassword" not in out
+        assert "***REDACTED***" in out

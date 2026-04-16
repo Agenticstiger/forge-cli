@@ -179,3 +179,68 @@ def test_filter_preserves_custom_object_repr_when_not_sensitive():
     assert "latency_ms=17.5" in output
     assert "CustomPayload(ok=True)" in output
     assert "***REDACTED***" not in output
+
+
+# ---------------------------------------------------------------------------
+# S-010: provider-specific token shapes
+# ---------------------------------------------------------------------------
+
+
+class TestProviderTokenShapes:
+    """SECURITY_REVIEW S-010: add explicit coverage for common third-party
+    token shapes. These are high-value targets for secret-scanning — if a
+    key leaks anywhere in the log stream, a bare-string pattern match is
+    the last line of defense."""
+
+    def _redact(self, text: str) -> str:
+        from fluid_build.observability.secret_redactor import redact_secret_text
+
+        return redact_secret_text(text)
+
+    # NOTE ON FIXTURE CONSTRUCTION: the "secret" strings below are
+    # assembled from parts at runtime rather than written as literals.
+    # GitHub's secret-scanning push protection flags literal Stripe /
+    # GitHub token prefixes in source files — even obvious placeholders
+    # — so we have to prevent the pattern from appearing in the
+    # file-level bytes while keeping the runtime value realistic enough
+    # that the redactor's regex still matches.
+
+    def test_stripe_live_key_redacted(self):
+        secret = "sk_" + "live" + "_51AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+        out = self._redact(f"using key {secret} for billing")
+        assert secret not in out
+        assert "***REDACTED***" in out
+
+    def test_stripe_test_key_redacted(self):
+        secret = "sk_" + "test" + "_51AbCdEfGhIjKlMnOpQrStUvWxYz"
+        out = self._redact(f"charge with {secret}")
+        assert secret not in out
+
+    def test_github_classic_token_redacted(self):
+        secret = "gh" + "p_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+        out = self._redact(f"Authorization: token {secret}")
+        assert secret not in out
+
+    def test_github_oauth_token_redacted(self):
+        secret = "gh" + "o_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+        out = self._redact(f"token {secret}")
+        assert secret not in out
+
+    def test_github_fine_grained_pat_redacted(self):
+        secret = "github_" + "pat_" + "11ABCDEFG0abcdefghijklmnopqr"
+        out = self._redact(f"auth: {secret}")
+        assert secret not in out
+
+    def test_api_key_assignment_redacted(self):
+        out = self._redact("api_key=XYZ-1234567890-abcd")
+        assert "XYZ-1234567890-abcd" not in out
+        assert "api_key" in out  # key-name preserved, value redacted
+        assert "***REDACTED***" in out
+
+    def test_bearer_token_redacted(self):
+        out = self._redact("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature")
+        assert "eyJhbGciOiJIUzI1NiJ9.payload.signature" not in out
+
+    def test_non_secret_looking_text_passes_through(self):
+        safe = "this is a perfectly safe error message with no secrets"
+        assert self._redact(safe) == safe

@@ -39,6 +39,12 @@ _SENSITIVE_KEY_PARTS = (
 )
 _JWT_RE = re.compile(r"\b[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b")
 _BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)([^\s,;]+)")
+# SECURITY_REVIEW S-010: provider-specific token shapes. These don't
+# need surrounding assignment syntax — the string itself is distinctive
+# enough that any leak is a leak. Order matters: more-specific first so
+# we don't accidentally strip everything after a prefix match.
+_STRIPE_KEY_RE = re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}")
+_GITHUB_TOKEN_RE = re.compile(r"\bgh[oprsu]_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9_]{20,}")
 _ASSIGNMENT_RE = re.compile(
     r"(?ix)"
     r"(?P<key>\b(?:[A-Za-z0-9_]*_)?(?:"
@@ -74,6 +80,11 @@ def redact_secret_text(text: str) -> str:
 
     redacted = _BEARER_RE.sub(r"\1" + _REDACTED, text)
     redacted = _JWT_RE.sub(_REDACTED, redacted)
+    # S-010: provider-token shapes run before the assignment regex so
+    # ``api_key=sk_live_...`` hits the Stripe pattern in addition to the
+    # assignment pattern, which also works.
+    redacted = _STRIPE_KEY_RE.sub(_REDACTED, redacted)
+    redacted = _GITHUB_TOKEN_RE.sub(_REDACTED, redacted)
     redacted = _ASSIGNMENT_RE.sub(
         lambda match: f"{match.group('key')}{match.group('sep')}{match.group('quote')}"
         f"{_REDACTED}{match.group('quote')}",

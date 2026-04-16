@@ -32,6 +32,68 @@ from typing import Any, Dict, List, Optional
 
 from fluid_build.cli.console import cprint
 
+# SECURITY_REVIEW S-011: when logging argv for provider subprocesses, the
+# next argument after a credential-bearing flag (and the RHS of
+# ``--flag=value`` forms) must be redacted. The central
+# SecretRedactingFilter catches most secret-shaped values, but flag
+# values like ``--password hunter2`` or a ``--key-file`` pointing at a
+# filesystem path aren't caught by generic pattern matching — they need
+# flag-aware stripping.
+_REDACTED = "***REDACTED***"
+_SENSITIVE_FLAG_SUFFIXES = ("-secret", "-key", "-token", "-password", "-passphrase")
+_SENSITIVE_FLAGS = frozenset(
+    {
+        "--password",
+        "--pass",
+        "--token",
+        "--api-key",
+        "--key-file",
+        "--key",
+        "--secret",
+        "--passphrase",
+        "--credentials",
+        "-p",
+    }
+)
+
+
+def _sanitize_argv(command: List[str]) -> List[str]:
+    """Return a copy of ``command`` with credential-bearing argv values
+    replaced by ``***REDACTED***``.
+
+    Handles two shapes:
+    - ``["--password", "hunter2"]`` → the next element is redacted.
+    - ``["--password=hunter2"]`` → the RHS of ``=`` is redacted.
+
+    Sensitive flags are the exact entries in ``_SENSITIVE_FLAGS`` plus
+    anything ending in ``-secret``, ``-key``, ``-token``, ``-password``,
+    ``-passphrase`` (catches provider-specific variants like
+    ``--client-secret`` or ``--service-account-key``).
+    """
+    out: List[str] = []
+    redact_next = False
+    for arg in command:
+        if redact_next:
+            out.append(_REDACTED)
+            redact_next = False
+            continue
+        if "=" in arg and arg.startswith("--"):
+            flag, _, _ = arg.partition("=")
+            if flag in _SENSITIVE_FLAGS or any(
+                flag.endswith(suffix) for suffix in _SENSITIVE_FLAG_SUFFIXES
+            ):
+                out.append(f"{flag}={_REDACTED}")
+                continue
+        if arg in _SENSITIVE_FLAGS or any(
+            arg.endswith(suffix) for suffix in _SENSITIVE_FLAG_SUFFIXES
+        ):
+            out.append(arg)
+            redact_next = True
+            continue
+        out.append(arg)
+    return out
+
+
 # Check for optional dependencies
 try:
     from rich.console import Console
@@ -107,7 +169,10 @@ class AuthProvider:
     ) -> subprocess.CompletedProcess:
         """Run a shell command with proper error handling"""
         try:
-            self.logger.debug(f"Running command: {' '.join(command)}")
+            # S-011: strip credential-bearing flag values before logging.
+            # ``%s`` + positional keeps the SecretRedactingFilter in the
+            # logging chain as defense-in-depth.
+            self.logger.debug("Running command: %s", " ".join(_sanitize_argv(command)))
             result = subprocess.run(command, capture_output=capture_output, text=True, check=check)
             return result
         except subprocess.CalledProcessError as e:
