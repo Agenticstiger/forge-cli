@@ -24,7 +24,7 @@ from typing import Any, Dict, Optional, Set
 
 import yaml
 
-__version__ = "0.7.9"
+__version__ = "0.7.10"
 
 __all__ = [
     "__version__",

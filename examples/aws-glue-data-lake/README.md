@@ -14,7 +14,7 @@ End-to-end data lake on AWS using Glue for cataloging, ETL, and Iceberg tables.
 ## Prerequisites
 
 - AWS account with Glue, S3, and IAM permissions
-- `fluid` CLI installed (`pip install fluid-forge`)
+- `fluid` CLI installed (`pip install data-product-forge`)
 - AWS credentials configured (`aws configure` or env vars)
 
 ## Quick Start

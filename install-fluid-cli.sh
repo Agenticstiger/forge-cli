@@ -13,7 +13,7 @@ NAS_HOST="${NAS_HOST:-localhost}"
 NAS_SSH_USER="${NAS_SSH_USER:-khyana_ai}"
 ARTIFACT_REPO="ssh://${NAS_SSH_USER}@${NAS_HOST}/volume1/git-server/fluid-cli-builds.git"
 ARTIFACT_DIR="builds"
-PACKAGE_NAME="fluid-forge"
+PACKAGE_NAME="data-product-forge"
 
 # Colors for output
 GREEN='\033[0;32m'

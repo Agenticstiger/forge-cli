@@ -96,13 +96,13 @@ the old org/repo name needs updating.
 
 ```bash
 # Preview changes first
-grep -rn "Agenticstiger/fluid-forge-cli" --include="*.py" --include="*.yml" \
+grep -rn "Agenticstiger/forge-cli" --include="*.py" --include="*.yml" \
   --include="*.yaml" --include="*.toml" --include="*.md" --include="Dockerfile"
 
 # Apply (macOS/Linux)
 find . -type f \( -name "*.py" -o -name "*.yml" -o -name "*.yaml" \
   -o -name "*.toml" -o -name "*.md" -o -name "Dockerfile" \) \
-  -exec sed -i 's|Agenticstiger/fluid-forge-cli|Agenticstiger/forge-cli|g' {} +
+  -exec sed -i 's|Agenticstiger/forge-cli|Agenticstiger/forge-cli|g' {} +
 ```
 
 ### 3c. pyproject.toml URLs (target state)
@@ -226,7 +226,7 @@ with PyPI.
 
   | Field | Value |
   |-------|-------|
-  | PyPI project name | `fluid-forge` |
+  | PyPI project name | `data-product-forge` |
   | Owner | `Agenticstiger` |
   | Repository | `forge-cli` |
   | Workflow name | `release.yml` |
@@ -240,7 +240,7 @@ with PyPI.
 
   | Field | Value |
   |-------|-------|
-  | PyPI project name | `fluid-forge` |
+  | PyPI project name | `data-product-forge` |
   | Owner | `Agenticstiger` |
   | Repository | `forge-cli` |
   | Workflow name | `release.yml` |
@@ -301,7 +301,7 @@ These should already exist — verify they're up to date:
 - [ ] `README.md` — updated badges pointing to new repo
   ```markdown
   [![CI](https://github.com/Agenticstiger/forge-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Agenticstiger/forge-cli/actions/workflows/ci.yml)
-  [![PyPI](https://img.shields.io/pypi/v/fluid-forge)](https://pypi.org/project/fluid-forge/)
+  [![PyPI](https://img.shields.io/pypi/v/data-product-forge)](https://pypi.org/project/fluid-forge/)
   [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
   ```
 - [ ] `CONTRIBUTING.md` — links to new repo issues/PRs
@@ -332,7 +332,7 @@ git push public v0.7.7a1
 
 # 3. Verify TestPyPI:
 pip install --index-url https://test.pypi.org/simple/ \
-  --extra-index-url https://pypi.org/simple/ fluid-forge==0.7.7a1
+  --extra-index-url https://pypi.org/simple/ data-product-forge==0.7.7a1
 
 # 4. Verify GHCR:
 docker pull ghcr.io/agenticstiger/forge-cli:0.7.7a1
@@ -359,7 +359,7 @@ git push public v0.7.7
 
 ```bash
 # PyPI
-pip install fluid-forge
+pip install data-product-forge
 fluid --version
 
 # Docker
@@ -405,10 +405,10 @@ docker run --rm ghcr.io/agenticstiger/forge-cli:latest --version
 |------|-------------------|----------------|
 | **Org** | `Agenticstiger` | `Agenticstiger` |
 | **Repo** | `fluid-forge-cli` | `forge-cli` |
-| **Full URL** | `github.com/Agenticstiger/fluid-forge-cli` | `github.com/Agenticstiger/forge-cli` |
+| **Full URL** | `github.com/Agenticstiger/forge-cli` | `github.com/Agenticstiger/forge-cli` |
 | **CI** | Jenkins + GitHub Actions | GitHub Actions only |
 | **PyPI** | Private NAS PyPI | pypi.org (Trusted Publisher) |
 | **Docker** | `localhost:5000` | `ghcr.io/agenticstiger/forge-cli` |
 | **Artifacts** | Git-based NAS repo | GitHub Actions artifacts + Releases |
-| **Package name** | `fluid-forge` | `fluid-forge` (unchanged) |
+| **Package name** | `data-product-forge` | `data-product-forge` (unchanged) |
 | **CLI command** | `fluid` | `fluid` (unchanged) |

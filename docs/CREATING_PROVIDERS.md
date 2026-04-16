@@ -166,7 +166,7 @@ name = "fluid-provider-mycloud"
 version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = [
-    "fluid-forge>=0.7.1",    # for BaseProvider
+    "data-product-forge>=0.7.1",    # for BaseProvider
     "mycloud-sdk>=1.0",       # your cloud SDK
 ]
 

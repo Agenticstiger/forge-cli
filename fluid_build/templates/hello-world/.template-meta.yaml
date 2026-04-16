@@ -11,7 +11,7 @@ concepts:
   - "Contract validation"
   - "Simple SQL transformations"
 prerequisites:
-  - "FLUID CLI installed (pip install fluid-forge)"
+  - "FLUID CLI installed (pip install data-product-forge)"
   - "Basic understanding of SQL"
 quickstart_tutorial: "001-hello-fluid.md"
 related_tutorials:

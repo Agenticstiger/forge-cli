@@ -10,7 +10,7 @@
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://python.org)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/fluid-forge.svg)](https://pypi.org/project/fluid-forge/)
+[![PyPI](https://img.shields.io/pypi/v/data-product-forge.svg)](https://pypi.org/project/data-product-forge/)
 
 [Documentation](https://agenticstiger.github.io/forge_docs/) · [Quickstart](#-60-seconds-to-magic) · [Community](https://github.com/Agenticstiger/forge-cli/discussions) · [Enterprise](https://fluidhq.io)
 
@@ -26,7 +26,7 @@ Data engineering shouldn't require weeks of handwritten infrastructure code, bes
 
 ```bash
 # 1. Install
-pip install fluid-forge
+pip install data-product-forge
 
 # 2. Validate your data product contract
 fluid validate contract.fluid.yaml
@@ -41,7 +41,7 @@ fluid apply contract.fluid.yaml
 That's it. You just deployed a **versioned, governed, and orchestrated Data Product** from a single YAML file.
 
 > **Want to move from local to Google Cloud?**
-> `pip install "fluid-forge[gcp]"` → change `platform: local` to `platform: gcp` → run `fluid apply`. Done.
+> `pip install "data-product-forge[gcp]"` → change `platform: local` to `platform: gcp` → run `fluid apply`. Done.
 
 **From source:**
 ```bash
@@ -161,15 +161,15 @@ Export-only providers for open data standards: **odps**, **odcs**, **datamesh-ma
 FLUID Forge is modular. Install only what you need.
 
 ```bash
-pip install fluid-forge                # Minimal — CLI + Local/DuckDB provider
-pip install "fluid-forge[gcp]"         # + Google Cloud
-pip install "fluid-forge[aws]"         # + AWS
-pip install "fluid-forge[snowflake]"   # + Snowflake
-pip install "fluid-forge[all]"         # Everything
+pip install data-product-forge                # Minimal — CLI + Local/DuckDB provider
+pip install "data-product-forge[gcp]"         # + Google Cloud
+pip install "data-product-forge[aws]"         # + AWS
+pip install "data-product-forge[snowflake]"   # + Snowflake
+pip install "data-product-forge[all]"         # Everything
 ```
 
 > 💡 **Tip:** We recommend [pipx](https://pipx.pypa.io/) for an isolated global install:
-> `pipx install "fluid-forge[all]"`
+> `pipx install "data-product-forge[all]"`
 
 ### From Source (Contributors)
 
@@ -345,6 +345,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for style guides and architecture overvie
 
 **Built for the future of data. Built for the Agentic Era.**
 
-[fluidhq.io](https://fluidhq.io) · [Documentation](https://agenticstiger.github.io/forge_docs/) · [PyPI](https://pypi.org/project/fluid-forge/) · [Issues](https://github.com/Agenticstiger/forge-cli/issues)
+[fluidhq.io](https://fluidhq.io) · [Documentation](https://agenticstiger.github.io/forge_docs/) · [PyPI](https://pypi.org/project/data-product-forge/) · [Issues](https://github.com/Agenticstiger/forge-cli/issues)
 
 </div>

@@ -43,7 +43,7 @@ We follow [coordinated disclosure](https://en.wikipedia.org/wiki/Coordinated_vul
 ## Security Best Practices for Users
 
 - **Never commit secrets** to your contract files. Use environment variables or a credential resolver.
-- **Keep dependencies updated:** `pip install --upgrade fluid-forge`
+- **Keep dependencies updated:** `pip install --upgrade data-product-forge`
 - **Use the built-in secret scanner:** `detect-secrets scan` (see [CONTRIBUTING.md](CONTRIBUTING.md))
 - **Review plans before applying:** Always run `fluid plan` and inspect the output before `fluid apply`.
 

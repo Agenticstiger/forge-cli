@@ -30,7 +30,7 @@ the mesh manager in a single command. Governance stays in sync with the pipeline
 ## Prerequisites
 
 ```bash
-pip install fluid-forge          # install the CLI
+pip install data-product-forge          # install the CLI
 
 export DMM_API_KEY=your-api-key  # Entropy Data API key
                                  # (or pass --api-key on every command)

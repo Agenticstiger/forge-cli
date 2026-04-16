@@ -363,7 +363,7 @@ def import_module_safe(module_name: str, attr_name: Optional[str] = None) -> Any
             suggestions=[
                 f"Ensure {module_name} is properly installed",
                 "Check your Python environment and dependencies",
-                "Run 'pip install fluid-forge' to reinstall",
+                "Run 'pip install data-product-forge' to reinstall",
             ],
         )
 

@@ -296,10 +296,10 @@ See [EXTENSION_GUIDE.md](EXTENSION_GUIDE.md) for comprehensive guidance on:
 
 ## Support
 
-- **Documentation**: [FLUID Build Docs](https://docs.fluid-forge.io/forge)
-- **Examples**: [GitHub Examples](https://github.com/fluid-forge/examples/forge)
-- **Community**: [Discord #forge](https://discord.gg/fluid-forge)
-- **Issues**: [GitHub Issues](https://github.com/fluid-forge/fluid-forge/issues)
+- **Documentation**: [FLUID Build Docs](https://agenticstiger.github.io/forge_docs/)
+- **Examples**: [GitHub Examples](https://github.com/Agenticstiger/forge-cli/tree/main/examples)
+- **Community**: [GitHub Discussions](https://github.com/Agenticstiger/forge-cli/discussions)
+- **Issues**: [GitHub Issues](https://github.com/Agenticstiger/forge-cli/issues)
 
 ---
 

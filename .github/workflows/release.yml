@@ -24,7 +24,7 @@ on:
 permissions: {}  # Job-level permissions only — least privilege
 
 env:
-  PACKAGE_NAME: fluid-forge
+  PACKAGE_NAME: data-product-forge
   PYTHON_VERSION: "3.12"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -183,7 +183,7 @@ jobs:
       id-token: write
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/fluid-forge
+      url: https://test.pypi.org/p/data-product-forge
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v5
@@ -218,7 +218,7 @@ jobs:
           /tmp/testpypi-verify/bin/pip install \
             --index-url https://test.pypi.org/simple/ \
             --extra-index-url https://pypi.org/simple/ \
-            "fluid-forge==${{ needs.quality-gate.outputs.version }}"
+            "data-product-forge==${{ needs.quality-gate.outputs.version }}"
 
       - name: Verify installed package
         run: |
@@ -262,7 +262,7 @@ jobs:
       id-token: write
     environment:
       name: pypi
-      url: https://pypi.org/p/fluid-forge
+      url: https://pypi.org/p/data-product-forge
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v5
@@ -308,15 +308,15 @@ jobs:
           ## Installation
 
           ```bash
-          pip install fluid-forge
+          pip install data-product-forge
           ```
 
           Or with extras:
           ```bash
-          pip install "fluid-forge[local]"       # DuckDB local provider
-          pip install "fluid-forge[gcp]"         # Google Cloud provider
-          pip install "fluid-forge[snowflake]"   # Snowflake provider
-          pip install "fluid-forge[all]"         # Everything
+          pip install "data-product-forge[local]"       # DuckDB local provider
+          pip install "data-product-forge[gcp]"         # Google Cloud provider
+          pip install "data-product-forge[snowflake]"   # Snowflake provider
+          pip install "data-product-forge[all]"         # Everything
           ```
 
           HEADER
@@ -328,7 +328,7 @@ jobs:
           >
           > Install from TestPyPI:
           > \`\`\`bash
-          > pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ fluid-forge==${VERSION}
+          > pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ data-product-forge==${VERSION}
           > \`\`\`
 
           EOF
