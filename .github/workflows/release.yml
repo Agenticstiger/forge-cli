@@ -1,5 +1,23 @@
 # Release Pipeline — publish to PyPI (via TestPyPI), GHCR, GitHub Releases.
 #
+# Design principles (matching modern Python OSS like Ruff / HTTPX / Pydantic):
+#
+#   1. Trust the PR-time CI.
+#      Branch protection on `main` requires `ci.yml` to pass before merge.
+#      This workflow does NOT re-run lint / pytest / bandit — `quality-gate`
+#      is a lightweight tag-shape + CI-green check (~10 s).
+#
+#   2. Every release is cryptographically signed.
+#      `pypa/gh-action-pypi-publish` uploads each wheel with a Sigstore
+#      attestation (`attestations: true`). `actions/attest-build-provenance`
+#      attaches an in-toto SLSA build provenance to every artifact. Both
+#      use GitHub OIDC — no long-lived secrets.
+#
+#   3. Release notes come from CHANGELOG.md, not git log.
+#      The GitHub Release body is extracted from the matching `## [X.Y.Z]`
+#      section of CHANGELOG.md; falls back to git log if the entry is
+#      missing (warning, not failure).
+#
 # Triggers:
 #   - Push a tag matching v*.*.* (e.g. v0.7.1, v0.7.1a1, v0.7.1b2)
 #   - Manual workflow_dispatch with a tag input
@@ -8,15 +26,15 @@
 #
 #   quality-gate
 #       └─ build
-#           └─ publish-testpypi          (always, every tag)
+#           └─ publish-testpypi          (always, every tag; + Sigstore)
 #               └─ verify-testpypi       (always; install + smoke from TestPyPI)
-#                   ├─ publish-pypi      (only when tag is stable; gated by
-#                   │       └─ verify-pypi    verify-testpypi success)
+#                   ├─ publish-pypi      (stable only; gated by verify-testpypi)
+#                   │       └─ verify-pypi    (final smoke from real PyPI)
 #                   ├─ docker            (after TestPyPI verify, regardless
 #                   └─ github-release     of stable/pre)
 #
 # Pre-release tags (containing a/b/rc/dev) stop after verify-testpypi.
-# Stable tags get promoted to PyPI only if the TestPyPI install smoke passes.
+# Stable tags promote to PyPI only if the TestPyPI install smoke passes.
 #
 # Wheel version comes from the git tag via setuptools-scm — no static
 # `version = "..."` literal in pyproject.toml to drift.
@@ -48,75 +66,75 @@ env:
 
 jobs:
   # ──────────────────────────────────────────────────────────────
-  # 1. Quality gate — must pass before any publishing
+  # 1. Quality gate — tag-shape + CI-green check. No lint/test re-run.
+  #
+  # Branch protection on `main` already requires `ci.yml` to pass before
+  # merge, so the commit we're tagging has been exercised end-to-end.
+  # This gate just validates the tag shape and confirms the commit's
+  # CI run concluded successfully. ~10 seconds.
   # ──────────────────────────────────────────────────────────────
   quality-gate:
     name: Quality Gate
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read            # read the matching ci.yml run status
     outputs:
       version: ${{ steps.meta.outputs.version }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
       profile: ${{ steps.meta.outputs.profile }}
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Parse version metadata
+      - name: Parse & validate tag shape
         id: meta
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          # Strip leading 'v'
-          VERSION="${TAG#v}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-          if [[ "$VERSION" == *a* ]] || [[ "$VERSION" == *dev* ]]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "profile=alpha" >> "$GITHUB_OUTPUT"
-          elif [[ "$VERSION" == *b* ]] || [[ "$VERSION" == *rc* ]]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "profile=beta" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
-            echo "profile=stable" >> "$GITHUB_OUTPUT"
+          # Strict PEP 440 / semver-compatible shape with optional
+          # pre-release suffix (a / b / rc / .dev).
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+|\.dev[0-9]+)?$ ]]; then
+            echo "::error::Tag '$TAG' is not a valid vX.Y.Z[(a|b|rc)N|.devN] form"
+            exit 1
           fi
+          VERSION="${TAG#v}"
+          if   [[ "$VERSION" == *a*    ]]; then PROFILE=alpha; PRE=true
+          elif [[ "$VERSION" == *b*    ]]; then PROFILE=beta;  PRE=true
+          elif [[ "$VERSION" == *rc*   ]]; then PROFILE=rc;    PRE=true
+          elif [[ "$VERSION" == *.dev* ]]; then PROFILE=dev;   PRE=true
+          else                                   PROFILE=stable; PRE=false
+          fi
+          {
+            echo "version=$VERSION"
+            echo "is_prerelease=$PRE"
+            echo "profile=$PROFILE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tag '$TAG' parsed as version='$VERSION' profile='$PROFILE' is_prerelease='$PRE'"
 
-          echo "Tag: ${TAG}"
-          echo "Version: ${VERSION}"
-
-      - uses: actions/setup-python@v6
+      - name: Assert tag points at a commit whose ci.yml is green
+        uses: actions/github-script@v7
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -e ".[dev,local]" || pip install -e ".[dev]"
-
-      - name: Lint
-        run: |
-          pip install "black==24.10.0"
-          ruff check fluid_build/ tests/
-          black --check fluid_build/ tests/
-
-      - name: Tests with coverage
-        run: |
-          pip install pytest-cov
-          # Tests known to fail in specific environments are now marked with
-          # @pytest.mark.skipif / @pytest.mark.xfail in the test files
-          # themselves (with explicit reasons). No deselect flags needed here.
-          pytest --cov=fluid_build --cov-report=xml --cov-report=term-missing -q
-
-      - name: Security scan
-        run: |
-          pip install bandit
-          bandit -r fluid_build/ -c pyproject.toml --severity-level medium -q
-
-      # Note: there is no longer a "Verify version matches tag" step.
-      # With setuptools-scm, the wheel version IS the tag (no static
-      # `version = "..."` in pyproject.toml to drift from). The build
-      # job's "Isolated wheel install and verify" step asserts
-      # `fluid --version` matches what setuptools-scm produced.
+          script: |
+            const { data: runs } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "ci.yml",
+              head_sha: context.sha,
+              per_page: 1,
+            });
+            const latest = runs.workflow_runs[0];
+            if (!latest) {
+              core.setFailed(
+                `No ci.yml run found for commit ${context.sha}. ` +
+                `Did you tag a commit before its PR CI finished?`,
+              );
+              return;
+            }
+            if (latest.conclusion !== "success") {
+              core.setFailed(
+                `Latest ci.yml run on ${context.sha} concluded '${latest.conclusion}'. ` +
+                `Refusing to release from a non-green commit. Run: ${latest.html_url}`,
+              );
+              return;
+            }
+            core.notice(`ci.yml on ${context.sha}: ${latest.conclusion} (${latest.html_url})`);
 
   # ──────────────────────────────────────────────────────────────
   # 2. Build distribution artifacts
@@ -127,8 +145,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write          # Sigstore / OIDC
+      attestations: write      # SLSA build provenance
     steps:
       - uses: actions/checkout@v5
+        with:
+          # setuptools-scm needs full history + all tags to derive the version.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
         with:
@@ -145,6 +168,14 @@ jobs:
 
       - name: Strict metadata check
         run: twine check --strict dist/*
+
+      - name: Attest build provenance (SLSA)
+        # Creates an in-toto attestation proving each dist artifact was built
+        # by this workflow / this commit. Verifiable via `gh attestation verify`
+        # or the Sigstore CLI.
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*"
 
       - name: Isolated wheel install and verify
         run: |
@@ -195,6 +226,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
+      attestations: write
     environment:
       name: testpypi
       url: https://test.pypi.org/p/data-product-forge
@@ -205,10 +237,11 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Publish to TestPyPI
+      - name: Publish to TestPyPI (with Sigstore attestations)
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
         with:
           repository-url: https://test.pypi.org/legacy/
+          attestations: true
 
   # ──────────────────────────────────────────────────────────────
   # 3a-verify. Install from TestPyPI and smoke-test the package.
@@ -274,6 +307,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
+      attestations: write
     environment:
       name: pypi
       url: https://pypi.org/p/data-product-forge
@@ -284,8 +318,10 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Publish to PyPI
+      - name: Publish to PyPI (with Sigstore attestations)
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
+        with:
+          attestations: true
 
   # ──────────────────────────────────────────────────────────────
   # 3b-verify. Install from PyPI and smoke-test (final gate).
@@ -343,52 +379,71 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Generate release notes
+      - name: Generate release notes from CHANGELOG.md
         id: notes
+        # Extracts the '## [X.Y.Z] — date' section body from CHANGELOG.md.
+        # Pre-release suffixes are stripped for lookup: v0.7.11a1 reads the
+        # [0.7.11] section. If no matching section exists, falls back to a
+        # git log since the previous tag (emitted as a workflow warning).
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          set -euo pipefail
           VERSION="${{ needs.quality-gate.outputs.version }}"
           PROFILE="${{ needs.quality-gate.outputs.profile }}"
           IS_PRE="${{ needs.quality-gate.outputs.is_prerelease }}"
 
-          # Get commits since last tag
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          # Strip pre-release suffix for CHANGELOG lookup.
+          BASE=$(echo "$VERSION" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
 
-          cat > release-notes.md << 'HEADER'
-          ## Installation
+          # Pull lines from '## [BASE]' to (but not including) the next '## ['.
+          NOTES=$(awk -v ver="## [$BASE]" '
+            $0 ~ "^"ver {flag=1; next}
+            /^## \[/ && flag {exit}
+            flag {print}
+          ' CHANGELOG.md || true)
 
-          ```bash
-          pip install data-product-forge
-          ```
-
-          Or with extras:
-          ```bash
-          pip install "data-product-forge[local]"       # DuckDB local provider
-          pip install "data-product-forge[gcp]"         # Google Cloud provider
-          pip install "data-product-forge[snowflake]"   # Snowflake provider
-          pip install "data-product-forge[all]"         # Everything
-          ```
-
-          HEADER
-
-          if [ "$IS_PRE" = "true" ]; then
-            cat >> release-notes.md << EOF
-
-          > **Pre-release** ($PROFILE) — not recommended for production use.
-          >
-          > Install from TestPyPI:
-          > \`\`\`bash
-          > pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ data-product-forge==${VERSION}
-          > \`\`\`
-
-          EOF
+          if [ -z "${NOTES// }" ]; then
+            echo "::warning::No CHANGELOG entry for [$BASE]; falling back to git log"
+            PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+            if [ -n "$PREV_TAG" ]; then
+              NOTES=$(git log --pretty=format:'- %s (%h)' "${PREV_TAG}..HEAD")
+            else
+              NOTES="(initial release — no prior tag to diff against)"
+            fi
           fi
 
-          if [ -n "$PREV_TAG" ]; then
-            echo "## Changes since ${PREV_TAG}" >> release-notes.md
-            echo "" >> release-notes.md
-            git log --pretty=format:"- %s (%h)" "${PREV_TAG}..HEAD" >> release-notes.md
-          fi
+          {
+            echo "## Installation"
+            echo
+            echo '```bash'
+            if [ "$IS_PRE" = "true" ]; then
+              echo "# Pre-release ($PROFILE) — not recommended for production."
+              echo "pip install --index-url https://test.pypi.org/simple/ \\"
+              echo "            --extra-index-url https://pypi.org/simple/ \\"
+              echo "            data-product-forge==$VERSION"
+            else
+              echo "pip install data-product-forge==$VERSION"
+            fi
+            echo '```'
+            echo
+            echo '### Provider extras'
+            echo '```bash'
+            echo 'pip install "data-product-forge[local]"      # DuckDB'
+            echo 'pip install "data-product-forge[gcp]"        # Google Cloud'
+            echo 'pip install "data-product-forge[snowflake]"  # Snowflake'
+            echo 'pip install "data-product-forge[all]"        # Everything'
+            echo '```'
+            echo
+            echo '### Verifying the release (Sigstore)'
+            echo 'Every wheel ships with a Sigstore attestation and an SLSA build provenance.'
+            echo 'To verify a downloaded wheel against this GitHub Actions release:'
+            echo '```bash'
+            echo 'pip install sigstore'
+            echo 'pip download data-product-forge=='"$VERSION"' --no-deps -d ./dpf'
+            echo "gh attestation verify ./dpf/*.whl --repo Agenticstiger/forge-cli"
+            echo '```'
+            echo
+            echo "$NOTES"
+          } > release-notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
