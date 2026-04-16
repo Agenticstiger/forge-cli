@@ -552,3 +552,58 @@ class TestUnifiedGovernanceApplicator:
         with pytest.raises(ValueError, match="Invalid SQL identifier"):
             app._apply_security_policies("DB", "SCH", "DB.SCH.TBL", expose)
         cursor.execute.assert_not_called()
+
+    # ── S-006: DDL identifier validation at _create_infrastructure ────
+    @pytest.mark.parametrize(
+        "database,schema,table",
+        [
+            ("good_db; DROP DATABASE prod; --", "SCH", "TBL"),
+            ("DB", "good_schema' OR '1'='1", "TBL"),
+            ("DB", "SCH", "tbl; DELETE FROM x"),
+            ("1leading-digit", "SCH", "TBL"),
+            ("", "SCH", "TBL"),
+        ],
+    )
+    def test_create_infrastructure_rejects_malicious_identifiers(self, database, schema, table):
+        """S-006: the DDL emitters in _create_infrastructure take raw
+        identifiers and f-string them into CREATE DATABASE/SCHEMA/TABLE
+        statements. A malicious identifier (contract author acting as
+        attacker) used to be interpolated raw. Now validated at the
+        function boundary via validate_ident."""
+        cursor = MagicMock()
+        app = UnifiedGovernanceApplicator(cursor, {}, dry_run=False)
+        with pytest.raises(ValueError, match="Invalid SQL identifier"):
+            app._create_infrastructure(database, schema, table, {})
+        cursor.execute.assert_not_called()
+
+    def test_create_infrastructure_accepts_valid_identifiers(self):
+        cursor = MagicMock()
+        app = UnifiedGovernanceApplicator(cursor, {"exposes": []}, dry_run=False)
+        # Should not raise; builds and executes DDL for valid identifiers.
+        app._create_infrastructure("MY_DB", "MY_SCHEMA", "MY_TABLE", {})
+        # At least the CREATE DATABASE + CREATE SCHEMA calls should have
+        # fired (CREATE TABLE may also fire depending on _generate_create_table_ddl
+        # for an empty expose).
+        executed_sql = [call.args[0] for call in cursor.execute.call_args_list]
+        assert any("CREATE DATABASE IF NOT EXISTS MY_DB" in s for s in executed_sql)
+        assert any("CREATE SCHEMA IF NOT EXISTS MY_DB.MY_SCHEMA" in s for s in executed_sql)
+
+    # ── S-007: quote_string_literal usage in tag / comment emitters ──
+    def test_apply_tags_to_table_doubles_embedded_quote(self):
+        """S-007: a tag value containing a single quote must be wrapped
+        via quote_string_literal (doubles the embedded '), not broken
+        out of the literal."""
+        cursor = MagicMock()
+        app = UnifiedGovernanceApplicator(cursor, {}, dry_run=False)
+        app._apply_tags_to_table("DB.SCH.TBL", {"T1": "O'Brien"})
+        executed_sql = cursor.execute.call_args_list[0].args[0]
+        assert "SET TAG T1 = 'O''Brien'" in executed_sql
+        # No bare backslash-escape or unescaped stray quote
+        assert "\\'" not in executed_sql
+
+    def test_apply_column_tag_doubles_embedded_quote(self):
+        cursor = MagicMock()
+        app = UnifiedGovernanceApplicator(cursor, {}, dry_run=False)
+        app._apply_column_tag("DB.SCH.TBL", "col", "TAG1", "it's fine")
+        executed_sql = cursor.execute.call_args_list[0].args[0]
+        assert "SET TAG TAG1 = 'it''s fine'" in executed_sql
