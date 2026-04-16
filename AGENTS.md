@@ -50,6 +50,8 @@ forge-cli/
 | Contract schemas | `fluid_build/schemas/*.json` |
 | Policy engine | `fluid_build/policy/` (compiler, agent_policy, sovereignty, guardrails) |
 | Forge (AI creation) | `fluid_build/forge/` (templates, generators, extensions) |
+| Log redaction (global) | `fluid_build/observability/secret_redactor.py` — `SecretRedactingFilter` wired into Python logging |
+| SQL safety helpers | `fluid_build/providers/_sql_safety.py` — `validate_ident`, `quote_string_literal` (required for every DDL f-string) |
 | Test suite | `tests/` — mirrors `fluid_build/` structure |
 
 ### Development Commands
@@ -71,6 +73,9 @@ make demo           # validate → plan → apply on example contract
 - **Adding a template**: Create `fluid_build/templates/<name>.j2` or add to `fluid_build/forge/templates/`
 - **Adding a policy rule**: Extend validators in `fluid_build/policy/`
 - **Modifying the contract schema**: Update `fluid_build/schemas/` and bump `fluidVersion`
+- **Adding a copilot tool that takes a path**: accept `workspace_root: Optional[Path]` as a kwarg from `dispatch_tool_call`; confine the LLM-supplied path with `resolved.relative_to(workspace_root)` and apply a suffix allow-list + size cap. Reference implementation: `cli/forge_copilot_tools.py::_dispatch_read_sample_schema`.
+- **Emitting new SQL DDL**: identifiers must go through `fluid_build/providers/_sql_safety.py::validate_ident`; string literals through `quote_string_literal`. Inline `.replace("'", "''")` is considered a regression — it diverges from the central helper.
+- **Adding a secret pattern to logs**: extend `fluid_build/providers/snowflake/util/logging.py::SENSITIVE_PATTERNS`/`SENSITIVE_KEYS` AND mirror the addition into `fluid_build/observability/secret_redactor.py` to keep the two redactor layers symmetric.
 
 ### Code Conventions
 
@@ -80,6 +85,17 @@ make demo           # validate → plan → apply on example contract
 - Logging via `fluid_build/structured_logging.py` (structured JSON logs)
 - Rich console output for user-facing messages
 - Test markers: `@pytest.mark.unit`, `@pytest.mark.integration`, `@pytest.mark.gcp`, etc.
+
+### Security Invariants
+
+A 2026-04-16 security review (see `SECURITY_REVIEW.md` if committed, or the PR #28–#33 series) established these invariants. Changes to the listed code paths should preserve them.
+
+- **Two redaction layers stay symmetric.** `observability/secret_redactor.py::SecretRedactingFilter` is the global log filter; `providers/snowflake/util/logging.py` has a Snowflake-provider-local twin. New secret-shaped patterns (JWT, Stripe, GitHub token, provider-specific key names) should land in both.
+- **Path validation is order-sensitive.** `cli/security.py::validate_input_path` calls `_reject_raw_traversal(raw)` BEFORE `Path.resolve()` (so `..` can't be silently collapsed), then runs `_validate_path_security(resolved)` for forbidden-path checks. `FORBIDDEN_PATHS` is platform-aware via `_build_forbidden_paths()` — macOS includes `/private/etc` because `/etc` resolves there.
+- **Copilot tool confinement.** Path-accepting copilot tools (`read_sample_schema`, `discover_workspace`) receive a `workspace_root` kwarg from `cli/forge_copilot_tools.py::dispatch_tool_call` and MUST confine the LLM's path argument. `discover_workspace` ignores the LLM's own `workspace_path` argument by design — scope is fixed by the invoking CLI.
+- **Encrypted credential store fails loud.** `credentials/encrypted_store.py::_load_store` raises `CredentialError` on `InvalidToken` — never silently returns `{}` (which previously caused destructive overwrite on next write with the wrong key).
+- **Tool errors are typed, not text.** `dispatch_tool_call` returns `{"error": <ExcName>, "message": "Tool … failed — see server logs"}` on exception; the full `exc` goes to `LOG.warning(..., exc_info=True)` where the redactor can scrub it. Exception text is never round-tripped into the LLM context (prevents path / hostname / env-var leaks).
+- **Subprocess argv sanitisation.** `cli/auth.py::_sanitize_argv` redacts values of `--password`, `--token`, `--api-key`, `--key-file`, any flag ending in `-secret`/`-key`/`-token`/`-password`/`-passphrase`. Called from `AuthProvider._run_command` before DEBUG-logging the command.
 
 ---
 
