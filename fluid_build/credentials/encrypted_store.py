@@ -36,6 +36,25 @@ except ImportError:
     Fernet = None
 
 
+def _secure_parent_dir(path: Path) -> None:
+    """Create ``path.parent`` with mode 0o700.
+
+    ``mkdir`` honors the process umask (typically 0o022 → 0o755), which
+    on shared hosts leaks existence / timestamps of the credentials
+    directory to other local accounts. We tighten to 0o700 after the
+    fact. ``chmod`` is best-effort: on Windows / restricted filesystems
+    the call may fail, which we tolerate silently.
+
+    See SECURITY_REVIEW S-009.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except (NotImplementedError, PermissionError, OSError):
+        # Windows / restricted FS — chmod is best-effort.
+        pass
+
+
 class EncryptedCredentialStore:
     """Encrypted credential storage for CI/CD environments."""
 
@@ -60,8 +79,10 @@ class EncryptedCredentialStore:
     def _ensure_key(self):
         """Create or load encryption key."""
         if not self.key_path.exists():
-            # Create new encryption key
-            self.key_path.parent.mkdir(parents=True, exist_ok=True)
+            # Create new encryption key. Parent dir is chmod'd 0o700 to
+            # prevent other local accounts from enumerating the store —
+            # see SECURITY_REVIEW S-009.
+            _secure_parent_dir(self.key_path)
             key = Fernet.generate_key()
             self.key_path.write_bytes(key)
             self.key_path.chmod(0o600)  # Owner read/write only
@@ -183,17 +204,46 @@ class EncryptedCredentialStore:
             data = json.loads(decrypted)
             logger.debug(f"Loaded {len(data)} credentials from encrypted store")
             return data
-        except InvalidToken:
-            logger.error("Invalid encryption key or corrupted credential store")
-            return {}
-        except Exception as e:
-            logger.error(f"Failed to load encrypted store: {e}")
-            return {}
+        except InvalidToken as exc:
+            # S-008: do NOT silently return {} here. The previous behavior
+            # caused the next `_save_store` call to overwrite the ciphertext
+            # with the *new* key, irreversibly destroying credentials that
+            # were still recoverable with the old key. Raise instead so the
+            # user can back up the ciphertext and investigate.
+            from fluid_build.credentials.resolver import (  # noqa: PLC0415
+                CredentialError,
+            )
+
+            logger.error("Encrypted credential store cannot be decrypted with the current key")
+            raise CredentialError(
+                "Encrypted credential store at "
+                f"{self.store_path} cannot be decrypted with the current "
+                f"key at {self.key_path}. This usually means the key was "
+                "regenerated or the ciphertext was copied from another "
+                "host. Back up the ciphertext before re-initializing.",
+                suggestions=[
+                    f"Back up: cp {self.store_path} {self.store_path}.bak",
+                    f"Re-initialize: rm {self.store_path} (will lose stored credentials)",
+                    "Restore the original key if you still have it",
+                ],
+            ) from exc
+        except (OSError, json.JSONDecodeError) as exc:
+            # Narrow catch: I/O errors and plaintext-corruption shouldn't
+            # masquerade as an empty store either. Re-raise as
+            # CredentialError so callers see the real failure.
+            from fluid_build.credentials.resolver import (  # noqa: PLC0415
+                CredentialError,
+            )
+
+            logger.error("Failed to load encrypted store: %s", exc)
+            raise CredentialError(
+                f"Failed to read encrypted credential store at {self.store_path}: {exc}"
+            ) from exc
 
     def _save_store(self, data: Dict[str, str]) -> None:
         """Encrypt and save credential store."""
         try:
-            self.store_path.parent.mkdir(parents=True, exist_ok=True)
+            _secure_parent_dir(self.store_path)
             serialized = json.dumps(data).encode()
             encrypted = self.cipher.encrypt(serialized)
             self.store_path.write_bytes(encrypted)

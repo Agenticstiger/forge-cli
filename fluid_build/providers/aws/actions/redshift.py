@@ -26,6 +26,7 @@ Implements idempotent Redshift operations:
 import time
 from typing import Any, Dict
 
+from ..._sql_safety import validate_ident
 from ..util.ddl import generate_redshift_ddl
 from ..util.logging import duration_ms
 
@@ -104,6 +105,21 @@ def ensure_schema(action: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "status": "error",
             "error": "'schema' is required",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    # SECURITY_REVIEW S-006: schema flows into an f-string DDL
+    # (``CREATE SCHEMA {schema}``) a few lines below, so we must validate
+    # it at the trust boundary. The existing ``%s`` binding on the
+    # information_schema query isn't enough — DDL identifiers can't be
+    # parameterized, so validation is the only defense.
+    try:
+        schema = validate_ident(schema)
+    except ValueError as exc:
+        return {
+            "status": "error",
+            "error": f"Invalid schema identifier: {exc}",
             "duration_ms": duration_ms(start_time),
             "changed": False,
         }

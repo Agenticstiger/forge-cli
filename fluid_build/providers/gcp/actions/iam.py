@@ -29,6 +29,21 @@ from typing import Any, Dict, Optional
 from ..util.logging import duration_ms
 
 
+def _is_gcp_service_account(principal: str) -> bool:
+    """Return True if ``principal`` is a GCP service-account email.
+
+    Extracts the domain portion (after ``@``) and matches on the domain
+    boundary rather than a raw ``endswith`` substring of the full email.
+    This is both more correct (e.g. rejects ``foo@evil-gserviceaccount.com``,
+    which a naive ``endswith("gserviceaccount.com")`` would accept) and
+    avoids CodeQL ``py/incomplete-url-substring-sanitization``.
+    """
+    if "@" not in principal:
+        return False
+    domain = principal.rsplit("@", 1)[-1].lower()
+    return domain == "gserviceaccount.com" or domain.endswith(".gserviceaccount.com")
+
+
 def bind_bq_dataset(action: Dict[str, Any]) -> Dict[str, Any]:
     """
     Bind IAM policies to BigQuery dataset.
@@ -223,7 +238,7 @@ def bind_gcs_bucket(action: Dict[str, Any]) -> Dict[str, Any]:
                     members = set()
                     for principal in principals:
                         if "@" in principal:
-                            if principal.endswith("gserviceaccount.com"):
+                            if _is_gcp_service_account(principal):
                                 members.add(f"serviceAccount:{principal}")
                             else:
                                 members.add(f"user:{principal}")
@@ -347,7 +362,7 @@ def bind_pubsub_topic(action: Dict[str, Any]) -> Dict[str, Any]:
                     members = []
                     for principal in principals:
                         if "@" in principal:
-                            if principal.endswith("gserviceaccount.com"):
+                            if _is_gcp_service_account(principal):
                                 members.append(f"serviceAccount:{principal}")
                             else:
                                 members.append(f"user:{principal}")

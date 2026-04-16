@@ -26,6 +26,12 @@ import re
 from typing import Any, Dict, List
 
 # Patterns for sensitive data that should be redacted
+#
+# SECURITY_REVIEW S-010: extended to cover common token shapes that were
+# previously missed (JWTs, Stripe, GitHub, bare ``key: value`` assignments)
+# and key-name variants that slipped past the dict-key redactor
+# (``api_key``, ``client_secret`` lowercase, ``aws_access_key_id`` as the
+# actual AWS standard name).
 SENSITIVE_PATTERNS = [
     # Connection strings (protocol://user:password@host)
     re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:]+:)[^@]+(@)", re.IGNORECASE),
@@ -39,6 +45,7 @@ SENSITIVE_PATTERNS = [
     re.compile(r'"access_token":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"refresh_token":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r"Authorization:\s*Bearer\s+[^\s]+", re.IGNORECASE),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=\-]{8,}", re.IGNORECASE),
     # Snowflake passwords and connection strings
     re.compile(r'"password":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r"password=[^\s;&]+", re.IGNORECASE),
@@ -46,16 +53,37 @@ SENSITIVE_PATTERNS = [
     re.compile(r'"secret":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"token":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"credentials":\s*"[^"]*"', re.IGNORECASE),
+    # API keys (new in S-010)
+    re.compile(r'"api[_-]?key":\s*"[^"]*"', re.IGNORECASE),
+    re.compile(r'"client_secret":\s*"[^"]*"', re.IGNORECASE),
+    re.compile(r'"passphrase":\s*"[^"]*"', re.IGNORECASE),
+    # Bare key:value / key=value assignments — both separators
+    re.compile(r"(?i)\b(api[_-]?key|password|secret|token|passphrase)\s*[:=]\s*\S+"),
     # AWS keys (for external stages)
     re.compile(r'"aws_key_id":\s*"[^"]*"', re.IGNORECASE),
+    re.compile(r'"aws_access_key_id":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"aws_secret_key":\s*"[^"]*"', re.IGNORECASE),
+    re.compile(r'"aws_secret_access_key":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r"AWS_SECRET_ACCESS_KEY=[^\s;&]+", re.IGNORECASE),
+    re.compile(r"AWS_ACCESS_KEY_ID=[^\s;&]+", re.IGNORECASE),
     # Azure keys (for external stages)
     re.compile(r'"azure_sas_token":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r"AZURE_STORAGE_SAS_TOKEN=[^\s;&]+", re.IGNORECASE),
+    # Third-party / provider token shapes (S-010)
+    # JWT (three base64url parts separated by dots)
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
+    # Stripe restricted / live / test secret keys
+    re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}"),
+    # GitHub personal access tokens, OAuth tokens, app installation tokens
+    re.compile(r"\bgh[oprsu]_[A-Za-z0-9]{30,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
 ]
 
-# Keys that should be redacted in dictionaries
+# Keys that should be redacted in dictionaries.
+#
+# S-010: added ``api_key``/``apikey``/``client_secret``/``client_id``/
+# ``passphrase``/``aws_access_key_id``/``connection_url``/``jwt``/``bearer``
+# — lowercase variants that the prior set missed.
 SENSITIVE_KEYS = {
     "private_key",
     "private_key_id",
@@ -65,17 +93,27 @@ SENSITIVE_KEYS = {
     "access_token",
     "refresh_token",
     "password",
+    "passphrase",
     "secret",
     "token",
     "credentials",
     "credential",
     "auth",
     "authorization",
+    "api_key",
+    "apikey",
+    "client_secret",
+    "client_id",
     "aws_key_id",
+    "aws_access_key_id",
     "aws_secret_key",
+    "aws_secret_access_key",
     "azure_sas_token",
     "connection_string",
+    "connection_url",
     "conn_str",
+    "bearer",
+    "jwt",
 }
 
 

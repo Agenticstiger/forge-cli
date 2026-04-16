@@ -36,7 +36,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import cprint, success
-from fluid_build.providers._sql_safety import validate_ident
+from fluid_build.providers._sql_safety import quote_string_literal, validate_ident
 
 logger = logging.getLogger("fluid_build.providers.snowflake.governance")
 
@@ -436,6 +436,15 @@ class UnifiedGovernanceApplicator:
         """Create database, schema, and table if they don't exist"""
         cprint("\n📦 Creating Infrastructure...\n")
 
+        # SECURITY_REVIEW S-006: identifiers flow into DDL f-strings below.
+        # Validate at the function boundary so every DDL emission in this
+        # method is guaranteed to see a safe identifier. ``_qualified_name``
+        # also re-validates (belt-and-suspenders); ``CREATE DATABASE`` and
+        # ``CREATE TABLE`` below consume the bare identifier.
+        database = validate_ident(database)
+        schema = validate_ident(schema)
+        table = validate_ident(table)
+
         # Create database
         if not self.dry_run:
             try:
@@ -500,8 +509,11 @@ class UnifiedGovernanceApplicator:
             col_name = validate_ident(field["name"].upper())
             col_type = self._map_type(field.get("type", "VARCHAR"))
             description = field.get("description")
-            escaped_description = str(description).replace("'", "''") if description else ""
-            comment = f" COMMENT '{escaped_description}'" if description else ""
+            # S-007: quote_string_literal returns the value already wrapped
+            # in single quotes and with embedded quotes doubled — safer than
+            # an inline .replace + f-string that can drift from the central
+            # helper's dialect handling.
+            comment = f" COMMENT {quote_string_literal(str(description))}" if description else ""
 
             column_defs.append(f"  {col_name} {col_type}{comment}")
 
@@ -514,8 +526,8 @@ class UnifiedGovernanceApplicator:
             ddl_parts.append(f"CLUSTER BY ({cluster_str})")
 
         if properties.get("comment"):
-            comment = properties["comment"].replace("'", "''")  # Escape quotes
-            ddl_parts.append(f"COMMENT = '{comment}'")
+            # S-007: use the central literal-quoting helper.
+            ddl_parts.append(f"COMMENT = {quote_string_literal(str(properties['comment']))}")
 
         return " ".join(ddl_parts)
 
@@ -652,11 +664,12 @@ class UnifiedGovernanceApplicator:
         """Apply tags to table"""
         for tag_name, tag_value in tags.items():
             safe_tag_name = validate_ident(tag_name)
-            safe_tag_value = str(tag_value).replace("'", "''")
+            # S-007: central helper handles the single-quote wrapping + escape.
+            safe_tag_value = quote_string_literal(str(tag_value))
             if not self.dry_run:
                 try:
                     self.cursor.execute(
-                        f"ALTER TABLE {full_table} SET TAG {safe_tag_name} = '{safe_tag_value}'"
+                        f"ALTER TABLE {full_table} SET TAG {safe_tag_name} = {safe_tag_value}"
                     )
                     cprint(f"   ✅ {safe_tag_name} = {tag_value}")
                     self.stats["table_tags_applied"] += 1
@@ -706,14 +719,15 @@ class UnifiedGovernanceApplicator:
         """Apply tag to column"""
         safe_column_name = validate_ident(column_name)
         safe_tag_name = validate_ident(tag_name)
-        safe_tag_value = str(tag_value).replace("'", "''")
+        # S-007: central helper handles the single-quote wrapping + escape.
+        safe_tag_value = quote_string_literal(str(tag_value))
         if not self.dry_run:
             try:
                 self.cursor.execute(
                     f"""
                     ALTER TABLE {full_table}
                     MODIFY COLUMN {safe_column_name}
-                    SET TAG {safe_tag_name} = '{safe_tag_value}'
+                    SET TAG {safe_tag_name} = {safe_tag_value}
                 """
                 )
             except Exception as e:

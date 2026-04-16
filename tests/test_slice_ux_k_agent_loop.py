@@ -132,10 +132,13 @@ class TestToolRegistry:
 
     def test_tool_failure_returns_error_not_raises(self):
         """Tools that crash internally must return an error dict,
-        never raise, so the agent loop can continue. The returned
-        error dict carries the exception type name (stable across
-        releases) and a static message — NOT the raw exception text
-        (which could leak paths/hostnames/envvars; see S-013)."""
+        never raise, so the agent loop can continue.
+
+        S-013: the error dict carries the exception *type name* (so the
+        LLM can distinguish ``FileNotFoundError`` from ``ValueError``)
+        but NOT the exception message — which can contain filesystem
+        paths, hostnames, or env vars that shouldn't round-trip into
+        the model context."""
         with patch.dict(
             TOOL_REGISTRY,
             {
@@ -148,10 +151,37 @@ class TestToolRegistry:
             },
         ):
             result = dispatch_tool_call("crash_test", {})
+        # Type name is returned as the error code.
         assert result.get("error") == "RuntimeError"
+        # Message is a static "see server logs" string, not the raw exc text.
         assert "message" in result
+        # The raw exception text must NOT round-trip back to the LLM.
         assert "boom" not in result.get("error", "")
         assert "boom" not in result.get("message", "")
+
+    def test_tool_failure_does_not_leak_path_like_exception_text(self):
+        """S-013: concrete regression — a FileNotFoundError carrying a
+        filesystem path must not land in the tool result."""
+        leaky_path = "/home/alice/.aws/credentials"
+
+        def _impl(**_kw):
+            raise FileNotFoundError(leaky_path)
+
+        with patch.dict(
+            TOOL_REGISTRY,
+            {
+                "leaky_tool": {
+                    "name": "leaky_tool",
+                    "description": "test",
+                    "input_schema": {},
+                    "impl": _impl,
+                }
+            },
+        ):
+            result = dispatch_tool_call("leaky_tool", {})
+        assert result.get("error") == "FileNotFoundError"
+        assert leaky_path not in result.get("error", "")
+        assert leaky_path not in result.get("message", "")
 
 
 # ---------------------------------------------------------------------------
@@ -602,3 +632,50 @@ class TestDiscoverWorkspaceIgnoresLlmArgument:
         # Effective root is the caller's workspace, not "/".
         assert captured["workspace_root"] == ws.resolve()
         assert captured["workspace_root"] != Path("/")
+
+
+# ---------------------------------------------------------------------------
+# S-014: FLUID_AGENT_COMPACT_AFTER env parse must not crash on malformed input
+# ---------------------------------------------------------------------------
+
+
+class TestCompactAfterEnvParse:
+    """Regression tests for the module-level int() parse of
+    ``FLUID_AGENT_COMPACT_AFTER``.
+
+    Pre-fix, a non-integer value (``FLUID_AGENT_COMPACT_AFTER=foo`` or the
+    empty string) raised ``ValueError`` at module import, crashing the CLI
+    before the user saw an error message. The fix wraps the parse in
+    try/except and logs a warning."""
+
+    def _reload(self):
+        import importlib
+
+        import fluid_build.cli.forge_copilot_agent_loop as agent_loop
+
+        return importlib.reload(agent_loop)
+
+    def test_malformed_value_falls_back_to_default(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("FLUID_AGENT_COMPACT_AFTER", "not-an-int")
+        with caplog.at_level(logging.WARNING, logger="fluid.cli.forge_copilot.agent_loop"):
+            agent_loop = self._reload()
+        assert agent_loop._COMPACT_AFTER == 6
+        assert "FLUID_AGENT_COMPACT_AFTER" in caplog.text
+        assert "not-an-int" in caplog.text
+
+    def test_empty_string_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("FLUID_AGENT_COMPACT_AFTER", "")
+        agent_loop = self._reload()
+        assert agent_loop._COMPACT_AFTER == 6
+
+    def test_valid_integer_overrides_default(self, monkeypatch):
+        monkeypatch.setenv("FLUID_AGENT_COMPACT_AFTER", "10")
+        agent_loop = self._reload()
+        assert agent_loop._COMPACT_AFTER == 10
+
+    def test_unset_defaults_to_six(self, monkeypatch):
+        monkeypatch.delenv("FLUID_AGENT_COMPACT_AFTER", raising=False)
+        agent_loop = self._reload()
+        assert agent_loop._COMPACT_AFTER == 6
