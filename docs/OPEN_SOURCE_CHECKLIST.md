@@ -2,7 +2,7 @@
 
 This document walks through every step required to take the `forge-cli`
 project from its current private state to a public repository under the
-**agentics-rising** GitHub organisation.
+**Agenticstiger** GitHub organisation.
 
 **Target repository:** `https://github.com/Agenticstiger/forge-cli`
 
@@ -28,9 +28,9 @@ project from its current private state to a public repository under the
 
 ## 1. GitHub Organisation Setup
 
-> If `agentics-rising` already exists, skip to step 2.
+> If `Agenticstiger` already exists, skip to step 2.
 
-- [ ] Go to <https://github.com/organizations/plan> and create the **agentics-rising** organisation.
+- [ ] Go to <https://github.com/organizations/plan> and create the **Agenticstiger** organisation.
 - [ ] Under **Settings → Member privileges**, set default repo permission to **Read**.
 - [ ] Create teams (optional but recommended):
 
@@ -40,7 +40,7 @@ project from its current private state to a public repository under the
   | `providers` | Write to provider directories | Provider contributors |
   | `security` | Reviews of auth / secrets code | Security reviewers |
 
-- [ ] Add a profile README at `agentics-rising/.github/profile/README.md`.
+- [ ] Add a profile README at `Agenticstiger/.github/profile/README.md`.
 - [ ] Set org-level Actions permissions: **Settings → Actions → General**
   - Allow GitHub Actions for all repositories
   - Allow actions created by GitHub and verified creators
@@ -49,7 +49,7 @@ project from its current private state to a public repository under the
 
 ## 2. Create the Repository
 
-- [ ] Create **`forge-cli`** under `agentics-rising`:
+- [ ] Create **`forge-cli`** under `Agenticstiger`:
   - **Visibility:** Public
   - **Description:** `Fluid Forge CLI — plan, apply, and visualize data products across providers`
   - **No** initialise with README (we're pushing existing code)
@@ -87,7 +87,7 @@ the old org/repo name needs updating.
 | `README.md` | Badge URLs, discussion links, clone URLs |
 | `CONTRIBUTING.md` | Issue/PR links |
 | `SECURITY.md` | Reporting URL (if GitHub-based) |
-| `.github/CODEOWNERS` | Team references → `@agentics-rising/core` etc. |
+| `.github/CODEOWNERS` | Team references → `@jeffwatson-ai` etc. |
 | `.github/workflows/*.yml` | Any hardcoded repo references |
 | `Dockerfile` | `org.opencontainers.image.source` label |
 | `Jenkinsfile` | Leave as-is (internal CI) or remove from public repo |
@@ -96,13 +96,13 @@ the old org/repo name needs updating.
 
 ```bash
 # Preview changes first
-grep -rn "agentics-rising/fluid-forge-cli" --include="*.py" --include="*.yml" \
+grep -rn "Agenticstiger/fluid-forge-cli" --include="*.py" --include="*.yml" \
   --include="*.yaml" --include="*.toml" --include="*.md" --include="Dockerfile"
 
 # Apply (macOS/Linux)
 find . -type f \( -name "*.py" -o -name "*.yml" -o -name "*.yaml" \
   -o -name "*.toml" -o -name "*.md" -o -name "Dockerfile" \) \
-  -exec sed -i 's|agentics-rising/fluid-forge-cli|Agenticstiger/forge-cli|g' {} +
+  -exec sed -i 's|Agenticstiger/fluid-forge-cli|Agenticstiger/forge-cli|g' {} +
 ```
 
 ### 3c. pyproject.toml URLs (target state)
@@ -118,15 +118,15 @@ Documentation = "https://agenticstiger.github.io/forge_docs/"
 ### 3d. CODEOWNERS (target state)
 
 ```
-*                               @agentics-rising/core
-fluid_build/cli/                @agentics-rising/core
-fluid_build/providers/aws/      @agentics-rising/providers
-fluid_build/providers/gcp/      @agentics-rising/providers
-fluid_build/providers/snowflake/ @agentics-rising/providers
-fluid_build/providers/local/    @agentics-rising/core
-fluid_build/credentials/        @agentics-rising/security
-fluid_build/secrets.py          @agentics-rising/security
-fluid_build/auth.py             @agentics-rising/security
+*                               @jeffwatson-ai
+fluid_build/cli/                @jeffwatson-ai
+fluid_build/providers/aws/      @jeffwatson-ai
+fluid_build/providers/gcp/      @jeffwatson-ai
+fluid_build/providers/snowflake/ @jeffwatson-ai
+fluid_build/providers/local/    @jeffwatson-ai
+fluid_build/credentials/        @jeffwatson-ai
+fluid_build/secrets.py          @jeffwatson-ai
+fluid_build/auth.py             @jeffwatson-ai
 ```
 
 ---
@@ -207,7 +207,7 @@ The following workflow files should already be in `.github/workflows/`:
 
 **Verify workflows reference the correct repo:**
 ```bash
-grep -rn "agentics-rising\|fluid-forge-cli" .github/workflows/
+grep -rn "Agenticstiger\|fluid-forge-cli" .github/workflows/
 ```
 
 All references should point to `Agenticstiger/forge-cli`.
@@ -227,7 +227,7 @@ with PyPI.
   | Field | Value |
   |-------|-------|
   | PyPI project name | `fluid-forge` |
-  | Owner | `agentics-rising` |
+  | Owner | `Agenticstiger` |
   | Repository | `forge-cli` |
   | Workflow name | `release.yml` |
   | Environment name | `pypi` |
@@ -241,7 +241,7 @@ with PyPI.
   | Field | Value |
   |-------|-------|
   | PyPI project name | `fluid-forge` |
-  | Owner | `agentics-rising` |
+  | Owner | `Agenticstiger` |
   | Repository | `forge-cli` |
   | Workflow name | `release.yml` |
   | Environment name | `testpypi` |
@@ -271,9 +271,9 @@ GHCR uses `GITHUB_TOKEN` — no additional setup needed for public repos.
   - `https://github.com/orgs/Agenticstiger/packages/container/forge-cli/settings`
 - [ ] Users will pull with:
   ```bash
-  docker pull ghcr.io/agentics-rising/forge-cli:latest
-  docker pull ghcr.io/agentics-rising/forge-cli:0.7.7
-  docker pull ghcr.io/agentics-rising/forge-cli:alpha-latest
+  docker pull ghcr.io/agenticstiger/forge-cli:latest
+  docker pull ghcr.io/agenticstiger/forge-cli:0.7.7
+  docker pull ghcr.io/agenticstiger/forge-cli:alpha-latest
   ```
 
 ---
@@ -335,7 +335,7 @@ pip install --index-url https://test.pypi.org/simple/ \
   --extra-index-url https://pypi.org/simple/ fluid-forge==0.7.7a1
 
 # 4. Verify GHCR:
-docker pull ghcr.io/agentics-rising/forge-cli:0.7.7a1
+docker pull ghcr.io/agenticstiger/forge-cli:0.7.7a1
 
 # 5. Verify GitHub Release exists with wheel attached
 ```
@@ -363,7 +363,7 @@ pip install fluid-forge
 fluid --version
 
 # Docker
-docker run --rm ghcr.io/agentics-rising/forge-cli:latest --version
+docker run --rm ghcr.io/agenticstiger/forge-cli:latest --version
 ```
 
 ---
@@ -371,7 +371,7 @@ docker run --rm ghcr.io/agentics-rising/forge-cli:latest --version
 ## 13. Post-Launch Checklist
 
 - [ ] **Announce** — post to relevant channels (blog, social, HN, Reddit r/dataengineering)
-- [ ] **Codecov** — connect at <https://app.codecov.io/gh/agentics-rising/forge-cli>
+- [ ] **Codecov** — connect at <https://app.codecov.io/gh/Agenticstiger/forge-cli>
 - [ ] **PyPI project page** — add description, URLs, and classifiers (pulled from `pyproject.toml`)
 - [ ] **GitHub repo settings**:
   - Add social preview image (use the Fluid Forge logo)
@@ -403,12 +403,12 @@ docker run --rm ghcr.io/agentics-rising/forge-cli:latest --version
 
 | Item | Before (private) | After (public) |
 |------|-------------------|----------------|
-| **Org** | `agentics-rising` | `agentics-rising` |
+| **Org** | `Agenticstiger` | `Agenticstiger` |
 | **Repo** | `fluid-forge-cli` | `forge-cli` |
-| **Full URL** | `github.com/agentics-rising/fluid-forge-cli` | `github.com/Agenticstiger/forge-cli` |
+| **Full URL** | `github.com/Agenticstiger/fluid-forge-cli` | `github.com/Agenticstiger/forge-cli` |
 | **CI** | Jenkins + GitHub Actions | GitHub Actions only |
 | **PyPI** | Private NAS PyPI | pypi.org (Trusted Publisher) |
-| **Docker** | `localhost:5000` | `ghcr.io/agentics-rising/forge-cli` |
+| **Docker** | `localhost:5000` | `ghcr.io/agenticstiger/forge-cli` |
 | **Artifacts** | Git-based NAS repo | GitHub Actions artifacts + Releases |
 | **Package name** | `fluid-forge` | `fluid-forge` (unchanged) |
 | **CLI command** | `fluid` | `fluid` (unchanged) |
