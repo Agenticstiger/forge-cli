@@ -774,7 +774,7 @@ dependencies = []  # Zero dependencies!
 
 [project.urls]
 Documentation = "https://agenticstiger.github.io/forge_docs/providers/"
-Repository = "https://github.com/agentics-rising/fluid-provider-sdk"
+Repository = "https://github.com/Agenticstiger/fluid-provider-sdk"
 ```
 
 **Migration path for `fluid-forge`:**

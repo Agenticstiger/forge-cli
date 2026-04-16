@@ -48,7 +48,7 @@ OPTIONS:
     -v, --version VERSION    CLI version to install (e.g., 0.7.1a42, 0.7.1dev1)
                             If not specified, uses latest from profile
     -t, --tag TAG           Additional Docker tag (default: same as version)
-    -r, --registry REGISTRY  Docker registry (default: ghcr.io/agentics-rising/fluid-forge-cli)
+    -r, --registry REGISTRY  Docker registry (default: ghcr.io/agenticstiger/fluid-forge-cli)
     --no-push               Build only, don't push to registry
     --pypi-url URL          PyPI server URL (default: http://\$NAS_HOST:\$PYPI_PORT/simple)
     --pypi-user USER        PyPI username for authentication

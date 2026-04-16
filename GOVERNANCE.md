@@ -43,7 +43,7 @@ Maintainers are responsible for the overall direction of the project. They have 
 
 | Name | GitHub | Role |
 |------|--------|------|
-| Jeff Watson | [@agentics-rising](https://github.com/agentics-rising) | Project steward, Agentics Transformation Pty Ltd |
+| Jeff Watson | [@jeffwatson-ai](https://github.com/jeffwatson-ai) | Project steward, Agentics Transformation Pty Ltd |
 
 ### Current Committers
 
@@ -88,7 +88,7 @@ If consensus cannot be reached through discussion, the maintainers make the fina
 
 ## Code Ownership
 
-Code ownership is tracked via the [CODEOWNERS](.github/CODEOWNERS) file. Changes to security-sensitive areas require review from the `@agentics-rising/fluid-security` team.
+Code ownership is tracked via the [CODEOWNERS](.github/CODEOWNERS) file. Changes to security-sensitive areas require review from the `@jeffwatson-ai` team.
 
 ## Releases
 
