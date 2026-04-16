@@ -17,7 +17,7 @@
 #
 # PRIMARY TYPES are imported from the lightweight ``fluid-provider-sdk``
 # package (zero dependencies).  If the SDK is not installed, a local
-# fallback is used so ``fluid-forge`` remains self-contained.
+# fallback is used so ``data-product-forge`` remains self-contained.
 #
 # The canonical registry lives in fluid_build.providers.__init__.
 # This module re-exports register_provider (deprecated path) for backward

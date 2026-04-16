@@ -4,8 +4,8 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fluid-forge"
-version = "0.7.9"
+name = "data-product-forge"
+version = "0.7.10"
 description = "FLUID Build System: plan/apply/visualize data products across providers (GCP, Snowflake, Local) with policy & contract tests."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -115,7 +115,7 @@ dev = [
 
 # One-shot install for contributors
 all = [
-  "fluid-forge[local,gcp,snowflake,viz,opds,tui,copilot,docs,dev]"
+  "data-product-forge[local,gcp,snowflake,viz,opds,tui,copilot,docs,dev]"
 ]
 
 [project.scripts]

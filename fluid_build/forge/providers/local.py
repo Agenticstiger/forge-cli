@@ -332,7 +332,7 @@ flake8>=5.0.0
 mypy>=1.0.0
 
 # FLUID Build
-# fluid-forge>=1.0.0
+# data-product-forge>=1.0.0
 """
 
         files["requirements.txt"] = requirements

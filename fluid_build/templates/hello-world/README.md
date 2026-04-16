@@ -143,7 +143,7 @@ Try modifying the contract to:
 ### Error: "FLUID CLI not found"
 ```bash
 # Install FLUID CLI
-pip install fluid-forge
+pip install data-product-forge
 
 # Verify installation
 fluid --version

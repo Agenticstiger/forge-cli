@@ -43,7 +43,7 @@ else
 	PLATFORM = Linux
 endif
 
-PKG_NAME = fluid-forge
+PKG_NAME = data-product-forge
 
 .DEFAULT_GOAL := setup
 

@@ -11,7 +11,7 @@ Fluid Forge is split into **two separate Python packages** that work together:
 | Package | PyPI Name | Dependencies | Who Uses It |
 |---------|-----------|-------------|-------------|
 | **Provider SDK** | `fluid-provider-sdk` | **Zero** (stdlib only) | Provider authors (you, if building a new cloud adapter) |
-| **CLI** | `fluid-forge` | ~40 deps (click, rich, pydantic, httpx, etc.) | Data engineers running `fluid validate / plan / apply` |
+| **CLI** | `data-product-forge` | ~40 deps (click, rich, pydantic, httpx, etc.) | Data engineers running `fluid validate / plan / apply` |
 
 **Why the split?** If you're building a Databricks provider, you shouldn't need to install BigQuery, Snowflake, Rich, and 40 other packages just to subclass `BaseProvider`. The SDK gives you the contract (ABC + types) with zero baggage.
 
@@ -55,7 +55,7 @@ The SDK (`fluid-provider-sdk`) is a **pure interface package**. It defines exact
 
 ## What the CLI Does (the "Engine")
 
-The CLI (`fluid-forge`) is the **orchestration engine**. It loads your YAML contract, finds the right provider, and drives the plan/apply lifecycle:
+The CLI (`data-product-forge`) is the **orchestration engine**. It loads your YAML contract, finds the right provider, and drives the plan/apply lifecycle:
 
 ```
  You run:  fluid apply contract.fluid.yaml

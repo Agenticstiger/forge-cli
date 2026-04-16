@@ -2,12 +2,12 @@
 # Multi-stage build for minimal production image
 #
 # Build locally:
-#   docker build -t fluid-forge-cli .
-#   docker build --build-arg PROFILE=alpha -t fluid-forge-cli:alpha .
+#   docker build -t forge-cli .
+#   docker build --build-arg PROFILE=alpha -t forge-cli:alpha .
 #
 # Run:
-#   docker run --rm fluid-forge-cli --version
-#   docker run --rm -v $(pwd):/workspace fluid-forge-cli validate /workspace/contract.fluid.yaml
+#   docker run --rm forge-cli --version
+#   docker run --rm -v $(pwd):/workspace forge-cli validate /workspace/contract.fluid.yaml
 
 # ============================================
 # Base stage — shared dependencies

@@ -7,7 +7,7 @@ set -e
 
 # Configuration
 REGISTRY="localhost:5000"
-IMAGE_NAME="fluid-forge-cli"
+IMAGE_NAME="forge-cli"
 DEFAULT_PROFILE="stable"
 CLI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -48,7 +48,7 @@ OPTIONS:
     -v, --version VERSION    CLI version to install (e.g., 0.7.1a42, 0.7.1dev1)
                             If not specified, uses latest from profile
     -t, --tag TAG           Additional Docker tag (default: same as version)
-    -r, --registry REGISTRY  Docker registry (default: ghcr.io/agenticstiger/fluid-forge-cli)
+    -r, --registry REGISTRY  Docker registry (default: ghcr.io/agenticstiger/forge-cli)
     --no-push               Build only, don't push to registry
     --pypi-url URL          PyPI server URL (default: http://\$NAS_HOST:\$PYPI_PORT/simple)
     --pypi-user USER        PyPI username for authentication
@@ -152,13 +152,13 @@ echo ""
 # Determine version if not specified
 if [ -z "$VERSION" ]; then
     print_warning "No version specified, will install latest from $PROFILE profile"
-    VERSION_SPEC="fluid-forge"
+    VERSION_SPEC="data-product-forge"
     if [ "$TAG" = "" ]; then
         TAG="$PROFILE-latest"
     fi
 else
     print_success "Building with version: $VERSION"
-    VERSION_SPEC="fluid-forge==$VERSION"
+    VERSION_SPEC="data-product-forge==$VERSION"
     if [ "$TAG" = "" ]; then
         TAG="$VERSION"
     fi

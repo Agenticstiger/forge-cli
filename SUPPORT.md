@@ -14,7 +14,7 @@
 2. **Check the docs** at [agenticstiger.github.io/forge_docs](https://agenticstiger.github.io/forge_docs/) for guidance.
 3. **Try the latest version** — your issue may already be fixed:
    ```bash
-   pip install --upgrade fluid-forge
+   pip install --upgrade data-product-forge
    ```
 
 ## Bug Reports

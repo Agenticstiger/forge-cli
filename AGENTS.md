@@ -275,7 +275,7 @@ For MCP (Model Context Protocol) tool servers, these JSON outputs can be piped d
 ## Links
 
 - **Documentation**: [https://agenticstiger.github.io/forge_docs/](https://agenticstiger.github.io/forge_docs/)
-- **PyPI**: [https://pypi.org/project/fluid-forge](https://pypi.org/project/fluid-forge/)
+- **PyPI**: [https://pypi.org/project/data-product-forge](https://pypi.org/project/data-product-forge/)
 - **Repository**: [https://github.com/Agenticstiger/forge-cli](https://github.com/Agenticstiger/forge-cli)
 - **Agent Policy Examples**: `examples/0.7.1/ai-restricted-data.yaml`
 - **Policy Validator Source**: `fluid_build/policy/agent_policy.py`

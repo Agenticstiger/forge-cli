@@ -546,8 +546,8 @@ Monitor your data product using:
 
 ## Support
 
-- **Documentation**: [FLUID Documentation](https://fluid-forge.io/docs)
-- **Community**: [FLUID Community](https://community.fluid-forge.io)
+- **Documentation**: [FLUID Documentation](https://agenticstiger.github.io/forge_docs/)
+- **Community**: [FLUID Community](https://github.com/Agenticstiger/forge-cli/discussions)
 - **Issues**: [GitHub Issues](https://github.com/your-org/{project_name}/issues)
 
 ## License

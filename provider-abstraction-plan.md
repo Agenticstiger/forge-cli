@@ -292,7 +292,7 @@ This document proposes a phased plan that draws from proven patterns in Airflow,
 | **G6** | **Two competing provider ABCs** — `BaseProvider` (build) vs `InfrastructureProvider` (forge) with no bridge | Confusing for third-party authors — which one to implement? | dbt has one `BaseAdapter`. Terraform has one Provider protocol. |
 | **G7** | **Plugin system (`cli/plugins.py`) is disconnected** — `ProviderPlugin` never feeds into the `PROVIDERS` registry or `build_provider()` | 859 lines of dead code for provider extensibility | N/A — should be unified or removed |
 | **G8** | **No conformance tests** — zero runnable provider tests in `tests/providers/` | No way to verify a provider works. No quality bar. | dbt ships `dbt-tests-adapter`. Terraform ships acceptance tests. |
-| **G9** | **No SDK package** — base classes live in the monolith. Provider authors must `pip install fluid-forge` with all deps. | Heavyweight dependency for provider development | dbt extracted `dbt-adapters`. Terraform has `terraform-plugin-framework`. |
+| **G9** | **No SDK package** — base classes live in the monolith. Provider authors must `pip install data-product-forge` with all deps. | Heavyweight dependency for provider development | dbt extracted `dbt-adapters`. Terraform has `terraform-plugin-framework`. |
 | **G10** | **`LocalProvider` duck-types** instead of subclassing `BaseProvider`. It's a `@dataclass` with `apply(actions, plan, out, **kwargs)` and `render(plan, out, **kwargs)` — **different signatures** from `BaseProvider.apply(actions)` and `BaseProvider.render(src, *, out, fmt)`. The comment in `local/__init__.py` says "must have class LocalProvider(BaseProvider)" — aspirational, not reality. | Bad precedent. Migration requires sig changes, not just adding a base class. | All OSS projects enforce the base class. |
 | **G11** | **`build_provider()` bypasses name normalization** — `cli/_common.py` does `registry.PROVIDERS.get(name)` with the raw user string, not via `get_provider()` which lower-cases and normalizes. `fluid plan --provider GCP` silently fails because `"GCP" != "gcp"`. | User-facing bug, provider not found on case mismatch | All OSS projects normalize names. |
 | **G12** | **`build_provider_instance()` is dead code** — exists in both `providers/__init__.py` (L349) and `providers/base.py` (L326) but has **zero callers** anywhere in the codebase | Code rot, confusion for contributors | Should be removed or made canonical |
@@ -379,7 +379,7 @@ except Exception:
 | Change | Severity | Who's Affected | Mitigation |
 |---|---|---|---|
 | **`BaseProvider` moves to `fluid-provider-sdk`** | **MEDIUM** for existing provider code | Any `from fluid_build.providers.base import BaseProvider` import path. | `providers/base.py` becomes a re-export shim: `from fluid_provider_sdk import BaseProvider`. Import paths continue to work unchanged. |
-| **New SDK dependency** | **LOW** | `fluid-forge` gains a new dependency: `fluid-provider-sdk>=0.1.0`. | Zero external deps in SDK. Size impact: ~50KB. Pure Python, no native deps. |
+| **New SDK dependency** | **LOW** | `data-product-forge` gains a new dependency: `fluid-provider-sdk>=0.1.0`. | Zero external deps in SDK. Size impact: ~50KB. Pure Python, no native deps. |
 | **`ProviderMetadata` required** | **NONE** (optional) | `get_provider_info()` returns a default stub. Providers can override when ready. | Default implementation returns `ProviderMetadata(name=cls.name, ...)`. |
 
 ### Phase 2 Breaking Changes
@@ -431,7 +431,7 @@ except Exception:
 - Already partially implemented (entry points declared in `pyproject.toml`)
 
 **Cons:**
-- Provider authors still depend on the full `fluid-forge` package for `BaseProvider`
+- Provider authors still depend on the full `data-product-forge` package for `BaseProvider`
 - No shared contract parsing — still duplicated
 - No conformance tests — quality is unverifiable
 - No action schema — no interop between plan/apply
@@ -745,7 +745,7 @@ def render(self, plan=None, out=None, **kwargs) -> None
 
 ### Phase 1: Provider SDK Extraction (Weeks 2-4)
 
-**Goal:** Third-party provider authors install `fluid-provider-sdk` (~0 deps) instead of `fluid-forge` (40+ deps).
+**Goal:** Third-party provider authors install `fluid-provider-sdk` (~0 deps) instead of `data-product-forge` (40+ deps).
 
 **Package structure:**
 
@@ -777,7 +777,7 @@ Documentation = "https://agenticstiger.github.io/forge_docs/providers/"
 Repository = "https://github.com/Agenticstiger/fluid-provider-sdk"
 ```
 
-**Migration path for `fluid-forge`:**
+**Migration path for `data-product-forge`:**
 ```python
 # fluid_build/providers/base.py becomes:
 try:
@@ -822,7 +822,7 @@ class BaseProvider(ABC):
 
 **Deliverables:**
 - [x] `fluid-provider-sdk` package published (installed editable at `/fluid-provider-sdk/`)
-- [x] `fluid-forge` imports from `fluid-provider-sdk` (with inline fallback)
+- [x] `data-product-forge` imports from `fluid-provider-sdk` (with inline fallback)
 - [x] Backward-compatible import paths preserved (`fluid_build.providers.base` re-exports)
 - [x] `get_provider_info()` on BaseProvider + all 4 built-in providers
 - [x] `fluid providers --debug` shows metadata from `get_provider_info()`
@@ -1302,7 +1302,7 @@ fluid provider publish              # submit to index (opens PR or API call)
 ┌────────────────────────────────────────────────────────────────────────────┐
 │  STEP 1: Discover (5 min)                                                  │
 │                                                                            │
-│  $ pip install fluid-forge                                                 │
+│  $ pip install data-product-forge                                                 │
 │  $ fluid providers                                                         │
 │  NAME       VERSION  SOURCE     PLATFORMS                                  │
 │  aws        0.7.1    builtin    glue, athena, s3, redshift                │
@@ -1489,7 +1489,7 @@ fluid provider publish              # submit to index (opens PR or API call)
 | "How do I register my provider?" | Entry-point in `pyproject.toml` — scaffolder sets this up |
 | "How do I test it?" | `ProviderTestHarness` — scaffolder generates conformance tests |
 | "What's the minimum I need to implement?" | `plan()` + `apply()` + `name` class attribute. Everything else has defaults. |
-| "Do I need all of fluid-forge as a dependency?" | No — `pip install fluid-provider-sdk` (~0 deps) is enough |
+| "Do I need all of data-product-forge as a dependency?" | No — `pip install fluid-provider-sdk` (~0 deps) is enough |
 | "How do users install it?" | `pip install fluid-provider-databricks` — entries points auto-register |
 | "How do I debug?" | `fluid plan --provider databricks -v` shows plan with verbose logging from `self.info_kv()` |
 | "Can I extend beyond plan/apply?" | Yes — implement optional hooks (`pre_plan`, `post_apply`, `estimate_cost`, etc.) |
@@ -1519,7 +1519,7 @@ class HelloProvider(BaseProvider):
 # pyproject.toml
 [project]
 name = "fluid-provider-hello"
-dependencies = ["fluid-forge>=0.7.0"]
+dependencies = ["data-product-forge>=0.7.0"]
 
 [project.entry-points."fluid_build.providers"]
 hello = "fluid_provider_hello:HelloProvider"
@@ -1577,7 +1577,7 @@ def apply(self, actions: Iterable[Mapping[str, Any]]) -> ApplyResult: ...
 ### Version scheme
 
 ```
-fluid-forge        0.7.x → 0.8.x → 1.0.x
+data-product-forge 0.7.x → 0.8.x → 1.0.x
 fluid-provider-sdk 0.1.x → 0.2.x → 1.0.x
 fluid-provider-*   independent semver
 ```
@@ -1678,7 +1678,7 @@ dependencies = [
 | **New:** `fluid-provider-sdk/src/fluid_provider_sdk/metadata.py` | `ProviderMetadata` + `get_provider_info()` | **Done** |
 | **New:** `fluid-provider-sdk/src/fluid_provider_sdk/version.py` | `SDK_VERSION`, `MIN_CLI_VERSION`, `MAX_CLI_VERSION` | **Done** |
 | **New:** `fluid-provider-sdk/src/fluid_provider_sdk/py.typed` | PEP 561 marker | **Done** |
-| `fluid-forge/providers/base.py` | Import from SDK with fallback (`_HAS_SDK` flag) | **Done** |
+| `fluid_build/providers/base.py` | Import from SDK with fallback (`_HAS_SDK` flag) | **Done** |
 | All 4 built-in providers | Added `get_provider_info()` returning `ProviderMetadata` | **Done** |
 
 ### Phase 2 changes — IMPLEMENTED
@@ -1698,7 +1698,7 @@ dependencies = [
 | **New:** `fluid-provider-sdk/src/fluid_provider_sdk/testing/__init__.py` | Testing subpackage init | **Done** |
 | **New:** `fluid-provider-sdk/src/fluid_provider_sdk/testing/harness.py` | `ProviderTestHarness` (16 conformance test methods) | **Done** |
 | **New:** `fluid-provider-sdk/src/fluid_provider_sdk/testing/fixtures.py` | `LOCAL_CONTRACT`, `GCP_CONTRACT`, `AWS_CONTRACT`, `SNOWFLAKE_CONTRACT` | **Done** |
-| **New:** `fluid-forge/cli/provider_init.py` | `fluid provider-init <name>` scaffolder | **Done** |
+| **New:** `fluid_build/cli/provider_init.py` | `fluid provider-init <name>` scaffolder | **Done** |
 | `cli/bootstrap.py` | Register `provider-init` subcommand | **Done** |
 | `tests/providers/test_phase3_harness_scaffold.py` | 41 tests for harness, fixtures, scaffolder | **Done** |
 
@@ -1724,7 +1724,7 @@ dependencies = [
 
 | File | Change | Status |
 |---|---|---|
-| **New:** `fluid-forge/cli/provider_market.py` | `fluid provider search/install/info/publish` | Pending |
+| **New:** `fluid_build/cli/provider_market.py` | `fluid provider search/install/info/publish` | Pending |
 | **New:** `providers.json` (hosted) | Provider index | Pending |
 | **New:** `awesome-fluid-providers/` (GitHub repo) | Curated list | Pending |
 
