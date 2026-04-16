@@ -117,7 +117,6 @@ jobs:
       # `version = "..."` in pyproject.toml to drift from). The build
       # job's "Isolated wheel install and verify" step asserts
       # `fluid --version` matches what setuptools-scm produced.
-          echo "Version verified: ${TAG_VERSION} (base matches ${PKG_VERSION})"
 
   # ──────────────────────────────────────────────────────────────
   # 2. Build distribution artifacts
