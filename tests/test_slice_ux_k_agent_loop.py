@@ -453,3 +453,50 @@ class TestAgentLoopGating:
             FakeProvider().build_tool_request(
                 _base_config(), "sys", [{"role": "user", "content": "hi"}], []
             )
+
+
+# ---------------------------------------------------------------------------
+# S-014: FLUID_AGENT_COMPACT_AFTER env parse must not crash on malformed input
+# ---------------------------------------------------------------------------
+
+
+class TestCompactAfterEnvParse:
+    """Regression tests for the module-level int() parse of
+    ``FLUID_AGENT_COMPACT_AFTER``.
+
+    Pre-fix, a non-integer value (``FLUID_AGENT_COMPACT_AFTER=foo`` or the
+    empty string) raised ``ValueError`` at module import, crashing the CLI
+    before the user saw an error message. The fix wraps the parse in
+    try/except and logs a warning."""
+
+    def _reload(self):
+        import importlib
+
+        import fluid_build.cli.forge_copilot_agent_loop as agent_loop
+
+        return importlib.reload(agent_loop)
+
+    def test_malformed_value_falls_back_to_default(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("FLUID_AGENT_COMPACT_AFTER", "not-an-int")
+        with caplog.at_level(logging.WARNING, logger="fluid.cli.forge_copilot.agent_loop"):
+            agent_loop = self._reload()
+        assert agent_loop._COMPACT_AFTER == 6
+        assert "FLUID_AGENT_COMPACT_AFTER" in caplog.text
+        assert "not-an-int" in caplog.text
+
+    def test_empty_string_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("FLUID_AGENT_COMPACT_AFTER", "")
+        agent_loop = self._reload()
+        assert agent_loop._COMPACT_AFTER == 6
+
+    def test_valid_integer_overrides_default(self, monkeypatch):
+        monkeypatch.setenv("FLUID_AGENT_COMPACT_AFTER", "10")
+        agent_loop = self._reload()
+        assert agent_loop._COMPACT_AFTER == 10
+
+    def test_unset_defaults_to_six(self, monkeypatch):
+        monkeypatch.delenv("FLUID_AGENT_COMPACT_AFTER", raising=False)
+        agent_loop = self._reload()
+        assert agent_loop._COMPACT_AFTER == 6
