@@ -18,6 +18,7 @@ Base credential resolver with multi-source fallback support.
 
 import logging
 import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -328,7 +329,15 @@ class BaseCredentialResolver(ABC):
             from getpass import getpass
 
             prompt = f"Enter {self.provider} {key}: "
-            if "password" in key.lower() or "secret" in key.lower() or "token" in key.lower():
+            # Use no-echo input (getpass) for any credential-shaped key name.
+            # Biased toward getpass: credential identifiers rarely benefit
+            # from visible input, and the prior 3-substring check missed
+            # ``access_key``, ``private_key``, ``passphrase``, ``api_key``,
+            # ``credential`` and similar. See SECURITY_REVIEW S-012.
+            if re.search(
+                r"(?i)pass(?:word|phrase)?|secret|token|key|credential|auth",
+                key,
+            ):
                 value = getpass(prompt)
             else:
                 value = input(prompt)

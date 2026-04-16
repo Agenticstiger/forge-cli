@@ -53,7 +53,17 @@ MAX_AGENT_ITERATIONS = 12
 
 # After this many iterations, compact old tool results to stay within
 # context window limits.  Configurable via FLUID_AGENT_COMPACT_AFTER.
-_COMPACT_AFTER = int(os.environ.get("FLUID_AGENT_COMPACT_AFTER", "6"))
+# A malformed value (e.g. ``FLUID_AGENT_COMPACT_AFTER=foo``) used to crash
+# the CLI at import time; we now log a warning and fall back to the
+# default. See SECURITY_REVIEW S-014.
+try:
+    _COMPACT_AFTER = int(os.environ.get("FLUID_AGENT_COMPACT_AFTER", "6"))
+except ValueError:
+    LOG.warning(
+        "Invalid FLUID_AGENT_COMPACT_AFTER=%r; falling back to default of 6",
+        os.environ.get("FLUID_AGENT_COMPACT_AFTER"),
+    )
+    _COMPACT_AFTER = 6
 _COMPACT_KEEP_TAIL = 4  # Keep last N messages intact.
 _COMPACT_MAX_CHARS = 500  # Truncate old tool results to this length.
 

@@ -196,3 +196,53 @@ class TestBaseCredentialResolver:
         resolver = ConcreteResolver(config=config)
         with pytest.raises(CredentialError):
             resolver.get_credential("key", required=True)
+
+    # ── S-012: broader hidden-input match ────────────────────────────
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "password",  # legacy — the old 3-substring check also matched
+            "api_key",  # regression: missed by the old check
+            "apikey",
+            "aws_access_key_id",
+            "access_key",
+            "private_key",
+            "passphrase",
+            "auth_token",
+            "client_secret",
+            "credentials",
+        ],
+    )
+    @patch("builtins.input")
+    @patch("getpass.getpass")
+    def test_prompt_uses_getpass_for_credential_shaped_keys(self, mock_getpass, mock_input, key):
+        """S-012: credential-shaped key names must use getpass (no echo).
+
+        The pre-fix 3-substring check (password/secret/token) echoed
+        ``access_key``, ``private_key``, ``passphrase``, ``api_key``
+        etc. to the terminal via ``input()``. This parametrised test
+        guards against regression across the common credential names.
+        """
+        mock_getpass.return_value = "typed-value"
+        mock_input.return_value = "should-not-be-called"
+        resolver = ConcreteResolver()
+        # Skip the "save to keyring?" prompt so this test doesn't touch
+        # input() through _confirm_save.
+        with patch.object(resolver, "_confirm_save", return_value=False):
+            result = resolver._get_from_prompt(key)
+        assert result == "typed-value"
+        mock_getpass.assert_called_once()
+        mock_input.assert_not_called()
+
+    @patch("builtins.input")
+    @patch("getpass.getpass")
+    def test_prompt_uses_input_for_non_credential_key(self, mock_getpass, mock_input):
+        """Non-credential keys (project, region, endpoint) use visible input."""
+        mock_input.return_value = "my-project"
+        mock_getpass.return_value = "should-not-be-called"
+        resolver = ConcreteResolver()
+        with patch.object(resolver, "_confirm_save", return_value=False):
+            result = resolver._get_from_prompt("project")
+        assert result == "my-project"
+        mock_input.assert_called_once()
+        mock_getpass.assert_not_called()
