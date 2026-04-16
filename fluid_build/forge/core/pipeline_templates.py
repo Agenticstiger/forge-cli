@@ -831,19 +831,29 @@ class GitLabCITemplate(BasePipelineTemplate):
         # Add deployment jobs for each environment
         for env in config.environments:
             deploy_script = []
-            # Add OIDC authentication for GitLab CI if configured
+            # Add OIDC authentication for GitLab CI if configured.
+            # SECURITY_REVIEW S-005: never write federated creds to a
+            # predictable `/tmp/*.json` path. Use ``mktemp`` + ``chmod 600``
+            # + a ``trap`` cleanup so the credential file exists only for
+            # the lifetime of the single shell invocation.
             if config.oidc_provider == "gcp":
                 deploy_script.append(
-                    'echo "${FLUID_OIDC_TOKEN}" > /tmp/oidc_token.json '
-                    "&& gcloud auth login --cred-file=/tmp/oidc_token.json --quiet"
+                    'CRED_FILE="$(mktemp)" '
+                    '&& chmod 600 "$CRED_FILE" '
+                    "&& trap 'rm -f \"$CRED_FILE\"' EXIT "
+                    '&& printf "%s" "${FLUID_OIDC_TOKEN}" > "$CRED_FILE" '
+                    '&& gcloud auth login --cred-file="$CRED_FILE" --quiet'
                 )
             elif config.oidc_provider == "aws":
                 deploy_script.append(
-                    "aws sts assume-role-with-web-identity"
-                    " --role-arn ${AWS_ROLE_ARN}"
-                    " --web-identity-token ${FLUID_OIDC_TOKEN}"
+                    'CRED_FILE="$(mktemp)" '
+                    '&& chmod 600 "$CRED_FILE" '
+                    "&& trap 'rm -f \"$CRED_FILE\"' EXIT "
+                    "&& aws sts assume-role-with-web-identity"
+                    ' --role-arn "${AWS_ROLE_ARN}"'
+                    ' --web-identity-token "${FLUID_OIDC_TOKEN}"'
                     ' --role-session-name "fluid-ci-${CI_PIPELINE_ID}"'
-                    " > /tmp/aws_creds.json"
+                    ' > "$CRED_FILE"'
                 )
             deploy_script.append(f"FLUID_ENV={env} {commands['generate_transformation']}")
             deploy_script.append(f"FLUID_ENV={env} {commands['generate_schedule']}")
