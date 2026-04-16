@@ -49,10 +49,7 @@ class TestWorkspaceScope:
 
     def test_workspace_init_receipt_path(self):
         ws = Path("/ws")
-        assert (
-            ap.workspace_init_receipt_path(ws)
-            == ws / ".fluid" / "init-receipt.json"
-        )
+        assert ap.workspace_init_receipt_path(ws) == ws / ".fluid" / "init-receipt.json"
 
 
 class TestProductScope:
@@ -82,10 +79,7 @@ class TestProductScope:
         p = Path("/ws/my-product")
         assert ap.product_memory_path(p) == p / ".fluid" / "copilot-memory.json"
         assert ap.product_ci_state_path(p) == p / ".fluid" / "ci-state.json"
-        assert (
-            ap.product_forge_receipt_path(p)
-            == p / ".fluid" / "forge-receipt.json"
-        )
+        assert ap.product_forge_receipt_path(p) == p / ".fluid" / "forge-receipt.json"
 
 
 class TestEnvelopeAndCIConstants:
@@ -120,13 +114,7 @@ class TestAcceptsStringsAndPaths:
         assert ap.workspace_state_dir("/ws") == Path("/ws") / ".fluid"
 
     def test_product_memory_path_accepts_string(self):
-        assert (
-            ap.product_memory_path("/ws/p")
-            == Path("/ws/p") / ".fluid" / "copilot-memory.json"
-        )
+        assert ap.product_memory_path("/ws/p") == Path("/ws/p") / ".fluid" / "copilot-memory.json"
 
     def test_product_bundled_path_accepts_string(self):
-        assert (
-            ap.product_bundled_path("/ws/p")
-            == Path("/ws/p") / "contract.bundled.yaml"
-        )
+        assert ap.product_bundled_path("/ws/p") == Path("/ws/p") / "contract.bundled.yaml"

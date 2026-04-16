@@ -76,7 +76,9 @@ class AirflowScheduler(ScheduleEngine):
         dag_code += "\n\n"
         dag_code += _generate_imports(provider)
         dag_code += "\n\n"
-        dag_code += _generate_dag_definition(contract_id, contract_name, schedule, timezone, provider)
+        dag_code += _generate_dag_definition(
+            contract_id, contract_name, schedule, timezone, provider
+        )
         dag_code += "\n\n"
         dag_code += _generate_task_definitions(provider_tasks, provider, provider_config)
         dag_code += "\n\n"
@@ -92,40 +94,48 @@ class AirflowScheduler(ScheduleEngine):
         issues: List[ValidationIssue] = []
         orchestration = contract.get("orchestration")
         if not orchestration:
-            issues.append(ValidationIssue(
-                message="Contract missing 'orchestration' section",
-                severity=Severity.ERROR,
-                field="orchestration",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message="Contract missing 'orchestration' section",
+                    severity=Severity.ERROR,
+                    field="orchestration",
+                )
+            )
             return issues
 
         tasks = orchestration.get("tasks")
         if not tasks:
-            issues.append(ValidationIssue(
-                message="Orchestration has no tasks",
-                severity=Severity.WARNING,
-                field="orchestration.tasks",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message="Orchestration has no tasks",
+                    severity=Severity.WARNING,
+                    field="orchestration.tasks",
+                )
+            )
 
         # Check for duplicate task IDs
         task_ids = [t.get("taskId") for t in (tasks or [])]
         if len(task_ids) != len(set(task_ids)):
-            issues.append(ValidationIssue(
-                message="Duplicate task IDs found in orchestration",
-                severity=Severity.ERROR,
-                field="orchestration.tasks",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message="Duplicate task IDs found in orchestration",
+                    severity=Severity.ERROR,
+                    field="orchestration.tasks",
+                )
+            )
 
         # Validate dependencies reference existing tasks
         task_id_set = set(task_ids)
-        for task in (tasks or []):
+        for task in tasks or []:
             for dep in task.get("dependsOn", []):
                 if dep not in task_id_set:
-                    issues.append(ValidationIssue(
-                        message=f"Task '{task.get('taskId')}' depends on non-existent task '{dep}'",
-                        severity=Severity.ERROR,
-                        field=f"orchestration.tasks[{task.get('taskId')}].dependsOn",
-                    ))
+                    issues.append(
+                        ValidationIssue(
+                            message=f"Task '{task.get('taskId')}' depends on non-existent task '{dep}'",
+                            severity=Severity.ERROR,
+                            field=f"orchestration.tasks[{task.get('taskId')}].dependsOn",
+                        )
+                    )
 
         return issues
 
@@ -171,7 +181,10 @@ from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator"""
 
 
 def _generate_dag_definition(
-    contract_id: str, contract_name: str, schedule: str, timezone: str,
+    contract_id: str,
+    contract_name: str,
+    schedule: str,
+    timezone: str,
     provider: Optional[str],
 ) -> str:
     """Generate DAG definition with default arguments."""

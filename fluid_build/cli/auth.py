@@ -127,6 +127,7 @@ class AuthProvider:
         """Retrieve a credential previously saved to the OS keyring."""
         try:
             from fluid_build.credentials.keyring_store import KeyringCredentialStore
+
             return KeyringCredentialStore.get_credential(f"{self.name}.{key}")
         except Exception:
             return None
@@ -135,6 +136,7 @@ class AuthProvider:
         """Save a credential to the OS keyring. Returns True on success."""
         try:
             from fluid_build.credentials.keyring_store import KeyringCredentialStore
+
             KeyringCredentialStore.set_credential(f"{self.name}.{key}", value)
             return True
         except Exception as e:
@@ -147,9 +149,7 @@ class AuthProvider:
             return
         try:
             if RICH_AVAILABLE:
-                save = Confirm.ask(
-                    "\n  Save to secure keyring for future use?", default=True
-                )
+                save = Confirm.ask("\n  Save to secure keyring for future use?", default=True)
             else:
                 resp = input("\n  Save to secure keyring for future use? (y/n): ")
                 save = resp.strip().lower() in ("y", "yes", "")
@@ -216,6 +216,7 @@ class GoogleCloudAuthProvider(AuthProvider):
     def _has_sdk() -> bool:
         try:
             import google.auth  # noqa: F401
+
             return True
         except ImportError:
             return False
@@ -349,6 +350,7 @@ class GoogleCloudAuthProvider(AuthProvider):
     async def login(self, **kwargs) -> AuthResult:
         """Smart login: CLI → env var → keyring → ADC → guided prompt."""
         import shutil
+
         try:
             has_cli = bool(shutil.which("gcloud"))
             has_sdk = self._has_sdk()
@@ -357,12 +359,18 @@ class GoogleCloudAuthProvider(AuthProvider):
             interactive = self._is_interactive()
 
             if interactive:
-                self._show_methods_panel([
-                    ("gcloud CLI", has_cli, "installed" if has_cli else "not installed"),
-                    ("GOOGLE_APPLICATION_CREDENTIALS", bool(env_creds), env_creds or "not set"),
-                    ("Saved credentials", bool(keyring_path), "found" if keyring_path else "none"),
-                    ("Manual setup", interactive, "available"),
-                ])
+                self._show_methods_panel(
+                    [
+                        ("gcloud CLI", has_cli, "installed" if has_cli else "not installed"),
+                        ("GOOGLE_APPLICATION_CREDENTIALS", bool(env_creds), env_creds or "not set"),
+                        (
+                            "Saved credentials",
+                            bool(keyring_path),
+                            "found" if keyring_path else "none",
+                        ),
+                        ("Manual setup", interactive, "available"),
+                    ]
+                )
 
             # 1. CLI (interactive only — opens browser)
             if has_cli and interactive:
@@ -414,10 +422,13 @@ class GoogleCloudAuthProvider(AuthProvider):
     async def logout(self) -> bool:
         """Logout from Google Cloud"""
         import shutil
+
         try:
             if shutil.which("gcloud"):
                 try:
-                    self._run_command(["gcloud", "auth", "application-default", "revoke"], check=False)
+                    self._run_command(
+                        ["gcloud", "auth", "application-default", "revoke"], check=False
+                    )
                 except Exception:
                     pass
                 try:
@@ -437,6 +448,7 @@ class GoogleCloudAuthProvider(AuthProvider):
     async def check_auth(self) -> AuthResult:
         """Check GCP auth — tries SDK first, CLI second."""
         import shutil
+
         try:
             # Try SDK first (works without gcloud)
             if self._has_sdk():
@@ -463,8 +475,14 @@ class GoogleCloudAuthProvider(AuthProvider):
                                 provider=self.name,
                                 status=AuthStatus.AUTHENTICATED,
                                 user_info={
-                                    "account": (account_r.stdout.strip() if account_r.stdout else "unknown"),
-                                    "project": (project_r.stdout.strip() if project_r.stdout else self.project_id),
+                                    "account": (
+                                        account_r.stdout.strip() if account_r.stdout else "unknown"
+                                    ),
+                                    "project": (
+                                        project_r.stdout.strip()
+                                        if project_r.stdout
+                                        else self.project_id
+                                    ),
                                 },
                                 scopes=self.scopes,
                             ),
@@ -494,6 +512,7 @@ class AWSAuthProvider(AuthProvider):
     def _has_boto3() -> bool:
         try:
             import boto3  # noqa: F401
+
             return True
         except ImportError:
             return False
@@ -623,6 +642,7 @@ class AWSAuthProvider(AuthProvider):
     async def login(self, **kwargs) -> AuthResult:
         """Smart login: CLI → env vars → keyring → boto3 default → guided prompt."""
         import shutil
+
         try:
             has_cli = bool(shutil.which("aws"))
             has_sdk = self._has_boto3()
@@ -633,12 +653,14 @@ class AWSAuthProvider(AuthProvider):
             interactive = self._is_interactive()
 
             if interactive:
-                self._show_methods_panel([
-                    ("AWS CLI", has_cli, "installed" if has_cli else "not installed"),
-                    ("AWS_ACCESS_KEY_ID", bool(env_key), "set" if env_key else "not set"),
-                    ("Saved credentials", bool(kr_key), "found" if kr_key else "none"),
-                    ("Manual setup", interactive, "available"),
-                ])
+                self._show_methods_panel(
+                    [
+                        ("AWS CLI", has_cli, "installed" if has_cli else "not installed"),
+                        ("AWS_ACCESS_KEY_ID", bool(env_key), "set" if env_key else "not set"),
+                        ("Saved credentials", bool(kr_key), "found" if kr_key else "none"),
+                        ("Manual setup", interactive, "available"),
+                    ]
+                )
 
             # 1. CLI (interactive)
             if has_cli and interactive:
@@ -693,6 +715,7 @@ class AWSAuthProvider(AuthProvider):
     async def logout(self) -> bool:
         """Logout from AWS"""
         import shutil
+
         try:
             if shutil.which("aws"):
                 try:
@@ -710,6 +733,7 @@ class AWSAuthProvider(AuthProvider):
     async def check_auth(self) -> AuthResult:
         """Check AWS auth — tries boto3 SDK first, CLI second."""
         import shutil
+
         try:
             if self._has_boto3():
                 result = self._validate_via_sdk()
@@ -719,7 +743,15 @@ class AWSAuthProvider(AuthProvider):
             if shutil.which("aws"):
                 try:
                     r = self._run_command(
-                        ["aws", "sts", "get-caller-identity", "--profile", self.profile, "--output", "json"],
+                        [
+                            "aws",
+                            "sts",
+                            "get-caller-identity",
+                            "--profile",
+                            self.profile,
+                            "--output",
+                            "json",
+                        ],
                         capture_output=True,
                     )
                     if r.returncode == 0:
@@ -762,6 +794,7 @@ class AzureAuthProvider(AuthProvider):
     def _has_sdk() -> bool:
         try:
             import azure.identity  # noqa: F401
+
             return True
         except ImportError:
             return False
@@ -842,16 +875,16 @@ class AzureAuthProvider(AuthProvider):
                 command.extend(["--tenant", self.tenant_id])
             self._run_command(command, capture_output=False)
             if self.subscription_id:
-                self._run_command(
-                    ["az", "account", "set", "--subscription", self.subscription_id]
-                )
+                self._run_command(["az", "account", "set", "--subscription", self.subscription_id])
 
         result = self._validate_via_sdk()
         if result.status == AuthStatus.AUTHENTICATED:
             return self._annotate_method(result, "Azure CLI")
         # Fallback to CLI status check
         try:
-            r = self._run_command(["az", "account", "show", "--output", "json"], capture_output=True)
+            r = self._run_command(
+                ["az", "account", "show", "--output", "json"], capture_output=True
+            )
             if r.returncode == 0:
                 info = json.loads(r.stdout)
                 return self._annotate_method(
@@ -893,14 +926,19 @@ class AzureAuthProvider(AuthProvider):
         result = self._validate_via_sdk(client, secret, tenant)
         if result.status == AuthStatus.AUTHENTICATED:
             result = self._annotate_method(result, "service principal")
-            self._offer_save_to_keyring({
-                "tenant_id": tenant, "client_id": client, "client_secret": secret,
-            })
+            self._offer_save_to_keyring(
+                {
+                    "tenant_id": tenant,
+                    "client_id": client,
+                    "client_secret": secret,
+                }
+            )
         return result
 
     async def login(self, **kwargs) -> AuthResult:
         """Smart login: CLI → env vars → keyring → DefaultAzureCredential → guided prompt."""
         import shutil
+
         try:
             has_cli = bool(shutil.which("az"))
             has_sdk = self._has_sdk()
@@ -913,12 +951,14 @@ class AzureAuthProvider(AuthProvider):
             interactive = self._is_interactive()
 
             if interactive:
-                self._show_methods_panel([
-                    ("Azure CLI", has_cli, "installed" if has_cli else "not installed"),
-                    ("AZURE_CLIENT_ID", bool(env_client), "set" if env_client else "not set"),
-                    ("Saved credentials", bool(kr_client), "found" if kr_client else "none"),
-                    ("Manual setup", interactive, "available"),
-                ])
+                self._show_methods_panel(
+                    [
+                        ("Azure CLI", has_cli, "installed" if has_cli else "not installed"),
+                        ("AZURE_CLIENT_ID", bool(env_client), "set" if env_client else "not set"),
+                        ("Saved credentials", bool(kr_client), "found" if kr_client else "none"),
+                        ("Manual setup", interactive, "available"),
+                    ]
+                )
 
             # 1. CLI
             if has_cli and interactive:
@@ -969,6 +1009,7 @@ class AzureAuthProvider(AuthProvider):
     async def logout(self) -> bool:
         """Logout from Azure"""
         import shutil
+
         try:
             if shutil.which("az"):
                 self._run_command(["az", "logout"], check=False)
@@ -981,6 +1022,7 @@ class AzureAuthProvider(AuthProvider):
     async def check_auth(self) -> AuthResult:
         """Check Azure auth — tries SDK first, CLI second."""
         import shutil
+
         try:
             if self._has_sdk():
                 result = self._validate_via_sdk()
@@ -1409,7 +1451,9 @@ class DatabricksAuthProvider(AuthProvider):
         from getpass import getpass
 
         if RICH_AVAILABLE:
-            host = Prompt.ask("\n  Databricks workspace URL (e.g., https://dbc-xxx.cloud.databricks.com)")
+            host = Prompt.ask(
+                "\n  Databricks workspace URL (e.g., https://dbc-xxx.cloud.databricks.com)"
+            )
         else:
             host = input("\n  Databricks workspace URL: ")
         token = getpass("  Personal Access Token: ")
@@ -1433,6 +1477,7 @@ class DatabricksAuthProvider(AuthProvider):
     async def login(self, **kwargs) -> AuthResult:
         """Smart login: CLI → env vars → keyring → config file → guided prompt."""
         import shutil
+
         try:
             has_cli = bool(shutil.which("databricks"))
             env_host = os.environ.get("DATABRICKS_HOST") or self.host
@@ -1442,12 +1487,14 @@ class DatabricksAuthProvider(AuthProvider):
             interactive = self._is_interactive()
 
             if interactive:
-                self._show_methods_panel([
-                    ("Databricks CLI", has_cli, "installed" if has_cli else "not installed"),
-                    ("DATABRICKS_HOST", bool(env_host), env_host or "not set"),
-                    ("Saved credentials", bool(kr_host), "found" if kr_host else "none"),
-                    ("Manual setup", interactive, "available"),
-                ])
+                self._show_methods_panel(
+                    [
+                        ("Databricks CLI", has_cli, "installed" if has_cli else "not installed"),
+                        ("DATABRICKS_HOST", bool(env_host), env_host or "not set"),
+                        ("Saved credentials", bool(kr_host), "found" if kr_host else "none"),
+                        ("Manual setup", interactive, "available"),
+                    ]
+                )
 
             # 1. CLI (interactive)
             if has_cli and interactive:
@@ -1473,6 +1520,7 @@ class DatabricksAuthProvider(AuthProvider):
             if os.path.exists(cfg_path):
                 try:
                     import configparser
+
                     cfg = configparser.ConfigParser()
                     cfg.read(cfg_path)
                     cfg_host = cfg.get("DEFAULT", "host", fallback=None)
@@ -1516,10 +1564,19 @@ class DatabricksAuthProvider(AuthProvider):
     async def check_auth(self) -> AuthResult:
         """Check Databricks auth — tries REST API first, CLI second."""
         import shutil
+
         try:
             # Try env/keyring + API first
-            host = os.environ.get("DATABRICKS_HOST") or self.host or self._get_keyring_credential("host")
-            token = os.environ.get("DATABRICKS_TOKEN") or self.token or self._get_keyring_credential("token")
+            host = (
+                os.environ.get("DATABRICKS_HOST")
+                or self.host
+                or self._get_keyring_credential("host")
+            )
+            token = (
+                os.environ.get("DATABRICKS_TOKEN")
+                or self.token
+                or self._get_keyring_credential("token")
+            )
             if host and token:
                 result = self._validate_via_api(host, token)
                 if result.status == AuthStatus.AUTHENTICATED:
@@ -1530,6 +1587,7 @@ class DatabricksAuthProvider(AuthProvider):
             if os.path.exists(cfg_path):
                 try:
                     import configparser
+
                     cfg = configparser.ConfigParser()
                     cfg.read(cfg_path)
                     cfg_host = cfg.get("DEFAULT", "host", fallback=None)
@@ -1750,7 +1808,9 @@ def register(subparsers: argparse._SubParsersAction):
         help="Provider to audit (omit to audit all)",
     )
     doctor_parser.add_argument(
-        "--fix", action="store_true", help="Auto-fix issues where possible",
+        "--fix",
+        action="store_true",
+        help="Auto-fix issues where possible",
     )
     doctor_parser.set_defaults(func=run)
 
@@ -2026,9 +2086,7 @@ async def handle_status(
                     )
 
                 console.print(table)
-                console.print(
-                    "\n[dim]💡 Use: fluid auth login <provider> to authenticate[/dim]"
-                )
+                console.print("\n[dim]💡 Use: fluid auth login <provider> to authenticate[/dim]")
             else:
                 cprint("Authentication Status:")
                 for provider_name in providers:
@@ -2050,8 +2108,10 @@ async def handle_status(
 # CI Environment Detection
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class CIEnvironment(Enum):
     """Detected CI/CD environment."""
+
     GITHUB_ACTIONS = "github_actions"
     GITLAB_CI = "gitlab_ci"
     JENKINS = "jenkins"
@@ -2129,6 +2189,7 @@ PROVIDER_MINIMAL_SCOPES = {
 
 class DoctorStatus(Enum):
     """Severity level for a doctor check."""
+
     PASS = "pass"
     WARN = "warn"
     FAIL = "fail"
@@ -2138,6 +2199,7 @@ class DoctorStatus(Enum):
 @dataclass
 class DoctorCheck:
     """Result of a single doctor check."""
+
     name: str
     status: DoctorStatus
     message: str
@@ -2158,50 +2220,63 @@ async def handle_doctor(
     ci_env = detect_ci_environment()
     is_ci = _is_ci()
     if is_ci:
-        checks.append(DoctorCheck(
-            name="CI Environment",
-            status=DoctorStatus.INFO,
-            message=f"Running in CI: {ci_env.value}",
-        ))
+        checks.append(
+            DoctorCheck(
+                name="CI Environment",
+                status=DoctorStatus.INFO,
+                message=f"Running in CI: {ci_env.value}",
+            )
+        )
 
         # Check for OIDC availability
         oidc = _has_oidc_available()
         oidc_available = [k for k, v in oidc.items() if v]
         if oidc_available:
-            checks.append(DoctorCheck(
-                name="OIDC Availability",
-                status=DoctorStatus.PASS,
-                message=f"OIDC tokens available for: {', '.join(oidc_available)}",
-            ))
+            checks.append(
+                DoctorCheck(
+                    name="OIDC Availability",
+                    status=DoctorStatus.PASS,
+                    message=f"OIDC tokens available for: {', '.join(oidc_available)}",
+                )
+            )
         else:
-            checks.append(DoctorCheck(
-                name="OIDC Availability",
-                status=DoctorStatus.WARN,
-                message="No OIDC tokens detected in CI — using stored secrets",
-                fix_hint="Configure Workload Identity Federation for your CI provider",
-            ))
+            checks.append(
+                DoctorCheck(
+                    name="OIDC Availability",
+                    status=DoctorStatus.WARN,
+                    message="No OIDC tokens detected in CI — using stored secrets",
+                    fix_hint="Configure Workload Identity Federation for your CI provider",
+                )
+            )
     else:
-        checks.append(DoctorCheck(
-            name="CI Environment",
-            status=DoctorStatus.INFO,
-            message="Running locally (not CI)",
-        ))
+        checks.append(
+            DoctorCheck(
+                name="CI Environment",
+                status=DoctorStatus.INFO,
+                message="Running locally (not CI)",
+            )
+        )
 
     # ── Check 2: Keyring availability ──
     try:
         import keyring as _kr  # noqa: F401
-        checks.append(DoctorCheck(
-            name="OS Keyring",
-            status=DoctorStatus.PASS,
-            message="OS keyring available for secure credential storage",
-        ))
+
+        checks.append(
+            DoctorCheck(
+                name="OS Keyring",
+                status=DoctorStatus.PASS,
+                message="OS keyring available for secure credential storage",
+            )
+        )
     except ImportError:
-        checks.append(DoctorCheck(
-            name="OS Keyring",
-            status=DoctorStatus.WARN,
-            message="keyring library not installed — credentials may use less secure storage",
-            fix_hint="pip install keyring",
-        ))
+        checks.append(
+            DoctorCheck(
+                name="OS Keyring",
+                status=DoctorStatus.WARN,
+                message="keyring library not installed — credentials may use less secure storage",
+                fix_hint="pip install keyring",
+            )
+        )
 
     # ── Check 3: .env file permissions ──
     env_files = [".env", ".env.local"]
@@ -2213,22 +2288,26 @@ async def handle_doctor(
                 stat = os.stat(env_path)
                 mode = stat.st_mode & 0o777
                 if mode & 0o044:  # world or group readable
-                    checks.append(DoctorCheck(
-                        name=f"{env_file} Permissions",
-                        status=DoctorStatus.FAIL,
-                        message=f"{env_file} is readable by group/others (mode {oct(mode)})",
-                        fix_hint=f"chmod 600 {env_file}",
-                    ))
+                    checks.append(
+                        DoctorCheck(
+                            name=f"{env_file} Permissions",
+                            status=DoctorStatus.FAIL,
+                            message=f"{env_file} is readable by group/others (mode {oct(mode)})",
+                            fix_hint=f"chmod 600 {env_file}",
+                        )
+                    )
                     if fix:
                         os.chmod(env_path, 0o600)
                         checks[-1].status = DoctorStatus.PASS
                         checks[-1].message += " [FIXED]"
                 else:
-                    checks.append(DoctorCheck(
-                        name=f"{env_file} Permissions",
-                        status=DoctorStatus.PASS,
-                        message=f"{env_file} has secure permissions ({oct(mode)})",
-                    ))
+                    checks.append(
+                        DoctorCheck(
+                            name=f"{env_file} Permissions",
+                            status=DoctorStatus.PASS,
+                            message=f"{env_file} has secure permissions ({oct(mode)})",
+                        )
+                    )
             except OSError:
                 pass
 
@@ -2239,22 +2318,26 @@ async def handle_doctor(
         try:
             mode = os.stat(key_path).st_mode & 0o777
             if mode != 0o600:
-                checks.append(DoctorCheck(
-                    name="Encryption Key Perms",
-                    status=DoctorStatus.FAIL,
-                    message=f"~/.fluid/.key has insecure permissions ({oct(mode)})",
-                    fix_hint="chmod 600 ~/.fluid/.key",
-                ))
+                checks.append(
+                    DoctorCheck(
+                        name="Encryption Key Perms",
+                        status=DoctorStatus.FAIL,
+                        message=f"~/.fluid/.key has insecure permissions ({oct(mode)})",
+                        fix_hint="chmod 600 ~/.fluid/.key",
+                    )
+                )
                 if fix:
                     os.chmod(key_path, 0o600)
                     checks[-1].status = DoctorStatus.PASS
                     checks[-1].message += " [FIXED]"
             else:
-                checks.append(DoctorCheck(
-                    name="Encryption Key Perms",
-                    status=DoctorStatus.PASS,
-                    message="~/.fluid/.key has secure permissions (0o600)",
-                ))
+                checks.append(
+                    DoctorCheck(
+                        name="Encryption Key Perms",
+                        status=DoctorStatus.PASS,
+                        message="~/.fluid/.key has secure permissions (0o600)",
+                    )
+                )
         except OSError:
             pass
 
@@ -2270,12 +2353,14 @@ async def handle_doctor(
             if provider and prov != _normalize_provider(provider):
                 continue
             if os.environ.get(env_var):
-                checks.append(DoctorCheck(
-                    name=f"Long-Lived Credential ({env_var})",
-                    status=DoctorStatus.WARN,
-                    message=f"{env_var} is set in CI — this is a long-lived credential",
-                    fix_hint=hint,
-                ))
+                checks.append(
+                    DoctorCheck(
+                        name=f"Long-Lived Credential ({env_var})",
+                        status=DoctorStatus.WARN,
+                        message=f"{env_var} is set in CI — this is a long-lived credential",
+                        fix_hint=hint,
+                    )
+                )
 
     # ── Check 6: Auth status per provider ──
     providers_to_check = (
@@ -2286,40 +2371,50 @@ async def handle_doctor(
             result = await auth_manager.check_auth(prov)
             if result.status == AuthStatus.AUTHENTICATED:
                 cred_type = result.user_info.get("credential_type", "unknown")
-                checks.append(DoctorCheck(
-                    name=f"{prov} Auth",
-                    status=DoctorStatus.PASS,
-                    message=f"Authenticated (type: {cred_type})",
-                ))
+                checks.append(
+                    DoctorCheck(
+                        name=f"{prov} Auth",
+                        status=DoctorStatus.PASS,
+                        message=f"Authenticated (type: {cred_type})",
+                    )
+                )
             elif result.status == AuthStatus.EXPIRED:
-                checks.append(DoctorCheck(
-                    name=f"{prov} Auth",
-                    status=DoctorStatus.WARN,
-                    message="Credentials expired — re-authenticate",
-                    fix_hint=f"fluid auth login {prov}",
-                ))
+                checks.append(
+                    DoctorCheck(
+                        name=f"{prov} Auth",
+                        status=DoctorStatus.WARN,
+                        message="Credentials expired — re-authenticate",
+                        fix_hint=f"fluid auth login {prov}",
+                    )
+                )
             else:
-                checks.append(DoctorCheck(
+                checks.append(
+                    DoctorCheck(
+                        name=f"{prov} Auth",
+                        status=DoctorStatus.INFO,
+                        message=f"Not authenticated ({result.error_message or 'not configured'})",
+                    )
+                )
+        except Exception:
+            checks.append(
+                DoctorCheck(
                     name=f"{prov} Auth",
                     status=DoctorStatus.INFO,
-                    message=f"Not authenticated ({result.error_message or 'not configured'})",
-                ))
-        except Exception:
-            checks.append(DoctorCheck(
-                name=f"{prov} Auth",
-                status=DoctorStatus.INFO,
-                message="Could not check (provider CLI not available)",
-            ))
+                    message="Could not check (provider CLI not available)",
+                )
+            )
 
     # ── Check 7: Least-privilege scope recommendations ──
     for prov in providers_to_check:
         if prov in PROVIDER_MINIMAL_SCOPES:
             scope_info = PROVIDER_MINIMAL_SCOPES[prov]
-            checks.append(DoctorCheck(
-                name=f"{prov} Scope Guidance",
-                status=DoctorStatus.INFO,
-                message=scope_info.get("note", "Review IAM permissions for least privilege"),
-            ))
+            checks.append(
+                DoctorCheck(
+                    name=f"{prov} Scope Guidance",
+                    status=DoctorStatus.INFO,
+                    message=scope_info.get("note", "Review IAM permissions for least privilege"),
+                )
+            )
 
     # ── Render results ──
     warn_count = sum(1 for c in checks if c.status == DoctorStatus.WARN)
@@ -2362,7 +2457,12 @@ async def handle_doctor(
         cprint("Auth Doctor — Credential Hygiene Audit")
         cprint("=" * 55)
         for check in checks:
-            icon = {DoctorStatus.PASS: "+", DoctorStatus.WARN: "!", DoctorStatus.FAIL: "X", DoctorStatus.INFO: "i"}.get(check.status, "?")
+            icon = {
+                DoctorStatus.PASS: "+",
+                DoctorStatus.WARN: "!",
+                DoctorStatus.FAIL: "X",
+                DoctorStatus.INFO: "i",
+            }.get(check.status, "?")
             cprint(f"  [{icon}] {check.name}: {check.message}")
             if check.fix_hint:
                 cprint(f"      Fix: {check.fix_hint}")

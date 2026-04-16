@@ -21,7 +21,6 @@ from fluid_build.schedulers.synthesis import (
     synthesize_orchestration_from_builds,
 )
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # _sanitize_task_id
 # ──────────────────────────────────────────────────────────────────────────────
@@ -126,9 +125,7 @@ class TestSynthesizeOrchestration:
             {"id": "step_b", "engine": "sql"},
             {"id": "step_c", "engine": "sql"},
         ]
-        result = synthesize_orchestration_from_builds(
-            self._make_contract(builds), "dagster"
-        )
+        result = synthesize_orchestration_from_builds(self._make_contract(builds), "dagster")
         tasks = result["tasks"]
         assert tasks[0]["dependsOn"] == []
         assert tasks[1]["dependsOn"] == ["step_a"]
@@ -136,9 +133,7 @@ class TestSynthesizeOrchestration:
 
     def test_default_schedule(self):
         builds = [{"id": "x", "engine": "sql"}]
-        result = synthesize_orchestration_from_builds(
-            self._make_contract(builds), "prefect"
-        )
+        result = synthesize_orchestration_from_builds(self._make_contract(builds), "prefect")
         assert result["schedule"] == "0 2 * * *"
         assert result["timezone"] == "UTC"
 
@@ -166,9 +161,7 @@ class TestSynthesizeOrchestration:
 
     def test_build_with_name_fallback(self):
         builds = [{"name": "My Build", "engine": "sql"}]
-        result = synthesize_orchestration_from_builds(
-            self._make_contract(builds), "airflow"
-        )
+        result = synthesize_orchestration_from_builds(self._make_contract(builds), "airflow")
         assert result["tasks"][0]["taskId"] == "my_build"
 
     def test_python_build_includes_model(self):
@@ -190,9 +183,11 @@ class TestGenerateScheduleArtifactsIntegration:
     def _ensure_schedulers_registered(self):
         """Re-discover schedulers in case a previous test reset the registry."""
         import importlib
+
         import fluid_build.schedulers.airflow
         import fluid_build.schedulers.dagster
         import fluid_build.schedulers.prefect
+
         importlib.reload(fluid_build.schedulers.airflow)
         importlib.reload(fluid_build.schedulers.dagster)
         importlib.reload(fluid_build.schedulers.prefect)
@@ -207,8 +202,16 @@ class TestGenerateScheduleArtifactsIntegration:
             "id": "customer-analytics",
             "name": "Customer Analytics",
             "builds": [
-                {"id": "raw_load", "engine": "sql", "properties": {"sql": "SELECT * FROM raw.customers"}},
-                {"id": "transform", "engine": "sql", "properties": {"sql": "SELECT id FROM staging.customers"}},
+                {
+                    "id": "raw_load",
+                    "engine": "sql",
+                    "properties": {"sql": "SELECT * FROM raw.customers"},
+                },
+                {
+                    "id": "transform",
+                    "engine": "sql",
+                    "properties": {"sql": "SELECT id FROM staging.customers"},
+                },
             ],
         }
         context = {"schedule_engine": "airflow", "provider": "gcp"}
@@ -235,10 +238,10 @@ class TestGenerateScheduleArtifactsIntegration:
 
     def test_no_schedule_engine_returns_empty(self):
         """Without schedule_engine in context, no files should be generated."""
-        from fluid_build.cli.forge_modes import _generate_schedule_artifacts
-
         import tempfile
         from pathlib import Path
+
+        from fluid_build.cli.forge_modes import _generate_schedule_artifacts
 
         contract = {"builds": [{"id": "x", "engine": "sql"}]}
         with tempfile.TemporaryDirectory() as tmp:
@@ -253,10 +256,10 @@ class TestGenerateScheduleArtifactsIntegration:
 
     def test_contract_with_orchestration_uses_it_directly(self):
         """If contract already has orchestration, synthesis is skipped."""
-        from fluid_build.cli.forge_modes import _generate_schedule_artifacts
-
         import tempfile
         from pathlib import Path
+
+        from fluid_build.cli.forge_modes import _generate_schedule_artifacts
 
         contract = {
             "id": "test",
@@ -266,7 +269,13 @@ class TestGenerateScheduleArtifactsIntegration:
                 "schedule": "0 3 * * *",
                 "timezone": "UTC",
                 "tasks": [
-                    {"taskId": "custom_task", "type": "provider_action", "action": "gcp.bigquery.query", "params": {}, "dependsOn": []},
+                    {
+                        "taskId": "custom_task",
+                        "type": "provider_action",
+                        "action": "gcp.bigquery.query",
+                        "params": {},
+                        "dependsOn": [],
+                    },
                 ],
             },
         }

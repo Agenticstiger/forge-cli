@@ -86,38 +86,46 @@ class DagsterScheduler(ScheduleEngine):
         issues: List[ValidationIssue] = []
         orchestration = contract.get("orchestration")
         if not orchestration:
-            issues.append(ValidationIssue(
-                message="Contract missing 'orchestration' section",
-                severity=Severity.ERROR,
-                field="orchestration",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message="Contract missing 'orchestration' section",
+                    severity=Severity.ERROR,
+                    field="orchestration",
+                )
+            )
             return issues
 
         tasks = orchestration.get("tasks")
         if not tasks:
-            issues.append(ValidationIssue(
-                message="Orchestration has no tasks",
-                severity=Severity.WARNING,
-                field="orchestration.tasks",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message="Orchestration has no tasks",
+                    severity=Severity.WARNING,
+                    field="orchestration.tasks",
+                )
+            )
 
         task_ids = [t.get("taskId") for t in (tasks or [])]
         if len(task_ids) != len(set(task_ids)):
-            issues.append(ValidationIssue(
-                message="Duplicate task IDs found in orchestration",
-                severity=Severity.ERROR,
-                field="orchestration.tasks",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message="Duplicate task IDs found in orchestration",
+                    severity=Severity.ERROR,
+                    field="orchestration.tasks",
+                )
+            )
 
         task_id_set = set(task_ids)
-        for task in (tasks or []):
+        for task in tasks or []:
             for dep in task.get("dependsOn", []):
                 if dep not in task_id_set:
-                    issues.append(ValidationIssue(
-                        message=f"Task '{task.get('taskId')}' depends on non-existent task '{dep}'",
-                        severity=Severity.ERROR,
-                        field=f"orchestration.tasks[{task.get('taskId')}].dependsOn",
-                    ))
+                    issues.append(
+                        ValidationIssue(
+                            message=f"Task '{task.get('taskId')}' depends on non-existent task '{dep}'",
+                            severity=Severity.ERROR,
+                            field=f"orchestration.tasks[{task.get('taskId')}].dependsOn",
+                        )
+                    )
 
         return issues
 
@@ -132,7 +140,10 @@ def _sanitize_name(name: str) -> str:
 
 
 def _generate_header(
-    contract_id: str, contract_name: str, schedule: str, timezone: str,
+    contract_id: str,
+    contract_name: str,
+    schedule: str,
+    timezone: str,
     provider: Optional[str],
 ) -> str:
     return f'''"""
@@ -222,7 +233,9 @@ def pipeline_config():
 
 
 def _generate_ops(
-    tasks: List[Dict[str, Any]], provider: Optional[str], config: Dict[str, Any],
+    tasks: List[Dict[str, Any]],
+    provider: Optional[str],
+    config: Dict[str, Any],
 ) -> str:
     ops_code = "# Pipeline Ops\n"
     for task in tasks:
@@ -232,7 +245,9 @@ def _generate_ops(
 
 
 def _generate_single_op(
-    task: Dict[str, Any], provider: Optional[str], config: Dict[str, Any],
+    task: Dict[str, Any],
+    provider: Optional[str],
+    config: Dict[str, Any],
 ) -> str:
     task_id = task.get("taskId")
     action = task.get("action", "")
@@ -301,7 +316,10 @@ def {task_id}(context):
 
 
 def _generate_job(
-    contract_id: str, tasks: List[Dict[str, Any]], schedule: str, timezone: str,
+    contract_id: str,
+    tasks: List[Dict[str, Any]],
+    schedule: str,
+    timezone: str,
     provider: Optional[str],
 ) -> str:
     op_calls = []

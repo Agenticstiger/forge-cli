@@ -36,7 +36,6 @@ from fluid_build.cli.artifact_receipts import ReceiptBuilder
 from fluid_build.cli.artifact_scan import diff_snapshots, snapshot_workspace
 from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
-from fluid_build.cli.next_steps import print_next_steps
 from fluid_build.cli.forge_agents import DOMAIN_AGENTS
 from fluid_build.cli.forge_context import (
     get_cli_arg as _get_cli_arg,
@@ -76,14 +75,17 @@ from fluid_build.cli.forge_copilot_runtime import (
 )
 from fluid_build.cli.forge_copilot_taxonomy import normalize_copilot_context
 from fluid_build.cli.forge_dialogs import ask_confirmation, ask_dialog_question
-from fluid_build.cli.forge_ui import print_welcome_panel
 from fluid_build.cli.forge_modes import (
     _scaffold_ci_pipeline,
+)
+from fluid_build.cli.forge_modes import (
     run_ai_copilot_mode as _run_copilot,
 )
 from fluid_build.cli.forge_modes import (
     run_guided_mode as _run_guided,
 )
+from fluid_build.cli.forge_ui import print_welcome_panel
+from fluid_build.cli.next_steps import print_next_steps
 
 try:
     from rich.console import Console
@@ -545,7 +547,9 @@ def run(args, logger: logging.Logger) -> int:
 
                 print_forge_help()
                 return 0
-            cprint("Run 'fluid forge' to start the AI Copilot, or 'fluid forge --blank' for an empty contract.")
+            cprint(
+                "Run 'fluid forge' to start the AI Copilot, or 'fluid forge --blank' for an empty contract."
+            )
             return 0
 
         # --- Memory management shortcuts ---
@@ -599,6 +603,7 @@ def run(args, logger: logging.Logger) -> int:
                 args.llm_endpoint = llm_config.endpoint
                 if llm_config.api_key:
                     from fluid_build.cli.ai_setup import set_session_env
+
                     set_session_env(llm_config.provider, llm_config.api_key)
                 LOG.debug("LLM config loaded: provider=%s", llm_config.provider)
             else:

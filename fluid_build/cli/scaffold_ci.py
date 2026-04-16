@@ -28,7 +28,9 @@ COMMAND = "scaffold-ci"
 def register(subparsers: argparse._SubParsersAction):
     p = subparsers.add_parser(COMMAND, help="Generate CI pipeline (GitLab/GitHub)")
     p.add_argument("contract", help="contract.fluid.yaml")
-    p.add_argument("--system", choices=["gitlab", "github", "jenkins"], default="gitlab", help="CI system")
+    p.add_argument(
+        "--system", choices=["gitlab", "github", "jenkins"], default="gitlab", help="CI system"
+    )
     p.add_argument("--out", default=".gitlab-ci.yml", help="Output path")
     p.set_defaults(cmd=COMMAND, func=run)
 

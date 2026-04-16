@@ -80,6 +80,7 @@ def _sanitize_ollama_host(host: str) -> str:
         return "http://localhost:11434"
     return clean
 
+
 # Keyring key prefix used when persisting API keys.
 _KEYRING_PREFIX = "llm_api_key"
 
@@ -88,9 +89,7 @@ _KEYRING_PREFIX = "llm_api_key"
 _ai_setup_skipped = False
 
 # Key format hints shown when auto-detection fails.
-_KEY_FORMAT_HINTS = (
-    "Recognised formats: sk-... (OpenAI), sk-ant-... (Anthropic), AIza... (Gemini)"
-)
+_KEY_FORMAT_HINTS = "Recognised formats: sk-... (OpenAI), sk-ant-... (Anthropic), AIza... (Gemini)"
 
 
 # ---------------------------------------------------------------------------
@@ -379,11 +378,13 @@ def _prompt_for_api_key(console: Any) -> Optional[LlmConfig]:
                 "anthropic": "https://console.anthropic.com/settings/keys",
             }.get(provider_choice, "")
             if attempt > 1 or provider_choice != "gemini":
-                url_hint = f"\n[dim]Get your key at: [bold cyan]{signup_url}[/bold cyan][/dim]" if signup_url else ""
+                url_hint = (
+                    f"\n[dim]Get your key at: [bold cyan]{signup_url}[/bold cyan][/dim]"
+                    if signup_url
+                    else ""
+                )
                 console.print(f"\n[bold]{label}[/bold] selected.{url_hint}")
-        console.print(
-            "[dim]Paste your API key (input is hidden).[/dim]"
-        )
+        console.print("[dim]Paste your API key (input is hidden).[/dim]")
 
         raw = Prompt.ask("[bold]API key[/bold]", password=True)
         raw = raw.strip()
@@ -395,9 +396,7 @@ def _prompt_for_api_key(console: Any) -> Optional[LlmConfig]:
         detected = detect_provider_from_api_key(raw)
         if detected and detected != provider_choice:
             actual_label = PROVIDER_DISPLAY_NAMES.get(detected, detected)
-            console.print(
-                f"[yellow]That looks like a key for {actual_label}.[/yellow]"
-            )
+            console.print(f"[yellow]That looks like a key for {actual_label}.[/yellow]")
             use_detected = Confirm.ask(f"Use {actual_label} instead?", default=True)
             if use_detected:
                 provider_choice = detected
@@ -773,6 +772,7 @@ def _run_ai_command(args, logger: logging.Logger) -> int:
             # Also reset Ollama detection cache so next run re-probes
             try:
                 from fluid_build.cli.forge_copilot_llm_providers import reset_llm_caches
+
                 reset_llm_caches()
             except ImportError:
                 pass
@@ -781,6 +781,7 @@ def _run_ai_command(args, logger: logging.Logger) -> int:
                 console.print("[dim]Run 'fluid forge' to choose a provider.[/dim]")
             else:
                 from fluid_build.cli.console import cprint
+
                 cprint("Cleared saved AI config and API keys.")
             return 0
         result = run_ai_setup_interactive(console)

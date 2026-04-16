@@ -62,9 +62,7 @@ def _write_contract(
                 "command": "fluid forge",
             },
         }
-    product_contract_path(product_root).write_text(
-        yaml.dump(contract), encoding="utf-8"
-    )
+    product_contract_path(product_root).write_text(yaml.dump(contract), encoding="utf-8")
 
 
 def _write_forge_receipt(
@@ -292,9 +290,7 @@ class TestFormatters:
     def test_authoring_formatter_shows_fragment_count(self):
         from fluid_build.cli.status import _format_authoring
 
-        summary = StatusSummary(
-            authoring_mode="fragment-first", fragment_count=5, overlay_count=2
-        )
+        summary = StatusSummary(authoring_mode="fragment-first", fragment_count=5, overlay_count=2)
         result = _format_authoring(summary)
         assert "fragment-first" in result
         assert "5 fragments" in result

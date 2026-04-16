@@ -66,8 +66,8 @@ EnvelopeKind = Literal[
     "CIState",
     "ContractLockfile",
     "ContractBundle",
-    "SkillsCompiled",      # slice UX-J
-    "DiscoveryCache",      # slice UX-J
+    "SkillsCompiled",  # slice UX-J
+    "DiscoveryCache",  # slice UX-J
 ]
 
 
@@ -138,9 +138,7 @@ def dump_yaml_with_envelope(
     responsible for the ``#`` prefix and trailing newline).
     """
     if yaml is None:  # pragma: no cover — YAML is required by other modules
-        raise RuntimeError(
-            "PyYAML is required to serialise envelope-wrapped YAML artifacts."
-        )
+        raise RuntimeError("PyYAML is required to serialise envelope-wrapped YAML artifacts.")
     envelope = build_envelope(
         kind=kind,
         command=command,

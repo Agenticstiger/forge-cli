@@ -27,8 +27,8 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from fluid_build.cli._common import redact_secrets, resolve_provider_from_contract
@@ -44,6 +44,7 @@ from fluid_build.cli.forge_copilot_contract_helpers import (  # noqa: F401
     _coerce_string_list,
     _normalize_consumes_for_generation,
     _normalize_interview_summary,
+    build_structured_repair_feedback,
     classify_generation_failure,
     extract_json_object,
     normalize_provider_name,
@@ -64,9 +65,6 @@ from fluid_build.cli.forge_copilot_contract_helpers import (
 )
 from fluid_build.cli.forge_copilot_contract_helpers import (
     validate_generated_result as _validate_generated_result_raw,
-)
-from fluid_build.cli.forge_copilot_contract_helpers import (
-    build_structured_repair_feedback,
 )
 
 # ---------------------------------------------------------------------------
@@ -546,9 +544,7 @@ def _call_llm_with_optional_streaming(
 
     try:
         char_total = 0
-        for chunk in call_llm_streaming(
-            provider_adapter, llm_config, system_prompt, user_prompt
-        ):
+        for chunk in call_llm_streaming(provider_adapter, llm_config, system_prompt, user_prompt):
             chunks.append(chunk)
             char_total += len(chunk)
             if char_total % 256 < len(chunk):  # cheap throttle
@@ -604,9 +600,7 @@ def _self_evaluate_contract(
         result = json.loads(raw) if isinstance(raw, str) else raw
         if isinstance(result, dict) and "score" in result:
             if logger:
-                logger.info(
-                    "Self-evaluation score: %s/10", result.get("score")
-                )
+                logger.info("Self-evaluation score: %s/10", result.get("score"))
             return result
     except Exception as exc:  # noqa: BLE001 — fail-open
         if logger:
@@ -715,7 +709,10 @@ def generate_copilot_artifacts(
             # loop back for another attempt.  Fail-open — evaluation
             # errors never block a valid contract from being returned.
             eval_result = _self_evaluate_contract(
-                llm_config, context, normalized["contract"], logger=logger,
+                llm_config,
+                context,
+                normalized["contract"],
+                logger=logger,
             )
             if eval_result and eval_result.get("score", 10) < 7 and attempt_index < max_attempts:
                 issues = eval_result.get("issues") or eval_result.get("suggestions") or []

@@ -76,9 +76,7 @@ class TestReceiptBuilder:
     def test_record_entry_classifies_by_action(self):
         b = ReceiptBuilder(flow="blank")
         b.record_entry(Path("a.yaml"), action="create", sha256="sha1", size=5)
-        b.record_entry(
-            Path("b.yaml"), action="skip", reason="exists"
-        )
+        b.record_entry(Path("b.yaml"), action="skip", reason="exists")
         assert len(b.entries) == 1
         assert b.entries[0].action == "create"
         assert len(b.skipped) == 1

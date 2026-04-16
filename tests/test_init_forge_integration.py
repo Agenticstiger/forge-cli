@@ -22,7 +22,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Arg factories (mirror register() defaults for each command)
 # ---------------------------------------------------------------------------
@@ -133,8 +132,10 @@ class TestInitBlank:
 
         args = _make_init_args(name=str(tmp_path / "blank-dry"), blank=True, dry_run=True)
 
-        with patch("fluid_build.cli.init.RICH_AVAILABLE", False), \
-             patch.dict("sys.modules", {"fluid_build.cli.product_new": MagicMock(run=mock_run)}):
+        with (
+            patch("fluid_build.cli.init.RICH_AVAILABLE", False),
+            patch.dict("sys.modules", {"fluid_build.cli.product_new": MagicMock(run=mock_run)}),
+        ):
             result = blank_mode(args, logger)
 
         # product_new import succeeds → delegates to it
@@ -150,15 +151,19 @@ class TestInitBlank:
         # Force ImportError on product_new so the manual fallback path fires
         import fluid_build.cli.init as init_mod
 
-        original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
+        original_import = (
+            __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
+        )
 
         def mock_import(name, *a, **kw):
             if name == ".product_new" or (isinstance(name, str) and "product_new" in name):
                 raise ImportError("mocked")
             return original_import(name, *a, **kw)
 
-        with patch("fluid_build.cli.init.RICH_AVAILABLE", False), \
-             patch("builtins.__import__", side_effect=mock_import):
+        with (
+            patch("fluid_build.cli.init.RICH_AVAILABLE", False),
+            patch("builtins.__import__", side_effect=mock_import),
+        ):
             # Re-import blank_mode inside the patched context won't work;
             # instead call blank_mode which has a try/except ImportError inside.
             # The issue is the import happens inside the function body.
@@ -194,9 +199,7 @@ class TestInitProviderUseCase:
         monkeypatch.chdir(tmp_path)
         from fluid_build.cli.init import blank_mode
 
-        args = _make_init_args(
-            name=str(tmp_path / "gcp-blank"), blank=True, provider="gcp"
-        )
+        args = _make_init_args(name=str(tmp_path / "gcp-blank"), blank=True, provider="gcp")
 
         with patch("fluid_build.cli.init.RICH_AVAILABLE", False):
             result = blank_mode(args, logger)
@@ -241,9 +244,11 @@ class TestInitWorkspaceRedirect:
 
         args = _make_init_args(yes=False)  # No explicit mode flag
 
-        with patch("fluid_build.cli.init.RICH_AVAILABLE", False), \
-             patch("fluid_build.cli.init.find_workspace_root", return_value=tmp_path), \
-             patch("fluid_build.cli.init.discover_workspace_products", return_value=[mock_product]):
+        with (
+            patch("fluid_build.cli.init.RICH_AVAILABLE", False),
+            patch("fluid_build.cli.init.find_workspace_root", return_value=tmp_path),
+            patch("fluid_build.cli.init.discover_workspace_products", return_value=[mock_product]),
+        ):
             result = detect_mode(args, logger)
 
         assert result is None  # Redirected — no mode to run
@@ -296,8 +301,10 @@ class TestInitProductListing:
             fluid_version="0.7.2",
         )
 
-        with patch("fluid_build.cli.init.RICH_AVAILABLE", False), \
-             patch("fluid_build.cli.init.load_workspace_config") as mock_ws:
+        with (
+            patch("fluid_build.cli.init.RICH_AVAILABLE", False),
+            patch("fluid_build.cli.init.load_workspace_config") as mock_ws,
+        ):
             mock_ws.return_value = SimpleNamespace(name="test-ws")
             result = _redirect_existing_workspace([mock_product], tmp_path)
 
@@ -426,20 +433,26 @@ class TestInitForgeHandover:
 
         mock_copilot = MagicMock(return_value=0)
 
-        with patch("fluid_build.cli.init.RICH_AVAILABLE", False), \
-             patch("fluid_build.cli.init.find_workspace_root", return_value=tmp_path), \
-             patch("fluid_build.cli.init.load_workspace_config") as mock_ws_config, \
-             patch("fluid_build.cli.init.CopilotAgent", create=True), \
-             patch("fluid_build.cli.init.ContextValidationError", create=True), \
-             patch("fluid_build.cli.init.build_interview_summary_from_context", create=True), \
-             patch("fluid_build.cli.init.get_cli_arg", create=True), \
-             patch("fluid_build.cli.init.get_target_directory", create=True), \
-             patch("fluid_build.cli.init.load_context", create=True):
+        with (
+            patch("fluid_build.cli.init.RICH_AVAILABLE", False),
+            patch("fluid_build.cli.init.find_workspace_root", return_value=tmp_path),
+            patch("fluid_build.cli.init.load_workspace_config") as mock_ws_config,
+            patch("fluid_build.cli.init.CopilotAgent", create=True),
+            patch("fluid_build.cli.init.ContextValidationError", create=True),
+            patch("fluid_build.cli.init.build_interview_summary_from_context", create=True),
+            patch("fluid_build.cli.init.get_cli_arg", create=True),
+            patch("fluid_build.cli.init.get_target_directory", create=True),
+            patch("fluid_build.cli.init.load_context", create=True),
+        ):
 
             # Mock workspace config
             mock_ws_config.return_value = SimpleNamespace(
-                name="test-ws", domain="analytics", owner_team="team",
-                owner_email="", provider="local", products_dir="."
+                name="test-ws",
+                domain="analytics",
+                owner_team="team",
+                owner_email="",
+                provider="local",
+                products_dir=".",
             )
 
             # Patch the actual forge copilot call
@@ -464,15 +477,20 @@ class TestInitForgeHandover:
         from fluid_build.cli.init import detect_mode
 
         mock_product = SimpleNamespace(
-            name="p1", path=tmp_path / "p1",
-            expose_count=2, provider="local", fluid_version="0.7.2",
+            name="p1",
+            path=tmp_path / "p1",
+            expose_count=2,
+            provider="local",
+            fluid_version="0.7.2",
         )
 
         args = _make_init_args(yes=False)
 
-        with patch("fluid_build.cli.init.RICH_AVAILABLE", False), \
-             patch("fluid_build.cli.init.find_workspace_root", return_value=tmp_path), \
-             patch("fluid_build.cli.init.discover_workspace_products", return_value=[mock_product]):
+        with (
+            patch("fluid_build.cli.init.RICH_AVAILABLE", False),
+            patch("fluid_build.cli.init.find_workspace_root", return_value=tmp_path),
+            patch("fluid_build.cli.init.discover_workspace_products", return_value=[mock_product]),
+        ):
             result = detect_mode(args, logger)
 
         assert result is None
@@ -482,8 +500,7 @@ class TestInitForgeHandover:
     @patch("fluid_build.cli.init.init_local_db")
     @patch("fluid_build.cli.init.show_success_message")
     def test_sequential_init_then_forge(
-        self, mock_success, mock_db, mock_data, mock_copy,
-        tmp_path, logger, monkeypatch
+        self, mock_success, mock_db, mock_data, mock_copy, tmp_path, logger, monkeypatch
     ):
         """Scenario 20: Sequential workflow — demo_mode scaffold then forge blank."""
         monkeypatch.chdir(tmp_path)
@@ -493,7 +510,9 @@ class TestInitForgeHandover:
 
         init_args = _make_init_args(
             name=str(tmp_path / "project"),
-            yes=True, no_run=True, no_dag=True,
+            yes=True,
+            no_run=True,
+            no_dag=True,
         )
 
         with patch("fluid_build.cli.init.RICH_AVAILABLE", False):

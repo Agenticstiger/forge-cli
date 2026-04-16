@@ -52,9 +52,7 @@ class TestDryRun:
         writer_dry.write_text(tmp_path / "a.yaml", content)
         writer_real.write_text(tmp_path / "a.yaml", content)
 
-        assert (
-            writer_dry.records[0].sha256 == writer_real.records[0].sha256
-        )
+        assert writer_dry.records[0].sha256 == writer_real.records[0].sha256
         assert writer_dry.records[0].size == writer_real.records[0].size
 
 

@@ -28,9 +28,7 @@ from fluid_build.cli.artifact_paths import ENVELOPE_SCHEMA_VERSION
 def mem_file(tmp_path):
     """Point ``_MEMORY_FILE`` at a temp path for the test duration."""
     path = tmp_path / "personal-memory.json"
-    with patch(
-        "fluid_build.cli.forge_copilot_personal_memory._MEMORY_FILE", path
-    ):
+    with patch("fluid_build.cli.forge_copilot_personal_memory._MEMORY_FILE", path):
         yield path
 
 
@@ -75,9 +73,7 @@ class TestLoadPersonalMemory:
         from fluid_build.cli.forge_copilot_personal_memory import load_personal_memory
 
         # A flat v0 shape — no preferences/history wrapper.
-        mem_file.write_text(
-            json.dumps({"preferred_provider": "aws", "recent_domains": ["old"]})
-        )
+        mem_file.write_text(json.dumps({"preferred_provider": "aws", "recent_domains": ["old"]}))
         result = load_personal_memory()
         # The loader returns a dict (the file is valid JSON), but because
         # the v1 projection only reads preferences.* / history.*, nothing
@@ -226,9 +222,7 @@ class TestSavePersonalMemory:
             save_personal_memory,
         )
 
-        save_personal_memory(
-            {"ci_provider": "github_actions", "ci_complexity": "advanced"}
-        )
+        save_personal_memory({"ci_provider": "github_actions", "ci_complexity": "advanced"})
         loaded = load_personal_memory()
         assert loaded["preferred_ci_provider"] == "github_actions"
         assert loaded["preferred_ci_complexity"] == "advanced"
@@ -273,9 +267,7 @@ class TestLegacyV0Isolation:
 
         # Legacy v0 file sitting on disk — must be ignored entirely.
         legacy = fake_home / ".fluid" / "engineer_memory.json"
-        legacy.write_text(
-            json.dumps({"preferred_provider": "legacy-aws", "recent_domains": ["x"]})
-        )
+        legacy.write_text(json.dumps({"preferred_provider": "legacy-aws", "recent_domains": ["x"]}))
 
         # Point _MEMORY_FILE at the new filename in the same dir.  The
         # legacy file exists but has a different name, so load() sees

@@ -210,11 +210,13 @@ def load_team_memory(workspace_root: Path) -> Optional[TeamMemory]:
     decisions = []
     for entry in raw_decisions[:_MAX_DECISIONS]:
         if isinstance(entry, dict) and entry.get("decision"):
-            decisions.append({
-                "date": str(entry.get("date", "")),
-                "decision": str(entry["decision"]),
-                "rationale": str(entry.get("rationale", "")),
-            })
+            decisions.append(
+                {
+                    "date": str(entry.get("date", "")),
+                    "decision": str(entry["decision"]),
+                    "rationale": str(entry.get("rationale", "")),
+                }
+            )
 
     vocabulary = raw.get("vocabulary") or {}
     if not isinstance(vocabulary, dict):

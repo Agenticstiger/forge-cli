@@ -20,10 +20,10 @@ from typing import Any, Dict, List, Optional
 
 from ..base import (
     GenerationResult,
+    Severity,
     TransformationEngine,
     TransformationIntent,
     ValidationIssue,
-    Severity,
 )
 from ..registry import register_engine
 from .models import generate_models
@@ -35,6 +35,7 @@ from .sources import generate_sources
 try:
     from fluid_build.util.contract import get_build_engine, get_exposes
 except ImportError:  # pragma: no cover
+
     def get_build_engine(build):
         return build.get("engine") or build.get("type")
 
@@ -70,7 +71,8 @@ class DbtEngine(TransformationEngine):
 
         # SQL model files
         model_files = generate_models(
-            contract, build,
+            contract,
+            build,
             schema_context=schema_context,
             transformation_intent=transformation_intent,
         )
@@ -96,26 +98,32 @@ class DbtEngine(TransformationEngine):
 
         engine = get_build_engine(build)
         if engine and engine not in ("dbt", "dbt-bigquery", "dbt-duckdb"):
-            issues.append(ValidationIssue(
-                message=f"Engine '{engine}' is not a dbt variant",
-                severity=Severity.ERROR,
-                field=f"builds[].engine",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message=f"Engine '{engine}' is not a dbt variant",
+                    severity=Severity.ERROR,
+                    field="builds[].engine",
+                )
+            )
 
         pattern = build.get("pattern", "hybrid-reference")
         if pattern not in self.supported_patterns:
-            issues.append(ValidationIssue(
-                message=f"Pattern '{pattern}' is not supported by the dbt engine",
-                severity=Severity.ERROR,
-                field="builds[].pattern",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message=f"Pattern '{pattern}' is not supported by the dbt engine",
+                    severity=Severity.ERROR,
+                    field="builds[].pattern",
+                )
+            )
 
         exposes = get_exposes(contract)
         if not exposes:
-            issues.append(ValidationIssue(
-                message="Contract has no exposes[] — dbt needs at least one output to generate models",
-                severity=Severity.WARNING,
-                field="exposes",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message="Contract has no exposes[] — dbt needs at least one output to generate models",
+                    severity=Severity.WARNING,
+                    field="exposes",
+                )
+            )
 
         return issues

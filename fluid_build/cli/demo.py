@@ -44,7 +44,8 @@ from fluid_build.cli.artifact_envelope import dump_json_with_envelope
 from fluid_build.cli.artifact_paths import workspace_init_receipt_path
 from fluid_build.cli.artifact_receipts import ReceiptBuilder
 from fluid_build.cli.artifact_scan import diff_snapshots, snapshot_workspace
-from fluid_build.cli.console import cprint, error as console_error
+from fluid_build.cli.console import cprint
+from fluid_build.cli.console import error as console_error
 from fluid_build.cli.next_steps import print_next_steps
 
 try:
@@ -142,9 +143,7 @@ def _find_artifacts(project_dir: Path) -> Tuple[List[Path], List[Path]]:
     # Limit to the top-level data/ directory to keep the panel short.
     data_dir = project_dir / "data"
     if data_dir.is_dir():
-        data = sorted(
-            p for p in data_dir.iterdir() if p.is_file() and not p.name.startswith(".")
-        )
+        data = sorted(p for p in data_dir.iterdir() if p.is_file() and not p.name.startswith("."))
     return contracts, data
 
 

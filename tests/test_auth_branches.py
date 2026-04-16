@@ -174,8 +174,10 @@ class TestGoogleCloudAuthProvider:
         p = self._make_provider()
         mock_cp = MagicMock(returncode=0, stdout="test-account@example.com")
         p._run_command = MagicMock(return_value=mock_cp)
-        with patch.object(p, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/gcloud"):
+        with (
+            patch.object(p, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/gcloud"),
+        ):
             result = asyncio.run(p.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -246,8 +248,10 @@ class TestAWSAuthProvider:
             ),
         )
         p._run_command = MagicMock(return_value=mock_cp)
-        with patch.object(p, "_has_boto3", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/aws"):
+        with (
+            patch.object(p, "_has_boto3", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/aws"),
+        ):
             result = asyncio.run(p.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 
@@ -329,8 +333,10 @@ class TestAzureAuthProvider:
             ),
         )
         p._run_command = MagicMock(return_value=mock_cp)
-        with patch.object(p, "_has_sdk", return_value=False), \
-             patch("shutil.which", return_value="/usr/bin/az"):
+        with (
+            patch.object(p, "_has_sdk", return_value=False),
+            patch("shutil.which", return_value="/usr/bin/az"),
+        ):
             result = asyncio.run(p.check_auth())
         assert result.status == AuthStatus.AUTHENTICATED
 

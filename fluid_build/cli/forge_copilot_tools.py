@@ -49,9 +49,8 @@ def _register(
 
 # ---- discover_workspace --------------------------------------------------
 
-def _dispatch_discover_workspace(
-    *, workspace_path: str = ".", **_kw: Any
-) -> Dict[str, Any]:
+
+def _dispatch_discover_workspace(*, workspace_path: str = ".", **_kw: Any) -> Dict[str, Any]:
     """Scan the workspace and return a metadata-only discovery report."""
     from fluid_build.cli.forge_copilot_discovery import discover_local_context
 
@@ -87,6 +86,7 @@ _register(
 
 # ---- read_sample_schema --------------------------------------------------
 
+
 def _dispatch_read_sample_schema(*, path: str, **_kw: Any) -> Dict[str, Any]:
     """Infer the schema of a single sample file (CSV, JSON, Parquet, Avro)."""
     from fluid_build.cli.forge_copilot_schema_inference import summarize_sample_file
@@ -118,9 +118,8 @@ _register(
 
 # ---- list_templates -------------------------------------------------------
 
-def _dispatch_list_templates(
-    *, use_case: str = "", domain: str = "", **_kw: Any
-) -> Dict[str, Any]:
+
+def _dispatch_list_templates(*, use_case: str = "", domain: str = "", **_kw: Any) -> Dict[str, Any]:
     """Return the capability matrix (available templates, providers, engines)."""
     from fluid_build.cli.forge_copilot_runtime import build_capability_matrix
 
@@ -157,6 +156,7 @@ _register(
 
 
 # ---- propose_contract -----------------------------------------------------
+
 
 def _dispatch_propose_contract(
     *,
@@ -214,9 +214,8 @@ _register(
 
 # ---- validate_contract ----------------------------------------------------
 
-def _dispatch_validate_contract(
-    *, contract: Dict[str, Any], **_kw: Any
-) -> Dict[str, Any]:
+
+def _dispatch_validate_contract(*, contract: Dict[str, Any], **_kw: Any) -> Dict[str, Any]:
     """Validate a candidate FLUID contract and return errors + warnings."""
     from fluid_build.cli.forge_copilot_runtime import (
         build_capability_matrix,
@@ -231,9 +230,7 @@ def _dispatch_validate_contract(
         "readme_markdown": "",
         "additional_files": {},
     }
-    errors, warnings = validate_generated_result(
-        normalized, capabilities=capabilities
-    )
+    errors, warnings = validate_generated_result(normalized, capabilities=capabilities)
     return {"errors": errors, "warnings": warnings}
 
 
@@ -278,15 +275,17 @@ def _dispatch_list_schedulers(**_kw: Any) -> Dict[str, Any]:
     if _cached_schedulers is not None:
         return _cached_schedulers
     try:
-        from fluid_build.schedulers import list_schedulers, get_scheduler
+        from fluid_build.schedulers import get_scheduler, list_schedulers
 
         result = []
         for name in list_schedulers():
             sched = get_scheduler(name)
-            result.append({
-                "name": name,
-                "platforms": getattr(sched, "supported_platforms", None) or "all",
-            })
+            result.append(
+                {
+                    "name": name,
+                    "platforms": getattr(sched, "supported_platforms", None) or "all",
+                }
+            )
         _cached_schedulers = {"schedulers": result, "trigger_types": _TRIGGER_TYPES}
         return _cached_schedulers
     except ImportError:
@@ -322,9 +321,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
     ]
 
 
-def dispatch_tool_call(
-    name: str, arguments: Dict[str, Any]
-) -> Any:
+def dispatch_tool_call(name: str, arguments: Dict[str, Any]) -> Any:
     """Execute a tool by name and return its result.
 
     Returns a plain dict or string that can be JSON-serialized and

@@ -25,8 +25,8 @@ from fluid_build.cli.forge_team_memory import (
     scaffold_team_memory,
 )
 
-
-_FULL_TEAM_MEMORY = dedent("""\
+_FULL_TEAM_MEMORY = dedent(
+    """\
     conventions:
       naming:
         product_prefix: acme
@@ -56,13 +56,16 @@ _FULL_TEAM_MEMORY = dedent("""\
       dimensions:
         - order_date
         - region
-""")
+"""
+)
 
-_MINIMAL_TEAM_MEMORY = dedent("""\
+_MINIMAL_TEAM_MEMORY = dedent(
+    """\
     conventions:
       defaults:
         provider: local
-""")
+"""
+)
 
 
 class TestLoadTeamMemory:
@@ -119,11 +122,10 @@ class TestLoadTeamMemory:
         assert tm is None
 
     def test_decisions_bounded(self, tmp_path):
-        decisions = [
-            {"date": f"2026-01-{i:02d}", "decision": f"Decision {i}"}
-            for i in range(20)
-        ]
-        content = yaml.dump({"decisions": decisions, "conventions": {"defaults": {"provider": "local"}}})
+        decisions = [{"date": f"2026-01-{i:02d}", "decision": f"Decision {i}"} for i in range(20)]
+        content = yaml.dump(
+            {"decisions": decisions, "conventions": {"defaults": {"provider": "local"}}}
+        )
         (tmp_path / ".fluid").mkdir()
         (tmp_path / ".fluid" / "team-memory.yaml").write_text(content)
 
@@ -139,7 +141,9 @@ class TestTeamMemoryDataclass:
         tm = TeamMemory(
             naming={"product_prefix": "acme"},
             defaults={"provider": "gcp"},
-            decisions=[{"date": "2026-01-01", "decision": "Use GCP", "rationale": "Team expertise"}],
+            decisions=[
+                {"date": "2026-01-01", "decision": "Use GCP", "rationale": "Team expertise"}
+            ],
             vocabulary_entities=["customer_id"],
             vocabulary_measures=["revenue"],
             vocabulary_dimensions=["date"],
@@ -204,6 +208,7 @@ class TestTeamMemoryInPrompt:
 
     def test_team_memory_in_user_prompt(self):
         import json
+
         from fluid_build.cli.forge_copilot_prompts import build_user_prompt
 
         team_payload = {"conventions": {"defaults": {"provider": "gcp"}}}
@@ -225,6 +230,7 @@ class TestTeamMemoryInPrompt:
 
     def test_no_team_memory_when_none(self):
         import json
+
         from fluid_build.cli.forge_copilot_prompts import build_user_prompt
 
         prompt_str = build_user_prompt(

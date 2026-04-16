@@ -79,11 +79,18 @@ Examples:
         default=None,
         help="Path to FLUID contract file (default: discover contract.fluid.yaml in CWD)",
     )
-    p.add_argument("--output", "-o", help="Output directory (default: ./dags or ./pipelines or ./flows)")
+    p.add_argument(
+        "--output", "-o", help="Output directory (default: ./dags or ./pipelines or ./flows)"
+    )
     p.add_argument("--scheduler", help="Override scheduler engine (airflow, dagster, prefect)")
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing output directory")
     p.add_argument("--env", help="Environment overlay to apply (dev/test/prod)")
-    p.add_argument("--list", dest="list_schedulers", action="store_true", help="List available schedulers and exit")
+    p.add_argument(
+        "--list",
+        dest="list_schedulers",
+        action="store_true",
+        help="List available schedulers and exit",
+    )
     p.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
 
     p.set_defaults(generate_sub=SUBCOMMAND, func=run)
@@ -101,7 +108,9 @@ def run(args: Any, logger: logging.Logger) -> int:
         if getattr(args, "verbose", False):
             info(logger, f"Loading contract from {contract_path}")
 
-        contract = load_contract_with_overlay(str(contract_path), getattr(args, "env", None), logger)
+        contract = load_contract_with_overlay(
+            str(contract_path), getattr(args, "env", None), logger
+        )
 
         # --- Resolve scheduler ---
         scheduler_name = getattr(args, "scheduler", None)
@@ -123,12 +132,17 @@ def run(args: Any, logger: logging.Logger) -> int:
 
             provider = contract.get("provider", "")
             synthesized = synthesize_orchestration_from_builds(
-                contract, scheduler_name, provider=provider,
+                contract,
+                scheduler_name,
+                provider=provider,
             )
             if synthesized:
                 contract = {**contract, "orchestration": synthesized}
                 if getattr(args, "verbose", False):
-                    info(logger, f"Synthesized orchestration from {len(synthesized.get('tasks', []))} build steps")
+                    info(
+                        logger,
+                        f"Synthesized orchestration from {len(synthesized.get('tasks', []))} build steps",
+                    )
 
         # --- Look up scheduler ---
         from fluid_build.schedulers import get_scheduler, has_scheduler, list_schedulers
@@ -220,6 +234,7 @@ def run(args: Any, logger: logging.Logger) -> int:
         error(logger, f"Error generating schedule artifacts: {e}")
         if getattr(args, "verbose", False):
             import traceback
+
             traceback.print_exc()
         return 1
 
@@ -237,10 +252,14 @@ def _resolve_contract_path(args: Any) -> Path:
         if candidate.exists():
             return candidate
 
-    raise CLIError(1, "no_contract_found", {
-        "cwd": str(Path.cwd()),
-        "hint": "Specify a contract path or run from a directory with contract.fluid.yaml",
-    })
+    raise CLIError(
+        1,
+        "no_contract_found",
+        {
+            "cwd": str(Path.cwd()),
+            "hint": "Specify a contract path or run from a directory with contract.fluid.yaml",
+        },
+    )
 
 
 def _resolve_output_dir(args: Any, scheduler_name: str) -> Path:
@@ -269,8 +288,13 @@ def _list_schedulers() -> int:
     cprint("Available schedule engines:\n")
     for name in schedulers:
         from fluid_build.schedulers import get_scheduler
+
         scheduler = get_scheduler(name)
-        platforms = ", ".join(scheduler.supported_platforms) if scheduler and scheduler.supported_platforms else "all"
+        platforms = (
+            ", ".join(scheduler.supported_platforms)
+            if scheduler and scheduler.supported_platforms
+            else "all"
+        )
         cprint(f"  {name:12s} platforms: {platforms}")
 
     cprint("\nUsage: fluid generate schedule [contract.fluid.yaml]")
@@ -285,4 +309,4 @@ def _print_summary(output_dir: Path, files: Dict[str, str], scheduler_name: str)
     for rel_path in sorted(files.keys()):
         cprint(f"  {output_dir / rel_path}")
 
-    cprint(f"\nTip: To regenerate after editing the contract: fluid generate schedule")
+    cprint("\nTip: To regenerate after editing the contract: fluid generate schedule")

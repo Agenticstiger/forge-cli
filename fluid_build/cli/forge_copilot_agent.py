@@ -55,8 +55,8 @@ from fluid_build.cli.forge_copilot_taxonomy import (
 )
 from fluid_build.cli.forge_copilot_taxonomy import clean_text as _clean_text
 from fluid_build.cli.forge_dialogs import ask_confirmation
-from fluid_build.schema_manager import FluidSchemaManager
 from fluid_build.cli.forge_ui import print_assumptions_panel, show_lines_panel
+from fluid_build.schema_manager import FluidSchemaManager
 
 try:
     from rich.console import Console

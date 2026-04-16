@@ -84,9 +84,7 @@ class TestImportCmdRun:
                 result = run(args, logger)
         assert result == 0
 
-    @patch(
-        "fluid_build.cli.import_cmd.detect_project_type", side_effect=RuntimeError("scan boom")
-    )
+    @patch("fluid_build.cli.import_cmd.detect_project_type", side_effect=RuntimeError("scan boom"))
     def test_exception_returns_1(self, _mock_detect, logger):
         from fluid_build.cli.import_cmd import run
 
@@ -109,9 +107,7 @@ class TestImportCmdRun:
             "sensitive_columns": [],
         }
 
-        with patch(
-            "fluid_build.cli.import_cmd.detect_project_type", return_value=mock_detector
-        ):
+        with patch("fluid_build.cli.import_cmd.detect_project_type", return_value=mock_detector):
             with patch("fluid_build.cli.import_cmd.RICH_AVAILABLE", False):
                 result = run(args, logger)
 
@@ -146,9 +142,7 @@ class TestImportCmdRun:
         mock_gen.return_value = [{"name": "sql-import"}]
         mock_governance.return_value = [{"name": "sql-import"}]
 
-        with patch(
-            "fluid_build.cli.import_cmd.detect_project_type", return_value=mock_detector
-        ):
+        with patch("fluid_build.cli.import_cmd.detect_project_type", return_value=mock_detector):
             with patch("fluid_build.cli.import_cmd.RICH_AVAILABLE", False):
                 result = run(args, logger)
         assert result == 0

@@ -24,7 +24,9 @@ from fluid_build.engines.registry import (
 
 class TestValidationIssue:
     def test_str_with_field(self):
-        issue = ValidationIssue(message="bad value", severity=Severity.ERROR, field="builds[0].engine")
+        issue = ValidationIssue(
+            message="bad value", severity=Severity.ERROR, field="builds[0].engine"
+        )
         assert str(issue) == "[builds[0].engine] error: bad value"
 
     def test_str_without_field(self):
@@ -56,12 +58,14 @@ class TestRegistry:
     def setup_method(self):
         # Save current state and reset for isolated tests
         from fluid_build.engines.registry import _ENGINES
+
         self._saved = dict(_ENGINES)
         _reset_registry()
 
     def teardown_method(self):
         # Restore previous registrations
         from fluid_build.engines.registry import _ENGINES
+
         _reset_registry()
         _ENGINES.update(self._saved)
 
@@ -87,15 +91,23 @@ class TestRegistry:
         class A(TransformationEngine):
             name = "aaa"
             supported_patterns = ()
-            def generate(self, contract, build, **kw): return {}
-            def validate(self, contract, build): return []
+
+            def generate(self, contract, build, **kw):
+                return {}
+
+            def validate(self, contract, build):
+                return []
 
         @register_engine
         class B(TransformationEngine):
             name = "bbb"
             supported_patterns = ()
-            def generate(self, contract, build, **kw): return {}
-            def validate(self, contract, build): return []
+
+            def generate(self, contract, build, **kw):
+                return {}
+
+            def validate(self, contract, build):
+                return []
 
         assert list_engines() == ["aaa", "bbb"]
 
@@ -105,12 +117,17 @@ class TestRegistry:
 
     def test_register_no_name_raises(self):
         with pytest.raises(ValueError, match="non-empty 'name'"):
+
             @register_engine
             class NoName(TransformationEngine):
                 name = ""
                 supported_patterns = ()
-                def generate(self, contract, build, **kw): return {}
-                def validate(self, contract, build): return []
+
+                def generate(self, contract, build, **kw):
+                    return {}
+
+                def validate(self, contract, build):
+                    return []
 
 
 class TestBuiltInEngines:
@@ -118,20 +135,24 @@ class TestBuiltInEngines:
 
     def test_dbt_registered(self):
         from fluid_build.engines import has_engine
+
         assert has_engine("dbt")
 
     def test_sql_registered(self):
         from fluid_build.engines import has_engine
+
         assert has_engine("sql")
 
     def test_dbt_engine_name(self):
         from fluid_build.engines import get_engine
+
         engine = get_engine("dbt")
         assert engine.name == "dbt"
         assert "hybrid-reference" in engine.supported_patterns
 
     def test_sql_engine_name(self):
         from fluid_build.engines import get_engine
+
         engine = get_engine("sql")
         assert engine.name == "sql"
         assert "embedded-logic" in engine.supported_patterns

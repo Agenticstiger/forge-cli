@@ -316,9 +316,7 @@ def discover_all_agent_specs() -> Dict[str, "AgentSpec"]:
                 spec = load_agent_spec_from_path(yaml_path)
                 specs[spec.name] = spec
             except (AgentSpecError, Exception) as exc:  # noqa: BLE001
-                _LOG.warning(
-                    "Skipping invalid user agent spec %s: %s", yaml_path, exc
-                )
+                _LOG.warning("Skipping invalid user agent spec %s: %s", yaml_path, exc)
 
     return specs
 

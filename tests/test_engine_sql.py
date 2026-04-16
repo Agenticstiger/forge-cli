@@ -5,14 +5,19 @@
 import pytest
 
 from fluid_build.engines import get_engine
-from fluid_build.engines.base import TransformationIntent, Severity
+from fluid_build.engines.base import Severity, TransformationIntent
 from fluid_build.engines.sql.scripts import generate_scripts
 
 
 class TestSqlEngineValidation:
     def test_valid_sql_engine(self):
         engine = get_engine("sql")
-        build = {"id": "main", "engine": "sql", "pattern": "embedded-logic", "properties": {"sql": "SELECT 1"}}
+        build = {
+            "id": "main",
+            "engine": "sql",
+            "pattern": "embedded-logic",
+            "properties": {"sql": "SELECT 1"},
+        }
         issues = engine.validate({}, build)
         errors = [i for i in issues if i.severity == Severity.ERROR]
         assert len(errors) == 0
@@ -27,7 +32,11 @@ class TestSqlEngineValidation:
 class TestEmbeddedLogic:
     def test_basic_sql(self):
         contract = {"id": "test.product"}
-        build = {"id": "transform", "pattern": "embedded-logic", "properties": {"sql": "SELECT 1 AS id, 'hello' AS name"}}
+        build = {
+            "id": "transform",
+            "pattern": "embedded-logic",
+            "properties": {"sql": "SELECT 1 AS id, 'hello' AS name"},
+        }
         files = generate_scripts(contract, build)
         assert "transform.sql" in files
         assert "SELECT 1 AS id" in files["transform.sql"]
@@ -49,9 +58,21 @@ class TestMultiStage:
             "pattern": "multi-stage",
             "properties": {
                 "stages": [
-                    {"name": "extract", "properties": {"sql": "SELECT * FROM raw"}, "dependsOn": []},
-                    {"name": "transform", "properties": {"sql": "SELECT id FROM extract"}, "dependsOn": ["extract"]},
-                    {"name": "load", "properties": {"sql": "INSERT INTO target SELECT * FROM transform"}, "dependsOn": ["transform"]},
+                    {
+                        "name": "extract",
+                        "properties": {"sql": "SELECT * FROM raw"},
+                        "dependsOn": [],
+                    },
+                    {
+                        "name": "transform",
+                        "properties": {"sql": "SELECT id FROM extract"},
+                        "dependsOn": ["extract"],
+                    },
+                    {
+                        "name": "load",
+                        "properties": {"sql": "INSERT INTO target SELECT * FROM transform"},
+                        "dependsOn": ["transform"],
+                    },
                 ]
             },
         }
@@ -68,7 +89,11 @@ class TestWithTransformationIntent:
         intent = TransformationIntent(
             stages=[
                 {"name": "stg_orders", "sql": "SELECT * FROM raw.orders", "depends_on": []},
-                {"name": "mart_summary", "sql": "SELECT count(*) FROM stg_orders", "depends_on": ["stg_orders"]},
+                {
+                    "name": "mart_summary",
+                    "sql": "SELECT count(*) FROM stg_orders",
+                    "depends_on": ["stg_orders"],
+                },
             ]
         )
         contract = {"id": "test"}
@@ -97,6 +122,7 @@ class TestPlatformFiltering:
 
     def test_list_engines_for_platform(self):
         from fluid_build.engines import list_engines_for_platform
+
         gcp = list_engines_for_platform("gcp")
         assert "dataform" in gcp
         assert "dataflow" in gcp

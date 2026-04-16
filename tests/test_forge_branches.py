@@ -719,7 +719,6 @@ class TestRunFunction:
         mock_copilot.assert_called_once()
 
 
-
 class TestRunAICopilotMode:
     @patch("fluid_build.cli.forge.CopilotAgent")
     def test_copilot_success(self, mock_agent_cls):
@@ -901,5 +900,3 @@ class TestCreateLegacyBootstrapper:
 
         assert result is not None
         assert callable(getattr(result, "run", None)) or hasattr(result, "target_dir")
-
-

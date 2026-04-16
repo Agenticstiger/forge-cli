@@ -111,7 +111,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     # Check if there's anything to split.
     preview = describe_fragment_layout(contract)
     if not preview:
-        sys.stderr.write("\u2139 Nothing to split \u2014 contract has no sections that benefit from fragments.\n")
+        sys.stderr.write(
+            "\u2139 Nothing to split \u2014 contract has no sections that benefit from fragments.\n"
+        )
         return 0
 
     if dry_run:

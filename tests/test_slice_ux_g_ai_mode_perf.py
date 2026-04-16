@@ -47,7 +47,6 @@ from fluid_build.cli.forge_copilot_schema_inference import (
     summarize_sample_file,
 )
 
-
 # ---------------------------------------------------------------------------
 # Slice UX-G caps
 # ---------------------------------------------------------------------------
@@ -56,9 +55,9 @@ from fluid_build.cli.forge_copilot_schema_inference import (
 class TestSliceUXGCaps:
     def test_discovery_depth_cap_is_bounded(self):
         assert isinstance(MAX_DISCOVERY_DEPTH, int)
-        assert 1 <= MAX_DISCOVERY_DEPTH <= 10, (
-            "MAX_DISCOVERY_DEPTH must stay small — 6 is the slice UX-G choice"
-        )
+        assert (
+            1 <= MAX_DISCOVERY_DEPTH <= 10
+        ), "MAX_DISCOVERY_DEPTH must stay small — 6 is the slice UX-G choice"
 
     def test_max_sample_files_is_halved_from_original(self):
         """Slice UX-G lowered the per-run parsed-sample budget from 12 to 6."""
@@ -86,9 +85,7 @@ class TestDiscoveryDepthCap:
         for depth in range(10):
             current = current / f"d{depth}"
             current.mkdir()
-            (current / f"file_{depth}.csv").write_text(
-                "col\n1\n", encoding="utf-8"
-            )
+            (current / f"file_{depth}.csv").write_text("col\n1\n", encoding="utf-8")
 
         files = list(_iter_candidate_files(tmp_path))
         # Every yielded file should be at depth <= MAX_DISCOVERY_DEPTH
@@ -117,9 +114,9 @@ class TestDiscoveryDepthCap:
         for i in range(500):
             (tmp_path / f"file_{i:04d}.csv").write_text("a\n1\n", encoding="utf-8")
         files = list(_iter_candidate_files(tmp_path))
-        assert len(files) == MAX_DISCOVERY_FILES, (
-            f"expected to be capped at {MAX_DISCOVERY_FILES}, got {len(files)}"
-        )
+        assert (
+            len(files) == MAX_DISCOVERY_FILES
+        ), f"expected to be capped at {MAX_DISCOVERY_FILES}, got {len(files)}"
 
     def test_walk_skips_ignored_directories(self, tmp_path: Path):
         """Ignored dirs (.git, node_modules, .venv) must not be walked."""

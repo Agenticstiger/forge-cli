@@ -245,8 +245,7 @@ def _install(args, logger: logging.Logger) -> int:
 
             console = Console()
             console.print(
-                f"[green]Installed[/green] [cyan]{industry}[/cyan] skills "
-                f"to .fluid/skills.yaml"
+                f"[green]Installed[/green] [cyan]{industry}[/cyan] skills " f"to .fluid/skills.yaml"
             )
         except ImportError:
             cprint(f"Installed {industry} skills to .fluid/skills.yaml")

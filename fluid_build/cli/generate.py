@@ -101,18 +101,22 @@ def run(args: Any, logger: logging.Logger) -> int:
 
     if sub == "transformation":
         from . import generate_transformation
+
         return generate_transformation.run(args, logger)
 
     if sub == "schedule":
         from . import generate_schedule
+
         return generate_schedule.run(args, logger)
 
     if sub == "ci":
         from . import generate_ci
+
         return generate_ci.run(args, logger)
 
     if sub == "standard":
         from . import generate_standard
+
         return generate_standard.run(args, logger)
 
     # No subcommand specified — default to transformation for backward compat
@@ -120,6 +124,7 @@ def run(args: Any, logger: logging.Logger) -> int:
         # Check if user passed --list
         if getattr(args, "list_engines", False):
             from . import generate_transformation
+
             return generate_transformation.run(args, logger)
 
         # Bare `fluid generate` — show help

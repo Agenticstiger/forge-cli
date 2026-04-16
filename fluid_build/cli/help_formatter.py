@@ -24,7 +24,6 @@ import argparse
 
 from fluid_build import __version__ as _VERSION
 
-
 try:
     from rich import box
     from rich.console import Console
@@ -69,23 +68,32 @@ def print_first_run_help(parser: argparse.ArgumentParser) -> None:
     # Three paths — instant demo / quickstart / AI-designed
     console.print("[bold bright_green]Pick your path:[/bold bright_green]\n")
 
-    console.print("[bold bright_yellow]  Instant[/bold bright_yellow] [dim](one command, ~30s — zero config)[/dim]")
+    console.print(
+        "[bold bright_yellow]  Instant[/bold bright_yellow] [dim](one command, ~30s — zero config)[/dim]"
+    )
     instant = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
     instant.add_column(style="bright_cyan", width=46)
     instant.add_column(style="dim bright_white")
     instant.add_row("fluid demo", "Scaffold + run a working customer-360 example")
     console.print(instant)
 
-    console.print("[bold bright_yellow]  Your project[/bold bright_yellow] [dim](template-based, no AI)[/dim]")
+    console.print(
+        "[bold bright_yellow]  Your project[/bold bright_yellow] [dim](template-based, no AI)[/dim]"
+    )
     fast = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
     fast.add_column(style="bright_cyan", width=46)
     fast.add_column(style="dim bright_white")
     fast.add_row("fluid init --list-templates", "See what templates are available")
-    fast.add_row("fluid init my-project --quickstart", "Scaffold a customer-360 project (run with fluid apply)")
+    fast.add_row(
+        "fluid init my-project --quickstart",
+        "Scaffold a customer-360 project (run with fluid apply)",
+    )
     fast.add_row("cd my-project && fluid apply --yes", "Run the pipeline end-to-end")
     console.print(fast)
 
-    console.print("[bold bright_yellow]  AI-designed[/bold bright_yellow] [dim](recommended for custom work)[/dim]")
+    console.print(
+        "[bold bright_yellow]  AI-designed[/bold bright_yellow] [dim](recommended for custom work)[/dim]"
+    )
     ai = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
     ai.add_column(style="bright_cyan", width=46)
     ai.add_column(style="dim bright_white")
@@ -282,9 +290,13 @@ def print_forge_help() -> None:
     console.print()
 
     # Header + usage
-    console.print("  [bold bright_cyan]fluid forge[/bold bright_cyan] [dim]— AI-powered data product creation[/dim]")
+    console.print(
+        "  [bold bright_cyan]fluid forge[/bold bright_cyan] [dim]— AI-powered data product creation[/dim]"
+    )
     console.print()
-    console.print("  [bold]USAGE[/bold]   [bright_cyan]fluid forge[/bright_cyan] [dim][OPTIONS][/dim]")
+    console.print(
+        "  [bold]USAGE[/bold]   [bright_cyan]fluid forge[/bright_cyan] [dim][OPTIONS][/dim]"
+    )
     console.print()
 
     def _group_table(title: str, rows: list) -> None:
@@ -297,35 +309,47 @@ def print_forge_help() -> None:
         console.print(tbl)
         console.print()
 
-    _group_table("Project", [
-        ("--target-dir, -d DIR", "Target directory for project creation"),
-        ("--provider, -p NAME", "Infrastructure provider"),
-        ("--domain NAME", "Domain hint (finance, healthcare, retail, telco)"),
-        ("--blank", "Empty contract without AI (no LLM needed)"),
-        ("--dry-run", "Preview without creating files"),
-        ("--non-interactive", "Use defaults without prompting"),
-        ("--context VALUE", "Additional AI context (JSON string or file path)"),
-    ])
+    _group_table(
+        "Project",
+        [
+            ("--target-dir, -d DIR", "Target directory for project creation"),
+            ("--provider, -p NAME", "Infrastructure provider"),
+            ("--domain NAME", "Domain hint (finance, healthcare, retail, telco)"),
+            ("--blank", "Empty contract without AI (no LLM needed)"),
+            ("--dry-run", "Preview without creating files"),
+            ("--non-interactive", "Use defaults without prompting"),
+            ("--context VALUE", "Additional AI context (JSON string or file path)"),
+        ],
+    )
 
-    _group_table("AI Config", [
-        ("--llm-provider NAME", "LLM provider (openai, anthropic, claude, gemini, ollama)"),
-        ("--llm-model NAME", "Model identifier"),
-        ("--llm-endpoint URL", "HTTP endpoint override"),
-    ])
+    _group_table(
+        "AI Config",
+        [
+            ("--llm-provider NAME", "LLM provider (openai, anthropic, claude, gemini, ollama)"),
+            ("--llm-model NAME", "Model identifier"),
+            ("--llm-endpoint URL", "HTTP endpoint override"),
+        ],
+    )
 
-    _group_table("Discovery", [
-        ("--discover", "Inspect local files before generation (default)"),
-        ("--no-discover", "Skip local discovery"),
-        ("--discovery-path PATH", "Additional path to scan"),
-    ])
+    _group_table(
+        "Discovery",
+        [
+            ("--discover", "Inspect local files before generation (default)"),
+            ("--no-discover", "Skip local discovery"),
+            ("--discovery-path PATH", "Additional path to scan"),
+        ],
+    )
 
-    _group_table("Memory", [
-        ("--memory", "Load copilot memory (default)"),
-        ("--no-memory", "Skip copilot memory for this run"),
-        ("--save-memory", "Persist memory after successful run"),
-        ("--show-memory", "Show memory summary and exit"),
-        ("--reset-memory", "Delete memory file and exit"),
-    ])
+    _group_table(
+        "Memory",
+        [
+            ("--memory", "Load copilot memory (default)"),
+            ("--no-memory", "Skip copilot memory for this run"),
+            ("--save-memory", "Persist memory after successful run"),
+            ("--show-memory", "Show memory summary and exit"),
+            ("--reset-memory", "Delete memory file and exit"),
+        ],
+    )
 
     # Examples
     console.print("  [bold bright_green]Examples[/bold bright_green]")
@@ -544,10 +568,7 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
     ),
     "context": (
         "Deprecated: use 'fluid config' instead. Get or set defaults.",
-        (
-            "  fluid config list\n"
-            "  fluid config set provider gcp"
-        ),
+        ("  fluid config list\n" "  fluid config set provider gcp"),
     ),
     "auth": (
         "Manage authentication credentials for cloud providers (GCP, AWS, Azure, Snowflake, Databricks).",
@@ -738,11 +759,23 @@ def print_command_help(parser: argparse.ArgumentParser, command_name: str) -> No
 
     # ── Arguments & Options ──────────────────────────────────────────
     # Global args inherited from the parent parser — hide from subcommand help
-    _GLOBAL_DESTS = frozenset({
-        "log_level", "log_file", "project", "region", "config_dir",
-        "no_color", "version", "profile", "health_check", "stats",
-        "safe_mode", "debug", "cmd",
-    })
+    _GLOBAL_DESTS = frozenset(
+        {
+            "log_level",
+            "log_file",
+            "project",
+            "region",
+            "config_dir",
+            "no_color",
+            "version",
+            "profile",
+            "health_check",
+            "stats",
+            "safe_mode",
+            "debug",
+            "cmd",
+        }
+    )
     # Groups that belong to the parent parser, not the subcommand
     _GLOBAL_GROUPS = frozenset({"production & monitoring"})
 

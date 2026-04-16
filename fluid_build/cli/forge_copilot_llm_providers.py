@@ -119,6 +119,7 @@ def streaming_is_enabled() -> bool:
     value = os.environ.get("FLUID_LLM_STREAMING", "1").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
+
 # Provider → environment variable mapping.  Shared across ai_setup.py and
 # this module to avoid duplication.
 PROVIDER_ENV_VARS: Dict[str, str] = {
@@ -321,13 +322,9 @@ class LlmProvider(ABC):
         Must be overridden by providers that support tool use.
         Default raises ``NotImplementedError``.
         """
-        raise NotImplementedError(
-            f"Provider {self.name} does not support tool use"
-        )
+        raise NotImplementedError(f"Provider {self.name} does not support tool use")
 
-    def extract_tool_calls(
-        self, response_json: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
+    def extract_tool_calls(self, response_json: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Extract tool calls from a provider response.
 
         Returns a list of ``{"id": str, "name": str, "arguments": dict}``
@@ -336,9 +333,7 @@ class LlmProvider(ABC):
         """
         return []
 
-    def extract_text_from_tool_response(
-        self, response_json: Dict[str, Any]
-    ) -> Optional[str]:
+    def extract_text_from_tool_response(self, response_json: Dict[str, Any]) -> Optional[str]:
         """Extract final text content from a tool-use response.
 
         Returns ``None`` if the response only contains tool calls and
@@ -357,9 +352,7 @@ class LlmProvider(ABC):
         Must be overridden per provider because the message format
         for tool results differs between OpenAI/Anthropic/Gemini.
         """
-        raise NotImplementedError(
-            f"Provider {self.name} does not support tool result messages"
-        )
+        raise NotImplementedError(f"Provider {self.name} does not support tool result messages")
 
 
 @dataclass
@@ -489,9 +482,7 @@ class OpenAIProvider(LlmProvider):
         }
         return config.endpoint, headers, payload
 
-    def extract_tool_calls(
-        self, response_json: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
+    def extract_tool_calls(self, response_json: Dict[str, Any]) -> List[Dict[str, Any]]:
         choices = response_json.get("choices") or []
         if not choices:
             return []
@@ -504,11 +495,13 @@ class OpenAIProvider(LlmProvider):
                 args = json.loads(fn.get("arguments", "{}"))
             except (json.JSONDecodeError, TypeError):
                 args = {}
-            result.append({
-                "id": tc.get("id", ""),
-                "name": fn.get("name", ""),
-                "arguments": args,
-            })
+            result.append(
+                {
+                    "id": tc.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "arguments": args,
+                }
+            )
         return result
 
     def build_tool_result_messages(
@@ -728,18 +721,18 @@ class AnthropicProvider(LlmProvider):
         }
         return config.endpoint, headers, payload
 
-    def extract_tool_calls(
-        self, response_json: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
+    def extract_tool_calls(self, response_json: Dict[str, Any]) -> List[Dict[str, Any]]:
         content = response_json.get("content") or []
         result = []
         for block in content:
             if block.get("type") == "tool_use":
-                result.append({
-                    "id": block.get("id", ""),
-                    "name": block.get("name", ""),
-                    "arguments": block.get("input") or {},
-                })
+                result.append(
+                    {
+                        "id": block.get("id", ""),
+                        "name": block.get("name", ""),
+                        "arguments": block.get("input") or {},
+                    }
+                )
         return result
 
     def build_tool_result_messages(
@@ -937,9 +930,7 @@ class GeminiProvider(LlmProvider):
         }
         return config.endpoint, headers, payload
 
-    def extract_tool_calls(
-        self, response_json: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
+    def extract_tool_calls(self, response_json: Dict[str, Any]) -> List[Dict[str, Any]]:
         candidates = response_json.get("candidates") or []
         result = []
         for candidate in candidates:
@@ -947,11 +938,13 @@ class GeminiProvider(LlmProvider):
             for part in content.get("parts") or []:
                 fc = part.get("functionCall")
                 if fc:
-                    result.append({
-                        "id": fc.get("name", ""),
-                        "name": fc.get("name", ""),
-                        "arguments": fc.get("args") or {},
-                    })
+                    result.append(
+                        {
+                            "id": fc.get("name", ""),
+                            "name": fc.get("name", ""),
+                            "arguments": fc.get("args") or {},
+                        }
+                    )
         return result
 
     def build_tool_result_messages(
@@ -960,8 +953,7 @@ class GeminiProvider(LlmProvider):
         # Gemini: model turn with functionCall parts, then user turn
         # with functionResponse parts
         model_parts = [
-            {"functionCall": {"name": tc["name"], "args": tc["arguments"]}}
-            for tc in tool_calls
+            {"functionCall": {"name": tc["name"], "args": tc["arguments"]}} for tc in tool_calls
         ]
         user_parts = [
             {
@@ -1011,8 +1003,6 @@ def _sync_provider_defaults_from_catalog() -> None:
                 provider.default_model = flagship
     except Exception:  # noqa: BLE001 — never break import
         pass
-
-
 
 
 def normalize_llm_provider_name(value: Any) -> str:
@@ -1101,13 +1091,9 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
     # Slice UX-J: resolve the optional routing model for cheap tasks
     # (interview clarification, classification, etc.).  Env vars take
     # precedence, then provider-specific defaults kick in.
-    routing_model = (
-        getattr(args, "llm_routing_model", None)
-        or env.get("FLUID_LLM_ROUTING_MODEL")
-    )
-    routing_endpoint = (
-        getattr(args, "llm_routing_endpoint", None)
-        or env.get("FLUID_LLM_ROUTING_ENDPOINT")
+    routing_model = getattr(args, "llm_routing_model", None) or env.get("FLUID_LLM_ROUTING_MODEL")
+    routing_endpoint = getattr(args, "llm_routing_endpoint", None) or env.get(
+        "FLUID_LLM_ROUTING_ENDPOINT"
     )
     if not routing_model:
         routing_model = _default_routing_model(provider.name, model)
@@ -1266,9 +1252,7 @@ def call_llm_streaming(
     delivered before the failure, which is not worth the complexity
     when the blocking path already has a solid retry story.
     """
-    url, headers, payload = provider.build_streaming_request(
-        config, system_prompt, user_prompt
-    )
+    url, headers, payload = provider.build_streaming_request(config, system_prompt, user_prompt)
     suggestions = [
         "Check the selected model and endpoint are correct",
         "Verify the API key environment variable is set",

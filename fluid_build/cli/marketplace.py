@@ -50,6 +50,7 @@ except ImportError:
 
 from ._command_center import get_command_center_client
 from ._common import CLIError
+from .console import cprint
 
 COMMAND = "marketplace"
 
@@ -138,7 +139,9 @@ def run(args, logger: logging.Logger) -> int:
                 "Use 'fluid market --blueprints' instead.[/yellow]\n"
             )
         else:
-            cprint("Note: 'fluid marketplace' is deprecated. Use 'fluid market --blueprints' instead.\n")
+            cprint(
+                "Note: 'fluid marketplace' is deprecated. Use 'fluid market --blueprints' instead.\n"
+            )
 
         if not args.marketplace_action:
             logger.error("Marketplace action required. Use --help for available actions.")
@@ -584,6 +587,8 @@ def list_categories(args, logger: logging.Logger, api_url: str) -> int:
     for cat, desc in categories.items():
         console.print(f"  [green]•[/green] [cyan]{cat}[/cyan] - {desc}")
 
-    console.print("\n[dim]💡 Use 'fluid market --blueprints --search --category <name>' to filter[/dim]")
+    console.print(
+        "\n[dim]💡 Use 'fluid market --blueprints --search --category <name>' to filter[/dim]"
+    )
 
     return 0

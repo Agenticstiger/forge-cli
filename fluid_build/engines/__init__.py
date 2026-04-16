@@ -23,6 +23,12 @@ Public API::
         files = engine.generate(contract, build)
 """
 
+# Auto-discover and register all engine subpackages.
+# Each engine subpackage uses @register_engine on its class.
+# New engines are picked up automatically — no need to edit this file.
+import importlib
+import pkgutil
+
 from .base import (
     GenerationResult,
     Severity,
@@ -30,13 +36,13 @@ from .base import (
     TransformationIntent,
     ValidationIssue,
 )
-from .registry import get_engine, has_engine, list_engines, list_engines_for_platform, register_engine
-
-# Auto-discover and register all engine subpackages.
-# Each engine subpackage uses @register_engine on its class.
-# New engines are picked up automatically — no need to edit this file.
-import importlib
-import pkgutil
+from .registry import (
+    get_engine,
+    has_engine,
+    list_engines,
+    list_engines_for_platform,
+    register_engine,
+)
 
 for _finder, _name, _ispkg in pkgutil.iter_modules(__path__):
     if _ispkg:

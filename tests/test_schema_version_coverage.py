@@ -74,12 +74,9 @@ class TestSchemaVersionCoverage:
             contract = yaml.safe_load(fh)
         mgr = FluidSchemaManager()
         result = mgr.validate_contract(contract, schema_version=version, offline_only=True)
-        error_msgs = [
-            getattr(e, "message", str(e)) for e in result.errors
-        ]
+        error_msgs = [getattr(e, "message", str(e)) for e in result.errors]
         assert result.is_valid, (
-            f"Fixture {fixture.name} failed validation for schema {version}: "
-            f"{error_msgs}"
+            f"Fixture {fixture.name} failed validation for schema {version}: " f"{error_msgs}"
         )
 
     def test_latest_version_is_highest(self):

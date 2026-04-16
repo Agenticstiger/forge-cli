@@ -58,9 +58,7 @@ def _build_forge_args(**overrides) -> Namespace:
 
 
 class TestForgeBlankReceipt:
-    def test_blank_mode_writes_forge_receipt(
-        self, fluid_home, workspace_dir, monkeypatch
-    ):
+    def test_blank_mode_writes_forge_receipt(self, fluid_home, workspace_dir, monkeypatch):
         logger = logging.getLogger("test.forge_receipt")
         args = _build_forge_args()
 
@@ -72,9 +70,7 @@ class TestForgeBlankReceipt:
         assert (product_root / "contract.fluid.yaml").exists()
 
         receipt_path = product_forge_receipt_path(product_root)
-        assert receipt_path.exists(), (
-            f"forge-receipt.json was not written at {receipt_path}"
-        )
+        assert receipt_path.exists(), f"forge-receipt.json was not written at {receipt_path}"
 
         doc = json.loads(receipt_path.read_text())
 
@@ -94,9 +90,7 @@ class TestForgeBlankReceipt:
         paths = {e["path"] for e in doc["artifacts"]}
         assert "contract.fluid.yaml" in paths
 
-    def test_receipt_records_blank_flag_in_inputs(
-        self, fluid_home, workspace_dir, monkeypatch
-    ):
+    def test_receipt_records_blank_flag_in_inputs(self, fluid_home, workspace_dir, monkeypatch):
         logger = logging.getLogger("test.forge_receipt")
         args = _build_forge_args()
 
@@ -108,9 +102,7 @@ class TestForgeBlankReceipt:
         assert doc["inputs"].get("blank") is True
         assert doc["inputs"].get("non_interactive") is True
 
-    def test_receipt_lives_under_dot_fluid(
-        self, fluid_home, workspace_dir, monkeypatch
-    ):
+    def test_receipt_lives_under_dot_fluid(self, fluid_home, workspace_dir, monkeypatch):
         logger = logging.getLogger("test.forge_receipt")
         args = _build_forge_args()
 
@@ -131,9 +123,7 @@ class TestForgeBlankReceipt:
 
         first = forge_module.run(args, logger)
         assert first == 0
-        first_receipt = product_forge_receipt_path(
-            workspace_dir / "my-blank-product"
-        ).read_text()
+        first_receipt = product_forge_receipt_path(workspace_dir / "my-blank-product").read_text()
 
         # Second run — blank mode refuses to overwrite an existing contract
         second = forge_module.run(args, logger)
@@ -141,6 +131,7 @@ class TestForgeBlankReceipt:
 
         # First receipt still intact — second run never got far enough
         # to overwrite it.
-        assert first_receipt == product_forge_receipt_path(
-            workspace_dir / "my-blank-product"
-        ).read_text()
+        assert (
+            first_receipt
+            == product_forge_receipt_path(workspace_dir / "my-blank-product").read_text()
+        )

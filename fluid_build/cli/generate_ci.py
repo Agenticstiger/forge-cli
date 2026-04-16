@@ -36,7 +36,7 @@ from ._io import atomic_write
 from ._logging import info
 
 # Re-use templates from scaffold_ci
-from .scaffold_ci import GITHUB, GITLAB, JENKINS, _DEFAULT_PATHS, _TEMPLATES
+from .scaffold_ci import _DEFAULT_PATHS, _TEMPLATES, GITHUB, GITLAB, JENKINS
 
 
 def register_subcommand(subparsers: argparse._SubParsersAction):
@@ -55,7 +55,10 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
     )
     p.add_argument("contract", nargs="?", default="contract.fluid.yaml", help="contract.fluid.yaml")
     p.add_argument(
-        "--system", choices=["gitlab", "github", "jenkins"], default="gitlab", help="CI system (default: gitlab)"
+        "--system",
+        choices=["gitlab", "github", "jenkins"],
+        default="gitlab",
+        help="CI system (default: gitlab)",
     )
     p.add_argument("--out", help="Output path (auto-detected from --system if not set)")
     p.set_defaults(generate_sub="ci", func=_run_from_generate)

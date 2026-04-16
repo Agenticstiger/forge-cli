@@ -63,7 +63,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Mapping, Optional
 
-from fluid_build.cli.artifact_writer import ArtifactWriteRecord, ArtifactWriter
+from fluid_build.cli.artifact_writer import ArtifactWriter, ArtifactWriteRecord
 
 ReceiptFlow = Literal["ai", "template", "blank", "demo", "copilot", "guided", "forge"]
 

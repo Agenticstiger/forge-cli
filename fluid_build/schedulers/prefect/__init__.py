@@ -88,38 +88,46 @@ class PrefectScheduler(ScheduleEngine):
         issues: List[ValidationIssue] = []
         orchestration = contract.get("orchestration")
         if not orchestration:
-            issues.append(ValidationIssue(
-                message="Contract missing 'orchestration' section",
-                severity=Severity.ERROR,
-                field="orchestration",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message="Contract missing 'orchestration' section",
+                    severity=Severity.ERROR,
+                    field="orchestration",
+                )
+            )
             return issues
 
         tasks = orchestration.get("tasks")
         if not tasks:
-            issues.append(ValidationIssue(
-                message="Orchestration has no tasks",
-                severity=Severity.WARNING,
-                field="orchestration.tasks",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message="Orchestration has no tasks",
+                    severity=Severity.WARNING,
+                    field="orchestration.tasks",
+                )
+            )
 
         task_ids = [t.get("taskId") for t in (tasks or [])]
         if len(task_ids) != len(set(task_ids)):
-            issues.append(ValidationIssue(
-                message="Duplicate task IDs found in orchestration",
-                severity=Severity.ERROR,
-                field="orchestration.tasks",
-            ))
+            issues.append(
+                ValidationIssue(
+                    message="Duplicate task IDs found in orchestration",
+                    severity=Severity.ERROR,
+                    field="orchestration.tasks",
+                )
+            )
 
         task_id_set = set(task_ids)
-        for task in (tasks or []):
+        for task in tasks or []:
             for dep in task.get("dependsOn", []):
                 if dep not in task_id_set:
-                    issues.append(ValidationIssue(
-                        message=f"Task '{task.get('taskId')}' depends on non-existent task '{dep}'",
-                        severity=Severity.ERROR,
-                        field=f"orchestration.tasks[{task.get('taskId')}].dependsOn",
-                    ))
+                    issues.append(
+                        ValidationIssue(
+                            message=f"Task '{task.get('taskId')}' depends on non-existent task '{dep}'",
+                            severity=Severity.ERROR,
+                            field=f"orchestration.tasks[{task.get('taskId')}].dependsOn",
+                        )
+                    )
 
         return issues
 
@@ -134,7 +142,10 @@ def _sanitize_name(name: str) -> str:
 
 
 def _generate_header(
-    contract_id: str, contract_name: str, schedule: str, timezone: str,
+    contract_id: str,
+    contract_name: str,
+    schedule: str,
+    timezone: str,
     provider: Optional[str],
 ) -> str:
     return f'''"""
@@ -193,7 +204,9 @@ AWS_REGION = "{region}" """
 
 
 def _generate_tasks(
-    tasks: List[Dict[str, Any]], provider: Optional[str], config: Dict[str, Any],
+    tasks: List[Dict[str, Any]],
+    provider: Optional[str],
+    config: Dict[str, Any],
 ) -> str:
     tasks_code = "# Prefect Tasks\n"
     for task_spec in tasks:
@@ -203,7 +216,9 @@ def _generate_tasks(
 
 
 def _generate_single_task(
-    task_spec: Dict[str, Any], provider: Optional[str], config: Dict[str, Any],
+    task_spec: Dict[str, Any],
+    provider: Optional[str],
+    config: Dict[str, Any],
 ) -> str:
     task_id = task_spec.get("taskId")
     action = task_spec.get("action", "")
@@ -281,7 +296,7 @@ def _generate_deployment(contract_id: str, contract_name: str, schedule: str, ti
     flow_name = _sanitize_name(contract_id)
     cron_schedule = convert_schedule_to_cron(schedule)
 
-    return f'''# Deployment configuration
+    return f"""# Deployment configuration
 if __name__ == "__main__":
     deployment = Deployment.build_from_flow(
         flow={flow_name}_flow,
@@ -295,4 +310,4 @@ if __name__ == "__main__":
         work_queue_name="default",
     )
     deployment.apply()
-    print(f"Deployment created: {{deployment.name}}")'''
+    print(f"Deployment created: {{deployment.name}}")"""

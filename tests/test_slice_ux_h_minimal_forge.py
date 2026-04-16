@@ -49,7 +49,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
@@ -133,11 +132,7 @@ def _minimal_generated_contract() -> Dict[str, Any]:
                     "format": "csv",
                     "location": {"path": "runtime/out/fake_output.csv"},
                 },
-                "contract": {
-                    "schema": [
-                        {"name": "id", "type": "integer", "required": False}
-                    ]
-                },
+                "contract": {"schema": [{"name": "id", "type": "integer", "required": False}]},
             }
         ],
     }
@@ -210,13 +205,8 @@ class TestDefaultMinimalForge:
 
         # Contract was written with the slice-4 provenance envelope.
         doc = yaml.safe_load(contract_path.read_text())
-        assert doc.get("metadata", {}).get("provenance", {}).get("kind") == (
-            "ContractMetadata"
-        )
-        assert (
-            doc["metadata"]["provenance"]["generated_by"]["command"]
-            == "fluid forge"
-        )
+        assert doc.get("metadata", {}).get("provenance", {}).get("kind") == ("ContractMetadata")
+        assert doc["metadata"]["provenance"]["generated_by"]["command"] == "fluid forge"
 
     def test_minimal_does_not_create_engine_tree(self, tmp_path: Path):
         """None of the opinionated engine template directories must
@@ -258,12 +248,8 @@ class TestDefaultMinimalForge:
 
             run_ai_copilot_mode(args, logger)
 
-        assert not (tmp_path / "data").exists(), (
-            "data/ must not be created in the minimal path"
-        )
-        assert not (tmp_path / "dbt").exists(), (
-            "dbt/ must not be created in the minimal path"
-        )
+        assert not (tmp_path / "data").exists(), "data/ must not be created in the minimal path"
+        assert not (tmp_path / "dbt").exists(), "dbt/ must not be created in the minimal path"
 
     def test_minimal_does_not_invoke_create_project(self, tmp_path: Path):
         """The legacy ``CopilotAgent.create_project`` (which hands off
@@ -315,30 +301,24 @@ class TestScaffoldOptIn:
         args = _build_args(tmp_path, scaffold="etl_pipeline")
         logger = logging.getLogger("test_slice_ux_h.scaffold_data_folder")
 
-        with patch(
-            "fluid_build.cli.forge_modes._scaffold_data_folder"
-        ) as mock_scaffold_data:
+        with patch("fluid_build.cli.forge_modes._scaffold_data_folder") as mock_scaffold_data:
             with patch("fluid_build.cli.forge.CopilotAgent", return_value=fake):
                 from fluid_build.cli.forge import run_ai_copilot_mode
 
                 run_ai_copilot_mode(args, logger)
 
-        assert mock_scaffold_data.called, (
-            "_scaffold_data_folder must still run when --scaffold is set"
-        )
+        assert (
+            mock_scaffold_data.called
+        ), "_scaffold_data_folder must still run when --scaffold is set"
 
-    def test_minimal_path_does_not_run_scaffold_data_folder(
-        self, tmp_path: Path
-    ):
+    def test_minimal_path_does_not_run_scaffold_data_folder(self, tmp_path: Path):
         """Mirror test: the minimal (default) path must NOT call
         ``_scaffold_data_folder``."""
         fake = _make_fake_copilot()
         args = _build_args(tmp_path)
         logger = logging.getLogger("test_slice_ux_h.minimal_scaffold_data_guard")
 
-        with patch(
-            "fluid_build.cli.forge_modes._scaffold_data_folder"
-        ) as mock_scaffold_data:
+        with patch("fluid_build.cli.forge_modes._scaffold_data_folder") as mock_scaffold_data:
             with patch("fluid_build.cli.forge.CopilotAgent", return_value=fake):
                 from fluid_build.cli.forge import run_ai_copilot_mode
 
@@ -434,9 +414,7 @@ class TestEnginePipelineShim:
         engine._generate_pipeline_files(tmp_path)
 
         files = list(tmp_path.iterdir())
-        assert files == [], (
-            f"slice UX-H shim must not write files, got {files}"
-        )
+        assert files == [], f"slice UX-H shim must not write files, got {files}"
 
     def test_shim_does_not_raise_on_empty_config(self, tmp_path: Path):
         engine = self._make_engine({})
@@ -451,14 +429,11 @@ class TestEnginePipelineShim:
         from fluid_build.forge.core.engine import ForgeEngine
 
         assert hasattr(ForgeEngine, "_generate_pipeline_files_legacy"), (
-            "slice UX-H must preserve the pre-UX-H body under "
-            "_generate_pipeline_files_legacy"
+            "slice UX-H must preserve the pre-UX-H body under " "_generate_pipeline_files_legacy"
         )
         assert callable(ForgeEngine._generate_pipeline_files_legacy)
 
-    def test_legacy_still_writes_when_explicitly_invoked(
-        self, tmp_path: Path
-    ):
+    def test_legacy_still_writes_when_explicitly_invoked(self, tmp_path: Path):
         """Opt-in callers of the legacy function must still get files
         on disk.  This keeps backward compat for any out-of-tree
         plugin or fixture that monkey-patches it."""

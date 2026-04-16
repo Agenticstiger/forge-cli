@@ -33,7 +33,6 @@ from fluid_build.cli import status as status_module
 from fluid_build.cli.artifact_scan import diff_snapshots, snapshot_workspace
 from fluid_build.cli.status import StatusSummary, build_status_summary
 
-
 # ---------------------------------------------------------------------------
 # Bug #1 — status reads top-level domain
 # ---------------------------------------------------------------------------
@@ -219,9 +218,7 @@ class TestTemplateMenuCrashBug4:
         monkeypatch.chdir(tmp_path)
         args = _build_args()
         with patch.object(init_module, "_ask_creation_mode", return_value="template"):
-            with patch.object(
-                init_module, "_ask_template_name", return_value="customer-360"
-            ):
+            with patch.object(init_module, "_ask_template_name", return_value="customer-360"):
                 mode = init_module.detect_mode(args, logging.getLogger("test"))
         assert mode == "template"
         assert args.template == "customer-360"
