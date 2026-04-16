@@ -14,6 +14,7 @@
 
 """Tests for fluid_build.cli.security — path validation, file ops, sanitization."""
 
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -228,3 +229,105 @@ class TestGlobalContext:
         set_security_context(custom)
         assert get_security_context().max_file_size == 999
         set_security_context(original)  # restore
+
+
+# ── S-001 + S-002: public-API coverage ──────────────────────────────
+
+
+class TestPathTraversalPublicApi:
+    """SECURITY_REVIEW S-001: the pre-fix ``..`` check ran AFTER
+    ``Path.resolve()`` had already collapsed ``..`` segments, so the
+    guard was inert in production. All the existing tests called
+    ``_validate_path_security`` directly with a hand-constructed
+    ``Path(".. in it")``, which bypassed the bug.
+
+    These tests go through the public API (``validate_input_path`` /
+    ``validate_output_path``) to lock in the pre-resolve rejection."""
+
+    def setup_method(self):
+        self.ctx = SecurityContext()
+        self.validator = SecurePathValidator(self.ctx)
+
+    def test_validate_input_path_rejects_raw_traversal(self):
+        """``..`` in the raw input → path_traversal_detected BEFORE
+        Path.resolve() can collapse it. The file does not need to exist
+        because the traversal check runs before the existence check."""
+        with pytest.raises(FluidCLIError) as exc:
+            self.validator.validate_input_path("/foo/../bar.yaml")
+        assert exc.value.event == "path_traversal_detected"
+
+    def test_validate_input_path_rejects_leading_double_dot(self):
+        """Relative ``../something`` is the classic traversal shape."""
+        with pytest.raises(FluidCLIError) as exc:
+            self.validator.validate_input_path("../../etc/passwd")
+        assert exc.value.event == "path_traversal_detected"
+
+    def test_validate_output_path_rejects_raw_traversal(self):
+        with pytest.raises(FluidCLIError) as exc:
+            self.validator.validate_output_path("/tmp/../etc/passwd")
+        assert exc.value.event == "path_traversal_detected"
+
+    def test_validate_input_path_accepts_normal_absolute(self, tmp_path):
+        """Happy path — a valid resolved path with no ``..`` in the raw
+        input still works after the refactor."""
+        f = tmp_path / "ok.yaml"
+        f.write_text("hi")
+        result = self.validator.validate_input_path(f)
+        assert result == f.resolve()
+
+
+class TestPlatformAwareForbiddenPaths:
+    """SECURITY_REVIEW S-002: ``FORBIDDEN_PATHS`` must include the
+    resolved macOS forms (e.g. ``/private/etc``), and the check must
+    use ``Path.is_relative_to`` instead of a naive string prefix so
+    siblings like ``/etcd/…`` aren't false-positive-denied."""
+
+    def setup_method(self):
+        self.ctx = SecurityContext()
+        self.validator = SecurePathValidator(self.ctx)
+
+    @pytest.mark.skipif(
+        not sys.platform.startswith("darwin"),
+        reason="Exercises macOS-specific /etc → /private/etc resolution",
+    )
+    def test_etc_passwd_forbidden_after_resolve_on_macos(self):
+        """S-002: on macOS ``/etc/passwd`` resolves to
+        ``/private/etc/passwd``. With the old Linux-only forbidden set,
+        the resolved path had no matching prefix and the guard was
+        inert. The new set includes ``/private/etc`` so the deny
+        fires."""
+        # Use validate_output_path so the test doesn't depend on
+        # ``/etc/passwd`` being readable by the test runner (which it
+        # is on macOS but shouldn't be required). Put the target under
+        # ``/etc`` with a made-up filename — _validate_path_security
+        # runs before _validate_output_directory so we raise before
+        # any mkdir is attempted.
+        with pytest.raises(FluidCLIError) as exc:
+            self.validator.validate_output_path(
+                "/etc/fluid_security_review_s002_target_should_not_exist.yaml"
+            )
+        assert exc.value.event == "forbidden_path_access"
+
+    def test_etc_sibling_not_false_positive(self):
+        """S-002 regression: the old ``startswith`` string check would
+        flag ``/etcd/file.yaml`` (Coreos, ``/etcd`` data dirs). The new
+        ``is_relative_to`` boundary check doesn't."""
+        # Private-method test because we can't easily create ``/etcd``
+        # in the real filesystem. The important invariant is that the
+        # forbidden-path matcher itself is boundary-correct.
+        # Should NOT raise.
+        self.validator._validate_path_security(Path("/etcd/file.yaml"), "read")
+
+    def test_forbidden_set_is_platform_aware(self):
+        """The module-level FORBIDDEN_PATHS includes ``/private/etc`` on
+        macOS (sanity check — this is what makes
+        test_etc_passwd_forbidden_after_resolve_on_macos work)."""
+        from fluid_build.cli.security import FORBIDDEN_PATHS
+
+        if sys.platform.startswith("darwin"):
+            assert "/private/etc" in FORBIDDEN_PATHS
+        elif sys.platform.startswith("win"):
+            assert any(p.startswith("C:\\Windows") for p in FORBIDDEN_PATHS)
+        else:
+            # Linux / other Unix
+            assert "/etc" in FORBIDDEN_PATHS

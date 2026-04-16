@@ -21,6 +21,7 @@ import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 import httpx
@@ -161,6 +162,7 @@ def run_copilot_agent_loop(
     max_iterations: int = MAX_AGENT_ITERATIONS,
     console: Any = None,
     perf_stats: Optional[Dict[str, Any]] = None,
+    workspace_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run the multi-turn agent loop and return the final result dict.
 
@@ -170,9 +172,19 @@ def run_copilot_agent_loop(
 
     Raises :class:`CopilotGenerationError` if the loop exhausts
     iterations without producing a valid contract.
+
+    ``workspace_root`` (SECURITY_REVIEW S-003/S-004): the directory the
+    copilot's path-accepting tools (``read_sample_schema``,
+    ``discover_workspace``) are confined to. Defaults to ``Path.cwd()``
+    when callers haven't plumbed it through — the CLI entry points
+    should pass this explicitly from the user's ``--workspace`` or
+    current directory.
     """
     provider_adapter = get_llm_provider(llm_config.provider)
     tools = get_tool_definitions()
+    # Resolve the workspace root ONCE, at loop entry, so every tool
+    # call within this loop sees the same canonical root.
+    ws_root: Path = (workspace_root or Path.cwd()).resolve()
 
     # Build the initial user message from the context.
     user_content = _build_initial_user_message(context, project_memory)
@@ -250,8 +262,10 @@ def run_copilot_agent_loop(
             except Exception:  # noqa: BLE001
                 pass
 
-        # Dispatch tool calls (parallel for read-only tools).
-        results = _dispatch_tools(tool_calls)
+        # Dispatch tool calls (parallel for read-only tools). Thread the
+        # loop's workspace_root through so path-accepting tools can
+        # confine the LLM's path argument (S-003 / S-004).
+        results = _dispatch_tools(tool_calls, workspace_root=ws_root)
 
         # Feed tool results back to the LLM.
         result_msgs = provider_adapter.build_tool_result_messages(tool_calls, results)
@@ -342,11 +356,17 @@ def _call_llm_with_tools(
 
 def _dispatch_tools(
     tool_calls: List[Dict[str, Any]],
+    *,
+    workspace_root: Optional[Path] = None,
 ) -> List[Any]:
-    """Dispatch tool calls, running read-only tools in parallel."""
+    """Dispatch tool calls, running read-only tools in parallel.
+
+    ``workspace_root`` is forwarded to every ``dispatch_tool_call`` so
+    path-accepting tools can confine the LLM's path argument.
+    """
     if len(tool_calls) == 1:
         tc = tool_calls[0]
-        return [dispatch_tool_call(tc["name"], tc["arguments"])]
+        return [dispatch_tool_call(tc["name"], tc["arguments"], workspace_root=workspace_root)]
 
     # Check if ALL calls are parallelizable.
     all_parallel = all(tc["name"] in _PARALLELIZABLE_TOOLS for tc in tool_calls)
@@ -357,10 +377,19 @@ def _dispatch_tools(
         # deterministic across runs.
         with ThreadPoolExecutor(max_workers=min(len(tool_calls), 4)) as pool:
             futures = [
-                pool.submit(dispatch_tool_call, tc["name"], tc["arguments"]) for tc in tool_calls
+                pool.submit(
+                    dispatch_tool_call,
+                    tc["name"],
+                    tc["arguments"],
+                    workspace_root=workspace_root,
+                )
+                for tc in tool_calls
             ]
             results = [f.result() for f in futures]
         return results
 
     # Sequential fallback for mixed read/write calls.
-    return [dispatch_tool_call(tc["name"], tc["arguments"]) for tc in tool_calls]
+    return [
+        dispatch_tool_call(tc["name"], tc["arguments"], workspace_root=workspace_root)
+        for tc in tool_calls
+    ]
