@@ -24,7 +24,14 @@ from typing import Any, Dict, Optional, Set
 
 import yaml
 
-__version__ = "0.7.10"
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("data-product-forge")
+except PackageNotFoundError:
+    # Editable / source checkout before the package is installed.
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "__version__",

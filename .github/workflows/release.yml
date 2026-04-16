@@ -1,12 +1,25 @@
-# Release Pipeline — publish to PyPI, GHCR, and GitHub Releases
+# Release Pipeline — publish to PyPI (via TestPyPI), GHCR, GitHub Releases.
 #
 # Triggers:
 #   - Push a tag matching v*.*.* (e.g. v0.7.1, v0.7.1a1, v0.7.1b2)
-#   - Manual dispatch with version input
+#   - Manual workflow_dispatch with a tag input
 #
-# Pre-release tags (containing 'a' or 'b') go to TestPyPI.
-# Stable tags go to PyPI.
-# Docker images always go to GHCR.
+# Promotion model (every release passes through TestPyPI first):
+#
+#   quality-gate
+#       └─ build
+#           └─ publish-testpypi          (always, every tag)
+#               └─ verify-testpypi       (always; install + smoke from TestPyPI)
+#                   ├─ publish-pypi      (only when tag is stable; gated by
+#                   │       └─ verify-pypi    verify-testpypi success)
+#                   ├─ docker            (after TestPyPI verify, regardless
+#                   └─ github-release     of stable/pre)
+#
+# Pre-release tags (containing a/b/rc/dev) stop after verify-testpypi.
+# Stable tags get promoted to PyPI only if the TestPyPI install smoke passes.
+#
+# Wheel version comes from the git tag via setuptools-scm — no static
+# `version = "..."` literal in pyproject.toml to drift.
 
 name: Release
 
@@ -20,6 +33,11 @@ on:
         description: "Version tag to release (e.g. v0.7.1, v0.7.1a1)"
         required: true
         type: string
+
+# Don't let two simultaneous tag pushes race PyPI uploads.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions: {}  # Job-level permissions only — least privilege
 
@@ -84,36 +102,21 @@ jobs:
       - name: Tests with coverage
         run: |
           pip install pytest-cov
-          # Deselected tests are pre-existing failures unrelated to 0.7.10 content:
-          #   - TestDetectCIEnvironment / TestRunExtra / copilot dispatch tests
-          #     assume a non-GHA environment (they break when CI=true and
-          #     GITHUB_ACTIONS=true are set by the runner)
-          #   - test_blank_dispatch / test_template_dispatch return exit 1 under
-          #     the 3.12 runner due to an import-time import cycle with the
-          #     copilot subsystem; does not affect the `fluid init` happy path
-          #     and is tracked for follow-up
-          pytest --cov=fluid_build --cov-report=xml --cov-report=term-missing -q \
-            --deselect tests/test_auth_doctor.py::TestDetectCIEnvironment \
-            --deselect tests/test_init_extra_branches.py::TestRun::test_blank_dispatch \
-            --deselect tests/test_init_extra_branches.py::TestRun::test_template_dispatch \
-            --deselect tests/test_forge_branches.py::TestRunFunction::test_run_copilot_mode \
-            --deselect tests/test_cli_doctor_ext.py::TestRunExtra
+          # Tests known to fail in specific environments are now marked with
+          # @pytest.mark.skipif / @pytest.mark.xfail in the test files
+          # themselves (with explicit reasons). No deselect flags needed here.
+          pytest --cov=fluid_build --cov-report=xml --cov-report=term-missing -q
 
       - name: Security scan
         run: |
           pip install bandit
           bandit -r fluid_build/ -c pyproject.toml --severity-level medium -q
 
-      - name: Verify version matches tag
-        run: |
-          PKG_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          TAG_VERSION="${{ steps.meta.outputs.version }}"
-          # For pre-release, strip suffix for comparison (0.7.1a1 base is 0.7.1)
-          TAG_BASE=$(echo "$TAG_VERSION" | sed 's/[ab].*//' | sed 's/\.dev.*//' | sed 's/rc.*//')
-          if [ "$PKG_VERSION" != "$TAG_BASE" ] && [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::Version mismatch: pyproject.toml=${PKG_VERSION}, tag=${TAG_VERSION} (base=${TAG_BASE})"
-            exit 1
-          fi
+      # Note: there is no longer a "Verify version matches tag" step.
+      # With setuptools-scm, the wheel version IS the tag (no static
+      # `version = "..."` in pyproject.toml to drift from). The build
+      # job's "Isolated wheel install and verify" step asserts
+      # `fluid --version` matches what setuptools-scm produced.
           echo "Version verified: ${TAG_VERSION} (base matches ${PKG_VERSION})"
 
   # ──────────────────────────────────────────────────────────────
@@ -185,12 +188,11 @@ jobs:
           retention-days: 30
 
   # ──────────────────────────────────────────────────────────────
-  # 3a. Publish to TestPyPI (pre-release tags only)
+  # 3a. Publish to TestPyPI — every release goes here first.
   # ──────────────────────────────────────────────────────────────
   publish-testpypi:
     name: Publish to TestPyPI
     needs: [quality-gate, build]
-    if: needs.quality-gate.outputs.is_prerelease == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -210,12 +212,12 @@ jobs:
           repository-url: https://test.pypi.org/legacy/
 
   # ──────────────────────────────────────────────────────────────
-  # 3a-verify. Install from TestPyPI and verify package
+  # 3a-verify. Install from TestPyPI and smoke-test the package.
+  # Always runs; gates the PyPI promotion below.
   # ──────────────────────────────────────────────────────────────
   verify-testpypi:
     name: Verify TestPyPI Install
     needs: [quality-gate, publish-testpypi]
-    if: needs.quality-gate.outputs.is_prerelease == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v6
@@ -264,11 +266,11 @@ jobs:
           echo "TestPyPI package verified successfully"
 
   # ──────────────────────────────────────────────────────────────
-  # 3b. Publish to PyPI (stable tags only)
+  # 3b. Publish to PyPI — stable tags only, gated by TestPyPI verify.
   # ──────────────────────────────────────────────────────────────
   publish-pypi:
     name: Publish to PyPI
-    needs: [quality-gate, build]
+    needs: [quality-gate, verify-testpypi]
     if: needs.quality-gate.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     permissions:
@@ -287,11 +289,47 @@ jobs:
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
 
   # ──────────────────────────────────────────────────────────────
-  # 4. GitHub Release with changelog and artifacts
+  # 3b-verify. Install from PyPI and smoke-test (final gate).
+  # ──────────────────────────────────────────────────────────────
+  verify-pypi:
+    name: Verify PyPI Install
+    needs: [quality-gate, publish-pypi]
+    if: needs.quality-gate.outputs.is_prerelease == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Wait for PyPI index
+        run: sleep 30
+
+      - name: Install from PyPI
+        run: |
+          python -m venv /tmp/pypi-verify
+          /tmp/pypi-verify/bin/pip install \
+            "data-product-forge==${{ needs.quality-gate.outputs.version }}"
+
+      - name: Verify installed package
+        run: |
+          /tmp/pypi-verify/bin/python -I -c "
+          import fluid_build
+          assert fluid_build.__version__ == '${{ needs.quality-gate.outputs.version }}', \
+              f'Version mismatch: {fluid_build.__version__}'
+          print(f'Version OK: {fluid_build.__version__}')
+          "
+          /tmp/pypi-verify/bin/fluid --version
+          cd /tmp
+          /tmp/pypi-verify/bin/fluid init pypi-verify-scaffold --template hello-world
+          test -f pypi-verify-scaffold/contract.fluid.yaml || { echo '::error::scaffold failed'; exit 1; }
+          echo "PyPI package verified successfully"
+
+  # ──────────────────────────────────────────────────────────────
+  # 4. GitHub Release with changelog and artifacts (after TestPyPI verify).
   # ──────────────────────────────────────────────────────────────
   github-release:
     name: GitHub Release
-    needs: [quality-gate, build]
+    needs: [quality-gate, verify-testpypi]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -367,7 +405,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────
   docker:
     name: Docker Image (GHCR)
-    needs: [quality-gate, build]
+    needs: [quality-gate, verify-testpypi]
     runs-on: ubuntu-latest
     permissions:
       contents: read
