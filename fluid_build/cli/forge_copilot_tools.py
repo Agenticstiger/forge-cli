@@ -336,5 +336,14 @@ def dispatch_tool_call(name: str, arguments: Dict[str, Any]) -> Any:
     try:
         return tool["impl"](**arguments)
     except Exception as exc:  # noqa: BLE001
-        LOG.warning("Tool %s failed: %s", name, exc)
-        return {"error": f"Tool {name} failed: {exc}"}
+        # SECURITY_REVIEW S-013: do not echo the exception text back to
+        # the LLM. ``FileNotFoundError('/home/alice/.aws/credentials')``
+        # used to round-trip into the model context and could surface in
+        # generated artifacts (contract reasoning / description fields).
+        # Keep the full exception server-side (where SecretRedactingFilter
+        # scrubs any accidental secret) and return only a typed code.
+        LOG.warning("Tool %s failed: %s", name, exc, exc_info=True)
+        return {
+            "error": type(exc).__name__,
+            "message": f"Tool {name} failed — see server logs",
+        }

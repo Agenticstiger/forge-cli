@@ -132,7 +132,13 @@ class TestToolRegistry:
 
     def test_tool_failure_returns_error_not_raises(self):
         """Tools that crash internally must return an error dict,
-        never raise, so the agent loop can continue."""
+        never raise, so the agent loop can continue.
+
+        S-013: the error dict carries the exception *type name* (so the
+        LLM can distinguish ``FileNotFoundError`` from ``ValueError``)
+        but NOT the exception message — which can contain filesystem
+        paths, hostnames, or env vars that shouldn't round-trip into
+        the model context."""
         with patch.dict(
             TOOL_REGISTRY,
             {
@@ -145,8 +151,37 @@ class TestToolRegistry:
             },
         ):
             result = dispatch_tool_call("crash_test", {})
-        assert "error" in result
-        assert "boom" in result["error"]
+        # Type name is returned as the error code.
+        assert result.get("error") == "RuntimeError"
+        # Message is a static "see server logs" string, not the raw exc text.
+        assert "message" in result
+        # The raw exception text must NOT round-trip back to the LLM.
+        assert "boom" not in result.get("error", "")
+        assert "boom" not in result.get("message", "")
+
+    def test_tool_failure_does_not_leak_path_like_exception_text(self):
+        """S-013: concrete regression — a FileNotFoundError carrying a
+        filesystem path must not land in the tool result."""
+        leaky_path = "/home/alice/.aws/credentials"
+
+        def _impl(**_kw):
+            raise FileNotFoundError(leaky_path)
+
+        with patch.dict(
+            TOOL_REGISTRY,
+            {
+                "leaky_tool": {
+                    "name": "leaky_tool",
+                    "description": "test",
+                    "input_schema": {},
+                    "impl": _impl,
+                }
+            },
+        ):
+            result = dispatch_tool_call("leaky_tool", {})
+        assert result.get("error") == "FileNotFoundError"
+        assert leaky_path not in result.get("error", "")
+        assert leaky_path not in result.get("message", "")
 
 
 # ---------------------------------------------------------------------------
