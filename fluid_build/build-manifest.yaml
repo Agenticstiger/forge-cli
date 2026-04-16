@@ -15,7 +15,7 @@ metadata:
   # PyPI Publishing Strategy
   pypi:
     repository: "fluid-mono-pypi"
-    base_version: "0.7.9"
+    base_version: "0.7.10"
     
     # Version naming convention per build type
     # alpha: 0.7.1a{build_number}     (e.g., 0.7.1a42)
