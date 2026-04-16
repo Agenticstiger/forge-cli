@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/fluid-forge-logo.png" alt="FLUID Forge" width="480">
+<img src="https://raw.githubusercontent.com/Agenticstiger/forge-cli/main/assets/fluid-forge-logo.png" alt="FLUID Forge" width="480">
 
 <br><br>
 
@@ -9,7 +9,7 @@
 **The declarative control plane for data engineering in the Agentic Era.**
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://python.org)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/Agenticstiger/forge-cli/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/data-product-forge.svg)](https://pypi.org/project/data-product-forge/)
 [![CI](https://github.com/Agenticstiger/forge-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Agenticstiger/forge-cli/actions/workflows/ci.yml)
 

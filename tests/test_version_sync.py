@@ -12,66 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Guard against version drift between pyproject.toml, __init__.py, and build-manifest.yaml."""
+"""Guard that ``fluid_build.__version__`` matches the installed distribution.
 
-import sys
-from pathlib import Path
+With setuptools-scm the wheel version is derived from the git tag at build
+time, so there is no static ``version = "..."`` literal to drift. The single
+remaining source of truth for runtime callers is
+``importlib.metadata.version("data-product-forge")``, and ``__init__.py``
+reads from there. This test simply asserts those two stay aligned and that
+the version isn't the ``0.0.0+unknown`` fallback (which would mean the
+package metadata is missing — typically a packaging bug).
+"""
 
-import yaml
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as pkg_version
 
-# Locate the repo root (parent of tests/)
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
-def _read_pyproject_version() -> str:
-    """Read version from pyproject.toml without importing the package."""
-    pyproject = REPO_ROOT / "pyproject.toml"
-    assert pyproject.exists(), f"pyproject.toml not found at {pyproject}"
-
-    if sys.version_info >= (3, 11):
-        import tomllib
-    else:
-        try:
-            import tomllib
-        except ImportError:
-            import tomli as tomllib  # type: ignore[no-redef]
-
-    with open(pyproject, "rb") as f:
-        data = tomllib.load(f)
-    return data["project"]["version"]
+import fluid_build
 
 
-def _read_init_version() -> str:
-    """Read __version__ from fluid_build/__init__.py."""
-    import fluid_build
+def test_init_version_matches_installed_metadata():
+    """fluid_build.__version__ must equal importlib.metadata for the dist."""
+    try:
+        installed = pkg_version("data-product-forge")
+    except PackageNotFoundError:
+        # Running outside an installed context (e.g. raw source tree without
+        # `pip install -e .`). Skip — the version-from-metadata path can't be
+        # exercised, and the editable-install fallback in __init__.py is the
+        # right answer.
+        import pytest
 
-    return fluid_build.__version__
+        pytest.skip("data-product-forge not installed; skipping metadata-version sync check")
 
-
-def _read_manifest_base_version() -> str:
-    """Read base_version from build-manifest.yaml."""
-    manifest = REPO_ROOT / "fluid_build" / "build-manifest.yaml"
-    assert manifest.exists(), f"build-manifest.yaml not found at {manifest}"
-
-    with open(manifest) as f:
-        data = yaml.safe_load(f)
-    return data["metadata"]["pypi"]["base_version"]
-
-
-def test_pyproject_and_init_versions_match():
-    """pyproject.toml version must equal fluid_build.__version__."""
-    pyproject_ver = _read_pyproject_version()
-    init_ver = _read_init_version()
-    assert pyproject_ver == init_ver, (
-        f"Version mismatch: pyproject.toml={pyproject_ver}, " f"fluid_build.__version__={init_ver}"
+    assert fluid_build.__version__ == installed, (
+        f"Version mismatch: fluid_build.__version__={fluid_build.__version__!r}, "
+        f"installed dist version={installed!r}"
     )
 
 
-def test_build_manifest_base_version_matches():
-    """build-manifest.yaml base_version must equal pyproject.toml version."""
-    pyproject_ver = _read_pyproject_version()
-    manifest_ver = _read_manifest_base_version()
-    assert pyproject_ver == manifest_ver, (
-        f"Version mismatch: pyproject.toml={pyproject_ver}, "
-        f"build-manifest.yaml base_version={manifest_ver}"
+def test_version_is_not_unknown_fallback():
+    """The fallback '0.0.0+unknown' should never ship in a real install."""
+    assert fluid_build.__version__ != "0.0.0+unknown", (
+        "fluid_build.__version__ resolved to the editable/source fallback "
+        "'0.0.0+unknown'. This usually means the package isn't installed "
+        "into site-packages (run `pip install -e .` or build a wheel)."
     )

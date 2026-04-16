@@ -15,8 +15,10 @@ metadata:
   # PyPI Publishing Strategy
   pypi:
     repository: "fluid-mono-pypi"
-    base_version: "0.7.10"
-    
+    # Version is derived dynamically from git tags via setuptools-scm at
+    # build time. There is no static base_version here — the wheel ships
+    # whatever the tag declares (e.g. v0.7.11a1 → 0.7.11a1).
+
     # Version naming convention per build type
     # alpha: 0.7.1a{build_number}     (e.g., 0.7.1a42)
     # beta:  0.7.1b{build_number}     (e.g., 0.7.1b42)
