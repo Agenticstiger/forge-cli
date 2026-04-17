@@ -52,19 +52,28 @@ _PARALLELIZABLE_TOOLS = frozenset(
 # Maximum number of LLM round-trips before we give up.
 MAX_AGENT_ITERATIONS = 12
 
+
+def _int_env(name: str, default: int) -> int:
+    """Read an integer from the environment, falling back to ``default``.
+
+    A malformed value (e.g. ``FLUID_AGENT_COMPACT_AFTER=foo``) used to crash
+    the CLI at import time. We now log a warning and fall back to the
+    default so a stray env var never breaks ``fluid forge --agent-loop``.
+    See SECURITY_REVIEW S-014.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        LOG.warning("Invalid %s=%r; falling back to default of %d", name, raw, default)
+        return default
+
+
 # After this many iterations, compact old tool results to stay within
 # context window limits.  Configurable via FLUID_AGENT_COMPACT_AFTER.
-# A malformed value (e.g. ``FLUID_AGENT_COMPACT_AFTER=foo``) used to crash
-# the CLI at import time; we now log a warning and fall back to the
-# default. See SECURITY_REVIEW S-014.
-try:
-    _COMPACT_AFTER = int(os.environ.get("FLUID_AGENT_COMPACT_AFTER", "6"))
-except ValueError:
-    LOG.warning(
-        "Invalid FLUID_AGENT_COMPACT_AFTER=%r; falling back to default of 6",
-        os.environ.get("FLUID_AGENT_COMPACT_AFTER"),
-    )
-    _COMPACT_AFTER = 6
+_COMPACT_AFTER = _int_env("FLUID_AGENT_COMPACT_AFTER", 6)
 _COMPACT_KEEP_TAIL = 4  # Keep last N messages intact.
 _COMPACT_MAX_CHARS = 500  # Truncate old tool results to this length.
 
@@ -210,9 +219,12 @@ def run_copilot_agent_loop(
         if iteration >= _COMPACT_AFTER:
             messages = _compact_message_history(messages)
 
-        # Call the LLM with the tool definitions.
+        # Call the LLM with the tool definitions. AGENT_SYSTEM_PROMPT is
+        # cached at module-import time; FluidSchemaManager.latest_bundled_version()
+        # doesn't change over the lifetime of a CLI invocation, so rebuilding
+        # the prompt on every iteration just wastes work.
         response_json = _call_llm_with_tools(
-            provider_adapter, llm_config, _build_agent_system_prompt(), messages, tools
+            provider_adapter, llm_config, AGENT_SYSTEM_PROMPT, messages, tools
         )
 
         # Check for tool calls.

@@ -337,7 +337,7 @@ class SecureFileOperations:
 
             # Content validation
             if self.security_context.enable_content_validation:
-                self._validate_content(content, validated_path)
+                self._scan_content_for_warnings(content, validated_path)
 
             return content
 
@@ -402,8 +402,16 @@ class SecureFileOperations:
                 ],
             )
 
-    def _validate_content(self, content: str, path: Path) -> None:
-        """Validate file content for security issues"""
+    def _scan_content_for_warnings(self, content: str, path: Path) -> None:
+        """Scan file content for suspicious patterns and emit warnings.
+
+        This method is **advisory only** — it never raises and never blocks
+        the read. Matches are logged at ``WARNING`` level so operators can
+        see potentially risky content passing through the CLI, but the
+        flow continues regardless. The previous name (``_validate_content``)
+        implied blocking validation, which was misleading. See CODE_REVIEW
+        C-014.
+        """
         # Check for suspicious patterns
         suspicious_patterns = [
             r"<script[^>]*>",  # Script tags

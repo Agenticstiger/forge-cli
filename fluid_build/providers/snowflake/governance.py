@@ -305,9 +305,15 @@ class GovernanceValidator:
             )
             return [{"column": row[0], "policy": row[1]} for row in self.cursor.fetchall()]
         except Exception as e:
-            # Try alternative query
+            # Try alternative query. Re-validate through _parse_qualified_name +
+            # _qualified_name as defense-in-depth: ``self.full_table`` is already
+            # built from validated identifiers at __init__, but the SQL-safety
+            # invariant (AGENTS.md / providers/_sql_safety.py) says every DDL
+            # f-string must route identifiers through ``validate_ident`` at the
+            # emission site — no exceptions.
             try:
-                self.cursor.execute(f"DESC TABLE {self.full_table}")
+                qualified = _qualified_name(*_parse_qualified_name(self.full_table))
+                self.cursor.execute(f"DESC TABLE {qualified}")
                 # This is a fallback - not all Snowflake versions support policy queries
                 return []
             except Exception:

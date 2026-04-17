@@ -167,7 +167,12 @@ class AuthProvider:
     def _run_command(
         self, command: List[str], capture_output: bool = True, check: bool = True
     ) -> subprocess.CompletedProcess:
-        """Run a shell command with proper error handling"""
+        """Run an external command as an argv list.
+
+        Never uses ``shell=True`` — ``command`` is always the argv list
+        passed directly to ``subprocess.run``. See SECURITY.md for why
+        ``shell=True`` is banned across this codebase.
+        """
         try:
             # S-011: strip credential-bearing flag values before logging.
             # ``%s`` + positional keeps the SecretRedactingFilter in the
