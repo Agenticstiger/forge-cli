@@ -26,6 +26,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from fluid_build.providers._sql_safety import validate_ident
+
 
 class LocalStackMock:
     """Mock AWS services using LocalStack."""
@@ -256,8 +258,14 @@ class SnowflakeDuckDBMock:
             self.connect()
 
         try:
-            self._con.execute(f"CREATE SCHEMA IF NOT EXISTS {database_name}")
+            # SQL-safety invariant (providers/_sql_safety.py): every DDL
+            # f-string must route identifiers through ``validate_ident``.
+            safe_name = validate_ident(database_name)
+            self._con.execute(f"CREATE SCHEMA IF NOT EXISTS {safe_name}")
             return {"success": True, "database": database_name}
+        except ValueError as e:
+            self.logger.error(f"Invalid database name: {e}")
+            return {"success": False, "error": str(e)}
         except Exception as e:
             self.logger.error(f"Failed to create database: {e}")
             return {"success": False, "error": str(e)}
