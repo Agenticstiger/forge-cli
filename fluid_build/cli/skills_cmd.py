@@ -141,7 +141,10 @@ def _show(logger: logging.Logger) -> int:
         content = skills_path.read_text()
         console.print(Syntax(content, "yaml", theme="monokai", line_numbers=True))
     except ImportError:
-        print(skills_path.read_text())
+        # Rich isn't available — dump the raw YAML so the user at least
+        # sees it. Bare ``print`` is the right primitive in this no-Rich
+        # fallback. See CODE_REVIEW C-011.
+        print(skills_path.read_text())  # noqa: T201 — no-Rich fallback
 
     return 0
 
@@ -213,8 +216,11 @@ def _install(args, logger: logging.Logger) -> int:
                 console.print()
                 raw = console.input("[bold]Pick a number or industry key: [/bold]").strip()
             except ImportError:
+                # Rich isn't available — plain numbered list. See C-011.
                 for i, choice in enumerate(choices, 1):
-                    print(f"  {i}. {choice['label']} ({choice['key']})")
+                    print(  # noqa: T201 — no-Rich fallback
+                        f"  {i}. {choice['label']} ({choice['key']})"
+                    )
                 raw = input("Pick a number or industry key: ").strip()
 
             # Resolve input

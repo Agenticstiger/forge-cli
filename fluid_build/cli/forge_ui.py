@@ -121,10 +121,14 @@ def ask_numbered_choice(
         except (ImportError, EOFError):
             raw = str(default)
     else:
-        print(f"\n{prompt}")
+        # Rich isn't available — drop to plain stdout so the menu is still
+        # usable. Bare ``print`` is intentional here; routing through
+        # ``cprint`` would just add a redundant import hop for the
+        # no-Rich path. See CODE_REVIEW C-011.
+        print(f"\n{prompt}")  # noqa: T201 — no-Rich fallback
         for i, (_, label) in enumerate(options, 1):
             marker = " (default)" if i == default else ""
-            print(f"  {i}. {label}{marker}")
+            print(f"  {i}. {label}{marker}")  # noqa: T201 — no-Rich fallback
         raw = input(f"Enter number [{default}]: ").strip() or str(default)
 
     try:

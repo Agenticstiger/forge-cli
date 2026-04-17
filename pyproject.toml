@@ -181,7 +181,14 @@ line-length = 100
 target-version = "py39"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B"]  # basic errors, imports, bugbear
+# T201 (flake8-print) is enabled for ``fluid_build/`` so stray ``print``
+# calls fail lint. User-facing output belongs in ``fluid_build.cli.console``
+# (``cprint``/``success``/``warning``/``error``). Legitimate low-level
+# sinks (the console module itself, the error printer, and plain-TTY
+# fallbacks when Rich is unavailable) are allowed via per-file-ignores
+# or a ``# noqa: T201`` comment that explains the exemption.
+# See CODE_REVIEW C-011.
+select = ["E", "F", "I", "B", "T201"]
 ignore = [
   "E203",   # whitespace before ':' — Black-compatible
   "E501",   # line-too-long — handled by Black where possible
@@ -202,6 +209,18 @@ ignore = [
   "F403",   # undefined-local-with-import-star — existing patterns
   "F811",   # redefined-while-unused — overload patterns
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests, doctor scripts, and one-shot tools are allowed bare print().
+"tests/**" = ["T201"]
+"scripts/**" = ["T201"]
+# The console module owns print() fallbacks by design.
+"fluid_build/cli/console.py" = ["T201"]
+# Core imports a fallback ``Console.print`` shim when Rich is missing.
+"fluid_build/cli/core.py" = ["T201"]
+# The error printer is the last-resort path when the Rich panel render
+# itself fails — it MUST use bare print(..., file=sys.stderr).
+"fluid_build/cli/errors.py" = ["T201"]
 
 [tool.bandit]
 # B608: SQL query construction is expected — this is a pipeline/SQL code generator

@@ -2420,21 +2420,21 @@ def run_guided_mode(
                 input("Step 1/3 -- Product name [my-data-product]: ").strip() or "my-data-product"
             )
 
-            print("\nStep 2/3 -- What area does this belong to?")
-            print("  1. Analytics")
-            print("  2. Data Engineering")
-            print("  3. Machine Learning")
-            print("  4. Governance")
+            cprint("\nStep 2/3 -- What area does this belong to?")
+            cprint("  1. Analytics")
+            cprint("  2. Data Engineering")
+            cprint("  3. Machine Learning")
+            cprint("  4. Governance")
             d = input("Enter number [1]: ").strip() or "1"
             domain = {"1": "analytics", "2": "data-engineering", "3": "ml", "4": "governance"}.get(
                 d, "analytics"
             )
 
-            print("\nStep 3/3 -- Where will it run?")
-            print("  1. Local (DuckDB)")
-            print("  2. Google Cloud")
-            print("  3. Snowflake")
-            print("  4. AWS")
+            cprint("\nStep 3/3 -- Where will it run?")
+            cprint("  1. Local (DuckDB)")
+            cprint("  2. Google Cloud")
+            cprint("  3. Snowflake")
+            cprint("  4. AWS")
             p = input("Enter number [1]: ").strip() or "1"
             provider = {"1": "local", "2": "gcp", "3": "snowflake", "4": "aws"}.get(p, "local")
 
