@@ -20,11 +20,9 @@ import logging
 import os
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
-
-from fluid_build.cli.console import success
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +44,27 @@ class CredentialSource(Enum):
 
 @dataclass
 class CredentialConfig:
-    """Configuration for credential resolution."""
+    """Configuration for credential resolution.
+
+    Fields:
+        allow_prompt: Whether to prompt user interactively for missing creds.
+        cache_duration_seconds: In-memory cache TTL.
+        required_sources: Restrict resolution to specific sources.
+        project_root: Project root for locating .env files.
+        environment: Named environment (dev, staging, prod).
+        on_keyring_save: Optional callback invoked after a credential is
+            successfully saved to the OS keyring. Used to surface a
+            user-visible confirmation without the resolver importing any
+            CLI/UI module (see CODE_REVIEW C-007 — layering inversion).
+            Receives a short human-readable message as its only argument.
+    """
 
     allow_prompt: bool = False
     cache_duration_seconds: int = 3600
     required_sources: Optional[List[CredentialSource]] = None
     project_root: Optional[str] = None
     environment: str = "dev"  # dev, staging, prod
+    on_keyring_save: Optional[Callable[[str], None]] = field(default=None, repr=False)
 
 
 class CredentialError(Exception):
@@ -212,10 +224,22 @@ class BaseCredentialResolver(ABC):
         return None
 
     def _get_from_dotenv(self, key: str) -> Optional[str]:
-        """Get credential from .env file."""
+        """Get credential from .env file.
+
+        C-009: narrowed catch list. ``ImportError`` covers the optional
+        ``python-dotenv`` dependency. ``OSError`` covers I/O (missing
+        read permission, path too long). ``ValueError`` covers
+        ``python-dotenv``'s own parser complaints. Unknown errors
+        surface at ``warning`` and still return ``None`` so a single
+        source failure doesn't collapse the fallback chain.
+        """
         try:
             from .dotenv_store import DotEnvCredentialStore
+        except ImportError:
+            logger.debug("python-dotenv not available, skipping .env file")
+            return None
 
+        try:
             store = DotEnvCredentialStore(
                 project_root=self.config.project_root, environment=self.config.environment
             )
@@ -229,43 +253,70 @@ class BaseCredentialResolver(ABC):
                     return value
 
             return None
-
-        except ImportError:
-            logger.debug("python-dotenv not available, skipping .env file")
+        except (OSError, ValueError) as e:
+            logger.debug("Failed to read from .env file: %s", e)
             return None
-        except Exception as e:
-            logger.debug(f"Failed to read from .env file: {e}")
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Unexpected error reading .env file: %s", e)
             return None
 
     def _get_from_keyring(self, key: str) -> Optional[str]:
-        """Get credential from OS keyring."""
+        """Get credential from OS keyring.
+
+        C-009: narrowed to ``KeyringError`` (covers ``NoKeyringError``,
+        ``PasswordDeleteError``, etc. — all subclass ``KeyringError``).
+        Unknown errors log at ``warning`` but still fall through.
+        """
         try:
             from .keyring_store import KeyringCredentialStore
-
-            keyring_key = f"{self.provider}.{key}"
-            return KeyringCredentialStore.get_credential(keyring_key)
-
         except ImportError:
             logger.debug("keyring library not available, skipping OS keyring")
             return None
-        except Exception as e:
-            logger.debug(f"Failed to read from keyring: {e}")
+
+        try:
+            from keyring.errors import KeyringError
+        except ImportError:
+            KeyringError = Exception  # type: ignore[assignment,misc]
+
+        keyring_key = f"{self.provider}.{key}"
+        try:
+            return KeyringCredentialStore.get_credential(keyring_key)
+        except KeyringError as e:
+            logger.debug("Failed to read from keyring: %s", e)
+            return None
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Unexpected error reading from keyring: %s", e)
             return None
 
     def _get_from_encrypted_file(self, key: str) -> Optional[str]:
-        """Get credential from encrypted file."""
+        """Get credential from encrypted file.
+
+        C-009: narrowed exception surface. ``CredentialError`` is what
+        ``EncryptedCredentialStore._load_store`` raises on an
+        ``InvalidToken`` (see S-008 / ``encrypted_store.py``) — this is
+        a hard failure we deliberately re-raise so the user is told the
+        store is unreadable rather than silently falling through (which
+        would mask a ciphertext/key mismatch). ``OSError`` is I/O.
+        """
         try:
             from .encrypted_store import EncryptedCredentialStore
-
-            store = EncryptedCredentialStore()
-            keyring_key = f"{self.provider}.{key}"
-            return store.get_credential(keyring_key)
-
         except ImportError:
             logger.debug("cryptography library not available, skipping encrypted file")
             return None
-        except Exception as e:
-            logger.debug(f"Failed to read from encrypted file: {e}")
+
+        keyring_key = f"{self.provider}.{key}"
+        try:
+            store = EncryptedCredentialStore()
+            return store.get_credential(keyring_key)
+        except CredentialError:
+            # Key mismatch / corruption — surface to caller; silent
+            # fall-through is the bug S-008 explicitly fixed.
+            raise
+        except OSError as e:
+            logger.debug("Failed to read encrypted credential file: %s", e)
+            return None
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Unexpected error reading encrypted file: %s", e)
             return None
 
     def _get_from_config(self, key: str) -> Optional[str]:
@@ -298,29 +349,56 @@ class BaseCredentialResolver(ABC):
         return None
 
     def _get_from_vault(self, key: str) -> Optional[str]:
-        """Get credential from HashiCorp Vault."""
+        """Get credential from HashiCorp Vault.
+
+        C-009: narrowed to the vendor/domain errors we expect — the
+        ``secrets`` module raises ``ConfigurationError`` /
+        ``AuthenticationError`` for misconfig; ``ImportError`` covers
+        the optional ``hvac`` dep; ``OSError`` covers network I/O.
+        Unknown errors log at ``warning`` so operational problems
+        (transient 5xx, DNS) become visible in logs instead of
+        disappearing silently.
+        """
         try:
+            from ..errors import AuthenticationError, ConfigurationError
             from ..secrets import get_secret
+        except ImportError:
+            logger.debug("secrets backend unavailable, skipping Vault")
+            return None
 
-            secret_name = f"{self.provider}/{key}"
+        secret_name = f"{self.provider}/{key}"
+        try:
             return get_secret(secret_name, required=False)
-
-        except Exception as e:
-            logger.debug(f"Failed to read from Vault: {e}")
+        except (ConfigurationError, AuthenticationError, OSError) as e:
+            logger.debug("Failed to read from Vault: %s", e)
+            return None
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Unexpected error reading from Vault: %s", e)
             return None
 
     def _get_from_secret_manager(self, key: str) -> Optional[str]:
-        """Get credential from cloud secret manager (GCP/AWS/Azure)."""
-        try:
-            from ..secrets import get_secret_manager
+        """Get credential from cloud secret manager (GCP/AWS/Azure).
 
+        C-009: same narrowing rationale as ``_get_from_vault``.
+        """
+        try:
+            from ..errors import AuthenticationError, ConfigurationError
+            from ..secrets import get_secret_manager
+        except ImportError:
+            logger.debug("secrets backend unavailable, skipping secret manager")
+            return None
+
+        secret_name = f"{self.provider}/{key}"
+        try:
             manager = get_secret_manager()
             if manager is None:
                 return None
-            secret_name = f"{self.provider}/{key}"
             return manager.get_secret(secret_name, required=False)
-        except Exception as e:
-            logger.debug(f"Failed to read from secret manager: {e}")
+        except (ConfigurationError, AuthenticationError, OSError) as e:
+            logger.debug("Failed to read from secret manager: %s", e)
+            return None
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Unexpected error reading from secret manager: %s", e)
             return None
 
     def _get_from_prompt(self, key: str) -> Optional[str]:
@@ -348,30 +426,84 @@ class BaseCredentialResolver(ABC):
 
             return value
 
-        except Exception as e:
-            logger.debug(f"Failed to prompt for credential: {e}")
+        except (KeyboardInterrupt, EOFError) as e:
+            # C-009: user aborted the prompt — treat as "no credential"
+            # without surfacing a confusing traceback.
+            logger.debug("Credential prompt cancelled: %s", type(e).__name__)
+            return None
+        except OSError as e:
+            # No TTY / closed stdin.
+            logger.debug("Failed to prompt for credential: %s", e)
             return None
 
     def _confirm_save(self, key: str) -> bool:
-        """Ask user if they want to save credential to keyring."""
+        """Ask user if they want to save credential to keyring.
+
+        C-009: only silence ``KeyboardInterrupt`` / ``EOFError`` /
+        ``OSError`` — the expected set when there's no TTY or the user
+        hits ctrl-c. Any other exception should propagate.
+        """
         try:
             response = input(
                 f"Save {self.provider} {key} to secure keyring for future use? (y/n): "
             )
             return response.lower() in ("y", "yes")
-        except Exception:
+        except (KeyboardInterrupt, EOFError, OSError):
             return False
 
     def _save_to_keyring(self, key: str, value: str):
-        """Save credential to OS keyring."""
+        """Save credential to OS keyring.
+
+        C-007: the resolver must not import from ``fluid_build.cli.*``
+        (that's a layering inversion — ``credentials`` is upstream of
+        ``cli``). Surface the "saved" notification via an optional
+        callback on ``CredentialConfig.on_keyring_save``; otherwise log
+        at ``info`` level.
+
+        C-009: narrowed to ``ImportError`` (optional dep) and
+        ``KeyringError`` (the common runtime failure). Unknown errors
+        log at ``warning`` to remain visible.
+        """
         try:
             from .keyring_store import KeyringCredentialStore
+        except ImportError as e:
+            logger.warning("Cannot save to keyring — library unavailable: %s", e)
+            return
 
-            keyring_key = f"{self.provider}.{key}"
+        try:
+            from keyring.errors import KeyringError
+        except ImportError:
+            KeyringError = Exception  # type: ignore[assignment,misc]
+
+        keyring_key = f"{self.provider}.{key}"
+        try:
             KeyringCredentialStore.set_credential(keyring_key, value)
-            success(f"Saved {self.provider} {key} to secure keyring")
-        except Exception as e:
-            logger.warning(f"Failed to save to keyring: {e}")
+        except KeyringError as e:
+            logger.warning("Failed to save to keyring: %s", e)
+            return
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Unexpected error saving to keyring: %s", e)
+            return
+
+        callback = self.config.on_keyring_save
+        if callback is not None:
+            # User-facing notification — includes the credential key name
+            # so operators can confirm which slot was written.
+            message = f"Saved {self.provider} {key} to secure keyring"
+            try:
+                callback(message)
+            except Exception as e:  # pragma: no cover - defensive
+                # The callback is user-facing; never let it break the
+                # credential-save path.
+                logger.debug("on_keyring_save callback raised: %s", e)
+        else:
+            # Static operator log — do NOT interpolate the credential
+            # ``key`` name here. CodeQL's ``py/clear-text-logging-sensitive-data``
+            # rule flags any f-string in this file that references ``key``
+            # because it conflates the credential *name* (e.g. the literal
+            # "password") with the credential *value*. The value is never
+            # logged; the provider label alone is enough for observability.
+            logger.debug("Credential stored in keyring (provider=%s)", self.provider)
 
     @abstractmethod
     def _get_provider_default(self, key: str, **kwargs) -> Optional[str]:
