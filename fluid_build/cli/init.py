@@ -272,9 +272,9 @@ def run(args, logger: logging.Logger) -> int:
             target = getattr(args, "target_dir", None)
             target_path = Path(target).resolve() if target else None
             path = scaffold_user_agent(agent_name, target_dir=target_path)
-            print(f"Created {path}")
-            print("Edit the file to customize questions, rules, and suggestions.")
-            print(f"Then run: fluid forge --domain {agent_name}")
+            success(f"Created {path}")
+            cprint("Edit the file to customize questions, rules, and suggestions.")
+            cprint(f"Then run: fluid forge --domain {agent_name}")
 
         # If --dir is specified, switch to that directory first.
         target_dir = getattr(args, "target_dir", None)
