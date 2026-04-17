@@ -51,15 +51,19 @@ def _run(coro):
 
 
 class TestCLIErrorExt2:
+    # CODE_REVIEW C-008: ``cli/auth.py`` imports the canonical
+    # ``CLIError`` from ``fluid_build.cli._common``; ``.code`` → ``.exit_code``,
+    # ``.details`` → ``.context``. ``.message`` kept as compat alias.
+
     def test_basic(self):
         err = CLIError(1, "test_error")
-        assert err.code == 1
+        assert err.exit_code == 1
         assert err.message == "test_error"
-        assert err.details == {}
+        assert err.context == {}
 
-    def test_with_details(self):
+    def test_with_context(self):
         err = CLIError(2, "err", {"key": "val"})
-        assert err.details["key"] == "val"
+        assert err.context["key"] == "val"
 
     def test_str(self):
         err = CLIError(1, "my message")

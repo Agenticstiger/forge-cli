@@ -82,8 +82,16 @@ class CircuitBreakerMetrics:
         }
 
 
-class CircuitBreakerOpenError(Exception):
-    """Raised when circuit breaker is open."""
+from fluid_build.resilience import CircuitBreakerOpenError as _BaseCircuitBreakerOpenError
+
+
+class CircuitBreakerOpenError(_BaseCircuitBreakerOpenError):
+    """Raised when circuit breaker is open.
+
+    Inherits from :class:`fluid_build.resilience.CircuitBreakerOpenError`
+    so callers that only care about circuit-open conditions (regardless
+    of provider) can use a single ``except`` clause. See CODE_REVIEW C-008.
+    """
 
     def __init__(self, message: str, retry_after_seconds: float):
         super().__init__(message)

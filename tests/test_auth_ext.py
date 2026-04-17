@@ -131,21 +131,27 @@ class TestAuthResult:
 
 
 class TestCLIError:
-    def test_code_attribute(self):
+    # CODE_REVIEW C-008: ``cli/auth.py`` now imports ``CLIError`` from
+    # ``fluid_build.cli._common``. Attribute names changed from
+    # ``.code``/``.details`` → ``.exit_code``/``.context`` (with
+    # ``.message`` kept as a compat alias for ``.event``).
+
+    def test_exit_code_attribute(self):
         err = CLIError(1, "something_failed")
-        assert err.code == 1
+        assert err.exit_code == 1
 
     def test_message_attribute(self):
         err = CLIError(2, "auth_failed")
         assert err.message == "auth_failed"
+        assert err.event == "auth_failed"
 
-    def test_details_default_empty(self):
+    def test_context_default_empty(self):
         err = CLIError(1, "msg")
-        assert err.details == {}
+        assert err.context == {}
 
-    def test_details_populated(self):
+    def test_context_populated(self):
         err = CLIError(1, "msg", {"key": "value"})
-        assert err.details["key"] == "value"
+        assert err.context["key"] == "value"
 
     def test_is_exception(self):
         with pytest.raises(CLIError):
@@ -171,7 +177,7 @@ class TestAuthProviderRunCommand:
         with patch("subprocess.run", side_effect=FileNotFoundError("not found")):
             with pytest.raises(CLIError) as exc_info:
                 self._provider()._run_command(["nonexistent_cmd"])
-        assert exc_info.value.code == 1
+        assert exc_info.value.exit_code == 1
 
     def test_called_process_error_reraises(self):
         cpe = subprocess.CalledProcessError(1, ["gcloud"])

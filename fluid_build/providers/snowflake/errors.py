@@ -68,15 +68,28 @@ class CompilationError(SnowflakeProviderError):
         super().__init__(message, SnowflakeErrorCategory.NON_RETRYABLE, snowflake_errno)
 
 
-class NetworkError(SnowflakeProviderError):
-    """Network error - retryable."""
+class SnowflakeNetworkError(SnowflakeProviderError):
+    """Network error - retryable.
+
+    Distinct from :class:`fluid_build.errors.NetworkError`: that one is a
+    ``FluidError`` subclass for top-level CLI/network layer errors. This
+    one is a ``SnowflakeProviderError`` that also carries a Snowflake
+    error number for retry categorization. CODE_REVIEW C-008 flagged
+    the ``NetworkError`` name collision.
+    """
 
     def __init__(self, message: str, snowflake_errno: Optional[int] = None):
         super().__init__(message, SnowflakeErrorCategory.RETRYABLE, snowflake_errno)
 
 
-class TimeoutError(SnowflakeProviderError):
-    """Timeout error - retryable."""
+class SnowflakeTimeoutError(SnowflakeProviderError):
+    """Timeout error - retryable.
+
+    Renamed from ``TimeoutError`` to avoid shadowing the Python builtin
+    (CODE_REVIEW C-008). ``except TimeoutError`` inside a module that
+    imported the provider-local class used to silently skip the
+    ``signal.SIGALRM``-raised builtin ``TimeoutError``.
+    """
 
     def __init__(self, message: str, snowflake_errno: Optional[int] = None):
         super().__init__(message, SnowflakeErrorCategory.RETRYABLE, snowflake_errno)

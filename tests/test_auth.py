@@ -60,15 +60,20 @@ def _run_async(coro):
 
 
 class TestCLIError:
+    # CODE_REVIEW C-008: ``cli/auth.py`` no longer defines its own
+    # ``CLIError`` — it imports the canonical one from
+    # ``fluid_build.cli._common``. These tests cover the shared class.
+
     def test_attributes(self):
         err = CLIError(2, "something_went_wrong", {"detail": "x"})
-        assert err.code == 2
-        assert err.message == "something_went_wrong"
-        assert err.details == {"detail": "x"}
+        assert err.exit_code == 2
+        assert err.event == "something_went_wrong"
+        assert err.message == "something_went_wrong"  # compat alias = event
+        assert err.context == {"detail": "x"}
 
-    def test_default_details_is_empty_dict(self):
+    def test_default_context_is_empty_dict(self):
         err = CLIError(1, "oops")
-        assert err.details == {}
+        assert err.context == {}
 
     def test_is_exception(self):
         with pytest.raises(CLIError):
