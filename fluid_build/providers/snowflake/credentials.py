@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from fluid_build.cli.console import success, warning
+from fluid_build.credentials.resolver import CredentialError as _BaseCredentialError
 
 
 @dataclass
@@ -249,13 +250,22 @@ class SnowflakeCredentialAdapter:
                 warning("Could not save credentials - keyring and cryptography not available")
 
 
-class CredentialError(Exception):
-    """Credential resolution or validation error."""
+class SnowflakeCredentialError(_BaseCredentialError):
+    """Snowflake-specific credential resolution or validation error.
+
+    Inherits from the canonical
+    :class:`fluid_build.credentials.resolver.CredentialError` so a
+    single ``except CredentialError`` clause catches both the generic
+    and provider-specific flavor. See CODE_REVIEW C-008 — before this
+    unification, ``CredentialError`` was defined independently here and
+    in ``credentials/resolver.py``, so the two classes were silently
+    different. Kept the richer ``details`` dict that the Snowflake
+    callers rely on.
+    """
 
     def __init__(self, message: str, details: Dict = None, suggestions: list = None):
-        super().__init__(message)
+        super().__init__(message, suggestions=suggestions or [])
         self.details = details or {}
-        self.suggestions = suggestions or []
 
     def __str__(self):
         msg = super().__str__()
@@ -274,6 +284,12 @@ class CredentialError(Exception):
                     msg += "\n"
 
         return msg
+
+
+# Back-compat alias. External code that imports ``CredentialError`` from
+# this module still works, but now resolves to the Snowflake subclass
+# which is ALSO a ``fluid_build.credentials.resolver.CredentialError``.
+CredentialError = SnowflakeCredentialError
 
 
 class _EnvironmentOnlyResolver:

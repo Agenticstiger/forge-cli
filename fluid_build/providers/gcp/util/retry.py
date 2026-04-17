@@ -409,7 +409,15 @@ class CircuitBreaker:
             self.state = "open"
 
 
-class CircuitBreakerOpenError(Exception):
-    """Exception raised when circuit breaker is open."""
+from fluid_build.resilience import CircuitBreakerOpenError as _BaseCircuitBreakerOpenError
+
+
+class CircuitBreakerOpenError(_BaseCircuitBreakerOpenError):
+    """Exception raised when circuit breaker is open.
+
+    Inherits from :class:`fluid_build.resilience.CircuitBreakerOpenError`
+    so catching the shared base also catches this provider-local class.
+    See CODE_REVIEW C-008.
+    """
 
     pass

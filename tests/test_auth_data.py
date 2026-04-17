@@ -53,12 +53,17 @@ class TestAuthResult:
 
 
 class TestAuthCLIError:
+    # CODE_REVIEW C-008: ``cli/auth.py`` re-exports the canonical
+    # ``CLIError`` from ``fluid_build.cli._common``. Attribute names
+    # migrated: ``.code`` → ``.exit_code``, ``.details`` → ``.context``.
+    # ``.message`` kept as a compat alias for ``.event``.
+
     def test_basic(self):
         e = AuthCLIError(1, "command_not_found", {"command": "gcloud"})
-        assert e.code == 1
+        assert e.exit_code == 1
         assert e.message == "command_not_found"
-        assert e.details["command"] == "gcloud"
+        assert e.context["command"] == "gcloud"
 
-    def test_default_details(self):
+    def test_default_context(self):
         e = AuthCLIError(2, "some_error")
-        assert e.details == {}
+        assert e.context == {}

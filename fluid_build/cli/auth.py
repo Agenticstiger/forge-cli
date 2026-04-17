@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from fluid_build.cli._common import CLIError
 from fluid_build.cli.console import cprint
 
 # SECURITY_REVIEW S-011: when logging argv for provider subprocesses, the
@@ -107,16 +108,6 @@ except ImportError:
     RICH_AVAILABLE = False
 
 COMMAND = "auth"
-
-
-class CLIError(Exception):
-    """Custom exception for CLI errors"""
-
-    def __init__(self, code: int, message: str, details: Optional[Dict[str, Any]] = None):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.details = details or {}
 
 
 class AuthStatus(Enum):
