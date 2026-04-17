@@ -485,9 +485,11 @@ class BaseCredentialResolver(ABC):
             logger.warning("Unexpected error saving to keyring: %s", e)
             return
 
-        message = f"Saved {self.provider} {key} to secure keyring"
         callback = self.config.on_keyring_save
         if callback is not None:
+            # User-facing notification — includes the credential key name
+            # so operators can confirm which slot was written.
+            message = f"Saved {self.provider} {key} to secure keyring"
             try:
                 callback(message)
             except Exception as e:  # pragma: no cover - defensive
@@ -495,7 +497,13 @@ class BaseCredentialResolver(ABC):
                 # credential-save path.
                 logger.debug("on_keyring_save callback raised: %s", e)
         else:
-            logger.info(message)
+            # Static operator log — do NOT interpolate the credential
+            # ``key`` name here. CodeQL's ``py/clear-text-logging-sensitive-data``
+            # rule flags any f-string in this file that references ``key``
+            # because it conflates the credential *name* (e.g. the literal
+            # "password") with the credential *value*. The value is never
+            # logged; the provider label alone is enough for observability.
+            logger.debug("Credential stored in keyring (provider=%s)", self.provider)
 
     @abstractmethod
     def _get_provider_default(self, key: str, **kwargs) -> Optional[str]:
