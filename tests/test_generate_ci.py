@@ -41,6 +41,52 @@ def _make_args(system: str = "jenkins", out: Optional[str] = None) -> argparse.N
     return argparse.Namespace(system=system, out=out, contract="contract.fluid.yaml")
 
 
+# ``generate_ci.run`` now delegates to
+# :class:`PipelineTemplateGenerator`, which emits canonical file paths
+# and a richer stage set than the legacy ``scaffold_ci`` constants.
+# The static constants (``GITHUB`` / ``GITLAB`` / ``JENKINS``) remain
+# the output shape for the legacy ``fluid scaffold-ci`` command and
+# are still covered by their own test classes below.
+_GENERATE_CI_EXPECTATIONS = (
+    (
+        "github",
+        ".github/workflows/fluid-standard.yml",
+        ("name:", "jobs:", "validate:", "runs-on:"),
+    ),
+    (
+        "gitlab",
+        ".gitlab-ci.yml",
+        ("stages:", "validate:", "image:", "fluid validate"),
+    ),
+    (
+        "jenkins",
+        "Jenkinsfile",
+        ("pipeline {", "stage('Validate')", "stage('Plan')", "fluid"),
+    ),
+    (
+        "azure",
+        "azure-pipelines.yml",
+        ("stages:", "jobs:", "fluid"),
+    ),
+    (
+        "bitbucket",
+        "bitbucket-pipelines.yml",
+        ("pipelines:", "step:", "fluid"),
+    ),
+    (
+        "circleci",
+        ".circleci/config.yml",
+        ("version:", "jobs:", "workflows:", "fluid"),
+    ),
+    (
+        "tekton",
+        "tekton/pipeline.yaml",
+        ("apiVersion:", "kind: Pipeline", "fluid"),
+    ),
+)
+
+
+# Back-compat alias for the scaffold-ci legacy-constant tests below.
 _STATIC_SYSTEM_CASES = (
     ("github", ".github/workflows/fluid.yml", GITHUB, ("name: FLUID", "runs-on: ubuntu-latest")),
     ("gitlab", ".gitlab-ci.yml", GITLAB, ("stages:", "validate:")),
@@ -138,11 +184,17 @@ class TestGenerateCIJenkins:
         generate_ci_run(_make_args(out=custom), _logger)
         assert Path(custom).exists()
 
-    def test_content_matches_template(self, tmp_path, monkeypatch):
+    def test_content_has_expected_structure(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         generate_ci_run(_make_args(), _logger)
         written = (tmp_path / "Jenkinsfile").read_text()
-        assert written == JENKINS
+        # Post-consolidation, ``generate_ci`` emits the rich
+        # ``PipelineTemplateGenerator`` output instead of the legacy
+        # ``JENKINS`` constant. Assert structural markers rather than
+        # byte equality so prose tweaks don't break the suite.
+        assert "pipeline {" in written
+        assert "stage('Validate')" in written
+        assert "fluid" in written
 
     def test_returns_zero_on_success(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -163,36 +215,50 @@ class TestGenerateCIStaticSystems:
             assert token in template
 
     @pytest.mark.parametrize(
-        ("system", "default_path", "template", "_tokens"),
-        _STATIC_SYSTEM_CASES,
+        ("system", "default_path", "tokens"),
+        _GENERATE_CI_EXPECTATIONS,
     )
     def test_generate_ci_writes_default_output(
-        self, tmp_path, monkeypatch, system, default_path, template, _tokens
+        self, tmp_path, monkeypatch, system, default_path, tokens
     ):
         monkeypatch.chdir(tmp_path)
         rc = generate_ci_run(_make_args(system=system), _logger)
         assert rc == 0
         written = tmp_path / default_path
-        assert written.exists()
-        assert written.read_text() == template
+        assert written.exists(), f"missing {default_path} for system={system}"
+        content = written.read_text()
+        for token in tokens:
+            assert (
+                token in content
+            ), f"expected token {token!r} missing from generated {default_path}"
 
     @pytest.mark.parametrize(
-        ("system", "_default_path", "template", "tokens"),
-        _STATIC_SYSTEM_CASES,
+        ("system", "_default_path", "tokens"),
+        [
+            case
+            for case in _GENERATE_CI_EXPECTATIONS
+            # Skip multi-file systems (tekton); --out is a no-op for them.
+            if case[0] != "tekton"
+        ],
     )
     def test_generate_ci_supports_custom_output(
-        self, tmp_path, monkeypatch, system, _default_path, template, tokens
+        self, tmp_path, monkeypatch, system, _default_path, tokens
     ):
         monkeypatch.chdir(tmp_path)
-        suffix = "Jenkinsfile" if system == "jenkins" else f"{system}.yml"
+        suffix = (
+            "Jenkinsfile"
+            if system == "jenkins"
+            else f"{system}.yml" if system != "circleci" else "circleci-config.yml"
+        )
         custom = tmp_path / "generated" / suffix
         rc = generate_ci_run(_make_args(system=system, out=str(custom)), _logger)
         assert rc == 0
         assert custom.exists()
         content = custom.read_text()
-        assert content == template
         for token in tokens:
-            assert token in content
+            assert (
+                token in content
+            ), f"expected token {token!r} missing from custom output for {system}"
 
 
 # ---------------------------------------------------------------------------
