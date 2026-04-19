@@ -17,10 +17,14 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 from pathlib import Path
 from unittest.mock import patch
 
-from fluid_build.cli.verify import run, verify_snowflake_table
+import pytest
+
+from fluid_build.cli.verify import _hydrate_dotenv_into_environ, run, verify_snowflake_table
 
 
 class _MockConnection:
@@ -288,3 +292,42 @@ def test_verify_rejects_injection_in_table_identifier():
 
     assert result["status"] == "error"
     assert _TrackingConnection.statements == []
+
+
+@pytest.fixture()
+def _clean_snowflake_env(monkeypatch):
+    for key in (
+        "SNOWFLAKE_DATABASE",
+        "SNOWFLAKE_FLUID_SCHEMA",
+        "SNOWFLAKE_WAREHOUSE",
+        "SNOWFLAKE_ACCOUNT",
+        "SNOWFLAKE_USER",
+        "SNOWFLAKE_PASSWORD",
+        "SNOWFLAKE_ROLE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    yield
+
+
+def test_verify_hydrates_dotenv_into_environ(tmp_path: Path, _clean_snowflake_env) -> None:
+    # Without the hydration step, `os.environ["SNOWFLAKE_DATABASE"]` stays
+    # unset and `_resolve_env_templates("{{ env.SNOWFLAKE_DATABASE }}")`
+    # returns the template string, which the Snowflake identifier
+    # allowlist rejects. The fix loads .env files at the top of `run`.
+    env_file = tmp_path / ".env"
+    env_file.write_text("SNOWFLAKE_DATABASE=UNIT_TEST_DB\n")
+
+    _hydrate_dotenv_into_environ(tmp_path, environment=None)
+
+    assert os.environ.get("SNOWFLAKE_DATABASE") == "UNIT_TEST_DB"
+
+
+def test_verify_hydration_is_noop_when_no_dotenv_present(
+    tmp_path: Path, _clean_snowflake_env, caplog
+) -> None:
+    # No .env file on disk -> no exception, no log warnings, env untouched.
+    with caplog.at_level(logging.WARNING, logger="fluid.cli.verify"):
+        _hydrate_dotenv_into_environ(tmp_path, environment=None)
+
+    assert os.environ.get("SNOWFLAKE_DATABASE") is None
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

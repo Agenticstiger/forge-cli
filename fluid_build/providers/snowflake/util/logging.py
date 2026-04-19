@@ -141,8 +141,9 @@ def redact_string(text: str) -> str:
     redacted = text
 
     for pattern in SENSITIVE_PATTERNS:
-        # For connection string pattern (has groups), use substitution with groups
-        if pattern.groups > 0:
+        # Only the 2-group shape (prefix + suffix) can use \1[REDACTED]\2;
+        # 1-group patterns would trigger `invalid group reference 2` on sub.
+        if pattern.groups >= 2:
             redacted = pattern.sub(r"\1[REDACTED]\2", redacted)
         else:
             redacted = pattern.sub("[REDACTED]", redacted)
