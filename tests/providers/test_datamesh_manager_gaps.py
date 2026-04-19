@@ -21,6 +21,7 @@ Gap 3: Fixed _resolve_location + _extract_provider for 0.7.1 bindings
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -535,6 +536,70 @@ class TestPublishTestResults:
 
 
 # ===================================================================
+# Team payload compatibility for local Entropy / DMM
+# ===================================================================
+
+
+class TestEnsureTeamPayload:
+    """Team auto-creation should send a payload DMM can accept."""
+
+    @patch.object(DataMeshManagerProvider, "_request")
+    @patch.object(DataMeshManagerProvider, "_session")
+    def test_ensure_team_includes_required_type_and_owner_details(self, mock_session, mock_request):
+        mock_session.return_value.get.return_value = MagicMock(status_code=404)
+        mock_request.return_value = MagicMock(status_code=200)
+
+        provider = _make_provider()
+        fluid = {
+            "metadata": {
+                "owner": {
+                    "team": "telco-data-platform",
+                    "email": "data-platform@example.com",
+                }
+            }
+        }
+
+        provider._ensure_team(fluid, "telco-data-platform")
+
+        payload = mock_request.call_args.kwargs["json_body"]
+        assert payload["id"] == "telco-data-platform"
+        assert payload["name"] == "telco-data-platform"
+        assert payload["type"] == "Data Product Team"
+        assert payload["contactEmail"] == "data-platform@example.com"
+        assert payload["members"] == [
+            {"emailAddress": "data-platform@example.com", "role": "Owner"}
+        ]
+
+    def test_build_team_payload_preserves_optional_owner_fields(self):
+        fluid = {
+            "owner": {
+                "team": "analytics-team",
+                "name": "Analytics Team",
+                "type": "Governance Group",
+                "description": "Owns governed analytics products.",
+                "email": "analytics@example.com",
+                "members": [{"emailAddress": "owner@example.com", "role": "Owner"}],
+                "tags": ["analytics", "governed"],
+                "links": {"slack": "https://example.slack.com/analytics"},
+                "custom": {"cost-center": "FIN-42"},
+            }
+        }
+
+        payload = DataMeshManagerProvider._build_team_payload(fluid, "analytics-team")
+        assert payload == {
+            "id": "analytics-team",
+            "name": "Analytics Team",
+            "type": "Governance Group",
+            "description": "Owns governed analytics products.",
+            "contactEmail": "analytics@example.com",
+            "members": [{"emailAddress": "owner@example.com", "role": "Owner"}],
+            "tags": ["analytics", "governed"],
+            "links": {"slack": "https://example.slack.com/analytics"},
+            "custom": {"cost-center": "FIN-42"},
+        }
+
+
+# ===================================================================
 # Gap 1 CLI integration: --publish flag on fluid test
 # ===================================================================
 
@@ -567,3 +632,178 @@ class TestFluidTestPublishFlag:
         register(subs)
         args = parser.parse_args(["test", "contract.yaml"])
         assert args.publish is None
+
+
+# ===================================================================
+# Gap 4: ODPS inputPorts sourceSystemId backfill + SourceSystem upsert
+#
+# Entropy DMM validates DataProduct payloads against the DPS v0.0.1
+# shape where every inputPort must carry a customProperties entry with
+# ``property: sourceSystem``. Without it, DMM returns 500 "Custom Property
+# sourceSystem could not be found" (verified by direct probe against the
+# live server). Top-level sourceSystemId is ignored. forge-cli must:
+# (a) backfill that custom property on each input port from the upstream
+# productId; (b) ensure the corresponding SourceSystem entity exists via
+# PUT /api/sourcesystems/{id} before the product PUT (lineage hygiene).
+# ===================================================================
+
+
+def _get_source_system_property(port):
+    for prop in port.get("customProperties") or []:
+        if isinstance(prop, Mapping) and prop.get("property") == "sourceSystem":
+            return prop.get("value")
+    return None
+
+
+class TestEnsureOdpsInputPortSourceSystemCustomProperty:
+    """Backfill ``customProperties[sourceSystem]`` on ODPS input ports."""
+
+    def test_backfills_from_reference(self):
+        # A1-shape contract: consumes references an upstream product, no
+        # explicit sourceSystem override — DMM still requires the custom
+        # property on the input port.
+        fluid = {
+            "consumes": [
+                {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
+            ],
+        }
+        odps_payload = {
+            "inputPorts": [
+                {
+                    "id": "account_source",
+                    "name": "account_source",
+                    "reference": "bronze.telco.party_v1",
+                }
+            ],
+        }
+        DataMeshManagerProvider._ensure_odps_input_port_source_system_custom_property(
+            odps_payload, fluid
+        )
+        assert _get_source_system_property(odps_payload["inputPorts"][0]) == "bronze.telco.party_v1"
+
+    def test_preserves_explicit_source_system_custom_property(self):
+        # Authors who already set the custom property must win over the
+        # productId fallback.
+        fluid = {
+            "consumes": [
+                {
+                    "productId": "bronze.telco.party_v1",
+                    "exposeId": "account_source",
+                    "sourceSystem": "bss-crm",
+                }
+            ],
+        }
+        odps_payload = {
+            "inputPorts": [
+                {
+                    "id": "account_source",
+                    "name": "account_source",
+                    "reference": "bronze.telco.party_v1",
+                    "customProperties": [{"property": "sourceSystem", "value": "bss-crm-override"}],
+                }
+            ],
+        }
+        DataMeshManagerProvider._ensure_odps_input_port_source_system_custom_property(
+            odps_payload, fluid
+        )
+        assert _get_source_system_property(odps_payload["inputPorts"][0]) == "bss-crm-override"
+
+    def test_appends_alongside_other_custom_properties(self):
+        # An inputPort with unrelated custom properties must keep them
+        # and gain the sourceSystem entry.
+        fluid = {
+            "consumes": [
+                {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
+            ],
+        }
+        odps_payload = {
+            "inputPorts": [
+                {
+                    "id": "account_source",
+                    "customProperties": [{"property": "platformRole", "value": "reader_role"}],
+                }
+            ],
+        }
+        DataMeshManagerProvider._ensure_odps_input_port_source_system_custom_property(
+            odps_payload, fluid
+        )
+        props = odps_payload["inputPorts"][0]["customProperties"]
+        assert len(props) == 2
+        assert {"property": "platformRole", "value": "reader_role"} in props
+        assert _get_source_system_property(odps_payload["inputPorts"][0]) == (
+            "bronze.telco.party_v1"
+        )
+
+    def test_noop_when_no_input_ports(self):
+        odps_payload: dict = {"inputPorts": []}
+        DataMeshManagerProvider._ensure_odps_input_port_source_system_custom_property(
+            odps_payload, {}
+        )
+        assert odps_payload["inputPorts"] == []
+
+    def test_skips_ports_without_id_and_reference(self):
+        odps_payload = {"inputPorts": [{"name": "orphan"}]}
+        DataMeshManagerProvider._ensure_odps_input_port_source_system_custom_property(
+            odps_payload, {}
+        )
+        assert _get_source_system_property(odps_payload["inputPorts"][0]) is None
+
+
+class TestEnsureSourceSystems:
+    """_ensure_source_systems upserts a SourceSystem for each referenced productId."""
+
+    def test_puts_one_source_system_per_unique_reference(self):
+        fluid = {
+            "consumes": [
+                {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
+                {"productId": "bronze.telco.party_v1", "exposeId": "service_source"},
+                {"productId": "bronze.telco.usage_v1", "exposeId": "usage_event_source"},
+            ],
+        }
+        provider = _make_provider()
+        session = MagicMock()
+        get_resp = MagicMock(status_code=404)
+        session.get.return_value = get_resp
+        put_resp = MagicMock(status_code=200)
+
+        with (
+            patch.object(provider, "_session", return_value=session),
+            patch.object(provider, "_request", return_value=put_resp) as mock_request,
+        ):
+            provider._ensure_source_systems(fluid, team_id="telco-data-platform")
+
+        put_paths = [c.args[1] for c in mock_request.call_args_list if c.args[0] == "PUT"]
+        assert sorted(put_paths) == [
+            "/api/sourcesystems/bronze.telco.party_v1",
+            "/api/sourcesystems/bronze.telco.usage_v1",
+        ]
+        put_bodies = [
+            c.kwargs["json_body"] for c in mock_request.call_args_list if c.args[0] == "PUT"
+        ]
+        assert all(body["owner"] == "telco-data-platform" for body in put_bodies)
+        assert all("id" in body and "name" in body for body in put_bodies)
+
+    def test_skips_put_when_source_system_exists(self):
+        fluid = {
+            "consumes": [
+                {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
+            ],
+        }
+        provider = _make_provider()
+        session = MagicMock()
+        session.get.return_value = MagicMock(status_code=200)
+
+        with (
+            patch.object(provider, "_session", return_value=session),
+            patch.object(provider, "_request") as mock_request,
+        ):
+            provider._ensure_source_systems(fluid, team_id="telco-data-platform")
+
+        put_calls = [c for c in mock_request.call_args_list if c.args[0] == "PUT"]
+        assert put_calls == []
+
+    def test_noop_when_no_consumes(self):
+        provider = _make_provider()
+        with patch.object(provider, "_request") as mock_request:
+            provider._ensure_source_systems({}, team_id="telco-data-platform")
+        assert mock_request.call_args_list == []

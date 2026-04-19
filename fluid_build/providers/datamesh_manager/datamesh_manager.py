@@ -42,6 +42,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from fluid_build.providers.base import BaseProvider, ProviderError
+from fluid_build.util.contract import consumes_to_canonical_ports
 
 if TYPE_CHECKING:
     import requests as requests_typing
@@ -394,6 +395,8 @@ class DataMeshManagerProvider(BaseProvider):
                 team_obj = {}
             team_obj.setdefault("name", tid)
             dp["team"] = team_obj
+            self._ensure_odps_input_port_contract_ids(dp, fluid)
+            self._ensure_odps_input_port_source_system_custom_property(dp, fluid)
         else:
             dp["teamId"] = tid
 
@@ -424,6 +427,13 @@ class DataMeshManagerProvider(BaseProvider):
         # Ensure team exists
         if create_team:
             self._ensure_team(fluid, tid)
+
+        # Ensure upstream SourceSystem entities exist so inputPorts[].sourceSystemId
+        # resolves on the server side. DMM's DPS schema treats sourceSystemId as a
+        # foreign key — the product PUT fails with a 500 if the referenced
+        # SourceSystem is missing.
+        if is_odps_payload:
+            self._ensure_source_systems(fluid, tid)
 
         # PUT data product
         resp = self._request("PUT", f"/api/dataproducts/{product_id}", json_body=dp)
@@ -832,6 +842,96 @@ class DataMeshManagerProvider(BaseProvider):
             return self.DATA_PRODUCT_SPEC_ODPS
 
         return self.DATA_PRODUCT_SPEC_DPS
+
+    @staticmethod
+    def _ensure_odps_input_port_contract_ids(
+        odps_payload: Dict[str, Any], fluid: Mapping[str, Any]
+    ) -> None:
+        """Backfill ODPS input-port contract IDs from FLUID consumes when missing.
+
+        Entropy's ODPS product API requires ``inputPorts[].contractId``. The
+        upstream ODPS renderer intentionally keeps contract IDs explicit-only,
+        so the DMM provider overlays deterministic references here using the
+        canonical consume reference ``{productId}.{exposeId}``.
+        """
+        input_ports = odps_payload.get("inputPorts")
+        if not isinstance(input_ports, list) or not input_ports:
+            return
+
+        canonical_ports = consumes_to_canonical_ports(fluid, logger=LOG)
+        contract_ids_by_id: Dict[str, str] = {}
+        for canonical in canonical_ports:
+            port_id = canonical.get("id")
+            if not port_id:
+                continue
+
+            contract_id = canonical.get("contract_id")
+            if not contract_id:
+                reference = canonical.get("reference")
+                if reference:
+                    contract_id = f"{reference}.{port_id}"
+
+            if contract_id:
+                contract_ids_by_id[str(port_id)] = str(contract_id)
+
+        for port in input_ports:
+            if not isinstance(port, dict) or port.get("contractId"):
+                continue
+
+            port_id = port.get("id") or port.get("name")
+            if not port_id:
+                continue
+
+            contract_id = contract_ids_by_id.get(str(port_id))
+            if contract_id:
+                port["contractId"] = contract_id
+
+    @staticmethod
+    def _ensure_odps_input_port_source_system_custom_property(
+        odps_payload: Dict[str, Any], fluid: Mapping[str, Any]
+    ) -> None:
+        """Backfill ODPS input-port ``customProperties[sourceSystem]``.
+
+        DMM resolves upstream lineage via a ``sourceSystem`` custom property
+        on each input port (verified by probing the live server: a port
+        missing this key returns ``500 "Custom Property sourceSystem could
+        not be found"``, and a top-level ``sourceSystemId`` is ignored).
+        Fill it from the FLUID ``consumes`` reference — the upstream
+        ``productId`` is the canonical identifier.
+        """
+        input_ports = odps_payload.get("inputPorts")
+        if not isinstance(input_ports, list) or not input_ports:
+            return
+
+        canonical_ports = consumes_to_canonical_ports(fluid, logger=LOG)
+        source_system_by_port: Dict[str, str] = {}
+        for canonical in canonical_ports:
+            port_id = canonical.get("id")
+            if not port_id:
+                continue
+            sys_id = canonical.get("source_system_id") or canonical.get("reference")
+            if sys_id:
+                source_system_by_port[str(port_id)] = str(sys_id)
+
+        for port in input_ports:
+            if not isinstance(port, dict):
+                continue
+
+            props = port.get("customProperties")
+            if not isinstance(props, list):
+                props = []
+            if any(isinstance(p, Mapping) and p.get("property") == "sourceSystem" for p in props):
+                continue
+
+            port_id = port.get("id") or port.get("name")
+            fallback = source_system_by_port.get(str(port_id)) if port_id else None
+            if not fallback:
+                fallback = port.get("reference")
+            if not fallback:
+                continue
+
+            props.append({"property": "sourceSystem", "value": str(fallback)})
+            port["customProperties"] = props
 
     # ---- port mapping -----------------------------------------------------
 
@@ -1606,6 +1706,47 @@ class DataMeshManagerProvider(BaseProvider):
 
     # ---- team management --------------------------------------------------
 
+    @staticmethod
+    def _build_team_payload(fluid: Mapping[str, Any], team_id: str) -> Dict[str, Any]:
+        """Build a Data Mesh Manager team payload from FLUID owner metadata."""
+        owner = fluid.get("owner", fluid.get("metadata", {}).get("owner", {}))
+        if not isinstance(owner, Mapping):
+            owner = {}
+
+        team: Dict[str, Any] = {
+            "id": team_id,
+            "name": owner.get("name") or owner.get("team") or team_id,
+            "type": owner.get("type") or owner.get("teamType") or "Data Product Team",
+        }
+
+        description = owner.get("description")
+        if description:
+            team["description"] = description
+
+        contact_email = owner.get("email")
+        if contact_email:
+            team["contactEmail"] = contact_email
+
+        members = owner.get("members")
+        if isinstance(members, list) and members:
+            team["members"] = members
+        elif contact_email:
+            team["members"] = [{"emailAddress": contact_email, "role": "Owner"}]
+
+        tags = owner.get("tags")
+        if isinstance(tags, list) and tags:
+            team["tags"] = tags
+
+        links = owner.get("links")
+        if isinstance(links, Mapping) and links:
+            team["links"] = dict(links)
+
+        custom = owner.get("custom")
+        if isinstance(custom, Mapping) and custom:
+            team["custom"] = dict(custom)
+
+        return team
+
     def _ensure_team(self, fluid: Mapping[str, Any], team_id: str) -> None:
         """Create team via ``PUT /api/teams/{id}`` if it doesn't exist."""
         try:
@@ -1620,19 +1761,50 @@ class DataMeshManagerProvider(BaseProvider):
         except Exception:
             pass  # proceed to create
 
-        owner = fluid.get("owner", fluid.get("metadata", {}).get("owner", {}))
-        team: Dict[str, Any] = {
-            "id": team_id,
-            "name": owner.get("name") or owner.get("team") or team_id,
-        }
-        if owner.get("email"):
-            team["contactEmail"] = owner["email"]
+        team = self._build_team_payload(fluid, team_id)
 
         try:
             resp = self._request("PUT", f"/api/teams/{team_id}", json_body=team)
             self._log.info("Created/updated team %s (%s)", team_id, resp.status_code)
         except ProviderError as exc:
             self._log.warning("Could not create team %s: %s", team_id, exc)
+
+    def _ensure_source_systems(self, fluid: Mapping[str, Any], team_id: str) -> None:
+        """Upsert a SourceSystem per unique upstream reference in ``consumes``.
+
+        DMM's DPS schema requires each ``inputPort.sourceSystemId`` to resolve
+        to an existing SourceSystem entity. We treat the upstream ``productId``
+        as the natural SourceSystem id — one upsert per distinct reference.
+        Idempotent: GET first, PUT only when missing.
+        """
+        canonical_ports = consumes_to_canonical_ports(fluid, logger=LOG)
+        seen: set = set()
+        for canonical in canonical_ports:
+            sys_id = canonical.get("source_system_id") or canonical.get("reference")
+            if not sys_id or sys_id in seen:
+                continue
+            seen.add(sys_id)
+
+            try:
+                resp = self._session().get(
+                    f"{self.api_url}/api/sourcesystems/{sys_id}",
+                    headers=self._headers(),
+                    timeout=_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    self._log.debug("SourceSystem already exists: %s", sys_id)
+                    continue
+            except Exception:
+                pass  # proceed to create
+
+            body = {"id": str(sys_id), "name": str(sys_id), "owner": team_id}
+            try:
+                put_resp = self._request("PUT", f"/api/sourcesystems/{sys_id}", json_body=body)
+                self._log.info(
+                    "Created/updated source system %s (%s)", sys_id, put_resp.status_code
+                )
+            except ProviderError as exc:
+                self._log.warning("Could not create source system %s: %s", sys_id, exc)
 
     # ---- id helpers -------------------------------------------------------
 

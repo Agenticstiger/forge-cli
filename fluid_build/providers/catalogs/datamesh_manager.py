@@ -25,6 +25,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+import yaml
+
 from .base import BaseCatalogProvider, CatalogAsset, PublishResult
 
 LOG = logging.getLogger(__name__)
@@ -42,6 +44,16 @@ class DataMeshManagerCatalogProvider(BaseCatalogProvider):
 
         api_key = config.get("api_key") or config.get("auth", {}).get("api_key", "")
         api_url = config.get("endpoint") or config.get("url", "")
+        # Default to ODPS-Bitol: the Entropy / Data Mesh Manager server treats
+        # DPS as legacy and returns a 500 (wrapped by urllib3 retry-exhaust
+        # into "too many 500 error responses") for DPS payloads on organizations
+        # configured as ODPS-only. Explicit config still wins.
+        self._data_product_specification = (
+            config.get("data_product_specification")
+            or config.get("dataProductSpecification")
+            or "odps"
+        )
+        self._provider_hint = config.get("provider_hint") or "odps"
         self._provider = DataMeshManagerProvider(
             api_key=api_key or None,
             api_url=api_url or None,
@@ -53,7 +65,29 @@ class DataMeshManagerCatalogProvider(BaseCatalogProvider):
         """Publish *asset* as a data product to Entropy Data."""
         fluid = self._asset_to_fluid(asset)
         try:
-            result = self._provider.apply(fluid, publish_contract=True)
+            result = self._provider.apply(
+                fluid,
+                publish_contract=True,
+                data_product_specification=self._data_product_specification,
+                provider_hint=self._provider_hint,
+            )
+        except Exception as exc:
+            if self._should_retry_with_odps(exc):
+                result = self._provider.apply(
+                    fluid,
+                    publish_contract=True,
+                    data_product_specification="odps",
+                    provider_hint="odps",
+                )
+            else:
+                return PublishResult(
+                    success=False,
+                    catalog_id=self.name,
+                    asset_id=asset.id,
+                    error=str(exc),
+                )
+
+        try:
             return PublishResult(
                 success=True,
                 catalog_id=self.name,
@@ -98,6 +132,16 @@ class DataMeshManagerCatalogProvider(BaseCatalogProvider):
     @staticmethod
     def _asset_to_fluid(asset: CatalogAsset) -> Dict[str, Any]:
         """Convert a CatalogAsset back to a minimal FLUID dict."""
+        if asset.contract_yaml:
+            try:
+                parsed = yaml.safe_load(asset.contract_yaml)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                LOG.debug(
+                    "Falling back to minimal FLUID mapping for asset %s", asset.id, exc_info=True
+                )
+
         fluid: Dict[str, Any] = {
             "id": asset.id,
             "name": asset.name,
@@ -132,3 +176,15 @@ class DataMeshManagerCatalogProvider(BaseCatalogProvider):
             fluid["exposes"] = [expose]
 
         return fluid
+
+    def _should_retry_with_odps(self, exc: Exception) -> bool:
+        """Retry with ODPS only when the server explicitly rejects DPS."""
+        if self._data_product_specification or self._provider_hint:
+            return False
+
+        message = str(exc).lower()
+        return (
+            "supported types: odps" in message
+            or "type 'dps' is not supported" in message
+            or 'type "dps" is not supported' in message
+        )

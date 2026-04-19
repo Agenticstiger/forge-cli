@@ -760,10 +760,19 @@ class TestCmdPublishEndToEnd:
         assert actual_refs == expected_refs
         assert actual_ids == expected_ids
 
-        # 0.7.2 ``consumeRef`` doesn't carry ``contractId`` / ``required``,
-        # so the renderer must not fabricate them.
-        for port in payload["inputPorts"]:
-            assert "contractId" not in port
+        # The DMM provider overlays ``contractId`` on the port and a
+        # ``customProperties[{property: sourceSystem}]`` entry because
+        # Entropy's server rejects inputPorts without both. The renderer's
+        # own no-fabricate invariant is tested separately in
+        # ``test_odps_standard``.
+        for port, consume in zip(payload["inputPorts"], fixture_contract["consumes"]):
+            assert port["contractId"] == f"{consume['productId']}.{consume['exposeId']}"
+            props = port.get("customProperties") or []
+            source_system = next(
+                (p.get("value") for p in props if p.get("property") == "sourceSystem"),
+                None,
+            )
+            assert source_system == consume["productId"]
             assert "required" not in port
 
 
