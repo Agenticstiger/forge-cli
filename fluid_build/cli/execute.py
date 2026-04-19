@@ -41,6 +41,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import yaml
+
 from fluid_build.cli.console import cprint, success
 from fluid_build.cli.console import error as console_error
 
@@ -49,7 +51,6 @@ from ._common import CLIError, load_contract_with_overlay
 LOG = logging.getLogger("fluid.cli.execute")
 
 COMMAND = "execute"
-DBT_ENGINES = {"dbt", "dbt-bigquery", "dbt-duckdb"}
 ENV_PLACEHOLDER_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
 
@@ -135,9 +136,15 @@ def resolve_script_path(contract_path: Path, build: Dict[str, Any]) -> Optional[
 
 
 def is_dbt_build(build: Dict[str, Any]) -> bool:
-    """Return True when a build should execute as a dbt project."""
+    """Return True when a build should execute as a dbt project.
+
+    Accepts ``dbt`` plus any ``dbt-<adapter>`` variant (``dbt-bigquery``,
+    ``dbt-snowflake``, ``dbt-redshift``, ``dbt-postgres``, ``dbt-duckdb``, …).
+    The adapter is selected by dbt itself from ``profiles.yml``; the engine
+    name just routes the build into the dbt execute path here.
+    """
     engine = (build.get("engine") or "").strip().lower()
-    return engine in DBT_ENGINES
+    return engine == "dbt" or engine.startswith("dbt-")
 
 
 def resolve_dbt_project_path(contract_path: Path, build: Dict[str, Any]) -> Optional[Path]:
@@ -161,8 +168,6 @@ def _resolve_env_placeholders(value: Any) -> Any:
 
 
 def _load_dbt_project_config(project_dir: Path) -> Dict[str, Any]:
-    import yaml
-
     with (project_dir / "dbt_project.yml").open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
     return data if isinstance(data, dict) else {}
@@ -170,7 +175,7 @@ def _load_dbt_project_config(project_dir: Path) -> Dict[str, Any]:
 
 def _resolve_dbt_executable() -> Optional[str]:
     configured = os.getenv("DBT_EXECUTABLE", "dbt")
-    if os.path.sep in configured or configured.startswith("."):
+    if os.path.sep in configured or configured.startswith((".", "~")):
         candidate = Path(configured).expanduser()
         if candidate.exists():
             return str(candidate)
@@ -189,7 +194,12 @@ def _normalize_selectors(raw: Any) -> list[str]:
 
 
 def _resolve_dbt_profile_name(props: Dict[str, Any], project_config: Dict[str, Any]) -> str:
-    return str(props.get("profile") or os.getenv("DBT_PROFILE") or project_config.get("profile") or "default")
+    return str(
+        props.get("profile")
+        or os.getenv("DBT_PROFILE")
+        or project_config.get("profile")
+        or "default"
+    )
 
 
 def _resolve_dbt_target_name(props: Dict[str, Any]) -> str:
@@ -285,12 +295,15 @@ def _create_temp_dbt_profiles_dir(
     if not generated_profile:
         return None, None
 
-    import yaml
-
     temp_dir = tempfile.TemporaryDirectory(prefix="fluid-dbt-profiles-")
     profiles_path = Path(temp_dir.name) / "profiles.yml"
     profiles_path.write_text(
-        yaml.safe_dump(generated_profile, default_flow_style=False, sort_keys=False, allow_unicode=True),
+        yaml.safe_dump(
+            generated_profile,
+            default_flow_style=False,
+            sort_keys=False,
+            allow_unicode=True,
+        ),
         encoding="utf-8",
     )
     return Path(temp_dir.name), temp_dir
@@ -355,6 +368,25 @@ def build_dbt_command(
         cmd += ["--vars", json.dumps(_resolve_env_placeholders(dbt_vars))]
 
     return cmd
+
+
+def _render_command_for_log(command: list[str]) -> str:
+    """Render a dbt CLI command for display, redacting the ``--vars`` payload.
+
+    ``--vars`` may contain resolved env values (see ``_resolve_env_placeholders``),
+    and ``cprint`` does not route through the logging redactor — so redact here.
+    """
+    parts: list[str] = []
+    redact_next = False
+    for part in command:
+        if redact_next:
+            parts.append("<redacted>")
+            redact_next = False
+        else:
+            parts.append(part)
+            if part == "--vars":
+                redact_next = True
+    return " ".join(parts)
 
 
 def execute_build(
@@ -511,14 +543,14 @@ def execute_dbt_build(
             profiles_dir=profiles_dir,
             project_config=project_config,
         )
-    except Exception as exc:
+    except (RuntimeError, OSError, yaml.YAMLError) as exc:
         if temp_profiles_dir:
             temp_profiles_dir.cleanup()
         console_error(f"Unable to prepare dbt build '{build_id}': {exc}")
         cprint(f"{'=' * 80}")
         return 1
 
-    cprint(f"   Command: {' '.join(command)}")
+    cprint(f"   Command: {_render_command_for_log(command)}")
 
     if trigger_type == "manual" or (trigger_type == "schedule" and force_run):
         iterations = 1 if trigger_type == "schedule" and force_run else trigger.get("iterations", 1)
@@ -574,7 +606,7 @@ def execute_dbt_build(
                             cprint("\n⚠️  Stopping execution (--fail-fast enabled)")
                             return 1
 
-                except Exception as exc:
+                except (OSError, subprocess.SubprocessError) as exc:
                     failed_runs += 1
                     console_error(f"Run {i+1} failed with exception: {exc}")
                     if fail_fast:

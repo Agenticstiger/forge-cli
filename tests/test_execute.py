@@ -24,9 +24,11 @@ import pytest
 
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.execute import (
+    _resolve_env_placeholders,
     build_dbt_command,
     execute_build,
     execute_dbt_build,
+    is_dbt_build,
     resolve_dbt_project_path,
     resolve_script_path,
     run,
@@ -126,6 +128,61 @@ class TestResolveDbtProjectPath:
         assert result is None
 
 
+class TestIsDbtBuild:
+    def test_plain_dbt_engine_is_dbt(self):
+        assert is_dbt_build({"engine": "dbt"}) is True
+
+    def test_known_adapter_variants_are_dbt(self):
+        for engine in ("dbt-bigquery", "dbt-duckdb"):
+            assert is_dbt_build({"engine": engine}) is True
+
+    def test_other_warehouse_adapters_are_dbt(self):
+        # Warehouse-agnostic: any dbt-<adapter> should route to the dbt path.
+        for engine in ("dbt-snowflake", "dbt-redshift", "dbt-postgres", "dbt-spark"):
+            assert is_dbt_build({"engine": engine}) is True
+
+    def test_engine_is_case_insensitive_and_trimmed(self):
+        assert is_dbt_build({"engine": "  DBT-Snowflake  "}) is True
+
+    def test_non_dbt_engines_are_not_dbt(self):
+        for engine in ("python", "sql", "spark", "custom", "", None):
+            assert is_dbt_build({"engine": engine}) is False
+
+    def test_missing_engine_is_not_dbt(self):
+        assert is_dbt_build({}) is False
+
+    def test_prefix_only_match_without_dash_is_not_dbt(self):
+        # Guard against "dbtx" false positives.
+        assert is_dbt_build({"engine": "dbtx"}) is False
+
+
+class TestResolveEnvPlaceholders:
+    def test_replaces_placeholder_in_plain_string(self, monkeypatch):
+        monkeypatch.setenv("DB_NAME", "TELCO")
+        assert _resolve_env_placeholders("db={{ env.DB_NAME }}") == "db=TELCO"
+
+    def test_missing_env_resolves_to_empty_string(self, monkeypatch):
+        monkeypatch.delenv("MISSING_VAR", raising=False)
+        assert _resolve_env_placeholders("x={{ env.MISSING_VAR }}") == "x="
+
+    def test_recurses_into_nested_dicts_and_lists(self, monkeypatch):
+        monkeypatch.setenv("A", "alpha")
+        monkeypatch.setenv("B", "beta")
+        value = {
+            "top": "{{ env.A }}",
+            "nested": [{"inner": "{{ env.B }}"}, "plain"],
+        }
+        assert _resolve_env_placeholders(value) == {
+            "top": "alpha",
+            "nested": [{"inner": "beta"}, "plain"],
+        }
+
+    def test_non_string_scalars_passthrough(self):
+        assert _resolve_env_placeholders(42) == 42
+        assert _resolve_env_placeholders(True) is True
+        assert _resolve_env_placeholders(None) is None
+
+
 class TestBuildDbtCommand:
     def _make_project(self, tmp_path):
         project_dir = tmp_path / "dbt_project"
@@ -133,9 +190,8 @@ class TestBuildDbtCommand:
         (project_dir / "dbt_project.yml").write_text("name: sample\nprofile: telco\n")
         return project_dir
 
-    def test_builds_full_project_command_for_multi_output_build(self, tmp_path, monkeypatch):
+    def test_builds_full_project_command_for_multi_output_build(self, tmp_path):
         project_dir = self._make_project(tmp_path)
-        monkeypatch.setenv("DBT_PROFILES_DIR", "/tmp/dbt-profiles")
 
         build = {
             "id": "b1",
@@ -144,8 +200,10 @@ class TestBuildDbtCommand:
             "properties": {"model": "mart_orders"},
         }
 
-        with patch("fluid_build.cli.execute._resolve_dbt_executable", return_value="/opt/homebrew/bin/dbt"):
-            cmd = build_dbt_command(build, project_dir)
+        with patch(
+            "fluid_build.cli.execute._resolve_dbt_executable", return_value="/opt/homebrew/bin/dbt"
+        ):
+            cmd = build_dbt_command(build, project_dir, profiles_dir=Path("/tmp/dbt-profiles"))
 
         assert cmd[:4] == ["/opt/homebrew/bin/dbt", "build", "--project-dir", str(project_dir)]
         assert "--profiles-dir" in cmd
@@ -163,7 +221,9 @@ class TestBuildDbtCommand:
             "properties": {"model": "mart_orders"},
         }
 
-        with patch("fluid_build.cli.execute._resolve_dbt_executable", return_value="/opt/homebrew/bin/dbt"):
+        with patch(
+            "fluid_build.cli.execute._resolve_dbt_executable", return_value="/opt/homebrew/bin/dbt"
+        ):
             cmd = build_dbt_command(build, project_dir)
 
         assert "--select" in cmd
@@ -179,7 +239,9 @@ class TestBuildDbtCommand:
             "properties": {"vars": {"database": "{{ env.SNOWFLAKE_DATABASE }}"}},
         }
 
-        with patch("fluid_build.cli.execute._resolve_dbt_executable", return_value="/opt/homebrew/bin/dbt"):
+        with patch(
+            "fluid_build.cli.execute._resolve_dbt_executable", return_value="/opt/homebrew/bin/dbt"
+        ):
             cmd = build_dbt_command(build, project_dir)
 
         vars_index = cmd.index("--vars")
@@ -577,6 +639,35 @@ class TestRun:
 
         assert result == 0
         assert mock_execute_dbt.call_args.kwargs["force_run"] is True
+
+    def test_run_passes_force_run_to_python_builds_from_apply(self, tmp_path):
+        contract_file = tmp_path / "contract.yaml"
+        contract_file.touch()
+        build = {
+            "id": "py-build",
+            "repository": "./",
+            "execution": {"trigger": {"type": "schedule"}},
+        }
+        script_path = tmp_path / "ingest.py"
+        script_path.touch()
+        args = self._args(contract=str(contract_file))
+        logger = logging.getLogger("test")
+
+        with (
+            patch(
+                "fluid_build.cli.execute.load_contract_with_overlay",
+                return_value={"builds": [build]},
+            ),
+            patch("fluid_build.cli.execute.resolve_script_path", return_value=script_path),
+            patch("fluid_build.cli.execute.execute_build", return_value=0) as mock_execute,
+            patch("fluid_build.cli.execute.cprint"),
+            patch("fluid_build.cli.execute.success"),
+            patch("fluid_build.cli.execute.console_error"),
+        ):
+            result = run(args, logger, _from_apply=True)
+
+        assert result == 0
+        assert mock_execute.call_args.kwargs["force_run"] is True
 
     def test_failed_build_returns_one(self, tmp_path):
         contract_file = tmp_path / "contract.yaml"
