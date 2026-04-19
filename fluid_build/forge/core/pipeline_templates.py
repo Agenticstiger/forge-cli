@@ -266,6 +266,54 @@ class BasePipelineTemplate:
             "PIP_CACHE_DIR": ".pip-cache",
         }
 
+    def _credential_banner(
+        self,
+        comment_prefix: str,
+        ci_system_name: str,
+        secret_surface_hint: str,
+    ) -> str:
+        """Render a provider-agnostic credential-model banner.
+
+        Every FLUID-aware CI pipeline needs the same thing: make the
+        provider's env vars (SNOWFLAKE_* / GOOGLE_APPLICATION_CREDENTIALS
+        / AWS_* / AZURE_* / DMM_*) available to the shell steps that
+        call ``fluid``. *How* those env vars arrive differs per CI
+        system — GitHub Actions uses ``secrets`` mapped via ``env:``,
+        GitLab injects CI/CD variables automatically, Jenkins offers
+        either agent env passthrough or the ``credentials()`` DSL, etc.
+
+        This helper emits the common "what env vars fluid expects"
+        paragraph plus a system-specific pointer so the generated
+        file is self-documenting — no hard-coded Snowflake-only list.
+
+        Arguments:
+          comment_prefix: ``# `` for YAML / shell; ``// `` for Groovy.
+          ci_system_name: human-readable name shown in the banner.
+          secret_surface_hint: one-line hint on how THIS system
+            surfaces secrets (e.g. "Settings → Secrets and variables
+            → Actions"). Kept short — the rest is pattern-agnostic.
+        """
+        p = comment_prefix
+        lines = [
+            f"{p}FLUID CI/CD Pipeline — {ci_system_name}",
+            f"{p}",
+            f"{p}Credential model (provider-agnostic):",
+            f"{p}  fluid's credential resolver reads provider auth from the runner",
+            f"{p}  environment. Each provider expects its own env vars:",
+            f"{p}    Snowflake → SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_PASSWORD /",
+            f"{p}                SNOWFLAKE_ROLE / SNOWFLAKE_WAREHOUSE / SNOWFLAKE_DATABASE",
+            f"{p}    GCP       → GOOGLE_APPLICATION_CREDENTIALS (or Workload Identity via OIDC)",
+            f"{p}    AWS       → AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or OIDC role)",
+            f"{p}    Azure     → AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID",
+            f"{p}    Catalog   → DMM_API_URL / DMM_API_KEY (only if using `fluid publish`)",
+            f"{p}  See ``fluid_build.credentials.resolver`` for the full resolver chain.",
+            f"{p}",
+            f"{p}How to surface them in {ci_system_name}:",
+            f"{p}  {secret_surface_hint}",
+            f"{p}",
+        ]
+        return "\n".join(lines) + "\n"
+
     def _get_oidc_steps(self, oidc_provider: Optional[str]) -> List[Dict[str, Any]]:
         """Get OIDC authentication steps for GitHub Actions deploy jobs."""
         if oidc_provider == "gcp":
@@ -443,7 +491,15 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             },
         }
 
-        files = {".github/workflows/fluid-pipeline.yml": yaml.dump(workflow, indent=2)}
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="GitHub Actions",
+            secret_surface_hint=(
+                "Settings → Secrets and variables → Actions. Reference per-job via "
+                "`env: FOO: ${{ secrets.FOO }}`."
+            ),
+        )
+        files = {".github/workflows/fluid-pipeline.yml": banner + yaml.dump(workflow, indent=2)}
         files[".env.ci.example"] = self._generate_env_ci_example(config.oidc_provider)
         return files
 
@@ -649,7 +705,17 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                 "steps": deploy_steps,
             }
 
-        files = {".github/workflows/fluid-standard.yml": yaml.dump(workflow, indent=2)}
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="GitHub Actions",
+            secret_surface_hint=(
+                "Settings → Secrets and variables → Actions. Then reference them "
+                "per-job via `env: FOO: ${{ secrets.FOO }}` or, for OIDC providers "
+                "(GCP/AWS/Azure), use the Workload Identity Federation steps "
+                "already wired when --oidc-provider is set."
+            ),
+        )
+        files = {".github/workflows/fluid-standard.yml": banner + yaml.dump(workflow, indent=2)}
         files[".env.ci.example"] = self._generate_env_ci_example(config.oidc_provider)
         return files
 
@@ -787,7 +853,16 @@ class GitLabCITemplate(BasePipelineTemplate):
         else:
             pipeline = self._generate_advanced_gitlab_pipeline(config, commands, env_vars)
 
-        return {".gitlab-ci.yml": yaml.dump(pipeline, indent=2)}
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="GitLab CI",
+            secret_surface_hint=(
+                "Project Settings → CI/CD → Variables. GitLab auto-injects them as "
+                "env for every job — mark as Masked + Protected to scope to "
+                "protected branches."
+            ),
+        )
+        return {".gitlab-ci.yml": banner + yaml.dump(pipeline, indent=2)}
 
     def _generate_basic_gitlab_pipeline(self, config, commands, env_vars):
         """Generate basic GitLab CI pipeline"""
@@ -1218,7 +1293,15 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
 
             pipeline["stages"].append(publish_stage)
 
-        return {"azure-pipelines.yml": yaml.dump(pipeline, indent=2)}
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="Azure DevOps Pipelines",
+            secret_surface_hint=(
+                "Pipelines → Library → Variable Groups. Link the group to the "
+                "pipeline and map secret vars into step env via `env: FOO: $(FOO)`."
+            ),
+        )
+        return {"azure-pipelines.yml": banner + yaml.dump(pipeline, indent=2)}
 
 
 class JenkinsTemplate(BasePipelineTemplate):
@@ -1236,15 +1319,38 @@ class JenkinsTemplate(BasePipelineTemplate):
 
         jenkins_pipeline = f"""
 pipeline {{
-    agent {{ label 'fluid' }}
+    // Default to any available agent. Change to `label 'your-label'`
+    // if you have a dedicated FLUID-equipped agent pool.
+    agent any
 
     environment {{
         FLUID_LOG_LEVEL = 'INFO'
         FLUID_CONFIG_PATH = './fluid_config'
         PYTHONPATH = '.'
-        // Bind credentials from Jenkins credential store.
-        // Configure 'fluid-provider-credentials' in Jenkins > Manage Credentials.
-        PROVIDER_CREDS = credentials('fluid-provider-credentials')
+
+        // ── Provider credential bindings (pick ONE pattern) ──────
+        // See the top-of-file banner for the full env-var list per
+        // provider.
+        //
+        // Path 1 — agent env passthrough. Set the env vars on the
+        // Jenkins agent/container (docker-compose `environment:`,
+        // Kubernetes agent template, or Jenkins Global Node
+        // Properties). `sh` steps inherit them automatically; no
+        // changes needed here.
+        //
+        // Path 2 — Jenkins credential store. After creating
+        // `string` credentials in Jenkins, uncomment + adapt:
+        //
+        //   <PROVIDER_ENV_VAR> = credentials('<your-credential-id>')
+        //
+        // e.g. Snowflake:  SNOWFLAKE_ACCOUNT = credentials('snowflake-account')
+        //      GCP:        GOOGLE_APPLICATION_CREDENTIALS = credentials('gcp-sa-key')
+        //      AWS:        AWS_ACCESS_KEY_ID = credentials('aws-access-key')
+        //                  AWS_SECRET_ACCESS_KEY = credentials('aws-secret-key')
+        //
+        // Catalog publish (only if using `fluid publish`):
+        //   DMM_API_URL = credentials('dmm-api-url')
+        //   DMM_API_KEY = credentials('dmm-api-key')
     }}
     
     triggers {{
@@ -1405,7 +1511,19 @@ pipeline {{
 }
 """
 
-        return {"Jenkinsfile": jenkins_pipeline}
+        banner = self._credential_banner(
+            comment_prefix="// ",
+            ci_system_name="Jenkinsfile",
+            secret_surface_hint=(
+                "Either (a) expose them as env vars on the Jenkins agent "
+                "(docker-compose `environment:`, Kubernetes agent template, "
+                "Jenkins Global Node Properties — sh steps inherit), or "
+                "(b) create string credentials in Jenkins → Manage Credentials "
+                "and bind them via the `credentials()` DSL inside the "
+                "`environment {}` block."
+            ),
+        )
+        return {"Jenkinsfile": banner + jenkins_pipeline}
 
 
 class BitbucketTemplate(BasePipelineTemplate):
@@ -1496,7 +1614,16 @@ class BitbucketTemplate(BasePipelineTemplate):
 
         pipeline["pipelines"]["branches"]["main"].append(publish_step)
 
-        return {"bitbucket-pipelines.yml": yaml.dump(pipeline, indent=2)}
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="Bitbucket Pipelines",
+            secret_surface_hint=(
+                "Repository Settings → Repository Variables (or Deployment "
+                "Variables for env-scoped secrets). Secured variables are "
+                "auto-injected as env vars for every step."
+            ),
+        )
+        return {"bitbucket-pipelines.yml": banner + yaml.dump(pipeline, indent=2)}
 
 
 class CircleCITemplate(BasePipelineTemplate):
@@ -1591,7 +1718,16 @@ class CircleCITemplate(BasePipelineTemplate):
 
             pipeline["workflows"]["fluid-pipeline"]["jobs"].append(workflow_job)
 
-        return {".circleci/config.yml": yaml.dump(pipeline, indent=2)}
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="CircleCI",
+            secret_surface_hint=(
+                "Project Settings → Environment Variables (per-project) or "
+                "Organization Settings → Contexts (reusable across projects). "
+                "Both auto-inject as env for every step."
+            ),
+        )
+        return {".circleci/config.yml": banner + yaml.dump(pipeline, indent=2)}
 
 
 class TektonTemplate(BasePipelineTemplate):
@@ -1674,9 +1810,19 @@ pip install --quiet data-product-forge
 
         task_definitions.append(validate_task)
 
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="Tekton",
+            secret_surface_hint=(
+                "Kubernetes Secrets referenced via `envFrom: - secretRef:` on "
+                "each Task (or `volumeMounts` for key-files like "
+                "GOOGLE_APPLICATION_CREDENTIALS). Create the Secrets in the "
+                "same namespace as the PipelineRun."
+            ),
+        )
         files = {
-            "tekton/pipeline.yaml": yaml.dump(pipeline, indent=2),
-            "tekton/tasks.yaml": yaml.dump_all(task_definitions, indent=2),
+            "tekton/pipeline.yaml": banner + yaml.dump(pipeline, indent=2),
+            "tekton/tasks.yaml": banner + yaml.dump_all(task_definitions, indent=2),
         }
 
         return files

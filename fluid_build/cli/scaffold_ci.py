@@ -36,14 +36,23 @@ def register(subparsers: argparse._SubParsersAction):
 
 
 GITLAB = """# FLUID CI/CD Pipeline — GitLab CI
-# Required CI/CD variables (Settings → CI/CD → Variables):
-#   SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_PASSWORD / SNOWFLAKE_ROLE
-#   SNOWFLAKE_WAREHOUSE / SNOWFLAKE_DATABASE / SNOWFLAKE_FLUID_SCHEMA
-#   SNOWFLAKE_STAGE_SCHEMA / SNOWFLAKE_DBT_SCHEMA (optional)
-#   DMM_API_KEY / DMM_API_URL    — catalog publish target
-#   GEMINI_API_KEY               — LLM for `fluid forge` (optional in CI)
-#   AIRFLOW_DAGS_DEST            — rsync target for airflow DAG deployment (optional)
-#   CATALOG                      — catalog name for `fluid publish` (default: datamesh-manager)
+#
+# Credential model (provider-agnostic):
+#   fluid's credential resolver reads provider auth from the runner
+#   environment. Each provider expects its own env vars (Snowflake:
+#   SNOWFLAKE_*; GCP: GOOGLE_APPLICATION_CREDENTIALS; AWS: AWS_*;
+#   Azure: AZURE_*; see `fluid_build.credentials.resolver`).
+#
+#   Surface them as GitLab CI/CD variables (Settings → CI/CD →
+#   Variables). GitLab auto-injects them as env for every job — no
+#   explicit binding needed in this file. Mark sensitive values as
+#   "Masked" and "Protected" so they only reach protected branches.
+#
+# Optional job-level knobs you may want as CI/CD variables too:
+#   PROVIDER             — default provider (e.g. snowflake, gcp, aws)
+#   BUILD_ID             — builds[].id for dbt hybrid-reference projects
+#   AIRFLOW_DAGS_DEST    — rsync target for airflow DAG deployment (optional)
+#   CATALOG              — catalog name for `fluid publish` (default: datamesh-manager)
 image: python:3.12-slim
 before_script:
   - pip install --quiet data-product-forge
@@ -104,14 +113,27 @@ publish:
 """
 
 GITHUB = """# FLUID CI/CD Pipeline — GitHub Actions
-# Required repository secrets (Settings → Secrets and variables → Actions):
-#   SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_PASSWORD / SNOWFLAKE_ROLE
-#   SNOWFLAKE_WAREHOUSE / SNOWFLAKE_DATABASE / SNOWFLAKE_FLUID_SCHEMA
-#   SNOWFLAKE_STAGE_SCHEMA / SNOWFLAKE_DBT_SCHEMA (optional)
-#   DMM_API_KEY / DMM_API_URL    — catalog publish target
-#   GEMINI_API_KEY               — LLM for `fluid forge` (optional in CI)
-# Required repository variables:
-#   PROVIDER             — default provider (e.g. snowflake)
+#
+# Credential model (provider-agnostic):
+#   fluid's credential resolver reads provider auth from the runner
+#   environment. Each provider expects its own env vars (Snowflake:
+#   SNOWFLAKE_*; GCP: GOOGLE_APPLICATION_CREDENTIALS; AWS: AWS_*;
+#   Azure: AZURE_*; see `fluid_build.credentials.resolver`).
+#
+#   Surface them as GitHub Actions secrets: Settings → Secrets and
+#   variables → Actions. Then map them into the job env at the job
+#   level (repeat per job that runs a `fluid` command):
+#
+#       env:
+#         SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+#         SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+#         # …etc for your provider
+#         DMM_API_KEY: ${{ secrets.DMM_API_KEY }}    # if using `fluid publish`
+#         DMM_API_URL: ${{ secrets.DMM_API_URL }}
+#         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}  # if running `fluid forge` in CI
+#
+# Required repository variables (Settings → Secrets and variables → Actions → Variables):
+#   PROVIDER             — default provider (e.g. snowflake, gcp, aws)
 #   BUILD_ID             — builds[].id for dbt hybrid-reference projects
 #   AIRFLOW_DAGS_DEST    — rsync target for airflow DAG deployment (optional)
 #   CATALOG              — catalog name for `fluid publish` (default: datamesh-manager)
@@ -205,15 +227,19 @@ jobs:
 
 JENKINS = """\
 // FLUID CI/CD Pipeline — Jenkinsfile
-// Required Jenkins credentials + vars (bind via withCredentials or env):
-//   SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_PASSWORD / SNOWFLAKE_ROLE
-//   SNOWFLAKE_WAREHOUSE / SNOWFLAKE_DATABASE / SNOWFLAKE_FLUID_SCHEMA
-//   SNOWFLAKE_STAGE_SCHEMA / SNOWFLAKE_DBT_SCHEMA (optional)
-//   DMM_API_KEY / DMM_API_URL    — catalog publish target
-//   GEMINI_API_KEY               — LLM for `fluid forge` (optional in CI)
-//   BUILD_ID                     — builds[].id for dbt hybrid-reference projects (leave blank otherwise)
-//   AIRFLOW_DAGS_DEST            — rsync target for airflow DAG deployment (leave blank to skip)
-//   CATALOG                      — catalog name for `fluid publish` (default: datamesh-manager)
+//
+// Credential model (provider-agnostic):
+//   fluid's credential resolver reads provider auth from the runner
+//   environment. Each provider expects its own env vars (Snowflake:
+//   SNOWFLAKE_*; GCP: GOOGLE_APPLICATION_CREDENTIALS; AWS: AWS_*;
+//   Azure: AZURE_*; see `fluid_build.credentials.resolver`). Two ways
+//   to surface them inside this pipeline — see the `environment {}`
+//   block below for the commented examples.
+//
+// Operator variables (set via Jenkins env, credentials, or inline):
+//   BUILD_ID            — builds[].id for dbt hybrid-reference projects
+//   AIRFLOW_DAGS_DEST   — rsync target for airflow DAG deployment (optional)
+//   CATALOG             — catalog name for `fluid publish` (default: datamesh-manager)
 pipeline {
     // Default to any available agent. Change to `label 'your-label'` if you
     // have a dedicated FLUID build agent.
@@ -225,6 +251,37 @@ pipeline {
         BUILD_ID = ''
         AIRFLOW_DAGS_DEST = ''
         CATALOG = 'datamesh-manager'
+
+        // ── Provider credential bindings (pick one pattern) ──────
+        // fluid's credential resolver chain (see
+        // `fluid_build.credentials.resolver`) already knows how to
+        // read provider auth from the runner environment — Snowflake
+        // reads SNOWFLAKE_*, GCP reads GOOGLE_APPLICATION_CREDENTIALS,
+        // AWS reads AWS_*, Azure reads AZURE_*, and so on. This
+        // Jenkinsfile is provider-agnostic; you only need to make
+        // sure those env vars are present when `fluid` runs.
+        //
+        // Path 1 — agent env passthrough. Set the env vars on the
+        // Jenkins agent/container once (docker-compose `environment:`,
+        // Kubernetes agent template, or Jenkins Global Node
+        // Properties). `sh` steps inherit them automatically; no
+        // changes needed here.
+        //
+        // Path 2 — Jenkins credential store. After creating
+        // `string` credentials for your provider, uncomment the
+        // matching lines below. Replace `<credential-id>` with your
+        // actual Jenkins credential ID.
+        //
+        //   <PROVIDER_ENV_VAR> = credentials('<credential-id>')
+        //
+        // e.g. Snowflake:  SNOWFLAKE_ACCOUNT = credentials('snowflake-account')
+        //      GCP:        GOOGLE_APPLICATION_CREDENTIALS = credentials('gcp-sa-key')
+        //      AWS:        AWS_ACCESS_KEY_ID = credentials('aws-access-key')
+        //                  AWS_SECRET_ACCESS_KEY = credentials('aws-secret-key')
+        //
+        // Catalog publish (only if using `fluid publish`):
+        //   DMM_API_URL = credentials('dmm-api-url')
+        //   DMM_API_KEY = credentials('dmm-api-key')
     }
 
     stages {
