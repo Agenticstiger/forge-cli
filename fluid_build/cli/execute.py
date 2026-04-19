@@ -28,10 +28,12 @@ Supports:
 """
 
 import argparse
+import functools
 import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -52,6 +54,18 @@ LOG = logging.getLogger("fluid.cli.execute")
 
 COMMAND = "execute"
 ENV_PLACEHOLDER_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+SENSITIVE_ENV_KEY_RE = re.compile(
+    r"(?i)(password|passphrase|secret|token|api[_-]?key|private[_-]?key|credential|auth)"
+)
+DBT_ENV_PREFIXES = (
+    "SNOWFLAKE_",
+    "DBT_",
+    "GCP_",
+    "GOOGLE_",
+    "AWS_",
+    "REDSHIFT_",
+    "DATABRICKS_",
+)
 
 
 def register(sp: argparse._SubParsersAction) -> None:
@@ -183,6 +197,14 @@ def _resolve_dbt_executable() -> Optional[str]:
     return shutil.which(configured)
 
 
+def _configured_dbt_command_prefix() -> Optional[list[str]]:
+    configured = os.getenv("DBT_EXECUTABLE")
+    if not configured:
+        return None
+    parts = shlex.split(configured)
+    return parts or None
+
+
 def _normalize_selectors(raw: Any) -> list[str]:
     if raw is None:
         return []
@@ -206,14 +228,114 @@ def _resolve_dbt_target_name(props: Dict[str, Any]) -> str:
     return str(props.get("target") or os.getenv("DBT_TARGET") or "dev")
 
 
+def _infer_dbt_adapter(build: Dict[str, Any]) -> Optional[str]:
+    engine = str(build.get("engine") or "").strip().lower()
+    if engine.startswith("dbt-") and len(engine) > 4:
+        return engine[4:]
+
+    execution = build.get("execution") or {}
+    runtime = execution.get("runtime") or {}
+    platform = str(runtime.get("platform") or "").strip().lower()
+    if platform in {"snowflake", "bigquery", "duckdb", "redshift", "postgres", "spark"}:
+        return platform
+    if platform == "gcp":
+        return "bigquery"
+    if platform == "aws":
+        return "redshift"
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _dbt_command_supports_adapter(dbt_executable: str, adapter: str) -> bool:
+    try:
+        result = subprocess.run(
+            [dbt_executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    return adapter.lower() in output or f"dbt-{adapter.lower()}" in output
+
+
+def _collect_dbt_container_env() -> Dict[str, str]:
+    env_vars: Dict[str, str] = {}
+    for key, value in os.environ.items():
+        if value and key.startswith(DBT_ENV_PREFIXES):
+            env_vars[key] = value
+    return env_vars
+
+
+def _rewrite_dbt_args_for_container(
+    args: list[str],
+    project_dir: Path,
+    profiles_dir: Optional[Path],
+) -> list[str]:
+    rewritten: list[str] = []
+    project_str = str(project_dir)
+    profiles_str = str(profiles_dir) if profiles_dir else None
+    for arg in args:
+        if arg == project_str:
+            rewritten.append("/workspace/project")
+        elif profiles_str and arg == profiles_str:
+            rewritten.append("/workspace/profiles")
+        else:
+            rewritten.append(arg)
+    return rewritten
+
+
+def _build_containerized_dbt_command(
+    adapter: str,
+    args: list[str],
+    project_dir: Path,
+    profiles_dir: Optional[Path],
+) -> list[str]:
+    # `-e KEY` (no `=value`) tells docker to inherit the value from the current
+    # process env. That keeps secrets out of argv (visible via `ps`) and out of
+    # the command-log line printed by `cprint`.
+    env_keys = sorted(_collect_dbt_container_env().keys())
+    container_args = _rewrite_dbt_args_for_container(args, project_dir, profiles_dir)
+
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{project_dir}:/workspace/project",
+        "-w",
+        "/workspace/project",
+    ]
+    if profiles_dir:
+        cmd.extend(["-v", f"{profiles_dir}:/workspace/profiles"])
+    for key in env_keys:
+        cmd.extend(["-e", key])
+
+    docker_image = os.getenv("DBT_DOCKER_IMAGE")
+    if docker_image:
+        cmd.extend([docker_image, "dbt", *container_args])
+        return cmd
+
+    bootstrap_image = os.getenv("DBT_BOOTSTRAP_IMAGE", "python:3.12-slim")
+    adapter_package = os.getenv("DBT_ADAPTER_PACKAGE") or f"dbt-{adapter}"
+    install_and_run = "python -m pip install --quiet {pkg} && {dbt_cmd}".format(
+        pkg=shlex.quote(adapter_package),
+        dbt_cmd=" ".join(shlex.quote(part) for part in ["dbt", *container_args]),
+    )
+    cmd.extend([bootstrap_image, "sh", "-lc", install_and_run])
+    return cmd
+
+
 def _build_generated_dbt_profile(
     build: Dict[str, Any], project_config: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
     execution = build.get("execution") or {}
     runtime = execution.get("runtime") or {}
     platform = str(runtime.get("platform", "local")).strip().lower()
-    resources = runtime.get("resources") or {}
-    props = build.get("properties") or {}
+    resources = _resolve_env_placeholders(runtime.get("resources") or {})
+    props = _resolve_env_placeholders(build.get("properties") or {})
     profile_name = _resolve_dbt_profile_name(props, project_config)
     target_name = _resolve_dbt_target_name(props)
 
@@ -306,6 +428,13 @@ def _create_temp_dbt_profiles_dir(
         ),
         encoding="utf-8",
     )
+    # The profile may carry a literal password. The tempdir is 0o700 by default
+    # but the file inherits the process umask — force 0o600 so another local
+    # user cannot read it during the brief lifetime of the run.
+    try:
+        os.chmod(profiles_path, 0o600)
+    except OSError:
+        pass
     return Path(temp_dir.name), temp_dir
 
 
@@ -335,24 +464,18 @@ def build_dbt_command(
     """Build the dbt CLI command for a dbt-based build."""
     props = build.get("properties") or {}
     project_config = project_config or _load_dbt_project_config(project_dir)
-    dbt_executable = _resolve_dbt_executable()
-    if not dbt_executable:
-        raise RuntimeError(
-            "dbt executable not found. Install dbt, add it to PATH, or set DBT_EXECUTABLE."
-        )
-
-    cmd = [dbt_executable, "build", "--project-dir", str(project_dir)]
+    dbt_args = ["build", "--project-dir", str(project_dir)]
 
     if profiles_dir:
-        cmd += ["--profiles-dir", str(profiles_dir)]
+        dbt_args += ["--profiles-dir", str(profiles_dir)]
 
     profile_name = _resolve_dbt_profile_name(props, project_config)
     if profile_name:
-        cmd += ["--profile", str(profile_name)]
+        dbt_args += ["--profile", str(profile_name)]
 
     target_name = props.get("target") or os.getenv("DBT_TARGET")
     if target_name:
-        cmd += ["--target", str(target_name)]
+        dbt_args += ["--target", str(target_name)]
 
     selectors = _normalize_selectors(props.get("select") or props.get("models"))
     if not selectors:
@@ -361,31 +484,74 @@ def build_dbt_command(
         if model and len(outputs) <= 1:
             selectors = [f"+{model}+"]
     if selectors:
-        cmd += ["--select", *selectors]
+        dbt_args += ["--select", *selectors]
 
     dbt_vars = props.get("vars")
     if dbt_vars:
-        cmd += ["--vars", json.dumps(_resolve_env_placeholders(dbt_vars))]
+        dbt_args += ["--vars", json.dumps(_resolve_env_placeholders(dbt_vars))]
 
-    return cmd
+    configured_prefix = _configured_dbt_command_prefix()
+    if configured_prefix:
+        return configured_prefix + dbt_args
+
+    dbt_executable = _resolve_dbt_executable()
+    adapter = _infer_dbt_adapter(build)
+    if dbt_executable and (not adapter or _dbt_command_supports_adapter(dbt_executable, adapter)):
+        return [dbt_executable, *dbt_args]
+
+    if adapter and shutil.which("docker"):
+        # `--no-partial-parse` is safe for containers (no persistent parse cache
+        # across runs) and avoids stale-cache surprises. Kept off the local path
+        # where users may legitimately rely on partial-parse for fast iteration.
+        container_args = [dbt_args[0], "--no-partial-parse", *dbt_args[1:]]
+        return _build_containerized_dbt_command(adapter, container_args, project_dir, profiles_dir)
+
+    if dbt_executable:
+        raise RuntimeError(
+            f"dbt executable '{dbt_executable}' does not support the required adapter '{adapter}'. "
+            "Install the adapter locally, set DBT_EXECUTABLE to a compatible command, or make Docker available."
+        )
+
+    raise RuntimeError(
+        "dbt executable not found. Install dbt, add it to PATH, set DBT_EXECUTABLE, or make Docker available for containerized execution."
+    )
 
 
 def _render_command_for_log(command: list[str]) -> str:
-    """Render a dbt CLI command for display, redacting the ``--vars`` payload.
+    """Render a dbt CLI command for display, redacting secret-bearing args.
 
-    ``--vars`` may contain resolved env values (see ``_resolve_env_placeholders``),
-    and ``cprint`` does not route through the logging redactor — so redact here.
+    ``cprint`` does not route through the logging redactor, so redact here:
+
+    - The value after ``--vars`` (JSON may carry resolved env secrets).
+    - The value side of ``-e KEY=VALUE`` / ``--env KEY=VALUE`` when ``KEY``
+      looks sensitive (password, token, …). The default containerized path
+      uses ``-e KEY`` (no value) so nothing hits argv, but user-configured
+      wrappers may still inline a value.
     """
     parts: list[str] = []
-    redact_next = False
+    redact_vars = False
+    inspect_env = False
     for part in command:
-        if redact_next:
+        if redact_vars:
             parts.append("<redacted>")
-            redact_next = False
-        else:
+            redact_vars = False
+            continue
+
+        if inspect_env:
+            inspect_env = False
+            if "=" in part:
+                key, _ = part.split("=", 1)
+                if SENSITIVE_ENV_KEY_RE.search(key):
+                    parts.append(f"{key}=<redacted>")
+                    continue
             parts.append(part)
-            if part == "--vars":
-                redact_next = True
+            continue
+
+        parts.append(part)
+        if part == "--vars":
+            redact_vars = True
+        elif part in ("-e", "--env"):
+            inspect_env = True
     return " ".join(parts)
 
 

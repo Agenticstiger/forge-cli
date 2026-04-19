@@ -24,6 +24,11 @@ import pytest
 
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.execute import (
+    _build_containerized_dbt_command,
+    _build_generated_dbt_profile,
+    _create_temp_dbt_profiles_dir,
+    _dbt_command_supports_adapter,
+    _render_command_for_log,
     _resolve_env_placeholders,
     build_dbt_command,
     execute_build,
@@ -206,6 +211,7 @@ class TestBuildDbtCommand:
             cmd = build_dbt_command(build, project_dir, profiles_dir=Path("/tmp/dbt-profiles"))
 
         assert cmd[:4] == ["/opt/homebrew/bin/dbt", "build", "--project-dir", str(project_dir)]
+        assert "--no-partial-parse" not in cmd
         assert "--profiles-dir" in cmd
         assert "/tmp/dbt-profiles" in cmd
         assert "--profile" in cmd
@@ -226,6 +232,7 @@ class TestBuildDbtCommand:
         ):
             cmd = build_dbt_command(build, project_dir)
 
+        assert "--no-partial-parse" not in cmd
         assert "--select" in cmd
         assert "+mart_orders+" in cmd
 
@@ -246,6 +253,257 @@ class TestBuildDbtCommand:
 
         vars_index = cmd.index("--vars")
         assert json.loads(cmd[vars_index + 1]) == {"database": "TELCO_LAB"}
+
+
+class TestGeneratedDbtProfile:
+    def test_runtime_resources_resolve_env_templates(self, monkeypatch):
+        monkeypatch.setenv("SNOWFLAKE_DATABASE", "TELCO_LAB")
+        monkeypatch.setenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
+        monkeypatch.setenv("SNOWFLAKE_ROLE", "ACCOUNTADMIN")
+        monkeypatch.setenv("SNOWFLAKE_FLUID_SCHEMA", "TELCO_FLUID_DEMO")
+        monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "acct")
+        monkeypatch.setenv("SNOWFLAKE_USER", "user")
+        monkeypatch.setenv("SNOWFLAKE_PASSWORD", "secret")
+
+        build = {
+            "execution": {
+                "runtime": {
+                    "platform": "snowflake",
+                    "resources": {
+                        "database": "{{ env.SNOWFLAKE_DATABASE }}",
+                        "warehouse": "{{ env.SNOWFLAKE_WAREHOUSE }}",
+                        "schema": "{{ env.SNOWFLAKE_FLUID_SCHEMA }}",
+                        "role": "{{ env.SNOWFLAKE_ROLE }}",
+                    },
+                }
+            },
+            "properties": {},
+        }
+
+        profile = _build_generated_dbt_profile(build, {"profile": "telco"})
+
+        output = profile["telco"]["outputs"]["dev"]
+        assert output["database"] == "TELCO_LAB"
+        assert output["warehouse"] == "COMPUTE_WH"
+        assert output["schema"] == "TELCO_FLUID_DEMO"
+        assert output["role"] == "ACCOUNTADMIN"
+
+
+class TestContainerizedDbtCommand:
+    def test_builds_bootstrap_container_command(self, tmp_path, monkeypatch):
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        profiles_dir = tmp_path / "profiles"
+        profiles_dir.mkdir()
+        monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "acct")
+        monkeypatch.setenv("SNOWFLAKE_USER", "user")
+        monkeypatch.setenv("SNOWFLAKE_PASSWORD", "super-secret-never-echoed")
+
+        cmd = _build_containerized_dbt_command(
+            "snowflake",
+            [
+                "build",
+                "--project-dir",
+                str(project_dir),
+                "--profiles-dir",
+                str(profiles_dir),
+                "--profile",
+                "telco",
+            ],
+            project_dir,
+            profiles_dir,
+        )
+
+        assert cmd[:3] == ["docker", "run", "--rm"]
+        assert any("/workspace/project" in part for part in cmd)
+        assert any("/workspace/profiles" in part for part in cmd)
+        assert "python:3.12-slim" in cmd
+        assert any("dbt-snowflake" in part for part in cmd)
+
+    def test_env_forwarding_uses_key_only_form(self, tmp_path, monkeypatch):
+        # `-e KEY` (no `=value`) keeps secrets out of argv (visible via `ps`).
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        monkeypatch.setenv("SNOWFLAKE_PASSWORD", "super-secret-never-echoed")
+        monkeypatch.setenv("SNOWFLAKE_USER", "user")
+
+        cmd = _build_containerized_dbt_command(
+            "snowflake",
+            ["build", "--project-dir", str(project_dir)],
+            project_dir,
+            None,
+        )
+
+        assert "super-secret-never-echoed" not in " ".join(cmd)
+        env_indices = [i for i, part in enumerate(cmd) if part == "-e"]
+        assert env_indices, "expected at least one -e flag"
+        for idx in env_indices:
+            assert "=" not in cmd[idx + 1], f"-e {cmd[idx + 1]} must not inline a value"
+
+    def test_uses_configured_docker_image_when_set(self, tmp_path, monkeypatch):
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        monkeypatch.setenv("DBT_DOCKER_IMAGE", "example/dbt-snowflake:custom")
+
+        cmd = _build_containerized_dbt_command(
+            "snowflake",
+            ["build", "--project-dir", str(project_dir)],
+            project_dir,
+            None,
+        )
+
+        assert "example/dbt-snowflake:custom" in cmd
+        assert "python:3.12-slim" not in cmd
+
+
+class TestBuildDbtCommandExecutionSelection:
+    def _make_project(self, tmp_path):
+        project_dir = tmp_path / "dbt_project"
+        project_dir.mkdir()
+        (project_dir / "dbt_project.yml").write_text("name: sample\nprofile: telco\n")
+        return project_dir
+
+    def test_uses_container_when_local_adapter_missing(self, tmp_path):
+        project_dir = self._make_project(tmp_path)
+        build = {
+            "engine": "dbt",
+            "execution": {"runtime": {"platform": "snowflake"}},
+            "properties": {},
+        }
+
+        with (
+            patch(
+                "fluid_build.cli.execute._resolve_dbt_executable",
+                return_value="/opt/homebrew/bin/dbt",
+            ),
+            patch("fluid_build.cli.execute._dbt_command_supports_adapter", return_value=False),
+            patch("fluid_build.cli.execute.shutil.which", return_value="/usr/local/bin/docker"),
+            patch(
+                "fluid_build.cli.execute._build_containerized_dbt_command",
+                return_value=["docker", "run", "dbt"],
+            ) as mock_container,
+        ):
+            cmd = build_dbt_command(build, project_dir)
+
+        assert cmd == ["docker", "run", "dbt"]
+        mock_container.assert_called_once()
+
+    def test_uses_configured_dbt_command_prefix_verbatim(self, tmp_path, monkeypatch):
+        project_dir = self._make_project(tmp_path)
+        build = {"engine": "dbt", "properties": {}}
+        monkeypatch.setenv("DBT_EXECUTABLE", "docker compose exec -T dbt-runner dbt")
+
+        cmd = build_dbt_command(build, project_dir)
+
+        assert cmd[:6] == ["docker", "compose", "exec", "-T", "dbt-runner", "dbt"]
+
+    def test_container_path_includes_no_partial_parse(self, tmp_path):
+        project_dir = self._make_project(tmp_path)
+        build = {
+            "engine": "dbt",
+            "execution": {"runtime": {"platform": "snowflake"}},
+            "properties": {},
+        }
+
+        with (
+            patch(
+                "fluid_build.cli.execute._resolve_dbt_executable",
+                return_value="/opt/homebrew/bin/dbt",
+            ),
+            patch(
+                "fluid_build.cli.execute._dbt_command_supports_adapter",
+                return_value=False,
+            ),
+            patch("fluid_build.cli.execute.shutil.which", return_value="/usr/local/bin/docker"),
+            patch(
+                "fluid_build.cli.execute._build_containerized_dbt_command",
+                side_effect=lambda adapter, args, pd, pfd: ["docker", *args],
+            ),
+        ):
+            cmd = build_dbt_command(build, project_dir)
+
+        assert "--no-partial-parse" in cmd
+
+
+class TestRenderCommandForLog:
+    def test_redacts_vars_payload(self):
+        cmd = ["dbt", "build", "--vars", '{"password": "hunter2"}']
+        rendered = _render_command_for_log(cmd)
+        assert "hunter2" not in rendered
+        assert "<redacted>" in rendered
+
+    def test_redacts_sensitive_e_flag_value(self):
+        cmd = ["docker", "run", "-e", "SNOWFLAKE_PASSWORD=hunter2", "image"]
+        rendered = _render_command_for_log(cmd)
+        assert "hunter2" not in rendered
+        assert "SNOWFLAKE_PASSWORD=<redacted>" in rendered
+
+    def test_preserves_non_sensitive_e_flag(self):
+        cmd = ["docker", "run", "-e", "SNOWFLAKE_ACCOUNT=acct", "image"]
+        rendered = _render_command_for_log(cmd)
+        assert "SNOWFLAKE_ACCOUNT=acct" in rendered
+
+    def test_preserves_key_only_e_flag(self):
+        # `-e KEY` (no value) — safe by construction, nothing to redact.
+        cmd = ["docker", "run", "-e", "SNOWFLAKE_PASSWORD", "image"]
+        rendered = _render_command_for_log(cmd)
+        assert rendered == "docker run -e SNOWFLAKE_PASSWORD image"
+
+    def test_redacts_long_form_env_flag(self):
+        cmd = ["docker", "run", "--env", "API_TOKEN=abc123", "image"]
+        rendered = _render_command_for_log(cmd)
+        assert "abc123" not in rendered
+
+
+class TestCreateTempDbtProfilesDir:
+    def test_profiles_yml_written_with_600_perms(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "acct")
+        monkeypatch.setenv("SNOWFLAKE_USER", "user")
+        monkeypatch.setenv("SNOWFLAKE_PASSWORD", "hunter2")
+
+        build = {
+            "execution": {
+                "runtime": {
+                    "platform": "snowflake",
+                    "resources": {"database": "DB", "warehouse": "WH"},
+                }
+            },
+            "properties": {},
+        }
+
+        profiles_dir, temp_dir = _create_temp_dbt_profiles_dir(build, {"profile": "telco"})
+        try:
+            assert profiles_dir is not None
+            profiles_path = profiles_dir / "profiles.yml"
+            assert profiles_path.exists()
+            import stat as _stat
+
+            mode = _stat.S_IMODE(profiles_path.stat().st_mode)
+            assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+        finally:
+            if temp_dir is not None:
+                temp_dir.cleanup()
+
+
+class TestDbtCommandSupportsAdapter:
+    def test_result_is_cached_across_calls(self, monkeypatch):
+        # Confirm @lru_cache avoids re-invoking `dbt --version`.
+        _dbt_command_supports_adapter.cache_clear()
+        call_count = {"n": 0}
+
+        def fake_run(*args, **kwargs):
+            call_count["n"] += 1
+            mock = Mock()
+            mock.stdout = "Plugins:\n  - snowflake: 1.11.4\n"
+            mock.stderr = ""
+            return mock
+
+        monkeypatch.setattr("fluid_build.cli.execute.subprocess.run", fake_run)
+
+        assert _dbt_command_supports_adapter("/opt/dbt", "snowflake") is True
+        assert _dbt_command_supports_adapter("/opt/dbt", "snowflake") is True
+        assert call_count["n"] == 1
+        _dbt_command_supports_adapter.cache_clear()
 
 
 # ── execute_build ─────────────────────────────────────────────────────
