@@ -25,7 +25,10 @@ __all__ = [
 
 
 import json
+from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
+
+import yaml
 
 from fluid_build.cli.forge_copilot_memory import CopilotMemorySnapshot
 from fluid_build.schema_manager import FluidSchemaManager
@@ -36,6 +39,43 @@ from .forge_copilot_contract_helpers import _normalize_interview_summary
 def _latest_fluid_version() -> str:
     """Return the newest bundled FLUID schema version."""
     return FluidSchemaManager.latest_bundled_version()
+
+
+# Default-guidance directory under agent_specs/. Each ``.yaml`` file has
+# a single top-level key ``system_prompt`` whose value is injected into
+# ``build_system_prompt`` at a labelled slot.  Editing the YAML is the
+# supported way to adjust the prose — no Python change needed — but the
+# snapshot test at ``tests/test_prompt_default_guidance.py`` locks the
+# composed prompt to byte-identical output and will fail if drift is
+# unintentional.
+_DEFAULTS_DIR: Path = Path(__file__).with_name("agent_specs") / "_defaults"
+
+
+def _load_default_guidance() -> Mapping[str, str]:
+    """Load ``_defaults/*.yaml`` into a {name: system_prompt_text} map.
+
+    Invoked once at module import.  Missing files or missing
+    ``system_prompt`` keys fall back to an empty string so that an
+    incomplete install doesn't crash the CLI — the snapshot test
+    catches such drift in CI.
+    """
+    guidance: dict[str, str] = {}
+    if not _DEFAULTS_DIR.is_dir():
+        return guidance
+    for path in sorted(_DEFAULTS_DIR.glob("*.yaml")):
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(raw, Mapping):
+            continue
+        text = raw.get("system_prompt")
+        if isinstance(text, str):
+            guidance[path.stem] = text
+    return guidance
+
+
+_DEFAULT_GUIDANCE: Mapping[str, str] = _load_default_guidance()
 
 
 # Per-technique rule sheets injected into the user prompt. Keyed by the
@@ -204,40 +244,16 @@ def build_system_prompt(
         "and optional measure (for simple), filter, inputMetrics (array of strings for derived/ratio), "
         "expr (for derived), numerator/denominator (for ratio), description.\n"
         "The semantics block enables AI agents and BI tools to generate correct queries without hallucination.\n\n"
-        # --- Sovereignty block guidance ---
-        "SOVEREIGNTY BLOCK (optional — include when user specifies compliance, jurisdiction, or data residency):\n"
-        "The contract MAY include a top-level 'sovereignty' object with:\n"
-        "- jurisdiction (enum): EU, US, UK, CA, AU, JP, CN, IN, BR, Global, Multi-Region\n"
-        "- allowedRegions (array of strings): Cloud regions where data may reside\n"
-        "- deniedRegions (array of strings): Cloud regions explicitly prohibited\n"
-        "- dataResidency (boolean, default true): Data must stay within jurisdiction\n"
-        "- crossBorderTransfer (boolean, default false): Whether cross-border transfer is allowed\n"
-        "- transferMechanisms (array, enum): SCCs, BCRs, Adequacy, DPF, Consent, Derogation\n"
-        "- regulatoryFramework (array, enum): GDPR, CCPA, CPRA, HIPAA, PIPEDA, LGPD, PDPA, POPIA, DPA, APPI\n"
-        "- enforcementMode (enum, default strict): strict, advisory, audit\n"
-        "Include sovereignty when the user mentions: GDPR, HIPAA, CCPA, data residency, EU-only, compliance, "
-        "regulated data, PII, PHI, jurisdiction, or regional restrictions.\n"
-        "Match allowedRegions to the chosen provider (e.g. eu-west-1/eu-central-1 for AWS in EU, "
-        "europe-west1/europe-west3 for GCP in EU).\n\n"
-        # --- Agent policy guidance ---
-        "AGENT POLICY (optional — include when data has sensitivity or AI access restrictions):\n"
-        "Each expose MAY include 'policy.agentPolicy' with:\n"
-        "- allowedModels (array): AI models permitted to consume this data (e.g. gpt-4, claude-3-opus)\n"
-        "- deniedModels (array): AI models explicitly blocked\n"
-        "- allowedUseCases (array, enum): inference, reasoning, analysis, summarization, classification, "
-        "embedding, search, qa, code_generation, fine_tuning, training, rag\n"
-        "- deniedUseCases (array, enum): Same enum values, explicitly blocked use cases\n"
-        "- canStore (boolean, default false): Whether AI systems can cache/persist data\n"
-        "- canReason (boolean, default false): Whether multi-step reasoning is allowed\n"
-        "- maxTokensPerRequest (integer): Per-request token limit\n"
-        "- retentionPolicy: {maxRetentionDays: int, requireDeletion: bool}\n"
-        "- auditRequired (boolean, default true): Whether AI access must be logged\n"
-        "- purposeLimitation (string): Free-text scope of allowed purpose\n"
-        "Include agentPolicy when the data involves: PII, PHI, financial data, regulated data, "
-        "or when the user mentions AI access controls, model restrictions, or data sensitivity.\n"
-        "Default to restrictive settings: canStore=false, canReason=false, "
-        "deniedUseCases=[training, fine_tuning], auditRequired=true.\n\n"
-        "Follow the seed_contract structure exactly as a reference for the correct schema shape.\n"
+        # --- Sovereignty + agent-policy guidance (loaded from agent_specs/_defaults/) ---
+        # The two blocks below are expanded from YAML at import time so
+        # editing the prose doesn't require a Python change. Each block
+        # ends with one trailing newline from YAML ``|``; we add one
+        # more newline per block to reproduce the original ``\n\n`` gap.
+        + _DEFAULT_GUIDANCE.get("sovereignty", "")
+        + "\n"
+        + _DEFAULT_GUIDANCE.get("agent_policy", "")
+        + "\n"
+        + "Follow the seed_contract structure exactly as a reference for the correct schema shape.\n"
         f"Allowed providers: {providers}.\n"
         "Only use build engines from the provided capability matrix.\n\n"
         # --- Upstream-driven transformation SQL ---

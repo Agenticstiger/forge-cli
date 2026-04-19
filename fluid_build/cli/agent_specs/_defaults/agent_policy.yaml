@@ -1,0 +1,21 @@
+# Default agent-policy guidance injected into the forge-copilot system prompt.
+# Loaded once at module import by fluid_build.cli.forge_copilot_prompts.
+# Edit this file to tweak the agent-policy prose without a Python change.
+# The snapshot test at tests/test_prompt_default_guidance.py locks the
+# composed prompt to byte-identical output, so any change here must be
+# accompanied by re-running the baseline capture script.
+system_prompt: |
+  AGENT POLICY (optional — include when data has sensitivity or AI access restrictions):
+  Each expose MAY include 'policy.agentPolicy' with:
+  - allowedModels (array): AI models permitted to consume this data (e.g. gpt-4, claude-3-opus)
+  - deniedModels (array): AI models explicitly blocked
+  - allowedUseCases (array, enum): inference, reasoning, analysis, summarization, classification, embedding, search, qa, code_generation, fine_tuning, training, rag
+  - deniedUseCases (array, enum): Same enum values, explicitly blocked use cases
+  - canStore (boolean, default false): Whether AI systems can cache/persist data
+  - canReason (boolean, default false): Whether multi-step reasoning is allowed
+  - maxTokensPerRequest (integer): Per-request token limit
+  - retentionPolicy: {maxRetentionDays: int, requireDeletion: bool}
+  - auditRequired (boolean, default true): Whether AI access must be logged
+  - purposeLimitation (string): Free-text scope of allowed purpose
+  Include agentPolicy when the data involves: PII, PHI, financial data, regulated data, or when the user mentions AI access controls, model restrictions, or data sensitivity.
+  Default to restrictive settings: canStore=false, canReason=false, deniedUseCases=[training, fine_tuning], auditRequired=true.
