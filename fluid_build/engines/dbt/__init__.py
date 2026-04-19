@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..base import (
@@ -58,14 +59,21 @@ class DbtEngine(TransformationEngine):
         build_index: int = 0,
         schema_context: Optional[Dict[str, Any]] = None,
         transformation_intent: Optional[TransformationIntent] = None,
+        workspace_root: Optional[Path] = None,
     ) -> GenerationResult:
         files: GenerationResult = {}
 
         # dbt_project.yml
         files["dbt_project.yml"] = generate_project_yml(contract, build)
 
-        # models/sources.yml
-        sources_content = generate_sources(contract, schema_context=schema_context)
+        # models/sources.yml — when a workspace_root is supplied we walk it
+        # looking for upstream contracts so ``sources.yml`` can point at the
+        # real database/schema/table rather than env_var placeholders.
+        sources_content = generate_sources(
+            contract,
+            schema_context=schema_context,
+            workspace_root=workspace_root,
+        )
         if sources_content:
             files["models/sources.yml"] = sources_content
 

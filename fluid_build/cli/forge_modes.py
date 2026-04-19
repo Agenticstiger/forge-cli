@@ -1768,6 +1768,29 @@ def _create_project_minimal(
         options = dict(copilot_options or {})
         options.setdefault("target_dir", str(target_dir))
 
+        # Index upstream products so the LLM can emit real dbt SQL with
+        # correct source identifiers and join keys. Honors the anchor
+        # workspace plus ``FLUID_UPSTREAM_CONTRACTS`` (colon-separated),
+        # used for upstream contracts living in a different repository
+        # from the current product. Cheap: filesystem walk of <= 4 levels.
+        try:
+            from fluid_build.util.upstream_discovery import (
+                discover_upstream_products,
+                project_upstream_for_prompt,
+            )
+
+            upstream_raw = discover_upstream_products(target_dir)
+            if upstream_raw:
+                upstream_projection = project_upstream_for_prompt(upstream_raw)
+                if upstream_projection:
+                    context["upstream_products"] = upstream_projection
+                    logger.debug(
+                        "upstream_products_indexed: count=%d",
+                        len(upstream_projection),
+                    )
+        except Exception as exc:  # noqa: BLE001 — discovery is best-effort
+            logger.debug("upstream_discovery_failed: %s", exc)
+
         try:
             generation_result = copilot.generate_project_artifacts(context, options)
         except CopilotGenerationError as generation_error:
@@ -1837,21 +1860,13 @@ def _create_project_minimal(
         else:
             use_fragments = is_complex_enough_for_fragments(contract)
 
-        if use_fragments:
-            root_contract, fragment_files = split_contract_to_fragments(contract)
-            write_contract(root_contract, contract_path, command="fluid forge")
-            for rel_path, content in fragment_files.items():
-                fpath = target_dir / rel_path
-                fpath.parent.mkdir(parents=True, exist_ok=True)
-                fpath.write_text(content, encoding="utf-8")
-        else:
-            fragment_files = {}
-            write_contract(contract, contract_path, command="fluid forge")
-
         # ── Transformation engine artifact generation ────────────
         # If the contract has a builds[].engine and we have a registered
         # generator, produce engine artifacts (dbt project, SQL scripts,
-        # etc.) and write them alongside the contract.
+        # etc.) and write them alongside the contract.  This runs BEFORE
+        # ``write_contract`` because the engine may mutate the contract
+        # (e.g. setting ``builds[].repository`` to point at the generated
+        # project directory so ``fluid apply --build`` can find it).
         engine_files = _generate_engine_artifacts(
             contract,
             target_dir=target_dir,
@@ -1873,13 +1888,32 @@ def _create_project_minimal(
             no_generate=options.get("no_generate", False),
         )
 
+        if use_fragments:
+            root_contract, fragment_files = split_contract_to_fragments(contract)
+            write_contract(root_contract, contract_path, command="fluid forge")
+            for rel_path, content in fragment_files.items():
+                fpath = target_dir / rel_path
+                fpath.parent.mkdir(parents=True, exist_ok=True)
+                fpath.write_text(content, encoding="utf-8")
+        else:
+            fragment_files = {}
+            write_contract(contract, contract_path, command="fluid forge")
+
         # Write additional files (dbt models, SQL, etc.) — these were
         # previously ignored in the minimal path.
-        additional_files = dict(generation_result.additional_files or {})
-        # Merge engine-generated files (engine files take precedence)
+        #
+        # Merge order matters.  Engine skeletons land first, then
+        # schedule files, then the LLM's additional_files — so when the
+        # LLM ships a real dbt mart SQL at the same path the engine
+        # emitted a TODO skeleton, the LLM content wins.  Infrastructure
+        # files the LLM never touches (dbt_project.yml, profiles.yml,
+        # sources.yml) still come from the engine.
+        additional_files: Dict[str, str] = {}
         additional_files.update(engine_files)
-        # Merge schedule-generated files
         additional_files.update(schedule_files)
+        llm_files = generation_result.additional_files or {}
+        if llm_files:
+            additional_files.update(llm_files)
         if additional_files:
             for rel_path, content in additional_files.items():
                 fpath = target_dir / rel_path
@@ -1936,7 +1970,7 @@ def _create_project_minimal(
                     console.print(f"[green]   + {n} additional file{'s' if n != 1 else ''}[/green]")
                 if engine_files:
                     console.print(
-                        "[dim]   Tip: use 'fluid generate transformation' to re-generate transformations.[/dim]"
+                        "[dim]   Tip: use 'fluid generate speed-transformation' to re-generate transformations.[/dim]"
                     )
                 if schedule_files:
                     console.print(
@@ -2058,6 +2092,7 @@ def _generate_engine_artifacts(
             transformation_intent = TransformationIntent(
                 canonical_model=domain_expertise.get("domain"),
                 user_data_model=modeling_standards,
+                data_modeling_technique=context.get("data_modeling_technique"),
             )
 
         # Include user-supplied data models from discovery
@@ -2075,19 +2110,48 @@ def _generate_engine_artifacts(
                 merged_cols.update(model.get("columns", {}))
             transformation_intent = TransformationIntent(
                 user_data_model=merged_cols,
+                data_modeling_technique=context.get("data_modeling_technique"),
             )
 
-        # Generate artifacts under the repository path (or default)
-        repository = build.get("repository", f"./{resolved_name}_project")
-        # Strip leading ./ for relative paths
-        if repository.startswith("./"):
-            repository = repository[2:]
+        # Even when neither domain expertise nor a user data model is
+        # available, we still want the engine to see the modeling
+        # technique so it can pick the right skeleton shape in the
+        # fallback path.  Build a minimal intent carrying just that.
+        if transformation_intent is None and context.get("data_modeling_technique"):
+            from fluid_build.engines.base import TransformationIntent
+
+            transformation_intent = TransformationIntent(
+                data_modeling_technique=context["data_modeling_technique"],
+            )
+
+        # Stamp the chosen technique onto the contract so downstream
+        # CLIs (``fluid generate speed-transformation``) can surface it
+        # in their banner without re-running the interview.
+        _technique = context.get("data_modeling_technique")
+        if _technique:
+            metadata = contract.setdefault("metadata", {})
+            annotations = metadata.setdefault("annotations", {})
+            annotations["dataModelingTechnique"] = _technique
+
+        # Generate artifacts under the repository path (or default).
+        # When the build doesn't specify a repository we pick a
+        # conventional sub-directory and persist it back on the build so
+        # ``fluid apply --build`` can locate the generated project.
+        repository_explicit = build.get("repository")
+        if repository_explicit:
+            repository = repository_explicit
+            if repository.startswith("./"):
+                repository = repository[2:]
+        else:
+            repository = f"{resolved_name}_project"
+            build["repository"] = f"./{repository}"
 
         files = engine.generate(
             contract,
             build,
             schema_context=schema_context,
             transformation_intent=transformation_intent,
+            workspace_root=target_dir,
         )
 
         # Prefix all paths with the repository directory

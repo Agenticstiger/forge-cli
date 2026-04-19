@@ -136,10 +136,12 @@ class TestAdaptiveCopilotInterview:
         ],
     )
     def test_interview_caps_round_questions_at_two(self, _mock_decision):
-        # Bootstrap asks up to 3 optional questions (byot, engine, schedule)
-        # before the LLM-driven dynamic round.  Provide empty strings to
-        # skip those, then the real answers for the dynamic questions.
-        console = FakeConsole(["", "", "", "dashboards", "table"])
+        # Bootstrap asks up to 4 optional questions (byot, engine, schedule,
+        # data_modeling_technique) before the LLM-driven dynamic round.
+        # Provide empty strings to skip those (the modeling-technique
+        # picker has a default of "data_vault_2"), then the real answers
+        # for the two dynamic questions.
+        console = FakeConsole(["", "", "", "", "dashboards", "table"])
         state = run_adaptive_copilot_interview(
             initial_context={
                 "project_goal": "Orders analytics",
@@ -278,10 +280,11 @@ class TestAdaptiveCopilotInterview:
         ],
     )
     def test_unresolved_structured_input_is_preserved_in_transcript(self, _mock_decision):
-        # Bootstrap asks up to 3 optional questions (byot, engine, schedule)
-        # before the LLM-driven dynamic round.  Provide empty strings to
-        # skip those, then the real answer for the dynamic question.
-        console = FakeConsole(["", "", "", "spark jobs"])
+        # Bootstrap asks up to 4 optional questions (byot, engine, schedule,
+        # data_modeling_technique) before the LLM-driven dynamic round.
+        # Provide empty strings to skip those, then the real answer for
+        # the dynamic question.
+        console = FakeConsole(["", "", "", "", "spark jobs"])
         state = run_adaptive_copilot_interview(
             initial_context={
                 "project_goal": "Orders analytics",

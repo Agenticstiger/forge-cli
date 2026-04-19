@@ -1,0 +1,68 @@
+# Modeling technique presets consumed by ``fluid forge`` whenever the
+# user (or the interview default) sets ``data_modeling_technique``.
+#
+# Shape: one top-level key per canonical technique value. Each block is
+# surfaced by ``forge_domain_enrichment.enrich_context_with_domain`` on
+# the ``domain_expertise.modeling_technique_guidance`` path and rides
+# the user prompt automatically (see ``build_user_prompt``).
+#
+# Field reference:
+#   naming_conventions: model prefix → template path. The LLM MUST
+#     follow these prefixes when emitting dbt SQL in additional_files.
+#   key_strategy: how surrogate keys are derived for this technique.
+#   load_metadata: required metadata columns on every emitted table.
+#   layer_structure: expected dbt layer layout.
+#   insert_only (DV2): if true, raw vault must never UPDATE/DELETE.
+#   scd_handling (dimensional): slowly-changing-dimension rule for dims.
+#   anti_patterns: explicit don'ts — injected into the guidance block.
+
+data_vault_2:
+  label: "Data Vault 2.0"
+  naming_conventions:
+    hub: "hub_<entity>"
+    link: "lnk_<relation>"
+    satellite: "sat_<entity>_<source_system>"
+    point_in_time: "pit_<entity>"
+    bridge: "br_<relation>"
+  key_strategy: >
+    Business keys are hashed to 32-hex surrogate keys via
+    md5(upper(trim(<business_key>))). Parent keys in links and
+    satellites reference hub hash keys only — never raw business keys.
+  load_metadata:
+    - "load_dts TIMESTAMP — insert time of the record"
+    - "record_source VARCHAR — short identifier of the upstream source system"
+    - "hash_diff VARCHAR (satellites only) — md5 of all descriptive attributes"
+  layer_structure: >
+    Staging view per upstream source (one per consume). Raw vault: hubs +
+    links + satellites. Business vault (optional) may derive PITs/bridges.
+  insert_only: true
+  anti_patterns:
+    - "Do NOT update or delete raw-vault rows — all history is insert-only."
+    - "Do NOT mix sources in one satellite; one source = one satellite."
+    - "Do NOT fabricate business keys when a natural key exists upstream."
+
+dimensional:
+  label: "Dimensional (Kimball)"
+  naming_conventions:
+    staging: "stg_<source>"
+    dimension: "dim_<entity>"
+    fact: "fct_<grain>"
+    conformed_dimension: "dim_<conformed_entity>"
+  key_strategy: >
+    Dimensions have integer surrogate keys (<entity>_key) generated via
+    dbt_utils.generate_surrogate_key() from the natural key + scd columns.
+    Facts reference dimension surrogate keys only — never natural keys.
+  load_metadata:
+    - "valid_from TIMESTAMP — SCD type-2 effective start"
+    - "valid_to TIMESTAMP — SCD type-2 effective end (null for current row)"
+    - "is_current BOOLEAN — true for the live row of each natural key"
+  layer_structure: >
+    Staging view per upstream source, then conformed dimensions (shared
+    across facts), then fact tables one per business process / grain.
+  scd_handling: >
+    Type-2 for dimensions with historical attributes; type-1 for rapidly
+    changing dimensions where history isn't required.
+  anti_patterns:
+    - "Do NOT reference natural keys from fact tables — only surrogate keys."
+    - "Do NOT duplicate conformed dimensions per fact; reuse the shared dim."
+    - "Do NOT store additive measures on dimensions; measures belong on facts."

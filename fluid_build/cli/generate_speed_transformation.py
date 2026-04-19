@@ -111,6 +111,12 @@ def run(args: Any, logger: logging.Logger) -> int:
             str(contract_path), getattr(args, "env", None), logger
         )
 
+        # --- Speed-transformation banner ---
+        # Reads the modeling technique stamped by ``fluid forge`` and
+        # tells the user whether the LLM / engine has the grounding it
+        # needs to avoid skeleton-only output.
+        _print_speed_transformation_banner(contract)
+
         # --- Resolve build ---
         from fluid_build.util.contract import get_build_engine, get_builds
 
@@ -216,6 +222,50 @@ def run(args: Any, logger: logging.Logger) -> int:
 
             traceback.print_exc()
         return 1
+
+
+def _print_speed_transformation_banner(contract: Dict[str, Any]) -> None:
+    """Surface the modeling technique + user-data-model signal to the user.
+
+    Contract annotations are stamped by ``fluid forge`` (see
+    ``forge_modes._generate_engine_artifacts``). The banner has three modes:
+
+    * technique + user-supplied model → green (best case)
+    * technique only → yellow (LLM works, but without a concrete data
+      model it falls back to heuristic joins)
+    * nothing to say → silent
+    """
+    metadata = contract.get("metadata") or {}
+    annotations = metadata.get("annotations") or {}
+    technique = annotations.get("dataModelingTechnique") or metadata.get("dataModelingTechnique")
+    if not technique:
+        return
+
+    has_data_model = bool(
+        metadata.get("user_data_model")
+        or metadata.get("userDataModel")
+        or annotations.get("dataModel")
+    )
+
+    display = _display_technique(technique)
+    if has_data_model:
+        cprint(
+            f"[green]Generating {display} speed-transformation grounded on your "
+            f"supplied data model.[/green]"
+        )
+    else:
+        cprint(
+            f"[yellow]{display} speed-transformation works best when a data model "
+            f"is supplied. Continuing without one — consider adding one via "
+            f"`fluid forge` or metadata.annotations.dataModel.[/yellow]"
+        )
+
+
+def _display_technique(technique: str) -> str:
+    return {
+        "data_vault_2": "Data Vault 2.0",
+        "dimensional": "dimensional (Kimball)",
+    }.get(technique, technique)
 
 
 def _resolve_contract_path(args: Any) -> Path:

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..base import (
@@ -204,6 +205,7 @@ class DataflowEngine(TransformationEngine):
         build_index: int = 0,
         schema_context: Optional[Dict[str, Any]] = None,
         transformation_intent: Optional[TransformationIntent] = None,
+        workspace_root: Optional[Path] = None,
     ) -> GenerationResult:
         files: GenerationResult = {}
 

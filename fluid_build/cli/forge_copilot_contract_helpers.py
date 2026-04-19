@@ -86,19 +86,15 @@ KNOWN_BUILD_ENGINES = {
     "sql",
     "python",
     "dbt",
-    "dbt-bigquery",
-    "dbt-athena",
-    "dbt-redshift",
-    "dbt-snowflake",
-    "dataform",
-    "glue",
+    "spark",
+    "custom",
 }
 
 PROVIDER_ENGINE_COMPATIBILITY = {
     "local": {"sql", "python", "dbt"},
-    "gcp": {"sql", "python", "dbt", "dbt-bigquery", "dataform"},
-    "aws": {"sql", "python", "dbt", "dbt-athena", "dbt-redshift", "glue"},
-    "snowflake": {"sql", "python", "dbt", "dbt-snowflake"},
+    "gcp": {"sql", "python", "dbt"},
+    "aws": {"sql", "python", "dbt"},
+    "snowflake": {"sql", "python", "dbt"},
 }
 
 _AMBIGUITY_ERROR_KEYWORDS = (
@@ -176,6 +172,37 @@ _REPAIR_GUIDANCE: List[Dict[str, Any]] = [
         "pattern": "is not valid",
         "category": "invalid_value",
         "fix_hint": "The value does not match the schema. Check allowed enum values or types.",
+    },
+    {
+        "pattern": "data_modeling_technique=data_vault_2",
+        "category": "modeling_technique_mismatch",
+        "fix_hint": (
+            "For Data Vault 2.0 you must emit at least one hub_ or sat_ model "
+            "in additional_files under dbt_project/models/staging/. Reference "
+            "hub hash keys from links, keep raw-vault inserts-only, and stamp "
+            "load_dts + record_source on every row."
+        ),
+        "example": (
+            '{"additional_files": {'
+            '"dbt_project/models/staging/hub_party_source.sql": "...", '
+            '"dbt_project/models/staging/sat_party_source_raw.sql": "...", '
+            '"dbt_project/models/marts/lnk_<mart>.sql": "..."}}'
+        ),
+    },
+    {
+        "pattern": "data_modeling_technique=dimensional",
+        "category": "modeling_technique_mismatch",
+        "fix_hint": (
+            "For dimensional modeling you must emit at least one dim_ or fct_ "
+            "model in additional_files under dbt_project/models/marts/. Use "
+            "dbt_utils.generate_surrogate_key() for dimension keys and "
+            "reference those surrogates from fact tables."
+        ),
+        "example": (
+            '{"additional_files": {'
+            '"dbt_project/models/marts/dim_customer.sql": "...", '
+            '"dbt_project/models/marts/fct_subscription_events.sql": "..."}}'
+        ),
     },
 ]
 
@@ -790,8 +817,14 @@ def validate_generated_result(
     schema_manager_cls: Any,
     resolve_provider_from_contract_fn: Callable[[Mapping[str, Any]], tuple[Optional[str], Any]],
     get_builds_fn: Callable[[Mapping[str, Any]], List[Mapping[str, Any]]],
+    context: Optional[Mapping[str, Any]] = None,
 ) -> tuple[List[str], List[str]]:
-    """Validate contract schema plus local provider/build sanity checks."""
+    """Validate contract schema plus local provider/build sanity checks.
+
+    ``context`` is optional so pre-existing callers keep working; when
+    supplied it drives additional technique-aware checks (e.g. DV2 runs
+    must ship at least one ``hub_`` / ``sat_`` model in additional_files).
+    """
     contract = normalized["contract"]
     suggestions = normalized["suggestions"]
     errors: List[str] = []
@@ -896,6 +929,35 @@ def validate_generated_result(
             errors.append(
                 f"Expose '{expose.get('exposeId', 'unknown')}' semantics must include at least one metric."
             )
+
+    # --- Modeling-technique post-check (DV2 / dimensional) ---------------
+    # Only fires when the LLM actually shipped additional_files but failed
+    # to use the technique-appropriate naming.  When additional_files is
+    # empty the engine's fallback skeleton handles the shape — don't burn
+    # a repair attempt on an orthogonal issue.
+    technique = (context or {}).get("data_modeling_technique") if context else None
+    if technique in {"data_vault_2", "dimensional"}:
+        additional_files = normalized.get("additional_files") or {}
+        sql_file_names = [
+            str(path).rsplit("/", 1)[-1]
+            for path in additional_files
+            if isinstance(path, str) and path.endswith(".sql")
+        ]
+        if sql_file_names:
+            if technique == "data_vault_2" and not any(
+                n.startswith(("hub_", "sat_", "lnk_")) for n in sql_file_names
+            ):
+                errors.append(
+                    "data_modeling_technique=data_vault_2 requires at least one "
+                    "hub_/sat_/lnk_ model in additional_files — none found."
+                )
+            if technique == "dimensional" and not any(
+                n.startswith(("fct_", "dim_")) for n in sql_file_names
+            ):
+                errors.append(
+                    "data_modeling_technique=dimensional requires at least one "
+                    "fct_/dim_ model in additional_files — none found."
+                )
 
     return errors, warnings
 

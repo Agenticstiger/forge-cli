@@ -63,6 +63,9 @@ runtime/
 *.yaml.bak
 *.md.bak
 
+# Forge discovery cache / project memory — generated per-run in the CWD
+.fluid/
+
 # FLUID Build Generated Files
 *.dot
 *.png

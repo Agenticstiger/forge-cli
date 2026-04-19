@@ -25,6 +25,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 # ---------------------------------------------------------------------------
@@ -86,6 +87,17 @@ class TransformationIntent:
     user_data_model: Optional[Dict[str, Any]] = None
     """Parsed user-supplied data model (guardrails for AI generation)."""
 
+    data_modeling_technique: Optional[str] = None
+    """Canonical modeling technique driving the fallback skeleton naming.
+
+    One of ``'data_vault_2'`` or ``'dimensional'`` (or ``None`` when the
+    interview was never run).  Populated by
+    :func:`fluid_build.cli.forge_copilot_interview.normalize_interview_value`.
+    When the LLM ships real SQL in ``additional_files`` this field is
+    informational; when it doesn't, the engine uses it to pick between
+    hub/link/satellite skeletons and stg/dim/fct skeletons.
+    """
+
 
 # ---------------------------------------------------------------------------
 # GenerationResult type alias
@@ -134,6 +146,7 @@ class TransformationEngine(ABC):
         build_index: int = 0,
         schema_context: Optional[Dict[str, Any]] = None,
         transformation_intent: Optional[TransformationIntent] = None,
+        workspace_root: Optional[Path] = None,
     ) -> GenerationResult:
         """Generate engine artifacts from contract + optional AI context.
 
@@ -150,6 +163,11 @@ class TransformationEngine(ABC):
         transformation_intent:
             AI-generated transformation plan.  When ``None``, the engine
             should produce skeleton files with TODO placeholders.
+        workspace_root:
+            Directory used as the anchor when the engine needs to locate
+            upstream artifacts (e.g. other ``contract.fluid.yaml`` files
+            referenced by ``consumes[]``).  Engines that do not consume
+            upstream metadata can ignore it.
 
         Returns
         -------

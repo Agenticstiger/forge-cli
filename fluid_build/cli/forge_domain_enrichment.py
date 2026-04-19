@@ -189,6 +189,26 @@ def enrich_context_with_domain(
     except (yaml.YAMLError, OSError):
         pass
 
+    # Load per-technique modeling guidance when the interview has
+    # settled on a technique.  The file ships two top-level keys
+    # (``data_vault_2`` / ``dimensional``); we surface the matching
+    # block under ``domain_expertise.modeling_technique_guidance`` so
+    # ``build_user_prompt`` forwards it into the prompt automatically.
+    technique = context.get("data_modeling_technique")
+    if technique:
+        try:
+            from fluid_build.cli.forge_agent_specs import AGENT_SPECS_DIR as _AGENT_SPECS_DIR
+
+            mt_path = _AGENT_SPECS_DIR / "modeling_techniques.yaml"
+            if mt_path.exists():
+                mt_raw = yaml.safe_load(mt_path.read_text(encoding="utf-8")) or {}
+                block = mt_raw.get(technique)
+                if isinstance(block, dict):
+                    expertise.setdefault("modeling_technique_guidance", {})[technique] = block
+                    LOG.debug("Loaded modeling technique guidance for %s", technique)
+        except (yaml.YAMLError, OSError) as exc:
+            LOG.debug("modeling_technique_load_failed: %s", exc)
+
     context["domain_expertise"] = expertise
     LOG.info("Enriched context with %s domain expertise", domain)
     return context
