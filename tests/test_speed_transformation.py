@@ -324,6 +324,52 @@ class TestValidationGuardrail:
         assert "hub_" in fb[0]["fix_hint"]
         assert "sat_" in fb[0]["fix_hint"]
 
+    def test_llm_sources_in_schema_yml_is_flagged(self):
+        """LLM `sources:` in additional_files/schema.yml collides with engine."""
+        from fluid_build.cli.forge_copilot_contract_helpers import validate_generated_result
+
+        bad = _minimal_normalized(
+            {
+                "dbt_project/models/staging/hub_mart.sql": "-- real hub",
+                "dbt_project/models/schema.yml": (
+                    "version: 2\n"
+                    "sources:\n"
+                    "  - name: raw\n"
+                    "    tables:\n"
+                    "      - name: party_source\n"
+                    "models:\n"
+                    "  - name: hub_mart\n"
+                ),
+            }
+        )
+        errors, _ = validate_generated_result(
+            bad,
+            capabilities={"providers": ["snowflake"], "templates": {"starter": {}}},
+            logger=None,
+            schema_manager_cls=_fake_schema_manager(),
+            resolve_provider_from_contract_fn=lambda c: ("snowflake", None),
+            get_builds_fn=lambda c: c["builds"],
+            context={"data_modeling_technique": "data_vault_2"},
+        )
+        sources_errs = [e for e in errors if "declares `sources:`" in e]
+        assert sources_errs, f"expected sources collision error, got {errors}"
+        assert "schema.yml" in sources_errs[0]
+
+    def test_sources_collision_routes_to_repair_hint(self):
+        from fluid_build.cli.forge_copilot_contract_helpers import (
+            build_structured_repair_feedback,
+        )
+
+        fb = build_structured_repair_feedback(
+            [
+                "LLM-shipped 'dbt_project/models/schema.yml' declares `sources:` — "
+                "that key is reserved for the engine-generated models/sources.yml. "
+                "Remove the `sources:` block; keep only `models:`."
+            ]
+        )
+        assert fb[0]["category"] == "engine_owned_file_collision"
+        assert "sources:" in fb[0]["fix_hint"] or "sources.yml" in fb[0]["fix_hint"]
+
 
 # ---------------------------------------------------------------------------
 # 5. Engine threading (TransformationIntent + dbt skeleton shape)
@@ -337,7 +383,8 @@ class TestEngineThreading:
         intent = TransformationIntent(data_modeling_technique="data_vault_2")
         assert intent.data_modeling_technique == "data_vault_2"
 
-    def test_dbt_dv2_skeleton_emits_hub_and_sat_files(self):
+    def test_dbt_dv2_emits_no_skeleton_files(self):
+        """DV2 technique → engine skips staging/mart skeletons; LLM owns it."""
         from fluid_build.engines.base import TransformationIntent
         from fluid_build.engines.dbt.models import generate_models
 
@@ -373,22 +420,10 @@ class TestEngineThreading:
         }
         intent = TransformationIntent(data_modeling_technique="data_vault_2")
         files = generate_models(contract, contract["builds"][0], transformation_intent=intent)
-        names = sorted(files.keys())
-        # Staging: hub + sat per consume
-        assert "models/staging/hub_party_source.sql" in names
-        assert "models/staging/sat_party_source_raw.sql" in names
-        assert "models/staging/hub_account_source.sql" in names
-        # Mart: lnk per expose
-        assert "models/marts/lnk_mart.sql" in names
-        # No dimensional leftovers.
-        assert not any(n.startswith("models/marts/fct_") for n in names)
-        assert not any(n.startswith("models/marts/dim_") for n in names)
-        # Emitted SQL carries the DV2 metadata columns.
-        hub_sql = files["models/staging/hub_party_source.sql"]
-        assert "load_dts" in hub_sql
-        assert "record_source" in hub_sql
+        assert files == {}, "engine must not emit DV2 skeletons — LLM owns staging + marts"
 
-    def test_dbt_dimensional_skeleton_keeps_stg_fct_dim(self):
+    def test_dbt_dimensional_emits_no_skeleton_files(self):
+        """Dimensional technique → engine skips staging/mart skeletons; LLM owns it."""
         from fluid_build.engines.base import TransformationIntent
         from fluid_build.engines.dbt.models import generate_models
 
@@ -415,11 +450,50 @@ class TestEngineThreading:
         }
         intent = TransformationIntent(data_modeling_technique="dimensional")
         files = generate_models(contract, contract["builds"][0], transformation_intent=intent)
-        names = sorted(files.keys())
-        assert "models/staging/stg_party_source.sql" in names
-        assert "models/marts/mart.sql" in names
-        assert not any(n.startswith("models/staging/hub_") for n in names)
-        assert not any(n.startswith("models/staging/sat_") for n in names)
+        assert files == {}, "engine must not emit dimensional skeletons — LLM owns staging + marts"
+
+    def test_dbt_engine_skips_schema_yml_when_technique_set(self):
+        """Engine must skip marts/schema.yml emission — LLM ships its own."""
+        from fluid_build.engines import get_engine
+        from fluid_build.engines.base import TransformationIntent
+
+        contract = {
+            "fluidVersion": "0.7.2",
+            "id": "silver.x_v1",
+            "consumes": [{"exposeId": "party_source", "productId": "bronze.party_v1"}],
+            "builds": [
+                {
+                    "id": "b1",
+                    "engine": "dbt",
+                    "pattern": "hybrid-reference",
+                    "properties": {"model": "mart"},
+                    "execution": {"runtime": {"platform": "snowflake"}},
+                }
+            ],
+            "exposes": [
+                {
+                    "exposeId": "mart",
+                    "kind": "table",
+                    "binding": {"platform": "snowflake"},
+                    "contract": {
+                        "schema": [{"name": "id", "type": "string", "required": True}],
+                        "dq": {"rules": [{"id": "r1", "type": "uniqueness", "selector": "id"}]},
+                    },
+                }
+            ],
+        }
+        engine = get_engine("dbt")
+        intent = TransformationIntent(data_modeling_technique="data_vault_2")
+        files = engine.generate(contract, contract["builds"][0], transformation_intent=intent)
+        # Engine still emits infrastructure; it must NOT emit model-level
+        # schema.yml files that would collide with the LLM's own.
+        schema_yml_files = [p for p in files if "schema.yml" in p]
+        assert (
+            schema_yml_files == []
+        ), f"engine must skip schema.yml when technique is set; got {schema_yml_files}"
+        # Infrastructure must still be there.
+        assert "dbt_project.yml" in files
+        assert "profiles.yml" in files
 
     def test_dbt_unset_technique_falls_back_to_default_dimensional(self):
         from fluid_build.engines.dbt.models import generate_models

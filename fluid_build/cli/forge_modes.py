@@ -2126,12 +2126,14 @@ def _generate_engine_artifacts(
 
         # Stamp the chosen technique onto the contract so downstream
         # CLIs (``fluid generate speed-transformation``) can surface it
-        # in their banner without re-running the interview.
+        # in their banner without re-running the interview. We use the
+        # top-level ``labels`` map because FLUID 0.7.2 ``metadata``
+        # declares ``additionalProperties: false`` — only ``labels``
+        # accepts arbitrary string-valued keys.
         _technique = context.get("data_modeling_technique")
         if _technique:
-            metadata = contract.setdefault("metadata", {})
-            annotations = metadata.setdefault("annotations", {})
-            annotations["dataModelingTechnique"] = _technique
+            labels = contract.setdefault("labels", {})
+            labels["dataModelingTechnique"] = _technique
 
         # Generate artifacts under the repository path (or default).
         # When the build doesn't specify a repository we pick a

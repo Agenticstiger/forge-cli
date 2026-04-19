@@ -74,27 +74,42 @@ def _generate_hybrid(
     schema_context: Optional[Dict[str, Any]] = None,
     transformation_intent: Optional[TransformationIntent] = None,
 ) -> GenerationResult:
+    """Hybrid-reference dbt generation.
+
+    Three code paths, in priority order:
+
+    1. ``transformation_intent.stages`` non-empty → render directly from
+       the LLM-supplied stages (proper AI-driven path).
+    2. ``transformation_intent.data_modeling_technique`` set (DV2 or
+       Dimensional) → *no skeletons*. The LLM pipeline owns every
+       staging/mart file via ``additional_files``; the Phase-7
+       validation guardrail catches LLM failures and repairs them.
+    3. Untyped / legacy → classic ``stg_`` + mart skeletons with
+       NULL-cast column projections so dbt compiles.
+
+    Path (2) exists because the previous DV2/Dimensional skeleton
+    emitters caused three distinct real-world failures on B1:
+      - "hub_<consumeId>" is semantically wrong (DV2 hubs are business
+        entities, not source tables).
+      - Placeholder SQL such as ``<business_key>`` doesn't compile.
+      - Stub-file names contaminated the LLM context; downstream
+        LLM-authored links referenced hub names that never had a real
+        implementation.
+    Skipping skeletons resolves all three.
+    """
     files: GenerationResult = {}
 
     if transformation_intent and transformation_intent.stages:
         return _generate_from_intent(contract, transformation_intent)
 
-    # No AI intent — generate skeletons from consumes + exposes. The
-    # shape depends on the chosen data modeling technique; see
-    # :class:`TransformationIntent.data_modeling_technique`.  When the
-    # LLM later ships real SQL via ``additional_files`` it overrides
-    # these skeletons (merge-precedence swap in ``forge_modes``).
-    technique = (
-        transformation_intent.data_modeling_technique if transformation_intent else None
-    ) or "dimensional"
+    technique = transformation_intent.data_modeling_technique if transformation_intent else None
+    if technique in {"data_vault_2", "dimensional"}:
+        # LLM owns staging + marts; no skeleton files from the engine.
+        return files
 
+    # Untyped path — classic staging + mart skeletons.
     consumes = contract.get("consumes", [])
     exposes = get_exposes(contract)
-
-    if technique == "data_vault_2":
-        return _dv2_skeleton_files(contract, build, consumes, exposes)
-
-    # Default: dimensional / Kimball stg + fct/dim skeletons.
     for consume in consumes:
         if not isinstance(consume, dict):
             continue
@@ -115,120 +130,6 @@ def _generate_hybrid(
         )
 
     return files
-
-
-def _dv2_skeleton_files(
-    contract: Dict[str, Any],
-    build: Dict[str, Any],
-    consumes: List[Any],
-    exposes: List[Any],
-) -> GenerationResult:
-    """Return hub / satellite / link skeleton files for a DV2 build.
-
-    Per DV2 conventions we emit:
-      - ``models/staging/hub_<source>.sql``  — hub + business-key hash
-      - ``models/staging/sat_<source>_raw.sql`` — raw satellite per source
-      - ``models/marts/lnk_<mart>.sql`` — link + descendants per expose
-    The mart SQL reference ``hub_*`` hashes (not natural keys) and carry
-    ``load_dts`` + ``record_source`` metadata so downstream consumers can
-    diff history insert-only.
-    """
-    files: GenerationResult = {}
-    for consume in consumes:
-        if not isinstance(consume, dict):
-            continue
-        source_id = consume.get("exposeId") or consume.get("id") or "source"
-        files[f"models/staging/hub_{source_id}.sql"] = _dv2_hub_skeleton(source_id)
-        files[f"models/staging/sat_{source_id}_raw.sql"] = _dv2_sat_skeleton(source_id)
-
-    for expose in exposes:
-        expose_id = get_expose_id(expose) or "output"
-        schema_cols = _extract_schema_columns(expose)
-        hub_refs = [
-            f"hub_{c.get('exposeId') or c.get('id', 'source')}"
-            for c in consumes
-            if isinstance(c, dict)
-        ]
-        files[f"models/marts/lnk_{expose_id}.sql"] = _dv2_link_skeleton(
-            expose_id, schema_cols, hub_refs
-        )
-
-    return files
-
-
-def _dv2_hub_skeleton(source_id: str) -> str:
-    """Generate a DV2 hub skeleton for an upstream source.
-
-    Hubs hold business-key → md5 hash-key mappings plus minimal load
-    metadata.  One hub per business entity; we use the exposeId as the
-    business entity identifier pending a smarter mapping.
-    """
-    return (
-        f"{_HEADER}"
-        "{{ config(materialized='table') }}\n\n"
-        f"-- DV2 hub skeleton for {source_id}. Fill in the business key column.\n"
-        "select\n"
-        "    md5(upper(trim(cast(<business_key> as varchar)))) as hk,\n"
-        "    <business_key> as business_key,\n"
-        "    current_timestamp() as load_dts,\n"
-        f"    '{source_id}' as record_source\n"
-        f"from {{{{ source('raw', '{source_id}') }}}}\n"
-        "-- TODO: replace <business_key> with the natural key column from "
-        f"{source_id}.\n"
-    )
-
-
-def _dv2_sat_skeleton(source_id: str) -> str:
-    """Generate a DV2 satellite skeleton — one satellite per upstream source."""
-    return (
-        f"{_HEADER}"
-        "{{ config(materialized='table') }}\n\n"
-        f"-- DV2 raw satellite for {source_id}. Insert-only — one row per change.\n"
-        "select\n"
-        "    md5(upper(trim(cast(<business_key> as varchar)))) as hk,\n"
-        "    current_timestamp() as load_dts,\n"
-        f"    '{source_id}' as record_source,\n"
-        "    md5(concat_ws('||', cast(*  as varchar))) as hash_diff,\n"
-        "    -- descriptive attributes follow\n"
-        "    *\n"
-        f"from {{{{ source('raw', '{source_id}') }}}}\n"
-        "-- TODO: replace <business_key> and narrow the `*` projection.\n"
-    )
-
-
-def _dv2_link_skeleton(
-    expose_id: str,
-    schema_cols: List[Dict[str, str]],
-    hub_refs: List[str],
-) -> str:
-    """Generate a DV2 link skeleton — joins hubs and projects the expose schema."""
-    lines = [_HEADER, "{{ config(materialized='table') }}\n\n"]
-    if schema_cols:
-        lines.append("select\n")
-        col_lines = [
-            f"    cast(null as {_sql_type(col.get('type', 'string'))}) as {col['name']}"
-            for col in schema_cols
-        ]
-        col_lines.append("    current_timestamp() as load_dts")
-        col_lines.append(f"    '{expose_id}' as record_source")
-        lines.append(",\n".join(col_lines))
-        lines.append("\n\n")
-    else:
-        lines.append(
-            "select\n"
-            "    current_timestamp() as load_dts,\n"
-            f"    '{expose_id}' as record_source\n"
-            "    -- TODO: project output columns\n\n"
-        )
-
-    if hub_refs:
-        lines.append(f"from {{{{ ref('{hub_refs[0]}') }}}}\n")
-        for ref_name in hub_refs[1:]:
-            lines.append(f"-- TODO: join {{ ref('{ref_name}') }} via hk\n")
-    else:
-        lines.append("-- TODO: add hub references\nfrom dual\n")
-    lines.append("\n-- TODO: replace the null projections with real hub/satellite joins.\n")
-    return "".join(lines)
 
 
 def _staging_skeleton(source_id: str) -> str:

@@ -86,9 +86,16 @@ class DbtEngine(TransformationEngine):
         )
         files.update(model_files)
 
-        # models/<layer>/schema.yml (dbt tests from DQ rules)
-        schema_files = generate_schema_yml(contract)
-        files.update(schema_files)
+        # models/<layer>/schema.yml — per-model dbt tests. We skip this
+        # when a modeling technique is set because the LLM pipeline owns
+        # the model set under that path; if we also emit schema.yml
+        # here, dbt rejects the project with "two schema.yml entries
+        # for the same resource". The LLM ships its own schema.yml via
+        # ``additional_files`` (system prompt mandates it).
+        technique = transformation_intent.data_modeling_technique if transformation_intent else None
+        if technique not in {"data_vault_2", "dimensional"}:
+            schema_files = generate_schema_yml(contract)
+            files.update(schema_files)
 
         # profiles.yml
         profiles_content = generate_profiles(contract, build)

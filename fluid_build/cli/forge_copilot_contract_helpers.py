@@ -204,6 +204,21 @@ _REPAIR_GUIDANCE: List[Dict[str, Any]] = [
             '"dbt_project/models/marts/fct_subscription_events.sql": "..."}}'
         ),
     },
+    {
+        "pattern": "declares `sources:`",
+        "category": "engine_owned_file_collision",
+        "fix_hint": (
+            "The engine emits dbt_project/models/sources.yml from the "
+            "upstream contracts — never include a `sources:` block in any "
+            "YAML you ship. Remove the `sources:` block from the offending "
+            "file; keep only `models:` (one top-level list of model tests)."
+        ),
+        "example": (
+            '{"additional_files": {'
+            '"dbt_project/models/schema.yml": '
+            '"version: 2\\nmodels:\\n  - name: hub_party\\n    columns: [...]"}}'
+        ),
+    },
 ]
 
 
@@ -958,6 +973,36 @@ def validate_generated_result(
                     "data_modeling_technique=dimensional requires at least one "
                     "fct_/dim_ model in additional_files — none found."
                 )
+
+    # --- Engine-owned file intrusion check -------------------------------
+    # The engine owns dbt_project/models/sources.yml (generated from
+    # upstream contracts) — duplicating the `sources:` block in any
+    # LLM-shipped YAML makes dbt blow up with "two sources with the
+    # same name". Catch this during validation so the repair loop can
+    # fix it before apply runs.
+    additional_files = normalized.get("additional_files") or {}
+    for rel_path, content in additional_files.items():
+        if not isinstance(rel_path, str) or not isinstance(content, str):
+            continue
+        if not rel_path.endswith(".yml") and not rel_path.endswith(".yaml"):
+            continue
+        # Only check YAML under dbt_project/models/... — e.g.
+        # dbt_project/models/schema.yml. Other yamls (docs, CI configs)
+        # are out of scope.
+        if "/models/" not in rel_path:
+            continue
+        # Cheap regex-less scan; YAML parsing would be stricter but adds
+        # a dependency on the LLM emitting syntactically clean YAML,
+        # which is a separate concern.
+        stripped_lines = [line.lstrip() for line in content.splitlines() if line.strip()]
+        for line in stripped_lines[:20]:
+            if line.startswith("sources:"):
+                errors.append(
+                    f"LLM-shipped {rel_path!r} declares `sources:` — that key is "
+                    f"reserved for the engine-generated models/sources.yml. "
+                    f"Remove the `sources:` block; keep only `models:`."
+                )
+                break
 
     return errors, warnings
 

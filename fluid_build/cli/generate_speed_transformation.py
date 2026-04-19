@@ -227,24 +227,25 @@ def run(args: Any, logger: logging.Logger) -> int:
 def _print_speed_transformation_banner(contract: Dict[str, Any]) -> None:
     """Surface the modeling technique + user-data-model signal to the user.
 
-    Contract annotations are stamped by ``fluid forge`` (see
-    ``forge_modes._generate_engine_artifacts``). The banner has three modes:
+    ``fluid forge`` stamps the chosen technique onto
+    ``contract["labels"]["dataModelingTechnique"]``. FLUID 0.7.2's
+    ``metadata`` block is closed to additional properties; ``labels``
+    is the open string map where such annotations live.  The banner
+    has three modes:
 
     * technique + user-supplied model → green (best case)
     * technique only → yellow (LLM works, but without a concrete data
       model it falls back to heuristic joins)
     * nothing to say → silent
     """
+    labels = contract.get("labels") or {}
     metadata = contract.get("metadata") or {}
-    annotations = metadata.get("annotations") or {}
-    technique = annotations.get("dataModelingTechnique") or metadata.get("dataModelingTechnique")
+    technique = labels.get("dataModelingTechnique") or metadata.get("dataModelingTechnique")
     if not technique:
         return
 
     has_data_model = bool(
-        metadata.get("user_data_model")
-        or metadata.get("userDataModel")
-        or annotations.get("dataModel")
+        metadata.get("user_data_model") or metadata.get("userDataModel") or labels.get("dataModel")
     )
 
     display = _display_technique(technique)
@@ -257,7 +258,7 @@ def _print_speed_transformation_banner(contract: Dict[str, Any]) -> None:
         cprint(
             f"[yellow]{display} speed-transformation works best when a data model "
             f"is supplied. Continuing without one — consider adding one via "
-            f"`fluid forge` or metadata.annotations.dataModel.[/yellow]"
+            f"`fluid forge` or labels.dataModel.[/yellow]"
         )
 
 

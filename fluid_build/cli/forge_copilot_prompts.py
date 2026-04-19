@@ -274,6 +274,18 @@ def build_system_prompt(
         "single-column primary keys).\n"
         "If upstream_products is empty or missing, fall back to normal contract generation — the "
         "dbt skeleton generator will run automatically.\n\n"
+        # --- Engine-owned files: do NOT recreate ---
+        "ENGINE-OWNED FILES (do NOT write these to additional_files):\n"
+        "- dbt_project/models/sources.yml — emitted by the engine. NEVER include a "
+        "  `sources:` block in any YAML you ship; duplicating source declarations makes "
+        '  dbt fail with "two sources with the same name". If you emit a schema.yml '
+        "  file, it must contain ONLY a `models:` top-level key.\n"
+        "- dbt_project/profiles.yml — emitted by the engine.\n"
+        "- dbt_project/dbt_project.yml — emitted by the engine.\n"
+        "When a modeling technique is active the engine does NOT emit any per-model "
+        "schema.yml either, so you SHOULD ship exactly one schema.yml at "
+        "`additional_files['dbt_project/models/schema.yml']` listing every staging + "
+        "mart model you authored, with per-column tests.\n\n"
         # --- Modeling-technique mandate ---
         "MODELING TECHNIQUE MANDATE:\n"
         "When the user prompt supplies `data_modeling_technique` + `data_modeling_guidance`, "
