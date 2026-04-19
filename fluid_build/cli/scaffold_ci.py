@@ -35,40 +35,79 @@ def register(subparsers: argparse._SubParsersAction):
     p.set_defaults(cmd=COMMAND, func=run)
 
 
-GITLAB = """stages:
+GITLAB = """# FLUID CI/CD Pipeline — GitLab CI
+# Required CI/CD variables (Settings → CI/CD → Variables):
+#   SNOWFLAKE_* / DMM_API_KEY / DMM_API_URL / GEMINI_API_KEY
+#   AIRFLOW_DAGS_DEST    — rsync target for airflow DAG deployment (optional)
+#   CATALOG              — catalog name for `fluid publish` (default: datamesh-manager)
+variables:
+  CONTRACT: contract.fluid.yaml
+  PROVIDER: default
+  BUILD_ID: ""                 # Set to builds[].id for dbt hybrid-reference projects.
+  CATALOG: datamesh-manager
+
+stages:
   - validate
   - generate
   - plan
   - test
   - apply
+  - deploy
+  - publish
+
 validate:
   stage: validate
   script:
-    - python -m fluid_build.cli validate $CONTRACT
+    - fluid validate $CONTRACT
 generate:
   stage: generate
   script:
-    - python -m fluid_build.cli generate transformation
-    - python -m fluid_build.cli generate schedule
+    - fluid generate speed-transformation
+    - fluid generate schedule
+  artifacts:
+    paths: [dbt_project/, dags/]
 plan:
   stage: plan
   script:
-    - python -m fluid_build.cli --provider $PROVIDER plan $CONTRACT --out runtime/plan.json
+    - fluid --provider $PROVIDER plan $CONTRACT --out runtime/plan.json
   artifacts:
     paths: [runtime/plan.json]
 tests:
   stage: test
   script:
-    - python -m fluid_build.cli contract-tests $CONTRACT
+    - fluid contract-tests $CONTRACT
 apply:
   stage: apply
   when: manual
   script:
-    - python -m fluid_build.cli --provider $PROVIDER apply runtime/plan.json --yes
+    # --build is required for dbt hybrid-reference builds; harmless otherwise.
+    - if [ -n "$BUILD_ID" ]; then fluid apply $CONTRACT --build $BUILD_ID --yes; else fluid apply runtime/plan.json --yes; fi
+airflow_sync:
+  stage: deploy
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == "main" && $AIRFLOW_DAGS_DEST'
+  script:
+    - if [ -d dags/ ]; then rsync -av --delete dags/ "$AIRFLOW_DAGS_DEST"/ ; fi
+publish:
+  stage: publish
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == "main" && $DMM_API_URL'
+  script:
+    - fluid publish $CONTRACT --catalog $CATALOG
 """
 
-GITHUB = """name: FLUID
-on: [push]
+GITHUB = """# FLUID CI/CD Pipeline — GitHub Actions
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   SNOWFLAKE_* / DMM_API_KEY / DMM_API_URL / GEMINI_API_KEY
+# Required repository variables:
+#   PROVIDER             — default provider (e.g. snowflake)
+#   BUILD_ID             — builds[].id for dbt hybrid-reference projects
+#   AIRFLOW_DAGS_DEST    — rsync target for airflow DAG deployment (optional)
+#   CATALOG              — catalog name for `fluid publish` (default: datamesh-manager)
+name: FLUID
+on: [push, workflow_dispatch]
+env:
+  CONTRACT: contract.fluid.yaml
 permissions: {}  # Least privilege — grant per-job only
 jobs:
   validate:
@@ -77,7 +116,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
-      - run: python -m fluid_build.cli validate ${{ env.CONTRACT }}
+      - run: fluid validate ${{ env.CONTRACT }}
   generate:
     needs: [validate]
     runs-on: ubuntu-latest
@@ -85,8 +124,13 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
-      - run: python -m fluid_build.cli generate transformation
-      - run: python -m fluid_build.cli generate schedule
+      - run: fluid generate speed-transformation
+      - run: fluid generate schedule
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with: { name: fluid-artifacts, path: |
+            dbt_project/
+            dags/
+        }
   plan:
     needs: [generate]
     runs-on: ubuntu-latest
@@ -94,7 +138,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
-      - run: python -m fluid_build.cli --provider ${{ env.PROVIDER }} plan ${{ env.CONTRACT }} --out runtime/plan.json
+      - run: fluid --provider ${{ vars.PROVIDER || 'default' }} plan ${{ env.CONTRACT }} --out runtime/plan.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with: { name: fluid-plan, path: runtime/plan.json }
   apply:
     needs: [plan]
     runs-on: ubuntu-latest
@@ -103,45 +149,82 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
-      - run: python -m fluid_build.cli --provider ${{ env.PROVIDER }} apply runtime/plan.json --yes
+      - name: Apply contract
+        run: |
+          if [ -n "${{ vars.BUILD_ID }}" ]; then
+            fluid apply ${{ env.CONTRACT }} --build ${{ vars.BUILD_ID }} --yes
+          else
+            fluid apply runtime/plan.json --yes
+          fi
+  airflow_sync:
+    needs: [apply]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: github.ref == 'refs/heads/main' && vars.AIRFLOW_DAGS_DEST != ''
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - run: |
+          if [ -d dags/ ]; then rsync -av --delete dags/ "${{ vars.AIRFLOW_DAGS_DEST }}"/ ; fi
+  publish:
+    needs: [apply]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: github.ref == 'refs/heads/main' && secrets.DMM_API_URL != ''
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - run: fluid publish ${{ env.CONTRACT }} --catalog ${{ vars.CATALOG || 'datamesh-manager' }}
 """
 
 JENKINS = """\
 // FLUID CI/CD Pipeline — Jenkinsfile
+// Required Jenkins credentials + vars:
+//   SNOWFLAKE_* / DMM_API_KEY / DMM_API_URL / GEMINI_API_KEY   (bind via withCredentials or env)
+//   BUILD_ID           — builds[].id for dbt hybrid-reference projects (leave blank otherwise)
+//   AIRFLOW_DAGS_DEST  — rsync target for airflow DAG deployment (leave blank to skip)
+//   CATALOG            — catalog name for `fluid publish` (default: datamesh-manager)
 pipeline {
-    agent { label 'fluid' }
+    // Default to any available agent. Change to `label 'your-label'` if you
+    // have a dedicated FLUID build agent.
+    agent any
 
     environment {
         CONTRACT = 'contract.fluid.yaml'
         PROVIDER = 'default'
-        // Bind credentials from Jenkins credential store.
-        // Configure 'fluid-provider-credentials' in Jenkins > Manage Credentials.
-        PROVIDER_CREDS = credentials('fluid-provider-credentials')
+        BUILD_ID = ''
+        AIRFLOW_DAGS_DEST = ''
+        CATALOG = 'datamesh-manager'
     }
 
     stages {
         stage('Validate') {
             steps {
-                sh 'python -m fluid_build.cli validate $CONTRACT'
+                sh 'fluid validate $CONTRACT'
             }
         }
         stage('Generate') {
             parallel {
                 stage('Transformations') {
                     steps {
-                        sh 'python -m fluid_build.cli generate transformation'
+                        sh 'fluid generate speed-transformation'
                     }
                 }
                 stage('Schedules') {
                     steps {
-                        sh 'python -m fluid_build.cli generate schedule'
+                        sh 'fluid generate schedule'
                     }
+                }
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: 'dbt_project/**, dags/**', allowEmptyArchive: true
                 }
             }
         }
         stage('Plan') {
             steps {
-                sh 'python -m fluid_build.cli --provider $PROVIDER plan $CONTRACT --out runtime/plan.json'
+                sh 'fluid --provider $PROVIDER plan $CONTRACT --out runtime/plan.json'
             }
             post {
                 success {
@@ -151,7 +234,7 @@ pipeline {
         }
         stage('Test') {
             steps {
-                sh 'python -m fluid_build.cli contract-tests $CONTRACT'
+                sh 'fluid contract-tests $CONTRACT'
             }
         }
         stage('Apply') {
@@ -161,7 +244,36 @@ pipeline {
                 ok 'Apply'
             }
             steps {
-                sh 'python -m fluid_build.cli --provider $PROVIDER apply runtime/plan.json --yes'
+                // --build is required for dbt hybrid-reference builds; harmless otherwise.
+                sh '''
+                    if [ -n "$BUILD_ID" ]; then
+                        fluid apply $CONTRACT --build $BUILD_ID --yes
+                    else
+                        fluid apply runtime/plan.json --yes
+                    fi
+                '''
+            }
+        }
+        stage('Airflow DAG Sync') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { return env.AIRFLOW_DAGS_DEST?.trim() }
+                }
+            }
+            steps {
+                sh 'if [ -d dags/ ]; then rsync -av --delete dags/ "$AIRFLOW_DAGS_DEST"/ ; fi'
+            }
+        }
+        stage('Publish') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { return env.DMM_API_URL?.trim() }
+                }
+            }
+            steps {
+                sh 'fluid publish $CONTRACT --catalog $CATALOG'
             }
         }
     }

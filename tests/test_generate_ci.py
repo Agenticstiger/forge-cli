@@ -84,8 +84,19 @@ class TestJenkinsStaticTemplate:
         assert first_line.startswith("//")
 
     def test_references_fluid_commands(self):
-        assert "fluid_build.cli validate" in JENKINS
-        assert "fluid_build.cli" in JENKINS
+        # Generated CI calls the public ``fluid`` console script rather
+        # than the internal ``python -m fluid_build.cli`` path — avoids
+        # assuming ``fluid_build`` is importable on the CI runner.
+        assert "fluid validate" in JENKINS
+        assert "fluid apply" in JENKINS
+        assert "fluid generate speed-transformation" in JENKINS
+
+    def test_has_dbt_airflow_publish_stages(self):
+        """B1 demo requires these three deploy/publish hooks."""
+        # dbt deployment rides on `fluid apply --build`, asserted above.
+        assert "Airflow DAG Sync" in JENKINS
+        assert "stage('Publish')" in JENKINS
+        assert "fluid publish" in JENKINS
 
     def test_has_post_cleanup(self):
         assert "cleanWs()" in JENKINS

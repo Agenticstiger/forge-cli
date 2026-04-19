@@ -201,13 +201,28 @@ class BasePipelineTemplate:
         }
 
     def _get_fluid_commands(self) -> Dict[str, str]:
-        """Get standard FLUID commands for different stages"""
+        """Get standard FLUID commands for different stages.
+
+        Build-aware commands use ``$BUILD_ID`` / ``$CONTRACT`` env vars so
+        a single template covers both dbt hybrid-reference projects
+        (where ``--build <buildId>`` is required) and non-build contracts
+        (where the plan-file path works).  CI generators inject the env
+        vars; missing ones fall through to the plan-file apply branch.
+        """
         return {
-            "validate": "fluid validate --strict",
-            "plan": "fluid plan --output plan.json",
-            "apply": "fluid apply --plan plan.json",
+            "validate": "fluid validate $CONTRACT",
+            "plan": "fluid plan $CONTRACT --out runtime/plan.json",
+            # --build is required for dbt hybrid-reference builds; the
+            # inline conditional keeps the template useful for both shapes.
+            "apply": (
+                'if [ -n "$BUILD_ID" ]; then '
+                "fluid apply $CONTRACT --build $BUILD_ID --yes; "
+                "else "
+                "fluid apply runtime/plan.json --yes; "
+                "fi"
+            ),
             "test": "fluid test --coverage",
-            "contract_test": "fluid contract-test --all",
+            "contract_test": "fluid contract-tests $CONTRACT",
             "generate_transformation": "fluid generate speed-transformation",
             "generate_schedule": "fluid generate schedule",
             "check_transformations": (
@@ -224,6 +239,22 @@ class BasePipelineTemplate:
             "publish_opds": "fluid export-opds --output opds-catalog.json",
             "marketplace_publish": "fluid marketplace publish --catalog opds-catalog.json",
             "doctor": "fluid doctor --extended",
+            # Airflow DAG deployment: rsync the generated ``dags/`` directory
+            # to an operator-supplied destination. Skipped when
+            # $AIRFLOW_DAGS_DEST is unset or dags/ doesn't exist.
+            "airflow_sync": (
+                'if [ -d dags/ ] && [ -n "$AIRFLOW_DAGS_DEST" ]; then '
+                'rsync -av --delete dags/ "$AIRFLOW_DAGS_DEST"/; '
+                "fi"
+            ),
+            # Catalog publish: push the contract (+ ODPS/ODCS exports) to
+            # a catalog. Skipped when $DMM_API_URL is unset (the catalog
+            # name defaults to datamesh-manager).
+            "publish_catalog": (
+                'if [ -n "$DMM_API_URL" ]; then '
+                "fluid publish $CONTRACT --catalog ${CATALOG:-datamesh-manager}; "
+                "fi"
+            ),
         }
 
     def _get_common_environment_vars(self) -> Dict[str, str]:
@@ -572,6 +603,19 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     "name": "Run Contract Tests",
                     "run": f"FLUID_ENV={env} {commands['contract_test']}",
                 },
+                # Airflow DAG sync + catalog publish fire only in prod.
+                # Both commands self-gate on env vars, so safe no-ops
+                # when AIRFLOW_DAGS_DEST / DMM_API_URL are unset.
+                {
+                    "name": "Sync Airflow DAGs",
+                    "run": commands["airflow_sync"],
+                    "if": f"'{env}' == 'prod'",
+                },
+                {
+                    "name": "Publish Contract to Catalog",
+                    "run": commands["publish_catalog"],
+                    "if": f"'{env}' == 'prod'",
+                },
                 {
                     "name": "Generate Visualization",
                     "run": commands["visualize"],
@@ -773,12 +817,22 @@ class GitLabCITemplate(BasePipelineTemplate):
                     "paths": ["test-results/"],
                 },
             },
+            "airflow_sync": {
+                "stage": "deploy",
+                "script": [commands["airflow_sync"]],
+                "only": ["main"],
+            },
             "publish": {
                 "stage": "publish",
-                "script": [commands["visualize"], commands["publish_opds"]],
+                "script": [
+                    commands["publish_catalog"],
+                    commands["visualize"],
+                    commands["publish_opds"],
+                ],
                 "artifacts": {
                     "paths": ["pipeline-viz.html", "dependency-graph.png", "opds-catalog.json"],
                     "expire_in": "30 days",
+                    "when": "always",
                 },
                 "only": ["main"],
             },
@@ -880,10 +934,22 @@ class GitLabCITemplate(BasePipelineTemplate):
 
             pipeline[f"deploy-{env}"] = deploy_job
 
+        # Airflow DAG sync — no-op when dags/ is empty or AIRFLOW_DAGS_DEST is unset.
+        pipeline["airflow-sync"] = {
+            "stage": "deploy",
+            "script": [commands["airflow_sync"]],
+            "only": ["main"],
+            "dependencies": [f"deploy-{config.environments[-1]}"],
+        }
+
         # Add publishing job
         pipeline["publish"] = {
             "stage": "publish",
-            "script": [commands["visualize"], commands["publish_opds"]],
+            "script": [
+                commands["publish_catalog"],
+                commands["visualize"],
+                commands["publish_opds"],
+            ],
             "artifacts": {
                 "paths": ["pipeline-viz.html", "dependency-graph.png", "opds-catalog.json"]
             },
@@ -1064,22 +1130,55 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
 
             pipeline["stages"].append(deploy_stage)
 
-        # Publishing stage
+        # Airflow DAG sync + catalog publish: always added on main.
+        # Both shell commands are self-gating via env vars
+        # (AIRFLOW_DAGS_DEST / DMM_API_URL) so they no-op cleanly when
+        # the operator hasn't configured them.
+        airflow_publish_stage = {
+            "stage": "DeployExtras",
+            "displayName": "Deploy Extras (Airflow + Catalog)",
+            "dependsOn": f"Deploy{config.environments[-1].title()}",
+            "condition": "and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))",
+            "jobs": [
+                {
+                    "job": "AirflowAndPublish",
+                    "displayName": "Sync DAGs + Publish contract",
+                    "steps": [
+                        {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.12"}},
+                        {
+                            "script": "pip install fluid-build",
+                            "displayName": "Install fluid-build",
+                        },
+                        {
+                            "script": commands["airflow_sync"],
+                            "displayName": "Sync Airflow DAGs",
+                        },
+                        {
+                            "script": commands["publish_catalog"],
+                            "displayName": "Publish contract to catalog",
+                        },
+                    ],
+                }
+            ],
+        }
+        pipeline["stages"].append(airflow_publish_stage)
+
+        # Publishing stage (OPDS + marketplace — opt-in)
         if config.enable_marketplace_publishing:
             publish_stage = {
                 "stage": "Publish",
                 "displayName": "Publish Artifacts",
-                "dependsOn": f"Deploy{config.environments[-1].title()}",
+                "dependsOn": "DeployExtras",
                 "condition": "and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))",
                 "jobs": [
                     {
                         "job": "PublishJob",
                         "displayName": "Publish to Marketplace",
                         "steps": [
-                            {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.9"}},
+                            {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.12"}},
                             {
-                                "script": "pip install -r requirements.txt",
-                                "displayName": "Install dependencies",
+                                "script": "pip install fluid-build",
+                                "displayName": "Install fluid-build",
                             },
                             {
                                 "script": commands["visualize"],
@@ -1246,14 +1345,28 @@ pipeline {{
         }}
 """
 
-        # Add publishing stage
+        # Airflow DAG sync — rsync dags/ to AIRFLOW_DAGS_DEST (no-op
+        # when either the dags/ directory or the destination var is
+        # missing; the shell conditional lives inside commands["airflow_sync"]).
+        jenkins_pipeline += f"""
+        stage('Airflow DAG Sync') {{
+            when {{ branch 'main' }}
+            steps {{
+                sh '{commands["airflow_sync"]}'
+            }}
+        }}
+"""
+
+        # Publishing stage: catalog push (DMM / Entropy) via `fluid publish`
+        # plus the existing OPDS/visualization exports.
         jenkins_pipeline += f"""
         stage('Publish') {{
             when {{ branch 'main' }}
             steps {{
+                sh '{commands["publish_catalog"]}'
                 sh '{commands["visualize"]}'
                 sh '{commands["publish_opds"]}'
-                archiveArtifacts artifacts: 'pipeline-viz.html,dependency-graph.png,opds-catalog.json', fingerprint: true
+                archiveArtifacts artifacts: 'pipeline-viz.html,dependency-graph.png,opds-catalog.json', fingerprint: true, allowEmptyArchive: true
 """
 
         if config.enable_marketplace_publishing:
@@ -1347,11 +1460,20 @@ class BitbucketTemplate(BasePipelineTemplate):
 
             pipeline["pipelines"]["branches"]["main"].append(deploy_step)
 
-        # Add publishing step
+        # Airflow DAG sync — self-gates on AIRFLOW_DAGS_DEST env var.
+        pipeline["pipelines"]["branches"]["main"].append(
+            {"step": {"name": "Airflow DAG Sync", "script": [commands["airflow_sync"]]}}
+        )
+
+        # Add publishing step (catalog push + visualize + OPDS export)
         publish_step = {
             "step": {
                 "name": "Publish",
-                "script": [commands["visualize"], commands["publish_opds"]],
+                "script": [
+                    commands["publish_catalog"],
+                    commands["visualize"],
+                    commands["publish_opds"],
+                ],
                 "artifacts": ["pipeline-viz.html", "dependency-graph.png", "opds-catalog.json"],
             }
         }
