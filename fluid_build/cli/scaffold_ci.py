@@ -37,9 +37,16 @@ def register(subparsers: argparse._SubParsersAction):
 
 GITLAB = """# FLUID CI/CD Pipeline — GitLab CI
 # Required CI/CD variables (Settings → CI/CD → Variables):
-#   SNOWFLAKE_* / DMM_API_KEY / DMM_API_URL / GEMINI_API_KEY
-#   AIRFLOW_DAGS_DEST    — rsync target for airflow DAG deployment (optional)
-#   CATALOG              — catalog name for `fluid publish` (default: datamesh-manager)
+#   SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_PASSWORD / SNOWFLAKE_ROLE
+#   SNOWFLAKE_WAREHOUSE / SNOWFLAKE_DATABASE / SNOWFLAKE_FLUID_SCHEMA
+#   SNOWFLAKE_STAGE_SCHEMA / SNOWFLAKE_DBT_SCHEMA (optional)
+#   DMM_API_KEY / DMM_API_URL    — catalog publish target
+#   GEMINI_API_KEY               — LLM for `fluid forge` (optional in CI)
+#   AIRFLOW_DAGS_DEST            — rsync target for airflow DAG deployment (optional)
+#   CATALOG                      — catalog name for `fluid publish` (default: datamesh-manager)
+image: python:3.12-slim
+before_script:
+  - pip install --quiet data-product-forge
 variables:
   CONTRACT: contract.fluid.yaml
   PROVIDER: default
@@ -98,7 +105,11 @@ publish:
 
 GITHUB = """# FLUID CI/CD Pipeline — GitHub Actions
 # Required repository secrets (Settings → Secrets and variables → Actions):
-#   SNOWFLAKE_* / DMM_API_KEY / DMM_API_URL / GEMINI_API_KEY
+#   SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_PASSWORD / SNOWFLAKE_ROLE
+#   SNOWFLAKE_WAREHOUSE / SNOWFLAKE_DATABASE / SNOWFLAKE_FLUID_SCHEMA
+#   SNOWFLAKE_STAGE_SCHEMA / SNOWFLAKE_DBT_SCHEMA (optional)
+#   DMM_API_KEY / DMM_API_URL    — catalog publish target
+#   GEMINI_API_KEY               — LLM for `fluid forge` (optional in CI)
 # Required repository variables:
 #   PROVIDER             — default provider (e.g. snowflake)
 #   BUILD_ID             — builds[].id for dbt hybrid-reference projects
@@ -116,6 +127,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with: { python-version: '3.12' }
+      - run: pip install --quiet data-product-forge
       - run: fluid validate ${{ env.CONTRACT }}
   generate:
     needs: [validate]
@@ -124,6 +138,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with: { python-version: '3.12' }
+      - run: pip install --quiet data-product-forge
       - run: fluid generate speed-transformation
       - run: fluid generate schedule
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -138,6 +155,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with: { python-version: '3.12' }
+      - run: pip install --quiet data-product-forge
       - run: fluid --provider ${{ vars.PROVIDER || 'default' }} plan ${{ env.CONTRACT }} --out runtime/plan.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with: { name: fluid-plan, path: runtime/plan.json }
@@ -149,6 +169,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with: { python-version: '3.12' }
+      - run: pip install --quiet data-product-forge
       - name: Apply contract
         run: |
           if [ -n "${{ vars.BUILD_ID }}" ]; then
@@ -174,16 +197,23 @@ jobs:
     if: github.ref == 'refs/heads/main' && secrets.DMM_API_URL != ''
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with: { python-version: '3.12' }
+      - run: pip install --quiet data-product-forge
       - run: fluid publish ${{ env.CONTRACT }} --catalog ${{ vars.CATALOG || 'datamesh-manager' }}
 """
 
 JENKINS = """\
 // FLUID CI/CD Pipeline — Jenkinsfile
-// Required Jenkins credentials + vars:
-//   SNOWFLAKE_* / DMM_API_KEY / DMM_API_URL / GEMINI_API_KEY   (bind via withCredentials or env)
-//   BUILD_ID           — builds[].id for dbt hybrid-reference projects (leave blank otherwise)
-//   AIRFLOW_DAGS_DEST  — rsync target for airflow DAG deployment (leave blank to skip)
-//   CATALOG            — catalog name for `fluid publish` (default: datamesh-manager)
+// Required Jenkins credentials + vars (bind via withCredentials or env):
+//   SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_PASSWORD / SNOWFLAKE_ROLE
+//   SNOWFLAKE_WAREHOUSE / SNOWFLAKE_DATABASE / SNOWFLAKE_FLUID_SCHEMA
+//   SNOWFLAKE_STAGE_SCHEMA / SNOWFLAKE_DBT_SCHEMA (optional)
+//   DMM_API_KEY / DMM_API_URL    — catalog publish target
+//   GEMINI_API_KEY               — LLM for `fluid forge` (optional in CI)
+//   BUILD_ID                     — builds[].id for dbt hybrid-reference projects (leave blank otherwise)
+//   AIRFLOW_DAGS_DEST            — rsync target for airflow DAG deployment (leave blank to skip)
+//   CATALOG                      — catalog name for `fluid publish` (default: datamesh-manager)
 pipeline {
     // Default to any available agent. Change to `label 'your-label'` if you
     // have a dedicated FLUID build agent.
@@ -198,6 +228,18 @@ pipeline {
     }
 
     stages {
+        stage('Setup') {
+            steps {
+                // Ensure Python + fluid-build are available on the agent.
+                // If your agent image pre-installs fluid-build, this step
+                // is a no-op.
+                sh '''
+                    python3 -m pip install --user --quiet data-product-forge
+                    export PATH="$HOME/.local/bin:$PATH"
+                    fluid --version
+                '''
+            }
+        }
         stage('Validate') {
             steps {
                 sh 'fluid validate $CONTRACT'

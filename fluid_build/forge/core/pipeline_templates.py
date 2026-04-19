@@ -410,7 +410,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             "uses": _pin_action("actions/setup-python@v5"),
                             "with": {"python-version": "3.9"},
                         },
-                        {"name": "Install FLUID", "run": "pip install -r requirements.txt"},
+                        {"name": "Install FLUID", "run": "pip install --quiet data-product-forge"},
                         *self._get_oidc_steps(config.oidc_provider),
                         {"name": "FLUID Doctor Check", "run": commands["doctor"]},
                         {"name": "Validate Configuration", "run": commands["validate"]},
@@ -473,7 +473,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             "uses": _pin_action("actions/setup-python@v5"),
                             "with": {"python-version": "3.9"},
                         },
-                        {"name": "Install Dependencies", "run": "pip install -r requirements.txt"},
+                        {
+                            "name": "Install Dependencies",
+                            "run": "pip install --quiet data-product-forge",
+                        },
                         {"name": "FLUID Doctor", "run": commands["doctor"]},
                         {"name": "Validate", "run": commands["validate"]},
                         {
@@ -495,7 +498,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             "uses": _pin_action("actions/setup-python@v5"),
                             "with": {"python-version": "3.9"},
                         },
-                        {"name": "Install Dependencies", "run": "pip install -r requirements.txt"},
+                        {
+                            "name": "Install Dependencies",
+                            "run": "pip install --quiet data-product-forge",
+                        },
                         {
                             "name": "Generate Transformations",
                             "run": commands["generate_transformation"],
@@ -526,7 +532,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             "uses": _pin_action("actions/setup-python@v5"),
                             "with": {"python-version": "3.9"},
                         },
-                        {"name": "Install Dependencies", "run": "pip install -r requirements.txt"},
+                        {
+                            "name": "Install Dependencies",
+                            "run": "pip install --quiet data-product-forge",
+                        },
                         {"name": "Generate Plan", "run": commands["plan"]},
                         {
                             "name": "Upload Plan",
@@ -547,7 +556,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             "uses": _pin_action("actions/setup-python@v5"),
                             "with": {"python-version": "3.9"},
                         },
-                        {"name": "Install Dependencies", "run": "pip install -r requirements.txt"},
+                        {
+                            "name": "Install Dependencies",
+                            "run": "pip install --quiet data-product-forge",
+                        },
                         {
                             "name": "Run Tests",
                             "run": "fluid test --type ${{ matrix.test-type }} --output test-results-${{ matrix.test-type }}.xml",
@@ -580,7 +592,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     "uses": _pin_action("actions/setup-python@v5"),
                     "with": {"python-version": "3.9"},
                 },
-                {"name": "Install Dependencies", "run": "pip install -r requirements.txt"},
+                {"name": "Install Dependencies", "run": "pip install --quiet data-product-forge"},
                 *self._get_oidc_steps(config.oidc_provider),
                 {
                     "name": "Generate Transformations",
@@ -783,8 +795,8 @@ class GitLabCITemplate(BasePipelineTemplate):
         return {
             "stages": ["validate", "generate", "plan", "apply", "test", "publish"],
             "variables": env_vars,
-            "image": "python:3.9",
-            "before_script": ["pip install -r requirements.txt"],
+            "image": "python:3.12-slim",
+            "before_script": ["pip install --quiet data-product-forge"],
             "validate": {
                 "stage": "validate",
                 "script": [commands["doctor"], commands["validate"]],
@@ -844,8 +856,8 @@ class GitLabCITemplate(BasePipelineTemplate):
         pipeline = {
             "stages": ["validate", "generate", "test", "plan", "deploy", "publish"],
             "variables": env_vars,
-            "image": "python:3.9",
-            "before_script": ["pip install -r requirements.txt"],
+            "image": "python:3.12-slim",
+            "before_script": ["pip install --quiet data-product-forge"],
         }
 
         # Add validation, generation, and testing jobs
@@ -1026,9 +1038,9 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                     "job": "ValidateJob",
                     "displayName": "FLUID Validation",
                     "steps": [
-                        {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.9"}},
+                        {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.12"}},
                         {
-                            "script": "pip install -r requirements.txt",
+                            "script": "pip install --quiet data-product-forge",
                             "displayName": "Install dependencies",
                         },
                         {"script": commands["doctor"], "displayName": "FLUID Doctor Check"},
@@ -1052,9 +1064,9 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                     "job": "TestJob",
                     "displayName": "Run Tests",
                     "steps": [
-                        {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.9"}},
+                        {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.12"}},
                         {
-                            "script": "pip install -r requirements.txt",
+                            "script": "pip install --quiet data-product-forge",
                             "displayName": "Install dependencies",
                         },
                         {"script": commands["test"], "displayName": "Run tests"},
@@ -1089,10 +1101,10 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                                     "steps": [
                                         {
                                             "task": "UsePythonVersion@0",
-                                            "inputs": {"versionSpec": "3.9"},
+                                            "inputs": {"versionSpec": "3.12"},
                                         },
                                         {
-                                            "script": "pip install -r requirements.txt",
+                                            "script": "pip install --quiet data-product-forge",
                                             "displayName": "Install dependencies",
                                         },
                                         {
@@ -1146,8 +1158,8 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                     "steps": [
                         {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.12"}},
                         {
-                            "script": "pip install fluid-build",
-                            "displayName": "Install fluid-build",
+                            "script": "pip install data-product-forge",
+                            "displayName": "Install data-product-forge",
                         },
                         {
                             "script": commands["airflow_sync"],
@@ -1177,8 +1189,8 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                         "steps": [
                             {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.12"}},
                             {
-                                "script": "pip install fluid-build",
-                                "displayName": "Install fluid-build",
+                                "script": "pip install data-product-forge",
+                                "displayName": "Install data-product-forge",
                             },
                             {
                                 "script": commands["visualize"],
@@ -1242,7 +1254,7 @@ pipeline {{
     stages {{
         stage('Setup') {{
             steps {{
-                sh 'pip install -r requirements.txt'
+                sh 'pip install --quiet data-product-forge'
             }}
         }}
         
@@ -1409,14 +1421,14 @@ class BitbucketTemplate(BasePipelineTemplate):
         commands = self._get_fluid_commands()
 
         pipeline = {
-            "image": "python:3.9",
+            "image": "python:3.12-slim",
             "definitions": {
                 "steps": [
                     {
                         "step": {
                             "name": "Validate",
                             "script": [
-                                "pip install -r requirements.txt",
+                                "pip install --quiet data-product-forge",
                                 commands["doctor"],
                                 commands["validate"],
                             ],
@@ -1503,7 +1515,7 @@ class CircleCITemplate(BasePipelineTemplate):
             "version": 2.1,
             "executors": {
                 "python-executor": {
-                    "docker": [{"image": "python:3.9"}],
+                    "docker": [{"image": "python:3.12-slim"}],
                     "working_directory": "~/project",
                 }
             },
@@ -1512,7 +1524,7 @@ class CircleCITemplate(BasePipelineTemplate):
                     "executor": "python-executor",
                     "steps": [
                         "checkout",
-                        {"run": "pip install -r requirements.txt"},
+                        {"run": "pip install --quiet data-product-forge"},
                         {"run": {"name": "FLUID Doctor", "command": commands["doctor"]}},
                         {"run": {"name": "Validate", "command": commands["validate"]}},
                     ],
@@ -1521,7 +1533,7 @@ class CircleCITemplate(BasePipelineTemplate):
                     "executor": "python-executor",
                     "steps": [
                         "checkout",
-                        {"run": "pip install -r requirements.txt"},
+                        {"run": "pip install --quiet data-product-forge"},
                         {"run": {"name": "Generate Plan", "command": commands["plan"]}},
                         {"persist_to_workspace": {"root": ".", "paths": ["plan.json"]}},
                     ],
@@ -1530,7 +1542,7 @@ class CircleCITemplate(BasePipelineTemplate):
                     "executor": "python-executor",
                     "steps": [
                         "checkout",
-                        {"run": "pip install -r requirements.txt"},
+                        {"run": "pip install --quiet data-product-forge"},
                         {"run": {"name": "Run Tests", "command": commands["test"]}},
                         {"store_test_results": {"path": "test-results"}},
                     ],
@@ -1552,7 +1564,7 @@ class CircleCITemplate(BasePipelineTemplate):
                 "steps": [
                     "checkout",
                     {"attach_workspace": {"at": "."}},
-                    {"run": "pip install -r requirements.txt"},
+                    {"run": "pip install --quiet data-product-forge"},
                     {
                         "run": {
                             "name": f"Deploy to {env}",
@@ -1648,10 +1660,10 @@ class TektonTemplate(BasePipelineTemplate):
                 "steps": [
                     {
                         "name": "validate",
-                        "image": "python:3.9",
+                        "image": "python:3.12-slim",
                         "workingDir": "$(workspaces.source.path)",
                         "script": f"""#!/bin/bash
-pip install -r requirements.txt
+pip install --quiet data-product-forge
 {commands["doctor"]}
 {commands["validate"]}
 """,
