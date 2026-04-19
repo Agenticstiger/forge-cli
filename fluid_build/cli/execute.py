@@ -28,10 +28,14 @@ Supports:
 """
 
 import argparse
+import json
 import logging
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +49,8 @@ from ._common import CLIError, load_contract_with_overlay
 LOG = logging.getLogger("fluid.cli.execute")
 
 COMMAND = "execute"
+DBT_ENGINES = {"dbt", "dbt-bigquery", "dbt-duckdb"}
+ENV_PLACEHOLDER_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
 
 def register(sp: argparse._SubParsersAction) -> None:
@@ -128,6 +134,229 @@ def resolve_script_path(contract_path: Path, build: Dict[str, Any]) -> Optional[
     return None
 
 
+def is_dbt_build(build: Dict[str, Any]) -> bool:
+    """Return True when a build should execute as a dbt project."""
+    engine = (build.get("engine") or "").strip().lower()
+    return engine in DBT_ENGINES
+
+
+def resolve_dbt_project_path(contract_path: Path, build: Dict[str, Any]) -> Optional[Path]:
+    """Resolve the dbt project root for a build."""
+    repository = build.get("repository", "./")
+    project_dir = (contract_path.parent / repository).resolve()
+    if (project_dir / "dbt_project.yml").exists():
+        return project_dir
+    return None
+
+
+def _resolve_env_placeholders(value: Any) -> Any:
+    """Resolve ``{{ env.NAME }}`` placeholders against the current environment."""
+    if isinstance(value, str):
+        return ENV_PLACEHOLDER_RE.sub(lambda m: os.getenv(m.group(1), ""), value)
+    if isinstance(value, list):
+        return [_resolve_env_placeholders(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _resolve_env_placeholders(item) for key, item in value.items()}
+    return value
+
+
+def _load_dbt_project_config(project_dir: Path) -> Dict[str, Any]:
+    import yaml
+
+    with (project_dir / "dbt_project.yml").open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_dbt_executable() -> Optional[str]:
+    configured = os.getenv("DBT_EXECUTABLE", "dbt")
+    if os.path.sep in configured or configured.startswith("."):
+        candidate = Path(configured).expanduser()
+        if candidate.exists():
+            return str(candidate)
+        return None
+    return shutil.which(configured)
+
+
+def _normalize_selectors(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return [str(item) for item in raw if str(item).strip()]
+    return [str(raw)]
+
+
+def _resolve_dbt_profile_name(props: Dict[str, Any], project_config: Dict[str, Any]) -> str:
+    return str(props.get("profile") or os.getenv("DBT_PROFILE") or project_config.get("profile") or "default")
+
+
+def _resolve_dbt_target_name(props: Dict[str, Any]) -> str:
+    return str(props.get("target") or os.getenv("DBT_TARGET") or "dev")
+
+
+def _build_generated_dbt_profile(
+    build: Dict[str, Any], project_config: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    execution = build.get("execution") or {}
+    runtime = execution.get("runtime") or {}
+    platform = str(runtime.get("platform", "local")).strip().lower()
+    resources = runtime.get("resources") or {}
+    props = build.get("properties") or {}
+    profile_name = _resolve_dbt_profile_name(props, project_config)
+    target_name = _resolve_dbt_target_name(props)
+
+    if platform == "snowflake":
+        output: Dict[str, Any] = {
+            "type": "snowflake",
+            "account": os.getenv("SNOWFLAKE_ACCOUNT", ""),
+            "user": os.getenv("SNOWFLAKE_USER", ""),
+            "database": resources.get("database") or os.getenv("SNOWFLAKE_DATABASE", ""),
+            "warehouse": resources.get("warehouse") or os.getenv("SNOWFLAKE_WAREHOUSE", ""),
+            "schema": resources.get("schema") or os.getenv("SNOWFLAKE_FLUID_SCHEMA", "PUBLIC"),
+            "threads": int(resources.get("threads") or props.get("threads") or 4),
+        }
+
+        role = resources.get("role") or os.getenv("SNOWFLAKE_ROLE")
+        if role:
+            output["role"] = role
+
+        password = os.getenv("SNOWFLAKE_PASSWORD")
+        if password:
+            output["password"] = password
+
+        private_key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH")
+        if private_key_path:
+            output["private_key_path"] = private_key_path
+            private_key_passphrase = os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE")
+            if private_key_passphrase:
+                output["private_key_passphrase"] = private_key_passphrase
+
+        authenticator = os.getenv("SNOWFLAKE_AUTHENTICATOR")
+        oauth_token = os.getenv("SNOWFLAKE_OAUTH_TOKEN")
+        if oauth_token:
+            output["authenticator"] = authenticator or "oauth"
+            output["token"] = oauth_token
+        elif authenticator and authenticator != "snowflake":
+            output["authenticator"] = authenticator
+
+        return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
+
+    if platform in {"gcp", "bigquery"}:
+        output = {
+            "type": "bigquery",
+            "method": "oauth",
+            "project": os.getenv("GCP_PROJECT", ""),
+            "dataset": resources.get("dataset") or "analytics",
+            "threads": int(resources.get("threads") or props.get("threads") or 4),
+            "location": resources.get("location") or os.getenv("GCP_REGION", "US"),
+        }
+        return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
+
+    if platform in {"aws", "redshift"}:
+        output = {
+            "type": "redshift",
+            "host": os.getenv("REDSHIFT_HOST", ""),
+            "user": os.getenv("REDSHIFT_USER", ""),
+            "password": os.getenv("REDSHIFT_PASSWORD", ""),
+            "port": int(os.getenv("REDSHIFT_PORT", "5439")),
+            "dbname": resources.get("database") or os.getenv("REDSHIFT_DATABASE", ""),
+            "schema": resources.get("schema") or "public",
+            "threads": int(resources.get("threads") or props.get("threads") or 4),
+        }
+        return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
+
+    if platform in {"duckdb", "local"}:
+        output = {
+            "type": "duckdb",
+            "path": str(resources.get("path") or props.get("path") or "target/dev.duckdb"),
+            "threads": int(resources.get("threads") or props.get("threads") or 4),
+        }
+        return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
+
+    return None
+
+
+def _create_temp_dbt_profiles_dir(
+    build: Dict[str, Any], project_config: Dict[str, Any]
+) -> tuple[Optional[Path], Optional[tempfile.TemporaryDirectory[str]]]:
+    generated_profile = _build_generated_dbt_profile(build, project_config)
+    if not generated_profile:
+        return None, None
+
+    import yaml
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="fluid-dbt-profiles-")
+    profiles_path = Path(temp_dir.name) / "profiles.yml"
+    profiles_path.write_text(
+        yaml.safe_dump(generated_profile, default_flow_style=False, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return Path(temp_dir.name), temp_dir
+
+
+def resolve_dbt_profiles_dir(
+    build: Dict[str, Any], project_dir: Path, project_config: Dict[str, Any]
+) -> tuple[Optional[Path], Optional[tempfile.TemporaryDirectory[str]]]:
+    props = build.get("properties") or {}
+    explicit = props.get("profiles_dir") or os.getenv("DBT_PROFILES_DIR")
+    if explicit:
+        return Path(str(explicit)).expanduser(), None
+
+    embedded_candidates = [project_dir / "config" / "dbt", project_dir]
+    for candidate in embedded_candidates:
+        if (candidate / "profiles.yml").exists():
+            return candidate, None
+
+    return _create_temp_dbt_profiles_dir(build, project_config)
+
+
+def build_dbt_command(
+    build: Dict[str, Any],
+    project_dir: Path,
+    *,
+    profiles_dir: Optional[Path] = None,
+    project_config: Optional[Dict[str, Any]] = None,
+) -> list[str]:
+    """Build the dbt CLI command for a dbt-based build."""
+    props = build.get("properties") or {}
+    project_config = project_config or _load_dbt_project_config(project_dir)
+    dbt_executable = _resolve_dbt_executable()
+    if not dbt_executable:
+        raise RuntimeError(
+            "dbt executable not found. Install dbt, add it to PATH, or set DBT_EXECUTABLE."
+        )
+
+    cmd = [dbt_executable, "build", "--project-dir", str(project_dir)]
+
+    if profiles_dir:
+        cmd += ["--profiles-dir", str(profiles_dir)]
+
+    profile_name = _resolve_dbt_profile_name(props, project_config)
+    if profile_name:
+        cmd += ["--profile", str(profile_name)]
+
+    target_name = props.get("target") or os.getenv("DBT_TARGET")
+    if target_name:
+        cmd += ["--target", str(target_name)]
+
+    selectors = _normalize_selectors(props.get("select") or props.get("models"))
+    if not selectors:
+        model = props.get("model")
+        outputs = build.get("outputs") or []
+        if model and len(outputs) <= 1:
+            selectors = [f"+{model}+"]
+    if selectors:
+        cmd += ["--select", *selectors]
+
+    dbt_vars = props.get("vars")
+    if dbt_vars:
+        cmd += ["--vars", json.dumps(_resolve_env_placeholders(dbt_vars))]
+
+    return cmd
+
+
 def execute_build(
     build: Dict[str, Any],
     script_path: Path,
@@ -136,6 +365,7 @@ def execute_build(
     delay: int = 2,
     no_output: bool = False,
     fail_fast: bool = False,
+    force_run: bool = False,
 ) -> int:
     """Execute a single build"""
     build_id = build.get("id", "unknown")
@@ -146,10 +376,13 @@ def execute_build(
     cprint(f"\n{'=' * 80}")
     cprint(f"📋 Build: {build_id}")
     cprint(f"   Script: {script_path}")
-    cprint(f"   Trigger: {trigger_type}")
+    trigger_label = trigger_type
+    if trigger_type == "schedule" and force_run:
+        trigger_label = "schedule (manual apply override)"
+    cprint(f"   Trigger: {trigger_label}")
 
-    if trigger_type == "manual":
-        iterations = trigger.get("iterations", 1)
+    if trigger_type == "manual" or (trigger_type == "schedule" and force_run):
+        iterations = 1 if trigger_type == "schedule" and force_run else trigger.get("iterations", 1)
         # Support both delaySeconds (schema-friendly) and delay (legacy)
         delay_from_contract = trigger.get("delaySeconds", trigger.get("delay"))
         if delay_from_contract is not None:
@@ -244,6 +477,141 @@ def execute_build(
         return 1
 
 
+def execute_dbt_build(
+    build: Dict[str, Any],
+    project_dir: Path,
+    contract_dir: Path,
+    dry_run: bool = False,
+    delay: int = 2,
+    no_output: bool = False,
+    fail_fast: bool = False,
+    force_run: bool = False,
+) -> int:
+    """Execute a dbt-based build."""
+    build_id = build.get("id", "unknown")
+    execution = build.get("execution", {})
+    trigger = execution.get("trigger", {})
+    trigger_type = trigger.get("type", "manual")
+
+    cprint(f"\n{'=' * 80}")
+    cprint(f"📋 Build: {build_id}")
+    cprint(f"   dbt project: {project_dir}")
+    trigger_label = trigger_type
+    if trigger_type == "schedule" and force_run:
+        trigger_label = "schedule (manual apply override)"
+    cprint(f"   Trigger: {trigger_label}")
+
+    project_config = _load_dbt_project_config(project_dir)
+    profiles_dir, temp_profiles_dir = resolve_dbt_profiles_dir(build, project_dir, project_config)
+
+    try:
+        command = build_dbt_command(
+            build,
+            project_dir,
+            profiles_dir=profiles_dir,
+            project_config=project_config,
+        )
+    except Exception as exc:
+        if temp_profiles_dir:
+            temp_profiles_dir.cleanup()
+        console_error(f"Unable to prepare dbt build '{build_id}': {exc}")
+        cprint(f"{'=' * 80}")
+        return 1
+
+    cprint(f"   Command: {' '.join(command)}")
+
+    if trigger_type == "manual" or (trigger_type == "schedule" and force_run):
+        iterations = 1 if trigger_type == "schedule" and force_run else trigger.get("iterations", 1)
+        delay_from_contract = trigger.get("delaySeconds", trigger.get("delay"))
+        if delay_from_contract is not None:
+            delay = delay_from_contract
+
+        cprint(f"   Iterations: {iterations}")
+        if delay > 0:
+            cprint(f"   Delay: {delay}s between runs")
+
+        if dry_run:
+            cprint(f"   🔍 [DRY RUN] Would execute {iterations} time(s)")
+            cprint(f"{'=' * 80}")
+            return 0
+
+        cprint(f"{'=' * 80}\n")
+
+        successful_runs = 0
+        failed_runs = 0
+
+        try:
+            for i in range(iterations):
+                cprint(f"🚀 Run {i+1}/{iterations} - {datetime.now().strftime('%H:%M:%S')}")
+                cprint("-" * 80)
+
+                start_time = time.time()
+
+                try:
+                    result = subprocess.run(
+                        command,
+                        cwd=contract_dir,
+                        capture_output=no_output,
+                        text=True,
+                    )
+
+                    duration = time.time() - start_time
+
+                    if result.returncode == 0:
+                        successful_runs += 1
+                        success(f"Run {i+1} completed successfully ({duration:.2f}s)")
+                    else:
+                        failed_runs += 1
+                        console_error(f"Run {i+1} failed with exit code {result.returncode}")
+
+                        if no_output:
+                            if result.stdout:
+                                cprint(f"dbt output:\n{result.stdout}")
+                            if result.stderr:
+                                cprint(f"dbt error output:\n{result.stderr}")
+
+                        if fail_fast:
+                            cprint("\n⚠️  Stopping execution (--fail-fast enabled)")
+                            return 1
+
+                except Exception as exc:
+                    failed_runs += 1
+                    console_error(f"Run {i+1} failed with exception: {exc}")
+                    if fail_fast:
+                        return 1
+
+                cprint("-" * 80)
+
+                if i < iterations - 1 and delay > 0:
+                    cprint(f"⏳ Waiting {delay}s before next run...\n")
+                    time.sleep(delay)
+
+            cprint(f"\n{'=' * 80}")
+            cprint(f"📊 Execution Summary for {build_id}:")
+            cprint(f"   Total runs: {iterations}")
+            cprint(f"   ✅ Successful: {successful_runs}")
+            cprint(f"   ❌ Failed: {failed_runs}")
+            cprint(f"{'=' * 80}")
+
+            return 0 if failed_runs == 0 else 1
+        finally:
+            if temp_profiles_dir:
+                temp_profiles_dir.cleanup()
+
+    if trigger_type == "schedule":
+        cron = trigger.get("cron", "")
+        cprint(f"   Cron: {cron}")
+        cprint("   ⚠️  Scheduled execution requires Cloud Composer/Scheduler (paid tier)")
+        cprint("   💡 For free tier, use trigger.type: manual with iterations")
+        cprint(f"{'=' * 80}")
+        return 0
+
+    cprint(f"   ❌ Unknown trigger type: {trigger_type}")
+    cprint("   Supported types: manual, schedule")
+    cprint(f"{'=' * 80}")
+    return 1
+
+
 def run(args: argparse.Namespace, logger: logging.Logger, *, _from_apply: bool = False) -> int:
     """Execute builds from FLUID contract.
 
@@ -299,29 +667,50 @@ def run(args: argparse.Namespace, logger: logging.Logger, *, _from_apply: bool =
     for build in builds:
         build_id = build.get("id", "unknown")
 
-        # Resolve script path
-        script_path = resolve_script_path(contract_path, build)
+        if is_dbt_build(build):
+            project_dir = resolve_dbt_project_path(contract_path, build)
+            if not project_dir:
+                repository = build.get("repository", "./")
+                expected = (contract_path.parent / repository / "dbt_project.yml").resolve()
+                cprint(f"\n⚠️  Build '{build_id}' - dbt project not found: {expected}")
+                total_skipped += 1
+                continue
 
-        if not script_path:
-            repository = build.get("repository", "./")
-            properties = build.get("properties", {})
-            model = properties.get("model", "ingest")
-            expected = contract_path.parent / repository / f"{model}.py"
+            result = execute_dbt_build(
+                build,
+                project_dir,
+                contract_path.parent,
+                dry_run=args.dry_run,
+                delay=args.delay,
+                no_output=args.no_output,
+                fail_fast=args.fail_fast,
+                force_run=_from_apply,
+            )
+        else:
+            # Resolve script path
+            script_path = resolve_script_path(contract_path, build)
 
-            cprint(f"\n⚠️  Build '{build_id}' - Script not found: {expected}")
-            total_skipped += 1
-            continue
+            if not script_path:
+                repository = build.get("repository", "./")
+                properties = build.get("properties", {})
+                model = properties.get("model", "ingest")
+                expected = contract_path.parent / repository / f"{model}.py"
 
-        # Execute build
-        result = execute_build(
-            build,
-            script_path,
-            contract_path.parent,
-            dry_run=args.dry_run,
-            delay=args.delay,
-            no_output=args.no_output,
-            fail_fast=args.fail_fast,
-        )
+                cprint(f"\n⚠️  Build '{build_id}' - Script not found: {expected}")
+                total_skipped += 1
+                continue
+
+            # Execute build
+            result = execute_build(
+                build,
+                script_path,
+                contract_path.parent,
+                dry_run=args.dry_run,
+                delay=args.delay,
+                no_output=args.no_output,
+                fail_fast=args.fail_fast,
+                force_run=_from_apply,
+            )
 
         if result == 0:
             total_executed += 1
