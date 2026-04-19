@@ -208,11 +208,11 @@ class BasePipelineTemplate:
             "apply": "fluid apply --plan plan.json",
             "test": "fluid test --coverage",
             "contract_test": "fluid contract-test --all",
-            "generate_transformation": "fluid generate transformation",
+            "generate_transformation": "fluid generate speed-transformation",
             "generate_schedule": "fluid generate schedule",
             "check_transformations": (
                 "if [ -f dbt_project.yml ] || [ -d models/ ]; then "
-                "fluid generate transformation --check; "
+                "fluid generate speed-transformation --check; "
                 "fi"
             ),
             "check_schedules": (

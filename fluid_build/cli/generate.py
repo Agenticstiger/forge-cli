@@ -15,13 +15,10 @@
 """CLI command ``fluid generate`` — unified entry point for artifact generation.
 
 Subcommands:
-    fluid generate transformation   Generate transformation artifacts (dbt, SQL, ...)
-    fluid generate schedule         Generate schedule artifacts (Airflow, Dagster, Prefect)
-    fluid generate ci               Generate CI/CD pipelines (GitHub Actions, GitLab CI)
-    fluid generate standard         Export to data product standards (OPDS, ODCS, ODPS, ODPS-Bitol)
-
-Legacy (still works):
-    fluid generate                  Without a subcommand, defaults to transformation
+    fluid generate speed-transformation   Generate transformation artifacts (dbt, SQL, ...)
+    fluid generate schedule               Generate schedule artifacts (Airflow, Dagster, Prefect)
+    fluid generate ci                     Generate CI/CD pipelines (GitHub Actions, GitLab CI)
+    fluid generate standard               Export to data product standards (OPDS, ODCS, ODPS, ODPS-Bitol)
 """
 
 from __future__ import annotations
@@ -44,17 +41,17 @@ def register(subparsers: argparse._SubParsersAction):
         Unified artifact generation from FLUID contracts.
 
         Subcommands:
-          transformation   Generate transformation engine artifacts (dbt, SQL, etc.)
-          schedule         Generate schedule/orchestration artifacts (Airflow, Dagster, Prefect)
-          ci               Generate CI/CD pipelines (GitHub Actions, GitLab CI)
-          standard         Export to data product standards (OPDS, ODCS, ODPS, ODPS-Bitol)
+          speed-transformation   Generate transformation engine artifacts (dbt, SQL, etc.)
+          schedule               Generate schedule/orchestration artifacts (Airflow, Dagster, Prefect)
+          ci                     Generate CI/CD pipelines (GitHub Actions, GitLab CI)
+          standard               Export to data product standards (OPDS, ODCS, ODPS, ODPS-Bitol)
 
         When called without a subcommand, shows available subcommands.
         """,
         epilog="""
 Examples:
   # Generate transformation artifacts
-  fluid generate transformation
+  fluid generate speed-transformation
 
   # Generate schedule artifacts
   fluid generate schedule
@@ -66,7 +63,7 @@ Examples:
   fluid generate standard contract.fluid.yaml --format opds
 
   # List available engines/schedulers/formats
-  fluid generate transformation --list
+  fluid generate speed-transformation --list
   fluid generate schedule --list
   fluid generate standard --list
         """,
@@ -76,9 +73,9 @@ Examples:
     # Register subcommands
     sub = p.add_subparsers(dest="generate_sub", help="Generation target")
 
-    from . import generate_ci, generate_schedule, generate_standard, generate_transformation
+    from . import generate_ci, generate_schedule, generate_speed_transformation, generate_standard
 
-    generate_transformation.register_subcommand(sub)
+    generate_speed_transformation.register_subcommand(sub)
     generate_schedule.register_subcommand(sub)
     generate_ci.register_subcommand(sub)
     generate_standard.register_subcommand(sub)
@@ -99,10 +96,10 @@ def run(args: Any, logger: logging.Logger) -> int:
     """Route to the appropriate subcommand."""
     sub = getattr(args, "generate_sub", None)
 
-    if sub == "transformation":
-        from . import generate_transformation
+    if sub == "speed-transformation":
+        from . import generate_speed_transformation
 
-        return generate_transformation.run(args, logger)
+        return generate_speed_transformation.run(args, logger)
 
     if sub == "schedule":
         from . import generate_schedule
@@ -119,24 +116,24 @@ def run(args: Any, logger: logging.Logger) -> int:
 
         return generate_standard.run(args, logger)
 
-    # No subcommand specified — default to transformation for backward compat
+    # No subcommand specified — default to speed-transformation.
     if sub is None:
         # Check if user passed --list
         if getattr(args, "list_engines", False):
-            from . import generate_transformation
+            from . import generate_speed_transformation
 
-            return generate_transformation.run(args, logger)
+            return generate_speed_transformation.run(args, logger)
 
         # Bare `fluid generate` — show help
         cprint("Usage: fluid generate <subcommand>\n")
         cprint("Subcommands:")
-        cprint("  transformation   Generate transformation artifacts (dbt, SQL, etc.)")
-        cprint("  schedule         Generate schedule artifacts (Airflow, Dagster, Prefect)")
-        cprint("  ci               Generate CI/CD pipelines (GitHub Actions, GitLab CI)")
-        cprint("  standard         Export to standards (OPDS, ODCS, ODPS, ODPS-Bitol)")
+        cprint("  speed-transformation   Generate transformation artifacts (dbt, SQL, etc.)")
+        cprint("  schedule               Generate schedule artifacts (Airflow, Dagster, Prefect)")
+        cprint("  ci                     Generate CI/CD pipelines (GitHub Actions, GitLab CI)")
+        cprint("  standard               Export to standards (OPDS, ODCS, ODPS, ODPS-Bitol)")
         cprint("")
         cprint("Examples:")
-        cprint("  fluid generate transformation")
+        cprint("  fluid generate speed-transformation")
         cprint("  fluid generate schedule")
         cprint("  fluid generate ci --system github")
         cprint("  fluid generate standard contract.fluid.yaml --format opds")
