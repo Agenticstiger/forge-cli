@@ -26,6 +26,7 @@ from fluid_build.cli._common import CLIError
 from fluid_build.cli.execute import (
     _build_containerized_dbt_command,
     _build_generated_dbt_profile,
+    _collect_dbt_container_env,
     _create_temp_dbt_profiles_dir,
     _dbt_command_supports_adapter,
     _render_command_for_log,
@@ -287,6 +288,276 @@ class TestGeneratedDbtProfile:
         assert output["warehouse"] == "COMPUTE_WH"
         assert output["schema"] == "TELCO_FLUID_DEMO"
         assert output["role"] == "ACCOUNTADMIN"
+
+    def test_bigquery_defaults_to_oauth_when_no_credentials_set(self, monkeypatch):
+        for var in (
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GCP_KEYFILE",
+            "GCP_SERVICE_ACCOUNT_JSON",
+            "GOOGLE_SERVICE_ACCOUNT_JSON",
+            "GCP_IMPERSONATE_SERVICE_ACCOUNT",
+            "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("GCP_PROJECT", "my-proj")
+
+        build = {
+            "execution": {"runtime": {"platform": "bigquery", "resources": {"dataset": "lab"}}},
+            "properties": {},
+        }
+
+        profile = _build_generated_dbt_profile(build, {"profile": "bq_demo"})
+        output = profile["bq_demo"]["outputs"]["dev"]
+
+        assert output["method"] == "oauth"
+        assert output["project"] == "my-proj"
+        assert output["dataset"] == "lab"
+
+    def test_bigquery_uses_service_account_when_keyfile_set(self, monkeypatch, tmp_path):
+        keyfile = tmp_path / "sa.json"
+        keyfile.write_text("{}")
+        monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(keyfile))
+        monkeypatch.delenv("GCP_SERVICE_ACCOUNT_JSON", raising=False)
+        monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+        monkeypatch.setenv("GCP_PROJECT", "my-proj")
+
+        build = {
+            "execution": {"runtime": {"platform": "bigquery", "resources": {"dataset": "lab"}}},
+            "properties": {},
+        }
+
+        profile = _build_generated_dbt_profile(build, {"profile": "bq_demo"})
+        output = profile["bq_demo"]["outputs"]["dev"]
+
+        assert output["method"] == "service-account"
+        assert output["keyfile"] == str(keyfile)
+
+    def test_bigquery_uses_service_account_json_when_inline_creds_set(self, monkeypatch):
+        monkeypatch.setenv(
+            "GCP_SERVICE_ACCOUNT_JSON",
+            '{"type": "service_account", "project_id": "inline-proj"}',
+        )
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+        monkeypatch.setenv("GCP_PROJECT", "my-proj")
+
+        build = {
+            "execution": {"runtime": {"platform": "bigquery", "resources": {"dataset": "lab"}}},
+            "properties": {},
+        }
+
+        profile = _build_generated_dbt_profile(build, {"profile": "bq_demo"})
+        output = profile["bq_demo"]["outputs"]["dev"]
+
+        assert output["method"] == "service-account-json"
+        assert output["keyfile_json"] == {
+            "type": "service_account",
+            "project_id": "inline-proj",
+        }
+
+    def test_bigquery_malformed_inline_json_falls_back_to_oauth(self, monkeypatch):
+        monkeypatch.setenv("GCP_SERVICE_ACCOUNT_JSON", "{not valid json")
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+
+        build = {
+            "execution": {"runtime": {"platform": "bigquery", "resources": {}}},
+            "properties": {},
+        }
+
+        profile = _build_generated_dbt_profile(build, {"profile": "bq_demo"})
+        output = profile["bq_demo"]["outputs"]["dev"]
+
+        assert output["method"] == "oauth"
+        assert "keyfile_json" not in output
+
+    def test_bigquery_includes_impersonation_when_set(self, monkeypatch):
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+        monkeypatch.delenv("GCP_SERVICE_ACCOUNT_JSON", raising=False)
+        monkeypatch.setenv("GCP_IMPERSONATE_SERVICE_ACCOUNT", "runner@proj.iam.gserviceaccount.com")
+
+        build = {
+            "execution": {"runtime": {"platform": "bigquery", "resources": {}}},
+            "properties": {},
+        }
+
+        profile = _build_generated_dbt_profile(build, {"profile": "bq_demo"})
+        output = profile["bq_demo"]["outputs"]["dev"]
+
+        assert output["impersonate_service_account"] == "runner@proj.iam.gserviceaccount.com"
+
+    def test_redshift_defaults_to_password_auth(self, monkeypatch):
+        for var in ("REDSHIFT_CLUSTER_ID", "REDSHIFT_IAM_PROFILE", "REDSHIFT_USE_IAM"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("REDSHIFT_HOST", "cluster.eu-west-1.redshift.amazonaws.com")
+        monkeypatch.setenv("REDSHIFT_USER", "admin")
+        monkeypatch.setenv("REDSHIFT_PASSWORD", "hunter2")
+        monkeypatch.setenv("REDSHIFT_DATABASE", "analytics")
+
+        build = {
+            "execution": {"runtime": {"platform": "redshift", "resources": {}}},
+            "properties": {},
+        }
+
+        profile = _build_generated_dbt_profile(build, {"profile": "rs"})
+        output = profile["rs"]["outputs"]["dev"]
+
+        assert output["password"] == "hunter2"
+        assert "method" not in output
+
+    def test_redshift_uses_iam_when_cluster_and_profile_set(self, monkeypatch):
+        monkeypatch.setenv("REDSHIFT_CLUSTER_ID", "prod-cluster")
+        monkeypatch.setenv("REDSHIFT_IAM_PROFILE", "dbt-runner")
+        monkeypatch.setenv("REDSHIFT_HOST", "cluster.eu-west-1.redshift.amazonaws.com")
+        monkeypatch.setenv("REDSHIFT_USER", "dbt_user")
+        monkeypatch.setenv("REDSHIFT_DATABASE", "analytics")
+        monkeypatch.setenv("AWS_REGION", "eu-west-1")
+
+        build = {
+            "execution": {"runtime": {"platform": "redshift", "resources": {}}},
+            "properties": {},
+        }
+
+        profile = _build_generated_dbt_profile(build, {"profile": "rs"})
+        output = profile["rs"]["outputs"]["dev"]
+
+        assert output["method"] == "iam"
+        assert output["cluster_id"] == "prod-cluster"
+        assert output["iam_profile"] == "dbt-runner"
+        assert output["region"] == "eu-west-1"
+        assert "password" not in output
+
+    def test_postgres_profile(self, monkeypatch):
+        monkeypatch.setenv("PGHOST", "db.internal")
+        monkeypatch.setenv("PGPORT", "5433")
+        monkeypatch.setenv("PGUSER", "analytics")
+        monkeypatch.setenv("PGPASSWORD", "hunter2")
+        monkeypatch.setenv("PGDATABASE", "lab")
+        monkeypatch.setenv("PGSSLMODE", "require")
+
+        build = {
+            "execution": {"runtime": {"platform": "postgres", "resources": {}}},
+            "properties": {},
+        }
+
+        profile = _build_generated_dbt_profile(build, {"profile": "pg"})
+        output = profile["pg"]["outputs"]["dev"]
+
+        assert output["type"] == "postgres"
+        assert output["host"] == "db.internal"
+        assert output["port"] == 5433
+        assert output["user"] == "analytics"
+        assert output["password"] == "hunter2"
+        assert output["dbname"] == "lab"
+        assert output["sslmode"] == "require"
+
+    def test_postgresql_alias_platform(self, monkeypatch):
+        # dbt historically spells the type `postgres`, but teams commonly use
+        # `postgresql` for the platform. Both should resolve to the same branch.
+        monkeypatch.setenv("PGHOST", "db.internal")
+        monkeypatch.setenv("PGUSER", "u")
+        monkeypatch.setenv("PGPASSWORD", "p")
+        monkeypatch.setenv("PGDATABASE", "lab")
+
+        build = {
+            "execution": {"runtime": {"platform": "postgresql", "resources": {}}},
+            "properties": {},
+        }
+
+        profile = _build_generated_dbt_profile(build, {"profile": "pg"})
+        assert profile["pg"]["outputs"]["dev"]["type"] == "postgres"
+
+    def test_databricks_profile(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_HOST", "https://dbc-abc.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/abc123")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-hunter2")
+        monkeypatch.setenv("DATABRICKS_CATALOG", "main")
+
+        build = {
+            "execution": {
+                "runtime": {"platform": "databricks", "resources": {"schema": "analytics"}}
+            },
+            "properties": {},
+        }
+
+        profile = _build_generated_dbt_profile(build, {"profile": "db"})
+        output = profile["db"]["outputs"]["dev"]
+
+        assert output["type"] == "databricks"
+        assert output["host"] == "https://dbc-abc.cloud.databricks.com"
+        assert output["http_path"] == "/sql/1.0/warehouses/abc123"
+        assert output["token"] == "dapi-hunter2"
+        assert output["catalog"] == "main"
+        assert output["schema"] == "analytics"
+
+
+class TestCollectDbtContainerEnv:
+    """Env forwarding into the dbt container must cover each adapter's conventions."""
+
+    def _only_sensitive_keys(self, env: dict, *known_keys: str) -> dict:
+        """Filter out whatever the inherited shell env already had — we only
+        want to assert on keys this test set."""
+        return {k: v for k, v in env.items() if k in known_keys}
+
+    def test_forwards_postgres_bare_env_keys(self, monkeypatch):
+        monkeypatch.setenv("PGHOST", "db.internal")
+        monkeypatch.setenv("PGUSER", "analytics")
+        monkeypatch.setenv("PGPASSWORD", "hunter2")
+
+        env = _collect_dbt_container_env()
+        forwarded = self._only_sensitive_keys(env, "PGHOST", "PGUSER", "PGPASSWORD")
+
+        assert forwarded == {
+            "PGHOST": "db.internal",
+            "PGUSER": "analytics",
+            "PGPASSWORD": "hunter2",
+        }
+
+    def test_forwards_clickhouse_and_trino_prefixes(self, monkeypatch):
+        monkeypatch.setenv("CLICKHOUSE_HOST", "clickhouse.internal")
+        monkeypatch.setenv("TRINO_USER", "dbt")
+        monkeypatch.setenv("STARBURST_PASSWORD", "hunter2")
+
+        env = _collect_dbt_container_env()
+        forwarded = self._only_sensitive_keys(
+            env, "CLICKHOUSE_HOST", "TRINO_USER", "STARBURST_PASSWORD"
+        )
+
+        assert forwarded == {
+            "CLICKHOUSE_HOST": "clickhouse.internal",
+            "TRINO_USER": "dbt",
+            "STARBURST_PASSWORD": "hunter2",
+        }
+
+    def test_respects_fluid_dbt_forward_env_exact_key(self, monkeypatch):
+        monkeypatch.setenv("FLUID_DBT_FORWARD_ENV", "MY_CUSTOM_TOKEN")
+        monkeypatch.setenv("MY_CUSTOM_TOKEN", "hunter2")
+        monkeypatch.setenv("MY_UNRELATED", "nope")
+
+        env = _collect_dbt_container_env()
+
+        assert env.get("MY_CUSTOM_TOKEN") == "hunter2"
+        assert "MY_UNRELATED" not in env
+
+    def test_respects_fluid_dbt_forward_env_prefix(self, monkeypatch):
+        monkeypatch.setenv("FLUID_DBT_FORWARD_ENV", "MYAPP_")
+        monkeypatch.setenv("MYAPP_HOST", "host")
+        monkeypatch.setenv("MYAPP_TOKEN", "hunter2")
+        monkeypatch.setenv("OTHERAPP_HOST", "nope")
+
+        env = _collect_dbt_container_env()
+
+        assert env.get("MYAPP_HOST") == "host"
+        assert env.get("MYAPP_TOKEN") == "hunter2"
+        assert "OTHERAPP_HOST" not in env
+
+    def test_skips_empty_values(self, monkeypatch):
+        # Empty values break `docker run -e KEY` (no inheritance to pick up).
+        monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "")
+        monkeypatch.setenv("SNOWFLAKE_USER", "user")
+
+        env = _collect_dbt_container_env()
+
+        assert "SNOWFLAKE_ACCOUNT" not in env
+        assert env.get("SNOWFLAKE_USER") == "user"
 
 
 class TestContainerizedDbtCommand:

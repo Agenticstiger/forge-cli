@@ -57,6 +57,11 @@ ENV_PLACEHOLDER_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 SENSITIVE_ENV_KEY_RE = re.compile(
     r"(?i)(password|passphrase|secret|token|api[_-]?key|private[_-]?key|credential|auth)"
 )
+# Any env key starting with one of these prefixes is forwarded into the dbt
+# container. Covers the common adapter conventions. For adapters that use bare,
+# unprefixed env vars (e.g. libpq's `PGHOST`/`PGPASSWORD`) see
+# `DBT_ENV_EXACT_KEYS` below. For anything else, users can extend the list via
+# the `FLUID_DBT_FORWARD_ENV` env var (see `_user_configured_forward_env`).
 DBT_ENV_PREFIXES = (
     "SNOWFLAKE_",
     "DBT_",
@@ -65,6 +70,28 @@ DBT_ENV_PREFIXES = (
     "AWS_",
     "REDSHIFT_",
     "DATABRICKS_",
+    "CLICKHOUSE_",
+    "TRINO_",
+    "STARBURST_",
+    "SPARK_",
+    "ATHENA_",
+)
+
+# Adapters whose ecosystems use bare, unprefixed env names (prefixing would be
+# too broad to auto-forward safely). These are matched exactly.
+DBT_ENV_EXACT_KEYS = frozenset(
+    {
+        # libpq / dbt-postgres
+        "PGHOST",
+        "PGPORT",
+        "PGUSER",
+        "PGPASSWORD",
+        "PGDATABASE",
+        "PGSSLMODE",
+        "PGSSLCERT",
+        "PGSSLKEY",
+        "PGSSLROOTCERT",
+    }
 )
 
 
@@ -261,10 +288,39 @@ def _dbt_command_supports_adapter(dbt_executable: str, adapter: str) -> bool:
     return adapter.lower() in output or f"dbt-{adapter.lower()}" in output
 
 
+def _user_configured_forward_env() -> list[str]:
+    """Return extra env keys/prefixes declared via ``FLUID_DBT_FORWARD_ENV``.
+
+    The env var is a comma-separated list. Entries ending in ``_`` are treated
+    as prefixes (`FOO_*`); everything else is an exact key. This is the escape
+    hatch for adapters whose conventions aren't built-in.
+    """
+    raw = os.getenv("FLUID_DBT_FORWARD_ENV", "").strip()
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _env_is_user_forwarded(key: str, patterns: list[str]) -> bool:
+    for pattern in patterns:
+        if pattern.endswith("_") and key.startswith(pattern):
+            return True
+        if key == pattern:
+            return True
+    return False
+
+
 def _collect_dbt_container_env() -> Dict[str, str]:
     env_vars: Dict[str, str] = {}
+    extra_patterns = _user_configured_forward_env()
     for key, value in os.environ.items():
-        if value and key.startswith(DBT_ENV_PREFIXES):
+        if not value:
+            continue
+        if (
+            key.startswith(DBT_ENV_PREFIXES)
+            or key in DBT_ENV_EXACT_KEYS
+            or _env_is_user_forwarded(key, extra_patterns)
+        ):
             env_vars[key] = value
     return env_vars
 
@@ -378,23 +434,93 @@ def _build_generated_dbt_profile(
     if platform in {"gcp", "bigquery"}:
         output = {
             "type": "bigquery",
-            "method": "oauth",
-            "project": os.getenv("GCP_PROJECT", ""),
+            "project": resources.get("project")
+            or os.getenv("GCP_PROJECT")
+            or os.getenv("GOOGLE_CLOUD_PROJECT")
+            or "",
             "dataset": resources.get("dataset") or "analytics",
             "threads": int(resources.get("threads") or props.get("threads") or 4),
             "location": resources.get("location") or os.getenv("GCP_REGION", "US"),
         }
+
+        # Auth method precedence: inline JSON > keyfile path > oauth (ADC).
+        keyfile_json_raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON") or os.getenv(
+            "GOOGLE_SERVICE_ACCOUNT_JSON"
+        )
+        keyfile_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("GCP_KEYFILE")
+        if keyfile_json_raw:
+            try:
+                output["method"] = "service-account-json"
+                output["keyfile_json"] = json.loads(keyfile_json_raw)
+            except json.JSONDecodeError:
+                # Fall back to oauth rather than emitting a malformed profile.
+                output["method"] = "oauth"
+        elif keyfile_path:
+            output["method"] = "service-account"
+            output["keyfile"] = keyfile_path
+        else:
+            output["method"] = "oauth"
+
+        impersonate = os.getenv("GCP_IMPERSONATE_SERVICE_ACCOUNT") or os.getenv(
+            "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT"
+        )
+        if impersonate:
+            output["impersonate_service_account"] = impersonate
+
         return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
 
     if platform in {"aws", "redshift"}:
+        cluster_id = resources.get("cluster_id") or os.getenv("REDSHIFT_CLUSTER_ID")
+        iam_profile = os.getenv("REDSHIFT_IAM_PROFILE") or os.getenv("AWS_PROFILE")
+        use_iam = bool(cluster_id) and bool(iam_profile or os.getenv("REDSHIFT_USE_IAM"))
+
         output = {
             "type": "redshift",
-            "host": os.getenv("REDSHIFT_HOST", ""),
+            "host": resources.get("host") or os.getenv("REDSHIFT_HOST", ""),
             "user": os.getenv("REDSHIFT_USER", ""),
-            "password": os.getenv("REDSHIFT_PASSWORD", ""),
-            "port": int(os.getenv("REDSHIFT_PORT", "5439")),
+            "port": int(resources.get("port") or os.getenv("REDSHIFT_PORT") or 5439),
             "dbname": resources.get("database") or os.getenv("REDSHIFT_DATABASE", ""),
             "schema": resources.get("schema") or "public",
+            "threads": int(resources.get("threads") or props.get("threads") or 4),
+        }
+
+        if use_iam:
+            output["method"] = "iam"
+            output["cluster_id"] = cluster_id
+            if iam_profile:
+                output["iam_profile"] = iam_profile
+            region = os.getenv("REDSHIFT_REGION") or os.getenv("AWS_REGION")
+            if region:
+                output["region"] = region
+        else:
+            output["password"] = os.getenv("REDSHIFT_PASSWORD", "")
+
+        return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
+
+    if platform in {"postgres", "postgresql"}:
+        output = {
+            "type": "postgres",
+            "host": resources.get("host") or os.getenv("PGHOST", ""),
+            "user": resources.get("user") or os.getenv("PGUSER", ""),
+            "password": os.getenv("PGPASSWORD", ""),
+            "port": int(resources.get("port") or os.getenv("PGPORT") or 5432),
+            "dbname": resources.get("database") or os.getenv("PGDATABASE", ""),
+            "schema": resources.get("schema") or "public",
+            "threads": int(resources.get("threads") or props.get("threads") or 4),
+        }
+        sslmode = resources.get("sslmode") or os.getenv("PGSSLMODE")
+        if sslmode:
+            output["sslmode"] = sslmode
+        return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
+
+    if platform == "databricks":
+        output = {
+            "type": "databricks",
+            "host": resources.get("host") or os.getenv("DATABRICKS_HOST", ""),
+            "http_path": resources.get("http_path") or os.getenv("DATABRICKS_HTTP_PATH", ""),
+            "token": os.getenv("DATABRICKS_TOKEN", ""),
+            "catalog": resources.get("catalog") or os.getenv("DATABRICKS_CATALOG", ""),
+            "schema": resources.get("schema") or os.getenv("DATABRICKS_SCHEMA", "default"),
             "threads": int(resources.get("threads") or props.get("threads") or 4),
         }
         return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
