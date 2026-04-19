@@ -186,3 +186,86 @@ def build_provider(
                     setattr(inst, k, v)
             return inst
         raise  # Re-raise real TypeErrors (wrong types, missing deps, etc.)
+
+
+def hydrate_dotenv(project_root: Path, environment: Optional[str] = None) -> None:
+    """Hydrate ``os.environ`` from project dotenv files and ``FLUID_SECRETS_FILE``.
+
+    ``fluid apply`` hydrates env as a side effect of the Snowflake credential
+    resolver chain; commands that don't traverse that chain (``verify``,
+    ``publish``) rely on this helper to mirror the same behavior. Without it,
+    a subprocess that only sources a launchpad script (and not the secrets
+    file it points at) sees empty ``DMM_API_KEY`` / ``SNOWFLAKE_*`` vars even
+    though the user "set them up".
+
+    Load order (later sources override earlier ones):
+        1. ``{project_root}/.env``
+        2. ``{project_root}/.env.{environment}``
+        3. ``{project_root}/.env.local``
+        4. ``$FLUID_SECRETS_FILE`` (if set and the path is a file)
+
+    Best-effort: missing ``python-dotenv``, missing files, and read errors are
+    DEBUG-logged and skipped — this is convenience hydration, not a gate.
+    """
+    env_logger = logging.getLogger("fluid.cli.env")
+
+    try:
+        from fluid_build.credentials.dotenv_store import DotEnvCredentialStore
+    except ImportError:
+        env_logger.debug("python-dotenv not installed; skipping env hydration")
+        return
+
+    try:
+        DotEnvCredentialStore(project_root=project_root, environment=environment).load()
+    except ImportError:
+        env_logger.debug("python-dotenv not available; skipping project dotenv hydration")
+    except (OSError, ValueError) as exc:
+        env_logger.debug("Skipping project dotenv hydration: %s", exc)
+    except Exception as exc:  # pragma: no cover - defensive
+        env_logger.warning("Unexpected error hydrating project dotenv: %s", exc)
+
+    secrets_file = os.environ.get("FLUID_SECRETS_FILE")
+    if not secrets_file:
+        return
+
+    secrets_path = Path(secrets_file).expanduser()
+    if not secrets_path.is_file():
+        env_logger.debug("FLUID_SECRETS_FILE=%s does not point at a file; skipping", secrets_path)
+        return
+
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        env_logger.debug("python-dotenv not available; cannot load FLUID_SECRETS_FILE")
+        return
+
+    try:
+        load_dotenv(secrets_path, override=True)
+        env_logger.debug("Hydrated os.environ from FLUID_SECRETS_FILE=%s", secrets_path)
+    except (OSError, ValueError) as exc:
+        env_logger.debug("Failed to load FLUID_SECRETS_FILE %s: %s", secrets_path, exc)
+    except Exception as exc:  # pragma: no cover - defensive
+        env_logger.warning("Unexpected error loading FLUID_SECRETS_FILE %s: %s", secrets_path, exc)
+
+
+def resolve_contract_env_templates(value: Any) -> Any:
+    """Recursively resolve ``{{ env.VAR }}`` placeholders in every string leaf.
+
+    ``plan``/``apply``/``verify`` resolve these per-string at the Snowflake
+    provider boundary (``providers/snowflake/plan/planner.py``), but ``publish``
+    forwards the raw contract dict to the catalog adapter — so without this
+    pass, raw placeholders like ``{{ env.SNOWFLAKE_DATABASE }}`` land in the
+    DMM server block and render in the UI as-is.
+
+    Unresolved placeholders (env var missing) are left intact so callers can
+    decide whether to error, warn, or fall back — matching the per-string
+    helper's behavior.
+    """
+    # Import lazily to keep the CLI import graph lean.
+    from fluid_build.providers.snowflake.util.config import resolve_env_templates
+
+    if isinstance(value, dict):
+        return {k: resolve_contract_env_templates(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [resolve_contract_env_templates(item) for item in value]
+    return resolve_env_templates(value)

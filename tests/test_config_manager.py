@@ -73,6 +73,10 @@ def _isolate_config(monkeypatch, tmp_path):
             "GCP_REGION",
             "AWS_REGION",
             "SNOWFLAKE_ACCOUNT",
+            "DMM_API_URL",
+            "DMM_API_KEY",
+            "DMM_DATA_PRODUCT_SPECIFICATION",
+            "DMM_PROVIDER_HINT",
             "NO_COLOR",
         ):
             monkeypatch.delenv(key, raising=False)
@@ -233,6 +237,21 @@ class TestConfigFileLoading:
 
         cfg = FluidConfig()
         assert cfg.get("logging.level") == "WARNING"
+
+    def test_user_config_from_dot_fluid_dir(self, tmp_path, monkeypatch):
+        home = tmp_path / "fakehome"
+        home.mkdir(exist_ok=True)
+        monkeypatch.setenv("HOME", str(home))
+
+        fluid_dir = home / ".fluid"
+        fluid_dir.mkdir(parents=True)
+        (fluid_dir / "config.yaml").write_text(
+            yaml.dump({"catalogs": {"datamesh-manager": {"endpoint": "http://localhost:8095"}}}),
+            encoding="utf-8",
+        )
+
+        cfg = FluidConfig()
+        assert cfg.get("catalogs.datamesh-manager.endpoint") == "http://localhost:8095"
 
     def test_user_config_from_xdg(self, tmp_path, monkeypatch):
         home = tmp_path / "fakehome"
@@ -467,6 +486,35 @@ class TestCatalogConfig:
         assert cc["endpoint"] == "https://cc.prod.example.com"
         assert cc["auth"]["api_key"] == "sk-test-123"
 
+    def test_datamesh_manager_env_override(self, monkeypatch):
+        monkeypatch.setenv("DMM_API_URL", "http://localhost:8095")
+        monkeypatch.setenv("DMM_API_KEY", "dmm-test-123")
+        monkeypatch.setenv("DMM_DATA_PRODUCT_SPECIFICATION", "odps")
+        monkeypatch.setenv("DMM_PROVIDER_HINT", "odps")
+        cfg = FluidConfig()
+        cfg.set("catalogs.datamesh-manager", {"enabled": True, "auth": {"type": "api_key"}})
+
+        dmm = cfg.get_catalog_config("datamesh-manager")
+        assert dmm["endpoint"] == "http://localhost:8095"
+        assert dmm["auth"]["api_key"] == "dmm-test-123"
+        assert dmm["data_product_specification"] == "odps"
+        assert dmm["provider_hint"] == "odps"
+
+    def test_catalog_config_expands_env_placeholders(self, monkeypatch):
+        monkeypatch.setenv("DMM_API_KEY", "dmm-live-key")
+        cfg = FluidConfig()
+        cfg.set(
+            "catalogs.datamesh-manager",
+            {
+                "endpoint": "http://localhost:8095",
+                "enabled": True,
+                "auth": {"type": "api_key", "api_key": "${DMM_API_KEY}"},
+            },
+        )
+
+        dmm = cfg.get_catalog_config("datamesh-manager")
+        assert dmm["auth"]["api_key"] == "dmm-live-key"
+
     def test_all_catalogs(self):
         cfg = FluidConfig()
         all_cats = cfg.get_catalog_config()
@@ -492,6 +540,20 @@ class TestSaveConfig:
         save_path = tmp_path / "saved.yaml"
         cfg.save_user_config(path=save_path)
 
+        assert save_path.exists()
+        loaded = yaml.safe_load(save_path.read_text())
+        assert loaded["logging"]["level"] == "CRITICAL"
+
+    def test_save_default_path_uses_dot_fluid_config(self, tmp_path, monkeypatch):
+        home = tmp_path / "fakehome"
+        home.mkdir(exist_ok=True)
+        monkeypatch.setenv("HOME", str(home))
+
+        cfg = FluidConfig()
+        cfg.set("logging.level", "CRITICAL")
+        cfg.save_user_config()
+
+        save_path = home / ".fluid" / "config.yaml"
         assert save_path.exists()
         loaded = yaml.safe_load(save_path.read_text())
         assert loaded["logging"]["level"] == "CRITICAL"
