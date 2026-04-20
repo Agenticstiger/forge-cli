@@ -1,4 +1,4 @@
-fluidVersion: "0.5.7"
+fluidVersion: "0.7.2"
 kind: DataProduct
 id: "crypto.bitcoin_prices_enhanced_v1"
 name: "Bitcoin Price Index - Enhanced Features (v0.5.7)"

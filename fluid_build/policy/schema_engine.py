@@ -164,7 +164,7 @@ class SchemaBasedPolicyEngine:
             contract: Parsed FLUID contract dictionary
         """
         self.contract = contract
-        self.schema_version = contract.get("fluidVersion", "0.5.7")
+        self.schema_version = contract.get("fluidVersion", "0.7.2")
         self.result = PolicyEnforcementResult()
 
         logger.info(f"Initialized policy engine for contract: {contract.get('id')}")

@@ -1,3 +1,6 @@
+# Pinned to 0.7.1: uses ``orchestration`` block and ``build.engine: glue``,
+# both removed/restricted in 0.7.2. Bump together with the Glue provider
+# rewrite.
 fluidVersion: "0.7.1"
 kind: DataProduct
 id: analytics.data_lake.sales_etl

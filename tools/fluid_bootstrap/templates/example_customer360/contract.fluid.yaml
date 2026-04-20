@@ -1,4 +1,7 @@
-
+# Pinned to 0.4.0: legacy bootstrap template kept for backward compatibility.
+# Uses ``build.transformation`` + ``consumes[].id``/``ref`` shapes that don't
+# exist in 0.7.2. Replace with ``fluid_build/templates/customer-360/`` (already
+# on 0.7.2) when the bootstrap surface adopts the canonical templates.
 fluidVersion: "0.4.0"
 kind: "DataProduct"
 id: "gold.customer360_v1"

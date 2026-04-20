@@ -1,6 +1,6 @@
 # Example contract with policy violations (for testing)
 
-fluidVersion: "0.5.7"
+fluidVersion: "0.7.2"
 kind: DataProduct
 id: test.violations.example
 name: Contract With Policy Violations
