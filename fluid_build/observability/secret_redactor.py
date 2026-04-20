@@ -100,6 +100,17 @@ def _is_sensitive_key(key: Any) -> bool:
     return any(part in lowered for part in _SENSITIVE_KEY_PARTS)
 
 
+def is_sensitive_key_name(name: str) -> bool:
+    """Public predicate: True when ``name`` looks like a credential-bearing key.
+
+    Single source of truth for "is this env var / mapping key secret-shaped?"
+    so callers outside this module (e.g. the contract env-template walker in
+    ``cli/_common.py``) stay in lock-step with the redactor's view of what
+    counts as sensitive.
+    """
+    return _is_sensitive_key(name)
+
+
 def redact_value(value: Any) -> Any:
     """Recursively redact secret-like values in logging payloads."""
     if isinstance(value, str):

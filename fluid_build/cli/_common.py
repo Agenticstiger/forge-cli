@@ -260,12 +260,52 @@ def resolve_contract_env_templates(value: Any) -> Any:
     Unresolved placeholders (env var missing) are left intact so callers can
     decide whether to error, warn, or fall back — matching the per-string
     helper's behavior.
-    """
-    # Import lazily to keep the CLI import graph lean.
-    from fluid_build.providers.snowflake.util.config import resolve_env_templates
 
-    if isinstance(value, dict):
-        return {k: resolve_contract_env_templates(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [resolve_contract_env_templates(item) for item in value]
-    return resolve_env_templates(value)
+    Defense-in-depth: placeholders whose *name* looks like a credential
+    (``{{ env.SNOWFLAKE_PASSWORD }}``, ``{{ env.DMM_API_KEY }}``, etc.) are
+    left literal — the resolved contract is serialized back to YAML and
+    shipped to the remote catalog, so resolving a secret-shaped placeholder
+    here would silently exfiltrate the credential. A WARNING is emitted once
+    per-variable-per-call so operators notice the unresolved placeholder
+    rather than assume resolution succeeded.
+    """
+    # Lazy imports keep the CLI startup graph lean — this helper is only
+    # called from publish/apply/verify paths, not from `fluid --help`.
+    from fluid_build.observability.secret_redactor import is_sensitive_key_name
+    from fluid_build.providers.snowflake.util.config import ENV_TEMPLATE_RE
+
+    publish_logger = logging.getLogger("fluid.cli.publish")
+    seen_sensitive: set[str] = set()
+
+    def _replace(match: re.Match[str]) -> str:
+        var_name = match.group(1).strip()
+        if is_sensitive_key_name(var_name):
+            if var_name not in seen_sensitive:
+                seen_sensitive.add(var_name)
+                publish_logger.warning(
+                    "Refusing to resolve sensitive-looking env placeholder "
+                    "'{{ env.%s }}' in contract body; leaving literal. "
+                    "Catalog adapters forward contract YAML downstream — "
+                    "secrets must not ride along. If this value is not a "
+                    "secret, rename the env variable to something outside "
+                    "the password/secret/token/key family.",
+                    var_name,
+                )
+            return match.group(0)
+        return os.environ.get(var_name, match.group(0))
+
+    def _resolve_string(text: str) -> str:
+        if "{{" not in text:
+            return text
+        return ENV_TEMPLATE_RE.sub(_replace, text).strip()
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {k: _walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [_walk(item) for item in node]
+        if isinstance(node, str):
+            return _resolve_string(node)
+        return node
+
+    return _walk(value)

@@ -102,3 +102,82 @@ def test_non_string_leaves_pass_through_unchanged() -> None:
 def test_mixed_string_values(monkeypatch, value: str, expected: str) -> None:
     monkeypatch.setenv("X", "RESOLVED")
     assert resolve_contract_env_templates(value) == expected
+
+
+@pytest.mark.parametrize(
+    "var_name",
+    [
+        "SNOWFLAKE_PASSWORD",
+        "SF_PASSWORD",
+        "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
+        "SNOWFLAKE_OAUTH_TOKEN",
+        "DMM_API_KEY",
+        "GITHUB_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "CLIENT_SECRET",
+        "SESSION_TOKEN",
+        "db_password",  # lowercase still matches
+    ],
+)
+def test_sensitive_env_placeholders_are_not_resolved(monkeypatch, caplog, var_name: str) -> None:
+    # The contract YAML produced by publish is shipped to the remote catalog.
+    # Substituting a secret-shaped placeholder would exfiltrate the credential,
+    # so the walker must leave these literal even when the env var is set.
+    monkeypatch.setenv(var_name, "super-secret-value")
+
+    contract = {
+        "binding": {"properties": {"password": "{{ env." + var_name + " }}"}},
+    }
+
+    with caplog.at_level("WARNING", logger="fluid.cli.publish"):
+        resolved = resolve_contract_env_templates(contract)
+
+    assert resolved["binding"]["properties"]["password"] == "{{ env." + var_name + " }}"
+    assert "super-secret-value" not in str(resolved)
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any(var_name in record.getMessage() for record in warnings)
+
+
+def test_sensitive_warning_deduped_per_call(monkeypatch, caplog) -> None:
+    # Same sensitive var appearing many times in a single contract should emit
+    # one WARNING per call, not N — otherwise a long contract with repeated
+    # placeholders would flood the operator's log output.
+    monkeypatch.setenv("SNOWFLAKE_PASSWORD", "x")
+
+    contract = {
+        "a": "{{ env.SNOWFLAKE_PASSWORD }}",
+        "b": "{{ env.SNOWFLAKE_PASSWORD }}",
+        "nested": {"c": ["{{ env.SNOWFLAKE_PASSWORD }}"]},
+    }
+
+    with caplog.at_level("WARNING", logger="fluid.cli.publish"):
+        resolve_contract_env_templates(contract)
+
+    matches = [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and "SNOWFLAKE_PASSWORD" in r.getMessage()
+    ]
+    assert len(matches) == 1
+
+
+def test_non_sensitive_placeholders_still_resolve_alongside_sensitive(
+    monkeypatch,
+) -> None:
+    # The gate must not block legitimate identifier substitution — the whole
+    # point of resolving env templates at publish time is that DMM renders
+    # concrete database/schema names instead of literal placeholder strings.
+    monkeypatch.setenv("SNOWFLAKE_DATABASE", "ANALYTICS_PROD")
+    monkeypatch.setenv("SNOWFLAKE_PASSWORD", "should-not-leak")
+
+    contract = {
+        "binding": {
+            "location": {"database": "{{ env.SNOWFLAKE_DATABASE }}"},
+            "properties": {"password": "{{ env.SNOWFLAKE_PASSWORD }}"},
+        }
+    }
+
+    resolved = resolve_contract_env_templates(contract)
+
+    assert resolved["binding"]["location"]["database"] == "ANALYTICS_PROD"
+    assert resolved["binding"]["properties"]["password"] == "{{ env.SNOWFLAKE_PASSWORD }}"
