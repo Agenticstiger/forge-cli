@@ -201,18 +201,35 @@ class BasePipelineTemplate:
         }
 
     def _get_fluid_commands(self) -> Dict[str, str]:
-        """Get standard FLUID commands for different stages"""
+        """Get standard FLUID commands for different stages.
+
+        Contract-path commands use the POSIX parameter-expansion default
+        ``${CONTRACT:-contract.fluid.yaml}`` so Build Now works out of the
+        box against the canonical filename. Operators who keep the
+        contract under a different name export ``CONTRACT`` in the CI
+        job / agent env to override. ``$BUILD_ID`` remains CI-injected —
+        when unset, ``apply`` falls through to the plan-file branch for
+        non-dbt contracts.
+        """
         return {
-            "validate": "fluid validate --strict",
-            "plan": "fluid plan --output plan.json",
-            "apply": "fluid apply --plan plan.json",
+            "validate": "fluid validate ${CONTRACT:-contract.fluid.yaml}",
+            "plan": "fluid plan ${CONTRACT:-contract.fluid.yaml} --out runtime/plan.json",
+            # --build is required for dbt hybrid-reference builds; the
+            # inline conditional keeps the template useful for both shapes.
+            "apply": (
+                'if [ -n "$BUILD_ID" ]; then '
+                "fluid apply ${CONTRACT:-contract.fluid.yaml} --build $BUILD_ID --yes; "
+                "else "
+                "fluid apply runtime/plan.json --yes; "
+                "fi"
+            ),
             "test": "fluid test --coverage",
-            "contract_test": "fluid contract-test --all",
-            "generate_transformation": "fluid generate transformation",
+            "contract_test": "fluid contract-tests ${CONTRACT:-contract.fluid.yaml}",
+            "generate_transformation": "fluid generate speed-transformation",
             "generate_schedule": "fluid generate schedule",
             "check_transformations": (
                 "if [ -f dbt_project.yml ] || [ -d models/ ]; then "
-                "fluid generate transformation --check; "
+                "fluid generate speed-transformation --check; "
                 "fi"
             ),
             "check_schedules": (
@@ -224,6 +241,23 @@ class BasePipelineTemplate:
             "publish_opds": "fluid export-opds --output opds-catalog.json",
             "marketplace_publish": "fluid marketplace publish --catalog opds-catalog.json",
             "doctor": "fluid doctor --extended",
+            # Airflow DAG deployment: rsync the generated ``dags/`` directory
+            # to an operator-supplied destination. Skipped when
+            # $AIRFLOW_DAGS_DEST is unset or dags/ doesn't exist.
+            "airflow_sync": (
+                'if [ -d dags/ ] && [ -n "$AIRFLOW_DAGS_DEST" ]; then '
+                'rsync -av --delete dags/ "$AIRFLOW_DAGS_DEST"/; '
+                "fi"
+            ),
+            # Catalog publish: push the contract (+ ODPS/ODCS exports) to
+            # a catalog. Skipped when $DMM_API_URL is unset (the catalog
+            # name defaults to datamesh-manager).
+            "publish_catalog": (
+                'if [ -n "$DMM_API_URL" ]; then '
+                "fluid publish ${CONTRACT:-contract.fluid.yaml} "
+                "--catalog ${CATALOG:-datamesh-manager}; "
+                "fi"
+            ),
         }
 
     def _get_common_environment_vars(self) -> Dict[str, str]:
@@ -234,6 +268,54 @@ class BasePipelineTemplate:
             "PYTHONPATH": ".",
             "PIP_CACHE_DIR": ".pip-cache",
         }
+
+    def _credential_banner(
+        self,
+        comment_prefix: str,
+        ci_system_name: str,
+        secret_surface_hint: str,
+    ) -> str:
+        """Render a provider-agnostic credential-model banner.
+
+        Every FLUID-aware CI pipeline needs the same thing: make the
+        provider's env vars (SNOWFLAKE_* / GOOGLE_APPLICATION_CREDENTIALS
+        / AWS_* / AZURE_* / DMM_*) available to the shell steps that
+        call ``fluid``. *How* those env vars arrive differs per CI
+        system — GitHub Actions uses ``secrets`` mapped via ``env:``,
+        GitLab injects CI/CD variables automatically, Jenkins offers
+        either agent env passthrough or the ``credentials()`` DSL, etc.
+
+        This helper emits the common "what env vars fluid expects"
+        paragraph plus a system-specific pointer so the generated
+        file is self-documenting — no hard-coded Snowflake-only list.
+
+        Arguments:
+          comment_prefix: ``# `` for YAML / shell; ``// `` for Groovy.
+          ci_system_name: human-readable name shown in the banner.
+          secret_surface_hint: one-line hint on how THIS system
+            surfaces secrets (e.g. "Settings → Secrets and variables
+            → Actions"). Kept short — the rest is pattern-agnostic.
+        """
+        p = comment_prefix
+        lines = [
+            f"{p}FLUID CI/CD Pipeline — {ci_system_name}",
+            f"{p}",
+            f"{p}Credential model (provider-agnostic):",
+            f"{p}  fluid's credential resolver reads provider auth from the runner",
+            f"{p}  environment. Each provider expects its own env vars:",
+            f"{p}    Snowflake → SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_PASSWORD /",
+            f"{p}                SNOWFLAKE_ROLE / SNOWFLAKE_WAREHOUSE / SNOWFLAKE_DATABASE",
+            f"{p}    GCP       → GOOGLE_APPLICATION_CREDENTIALS (or Workload Identity via OIDC)",
+            f"{p}    AWS       → AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or OIDC role)",
+            f"{p}    Azure     → AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID",
+            f"{p}    Catalog   → DMM_API_URL / DMM_API_KEY (only if using `fluid publish`)",
+            f"{p}  See ``fluid_build.credentials.resolver`` for the full resolver chain.",
+            f"{p}",
+            f"{p}How to surface them in {ci_system_name}:",
+            f"{p}  {secret_surface_hint}",
+            f"{p}",
+        ]
+        return "\n".join(lines) + "\n"
 
     def _get_oidc_steps(self, oidc_provider: Optional[str]) -> List[Dict[str, Any]]:
         """Get OIDC authentication steps for GitHub Actions deploy jobs."""
@@ -379,7 +461,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             "uses": _pin_action("actions/setup-python@v5"),
                             "with": {"python-version": "3.9"},
                         },
-                        {"name": "Install FLUID", "run": "pip install -r requirements.txt"},
+                        {"name": "Install FLUID", "run": "pip install --quiet data-product-forge"},
                         *self._get_oidc_steps(config.oidc_provider),
                         {"name": "FLUID Doctor Check", "run": commands["doctor"]},
                         {"name": "Validate Configuration", "run": commands["validate"]},
@@ -412,7 +494,15 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             },
         }
 
-        files = {".github/workflows/fluid-pipeline.yml": yaml.dump(workflow, indent=2)}
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="GitHub Actions",
+            secret_surface_hint=(
+                "Settings → Secrets and variables → Actions. Reference per-job via "
+                "`env: FOO: ${{ secrets.FOO }}`."
+            ),
+        )
+        files = {".github/workflows/fluid-pipeline.yml": banner + yaml.dump(workflow, indent=2)}
         files[".env.ci.example"] = self._generate_env_ci_example(config.oidc_provider)
         return files
 
@@ -442,7 +532,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             "uses": _pin_action("actions/setup-python@v5"),
                             "with": {"python-version": "3.9"},
                         },
-                        {"name": "Install Dependencies", "run": "pip install -r requirements.txt"},
+                        {
+                            "name": "Install Dependencies",
+                            "run": "pip install --quiet data-product-forge",
+                        },
                         {"name": "FLUID Doctor", "run": commands["doctor"]},
                         {"name": "Validate", "run": commands["validate"]},
                         {
@@ -464,7 +557,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             "uses": _pin_action("actions/setup-python@v5"),
                             "with": {"python-version": "3.9"},
                         },
-                        {"name": "Install Dependencies", "run": "pip install -r requirements.txt"},
+                        {
+                            "name": "Install Dependencies",
+                            "run": "pip install --quiet data-product-forge",
+                        },
                         {
                             "name": "Generate Transformations",
                             "run": commands["generate_transformation"],
@@ -495,7 +591,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             "uses": _pin_action("actions/setup-python@v5"),
                             "with": {"python-version": "3.9"},
                         },
-                        {"name": "Install Dependencies", "run": "pip install -r requirements.txt"},
+                        {
+                            "name": "Install Dependencies",
+                            "run": "pip install --quiet data-product-forge",
+                        },
                         {"name": "Generate Plan", "run": commands["plan"]},
                         {
                             "name": "Upload Plan",
@@ -516,7 +615,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             "uses": _pin_action("actions/setup-python@v5"),
                             "with": {"python-version": "3.9"},
                         },
-                        {"name": "Install Dependencies", "run": "pip install -r requirements.txt"},
+                        {
+                            "name": "Install Dependencies",
+                            "run": "pip install --quiet data-product-forge",
+                        },
                         {
                             "name": "Run Tests",
                             "run": "fluid test --type ${{ matrix.test-type }} --output test-results-${{ matrix.test-type }}.xml",
@@ -549,7 +651,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     "uses": _pin_action("actions/setup-python@v5"),
                     "with": {"python-version": "3.9"},
                 },
-                {"name": "Install Dependencies", "run": "pip install -r requirements.txt"},
+                {"name": "Install Dependencies", "run": "pip install --quiet data-product-forge"},
                 *self._get_oidc_steps(config.oidc_provider),
                 {
                     "name": "Generate Transformations",
@@ -572,6 +674,19 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     "name": "Run Contract Tests",
                     "run": f"FLUID_ENV={env} {commands['contract_test']}",
                 },
+                # Airflow DAG sync + catalog publish fire only in prod.
+                # Both commands self-gate on env vars, so safe no-ops
+                # when AIRFLOW_DAGS_DEST / DMM_API_URL are unset.
+                {
+                    "name": "Sync Airflow DAGs",
+                    "run": commands["airflow_sync"],
+                    "if": f"'{env}' == 'prod'",
+                },
+                {
+                    "name": "Publish Contract to Catalog",
+                    "run": commands["publish_catalog"],
+                    "if": f"'{env}' == 'prod'",
+                },
                 {
                     "name": "Generate Visualization",
                     "run": commands["visualize"],
@@ -593,7 +708,17 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                 "steps": deploy_steps,
             }
 
-        files = {".github/workflows/fluid-standard.yml": yaml.dump(workflow, indent=2)}
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="GitHub Actions",
+            secret_surface_hint=(
+                "Settings → Secrets and variables → Actions. Then reference them "
+                "per-job via `env: FOO: ${{ secrets.FOO }}` or, for OIDC providers "
+                "(GCP/AWS/Azure), use the Workload Identity Federation steps "
+                "already wired when --oidc-provider is set."
+            ),
+        )
+        files = {".github/workflows/fluid-standard.yml": banner + yaml.dump(workflow, indent=2)}
         files[".env.ci.example"] = self._generate_env_ci_example(config.oidc_provider)
         return files
 
@@ -731,7 +856,16 @@ class GitLabCITemplate(BasePipelineTemplate):
         else:
             pipeline = self._generate_advanced_gitlab_pipeline(config, commands, env_vars)
 
-        return {".gitlab-ci.yml": yaml.dump(pipeline, indent=2)}
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="GitLab CI",
+            secret_surface_hint=(
+                "Project Settings → CI/CD → Variables. GitLab auto-injects them as "
+                "env for every job — mark as Masked + Protected to scope to "
+                "protected branches."
+            ),
+        )
+        return {".gitlab-ci.yml": banner + yaml.dump(pipeline, indent=2)}
 
     def _generate_basic_gitlab_pipeline(self, config, commands, env_vars):
         """Generate basic GitLab CI pipeline"""
@@ -739,8 +873,8 @@ class GitLabCITemplate(BasePipelineTemplate):
         return {
             "stages": ["validate", "generate", "plan", "apply", "test", "publish"],
             "variables": env_vars,
-            "image": "python:3.9",
-            "before_script": ["pip install -r requirements.txt"],
+            "image": "python:3.12-slim",
+            "before_script": ["pip install --quiet data-product-forge"],
             "validate": {
                 "stage": "validate",
                 "script": [commands["doctor"], commands["validate"]],
@@ -773,12 +907,22 @@ class GitLabCITemplate(BasePipelineTemplate):
                     "paths": ["test-results/"],
                 },
             },
+            "airflow_sync": {
+                "stage": "deploy",
+                "script": [commands["airflow_sync"]],
+                "only": ["main"],
+            },
             "publish": {
                 "stage": "publish",
-                "script": [commands["visualize"], commands["publish_opds"]],
+                "script": [
+                    commands["publish_catalog"],
+                    commands["visualize"],
+                    commands["publish_opds"],
+                ],
                 "artifacts": {
                     "paths": ["pipeline-viz.html", "dependency-graph.png", "opds-catalog.json"],
                     "expire_in": "30 days",
+                    "when": "always",
                 },
                 "only": ["main"],
             },
@@ -790,8 +934,8 @@ class GitLabCITemplate(BasePipelineTemplate):
         pipeline = {
             "stages": ["validate", "generate", "test", "plan", "deploy", "publish"],
             "variables": env_vars,
-            "image": "python:3.9",
-            "before_script": ["pip install -r requirements.txt"],
+            "image": "python:3.12-slim",
+            "before_script": ["pip install --quiet data-product-forge"],
         }
 
         # Add validation, generation, and testing jobs
@@ -880,10 +1024,22 @@ class GitLabCITemplate(BasePipelineTemplate):
 
             pipeline[f"deploy-{env}"] = deploy_job
 
+        # Airflow DAG sync — no-op when dags/ is empty or AIRFLOW_DAGS_DEST is unset.
+        pipeline["airflow-sync"] = {
+            "stage": "deploy",
+            "script": [commands["airflow_sync"]],
+            "only": ["main"],
+            "dependencies": [f"deploy-{config.environments[-1]}"],
+        }
+
         # Add publishing job
         pipeline["publish"] = {
             "stage": "publish",
-            "script": [commands["visualize"], commands["publish_opds"]],
+            "script": [
+                commands["publish_catalog"],
+                commands["visualize"],
+                commands["publish_opds"],
+            ],
             "artifacts": {
                 "paths": ["pipeline-viz.html", "dependency-graph.png", "opds-catalog.json"]
             },
@@ -960,9 +1116,9 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                     "job": "ValidateJob",
                     "displayName": "FLUID Validation",
                     "steps": [
-                        {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.9"}},
+                        {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.12"}},
                         {
-                            "script": "pip install -r requirements.txt",
+                            "script": "pip install --quiet data-product-forge",
                             "displayName": "Install dependencies",
                         },
                         {"script": commands["doctor"], "displayName": "FLUID Doctor Check"},
@@ -986,9 +1142,9 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                     "job": "TestJob",
                     "displayName": "Run Tests",
                     "steps": [
-                        {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.9"}},
+                        {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.12"}},
                         {
-                            "script": "pip install -r requirements.txt",
+                            "script": "pip install --quiet data-product-forge",
                             "displayName": "Install dependencies",
                         },
                         {"script": commands["test"], "displayName": "Run tests"},
@@ -1023,10 +1179,10 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                                     "steps": [
                                         {
                                             "task": "UsePythonVersion@0",
-                                            "inputs": {"versionSpec": "3.9"},
+                                            "inputs": {"versionSpec": "3.12"},
                                         },
                                         {
-                                            "script": "pip install -r requirements.txt",
+                                            "script": "pip install --quiet data-product-forge",
                                             "displayName": "Install dependencies",
                                         },
                                         {
@@ -1064,22 +1220,55 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
 
             pipeline["stages"].append(deploy_stage)
 
-        # Publishing stage
+        # Airflow DAG sync + catalog publish: always added on main.
+        # Both shell commands are self-gating via env vars
+        # (AIRFLOW_DAGS_DEST / DMM_API_URL) so they no-op cleanly when
+        # the operator hasn't configured them.
+        airflow_publish_stage = {
+            "stage": "DeployExtras",
+            "displayName": "Deploy Extras (Airflow + Catalog)",
+            "dependsOn": f"Deploy{config.environments[-1].title()}",
+            "condition": "and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))",
+            "jobs": [
+                {
+                    "job": "AirflowAndPublish",
+                    "displayName": "Sync DAGs + Publish contract",
+                    "steps": [
+                        {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.12"}},
+                        {
+                            "script": "pip install data-product-forge",
+                            "displayName": "Install data-product-forge",
+                        },
+                        {
+                            "script": commands["airflow_sync"],
+                            "displayName": "Sync Airflow DAGs",
+                        },
+                        {
+                            "script": commands["publish_catalog"],
+                            "displayName": "Publish contract to catalog",
+                        },
+                    ],
+                }
+            ],
+        }
+        pipeline["stages"].append(airflow_publish_stage)
+
+        # Publishing stage (OPDS + marketplace — opt-in)
         if config.enable_marketplace_publishing:
             publish_stage = {
                 "stage": "Publish",
                 "displayName": "Publish Artifacts",
-                "dependsOn": f"Deploy{config.environments[-1].title()}",
+                "dependsOn": "DeployExtras",
                 "condition": "and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))",
                 "jobs": [
                     {
                         "job": "PublishJob",
                         "displayName": "Publish to Marketplace",
                         "steps": [
-                            {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.9"}},
+                            {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.12"}},
                             {
-                                "script": "pip install -r requirements.txt",
-                                "displayName": "Install dependencies",
+                                "script": "pip install data-product-forge",
+                                "displayName": "Install data-product-forge",
                             },
                             {
                                 "script": commands["visualize"],
@@ -1107,7 +1296,15 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
 
             pipeline["stages"].append(publish_stage)
 
-        return {"azure-pipelines.yml": yaml.dump(pipeline, indent=2)}
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="Azure DevOps Pipelines",
+            secret_surface_hint=(
+                "Pipelines → Library → Variable Groups. Link the group to the "
+                "pipeline and map secret vars into step env via `env: FOO: $(FOO)`."
+            ),
+        )
+        return {"azure-pipelines.yml": banner + yaml.dump(pipeline, indent=2)}
 
 
 class JenkinsTemplate(BasePipelineTemplate):
@@ -1125,15 +1322,38 @@ class JenkinsTemplate(BasePipelineTemplate):
 
         jenkins_pipeline = f"""
 pipeline {{
-    agent {{ label 'fluid' }}
+    // Default to any available agent. Change to `label 'your-label'`
+    // if you have a dedicated FLUID-equipped agent pool.
+    agent any
 
     environment {{
         FLUID_LOG_LEVEL = 'INFO'
         FLUID_CONFIG_PATH = './fluid_config'
         PYTHONPATH = '.'
-        // Bind credentials from Jenkins credential store.
-        // Configure 'fluid-provider-credentials' in Jenkins > Manage Credentials.
-        PROVIDER_CREDS = credentials('fluid-provider-credentials')
+
+        // ── Provider credential bindings (pick ONE pattern) ──────
+        // See the top-of-file banner for the full env-var list per
+        // provider.
+        //
+        // Path 1 — agent env passthrough. Set the env vars on the
+        // Jenkins agent/container (docker-compose `environment:`,
+        // Kubernetes agent template, or Jenkins Global Node
+        // Properties). `sh` steps inherit them automatically; no
+        // changes needed here.
+        //
+        // Path 2 — Jenkins credential store. After creating
+        // `string` credentials in Jenkins, uncomment + adapt:
+        //
+        //   <PROVIDER_ENV_VAR> = credentials('<your-credential-id>')
+        //
+        // e.g. Snowflake:  SNOWFLAKE_ACCOUNT = credentials('snowflake-account')
+        //      GCP:        GOOGLE_APPLICATION_CREDENTIALS = credentials('gcp-sa-key')
+        //      AWS:        AWS_ACCESS_KEY_ID = credentials('aws-access-key')
+        //                  AWS_SECRET_ACCESS_KEY = credentials('aws-secret-key')
+        //
+        // Catalog publish (only if using `fluid publish`):
+        //   DMM_API_URL = credentials('dmm-api-url')
+        //   DMM_API_KEY = credentials('dmm-api-key')
     }}
     
     triggers {{
@@ -1143,7 +1363,7 @@ pipeline {{
     stages {{
         stage('Setup') {{
             steps {{
-                sh 'pip install -r requirements.txt'
+                sh 'pip install --quiet data-product-forge'
             }}
         }}
         
@@ -1246,14 +1466,28 @@ pipeline {{
         }}
 """
 
-        # Add publishing stage
+        # Airflow DAG sync — rsync dags/ to AIRFLOW_DAGS_DEST (no-op
+        # when either the dags/ directory or the destination var is
+        # missing; the shell conditional lives inside commands["airflow_sync"]).
+        jenkins_pipeline += f"""
+        stage('Airflow DAG Sync') {{
+            when {{ branch 'main' }}
+            steps {{
+                sh '{commands["airflow_sync"]}'
+            }}
+        }}
+"""
+
+        # Publishing stage: catalog push (DMM / Entropy) via `fluid publish`
+        # plus the existing OPDS/visualization exports.
         jenkins_pipeline += f"""
         stage('Publish') {{
             when {{ branch 'main' }}
             steps {{
+                sh '{commands["publish_catalog"]}'
                 sh '{commands["visualize"]}'
                 sh '{commands["publish_opds"]}'
-                archiveArtifacts artifacts: 'pipeline-viz.html,dependency-graph.png,opds-catalog.json', fingerprint: true
+                archiveArtifacts artifacts: 'pipeline-viz.html,dependency-graph.png,opds-catalog.json', fingerprint: true, allowEmptyArchive: true
 """
 
         if config.enable_marketplace_publishing:
@@ -1280,7 +1514,19 @@ pipeline {{
 }
 """
 
-        return {"Jenkinsfile": jenkins_pipeline}
+        banner = self._credential_banner(
+            comment_prefix="// ",
+            ci_system_name="Jenkinsfile",
+            secret_surface_hint=(
+                "Either (a) expose them as env vars on the Jenkins agent "
+                "(docker-compose `environment:`, Kubernetes agent template, "
+                "Jenkins Global Node Properties — sh steps inherit), or "
+                "(b) create string credentials in Jenkins → Manage Credentials "
+                "and bind them via the `credentials()` DSL inside the "
+                "`environment {}` block."
+            ),
+        )
+        return {"Jenkinsfile": banner + jenkins_pipeline}
 
 
 class BitbucketTemplate(BasePipelineTemplate):
@@ -1296,14 +1542,14 @@ class BitbucketTemplate(BasePipelineTemplate):
         commands = self._get_fluid_commands()
 
         pipeline = {
-            "image": "python:3.9",
+            "image": "python:3.12-slim",
             "definitions": {
                 "steps": [
                     {
                         "step": {
                             "name": "Validate",
                             "script": [
-                                "pip install -r requirements.txt",
+                                "pip install --quiet data-product-forge",
                                 commands["doctor"],
                                 commands["validate"],
                             ],
@@ -1347,11 +1593,20 @@ class BitbucketTemplate(BasePipelineTemplate):
 
             pipeline["pipelines"]["branches"]["main"].append(deploy_step)
 
-        # Add publishing step
+        # Airflow DAG sync — self-gates on AIRFLOW_DAGS_DEST env var.
+        pipeline["pipelines"]["branches"]["main"].append(
+            {"step": {"name": "Airflow DAG Sync", "script": [commands["airflow_sync"]]}}
+        )
+
+        # Add publishing step (catalog push + visualize + OPDS export)
         publish_step = {
             "step": {
                 "name": "Publish",
-                "script": [commands["visualize"], commands["publish_opds"]],
+                "script": [
+                    commands["publish_catalog"],
+                    commands["visualize"],
+                    commands["publish_opds"],
+                ],
                 "artifacts": ["pipeline-viz.html", "dependency-graph.png", "opds-catalog.json"],
             }
         }
@@ -1362,7 +1617,16 @@ class BitbucketTemplate(BasePipelineTemplate):
 
         pipeline["pipelines"]["branches"]["main"].append(publish_step)
 
-        return {"bitbucket-pipelines.yml": yaml.dump(pipeline, indent=2)}
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="Bitbucket Pipelines",
+            secret_surface_hint=(
+                "Repository Settings → Repository Variables (or Deployment "
+                "Variables for env-scoped secrets). Secured variables are "
+                "auto-injected as env vars for every step."
+            ),
+        )
+        return {"bitbucket-pipelines.yml": banner + yaml.dump(pipeline, indent=2)}
 
 
 class CircleCITemplate(BasePipelineTemplate):
@@ -1381,7 +1645,7 @@ class CircleCITemplate(BasePipelineTemplate):
             "version": 2.1,
             "executors": {
                 "python-executor": {
-                    "docker": [{"image": "python:3.9"}],
+                    "docker": [{"image": "python:3.12-slim"}],
                     "working_directory": "~/project",
                 }
             },
@@ -1390,7 +1654,7 @@ class CircleCITemplate(BasePipelineTemplate):
                     "executor": "python-executor",
                     "steps": [
                         "checkout",
-                        {"run": "pip install -r requirements.txt"},
+                        {"run": "pip install --quiet data-product-forge"},
                         {"run": {"name": "FLUID Doctor", "command": commands["doctor"]}},
                         {"run": {"name": "Validate", "command": commands["validate"]}},
                     ],
@@ -1399,7 +1663,7 @@ class CircleCITemplate(BasePipelineTemplate):
                     "executor": "python-executor",
                     "steps": [
                         "checkout",
-                        {"run": "pip install -r requirements.txt"},
+                        {"run": "pip install --quiet data-product-forge"},
                         {"run": {"name": "Generate Plan", "command": commands["plan"]}},
                         {"persist_to_workspace": {"root": ".", "paths": ["plan.json"]}},
                     ],
@@ -1408,7 +1672,7 @@ class CircleCITemplate(BasePipelineTemplate):
                     "executor": "python-executor",
                     "steps": [
                         "checkout",
-                        {"run": "pip install -r requirements.txt"},
+                        {"run": "pip install --quiet data-product-forge"},
                         {"run": {"name": "Run Tests", "command": commands["test"]}},
                         {"store_test_results": {"path": "test-results"}},
                     ],
@@ -1430,7 +1694,7 @@ class CircleCITemplate(BasePipelineTemplate):
                 "steps": [
                     "checkout",
                     {"attach_workspace": {"at": "."}},
-                    {"run": "pip install -r requirements.txt"},
+                    {"run": "pip install --quiet data-product-forge"},
                     {
                         "run": {
                             "name": f"Deploy to {env}",
@@ -1457,7 +1721,16 @@ class CircleCITemplate(BasePipelineTemplate):
 
             pipeline["workflows"]["fluid-pipeline"]["jobs"].append(workflow_job)
 
-        return {".circleci/config.yml": yaml.dump(pipeline, indent=2)}
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="CircleCI",
+            secret_surface_hint=(
+                "Project Settings → Environment Variables (per-project) or "
+                "Organization Settings → Contexts (reusable across projects). "
+                "Both auto-inject as env for every step."
+            ),
+        )
+        return {".circleci/config.yml": banner + yaml.dump(pipeline, indent=2)}
 
 
 class TektonTemplate(BasePipelineTemplate):
@@ -1526,10 +1799,10 @@ class TektonTemplate(BasePipelineTemplate):
                 "steps": [
                     {
                         "name": "validate",
-                        "image": "python:3.9",
+                        "image": "python:3.12-slim",
                         "workingDir": "$(workspaces.source.path)",
                         "script": f"""#!/bin/bash
-pip install -r requirements.txt
+pip install --quiet data-product-forge
 {commands["doctor"]}
 {commands["validate"]}
 """,
@@ -1540,9 +1813,19 @@ pip install -r requirements.txt
 
         task_definitions.append(validate_task)
 
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="Tekton",
+            secret_surface_hint=(
+                "Kubernetes Secrets referenced via `envFrom: - secretRef:` on "
+                "each Task (or `volumeMounts` for key-files like "
+                "GOOGLE_APPLICATION_CREDENTIALS). Create the Secrets in the "
+                "same namespace as the PipelineRun."
+            ),
+        )
         files = {
-            "tekton/pipeline.yaml": yaml.dump(pipeline, indent=2),
-            "tekton/tasks.yaml": yaml.dump_all(task_definitions, indent=2),
+            "tekton/pipeline.yaml": banner + yaml.dump(pipeline, indent=2),
+            "tekton/tasks.yaml": banner + yaml.dump_all(task_definitions, indent=2),
         }
 
         return files

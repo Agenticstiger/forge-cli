@@ -274,7 +274,7 @@ pip install -e ".[all]"         # Everything (all providers + dev tools)
 Everything starts with `contract.fluid.yaml` — the **single source of truth** for your data product's entire lifecycle.
 
 ```yaml
-fluidVersion: "0.7.1"
+fluidVersion: "0.7.2"
 kind: DataProduct
 id: example.customer_360
 name: Customer 360

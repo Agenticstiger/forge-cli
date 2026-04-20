@@ -47,6 +47,20 @@ COMMAND = "verify"
 # Backwards-compatible alias for any legacy callers in this module.
 _resolve_env_templates = resolve_env_templates
 
+
+def _hydrate_dotenv_into_environ(project_root: Path, environment: Optional[str]) -> None:
+    """Hydrate ``os.environ`` from ``.env`` files and ``FLUID_SECRETS_FILE``.
+
+    Thin shim over ``_common.hydrate_dotenv`` — kept in this module so tests
+    and legacy callers that import it from ``fluid_build.cli.verify`` keep
+    working. See the shared helper's docstring for load order and error
+    semantics.
+    """
+    from ._common import hydrate_dotenv
+
+    hydrate_dotenv(project_root, environment=environment)
+
+
 _SNOWFLAKE_TYPE_FAMILIES = {
     "STRING": {"VARCHAR", "CHAR", "CHARACTER", "TEXT", "STRING"},
     "NUMBER": {
@@ -654,6 +668,15 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     contract_id = contract.get("id", "unknown")
     cprint(f"Contract ID: {contract_id}")
+
+    # Hydrate .env files into os.environ so subsequent {{ env.VAR }}
+    # resolution (and the Snowflake identifier allowlist) sees values
+    # the user already staged in .env. Matches the apply path, which hits
+    # the credential resolver chain with project_root defaulted to Path.cwd()
+    # (see provider_enhanced -> resolve_snowflake_settings fallback). The
+    # contract file itself lives deeper in the tree (e.g. fluid/contracts/*)
+    # so its parent is NOT the project root.
+    _hydrate_dotenv_into_environ(Path.cwd(), getattr(args, "env", None))
 
     # Get exposes to verify
     exposes = contract.get("exposes", [])

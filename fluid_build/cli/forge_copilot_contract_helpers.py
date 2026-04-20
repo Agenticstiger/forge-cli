@@ -86,19 +86,15 @@ KNOWN_BUILD_ENGINES = {
     "sql",
     "python",
     "dbt",
-    "dbt-bigquery",
-    "dbt-athena",
-    "dbt-redshift",
-    "dbt-snowflake",
-    "dataform",
-    "glue",
+    "spark",
+    "custom",
 }
 
 PROVIDER_ENGINE_COMPATIBILITY = {
     "local": {"sql", "python", "dbt"},
-    "gcp": {"sql", "python", "dbt", "dbt-bigquery", "dataform"},
-    "aws": {"sql", "python", "dbt", "dbt-athena", "dbt-redshift", "glue"},
-    "snowflake": {"sql", "python", "dbt", "dbt-snowflake"},
+    "gcp": {"sql", "python", "dbt"},
+    "aws": {"sql", "python", "dbt"},
+    "snowflake": {"sql", "python", "dbt"},
 }
 
 _AMBIGUITY_ERROR_KEYWORDS = (
@@ -176,6 +172,52 @@ _REPAIR_GUIDANCE: List[Dict[str, Any]] = [
         "pattern": "is not valid",
         "category": "invalid_value",
         "fix_hint": "The value does not match the schema. Check allowed enum values or types.",
+    },
+    {
+        "pattern": "data_modeling_technique=data_vault_2",
+        "category": "modeling_technique_mismatch",
+        "fix_hint": (
+            "For Data Vault 2.0 you must emit at least one hub_ or sat_ model "
+            "in additional_files under dbt_project/models/staging/. Reference "
+            "hub hash keys from links, keep raw-vault inserts-only, and stamp "
+            "load_dts + record_source on every row."
+        ),
+        "example": (
+            '{"additional_files": {'
+            '"dbt_project/models/staging/hub_party_source.sql": "...", '
+            '"dbt_project/models/staging/sat_party_source_raw.sql": "...", '
+            '"dbt_project/models/marts/lnk_<mart>.sql": "..."}}'
+        ),
+    },
+    {
+        "pattern": "data_modeling_technique=dimensional",
+        "category": "modeling_technique_mismatch",
+        "fix_hint": (
+            "For dimensional modeling you must emit at least one dim_ or fct_ "
+            "model in additional_files under dbt_project/models/marts/. Use "
+            "dbt_utils.generate_surrogate_key() for dimension keys and "
+            "reference those surrogates from fact tables."
+        ),
+        "example": (
+            '{"additional_files": {'
+            '"dbt_project/models/marts/dim_customer.sql": "...", '
+            '"dbt_project/models/marts/fct_subscription_events.sql": "..."}}'
+        ),
+    },
+    {
+        "pattern": "declares `sources:`",
+        "category": "engine_owned_file_collision",
+        "fix_hint": (
+            "The engine emits dbt_project/models/sources.yml from the "
+            "upstream contracts — never include a `sources:` block in any "
+            "YAML you ship. Remove the `sources:` block from the offending "
+            "file; keep only `models:` (one top-level list of model tests)."
+        ),
+        "example": (
+            '{"additional_files": {'
+            '"dbt_project/models/schema.yml": '
+            '"version: 2\\nmodels:\\n  - name: hub_party\\n    columns: [...]"}}'
+        ),
     },
 ]
 
@@ -790,8 +832,14 @@ def validate_generated_result(
     schema_manager_cls: Any,
     resolve_provider_from_contract_fn: Callable[[Mapping[str, Any]], tuple[Optional[str], Any]],
     get_builds_fn: Callable[[Mapping[str, Any]], List[Mapping[str, Any]]],
+    context: Optional[Mapping[str, Any]] = None,
 ) -> tuple[List[str], List[str]]:
-    """Validate contract schema plus local provider/build sanity checks."""
+    """Validate contract schema plus local provider/build sanity checks.
+
+    ``context`` is optional so pre-existing callers keep working; when
+    supplied it drives additional technique-aware checks (e.g. DV2 runs
+    must ship at least one ``hub_`` / ``sat_`` model in additional_files).
+    """
     contract = normalized["contract"]
     suggestions = normalized["suggestions"]
     errors: List[str] = []
@@ -896,6 +944,65 @@ def validate_generated_result(
             errors.append(
                 f"Expose '{expose.get('exposeId', 'unknown')}' semantics must include at least one metric."
             )
+
+    # --- Modeling-technique post-check (DV2 / dimensional) ---------------
+    # Only fires when the LLM actually shipped additional_files but failed
+    # to use the technique-appropriate naming.  When additional_files is
+    # empty the engine's fallback skeleton handles the shape — don't burn
+    # a repair attempt on an orthogonal issue.
+    technique = (context or {}).get("data_modeling_technique") if context else None
+    if technique in {"data_vault_2", "dimensional"}:
+        additional_files = normalized.get("additional_files") or {}
+        sql_file_names = [
+            str(path).rsplit("/", 1)[-1]
+            for path in additional_files
+            if isinstance(path, str) and path.endswith(".sql")
+        ]
+        if sql_file_names:
+            if technique == "data_vault_2" and not any(
+                n.startswith(("hub_", "sat_", "lnk_")) for n in sql_file_names
+            ):
+                errors.append(
+                    "data_modeling_technique=data_vault_2 requires at least one "
+                    "hub_/sat_/lnk_ model in additional_files — none found."
+                )
+            if technique == "dimensional" and not any(
+                n.startswith(("fct_", "dim_")) for n in sql_file_names
+            ):
+                errors.append(
+                    "data_modeling_technique=dimensional requires at least one "
+                    "fct_/dim_ model in additional_files — none found."
+                )
+
+    # --- Engine-owned file intrusion check -------------------------------
+    # The engine owns dbt_project/models/sources.yml (generated from
+    # upstream contracts) — duplicating the `sources:` block in any
+    # LLM-shipped YAML makes dbt blow up with "two sources with the
+    # same name". Catch this during validation so the repair loop can
+    # fix it before apply runs.
+    additional_files = normalized.get("additional_files") or {}
+    for rel_path, content in additional_files.items():
+        if not isinstance(rel_path, str) or not isinstance(content, str):
+            continue
+        if not rel_path.endswith(".yml") and not rel_path.endswith(".yaml"):
+            continue
+        # Only check YAML under dbt_project/models/... — e.g.
+        # dbt_project/models/schema.yml. Other yamls (docs, CI configs)
+        # are out of scope.
+        if "/models/" not in rel_path:
+            continue
+        # Cheap regex-less scan; YAML parsing would be stricter but adds
+        # a dependency on the LLM emitting syntactically clean YAML,
+        # which is a separate concern.
+        stripped_lines = [line.lstrip() for line in content.splitlines() if line.strip()]
+        for line in stripped_lines[:20]:
+            if line.startswith("sources:"):
+                errors.append(
+                    f"LLM-shipped {rel_path!r} declares `sources:` — that key is "
+                    f"reserved for the engine-generated models/sources.yml. "
+                    f"Remove the `sources:` block; keep only `models:`."
+                )
+                break
 
     return errors, warnings
 

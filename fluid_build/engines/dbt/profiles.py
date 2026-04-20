@@ -76,6 +76,11 @@ def _profile_for_platform(platform: str, profile_name: str) -> Dict[str, Any]:
         }
 
     if lower in ("snowflake",):
+        # All Snowflake connection parameters are sourced from env vars so
+        # the same profiles.yml works across environments. dbt's env_var
+        # helper supports a default value as the second argument; we use
+        # it only for the schema target (which is optional — dbt falls
+        # back to the profile's schema per DAG model config).
         return {
             profile_name: {
                 "target": "dev",
@@ -85,10 +90,13 @@ def _profile_for_platform(platform: str, profile_name: str) -> Dict[str, Any]:
                         "account": "{{ env_var('SNOWFLAKE_ACCOUNT') }}",
                         "user": "{{ env_var('SNOWFLAKE_USER') }}",
                         "password": "{{ env_var('SNOWFLAKE_PASSWORD') }}",
-                        "role": "TRANSFORMER",
-                        "database": "ANALYTICS",
-                        "warehouse": "TRANSFORM_WH",
-                        "schema": "DEV",
+                        "role": "{{ env_var('SNOWFLAKE_ROLE') }}",
+                        "database": "{{ env_var('SNOWFLAKE_DATABASE') }}",
+                        "warehouse": "{{ env_var('SNOWFLAKE_WAREHOUSE') }}",
+                        "schema": (
+                            "{{ env_var('SNOWFLAKE_DBT_SCHEMA', "
+                            "env_var('SNOWFLAKE_FLUID_SCHEMA', 'PUBLIC')) }}"
+                        ),
                         "threads": 4,
                     },
                 },

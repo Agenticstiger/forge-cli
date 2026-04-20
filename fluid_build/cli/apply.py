@@ -73,7 +73,13 @@ from ..structured_logging import (
     log_operation_start,
     log_operation_success,
 )
-from ._common import CLIError, build_provider, load_contract_with_overlay, read_json
+from ._common import (
+    CLIError,
+    build_provider,
+    hydrate_dotenv,
+    load_contract_with_overlay,
+    read_json,
+)
 from .core import ProgressManager, confirm_action
 
 # Import orchestration engine (extracted for maintainability)
@@ -359,6 +365,12 @@ def run(args, logger: logging.Logger) -> int:
     """
     start_time = time.time()
     execution_id = f"fluid_apply_{int(time.time())}_{os.getpid()}"
+
+    # Mirror verify/publish: hydrate os.environ from project dotenv +
+    # FLUID_SECRETS_FILE before anything that reads SNOWFLAKE_*, DMM_*, etc.
+    # Must happen before the --build branch delegates to execute.run, since
+    # the dbt subprocess launched there reads os.environ for its profile.
+    hydrate_dotenv(Path.cwd(), environment=getattr(args, "env", None))
 
     # Log operation start
     log_operation_start(

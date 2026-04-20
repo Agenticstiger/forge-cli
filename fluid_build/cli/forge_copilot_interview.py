@@ -44,6 +44,7 @@ from .forge_dialogs import (
     ask_dialog_question as ask_interview_question,
 )
 from .forge_dialogs import (
+    ask_flexible_choice,
     ask_friendly_text,
     normalize_prompt_choices,
     resolve_choice_input,
@@ -129,6 +130,7 @@ SUMMARY_FIELDS = {
     "user_data_model",
     "schedule_engine",
     "byos_path",
+    "data_modeling_technique",
 }
 
 LIST_LIKE_FIELDS = {"primary_measures", "primary_dimensions", "supporting_standards"}
@@ -154,6 +156,33 @@ SCALAR_FIELDS = {
     "user_data_model",
     "schedule_engine",
     "byos_path",
+    "data_modeling_technique",
+}
+
+# Canonical values for the data_modeling_technique field. ``data_vault_2`` is
+# the default because most of our demo customers standardize on DV2 raw vault
+# before any dimensional layer; the interview lets the user pick ``dimensional``
+# for the classic Kimball / star schema shape.
+_DATA_VAULT_2_ALIASES = {
+    "dv2",
+    "dv 2",
+    "dv2.0",
+    "dv 2.0",
+    "data vault",
+    "data vault 2",
+    "data vault 2.0",
+    "datavault",
+    "datavault2",
+    "data_vault_2",
+    "data-vault-2",
+}
+_DIMENSIONAL_ALIASES = {
+    "dimensional",
+    "dimensional modeling",
+    "dim",
+    "kimball",
+    "star",
+    "star schema",
 }
 
 
@@ -338,6 +367,16 @@ def normalize_interview_value(field_name: str, value: Any) -> Any:
         return normalize_use_case(value) or str(value or "").strip() or None
     if key == "consumes":
         return _normalize_consumes(value)
+    if key == "data_modeling_technique":
+        text = str(value or "").strip().lower()
+        if text in _DATA_VAULT_2_ALIASES:
+            return "data_vault_2"
+        if text in _DIMENSIONAL_ALIASES:
+            return "dimensional"
+        # Accept the canonical values verbatim.
+        if text in {"data_vault_2", "dimensional"}:
+            return text
+        return None
     if key in LIST_LIKE_FIELDS:
         return _listify_strings(value)
     if key in SCALAR_FIELDS:
@@ -448,6 +487,15 @@ def bootstrap_interview_state(
         memory_engines = list(getattr(project_memory, "build_engines", []) or [])
         if not state.normalized_context.get("build_engine") and memory_engines:
             state.apply_patch({"build_engine": memory_engines[0]}, source="project_memory")
+
+    # Ensure ``data_modeling_technique`` always has a value so downstream
+    # codepaths (prompt injection, engine fallback, validation guardrail)
+    # can rely on it even when the interview is skipped entirely (non-
+    # interactive / ``--no-interaction`` / piped stdin).  ``source="default"``
+    # is the lowest precedence in SOURCE_PRECEDENCE, so any explicit
+    # answer — bootstrap question, clarifier LLM, CLI flag — still wins.
+    if not state.normalized_context.get("data_modeling_technique"):
+        state.apply_patch({"data_modeling_technique": "data_vault_2"}, source="default")
 
     return state
 
@@ -678,6 +726,16 @@ def _ask_bootstrap_questions(
     ):
         _ask_schedule_question(state, console, discovery_report=discovery_report)
 
+    # ── Data modeling technique ───────────────────────────────────────
+    # Only re-ask when the user hasn't explicitly answered.  The default
+    # ("data_vault_2") is applied in ``bootstrap_interview_state`` with
+    # ``source="default"``, which is the lowest precedence — so the user
+    # is presented the picker unless they (or a higher-precedence source
+    # like project_memory) already supplied an explicit choice.
+    _modeling_technique_source = state.field_sources.get("data_modeling_technique")
+    if _modeling_technique_source in (None, "default"):
+        _ask_data_modeling_technique(state, console)
+
     # Ask about data modeling if domain expertise has modeling standards
     domain_expertise = state.normalized_context.get("domain_expertise") or {}
     if domain_expertise.get("data_modeling_standards") and not state.normalized_context.get(
@@ -866,6 +924,60 @@ def _ask_engine_selection(
             state.apply_patch({"build_engine": available[0]}, source="interactive")
     except ImportError:
         pass  # engines module not available
+
+
+def _ask_data_modeling_technique(
+    state: CopilotInterviewState,
+    console: Any,
+) -> None:
+    """Ask the user to pick a data modeling technique (DV2 / Dimensional).
+
+    Runs as a bootstrap question right after the schedule step when the
+    current value came from the default precedence — so explicit answers
+    (project_memory, CLI, LLM) always take priority.  The helper is a
+    no-op when ``console`` is falsy; the non-interactive default is
+    applied in :func:`bootstrap_interview_state`.
+    """
+    if not console:
+        return
+
+    choices = [
+        {
+            "label": "Data Vault 2.0 (recommended)",
+            "value": "data_vault_2",
+            "aliases": list(_DATA_VAULT_2_ALIASES),
+        },
+        {
+            "label": "Dimensional / Kimball",
+            "value": "dimensional",
+            "aliases": list(_DIMENSIONAL_ALIASES),
+        },
+    ]
+    match = ask_flexible_choice(
+        console,
+        prompt=(
+            "Which data modeling technique should the speed-transformation follow? "
+            "[dim](Data Vault 2.0 default — hub/link/satellite; Dimensional — star schema)[/dim]"
+        ),
+        field_name="data_modeling_technique",
+        choices=choices,
+        required=False,
+        allow_skip=True,
+        default="data_vault_2",
+    )
+    resolved = match.value if match.status in {"matched", "confirmed", "custom"} else None
+    resolved = normalize_interview_value("data_modeling_technique", resolved) or "data_vault_2"
+
+    state.apply_patch({"data_modeling_technique": resolved}, source="interactive")
+    state.record_turn(
+        role="user",
+        content=resolved,
+        field="data_modeling_technique",
+        question_id="bootstrap_data_modeling_technique",
+        raw_input=match.raw_input or "",
+        resolved_value=resolved,
+        resolution_status=match.status or "matched",
+    )
 
 
 def _ask_schedule_question(

@@ -253,6 +253,9 @@ class BaseCredentialResolver(ABC):
                     return value
 
             return None
+        except ImportError as e:
+            logger.debug("python-dotenv not installed; skipping .env file (%s)", e)
+            return None
         except (OSError, ValueError) as e:
             logger.debug("Failed to read from .env file: %s", e)
             return None
@@ -312,6 +315,9 @@ class BaseCredentialResolver(ABC):
             # Key mismatch / corruption — surface to caller; silent
             # fall-through is the bug S-008 explicitly fixed.
             raise
+        except ImportError as e:
+            logger.debug("cryptography not installed; skipping encrypted file (%s)", e)
+            return None
         except OSError as e:
             logger.debug("Failed to read encrypted credential file: %s", e)
             return None

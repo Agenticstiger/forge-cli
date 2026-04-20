@@ -25,7 +25,10 @@ __all__ = [
 
 
 import json
+from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
+
+import yaml
 
 from fluid_build.cli.forge_copilot_memory import CopilotMemorySnapshot
 from fluid_build.schema_manager import FluidSchemaManager
@@ -36,6 +39,114 @@ from .forge_copilot_contract_helpers import _normalize_interview_summary
 def _latest_fluid_version() -> str:
     """Return the newest bundled FLUID schema version."""
     return FluidSchemaManager.latest_bundled_version()
+
+
+# Default-guidance directory under agent_specs/. Each ``.yaml`` file has
+# a single top-level key ``system_prompt`` whose value is injected into
+# ``build_system_prompt`` at a labelled slot.  Editing the YAML is the
+# supported way to adjust the prose — no Python change needed — but the
+# snapshot test at ``tests/test_prompt_default_guidance.py`` locks the
+# composed prompt to byte-identical output and will fail if drift is
+# unintentional.
+_DEFAULTS_DIR: Path = Path(__file__).with_name("agent_specs") / "_defaults"
+
+
+def _load_default_guidance() -> Mapping[str, str]:
+    """Load ``_defaults/*.yaml`` into a {name: system_prompt_text} map.
+
+    Invoked once at module import.  Missing files or missing
+    ``system_prompt`` keys fall back to an empty string so that an
+    incomplete install doesn't crash the CLI — the snapshot test
+    catches such drift in CI.
+    """
+    guidance: dict[str, str] = {}
+    if not _DEFAULTS_DIR.is_dir():
+        return guidance
+    for path in sorted(_DEFAULTS_DIR.glob("*.yaml")):
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(raw, Mapping):
+            continue
+        text = raw.get("system_prompt")
+        if isinstance(text, str):
+            guidance[path.stem] = text
+    return guidance
+
+
+_DEFAULT_GUIDANCE: Mapping[str, str] = _load_default_guidance()
+
+
+# Per-technique rule sheets injected into the user prompt. Keyed by the
+# canonical value of ``context["data_modeling_technique"]`` (produced by
+# :func:`fluid_build.cli.forge_copilot_interview.normalize_interview_value`).
+# The LLM reads this alongside ``upstream_products`` and must follow the
+# named conventions in every ``additional_files`` SQL file it emits.
+_MODELING_GUIDANCE: Mapping[str, Mapping[str, Any]] = {
+    "data_vault_2": {
+        "label": "Data Vault 2.0",
+        "naming_conventions": {
+            "hub": "hub_<entity>",
+            "link": "lnk_<relation>",
+            "satellite": "sat_<entity>_<source_system>",
+            "point_in_time": "pit_<entity>",
+            "bridge": "br_<relation>",
+        },
+        "key_strategy": (
+            "Business keys are hashed to 32-hex surrogate keys via "
+            "md5(upper(trim(<business_key>))). Parent keys in links and "
+            "satellites reference hub hash keys only — never raw business keys."
+        ),
+        "load_metadata": [
+            "load_dts TIMESTAMP — insert time of the record",
+            "record_source VARCHAR — short identifier of the upstream source system",
+            "hash_diff VARCHAR (satellites only) — md5 of all descriptive attributes",
+        ],
+        "layer_structure": (
+            "Staging view per upstream source (one per consume). Raw vault: hubs + "
+            "links + satellites. Business vault (optional) may derive PITs/bridges."
+        ),
+        "insert_only": True,
+        "anti_patterns": [
+            "Do NOT update or delete raw-vault rows — all history is insert-only.",
+            "Do NOT mix sources in one satellite; one source = one satellite.",
+            "Do NOT fabricate business keys when a natural key exists upstream.",
+        ],
+    },
+    "dimensional": {
+        "label": "Dimensional (Kimball)",
+        "naming_conventions": {
+            "staging": "stg_<source>",
+            "dimension": "dim_<entity>",
+            "fact": "fct_<grain>",
+            "conformed_dimension": "dim_<conformed_entity>",
+        },
+        "key_strategy": (
+            "Dimensions have integer surrogate keys (<entity>_key) generated via "
+            "dbt_utils.generate_surrogate_key() from the natural key + scd columns. "
+            "Facts reference dimension surrogate keys only — never natural keys."
+        ),
+        "load_metadata": [
+            "valid_from TIMESTAMP — SCD type-2 effective start",
+            "valid_to TIMESTAMP — SCD type-2 effective end (null for current row)",
+            "is_current BOOLEAN — true for the live row of each natural key",
+        ],
+        "layer_structure": (
+            "Staging view per upstream source, then conformed dimensions (shared "
+            "across facts), then fact tables one per business process / grain."
+        ),
+        "scd_handling": (
+            "Type-2 for dimensions with historical attributes; type-1 for rapidly "
+            "changing dimensions where history isn't required."
+        ),
+        "anti_patterns": [
+            "Do NOT reference natural keys from fact tables — only surrogate keys.",
+            "Do NOT duplicate conformed dimensions per fact; reuse the shared dim.",
+            "Do NOT store additive measures on dimensions; measures belong on facts.",
+        ],
+    },
+}
 
 
 def build_system_prompt(
@@ -82,6 +193,22 @@ def build_system_prompt(
         "metadata must be an object with: owner (object with team and email) and layer.\n\n"
         "Each build must have: id, pattern (one of: 'embedded-logic', 'hybrid-reference', 'multi-stage'), "
         "engine (one of: " + engines + "), properties, execution.\n"
+        "The 'engine' value MUST be exactly one of the short names above. "
+        "Do NOT invent provider-suffixed variants like 'dbt-snowflake', 'dbt-bigquery', 'dbt-athena', "
+        "'dbt-redshift', 'dataform', or 'glue' — those are NOT valid. "
+        "For Snowflake/BigQuery/Athena dbt projects, use engine='dbt' and declare the target platform "
+        "via binding.platform on each expose.\n"
+        "BUILD PROPERTIES SHAPE (strict — additionalProperties is false per pattern):\n"
+        "- pattern='hybrid-reference' (the common dbt case): properties = {model (required, string), "
+        "vars? (object), materializations? (object, keys->{table|view|incremental|ephemeral}), "
+        "tags?, labels?}. DO NOT add 'profile', 'projectDir', 'target', 'schema', 'database', or any "
+        "other key to properties — those are resolved at apply time from the provider config, not "
+        "declared in the contract.\n"
+        "- pattern='embedded-logic' (engine='sql' or 'python'): properties = {sql (required, string), "
+        "language? (one of: sql, flink_sql, pyspark, scala, python, r), parameters? (object), "
+        "tags?, labels?}.\n"
+        "- pattern='multi-stage': properties = {stages (array of objects with name, pattern, "
+        "properties, dependsOn)}.\n"
         "For engine='sql', properties must contain 'sql' with a SQL string.\n"
         "For engine='python', the build must have 'repository' and properties.model.\n"
         "execution must have trigger (object with type and iterations) and runtime (object with platform and resources).\n"
@@ -93,6 +220,12 @@ def build_system_prompt(
         "Each expose must have: exposeId (string), kind (string), binding (object with platform, format, location), "
         "contract (object with schema as array of column objects with name, type, required).\n"
         "binding.platform is REQUIRED and must be one of: " + providers + ".\n"
+        "binding.format is REQUIRED and must be one of: 'bigquery_table', 'snowflake_table', "
+        "'gcs_file', 's3_file', 'http_api', 'grpc_api', 'pubsub_topic', 'kafka_topic', "
+        "'delta_table', 'iceberg', 'parquet', 'csv', 'json', 'other'. "
+        "Match the format to the platform: snowflake->'snowflake_table', gcp->'bigquery_table', "
+        "aws->'s3_file' or 'delta_table' or 'iceberg', local->'parquet' or 'csv' or 'json'. "
+        "Do NOT use generic values like 'table', 'view', or 'dataset'.\n"
         "DO NOT put 'platform' inside binding.location.\n\n"
         f"NEW IN {fv} — SEMANTICS BLOCK (required on each expose):\n"
         "Each expose MUST include a 'semantics' object with the following structure:\n"
@@ -111,42 +244,76 @@ def build_system_prompt(
         "and optional measure (for simple), filter, inputMetrics (array of strings for derived/ratio), "
         "expr (for derived), numerator/denominator (for ratio), description.\n"
         "The semantics block enables AI agents and BI tools to generate correct queries without hallucination.\n\n"
-        # --- Sovereignty block guidance ---
-        "SOVEREIGNTY BLOCK (optional — include when user specifies compliance, jurisdiction, or data residency):\n"
-        "The contract MAY include a top-level 'sovereignty' object with:\n"
-        "- jurisdiction (enum): EU, US, UK, CA, AU, JP, CN, IN, BR, Global, Multi-Region\n"
-        "- allowedRegions (array of strings): Cloud regions where data may reside\n"
-        "- deniedRegions (array of strings): Cloud regions explicitly prohibited\n"
-        "- dataResidency (boolean, default true): Data must stay within jurisdiction\n"
-        "- crossBorderTransfer (boolean, default false): Whether cross-border transfer is allowed\n"
-        "- transferMechanisms (array, enum): SCCs, BCRs, Adequacy, DPF, Consent, Derogation\n"
-        "- regulatoryFramework (array, enum): GDPR, CCPA, CPRA, HIPAA, PIPEDA, LGPD, PDPA, POPIA, DPA, APPI\n"
-        "- enforcementMode (enum, default strict): strict, advisory, audit\n"
-        "Include sovereignty when the user mentions: GDPR, HIPAA, CCPA, data residency, EU-only, compliance, "
-        "regulated data, PII, PHI, jurisdiction, or regional restrictions.\n"
-        "Match allowedRegions to the chosen provider (e.g. eu-west-1/eu-central-1 for AWS in EU, "
-        "europe-west1/europe-west3 for GCP in EU).\n\n"
-        # --- Agent policy guidance ---
-        "AGENT POLICY (optional — include when data has sensitivity or AI access restrictions):\n"
-        "Each expose MAY include 'policy.agentPolicy' with:\n"
-        "- allowedModels (array): AI models permitted to consume this data (e.g. gpt-4, claude-3-opus)\n"
-        "- deniedModels (array): AI models explicitly blocked\n"
-        "- allowedUseCases (array, enum): inference, reasoning, analysis, summarization, classification, "
-        "embedding, search, qa, code_generation, fine_tuning, training, rag\n"
-        "- deniedUseCases (array, enum): Same enum values, explicitly blocked use cases\n"
-        "- canStore (boolean, default false): Whether AI systems can cache/persist data\n"
-        "- canReason (boolean, default false): Whether multi-step reasoning is allowed\n"
-        "- maxTokensPerRequest (integer): Per-request token limit\n"
-        "- retentionPolicy: {maxRetentionDays: int, requireDeletion: bool}\n"
-        "- auditRequired (boolean, default true): Whether AI access must be logged\n"
-        "- purposeLimitation (string): Free-text scope of allowed purpose\n"
-        "Include agentPolicy when the data involves: PII, PHI, financial data, regulated data, "
-        "or when the user mentions AI access controls, model restrictions, or data sensitivity.\n"
-        "Default to restrictive settings: canStore=false, canReason=false, "
-        "deniedUseCases=[training, fine_tuning], auditRequired=true.\n\n"
-        "Follow the seed_contract structure exactly as a reference for the correct schema shape.\n"
+        # --- Sovereignty + agent-policy guidance (loaded from agent_specs/_defaults/) ---
+        # The two blocks below are expanded from YAML at import time so
+        # editing the prose doesn't require a Python change. Each block
+        # ends with one trailing newline from YAML ``|``; we add one
+        # more newline per block to reproduce the original ``\n\n`` gap.
+        + _DEFAULT_GUIDANCE.get("sovereignty", "")
+        + "\n"
+        + _DEFAULT_GUIDANCE.get("agent_policy", "")
+        + "\n"
+        + "Follow the seed_contract structure exactly as a reference for the correct schema shape.\n"
         f"Allowed providers: {providers}.\n"
-        "Only use build engines from the provided capability matrix."
+        "Only use build engines from the provided capability matrix.\n\n"
+        # --- Upstream-driven transformation SQL ---
+        "UPSTREAM TRANSFORMATION SQL (required when consumes[] references upstream products):\n"
+        "When the user prompt contains 'upstream_products', the keys are productIds that you MAY "
+        "reference from consumes[]. Each productId maps to an object whose 'exposes' keys are the "
+        "exact exposeIds you must use in consumes[].exposeId, and whose schema tells you the column "
+        "names/types available in each upstream source.\n"
+        "Whenever your contract declares consumes[] that point at entries in upstream_products AND "
+        "uses engine='dbt' with pattern='hybrid-reference', you MUST also emit working dbt SQL in "
+        "additional_files — NOT TODO skeletons. Use these exact paths:\n"
+        "  additional_files['dbt_project/models/staging/stg_<consumeExposeId>.sql']\n"
+        "  additional_files['dbt_project/models/marts/<buildModelName>.sql']\n"
+        "where <buildModelName> is the value you put in builds[0].properties.model.\n"
+        "STAGING MODELS must:\n"
+        "  - start with \"{{ config(materialized='view') }}\"\n"
+        "  - select the upstream columns named in upstream_products[productId].exposes[exposeId].schema\n"
+        "  - rename columns to snake_case when the upstream uses SCREAMING_CASE, keep types intact\n"
+        "  - read from {{ source('raw', '<consumeExposeId>') }}\n"
+        "MART MODEL must:\n"
+        "  - start with \"{{ config(materialized='table') }}\"\n"
+        "  - select EVERY column declared in exposes[0].contract.schema with the correct type\n"
+        "  - JOIN the staging models via the obvious identifier columns "
+        "(party_id, account_id, customer_id, subscription_id, service_id, etc.) — "
+        "prefer INNER JOIN when the downstream column is 'required: true', LEFT JOIN otherwise\n"
+        "  - compute aggregations (SUM, COUNT, MAX, AVG) when the downstream column name or type "
+        "implies them (e.g. 'total_invoice_amount' → SUM(invoice.amount); "
+        "'number_of_trouble_tickets' → COUNT(DISTINCT trouble_ticket.id); "
+        "'last_interaction_at' → MAX(interaction.timestamp))\n"
+        "  - apply a GROUP BY over the identifying keys when any aggregation is present\n"
+        "  - NEVER emit 'cast(null as ...)' or '-- TODO' lines — real SELECT expressions only\n"
+        "Also emit additional_files['dbt_project/models/schema.yml'] with per-model column tests "
+        "mirroring the exposes[].contract.schema (not_null for required columns; unique for "
+        "single-column primary keys).\n"
+        "If upstream_products is empty or missing, fall back to normal contract generation — the "
+        "dbt skeleton generator will run automatically.\n\n"
+        # --- Engine-owned files: do NOT recreate ---
+        "ENGINE-OWNED FILES (do NOT write these to additional_files):\n"
+        "- dbt_project/models/sources.yml — emitted by the engine. NEVER include a "
+        "  `sources:` block in any YAML you ship; duplicating source declarations makes "
+        '  dbt fail with "two sources with the same name". If you emit a schema.yml '
+        "  file, it must contain ONLY a `models:` top-level key.\n"
+        "- dbt_project/profiles.yml — emitted by the engine.\n"
+        "- dbt_project/dbt_project.yml — emitted by the engine.\n"
+        "When a modeling technique is active the engine does NOT emit any per-model "
+        "schema.yml either, so you SHOULD ship exactly one schema.yml at "
+        "`additional_files['dbt_project/models/schema.yml']` listing every staging + "
+        "mart model you authored, with per-column tests.\n\n"
+        # --- Modeling-technique mandate ---
+        "MODELING TECHNIQUE MANDATE:\n"
+        "When the user prompt supplies `data_modeling_technique` + `data_modeling_guidance`, "
+        "every staging/mart SQL file you emit in `additional_files['dbt_project/models/...']` "
+        "MUST follow those rules — naming prefixes, key strategy, load-metadata columns, "
+        "insert-only vs SCD rules. Do not mix conventions across techniques in one run. "
+        "For `data_modeling_technique = 'data_vault_2'`, produce hub_/lnk_/sat_ models in "
+        "`models/staging/` (hubs + satellites) and `models/marts/` (links), with "
+        "`load_dts`, `record_source`, and md5-hash surrogate keys. For "
+        "`data_modeling_technique = 'dimensional'`, produce stg_ + dim_ + fct_ models with "
+        "dbt_utils.generate_surrogate_key() dimension keys and SCD type-2 metadata "
+        "(valid_from / valid_to / is_current) on historical dimensions.\n"
     )
 
 
@@ -408,6 +575,25 @@ def build_user_prompt(
             "and dimension tables (dim_ prefix) for entities. "
             "Include a schema.yml with column descriptions."
         )
+
+    # Inject upstream product schemas — lets the LLM emit real dbt SQL
+    # with correct source identifiers, join keys, and column projections
+    # instead of TODO skeletons. Present only when upstream contracts
+    # were discovered by ``_create_project_minimal``.
+    upstream_products = context.get("upstream_products")
+    if upstream_products:
+        prompt["upstream_products"] = upstream_products
+
+    # Data-modeling technique guidance. The interview bootstrap always
+    # resolves this field to a canonical value (default ``data_vault_2``)
+    # so the LLM prompt can unconditionally include the matching naming,
+    # key-strategy and load-metadata rules. The guidance text is kept in
+    # ``_MODELING_GUIDANCE`` rather than inside the system prompt so it
+    # ships under the user prompt where it belongs (per-run context).
+    technique = context.get("data_modeling_technique")
+    if technique and technique in _MODELING_GUIDANCE:
+        prompt["data_modeling_technique"] = technique
+        prompt["data_modeling_guidance"] = _MODELING_GUIDANCE[technique]
 
     if team_memory:
         prompt["team_memory"] = team_memory

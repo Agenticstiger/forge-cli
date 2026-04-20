@@ -87,7 +87,7 @@ def _scaffold_product(
     ensure_dir(product_path / "models")
     contract_path = product_path / "contract.fluid.yaml"
     contract = {
-        "fluidVersion": "0.4.0",
+        "fluidVersion": "0.7.2",
         "kind": "DataProduct",
         "id": product_id,
         "name": name,

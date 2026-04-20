@@ -1,4 +1,4 @@
-fluidVersion: "0.5.7"
+fluidVersion: "0.7.2"
 kind: "DataProduct"
 id: "silver.ote.billing_history_v1"
 name: "OTE Billing History"

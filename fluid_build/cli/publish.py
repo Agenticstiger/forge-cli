@@ -56,6 +56,7 @@ from ..config_manager import FluidConfig
 from ..loader import load_contract
 from ..providers.catalogs import PublishResult, get_catalog_provider
 from ..providers.common import metrics_collector
+from ._common import hydrate_dotenv, resolve_contract_env_templates
 
 COMMAND = "publish"
 logger = logging.getLogger(__name__)
@@ -223,6 +224,12 @@ async def publish_contract(
             error=f"Failed to load contract: {e}",
         )
 
+    # Resolve {{ env.VAR }} templates across the whole contract before the
+    # catalog adapter forwards it downstream. Without this, raw placeholders
+    # land in the DMM server block (plan/apply resolve them per-string at the
+    # Snowflake boundary — publish has no such boundary).
+    contract = resolve_contract_env_templates(contract)
+
     # Get catalog config
     catalog_config = config.get_catalog_config(catalog_name)
     if not catalog_config:
@@ -254,9 +261,13 @@ async def publish_contract(
 
     # Map contract to asset
     try:
+        import yaml as _yaml
+
         asset = provider.map_contract_to_asset(contract)
-        # Attach raw contract YAML so catalogs can store the full file
-        asset.contract_yaml = contract_path.read_text(encoding="utf-8")
+        # Attach the env-resolved contract YAML so downstream catalogs parse the
+        # same values the dict pass has — reading contract_path.read_text()
+        # would re-introduce the raw ``{{ env.VAR }}`` placeholders.
+        asset.contract_yaml = _yaml.safe_dump(contract, sort_keys=False)
     except Exception as e:
         return PublishResult(
             success=False,
@@ -397,6 +408,13 @@ def format_results(
 
 async def run_async(args, logger: logging.Logger) -> int:
     """Async main execution logic"""
+    # Hydrate os.environ from project dotenv files and FLUID_SECRETS_FILE before
+    # FluidConfig reads catalog credentials. fluid apply gets this for free via
+    # the credential resolver chain; publish has no such chain, so a subprocess
+    # that only sources a launchpad (which exports only FLUID_SECRETS_FILE)
+    # would otherwise see empty DMM_API_KEY and fail the health check.
+    hydrate_dotenv(Path.cwd(), environment=getattr(args, "env", None))
+
     config = FluidConfig()
     console = Console() if RICH_AVAILABLE else None
 

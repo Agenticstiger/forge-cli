@@ -41,6 +41,52 @@ def _make_args(system: str = "jenkins", out: Optional[str] = None) -> argparse.N
     return argparse.Namespace(system=system, out=out, contract="contract.fluid.yaml")
 
 
+# ``generate_ci.run`` now delegates to
+# :class:`PipelineTemplateGenerator`, which emits canonical file paths
+# and a richer stage set than the legacy ``scaffold_ci`` constants.
+# The static constants (``GITHUB`` / ``GITLAB`` / ``JENKINS``) remain
+# the output shape for the legacy ``fluid scaffold-ci`` command and
+# are still covered by their own test classes below.
+_GENERATE_CI_EXPECTATIONS = (
+    (
+        "github",
+        ".github/workflows/fluid-standard.yml",
+        ("name:", "jobs:", "validate:", "runs-on:"),
+    ),
+    (
+        "gitlab",
+        ".gitlab-ci.yml",
+        ("stages:", "validate:", "image:", "fluid validate"),
+    ),
+    (
+        "jenkins",
+        "Jenkinsfile",
+        ("pipeline {", "stage('Validate')", "stage('Plan')", "fluid"),
+    ),
+    (
+        "azure",
+        "azure-pipelines.yml",
+        ("stages:", "jobs:", "fluid"),
+    ),
+    (
+        "bitbucket",
+        "bitbucket-pipelines.yml",
+        ("pipelines:", "step:", "fluid"),
+    ),
+    (
+        "circleci",
+        ".circleci/config.yml",
+        ("version:", "jobs:", "workflows:", "fluid"),
+    ),
+    (
+        "tekton",
+        "tekton/pipeline.yaml",
+        ("apiVersion:", "kind: Pipeline", "fluid"),
+    ),
+)
+
+
+# Back-compat alias for the scaffold-ci legacy-constant tests below.
 _STATIC_SYSTEM_CASES = (
     ("github", ".github/workflows/fluid.yml", GITHUB, ("name: FLUID", "runs-on: ubuntu-latest")),
     ("gitlab", ".gitlab-ci.yml", GITLAB, ("stages:", "validate:")),
@@ -84,8 +130,19 @@ class TestJenkinsStaticTemplate:
         assert first_line.startswith("//")
 
     def test_references_fluid_commands(self):
-        assert "fluid_build.cli validate" in JENKINS
-        assert "fluid_build.cli" in JENKINS
+        # Generated CI calls the public ``fluid`` console script rather
+        # than the internal ``python -m fluid_build.cli`` path — avoids
+        # assuming ``fluid_build`` is importable on the CI runner.
+        assert "fluid validate" in JENKINS
+        assert "fluid apply" in JENKINS
+        assert "fluid generate speed-transformation" in JENKINS
+
+    def test_has_dbt_airflow_publish_stages(self):
+        """B1 demo requires these three deploy/publish hooks."""
+        # dbt deployment rides on `fluid apply --build`, asserted above.
+        assert "Airflow DAG Sync" in JENKINS
+        assert "stage('Publish')" in JENKINS
+        assert "fluid publish" in JENKINS
 
     def test_has_post_cleanup(self):
         assert "cleanWs()" in JENKINS
@@ -127,11 +184,17 @@ class TestGenerateCIJenkins:
         generate_ci_run(_make_args(out=custom), _logger)
         assert Path(custom).exists()
 
-    def test_content_matches_template(self, tmp_path, monkeypatch):
+    def test_content_has_expected_structure(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         generate_ci_run(_make_args(), _logger)
         written = (tmp_path / "Jenkinsfile").read_text()
-        assert written == JENKINS
+        # Post-consolidation, ``generate_ci`` emits the rich
+        # ``PipelineTemplateGenerator`` output instead of the legacy
+        # ``JENKINS`` constant. Assert structural markers rather than
+        # byte equality so prose tweaks don't break the suite.
+        assert "pipeline {" in written
+        assert "stage('Validate')" in written
+        assert "fluid" in written
 
     def test_returns_zero_on_success(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -152,36 +215,50 @@ class TestGenerateCIStaticSystems:
             assert token in template
 
     @pytest.mark.parametrize(
-        ("system", "default_path", "template", "_tokens"),
-        _STATIC_SYSTEM_CASES,
+        ("system", "default_path", "tokens"),
+        _GENERATE_CI_EXPECTATIONS,
     )
     def test_generate_ci_writes_default_output(
-        self, tmp_path, monkeypatch, system, default_path, template, _tokens
+        self, tmp_path, monkeypatch, system, default_path, tokens
     ):
         monkeypatch.chdir(tmp_path)
         rc = generate_ci_run(_make_args(system=system), _logger)
         assert rc == 0
         written = tmp_path / default_path
-        assert written.exists()
-        assert written.read_text() == template
+        assert written.exists(), f"missing {default_path} for system={system}"
+        content = written.read_text()
+        for token in tokens:
+            assert (
+                token in content
+            ), f"expected token {token!r} missing from generated {default_path}"
 
     @pytest.mark.parametrize(
-        ("system", "_default_path", "template", "tokens"),
-        _STATIC_SYSTEM_CASES,
+        ("system", "_default_path", "tokens"),
+        [
+            case
+            for case in _GENERATE_CI_EXPECTATIONS
+            # Skip multi-file systems (tekton); --out is a no-op for them.
+            if case[0] != "tekton"
+        ],
     )
     def test_generate_ci_supports_custom_output(
-        self, tmp_path, monkeypatch, system, _default_path, template, tokens
+        self, tmp_path, monkeypatch, system, _default_path, tokens
     ):
         monkeypatch.chdir(tmp_path)
-        suffix = "Jenkinsfile" if system == "jenkins" else f"{system}.yml"
+        suffix = (
+            "Jenkinsfile"
+            if system == "jenkins"
+            else f"{system}.yml" if system != "circleci" else "circleci-config.yml"
+        )
         custom = tmp_path / "generated" / suffix
         rc = generate_ci_run(_make_args(system=system, out=str(custom)), _logger)
         assert rc == 0
         assert custom.exists()
         content = custom.read_text()
-        assert content == template
         for token in tokens:
-            assert token in content
+            assert (
+                token in content
+            ), f"expected token {token!r} missing from custom output for {system}"
 
 
 # ---------------------------------------------------------------------------
@@ -591,3 +668,56 @@ class TestStaticJenkinsSimulatedRun:
         runner = _SimulatedJenkinsRunner(pipeline, branch="main", fail_command="validate")
         assert runner.run() is False
         assert not any("apply" in c for c in runner.executed_commands)
+
+
+# ---------------------------------------------------------------------------
+# 6. Cross-system regression: generated pipelines must not emit bare $CONTRACT
+# ---------------------------------------------------------------------------
+
+
+class TestGeneratedContractEnvAcrossSystems:
+    """Every generated CI pipeline calls ``fluid validate / plan / apply /
+    contract-tests / publish`` with a contract-path argument. Before the
+    fix, the argument was a bare ``$CONTRACT`` and no CI template's env
+    block injected the var — so Build Now failed on the first shell
+    step. The fix uses ``${CONTRACT:-contract.fluid.yaml}`` in
+    ``_get_fluid_commands()``. This test locks that shape in across all
+    seven supported providers so a regression in any one template is
+    caught.
+    """
+
+    _DEFAULT = "${CONTRACT:-contract.fluid.yaml}"
+    _PRIMARY_FILE = {
+        PipelineProvider.GITHUB_ACTIONS: ".github/workflows/fluid-standard.yml",
+        PipelineProvider.GITLAB_CI: ".gitlab-ci.yml",
+        PipelineProvider.AZURE_DEVOPS: "azure-pipelines.yml",
+        PipelineProvider.JENKINS: "Jenkinsfile",
+        PipelineProvider.BITBUCKET: "bitbucket-pipelines.yml",
+        PipelineProvider.CIRCLE_CI: ".circleci/config.yml",
+        PipelineProvider.TEKTON: "tekton/tasks.yaml",
+    }
+
+    @pytest.mark.parametrize("provider", list(_PRIMARY_FILE.keys()))
+    def test_primary_file_uses_default_expansion_not_bare_var(self, provider):
+        cfg = PipelineConfig(
+            provider=provider,
+            complexity=PipelineComplexity.STANDARD,
+            environments=["dev", "prod"],
+        )
+        files = PipelineTemplateGenerator().generate_pipeline(cfg)
+        primary = files[self._PRIMARY_FILE[provider]]
+
+        # Must contain the default-expansion form at least once.
+        assert self._DEFAULT in primary, (
+            f"{provider.value}: expected {self._DEFAULT!r} in generated "
+            f"{self._PRIMARY_FILE[provider]}"
+        )
+
+        # Must not contain any bare $CONTRACT references (i.e. any
+        # occurrence that is not part of the default-expansion form).
+        without_default = primary.replace(self._DEFAULT, "")
+        assert "$CONTRACT" not in without_default, (
+            f"{provider.value}: generated {self._PRIMARY_FILE[provider]} "
+            f"contains a bare $CONTRACT reference — regression of the "
+            f"A1 Jenkins Build-Now gap"
+        )

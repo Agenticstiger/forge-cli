@@ -179,6 +179,158 @@ class TestSources:
         col_names = [c["name"] for c in orders_table["columns"]]
         assert "order_id" in col_names
 
+    def test_fallback_when_upstream_missing(self, minimal_contract, tmp_path, monkeypatch):
+        """With no upstream contract in the workspace we emit env_var() placeholders."""
+        monkeypatch.delenv("FLUID_UPSTREAM_CONTRACTS", raising=False)
+        content = generate_sources(minimal_contract, workspace_root=tmp_path)
+        data = yaml.safe_load(content)
+        src = data["sources"][0]
+        assert "env_var('SNOWFLAKE_DATABASE')" in src["database"]
+        assert "env_var('SNOWFLAKE_STAGE_SCHEMA'" in src["schema"]
+        # identifier gets the uppercase fallback.
+        identifiers = {t.get("identifier") for t in src["tables"]}
+        assert "ORDERS" in identifiers or "CUSTOMERS" in identifiers
+
+    def test_resolves_upstream_snowflake_binding(self, minimal_contract, tmp_path, monkeypatch):
+        """When an upstream contract is found, sources.yml uses its real binding."""
+        monkeypatch.delenv("FLUID_UPSTREAM_CONTRACTS", raising=False)
+        upstream_dir = tmp_path / "bronze_orders"
+        upstream_dir.mkdir()
+        upstream = {
+            "fluidVersion": "0.7.2",
+            "kind": "DataProduct",
+            "id": "silver.sales.orders_v1",
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "kind": "table",
+                    "binding": {
+                        "platform": "snowflake",
+                        "format": "snowflake_table",
+                        "location": {
+                            "database": "{{ env.SNOWFLAKE_DATABASE }}",
+                            "schema": "{{ env.SNOWFLAKE_STAGE_SCHEMA }}",
+                            "table": "ORDERS_RAW",
+                        },
+                    },
+                }
+            ],
+        }
+        (upstream_dir / "contract.fluid.yaml").write_text(yaml.safe_dump(upstream))
+
+        content = generate_sources(minimal_contract, workspace_root=tmp_path)
+        data = yaml.safe_load(content)
+
+        orders_block = None
+        for src in data["sources"]:
+            for table in src["tables"]:
+                if table["name"] == "orders":
+                    orders_block = (src, table)
+                    break
+            if orders_block:
+                break
+        assert orders_block is not None
+        src, table = orders_block
+        # FLUID {{ env.X }} gets rewritten to dbt env_var('X').
+        assert "env_var('SNOWFLAKE_DATABASE')" in src["database"]
+        assert "env_var('SNOWFLAKE_STAGE_SCHEMA')" in src["schema"]
+        # Real physical table name from the upstream binding.
+        assert table["identifier"] == "ORDERS_RAW"
+
+    def test_groups_tables_by_distinct_schema(self, tmp_path, monkeypatch):
+        """Consumes from two different schemas produce two dbt source blocks."""
+        monkeypatch.delenv("FLUID_UPSTREAM_CONTRACTS", raising=False)
+        # Two upstream contracts on different Snowflake schemas.
+        (tmp_path / "a").mkdir()
+        (tmp_path / "a" / "contract.fluid.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "id": "bronze.a_v1",
+                    "exposes": [
+                        {
+                            "exposeId": "party_source",
+                            "binding": {
+                                "location": {
+                                    "database": "${SNOWFLAKE_DATABASE}",
+                                    "schema": "${SNOWFLAKE_STAGE_SCHEMA}",
+                                    "table": "PARTY",
+                                }
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+        (tmp_path / "b").mkdir()
+        (tmp_path / "b" / "contract.fluid.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "id": "bronze.b_v1",
+                    "exposes": [
+                        {
+                            "exposeId": "policy_source",
+                            "binding": {
+                                "location": {
+                                    "database": "${SNOWFLAKE_DATABASE}",
+                                    "schema": "${SNOWFLAKE_GOVERNANCE_SCHEMA}",
+                                    "table": "POLICY",
+                                }
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+
+        downstream = {
+            "id": "silver.mix_v1",
+            "consumes": [
+                {"productId": "bronze.a_v1", "exposeId": "party_source"},
+                {"productId": "bronze.b_v1", "exposeId": "policy_source"},
+            ],
+        }
+        content = generate_sources(downstream, workspace_root=tmp_path)
+        data = yaml.safe_load(content)
+        assert len(data["sources"]) == 2
+        schemas = {s["schema"] for s in data["sources"]}
+        assert any("env_var('SNOWFLAKE_STAGE_SCHEMA')" in s for s in schemas)
+        assert any("env_var('SNOWFLAKE_GOVERNANCE_SCHEMA')" in s for s in schemas)
+
+    def test_env_var_extra_search_path(self, minimal_contract, tmp_path, monkeypatch):
+        """FLUID_UPSTREAM_CONTRACTS lets operators point at sibling repos."""
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "up").mkdir()
+        (external / "up" / "contract.fluid.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "id": "silver.sales.orders_v1",
+                    "exposes": [
+                        {
+                            "exposeId": "orders",
+                            "binding": {
+                                "location": {
+                                    "database": "ANALYTICS",
+                                    "schema": "RAW",
+                                    "table": "ORDERS_CURRENT",
+                                }
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+        monkeypatch.setenv("FLUID_UPSTREAM_CONTRACTS", str(external))
+
+        # workspace_root intentionally somewhere ELSE (empty dir) so the
+        # only way to find the upstream is via the env var.
+        other = tmp_path / "other"
+        other.mkdir()
+        content = generate_sources(minimal_contract, workspace_root=other)
+        data = yaml.safe_load(content)
+        orders = next(t for src in data["sources"] for t in src["tables"] if t["name"] == "orders")
+        assert orders["identifier"] == "ORDERS_CURRENT"
+
 
 # ---------------------------------------------------------------------------
 # Model generation
@@ -331,6 +483,27 @@ class TestProfiles:
         data = yaml.safe_load(content)
         profile = list(data.values())[0]
         assert profile["outputs"]["dev"]["type"] == "snowflake"
+
+    def test_snowflake_profile_uses_env_vars(self, minimal_contract):
+        """Connection params must be env_var() references, not hardcoded strings.
+
+        Regression guard: an earlier generator hardcoded role=TRANSFORMER,
+        database=ANALYTICS, warehouse=TRANSFORM_WH, schema=DEV — none of
+        which exist outside the original author's Snowflake account.
+        """
+        build = minimal_contract["builds"][0]
+        build["execution"]["runtime"]["platform"] = "snowflake"
+        content = generate_profiles(minimal_contract, build)
+        data = yaml.safe_load(content)
+        dev = list(data.values())[0]["outputs"]["dev"]
+        assert "env_var('SNOWFLAKE_ROLE')" in dev["role"]
+        assert "env_var('SNOWFLAKE_DATABASE')" in dev["database"]
+        assert "env_var('SNOWFLAKE_WAREHOUSE')" in dev["warehouse"]
+        assert "env_var('SNOWFLAKE_DBT_SCHEMA'" in dev["schema"]
+        # No leftover hardcoded values from the old generator.
+        assert "TRANSFORMER" not in content
+        assert "ANALYTICS" not in content
+        assert "TRANSFORM_WH" not in content
 
 
 # ---------------------------------------------------------------------------

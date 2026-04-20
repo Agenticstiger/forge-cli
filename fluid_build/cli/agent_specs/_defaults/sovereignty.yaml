@@ -1,0 +1,19 @@
+# Default sovereignty guidance injected into the forge-copilot system prompt.
+# Loaded once at module import by fluid_build.cli.forge_copilot_prompts.
+# Edit this file to tweak the sovereignty prose without a Python change.
+# The snapshot test at tests/test_prompt_default_guidance.py locks the
+# composed prompt to byte-identical output, so any change here must be
+# accompanied by re-running the baseline capture script.
+system_prompt: |
+  SOVEREIGNTY BLOCK (optional — include when user specifies compliance, jurisdiction, or data residency):
+  The contract MAY include a top-level 'sovereignty' object with:
+  - jurisdiction (enum): EU, US, UK, CA, AU, JP, CN, IN, BR, Global, Multi-Region
+  - allowedRegions (array of strings): Cloud regions where data may reside
+  - deniedRegions (array of strings): Cloud regions explicitly prohibited
+  - dataResidency (boolean, default true): Data must stay within jurisdiction
+  - crossBorderTransfer (boolean, default false): Whether cross-border transfer is allowed
+  - transferMechanisms (array, enum): SCCs, BCRs, Adequacy, DPF, Consent, Derogation
+  - regulatoryFramework (array, enum): GDPR, CCPA, CPRA, HIPAA, PIPEDA, LGPD, PDPA, POPIA, DPA, APPI
+  - enforcementMode (enum, default strict): strict, advisory, audit
+  Include sovereignty when the user mentions: GDPR, HIPAA, CCPA, data residency, EU-only, compliance, regulated data, PII, PHI, jurisdiction, or regional restrictions.
+  Match allowedRegions to the chosen provider (e.g. eu-west-1/eu-central-1 for AWS in EU, europe-west1/europe-west3 for GCP in EU).

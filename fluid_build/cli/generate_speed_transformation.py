@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``fluid generate transformation`` subcommand.
+"""``fluid generate speed-transformation`` subcommand.
 
 Generates transformation engine artifacts (dbt project, SQL scripts, etc.)
 from a FLUID contract.  The engine is auto-detected from ``builds[].engine``.
 
 Usage:
-    fluid generate transformation                              # discover contract + engine
-    fluid generate transformation contract.fluid.yaml          # specify contract
-    fluid generate transformation contract.fluid.yaml -o ./out # specify output dir
-    fluid generate transformation --list                       # show available engines
+    fluid generate speed-transformation                              # discover contract + engine
+    fluid generate speed-transformation contract.fluid.yaml          # specify contract
+    fluid generate speed-transformation contract.fluid.yaml -o ./out # specify output dir
+    fluid generate speed-transformation --list                       # show available engines
 """
 
 from __future__ import annotations
@@ -36,11 +36,11 @@ from fluid_build.cli.console import cprint
 from ._common import CLIError, load_contract_with_overlay
 from ._logging import error, info
 
-SUBCOMMAND = "transformation"
+SUBCOMMAND = "speed-transformation"
 
 
 def register_subcommand(subparsers: argparse._SubParsersAction):
-    """Register the transformation subcommand under ``fluid generate``."""
+    """Register the speed-transformation subcommand under ``fluid generate``."""
     p = subparsers.add_parser(
         SUBCOMMAND,
         help="Generate transformation artifacts (dbt, SQL, etc.) from FLUID contract",
@@ -48,22 +48,25 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         Generate transformation engine artifacts (dbt project, SQL scripts, etc.)
         from a FLUID contract. The engine is auto-detected from builds[].engine.
 
+        Works best when a data model is supplied (upstream contracts or an
+        explicit modeling technique from ``fluid forge``).
+
         Supports dbt (generates full project), sql (generates SQL scripts),
         and is extensible to new engines.
         """,
         epilog="""
 Examples:
   # Auto-discover contract and engine
-  fluid generate transformation
+  fluid generate speed-transformation
 
   # Specify contract path
-  fluid generate transformation contract.fluid.yaml
+  fluid generate speed-transformation contract.fluid.yaml
 
   # Specify output directory
-  fluid generate transformation contract.fluid.yaml -o ./dbt_project
+  fluid generate speed-transformation contract.fluid.yaml -o ./dbt_project
 
   # List available engines
-  fluid generate transformation --list
+  fluid generate speed-transformation --list
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -93,7 +96,7 @@ Examples:
 
 
 def run(args: Any, logger: logging.Logger) -> int:
-    """Execute transformation artifact generation."""
+    """Execute speed-transformation artifact generation."""
     try:
         # --- List mode ---
         if getattr(args, "list_engines", False):
@@ -107,6 +110,12 @@ def run(args: Any, logger: logging.Logger) -> int:
         contract = load_contract_with_overlay(
             str(contract_path), getattr(args, "env", None), logger
         )
+
+        # --- Speed-transformation banner ---
+        # Reads the modeling technique stamped by ``fluid forge`` and
+        # tells the user whether the LLM / engine has the grounding it
+        # needs to avoid skeleton-only output.
+        _print_speed_transformation_banner(contract)
 
         # --- Resolve build ---
         from fluid_build.util.contract import get_build_engine, get_builds
@@ -167,7 +176,14 @@ def run(args: Any, logger: logging.Logger) -> int:
                 cprint(f"Warning: {issue}")
 
         # --- Generate ---
-        files = engine.generate(contract, build, build_index=build_index)
+        # ``contract_path.parent`` is the workspace anchor used to locate
+        # upstream ``contract.fluid.yaml`` files referenced by ``consumes[]``.
+        files = engine.generate(
+            contract,
+            build,
+            build_index=build_index,
+            workspace_root=contract_path.parent,
+        )
 
         if not files:
             cprint("No files generated.")
@@ -206,6 +222,51 @@ def run(args: Any, logger: logging.Logger) -> int:
 
             traceback.print_exc()
         return 1
+
+
+def _print_speed_transformation_banner(contract: Dict[str, Any]) -> None:
+    """Surface the modeling technique + user-data-model signal to the user.
+
+    ``fluid forge`` stamps the chosen technique onto
+    ``contract["labels"]["dataModelingTechnique"]``. FLUID 0.7.2's
+    ``metadata`` block is closed to additional properties; ``labels``
+    is the open string map where such annotations live.  The banner
+    has three modes:
+
+    * technique + user-supplied model → green (best case)
+    * technique only → yellow (LLM works, but without a concrete data
+      model it falls back to heuristic joins)
+    * nothing to say → silent
+    """
+    labels = contract.get("labels") or {}
+    metadata = contract.get("metadata") or {}
+    technique = labels.get("dataModelingTechnique") or metadata.get("dataModelingTechnique")
+    if not technique:
+        return
+
+    has_data_model = bool(
+        metadata.get("user_data_model") or metadata.get("userDataModel") or labels.get("dataModel")
+    )
+
+    display = _display_technique(technique)
+    if has_data_model:
+        cprint(
+            f"[green]Generating {display} speed-transformation grounded on your "
+            f"supplied data model.[/green]"
+        )
+    else:
+        cprint(
+            f"[yellow]{display} speed-transformation works best when a data model "
+            f"is supplied. Continuing without one — consider adding one via "
+            f"`fluid forge` or labels.dataModel.[/yellow]"
+        )
+
+
+def _display_technique(technique: str) -> str:
+    return {
+        "data_vault_2": "Data Vault 2.0",
+        "dimensional": "dimensional (Kimball)",
+    }.get(technique, technique)
 
 
 def _resolve_contract_path(args: Any) -> Path:
@@ -263,7 +324,7 @@ def _list_engines() -> int:
         patterns = ", ".join(engine.supported_patterns) if engine else ""
         cprint(f"  {name:12s} patterns: {patterns}")
 
-    cprint("\nUsage: fluid generate transformation [contract.fluid.yaml]")
+    cprint("\nUsage: fluid generate speed-transformation [contract.fluid.yaml]")
     cprint("Engine is auto-detected from builds[].engine in the contract.")
     return 0
 
@@ -291,4 +352,4 @@ def _print_summary(output_dir: Path, files: Dict[str, str], engine_name: str) ->
             for f in file_names:
                 cprint(f"    {f}")
 
-    cprint("\nTip: To regenerate after editing the contract: fluid generate transformation")
+    cprint("\nTip: To regenerate after editing the contract: fluid generate speed-transformation")

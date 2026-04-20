@@ -1,3 +1,7 @@
+# Pinned to 0.7.1: Glue contracts use the legacy ``crawler`` / ``iceberg``
+# expose shapes, ``glue`` build engine, and ``pseudonymized`` sensitivity
+# value — all dropped from the 0.7.2 schema. Migrate the Glue provider's
+# contract surface before bumping.
 fluidVersion: "0.7.1"
 kind: DataProduct
 id: analytics.data_lake.sales_db

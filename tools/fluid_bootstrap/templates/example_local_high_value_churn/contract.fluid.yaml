@@ -1,4 +1,8 @@
-
+# Pinned to 0.4.0: legacy bootstrap template kept for backward compatibility
+# with ``fluid_bootstrap`` users on older installs. ``build.transformation``
+# and ``consumes[].id``/``ref`` shapes don't exist in 0.7.2. Replace with the
+# canonical ``fluid_build/templates/*`` (already on 0.7.2) when those land
+# in the bootstrap surface.
 fluidVersion: "0.4.0"
 kind: "DataProduct"
 id: "silver.high_value_churn_v1"

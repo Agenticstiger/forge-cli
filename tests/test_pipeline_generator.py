@@ -189,6 +189,41 @@ class TestPipelineTemplateGenerator(unittest.TestCase):
         self.assertEqual(features, {})
 
 
+class TestFluidCommandsContractDefault(unittest.TestCase):
+    """Regression guard for the generated-CI ``$CONTRACT`` gap.
+
+    Previously, ``_get_fluid_commands()`` emitted bare ``$CONTRACT``
+    and relied on each CI system to inject the var into its env
+    block — none of them did, so `Build Now` against the generated
+    Jenkinsfile (and every other provider) failed on validate/plan.
+    The fix uses shell parameter-expansion default. These tests
+    freeze that shape so it cannot regress silently.
+    """
+
+    _DEFAULT = "${CONTRACT:-contract.fluid.yaml}"
+    _CONTRACT_KEYS = ("validate", "plan", "apply", "contract_test", "publish_catalog")
+
+    def test_contract_keys_use_default_expansion(self):
+        from fluid_build.forge.core.pipeline_templates import BasePipelineTemplate
+
+        commands = BasePipelineTemplate()._get_fluid_commands()
+        for key in self._CONTRACT_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(self._DEFAULT, commands[key])
+
+    def test_no_bare_contract_var_in_commands(self):
+        """A bare ``$CONTRACT`` (no ``{…:-default}``) is the regression shape."""
+        from fluid_build.forge.core.pipeline_templates import BasePipelineTemplate
+
+        commands = BasePipelineTemplate()._get_fluid_commands()
+        for key, cmd in commands.items():
+            with self.subTest(key=key):
+                # The default-form contains the string "$CONTRACT" as a
+                # substring; strip it before checking for the bare form.
+                without_default = cmd.replace(self._DEFAULT, "")
+                self.assertNotIn("$CONTRACT", without_default)
+
+
 # ---------------------------------------------------------------------------
 # run()
 # ---------------------------------------------------------------------------

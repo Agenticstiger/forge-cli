@@ -18,7 +18,7 @@ Configuration Management for FLUID CLI
 Provides hierarchical configuration loading from multiple sources:
 1. Default configuration (built-in)
 2. System-wide configuration (/etc/fluid/config.yaml or C:\\ProgramData\\fluid\\config.yaml)
-3. User configuration (~/.fluidrc.yaml or ~/.config/fluid/config.yaml)
+3. User configuration (~/.fluidrc.yaml, ~/.fluid/config.yaml, or ~/.config/fluid/config.yaml)
 4. Project configuration (.fluidrc.yaml or fluid.config.yaml in current directory)
 5. Environment variables (FLUID_*)
 6. Command-line arguments (highest priority)
@@ -26,6 +26,7 @@ Provides hierarchical configuration loading from multiple sources:
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from pathlib import Path
@@ -128,6 +129,7 @@ class FluidConfig:
         user_configs = [
             home / ".fluidrc.yaml",
             home / ".fluidrc",
+            home / ".fluid" / "config.yaml",
             home / ".config" / "fluid" / "config.yaml",
         ]
 
@@ -317,6 +319,16 @@ class FluidConfig:
         value = self.get(section, {})
         return value if isinstance(value, dict) else {}
 
+    def _resolve_env_placeholders(self, value: Any) -> Any:
+        """Recursively expand environment variables in config values."""
+        if isinstance(value, dict):
+            return {key: self._resolve_env_placeholders(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._resolve_env_placeholders(item) for item in value]
+        if isinstance(value, str):
+            return os.path.expandvars(value)
+        return value
+
     def get_catalog_config(self, catalog_name: Optional[str] = None) -> Dict[str, Any]:
         """
         Get catalog configuration.
@@ -331,7 +343,7 @@ class FluidConfig:
         catalogs = self.get_section("catalogs")
 
         if catalog_name:
-            catalog_config = catalogs.get(catalog_name, {})
+            catalog_config = copy.deepcopy(catalogs.get(catalog_name, {}))
 
             # Apply environment variable overrides
             if catalog_name == "fluid-command-center":
@@ -344,10 +356,28 @@ class FluidConfig:
                     if "auth" not in catalog_config:
                         catalog_config["auth"] = {}
                     catalog_config["auth"]["api_key"] = api_key
+            elif catalog_name == "datamesh-manager":
+                endpoint = os.environ.get("DMM_API_URL")
+                if endpoint:
+                    catalog_config["endpoint"] = endpoint
 
-            return catalog_config
+                api_key = os.environ.get("DMM_API_KEY")
+                if api_key:
+                    if "auth" not in catalog_config:
+                        catalog_config["auth"] = {}
+                    catalog_config["auth"]["api_key"] = api_key
 
-        return catalogs
+                data_product_specification = os.environ.get("DMM_DATA_PRODUCT_SPECIFICATION")
+                if data_product_specification:
+                    catalog_config["data_product_specification"] = data_product_specification
+
+                provider_hint = os.environ.get("DMM_PROVIDER_HINT")
+                if provider_hint:
+                    catalog_config["provider_hint"] = provider_hint
+
+            return self._resolve_env_placeholders(catalog_config)
+
+        return self._resolve_env_placeholders(copy.deepcopy(catalogs))
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -399,13 +429,13 @@ class FluidConfig:
         Save current configuration to user config file.
 
         Args:
-            path: Optional custom path (default: ~/.fluidrc.yaml)
+            path: Optional custom path (default: ~/.fluid/config.yaml)
 
         Raises:
             FileSystemError: If unable to write config file
         """
         if path is None:
-            path = Path.home() / ".fluidrc.yaml"
+            path = Path.home() / ".fluid" / "config.yaml"
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

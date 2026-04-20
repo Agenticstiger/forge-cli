@@ -1,4 +1,4 @@
-fluidVersion: "0.5.7"
+fluidVersion: "0.7.2"
 kind: DataProduct
 id: crypto.bitcoin_prices_gcp_governed
 name: Bitcoin Price Index (FLUID Declarative + Governance)

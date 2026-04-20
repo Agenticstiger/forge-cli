@@ -252,9 +252,11 @@ def test_apply_dry_run_odps_maps_consumes_to_top_level_input_ports():
         provider_hint="odps",
     )
 
-    # The ODPS-Bitol provider only emits fields that were explicitly declared
-    # on the consume entries — it no longer fabricates ``contractId`` suffixes
-    # or defaults ``required: True``. See CHANGELOG for rationale.
+    # The ODPS-Bitol renderer itself keeps ``contractId`` and the
+    # ``sourceSystem`` custom property explicit-only, but the DMM provider
+    # layer overlays both so Entropy's ODPS product PUT is accepted. See
+    # ``_ensure_odps_input_port_contract_ids`` and
+    # ``_ensure_odps_input_port_source_system_custom_property``.
     input_ports = result["payload"].get("inputPorts", [])
     assert input_ports == [
         {
@@ -263,6 +265,13 @@ def test_apply_dry_run_odps_maps_consumes_to_top_level_input_ports():
             "description": "Supply daily subscriber usage features to the health model.",
             "version": "1",
             "reference": "bizlab.teleforge.subscriber_usage_daily_lineage_local",
+            "contractId": "bizlab.teleforge.subscriber_usage_daily_lineage_local.subscriber_usage_daily",
+            "customProperties": [
+                {
+                    "property": "sourceSystem",
+                    "value": "bizlab.teleforge.subscriber_usage_daily_lineage_local",
+                }
+            ],
         },
         {
             "id": "billing_health_daily",
@@ -270,6 +279,13 @@ def test_apply_dry_run_odps_maps_consumes_to_top_level_input_ports():
             "description": "Supply payment behavior and overdue indicators to the health model.",
             "version": "1",
             "reference": "bizlab.teleforge.billing_health_daily_lineage_local",
+            "contractId": "bizlab.teleforge.billing_health_daily_lineage_local.billing_health_daily",
+            "customProperties": [
+                {
+                    "property": "sourceSystem",
+                    "value": "bizlab.teleforge.billing_health_daily_lineage_local",
+                }
+            ],
         },
     ]
 
@@ -284,7 +300,12 @@ def test_apply_dry_run_odps_preserves_input_port_source_system_metadata():
     )
 
     input_ports = result["payload"].get("inputPorts", [])
-    assert input_ports[0]["sourceSystemId"] == "bss-crm"
+    props = input_ports[0].get("customProperties") or []
+    source_system = next(
+        (p.get("value") for p in props if p.get("property") == "sourceSystem"),
+        None,
+    )
+    assert source_system == "bss-crm"
 
 
 def test_cmd_publish_passes_provider_hint_to_apply():

@@ -296,8 +296,14 @@ def validate_generated_result(
     *,
     capabilities: Mapping[str, Any],
     logger: Optional[logging.Logger] = None,
+    context: Optional[Mapping[str, Any]] = None,
 ) -> tuple[List[str], List[str]]:
-    """Validate generated contract, injecting schema manager and helpers."""
+    """Validate generated contract, injecting schema manager and helpers.
+
+    ``context`` carries the interview/normalised-context dict so
+    technique-aware checks (e.g. DV2 additional_files) fire only on the
+    runs that opted in.
+    """
     return _validate_generated_result_raw(
         normalized,
         capabilities=capabilities,
@@ -305,6 +311,7 @@ def validate_generated_result(
         schema_manager_cls=FluidSchemaManager,
         resolve_provider_from_contract_fn=resolve_provider_from_contract,
         get_builds_fn=get_builds,
+        context=context,
     )
 
 
@@ -699,6 +706,7 @@ def generate_copilot_artifacts(
             normalized,
             capabilities=capabilities,
             logger=logger,
+            context=context,
         )
         report.validation_errors = validation_errors
         report.validation_warnings = validation_warnings

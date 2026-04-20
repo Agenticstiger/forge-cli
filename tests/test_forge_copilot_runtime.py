@@ -813,8 +813,10 @@ class TestGenerationValidation:
         mock_schema_manager.return_value.validate_contract.return_value = ValidationResult(
             is_valid=True, errors=[], warnings=[]
         )
+        # 'spark' is a schema-valid engine but not in any provider's
+        # compatibility set, so it exercises the provider/engine mismatch branch.
         normalized = {
-            "contract": _minimal_contract(provider="aws", engine="dataform"),
+            "contract": _minimal_contract(provider="aws", engine="spark"),
             "suggestions": {
                 "recommended_provider": "aws",
                 "recommended_template": "starter",

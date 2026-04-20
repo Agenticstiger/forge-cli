@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_WAREHOUSE = "COMPUTE_WH"
 DEFAULT_SCHEMA = "PUBLIC"
 _ENV_TEMPLATE_RE = re.compile(r"\{\{\s*env\.(\S+?)\s*\}\}")
+# Public alias so cross-module callers (cli/_common.py contract walker) can
+# share the canonical pattern without redefining or importing a private name.
+ENV_TEMPLATE_RE = _ENV_TEMPLATE_RE
 _ACCOUNT_HOST_RE = re.compile(r"\.snowflakecomputing\.com$", re.IGNORECASE)
 _ACCOUNT_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _ACCOUNT_REGION_SEGMENT_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+$")

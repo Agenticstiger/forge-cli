@@ -1,6 +1,9 @@
 # Example: Fully Compliant Customer Profiles Data Product
 # Demonstrates all 5 policy categories
-
+#
+# Pinned to 0.5.7: uses ``dq.monitoring.alerting``/``interval``,
+# severity ``warning``, and ``lifecycle.archival`` — none survive the
+# 0.7.2 dq/lifecycle reshape. Bump after migrating to the new dq schema.
 fluidVersion: "0.5.7"
 kind: DataProduct
 id: gold.customer.profiles_v1
