@@ -668,3 +668,56 @@ class TestStaticJenkinsSimulatedRun:
         runner = _SimulatedJenkinsRunner(pipeline, branch="main", fail_command="validate")
         assert runner.run() is False
         assert not any("apply" in c for c in runner.executed_commands)
+
+
+# ---------------------------------------------------------------------------
+# 6. Cross-system regression: generated pipelines must not emit bare $CONTRACT
+# ---------------------------------------------------------------------------
+
+
+class TestGeneratedContractEnvAcrossSystems:
+    """Every generated CI pipeline calls ``fluid validate / plan / apply /
+    contract-tests / publish`` with a contract-path argument. Before the
+    fix, the argument was a bare ``$CONTRACT`` and no CI template's env
+    block injected the var — so Build Now failed on the first shell
+    step. The fix uses ``${CONTRACT:-contract.fluid.yaml}`` in
+    ``_get_fluid_commands()``. This test locks that shape in across all
+    seven supported providers so a regression in any one template is
+    caught.
+    """
+
+    _DEFAULT = "${CONTRACT:-contract.fluid.yaml}"
+    _PRIMARY_FILE = {
+        PipelineProvider.GITHUB_ACTIONS: ".github/workflows/fluid-standard.yml",
+        PipelineProvider.GITLAB_CI: ".gitlab-ci.yml",
+        PipelineProvider.AZURE_DEVOPS: "azure-pipelines.yml",
+        PipelineProvider.JENKINS: "Jenkinsfile",
+        PipelineProvider.BITBUCKET: "bitbucket-pipelines.yml",
+        PipelineProvider.CIRCLE_CI: ".circleci/config.yml",
+        PipelineProvider.TEKTON: "tekton/tasks.yaml",
+    }
+
+    @pytest.mark.parametrize("provider", list(_PRIMARY_FILE.keys()))
+    def test_primary_file_uses_default_expansion_not_bare_var(self, provider):
+        cfg = PipelineConfig(
+            provider=provider,
+            complexity=PipelineComplexity.STANDARD,
+            environments=["dev", "prod"],
+        )
+        files = PipelineTemplateGenerator().generate_pipeline(cfg)
+        primary = files[self._PRIMARY_FILE[provider]]
+
+        # Must contain the default-expansion form at least once.
+        assert self._DEFAULT in primary, (
+            f"{provider.value}: expected {self._DEFAULT!r} in generated "
+            f"{self._PRIMARY_FILE[provider]}"
+        )
+
+        # Must not contain any bare $CONTRACT references (i.e. any
+        # occurrence that is not part of the default-expansion form).
+        without_default = primary.replace(self._DEFAULT, "")
+        assert "$CONTRACT" not in without_default, (
+            f"{provider.value}: generated {self._PRIMARY_FILE[provider]} "
+            f"contains a bare $CONTRACT reference — regression of the "
+            f"A1 Jenkins Build-Now gap"
+        )

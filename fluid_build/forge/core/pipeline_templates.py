@@ -203,26 +203,28 @@ class BasePipelineTemplate:
     def _get_fluid_commands(self) -> Dict[str, str]:
         """Get standard FLUID commands for different stages.
 
-        Build-aware commands use ``$BUILD_ID`` / ``$CONTRACT`` env vars so
-        a single template covers both dbt hybrid-reference projects
-        (where ``--build <buildId>`` is required) and non-build contracts
-        (where the plan-file path works).  CI generators inject the env
-        vars; missing ones fall through to the plan-file apply branch.
+        Contract-path commands use the POSIX parameter-expansion default
+        ``${CONTRACT:-contract.fluid.yaml}`` so Build Now works out of the
+        box against the canonical filename. Operators who keep the
+        contract under a different name export ``CONTRACT`` in the CI
+        job / agent env to override. ``$BUILD_ID`` remains CI-injected —
+        when unset, ``apply`` falls through to the plan-file branch for
+        non-dbt contracts.
         """
         return {
-            "validate": "fluid validate $CONTRACT",
-            "plan": "fluid plan $CONTRACT --out runtime/plan.json",
+            "validate": "fluid validate ${CONTRACT:-contract.fluid.yaml}",
+            "plan": "fluid plan ${CONTRACT:-contract.fluid.yaml} --out runtime/plan.json",
             # --build is required for dbt hybrid-reference builds; the
             # inline conditional keeps the template useful for both shapes.
             "apply": (
                 'if [ -n "$BUILD_ID" ]; then '
-                "fluid apply $CONTRACT --build $BUILD_ID --yes; "
+                "fluid apply ${CONTRACT:-contract.fluid.yaml} --build $BUILD_ID --yes; "
                 "else "
                 "fluid apply runtime/plan.json --yes; "
                 "fi"
             ),
             "test": "fluid test --coverage",
-            "contract_test": "fluid contract-tests $CONTRACT",
+            "contract_test": "fluid contract-tests ${CONTRACT:-contract.fluid.yaml}",
             "generate_transformation": "fluid generate speed-transformation",
             "generate_schedule": "fluid generate schedule",
             "check_transformations": (
@@ -252,7 +254,8 @@ class BasePipelineTemplate:
             # name defaults to datamesh-manager).
             "publish_catalog": (
                 'if [ -n "$DMM_API_URL" ]; then '
-                "fluid publish $CONTRACT --catalog ${CATALOG:-datamesh-manager}; "
+                "fluid publish ${CONTRACT:-contract.fluid.yaml} "
+                "--catalog ${CATALOG:-datamesh-manager}; "
                 "fi"
             ),
         }
