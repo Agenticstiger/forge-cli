@@ -45,6 +45,7 @@ def register(subparsers: argparse._SubParsersAction):
           schedule               Generate schedule/orchestration artifacts (Airflow, Dagster, Prefect)
           ci                     Generate CI/CD pipelines (GitHub Actions, GitLab CI)
           standard               Export to data product standards (OPDS, ODCS, ODPS, ODPS-Bitol)
+          artifacts              Stage-3 fanout: bundle → ODPS, ODCS, OPDS, schedule, policies
 
         When called without a subcommand, shows available subcommands.
         """,
@@ -73,12 +74,19 @@ Examples:
     # Register subcommands
     sub = p.add_subparsers(dest="generate_sub", help="Generation target")
 
-    from . import generate_ci, generate_schedule, generate_speed_transformation, generate_standard
+    from . import (
+        generate_artifacts,
+        generate_ci,
+        generate_schedule,
+        generate_speed_transformation,
+        generate_standard,
+    )
 
     generate_speed_transformation.register_subcommand(sub)
     generate_schedule.register_subcommand(sub)
     generate_ci.register_subcommand(sub)
     generate_standard.register_subcommand(sub)
+    generate_artifacts.register_subcommand(sub)
 
     # Default handler (backward compat: no subcommand → transformation)
     p.set_defaults(cmd=COMMAND, func=run)
@@ -115,6 +123,11 @@ def run(args: Any, logger: logging.Logger) -> int:
         from . import generate_standard
 
         return generate_standard.run(args, logger)
+
+    if sub == "artifacts":
+        from . import generate_artifacts
+
+        return generate_artifacts.run(args, logger)
 
     # No subcommand specified — default to speed-transformation.
     if sub is None:
