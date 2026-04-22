@@ -38,7 +38,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from typing import Dict
+import subprocess
+from typing import Dict, Optional
 
 from ._common import CLIError
 from ._io import atomic_write
@@ -132,12 +133,74 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
             "Multi-file systems (tekton, enterprise GitHub) keep canonical paths."
         ),
     )
+    p.add_argument(
+        "--no-generate-artifacts",
+        action="store_true",
+        help=(
+            "Skip the `fluid generate transformation` and `fluid generate schedule` "
+            "stages. Use for reference-only contracts (hybrid-reference dbt, "
+            "external Airflow) where artifacts are owned outside fluid. "
+            "Auto-detected for contracts whose builds[].pattern is hybrid-reference."
+        ),
+    )
     p.set_defaults(generate_sub="ci", func=_run_from_generate)
 
 
 def _run_from_generate(args, logger: logging.Logger) -> int:
     """Entry point when called via ``fluid generate ci``."""
     return run(args, logger)
+
+
+def _contract_is_reference_only(contract_path: str) -> bool:
+    """Detect whether a contract is reference-only (no artifact generation).
+
+    Returns True when any build uses ``pattern: hybrid-reference`` — these
+    contracts point at externally-owned dbt projects / Airflow DAGs, so
+    asking fluid to generate transformations or schedules is a no-op that
+    only surfaces spurious pipeline failures. Returns False on any read or
+    parse error so we err on the side of keeping the generate stages
+    (the legacy behavior).
+    """
+    try:
+        import yaml
+
+        with open(contract_path) as fh:
+            contract = yaml.safe_load(fh) or {}
+    except (FileNotFoundError, OSError, ImportError):
+        return False
+    except Exception:
+        return False
+    builds = contract.get("builds") or []
+    if not isinstance(builds, list):
+        return False
+    reference_patterns = {"hybrid-reference", "reference", "external-reference"}
+    for build in builds:
+        if isinstance(build, dict) and build.get("pattern") in reference_patterns:
+            return True
+    return False
+
+
+def _git_prefix() -> Optional[str]:
+    """Return the current directory's path relative to the git repo root.
+
+    Used by ``fluid generate ci`` so Jenkins-style pipelines (which run at
+    the SCM checkout root, not the contract's folder) know to cd into the
+    subfolder before executing fluid commands. Returns None when not inside
+    a git repo or when git is unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-prefix"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    prefix = result.stdout.strip().rstrip("/")
+    return prefix or None
 
 
 def run(args, logger: logging.Logger) -> int:
@@ -170,7 +233,16 @@ def run(args, logger: logging.Logger) -> int:
                 {"complexity": complexity_value},
             )
 
-        config = PipelineConfig(provider=provider, complexity=complexity)
+        contract_path = getattr(args, "contract", None) or "contract.fluid.yaml"
+        no_generate_flag = bool(getattr(args, "no_generate_artifacts", False))
+        generates_artifacts = not (no_generate_flag or _contract_is_reference_only(contract_path))
+
+        config = PipelineConfig(
+            provider=provider,
+            complexity=complexity,
+            workdir=_git_prefix(),
+            generates_artifacts=generates_artifacts,
+        )
         files = PipelineTemplateGenerator().generate_pipeline(config)
         if not files:
             raise CLIError(

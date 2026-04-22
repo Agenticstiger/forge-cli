@@ -120,6 +120,17 @@ class PipelineConfig:
     notification_channels: List[str] = None
     custom_steps: List[Dict[str, Any]] = None
     oidc_provider: Optional[str] = None  # "gcp", "aws", "azure", or None
+    # Pipeline working directory, relative to the SCM checkout root. Set when
+    # `fluid generate ci` is invoked from a subfolder of a git repo so the
+    # generated pipeline can cd into that folder before running fluid commands.
+    # None or "" => no cd wrapper (steps run at checkout root).
+    workdir: Optional[str] = None
+    # Whether the pipeline should run `fluid generate transformation/schedule`
+    # in a dedicated "Generate Artifacts" stage. False for reference-only
+    # contracts (e.g. hybrid-reference dbt) where the transformation and
+    # schedule artifacts already exist externally and fluid shouldn't be
+    # asked to generate new ones.
+    generates_artifacts: bool = True
 
     def __post_init__(self):
         if self.environments is None:
@@ -240,7 +251,11 @@ class BasePipelineTemplate:
             "visualize": "fluid viz-plan --output pipeline-viz.html && fluid viz-graph --output dependency-graph.png",
             "publish_opds": "fluid export-opds --output opds-catalog.json",
             "marketplace_publish": "fluid marketplace publish --catalog opds-catalog.json",
-            "doctor": "fluid doctor --extended",
+            # Plain `fluid doctor` — `--extended` requires scripts/diagnose.sh
+            # in the workspace, which fresh forge-generated variants don't
+            # ship. Users who set up extended diagnostics can edit the
+            # generated file to opt in.
+            "doctor": "fluid doctor",
             # Airflow DAG deployment: rsync the generated ``dags/`` directory
             # to an operator-supplied destination. Skipped when
             # $AIRFLOW_DAGS_DEST is unset or dags/ doesn't exist.
@@ -1320,6 +1335,63 @@ class JenkinsTemplate(BasePipelineTemplate):
 
         commands = self._get_fluid_commands()
 
+        # When `fluid generate ci` runs inside a subfolder of the SCM checkout,
+        # Jenkins still checks out at the repo root, so every `sh` step needs
+        # to cd into the variant folder before running fluid. Wrap each fluid
+        # command with `cd "<workdir>" && ...` when workdir is set.
+        if config.workdir:
+            commands = {k: f'cd "{config.workdir}" && {v}' for k, v in commands.items()}
+        # `fluid test` has no unit/integration split — instead, --no-data
+        # restricts to structural checks (schema, types, uniqueness) while
+        # the default runs full data validation. Map that onto the parallel
+        # "Unit" / "Integration" stages. `--output` is the format (junit),
+        # `--output-file` is the path.
+        fluid_test_unit = (
+            "fluid test ${CONTRACT:-contract.fluid.yaml} --no-data "
+            "--output junit --output-file test-results-unit.xml"
+        )
+        fluid_test_integration = (
+            "fluid test ${CONTRACT:-contract.fluid.yaml} "
+            "--output junit --output-file test-results-integration.xml"
+        )
+        if config.workdir:
+            fluid_test_unit = f'cd "{config.workdir}" && {fluid_test_unit}'
+            fluid_test_integration = f'cd "{config.workdir}" && {fluid_test_integration}'
+
+        # `fluid plan ... --out runtime/plan.json` and the junit test-result
+        # files are written under <workdir>, but `archiveArtifacts` / `junit`
+        # are rooted at the Jenkins workspace (SCM root). Prefix each pattern
+        # with workdir so Jenkins actually finds the files — and enable
+        # empty-result tolerance so reference-only builds without a plan or
+        # tests don't fail the whole stage.
+        _archive_prefix = f"{config.workdir}/" if config.workdir else ""
+        plan_archive_pattern = f"{_archive_prefix}runtime/plan.json"
+        junit_unit_pattern = f"{_archive_prefix}test-results-unit.xml"
+        junit_integration_pattern = f"{_archive_prefix}test-results-integration.xml"
+
+        # Reference-only contracts (e.g. hybrid-reference dbt) own their dbt
+        # project + Airflow DAG externally, so asking `fluid generate` to
+        # produce transformation/schedule artifacts is a no-op that only
+        # surfaces noise. Omit the whole stage in that case.
+        generate_artifacts_stage = ""
+        if config.generates_artifacts:
+            generate_artifacts_stage = f"""
+        stage('Generate Artifacts') {{
+            parallel {{
+                stage('Transformations') {{
+                    steps {{
+                        sh '{commands["generate_transformation"]}'
+                    }}
+                }}
+                stage('Schedules') {{
+                    steps {{
+                        sh '{commands["generate_schedule"]}'
+                    }}
+                }}
+            }}
+        }}
+"""
+
         jenkins_pipeline = f"""
 pipeline {{
     // Default to any available agent. Change to `label 'your-label'`
@@ -1382,25 +1454,11 @@ pipeline {{
             }}
         }}
         
-        stage('Generate Artifacts') {{
-            parallel {{
-                stage('Transformations') {{
-                    steps {{
-                        sh '{commands["generate_transformation"]}'
-                    }}
-                }}
-                stage('Schedules') {{
-                    steps {{
-                        sh '{commands["generate_schedule"]}'
-                    }}
-                }}
-            }}
-        }}
-
+{generate_artifacts_stage}
         stage('Plan') {{
             steps {{
                 sh '{commands["plan"]}'
-                archiveArtifacts artifacts: 'plan.json', fingerprint: true
+                archiveArtifacts artifacts: '{plan_archive_pattern}', fingerprint: true, allowEmptyArchive: true
             }}
         }}
         
@@ -1408,21 +1466,21 @@ pipeline {{
             parallel {{
                 stage('Unit Tests') {{
                     steps {{
-                        sh 'fluid test --type unit --output test-results-unit.xml'
+                        sh '{fluid_test_unit}'
                     }}
                     post {{
                         always {{
-                            junit 'test-results-unit.xml'
+                            junit testResults: '{junit_unit_pattern}', allowEmptyResults: true
                         }}
                     }}
                 }}
                 stage('Integration Tests') {{
                     steps {{
-                        sh 'fluid test --type integration --output test-results-integration.xml'
+                        sh '{fluid_test_integration}'
                     }}
                     post {{
                         always {{
-                            junit 'test-results-integration.xml'
+                            junit testResults: '{junit_integration_pattern}', allowEmptyResults: true
                         }}
                     }}
                 }}
@@ -1452,8 +1510,8 @@ pipeline {{
         stage('Deploy to {env.upper()}') {{
             {when_condition}
             steps {{{approval}
-                sh 'FLUID_ENV={env} {commands["apply"]}'
-                sh 'FLUID_ENV={env} {commands["contract_test"]}'
+                sh 'export FLUID_ENV={env}; {commands["apply"]}'
+                sh 'export FLUID_ENV={env}; {commands["contract_test"]}'
             }}
             post {{
                 success {{
@@ -1479,7 +1537,14 @@ pipeline {{
 """
 
         # Publishing stage: catalog push (DMM / Entropy) via `fluid publish`
-        # plus the existing OPDS/visualization exports.
+        # plus the existing OPDS/visualization exports. Archive pattern is
+        # workdir-prefixed for the same reason the plan.json pattern is.
+        publish_prefix = f"{config.workdir}/" if config.workdir else ""
+        publish_artifacts = (
+            f"{publish_prefix}pipeline-viz.html,"
+            f"{publish_prefix}dependency-graph.png,"
+            f"{publish_prefix}opds-catalog.json"
+        )
         jenkins_pipeline += f"""
         stage('Publish') {{
             when {{ branch 'main' }}
@@ -1487,7 +1552,7 @@ pipeline {{
                 sh '{commands["publish_catalog"]}'
                 sh '{commands["visualize"]}'
                 sh '{commands["publish_opds"]}'
-                archiveArtifacts artifacts: 'pipeline-viz.html,dependency-graph.png,opds-catalog.json', fingerprint: true, allowEmptyArchive: true
+                archiveArtifacts artifacts: '{publish_artifacts}', fingerprint: true, allowEmptyArchive: true
 """
 
         if config.enable_marketplace_publishing:

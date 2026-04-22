@@ -59,6 +59,11 @@ A six-PR security-hardening series landed (PRs #28–#33) resolving the 14 findi
 - Typed tool errors (`{"error": <ExcName>, "message": "…see server logs"}`) — exception text no longer round-trips into the LLM context.
 - Expanded redactor coverage for JWTs, Stripe, GitHub, and bare `key[:=]value` assignments.
 
+## Working style
+
+- **Goal-driven execution.** For non-trivial tasks, state success criteria before implementing and loop until verified. Transform imperatives into tests: "add redactor coverage" → "new pattern is masked by a test assertion"; "fix the bug" → "reproducing test passes first, then fix makes it green".
+- For multi-step work, write a brief plan with per-step checks (`1. step → verify: check`). Strong criteria let you iterate without asking; weak criteria ("make it work") do not.
+
 ## Commit / PR etiquette
 
 - Conventional-commits style (`feat(scope):`, `fix(scope):`, `chore(ci):`, `security: …`). See the git log for the in-use shape.

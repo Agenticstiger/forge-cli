@@ -352,3 +352,165 @@ class TestGitlabOidcCredentialHygiene:
         yaml_out = self._generate_gitlab_yaml(oidc_provider=None)
         assert "mktemp" not in yaml_out
         assert "FLUID_OIDC_TOKEN" not in yaml_out
+
+
+# ── PipelineConfig.workdir + generates_artifacts ────────────────────
+
+
+class TestPipelineConfigWorkdirAndArtifacts:
+    """New fields on PipelineConfig: ``workdir`` (SCM-root → contract folder
+    relative path) and ``generates_artifacts`` (skip Generate Artifacts stage
+    for reference-only contracts)."""
+
+    def test_workdir_default_is_none(self):
+        cfg = PipelineConfig(
+            provider=PipelineProvider.JENKINS,
+            complexity=PipelineComplexity.BASIC,
+        )
+        assert cfg.workdir is None
+
+    def test_workdir_explicit_value_preserved(self):
+        cfg = PipelineConfig(
+            provider=PipelineProvider.JENKINS,
+            complexity=PipelineComplexity.BASIC,
+            workdir="examples/demo",
+        )
+        assert cfg.workdir == "examples/demo"
+
+    def test_generates_artifacts_default_true(self):
+        cfg = PipelineConfig(
+            provider=PipelineProvider.JENKINS,
+            complexity=PipelineComplexity.BASIC,
+        )
+        assert cfg.generates_artifacts is True
+
+    def test_generates_artifacts_explicit_false(self):
+        cfg = PipelineConfig(
+            provider=PipelineProvider.JENKINS,
+            complexity=PipelineComplexity.BASIC,
+            generates_artifacts=False,
+        )
+        assert cfg.generates_artifacts is False
+
+
+# ── Jenkins template hardening ──────────────────────────────────────
+
+
+class TestJenkinsTemplateHardening:
+    """Jenkins template now hardens against three independent regressions:
+
+    1. **Subfolder checkouts.** Jenkins checks out at the SCM root; when
+       ``fluid generate ci`` runs from a product subfolder, every ``sh`` step
+       must be prefixed with ``cd "<workdir>" && ...``. Otherwise the fluid
+       command runs in the wrong dir and every contract reference fails.
+
+    2. **Reference-only contracts.** When ``generates_artifacts=False``, the
+       ``Generate Artifacts`` stage must be omitted entirely — not just
+       no-op'd. Emitting it surfaces spurious failures for externally-owned
+       dbt/Airflow projects.
+
+    3. **Missing-artifact tolerance.** Reference-only contracts don't produce
+       ``plan.json`` or test-results XML, so ``archiveArtifacts`` and ``junit``
+       must tolerate empty matches. Without ``allowEmptyArchive: true`` /
+       ``allowEmptyResults: true`` the build fails at the archive stage.
+    """
+
+    def _jenkinsfile(self, **kwargs):
+        cfg = PipelineConfig(
+            provider=PipelineProvider.JENKINS,
+            complexity=PipelineComplexity.BASIC,
+            **kwargs,
+        )
+        files = PipelineTemplateGenerator().generate_pipeline(cfg)
+        return files["Jenkinsfile"]
+
+    # Regression 1: workdir wrapping -----------------------------------
+
+    def test_no_workdir_produces_no_cd_wrapper(self):
+        content = self._jenkinsfile()
+        # Without workdir, commands should not have a `cd "..." &&` prefix.
+        assert (
+            'cd "' not in content
+        ), "Jenkinsfile should not contain cd wrappers when workdir is unset"
+
+    def test_workdir_wraps_every_fluid_command(self):
+        content = self._jenkinsfile(workdir="examples/demo")
+        assert 'cd "examples/demo" && fluid validate' in content
+        assert 'cd "examples/demo" && fluid plan' in content
+
+    def test_workdir_prefixes_archive_patterns(self):
+        content = self._jenkinsfile(workdir="examples/demo")
+        # plan.json archive path must be workdir-prefixed or Jenkins can't
+        # find it (archiveArtifacts is rooted at the SCM checkout root).
+        assert "examples/demo/runtime/plan.json" in content
+
+    def test_workdir_prefixes_junit_patterns(self):
+        content = self._jenkinsfile(workdir="examples/demo")
+        assert "examples/demo/test-results-unit.xml" in content
+        assert "examples/demo/test-results-integration.xml" in content
+
+    # Regression 2: reference-only stage omission ----------------------
+
+    def test_default_contains_generate_artifacts_stage(self):
+        content = self._jenkinsfile()
+        assert "stage('Generate Artifacts')" in content
+
+    def test_generates_artifacts_false_omits_stage(self):
+        content = self._jenkinsfile(generates_artifacts=False)
+        assert "stage('Generate Artifacts')" not in content
+        # Adjacent stages must still be present — we're skipping a stage,
+        # not breaking the template.
+        assert "stage('Validate')" in content
+        assert "stage('Plan')" in content
+
+    # Regression 3: empty-archive/result tolerance --------------------
+
+    def test_archiveartifacts_tolerates_empty(self):
+        content = self._jenkinsfile()
+        # Every archiveArtifacts must include allowEmptyArchive: true so
+        # reference-only contracts (no plan.json) don't fail the build.
+        archive_lines = [line for line in content.splitlines() if "archiveArtifacts" in line]
+        assert archive_lines, "expected at least one archiveArtifacts line"
+        for line in archive_lines:
+            assert (
+                "allowEmptyArchive: true" in line
+            ), f"archiveArtifacts without allowEmptyArchive breaks reference-only builds: {line}"
+
+    def test_junit_tolerates_empty_results(self):
+        content = self._jenkinsfile()
+        junit_lines = [line for line in content.splitlines() if line.strip().startswith("junit ")]
+        assert junit_lines, "expected at least one junit line"
+        for line in junit_lines:
+            assert (
+                "allowEmptyResults: true" in line
+            ), f"junit without allowEmptyResults breaks reference-only builds: {line}"
+
+    # Other hardening fixes --------------------------------------------
+
+    def test_uses_fluid_test_no_data_for_unit(self):
+        """`fluid test` has no --type flag; --no-data is the structural-only
+        mode. Emitting --type unit silently fails with unrecognised-arg."""
+        content = self._jenkinsfile()
+        assert "fluid test" in content
+        assert "--no-data" in content
+        # The broken `--type unit` shape must not appear.
+        assert "--type unit" not in content
+        assert "--type integration" not in content
+
+    def test_fluid_env_uses_export_not_inline(self):
+        """`FLUID_ENV=dev cmd` only exports for one command; subshell
+        invocations inside ``cmd`` don't see it. The `export FLUID_ENV=dev;
+        cmd` form sets it for the whole shell."""
+        content = self._jenkinsfile()
+        # Inline form is a regression — would break subshells.
+        assert "sh 'FLUID_ENV=" not in content
+        # Export form is the expected shape.
+        assert "export FLUID_ENV=" in content
+
+    def test_doctor_not_extended(self):
+        """`fluid doctor --extended` requires scripts/diagnose.sh which
+        forge-generated variants don't ship — running it always fails with
+        a CLIError. Generated pipelines must call plain `fluid doctor`."""
+        content = self._jenkinsfile()
+        assert "fluid doctor" in content
+        assert "fluid doctor --extended" not in content

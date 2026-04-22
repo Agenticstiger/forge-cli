@@ -312,7 +312,15 @@ def _print_doctor_next_steps(
     suggestions: List[str] = []
 
     if not copilot_readiness.ready and copilot_readiness.error is not None:
-        suggestions.extend(copilot_readiness.error.suggestions)
+        # LlmReadinessCheck.error is a plain string message; older code paths
+        # expected a structured error with .suggestions. Accept both shapes so
+        # doctor keeps working whichever provider populates `error`.
+        error = copilot_readiness.error
+        error_suggestions = getattr(error, "suggestions", None)
+        if error_suggestions:
+            suggestions.extend(error_suggestions)
+        elif isinstance(error, str):
+            suggestions.append(error)
 
     if not feature_checks_ok:
         suggestions.append("Run `fluid doctor --verbose` to inspect failing feature checks.")

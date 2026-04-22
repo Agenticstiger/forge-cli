@@ -244,3 +244,88 @@ class TestRun:
             run(args, MagicMock())
 
         assert exc.value.message == "Extended diagnostics are not installed in this checkout."
+
+
+class TestPrintDoctorNextStepsDualShape:
+    """`_print_doctor_next_steps` must accept both shapes of
+    ``LlmReadinessCheck.error`` — a bare string *and* an older structured
+    error object with a ``.suggestions`` list. A drive-by refactor could
+    narrow the accepted shape and silently lose the suggestion text in CI.
+    """
+
+    def _make_unready_check(self, error_value):
+        from fluid_build.cli.forge_copilot_llm_providers import LlmReadinessCheck
+
+        return LlmReadinessCheck(
+            ready=False,
+            provider="openai",
+            model="gpt-4o-mini",
+            endpoint="https://api.openai.com/v1/chat/completions",
+            auth_available=False,
+            error=error_value,
+        )
+
+    @patch("fluid_build.cli.doctor.RICH_AVAILABLE", False)
+    @patch("fluid_build.cli.doctor.cprint")
+    def test_string_error_appended_verbatim(self, mock_cprint):
+        """A plain-string error must end up as a bullet in the suggestions."""
+        from fluid_build.cli.doctor import _print_doctor_next_steps
+
+        _print_doctor_next_steps(
+            feature_checks_ok=True,
+            copilot_readiness=self._make_unready_check("Set OPENAI_API_KEY"),
+        )
+
+        printed = " ".join(str(call) for call in mock_cprint.call_args_list)
+        assert "Set OPENAI_API_KEY" in printed
+
+    @patch("fluid_build.cli.doctor.RICH_AVAILABLE", False)
+    @patch("fluid_build.cli.doctor.cprint")
+    def test_structured_error_with_suggestions_is_expanded(self, mock_cprint):
+        """A structured error (``.suggestions`` list) must expand to multiple bullets."""
+        from fluid_build.cli.doctor import _print_doctor_next_steps
+
+        class StructuredError:
+            suggestions = ["Run `fluid login`", "Export FLUID_API_KEY"]
+
+        _print_doctor_next_steps(
+            feature_checks_ok=True,
+            copilot_readiness=self._make_unready_check(StructuredError()),
+        )
+
+        printed = " ".join(str(call) for call in mock_cprint.call_args_list)
+        assert "Run `fluid login`" in printed
+        assert "Export FLUID_API_KEY" in printed
+
+    @patch("fluid_build.cli.doctor.RICH_AVAILABLE", False)
+    @patch("fluid_build.cli.doctor.cprint")
+    def test_none_error_produces_no_output(self, mock_cprint):
+        """When the check is ready (error is None), next-steps stays silent."""
+        from fluid_build.cli.doctor import _print_doctor_next_steps
+        from fluid_build.cli.forge_copilot_llm_providers import LlmReadinessCheck
+
+        ready = LlmReadinessCheck(
+            ready=True,
+            provider="ollama",
+            model="llama3.2",
+            endpoint="http://localhost:11434/api/chat",
+            auth_available=True,
+        )
+        _print_doctor_next_steps(feature_checks_ok=True, copilot_readiness=ready)
+        mock_cprint.assert_not_called()
+
+    @patch("fluid_build.cli.doctor.RICH_AVAILABLE", False)
+    @patch("fluid_build.cli.doctor.cprint")
+    def test_non_string_non_structured_error_ignored(self, mock_cprint):
+        """A value that is neither a string nor has ``.suggestions`` must not
+        raise — it's a defensive fallback for unexpected provider shapes."""
+        from fluid_build.cli.doctor import _print_doctor_next_steps
+
+        # An integer has neither .suggestions nor is a str; must no-op quietly.
+        _print_doctor_next_steps(
+            feature_checks_ok=True,
+            copilot_readiness=self._make_unready_check(12345),
+        )
+        # No suggestions emitted → cprint not called (short-circuits at the
+        # "if not suggestions: return" branch).
+        mock_cprint.assert_not_called()

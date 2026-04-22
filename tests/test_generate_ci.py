@@ -721,3 +721,224 @@ class TestGeneratedContractEnvAcrossSystems:
             f"contains a bare $CONTRACT reference — regression of the "
             f"A1 Jenkins Build-Now gap"
         )
+
+
+# ---------------------------------------------------------------------------
+# Reference-only contract detection + git-prefix workdir resolution
+# ---------------------------------------------------------------------------
+
+
+class TestContractIsReferenceOnly:
+    """`_contract_is_reference_only` gates whether `fluid generate ci` emits the
+    Generate Artifacts stage. A contract with any ``builds[].pattern`` in
+    ``{hybrid-reference, reference, external-reference}`` is owned externally
+    (team's own dbt project / Airflow DAG), so asking fluid to regenerate those
+    artifacts surfaces only spurious failures. Edge cases are the point.
+    """
+
+    def _write(self, tmp_path: Path, yaml_content: str) -> Path:
+        p = tmp_path / "contract.fluid.yaml"
+        p.write_text(yaml_content)
+        return p
+
+    def test_missing_file_returns_false(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        missing = tmp_path / "nope.yaml"
+        assert _contract_is_reference_only(str(missing)) is False
+
+    def test_broken_yaml_returns_false(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(tmp_path, "not: valid: yaml: [\n")
+        # Defensive: parse failure must not crash; returns False so the
+        # generate-artifacts stage stays on by default.
+        assert _contract_is_reference_only(str(p)) is False
+
+    def test_no_builds_key_returns_false(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(tmp_path, "dataProduct:\n  name: foo\n")
+        assert _contract_is_reference_only(str(p)) is False
+
+    def test_builds_is_dict_not_list_returns_false(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(tmp_path, "builds:\n  not_a_list: true\n")
+        assert _contract_is_reference_only(str(p)) is False
+
+    def test_build_without_pattern_returns_false(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(tmp_path, "builds:\n  - id: foo\n    engine: python\n")
+        assert _contract_is_reference_only(str(p)) is False
+
+    @pytest.mark.parametrize("pattern", ["hybrid-reference", "reference", "external-reference"])
+    def test_recognised_reference_patterns_return_true(self, tmp_path, pattern):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(tmp_path, f"builds:\n  - id: foo\n    pattern: {pattern}\n")
+        assert _contract_is_reference_only(str(p)) is True
+
+    def test_unrecognised_pattern_returns_false(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(tmp_path, "builds:\n  - id: foo\n    pattern: something-else\n")
+        assert _contract_is_reference_only(str(p)) is False
+
+    def test_any_build_with_reference_pattern_wins(self, tmp_path):
+        """Mixed contracts (one normal build, one reference build) must be
+        treated as reference-only — the reference build's external ownership
+        still blocks fluid from regenerating anything for that build."""
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(
+            tmp_path,
+            "builds:\n"
+            "  - id: normal\n"
+            "    pattern: declarative\n"
+            "  - id: ref\n"
+            "    pattern: hybrid-reference\n",
+        )
+        assert _contract_is_reference_only(str(p)) is True
+
+    def test_non_dict_build_entry_skipped(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(
+            tmp_path,
+            "builds:\n" "  - just a string\n" "  - id: foo\n" "    pattern: reference\n",
+        )
+        # Must not raise on the bare-string entry; must still detect the
+        # dict entry's reference pattern.
+        assert _contract_is_reference_only(str(p)) is True
+
+
+class TestGitPrefix:
+    """`_git_prefix` returns the current directory's path relative to the git
+    repo root — used to generate ``cd "<workdir>" && ...`` wrappers for
+    Jenkins when ``fluid generate ci`` runs in a subfolder of the checkout.
+    """
+
+    @patch("fluid_build.cli.generate_ci.subprocess.run")
+    def test_root_of_repo_returns_none(self, mock_run):
+        """git rev-parse --show-prefix returns '' at the repo root;
+        _git_prefix must normalise that to None so no cd wrapper is injected."""
+        from fluid_build.cli.generate_ci import _git_prefix
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="\n")
+        assert _git_prefix() is None
+
+    @patch("fluid_build.cli.generate_ci.subprocess.run")
+    def test_subfolder_returns_stripped_path(self, mock_run):
+        from fluid_build.cli.generate_ci import _git_prefix
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="examples/demo/\n")
+        assert _git_prefix() == "examples/demo"
+
+    @patch("fluid_build.cli.generate_ci.subprocess.run")
+    def test_non_zero_returncode_returns_none(self, mock_run):
+        """`git rev-parse` fails outside a repo → exit 128 → return None."""
+        from fluid_build.cli.generate_ci import _git_prefix
+
+        mock_run.return_value = MagicMock(returncode=128, stdout="")
+        assert _git_prefix() is None
+
+    @patch("fluid_build.cli.generate_ci.subprocess.run", side_effect=FileNotFoundError)
+    def test_git_not_installed_returns_none(self, _mock_run):
+        from fluid_build.cli.generate_ci import _git_prefix
+
+        assert _git_prefix() is None
+
+    @patch("fluid_build.cli.generate_ci.subprocess.run", side_effect=OSError("boom"))
+    def test_oserror_returns_none(self, _mock_run):
+        from fluid_build.cli.generate_ci import _git_prefix
+
+        assert _git_prefix() is None
+
+
+class TestNoGenerateArtifactsFlag:
+    """`--no-generate-artifacts` on `fluid generate ci` must propagate to
+    ``PipelineConfig.generates_artifacts=False`` so the Generate Artifacts
+    stage is omitted from the emitted pipeline. Auto-detection (via
+    ``_contract_is_reference_only``) must achieve the same result without
+    the flag.
+    """
+
+    # CRITICAL: every test here must `monkeypatch.chdir(tmp_path)` because
+    # `generate_ci.run()` writes files via `atomic_write(rel_path, ...)`
+    # regardless of whether the PipelineTemplateGenerator is mocked. Without
+    # chdir, the test clobbers the repo's real Jenkinsfile at the repo root.
+
+    @patch("fluid_build.cli.generate_ci._contract_is_reference_only", return_value=False)
+    @patch("fluid_build.cli.generate_ci._git_prefix", return_value=None)
+    @patch("fluid_build.forge.core.pipeline_templates.PipelineTemplateGenerator")
+    def test_flag_forces_generates_artifacts_false(
+        self, mock_gen, _mock_prefix, _mock_ref_only, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        from fluid_build.cli.generate_ci import run as generate_ci_run
+
+        mock_gen.return_value.generate_pipeline.return_value = {"Jenkinsfile": "pipeline {}\n"}
+
+        args = argparse.Namespace(
+            system="jenkins",
+            out=None,
+            contract="contract.fluid.yaml",
+            no_generate_artifacts=True,
+            provider=None,
+            complexity="basic",
+        )
+
+        generate_ci_run(args, _logger)
+        cfg = mock_gen.return_value.generate_pipeline.call_args[0][0]
+        assert cfg.generates_artifacts is False
+
+    @patch("fluid_build.cli.generate_ci._contract_is_reference_only", return_value=True)
+    @patch("fluid_build.cli.generate_ci._git_prefix", return_value=None)
+    @patch("fluid_build.forge.core.pipeline_templates.PipelineTemplateGenerator")
+    def test_reference_only_contract_auto_disables_generate(
+        self, mock_gen, _mock_prefix, _mock_ref_only, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        from fluid_build.cli.generate_ci import run as generate_ci_run
+
+        mock_gen.return_value.generate_pipeline.return_value = {"Jenkinsfile": "pipeline {}\n"}
+
+        args = argparse.Namespace(
+            system="jenkins",
+            out=None,
+            contract="contract.fluid.yaml",
+            no_generate_artifacts=False,  # flag NOT set
+            provider=None,
+            complexity="basic",
+        )
+
+        generate_ci_run(args, _logger)
+        cfg = mock_gen.return_value.generate_pipeline.call_args[0][0]
+        # Auto-detection wins even without the flag.
+        assert cfg.generates_artifacts is False
+
+    @patch("fluid_build.cli.generate_ci._contract_is_reference_only", return_value=False)
+    @patch("fluid_build.cli.generate_ci._git_prefix", return_value="examples/demo")
+    @patch("fluid_build.forge.core.pipeline_templates.PipelineTemplateGenerator")
+    def test_git_prefix_propagates_to_workdir(
+        self, mock_gen, _mock_prefix, _mock_ref_only, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        from fluid_build.cli.generate_ci import run as generate_ci_run
+
+        mock_gen.return_value.generate_pipeline.return_value = {"Jenkinsfile": "pipeline {}\n"}
+
+        args = argparse.Namespace(
+            system="jenkins",
+            out=None,
+            contract="contract.fluid.yaml",
+            no_generate_artifacts=False,
+            provider=None,
+            complexity="basic",
+        )
+
+        generate_ci_run(args, _logger)
+        cfg = mock_gen.return_value.generate_pipeline.call_args[0][0]
+        assert cfg.workdir == "examples/demo"
