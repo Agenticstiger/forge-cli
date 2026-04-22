@@ -224,6 +224,13 @@ class BasePipelineTemplate:
         """
         return {
             "validate": "fluid validate ${CONTRACT:-contract.fluid.yaml}",
+            # 11-stage pipeline stage 5 — drift gate. Runs BEFORE plan so the
+            # plan is never computed against a drifted baseline. --exit-on-drift
+            # makes any drift a hard fail; local inspection runs omit the flag.
+            "diff": (
+                "fluid diff ${CONTRACT:-contract.fluid.yaml} --exit-on-drift "
+                "--env ${FLUID_ENV:-dev}"
+            ),
             "plan": "fluid plan ${CONTRACT:-contract.fluid.yaml} --out runtime/plan.json",
             # --build is required for dbt hybrid-reference builds; the
             # inline conditional keeps the template useful for both shapes.
@@ -233,6 +240,14 @@ class BasePipelineTemplate:
                 "else "
                 "fluid apply runtime/plan.json --yes; "
                 "fi"
+            ),
+            # 11-stage pipeline stage 9 — post-apply reconciliation. --strict
+            # fails on any schema mismatch (not just missing objects), which
+            # catches silent type coercions (TIMESTAMP_NTZ→LTZ, etc.). Writes
+            # a JSON report for CI artifact uploads.
+            "verify": (
+                "fluid verify ${CONTRACT:-contract.fluid.yaml} --strict "
+                "--env ${FLUID_ENV:-dev} --report runtime/verify-report.json"
             ),
             "test": "fluid test --coverage",
             "contract_test": "fluid contract-tests ${CONTRACT:-contract.fluid.yaml}",
@@ -264,13 +279,22 @@ class BasePipelineTemplate:
                 'rsync -av --delete dags/ "$AIRFLOW_DAGS_DEST"/; '
                 "fi"
             ),
-            # Catalog publish: push the contract (+ ODPS/ODCS exports) to
-            # a catalog. Skipped when $DMM_API_URL is unset (the catalog
-            # name defaults to datamesh-manager).
+            # Stage 10 — Catalog publish. Push the contract (+ ODPS/ODCS
+            # exports) to one or more catalogs. Uses ``--target`` (repeatable)
+            # per the 11-stage pipeline design: ``PUBLISH_TARGETS`` is a
+            # space-separated list (e.g. ``command-center datahub``) that the
+            # shell expands into ``--target X --target Y``. Falls back to the
+            # legacy ``${CATALOG:-datamesh-manager}`` single-target form so
+            # existing environments keep working.
             "publish_catalog": (
-                'if [ -n "$DMM_API_URL" ]; then '
+                'if [ -n "$DMM_API_URL" ] || [ -n "$PUBLISH_TARGETS" ]; then '
+                'if [ -n "$PUBLISH_TARGETS" ]; then '
+                'TARGETS=""; for t in $PUBLISH_TARGETS; do TARGETS="$TARGETS --target $t"; done; '
+                "fluid publish ${CONTRACT:-contract.fluid.yaml} $TARGETS; "
+                "else "
                 "fluid publish ${CONTRACT:-contract.fluid.yaml} "
-                "--catalog ${CATALOG:-datamesh-manager}; "
+                "--target ${CATALOG:-datamesh-manager}; "
+                "fi; "
                 "fi"
             ),
         }
