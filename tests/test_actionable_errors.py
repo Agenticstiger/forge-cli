@@ -91,7 +91,7 @@ class TestFormatActionableError:
     def test_subclass_name_in_output(self):
         exc = LockfileMismatchError(
             "lockfile is out of date",
-            fix="run fluid compile",
+            fix="run fluid bundle",
         )
         rendered = format_actionable_error(exc)
         assert "LockfileMismatchError" in rendered

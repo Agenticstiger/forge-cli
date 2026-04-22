@@ -172,10 +172,10 @@ def workspace_init_receipt_path(workspace_root: Path) -> Path:
 CONTRACT_FILENAME: str = "contract.fluid.yaml"
 
 #: The flat, committed, DO-NOT-EDIT bundled contract produced by
-#: ``fluid compile``.  Lives next to the contract at the product root.
+#: ``fluid bundle``.  Lives next to the contract at the product root.
 CONTRACT_BUNDLED_FILENAME: str = "contract.bundled.yaml"
 
-#: The committed integrity lockfile produced by ``fluid compile --write-lock``.
+#: The committed integrity lockfile produced by ``fluid bundle --write-lock``.
 #: Carries fragment paths + sha256 + fluidVersion.  Treated like
 #: ``package-lock.json`` / ``Cargo.lock`` — small diff, checked in CI.
 CONTRACT_LOCK_FILENAME: str = "contract.lock.yaml"

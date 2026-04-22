@@ -16,6 +16,10 @@
 
 This is the inverse of ``fluid split``.
 
+Previously registered under the hidden alias ``fluid compile`` for backwards
+compatibility; that alias was removed when the 11-stage pipeline landed. Use
+``fluid bundle`` directly.
+
 Usage:
     fluid bundle contract.fluid.yaml
     fluid bundle contract.fluid.yaml --out contract.bundled.fluid.yaml
@@ -85,19 +89,6 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="Output format (default: infer from --out extension, else YAML)",
     )
     p.set_defaults(cmd=COMMAND, func=run)
-
-
-def register_alias(subparsers: argparse._SubParsersAction) -> None:
-    """Register ``compile`` as a hidden backwards-compatibility alias."""
-    p = subparsers.add_parser(
-        "compile",
-        help=argparse.SUPPRESS,
-    )
-    p.add_argument("contract", help="Path to the root FLUID contract file")
-    p.add_argument("--out", "-o", default="-")
-    p.add_argument("--env", "-e", default=None)
-    p.add_argument("--format", "-f", choices=["yaml", "json"], default=None)
-    p.set_defaults(cmd="compile", func=run)
 
 
 def _infer_format(out: str, explicit: str | None) -> str:

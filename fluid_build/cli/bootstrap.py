@@ -536,15 +536,10 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     _try_register(sp, "auth", "auth")
     _try_register(sp, "marketplace", "marketplace")  # deprecated — use market --blueprints
     _try_register(sp, "publish", "publish")
-    _try_register(sp, "compile", "bundle")
-    # Hidden backwards-compat alias: ``fluid compile`` → ``fluid bundle``
-    try:
-        from . import compile as _compile_mod
-
-        if hasattr(_compile_mod, "register_alias"):
-            _compile_mod.register_alias(sp)
-    except ImportError:
-        pass
+    _try_register(sp, "bundle", "bundle")
+    # The hidden ``fluid compile`` alias was removed when the 11-stage
+    # pipeline landed. Users running ``fluid compile`` now get the standard
+    # argparse "invalid choice" error, which is the desired signal.
     _try_register(sp, "split", "split")
     _try_register(sp, "preview", "preview")  # deprecated — use plan --html
     _try_register(sp, "diff", "diff")
