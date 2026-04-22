@@ -383,12 +383,15 @@ def run(args, logger: logging.Logger) -> int:
     )
 
     try:
-        # --- Build execution mode (absorbed from 'fluid execute') ---
+        # --- Build execution mode (absorbed from legacy 'fluid execute') ---
+        # Dispatches to build_runners.base.run_builds_from_args; force_run=True
+        # is the legacy ``_from_apply=True`` semantic that lets apply-invoked
+        # runs trigger scheduled builds one-shot.
         build_id = getattr(args, "build_id", None)
         if build_id and isinstance(build_id, str):
-            from .execute import run as execute_run
+            from fluid_build.build_runners import run_builds_from_args
 
-            return execute_run(args, logger, _from_apply=True)
+            return run_builds_from_args(args, logger, force_run=True)
 
         # Load contract or execution plan
         if args.contract.endswith(".json"):

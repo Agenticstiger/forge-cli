@@ -46,7 +46,8 @@ _STABLE_COMMANDS = frozenset(
         "plan",
         "apply",
         "graph",
-        "execute",
+        # "execute" removed — deprecated subcommand deleted when build_runners
+        # landed. Users should call ``fluid apply --build <id>`` instead.
         "verify",
         "export",
         "docs",
@@ -505,7 +506,9 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
             gr.set_defaults(func=cmd_graph_run)
 
     # --- Simple registrations (profile-gated via _try_register) ---
-    _try_register(sp, "execute", "execute")
+    # ``fluid execute`` was deleted when build_runners landed. Its engine code
+    # moved to ``fluid_build.build_runners``; ``fluid apply --build <id>`` is
+    # the canonical entry point.
     _try_register(sp, "verify", "verify")
     _try_register(sp, "viz_plan", "viz-plan")
     _try_register(sp, "contract_tests", "contract-tests")
