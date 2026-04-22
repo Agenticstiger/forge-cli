@@ -177,13 +177,56 @@ your data product is production-ready with full observability.
     p.add_argument("contract", help="Path to contract.fluid.yaml or execution plan JSON file")
     p.add_argument("--env", help="Environment overlay (dev, staging, prod, etc.)")
 
+    # --- Mode matrix (11-stage pipeline stage 7) ---
+    # Six modes express every realistic deploy decision. See
+    # ``fluid_build.forge.core.apply_modes`` for the full matrix + semantics.
+    # Default is ``amend`` (additive schema evolution, data preserved).
+    from fluid_build.forge.core.apply_modes import CANONICAL_CHOICES as _MODE_CHOICES
+
+    mode_group = p.add_argument_group("Apply Mode (stage-7 dispatch)")
+    mode_group.add_argument(
+        "--mode",
+        choices=_MODE_CHOICES,
+        default=None,  # resolved by resolve_mode_with_build_alias; None = amend
+        help=(
+            "What DDL/DML to run against the target. "
+            "dry-run (render only; no warehouse calls). "
+            "create-only (fail if target exists; otherwise CREATE IF NOT EXISTS). "
+            "amend (default — ALTER ADD COLUMN IF NOT EXISTS; views CREATE OR REPLACE; "
+            "data preserved). "
+            "amend-and-build (amend + dbt run; transforms refreshed). "
+            "replace (auto-snapshot then DROP+RECREATE; requires --allow-data-loss "
+            "in non-dev or when target has rows). "
+            "replace-and-build (replace + dbt run --full-refresh). "
+            "See plan Part 1 for the full matrix."
+        ),
+    )
+    mode_group.add_argument(
+        "--allow-data-loss",
+        action="store_true",
+        default=False,
+        help=(
+            "Required for --mode replace / --mode replace-and-build when the "
+            "environment is not ``dev`` OR the target has rows. Explicit "
+            "operator opt-in that can't be accidentally typed. The pre-replace "
+            "table is snapshotted to ``<target>__backup_<ts>`` so "
+            "``fluid rollback`` can restore it."
+        ),
+    )
+
     # Execution control
     execution_group = p.add_argument_group("Execution Control")
     execution_group.add_argument(
         "--yes", action="store_true", help="Skip confirmation prompt and proceed automatically"
     )
     execution_group.add_argument(
-        "--dry-run", action="store_true", help="Show what would be executed without making changes"
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Show what would be executed without making changes. Equivalent to "
+            "--mode dry-run but retained as an orthogonal flag for back-compat "
+            "with existing CI scripts."
+        ),
     )
     execution_group.add_argument(
         "--timeout", type=int, default=120, help="Global timeout in minutes (default: 120)"
@@ -261,7 +304,13 @@ your data product is production-ready with full observability.
         "--build",
         "--build-id",
         dest="build_id",
-        help="Execute a specific build job by ID (from contract builds section)",
+        help=(
+            "Execute a specific build job by ID (from contract builds section). "
+            "DEPRECATED in 11-stage pipeline: use --mode amend-and-build (or "
+            "--mode replace-and-build) instead. When --build is set WITHOUT "
+            "--mode, the apply auto-upgrades to --mode amend-and-build with a "
+            "deprecation warning. Alias kept for one release."
+        ),
     )
     build_group.add_argument(
         "--delay",
@@ -372,23 +421,64 @@ def run(args, logger: logging.Logger) -> int:
     # the dbt subprocess launched there reads os.environ for its profile.
     hydrate_dotenv(Path.cwd(), environment=getattr(args, "env", None))
 
-    # Log operation start
+    # --- Resolve --mode + --build back-compat (11-stage pipeline stage 7) ---
+    # ``--build X`` without ``--mode`` auto-upgrades to ``--mode amend-and-build``
+    # with a deprecation warning. ``--build`` combined with a non-build-augmented
+    # mode raises a clear error.
+    from fluid_build.forge.core.apply_modes import (
+        ApplyMode,
+        check_data_loss_gate,
+        is_dry_run,
+        needs_build,
+        resolve_mode_with_build_alias,
+    )
+
+    build_id = getattr(args, "build_id", None)
+    try:
+        resolved_mode, resolved_build_id = resolve_mode_with_build_alias(
+            getattr(args, "mode", None),
+            build_id if isinstance(build_id, str) else None,
+        )
+    except ValueError as exc:
+        raise CLIError(1, "apply_mode_invalid", {"error": str(exc)})
+
+    # Deprecation warning when the legacy --build flag kicked the upgrade.
+    if (
+        resolved_build_id
+        and getattr(args, "mode", None) is None
+        and resolved_mode is ApplyMode.AMEND_AND_BUILD
+    ):
+        logger.warning(
+            "--build is deprecated; use --mode amend-and-build instead. "
+            "This invocation has been auto-upgraded. --build will be removed "
+            "in the next release."
+        )
+
+    # --dry-run flag is still honored for back-compat; --mode dry-run is the
+    # canonical form. Normalize the two so the downstream code sees one signal.
+    effective_dry_run = bool(getattr(args, "dry_run", False)) or is_dry_run(resolved_mode)
+
+    # Log operation start — include resolved mode so observability surfaces it.
     log_operation_start(
         logger,
         "apply_contract",
         execution_id=execution_id,
         source=args.contract,
         env=args.env,
-        dry_run=args.dry_run,
+        dry_run=effective_dry_run,
+        mode=resolved_mode.value,
     )
 
     try:
         # --- Build execution mode (absorbed from legacy 'fluid execute') ---
-        # Dispatches to build_runners.base.run_builds_from_args; force_run=True
-        # is the legacy ``_from_apply=True`` semantic that lets apply-invoked
-        # runs trigger scheduled builds one-shot.
-        build_id = getattr(args, "build_id", None)
-        if build_id and isinstance(build_id, str):
+        # ``--mode amend-and-build`` / ``--mode replace-and-build`` + an
+        # explicit ``--build <id>`` delegate to build_runners. Legacy --build
+        # calls land here too (post-resolve mode is amend-and-build).
+        # force_run=True mirrors the historical ``_from_apply=True`` semantic.
+        if resolved_build_id and needs_build(resolved_mode):
+            # Ensure the build engine sees the resolved build_id even if the
+            # caller only passed --mode (no --build). Safe-no-op when already set.
+            args.build_id = resolved_build_id
             from fluid_build.build_runners import run_builds_from_args
 
             return run_builds_from_args(args, logger, force_run=True)
@@ -451,6 +541,29 @@ def run(args, logger: logging.Logger) -> int:
                 error.message = "Invalid --config-override JSON"
                 raise error from exc
             contract.update(override_config)
+
+        # --- Data-loss safety gate (11-stage pipeline stage 7) ---
+        # Destructive modes (``replace*``) require ``--allow-data-loss`` in any
+        # env where FLUID_ENV != dev OR the target has rows. This runs BEFORE
+        # any provider call so no DDL executes when the gate blocks.
+        #
+        # ``target_row_count=None`` signals "unknown" — the gate treats that as
+        # populated (fail-safe). Future enhancement: providers can implement
+        # a cheap ``estimate_row_count()`` and pass it in. For now, the gate's
+        # default behavior is "non-dev + replace → require --allow-data-loss
+        # unless you can prove the target is empty."
+        gate = check_data_loss_gate(
+            resolved_mode,
+            env=args.env,
+            target_row_count=None,  # unknown until provider check added
+            allow_data_loss=bool(getattr(args, "allow_data_loss", False)),
+        )
+        if gate.blocked:
+            raise CLIError(
+                1,
+                "apply_mode_data_loss_blocked",
+                {"mode": resolved_mode.value, "env": args.env, "reason": gate.reason},
+            )
 
         # Simple mode execution
         if use_simple_mode:

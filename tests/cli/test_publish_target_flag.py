@@ -192,20 +192,51 @@ class TestTargetResolution:
         assert recorded[1]["catalog_name"] == "datahub"
         assert recorded[1].get("endpoint_override") is None
 
-    def test_catalog_deprecated_still_works(self, caplog):
+    def test_catalog_deprecated_still_works(self):
         """Legacy ``--catalog X`` continues to publish (preserves existing
-        CI scripts during the deprecation window) but logs a warning."""
+        CI scripts during the deprecation window) but logs a warning.
+
+        Uses a logger-spy fixture rather than caplog — caplog's capture
+        relies on root-logger propagation which other tests occasionally
+        leave in a reconfigured state under random test ordering."""
+        import asyncio
+
+        from fluid_build.providers.catalogs import PublishResult
+
         recorded = []
+        warnings = []
+
+        async def _fake_publish(**kwargs):
+            recorded.append(kwargs)
+            return PublishResult(success=True, catalog_id=kwargs["catalog_name"], asset_id="x")
+
+        # Spy on the logger passed INTO run_async — publish.py emits the
+        # deprecation warning via that logger, not the module logger.
+        spy_logger = logging.getLogger("test.publish_target_deprecated")
+
+        original_warning = spy_logger.warning
+
+        def _capture_warning(msg, *a, **kw):
+            warnings.append(str(msg) % a if a else str(msg))
+            return original_warning(msg, *a, **kw)
+
+        spy_logger.warning = _capture_warning  # type: ignore[method-assign]
+
         args = self._make_args(catalog="legacy-catalog")
-        with caplog.at_level(logging.WARNING):
-            rc = self._run_and_capture(args, recorded)
+        try:
+            with patch.object(publish, "publish_contract", _fake_publish):
+                rc = asyncio.run(publish.run_async(args, spy_logger))
+        finally:
+            spy_logger.warning = original_warning  # type: ignore[method-assign]
+
         assert rc == 0
         assert len(recorded) == 1
         assert recorded[0]["catalog_name"] == "legacy-catalog"
-        # Deprecation warning surfaced.
+        # Deprecation warning surfaced — captured via direct logger spy,
+        # order-independent.
         assert any(
-            "deprecated" in r.message.lower() for r in caplog.records
-        ), "--catalog should log a deprecation warning"
+            "deprecated" in w.lower() for w in warnings
+        ), f"--catalog should log a deprecation warning; saw: {warnings}"
 
     def test_target_and_catalog_both_publish(self):
         """When BOTH flags are set, both participate (both get published).
@@ -308,9 +339,16 @@ class TestOdcsOutputPortLinkage:
     """
 
     def _load_lineage_contract(self):
+        """Resolve the fixture path from __file__ rather than cwd. Test
+        isolation: random-order runs can land this test when a prior test
+        left cwd pointing at a tmp_path; absolute resolution avoids that."""
+        from pathlib import Path
+
         import yaml
 
-        with open("tests/fixtures/contracts/compatibility/lineage_072.yaml", "r") as fh:
+        repo_root = Path(__file__).parent.parent.parent
+        fixture = repo_root / "tests/fixtures/contracts/compatibility/lineage_072.yaml"
+        with open(fixture, "r") as fh:
             return yaml.safe_load(fh)
 
     def test_every_output_port_has_matching_odcs_put_url(self):
