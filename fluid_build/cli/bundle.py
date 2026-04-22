@@ -84,18 +84,33 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--format",
         "-f",
-        choices=["yaml", "json"],
+        choices=["yaml", "json", "tgz"],
         default=None,
-        help="Output format (default: infer from --out extension, else YAML)",
+        help=(
+            "Output format. ``yaml`` (default) and ``json`` emit a single "
+            "resolved-contract document. ``tgz`` emits a deterministic "
+            "content-addressable bundle with a MANIFEST.json, SHA-256 per "
+            "file, a merkle root, and inline SQL/OpenAPI extracted into "
+            "sources/ (replaced by {'$source': 'sources/...'} sentinels). "
+            "The tgz format is the canonical input to every downstream "
+            "stage of the 11-stage pipeline."
+        ),
     )
     p.set_defaults(cmd=COMMAND, func=run)
 
 
 def _infer_format(out: str, explicit: str | None) -> str:
-    """Determine output format from --format flag, --out extension, or default to YAML."""
+    """Determine output format from --format flag, --out extension, or default to YAML.
+
+    ``.tgz`` / ``.tar.gz`` suffixes imply ``--format tgz`` unless the user
+    explicitly passed a different format.
+    """
     if explicit:
         return explicit
     if out and out != "-":
+        lowered = out.lower()
+        if lowered.endswith(".tgz") or lowered.endswith(".tar.gz"):
+            return "tgz"
         suffix = Path(out).suffix.lower()
         if suffix == ".json":
             return "json"
@@ -197,17 +212,57 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         return 1
 
     # Feedback: tell the user if the contract had nothing to bundle
-    if not has_refs and not env:
+    # (suppressed for --format tgz — the tgz has fragments regardless of refs)
+    if not has_refs and not env and fmt != "tgz":
         sys.stderr.write(
             "ℹ️  Contract has no $ref pointers — already a single file.\n"
             "   Use 'fluid split' first to break it into fragments,\n"
             "   then 'fluid bundle' to reassemble.\n"
         )
 
-    # Serialize
+    # ── tgz branch: canonical deterministic bundle (stage-1 pipeline output) ──
+    if fmt == "tgz":
+        from fluid_build.forge.core.bundle import _slug, build_bundle_tgz
+
+        # Product-id defaulted output filename. Bundles travel outside the
+        # product folder (CI artifact stores, S3, catalog publish). Naming
+        # them after the product makes them self-identifying in a shared
+        # bin — matches how wheels / npm packages / OCI images are named.
+        # Override by passing ``--out <explicit-path>``.
+        contract_id_raw = (
+            compiled.get("id")
+            or compiled.get("name")
+            or compiled.get("dataProduct", {}).get("id")
+            or ""
+        )
+        if out == "-":
+            if contract_id_raw:
+                default_name = f"{_slug(str(contract_id_raw))}.fluid.bundle.tgz"
+            else:
+                default_name = "contract.fluid.bundle.tgz"
+            out = str(contract_dir / default_name)
+            sys.stderr.write(
+                f"ℹ️  --out not specified; defaulting to {out}\n"
+                f"   (derived from contract.id; override with --out <path>)\n"
+            )
+
+        try:
+            digest = build_bundle_tgz(
+                compiled,
+                Path(out),
+                contract_id=str(contract_id_raw),
+            )
+        except Exception as e:
+            sys.stderr.write(f"❌ Bundle tgz build failed: {e}\n")
+            return 1
+
+        sys.stderr.write(f"✅ Bundle written to {out}\n")
+        sys.stderr.write(f"   digest: {digest}\n")
+        return 0
+
+    # ── yaml / json branch (legacy single-file output) ─────────────────────
     output = _serialize(compiled, fmt)
 
-    # Write
     if out == "-":
         sys.stdout.write(output)
     else:
