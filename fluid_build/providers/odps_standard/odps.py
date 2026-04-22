@@ -251,59 +251,91 @@ class OdpsStandardProvider(BaseProvider):
         return {"purpose": description}
 
     def _extract_team(self, fluid: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Extract team information.
+        """Extract team information as ODPS-Bitol v1.0.0-conformant shape.
 
-        ODPS team structure:
-        {
-            "name": "team-name",
-            "contacts": [
-                {"name": "John Doe", "email": "john@company.com"}
-            ]
-        }
+        The v1.0.0 ``Team`` schema (``additionalProperties: false``) permits
+        only: ``name, description, members, tags, customProperties,
+        authoritativeDefinitions``. It does NOT permit a ``contacts`` key.
+
+        FLUID's ``metadata.owner`` structure carries name+email+team+contacts
+        in one dict. We map that to v1.0.0 as follows:
+
+        * ``owner.team`` / ``owner.name`` → ``team.name``
+        * ``owner.name`` + ``owner.email`` → one ``members[]`` entry with
+          ``{username: email, name}`` (TeamMember requires ``username``)
+        * ``owner.contacts[]`` → additional ``members[]`` entries with
+          ``{username: email or name, name: name}``
         """
         owner = get_owner(fluid)
         if not owner:
             return None
 
-        team = {}
+        team: Dict[str, Any] = {}
 
         # Team name
         team_name = owner.get("team") or owner.get("name")
         if team_name:
             team["name"] = team_name
 
-        # Contacts
-        contacts = []
+        # Members list (replaces the forbidden 'contacts' key). ODPS-Bitol
+        # TeamMember requires 'username'; use email when available, fall
+        # back to name so we always produce a valid member.
+        members: list = []
 
-        # Primary contact from owner
         if owner.get("name") or owner.get("email"):
-            contact = {}
+            member: Dict[str, Any] = {}
+            username = owner.get("email") or owner.get("name") or ""
+            if username:
+                member["username"] = str(username)
             if owner.get("name"):
-                contact["name"] = owner["name"]
-            if owner.get("email"):
-                contact["email"] = owner["email"]
-            contacts.append(contact)
+                member["name"] = str(owner["name"])
+            if owner.get("role"):
+                member["role"] = str(owner["role"])
+            if member.get("username"):
+                members.append(member)
 
-        # Additional contacts
-        if "contacts" in owner:
+        if "contacts" in owner and isinstance(owner["contacts"], list):
             for c in owner["contacts"]:
-                if isinstance(c, dict):
-                    contacts.append(c)
+                if not isinstance(c, dict):
+                    continue
+                username = c.get("username") or c.get("email") or c.get("name")
+                if not username:
+                    continue
+                entry: Dict[str, Any] = {"username": str(username)}
+                if c.get("name"):
+                    entry["name"] = str(c["name"])
+                if c.get("role"):
+                    entry["role"] = str(c["role"])
+                members.append(entry)
 
-        if contacts:
-            team["contacts"] = contacts
+        if members:
+            team["members"] = members
 
         return team if team else None
 
     def _extract_input_ports(self, fluid: Mapping[str, Any]) -> List[Dict[str, Any]]:
-        """Map FLUID ``consumes[]`` to ODPS-Bitol input ports.
+        """Map FLUID ``consumes[]`` to ODPS-Bitol v1.0.0 input ports.
 
-        Uses the shared :func:`consumes_to_canonical_ports` helper to keep
-        the 0.4.0/0.5.7/0.7.x compatibility logic in a single place. Fields
-        that were not explicitly supplied (``contractId``, ``required``) are
-        omitted rather than fabricated, so downstream consumers never see
-        dangling references or unintended "hard dependency" semantics.
+        ODPS-Bitol v1.0.0 ``InputPort`` (``additionalProperties: false``) permits
+        only: ``name, version, contractId, tags, customProperties,
+        authoritativeDefinitions``. Required: ``name, version, contractId``.
+
+        Two divergences from the previous shape:
+
+        * ``id``, ``description``, ``reference``, ``required``, ``sourceSystemId``
+          are NOT permitted on ``InputPort`` under v1.0.0. Stripped. If the
+          host repo uses them downstream (e.g. for DMM provider overlay),
+          that extension should happen after this provider returns — not
+          be baked into the v1.0.0 artifact.
+        * ``contractId`` is REQUIRED. We synthesize when the FLUID consume
+          didn't carry one explicitly, in order of preference:
+            1. Canonical ``contract_id`` field (FLUID's explicit field)
+            2. Canonical ``reference`` field (source's fully-qualified name
+               — stable identifier for the contract's upstream source)
+            3. Canonical ``name`` (last-resort stable identifier)
+
+        Uses :func:`consumes_to_canonical_ports` for 0.4.0/0.5.7/0.7.x
+        compatibility.
         """
         canonical_ports = consumes_to_canonical_ports(
             fluid,
@@ -313,20 +345,16 @@ class OdpsStandardProvider(BaseProvider):
 
         input_ports: List[Dict[str, Any]] = []
         for canonical in canonical_ports:
+            # Synthesize contractId via fallback chain so the emitted port
+            # always carries the v1.0.0-required field.
+            contract_id = (
+                canonical.get("contract_id") or canonical.get("reference") or canonical.get("name")
+            )
             port: Dict[str, Any] = {
-                "id": canonical["id"],
                 "name": canonical["name"],
-                "description": canonical["description"],
                 "version": canonical["version"],
+                "contractId": str(contract_id) if contract_id else canonical["name"],
             }
-            if canonical["reference"]:
-                port["reference"] = canonical["reference"]
-            if canonical["contract_id"]:
-                port["contractId"] = canonical["contract_id"]
-            if canonical["required"] is not None:
-                port["required"] = bool(canonical["required"])
-            if canonical["source_system_id"]:
-                port["sourceSystemId"] = canonical["source_system_id"]
             input_ports.append(port)
 
         return input_ports
@@ -359,8 +387,10 @@ class OdpsStandardProvider(BaseProvider):
             ODPS output port dictionary
         """
         expose_id = self._extract_expose_id(expose)
+        # ODPS-Bitol v1.0.0 OutputPort (``additionalProperties: false``) does
+        # NOT permit an ``id`` field. The expose identifier travels via
+        # ``name`` instead. Keep ``id`` OUT of the emitted port dict.
         port = {
-            "id": expose_id,
             "name": expose_id,
             "version": str(expose.get("version", self.default_port_version)),
             "description": expose.get("description", ""),

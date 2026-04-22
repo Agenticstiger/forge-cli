@@ -252,20 +252,22 @@ def test_apply_dry_run_odps_maps_consumes_to_top_level_input_ports():
         provider_hint="odps",
     )
 
-    # The ODPS-Bitol renderer itself keeps ``contractId`` and the
-    # ``sourceSystem`` custom property explicit-only, but the DMM provider
-    # layer overlays both so Entropy's ODPS product PUT is accepted. See
-    # ``_ensure_odps_input_port_contract_ids`` and
-    # ``_ensure_odps_input_port_source_system_custom_property``.
+    # ODPS-Bitol v1.0.0 InputPort (``additionalProperties: false``) permits
+    # only: name, version, contractId, tags, customProperties,
+    # authoritativeDefinitions. The upstream OdpsStandardProvider emits
+    # the conformant base shape; DMM overlays the ``sourceSystem`` custom
+    # property so Entropy's ODPS product PUT carries that lineage hint.
+    #
+    # ``id``, ``description``, ``reference`` are NOT permitted on v1.0.0
+    # InputPort and are stripped from the artifact. The DMM overlay's
+    # ``_ensure_odps_input_port_source_system_custom_property`` preserves
+    # the lineage ref via customProperties instead.
     input_ports = result["payload"].get("inputPorts", [])
     assert input_ports == [
         {
-            "id": "subscriber_usage_daily",
             "name": "subscriber_usage_daily",
-            "description": "Supply daily subscriber usage features to the health model.",
             "version": "1",
-            "reference": "bizlab.teleforge.subscriber_usage_daily_lineage_local",
-            "contractId": "bizlab.teleforge.subscriber_usage_daily_lineage_local.subscriber_usage_daily",
+            "contractId": "bizlab.teleforge.subscriber_usage_daily_lineage_local",
             "customProperties": [
                 {
                     "property": "sourceSystem",
@@ -274,12 +276,9 @@ def test_apply_dry_run_odps_maps_consumes_to_top_level_input_ports():
             ],
         },
         {
-            "id": "billing_health_daily",
             "name": "billing_health_daily",
-            "description": "Supply payment behavior and overdue indicators to the health model.",
             "version": "1",
-            "reference": "bizlab.teleforge.billing_health_daily_lineage_local",
-            "contractId": "bizlab.teleforge.billing_health_daily_lineage_local.billing_health_daily",
+            "contractId": "bizlab.teleforge.billing_health_daily_lineage_local",
             "customProperties": [
                 {
                     "property": "sourceSystem",

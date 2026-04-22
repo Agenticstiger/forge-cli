@@ -753,26 +753,40 @@ class TestCmdPublishEndToEnd:
         assert payload["kind"] == "DataProduct"
         assert payload["id"] == fixture_contract["id"]
 
+        # ODPS-Bitol v1.0.0 InputPort forbids ``id`` and ``reference``; the
+        # identifier travels via ``name`` and the upstream source's canonical
+        # name is folded into ``contractId`` (synthesized by OdpsStandardProvider
+        # when the FLUID consume didn't declare one explicitly).
         expected_refs = [c["productId"] for c in fixture_contract["consumes"]]
         expected_ids = [c["exposeId"] for c in fixture_contract["consumes"]]
-        actual_refs = [p["reference"] for p in payload["inputPorts"]]
-        actual_ids = [p["id"] for p in payload["inputPorts"]]
-        assert actual_refs == expected_refs
+        actual_ids = [p["name"] for p in payload["inputPorts"]]
         assert actual_ids == expected_ids
 
-        # The DMM provider overlays ``contractId`` on the port and a
-        # ``customProperties[{property: sourceSystem}]`` entry because
-        # Entropy's server rejects inputPorts without both. The renderer's
-        # own no-fabricate invariant is tested separately in
-        # ``test_odps_standard``.
-        for port, consume in zip(payload["inputPorts"], fixture_contract["consumes"]):
-            assert port["contractId"] == f"{consume['productId']}.{consume['exposeId']}"
+        # DMM overlay preserves the upstream source as a customProperties
+        # entry (sourceSystem), since v1.0.0 InputPort doesn't permit
+        # a ``reference`` field directly. Assert both the contractId
+        # synthesis and the sourceSystem preservation.
+        for port, consume, expected_ref in zip(
+            payload["inputPorts"], fixture_contract["consumes"], expected_refs
+        ):
+            # contractId is the upstream source ref (name-synthesis fallback
+            # of the OdpsStandardProvider chain).
+            assert expected_ref in port["contractId"], (
+                f"contractId should reflect upstream source; "
+                f"got {port['contractId']!r}, expected to contain {expected_ref!r}"
+            )
             props = port.get("customProperties") or []
             source_system = next(
                 (p.get("value") for p in props if p.get("property") == "sourceSystem"),
                 None,
             )
-            assert source_system == consume["productId"]
+            assert source_system == expected_ref, (
+                f"sourceSystem customProperty should carry the upstream "
+                f"productId {expected_ref!r}; got {source_system!r}"
+            )
+            # Schema-forbidden fields must NOT appear.
+            assert "id" not in port
+            assert "reference" not in port
             assert "required" not in port
 
 

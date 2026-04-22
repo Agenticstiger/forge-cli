@@ -86,7 +86,11 @@ def test_provider_render_supports_expose_id_only_contracts():
         )
     }
     assert result["team"]["name"] == "bizlab"
-    assert result["outputPorts"][0]["id"] == "subscriber_health_360"
+    # ODPS-Bitol v1.0.0 OutputPort forbids ``id`` (additionalProperties: false).
+    # The expose identifier travels via ``name``; validation against the
+    # vendored schema would fail if we emitted ``id``. See
+    # providers/odps_standard/odps-bitol-schema-v1.0.0.json.
+    assert "id" not in result["outputPorts"][0]
     assert result["outputPorts"][0]["name"] == "subscriber_health_360"
     assert result["outputPorts"][0]["type"] == "local"
 
@@ -98,45 +102,50 @@ def test_provider_render_prefers_expose_id_over_legacy_id():
 
     result = provider.render(contract)
 
-    assert result["outputPorts"][0]["id"] == "subscriber_health_360"
+    # No ``id`` on OutputPort under v1.0.0; ``name`` carries the identifier.
+    assert "id" not in result["outputPorts"][0]
     assert result["outputPorts"][0]["name"] == "subscriber_health_360"
 
 
 def test_provider_render_maps_consumes_to_input_ports():
+    """ODPS-Bitol v1.0.0 ``InputPort`` (``additionalProperties: false``) permits
+    only ``name, version, contractId, tags, customProperties,
+    authoritativeDefinitions``. The provider strips FLUID-specific extras
+    (``id``, ``description``, ``reference``, ``required``, ``sourceSystemId``)
+    and synthesizes ``contractId`` from ``reference`` when the FLUID consume
+    didn't declare one explicitly."""
     provider = OdpsStandardProvider()
 
     result = provider.render(_sample_fluid_contract_with_consumes_and_expose_id())
 
-    # Only fields explicitly present on the consume entries are emitted —
-    # the provider deliberately does NOT fabricate a ``contractId`` suffix
-    # or a default ``required: True`` (see CHANGELOG for rationale).
     assert result["inputPorts"] == [
         {
-            "id": "subscriber_usage_daily",
             "name": "subscriber_usage_daily",
-            "description": "Supply daily subscriber usage features to the health model.",
             "version": "1",
-            "reference": "bizlab.teleforge.subscriber_usage_daily_lineage_local",
+            # contractId synthesized from reference (consume had no explicit
+            # contractId; reference is the upstream source's canonical name).
+            "contractId": "bizlab.teleforge.subscriber_usage_daily_lineage_local",
         },
         {
-            "id": "billing_health_daily",
             "name": "billing_health_daily",
-            "description": "Supply payment behavior and overdue indicators to the health model.",
             "version": "1",
-            "reference": "bizlab.teleforge.billing_health_daily_lineage_local",
+            "contractId": "bizlab.teleforge.billing_health_daily_lineage_local",
         },
     ]
 
 
-def test_provider_render_emits_input_port_contract_id_and_required_only_when_set():
-    """Explicit ``contractId`` and ``required`` on a consume should pass through;
-    omission should NOT fabricate a default value.
+def test_provider_render_emits_input_port_contract_id_when_explicit():
+    """Explicit ``contractId`` on a consume passes through unchanged.
+    When the consume has no ``contractId`` but does have ``reference``,
+    the provider synthesizes ``contractId`` from the reference (v1.0.0
+    InputPort requires contractId).
 
-    The contract is labelled as FLUID 0.7.1 rather than 0.7.2 because the
-    0.7.2 ``consumeRef`` schema has ``additionalProperties: false`` and does
-    not include ``contractId`` / ``required`` — this test exercises the
-    provider's *extension-field tolerance* for older or custom contracts,
-    not a conforming 0.7.2 document.
+    The contract is labelled FLUID 0.7.1 rather than 0.7.2 because the
+    0.7.2 ``consumeRef`` schema has ``additionalProperties: false`` and
+    does not include ``contractId`` — this test exercises the provider's
+    *extension-field tolerance* for older or custom contracts, not a
+    conforming 0.7.2 document. Note that ``required`` is ODPS-Bitol-
+    forbidden under v1.0.0 and is stripped from the output regardless.
     """
     provider = OdpsStandardProvider()
 
@@ -163,14 +172,29 @@ def test_provider_render_emits_input_port_contract_id_and_required_only_when_set
 
     result = provider.render(contract)
 
+    # Explicit contractId preserved verbatim.
     assert result["inputPorts"][0]["contractId"] == "test.upstream.a.contract.v1"
-    assert result["inputPorts"][0]["required"] is False
-    # Second port: neither field was set → neither appears in the output.
-    assert "contractId" not in result["inputPorts"][1]
+    # Second port: no explicit contractId → synthesis fallback chain kicks
+    # in (reference → name). Must be set (v1.0.0 schema requires it) and
+    # stable — the exact value depends on what reference the canonical
+    # helper produces from productId+exposeId, which we treat as an impl
+    # detail. Pin that contractId is non-empty and matches a known source.
+    cid_1 = result["inputPorts"][1]["contractId"]
+    assert cid_1, "contractId must be synthesized when FLUID consume omits it"
+    assert (
+        "test.upstream.b" in cid_1 or "upstream_b" in cid_1
+    ), f"synthesized contractId should reflect the upstream source; got {cid_1!r}"
+    # ``required`` is NOT permitted on v1.0.0 InputPort — stripped.
+    assert "required" not in result["inputPorts"][0]
     assert "required" not in result["inputPorts"][1]
 
 
-def test_provider_render_preserves_input_port_source_system_metadata():
+def test_provider_render_strips_input_port_source_system_metadata():
+    """``sourceSystemId`` is a FLUID extension field; v1.0.0 ODPS-Bitol
+    InputPort (``additionalProperties: false``) does not permit it. The
+    provider strips it from the emitted artifact. Downstream consumers that
+    need source-system info should read it from the FLUID contract directly
+    or via the DMM provider overlay, not from the ODPS-Bitol artifact."""
     provider = OdpsStandardProvider()
 
     contract = {
@@ -191,7 +215,17 @@ def test_provider_render_preserves_input_port_source_system_metadata():
 
     result = provider.render(contract)
 
-    assert result["inputPorts"][0]["sourceSystemId"] == "bss-crm"
+    # sourceSystemId is NOT permitted on v1.0.0 InputPort — stripped.
+    assert "sourceSystemId" not in result["inputPorts"][0]
+    # Only the schema-permitted fields survive.
+    assert set(result["inputPorts"][0].keys()) <= {
+        "name",
+        "version",
+        "contractId",
+        "tags",
+        "customProperties",
+        "authoritativeDefinitions",
+    }
 
 
 def test_provider_render_skips_malformed_consume_entries(caplog):
@@ -218,8 +252,9 @@ def test_provider_render_skips_malformed_consume_entries(caplog):
     with caplog.at_level(logging.WARNING):
         result = provider.render(contract)
 
-    ids = [port["id"] for port in result["inputPorts"]]
-    assert ids == ["valid"]
+    # InputPort has no ``id`` under v1.0.0; assert via ``name`` instead.
+    names = [port["name"] for port in result["inputPorts"]]
+    assert names == ["valid"]
     # Two warnings for the two malformed entries.
     skip_warnings = [r for r in caplog.records if "Skipping consumes" in r.getMessage()]
     assert len(skip_warnings) == 2
