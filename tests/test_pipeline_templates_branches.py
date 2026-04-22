@@ -167,6 +167,28 @@ class TestBasePipelineTemplate:
         assert "doctor" in cmds
         assert "fluid" in cmds["validate"]
 
+    def test_get_fluid_commands_includes_policy_apply(self):
+        """Stage-8 policy enforcement must appear in the commands dict.
+        Missing this key breaks the 11-stage sequence: apply succeeds,
+        verify runs on an unprotected schema, silently diverging from
+        the declared governance policy. Regression-critical."""
+        cmds = BasePipelineTemplate()._get_fluid_commands()
+        assert "policy_apply" in cmds
+        # Must invoke the CLI command we actually ship.
+        assert "fluid policy-apply" in cmds["policy_apply"]
+        # Must default to enforce-mode — check-mode would be a silent
+        # advisory with no teeth, which defeats the stage's purpose.
+        assert "--mode enforce" in cmds["policy_apply"]
+
+    def test_get_fluid_commands_includes_diff_and_verify(self):
+        """Stage-5 drift gate + stage-9 verify must both exist. These
+        are the two reconciliation bookends around stages 6–8."""
+        cmds = BasePipelineTemplate()._get_fluid_commands()
+        assert "diff" in cmds
+        assert "--exit-on-drift" in cmds["diff"]
+        assert "verify" in cmds
+        assert "--strict" in cmds["verify"]
+
     def test_get_common_environment_vars(self):
         t = BasePipelineTemplate()
         env = t._get_common_environment_vars()

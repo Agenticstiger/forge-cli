@@ -241,6 +241,22 @@ class BasePipelineTemplate:
                 "fluid apply runtime/plan.json --yes; "
                 "fi"
             ),
+            # 11-stage pipeline stage 8 — enforce policy bindings against the
+            # freshly-applied schema. GRANT statements require the target
+            # objects to exist, so policy-apply runs AFTER apply but BEFORE
+            # verify — a transform running on an under-authorized object
+            # would otherwise mask the policy gap as a build failure.
+            # Skipped silently when bindings.json is absent (e.g. a
+            # reference-only contract that delegates policy to upstream).
+            "policy_apply": (
+                "if [ -f dist/artifacts/policy/bindings.json ]; then "
+                "fluid policy-apply dist/artifacts/policy/bindings.json "
+                "--mode enforce --env ${FLUID_ENV:-dev}; "
+                "elif [ -f runtime/policy/bindings.json ]; then "
+                "fluid policy-apply runtime/policy/bindings.json "
+                "--mode enforce --env ${FLUID_ENV:-dev}; "
+                "fi"
+            ),
             # 11-stage pipeline stage 9 — post-apply reconciliation. --strict
             # fails on any schema mismatch (not just missing objects), which
             # catches silent type coercions (TIMESTAMP_NTZ→LTZ, etc.). Writes
@@ -708,6 +724,24 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                 {
                     "name": f"Deploy to {env.upper()}",
                     "run": f"FLUID_ENV={env} {commands['apply']}",
+                },
+                # 11-stage pipeline stage 8 — policy enforcement. Runs
+                # AFTER apply (GRANTs need the target objects to exist)
+                # and BEFORE verify/tests (so unauthorized access surfaces
+                # as a clear policy failure, not a masked build error).
+                # Self-gates on bindings.json existence — no-op when the
+                # contract doesn't emit policies.
+                {
+                    "name": f"Enforce Policies ({env.upper()})",
+                    "run": f"FLUID_ENV={env} {commands['policy_apply']}",
+                },
+                # 11-stage pipeline stage 9 — post-apply reconciliation.
+                # Runs after policy enforcement so the verify pass sees the
+                # fully-authorized state. Writes a JSON report uploaded
+                # as a CI artifact below.
+                {
+                    "name": f"Verify Deployed State ({env.upper()})",
+                    "run": f"FLUID_ENV={env} {commands['verify']}",
                 },
                 {
                     "name": "Run Contract Tests",

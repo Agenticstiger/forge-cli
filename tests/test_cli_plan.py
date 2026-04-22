@@ -324,5 +324,215 @@ class TestRun(unittest.TestCase):
             run(args, LOG)
 
 
+# ---------------------------------------------------------------------------
+# Plan-binding digests + SchedulePlanner (Phase 6B wiring)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanDigestInjection(unittest.TestCase):
+    """Pin the stage-6 side of the plan-binding invariant: every plan.json
+    written by ``fluid plan`` MUST carry both ``bundleDigest`` (pins the
+    input bundle) and ``planDigest`` (catches tampering). Missing fields
+    break the stage-7 verify gate silently."""
+
+    @patch("fluid_build.cli.plan._display_plan_simple")
+    @patch("fluid_build.cli.plan._plan_legacy")
+    @patch("fluid_build.cli.plan._should_use_provider_actions")
+    @patch("fluid_build.cli.plan.load_contract_with_overlay")
+    def test_emits_plan_digest_for_yaml_contract(
+        self,
+        mock_load,
+        mock_should_use,
+        mock_legacy,
+        _mock_display,
+    ):
+        """Yaml-contract path → bundleDigest='' (no bundle to pin) but
+        planDigest MUST be populated so verify_plan_binding can run."""
+        mock_load.return_value = _minimal_contract()
+        mock_should_use.return_value = False
+        mock_legacy.return_value = {
+            "format_version": "0.5.7",
+            "actions": [],
+            "total_actions": 0,
+            "contract": {"name": "Test", "version": "0.5.7"},
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, "plan.json")
+            args = _make_args(out=out_path)
+            result = run(args, LOG)
+            self.assertEqual(result, 0)
+
+            with open(out_path) as f:
+                plan = json.load(f)
+
+            self.assertIn("bundleDigest", plan)
+            self.assertIn("planDigest", plan)
+            # YAML contract has no bundle → empty string, not missing.
+            self.assertEqual(plan["bundleDigest"], "")
+            # planDigest is always a real sha256.
+            self.assertTrue(plan["planDigest"].startswith("sha256:"))
+            self.assertEqual(len(plan["planDigest"]), 7 + 64)
+
+    @patch("fluid_build.cli.plan._display_plan_simple")
+    @patch("fluid_build.cli.plan._plan_legacy")
+    @patch("fluid_build.cli.plan._should_use_provider_actions")
+    @patch("fluid_build.cli.plan.load_contract_with_overlay")
+    def test_deterministic_plan_digest_across_runs(
+        self,
+        mock_load,
+        mock_should_use,
+        mock_legacy,
+        _mock_display,
+    ):
+        """Two runs with identical inputs produce identical planDigest.
+        This is what makes CI caching / determinism checks possible."""
+        mock_load.return_value = _minimal_contract()
+        mock_should_use.return_value = False
+        mock_legacy.return_value = {
+            "format_version": "0.5.7",
+            "actions": [],
+            "total_actions": 0,
+            "contract": {"name": "Test", "version": "0.5.7"},
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_a = os.path.join(tmpdir, "a.json")
+            out_b = os.path.join(tmpdir, "b.json")
+            run(_make_args(out=out_a), LOG)
+            run(_make_args(out=out_b), LOG)
+
+            plan_a = json.loads(open(out_a).read())
+            plan_b = json.loads(open(out_b).read())
+
+            self.assertEqual(plan_a["planDigest"], plan_b["planDigest"])
+
+
+class TestSchedulePlannerInvocation(unittest.TestCase):
+    """Pin Path-B scheduling: when ``orchestration.engine`` is a native
+    scheduler (eventbridge / snowflake_tasks / mwaa), plan.py must invoke
+    the provider planner and merge the schedule actions into the plan.
+    Regression here would silently break scheduled deployments."""
+
+    @patch("fluid_build.cli.plan._display_plan_simple")
+    @patch("fluid_build.cli.plan._plan_legacy")
+    @patch("fluid_build.cli.plan._should_use_provider_actions")
+    @patch("fluid_build.cli.plan.load_contract_with_overlay")
+    def test_path_a_contract_emits_no_schedule_actions(
+        self,
+        mock_load,
+        mock_should_use,
+        mock_legacy,
+        _mock_display,
+    ):
+        """Path-A engines (airflow) are handled by ``generate schedule``,
+        NOT by plan.py. plan must NOT add provider actions for them."""
+        contract = _minimal_contract()
+        contract["orchestration"] = {"engine": "airflow", "schedule": "0 * * * *"}
+        mock_load.return_value = contract
+        mock_should_use.return_value = False
+        mock_legacy.return_value = {
+            "format_version": "0.5.7",
+            "actions": [],
+            "total_actions": 0,
+            "contract": {"name": "Test", "version": "0.5.7"},
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = os.path.join(tmpdir, "plan.json")
+            run(_make_args(out=out), LOG)
+            with open(out) as f:
+                plan = json.load(f)
+            # No schedule actions appended for Path-A engines.
+            self.assertEqual(plan["total_actions"], 0)
+
+    @patch("fluid_build.cli.plan._display_plan_simple")
+    @patch("fluid_build.cli.plan._plan_legacy")
+    @patch("fluid_build.cli.plan._should_use_provider_actions")
+    @patch("fluid_build.cli.plan.load_contract_with_overlay")
+    def test_path_b_eventbridge_invokes_planner(
+        self,
+        mock_load,
+        mock_should_use,
+        mock_legacy,
+        _mock_display,
+    ):
+        """Path-B eventbridge contract must result in schedule actions
+        appearing in plan.json with ``op=eventbridge.ensure_schedule``
+        or ``op=lambda.ensure_function`` (both emitted together)."""
+        contract = _minimal_contract()
+        contract["id"] = "dp-sched"
+        contract["orchestration"] = {
+            "engine": "eventbridge",
+            "schedule": "rate(1 hour)",
+        }
+        mock_load.return_value = contract
+        mock_should_use.return_value = False
+        mock_legacy.return_value = {
+            "format_version": "0.5.7",
+            "actions": [],
+            "total_actions": 0,
+            "contract": {"name": "Test", "version": "0.5.7"},
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = os.path.join(tmpdir, "plan.json")
+            run(_make_args(out=out), LOG)
+            with open(out) as f:
+                plan = json.load(f)
+
+            # SchedulePlanner emits both a Lambda + an EventBridge rule
+            # for the eventbridge path. Assert presence of both.
+            ops = [a.get("op") for a in plan["actions"]]
+            self.assertIn("lambda.ensure_function", ops)
+            self.assertIn("eventbridge.ensure_schedule", ops)
+
+    @patch("fluid_build.cli.plan._display_plan_simple")
+    @patch("fluid_build.cli.plan._plan_legacy")
+    @patch("fluid_build.cli.plan._should_use_provider_actions")
+    @patch("fluid_build.cli.plan.load_contract_with_overlay")
+    def test_planner_failure_is_non_fatal(
+        self,
+        mock_load,
+        mock_should_use,
+        mock_legacy,
+        _mock_display,
+    ):
+        """If SchedulePlanner itself raises, plan.py must warn and
+        proceed — planning DDL is more important than wiring schedules."""
+        contract = _minimal_contract()
+        contract["orchestration"] = {
+            "engine": "eventbridge",
+            "schedule": "rate(1 hour)",
+        }
+        mock_load.return_value = contract
+        mock_should_use.return_value = False
+        mock_legacy.return_value = {
+            "format_version": "0.5.7",
+            "actions": [],
+            "total_actions": 0,
+            "contract": {"name": "Test", "version": "0.5.7"},
+        }
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("fluid_build.providers.aws.plan.schedule.SchedulePlanner") as mock_planner_cls,
+        ):
+            mock_planner_cls.return_value.plan_schedule_actions.side_effect = RuntimeError(
+                "STS unreachable"
+            )
+            out = os.path.join(tmpdir, "plan.json")
+            result = run(_make_args(out=out), LOG)
+
+            # Planner failure must not propagate — planning still returns 0.
+            self.assertEqual(result, 0)
+            with open(out) as f:
+                plan = json.load(f)
+            # Actions stay empty (scheduler output omitted) but plan still
+            # carries the digest fields so apply can verify.
+            self.assertEqual(plan["total_actions"], 0)
+            self.assertIn("planDigest", plan)
+
+
 if __name__ == "__main__":
     unittest.main()

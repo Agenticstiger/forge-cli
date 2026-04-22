@@ -213,6 +213,19 @@ your data product is production-ready with full observability.
             "``fluid rollback`` can restore it."
         ),
     )
+    mode_group.add_argument(
+        "--no-verify-digest",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the ``planDigest`` + ``bundleDigest`` verification that "
+            "normally runs before any DDL (emergency-hotfix escape hatch). "
+            "Use only when a legitimate plan.json exists but the original "
+            "bundle is unreachable (mid-incident recovery, out-of-band "
+            "DR runbook). Logged prominently so audit trails show the "
+            "operator waived the binding."
+        ),
+    )
 
     # Execution control
     execution_group = p.add_argument_group("Execution Control")
@@ -405,6 +418,47 @@ def _actions_from_source(src: str, env: str | None, provider, logger: logging.Lo
     return [{"op": "ensure_dataset"}, {"op": "ensure_table"}]
 
 
+def _verify_plan_digests(plan_data: Dict[str, Any], args, logger: logging.Logger) -> None:
+    """Enforce the stage-7 plan-binding gate.
+
+    Cryptographic "apply consumes exact plan" guarantee: before any DDL runs,
+    recompute ``planDigest`` over the plan body and compare against the
+    value stored in ``plan.json``. Mismatch → ``CLIError`` with a stable
+    ``event`` field so CI logs can classify the failure.
+
+    ``--no-verify-digest`` waives the check for legitimate emergencies
+    (bundle unreachable during DR). The waiver is logged at WARNING level
+    so audit trails show the operator made the call.
+
+    Plans without a ``planDigest`` field are treated as tamper signals —
+    legitimate plans always carry one. This catches both (a) plans produced
+    by an older fluid version and (b) plans that had the digest stripped.
+    """
+    if getattr(args, "no_verify_digest", False):
+        logger.warning(
+            "--no-verify-digest: plan-binding verification was SKIPPED. "
+            "This is an emergency escape hatch; the apply may be running "
+            "against a tampered or stale plan. Make sure this is recorded "
+            "in the change log."
+        )
+        return
+
+    # Local import so plan_digest's own import of bundle/tarfile only loads
+    # when verification actually happens (keeps cold-path tests fast).
+    from ..forge.core.plan_digest import PlanBindingError, verify_plan_binding
+
+    try:
+        verify_plan_binding(plan_data, bundle_path=None)
+    except PlanBindingError as exc:
+        # ``exc.kind`` is either ``bundle-mismatch`` or ``plan-tamper``.
+        # Surface it as the stable event field so CI log parsers can match.
+        raise CLIError(
+            1,
+            f"apply_plan_digest_{exc.kind.replace('-', '_')}",
+            context={"kind": exc.kind, "error": str(exc)},
+        )
+
+
 def run(args, logger: logging.Logger) -> int:
     """
     Main execution function for the apply command
@@ -488,6 +542,16 @@ def run(args, logger: logging.Logger) -> int:
             # Load pre-generated execution plan
             logger.info("Loading pre-generated execution plan")
             plan_data = read_json(args.contract)
+
+            # --- Plan-binding verification (stage-7 apply gate) ---
+            # Before ANY DDL runs, re-verify the plan's ``planDigest``
+            # (catches tampering between stages 6 and 7). ``bundleDigest``
+            # verification is skipped here because the plan is consumed
+            # standalone — the canonical path where both digests verify is
+            # ``fluid apply <bundle.tgz> --plan plan.json`` (Phase 7 wiring).
+            # ``--no-verify-digest`` waives the gate for emergency hotfixes.
+            _verify_plan_digests(plan_data, args, logger)
+
             contract = plan_data.get("contract", {})
             plan = ExecutionPlan(**plan_data.get("plan", {}))
             use_simple_mode = False

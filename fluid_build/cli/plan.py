@@ -29,10 +29,14 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fluid_build.cli.console import cprint, warning
 
+# 11-stage pipeline: stage-6 → stage-7 cryptographic plan-binding. ``plan.json``
+# carries ``bundleDigest`` (pins input bundle) + ``planDigest`` (catches
+# plan-file tampering). ``fluid apply`` re-verifies both before any DDL.
+from ..forge.core.plan_digest import inject_digests, is_bundle_path
 from ._common import (
     CLIError,
     build_provider,
@@ -40,6 +44,14 @@ from ._common import (
     resolve_provider_from_contract,
 )
 from ._logging import info, warn
+
+# Path-B scheduling engines. When ``orchestration.engine`` matches one of
+# these, plan.py invokes the provider-native scheduler planner so the
+# scheduling resources (EventBridge rules, Snowflake tasks, MWAA env) land
+# inside ``plan.json`` and get applied alongside DDL in stage 7. Path-A
+# engines (airflow/prefect/dagster) go through ``fluid generate schedule``
+# + ``fluid schedule-sync`` and do not need plan-time action emission.
+_PATH_B_ENGINES = {"eventbridge", "snowflake_tasks", "mwaa", "step-functions"}
 
 
 def _parse_semver(v: str) -> tuple:
@@ -209,6 +221,42 @@ def run(args, logger: logging.Logger) -> int:
         else:
             plan = _plan_legacy(contract, args, logger)
 
+        # --- Path-B scheduling (stage 6 ⇒ stage 7 pipeline) -----------------
+        # When ``orchestration.engine`` selects a provider-native scheduler
+        # (EventBridge / Snowflake Tasks / MWAA / Step Functions), merge the
+        # schedule actions into ``plan["actions"]`` so stage-7 apply creates
+        # them alongside DDL. Path-A engines (airflow/prefect/dagster) emit
+        # DAG files via ``fluid generate schedule`` — handled in stage 3, not
+        # here — so schedule wiring is a no-op for them.
+        schedule_actions = _plan_schedule_actions(contract, args, logger)
+        if schedule_actions:
+            existing = plan.get("actions") or []
+            plan["actions"] = list(existing) + schedule_actions
+            plan["total_actions"] = len(plan["actions"])
+
+        # --- Plan-binding digests (stage 6 ⇒ stage 7 pipeline) --------------
+        # ``bundleDigest`` pins the input bundle when the contract is a tgz;
+        # ``planDigest`` catches tampering of plan.json between stages 6 and
+        # 7. Both are verified by ``fluid apply`` before any DDL runs.
+        bundle_path: Path | None = Path(args.contract) if is_bundle_path(args.contract) else None
+        try:
+            plan = inject_digests(plan, bundle_path=bundle_path)
+        except FileNotFoundError as exc:
+            raise CLIError(
+                1,
+                "plan_bundle_missing",
+                context={"bundle": str(bundle_path), "error": str(exc)},
+            )
+        except ValueError as exc:
+            # ``read_bundle_digest`` raises ValueError on malformed MANIFEST
+            # or broken tarball. Surface as a dedicated event so CI logs
+            # don't blur bundle tamper with generic planner failure.
+            raise CLIError(
+                1,
+                "plan_bundle_invalid",
+                context={"bundle": str(bundle_path), "error": str(exc)},
+            )
+
         # Write plan to file (idempotent - only if changed)
         write_json_idempotent(args.out, plan)
 
@@ -254,6 +302,10 @@ def run(args, logger: logging.Logger) -> int:
                     if estimate.notes:
                         cprint(f"  Note: {estimate.notes}")
                     plan["cost_estimate"] = estimate.to_dict()
+                    # Re-inject digests — cost_estimate was added AFTER the
+                    # first inject, so planDigest no longer covers the plan
+                    # body. Recompute to keep the stage-7 tamper gate honest.
+                    plan = inject_digests(plan, bundle_path=bundle_path)
                     write_json_idempotent(args.out, plan)
                 else:
                     cprint("\nCost estimation: not supported by this provider")
@@ -329,6 +381,103 @@ def _validate_plan_actions(plan: Dict[str, Any], logger: logging.Logger) -> None
             cprint(f"   • {err}")
     else:
         cprint(f"\n✓  All {len(typed)} actions pass schema validation")
+
+
+def _plan_schedule_actions(
+    contract: Dict[str, Any], args, logger: logging.Logger
+) -> List[Dict[str, Any]]:
+    """Return Path-B scheduling actions for the contract, or ``[]``.
+
+    Path B (provider-native scheduling) puts schedule resources into
+    ``plan.json`` so stage-7 apply creates them alongside DDL. Today only
+    the AWS provider's ``SchedulePlanner`` is wired up; Snowflake-Tasks
+    lands when the Snowflake planner gains a schedule method. Other engines
+    (airflow/prefect/dagster — Path A) emit DAG files at stage 3 and get
+    synced at stage 11; they return ``[]`` here.
+
+    The helper is defensive by design — any import/runtime failure
+    degrades gracefully to "no schedule actions" with a warning. A
+    plan-time failure should never block apply for a contract whose
+    author didn't need schedule wiring at all.
+    """
+    orchestration = contract.get("orchestration") or {}
+    engine = str(orchestration.get("engine") or "").strip().lower()
+    if engine not in _PATH_B_ENGINES:
+        return []
+
+    # Today only AWS has a SchedulePlanner. Snowflake Tasks path is in
+    # scope but not yet implemented — log + skip so the plan still emits.
+    if engine == "snowflake_tasks":
+        warn(
+            logger,
+            "schedule_planner_not_implemented",
+            engine=engine,
+            detail="Snowflake Tasks scheduling is not yet wired into plan.py",
+        )
+        return []
+
+    try:
+        from ..providers.aws.plan.schedule import SchedulePlanner
+    except ImportError:
+        warn(
+            logger,
+            "schedule_planner_unavailable",
+            engine=engine,
+            detail="AWS schedule planner not importable — skipping schedule actions",
+        )
+        return []
+
+    # Resolve account + region for the planner. Fall back to placeholders
+    # so plan-time rendering works even without AWS creds; apply re-resolves
+    # against STS at execution time.
+    account_id = (
+        getattr(args, "project", None)
+        or contract.get("project")
+        or "000000000000"  # placeholder; apply resolves via STS
+    )
+    # Region resolution order (most-specific → least-specific):
+    #   1. --region CLI flag
+    #   2. contract.region (top-level declaration)
+    #   3. contract.binding.location.region (per-expose binding)
+    #   4. FLUID_DEFAULT_REGION env (project-wide override)
+    #   5. AWS_REGION / AWS_DEFAULT_REGION env (standard boto3 chain)
+    #   6. ``eu-west-1`` as a neutral EU default (GDPR-friendly; Dublin
+    #      is within the EEA). us-east-1 was the prior default but made
+    #      EU-first workflows hostile to inspect; operators who want us-east
+    #      export AWS_REGION=us-east-1 and get the old behaviour.
+    region_from_contract = contract.get("region")
+    if not region_from_contract:
+        for _expose in contract.get("exposes", []) or []:
+            _loc = (_expose.get("binding") or {}).get("location") or {}
+            if _loc.get("region"):
+                region_from_contract = _loc["region"]
+                break
+    region = (
+        getattr(args, "region", None)
+        or region_from_contract
+        or os.environ.get("FLUID_DEFAULT_REGION")
+        or os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or "eu-west-1"
+    )
+
+    try:
+        planner = SchedulePlanner(account_id=str(account_id), region=str(region), logger=logger)
+        actions = planner.plan_schedule_actions(contract)
+    except Exception as exc:
+        # Non-fatal — the contract will still apply, but operators need to
+        # set up schedules manually. Surfacing via warn() (not error()) is
+        # intentional: plan doesn't fail because schedule planning fails.
+        warn(
+            logger,
+            "schedule_planner_failed",
+            engine=engine,
+            error=str(exc),
+            detail="Schedule planner raised; schedule actions omitted from plan",
+        )
+        return []
+
+    return actions or []
 
 
 def _should_use_provider_actions(contract: Dict[str, Any], logger: logging.Logger) -> bool:

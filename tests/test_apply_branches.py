@@ -629,12 +629,23 @@ class TestApplyRunComplex:
     @patch("fluid_build.cli.apply.load_contract_with_overlay")
     def test_json_plan_input(self, _mock_load):
         from fluid_build.cli.apply import run
+        from fluid_build.forge.core.plan_digest import inject_digests
 
         args = _make_simple_args(contract="plan.json", dry_run=True)
-        plan_data = {
-            "contract": {"name": "test"},
-            "plan": {"contract_path": "test.yaml", "environment": "dev", "phases": []},
-        }
+        # Post-Phase-6B, plan.json MUST carry planDigest for the stage-7
+        # verification gate. Stamp one in so this test exercises the
+        # happy path of digest verification alongside the JSON-load branch.
+        plan_data = inject_digests(
+            {
+                "contract": {"name": "test"},
+                "plan": {
+                    "contract_path": "test.yaml",
+                    "environment": "dev",
+                    "phases": [],
+                },
+            },
+            bundle_path=None,
+        )
         with patch("fluid_build.cli.apply.read_json", return_value=plan_data):
             result = run(args, logging.getLogger("test"))
             assert result == 0
