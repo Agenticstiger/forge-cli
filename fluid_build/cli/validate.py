@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 from pathlib import Path
@@ -136,6 +137,28 @@ Examples:
         help="Show the schema being used for validation",
     )
 
+    # Bundle-mode options (stage-2 of the 11-stage pipeline)
+    p.add_argument(
+        "--report",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Write a structured JSON report to PATH. Format: "
+            "{bundleDigest, input, strict, status, summary, issues[]}. "
+            "Applies to .tgz bundles and (when set) routes single-contract "
+            "validation through the same pluggable validator registry."
+        ),
+    )
+    p.add_argument(
+        "--fail-fast",
+        action="store_true",
+        default=False,
+        help=(
+            "Stop traversal at the first error-severity issue. Default is "
+            "collect-all so one bad file doesn't hide issues in others."
+        ),
+    )
+
     p.set_defaults(cmd=COMMAND, func=run)
 
 
@@ -182,6 +205,14 @@ def run(args, logger: logging.Logger) -> int:
         contract_path = Path(args.contract)
         if not contract_path.exists():
             raise CLIError(1, "contract_file_not_found", {"path": str(contract_path)})
+
+        # ── Bundle (.tgz) validation — 11-stage pipeline stage 2 ─────────
+        # Detect a .tgz / .tar.gz input and dispatch to the extension-routed
+        # validator. Raw .fluid.yaml contracts continue through the legacy
+        # JSON-Schema path below (back-compat preserved).
+        contract_lower = str(contract_path).lower()
+        if contract_lower.endswith(".tgz") or contract_lower.endswith(".tar.gz"):
+            return _run_bundle_validation(contract_path, args, schema_manager, logger, start_time)
 
         # Load contract with overlay
         try:
@@ -766,6 +797,87 @@ def _try_workspace_validate(
         return 1
     cprint(f"All {passed} product{'s' if passed != 1 else ''} valid.")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Bundle (.tgz) validation — stage 2 of the 11-stage pipeline
+# ---------------------------------------------------------------------------
+
+
+def _run_bundle_validation(
+    tgz_path: Path,
+    args: argparse.Namespace,
+    schema_manager: FluidSchemaManager,
+    logger: logging.Logger,
+    start_time: float,
+) -> int:
+    """Dispatch a .tgz bundle through the extension-routed validator.
+
+    Returns 0 pass, 1 validation failures, 2 runtime errors. ``--report``
+    writes a structured JSON report regardless of status (useful for CI
+    artifact uploads even on pass).
+    """
+    from fluid_build.forge.core.validators import validate_bundle
+
+    strict = bool(getattr(args, "strict", False))
+    fail_fast = bool(getattr(args, "fail_fast", False))
+    report_path = getattr(args, "report", None)
+
+    try:
+        report = validate_bundle(
+            tgz_path,
+            schema_manager=schema_manager,
+            strict=strict,
+            fail_fast=fail_fast,
+        )
+    except Exception as exc:
+        raise CLIError(2, "bundle_validation_failed", {"path": str(tgz_path), "error": str(exc)})
+
+    # Print a compact summary to stderr (stdout is reserved for --format json).
+    out_format = getattr(args, "format", "text")
+    quiet = bool(getattr(args, "quiet", False))
+    verbose = bool(getattr(args, "verbose", False))
+
+    if out_format == "json":
+        cprint(json.dumps(report.to_dict(), indent=2))
+    elif not quiet:
+        status_icon = "✅" if report.status == "pass" else "❌"
+        cprint(f"{status_icon} Bundle {report.status}: {tgz_path}")
+        cprint(f"   digest: {report.bundle_digest}")
+        s = report.summary
+        cprint(
+            f"   issues: {s['total']} total "
+            f"({s.get('error', 0)} error, {s.get('warning', 0)} warning, "
+            f"{s.get('info', 0)} info)"
+        )
+        if verbose or report.status == "fail":
+            for issue in report.issues:
+                loc = ""
+                if issue.line is not None:
+                    loc = f" (L{issue.line}"
+                    if issue.column is not None:
+                        loc += f":C{issue.column}"
+                    loc += ")"
+                cprint(
+                    f"   [{issue.severity}] {issue.validator}: {issue.file}{loc}: "
+                    f"{issue.message}"
+                )
+
+    # Structured report file — atomic write.
+    if report_path:
+        p = Path(report_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8")
+        tmp.replace(p)
+        if verbose and not quiet:
+            cprint(f"   report written: {p}")
+
+    elapsed = time.time() - start_time
+    if verbose and not quiet:
+        cprint(f"   validation completed in {elapsed:.2f}s")
+
+    return 0 if report.status == "pass" else 1
 
 
 def _load_contract_for_workspace(
