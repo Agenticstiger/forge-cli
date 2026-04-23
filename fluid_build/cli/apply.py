@@ -177,13 +177,69 @@ your data product is production-ready with full observability.
     p.add_argument("contract", help="Path to contract.fluid.yaml or execution plan JSON file")
     p.add_argument("--env", help="Environment overlay (dev, staging, prod, etc.)")
 
+    # --- Mode matrix (11-stage pipeline stage 7) ---
+    # Six modes express every realistic deploy decision. See
+    # ``fluid_build.forge.core.apply_modes`` for the full matrix + semantics.
+    # Default is ``amend`` (additive schema evolution, data preserved).
+    from fluid_build.forge.core.apply_modes import CANONICAL_CHOICES as _MODE_CHOICES
+
+    mode_group = p.add_argument_group("Apply Mode (stage-7 dispatch)")
+    mode_group.add_argument(
+        "--mode",
+        choices=_MODE_CHOICES,
+        default=None,  # resolved by resolve_mode_with_build_alias; None = amend
+        help=(
+            "What DDL/DML to run against the target. "
+            "dry-run (render only; no warehouse calls). "
+            "create-only (fail if target exists; otherwise CREATE IF NOT EXISTS). "
+            "amend (default — ALTER ADD COLUMN IF NOT EXISTS; views CREATE OR REPLACE; "
+            "data preserved). "
+            "amend-and-build (amend + dbt run; transforms refreshed). "
+            "replace (auto-snapshot then DROP+RECREATE; requires --allow-data-loss "
+            "in non-dev or when target has rows). "
+            "replace-and-build (replace + dbt run --full-refresh). "
+            "See plan Part 1 for the full matrix."
+        ),
+    )
+    mode_group.add_argument(
+        "--allow-data-loss",
+        action="store_true",
+        default=False,
+        help=(
+            "Required for --mode replace / --mode replace-and-build when the "
+            "environment is not ``dev`` OR the target has rows. Explicit "
+            "operator opt-in that can't be accidentally typed. The pre-replace "
+            "table is snapshotted to ``<target>__backup_<ts>`` so "
+            "``fluid rollback`` can restore it."
+        ),
+    )
+    mode_group.add_argument(
+        "--no-verify-digest",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the ``planDigest`` + ``bundleDigest`` verification that "
+            "normally runs before any DDL (emergency-hotfix escape hatch). "
+            "Use only when a legitimate plan.json exists but the original "
+            "bundle is unreachable (mid-incident recovery, out-of-band "
+            "DR runbook). Logged prominently so audit trails show the "
+            "operator waived the binding."
+        ),
+    )
+
     # Execution control
     execution_group = p.add_argument_group("Execution Control")
     execution_group.add_argument(
         "--yes", action="store_true", help="Skip confirmation prompt and proceed automatically"
     )
     execution_group.add_argument(
-        "--dry-run", action="store_true", help="Show what would be executed without making changes"
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Show what would be executed without making changes. Equivalent to "
+            "--mode dry-run but retained as an orthogonal flag for back-compat "
+            "with existing CI scripts."
+        ),
     )
     execution_group.add_argument(
         "--timeout", type=int, default=120, help="Global timeout in minutes (default: 120)"
@@ -261,7 +317,13 @@ your data product is production-ready with full observability.
         "--build",
         "--build-id",
         dest="build_id",
-        help="Execute a specific build job by ID (from contract builds section)",
+        help=(
+            "Execute a specific build job by ID (from contract builds section). "
+            "DEPRECATED in 11-stage pipeline: use --mode amend-and-build (or "
+            "--mode replace-and-build) instead. When --build is set WITHOUT "
+            "--mode, the apply auto-upgrades to --mode amend-and-build with a "
+            "deprecation warning. Alias kept for one release."
+        ),
     )
     build_group.add_argument(
         "--delay",
@@ -337,7 +399,15 @@ def _actions_from_source(src: str, env: str | None, provider, logger: logging.Lo
         provider_actions = parser.parse(contract)
 
         if provider_actions:
-            logger.info(f"Parsed {len(provider_actions)} provider actions from 0.7.1 contract")
+            # Stamp each action with the CURRENT latest bundled schema
+            # version rather than a hardcoded literal. When the schema
+            # ships 0.8.x, the metadata tracks it automatically.
+            from fluid_build.schema_manager import SchemaManager
+
+            latest_version = SchemaManager.latest_bundled_version()
+            logger.info(
+                f"Parsed {len(provider_actions)} provider actions " f"(schema {latest_version})"
+            )
             return [
                 {
                     "op": action.action_type.value,
@@ -345,7 +415,7 @@ def _actions_from_source(src: str, env: str | None, provider, logger: logging.Lo
                     "provider": action.provider,
                     "params": action.params,
                     "depends_on": action.depends_on,
-                    "metadata": {"type": "provider_action", "version": "0.7.1"},
+                    "metadata": {"type": "provider_action", "version": latest_version},
                 }
                 for action in provider_actions
             ]
@@ -354,6 +424,47 @@ def _actions_from_source(src: str, env: str | None, provider, logger: logging.Lo
 
     # Final fallback
     return [{"op": "ensure_dataset"}, {"op": "ensure_table"}]
+
+
+def _verify_plan_digests(plan_data: Dict[str, Any], args, logger: logging.Logger) -> None:
+    """Enforce the stage-7 plan-binding gate.
+
+    Cryptographic "apply consumes exact plan" guarantee: before any DDL runs,
+    recompute ``planDigest`` over the plan body and compare against the
+    value stored in ``plan.json``. Mismatch → ``CLIError`` with a stable
+    ``event`` field so CI logs can classify the failure.
+
+    ``--no-verify-digest`` waives the check for legitimate emergencies
+    (bundle unreachable during DR). The waiver is logged at WARNING level
+    so audit trails show the operator made the call.
+
+    Plans without a ``planDigest`` field are treated as tamper signals —
+    legitimate plans always carry one. This catches both (a) plans produced
+    by an older fluid version and (b) plans that had the digest stripped.
+    """
+    if getattr(args, "no_verify_digest", False):
+        logger.warning(
+            "--no-verify-digest: plan-binding verification was SKIPPED. "
+            "This is an emergency escape hatch; the apply may be running "
+            "against a tampered or stale plan. Make sure this is recorded "
+            "in the change log."
+        )
+        return
+
+    # Local import so plan_digest's own import of bundle/tarfile only loads
+    # when verification actually happens (keeps cold-path tests fast).
+    from ..forge.core.plan_digest import PlanBindingError, verify_plan_binding
+
+    try:
+        verify_plan_binding(plan_data, bundle_path=None)
+    except PlanBindingError as exc:
+        # ``exc.kind`` is either ``bundle-mismatch`` or ``plan-tamper``.
+        # Surface it as the stable event field so CI log parsers can match.
+        raise CLIError(
+            1,
+            f"apply_plan_digest_{exc.kind.replace('-', '_')}",
+            context={"kind": exc.kind, "error": str(exc)},
+        )
 
 
 def run(args, logger: logging.Logger) -> int:
@@ -372,32 +483,114 @@ def run(args, logger: logging.Logger) -> int:
     # the dbt subprocess launched there reads os.environ for its profile.
     hydrate_dotenv(Path.cwd(), environment=getattr(args, "env", None))
 
-    # Log operation start
+    # --- Resolve --mode + --build back-compat (11-stage pipeline stage 7) ---
+    # ``--build X`` without ``--mode`` auto-upgrades to ``--mode amend-and-build``
+    # with a deprecation warning. ``--build`` combined with a non-build-augmented
+    # mode raises a clear error.
+    from fluid_build.forge.core.apply_modes import (
+        ApplyMode,
+        check_data_loss_gate,
+        is_dry_run,
+        needs_build,
+        resolve_mode_with_build_alias,
+    )
+
+    build_id = getattr(args, "build_id", None)
+    try:
+        resolved_mode, resolved_build_id = resolve_mode_with_build_alias(
+            getattr(args, "mode", None),
+            build_id if isinstance(build_id, str) else None,
+        )
+    except ValueError as exc:
+        raise CLIError(1, "apply_mode_invalid", {"error": str(exc)})
+
+    # Deprecation warning when the legacy --build flag kicked the upgrade.
+    if (
+        resolved_build_id
+        and getattr(args, "mode", None) is None
+        and resolved_mode is ApplyMode.AMEND_AND_BUILD
+    ):
+        logger.warning(
+            "--build is deprecated; use --mode amend-and-build instead. "
+            "This invocation has been auto-upgraded. --build will be removed "
+            "in the next release."
+        )
+
+    # --dry-run flag is still honored for back-compat; --mode dry-run is the
+    # canonical form. Normalize the two so the downstream code sees one signal.
+    effective_dry_run = bool(getattr(args, "dry_run", False)) or is_dry_run(resolved_mode)
+
+    # Log operation start — include resolved mode so observability surfaces it.
     log_operation_start(
         logger,
         "apply_contract",
         execution_id=execution_id,
         source=args.contract,
         env=args.env,
-        dry_run=args.dry_run,
+        dry_run=effective_dry_run,
+        mode=resolved_mode.value,
     )
 
     try:
-        # --- Build execution mode (absorbed from 'fluid execute') ---
-        build_id = getattr(args, "build_id", None)
-        if build_id and isinstance(build_id, str):
-            from .execute import run as execute_run
+        # --- Build execution mode (absorbed from legacy 'fluid execute') ---
+        # ``--mode amend-and-build`` / ``--mode replace-and-build`` + an
+        # explicit ``--build <id>`` delegate to build_runners. Legacy --build
+        # calls land here too (post-resolve mode is amend-and-build).
+        # force_run=True mirrors the historical ``_from_apply=True`` semantic.
+        if resolved_build_id and needs_build(resolved_mode):
+            # Ensure the build engine sees the resolved build_id even if the
+            # caller only passed --mode (no --build). Safe-no-op when already set.
+            args.build_id = resolved_build_id
+            from fluid_build.build_runners import run_builds_from_args
 
-            return execute_run(args, logger, _from_apply=True)
+            return run_builds_from_args(args, logger, force_run=True)
 
         # Load contract or execution plan
         if args.contract.endswith(".json"):
             # Load pre-generated execution plan
             logger.info("Loading pre-generated execution plan")
             plan_data = read_json(args.contract)
+
+            # --- Plan-binding verification (stage-7 apply gate) ---
+            # Before ANY DDL runs, re-verify the plan's ``planDigest``
+            # (catches tampering between stages 6 and 7). ``bundleDigest``
+            # verification is skipped here because the plan is consumed
+            # standalone — the canonical path where both digests verify is
+            # ``fluid apply <bundle.tgz> --plan plan.json`` (Phase 7 wiring).
+            # ``--no-verify-digest`` waives the gate for emergency hotfixes.
+            _verify_plan_digests(plan_data, args, logger)
+
             contract = plan_data.get("contract", {})
-            plan = ExecutionPlan(**plan_data.get("plan", {}))
-            use_simple_mode = False
+
+            # --- Plan-format detection ---
+            # Two plan.json shapes exist today:
+            #
+            # 1. plan.py output (Phase-6C canonical form): flat dict with
+            #    top-level ``actions`` + ``total_actions`` + full ``contract``.
+            #    Route to SIMPLE mode — provider detection + action dispatch
+            #    walks the embedded contract the same way yaml-loaded contracts
+            #    do.
+            # 2. Legacy orchestration format: nested ``plan`` sub-key with
+            #    ``contract_path`` + ``environment`` + ``phases``. Route to
+            #    COMPLEX mode — FluidOrchestrationEngine consumes the
+            #    ExecutionPlan dataclass directly.
+            #
+            # Heuristic: presence of ``plan_data["plan"]["phases"]`` identifies
+            # the legacy format. Anything else is the flat plan.py shape.
+            legacy_nested_plan = plan_data.get("plan")
+            has_legacy_orchestration_plan = (
+                isinstance(legacy_nested_plan, dict) and "phases" in legacy_nested_plan
+            )
+
+            if has_legacy_orchestration_plan:
+                plan = ExecutionPlan(**legacy_nested_plan)
+                use_simple_mode = False
+            else:
+                # plan.py flat format. Simple-mode path handles actions via
+                # ``_actions_from_source`` which reads plan_data["actions"]
+                # when args.contract is a .json file.
+                plan = None
+                use_simple_mode = True
         else:
             # Load contract
             logger.info(f"Loading FLUID contract: {args.contract}")
@@ -448,6 +641,29 @@ def run(args, logger: logging.Logger) -> int:
                 error.message = "Invalid --config-override JSON"
                 raise error from exc
             contract.update(override_config)
+
+        # --- Data-loss safety gate (11-stage pipeline stage 7) ---
+        # Destructive modes (``replace*``) require ``--allow-data-loss`` in any
+        # env where FLUID_ENV != dev OR the target has rows. This runs BEFORE
+        # any provider call so no DDL executes when the gate blocks.
+        #
+        # ``target_row_count=None`` signals "unknown" — the gate treats that as
+        # populated (fail-safe). Future enhancement: providers can implement
+        # a cheap ``estimate_row_count()`` and pass it in. For now, the gate's
+        # default behavior is "non-dev + replace → require --allow-data-loss
+        # unless you can prove the target is empty."
+        gate = check_data_loss_gate(
+            resolved_mode,
+            env=args.env,
+            target_row_count=None,  # unknown until provider check added
+            allow_data_loss=bool(getattr(args, "allow_data_loss", False)),
+        )
+        if gate.blocked:
+            raise CLIError(
+                1,
+                "apply_mode_data_loss_blocked",
+                {"mode": resolved_mode.value, "env": args.env, "reason": gate.reason},
+            )
 
         # Simple mode execution
         if use_simple_mode:

@@ -16,11 +16,19 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
-from ._common import CLIError, build_provider, load_contract_with_overlay, read_json, write_json
+from ._common import (
+    CLIError,
+    build_provider,
+    load_contract_with_overlay,
+    read_json,
+    resolve_provider_from_contract,
+    write_json,
+)
 from ._logging import info
 
 COMMAND = "diff"
@@ -46,8 +54,30 @@ def run(args, logger: logging.Logger) -> int:
     try:
         # Load contract and generate desired state
         contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
+
+        # Bug 5a: infer the provider from ``binding.platform`` when the
+        # operator didn't pass ``--provider`` and ``FLUID_PROVIDER`` env
+        # isn't set. Every other FLUID command auto-detects this way
+        # (apply, plan, verify); ``diff`` was the odd one out — it
+        # raised ``provider_not_specified`` and forced operators to
+        # re-run with the env var. The inferred name is passed to
+        # :func:`build_provider` which still honours explicit
+        # ``--provider`` / ``FLUID_PROVIDER`` (either wins over the
+        # contract inference, matching the existing precedence).
+        provider_arg = getattr(args, "provider", None)
+        if not provider_arg and not os.environ.get("FLUID_PROVIDER"):
+            inferred_platform, _inferred_location = resolve_provider_from_contract(contract)
+            if inferred_platform:
+                info(
+                    logger,
+                    "diff_provider_inferred",
+                    platform=inferred_platform,
+                    source="contract.binding.platform",
+                )
+                provider_arg = inferred_platform
+
         provider = build_provider(
-            getattr(args, "provider", None),
+            provider_arg,
             getattr(args, "project", None),
             getattr(args, "region", None),
             logger,
@@ -61,16 +91,39 @@ def run(args, logger: logging.Logger) -> int:
 
         # Load previous state if provided
         actual_resources: Set[str] = set()
+        has_baseline = False
         if args.state and Path(args.state).exists():
             info(logger, "diff_loading_state", state_file=args.state)
             state = read_json(args.state)
             actual_resources = _extract_resource_ids(state.get("results", []))
+            has_baseline = True
         else:
-            # Note: Most providers don't implement inventory yet, so we'll simulate
+            # Bug 5b: ``info(logger, message, **payload)`` — the second
+            # positional param is named ``message``. Passing
+            # ``message=...`` as a kwarg here collided with Python's
+            # argument binding: ``TypeError: info() got multiple values
+            # for argument 'message'``. Rename to ``detail`` (lands in
+            # the JSON payload as a structured field, same semantics).
+            #
+            # Note: Most providers don't implement live-inventory yet.
+            # Without ``--state``, ``actual_resources`` stays empty and
+            # every desired resource shows up as "added" — which the
+            # drift summary would otherwise hard-fail on under
+            # ``--exit-on-drift``. That's wrong: the drift gate should
+            # detect UNEXPECTED changes, not "we don't know the
+            # baseline." The ``has_baseline`` flag below downgrades
+            # the exit-on-drift check to a warning-only path in the
+            # no-state case (see summary logic below).
             info(
                 logger,
                 "diff_no_state",
-                message="No previous state file; showing planned changes only",
+                detail=(
+                    "No previous state file; treating this as a fresh "
+                    "baseline — exit-on-drift will NOT fire without a "
+                    "prior state to compare against. Pass --state "
+                    "<path-to-prior-apply-report.json> to enable "
+                    "drift-based gating."
+                ),
             )
 
         # Compare and categorize changes
@@ -105,8 +158,28 @@ def run(args, logger: logging.Logger) -> int:
             info(
                 logger, "diff_drift_detected", added=len(added), removed=len(removed), out=args.out
             )
-            if args.exit_on_drift:
+            # ``--exit-on-drift`` only fires when we had an actual
+            # baseline to compare against. Without ``--state``, the
+            # whole desired set counts as "added" — gating on that
+            # would make the first-ever Jenkins build of a product
+            # always fail at the drift stage. Closes the gap where
+            # the Jenkins template defaulted DIFF_EXIT_ON_DRIFT=true
+            # and every fresh pipeline run hit exit 1.
+            if args.exit_on_drift and has_baseline:
                 return 1
+            if args.exit_on_drift and not has_baseline:
+                info(
+                    logger,
+                    "diff_exit_on_drift_skipped",
+                    detail=(
+                        "--exit-on-drift requested but no --state "
+                        "baseline was supplied; drift cannot be "
+                        "cryptographically compared to a prior apply, "
+                        "so the gate is DOWNGRADED to a warning. "
+                        "Wire the last apply-report.json as --state "
+                        "to re-enable hard-fail drift gating."
+                    ),
+                )
         else:
             info(logger, "diff_no_drift", resources=len(unchanged), out=args.out)
 

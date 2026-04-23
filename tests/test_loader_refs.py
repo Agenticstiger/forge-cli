@@ -585,45 +585,45 @@ class TestBackwardCompatibility:
 
 
 # ===========================================================================
-# Unit tests: compile CLI helpers
+# Unit tests: bundle CLI helpers (formerly compile — renamed for 11-stage pipeline)
 # ===========================================================================
 class TestCompileCLIHelpers:
-    """Tests for compile.py helper functions."""
+    """Tests for bundle.py helper functions (class name kept for git blame stability)."""
 
     def test_infer_format_explicit_json(self):
-        from fluid_build.cli.compile import _infer_format
+        from fluid_build.cli.bundle import _infer_format
 
         assert _infer_format("out.yaml", "json") == "json"
 
     def test_infer_format_explicit_yaml(self):
-        from fluid_build.cli.compile import _infer_format
+        from fluid_build.cli.bundle import _infer_format
 
         assert _infer_format("out.json", "yaml") == "yaml"
 
     def test_infer_format_from_json_extension(self):
-        from fluid_build.cli.compile import _infer_format
+        from fluid_build.cli.bundle import _infer_format
 
         assert _infer_format("out.json", None) == "json"
 
     def test_infer_format_from_yaml_extension(self):
-        from fluid_build.cli.compile import _infer_format
+        from fluid_build.cli.bundle import _infer_format
 
         assert _infer_format("out.yaml", None) == "yaml"
 
     def test_infer_format_stdout_defaults_yaml(self):
-        from fluid_build.cli.compile import _infer_format
+        from fluid_build.cli.bundle import _infer_format
 
         assert _infer_format("-", None) == "yaml"
 
     def test_serialize_json(self):
-        from fluid_build.cli.compile import _serialize
+        from fluid_build.cli.bundle import _serialize
 
         result = _serialize({"a": 1, "b": [2, 3]}, "json")
         parsed = json.loads(result)
         assert parsed == {"a": 1, "b": [2, 3]}
 
     def test_serialize_yaml(self):
-        from fluid_build.cli.compile import _serialize
+        from fluid_build.cli.bundle import _serialize
 
         result = _serialize({"a": 1, "b": [2, 3]}, "yaml")
         parsed = yaml.safe_load(result)
@@ -634,7 +634,7 @@ class TestCompileCLIRun:
     """Integration tests for the compile command run() function."""
 
     def test_compile_to_file(self, tmp_path):
-        from fluid_build.cli.compile import run
+        from fluid_build.cli.bundle import run
 
         _write_yaml(tmp_path / "frag.yaml", {"resolved": True})
         _write_yaml(
@@ -659,7 +659,7 @@ class TestCompileCLIRun:
         assert "$ref" not in out_path.read_text()
 
     def test_compile_to_json_file(self, tmp_path):
-        from fluid_build.cli.compile import run
+        from fluid_build.cli.bundle import run
 
         _write_yaml(tmp_path / "contract.yaml", {"name": "test", "val": 42})
         out_path = tmp_path / "bundled.json"
@@ -678,7 +678,7 @@ class TestCompileCLIRun:
         assert result["name"] == "test"
 
     def test_compile_missing_file_returns_2(self, tmp_path):
-        from fluid_build.cli.compile import run
+        from fluid_build.cli.bundle import run
 
         args = argparse.Namespace(
             contract=str(tmp_path / "nonexistent.yaml"),
@@ -691,7 +691,7 @@ class TestCompileCLIRun:
         assert rc == 2
 
     def test_compile_broken_ref_returns_2(self, tmp_path):
-        from fluid_build.cli.compile import run
+        from fluid_build.cli.bundle import run
 
         _write_yaml(
             tmp_path / "contract.yaml",
@@ -709,7 +709,7 @@ class TestCompileCLIRun:
         assert rc == 2
 
     def test_compile_with_env_overlay(self, tmp_path):
-        from fluid_build.cli.compile import run
+        from fluid_build.cli.bundle import run
 
         _write_yaml(
             tmp_path / "contract.yaml",

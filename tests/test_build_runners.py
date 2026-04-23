@@ -12,7 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for fluid_build.cli.execute."""
+"""Tests for fluid_build.build_runners (migrated from tests/test_execute.py).
+
+Module-path mapping from the legacy ``cli/execute.py``:
+
+- ``fluid_build.cli.execute.is_dbt_build`` / ``_resolve_env_placeholders``
+  / ``run_builds_from_args`` (was ``run``) → ``fluid_build.build_runners.base``
+- Python script runner (``execute_build``, ``resolve_script_path``) →
+  ``fluid_build.build_runners.python.runner``
+- dbt runner (``execute_dbt_build``, ``build_dbt_command``,
+  ``resolve_dbt_project_path``, all ``_*dbt*`` container + env helpers) →
+  ``fluid_build.build_runners.dbt.runner``
+- dbt profile builders (``_build_generated_dbt_profile``,
+  ``_create_temp_dbt_profiles_dir``, ``_load_dbt_project_config``) →
+  ``fluid_build.build_runners.dbt.profiles``
+
+``_from_apply=True`` was renamed to ``force_run=True`` (no deprecation banner
+to suppress anymore — ``fluid execute`` was removed).
+"""
 
 import argparse
 import json
@@ -22,23 +39,31 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from fluid_build.cli._common import CLIError
-from fluid_build.cli.execute import (
-    _build_containerized_dbt_command,
+from fluid_build.build_runners.base import (
+    _resolve_env_placeholders,
+    is_dbt_build,
+)
+from fluid_build.build_runners.base import (
+    run_builds_from_args as run,
+)
+from fluid_build.build_runners.dbt.profiles import (
     _build_generated_dbt_profile,
-    _collect_dbt_container_env,
     _create_temp_dbt_profiles_dir,
+)
+from fluid_build.build_runners.dbt.runner import (
+    _build_containerized_dbt_command,
+    _collect_dbt_container_env,
     _dbt_command_supports_adapter,
     _render_command_for_log,
-    _resolve_env_placeholders,
     build_dbt_command,
-    execute_build,
     execute_dbt_build,
-    is_dbt_build,
     resolve_dbt_project_path,
-    resolve_script_path,
-    run,
 )
+from fluid_build.build_runners.python.runner import (
+    execute_build,
+    resolve_script_path,
+)
+from fluid_build.cli._common import CLIError
 
 # ── resolve_script_path ───────────────────────────────────────────────
 
@@ -207,7 +232,8 @@ class TestBuildDbtCommand:
         }
 
         with patch(
-            "fluid_build.cli.execute._resolve_dbt_executable", return_value="/opt/homebrew/bin/dbt"
+            "fluid_build.build_runners.dbt.runner._resolve_dbt_executable",
+            return_value="/opt/homebrew/bin/dbt",
         ):
             cmd = build_dbt_command(build, project_dir, profiles_dir=Path("/tmp/dbt-profiles"))
 
@@ -229,7 +255,8 @@ class TestBuildDbtCommand:
         }
 
         with patch(
-            "fluid_build.cli.execute._resolve_dbt_executable", return_value="/opt/homebrew/bin/dbt"
+            "fluid_build.build_runners.dbt.runner._resolve_dbt_executable",
+            return_value="/opt/homebrew/bin/dbt",
         ):
             cmd = build_dbt_command(build, project_dir)
 
@@ -248,7 +275,8 @@ class TestBuildDbtCommand:
         }
 
         with patch(
-            "fluid_build.cli.execute._resolve_dbt_executable", return_value="/opt/homebrew/bin/dbt"
+            "fluid_build.build_runners.dbt.runner._resolve_dbt_executable",
+            return_value="/opt/homebrew/bin/dbt",
         ):
             cmd = build_dbt_command(build, project_dir)
 
@@ -644,13 +672,19 @@ class TestBuildDbtCommandExecutionSelection:
 
         with (
             patch(
-                "fluid_build.cli.execute._resolve_dbt_executable",
+                "fluid_build.build_runners.dbt.runner._resolve_dbt_executable",
                 return_value="/opt/homebrew/bin/dbt",
             ),
-            patch("fluid_build.cli.execute._dbt_command_supports_adapter", return_value=False),
-            patch("fluid_build.cli.execute.shutil.which", return_value="/usr/local/bin/docker"),
             patch(
-                "fluid_build.cli.execute._build_containerized_dbt_command",
+                "fluid_build.build_runners.dbt.runner._dbt_command_supports_adapter",
+                return_value=False,
+            ),
+            patch(
+                "fluid_build.build_runners.dbt.runner.shutil.which",
+                return_value="/usr/local/bin/docker",
+            ),
+            patch(
+                "fluid_build.build_runners.dbt.runner._build_containerized_dbt_command",
                 return_value=["docker", "run", "dbt"],
             ) as mock_container,
         ):
@@ -678,16 +712,19 @@ class TestBuildDbtCommandExecutionSelection:
 
         with (
             patch(
-                "fluid_build.cli.execute._resolve_dbt_executable",
+                "fluid_build.build_runners.dbt.runner._resolve_dbt_executable",
                 return_value="/opt/homebrew/bin/dbt",
             ),
             patch(
-                "fluid_build.cli.execute._dbt_command_supports_adapter",
+                "fluid_build.build_runners.dbt.runner._dbt_command_supports_adapter",
                 return_value=False,
             ),
-            patch("fluid_build.cli.execute.shutil.which", return_value="/usr/local/bin/docker"),
             patch(
-                "fluid_build.cli.execute._build_containerized_dbt_command",
+                "fluid_build.build_runners.dbt.runner.shutil.which",
+                return_value="/usr/local/bin/docker",
+            ),
+            patch(
+                "fluid_build.build_runners.dbt.runner._build_containerized_dbt_command",
                 side_effect=lambda adapter, args, pd, pfd: ["docker", *args],
             ),
         ):
@@ -769,7 +806,7 @@ class TestDbtCommandSupportsAdapter:
             mock.stderr = ""
             return mock
 
-        monkeypatch.setattr("fluid_build.cli.execute.subprocess.run", fake_run)
+        monkeypatch.setattr("fluid_build.build_runners.dbt.runner.subprocess.run", fake_run)
 
         assert _dbt_command_supports_adapter("/opt/dbt", "snowflake") is True
         assert _dbt_command_supports_adapter("/opt/dbt", "snowflake") is True
@@ -792,7 +829,7 @@ class TestExecuteBuild:
             "execution": {"trigger": {"type": "manual", "iterations": 3}},
         }
         script = self._make_script(tmp_path)
-        with patch("fluid_build.cli.execute.cprint"):
+        with patch("fluid_build.build_runners.python.runner.cprint"):
             result = execute_build(build, script, tmp_path, dry_run=True)
         assert result == 0
 
@@ -802,7 +839,7 @@ class TestExecuteBuild:
             "execution": {"trigger": {"type": "schedule", "cron": "0 0 * * *"}},
         }
         script = self._make_script(tmp_path)
-        with patch("fluid_build.cli.execute.cprint"):
+        with patch("fluid_build.build_runners.python.runner.cprint"):
             result = execute_build(build, script, tmp_path)
         assert result == 0
 
@@ -812,7 +849,7 @@ class TestExecuteBuild:
             "execution": {"trigger": {"type": "unknown_type"}},
         }
         script = self._make_script(tmp_path)
-        with patch("fluid_build.cli.execute.cprint"):
+        with patch("fluid_build.build_runners.python.runner.cprint"):
             result = execute_build(build, script, tmp_path)
         assert result == 1
 
@@ -825,9 +862,11 @@ class TestExecuteBuild:
         mock_result = Mock(returncode=0, stderr="")
 
         with (
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.subprocess.run", return_value=mock_result),
+            patch("fluid_build.build_runners.python.runner.cprint"),
+            patch("fluid_build.build_runners.python.runner.success"),
+            patch(
+                "fluid_build.build_runners.python.runner.subprocess.run", return_value=mock_result
+            ),
         ):
             result = execute_build(build, script, tmp_path, delay=0)
         assert result == 0
@@ -841,9 +880,11 @@ class TestExecuteBuild:
         mock_result = Mock(returncode=1, stderr="error!")
 
         with (
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.console_error"),
-            patch("fluid_build.cli.execute.subprocess.run", return_value=mock_result),
+            patch("fluid_build.build_runners.python.runner.cprint"),
+            patch("fluid_build.build_runners.python.runner.console_error"),
+            patch(
+                "fluid_build.build_runners.python.runner.subprocess.run", return_value=mock_result
+            ),
         ):
             result = execute_build(build, script, tmp_path, delay=0)
         assert result == 1
@@ -857,9 +898,11 @@ class TestExecuteBuild:
         mock_result = Mock(returncode=1, stderr="")
 
         with (
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.console_error"),
-            patch("fluid_build.cli.execute.subprocess.run", return_value=mock_result),
+            patch("fluid_build.build_runners.python.runner.cprint"),
+            patch("fluid_build.build_runners.python.runner.console_error"),
+            patch(
+                "fluid_build.build_runners.python.runner.subprocess.run", return_value=mock_result
+            ),
         ):
             result = execute_build(build, script, tmp_path, delay=0, fail_fast=True)
         assert result == 1
@@ -872,9 +915,12 @@ class TestExecuteBuild:
         script = self._make_script(tmp_path)
 
         with (
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.console_error"),
-            patch("fluid_build.cli.execute.subprocess.run", side_effect=RuntimeError("boom")),
+            patch("fluid_build.build_runners.python.runner.cprint"),
+            patch("fluid_build.build_runners.python.runner.console_error"),
+            patch(
+                "fluid_build.build_runners.python.runner.subprocess.run",
+                side_effect=RuntimeError("boom"),
+            ),
         ):
             result = execute_build(build, script, tmp_path, delay=0, fail_fast=True)
         assert result == 1
@@ -888,10 +934,12 @@ class TestExecuteBuild:
         mock_result = Mock(returncode=0, stderr="")
 
         with (
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.subprocess.run", return_value=mock_result),
-            patch("fluid_build.cli.execute.time.sleep") as mock_sleep,
+            patch("fluid_build.build_runners.python.runner.cprint"),
+            patch("fluid_build.build_runners.python.runner.success"),
+            patch(
+                "fluid_build.build_runners.python.runner.subprocess.run", return_value=mock_result
+            ),
+            patch("fluid_build.build_runners.python.runner.time.sleep") as mock_sleep,
         ):
             execute_build(build, script, tmp_path, delay=5)
         mock_sleep.assert_called_once_with(5)
@@ -906,10 +954,12 @@ class TestExecuteBuild:
         mock_result = Mock(returncode=0, stderr="")
 
         with (
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.subprocess.run", return_value=mock_result),
-            patch("fluid_build.cli.execute.time.sleep") as mock_sleep,
+            patch("fluid_build.build_runners.python.runner.cprint"),
+            patch("fluid_build.build_runners.python.runner.success"),
+            patch(
+                "fluid_build.build_runners.python.runner.subprocess.run", return_value=mock_result
+            ),
+            patch("fluid_build.build_runners.python.runner.time.sleep") as mock_sleep,
         ):
             execute_build(build, script, tmp_path, delay=2)
         mock_sleep.assert_called_once_with(10)
@@ -932,9 +982,9 @@ class TestExecuteBuild:
             return mock_result
 
         with (
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.subprocess.run", side_effect=fake_run),
+            patch("fluid_build.build_runners.python.runner.cprint"),
+            patch("fluid_build.build_runners.python.runner.success"),
+            patch("fluid_build.build_runners.python.runner.subprocess.run", side_effect=fake_run),
             patch.dict("os.environ", {"VIRTUAL_ENV": str(tmp_path)}),
         ):
             execute_build(build, script, tmp_path, delay=0)
@@ -951,9 +1001,14 @@ class TestExecuteBuild:
         printed = []
 
         with (
-            patch("fluid_build.cli.execute.cprint", side_effect=lambda m: printed.append(m)),
-            patch("fluid_build.cli.execute.console_error"),
-            patch("fluid_build.cli.execute.subprocess.run", return_value=mock_result),
+            patch(
+                "fluid_build.build_runners.python.runner.cprint",
+                side_effect=lambda m: printed.append(m),
+            ),
+            patch("fluid_build.build_runners.python.runner.console_error"),
+            patch(
+                "fluid_build.build_runners.python.runner.subprocess.run", return_value=mock_result
+            ),
         ):
             execute_build(build, script, tmp_path, delay=0, no_output=True)
 
@@ -972,9 +1027,9 @@ class TestExecuteDbtBuild:
         project_dir = self._make_project(tmp_path)
 
         with (
-            patch("fluid_build.cli.execute.cprint"),
+            patch("fluid_build.build_runners.dbt.runner.cprint"),
             patch(
-                "fluid_build.cli.execute.build_dbt_command",
+                "fluid_build.build_runners.dbt.runner.build_dbt_command",
                 return_value=["dbt", "build", "--project-dir", str(project_dir)],
             ),
         ):
@@ -988,13 +1043,13 @@ class TestExecuteDbtBuild:
         mock_result = Mock(returncode=0, stdout="", stderr="")
 
         with (
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
+            patch("fluid_build.build_runners.dbt.runner.cprint"),
+            patch("fluid_build.build_runners.dbt.runner.success"),
             patch(
-                "fluid_build.cli.execute.build_dbt_command",
+                "fluid_build.build_runners.dbt.runner.build_dbt_command",
                 return_value=["dbt", "build", "--project-dir", str(project_dir)],
             ),
-            patch("fluid_build.cli.execute.subprocess.run", return_value=mock_result),
+            patch("fluid_build.build_runners.dbt.runner.subprocess.run", return_value=mock_result),
         ):
             result = execute_dbt_build(build, project_dir, tmp_path, delay=0)
 
@@ -1010,13 +1065,15 @@ class TestExecuteDbtBuild:
         mock_result = Mock(returncode=0, stdout="", stderr="")
 
         with (
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
+            patch("fluid_build.build_runners.dbt.runner.cprint"),
+            patch("fluid_build.build_runners.dbt.runner.success"),
             patch(
-                "fluid_build.cli.execute.build_dbt_command",
+                "fluid_build.build_runners.dbt.runner.build_dbt_command",
                 return_value=["dbt", "build", "--project-dir", str(project_dir)],
             ),
-            patch("fluid_build.cli.execute.subprocess.run", return_value=mock_result) as mock_run,
+            patch(
+                "fluid_build.build_runners.dbt.runner.subprocess.run", return_value=mock_result
+            ) as mock_run,
         ):
             result = execute_dbt_build(build, project_dir, tmp_path, delay=0, force_run=True)
 
@@ -1057,12 +1114,12 @@ class TestRun:
 
         with (
             patch(
-                "fluid_build.cli.execute.load_contract_with_overlay",
+                "fluid_build.build_runners.base.load_contract_with_overlay",
                 return_value={"builds": []},
             ),
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.console_error"),
+            patch("fluid_build.build_runners.base.cprint"),
+            patch("fluid_build.build_runners.base.success"),
+            patch("fluid_build.build_runners.base.console_error"),
         ):
             result = run(args, logger)
         assert result == 0
@@ -1075,10 +1132,10 @@ class TestRun:
 
         with (
             patch(
-                "fluid_build.cli.execute.load_contract_with_overlay",
+                "fluid_build.build_runners.base.load_contract_with_overlay",
                 return_value={"builds": [{"id": "other-build"}]},
             ),
-            patch("fluid_build.cli.execute.cprint"),
+            patch("fluid_build.build_runners.base.cprint"),
         ):
             result = run(args, logger)
         assert result == 1
@@ -1090,7 +1147,7 @@ class TestRun:
         logger = logging.getLogger("test")
 
         with patch(
-            "fluid_build.cli.execute.load_contract_with_overlay",
+            "fluid_build.build_runners.base.load_contract_with_overlay",
             side_effect=ValueError("bad yaml"),
         ):
             with pytest.raises(CLIError) as exc_info:
@@ -1106,12 +1163,12 @@ class TestRun:
 
         with (
             patch(
-                "fluid_build.cli.execute.load_contract_with_overlay",
+                "fluid_build.build_runners.base.load_contract_with_overlay",
                 return_value={"builds": [build]},
             ),
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.console_error"),
+            patch("fluid_build.build_runners.base.cprint"),
+            patch("fluid_build.build_runners.base.success"),
+            patch("fluid_build.build_runners.base.console_error"),
         ):
             result = run(args, logger)
         assert result == 0
@@ -1127,14 +1184,17 @@ class TestRun:
 
         with (
             patch(
-                "fluid_build.cli.execute.load_contract_with_overlay",
+                "fluid_build.build_runners.base.load_contract_with_overlay",
                 return_value={"builds": [build]},
             ),
-            patch("fluid_build.cli.execute.resolve_script_path", return_value=script_path),
-            patch("fluid_build.cli.execute.execute_build", return_value=0),
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.console_error"),
+            patch(
+                "fluid_build.build_runners.python.runner.resolve_script_path",
+                return_value=script_path,
+            ),
+            patch("fluid_build.build_runners.python.runner.execute_build", return_value=0),
+            patch("fluid_build.build_runners.base.cprint"),
+            patch("fluid_build.build_runners.base.success"),
+            patch("fluid_build.build_runners.base.console_error"),
         ):
             result = run(args, logger)
         assert result == 0
@@ -1155,16 +1215,21 @@ class TestRun:
 
         with (
             patch(
-                "fluid_build.cli.execute.load_contract_with_overlay",
+                "fluid_build.build_runners.base.load_contract_with_overlay",
                 return_value={"builds": [build]},
             ),
-            patch("fluid_build.cli.execute.resolve_dbt_project_path", return_value=project_dir),
-            patch("fluid_build.cli.execute.execute_dbt_build", return_value=0) as mock_execute_dbt,
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.console_error"),
+            patch(
+                "fluid_build.build_runners.dbt.runner.resolve_dbt_project_path",
+                return_value=project_dir,
+            ),
+            patch(
+                "fluid_build.build_runners.dbt.runner.execute_dbt_build", return_value=0
+            ) as mock_execute_dbt,
+            patch("fluid_build.build_runners.base.cprint"),
+            patch("fluid_build.build_runners.base.success"),
+            patch("fluid_build.build_runners.base.console_error"),
         ):
-            result = run(args, logger, _from_apply=True)
+            result = run(args, logger, force_run=True)
 
         assert result == 0
         assert mock_execute_dbt.call_args.kwargs["force_run"] is True
@@ -1184,16 +1249,21 @@ class TestRun:
 
         with (
             patch(
-                "fluid_build.cli.execute.load_contract_with_overlay",
+                "fluid_build.build_runners.base.load_contract_with_overlay",
                 return_value={"builds": [build]},
             ),
-            patch("fluid_build.cli.execute.resolve_script_path", return_value=script_path),
-            patch("fluid_build.cli.execute.execute_build", return_value=0) as mock_execute,
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.console_error"),
+            patch(
+                "fluid_build.build_runners.python.runner.resolve_script_path",
+                return_value=script_path,
+            ),
+            patch(
+                "fluid_build.build_runners.python.runner.execute_build", return_value=0
+            ) as mock_execute,
+            patch("fluid_build.build_runners.base.cprint"),
+            patch("fluid_build.build_runners.base.success"),
+            patch("fluid_build.build_runners.base.console_error"),
         ):
-            result = run(args, logger, _from_apply=True)
+            result = run(args, logger, force_run=True)
 
         assert result == 0
         assert mock_execute.call_args.kwargs["force_run"] is True
@@ -1209,14 +1279,17 @@ class TestRun:
 
         with (
             patch(
-                "fluid_build.cli.execute.load_contract_with_overlay",
+                "fluid_build.build_runners.base.load_contract_with_overlay",
                 return_value={"builds": [build]},
             ),
-            patch("fluid_build.cli.execute.resolve_script_path", return_value=script_path),
-            patch("fluid_build.cli.execute.execute_build", return_value=1),
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.console_error"),
+            patch(
+                "fluid_build.build_runners.python.runner.resolve_script_path",
+                return_value=script_path,
+            ),
+            patch("fluid_build.build_runners.python.runner.execute_build", return_value=1),
+            patch("fluid_build.build_runners.base.cprint"),
+            patch("fluid_build.build_runners.base.success"),
+            patch("fluid_build.build_runners.base.console_error"),
         ):
             result = run(args, logger)
         assert result == 1
@@ -1241,14 +1314,20 @@ class TestRun:
 
         with (
             patch(
-                "fluid_build.cli.execute.load_contract_with_overlay",
+                "fluid_build.build_runners.base.load_contract_with_overlay",
                 return_value={"builds": builds},
             ),
-            patch("fluid_build.cli.execute.resolve_script_path", return_value=script_path),
-            patch("fluid_build.cli.execute.execute_build", side_effect=fake_execute_build),
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.console_error"),
+            patch(
+                "fluid_build.build_runners.python.runner.resolve_script_path",
+                return_value=script_path,
+            ),
+            patch(
+                "fluid_build.build_runners.python.runner.execute_build",
+                side_effect=fake_execute_build,
+            ),
+            patch("fluid_build.build_runners.base.cprint"),
+            patch("fluid_build.build_runners.base.success"),
+            patch("fluid_build.build_runners.base.console_error"),
         ):
             result = run(args, logger)
 
@@ -1275,14 +1354,20 @@ class TestRun:
 
         with (
             patch(
-                "fluid_build.cli.execute.load_contract_with_overlay",
+                "fluid_build.build_runners.base.load_contract_with_overlay",
                 return_value={"builds": builds},
             ),
-            patch("fluid_build.cli.execute.resolve_script_path", return_value=script_path),
-            patch("fluid_build.cli.execute.execute_build", side_effect=fake_execute_build),
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.console_error"),
+            patch(
+                "fluid_build.build_runners.python.runner.resolve_script_path",
+                return_value=script_path,
+            ),
+            patch(
+                "fluid_build.build_runners.python.runner.execute_build",
+                side_effect=fake_execute_build,
+            ),
+            patch("fluid_build.build_runners.base.cprint"),
+            patch("fluid_build.build_runners.base.success"),
+            patch("fluid_build.build_runners.base.console_error"),
         ):
             result = run(args, logger)
 
@@ -1301,13 +1386,15 @@ class TestRun:
 
         with (
             patch(
-                "fluid_build.cli.execute.load_contract_with_overlay",
+                "fluid_build.build_runners.base.load_contract_with_overlay",
                 return_value={"builds": [build]},
             ),
-            patch("fluid_build.cli.execute.execute_dbt_build", return_value=0) as mock_execute_dbt,
-            patch("fluid_build.cli.execute.cprint"),
-            patch("fluid_build.cli.execute.success"),
-            patch("fluid_build.cli.execute.console_error"),
+            patch(
+                "fluid_build.build_runners.dbt.runner.execute_dbt_build", return_value=0
+            ) as mock_execute_dbt,
+            patch("fluid_build.build_runners.base.cprint"),
+            patch("fluid_build.build_runners.base.success"),
+            patch("fluid_build.build_runners.base.console_error"),
         ):
             result = run(args, logger)
 

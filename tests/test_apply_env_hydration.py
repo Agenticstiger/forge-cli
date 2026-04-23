@@ -33,8 +33,8 @@ from fluid_build.cli import apply as apply_module
 
 def test_apply_run_hydrates_dotenv_before_branch_dispatch(tmp_path: Path) -> None:
     # Build a minimal argparse.Namespace that apply.run will short-circuit on.
-    # The --build path delegates to execute.run; we stub that so we can assert
-    # hydrate_dotenv fired *before* the delegation happens.
+    # The --build path delegates to build_runners.run_builds_from_args; we stub
+    # that so we can assert hydrate_dotenv fired *before* the delegation happens.
     args = argparse.Namespace(
         contract=str(tmp_path / "contract.fluid.yaml"),
         env=None,
@@ -48,20 +48,20 @@ def test_apply_run_hydrates_dotenv_before_branch_dispatch(tmp_path: Path) -> Non
     def _fake_hydrate(project_root: Path, environment=None) -> None:
         call_order.append("hydrate")
 
-    def _fake_execute_run(args, logger, _from_apply=False) -> int:
-        call_order.append("execute")
+    def _fake_run_builds(args, logger, *, force_run=False) -> int:
+        call_order.append("run_builds")
         return 0
 
     with (
         patch.object(apply_module, "hydrate_dotenv", _fake_hydrate),
-        patch("fluid_build.cli.execute.run", _fake_execute_run),
+        patch("fluid_build.build_runners.run_builds_from_args", _fake_run_builds),
     ):
         rc = apply_module.run(args, logging.getLogger("test"))
 
     assert rc == 0
-    # Critically: hydrate ran, and ran *before* execute — otherwise the dbt
-    # subprocess launched inside execute_run would see empty SNOWFLAKE_*.
-    assert call_order == ["hydrate", "execute"]
+    # Critically: hydrate ran, and ran *before* run_builds — otherwise the dbt
+    # subprocess launched inside build_runners would see empty SNOWFLAKE_*.
+    assert call_order == ["hydrate", "run_builds"]
 
 
 def test_apply_run_passes_env_overlay_to_hydrate(tmp_path: Path) -> None:
@@ -82,7 +82,7 @@ def test_apply_run_passes_env_overlay_to_hydrate(tmp_path: Path) -> None:
 
     with (
         patch.object(apply_module, "hydrate_dotenv", _fake_hydrate),
-        patch("fluid_build.cli.execute.run", lambda *a, **k: 0),
+        patch("fluid_build.build_runners.run_builds_from_args", lambda *a, **k: 0),
     ):
         apply_module.run(args, logging.getLogger("test"))
 

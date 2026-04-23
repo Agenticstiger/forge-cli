@@ -26,10 +26,14 @@
 
 Think of it as **Terraform for data products**: one contract, many clouds, zero boilerplate.
 
+The everyday flow is three commands — validate, plan, apply. Behind the scenes, FLUID Forge ships an **11-stage deterministic pipeline** with cryptographic plan-binding and per-stage hard gates:
+
 ```
-contract.fluid.yaml  →  fluid validate  →  fluid plan  →  fluid apply
-       (declare)          (check)           (preview)       (deploy)
+bundle → validate → generate-artifacts → validate-artifacts → diff →
+plan → apply → policy-apply → verify → publish → schedule-sync
 ```
+
+You rarely run all 11 by hand; `fluid generate ci` emits a parameterized CI pipeline (Jenkins, GitHub Actions, GitLab CI, Azure DevOps, Bitbucket, CircleCI, Tekton) that runs every stage in order with cryptographic binding between stages 6 and 7 — apply refuses to proceed if the plan has been tampered with since it was computed. See [AGENTS.md](AGENTS.md#the-11-stage-pipeline) for the full stage lifecycle and [the apply mode matrix](AGENTS.md#apply-mode-matrix) (`dry-run`, `create-only`, `amend`, `amend-and-build`, `replace`, `replace-and-build`).
 
 ---
 
@@ -76,6 +80,30 @@ That's it. You just deployed a **versioned, governed, and orchestrated Data Prod
 
 > **Want to move from local to Google Cloud?**
 > `pip install "data-product-forge[gcp]"` → change `platform: local` to `platform: gcp` → run `fluid apply`. **Done.**
+
+### From dev to CI — `fluid generate ci`
+
+When you're ready to run the full 11-stage pipeline in CI instead of manually, one command emits the pipeline file for your CI system:
+
+```bash
+# Jenkins (ships the richest template today — every stage parameterized)
+fluid generate ci --system jenkins --out Jenkinsfile
+
+# GitHub Actions, GitLab, Azure DevOps, Bitbucket, CircleCI, Tekton
+fluid generate ci --system github --out .github/workflows/fluid.yml
+```
+
+The generated Jenkinsfile has a **"Build with Parameters"** dialog where operators pick the subset of stages to run + the apply mode + the publish targets + schedule-sync scheduler — all without editing Groovy:
+
+| Param | Default | Purpose |
+|---|---|---|
+| `RUN_STAGE_N_*` (11 booleans) | all `true` | Toggle individual stages |
+| `APPLY_MODE` | `amend` | 6-mode choice |
+| `ALLOW_DATA_LOSS` | `false` | Required for `replace*` outside dev |
+| `PUBLISH_TARGETS` | `datamesh-manager` | Space-separated list |
+| `SCHEDULER` | `` (none) | DAG push target for stage 11 |
+
+Generated Jenkinsfiles install `fluid` via `pip install data-product-forge` at build time by default. For lab iteration against a local forge-cli checkout, `fluid generate ci --install-mode dev-source` emits a Jenkinsfile that bind-mounts your checkout inside the Jenkins container — zero pip install, changes reflect live.
 
 ---
 

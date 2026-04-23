@@ -292,24 +292,48 @@ class SnowflakeProviderEnhanced(BaseProvider):
         """
         Dispatch action to appropriate service handler.
 
-        Routes actions based on operation prefix:
-        - sf.database.*: Database operations
-        - sf.schema.*: Schema operations
-        - sf.table.*: Table operations
-        - sf.view.*: View operations
-        - sf.stream.*: Stream operations
-        - sf.task.*: Task operations
-        - sf.procedure.*: Stored procedure operations
-        - sf.udf.*: User-defined function operations
-        - sf.grant.*: RBAC operations
-        - sf.share.*: Data sharing operations
+        Two dispatch modes are supported, in this order:
+
+        1. **0.7.1 abstract ops** (``provisionDataset``, ``grantAccess``,
+           ``revokeAccess``, ``scheduleTask``, ``registerSchema``,
+           ``createView``, ``updatePolicy``, ``publishEvent``,
+           ``custom``). These are the provider-agnostic op names that
+           ``fluid plan`` emits into ``plan.json`` when the contract is
+           fluidVersion >= 0.7.1. Each is translated into one or more
+           synthetic sub-actions with ``sf.*`` ops and re-dispatched.
+           Status is aggregated via :meth:`_aggregate_sub_status`.
+
+        2. **Native ``sf.*`` ops** (``sf.database.ensure``,
+           ``sf.schema.ensure``, etc.). These are the low-level routes
+           used by the native planner directly, and as the target of
+           abstract-op translation above.
+
+        Phase 6F: previously only mode 2 was implemented; abstract ops
+        fell through to the ``unknown_action_op`` branch and returned
+        silent no-ops while apply reported SUCCESS. This dispatcher now
+        handles both.
         """
         op = action.get("op")
 
         if not op:
             raise ProviderError("Action missing required 'op' field")
 
-        # Route to service-specific handlers
+        # ── 1. Abstract-op dispatch (0.7.1) ──────────────────────────
+        abstract_handlers = {
+            "provisionDataset": self._handle_abstract_provision_dataset,
+            "registerSchema": self._handle_abstract_register_schema,
+            "createView": self._handle_abstract_create_view,
+            "grantAccess": self._handle_abstract_grant_access,
+            "revokeAccess": self._handle_abstract_revoke_access,
+            "scheduleTask": self._handle_abstract_schedule_task,
+            "updatePolicy": self._handle_abstract_update_policy,
+            "publishEvent": self._handle_abstract_publish_event,
+            "custom": self._handle_abstract_custom,
+        }
+        if op in abstract_handlers:
+            return abstract_handlers[op](action)
+
+        # ── 2. Native sf.* prefix dispatch ───────────────────────────
         if op.startswith("sf.database."):
             return self._execute_database_action(action)
         elif op.startswith("sf.schema."):
@@ -340,6 +364,415 @@ class SnowflakeProviderEnhanced(BaseProvider):
                 "reason": f"Unknown operation: {op}",
                 "changed": False,
             }
+
+    # -------------------------------------------------------------------------
+    # 0.7.1 abstract-op handlers (Phase 6F)
+    #
+    # Each handler translates an abstract op into one or more synthetic
+    # sub-actions with native ``sf.*`` ops, dispatches each through the
+    # existing service-specific handlers, then aggregates sub-results.
+    # Kept as small single-purpose methods so each op's translation is
+    # auditable in isolation.
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _binding_location(action: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract ``params.binding.location`` with ``{{ env.X }}`` resolved.
+
+        The 0.7.1 ActionType spec nests the target identity under
+        ``params.binding.location`` for every dataset-touching op. The
+        planner emits ``{{ env.SNOWFLAKE_DATABASE }}``-style templates
+        for the account/database/schema values (so ``plan.json`` is
+        environment-agnostic); apply-time resolution uses the Snowflake
+        provider's canonical resolver. Returning a safe empty dict lets
+        handlers do ``loc.get("database")`` without a guard at the call
+        site.
+        """
+        from .util.config import resolve_env_templates
+
+        params = action.get("params") or {}
+        binding = params.get("binding") or {}
+        raw = binding.get("location") or {}
+        return {k: resolve_env_templates(v) for k, v in raw.items()}
+
+    @staticmethod
+    def _aggregate_sub_status(sub_results: List[Dict[str, Any]]) -> str:
+        """Roll up status across sub-actions.
+
+        - any ``error`` → overall ``error`` (first one wins for reason)
+        - any ``success`` → overall ``success``
+        - otherwise → ``skipped``
+
+        Matches the semantics of the Phase 6F test suite in
+        :mod:`tests.providers.test_snowflake_abstract_ops`.
+        """
+        if not sub_results:
+            return "skipped"
+        if any(r.get("status") == "error" for r in sub_results):
+            return "error"
+        if any(r.get("status") == "success" for r in sub_results):
+            return "success"
+        return "skipped"
+
+    def _handle_abstract_provision_dataset(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """provisionDataset → ensure_database + ensure_schema (+ ensure_table).
+
+        Field flow — ``ensure_database`` / ``ensure_schema`` /
+        ``ensure_table`` read action keys at the **top level** (not nested
+        under ``params``). The synthetic sub-actions built here flatten
+        accordingly so the downstream handlers find their inputs.
+
+        The ``ensure_table`` sub-action is emitted only when the caller
+        supplies ``params.table.columns`` (or ``params.columns``). For
+        reference-style data products that delegate table shape to dbt,
+        the table step is skipped and only the db + schema are ensured.
+        The dbt runner then creates the table during stage-7's
+        ``amend-and-build`` mode.
+        """
+        loc = self._binding_location(action)
+        action_id = action.get("id")
+        sub_results: List[Dict[str, Any]] = []
+
+        account = loc.get("account")
+        database = loc.get("database")
+        schema = loc.get("schema")
+        table = loc.get("table")
+
+        if not database or not schema:
+            return {
+                "status": "error",
+                "op": "provisionDataset",
+                "action_id": action_id,
+                "reason": (
+                    "params.binding.location must include database and schema "
+                    f"(got database={database!r}, schema={schema!r})"
+                ),
+                "changed": False,
+            }
+
+        # Sub-action 1: ensure_database (fields at top level)
+        sub_db = {
+            "op": "sf.database.ensure",
+            "id": f"{action_id}.db" if action_id else None,
+            "account": account,
+            "database": database,
+        }
+        sub_results.append(self._execute_database_action(sub_db))
+        if sub_results[-1].get("status") == "error":
+            return {
+                "status": "error",
+                "op": "provisionDataset",
+                "action_id": action_id,
+                "sub_results": sub_results,
+                "reason": "ensure_database failed",
+                "changed": any(r.get("changed") for r in sub_results),
+            }
+
+        # Sub-action 2: ensure_schema
+        sub_sc = {
+            "op": "sf.schema.ensure",
+            "id": f"{action_id}.schema" if action_id else None,
+            "account": account,
+            "database": database,
+            "schema": schema,
+        }
+        sub_results.append(self._execute_schema_action(sub_sc))
+        if sub_results[-1].get("status") == "error":
+            return {
+                "status": "error",
+                "op": "provisionDataset",
+                "action_id": action_id,
+                "sub_results": sub_results,
+                "reason": "ensure_schema failed",
+                "changed": any(r.get("changed") for r in sub_results),
+            }
+
+        # Sub-action 3 (optional): ensure_table. Only emitted when the
+        # caller supplied an explicit column spec; reference contracts
+        # defer table creation to dbt in stage-7's build.
+        if table:
+            params = action.get("params") or {}
+            table_spec = params.get("table") or params.get("tableSpec") or {}
+            columns = table_spec.get("columns") or params.get("columns")
+            if columns:
+                sub_tb = {
+                    "op": "sf.table.ensure",
+                    "id": f"{action_id}.table" if action_id else None,
+                    "account": account,
+                    "database": database,
+                    "schema": schema,
+                    "table": table,
+                    "columns": columns,
+                    **{
+                        k: v
+                        for k, v in table_spec.items()
+                        if k in {"comment", "cluster_by", "tags"}
+                    },
+                }
+                sub_results.append(self._execute_table_action(sub_tb))
+            else:
+                # Record an informational skipped result so the apply
+                # report carries evidence that table creation was
+                # deferred — important for operators debugging why a
+                # table didn't appear.
+                sub_results.append(
+                    {
+                        "status": "skipped",
+                        "op": "sf.table.ensure",
+                        "table": table,
+                        "reason": (
+                            "no columns in params.table.columns / params.columns; "
+                            "deferring table creation to dbt build"
+                        ),
+                        "changed": False,
+                    }
+                )
+
+        return {
+            "status": self._aggregate_sub_status(sub_results),
+            "op": "provisionDataset",
+            "action_id": action_id,
+            "sub_results": sub_results,
+            "changed": any(r.get("changed") for r in sub_results),
+        }
+
+    def _handle_abstract_register_schema(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """registerSchema → ensure_database + ensure_schema only."""
+        loc = self._binding_location(action)
+        action_id = action.get("id")
+        sub_results: List[Dict[str, Any]] = []
+
+        account = loc.get("account")
+        database = loc.get("database")
+        schema = loc.get("schema")
+
+        if not database or not schema:
+            return {
+                "status": "error",
+                "op": "registerSchema",
+                "action_id": action_id,
+                "reason": "params.binding.location must include database and schema",
+                "changed": False,
+            }
+
+        sub_results.append(
+            self._execute_database_action(
+                {
+                    "op": "sf.database.ensure",
+                    "id": f"{action_id}.db" if action_id else None,
+                    "account": account,
+                    "database": database,
+                }
+            )
+        )
+        if sub_results[-1].get("status") == "error":
+            return {
+                "status": "error",
+                "op": "registerSchema",
+                "action_id": action_id,
+                "sub_results": sub_results,
+                "changed": any(r.get("changed") for r in sub_results),
+            }
+
+        sub_results.append(
+            self._execute_schema_action(
+                {
+                    "op": "sf.schema.ensure",
+                    "id": f"{action_id}.schema" if action_id else None,
+                    "account": account,
+                    "database": database,
+                    "schema": schema,
+                }
+            )
+        )
+
+        return {
+            "status": self._aggregate_sub_status(sub_results),
+            "op": "registerSchema",
+            "action_id": action_id,
+            "sub_results": sub_results,
+            "changed": any(r.get("changed") for r in sub_results),
+        }
+
+    def _handle_abstract_create_view(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """createView → ensure_view. ``params.sql`` / ``params.view.sql``
+        carries the view body; flattened to top-level ``query`` on the
+        sub-action because :func:`ensure_view` reads ``action["query"]``.
+        """
+        loc = self._binding_location(action)
+        action_id = action.get("id")
+        params = action.get("params") or {}
+
+        sql = params.get("sql") or (params.get("view") or {}).get("sql")
+        if not sql:
+            return {
+                "status": "error",
+                "op": "createView",
+                "action_id": action_id,
+                "reason": "params.sql (or params.view.sql) is required for createView",
+                "changed": False,
+            }
+
+        view_name = loc.get("table") or loc.get("view") or params.get("name")
+        sub = {
+            "op": "sf.view.ensure",
+            "id": f"{action_id}.view" if action_id else None,
+            "account": loc.get("account"),
+            "database": loc.get("database"),
+            "schema": loc.get("schema"),
+            "name": view_name,
+            "query": sql,
+        }
+        result = self._execute_view_action(sub)
+        return {
+            "status": result.get("status", "success"),
+            "op": "createView",
+            "action_id": action_id,
+            "sub_results": [result],
+            "changed": result.get("changed", False),
+        }
+
+    def _handle_abstract_grant_access(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """grantAccess → sf.grant.privilege (or sf.grant.role).
+
+        Dispatches on ``params.type``: "role" → grant_role,
+        otherwise → grant_privilege.
+        """
+        params = action.get("params") or {}
+        action_id = action.get("id")
+        grant_type = params.get("type", "privilege").lower()
+
+        if grant_type == "role":
+            sub = {
+                "op": "sf.grant.role",
+                "id": f"{action_id}.grant" if action_id else None,
+                "params": params,
+            }
+        else:
+            sub = {
+                "op": "sf.grant.privilege",
+                "id": f"{action_id}.grant" if action_id else None,
+                "params": params,
+            }
+        result = self._execute_grant_action(sub)
+        return {
+            "status": result.get("status", "success"),
+            "op": "grantAccess",
+            "action_id": action_id,
+            "sub_results": [result],
+            "changed": result.get("changed", False),
+        }
+
+    def _handle_abstract_revoke_access(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """revokeAccess — deferred.
+
+        Revocation requires a REVOKE DDL path that the current action
+        handlers in ``snowflake.actions.grants`` do not yet expose. We
+        deliberately return ``skipped`` with a machine-readable reason
+        rather than error-out, because a revocation that doesn't happen
+        is a visibility issue (fail loud in audit logs) rather than a
+        pipeline halt.
+        """
+        return {
+            "status": "skipped",
+            "op": "revokeAccess",
+            "action_id": action.get("id"),
+            "reason": (
+                "revokeAccess is not yet implemented in the enhanced "
+                "Snowflake provider; grants are not auto-revoked. "
+                "Track under trello-verify-revoke-access."
+            ),
+            "changed": False,
+        }
+
+    def _handle_abstract_schedule_task(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """scheduleTask → Path-B handled by SchedulePlanner; Path-A uses
+        stage-11 fluid schedule-sync. Return skipped-with-reason so apply
+        reports an explicit no-op rather than silently succeed."""
+        params = action.get("params") or {}
+        engine = params.get("engine") or params.get("orchestration", {}).get("engine") or "unknown"
+        return {
+            "status": "skipped",
+            "op": "scheduleTask",
+            "action_id": action.get("id"),
+            "reason": (
+                f"schedule task deferred (engine={engine}). Path-B engines "
+                "(snowflake_tasks, eventbridge) land schedule actions in "
+                "plan.json for stage-7 apply via SchedulePlanner; Path-A "
+                "engines (airflow, prefect, dagster) are pushed by stage-11 "
+                "fluid schedule-sync."
+            ),
+            "changed": False,
+        }
+
+    def _handle_abstract_update_policy(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """updatePolicy — deferred.
+
+        Policy update in Snowflake maps to SECURITY.* DDL that is
+        primarily driven by the dedicated ``fluid policy-apply`` stage-8
+        command. Return skipped so this op appears in apply's report
+        without firing a duplicate or conflicting DDL path.
+        """
+        return {
+            "status": "skipped",
+            "op": "updatePolicy",
+            "action_id": action.get("id"),
+            "reason": (
+                "policy updates are driven by stage-8 ``fluid policy-apply`` "
+                "against policy/bindings.json; stage-7 apply treats "
+                "updatePolicy as a declarative marker."
+            ),
+            "changed": False,
+        }
+
+    def _handle_abstract_publish_event(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """publishEvent — skipped silently.
+
+        Snowflake has no native event-publish primitive. The op is
+        accepted without warning so contracts that emit events for
+        cross-provider consumers (e.g. BigQuery subscribers) don't
+        trigger false alarms in Snowflake apply.
+        """
+        return {
+            "status": "skipped",
+            "op": "publishEvent",
+            "action_id": action.get("id"),
+            "reason": "publishEvent has no Snowflake primitive; no-op by design",
+            "changed": False,
+        }
+
+    def _handle_abstract_custom(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """custom → sf.sql.execute on params.sql.
+
+        Provides an escape hatch for contracts that embed raw SQL (e.g.
+        warehouse sizing, stream-append statements) that no other op
+        covers. Fails loud if ``params.sql`` is missing — a custom op
+        without SQL is always a contract authoring bug.
+        """
+        action_id = action.get("id")
+        params = action.get("params") or {}
+        sql = params.get("sql")
+        if not sql:
+            return {
+                "status": "error",
+                "op": "custom",
+                "action_id": action_id,
+                "reason": "custom op requires params.sql",
+                "changed": False,
+            }
+        sub = {
+            "op": "sf.sql.execute",
+            "id": f"{action_id}.sql" if action_id else None,
+            "params": {"sql": sql},
+        }
+        result = self._execute_sql_action(sub)
+        return {
+            "status": result.get("status", "success"),
+            "op": "custom",
+            "action_id": action_id,
+            "sub_results": [result],
+            "changed": result.get("changed", False),
+        }
 
     def _execute_database_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """Execute database operations."""

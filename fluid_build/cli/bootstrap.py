@@ -46,7 +46,8 @@ _STABLE_COMMANDS = frozenset(
         "plan",
         "apply",
         "graph",
-        "execute",
+        # "execute" removed — deprecated subcommand deleted when build_runners
+        # landed. Users should call ``fluid apply --build <id>`` instead.
         "verify",
         "export",
         "docs",
@@ -505,7 +506,9 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
             gr.set_defaults(func=cmd_graph_run)
 
     # --- Simple registrations (profile-gated via _try_register) ---
-    _try_register(sp, "execute", "execute")
+    # ``fluid execute`` was deleted when build_runners landed. Its engine code
+    # moved to ``fluid_build.build_runners``; ``fluid apply --build <id>`` is
+    # the canonical entry point.
     _try_register(sp, "verify", "verify")
     _try_register(sp, "viz_plan", "viz-plan")
     _try_register(sp, "contract_tests", "contract-tests")
@@ -543,15 +546,14 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     _try_register(sp, "auth", "auth")
     _try_register(sp, "marketplace", "marketplace")  # deprecated — use market --blueprints
     _try_register(sp, "publish", "publish")
-    _try_register(sp, "compile", "bundle")
-    # Hidden backwards-compat alias: ``fluid compile`` → ``fluid bundle``
-    try:
-        from . import compile as _compile_mod
-
-        if hasattr(_compile_mod, "register_alias"):
-            _compile_mod.register_alias(sp)
-    except ImportError:
-        pass
+    _try_register(sp, "bundle", "bundle")
+    _try_register(sp, "validate_artifacts", "validate-artifacts")
+    _try_register(sp, "schedule_sync", "schedule-sync")
+    _try_register(sp, "verify_signature", "verify-signature")
+    _try_register(sp, "rollback", "rollback")
+    # The hidden ``fluid compile`` alias was removed when the 11-stage
+    # pipeline landed. Users running ``fluid compile`` now get the standard
+    # argparse "invalid choice" error, which is the desired signal.
     _try_register(sp, "split", "split")
     _try_register(sp, "preview", "preview")  # deprecated — use plan --html
     _try_register(sp, "diff", "diff")

@@ -60,6 +60,7 @@ class DbtEngine(TransformationEngine):
         schema_context: Optional[Dict[str, Any]] = None,
         transformation_intent: Optional[TransformationIntent] = None,
         workspace_root: Optional[Path] = None,
+        mesh_hub: Optional[str] = None,
     ) -> GenerationResult:
         files: GenerationResult = {}
 
@@ -94,8 +95,17 @@ class DbtEngine(TransformationEngine):
         # ``additional_files`` (system prompt mandates it).
         technique = transformation_intent.data_modeling_technique if transformation_intent else None
         if technique not in {"data_vault_2", "dimensional"}:
-            schema_files = generate_schema_yml(contract)
+            schema_files = generate_schema_yml(contract, mesh_hub=mesh_hub)
             files.update(schema_files)
+        elif mesh_hub:
+            # DV2 / dimensional techniques own schema.yml themselves
+            # (the LLM pipeline emits it via additional_files). But
+            # dependencies.yml is orthogonal to schema.yml, so we
+            # still emit it when mesh_hub is set — the LLM pipeline
+            # doesn't touch this file.
+            from .schema_yml import _mesh_only_output
+
+            files.update(_mesh_only_output(mesh_hub))
 
         # profiles.yml
         profiles_content = generate_profiles(contract, build)

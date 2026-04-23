@@ -27,7 +27,7 @@ non-zero.  Example printed output:
 
     ❌ LockfileMismatch: fragments/builds/main.yaml has been edited but
        contract.lock.yaml is out of date.
-       Fix: run 'fluid compile' and commit the updated contract.bundled.yaml
+       Fix: run 'fluid bundle' and commit the updated contract.bundled.yaml
             and contract.lock.yaml.
        Docs: https://fluid-build.dev/docs/fragments#lockfile
 
@@ -130,8 +130,8 @@ class FragmentShapeError(ActionableError):
 class LockfileMismatchError(ActionableError):
     """Raised when ``contract.lock.yaml`` is out of date.
 
-    Surfaced by ``fluid compile --check`` (future slice F2).  The fix
-    is always "run `fluid compile` and commit the updated files".
+    Surfaced by ``fluid bundle --check`` (future slice F2).  The fix
+    is always "run `fluid bundle` and commit the updated files".
     """
 
     code = "fluid.lockfile.mismatch"

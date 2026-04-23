@@ -1,5 +1,16 @@
 # Copyright 2024-2026 Agentics Transformation Ltd
-# Licensed under the Apache License, Version 2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Tests for static CI generation and Jenkins pipeline behavior.
 
@@ -37,8 +48,17 @@ from fluid_build.forge.core.pipeline_templates import (
 _logger = logging.getLogger("test_generate_ci_jenkins")
 
 
-def _make_args(system: str = "jenkins", out: Optional[str] = None) -> argparse.Namespace:
-    return argparse.Namespace(system=system, out=out, contract="contract.fluid.yaml")
+def _make_args(
+    system: str = "jenkins",
+    out: Optional[str] = None,
+    install_mode: str = "pypi",
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        system=system,
+        out=out,
+        contract="contract.fluid.yaml",
+        install_mode=install_mode,
+    )
 
 
 # ``generate_ci.run`` now delegates to
@@ -61,7 +81,9 @@ _GENERATE_CI_EXPECTATIONS = (
     (
         "jenkins",
         "Jenkinsfile",
-        ("pipeline {", "stage('Validate')", "stage('Plan')", "fluid"),
+        # 11-stage parameterized template — names are prefixed with stage
+        # number ("2 · validate", "6 · plan") per the perfect-pipeline design.
+        ("pipeline {", "stage('2 · validate')", "stage('6 · plan')", "parameters {", "fluid"),
     ),
     (
         "azure",
@@ -188,13 +210,31 @@ class TestGenerateCIJenkins:
         monkeypatch.chdir(tmp_path)
         generate_ci_run(_make_args(), _logger)
         written = (tmp_path / "Jenkinsfile").read_text()
-        # Post-consolidation, ``generate_ci`` emits the rich
-        # ``PipelineTemplateGenerator`` output instead of the legacy
-        # ``JENKINS`` constant. Assert structural markers rather than
+        # Post-11-stage-rewrite, the Jenkins template emits a
+        # parameterized declarative pipeline with every stage named
+        # ``<n> · <stage-name>``. Assert structural markers rather than
         # byte equality so prose tweaks don't break the suite.
         assert "pipeline {" in written
-        assert "stage('Validate')" in written
+        assert "stage('2 · validate')" in written
         assert "fluid" in written
+        assert "parameters {" in written
+        # Default install mode is pypi — stable PyPI.
+        assert "stage('Setup [install-mode: pypi]')" in written
+
+    def test_install_mode_dev_source_flag(self, tmp_path, monkeypatch):
+        """``--install-mode dev-source`` emits the bind-mount install
+        branch + fail-loud check. Default path (pypi) still covered by
+        test_content_has_expected_structure above."""
+        monkeypatch.chdir(tmp_path)
+        rc = generate_ci_run(_make_args(install_mode="dev-source"), _logger)
+        assert rc == 0
+        written = (tmp_path / "Jenkinsfile").read_text()
+        assert "stage('Setup [install-mode: dev-source]')" in written
+        assert "/forge-cli-src" in written
+        # Fail-loud ERROR message must be present in the generated Setup.
+        assert "install-mode=dev-source but /forge-cli-src" in written
+        # pypi's Jenkins parameters must NOT leak into dev-source mode.
+        assert "name: 'FLUID_PIP_INDEX_URL'" not in written
 
     def test_returns_zero_on_success(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -289,37 +329,110 @@ class TestJenkinsPipelineTemplateGenerator:
         result = self._generate(generator)
         assert "pipeline {" in result["Jenkinsfile"]
 
-    def test_output_contains_expected_stages(self, generator):
+    def test_output_contains_all_11_stages(self, generator):
+        """11-stage template must emit all 11 named stages in order.
+        Setup stage's name includes the install-mode marker —
+        ``stage('Setup [install-mode: pypi]')`` by default, or
+        ``stage('Setup [install-mode: dev-source]')`` when generated
+        with ``--install-mode dev-source``."""
         content = self._generate(generator)["Jenkinsfile"]
-        for stage in ("Setup", "Validate", "Plan", "Test"):
-            assert f"stage('{stage}" in content or f'stage("{stage}' in content
+        expected = [
+            "stage('Setup [install-mode: pypi]')",
+            "stage('1 · bundle')",
+            "stage('2 · validate')",
+            "stage('3 · generate artifacts')",
+            "stage('4 · validate artifacts')",
+            "stage('5 · diff (drift gate)')",
+            "stage('6 · plan')",
+            "stage('7 · apply')",
+            "stage('8 · policy apply')",
+            "stage('9 · verify')",
+            "stage('10 · publish')",
+            "stage('11 · schedule sync')",
+        ]
+        for s in expected:
+            assert s in content, f"missing stage: {s}"
+        # Stage order must match the HTML design — validate before plan,
+        # plan before apply, apply before verify, verify before publish.
+        idx = {s: content.index(s) for s in expected}
+        ordered = sorted(expected, key=lambda s: idx[s])
+        assert ordered == expected, f"stage order wrong: {ordered}"
 
-    def test_output_contains_deploy_stages(self, generator):
-        content = self._generate(generator, environments=["dev", "staging"])["Jenkinsfile"]
-        assert "Deploy to DEV" in content
-        assert "Deploy to STAGING" in content
-
-    def test_output_contains_publish_stage(self, generator):
+    def test_output_contains_apply_mode_choice(self, generator):
+        """Stage 7 apply exposes --mode as a Jenkins choice parameter
+        with all 6 canonical modes from the HTML design."""
         content = self._generate(generator)["Jenkinsfile"]
-        assert "Publish" in content
+        assert "name: 'APPLY_MODE'" in content
+        for mode in [
+            "dry-run",
+            "amend",
+            "create-only",
+            "amend-and-build",
+            "replace",
+            "replace-and-build",
+        ]:
+            assert f"'{mode}'" in content, f"APPLY_MODE choice missing: {mode}"
+
+    def test_output_contains_publish_targets_parameter(self, generator):
+        """Stage 10 publish uses --target (repeatable) — exposed via a
+        space-separated PUBLISH_TARGETS string parameter."""
+        content = self._generate(generator)["Jenkinsfile"]
+        assert "name: 'PUBLISH_TARGETS'" in content
+        assert "--target" in content
+
+    def test_output_contains_scheduler_choice(self, generator):
+        """Stage 11 schedule-sync exposes --scheduler as a choice with
+        all supported scheduler targets."""
+        content = self._generate(generator)["Jenkinsfile"]
+        assert "name: 'SCHEDULER'" in content
+        for sch in ["airflow", "mwaa", "composer", "astronomer", "prefect", "dagster"]:
+            assert f"'{sch}'" in content, f"SCHEDULER choice missing: {sch}"
+
+    def test_output_contains_per_stage_toggles(self, generator):
+        """Every stage (1-11) must have a RUN_STAGE_N_* boolean toggle."""
+        content = self._generate(generator)["Jenkinsfile"]
+        for n in range(1, 12):
+            assert (
+                f"RUN_STAGE_{n}_" in content
+            ), f"RUN_STAGE_{n}_* toggle missing — stage {n} not parameterized"
+
+    def test_output_contains_allow_data_loss_gate(self, generator):
+        """Stage 7 destructive-mode gate must be exposed as a param."""
+        content = self._generate(generator)["Jenkinsfile"]
+        assert "name: 'ALLOW_DATA_LOSS'" in content
+        assert "--allow-data-loss" in content
+
+    def test_output_contains_no_verify_digest_escape_hatch(self, generator):
+        """Stage 7 emergency plan-binding waiver flag."""
+        content = self._generate(generator)["Jenkinsfile"]
+        assert "name: 'NO_VERIFY_DIGEST'" in content
+        assert "--no-verify-digest" in content
+
+    def test_output_contains_diff_drift_gate_toggle(self, generator):
+        """Stage 5 --exit-on-drift behavior must be toggleable."""
+        content = self._generate(generator)["Jenkinsfile"]
+        assert "name: 'DIFF_EXIT_ON_DRIFT'" in content
+        assert "--exit-on-drift" in content
+
+    def test_output_contains_policy_apply_mode(self, generator):
+        """Stage 8 must expose check | enforce as a choice."""
+        content = self._generate(generator)["Jenkinsfile"]
+        assert "name: 'POLICY_APPLY_MODE'" in content
+        assert "'enforce'" in content
+        assert "'check'" in content
+
+    def test_output_contains_bundle_format_choice(self, generator):
+        """Stage 1 bundle format is user-selectable."""
+        content = self._generate(generator)["Jenkinsfile"]
+        assert "name: 'BUNDLE_FORMAT'" in content
+        assert "'tgz'" in content
+        assert "'yaml-single-file'" in content
 
     @pytest.mark.parametrize("complexity", ["basic", "standard", "advanced", "enterprise"])
     def test_all_complexity_levels(self, generator, complexity):
         result = self._generate(generator, complexity=complexity)
         assert "Jenkinsfile" in result
         assert len(result["Jenkinsfile"]) > 0
-
-    def test_marketplace_publishing_enabled(self, generator):
-        content = self._generate(generator, enable_marketplace_publishing=True)["Jenkinsfile"]
-        assert "marketplace" in content.lower() or "publish" in content.lower()
-
-    def test_marketplace_publishing_disabled(self, generator):
-        content = self._generate(generator, enable_marketplace_publishing=False)["Jenkinsfile"]
-        assert "marketplace" not in content.lower() or "marketplace_publish" not in content.lower()
-
-    def test_prod_environment_has_approval_gate(self, generator):
-        content = self._generate(generator, environments=["dev", "prod"])["Jenkinsfile"]
-        assert "input {" in content
 
     def test_comment_prefix_is_double_slash(self):
         assert _comment_prefix_for("Jenkinsfile") == "//"
@@ -370,9 +483,23 @@ class _JenkinsPipeline:
             body = parts[i + 1] if i + 1 < len(parts) else ""
             stage = _JenkinsStage(name)
 
-            # Extract sh commands
-            for m in re.finditer(r"sh\s+['\"](.+?)['\"]", body):
-                stage.sh_commands.append(m.group(1))
+            # Extract sh commands — handle all 4 Groovy string forms in
+            # ONE regex with alternation so matches stay in file order
+            # (order matters for test_setup_stage_runs_first):
+            #   sh '''...'''  (triple-single, multi-line, no interpolation)
+            #   sh """..."""  (triple-double, multi-line, with interpolation)
+            #   sh '...'      (single-single, single-line)
+            #   sh "..."      (single-double, single-line)
+            # The 11-stage template uses triple-single predominantly so env
+            # vars ${VAR} flow at shell runtime rather than Groovy-eval time.
+            sh_pattern = re.compile(
+                r"""sh\s+(?:'''(?P<tsq>.+?)'''|\"\"\"(?P<tdq>.+?)\"\"\"|'(?P<ssq>[^']+)'|"(?P<sdq>[^"]+)")""",
+                re.DOTALL,
+            )
+            for m in sh_pattern.finditer(body):
+                stage.sh_commands.append(
+                    m.group("tsq") or m.group("tdq") or m.group("ssq") or m.group("sdq")
+                )
 
             # Detect when { branch 'xxx' }
             when_match = re.search(r"when\s*\{[^}]*branch\s+['\"](\w+)['\"]", body)
@@ -512,17 +639,34 @@ class TestJenkinsSimulatedRun:
             or "requirements" in runner.executed_commands[0]
         )
 
-    def test_deploy_stages_present(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main")
-        runner.run()
+    def test_11_stages_present(self, pipeline):
+        """Replaces the old per-env deploy stages. The 11-stage design
+        has a single parameterized ``7 · apply`` stage controlled by
+        FLUID_ENV + APPLY_MODE params, not N environment-named stages.
+        Every structural stage (1-11) must be present."""
         stage_names = [s.name for s in pipeline.stages]
-        assert any("DEV" in n for n in stage_names)
-        assert any("STAGING" in n for n in stage_names)
-        assert any("PROD" in n for n in stage_names)
+        for marker in [
+            "1 · bundle",
+            "2 · validate",
+            "3 · generate artifacts",
+            "4 · validate artifacts",
+            "5 · diff",
+            "6 · plan",
+            "7 · apply",
+            "8 · policy apply",
+            "9 · verify",
+            "10 · publish",
+            "11 · schedule sync",
+        ]:
+            assert any(
+                marker in n for n in stage_names
+            ), f"stage containing {marker!r} missing from {stage_names}"
 
     def test_publish_stage_present(self, pipeline):
+        """Stage 10 is named ``10 · publish`` in the parameterized
+        template — matches the HTML design's naming scheme."""
         stage_names = [s.name for s in pipeline.stages]
-        assert any("Publish" in n for n in stage_names)
+        assert any("publish" in n.lower() for n in stage_names)
 
     # -- stage failure halts pipeline --------------------------------------
 
@@ -583,11 +727,9 @@ class TestJenkinsSimulatedRun:
         all_post = runner.post_actions_recorded
         assert any("archiveArtifacts" in a for a in all_post)
 
-    def test_junit_results_recorded(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main")
-        runner.run()
-        all_post = runner.post_actions_recorded
-        assert any("junit" in a for a in all_post)
+    # Junit post-action dropped — the 11-stage design treats ``fluid test``
+    # as a separate tool, not a structural pipeline stage. Contract tests
+    # run via stage 9 verify which emits a JSON report (not junit XML).
 
     def test_cleanup_always_runs_on_success(self, pipeline):
         runner = _SimulatedJenkinsRunner(pipeline, branch="main")
@@ -599,13 +741,10 @@ class TestJenkinsSimulatedRun:
         runner.run()
         assert runner.cleanup_ran is True
 
-    # -- marketplace publishing --------------------------------------------
-
-    def test_marketplace_publish_command_present(self, pipeline):
-        all_cmds = []
-        for stage in pipeline.stages:
-            all_cmds.extend(stage.sh_commands)
-        assert any("marketplace" in c.lower() for c in all_cmds)
+    # Marketplace is not a structural stage in the 11-stage design —
+    # it's a --target value of stage 10 publish (fluid publish <contract>
+    # --target marketplace). The previous test_marketplace_publish_command_present
+    # was dropped along with the standalone marketplace stage.
 
     def test_marketplace_disabled_no_publish(self):
         gen = PipelineTemplateGenerator()
@@ -721,3 +860,224 @@ class TestGeneratedContractEnvAcrossSystems:
             f"contains a bare $CONTRACT reference — regression of the "
             f"A1 Jenkins Build-Now gap"
         )
+
+
+# ---------------------------------------------------------------------------
+# Reference-only contract detection + git-prefix workdir resolution
+# ---------------------------------------------------------------------------
+
+
+class TestContractIsReferenceOnly:
+    """`_contract_is_reference_only` gates whether `fluid generate ci` emits the
+    Generate Artifacts stage. A contract with any ``builds[].pattern`` in
+    ``{hybrid-reference, reference, external-reference}`` is owned externally
+    (team's own dbt project / Airflow DAG), so asking fluid to regenerate those
+    artifacts surfaces only spurious failures. Edge cases are the point.
+    """
+
+    def _write(self, tmp_path: Path, yaml_content: str) -> Path:
+        p = tmp_path / "contract.fluid.yaml"
+        p.write_text(yaml_content)
+        return p
+
+    def test_missing_file_returns_false(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        missing = tmp_path / "nope.yaml"
+        assert _contract_is_reference_only(str(missing)) is False
+
+    def test_broken_yaml_returns_false(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(tmp_path, "not: valid: yaml: [\n")
+        # Defensive: parse failure must not crash; returns False so the
+        # generate-artifacts stage stays on by default.
+        assert _contract_is_reference_only(str(p)) is False
+
+    def test_no_builds_key_returns_false(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(tmp_path, "dataProduct:\n  name: foo\n")
+        assert _contract_is_reference_only(str(p)) is False
+
+    def test_builds_is_dict_not_list_returns_false(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(tmp_path, "builds:\n  not_a_list: true\n")
+        assert _contract_is_reference_only(str(p)) is False
+
+    def test_build_without_pattern_returns_false(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(tmp_path, "builds:\n  - id: foo\n    engine: python\n")
+        assert _contract_is_reference_only(str(p)) is False
+
+    @pytest.mark.parametrize("pattern", ["hybrid-reference", "reference", "external-reference"])
+    def test_recognised_reference_patterns_return_true(self, tmp_path, pattern):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(tmp_path, f"builds:\n  - id: foo\n    pattern: {pattern}\n")
+        assert _contract_is_reference_only(str(p)) is True
+
+    def test_unrecognised_pattern_returns_false(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(tmp_path, "builds:\n  - id: foo\n    pattern: something-else\n")
+        assert _contract_is_reference_only(str(p)) is False
+
+    def test_any_build_with_reference_pattern_wins(self, tmp_path):
+        """Mixed contracts (one normal build, one reference build) must be
+        treated as reference-only — the reference build's external ownership
+        still blocks fluid from regenerating anything for that build."""
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(
+            tmp_path,
+            "builds:\n"
+            "  - id: normal\n"
+            "    pattern: declarative\n"
+            "  - id: ref\n"
+            "    pattern: hybrid-reference\n",
+        )
+        assert _contract_is_reference_only(str(p)) is True
+
+    def test_non_dict_build_entry_skipped(self, tmp_path):
+        from fluid_build.cli.generate_ci import _contract_is_reference_only
+
+        p = self._write(
+            tmp_path,
+            "builds:\n" "  - just a string\n" "  - id: foo\n" "    pattern: reference\n",
+        )
+        # Must not raise on the bare-string entry; must still detect the
+        # dict entry's reference pattern.
+        assert _contract_is_reference_only(str(p)) is True
+
+
+class TestGitPrefix:
+    """`_git_prefix` returns the current directory's path relative to the git
+    repo root — used to generate ``cd "<workdir>" && ...`` wrappers for
+    Jenkins when ``fluid generate ci`` runs in a subfolder of the checkout.
+    """
+
+    @patch("fluid_build.cli.generate_ci.subprocess.run")
+    def test_root_of_repo_returns_none(self, mock_run):
+        """git rev-parse --show-prefix returns '' at the repo root;
+        _git_prefix must normalise that to None so no cd wrapper is injected."""
+        from fluid_build.cli.generate_ci import _git_prefix
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="\n")
+        assert _git_prefix() is None
+
+    @patch("fluid_build.cli.generate_ci.subprocess.run")
+    def test_subfolder_returns_stripped_path(self, mock_run):
+        from fluid_build.cli.generate_ci import _git_prefix
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="examples/demo/\n")
+        assert _git_prefix() == "examples/demo"
+
+    @patch("fluid_build.cli.generate_ci.subprocess.run")
+    def test_non_zero_returncode_returns_none(self, mock_run):
+        """`git rev-parse` fails outside a repo → exit 128 → return None."""
+        from fluid_build.cli.generate_ci import _git_prefix
+
+        mock_run.return_value = MagicMock(returncode=128, stdout="")
+        assert _git_prefix() is None
+
+    @patch("fluid_build.cli.generate_ci.subprocess.run", side_effect=FileNotFoundError)
+    def test_git_not_installed_returns_none(self, _mock_run):
+        from fluid_build.cli.generate_ci import _git_prefix
+
+        assert _git_prefix() is None
+
+    @patch("fluid_build.cli.generate_ci.subprocess.run", side_effect=OSError("boom"))
+    def test_oserror_returns_none(self, _mock_run):
+        from fluid_build.cli.generate_ci import _git_prefix
+
+        assert _git_prefix() is None
+
+
+class TestNoGenerateArtifactsFlag:
+    """`--no-generate-artifacts` on `fluid generate ci` must propagate to
+    ``PipelineConfig.generates_artifacts=False`` so the Generate Artifacts
+    stage is omitted from the emitted pipeline. Auto-detection (via
+    ``_contract_is_reference_only``) must achieve the same result without
+    the flag.
+    """
+
+    # CRITICAL: every test here must `monkeypatch.chdir(tmp_path)` because
+    # `generate_ci.run()` writes files via `atomic_write(rel_path, ...)`
+    # regardless of whether the PipelineTemplateGenerator is mocked. Without
+    # chdir, the test clobbers the repo's real Jenkinsfile at the repo root.
+
+    @patch("fluid_build.cli.generate_ci._contract_is_reference_only", return_value=False)
+    @patch("fluid_build.cli.generate_ci._git_prefix", return_value=None)
+    @patch("fluid_build.forge.core.pipeline_templates.PipelineTemplateGenerator")
+    def test_flag_forces_generates_artifacts_false(
+        self, mock_gen, _mock_prefix, _mock_ref_only, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        from fluid_build.cli.generate_ci import run as generate_ci_run
+
+        mock_gen.return_value.generate_pipeline.return_value = {"Jenkinsfile": "pipeline {}\n"}
+
+        args = argparse.Namespace(
+            system="jenkins",
+            out=None,
+            contract="contract.fluid.yaml",
+            no_generate_artifacts=True,
+            provider=None,
+            complexity="basic",
+        )
+
+        generate_ci_run(args, _logger)
+        cfg = mock_gen.return_value.generate_pipeline.call_args[0][0]
+        assert cfg.generates_artifacts is False
+
+    @patch("fluid_build.cli.generate_ci._contract_is_reference_only", return_value=True)
+    @patch("fluid_build.cli.generate_ci._git_prefix", return_value=None)
+    @patch("fluid_build.forge.core.pipeline_templates.PipelineTemplateGenerator")
+    def test_reference_only_contract_auto_disables_generate(
+        self, mock_gen, _mock_prefix, _mock_ref_only, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        from fluid_build.cli.generate_ci import run as generate_ci_run
+
+        mock_gen.return_value.generate_pipeline.return_value = {"Jenkinsfile": "pipeline {}\n"}
+
+        args = argparse.Namespace(
+            system="jenkins",
+            out=None,
+            contract="contract.fluid.yaml",
+            no_generate_artifacts=False,  # flag NOT set
+            provider=None,
+            complexity="basic",
+        )
+
+        generate_ci_run(args, _logger)
+        cfg = mock_gen.return_value.generate_pipeline.call_args[0][0]
+        # Auto-detection wins even without the flag.
+        assert cfg.generates_artifacts is False
+
+    @patch("fluid_build.cli.generate_ci._contract_is_reference_only", return_value=False)
+    @patch("fluid_build.cli.generate_ci._git_prefix", return_value="examples/demo")
+    @patch("fluid_build.forge.core.pipeline_templates.PipelineTemplateGenerator")
+    def test_git_prefix_propagates_to_workdir(
+        self, mock_gen, _mock_prefix, _mock_ref_only, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        from fluid_build.cli.generate_ci import run as generate_ci_run
+
+        mock_gen.return_value.generate_pipeline.return_value = {"Jenkinsfile": "pipeline {}\n"}
+
+        args = argparse.Namespace(
+            system="jenkins",
+            out=None,
+            contract="contract.fluid.yaml",
+            no_generate_artifacts=False,
+            provider=None,
+            complexity="basic",
+        )
+
+        generate_ci_run(args, _logger)
+        cfg = mock_gen.return_value.generate_pipeline.call_args[0][0]
+        assert cfg.workdir == "examples/demo"

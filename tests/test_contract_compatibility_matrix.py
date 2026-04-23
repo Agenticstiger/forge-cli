@@ -130,7 +130,9 @@ def test_compatibility_fixtures_export_to_odps_standard(fixture_name: str, _expe
     assert rendered["apiVersion"] == "v1.0.0"
     assert rendered["kind"] == "DataProduct"
     assert rendered["id"] == contract["id"]
-    assert [port["id"] for port in rendered["outputPorts"]] == _expected_output_ids(contract)
+    # ODPS-Bitol v1.0.0 OutputPort (``additionalProperties: false``) forbids
+    # ``id``; the expose identifier travels via ``name``. Assert that shape.
+    assert [port["name"] for port in rendered["outputPorts"]] == _expected_output_ids(contract)
 
 
 @pytest.mark.parametrize(("fixture_name", "_expected_version"), ALL_FIXTURES)
@@ -144,6 +146,7 @@ def test_compatibility_fixtures_dmm_dry_run_dps(fixture_name: str, _expected_ver
     assert payload["id"] == contract["id"]
     assert payload["dataProductSpecification"] == "0.0.1"
     assert payload["teamId"] == contract["metadata"]["owner"]["team"]
+    # DPS output ports keep ``id`` (non-ODPS-Bitol shape); unchanged.
     assert [port["id"] for port in payload["outputPorts"]] == _expected_output_ids(contract)
 
 
@@ -159,7 +162,8 @@ def test_compatibility_fixtures_dmm_dry_run_odps(fixture_name: str, _expected_ve
     assert payload["kind"] == "DataProduct"
     assert payload["id"] == contract["id"]
     assert payload["team"]["name"] == contract["metadata"]["owner"]["team"]
-    assert [port["id"] for port in payload["outputPorts"]] == _expected_output_ids(contract)
+    # ODPS-Bitol v1.0.0 — ``name`` not ``id``.
+    assert [port["name"] for port in payload["outputPorts"]] == _expected_output_ids(contract)
 
 
 @pytest.mark.parametrize(("fixture_name", "_expected_version"), LINEAGE_FIXTURES)
@@ -176,9 +180,18 @@ def test_lineage_fixtures_preserve_input_ports_across_odps_exports(
     ).apply(contract, dry_run=True, provider_hint="odps")["payload"]
     official_opds = OdpsProvider().render(contract)["artifacts"]["product"]["_legacy"]
 
-    assert [port["id"] for port in odps_standard["inputPorts"]] == expected_ids
-    assert [port["reference"] for port in odps_standard["inputPorts"]] == expected_refs
-    assert [port["id"] for port in dmm_odps["inputPorts"]] == expected_ids
-    assert [port["reference"] for port in dmm_odps["inputPorts"]] == expected_refs
+    # ODPS-Bitol v1.0.0 InputPort forbids ``id`` and ``reference``; the
+    # identifier travels via ``name`` and the reference is folded into
+    # ``contractId`` (synthesized when no explicit contractId is provided).
+    assert [port["name"] for port in odps_standard["inputPorts"]] == expected_ids
+    assert [port["contractId"] for port in odps_standard["inputPorts"]] == expected_refs
+    # DMM ``provider_hint="odps"`` delegates to OdpsStandardProvider → same
+    # v1.0.0 shape. DMM's overlay adds sourceSystem to ``customProperties``
+    # so the data isn't lost, but the InputPort itself is v1.0.0-conformant.
+    assert [port["name"] for port in dmm_odps["inputPorts"]] == expected_ids
+    assert [port["contractId"] for port in dmm_odps["inputPorts"]] == expected_refs
+    # OdpsProvider (legacy OPDS/Linux Foundation emitter) is a DIFFERENT
+    # provider — keeps its legacy {id, reference} shape. Not part of the
+    # ODPS-Bitol schema contract.
     assert [port["id"] for port in official_opds["inputPorts"]] == expected_ids
     assert [port["reference"] for port in official_opds["inputPorts"]] == expected_refs

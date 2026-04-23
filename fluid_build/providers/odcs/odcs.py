@@ -977,11 +977,13 @@ class OdcsProvider(BaseProvider):
         binding = expose.get("binding")
         provider = None
         location = None
+        fmt = None
 
         # Safely extract from binding (handle None case)
         if isinstance(binding, dict):
             provider = binding.get("platform") or binding.get("provider")
             location = binding.get("location")
+            fmt = binding.get("format")
 
         # Fall back to 0.5.7 format: direct provider field
         if not provider:
@@ -993,10 +995,11 @@ class OdcsProvider(BaseProvider):
         # Use exposeId (0.7.1) or id (0.5.7)
         expose_id = expose.get("exposeId") or expose.get("id", "default")
 
+        server_type = self._map_provider_to_server_type(provider)
         server = {
             "id": expose_id,
             "server": expose_id,
-            "type": self._map_provider_to_server_type(provider),
+            "type": server_type,
         }
 
         # Location/connection details - ensure it's a dict
@@ -1010,6 +1013,15 @@ class OdcsProvider(BaseProvider):
             except Exception as e:
                 self.logger.error(f"Error extracting server details: {e}")
 
+        # ODCS v3.1.0 requires 'format' for certain server types (e.g. LocalServer,
+        # where {path, format} are BOTH required). We always emit format when the
+        # contract's binding.format is declared so validation passes for every
+        # type that conditionally requires it. Fallback default matches ODCS's
+        # most common example values.
+        declared_format = fmt or self._default_format_for_server_type(server_type)
+        if declared_format and "format" not in server:
+            server["format"] = declared_format
+
         return server
 
     def _expect_to_server(self, expect: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1022,11 +1034,13 @@ class OdcsProvider(BaseProvider):
         binding = expect.get("binding")
         provider = None
         location = None
+        fmt = None
 
         # Safely extract from binding (handle None case)
         if isinstance(binding, dict):
             provider = binding.get("platform") or binding.get("provider")
             location = binding.get("location")
+            fmt = binding.get("format")
 
         if not provider:
             provider = expect.get("provider")
@@ -1035,10 +1049,11 @@ class OdcsProvider(BaseProvider):
             return None
 
         expect_id = expect.get("id", "dependency")
+        server_type = self._map_provider_to_server_type(provider)
         server = {
             "id": expect_id,
             "server": expect_id,
-            "type": self._map_provider_to_server_type(provider),
+            "type": server_type,
         }
 
         # Location/connection details - ensure it's a dict
@@ -1051,7 +1066,29 @@ class OdcsProvider(BaseProvider):
             except Exception as e:
                 self.logger.error(f"Error extracting server details: {e}")
 
+        # ODCS v3.1.0 conditional-required ``format`` — see _expose_to_server.
+        declared_format = fmt or self._default_format_for_server_type(server_type)
+        if declared_format and "format" not in server:
+            server["format"] = declared_format
+
         return server
+
+    def _default_format_for_server_type(self, server_type: str) -> Optional[str]:
+        """Best-effort format default when the FLUID binding didn't declare one.
+
+        Only returns a value for server types where ODCS v3.1.0 REQUIRES
+        ``format`` (currently the ``local`` / file-based types). For other
+        types, returns None so the emitter doesn't add noise fields.
+        """
+        # LocalServer requires path + format. Default csv for file-ish types.
+        if server_type == "local":
+            return "csv"
+        # S3 + GCS + Azure Blob behave like file stores when the contract
+        # declares object paths — provide a conservative default too so the
+        # schema-required-branch cases are covered.
+        if server_type in ("s3", "gcs", "azure"):
+            return "csv"
+        return None
 
     def _map_provider_to_server_type(self, provider: str) -> str:
         """

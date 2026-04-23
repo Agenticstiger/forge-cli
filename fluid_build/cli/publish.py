@@ -39,7 +39,7 @@ import argparse
 import asyncio
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from fluid_build.cli.console import cprint
 
@@ -129,13 +129,33 @@ The publish command enables the full data product lifecycle: develop → deploy 
         help="FLUID contract file(s) to publish (supports glob patterns)",
     )
 
-    # Catalog selection
-    catalog_group = p.add_argument_group("Catalog Selection")
+    # Catalog / target selection
+    catalog_group = p.add_argument_group("Catalog / Target Selection")
+    catalog_group.add_argument(
+        "--target",
+        "-t",
+        action="append",
+        default=None,
+        metavar="NAME[:ENDPOINT]",
+        help=(
+            "Target catalog to publish to. Format: ``<name>`` or "
+            "``<name>:<endpoint>`` (endpoint override for this target only). "
+            "Repeatable — ``--target command-center --target datahub`` "
+            "publishes to both. Default: fluid-command-center. Per the "
+            "11-stage pipeline design (perfect-pipeline.html), this is the "
+            "canonical flag going forward; ``--catalog`` is a deprecated "
+            "alias kept for one release."
+        ),
+    )
     catalog_group.add_argument(
         "--catalog",
         "-c",
-        default="fluid-command-center",
-        help="Target catalog name (default: fluid-command-center)",
+        default=None,
+        help=(
+            "DEPRECATED: use --target instead (single-catalog form only). "
+            "Kept for one release for back-compat. A warning is logged when "
+            "used."
+        ),
     )
     catalog_group.add_argument(
         "--list-catalogs", action="store_true", help="List configured catalogs and exit"
@@ -195,6 +215,7 @@ async def publish_contract(
     verify_only: bool = False,
     skip_health_check: bool = False,
     verbose: bool = False,
+    endpoint_override: Optional[str] = None,
 ) -> PublishResult:
     """Publish a single contract to catalog
 
@@ -206,6 +227,9 @@ async def publish_contract(
         verify_only: If True, only verify existence
         skip_health_check: If True, skip pre-publish health check
         verbose: If True, show detailed progress
+        endpoint_override: When set, overrides the ``endpoint`` in the
+            catalog config for this call only. Sourced from the
+            ``--target name:endpoint`` CLI form.
 
     Returns:
         PublishResult with success/failure details
@@ -239,6 +263,14 @@ async def publish_contract(
             asset_id=contract.get("id", str(contract_path)),
             error=f"Catalog '{catalog_name}' not configured",
         )
+
+    # Apply per-invocation endpoint override (from ``--target name:endpoint``).
+    # Shallow-copy so we don't mutate the shared config dict across targets.
+    if endpoint_override:
+        catalog_config = dict(catalog_config)
+        catalog_config["endpoint"] = endpoint_override
+        if verbose:
+            logger.info(f"🔧 {catalog_name}: endpoint overridden to {endpoint_override}")
 
     if not catalog_config.get("enabled", True):
         return PublishResult(
@@ -465,22 +497,51 @@ async def run_async(args, logger: logging.Logger) -> int:
         logger.error(f"Contract files not found: {', '.join(str(p) for p in invalid_paths)}")
         return 1
 
-    if not args.quiet:
-        logger.info(f"📤 Publishing {len(contract_paths)} contract(s) to '{args.catalog}'")
+    # Resolve the target list from --target (new) + --catalog (deprecated).
+    # Format: list of (name, endpoint_override or None). If neither flag is
+    # set, default to a single fluid-command-center target — matches the
+    # pre-11-stage-pipeline behavior so existing ``fluid publish X.yaml``
+    # invocations keep working.
+    targets: List[Tuple[str, Optional[str]]] = []
+    if args.target:
+        for raw in args.target:
+            if not raw:
+                continue
+            name, sep, endpoint = raw.partition(":")
+            targets.append((name.strip(), endpoint.strip() or None))
+    if args.catalog:
+        logger.warning(
+            "--catalog is deprecated; use --target instead. "
+            "--catalog will be removed in the next release."
+        )
+        targets.append((args.catalog, None))
+    if not targets:
+        targets.append(("fluid-command-center", None))
 
-    # Publish each contract
+    if not args.quiet:
+        target_summary = ", ".join(f"{n}{':' + e if e else ''}" for n, e in targets)
+        logger.info(
+            f"📤 Publishing {len(contract_paths)} contract(s) "
+            f"to {len(targets)} target(s): {target_summary}"
+        )
+
+    # Publish each contract to every target. Endpoint overrides (from the
+    # ``--target name:endpoint`` form) apply to that target only; other
+    # targets resolve their endpoint via the normal config lookup.
     results = []
     for contract_path in contract_paths:
-        result = await publish_contract(
-            contract_path=contract_path,
-            catalog_name=args.catalog,
-            config=config,
-            dry_run=args.dry_run,
-            verify_only=args.verify_only,
-            skip_health_check=args.skip_health_check,
-            verbose=args.verbose,
-        )
-        results.append(result)
+        for target_name, endpoint_override in targets:
+            result = await publish_contract(
+                contract_path=contract_path,
+                catalog_name=target_name,
+                config=config,
+                dry_run=args.dry_run,
+                verify_only=args.verify_only,
+                skip_health_check=args.skip_health_check,
+                verbose=args.verbose,
+                endpoint_override=endpoint_override,
+            )
+            results.append(result)
 
     # Display results
     output = format_results(results, args.format, console)

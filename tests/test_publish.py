@@ -51,6 +51,10 @@ def _make_result(
 def _make_args(**kwargs):
     defaults = {
         "contract_files": ["contract.fluid.yaml"],
+        # ``target`` is the canonical Phase-5 flag (repeatable); ``catalog``
+        # is a deprecated alias. Tests use the legacy single-catalog shape
+        # by default for back-compat with what was asserted here.
+        "target": None,
         "catalog": "fluid-command-center",
         "list_catalogs": False,
         "dry_run": False,
