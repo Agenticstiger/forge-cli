@@ -59,6 +59,21 @@ A six-PR security-hardening series landed (PRs #28–#33) resolving the 14 findi
 - Typed tool errors (`{"error": <ExcName>, "message": "…see server logs"}`) — exception text no longer round-trips into the LLM context.
 - Expanded redactor coverage for JWTs, Stripe, GitHub, and bare `key[:=]value` assignments.
 
+## Recent architectural changes worth knowing (2026-04-23)
+
+The `feat/cli-pipeline-and-publish-hardening` branch (15 commits) landed the **11-stage pipeline** and its supporting surface. AGENTS.md has the canonical lifecycle doc; the Claude-Code-specific operational notes are:
+
+- **11 CLI stages, one command per stage.** `fluid bundle → validate → generate artifacts → validate-artifacts → diff → plan → apply → policy-apply → verify → publish → schedule-sync`. Each stage has `cli/<stage>.py`. Re-reading `AGENTS.md#the-11-stage-pipeline` is cheaper than re-deriving the flow from commit history.
+- **`cli/execute.py` is gone.** Its dbt + python runners extracted to `build_runners/{dbt,python}/`. `apply --mode amend-and-build` dispatches there via `build_runners.run_builds_from_args`. If you find yourself writing `from fluid_build.cli.execute import ...` that's the old path — use `build_runners` instead.
+- **`cli/compile.py` is gone too.** Renamed to `cli/bundle.py` in Phase 1; the hidden `fluid compile` alias was deleted. `fluid bundle --format tgz` is the canonical call.
+- **Plan-binding is cryptographic.** `fluid plan` emits `bundleDigest` + `planDigest` into `plan.json`. `fluid apply` re-verifies both before any DDL. Helpers live in `forge/core/plan_digest.py`: `compute_plan_digest`, `inject_digests`, `verify_plan_binding`, `PlanBindingError` (`.kind` attribute is `"bundle-mismatch"` or `"plan-tamper"` — stable event tags for CI log parsers). The `--no-verify-digest` flag is the DR escape hatch and logs at WARNING level so audit trails catch it.
+- **Apply actions carry BOTH `op` and `action_type` fields.** `apply.py`'s provider dispatcher reads `op`; display/viz reads `action_type`. Dropping either silently breaks the pipeline. See `plan.py::_plan_with_provider_actions` — both get `action.action_type.value`.
+- **No hardcoded `"0.7.1"` fallback.** `SchemaManager.latest_bundled_version()` scans `fluid_build/schemas/fluid-schema-*.json` and returns the newest. Use it anywhere the "default fluidVersion" is needed; `cli/plan.py::_default_fluid_version()` is the canonical wrapper.
+- **CI template generation got install-mode.** `fluid generate ci --system jenkins --install-mode {pypi,dev-source}`. The generated Jenkinsfile carries ONE mode's logic — no runtime branching in the file. `pypi` (default, production) exposes 4 build-time Jenkins parameters (`FLUID_PACKAGE_SPEC`, `FLUID_PIP_INDEX_URL`, `FLUID_PIP_EXTRA_INDEX_URL`, `FLUID_ALLOW_PRERELEASE`). `dev-source` (lab) uses `PYTHONPATH=/forge-cli-src` and fails LOUD if the mount is missing.
+- **The Jenkins template is the reference 11-stage implementation.** `forge/core/pipeline_templates.py::JenkinsTemplate.generate()` ships the full parameterized template. The other 6 CI systems (GitHub Actions, GitLab, Azure DevOps, Bitbucket, CircleCI, Tekton) are scheduled for Phase 7-rest to port from it.
+- **Smoke scripts live in `scripts/`.** `scripts/smoke_phase_6b.py` validates plan-binding + data-loss-gate against a real .venv.fluid-dev venv. `scripts/smoke_a1.py` validates the A1 variant with the new `--mode` / `--target` flags. Both auto-discover env from the launchpad; both are safe (every apply runs `--dry-run`).
+- **Known gap — `unknown_action_op` (Phase 6F, deferred).** The Snowflake provider's dispatcher doesn't yet recognize the 0.7.1 high-level abstract ops (`provisionDataset`, `scheduleTask`). Stage 7 apply logs `{"event": "unknown_action_op", ...}` and no-ops instead of emitting native DDL. Pipeline reports SUCCESS but accomplishes nothing. Fix involves a translator layer in `providers/snowflake/` that maps abstract → native ops. Pre-existing, not a regression.
+
 ## Working style
 
 - **Goal-driven execution.** For non-trivial tasks, state success criteria before implementing and loop until verified. Transform imperatives into tests: "add redactor coverage" → "new pattern is masked by a test assertion"; "fix the bug" → "reproducing test passes first, then fix makes it green".
