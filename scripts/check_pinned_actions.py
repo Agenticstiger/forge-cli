@@ -7,12 +7,11 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Checks whether SHA-pinned GitHub Actions in pipeline_templates.py
-# are still the latest release for their major version tag.
-#
-# Usage:
-#   python scripts/check_pinned_actions.py          # prints report
-#   python scripts/check_pinned_actions.py --strict  # exits 1 if stale
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from __future__ import annotations
 

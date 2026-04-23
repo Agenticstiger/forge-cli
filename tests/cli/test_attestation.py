@@ -5,6 +5,12 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Tests for ``fluid_build.cli._attestation``.
 
@@ -32,11 +38,32 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import urlparse
 
 import pytest
 
 from fluid_build.cli import _attestation
 from fluid_build.cli._common import CLIError
+
+
+def _host_matches(url: str, expected_host: str) -> bool:
+    """Exact host-match helper for CI-provider assertions.
+
+    Replaces the naïve ``"github.com" in url`` / ``url.startswith(
+    "https://github.com")`` patterns that CodeQL flags as
+    ``py/incomplete-url-substring-sanitization``: a URL like
+    ``https://evil.com/github.com/...`` would pass the substring
+    check, and ``https://github.com.evil.com/...`` would pass the
+    startswith check. Parsing via ``urllib.parse.urlparse`` and
+    comparing ``.netloc`` eliminates both bypasses in one line.
+
+    Port and userinfo are stripped so ``https://user@github.com:443/``
+    still matches ``"github.com"`` — which is what tests want.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    return host == expected_host.lower()
+
 
 # -----------------------------------------------------------------------------
 # Fixtures
@@ -115,7 +142,7 @@ class TestCollectRunMetadataGitHub:
         clear_ci_env.setenv("GITHUB_SERVER_URL", "https://github.com")
         clear_ci_env.setenv("GITHUB_REPOSITORY", "acme/fluid-product")
         meta = _attestation._collect_run_metadata()
-        assert "github.com" in meta["builder"]["id"]
+        assert _host_matches(meta["builder"]["id"], "github.com")
         assert "acme/fluid-product" in meta["builder"]["id"]
         assert meta["metadata"]["invocationId"] == (
             "https://github.com/acme/fluid-product/actions/runs/1234567"
@@ -137,7 +164,7 @@ class TestCollectRunMetadataGitLab:
         clear_ci_env.setenv("CI_JOB_URL", "https://gitlab.com/acme/fluid/-/jobs/98765")
         clear_ci_env.setenv("CI_SERVER_URL", "https://gitlab.com")
         meta = _attestation._collect_run_metadata()
-        assert meta["builder"]["id"].startswith("https://gitlab.com")
+        assert _host_matches(meta["builder"]["id"], "gitlab.com")
         assert meta["metadata"]["invocationId"] == ("https://gitlab.com/acme/fluid/-/jobs/98765")
 
     def test_self_hosted_gitlab(self, clear_ci_env):
@@ -150,7 +177,7 @@ class TestCollectRunMetadataGitLab:
             "https://gitlab.internal.acme.com/team/product/-/jobs/1",
         )
         meta = _attestation._collect_run_metadata()
-        assert meta["builder"]["id"].startswith("https://gitlab.internal.acme.com")
+        assert _host_matches(meta["builder"]["id"], "gitlab.internal.acme.com")
 
 
 class TestCollectRunMetadataOthers:
@@ -162,7 +189,7 @@ class TestCollectRunMetadataOthers:
         )
         meta = _attestation._collect_run_metadata()
         assert "circleci" in meta["builder"]["id"]
-        assert meta["metadata"]["invocationId"].startswith("https://app.circleci.com")
+        assert _host_matches(meta["metadata"]["invocationId"], "app.circleci.com")
 
     def test_azure_devops_detected(self, clear_ci_env):
         clear_ci_env.setenv("BUILD_BUILDID", "500")
@@ -189,7 +216,7 @@ class TestCollectRunMetadataOthers:
         clear_ci_env.setenv("JENKINS_URL", "https://jenkins.acme.com/")
         clear_ci_env.setenv("BUILD_URL", "https://jenkins.acme.com/job/fluid/42/")
         meta = _attestation._collect_run_metadata()
-        assert "jenkins.acme.com" in meta["builder"]["id"]
+        assert _host_matches(meta["builder"]["id"], "jenkins.acme.com")
         assert meta["metadata"]["invocationId"].endswith("/fluid/42/")
 
     def test_priority_order_github_over_others(self, clear_ci_env):
@@ -277,7 +304,7 @@ class TestBuildAttestation:
         clear_ci_env.setenv("GITHUB_REPOSITORY", "acme/product")
         stmt = _attestation.build_attestation(str(fake_bundle))
         run = stmt["predicate"]["runDetails"]
-        assert "github.com" in run["builder"]["id"]
+        assert _host_matches(run["builder"]["id"], "github.com")
         assert "12345" in run["metadata"]["invocationId"]
 
 

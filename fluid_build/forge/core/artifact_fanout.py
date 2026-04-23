@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import tarfile
 import tempfile
@@ -128,17 +129,56 @@ def _is_tgz_input(path: Path) -> bool:
     return name.endswith(".tgz") or name.endswith(".tar.gz")
 
 
+def _safe_tar_members(tar: tarfile.TarFile, dest: Path):
+    """Filter tar members to prevent path-traversal via ``../`` entries
+    or absolute paths, even though ``validate_manifest`` has already
+    attested the content.
+
+    Bandit B202 flags unconditional ``tar.extractall`` on the grounds
+    that tar entries can escape the destination via ``../`` or
+    absolute paths. We trust bundle bytes post-``validate_manifest``
+    (SHA-256 merkle root match), but defence-in-depth is cheap:
+    reject any member whose resolved path is outside ``dest``.
+
+    Yields the subset of ``tar.getmembers()`` safe to extract.
+    """
+    dest_resolved = dest.resolve()
+    for member in tar.getmembers():
+        # Reject absolute paths + parent refs before resolution —
+        # ``Path.resolve()`` itself won't catch symlink-based traversal.
+        if member.name.startswith("/") or ".." in Path(member.name).parts:
+            raise FanoutError(
+                f"bundle tar entry escapes destination: {member.name!r} "
+                f"(absolute path or ``..`` parent reference rejected)",
+                key=None,
+            )
+        target = (dest / member.name).resolve()
+        if not str(target).startswith(str(dest_resolved) + os.sep) and target != dest_resolved:
+            raise FanoutError(
+                f"bundle tar entry resolves outside destination: " f"{member.name!r} → {target}",
+                key=None,
+            )
+        yield member
+
+
 def _extract_bundle(tgz_path: Path, dest: Path) -> Path:
     """Extract ``contract.resolved.yaml`` + any ``sources/`` from a Phase-2
     bundle into ``dest``. Re-verifies the MANIFEST first so stage 3 can't
-    be fed a tampered bundle.
+    be fed a tampered bundle, AND filters tar members to reject any
+    path that escapes ``dest`` (defence-in-depth — bundle contents are
+    already content-attested by ``validate_manifest``, but rejecting
+    ``../`` / absolute-path members costs ~5 lines and eliminates
+    Bandit B202 as a standing HIGH finding).
 
     Returns the path to ``contract.resolved.yaml`` within ``dest``.
     """
     validate_manifest(tgz_path)  # tamper gate — raises on mismatch
     with tarfile.open(tgz_path, "r:gz") as tar:
-        # Extract everything so embedded $source pointers resolve locally.
-        tar.extractall(dest)  # noqa: S202 — bundle is trusted after validate_manifest
+        # ``_safe_tar_members`` filters out any member that would
+        # land outside ``dest`` after resolution. Combined with the
+        # MANIFEST SHA-256 attestation, this covers both tampered-
+        # bytes and legitimate-bytes-with-malicious-paths threats.
+        tar.extractall(dest, members=_safe_tar_members(tar, dest))
     contract_path = dest / "contract.resolved.yaml"
     if not contract_path.exists():
         raise FanoutError(

@@ -190,9 +190,7 @@ def _echo_install_mode_summary(install_mode: str, out_path: Optional[str]) -> No
             "  |- Jenkins installs: pip install data-product-forge (stable PyPI)",
             markup=False,
         )
-        cprint(
-            "  |  Override at build time via these Jenkins parameters:", markup=False
-        )
+        cprint("  |  Override at build time via these Jenkins parameters:", markup=False)
         cprint(
             "  |    FLUID_PACKAGE_SPEC        = 'data-product-forge==X.Y.Z'  (pin version)",
             markup=False,
@@ -210,9 +208,7 @@ def _echo_install_mode_summary(install_mode: str, out_path: Optional[str]) -> No
             markup=False,
         )
     elif install_mode == "dev-source":
-        cprint(
-            f"[install-mode: dev-source] Jenkinsfile written -> {dest}", markup=False
-        )
+        cprint(f"[install-mode: dev-source] Jenkinsfile written -> {dest}", markup=False)
         cprint(
             "  |- Jenkins installs from /forge-cli-src bind mount (LAB ONLY)",
             markup=False,
@@ -222,9 +218,7 @@ def _echo_install_mode_summary(install_mode: str, out_path: Optional[str]) -> No
             "  |    - ${FORGE_CLI_REPO:-../../../forge-cli}:/forge-cli-src:ro",
             markup=False,
         )
-        cprint(
-            "  |  Fails LOUD if the mount is missing - no silent fallback.", markup=False
-        )
+        cprint("  |  Fails LOUD if the mount is missing - no silent fallback.", markup=False)
     else:
         # Defensive - template would have raised already, but log
         # something if it didn't.

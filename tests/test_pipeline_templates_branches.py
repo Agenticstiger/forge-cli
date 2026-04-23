@@ -736,7 +736,7 @@ class TestJenkinsTemplateStage11ScheduleSync:
             "[ ! -d dist/artifacts/schedule ]" in sh_body
             or "! -d dist/artifacts/schedule" in sh_body
         ), "stage 11 must test for absent dags-dir as a skip condition"
-        assert 'ls -A dist/artifacts/schedule' in sh_body, (
+        assert "ls -A dist/artifacts/schedule" in sh_body, (
             "stage 11 must also test for empty dags-dir — not just missing — "
             "since stage 3 can create an empty schedule/ subfolder"
         )
