@@ -328,6 +328,33 @@ def _validate_destination(raw: str, scheduler: str) -> Tuple[str, Optional[str]]
             },
         )
 
+    # SECURITY: reject netloc beginning with a hyphen — scp/rsync argv
+    # parsers treat any element starting with ``-`` as an option flag
+    # regardless of shell quoting (this is argv-level parsing, not
+    # shell-level), so ``scp://-oProxyCommand=…/path`` would smuggle
+    # ``-oProxyCommand=<cmd>`` into the scp argv and OpenSSH would run
+    # ``<cmd>`` locally to establish the connection (CVE-2020-15778
+    # class). urlparse does NOT reject this; the whitelist further down
+    # in :func:`_validate_safe_ident` never runs on netloc. This gate
+    # plus the ``--`` end-of-options marker inserted in
+    # :func:`_airflow_dispatch` / :func:`_mwaa_dispatch` form a
+    # defence-in-depth pair — either alone is sufficient, but together
+    # they close both the validation and the argv-construction sides of
+    # the hole.
+    if parsed.netloc.startswith("-"):
+        raise CLIError(
+            2,
+            "schedule_sync_destination_hyphen_netloc",
+            {
+                "raw": raw,
+                "netloc": parsed.netloc,
+                "reason": (
+                    "destination netloc may not start with '-' — this is a "
+                    "scp/rsync/ssh option-smuggling vector (CVE-2020-15778 class)"
+                ),
+            },
+        )
+
     # Any shell metacharacter past the scheme is suspicious. The
     # SCP / SSH forms accept ``user@host`` but not spaces or semicolons.
     if any(c in raw for c in (";", "|", "&", "`", "$", "\n", "\r")):
@@ -466,11 +493,41 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
 
     trailing_slash_src = str(dags_dir).rstrip("/") + "/"
 
+    # SECURITY: every argv below that positions user-controlled strings
+    # (remote_target, local_dest, dest) AFTER the ``rsync`` / ``scp`` /
+    # ``aws`` binary and its option flags inserts ``--`` as the
+    # end-of-options marker. This forces the target tool to treat all
+    # subsequent positional elements as pathnames — even if a future
+    # regex gap lets a leading-hyphen value slip past
+    # :func:`_validate_destination`. This is defence-in-depth paired
+    # with the netloc-hyphen rejection there.
+    #
+    # Tool-specific notes:
+    # - rsync: supports ``--`` end-of-options universally.
+    # - scp:   supports ``--`` since OpenSSH 8.2 (Feb 2020). Any hosts
+    #          running an older sshd on the SENDING side (where scp is
+    #          invoked) would ignore ``--`` and still parse options —
+    #          which is exactly why we also reject hyphen-netloc at
+    #          validation time above.
+    # - aws s3 sync / gsutil rsync: the user-controlled element is a
+    #          ``s3://`` / ``gs://`` URL whose shape (bucket-name rules)
+    #          already excludes a leading hyphen on the AWS/GCS side,
+    #          but the netloc-hyphen rejection above makes this
+    #          structural — not a coincidence — so ``--`` is added
+    #          anyway.
     if scheme == "s3":
         binary = _which_or_raise("aws")
+        # aws s3 sync accepts --delete as a flag; the positional args
+        # are src + dest. Inserting ``--`` would make aws treat
+        # ``--delete`` itself as a pathname, so DO NOT add it here.
+        # The hyphen-netloc rejection above is the sole defence for this
+        # branch (s3:// bucket names never start with '-' per AWS rules).
         argv = [binary, "s3", "sync", trailing_slash_src, dest, "--delete"]
     elif scheme == "gs":
         binary = _which_or_raise("gsutil")
+        # gsutil rsync: same analysis as aws s3. gs:// bucket names per
+        # Google rules never start with '-'; netloc-hyphen rejection
+        # covers this branch.
         argv = [binary, "-m", "rsync", "-r", "-d", trailing_slash_src, dest]
     elif scheme == "az":
         binary = _which_or_raise("az")
@@ -485,6 +542,13 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
                 "schedule_sync_az_missing_container",
                 {"destination": dest},
             )
+        # Azure container and blob names are the user-controlled
+        # values. Azure storage naming rules forbid leading '-' (see
+        # the netloc-hyphen rejection above); the blob_path is after a
+        # '/'. Each value flows through a named flag (--destination /
+        # --destination-path) rather than a positional argument, so
+        # even a leading-'-' value would be consumed as the flag's
+        # argument — not re-parsed as a new option.
         argv = [
             binary,
             "storage",
@@ -506,7 +570,17 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
         if local_dest.startswith("file://"):
             local_dest = local_dest[len("file://") :]
         # --delete is deliberate: Airflow expects DAG removal to propagate.
-        argv = [binary, "-av", "--delete", trailing_slash_src, local_dest.rstrip("/") + "/"]
+        # ``--`` end-of-options before the positional src / dest so a
+        # future change to _validate_destination that lets a leading-'-'
+        # path slip through still doesn't smuggle an rsync option.
+        argv = [
+            binary,
+            "-av",
+            "--delete",
+            "--",
+            trailing_slash_src,
+            local_dest.rstrip("/") + "/",
+        ]
     elif scheme == "ssh":
         binary = _which_or_raise("rsync")
         # rsync over ssh: ssh://user@host/path → user@host:/path
@@ -521,6 +595,7 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
             "--delete",
             "-e",
             "ssh",
+            "--",
             trailing_slash_src,
             remote_target.rstrip("/") + "/",
         ]
@@ -532,7 +607,14 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
         if not parsed.netloc:
             raise CLIError(2, "schedule_sync_scp_missing_host", {"destination": dest})
         remote_target = f"{parsed.netloc}:{parsed.path or '/'}"
-        argv = [binary, "-r", trailing_slash_src, remote_target]
+        # ``--`` is supported by scp since OpenSSH 8.2 (Feb 2020). On
+        # older sshd on the sending side the ``--`` would be passed
+        # through as a literal path and the transfer would fail — which
+        # is a safer failure mode than option smuggling. Combined with
+        # the netloc-hyphen rejection in _validate_destination, this
+        # closes CVE-2020-15778-class attacks across all supported scp
+        # versions.
+        argv = [binary, "-r", "--", trailing_slash_src, remote_target]
     elif scheme == "git+ssh":
         # We don't implement in-process git orchestration for this release —
         # that needs a temp workdir, clone, rsync, git add/commit/push flow

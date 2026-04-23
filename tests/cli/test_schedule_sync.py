@@ -192,6 +192,52 @@ class TestValidateDestination:
         with pytest.raises(CLIError, match="schedule_sync_destination_required"):
             schedule_sync._validate_destination("", "airflow")
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # scp/ssh + -oProxyCommand: CVE-2020-15778 class
+            "scp://-oProxyCommand=id/remote/path",
+            'ssh://-oProxyCommand=sh -c "touch /tmp/pwn"/path',
+            # Double-hyphen option names (e.g. --skip-default-config)
+            "scp://--lskip/path",
+            "ssh://--skip-host-keys/path",
+            # gs/s3/az with hyphen-first netloc — rejected regardless of
+            # whether the underlying tool would have parsed it. Closes
+            # the option-smuggling surface structurally.
+            "s3://-oProxyCommand=id/bucket-path",
+            "gs://-oProxyCommand=id/path",
+            "az://-bad-container/path",
+            # file:// with hyphen-first netloc (rsync would parse as
+            # option on the positional dest).
+            "file://-pwn/path",
+        ],
+    )
+    def test_rejects_hyphen_netloc(self, url):
+        """CVE-2020-15778-class option smuggling.
+
+        A netloc starting with ``-`` is refused regardless of scheme so
+        scp / rsync / ssh / any downstream tool never sees an argv
+        element that argv-parses as an option flag. This is the
+        critical security gate; the ``--`` end-of-options marker added
+        in the dispatchers is the second layer of defence.
+        """
+        with pytest.raises(CLIError, match="schedule_sync_destination_hyphen_netloc"):
+            schedule_sync._validate_destination(url, "airflow")
+
+    def test_user_at_host_still_accepted_after_hyphen_guard(self):
+        """The hyphen guard must not regress the common ``user@host``
+        netloc form; only leading-hyphen is disallowed."""
+        scheme, norm = schedule_sync._validate_destination(
+            "ssh://user@host.example.com/remote/path", "airflow"
+        )
+        assert scheme == "ssh"
+        # User or host containing a hyphen mid-token is fine — only a
+        # leading hyphen on the whole netloc is refused.
+        scheme, norm = schedule_sync._validate_destination(
+            "ssh://user-a@host-b.example.com/remote/path", "airflow"
+        )
+        assert scheme == "ssh"
+
 
 # -----------------------------------------------------------------------------
 # _clamp_timeout
@@ -265,6 +311,13 @@ class TestAirflowDispatch:
         assert "-av" in argv
         assert "--delete" in argv
         assert argv[-1].endswith("/")
+        # Defence-in-depth: ``--`` appears BEFORE the positional src/dest
+        # pair so rsync treats any future leading-'-' value as a path
+        # not an option. See _airflow_dispatch security comment.
+        assert "--" in argv
+        dd_idx = argv.index("--")
+        # Positional src + dest immediately after ``--``.
+        assert dd_idx == len(argv) - 3
 
     def test_ssh_destination_builds_rsync_ssh_argv(self, dags_dir):
         args = _args(
@@ -277,6 +330,10 @@ class TestAirflowDispatch:
         assert "-e" in argv
         assert "ssh" in argv
         assert any("user@host:" in a for a in argv)
+        # ``--`` end-of-options immediately before the src + dest pair.
+        assert "--" in argv
+        dd_idx = argv.index("--")
+        assert dd_idx == len(argv) - 3
 
     def test_ssh_destination_missing_host_raises(self, dags_dir):
         args = _args(scheduler="airflow", destination="ssh:///just/path")
@@ -291,6 +348,12 @@ class TestAirflowDispatch:
         argv = results[0]["argv"]
         assert argv[0] == "/bin/scp"
         assert "-r" in argv
+        # OpenSSH scp 8.2+ accepts ``--`` as end-of-options. We include
+        # it so a future regex gap in _validate_destination can't turn
+        # a leading-'-' value into an smuggled scp option.
+        assert "--" in argv
+        dd_idx = argv.index("--")
+        assert dd_idx == len(argv) - 3
 
     def test_git_ssh_not_implemented(self, dags_dir):
         args = _args(scheduler="airflow", destination="git+ssh://git@github.com/org/repo.git")
