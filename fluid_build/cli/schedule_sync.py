@@ -78,6 +78,7 @@ from urllib.parse import urlparse
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.auth import _sanitize_argv
 from fluid_build.cli.console import cprint
+from fluid_build.observability.tracing import traced_stage
 
 COMMAND = "schedule-sync"
 logger = logging.getLogger(__name__)
@@ -873,6 +874,7 @@ _DISPATCHERS = {
 # -----------------------------------------------------------------------------
 
 
+@traced_stage("schedule-sync")
 def run(args) -> int:
     """Entry point wired to ``func=run`` in :func:`register`.
 

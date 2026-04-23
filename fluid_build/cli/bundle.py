@@ -42,6 +42,7 @@ except Exception:  # pragma: no cover
     yaml = None
 
 from ..loader import RefResolutionError, compile_contract, load_with_overlay
+from ..observability.tracing import traced_stage
 
 COMMAND = "bundle"
 
@@ -145,6 +146,7 @@ def _has_refs(obj: Any) -> bool:
     return False
 
 
+@traced_stage("bundle")
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     contract_path = args.contract
     out = args.out
