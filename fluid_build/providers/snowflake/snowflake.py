@@ -786,11 +786,43 @@ class SnowflakeProvider(BaseProvider):
             }
 
     def _execute_action(self, action: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a single deployment action."""
+        """Execute a single deployment action.
+
+        Two dispatch layers:
+
+        1. **Abstract ops** (the 0.7.1 ``ActionType`` enum values from
+           ``forge/core/provider_actions.py`` — ``provisionDataset``,
+           ``grantAccess``, etc.). These are provider-agnostic high-level
+           actions emitted by ``fluid plan`` for 0.7.x+ contracts. Each
+           handler here orchestrates one or more NATIVE ops below,
+           reading the action's ``params`` dict for binding info.
+
+        2. **Native ops** (``ensure_database``, ``ensure_schema``,
+           ``ensure_table``, etc.) — Snowflake-specific DDL emitters.
+           These are the historical ops; handlers exist on this class
+           and are reused by the abstract-op translators.
+
+        When ``op`` is not in either table → error. Stage 7 apply will
+        surface it with a clear message.
+        """
         op = action.get("op")
 
-        # Route to appropriate handler
-        handlers = {
+        # Abstract ops (0.7.1 ActionType enum values). These translate
+        # to one-or-more native ops internally.
+        abstract_handlers = {
+            "provisionDataset": self._handle_provision_dataset,
+            "grantAccess": self._handle_grant_access,
+            "revokeAccess": self._handle_revoke_access,
+            "scheduleTask": self._handle_schedule_task,
+            "registerSchema": self._handle_register_schema,
+            "createView": self._handle_create_view,
+            "updatePolicy": self._handle_update_policy,
+            "publishEvent": self._handle_publish_event,
+            "custom": self._handle_custom_op,
+        }
+
+        # Native ops (Snowflake-specific DDL).
+        native_handlers = {
             "ensure_database": self._ensure_database,
             "ensure_schema": self._ensure_schema,
             "ensure_table": self._ensure_table,
@@ -804,11 +836,316 @@ class SnowflakeProvider(BaseProvider):
             "execute_sql": self._execute_sql,
         }
 
-        handler = handlers.get(op)
+        handler = abstract_handlers.get(op) or native_handlers.get(op)
         if not handler:
             return {"op": op, "status": "error", "error": f"Unknown operation: {op}"}
 
         return handler(action, context)
+
+    # =========================================================================
+    # Abstract-op handlers (0.7.1 ActionType translators)
+    # =========================================================================
+    # Each handler reads ``action["params"]`` (the dict emitted by
+    # ProviderActionParser in forge/core/provider_actions.py) and calls
+    # one-or-more native handlers. Return shape matches native handlers:
+    # ``{"op": <op>, "status": success|skipped|error, ...}``. When an abstract
+    # op decomposes into multiple native ops, the sub-results are collected
+    # under ``sub_results`` and the overall status reflects the worst case
+    # (any error → error; all success → success; else → partial).
+
+    def _binding_location(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract ``binding.location`` from an abstract-op's params dict.
+
+        0.7.1 ProviderActions carry their target's location inside
+        ``params.binding.location``. Provides a typed-ish accessor so
+        handlers don't re-walk the dict each time.
+        """
+        params = action.get("params") or {}
+        binding = params.get("binding") or {}
+        return binding.get("location") or {}
+
+    def _aggregate_sub_status(self, sub_results: List[Dict[str, Any]]) -> str:
+        """Roll up a list of sub-op results into a single status.
+
+        - any error → error (the first failure stops the abstract op)
+        - all skipped → skipped
+        - all success → success
+        - mixed success + skipped → success (skipped is not a failure)
+        """
+        if not sub_results:
+            return "skipped"
+        if any(r.get("status") == "error" for r in sub_results):
+            return "error"
+        if all(r.get("status") == "skipped" for r in sub_results):
+            return "skipped"
+        return "success"
+
+    def _handle_provision_dataset(
+        self, action: Dict[str, Any], context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """provisionDataset → ensure_database + ensure_schema (+ ensure_table).
+
+        Snowflake's "dataset" concept is the database + schema pair. Tables
+        are separate native ops; we provision them here when the action's
+        params include a ``binding.location.table`` (common for
+        single-table exposes) so one provisionDataset fully materializes
+        the port. Multi-table provisionDataset (schema-level only) is also
+        supported — the table step is skipped when no table is named.
+        """
+        location = self._binding_location(action)
+        database = location.get("database") or self.options.database
+        schema = location.get("schema")
+        table = location.get("table")
+
+        if not database:
+            return {
+                "op": "provisionDataset",
+                "status": "error",
+                "error": "binding.location.database required (not in params, not in provider options)",
+            }
+        if not schema:
+            return {
+                "op": "provisionDataset",
+                "status": "error",
+                "error": "binding.location.schema required in params",
+            }
+
+        sub_results: List[Dict[str, Any]] = []
+
+        # Step 1: ensure database
+        sub_results.append(
+            self._ensure_database({"op": "ensure_database", "database": database}, context)
+        )
+        if sub_results[-1].get("status") == "error":
+            return {
+                "op": "provisionDataset",
+                "status": "error",
+                "error": f"ensure_database failed: {sub_results[-1].get('error')}",
+                "sub_results": sub_results,
+            }
+
+        # Step 2: ensure schema
+        sub_results.append(
+            self._ensure_schema(
+                {"op": "ensure_schema", "database": database, "schema": schema}, context
+            )
+        )
+        if sub_results[-1].get("status") == "error":
+            return {
+                "op": "provisionDataset",
+                "status": "error",
+                "error": f"ensure_schema failed: {sub_results[-1].get('error')}",
+                "sub_results": sub_results,
+            }
+
+        # Step 3: ensure table (when present). Skip silently for schema-
+        # level provisioning.
+        if table:
+            params = action.get("params") or {}
+            columns = (params.get("schema") or {}).get("columns") or []
+            sub_results.append(
+                self._ensure_table(
+                    {
+                        "op": "ensure_table",
+                        "database": database,
+                        "schema": schema,
+                        "table": table,
+                        "columns": columns,
+                    },
+                    context,
+                )
+            )
+
+        return {
+            "op": "provisionDataset",
+            "status": self._aggregate_sub_status(sub_results),
+            "database": database,
+            "schema": schema,
+            "table": table,
+            "sub_results": sub_results,
+        }
+
+    def _handle_register_schema(
+        self, action: Dict[str, Any], context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """registerSchema → ensure_database + ensure_schema.
+
+        Pure schema registration — no table materialization. Useful for
+        contracts that declare schemas up-front but defer table creation
+        to downstream dbt / ELT jobs.
+        """
+        provision = self._handle_provision_dataset(action, context)
+        # Rename the op tag so downstream reports label it correctly.
+        provision["op"] = "registerSchema"
+        return provision
+
+    def _handle_create_view(
+        self, action: Dict[str, Any], context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """createView → ensure_view.
+
+        Abstract createView carries the view SQL + binding.location. The
+        native ensure_view handler does the actual ``CREATE OR REPLACE VIEW``.
+        """
+        location = self._binding_location(action)
+        params = action.get("params") or {}
+        view_sql = params.get("view_sql") or params.get("sql")
+
+        native_action = {
+            "op": "ensure_view",
+            "database": location.get("database") or self.options.database,
+            "schema": location.get("schema"),
+            "view": location.get("table") or location.get("view"),
+            "sql": view_sql,
+        }
+        result = self._ensure_view(native_action, context)
+        result["op"] = "createView"
+        return result
+
+    def _handle_grant_access(
+        self, action: Dict[str, Any], context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """grantAccess → apply_security for the principal/role pair.
+
+        The abstract op carries the high-level ``role`` (reader/writer/owner)
+        that Snowflake's apply_security handler maps to native GRANTs
+        (``GRANT SELECT``, ``GRANT USAGE``, etc.).
+
+        Today we dispatch to apply_security with the full grant dict so
+        the existing policy-mapping logic applies. When apply_security
+        doesn't understand a grant shape it returns status=skipped — not
+        a hard error, which matches GRANT semantics (idempotent / optional).
+        """
+        params = action.get("params") or {}
+        location = self._binding_location(action)
+
+        native_action = {
+            "op": "apply_security",
+            "database": location.get("database") or self.options.database,
+            "schema": location.get("schema"),
+            "target": location.get("table") or location.get("view"),
+            "principal": params.get("principal"),
+            "role": params.get("role"),
+            "mode": "grant",
+        }
+        result = self._apply_security(native_action, context)
+        result["op"] = "grantAccess"
+        return result
+
+    def _handle_revoke_access(
+        self, action: Dict[str, Any], context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """revokeAccess → apply_security with mode=revoke.
+
+        Symmetric with grantAccess; apply_security's mode=revoke branch
+        emits ``REVOKE`` instead of ``GRANT``. Idempotent.
+        """
+        params = action.get("params") or {}
+        location = self._binding_location(action)
+
+        native_action = {
+            "op": "apply_security",
+            "database": location.get("database") or self.options.database,
+            "schema": location.get("schema"),
+            "target": location.get("table") or location.get("view"),
+            "principal": params.get("principal"),
+            "role": params.get("role"),
+            "mode": "revoke",
+        }
+        result = self._apply_security(native_action, context)
+        result["op"] = "revokeAccess"
+        return result
+
+    def _handle_schedule_task(
+        self, action: Dict[str, Any], context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """scheduleTask → skipped (for non-snowflake_tasks engines).
+
+        When ``orchestration.engine == "snowflake_tasks"`` this would emit
+        ``CREATE TASK`` DDL. For other engines (airflow/mwaa/eventbridge)
+        the schedule lives outside Snowflake — EventBridge rule, MWAA DAG,
+        Airflow DAG, etc. — and Snowflake provider is a no-op.
+
+        Today we always skip with the engine name recorded. Real
+        ``CREATE TASK`` emission belongs in
+        ``providers/snowflake/orchestration/`` and ships as follow-up.
+        """
+        params = action.get("params") or {}
+        engine = params.get("engine") or "unknown"
+        build_id = params.get("buildId") or params.get("build_id")
+        return {
+            "op": "scheduleTask",
+            "status": "skipped",
+            "reason": (
+                f"schedule engine={engine!r} — Snowflake Task DDL not yet "
+                f"implemented. Schedule is owned by the external scheduler "
+                f"(Airflow/MWAA/EventBridge)."
+            ),
+            "build_id": build_id,
+            "engine": engine,
+        }
+
+    def _handle_update_policy(
+        self, action: Dict[str, Any], context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """updatePolicy → apply_security (policy update variant).
+
+        Masking policy / row access policy updates. Dispatches to the
+        existing apply_security handler with a policy-update marker.
+        """
+        params = action.get("params") or {}
+        location = self._binding_location(action)
+
+        native_action = {
+            "op": "apply_security",
+            "database": location.get("database") or self.options.database,
+            "schema": location.get("schema"),
+            "target": location.get("table") or location.get("view"),
+            "policy": params.get("policy"),
+            "mode": "policy_update",
+        }
+        result = self._apply_security(native_action, context)
+        result["op"] = "updatePolicy"
+        return result
+
+    def _handle_publish_event(
+        self, action: Dict[str, Any], context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """publishEvent → skipped (cross-provider concern, not Snowflake).
+
+        Event publication lives in the catalog layer (``fluid publish``)
+        or in a cross-provider event bus (EventBridge / Pub-Sub).
+        Snowflake provider has no equivalent native concept.
+        """
+        return {
+            "op": "publishEvent",
+            "status": "skipped",
+            "reason": (
+                "publishEvent is a cross-provider concern handled by "
+                "stage 10 (fluid publish) or a provider-native event bus "
+                "(EventBridge/Pub-Sub). Snowflake provider is a no-op."
+            ),
+        }
+
+    def _handle_custom_op(self, action: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        """custom → execute_sql (escape hatch for ad-hoc DDL).
+
+        ``params.sql`` is the SQL statement. Dispatches to the native
+        ``execute_sql`` handler which does identifier validation + quotes
+        literals via the central SQL-safety helpers.
+        """
+        params = action.get("params") or {}
+        sql = params.get("sql")
+        if not sql:
+            return {
+                "op": "custom",
+                "status": "error",
+                "error": "custom action requires params.sql",
+            }
+        native_action = {"op": "execute_sql", "sql": sql}
+        result = self._execute_sql(native_action, context)
+        result["op"] = "custom"
+        return result
 
     def _ensure_database(self, action: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         """Ensure database exists with proper configuration."""
