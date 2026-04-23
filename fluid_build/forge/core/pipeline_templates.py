@@ -730,6 +730,221 @@ class BasePipelineTemplate:
             return bool(config.generates_artifacts)
         return spec.default_run
 
+    def _render_install_setup(self, config: "PipelineConfig") -> str:
+        """Return the shared install-setup sh script for the Setup stage.
+
+        Every non-Jenkins CI system runs this as its first step. The
+        output is a single POSIX sh body that:
+
+        - ``pypi`` mode: pip-installs ``data-product-forge`` with
+          optional TestPyPI overrides (``FLUID_PIP_INDEX_URL``,
+          ``FLUID_PIP_EXTRA_INDEX_URL``, ``FLUID_ALLOW_PRERELEASE``,
+          ``FLUID_PACKAGE_SPEC`` — matches the Jenkins build-param
+          semantics so operators can pilot TestPyPI releases without
+          editing Groovy or YAML).
+        - ``dev-source`` mode: expects ``/forge-cli-src`` bind mount
+          with the forge-cli checkout; exports ``PYTHONPATH=/forge-cli-src``.
+          Fails loud with an actionable message if the mount is
+          missing. Only supported on systems that run self-hosted
+          runners (GitHub Actions, GitLab, Azure DevOps, Tekton).
+          Bitbucket / CircleCI pass this check with a warning because
+          they're hosted-only; operators who need dev-source there
+          must bake forge-cli into the container image instead.
+
+        The rendered body uses ``set -eu`` so a failed install halts
+        the pipeline rather than silently moving to the next step.
+        """
+        mode = getattr(config, "install_mode", "pypi") or "pypi"
+        if mode == "dev-source":
+            return (
+                "set -eu\n"
+                'if [ ! -d "/forge-cli-src" ]; then\n'
+                "  echo 'FATAL: dev-source install mode requires "
+                "/forge-cli-src bind mount' >&2\n"
+                "  exit 2\n"
+                "fi\n"
+                'export PYTHONPATH="/forge-cli-src:${PYTHONPATH:-}"\n'
+                'python -c "import fluid_build" || (echo \'FATAL: '
+                "fluid_build import failed; check /forge-cli-src' >&2 && exit 3)\n"
+                "fluid --version"
+            )
+        # pypi mode — TestPyPI overrides + optional --pre
+        return (
+            "set -eu\n"
+            "python -m pip install --upgrade pip\n"
+            'INDEX_FLAGS=""\n'
+            'if [ -n "${FLUID_PIP_INDEX_URL:-}" ]; then\n'
+            '  INDEX_FLAGS="--index-url \\"${FLUID_PIP_INDEX_URL}\\""\n'
+            "fi\n"
+            'if [ -n "${FLUID_PIP_EXTRA_INDEX_URL:-}" ]; then\n'
+            '  INDEX_FLAGS="$INDEX_FLAGS --extra-index-url \\"${FLUID_PIP_EXTRA_INDEX_URL}\\""\n'
+            "fi\n"
+            'PRE_FLAG=""\n'
+            'if [ "${FLUID_ALLOW_PRERELEASE:-false}" = "true" ]; then\n'
+            '  PRE_FLAG="--pre"\n'
+            "fi\n"
+            'SPEC="${FLUID_PACKAGE_SPEC:-data-product-forge}"\n'
+            'sh -c "python -m pip install $INDEX_FLAGS $PRE_FLAG $SPEC"\n'
+            "fluid --version"
+        )
+
+    def _stage_toggle_defaults(self, config: "PipelineConfig") -> Dict[str, bool]:
+        """Return ``{toggle_param: default_bool}`` for the 11 stages.
+
+        Each CI-system subclass uses this to declare its native build-
+        parameter surface (GitHub Actions workflow_dispatch inputs,
+        GitLab variables, Azure DevOps parameters, etc.) without
+        hardcoding the list. Keys are UPPER_SNAKE (e.g.
+        ``RUN_STAGE_3_GENERATE_ARTIFACTS``) to match Jenkins and the
+        env-var form every CI system accepts.
+        """
+        return {
+            spec.toggle_param: self._stage_default_run(spec, config) for spec in self._stage_specs()
+        }
+
+    def _eleven_stage_parameters(self, config: "PipelineConfig") -> List[Tuple[str, str, str, str]]:
+        """Return the canonical build-parameter declaration set.
+
+        Each tuple is ``(name, kind, default, description)`` where:
+        - ``kind`` ∈ {``boolean``, ``string``, ``choice``}
+        - ``default`` is a string (``"true"``/``"false"`` for booleans)
+        - description is human-readable
+
+        Every non-Jenkins CI subclass iterates this list to emit its
+        native parameter declaration dialect (GitHub Actions
+        ``workflow_dispatch.inputs``, GitLab ``variables:``, Azure
+        DevOps ``parameters:``, etc.). Keeping one list here avoids
+        6-way drift — adding / renaming a parameter flows to every
+        system automatically.
+        """
+        params: List[Tuple[str, str, str, str]] = [
+            # Global
+            (
+                "CONTRACT",
+                "string",
+                "contract.fluid.yaml",
+                "Contract path relative to workspace (or workdir when set).",
+            ),
+            (
+                "FLUID_ENV",
+                "string",
+                "dev",
+                "Environment overlay (dev | staging | prod).",
+            ),
+        ]
+        # 11 stage toggles
+        for spec in self._stage_specs():
+            params.append(
+                (
+                    spec.toggle_param,
+                    "boolean",
+                    "true" if self._stage_default_run(spec, config) else "false",
+                    f"Stage {spec.num}: toggle {spec.display}.",
+                )
+            )
+        # Apply-mode matrix
+        params.extend(
+            [
+                (
+                    "APPLY_MODE",
+                    "choice:dry-run,create-only,amend,amend-and-build,replace,replace-and-build",
+                    "amend",
+                    "Stage 7: apply mode. ``replace*`` variants require ALLOW_DATA_LOSS=true.",
+                ),
+                (
+                    "APPLY_BUILD_ID",
+                    "string",
+                    "",
+                    "Stage 7: build ID for amend-and-build / replace-and-build. Empty skips.",
+                ),
+                (
+                    "ALLOW_DATA_LOSS",
+                    "boolean",
+                    "false",
+                    "Stage 7: gate for replace / replace-and-build modes.",
+                ),
+                (
+                    "NO_VERIFY_DIGEST",
+                    "boolean",
+                    "false",
+                    "Stage 7: emergency escape from plan-binding verification. Audit log flag.",
+                ),
+                (
+                    "PUBLISH_TARGETS",
+                    "string",
+                    "datamesh-manager",
+                    "Stage 10: space-separated catalog targets.",
+                ),
+                (
+                    "SCHEDULER",
+                    "choice:,airflow,mwaa,composer,astronomer,prefect,dagster",
+                    "",
+                    "Stage 11: scheduler target. Blank = no-op.",
+                ),
+                (
+                    "SCHEDULER_DESTINATION",
+                    "string",
+                    "",
+                    "Stage 11: airflow/mwaa destination URL (s3:, gs:, az:, ssh:, scp:, file:).",
+                ),
+                (
+                    "SCHEDULER_ENVIRONMENT_NAME",
+                    "string",
+                    "",
+                    "Stage 11: composer env name or astronomer deployment name.",
+                ),
+                (
+                    "SCHEDULER_LOCATION",
+                    "string",
+                    "",
+                    "Stage 11: GCP region for composer.",
+                ),
+                (
+                    "SCHEDULER_WORKSPACE",
+                    "string",
+                    "",
+                    "Stage 11: prefect workspace or dagster-cloud deployment name.",
+                ),
+                (
+                    "SCHEDULE_SYNC_DRY_RUN",
+                    "boolean",
+                    "false",
+                    "Stage 11: --dry-run (log planned subprocess argv without executing).",
+                ),
+            ]
+        )
+        # Install-mode (pypi mode only gets the TestPyPI overrides)
+        if getattr(config, "install_mode", "pypi") == "pypi":
+            params.extend(
+                [
+                    (
+                        "FLUID_PACKAGE_SPEC",
+                        "string",
+                        "data-product-forge",
+                        "pip package spec. Pin with 'data-product-forge==X.Y.Z'.",
+                    ),
+                    (
+                        "FLUID_PIP_INDEX_URL",
+                        "string",
+                        "",
+                        "Primary pip index. Blank = stable PyPI; set TestPyPI URL for pilot builds.",
+                    ),
+                    (
+                        "FLUID_PIP_EXTRA_INDEX_URL",
+                        "string",
+                        "",
+                        "Fallback pip index for transitive deps.",
+                    ),
+                    (
+                        "FLUID_ALLOW_PRERELEASE",
+                        "boolean",
+                        "false",
+                        "Pass pip --pre (pulls alpha/rc releases).",
+                    ),
+                ]
+            )
+        return params
+
 
 @dataclass(frozen=True)
 class StageSpec:
@@ -788,6 +1003,139 @@ class GitHubActionsTemplate(BasePipelineTemplate):
         super().__init__()
         self.provider_name = "GitHub Actions"
         self.file_extensions = [".yml", ".yaml"]
+
+    def _generate_eleven_stage(self, config: PipelineConfig) -> Dict[str, str]:
+        """Emit the canonical 11-stage pipeline as a GitHub Actions workflow.
+
+        Single-file output (``.github/workflows/fluid-pipeline.yml``)
+        with ``workflow_dispatch.inputs`` for every build parameter and
+        one ``steps:`` entry per stage. Stage toggles map to
+        ``if: ${{ inputs.run_stage_N_slug }}`` which — because GitHub
+        Actions evaluates ``inputs`` at workflow-load time, not at
+        shell-eval time — is injection-proof: a malicious input value
+        can't break out of the conditional or affect downstream steps.
+
+        Workdir handling: when ``config.workdir`` is set, every step
+        inherits ``defaults.run.working-directory`` at the job level
+        (GitHub Actions' native primitive), and each stage body is
+        additionally prefixed with ``cd "<workdir>" && `` via the
+        shared ``_render_stage_command`` helper (defence-in-depth —
+        the job-level default covers raw ``run:`` scripts; the body
+        prefix covers the case where a step uses the shell directly).
+
+        Parameters threaded via env vars at job level (NOT interpolated
+        into ``run:`` bodies) so stage 7's APPLY_BUILD_ID can't smuggle
+        argv tokens. Matches the Jenkins stage-7 + stage-11 pattern.
+        """
+        env_vars = [
+            "CONTRACT",
+            "FLUID_ENV",
+            "APPLY_MODE",
+            "APPLY_BUILD_ID",
+            "ALLOW_DATA_LOSS",
+            "NO_VERIFY_DIGEST",
+            "PUBLISH_TARGETS",
+            "SCHEDULER",
+            "SCHEDULER_DESTINATION",
+            "SCHEDULER_ENVIRONMENT_NAME",
+            "SCHEDULER_LOCATION",
+            "SCHEDULER_WORKSPACE",
+            "SCHEDULE_SYNC_DRY_RUN",
+            "FLUID_PACKAGE_SPEC",
+            "FLUID_PIP_INDEX_URL",
+            "FLUID_PIP_EXTRA_INDEX_URL",
+            "FLUID_ALLOW_PRERELEASE",
+        ]
+        # Build workflow_dispatch.inputs block
+        inputs: Dict[str, Dict[str, Any]] = {}
+        for name, kind, default, description in self._eleven_stage_parameters(config):
+            # GitHub Actions naming: lower-snake for inputs
+            key = name.lower()
+            if kind.startswith("choice:"):
+                options = kind.split(":", 1)[1].split(",")
+                inputs[key] = {
+                    "type": "choice",
+                    "options": options,
+                    "default": default,
+                    "description": description,
+                }
+            elif kind == "boolean":
+                inputs[key] = {
+                    "type": "boolean",
+                    "default": default == "true",
+                    "description": description,
+                }
+            else:
+                inputs[key] = {
+                    "type": "string",
+                    "default": default,
+                    "description": description,
+                }
+        # Build job env: from inputs (one-to-one mapping so stage
+        # sh bodies read $VAR instead of ${{ inputs.var }}).
+        job_env: Dict[str, str] = {}
+        for var in env_vars:
+            job_env[var] = "${{ inputs." + var.lower() + " }}"
+        # Steps: checkout → setup → 11 stages
+        steps: List[Dict[str, Any]] = [
+            {"name": "Checkout", "uses": _pin_action("actions/checkout@v4")},
+            {
+                "name": "Setup Python",
+                "uses": _pin_action("actions/setup-python@v5"),
+                "with": {"python-version": "3.12"},
+            },
+            {
+                "name": "Setup fluid (install + verify)",
+                "run": self._render_install_setup(config),
+                "shell": "bash",
+            },
+        ]
+        for spec in self._stage_specs():
+            stage_body = self._render_stage_command(spec, config)
+            step: Dict[str, Any] = {
+                "name": f"{spec.num} \u00b7 {spec.display}",
+                # ``inputs.run_stage_N_slug`` is a workflow_dispatch
+                # input set from the UI; GitHub evaluates it before
+                # running the step, so a malicious value can't
+                # short-circuit into shell context.
+                "if": "${{ inputs." + spec.toggle_param.lower() + " }}",
+                "run": stage_body,
+                "shell": "bash",
+            }
+            # Stage 11 requires a non-blank SCHEDULER; gate accordingly.
+            if spec.num == 11:
+                step["if"] = (
+                    "${{ inputs." + spec.toggle_param.lower() + " && inputs.scheduler != '' }}"
+                )
+            steps.append(step)
+        workflow: Dict[str, Any] = {
+            "name": "fluid 11-stage pipeline",
+            "on": {"workflow_dispatch": {"inputs": inputs}},
+            "jobs": {
+                "pipeline": {
+                    "runs-on": "ubuntu-latest",
+                    "env": job_env,
+                    "steps": steps,
+                }
+            },
+        }
+        # Apply workdir via defaults.run.working-directory.
+        if config.workdir:
+            workflow["jobs"]["pipeline"]["defaults"] = {
+                "run": {"working-directory": config.workdir}
+            }
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="GitHub Actions",
+            secret_surface_hint=(
+                "Settings \u2192 Secrets and variables \u2192 Actions. "
+                "Map each secret to a job-level env: block."
+            ),
+        )
+        content = banner + json.dumps(workflow, indent=2, default=str)
+        # json.dumps produces valid YAML (JSON is a subset). Keep it
+        # this way — no yaml.dump dependency, no anchor/alias surprises.
+        return {".github/workflows/fluid-pipeline.yml": content}
 
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate GitHub Actions workflow"""
@@ -1226,6 +1574,85 @@ class GitLabCITemplate(BasePipelineTemplate):
         self.provider_name = "GitLab CI"
         self.file_extensions = [".yml"]
 
+    def _generate_eleven_stage(self, config: PipelineConfig) -> Dict[str, str]:
+        """Emit the canonical 11-stage pipeline as a ``.gitlab-ci.yml``.
+
+        Each stage becomes a separate job in its own pipeline stage so
+        they run sequentially (GitLab parallelizes jobs within the same
+        stage). ``rules:`` with ``$RUN_STAGE_N_<SLUG> == "true"``
+        implements the per-stage toggle — GitLab evaluates ``rules:``
+        before any shell runs, so the gate is injection-proof.
+
+        Workdir: ``default.before_script`` prepends ``cd "$CI_WORKDIR"``
+        when set, so every job step runs in the contract folder.
+        Stage-body commands ALSO carry a ``cd`` prefix as defence-in-
+        depth (same pattern as GitHub Actions).
+
+        Parameters are declared in ``variables:`` so the GitLab
+        "Run pipeline" UI surfaces them as editable fields.
+        """
+        # variables: block — GitLab's native parameter surface.
+        variables: Dict[str, str] = {}
+        for name, kind, default, _desc in self._eleven_stage_parameters(config):
+            # GitLab strings all go through as strings; booleans are
+            # encoded as "true"/"false" and evaluated in ``rules:``.
+            variables[name] = default
+
+        # Stages list — 1 setup stage + 11 pipeline stages.
+        stages = ["setup"] + [f"stage-{spec.num}" for spec in self._stage_specs()]
+
+        jobs: Dict[str, Any] = {}
+
+        # Setup job
+        setup_script = self._render_install_setup(config)
+        if config.workdir:
+            setup_script = f'cd "{config.workdir}" && {setup_script.replace(chr(10), "; ")}'
+        else:
+            setup_script = setup_script.replace("\n", "; ")
+        jobs["setup"] = {
+            "stage": "setup",
+            "image": "python:3.12-slim",
+            "script": [setup_script],
+        }
+
+        # 11 stage jobs
+        for spec in self._stage_specs():
+            body = self._render_stage_command(spec, config)
+            rule_expr = (
+                f'$({spec.toggle_param}) == "true"'
+                if False
+                else (
+                    # GitLab uses $VAR (not $(VAR)) in rules:if
+                    f'${spec.toggle_param} == "true"'
+                )
+            )
+            job: Dict[str, Any] = {
+                "stage": f"stage-{spec.num}",
+                "image": "python:3.12-slim",
+                "rules": [{"if": rule_expr}],
+                "script": [body],
+            }
+            # Stage 11 also gates on non-blank SCHEDULER.
+            if spec.num == 11:
+                job["rules"] = [{"if": (f'${spec.toggle_param} == "true" ' '&& $SCHEDULER != ""')}]
+            jobs[f"stage-{spec.num}-{spec.slug.replace('_', '-')}"] = job
+
+        pipeline: Dict[str, Any] = {
+            "stages": stages,
+            "variables": variables,
+            **jobs,
+        }
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="GitLab CI",
+            secret_surface_hint=(
+                "Settings \u2192 CI/CD \u2192 Variables. "
+                "Protect + mask any credential-bearing values."
+            ),
+        )
+        content = banner + json.dumps(pipeline, indent=2, default=str)
+        return {".gitlab-ci.yml": content}
+
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate GitLab CI pipeline"""
 
@@ -1476,6 +1903,132 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
         super().__init__()
         self.provider_name = "Azure DevOps"
         self.file_extensions = [".yml"]
+
+    def _generate_eleven_stage(self, config: PipelineConfig) -> Dict[str, str]:
+        """Emit the canonical 11-stage pipeline as an Azure DevOps
+        ``azure-pipelines.yml``.
+
+        Each stage becomes an Azure ``- stage:`` entry with a
+        ``condition: eq(variables['RUN_STAGE_N_SLUG'], 'true')`` so the
+        UI's "Run pipeline" dialog surfaces the toggles as parameters
+        and the condition is evaluated by Azure before any shell runs
+        (injection-proof).
+
+        Workdir: each step's ``workingDirectory:`` points at
+        ``$(System.DefaultWorkingDirectory)/<workdir>`` when set.
+
+        Parameters declared via ``parameters:`` (Azure's native
+        pipeline-parameter surface) with ``type: string`` / ``boolean``
+        / ``string`` (Azure lacks first-class choice parameters outside
+        YAML templates — we emit string with a ``values:`` hint).
+        """
+        # parameters: block
+        params_yaml: List[Dict[str, Any]] = []
+        for name, kind, default, description in self._eleven_stage_parameters(config):
+            p: Dict[str, Any] = {
+                "name": name,
+                "displayName": description,
+                "default": default,
+            }
+            if kind == "boolean":
+                p["type"] = "boolean"
+                p["default"] = default == "true"
+            elif kind.startswith("choice:"):
+                p["type"] = "string"
+                p["values"] = kind.split(":", 1)[1].split(",")
+            else:
+                p["type"] = "string"
+            params_yaml.append(p)
+
+        # Setup stage (runs on every trigger; not toggle-gated)
+        setup_script = self._render_install_setup(config)
+        setup_stage = {
+            "stage": "Setup",
+            "displayName": "Setup fluid",
+            "jobs": [
+                {
+                    "job": "Install",
+                    "pool": {"vmImage": "ubuntu-latest"},
+                    "steps": [
+                        {
+                            "task": "UsePythonVersion@0",
+                            "inputs": {"versionSpec": "3.12"},
+                        },
+                        {
+                            "bash": setup_script,
+                            "displayName": "Install fluid",
+                        },
+                    ],
+                }
+            ],
+        }
+
+        stages: List[Dict[str, Any]] = [setup_stage]
+        for spec in self._stage_specs():
+            body = self._render_stage_command(spec, config)
+            condition = f"eq(variables['{spec.toggle_param}'], 'true')"
+            if spec.num == 11:
+                condition = (
+                    f"and(eq(variables['{spec.toggle_param}'], 'true'), "
+                    "ne(variables['SCHEDULER'], ''))"
+                )
+            step: Dict[str, Any] = {"bash": body, "displayName": spec.display}
+            if config.workdir:
+                step["workingDirectory"] = f"$(System.DefaultWorkingDirectory)/{config.workdir}"
+            stages.append(
+                {
+                    "stage": f"Stage{spec.num}{''.join(w.title() for w in spec.slug.split('_'))}",
+                    "displayName": f"{spec.num} \u00b7 {spec.display}",
+                    "condition": condition,
+                    "dependsOn": (
+                        "Setup"
+                        if spec.num == 1
+                        else (
+                            f"Stage{spec.num - 1}{''.join(w.title() for w in self._stage_specs()[spec.num - 2].slug.split('_'))}"
+                        )
+                    ),
+                    "jobs": [
+                        {
+                            "job": f"Stage{spec.num}Job",
+                            "pool": {"vmImage": "ubuntu-latest"},
+                            "steps": [
+                                {
+                                    "task": "UsePythonVersion@0",
+                                    "inputs": {"versionSpec": "3.12"},
+                                },
+                                {
+                                    "bash": setup_script,
+                                    "displayName": "Install fluid",
+                                },
+                                step,
+                            ],
+                        }
+                    ],
+                }
+            )
+
+        pipeline: Dict[str, Any] = {
+            "trigger": ["main"],
+            "pool": {"vmImage": "ubuntu-latest"},
+            "parameters": params_yaml,
+            "variables": {
+                # Expose parameters as variables so stage conditions +
+                # shell env both see them with the same names.
+                name: f"${{{{ parameters.{name} }}}}"
+                for name, _k, _d, _desc in self._eleven_stage_parameters(config)
+            },
+            "stages": stages,
+        }
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="Azure DevOps",
+            secret_surface_hint=(
+                "Library \u2192 Variable groups (or pipeline Variables \u2192 "
+                "Keep this value secret) for credential bindings."
+            ),
+        )
+        content = banner + json.dumps(pipeline, indent=2, default=str)
+        return {"azure-pipelines.yml": content}
 
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate Azure DevOps pipeline"""
@@ -2302,6 +2855,93 @@ class BitbucketTemplate(BasePipelineTemplate):
         super().__init__()
         self.provider_name = "Bitbucket Pipelines"
 
+    def _generate_eleven_stage(self, config: PipelineConfig) -> Dict[str, str]:
+        """Emit the canonical 11-stage pipeline as ``bitbucket-pipelines.yml``.
+
+        Uses ``pipelines.custom.fluid-11-stage`` so operators launch it
+        from the Bitbucket UI "Run pipeline" menu and get the
+        ``variables:`` prompt to fill in CONTRACT, FLUID_ENV, APPLY_MODE,
+        etc. Each step runs a single ``[ "$RUN_STAGE_N_SLUG" = "true" ]
+        && <body> || echo 'skipped'`` gate — Bitbucket doesn't support
+        per-step ``when:`` conditionals in ``custom:`` pipelines, so
+        the gating happens at shell level. Empty params stay empty (the
+        underlying fluid CLI re-validates).
+
+        Workdir: ``cd "$WORKDIR"`` is prepended in every step via the
+        ``_render_stage_command`` helper.
+
+        Install-mode: Bitbucket is hosted-only; ``dev-source`` mode is
+        unsupported here and the emit falls back to a ``pypi`` install
+        with a banner comment directing operators to bake forge-cli
+        into a custom image if they need dev-source parity.
+        """
+        # Build variables prompt list — Bitbucket's "custom:" pipelines
+        # take a list of {name, default?, description?} entries.
+        variables_prompt: List[Dict[str, Any]] = []
+        for name, _kind, default, description in self._eleven_stage_parameters(config):
+            v: Dict[str, Any] = {"name": name}
+            if default:
+                v["default"] = default
+            if description:
+                v["description"] = description
+            variables_prompt.append(v)
+
+        setup_script = self._render_install_setup(config)
+
+        # Each stage is one step with a gate
+        stage_steps: List[Dict[str, Any]] = []
+        stage_steps.append(
+            {
+                "step": {
+                    "name": "Setup fluid",
+                    "image": "python:3.12-slim",
+                    "script": [setup_script],
+                }
+            }
+        )
+        for spec in self._stage_specs():
+            body = self._render_stage_command(spec, config)
+            # Gate at shell level — Bitbucket custom pipelines don't
+            # expose per-step when: clauses. The ``|| echo`` branch
+            # keeps the step exit-0 when skipped.
+            gate = f'[ "${spec.toggle_param}" = "true" ]'
+            if spec.num == 11:
+                gate = f'[ "${spec.toggle_param}" = "true" ] && [ -n "$SCHEDULER" ]'
+            gated = (
+                f'{gate} && ({body}) || echo "[fluid] stage {spec.num} ({spec.display}) skipped"'
+            )
+            stage_steps.append(
+                {
+                    "step": {
+                        "name": f"{spec.num} \u00b7 {spec.display}",
+                        "image": "python:3.12-slim",
+                        "script": [setup_script, gated],
+                    }
+                }
+            )
+
+        pipeline: Dict[str, Any] = {
+            "image": "python:3.12-slim",
+            "pipelines": {
+                "custom": {
+                    "fluid-11-stage": [
+                        {"variables": variables_prompt},
+                        *stage_steps,
+                    ]
+                }
+            },
+        }
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="Bitbucket Pipelines",
+            secret_surface_hint=(
+                "Repository settings \u2192 Pipelines \u2192 Repository variables. "
+                "Mark Secured for credential values."
+            ),
+        )
+        content = banner + json.dumps(pipeline, indent=2, default=str)
+        return {"bitbucket-pipelines.yml": content}
+
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate Bitbucket pipeline"""
 
@@ -2401,6 +3041,132 @@ class CircleCITemplate(BasePipelineTemplate):
     def __init__(self):
         super().__init__()
         self.provider_name = "CircleCI"
+
+    def _generate_eleven_stage(self, config: PipelineConfig) -> Dict[str, str]:
+        """Emit the canonical 11-stage pipeline as ``.circleci/config.yml``.
+
+        One job per stage, chained via ``requires:`` in the workflow
+        block. Stage toggles implemented via ``when: <<pipeline.parameters.run_stage_N>>``
+        — CircleCI evaluates these at pipeline-load time, not at shell
+        level, so the gates are injection-proof.
+
+        Workdir: jobs use ``working_directory: ~/project/<workdir>``
+        when set (CircleCI's native primitive).
+
+        Install-mode: hosted-only (like Bitbucket); dev-source falls
+        back to pypi with a banner comment.
+        """
+        # parameters block — CircleCI's native pipeline-parameter surface.
+        parameters: Dict[str, Dict[str, Any]] = {}
+        for name, kind, default, description in self._eleven_stage_parameters(config):
+            key = name.lower()
+            if kind == "boolean":
+                parameters[key] = {
+                    "type": "boolean",
+                    "default": default == "true",
+                    "description": description,
+                }
+            elif kind.startswith("choice:"):
+                # CircleCI lacks native choice; use string + description.
+                parameters[key] = {
+                    "type": "string",
+                    "default": default,
+                    "description": (
+                        description + " Values: " + ", ".join(kind.split(":", 1)[1].split(","))
+                    ),
+                }
+            else:
+                parameters[key] = {
+                    "type": "string",
+                    "default": default,
+                    "description": description,
+                }
+
+        # Shared env mapping — parameters flow into job env.
+        env_from_params = {
+            name: f"<<pipeline.parameters.{name.lower()}>>"
+            for name, _k, _d, _desc in self._eleven_stage_parameters(config)
+        }
+
+        setup_script = self._render_install_setup(config)
+        working_dir = f"~/project/{config.workdir}" if config.workdir else "~/project"
+
+        # Jobs: setup + 11 stage jobs
+        jobs: Dict[str, Any] = {
+            "setup": {
+                "docker": [{"image": "cimg/python:3.12"}],
+                "working_directory": working_dir,
+                "steps": ["checkout", {"run": {"command": setup_script}}],
+            }
+        }
+        for spec in self._stage_specs():
+            body = self._render_stage_command(spec, config)
+            jobs[f"stage_{spec.num}_{spec.slug}"] = {
+                "docker": [{"image": "cimg/python:3.12"}],
+                "working_directory": working_dir,
+                "environment": env_from_params,
+                "steps": [
+                    "checkout",
+                    {"run": {"command": setup_script}},
+                    {
+                        "run": {
+                            "name": f"{spec.num} \u00b7 {spec.display}",
+                            "command": body,
+                        }
+                    },
+                ],
+            }
+
+        # Workflow with stage toggles as `when:` clauses
+        workflow_jobs: List[Any] = ["setup"]
+        prev_job = "setup"
+        for spec in self._stage_specs():
+            job_key = f"stage_{spec.num}_{spec.slug}"
+            when_expr = f"<<pipeline.parameters.{spec.toggle_param.lower()}>>"
+            if spec.num == 11:
+                # Stage 11 additionally requires a non-blank SCHEDULER.
+                # CircleCI's ``when:`` supports logic via
+                # ``and: [param, {not: {equal: [<<…>>, '']}}]``.
+                when_expr = {
+                    "and": [
+                        when_expr,
+                        {
+                            "not": {
+                                "equal": [
+                                    "<<pipeline.parameters.scheduler>>",
+                                    "",
+                                ]
+                            }
+                        },
+                    ]
+                }
+            workflow_jobs.append(
+                {
+                    job_key: {
+                        "requires": [prev_job],
+                        "when": when_expr,
+                    }
+                }
+            )
+            prev_job = job_key
+
+        pipeline: Dict[str, Any] = {
+            "version": 2.1,
+            "parameters": parameters,
+            "jobs": jobs,
+            "workflows": {
+                "fluid-11-stage": {"jobs": workflow_jobs},
+            },
+        }
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="CircleCI",
+            secret_surface_hint=(
+                "Project Settings \u2192 Environment Variables for credential bindings."
+            ),
+        )
+        content = banner + json.dumps(pipeline, indent=2, default=str)
+        return {".circleci/config.yml": content}
 
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate CircleCI pipeline"""
@@ -2505,6 +3271,138 @@ class TektonTemplate(BasePipelineTemplate):
     def __init__(self):
         super().__init__()
         self.provider_name = "Tekton"
+
+    def _generate_eleven_stage(self, config: PipelineConfig) -> Dict[str, str]:
+        """Emit the canonical 11-stage pipeline as a Tekton Pipeline + Task.
+
+        Single ``fluid-stage`` Task takes ``stage-num``, ``stage-slug``,
+        and ``stage-command`` params + standard env params; the
+        Pipeline declares 11 ``tasks:`` entries (one per stage) plus a
+        setup task. Toggles are Pipeline-level string params
+        (``run-stage-N-slug: "true"`` default) referenced from each
+        task's ``when:`` clause.
+
+        Workdir: Tekton tasks don't have a direct cd primitive, so the
+        ``_render_stage_command`` helper's ``cd "<workdir>" && `` prefix
+        is the only hook. Combined with a ``workingDir:`` on the step
+        (Tekton's native primitive), this is injection-proof.
+
+        Install-mode: self-hosted runners via workspace volume; both
+        ``pypi`` and ``dev-source`` supported.
+        """
+        setup_script = self._render_install_setup(config)
+
+        # Pipeline-level params: one per build-parameter we expose.
+        pipeline_params: List[Dict[str, Any]] = []
+        for name, kind, default, description in self._eleven_stage_parameters(config):
+            # Tekton's parameter system is string-only (booleans are
+            # encoded as "true"/"false" strings). Encode uniformly.
+            pipeline_params.append(
+                {
+                    "name": name.lower().replace("_", "-"),
+                    "type": "string",
+                    "default": default,
+                    "description": description,
+                }
+            )
+
+        # Setup task — one-off, runs first, no toggle gate.
+        setup_task_ref = {
+            "apiVersion": "tekton.dev/v1beta1",
+            "kind": "Task",
+            "metadata": {"name": "fluid-setup"},
+            "spec": {
+                "steps": [
+                    {
+                        "name": "install-fluid",
+                        "image": "python:3.12-slim",
+                        "script": setup_script,
+                        **({"workingDir": config.workdir} if config.workdir else {}),
+                    }
+                ]
+            },
+        }
+        # Per-stage task template (one Task resource handles every
+        # stage since the body varies only in the `script:` content;
+        # we instantiate it 11 times in the Pipeline with different
+        # params). For simplicity here we emit one Task per stage.
+        stage_tasks: List[Dict[str, Any]] = [setup_task_ref]
+        pipeline_tasks: List[Dict[str, Any]] = [
+            {"name": "setup", "taskRef": {"name": "fluid-setup"}}
+        ]
+        for i, spec in enumerate(self._stage_specs()):
+            task_name = f"fluid-stage-{spec.num}-{spec.slug.replace('_', '-')}"
+            body = self._render_stage_command(spec, config)
+            stage_tasks.append(
+                {
+                    "apiVersion": "tekton.dev/v1beta1",
+                    "kind": "Task",
+                    "metadata": {"name": task_name},
+                    "spec": {
+                        "steps": [
+                            {
+                                "name": "install-fluid",
+                                "image": "python:3.12-slim",
+                                "script": setup_script,
+                                **({"workingDir": config.workdir} if config.workdir else {}),
+                            },
+                            {
+                                "name": f"stage-{spec.num}",
+                                "image": "python:3.12-slim",
+                                "script": body,
+                                **({"workingDir": config.workdir} if config.workdir else {}),
+                            },
+                        ]
+                    },
+                }
+            )
+            when_clauses: List[Dict[str, Any]] = [
+                {
+                    "input": f"$(params.{spec.toggle_param.lower().replace('_', '-')})",
+                    "operator": "in",
+                    "values": ["true"],
+                }
+            ]
+            if spec.num == 11:
+                when_clauses.append(
+                    {
+                        "input": "$(params.scheduler)",
+                        "operator": "notin",
+                        "values": [""],
+                    }
+                )
+            pipeline_tasks.append(
+                {
+                    "name": f"stage-{spec.num}",
+                    "taskRef": {"name": task_name},
+                    "runAfter": ["setup" if i == 0 else f"stage-{spec.num - 1}"],
+                    "when": when_clauses,
+                }
+            )
+
+        pipeline_doc: Dict[str, Any] = {
+            "apiVersion": "tekton.dev/v1beta1",
+            "kind": "Pipeline",
+            "metadata": {"name": "fluid-11-stage-pipeline"},
+            "spec": {
+                "params": pipeline_params,
+                "tasks": pipeline_tasks,
+            },
+        }
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="Tekton",
+            secret_surface_hint=(
+                "Secret resources bound via ``workspaces:`` or env-var projection. "
+                "See the Tekton Secrets docs."
+            ),
+        )
+        pipeline_yaml = banner + json.dumps(pipeline_doc, indent=2, default=str)
+        tasks_yaml = banner + json.dumps({"items": stage_tasks}, indent=2, default=str)
+        return {
+            "tekton/pipeline.yaml": pipeline_yaml,
+            "tekton/tasks.yaml": tasks_yaml,
+        }
 
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate Tekton pipeline"""

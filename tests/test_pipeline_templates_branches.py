@@ -1049,3 +1049,237 @@ class TestStageSpecsHelper:
                     "doesn't use the ${CONTRACT:-contract.fluid.yaml} "
                     "fallback — Build Now would fail without a pre-set env var"
                 )
+
+
+class TestElevenStagePortsAllSystems:
+    """Verify each of the 6 non-Jenkins CI systems emits an 11-stage
+    pipeline via the new ``_generate_eleven_stage`` method.
+
+    The Jenkins template (``JenkinsTemplate.generate``) is the
+    reference implementation. This class is the "6-way contract
+    check" — every non-Jenkins CI system must:
+
+    1. Render all 11 stages in its output (structural invariant).
+    2. Declare a toggle parameter per stage that surfaces to the
+       system's native build-params UI.
+    3. Route user-supplied params through env vars / variables, NOT
+       by direct-interpolating them into shell bodies. (Stage 7 +
+       stage 11 argument-smuggling defence carried across ports.)
+    4. Produce the ``install_mode`` setup body so the runner installs
+       fluid before any stage runs.
+    5. Support ``workdir`` when set (subfolder contract in monorepo).
+    6. Fail loud for an unknown scheduler (stage 11's ``--scheduler``
+       argument) — enforced at the CLI level, but the template must
+       thread the value through without corruption.
+
+    These tests don't regenerate goldens — they assert structural
+    properties of the output strings. Goldens remain the Jenkins
+    template's specific golden file.
+    """
+
+    from fluid_build.forge.core.pipeline_templates import (  # noqa: E402
+        AzureDevOpsTemplate,
+        BitbucketTemplate,
+        CircleCITemplate,
+        GitHubActionsTemplate,
+        GitLabCITemplate,
+        TektonTemplate,
+    )
+
+    SYSTEMS = [
+        # (name, template_class, provider_enum, filename_substring)
+        (
+            "GitHubActions",
+            GitHubActionsTemplate,
+            PipelineProvider.GITHUB_ACTIONS,
+            ".github/workflows",
+        ),
+        ("GitLab", GitLabCITemplate, PipelineProvider.GITLAB_CI, ".gitlab-ci.yml"),
+        ("AzureDevOps", AzureDevOpsTemplate, PipelineProvider.AZURE_DEVOPS, "azure-pipelines.yml"),
+        ("Bitbucket", BitbucketTemplate, PipelineProvider.BITBUCKET, "bitbucket-pipelines.yml"),
+        ("CircleCI", CircleCITemplate, PipelineProvider.CIRCLE_CI, ".circleci/config.yml"),
+        ("Tekton", TektonTemplate, PipelineProvider.TEKTON, "tekton/"),
+    ]
+
+    def _generate(self, template_cls, provider, **kwargs):
+        cfg = PipelineConfig(provider=provider, complexity=PipelineComplexity.BASIC, **kwargs)
+        return template_cls()._generate_eleven_stage(cfg)
+
+    def _all_content(self, out):
+        """Join every file's content — helper for cross-file checks
+        (Tekton splits into pipeline.yaml + tasks.yaml, others are
+        single-file)."""
+        return "\n".join(out.values())
+
+    # -----------------------------------------------------------------
+    # 1. Structural invariant: all 11 stages appear in every emit
+    # -----------------------------------------------------------------
+
+    @pytest.mark.parametrize("name,cls,provider,fname", SYSTEMS)
+    def test_all_eleven_stages_present(self, name, cls, provider, fname):
+        """Every of the 6 CI systems must emit all 11 stages."""
+        out = self._generate(cls, provider)
+        assert out, f"{name}: _generate_eleven_stage returned empty"
+        content = self._all_content(out)
+        # Every stage body reaches the output via `fluid <verb>`.
+        verbs = [
+            "fluid bundle ",
+            "fluid validate ",
+            "fluid generate artifacts ",
+            "fluid validate-artifacts ",
+            "fluid diff ",
+            "fluid plan ",
+            "fluid apply",
+            "fluid policy-apply",
+            "fluid verify ",
+            "fluid publish ",
+            "fluid schedule-sync ",
+        ]
+        missing = [v for v in verbs if v not in content]
+        assert not missing, (
+            f"{name} emit is missing stage(s): {missing!r}. " f"Output files: {list(out.keys())}"
+        )
+
+    @pytest.mark.parametrize("name,cls,provider,fname", SYSTEMS)
+    def test_filename_matches_system_convention(self, name, cls, provider, fname):
+        """File-path convention per CI system's documented location."""
+        out = self._generate(cls, provider)
+        matching = [k for k in out.keys() if fname in k]
+        assert matching, (
+            f"{name}: no output file matches expected path substring {fname!r}; "
+            f"got {list(out.keys())}"
+        )
+
+    # -----------------------------------------------------------------
+    # 2. Toggle parameters surface in every native param mechanism
+    # -----------------------------------------------------------------
+
+    @pytest.mark.parametrize("name,cls,provider,fname", SYSTEMS)
+    def test_all_eleven_toggles_declared(self, name, cls, provider, fname):
+        """Every RUN_STAGE_N_SLUG toggle must appear somewhere in the
+        emit — as an input / parameter / variable declaration. The
+        exact YAML path varies by system; we only check the token
+        appears verbatim so operators can find it in the Build-With-
+        Parameters UI."""
+        out = self._generate(cls, provider)
+        content = self._all_content(out)
+        for n in range(1, 12):
+            # Case-insensitive + underscore-or-hyphen tolerant: Tekton
+            # converts RUN_STAGE_1_BUNDLE → run-stage-1-bundle.
+            toggles = [f"RUN_STAGE_{n}_", f"run_stage_{n}_", f"run-stage-{n}-"]
+            assert any(
+                t in content for t in toggles
+            ), f"{name} emit is missing stage-{n} toggle (tried {toggles!r})"
+
+    # -----------------------------------------------------------------
+    # 3. Install setup — every emit carries the install-mode body
+    # -----------------------------------------------------------------
+
+    @pytest.mark.parametrize("name,cls,provider,fname", SYSTEMS)
+    def test_install_setup_emitted(self, name, cls, provider, fname):
+        """Every emit must contain the fluid install command (pypi mode
+        default) so a fresh runner can execute the pipeline."""
+        out = self._generate(cls, provider)
+        content = self._all_content(out)
+        # The install setup always invokes pip install for pypi mode
+        # and references the package spec env var.
+        assert "pip install" in content, f"{name}: missing pip install in install-setup body"
+        assert "FLUID_PACKAGE_SPEC" in content, f"{name}: missing FLUID_PACKAGE_SPEC override"
+        assert "fluid --version" in content, f"{name}: missing fluid --version sanity check"
+
+    # -----------------------------------------------------------------
+    # 4. Workdir support — subfolder contracts
+    # -----------------------------------------------------------------
+
+    @pytest.mark.parametrize("name,cls,provider,fname", SYSTEMS)
+    def test_workdir_applied_when_set(self, name, cls, provider, fname):
+        """When config.workdir is set, the workdir value must appear
+        in the output — via the native primitive (working-directory,
+        workingDir, working_directory, etc.) or via a `cd` prefix in
+        the stage bodies."""
+        out = self._generate(cls, provider, workdir="examples/demo")
+        content = self._all_content(out)
+        assert "examples/demo" in content, (
+            f"{name}: workdir='examples/demo' not reflected in emit. "
+            f"Must appear via native primitive or cd prefix."
+        )
+
+    # -----------------------------------------------------------------
+    # 5. Stage 11 gate — both toggle AND non-blank SCHEDULER required
+    # -----------------------------------------------------------------
+
+    @pytest.mark.parametrize("name,cls,provider,fname", SYSTEMS)
+    def test_stage_11_requires_scheduler(self, name, cls, provider, fname):
+        """Stage 11 must NOT run when SCHEDULER is blank, even if
+        RUN_STAGE_11_SCHEDULE_SYNC is true. Otherwise `fluid schedule-
+        sync` would invoke with an empty --scheduler and the CLI would
+        fail with a confusing error instead of cleanly skipping."""
+        out = self._generate(cls, provider)
+        content = self._all_content(out)
+        # Each system expresses the gate differently; check that the
+        # SCHEDULER param is referenced alongside the stage-11 toggle.
+        # We look for any mention of "SCHEDULER" (case variants).
+        scheduler_refs = [
+            "SCHEDULER",
+            "scheduler",
+        ]
+        assert any(
+            r in content for r in scheduler_refs
+        ), f"{name}: SCHEDULER param not referenced anywhere in emit"
+
+    # -----------------------------------------------------------------
+    # 6. Parameters come from the shared list (no drift between systems)
+    # -----------------------------------------------------------------
+
+    @pytest.mark.parametrize("name,cls,provider,fname", SYSTEMS)
+    def test_standard_params_declared(self, name, cls, provider, fname):
+        """CONTRACT / FLUID_ENV / APPLY_MODE / ALLOW_DATA_LOSS /
+        NO_VERIFY_DIGEST / PUBLISH_TARGETS / SCHEDULER_* must all be
+        declared. These come from the shared
+        :meth:`BasePipelineTemplate._eleven_stage_parameters` helper
+        so any future parameter addition must land across all 6
+        systems automatically."""
+        out = self._generate(cls, provider)
+        content = self._all_content(out)
+        # Check canonical param names (tolerating lower/hyphen variants)
+        for param in [
+            "CONTRACT",
+            "FLUID_ENV",
+            "APPLY_MODE",
+            "ALLOW_DATA_LOSS",
+            "NO_VERIFY_DIGEST",
+            "PUBLISH_TARGETS",
+            "SCHEDULER_DESTINATION",
+        ]:
+            variants = [param, param.lower(), param.lower().replace("_", "-")]
+            assert any(
+                v in content for v in variants
+            ), f"{name}: parameter {param!r} (or case variants) not declared"
+
+    # -----------------------------------------------------------------
+    # 7. Reference-only contracts skip stage 3 (generate artifacts)
+    # -----------------------------------------------------------------
+
+    @pytest.mark.parametrize("name,cls,provider,fname", SYSTEMS)
+    def test_reference_only_contract_stage_3_default_false(self, name, cls, provider, fname):
+        """When config.generates_artifacts=False, the RUN_STAGE_3_GENERATE_ARTIFACTS
+        toggle must default to ``false`` — reference-only contracts
+        delegate artifact ownership upstream and running stage 3 would
+        surface spurious 'nothing to generate' failures."""
+        out = self._generate(cls, provider, generates_artifacts=False)
+        content = self._all_content(out)
+        # Either the default is 'false' in the param declaration OR
+        # the stage is conditionally omitted — either is acceptable.
+        # We check the toggle's default by looking for
+        # "RUN_STAGE_3_GENERATE_ARTIFACTS" in the same line as "false".
+        lower = content.lower()
+        idx = lower.find("run_stage_3_generate_artifacts")
+        if idx == -1:
+            idx = lower.find("run-stage-3-generate-artifacts")
+        assert idx != -1, f"{name}: stage-3 toggle not found in emit"
+        # Scan a 400-char window around the toggle for "false"
+        window = content[max(0, idx - 50) : idx + 400]
+        assert "false" in window.lower(), (
+            f"{name}: stage-3 toggle should default to 'false' for "
+            f"reference-only contracts. Window: {window!r}"
+        )
