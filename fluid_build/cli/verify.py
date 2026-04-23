@@ -44,9 +44,6 @@ LOG = logging.getLogger("fluid.cli.verify")
 
 COMMAND = "verify"
 
-# Backwards-compatible alias for any legacy callers in this module.
-_resolve_env_templates = resolve_env_templates
-
 
 def _hydrate_dotenv_into_environ(project_root: Path, environment: Optional[str]) -> None:
     """Hydrate ``os.environ`` from ``.env`` files and ``FLUID_SECRETS_FILE``.
@@ -784,14 +781,14 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             location = binding.get("location", expose_config.get("location", {}))
             properties = binding.get("properties", {})
 
-            database = _resolve_env_templates(location.get("database")) or snowflake_settings.get(
+            database = resolve_env_templates(location.get("database")) or snowflake_settings.get(
                 "database"
             )
-            schema = _resolve_env_templates(location.get("schema")) or snowflake_settings.get(
+            schema = resolve_env_templates(location.get("schema")) or snowflake_settings.get(
                 "schema"
             )
             table = (
-                _resolve_env_templates(location.get("table"))
+                resolve_env_templates(location.get("table"))
                 or properties.get("table")
                 or expose_name
             )
@@ -857,9 +854,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 target = ".".join(
                     part
                     for part in [
-                        _resolve_env_templates(location.get("database", "")) or "",
-                        _resolve_env_templates(location.get("schema", "")) or "",
-                        _resolve_env_templates(location.get("table", "")) or "",
+                        resolve_env_templates(location.get("database", "")) or "",
+                        resolve_env_templates(location.get("schema", "")) or "",
+                        resolve_env_templates(location.get("table", "")) or "",
                     ]
                     if part
                 )
