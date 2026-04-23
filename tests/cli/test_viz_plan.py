@@ -265,7 +265,14 @@ class TestRenderPlanHtml:
         viz_plan.render_plan_html(str(plan), str(out), logger)
         content = out.read_text()
         assert "mermaid" in content.lower()
-        assert "jsdelivr.net" in content  # CDN source
+        # Match the full expected CDN path rather than a bare
+        # ``jsdelivr.net`` substring — CodeQL flags bare-domain
+        # substring checks as ``py/incomplete-url-substring-
+        # sanitization`` (a URL like ``https://evil.com/jsdelivr.net/``
+        # would satisfy the weaker check). The full path pins the
+        # expected CDN origin + package without re-implementing a
+        # URL parser just for a test assertion.
+        assert "cdn.jsdelivr.net/npm/mermaid" in content
 
     def test_security_level_strict_set(self, tmp_path, logger):
         """The mermaid.initialize call must include
