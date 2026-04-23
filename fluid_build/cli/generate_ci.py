@@ -143,7 +143,95 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
             "Auto-detected for contracts whose builds[].pattern is hybrid-reference."
         ),
     )
+    p.add_argument(
+        "--install-mode",
+        choices=["pypi", "dev-source"],
+        default="pypi",
+        help=(
+            "How the generated Jenkinsfile installs fluid at build time:\n"
+            "  pypi (default)  production. `pip install data-product-forge`\n"
+            "                  from stable PyPI. Override the package spec\n"
+            "                  via FLUID_PACKAGE_SPEC env var at build time.\n"
+            "  dev-source      lab / contributor only. Installs from a\n"
+            "                  /forge-cli-src bind mount in the Jenkins\n"
+            "                  container. Fails LOUD if the mount is\n"
+            "                  missing — no silent fallback to PyPI.\n"
+            "Only the Jenkins template uses this flag today; other CI\n"
+            "systems ignore it."
+        ),
+    )
     p.set_defaults(generate_sub="ci", func=_run_from_generate)
+
+
+def _echo_install_mode_summary(install_mode: str, out_path: Optional[str]) -> None:
+    """Print a single-line, human-readable summary of the install mode.
+
+    Shows up AFTER the ``generate_ci_ok`` JSON log event, on stdout,
+    unambiguous so an operator running ``fluid generate ci`` in a
+    terminal sees at a glance which mode the generated Jenkinsfile
+    expects. For programmatic consumers (CI wrapping CI), the JSON log
+    event is still the source of truth; this echo is UX candy for
+    humans.
+
+    Uses ``print`` rather than ``console.cprint`` because cprint routes
+    through Rich which treats ``[text]`` as style markup and silently
+    strips the bracket. The whole point of this echo is to surface the
+    mode tag unambiguously.
+    """
+    from fluid_build.cli.console import cprint
+
+    dest = out_path or "<default path>"
+    # markup=False tells Rich (via cprint) not to interpret "[text]" as
+    # style markup — critical because our install-mode tag uses literal
+    # square brackets.
+    if install_mode == "pypi":
+        cprint(f"[install-mode: pypi] Jenkinsfile written -> {dest}", markup=False)
+        cprint(
+            "  |- Jenkins installs: pip install data-product-forge (stable PyPI)",
+            markup=False,
+        )
+        cprint(
+            "  |  Override at build time via these Jenkins parameters:", markup=False
+        )
+        cprint(
+            "  |    FLUID_PACKAGE_SPEC        = 'data-product-forge==X.Y.Z'  (pin version)",
+            markup=False,
+        )
+        cprint(
+            "  |    FLUID_PIP_INDEX_URL       = 'https://test.pypi.org/simple/'  (TestPyPI)",
+            markup=False,
+        )
+        cprint(
+            "  |    FLUID_PIP_EXTRA_INDEX_URL = 'https://pypi.org/simple/'   (fallback)",
+            markup=False,
+        )
+        cprint(
+            "  |    FLUID_ALLOW_PRERELEASE    = true  (pip --pre, alpha/rc releases)",
+            markup=False,
+        )
+    elif install_mode == "dev-source":
+        cprint(
+            f"[install-mode: dev-source] Jenkinsfile written -> {dest}", markup=False
+        )
+        cprint(
+            "  |- Jenkins installs from /forge-cli-src bind mount (LAB ONLY)",
+            markup=False,
+        )
+        cprint("  |  Requires docker-compose:", markup=False)
+        cprint(
+            "  |    - ${FORGE_CLI_REPO:-../../../forge-cli}:/forge-cli-src:ro",
+            markup=False,
+        )
+        cprint(
+            "  |  Fails LOUD if the mount is missing - no silent fallback.", markup=False
+        )
+    else:
+        # Defensive - template would have raised already, but log
+        # something if it didn't.
+        cprint(
+            f"[install-mode: {install_mode}] Jenkinsfile written -> {dest}",
+            markup=False,
+        )
 
 
 def _run_from_generate(args, logger: logging.Logger) -> int:
@@ -237,11 +325,13 @@ def run(args, logger: logging.Logger) -> int:
         no_generate_flag = bool(getattr(args, "no_generate_artifacts", False))
         generates_artifacts = not (no_generate_flag or _contract_is_reference_only(contract_path))
 
+        install_mode = getattr(args, "install_mode", "pypi") or "pypi"
         config = PipelineConfig(
             provider=provider,
             complexity=complexity,
             workdir=_git_prefix(),
             generates_artifacts=generates_artifacts,
+            install_mode=install_mode,
         )
         files = PipelineTemplateGenerator().generate_pipeline(config)
         if not files:
@@ -294,6 +384,16 @@ def run(args, logger: logging.Logger) -> int:
                 system=system,
                 primary=(rel == primary or rel == out_override),
             )
+
+        # Human-readable terminal echo — unambiguous single line so
+        # operators see at a glance which install mode the generated
+        # CI file expects. Only emitted for systems that actually
+        # consume the install-mode flag (currently Jenkins only); for
+        # other systems it's a no-op.
+        if canonical == "jenkins":
+            primary_path = out_override or primary
+            _echo_install_mode_summary(install_mode, primary_path)
+
         return 0
     except CLIError:
         raise

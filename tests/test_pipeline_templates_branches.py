@@ -457,8 +457,14 @@ class TestJenkinsTemplateHardening:
 
     def test_workdir_wraps_every_fluid_command(self):
         content = self._jenkinsfile(workdir="examples/demo")
+        # CD prefix appears inside each sh block. Every sh uses the
+        # triple-single ``sh '''...'''`` Groovy form so the cd prefix
+        # can safely use double-quoted paths (safe within single-quoted
+        # outer string).
+        assert 'cd "examples/demo" && fluid' in content
         assert 'cd "examples/demo" && fluid validate' in content
         assert 'cd "examples/demo" && fluid plan' in content
+        assert 'cd "examples/demo" && fluid apply' in content
 
     def test_workdir_prefixes_archive_patterns(self):
         content = self._jenkinsfile(workdir="examples/demo")
@@ -466,24 +472,31 @@ class TestJenkinsTemplateHardening:
         # find it (archiveArtifacts is rooted at the SCM checkout root).
         assert "examples/demo/runtime/plan.json" in content
 
-    def test_workdir_prefixes_junit_patterns(self):
-        content = self._jenkinsfile(workdir="examples/demo")
-        assert "examples/demo/test-results-unit.xml" in content
-        assert "examples/demo/test-results-integration.xml" in content
-
-    # Regression 2: reference-only stage omission ----------------------
+    # Regression 2: reference-only stage auto-defaulting ---------------
+    # The 11-stage template makes stage 3 generate-artifacts toggleable
+    # via RUN_STAGE_3_GENERATE_ARTIFACTS. For reference-only contracts
+    # the default value flips to ``false`` so operators who just click
+    # "Build" don't run stage 3.
 
     def test_default_contains_generate_artifacts_stage(self):
         content = self._jenkinsfile()
-        assert "stage('Generate Artifacts')" in content
+        # Stage 3 is always PRESENT in the template (toggleable) —
+        # what changes between reference-only and normal is the DEFAULT
+        # value of RUN_STAGE_3_GENERATE_ARTIFACTS.
+        assert "stage('3 · generate artifacts')" in content
+        # Default generates_artifacts=True → param default true.
+        assert "name: 'RUN_STAGE_3_GENERATE_ARTIFACTS', defaultValue: true" in content
 
-    def test_generates_artifacts_false_omits_stage(self):
+    def test_generates_artifacts_false_flips_param_default(self):
         content = self._jenkinsfile(generates_artifacts=False)
-        assert "stage('Generate Artifacts')" not in content
-        # Adjacent stages must still be present — we're skipping a stage,
-        # not breaking the template.
-        assert "stage('Validate')" in content
-        assert "stage('Plan')" in content
+        # Stage 3 is still declared (parameterized), but the default
+        # flips to false so a zero-click build skips it.
+        assert "stage('3 · generate artifacts')" in content
+        assert "name: 'RUN_STAGE_3_GENERATE_ARTIFACTS', defaultValue: false" in content
+        # Adjacent stages must still be present — we're defaulting a
+        # stage off, not breaking the template.
+        assert "stage('2 · validate')" in content
+        assert "stage('6 · plan')" in content
 
     # Regression 3: empty-archive/result tolerance --------------------
 
@@ -498,41 +511,92 @@ class TestJenkinsTemplateHardening:
                 "allowEmptyArchive: true" in line
             ), f"archiveArtifacts without allowEmptyArchive breaks reference-only builds: {line}"
 
-    def test_junit_tolerates_empty_results(self):
-        content = self._jenkinsfile()
-        junit_lines = [line for line in content.splitlines() if line.strip().startswith("junit ")]
-        assert junit_lines, "expected at least one junit line"
-        for line in junit_lines:
-            assert (
-                "allowEmptyResults: true" in line
-            ), f"junit without allowEmptyResults breaks reference-only builds: {line}"
-
     # Other hardening fixes --------------------------------------------
 
-    def test_uses_fluid_test_no_data_for_unit(self):
-        """`fluid test` has no --type flag; --no-data is the structural-only
-        mode. Emitting --type unit silently fails with unrecognised-arg."""
+    def test_fluid_env_flows_via_parameter_not_inline_env_prefix(self):
+        """The 11-stage template uses ``--env "${FLUID_ENV:-dev}"`` flags
+        on each command rather than inline ``FLUID_ENV=dev cmd`` prefixes
+        or stage-level ``export FLUID_ENV=dev; cmd``. Flag passing is:
+        (a) explicit at the fluid command boundary,
+        (b) unambiguous for subshell invocations inside fluid, and
+        (c) POSIX-default-safe — falls back to ``dev`` if the Jenkins
+            param wasn't populated (webhook-triggered builds, SCM polls)."""
         content = self._jenkinsfile()
-        assert "fluid test" in content
-        assert "--no-data" in content
-        # The broken `--type unit` shape must not appear.
-        assert "--type unit" not in content
-        assert "--type integration" not in content
-
-    def test_fluid_env_uses_export_not_inline(self):
-        """`FLUID_ENV=dev cmd` only exports for one command; subshell
-        invocations inside ``cmd`` don't see it. The `export FLUID_ENV=dev;
-        cmd` form sets it for the whole shell."""
-        content = self._jenkinsfile()
-        # Inline form is a regression — would break subshells.
+        # Inline form would break subshells — must not appear.
         assert "sh 'FLUID_ENV=" not in content
-        # Export form is the expected shape.
-        assert "export FLUID_ENV=" in content
+        # POSIX default expansion form used throughout.
+        assert '--env "${FLUID_ENV:-dev}"' in content
 
     def test_doctor_not_extended(self):
-        """`fluid doctor --extended` requires scripts/diagnose.sh which
-        forge-generated variants don't ship — running it always fails with
-        a CLIError. Generated pipelines must call plain `fluid doctor`."""
+        """``fluid doctor --extended`` requires scripts/diagnose.sh which
+        forge-generated variants don't ship. The 11-stage template
+        dropped doctor from pipeline stages (it is a diagnostic tool,
+        not a pipeline gate) — what remains is `fluid --version` in
+        Setup. Neither should emit ``--extended``."""
         content = self._jenkinsfile()
-        assert "fluid doctor" in content
         assert "fluid doctor --extended" not in content
+
+    # ── install-mode dispatch (generation-time decision) ─────────────
+    # Two modes replace the old runtime-branching tree:
+    #   pypi (default, production) — single pip install from stable PyPI.
+    #                                TestPyPI / private-index supported at
+    #                                BUILD time via Jenkins parameters
+    #                                (FLUID_PIP_INDEX_URL etc), not at
+    #                                generation time.
+    #   dev-source (lab only)      — bind-mount install, fails loud if
+    #                                the mount is missing.
+    # Mode is chosen ONCE at `fluid generate ci` time; generated
+    # Jenkinsfile carries ONLY that mode's logic.
+
+    def test_install_mode_default_is_pypi(self):
+        content = self._jenkinsfile()
+        # Unambiguous marker in stage name — operator sees it in UI.
+        assert "stage('Setup [install-mode: pypi]')" in content
+        # pypi mode's pip install sees FLUID_PACKAGE_SPEC with default.
+        assert '"${FLUID_PACKAGE_SPEC:-data-product-forge}"' in content
+        # dev-source branch must NOT appear in pypi mode — clean separation.
+        assert "/forge-cli-src" not in content
+        # pypi mode exposes the index-URL override parameters so TestPyPI
+        # pilot builds are possible via the Build-With-Parameters dialog.
+        assert "name: 'FLUID_PIP_INDEX_URL'" in content
+        assert "name: 'FLUID_PIP_EXTRA_INDEX_URL'" in content
+        assert "name: 'FLUID_ALLOW_PRERELEASE'" in content
+        assert "name: 'FLUID_PACKAGE_SPEC'" in content
+
+    def test_install_mode_dev_source(self):
+        content = self._jenkinsfile(install_mode="dev-source")
+        # Unambiguous marker in stage name.
+        assert "stage('Setup [install-mode: dev-source]')" in content
+        # Fail-loud check is required — no silent fallback to PyPI.
+        assert "install-mode=dev-source but /forge-cli-src" in content
+        assert "exit 2" in content
+        # Uninstall the shadowing installed version so PYTHONPATH wins.
+        assert "pip uninstall -y data-product-forge" in content
+        # PYTHONPATH = /forge-cli-src at the pipeline environment level
+        # means every sh step inherits it and imports resolve to the
+        # bind mount live — no pip install, no wheel cache, no stale
+        # files.
+        assert "PYTHONPATH = '/forge-cli-src'" in content
+        # pypi branch must NOT appear — clean separation.
+        assert "${FLUID_PIP_INDEX_URL" not in content
+        assert "FLUID_ALLOW_PRERELEASE" not in content
+
+    def test_install_mode_unknown_raises_at_generate_time(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="Unknown install_mode"):
+            self._jenkinsfile(install_mode="testpypi")  # dropped — no longer supported
+
+    def test_pypi_mode_supports_testpypi_via_build_params(self):
+        """TestPyPI is a BUILD-time choice in pypi mode: operator sets
+        FLUID_PIP_INDEX_URL + FLUID_PIP_EXTRA_INDEX_URL + FLUID_ALLOW_PRERELEASE
+        in the Jenkins Build-With-Parameters dialog. The Setup shell
+        consumes them via shell-level env expansion; no Groovy rebuild."""
+        content = self._jenkinsfile()
+        # The shell consumes the 3 pip params.
+        assert "${FLUID_PIP_INDEX_URL:-}" in content
+        assert "${FLUID_PIP_EXTRA_INDEX_URL:-}" in content
+        assert '"${FLUID_ALLOW_PRERELEASE:-false}" = "true"' in content
+        # --index-url is only emitted when FLUID_PIP_INDEX_URL is set.
+        assert "INDEX_FLAGS=" in content
+        assert "--index-url " in content
