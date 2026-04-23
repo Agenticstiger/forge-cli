@@ -672,6 +672,24 @@ class BasePipelineTemplate:
                 # the security-hardened Jenkins stage-11 pattern.
                 command=(
                     "set -eu; "
+                    # Self-gate: skip cleanly when there's nothing to
+                    # sync. Three cases are collapsed into one INFO-
+                    # level skip: (a) reference-only contract where
+                    # stage 3 auto-skipped the schedule emitter,
+                    # (b) stage 3 was toggled off so dist/artifacts/
+                    # never materialised, (c) contract has no
+                    # orchestration.engine so fluid generate
+                    # schedule produced zero DAGs. In all three the
+                    # pre-stage-11 pipeline (bundle → apply →
+                    # verify) may have succeeded and the correct
+                    # posture is "nothing to do, move on" — not
+                    # FAILURE. Matches stage 8's bindings.json gate.
+                    "if [ ! -d dist/artifacts/schedule ] || "
+                    '[ -z "$(ls -A dist/artifacts/schedule 2>/dev/null)" ]; then '
+                    'echo "no dist/artifacts/schedule/ DAGs to sync '
+                    "— skipping stage 11 (reference-only contract, "
+                    "stage 3 not run, or no orchestration.engine "
+                    'configured)"; exit 0; fi; '
                     'set -- --scheduler "$SCHEDULER" '
                     "--dags-dir dist/artifacts/schedule/ "
                     '--env "${FLUID_ENV:-dev}"; '
@@ -2850,7 +2868,42 @@ pipeline {{
                 // Use if/then/fi rather than `[ ] && …` because the
                 // `set -e` interaction with `&&` short-circuits is shell-
                 // dependent and can trip on the first false test.
+                // Self-gate on the presence of generated DAG files —
+                // mirrors stage 8's bindings.json gate. Three failure
+                // shapes are collapsed into a single clean skip with
+                // guidance:
+                //
+                //  * ``dist/artifacts/schedule/`` missing entirely —
+                //    contract is reference-only (builds[].pattern =
+                //    hybrid-reference / reference / external-reference)
+                //    so ``fluid generate artifacts`` auto-skipped the
+                //    ``schedule`` emitter. Nothing to sync; this is
+                //    the most common case for A1 / A2 variants.
+                //
+                //  * ``dist/artifacts/schedule/`` exists but is empty —
+                //    stage 3 ran but the contract has no
+                //    ``orchestration.engine`` configured so the schedule
+                //    emitter produced no DAGs. Still a valid "nothing
+                //    to sync" state for Path-B contracts.
+                //
+                //  * stage 3 never ran (``RUN_STAGE_3_GENERATE_ARTIFACTS=
+                //    false``) so there's no ``dist/artifacts/`` tree
+                //    at all. Safe to skip.
+                //
+                // Without this gate, fluid schedule-sync hard-fails with
+                // ``schedule_sync_dags_dir_missing`` / ``_empty`` (CLI
+                // exit 2, config error) and the whole pipeline is
+                // FAILURE — even though the pre-stage-11 work (bundle
+                // → apply → verify) succeeded. That's wrong for
+                // reference-only pipelines which are the default
+                // shape on A1 / A2. Direct CLI users of
+                // ``fluid schedule-sync`` still get the strict
+                // hard-fail so typos in ``--dags-dir`` surface loud.
                 sh '''{CD}set -eu
+                    if [ ! -d dist/artifacts/schedule ] || [ -z "$(ls -A dist/artifacts/schedule 2>/dev/null)" ]; then
+                        echo "no dist/artifacts/schedule/ DAGs to sync — skipping stage 11 (reference-only contract, stage 3 not run, or no orchestration.engine configured)"
+                        exit 0
+                    fi
                     set -- --scheduler "$SCHEDULER" --dags-dir dist/artifacts/schedule/ --env "${{FLUID_ENV:-dev}}"
                     if [ -n "${{SCHEDULER_DESTINATION:-}}" ];      then set -- "$@" --destination "$SCHEDULER_DESTINATION"; fi
                     if [ -n "${{SCHEDULER_ENVIRONMENT_NAME:-}}" ]; then set -- "$@" --environment-name "$SCHEDULER_ENVIRONMENT_NAME"; fi

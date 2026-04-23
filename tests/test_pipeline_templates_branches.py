@@ -704,6 +704,52 @@ class TestJenkinsTemplateStage11ScheduleSync:
         content = self._jenkinsfile()
         assert "params.RUN_STAGE_11_SCHEDULE_SYNC && params.SCHEDULER?.trim()" in content
 
+    def test_stage_11_self_gates_on_schedule_dags_dir(self):
+        """Stage 11 must self-gate on ``dist/artifacts/schedule/`` the way
+        stage 8 self-gates on ``dist/artifacts/policy/bindings.json``.
+
+        Bug A (discovered via A1 matrix V8/V9): reference-only contracts
+        don't emit schedule/ (stage 3 auto-skips the schedule emitter),
+        so ``fluid schedule-sync --dags-dir dist/artifacts/schedule/``
+        hard-fails with ``schedule_sync_dags_dir_missing`` — even when
+        the user opted into stage 11 assuming something would be there.
+        The fix is a pre-invocation check that skips cleanly (exit 0)
+        with an INFO message when the directory is missing or empty.
+
+        The three conditions collapsed into one skip:
+        - ``dist/artifacts/schedule/`` missing entirely (ref-only
+          auto-skip or stage 3 toggled off)
+        - empty directory (stage 3 ran but no DAGs to emit)
+        - no ``orchestration.engine`` in the contract
+
+        Regression guard for a shape of bug that keeps recurring:
+        pipeline stage defaults to "hard-fail on absent optional input".
+        """
+        content = self._jenkinsfile()
+        sh_body = self._extract_stage_sh_body(content, "11 · schedule sync")
+        # The gate condition: missing dir OR empty dir. Mirror the
+        # stage 8 pattern of ``if [ ... ]; then ...; else ...; fi``
+        # but with ``exit 0`` + explanatory echo so the skip is
+        # visible in Jenkins console output.
+        assert "dist/artifacts/schedule" in sh_body, "stage 11 must reference the dags-dir path"
+        assert (
+            "[ ! -d dist/artifacts/schedule ]" in sh_body
+            or "! -d dist/artifacts/schedule" in sh_body
+        ), "stage 11 must test for absent dags-dir as a skip condition"
+        assert 'ls -A dist/artifacts/schedule' in sh_body, (
+            "stage 11 must also test for empty dags-dir — not just missing — "
+            "since stage 3 can create an empty schedule/ subfolder"
+        )
+        assert "exit 0" in sh_body, (
+            "the gate must exit CLEAN when there's nothing to sync; a "
+            "non-zero exit here breaks the whole pipeline on reference-"
+            "only contracts"
+        )
+        assert "skipping stage 11" in sh_body, (
+            "the skip must emit a human-readable INFO line so operators "
+            "understand why stage 11 was a no-op"
+        )
+
     def test_stage_11_no_direct_params_interpolation_in_sh(self):
         """Regression: ``${params.X}`` must not appear inside any ``sh``
         triple-single-quoted body. Our template uses ``${X}`` (env
