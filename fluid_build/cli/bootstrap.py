@@ -529,6 +529,13 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     _try_register(sp, "ai_setup", "ai")
     _try_register(sp, "forge", "forge")
     _try_register(sp, "market", "market")
+    # ``fluid policy {check,compile,apply}`` — unified umbrella that
+    # groups the three policy verbs under one subcommand. The legacy
+    # hyphenated top-level forms below remain registered for
+    # backward-compat (one-release deprecation window); both surfaces
+    # share the same ``_add_arguments`` helpers in the underlying
+    # policy_* modules, so options stay in sync automatically.
+    _try_register(sp, "policy", "policy")
     _try_register(sp, "policy_check", "policy-check")
     _try_register(sp, "policy_compile", "policy-compile")
     _try_register(sp, "policy_apply", "policy-apply")

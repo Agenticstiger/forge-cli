@@ -63,42 +63,51 @@ logger = logging.getLogger(__name__)
 COMMAND = "policy-check"
 
 
-def register(subparsers: argparse._SubParsersAction) -> None:
-    """Register policy-check command"""
-    parser = subparsers.add_parser(
-        "policy-check",
-        help="Validate contract against schema-driven policies",
-        description="Enforce governance policies declared in FLUID contracts",
-    )
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Populate a pre-created parser with the policy-check argument surface.
 
+    Extracted so the same args can be wired onto EITHER the legacy
+    ``fluid policy-check`` top-level command OR the new
+    ``fluid policy check`` subcommand (G4 from the code review) —
+    without duplicating the argument definitions.
+    """
     parser.add_argument("contract", help="Path to FLUID contract file (contract.fluid.yaml)")
-
     parser.add_argument("--env", help="Environment overlay (dev, staging, prod)")
-
     parser.add_argument(
         "--strict", action="store_true", help="Treat warnings as errors (fail on any violation)"
     )
-
     parser.add_argument(
         "--category",
         choices=["sensitivity", "access_control", "data_quality", "lifecycle", "schema_evolution"],
         help="Check only specific policy category",
     )
-
     parser.add_argument("--output", "-o", help="Output file for policy report (JSON)")
-
     parser.add_argument(
         "--format",
         choices=["rich", "text", "json"],
         default="rich" if RICH_AVAILABLE else "text",
         help="Output format",
     )
-
     parser.add_argument(
         "--show-passed", action="store_true", help="Show passed checks (default: only violations)"
     )
-
     parser.set_defaults(func=run)
+
+
+def register(subparsers: argparse._SubParsersAction) -> None:
+    """Register the legacy top-level ``fluid policy-check`` command.
+
+    New code should prefer ``fluid policy check`` (see ``cli/policy.py``).
+    This entry point is kept as a deprecation-aliased surface for one
+    release window so existing CI scripts and ``fluid --help``-derived
+    muscle memory don't break in place.
+    """
+    parser = subparsers.add_parser(
+        "policy-check",
+        help="Validate contract against schema-driven policies",
+        description="Enforce governance policies declared in FLUID contracts",
+    )
+    _add_arguments(parser)
 
 
 def run(args: argparse.Namespace, logger_instance: logging.Logger) -> int:
