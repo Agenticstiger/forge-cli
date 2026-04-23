@@ -473,6 +473,126 @@ class TestRunStrictAndOutput:
 
 
 # ---------------------------------------------------------------------------
+# run() – reference-only contracts downgrade missing-table errors to INFO
+# (Bug 6: verify on hybrid-reference contracts like A1 should not hard-fail
+# under --strict when the external dbt/Airflow project hasn't run yet)
+# ---------------------------------------------------------------------------
+
+
+class TestRunReferenceOnly:
+    def _ref_only_snowflake_contract(self):
+        # A minimal reference-only Snowflake contract. builds[].pattern is
+        # the marker; the expose points at a table the external pipeline
+        # will eventually materialize but that doesn't exist yet.
+        return {
+            "id": "ref-only",
+            "builds": [{"pattern": "hybrid-reference", "id": "ext_build"}],
+            "exposes": [
+                {
+                    "exposeId": "customers",
+                    "format": "snowflake_table",
+                    "binding": {
+                        "location": {
+                            "database": "MY_DB",
+                            "schema": "MY_SCHEMA",
+                            "table": "CUSTOMERS",
+                        },
+                    },
+                }
+            ],
+        }
+
+    def test_reference_only_missing_table_returns_0_under_strict(self, tmp_path):
+        """Fresh A1 deploy: external dbt hasn't run, table missing → should
+        NOT exit 1 under --strict. The whole point of bug 6."""
+        contract_path = tmp_path / "c.yaml"
+        contract_path.write_text("id: t\n")
+        args = _make_args(contract=str(contract_path), strict=True)
+        with (
+            patch(
+                "fluid_build.cli.verify.load_contract_with_overlay",
+                return_value=self._ref_only_snowflake_contract(),
+            ),
+            patch(
+                "fluid_build.providers.snowflake.util.config.resolve_snowflake_settings",
+                return_value={"account": "a", "warehouse": "w", "user": "u"},
+            ),
+            patch(
+                "fluid_build.cli.verify.verify_snowflake_table",
+                return_value={
+                    "status": "error",
+                    "error": "Table not found: MY_DB.MY_SCHEMA.CUSTOMERS",
+                    "exists": False,
+                },
+            ),
+        ):
+            result = run(args, logging.getLogger("test"))
+        # Strict mode, but reference-only + exists=False → downgraded to
+        # INFO and excluded from error_count, so exit 0.
+        assert result == 0
+
+    def test_non_reference_missing_table_still_hard_fails_under_strict(self, tmp_path):
+        """Regression guard: non-reference (imperative/declarative) contracts
+        must still fail under --strict on a missing table. Only the
+        reference-only flag flips the behavior."""
+        contract = self._ref_only_snowflake_contract()
+        contract["builds"] = [{"pattern": "imperative", "id": "native_build"}]
+        contract_path = tmp_path / "c.yaml"
+        contract_path.write_text("id: t\n")
+        args = _make_args(contract=str(contract_path), strict=True)
+        with (
+            patch(
+                "fluid_build.cli.verify.load_contract_with_overlay",
+                return_value=contract,
+            ),
+            patch(
+                "fluid_build.providers.snowflake.util.config.resolve_snowflake_settings",
+                return_value={"account": "a", "warehouse": "w", "user": "u"},
+            ),
+            patch(
+                "fluid_build.cli.verify.verify_snowflake_table",
+                return_value={
+                    "status": "error",
+                    "error": "Table not found: MY_DB.MY_SCHEMA.CUSTOMERS",
+                    "exists": False,
+                },
+            ),
+        ):
+            result = run(args, logging.getLogger("test"))
+        assert result == 1
+
+    def test_reference_only_non_missing_error_still_counts(self, tmp_path):
+        """Regression guard: reference-only does NOT blanket-silence all
+        errors — only the specific exists=False missing-table case. An
+        auth or config error (exists flag NOT False) still fails under
+        --strict."""
+        contract_path = tmp_path / "c.yaml"
+        contract_path.write_text("id: t\n")
+        args = _make_args(contract=str(contract_path), strict=True)
+        with (
+            patch(
+                "fluid_build.cli.verify.load_contract_with_overlay",
+                return_value=self._ref_only_snowflake_contract(),
+            ),
+            patch(
+                "fluid_build.providers.snowflake.util.config.resolve_snowflake_settings",
+                return_value={"account": "a", "warehouse": "w", "user": "u"},
+            ),
+            patch(
+                "fluid_build.cli.verify.verify_snowflake_table",
+                return_value={
+                    "status": "error",
+                    "error": "Authentication failed: JWT expired",
+                    # NOTE: no 'exists' key — this is NOT a table-missing case,
+                    # it's a real connection failure.
+                },
+            ),
+        ):
+            result = run(args, logging.getLogger("test"))
+        assert result == 1
+
+
+# ---------------------------------------------------------------------------
 # run() – bigquery_table format end-to-end via mocked verify_bigquery_table
 # ---------------------------------------------------------------------------
 

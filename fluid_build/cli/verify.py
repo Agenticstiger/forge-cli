@@ -61,6 +61,39 @@ def _hydrate_dotenv_into_environ(project_root: Path, environment: Optional[str])
     hydrate_dotenv(project_root, environment=environment)
 
 
+# Bug 6: reference-only contracts (builds[].pattern in
+# {hybrid-reference, reference, external-reference}) declare a
+# schema but delegate materialization to an externally-owned dbt /
+# Airflow project. On the first pipeline run the external DAG has
+# not yet materialized the table, so Snowflake ``INFORMATION_SCHEMA``
+# returns zero columns and ``verify_snowflake_table`` hard-fails
+# with "Table not found". Under ``--strict`` that propagates as
+# exit 1 at stage 9 — which is wrong: we can't verify a shape that
+# the external pipeline owns the creation of. The set below is the
+# same marker ``forge/core/artifact_fanout._REFERENCE_PATTERNS``
+# uses so the three detection sites (generate_ci, artifact_fanout,
+# verify) stay in sync. Mirror any extension in all three.
+_REFERENCE_PATTERNS: set = {"hybrid-reference", "reference", "external-reference"}
+
+
+def _contract_is_reference_only(contract: Dict[str, Any]) -> bool:
+    """Return ``True`` if any ``builds[].pattern`` is a reference variant.
+
+    Takes an already-loaded contract dict (``load_contract_with_overlay``
+    output) rather than a path, so we avoid a second parse in the verify
+    hot path. The canonical path-based helper lives in
+    ``forge/core/artifact_fanout._contract_is_reference_only``; this one
+    keeps the same predicate shape for dict-holding callers.
+    """
+    builds = contract.get("builds")
+    if not isinstance(builds, list):
+        return False
+    for build in builds:
+        if isinstance(build, dict) and build.get("pattern") in _REFERENCE_PATTERNS:
+            return True
+    return False
+
+
 _SNOWFLAKE_TYPE_FAMILIES = {
     "STRING": {"VARCHAR", "CHAR", "CHARACTER", "TEXT", "STRING"},
     "NUMBER": {
@@ -669,6 +702,19 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     contract_id = contract.get("id", "unknown")
     cprint(f"Contract ID: {contract_id}")
 
+    # Bug 6: detect reference-only mode once, used below to downgrade
+    # "table not found" hard-errors to informational notices. The
+    # underlying dbt / Airflow project owns table creation; on the
+    # first pipeline run the table provably doesn't exist yet, so
+    # failing ``verify --strict`` adds no signal — it just blocks
+    # stage 10 publish.
+    reference_only = _contract_is_reference_only(contract)
+    if reference_only:
+        cprint(
+            "   (contract is reference-only — missing tables will be reported as INFO, "
+            "not treated as verification failures)"
+        )
+
     # Hydrate .env files into os.environ so subsequent {{ env.VAR }}
     # resolution (and the Snowflake identifier allowlist) sees values
     # the user already staged in .env. Matches the apply path, which hits
@@ -876,6 +922,22 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         cprint(f"   Target: {target}")
 
         if result["status"] == "error":
+            # Bug 6: downgrade "table missing" to INFO for
+            # reference-only contracts. The external dbt project hasn't
+            # run yet, so the absence of the target table is expected
+            # state — not a verification failure. Other errors
+            # (auth, bad config, SQL syntax) still fail hard because
+            # they indicate real problems regardless of materialization
+            # source.
+            if reference_only and result.get("exists") is False:
+                cprint(
+                    f"   🔵 INFO: {result.get('error', 'Table not materialized yet')} "
+                    "(reference-only — external pipeline owns creation)"
+                )
+                # Don't count as error or mismatch: the shape cannot
+                # be compared, so we report nothing either way. This
+                # mirrors how ``fluid diff`` treats a missing baseline.
+                continue
             cprint(f"   ❌ Error: {result.get('error', 'Unknown error')}")
             error_count += 1
             continue
