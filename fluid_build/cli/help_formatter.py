@@ -228,16 +228,82 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
         ],
     )
 
+    # ── Pipeline Stages (11-stage production flow) ──────────────────
+    # Every stage of the canonical 11-stage production pipeline
+    # surfaced in order so operators discover the full surface from
+    # ``fluid --help`` alone. Mirrors how Terraform keeps every state
+    # verb (state / import / taint / refresh) on the top-level help
+    # rather than hiding them behind subcommand tree exploration.
+    console.print(
+        "  ▸ [bold bright_blue]Pipeline Stages[/bold bright_blue]  "
+        "[dim](11-stage production flow — each command is a CI stage gate)[/dim]"
+    )
+    stages_tbl = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False)
+    stages_tbl.add_column(style="bright_blue bold", min_width=24, max_width=24)
+    stages_tbl.add_column(style="bright_white")
+    stages_tbl.add_row(
+        "  bundle",
+        "1 · Package contract + sources into signed tgz bundle  [dim]--sign · --attest · --format tgz[/dim]",
+    )
+    stages_tbl.add_row(
+        "  validate", "2 · Check contract syntax and provider rules  [dim]--strict · --report[/dim]"
+    )
+    stages_tbl.add_row(
+        "  generate artifacts", "3 · Fanout: ODCS + ODPS-Bitol + schedule + policy bindings"
+    )
+    stages_tbl.add_row(
+        "  validate-artifacts", "4 · Verify MANIFEST SHA-256 + per-format schema checks"
+    )
+    stages_tbl.add_row("  diff", "5 · Detect drift from deployed state  [dim]--exit-on-drift[/dim]")
+    stages_tbl.add_row(
+        "  plan", "6 · Plan execution  [dim]--html (mermaid DAG) · --env · --out[/dim]"
+    )
+    stages_tbl.add_row(
+        "  apply", "7 · Deploy end-to-end  [dim]--mode · --allow-data-loss · --yes[/dim]"
+    )
+    stages_tbl.add_row(
+        "  policy-apply", "8 · Enforce IAM/GRANT bindings  [dim]--mode check|enforce[/dim]"
+    )
+    stages_tbl.add_row(
+        "  verify", "9 · Confirm deployed state matches the contract  [dim]--strict[/dim]"
+    )
+    stages_tbl.add_row(
+        "  publish", "10 · Publish to enterprise data catalogs  [dim]--target (repeatable)[/dim]"
+    )
+    stages_tbl.add_row(
+        "  schedule-sync", "11 · Push DAGs to airflow/composer/mwaa/astronomer/prefect/dagster"
+    )
+    console.print(stages_tbl)
+    console.print()
+
     # ── Quality & Governance ────────────────────────────────────────
     _section(
         "▸",
         "Quality & Governance",
         "yellow",
         [
-            ("policy-check", "Governance & compliance checks  [dim]--strict[/dim]"),
-            ("diff", "Detect drift from deployed state"),
+            ("policy-check", "Lint contract for policy violations  [dim]--strict[/dim]"),
             ("test", "Test contract against live data  [dim]--output json · --strict[/dim]"),
-            ("verify", "Confirm deployed state matches the contract"),
+        ],
+    )
+
+    # ── Safety & Supply Chain ───────────────────────────────────────
+    # New group introduced for the destructive-mode rollback tool and
+    # the Sigstore/SLSA supply-chain commands. Grouping them together
+    # puts them within reach of the operator who just ran
+    # ``apply --mode replace`` and needs to know "how do I undo
+    # this?" — the answer lives next to ``verify-signature``, which
+    # is the same operator's other production-safety concern.
+    _section(
+        "▸",
+        "Safety & Supply Chain",
+        "bright_red",
+        [
+            (
+                "rollback",
+                "Restore from auto-snapshot taken before apply --mode replace  [dim]--list[/dim]",
+            ),
+            ("verify-signature", "Verify cosign signature + SLSA attestation on a tgz bundle"),
         ],
     )
 
@@ -249,7 +315,6 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
         [
             ("config", "Get/set default provider, project, region"),
             ("split", "Split contract into composable fragments"),
-            ("bundle", "Bundle fragments into single contract"),
             ("auth", "Manage cloud provider credentials  [dim]login · status · logout[/dim]"),
             ("doctor", "Check system health & dependencies"),
             ("providers", "List available infrastructure providers"),
@@ -258,14 +323,32 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
     )
 
     # ── Quick-start ─────────────────────────────────────────────────
+    # Two lines: the local/dev on-ramp (onboard a new user in 30s)
+    # and the production pipeline (what the CI template actually
+    # runs). Before this change the help showed only the dev path;
+    # operators had to read AGENTS.md to discover the 11-stage
+    # production flow. Terraform / Pulumi both put the production
+    # verb sequence in their top-level help — this matches that
+    # expectation.
     console.print(f"  {bar}")
     console.print(
-        "  [bold bright_green]⚡ Quick Start[/bold bright_green]     "
+        "  [bold bright_green]⚡ Quick Start (dev)[/bold bright_green]     "
         "[bright_cyan]fluid init[/bright_cyan]  →  "
-        "[bright_cyan]fluid forge[/bright_cyan]  →  "
-        "[bright_cyan]fluid validate[/bright_cyan]  →  "
-        "[bright_cyan]fluid plan[/bright_cyan]  →  "
-        "[bright_cyan]fluid apply[/bright_cyan]"
+        "[bright_cyan]forge[/bright_cyan]  →  "
+        "[bright_cyan]validate[/bright_cyan]  →  "
+        "[bright_cyan]plan[/bright_cyan]  →  "
+        "[bright_cyan]apply[/bright_cyan]"
+    )
+    console.print(
+        "  [bold bright_magenta]⚡ Production pipeline[/bold bright_magenta]   "
+        "[bright_cyan]bundle[/bright_cyan]  →  "
+        "[bright_cyan]validate[/bright_cyan]  →  "
+        "[bright_cyan]generate artifacts[/bright_cyan]  →  "
+        "[bright_cyan]diff[/bright_cyan]  →  "
+        "[bright_cyan]plan[/bright_cyan]  →  "
+        "[bright_cyan]apply[/bright_cyan]  →  "
+        "[bright_cyan]verify[/bright_cyan]  →  "
+        "[bright_cyan]publish[/bright_cyan]"
     )
     console.print(f"  {bar}")
 
