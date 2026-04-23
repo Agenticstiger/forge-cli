@@ -1669,6 +1669,21 @@ EOM
         choice(name: 'SCHEDULER',
                choices: ['', 'airflow', 'mwaa', 'composer', 'astronomer', 'prefect', 'dagster'],
                description: 'Stage 11 scheduler target. Blank = no-op.')
+        string(name: 'SCHEDULER_DESTINATION',
+               defaultValue: '',
+               description: 'Stage 11: airflow/mwaa destination URL. Supports s3://, gs://, az://, ssh://, scp://, file:// or a bare path. Required for airflow + mwaa; ignored for composer / astronomer / prefect / dagster.')
+        string(name: 'SCHEDULER_ENVIRONMENT_NAME',
+               defaultValue: '',
+               description: 'Stage 11: composer environment name or astronomer deployment name.')
+        string(name: 'SCHEDULER_LOCATION',
+               defaultValue: '',
+               description: 'Stage 11: GCP region for composer (e.g. europe-west1, us-central1).')
+        string(name: 'SCHEDULER_WORKSPACE',
+               defaultValue: '',
+               description: 'Stage 11: prefect workspace or dagster-cloud deployment name.')
+        booleanParam(name: 'SCHEDULE_SYNC_DRY_RUN',
+                     defaultValue: false,
+                     description: 'Stage 11: --dry-run (log the planned subprocess argv without executing).')
     }}"""
 
         jenkins_pipeline = f"""
@@ -1906,10 +1921,38 @@ pipeline {{
             when {{
                 expression {{ return params.RUN_STAGE_11_SCHEDULE_SYNC && params.SCHEDULER?.trim() }}
             }}
+            // Thread user-supplied params through the environment rather
+            // than Groovy-interpolating them into the sh string. Jenkins
+            // quotes env values safely; passing via the environment +
+            // bash array construction below is injection-proof — a
+            // malicious param value reaches our CLI as a single argv
+            // token and is rejected there by _validate_destination /
+            // _validate_safe_ident.
+            environment {{
+                SCHEDULER = "${{params.SCHEDULER}}"
+                SCHEDULER_DESTINATION = "${{params.SCHEDULER_DESTINATION}}"
+                SCHEDULER_ENVIRONMENT_NAME = "${{params.SCHEDULER_ENVIRONMENT_NAME}}"
+                SCHEDULER_LOCATION = "${{params.SCHEDULER_LOCATION}}"
+                SCHEDULER_WORKSPACE = "${{params.SCHEDULER_WORKSPACE}}"
+                SCHEDULE_SYNC_DRY_RUN = "${{params.SCHEDULE_SYNC_DRY_RUN}}"
+            }}
             steps {{
-                sh '''{CD}fluid schedule-sync --scheduler "${{SCHEDULER}}" \\
-                         --dags-dir dist/artifacts/schedule/ \\
-                         --env "${{FLUID_ENV:-dev}}"'''
+                // Use POSIX `set --` rather than bash arrays so this runs
+                // under Jenkins's default `/bin/sh` invocation. Each $VAR
+                // is quoted — one argv token per expansion — so a
+                // malicious value stays a single token that our CLI then
+                // rejects in _validate_destination / _validate_safe_ident.
+                // Use if/then/fi rather than `[ ] && …` because the
+                // `set -e` interaction with `&&` short-circuits is shell-
+                // dependent and can trip on the first false test.
+                sh '''{CD}set -eu
+                    set -- --scheduler "$SCHEDULER" --dags-dir dist/artifacts/schedule/ --env "${{FLUID_ENV:-dev}}"
+                    if [ -n "${{SCHEDULER_DESTINATION:-}}" ];      then set -- "$@" --destination "$SCHEDULER_DESTINATION"; fi
+                    if [ -n "${{SCHEDULER_ENVIRONMENT_NAME:-}}" ]; then set -- "$@" --environment-name "$SCHEDULER_ENVIRONMENT_NAME"; fi
+                    if [ -n "${{SCHEDULER_LOCATION:-}}" ];         then set -- "$@" --location "$SCHEDULER_LOCATION"; fi
+                    if [ -n "${{SCHEDULER_WORKSPACE:-}}" ];        then set -- "$@" --workspace "$SCHEDULER_WORKSPACE"; fi
+                    if [ "${{SCHEDULE_SYNC_DRY_RUN:-false}}" = "true" ]; then set -- "$@" --dry-run; fi
+                    fluid schedule-sync "$@"'''
             }}
         }}
     }}

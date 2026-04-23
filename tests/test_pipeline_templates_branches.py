@@ -600,3 +600,126 @@ class TestJenkinsTemplateHardening:
         # --index-url is only emitted when FLUID_PIP_INDEX_URL is set.
         assert "INDEX_FLAGS=" in content
         assert "--index-url " in content
+
+
+class TestJenkinsTemplateStage11ScheduleSync:
+    """Stage-11 ``fluid schedule-sync`` must be wired in the Jenkins template
+    such that:
+
+    1. **All scheduler variants are reachable** via Jenkins build parameters
+       — not hardcoded. A single generated Jenkinsfile supports airflow
+       (url-scheme dispatch), mwaa, composer, astronomer, prefect, dagster.
+
+    2. **User-supplied parameter values never reach a ``sh`` string via
+       Groovy interpolation.** Groovy-string-interpolating ``${params.X}``
+       into the sh body is a shell-injection surface: a malicious param
+       value with an unescaped quote breaks the wrapper and bleeds into
+       subsequent argv positions. The fix routes params through
+       ``environment { ... }`` which Jenkins quotes safely, then the sh
+       body uses ``"$VAR"`` expansion + POSIX ``set --`` to build argv.
+
+    3. **Empty parameters never reach the CLI.** Our CLI rejects an empty
+       ``--destination`` / ``--environment-name`` — passing an empty flag
+       would surface a confusing "required" error from the CLI rather
+       than a clean "user didn't set this optional param" Jenkins state.
+    """
+
+    def _jenkinsfile(self, **kwargs):
+        cfg = PipelineConfig(
+            provider=PipelineProvider.JENKINS,
+            complexity=PipelineComplexity.BASIC,
+            **kwargs,
+        )
+        files = PipelineTemplateGenerator().generate_pipeline(cfg)
+        return files["Jenkinsfile"]
+
+    def test_stage_11_param_surface_complete(self):
+        """All five variant-specific params + the scheduler choice + the
+        dry-run toggle must be declared as Jenkins build parameters so
+        operators set them via Build-With-Parameters UI."""
+        content = self._jenkinsfile()
+        assert "RUN_STAGE_11_SCHEDULE_SYNC" in content
+        assert "name: 'SCHEDULER'" in content
+        assert "'airflow'" in content
+        assert "'mwaa'" in content
+        assert "'composer'" in content
+        assert "'astronomer'" in content
+        assert "'prefect'" in content
+        assert "'dagster'" in content
+        assert "SCHEDULER_DESTINATION" in content
+        assert "SCHEDULER_ENVIRONMENT_NAME" in content
+        assert "SCHEDULER_LOCATION" in content
+        assert "SCHEDULER_WORKSPACE" in content
+        assert "SCHEDULE_SYNC_DRY_RUN" in content
+
+    def test_stage_11_routes_params_through_environment_block(self):
+        """Injection defence: every scheduler param must be threaded
+        via ``environment { ... }``. If any param were Groovy-interpolated
+        directly into the sh string, a quote in the value could break
+        out of the wrapper and become an argv position of its own."""
+        content = self._jenkinsfile()
+        # The env block assignments are the canonical hand-off point.
+        assert 'SCHEDULER = "${params.SCHEDULER}"' in content
+        assert 'SCHEDULER_DESTINATION = "${params.SCHEDULER_DESTINATION}"' in content
+        assert 'SCHEDULER_ENVIRONMENT_NAME = "${params.SCHEDULER_ENVIRONMENT_NAME}"' in content
+        assert 'SCHEDULER_LOCATION = "${params.SCHEDULER_LOCATION}"' in content
+        assert 'SCHEDULER_WORKSPACE = "${params.SCHEDULER_WORKSPACE}"' in content
+        assert 'SCHEDULE_SYNC_DRY_RUN = "${params.SCHEDULE_SYNC_DRY_RUN}"' in content
+
+    def test_stage_11_sh_body_uses_posix_set_dash_dash(self):
+        """The sh body must build argv via POSIX ``set --`` (not bash
+        arrays) so it runs under Jenkins's default ``/bin/sh``. Each
+        variable expansion is quoted so a malicious value stays one
+        argv token for our CLI to reject in
+        ``_validate_destination`` / ``_validate_safe_ident``."""
+        content = self._jenkinsfile()
+        assert "set -eu" in content
+        assert "set -- --scheduler " in content
+        # Each optional flag is appended conditionally via if/then/fi
+        # (not ``[ ... ] && ...`` — that interacts badly with set -e).
+        assert 'if [ -n "${SCHEDULER_DESTINATION:-}" ];' in content
+        assert 'if [ -n "${SCHEDULER_ENVIRONMENT_NAME:-}" ];' in content
+        assert 'if [ -n "${SCHEDULER_LOCATION:-}" ];' in content
+        assert 'if [ -n "${SCHEDULER_WORKSPACE:-}" ];' in content
+        assert 'if [ "${SCHEDULE_SYNC_DRY_RUN:-false}" = "true" ];' in content
+        # Final invocation uses "$@" so each accumulated argv token is
+        # passed as-is — no shell word-splitting of user input.
+        assert 'fluid schedule-sync "$@"' in content
+
+    def test_stage_11_gated_by_both_run_flag_and_scheduler_trim(self):
+        """The when{} clause must require BOTH RUN_STAGE_11_SCHEDULE_SYNC
+        AND a non-blank SCHEDULER. A blank scheduler with the run flag
+        on is a misconfiguration, not a pipeline intent."""
+        content = self._jenkinsfile()
+        assert "params.RUN_STAGE_11_SCHEDULE_SYNC && params.SCHEDULER?.trim()" in content
+
+    def test_stage_11_no_direct_params_interpolation_in_sh(self):
+        """Regression: ``${params.X}`` must not appear inside any ``sh``
+        triple-single-quoted body. Our template uses ``${X}`` (env
+        expansion) instead. This test enforces the injection boundary."""
+        content = self._jenkinsfile()
+        # Locate the stage-11 sh block and assert it has no ${params.*} inside.
+        # We slice from the stage label to the next `stage(` boundary or post.
+        marker = "stage('11 · schedule sync')"
+        assert marker in content
+        start = content.index(marker)
+        # Find the next stage boundary or the start of the post{} block.
+        tail = content[start:]
+        end = len(tail)
+        for needle in ("stage('", "post {"):
+            idx = tail.find(needle, 30)  # skip past the marker itself
+            if idx != -1 and idx < end:
+                end = idx
+        stage_body = tail[:end]
+        # The env block is fine (has ${params.*}); the sh body inside
+        # triple-single-quoted strings is what must be clean. Find the
+        # sh block.
+        sh_idx = stage_body.find("sh '''")
+        assert sh_idx != -1, "stage 11 must contain a ``sh '''...'''`` block"
+        sh_end = stage_body.find("'''", sh_idx + 6)
+        assert sh_end != -1
+        sh_body = stage_body[sh_idx:sh_end]
+        assert "${params." not in sh_body, (
+            "stage 11 sh body leaks ${params.*} — that's a Groovy "
+            "interpolation into sh, which is a shell-injection surface."
+        )
