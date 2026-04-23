@@ -91,6 +91,20 @@ Examples:
         "--list", dest="list_engines", action="store_true", help="List available engines and exit"
     )
     p.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    p.add_argument(
+        "--mesh-hub",
+        default=None,
+        metavar="HUB_PROJECT_NAME",
+        help=(
+            "dbt Mesh hub project this data product participates in. "
+            "When set, emits a ``dependencies.yml`` declaring the hub "
+            "so ``dbt deps`` pulls it in. Every model in ``exposes[]`` "
+            "also gets ``access: public`` on its emitted schema.yml "
+            "entry regardless of this flag — the --mesh-hub addition is "
+            "only for products that reference a central hub. Requires "
+            "dbt-core >= 1.6."
+        ),
+    )
 
     p.set_defaults(generate_sub=SUBCOMMAND, func=run)
 
@@ -178,11 +192,27 @@ def run(args: Any, logger: logging.Logger) -> int:
         # --- Generate ---
         # ``contract_path.parent`` is the workspace anchor used to locate
         # upstream ``contract.fluid.yaml`` files referenced by ``consumes[]``.
+        # dbt Mesh: --mesh-hub is a dbt-only concept (access: public +
+        # dependencies.yml). For non-dbt engines, we WARN the operator
+        # and drop the flag — passing mesh_hub to a Dataflow / Spark /
+        # SQL engine would surface as an unknown-kwarg TypeError.
+        engine_kwargs: Dict[str, Any] = {}
+        mesh_hub = getattr(args, "mesh_hub", None)
+        if mesh_hub:
+            if engine_name == "dbt":
+                engine_kwargs["mesh_hub"] = mesh_hub
+            else:
+                cprint(
+                    f"[yellow]Warning: --mesh-hub is only meaningful for "
+                    f"engine=dbt; ignoring for engine={engine_name}.[/yellow]"
+                )
+
         files = engine.generate(
             contract,
             build,
             build_index=build_index,
             workspace_root=contract_path.parent,
+            **engine_kwargs,
         )
 
         if not files:

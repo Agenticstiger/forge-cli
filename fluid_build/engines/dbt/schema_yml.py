@@ -12,11 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generate ``schema.yml`` (dbt tests) from ``exposes[].contract.dq``."""
+"""Generate ``schema.yml`` (dbt tests + Mesh ``access:``) from contract.
+
+Each entry in ``exposes[]`` becomes a dbt model with:
+- ``name`` — the ``exposeId``
+- ``description`` — from ``exposes[].description``
+- ``access: public`` — per the dbt Mesh spec (dbt-core >= 1.6). Every
+  expose is by definition a public output port of the data product;
+  marking the model as ``access: public`` lets downstream dbt Mesh
+  consumers ``ref('other_project', 'public_model')`` reference it,
+  while keeping non-exposed internal staging models at their default
+  ``access: protected``. This is Q4 Option 1 of the Phase 7-rest
+  design — automatic mesh annotations from ``exposes[]``, zero extra
+  contract authoring work.
+- ``columns[]`` — column metadata + dbt tests derived from the
+  FLUID schema + DQ rules (unchanged pre-existing behaviour).
+
+Optional ``--mesh-hub <name>`` CLI flag (wired at the
+:mod:`fluid_build.cli.generate_speed_transformation` layer, not this
+module): when set, also emits a ``dependencies.yml`` naming the hub
+project so the generated dbt project participates in a dbt Mesh
+network.
+"""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -40,13 +61,30 @@ except ImportError:  # pragma: no cover
         return expose.get("contract")
 
 
-def generate_schema_yml(contract: Dict[str, Any]) -> GenerationResult:
-    """Generate ``schema.yml`` files with dbt tests from DQ rules.
+def generate_schema_yml(
+    contract: Dict[str, Any],
+    *,
+    mesh_hub: Optional[str] = None,
+) -> GenerationResult:
+    """Generate ``schema.yml`` (dbt tests + Mesh ``access: public``)
+    and, when ``mesh_hub`` is set, a companion ``dependencies.yml``.
 
-    Returns one ``schema.yml`` per layer where models have DQ rules.
+    Every entry in ``exposes[]`` gets ``access: public`` on its
+    emitted model. Internal staging models (in ``models/staging/``)
+    are NOT touched — they inherit dbt's default ``access: protected``
+    so they remain invisible to cross-project ``ref('other', ...)``.
+
+    When ``mesh_hub`` is set, also emit ``dependencies.yml`` declaring
+    the hub project this data product participates in (dbt Mesh's
+    hub-and-spoke pattern for cross-product lineage).
     """
     exposes = get_exposes(contract)
     if not exposes:
+        # No exposes = no public surface = no schema.yml needed.
+        # Still emit dependencies.yml when mesh_hub is set because
+        # even a purely-consuming product participates in the hub.
+        if mesh_hub:
+            return _mesh_only_output(mesh_hub)
         return {}
 
     # All mart models go into a single schema.yml for now
@@ -65,8 +103,6 @@ def generate_schema_yml(contract: Dict[str, Any]) -> GenerationResult:
         dq_rules = dq.get("rules", []) if isinstance(dq, dict) else []
 
         columns = _build_column_tests(schema_cols, dq_rules)
-        if not columns and not schema_cols:
-            continue
 
         model_def: Dict[str, Any] = {"name": expose_id}
 
@@ -74,19 +110,59 @@ def generate_schema_yml(contract: Dict[str, Any]) -> GenerationResult:
         if desc:
             model_def["description"] = desc
 
+        # Mesh annotation: every expose is a public output port by
+        # definition of ``exposes``. This lets dbt-core >= 1.6
+        # consumers reference the model via
+        # ``ref('this_project', 'expose_id')`` from another project.
+        # Internal staging models — NOT in ``exposes[]`` — inherit
+        # dbt's default ``access: protected`` so they stay private
+        # to this project.
+        model_def["access"] = "public"
+
+        # Semantic versioning for public interfaces: read ``version``
+        # from ``exposes[].contract.version`` and thread it through.
+        # dbt uses this for model-version pinning in downstream refs.
+        version = contract_section.get("version")
+        if version:
+            model_def["latest_version"] = version
+            # dbt model-versions require a ``versions`` list too.
+            model_def["versions"] = [{"v": version}]
+
         if columns:
             model_def["columns"] = columns
 
         model_defs.append(model_def)
 
-    if not model_defs:
-        return {}
+    out: GenerationResult = {}
+    if model_defs:
+        data = {"version": 2, "models": model_defs}
+        content = _HEADER + yaml.dump(
+            data, default_flow_style=False, sort_keys=False, allow_unicode=True
+        )
+        out["models/marts/schema.yml"] = content
 
-    data = {"version": 2, "models": model_defs}
+    if mesh_hub:
+        out.update(_mesh_only_output(mesh_hub))
+
+    return out
+
+
+def _mesh_only_output(mesh_hub: str) -> GenerationResult:
+    """Emit ``dependencies.yml`` for a product participating in a hub.
+
+    Shape (dbt-core spec):
+        projects:
+          - name: <hub-project-name>
+
+    The hub project at the ``name`` needs to exist in the downstream
+    dbt environment — typically by adding it as a package or installing
+    it via ``dbt deps``. This file just declares the participation.
+    """
+    data = {"projects": [{"name": mesh_hub}]}
     content = _HEADER + yaml.dump(
         data, default_flow_style=False, sort_keys=False, allow_unicode=True
     )
-    return {"models/marts/schema.yml": content}
+    return {"dependencies.yml": content}
 
 
 def _build_column_tests(
