@@ -501,7 +501,7 @@ _RESTORE_DISPATCH = {
 # ---------------------------------------------------------------------------
 
 
-def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace, _logger: Optional[logging.Logger] = None) -> int:
     product = _validate_product_id(args.product)
     state_path = Path(args.state_file).resolve()
 

@@ -933,7 +933,7 @@ _DISPATCHERS = {
 
 
 @traced_stage("schedule-sync")
-def run(args) -> int:
+def run(args, _logger: Optional[logging.Logger] = None) -> int:
     """Entry point wired to ``func=run`` in :func:`register`.
 
     Returns an exit code: 0 on success, 1 on any non-zero subprocess

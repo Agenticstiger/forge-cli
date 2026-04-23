@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from typing import Optional
 
 from fluid_build.cli._common import CLIError
 from fluid_build.cli._signing import cosign_available, verify_bundle
@@ -118,8 +119,14 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=run)
 
 
-def run(args: argparse.Namespace) -> int:
-    """Entry point wired to ``func=run`` in :func:`register`."""
+def run(args: argparse.Namespace, _logger: Optional[logging.Logger] = None) -> int:
+    """Entry point wired to ``func=run`` in :func:`register`.
+
+    The ``_logger`` parameter is accepted (but ignored) because the
+    fluid CLI dispatcher uniformly calls ``args.func(args, logger)``
+    on every registered subcommand. Commands that don't need the
+    logger just accept it as an ignored positional.
+    """
     if not cosign_available():
         raise CLIError(
             2,
