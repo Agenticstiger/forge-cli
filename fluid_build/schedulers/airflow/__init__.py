@@ -364,13 +364,48 @@ def _generate_snowflake_task(task: Dict[str, Any], config: Dict[str, Any]) -> st
 
 
 def _generate_generic_task(task: Dict[str, Any]) -> str:
-    """Generate a generic Python task (no provider-specific operators)."""
-    task_id = task.get("taskId")
-    action = task.get("action")
+    """Generate a generic Python task (no provider-specific operators).
+
+    **Quote safety:** the previous implementation interpolated
+    ``{params!r}`` (Python repr) inside a single-quoted string literal.
+    ``repr({'model': 'x'})`` returns ``"{'model': 'x'}"`` — a string
+    containing single quotes. When embedded in the lambda body as
+    ``'Action: foo, Params: {'model': 'x'}'`` the Python parser sees
+    the first inner ``'`` as a string terminator and fails with
+    ``SyntaxError: invalid syntax. Perhaps you forgot a comma?``
+    Airflow's scheduler rejects the DAG file at parse time; the DAG
+    never appears in ``airflow dags list``.
+
+    **Fix:** serialize via ``json.dumps`` (produces double-quoted
+    JSON, which is safe inside single-quoted Python strings) and
+    use ``repr()`` on the task_id + action strings so any embedded
+    quotes get properly escaped by Python's own repr machinery.
+    """
+    import json
+
+    task_id = task.get("taskId") or "unnamed_task"
+    action = task.get("action") or ""
     params = task.get("params", {})
 
-    return f"""{task_id} = PythonOperator(
-    task_id='{task_id}',
-    python_callable=lambda: logger.info('Action: {action}, Params: {params!r}'),
+    # repr() handles arbitrary quote content correctly by choosing the
+    # appropriate quote style and escaping where needed — safer than a
+    # naive f-string wrapping.
+    task_id_literal = repr(task_id)
+    action_literal = repr(action)
+    # json.dumps produces double-quoted JSON, embedded here inside
+    # the outer single-quoted f-string payload via repr().
+    params_json = repr(json.dumps(params, sort_keys=True))
+
+    # The Python identifier in ``<task_id> = PythonOperator(...)`` must
+    # be a legal Python name; we emit it literally as returned by the
+    # caller (who is responsible for pre-validation). Fall back to a
+    # safe placeholder when the task_id isn't a legal identifier.
+    py_id = task_id if task_id.isidentifier() else "unnamed_task"
+
+    return f"""{py_id} = PythonOperator(
+    task_id={task_id_literal},
+    python_callable=lambda: logger.info(
+        'Action: ' + {action_literal} + ', Params: ' + {params_json}
+    ),
     dag=dag,
 )"""

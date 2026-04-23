@@ -2628,7 +2628,25 @@ pipeline {{
         // Defence-in-depth against in-flight CI tampering.
         // ═════════════════════════════════════════════════════════════
         stage('4 · validate artifacts') {{
-            when {{ expression {{ return params.RUN_STAGE_4_VALIDATE_ARTIFACTS }} }}
+            // Self-gate: stage 4 re-verifies the output of stage 3
+            // (generate artifacts). When stage 3 was skipped — either
+            // because the contract is reference-only (RUN_STAGE_3_*
+            // default False) or because the operator unchecked it —
+            // ``dist/artifacts/`` won't exist and this stage would
+            // hard-fail with ``validate_artifacts_input_missing``,
+            // cascading into skipping every downstream stage.
+            //
+            // Fix: skip stage 4 when either (a) the run-toggle is
+            // off, OR (b) the artifacts directory doesn't exist.
+            // The ``fileExists`` check runs at Groovy-pipeline-
+            // evaluation time; if the path is missing we no-op the
+            // stage so stages 5-11 can still run.
+            when {{
+                expression {{
+                    return params.RUN_STAGE_4_VALIDATE_ARTIFACTS \
+                        && fileExists('{P}dist/artifacts/MANIFEST.json')
+                }}
+            }}
             steps {{
                 sh '''{CD}fluid validate-artifacts dist/artifacts/ \\
                          --manifest dist/artifacts/MANIFEST.json \\
@@ -2644,13 +2662,20 @@ pipeline {{
         // ═════════════════════════════════════════════════════════════
         stage('5 · diff (drift gate)') {{
             when {{ expression {{ return params.RUN_STAGE_5_DIFF }} }}
+            // SECURITY: argument-smuggling defence (match stages 7, 9, 11).
             environment {{
-                DIFF_DRIFT_FLAG = "${{params.DIFF_EXIT_ON_DRIFT ? '--exit-on-drift' : ''}}"
+                DIFF_EXIT_ON_DRIFT_VAL = "${{params.DIFF_EXIT_ON_DRIFT}}"
             }}
             steps {{
-                sh '''{CD}fluid diff "${{CONTRACT:-contract.fluid.yaml}}" ${{DIFF_DRIFT_FLAG}} \\
-                           --env "${{FLUID_ENV:-dev}}" \\
-                           --report runtime/diff-report.json'''
+                // ``fluid diff`` takes ``--out``, NOT ``--report``.
+                // Pre-fix the template emitted ``--report`` which made
+                // every stage-5 invocation fail with
+                // ``unrecognized arguments: --report`` before any
+                // drift comparison could run.
+                sh '''{CD}set -eu
+                    set -- "${{CONTRACT:-contract.fluid.yaml}}" --env "${{FLUID_ENV:-dev}}" --out runtime/diff-report.json
+                    if [ "${{DIFF_EXIT_ON_DRIFT_VAL:-false}}" = "true" ]; then set -- "$@" --exit-on-drift; fi
+                    fluid diff "$@"'''
                 archiveArtifacts artifacts: '{P}runtime/diff-report.json', fingerprint: true, allowEmptyArchive: true
             }}
         }}
@@ -2724,10 +2749,18 @@ pipeline {{
         stage('8 · policy apply') {{
             when {{ expression {{ return params.RUN_STAGE_8_POLICY_APPLY }} }}
             steps {{
+                // ``fluid policy-apply`` does NOT accept a --report
+                // flag — pre-fix the template emitted one anyway, so
+                // when bindings.json DID exist, the command failed
+                // loud with ``unrecognized arguments: --report``.
+                // Policy-apply's report output goes to stdout; if a
+                // JSON report is needed, capture stdout to the file
+                // via shell redirection.
                 sh '''{CD}if [ -f dist/artifacts/policy/bindings.json ]; then \\
                          fluid policy-apply dist/artifacts/policy/bindings.json \\
                            --mode "${{POLICY_APPLY_MODE}}" --env "${{FLUID_ENV:-dev}}" \\
-                           --report runtime/policy-apply-report.json; \\
+                           > runtime/policy-apply-report.json 2>&1 || \\
+                         {{ cat runtime/policy-apply-report.json; exit 1; }}; \\
                        else echo "no dist/artifacts/policy/bindings.json — skipping stage 8"; fi'''
                 archiveArtifacts artifacts: '{P}runtime/policy-apply-report.json', fingerprint: true, allowEmptyArchive: true
             }}
@@ -2740,13 +2773,26 @@ pipeline {{
         // ═════════════════════════════════════════════════════════════
         stage('9 · verify') {{
             when {{ expression {{ return params.RUN_STAGE_9_VERIFY }} }}
+            // SECURITY: same argument-smuggling defence as stage 7 —
+            // route VERIFY_STRICT through a plain env var and compose
+            // argv via POSIX set -- + if/then/fi rather than Groovy-
+            // ternary-concatenating + unquoted env expansion. A
+            // malicious VERIFY_STRICT=true Jenkins boolean is safe
+            // anyway (it's just a toggle), but the pattern keeps the
+            // defence consistent across all stages that take
+            // parameters.
             environment {{
-                VERIFY_STRICT_FLAG = "${{params.VERIFY_STRICT ? '--strict' : ''}}"
+                VERIFY_STRICT_VAL = "${{params.VERIFY_STRICT}}"
             }}
             steps {{
-                sh '''{CD}fluid verify "${{CONTRACT:-contract.fluid.yaml}}" ${{VERIFY_STRICT_FLAG}} \\
-                           --env "${{FLUID_ENV:-dev}}" \\
-                           --report runtime/verify-report.json'''
+                // ``fluid verify`` takes ``--out``, NOT ``--report``
+                // (fixed in this batch — previously emitted --report
+                // which failed with ``unrecognized arguments`` on
+                // every invocation).
+                sh '''{CD}set -eu
+                    set -- "${{CONTRACT:-contract.fluid.yaml}}" --env "${{FLUID_ENV:-dev}}" --out runtime/verify-report.json
+                    if [ "${{VERIFY_STRICT_VAL:-false}}" = "true" ]; then set -- "$@" --strict; fi
+                    fluid verify "$@"'''
                 archiveArtifacts artifacts: '{P}runtime/verify-report.json', fingerprint: true, allowEmptyArchive: true
             }}
         }}
