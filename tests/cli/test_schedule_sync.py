@@ -52,6 +52,12 @@ def _args(**overrides) -> argparse.Namespace:
         "dry_run": True,
         "timeout": 60,
         "report": None,
+        # Supply-chain gate fields (opt-in; all default-off).
+        "bundle": None,
+        "verify_signature": False,
+        "verify_key": None,
+        "verify_identity_regexp": ".*",
+        "verify_oidc_issuer_regexp": ".*",
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -662,3 +668,253 @@ class TestWhichOrRaise:
         with patch.object(schedule_sync.shutil, "which", return_value=None):
             with pytest.raises(CLIError, match="schedule_sync_binary_not_on_path"):
                 schedule_sync._which_or_raise("nonexistent-binary-123")
+
+
+# -----------------------------------------------------------------------------
+# --verify-signature gate (commit 13 supply-chain integration)
+# -----------------------------------------------------------------------------
+
+
+class TestVerifySignatureGate:
+    """The opt-in ``--verify-signature`` gate runs cosign verify-blob
+    against the bundle BEFORE any DAG is dispatched to the scheduler.
+    A failed verification aborts with exit 1; no DAGs leave the CI
+    environment.
+
+    These tests are the critical regression guard for the gate's
+    correctness — if the check runs AFTER dispatch, it's worthless;
+    if it's silently bypassed on a cosign-missing system, a
+    compromised bundle ships. Both failure modes are locked down here.
+    """
+
+    def test_disabled_by_default_dispatches_normally(self, dags_dir, tmp_path):
+        """--verify-signature defaults to False. Happy-path schedule-
+        sync must NOT call the verify helper at all."""
+        args = _args(
+            scheduler="airflow",
+            dags_dir=str(dags_dir),
+            destination="s3://bucket/dags/",
+            dry_run=True,
+        )
+        with (
+            patch.object(schedule_sync, "_which_or_raise", return_value="/bin/aws"),
+            patch("fluid_build.cli._signing.verify_bundle") as mock_verify,
+        ):
+            rc = schedule_sync.run(args)
+        assert rc == 0
+        mock_verify.assert_not_called()
+
+    def test_enabled_but_no_bundle_raises_cli_error(self, dags_dir, tmp_path):
+        """--verify-signature without --bundle is a config error —
+        the gate needs a bundle path to verify. Fail loud with an
+        actionable CLIError rather than silently skipping."""
+        args = _args(
+            scheduler="airflow",
+            dags_dir=str(dags_dir),
+            destination="s3://bucket/dags/",
+            verify_signature=True,
+            bundle=None,
+        )
+        with patch.object(schedule_sync, "_which_or_raise", return_value="/bin/aws"):
+            with pytest.raises(
+                CLIError,
+                match="schedule_sync_verify_signature_missing_bundle",
+            ):
+                schedule_sync.run(args)
+
+    def test_enabled_cosign_missing_raises_cli_error(self, dags_dir, tmp_path):
+        """Silent skip on cosign-missing would be a downgrade attack:
+        an attacker could strip cosign from the runner image and the
+        check would just vanish. We hard-fail instead with guidance."""
+        bundle = tmp_path / "b.tgz"
+        bundle.write_bytes(b"x")
+        args = _args(
+            scheduler="airflow",
+            dags_dir=str(dags_dir),
+            destination="s3://bucket/dags/",
+            verify_signature=True,
+            bundle=str(bundle),
+        )
+        with patch(
+            "fluid_build.cli._signing.cosign_available",
+            return_value=False,
+        ):
+            with pytest.raises(
+                CLIError,
+                match="schedule_sync_verify_signature_cosign_missing",
+            ):
+                schedule_sync.run(args)
+
+    def test_enabled_verify_success_proceeds_to_dispatch(self, dags_dir, tmp_path):
+        """Happy path: cosign returns exit 0 → dispatch runs
+        normally."""
+        bundle = tmp_path / "b.tgz"
+        bundle.write_bytes(b"x")
+        args = _args(
+            scheduler="airflow",
+            dags_dir=str(dags_dir),
+            destination="s3://bucket/dags/",
+            verify_signature=True,
+            bundle=str(bundle),
+            dry_run=True,
+        )
+        verify_ok = {
+            "exit_code": 0,
+            "argv": ["cosign", "verify-blob"],
+            "key_mode": "keyless",
+            "stderr_tail": "",
+        }
+        with (
+            patch(
+                "fluid_build.cli._signing.cosign_available",
+                return_value=True,
+            ),
+            patch(
+                "fluid_build.cli._signing.verify_bundle",
+                return_value=verify_ok,
+            ) as mock_verify,
+            patch.object(schedule_sync, "_which_or_raise", return_value="/bin/aws"),
+        ):
+            rc = schedule_sync.run(args)
+        assert rc == 0
+        mock_verify.assert_called_once()
+        # Verify was called with the bundle path, not the dags-dir.
+        assert mock_verify.call_args.args[0] == str(bundle)
+
+    def test_enabled_verify_failure_aborts_with_exit_1(self, dags_dir, tmp_path):
+        """Failed verification MUST abort with exit 1 BEFORE any
+        scheduler dispatch. This is the core invariant — if dispatch
+        runs despite a signature failure, the gate is worthless."""
+        bundle = tmp_path / "b.tgz"
+        bundle.write_bytes(b"x")
+        args = _args(
+            scheduler="airflow",
+            dags_dir=str(dags_dir),
+            destination="s3://bucket/dags/",
+            verify_signature=True,
+            bundle=str(bundle),
+            dry_run=True,
+        )
+        verify_fail = {
+            "exit_code": 1,
+            "argv": ["cosign", "verify-blob"],
+            "key_mode": "keyless",
+            "stderr_tail": "signature verification failed",
+        }
+        with (
+            patch(
+                "fluid_build.cli._signing.cosign_available",
+                return_value=True,
+            ),
+            patch(
+                "fluid_build.cli._signing.verify_bundle",
+                return_value=verify_fail,
+            ),
+            patch.object(schedule_sync, "_which_or_raise", return_value="/bin/aws") as mock_which,
+        ):
+            rc = schedule_sync.run(args)
+        assert rc == 1
+        # CRITICAL: the dispatcher must NOT have been reached —
+        # _which_or_raise (which every dispatcher calls first) was
+        # never consulted.
+        mock_which.assert_not_called()
+
+    def test_keyed_mode_key_ref_flows_through(self, dags_dir, tmp_path):
+        """--verify-key is plumbed through to verify_bundle so the
+        keyed-verification path is reachable from schedule-sync (not
+        just from the standalone verify-signature command)."""
+        bundle = tmp_path / "b.tgz"
+        bundle.write_bytes(b"x")
+        key = tmp_path / "pub.key"
+        key.write_bytes(b"pub")
+        args = _args(
+            scheduler="airflow",
+            dags_dir=str(dags_dir),
+            destination="s3://bucket/dags/",
+            verify_signature=True,
+            bundle=str(bundle),
+            verify_key=str(key),
+            dry_run=True,
+        )
+        verify_ok = {
+            "exit_code": 0,
+            "argv": ["cosign", "verify-blob"],
+            "key_mode": "keyed",
+            "stderr_tail": "",
+        }
+        with (
+            patch(
+                "fluid_build.cli._signing.cosign_available",
+                return_value=True,
+            ),
+            patch(
+                "fluid_build.cli._signing.verify_bundle",
+                return_value=verify_ok,
+            ) as mock_verify,
+            patch.object(schedule_sync, "_which_or_raise", return_value="/bin/aws"),
+        ):
+            schedule_sync.run(args)
+        # verify_bundle called with key_ref=str(key)
+        assert mock_verify.call_args.kwargs["key_ref"] == str(key)
+
+    def test_identity_regexp_flows_through(self, dags_dir, tmp_path):
+        """Operator-pinned signer identity flows into verify_bundle."""
+        bundle = tmp_path / "b.tgz"
+        bundle.write_bytes(b"x")
+        args = _args(
+            scheduler="airflow",
+            dags_dir=str(dags_dir),
+            destination="s3://bucket/dags/",
+            verify_signature=True,
+            bundle=str(bundle),
+            verify_identity_regexp="https://github.com/acme/.*",
+            dry_run=True,
+        )
+        verify_ok = {
+            "exit_code": 0,
+            "argv": [],
+            "key_mode": "keyless",
+            "stderr_tail": "",
+        }
+        with (
+            patch(
+                "fluid_build.cli._signing.cosign_available",
+                return_value=True,
+            ),
+            patch(
+                "fluid_build.cli._signing.verify_bundle",
+                return_value=verify_ok,
+            ) as mock_verify,
+            patch.object(schedule_sync, "_which_or_raise", return_value="/bin/aws"),
+        ):
+            schedule_sync.run(args)
+        assert mock_verify.call_args.kwargs["identity_regexp"] == "https://github.com/acme/.*"
+
+    def test_argparse_registration_exposes_all_verify_flags(self):
+        """End-to-end argparse check: the four new flags surface in
+        the parser output."""
+        parser = argparse.ArgumentParser()
+        sp = parser.add_subparsers(dest="command")
+        schedule_sync.register(sp)
+        ns = parser.parse_args(
+            [
+                "schedule-sync",
+                "--scheduler",
+                "airflow",
+                "--dags-dir",
+                "/tmp/x",
+                "--destination",
+                "s3://b/d/",
+                "--bundle",
+                "/tmp/b.tgz",
+                "--verify-signature",
+                "--verify-identity-regexp",
+                "https://github.com/org/.*",
+                "--verify-oidc-issuer-regexp",
+                "https://token.actions.githubusercontent.com",
+            ]
+        )
+        assert ns.verify_signature is True
+        assert ns.bundle == "/tmp/b.tgz"
+        assert ns.verify_identity_regexp == "https://github.com/org/.*"
+        assert ns.verify_oidc_issuer_regexp == ("https://token.actions.githubusercontent.com")

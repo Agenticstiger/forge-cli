@@ -210,6 +210,64 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         default=None,
         help="Optional path to write a JSON result summary.",
     )
+    # ── Supply-chain gate (opt-in) ────────────────────────────────────
+    p.add_argument(
+        "--bundle",
+        default=None,
+        help=(
+            "Optional: path to the tgz bundle the DAGs were generated "
+            "from. When paired with ``--verify-signature``, the bundle "
+            "signature is verified BEFORE dispatching DAGs to the "
+            "scheduler \u2014 unsigned / tampered bundles are refused. "
+            "Unused when --verify-signature is not set."
+        ),
+    )
+    p.add_argument(
+        "--verify-signature",
+        action="store_true",
+        default=False,
+        help=(
+            "Before pushing DAGs to the scheduler, verify the bundle's "
+            "Sigstore signature via ``cosign verify-blob``. Requires "
+            "``--bundle <path>`` pointing at the signed tgz. Verification "
+            "failure aborts the sync with exit 1 \u2014 production scheduler "
+            "endpoints must never receive DAGs from an untrusted source. "
+            "Supports both keyless (default) and keyed (``--verify-key``) "
+            "verification to match the two ``bundle --sign`` modes."
+        ),
+    )
+    p.add_argument(
+        "--verify-key",
+        default=None,
+        help=(
+            "Keyed-mode verification public key (path or KMS URI) for "
+            "``--verify-signature``. Matches bundles signed with "
+            "``bundle --sign --sign-key``. Selects keyed verification "
+            "over the default keyless Fulcio-cert verification. "
+            "Ignored when --verify-signature is not set."
+        ),
+    )
+    p.add_argument(
+        "--verify-identity-regexp",
+        default=".*",
+        help=(
+            "Regexp matching the acceptable OIDC signer identity "
+            "(keyless mode). Default '.*' accepts any \u2014 pin this in "
+            "production to 'https://github.com/<your-org>/.*' or "
+            "equivalent so a stolen/compromised signer can't push "
+            "malicious DAGs."
+        ),
+    )
+    p.add_argument(
+        "--verify-oidc-issuer-regexp",
+        default=".*",
+        help=(
+            "Regexp matching the acceptable OIDC issuer (keyless "
+            "mode). Default '.*' accepts any. Pin to "
+            "'https://token.actions.githubusercontent.com' to force "
+            "GitHub-only signers, or your GitLab OIDC issuer URL."
+        ),
+    )
     p.set_defaults(func=run)
 
 
@@ -892,6 +950,74 @@ def run(args) -> int:
             2,
             "schedule_sync_unknown_scheduler",
             {"scheduler": args.scheduler, "supported": list(_DISPATCHERS.keys())},
+        )
+
+    # ── Supply-chain gate: verify bundle signature BEFORE dispatching ──
+    # Opt-in via --verify-signature. When set, the bundle signature is
+    # verified before any DAG reaches the scheduler. Rationale: DAGs
+    # pushed to production schedulers (MWAA, Composer, etc.) execute
+    # arbitrary code in a privileged env. A tampered bundle that
+    # survives the 11-stage pipeline would be a serious supply-chain
+    # incident — the signature check is the last opportunity to stop
+    # it before the scheduler runs the code. Failure aborts the sync
+    # with exit 1 so CI stops; no DAGs land in the scheduler.
+    if getattr(args, "verify_signature", False):
+        bundle = getattr(args, "bundle", None)
+        if not bundle:
+            raise CLIError(
+                2,
+                "schedule_sync_verify_signature_missing_bundle",
+                {
+                    "hint": (
+                        "--verify-signature requires --bundle <path> pointing "
+                        "at the signed tgz (the same bundle whose DAGs are in "
+                        "--dags-dir). Re-run with --bundle /path/to/bundle.tgz."
+                    )
+                },
+            )
+        from fluid_build.cli._signing import cosign_available, verify_bundle
+
+        if not cosign_available():
+            raise CLIError(
+                2,
+                "schedule_sync_verify_signature_cosign_missing",
+                {
+                    "hint": (
+                        "cosign not on PATH. Install from "
+                        "https://docs.sigstore.dev/cosign/installation/ "
+                        "or drop --verify-signature to skip verification."
+                    )
+                },
+            )
+        verify_result = verify_bundle(
+            bundle,
+            key_ref=getattr(args, "verify_key", None),
+            identity_regexp=getattr(args, "verify_identity_regexp", ".*"),
+            oidc_issuer_regexp=getattr(args, "verify_oidc_issuer_regexp", ".*"),
+            timeout=args.timeout,
+        )
+        if verify_result["exit_code"] != 0:
+            cprint(
+                "[schedule-sync] \u2718 bundle signature verification FAILED "
+                f"(exit {verify_result['exit_code']}): "
+                f"{verify_result.get('stderr_tail', '')[:500]}",
+                markup=False,
+            )
+            logger.error(
+                "schedule_sync_signature_verify_failed",
+                extra={
+                    "bundle": bundle,
+                    "exit_code": verify_result["exit_code"],
+                    "key_mode": verify_result.get("key_mode"),
+                },
+            )
+            # Hard-abort: do not dispatch DAGs.
+            return 1
+        cprint(
+            f"[schedule-sync] \u2714 bundle signature valid "
+            f"(mode: {verify_result.get('key_mode', 'unknown')}) \u2014 "
+            "proceeding to dispatch DAGs.",
+            markup=False,
         )
 
     dispatcher = _DISPATCHERS[args.scheduler]
