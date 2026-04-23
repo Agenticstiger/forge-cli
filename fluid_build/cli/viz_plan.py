@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import os
@@ -52,19 +53,45 @@ def _mermaid_node_id(action_id: str, idx: int) -> str:
 def _mermaid_label(action: dict, idx: int) -> str:
     """Render the per-node display label.
 
-    Shape: ``<op>\\n<id>`` so the graph shows both the operation
+    Shape: ``<op><br/><id>`` so the graph shows both the operation
     (``provisionDataset``, ``grantAccess``, …) and the contract-
-    specified action id. Both are useful at a glance — op tells
-    you what; id tells you which. Quotes are escaped so the mermaid
-    parser doesn't choke on action ids containing them.
+    specified action id. Both are useful at a glance — op tells you
+    what; id tells you which.
+
+    **SECURITY — XSS prevention:** the op + id values come from the
+    contract via ``plan.json``. Contract YAML is schema-unconstrained
+    on ``providerActions[].actionId`` / ``op`` — a malicious
+    contributor (or compromised upstream reference) can land a string
+    like ``"safe_id</pre><script>…</script>"`` in an action id.
+    Without HTML-escaping, that payload breaks out of the surrounding
+    ``<pre class="mermaid">`` element (HTML5 ``<pre>`` is ordinary
+    flow content, NOT a raw-text element — child ``<script>`` tags
+    parse + execute) and runs under the origin the plan.html is
+    opened at. Mermaid's own ``securityLevel: 'strict'`` only
+    sanitises WITHIN mermaid rendering; the browser's HTML
+    tokenizer runs first, so a pre-mermaid escape is the only
+    defence.
+
+    Fix: route both op + id through ``html.escape(..., quote=True)``.
+    This turns ``<`` / ``>`` / ``&`` / ``"`` / ``'`` into their
+    character-reference forms before the mermaid parser or the HTML
+    tokenizer sees them. Mermaid preserves HTML entity references in
+    labels — ``&lt;br/&gt;`` renders as the literal string
+    ``<br/>``, which is the desired display for a malicious id
+    containing that substring. The explicit ``<br/>`` we insert
+    between op and id is ASCII-literal (NOT entity-encoded) so
+    mermaid still honours it as a line break.
     """
     op = action.get("op") or action.get("action_type") or "unknown"
     action_id = action.get("id") or action.get("action_id") or f"action_{idx}"
-    # Mermaid labels support <br/> for line breaks inside quoted
-    # strings. Double-quote the label so special chars (spaces, dots)
-    # don't break the parser.
-    safe_op = str(op).replace('"', "'")
-    safe_id = str(action_id).replace('"', "'")
+    # HTML-escape BEFORE the mermaid parser — this disarms both the
+    # browser's HTML tokenizer (no ``</pre>`` escape) and the mermaid
+    # label parser (no embedded ``"``). quote=True also covers ``'``
+    # so a payload wrapped in single-quotes can't break out either.
+    safe_op = html.escape(str(op), quote=True)
+    safe_id = html.escape(str(action_id), quote=True)
+    # The ``<br/>`` separator is our own safe literal — NOT operator-
+    # controlled — so it stays as a mermaid line-break directive.
     return f'"{safe_op}<br/>{safe_id}"'
 
 
@@ -213,25 +240,42 @@ def render_plan_html(plan_path: str, out_html: str, logger: logging.Logger) -> N
     — acceptable for a diagnostics view, not something that ships
     into production data planes.
 
-    ``securityLevel: 'strict'`` in the init call is important: it
-    disables click bindings + HTML rendering inside node labels so
-    a malicious action id / op value can't smuggle script into the
-    rendered graph. Our label-building code also escapes double
-    quotes before they reach the mermaid parser.
+    ``securityLevel: 'strict'`` in the init call is defence-in-depth
+    WITHIN mermaid rendering (disables click bindings + HTML in node
+    labels). The primary XSS defence is pre-mermaid HTML-escaping in
+    :func:`_mermaid_label` + the JSON-in-HTML escape applied to the
+    raw-JSON drill-down block below. Without both, a contract with a
+    malicious ``actionId`` like ``"x</pre><script>…</script>"`` would
+    break out of the ``<pre>`` container and execute JS — because
+    HTML5 ``<pre>`` is ordinary flow content, NOT a raw-text element,
+    so child ``<script>`` tags are parsed + executed.
     """
     data = read_json(plan_path)
     actions = data.get("actions", [])
     mermaid_body = _build_mermaid_graph(actions)
-    html = _HTML_TEMPLATE.format(
+    # JSON-in-HTML escape: ``json.dumps`` does not by default escape
+    # HTML-relevant characters — ``</pre>`` / ``</script>`` pass
+    # through verbatim. When that JSON is embedded inside ``<pre>``,
+    # a ``</pre>`` substring closes the block and any subsequent
+    # ``<script>`` runs. Replacing ``<`` / ``>`` / ``&`` with their
+    # \uXXXX escapes produces valid JSON that still parses identically
+    # (JSON allows \u-escapes of any ASCII char) but is inert against
+    # the HTML tokenizer. Standard OWASP-recommended JSON-in-HTML
+    # pattern; see https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html#output-encoding-for-html-contexts
+    raw_json = json.dumps(actions, indent=2)
+    actions_json_safe = (
+        raw_json.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
+    )
+    rendered = _HTML_TEMPLATE.format(
         count=len(actions),
         mermaid_body=mermaid_body,
-        actions_json=json.dumps(actions, indent=2),
+        actions_json=actions_json_safe,
     )
     out_dir = os.path.dirname(out_html)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     with open(out_html, "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(rendered)
     info(logger, "viz_plan_ok", out=out_html, actions=len(actions))
 
 

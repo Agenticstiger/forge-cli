@@ -322,15 +322,34 @@ def _restore_snowflake(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, 
     dropped, cosign — I mean, Snowflake — will surface a "does not
     exist" error from the client which we surface to the operator.
     """
-    backup_name = snapshot["backup_name"]
+    # SECURITY: both ``database`` and ``backup_name`` are read from the
+    # on-disk state file, which the rollback docstring explicitly invites
+    # operators to commit to the product repo. That makes the state file
+    # attacker-authorable via a PR — reviewed as a YAML-style data blob,
+    # not byte-level audited. Without validation, a crafted
+    # ``backup_name`` like
+    #   "ok; DROP DATABASE production; CREATE DATABASE pwn CLONE ok"
+    # would smuggle arbitrary DDL into the f-string + ``executescript``
+    # (which splits on ';'). Route BOTH fields through the canonical
+    # identifier validator (``^[A-Za-z_][A-Za-z0-9_]*$``) BEFORE the
+    # f-string construction to reject every semicolon / whitespace /
+    # quote / backtick / wildcard-based payload at the validation layer.
+    #
+    # Legitimate backup names (e.g.
+    # ``backup_silver_telco_subscriber360_v1_1714000000``) + target db
+    # names (e.g. ``TELCO_LAB``) match the regex cleanly, so the defence
+    # has zero false-positive cost on valid inputs.
+    from fluid_build.providers._sql_safety import validate_ident
+
+    raw_backup_name = snapshot.get("backup_name")
     location = snapshot.get("location", {})
-    database = location.get("database") or snapshot.get("database")
-    if not database:
+    raw_database = location.get("database") or snapshot.get("database")
+    if not raw_database:
         raise CLIError(
             2,
             "rollback_snowflake_missing_database",
             {
-                "snapshot": backup_name,
+                "snapshot": raw_backup_name,
                 "hint": (
                     "snapshot record is missing location.database — the "
                     "snapshot writer (apply.py replace-path) should set "
@@ -338,6 +357,36 @@ def _restore_snowflake(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, 
                 ),
             },
         )
+    if not raw_backup_name:
+        raise CLIError(
+            2,
+            "rollback_snowflake_missing_backup_name",
+            {
+                "hint": ("snapshot record is missing backup_name — state file " "is malformed."),
+            },
+        )
+    try:
+        database = validate_ident(raw_database)
+        backup_name = validate_ident(raw_backup_name)
+    except ValueError as exc:
+        # Raise as a CLIError with a diagnostic event slug so CI log
+        # parsers and operators see a specific "rollback refused to
+        # run because state-file values don't look like identifiers".
+        raise CLIError(
+            2,
+            "rollback_snowflake_invalid_identifier",
+            {
+                "error": str(exc),
+                "hint": (
+                    "state-file values must match "
+                    "^[A-Za-z_][A-Za-z0-9_]*$ (alphanumeric + "
+                    "underscore). A value containing spaces, "
+                    "semicolons, quotes, or shell metacharacters "
+                    "indicates a corrupt or attacker-crafted state "
+                    "file."
+                ),
+            },
+        ) from exc
 
     ddl = f"CREATE OR REPLACE DATABASE {database} CLONE {backup_name};"
     cprint(

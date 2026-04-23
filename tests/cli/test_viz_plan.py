@@ -325,5 +325,186 @@ class TestRenderPlanHtml:
         out = tmp_path / "plan.html"
         viz_plan.render_plan_html(str(plan), str(out), logger)
         content = out.read_text()
-        # The JSON should contain the full action object.
+        # The JSON should contain the full action object — but with
+        # HTML-safe unicode escapes on any <, >, & characters (the
+        # JSON-in-HTML defence). ``"mode": "amend"`` is pure ASCII
+        # alpha, so it's present verbatim.
         assert '"mode": "amend"' in content
+
+
+# -----------------------------------------------------------------------------
+# XSS regression guards — SECURITY-critical
+#
+# Pre-fix: the viz-plan renderer escaped only double-quotes on mermaid
+# labels, leaving ``<``, ``>``, ``&`` unescaped. ``json.dumps`` by
+# default doesn't escape HTML-relevant characters either. A contract
+# author could set an action id / op to
+# ``"safe_id</pre><script>alert(1)</script>"`` and the payload would
+# break out of the ``<pre>`` wrapper + execute when an operator opened
+# plan.html (HTML5 ``<pre>`` is ordinary flow content — child
+# ``<script>`` tags execute; ``mermaid.securityLevel='strict'`` is a
+# red herring because the browser's HTML tokenizer runs first).
+#
+# These tests lock the fix in. If any of them regress, the rendered
+# HTML is XSS-vulnerable again.
+# -----------------------------------------------------------------------------
+
+
+class TestXssRegressionGuards:
+    @pytest.fixture()
+    def logger(self):
+        return logging.getLogger("test_viz_plan")
+
+    def _render(self, tmp_path, logger, actions):
+        plan = tmp_path / "plan.json"
+        plan.write_text(json.dumps({"actions": actions}), encoding="utf-8")
+        out = tmp_path / "plan.html"
+        viz_plan.render_plan_html(str(plan), str(out), logger)
+        return out.read_text()
+
+    def test_malicious_action_id_does_not_produce_live_script_tag(self, tmp_path, logger):
+        """The canonical XSS payload. A raw ``<script>alert(1)</script>``
+        with a preceding ``</pre>`` closer MUST NOT survive into the
+        rendered HTML in a browser-executable form.
+
+        Fix: ``html.escape`` on op + id inside ``_mermaid_label`` +
+        JSON-in-HTML unicode escape on the raw-JSON drill-down block.
+        Both sinks must be disarmed — the mermaid label is the
+        primary one, but the JSON-dump block is a secondary sink
+        that would be independently exploitable without its own
+        escape.
+        """
+        payload = "safe_id</pre><script>alert(1)</script>"
+        content = self._render(
+            tmp_path,
+            logger,
+            [{"op": "provisionDataset", "id": payload}],
+        )
+        # Core invariant: the browser-executable substring must NOT
+        # appear anywhere in the rendered HTML.
+        assert "<script>alert(1)</script>" not in content, (
+            "XSS: raw <script>alert(1)</script> survived into HTML output. "
+            "The ``_mermaid_label`` and/or JSON-dump sink failed to "
+            "HTML-escape the action id. Check the ``html.escape`` call "
+            "in _mermaid_label + the \\u003c/\\u003e replacement in "
+            "render_plan_html."
+        )
+        # Secondary: the ``</pre>`` closer that would break out of
+        # the surrounding element must also be gone.
+        assert "</pre><script>" not in content, (
+            "XSS: </pre><script> tag-breakout sequence survived into "
+            "HTML. A browser would close the <pre>, then execute the "
+            "following <script> as a real HTMLScriptElement."
+        )
+
+    def test_malicious_op_field_escaped_in_mermaid_label(self, tmp_path, logger):
+        """Same class of attack, different field. ``op`` flows into
+        the mermaid label alongside ``id`` — both must be escaped."""
+        content = self._render(
+            tmp_path,
+            logger,
+            [{"op": "evil</pre><script>x=1</script>", "id": "a1"}],
+        )
+        assert "<script>x=1</script>" not in content
+        assert "</pre><script>" not in content
+
+    def test_malicious_description_field_escaped_in_json_block(self, tmp_path, logger):
+        """The raw-JSON drill-down block is a SECONDARY sink — it
+        embeds the entire action dict. A malicious string in ANY
+        field (description, params, etc.) would break out of the
+        surrounding ``<pre>`` if not escaped. Test a field that
+        doesn't appear in the mermaid label so this test isolates
+        the JSON-sink defence."""
+        content = self._render(
+            tmp_path,
+            logger,
+            [
+                {
+                    "op": "harmless",
+                    "id": "a1",
+                    "description": "</pre><script>alert('json sink')</script>",
+                }
+            ],
+        )
+        assert "<script>alert(" not in content, (
+            "XSS via JSON-dump sink: a description field containing a "
+            "<script> tag was embedded as raw HTML inside the <pre> "
+            "drill-down block. The render_plan_html function must "
+            "\\uXXXX-escape < > & before template substitution."
+        )
+        # The JSON unicode escape should have rewritten these chars.
+        # Confirm ``\u003c`` (< escape) appears in the rendered output
+        # so we know the defence actually fired.
+        assert "\\u003c" in content, (
+            "expected JSON-in-HTML unicode escapes (\\u003c/\\u003e/"
+            "\\u0026) on <, >, & — the escape pattern in "
+            "render_plan_html didn't execute."
+        )
+
+    def test_ampersand_in_fields_escaped(self, tmp_path, logger):
+        """``&`` must be escaped in both the mermaid label AND the
+        JSON block. Without that, a payload like ``id=x&amp;`` could
+        interact with other decoding paths downstream (URL encoders,
+        email clients, etc.) in surprising ways.
+
+        Fix uses ``html.escape(..., quote=True)`` on labels (turns
+        ``&`` into ``&amp;``) and ``\\u0026`` on JSON.
+        """
+        content = self._render(
+            tmp_path,
+            logger,
+            [{"op": "foo&bar", "id": "a&b"}],
+        )
+        # Raw ``&`` from op/id should NOT appear unescaped inside the
+        # mermaid label. It should become ``&amp;``. (Note: the
+        # ``&`` character elsewhere in the HTML template — e.g. CSS
+        # selectors — is fine; we only check it's escaped where our
+        # escape routine ran.)
+        # The mermaid label block contains our escaped op + id.
+        assert "foo&amp;bar" in content or "foo\\u0026bar" in content, (
+            "& character in op field not escaped — check html.escape "
+            "with quote=True in _mermaid_label."
+        )
+
+    def test_single_quote_in_op_escaped(self, tmp_path, logger):
+        """``html.escape(..., quote=True)`` escapes ``'`` to ``&#x27;``.
+        Without quote=True, an injected single quote could break out
+        of a single-quoted HTML attribute context. Regression guard
+        against accidentally flipping quote=False."""
+        content = self._render(tmp_path, logger, [{"op": "f'unction", "id": "a1"}])
+        # The literal apostrophe from op must be entity-encoded.
+        # Inside the mermaid label area (double-quoted string), a
+        # bare ``'`` would be fine for mermaid itself, but we want
+        # defence-in-depth across contexts.
+        assert "&#x27;" in content or "&#39;" in content
+
+    def test_benign_payload_still_renders_correctly(self, tmp_path, logger):
+        """The fix must NOT regress normal plans. A mundane
+        ``provisionDataset`` action should render with its op and id
+        visible (the escape turns nothing into nothing for
+        alphanumeric inputs)."""
+        content = self._render(
+            tmp_path,
+            logger,
+            [
+                {
+                    "op": "provisionDataset",
+                    "id": "silver.telco.subscriber360",
+                    "mode": "amend",
+                }
+            ],
+        )
+        # Op + id both reachable in the output (not accidentally
+        # entity-encoded so you can't read them).
+        assert "provisionDataset" in content
+        assert "silver.telco.subscriber360" in content
+
+    def test_brnbsp_literal_preserved_in_mermaid_label(self, tmp_path, logger):
+        """The safe literal ``<br/>`` separator that WE insert between
+        op and id must remain as a mermaid line-break directive — NOT
+        get escaped to ``&lt;br/&gt;``. Regression guard: a naive
+        ``html.escape(full_label)`` would break this."""
+        content = self._render(tmp_path, logger, [{"op": "a", "id": "b"}])
+        # Our literal `<br/>` must be present verbatim inside the
+        # label; mermaid treats it as a line break.
+        assert "<br/>" in content

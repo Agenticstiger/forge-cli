@@ -279,6 +279,159 @@ class TestRestoreSnowflake:
         mock_provider_cls.assert_called_once_with(database="TELCO_LAB")
 
 
+class TestRestoreSnowflakeSqlInjection:
+    """SECURITY regression guard — SQL injection on the Snowflake
+    restore DDL.
+
+    Pre-fix: ``_restore_snowflake`` built the CLONE DDL via an f-string
+    with unvalidated state-file fields. A crafted ``backup_name`` like
+    ``"ok; DROP DATABASE production; CREATE DATABASE pwn CLONE ok"``
+    would smuggle arbitrary DDL via ``executescript`` (which splits on
+    ``;``). The rollback docstring explicitly invites committing the
+    state file to the product repo, which is an attacker-authorable
+    surface via PR.
+
+    Fix: route ``database`` + ``backup_name`` through
+    ``fluid_build.providers._sql_safety.validate_ident`` BEFORE the
+    f-string. Regex is ``^[A-Za-z_][A-Za-z0-9_]*$`` — rejects every
+    semicolon / whitespace / quote / backtick / wildcard payload at
+    the validation layer. Legitimate identifiers
+    (``backup_silver_telco_subscriber360_v1_1714000000``,
+    ``TELCO_LAB``) match cleanly, so zero false-positive cost.
+
+    These tests lock the fix in. Any regression that removes
+    validate_ident from the f-string construction path re-introduces
+    the SQL injection.
+    """
+
+    @pytest.mark.parametrize(
+        "malicious_value",
+        [
+            # Classic semicolon smuggling — closes one DDL, opens
+            # another. Would destroy a named production database.
+            "ok; DROP DATABASE production",
+            # Multi-statement chain; second statement is arbitrary DDL
+            # the attacker controls (CREATE PROCEDURE, CREATE USER,
+            # GRANT, etc. are all reachable).
+            "ok; CREATE DATABASE pwn CLONE ok",
+            # Whitespace / tab variants — separators inside SQL work
+            # equally for statement termination.
+            "ok;\tDROP DATABASE production;",
+            # Comment-based obfuscation — classic SQLi pattern.
+            "ok/**/;/**/DROP/**/DATABASE/**/production",
+            # Quote-based — could escape identifier context in some
+            # dialects or embed a string literal.
+            "ok' OR 1=1 --",
+            # Backticks — harmless on Snowflake but universally rejected
+            # by the ident whitelist (Snowflake uses double quotes; a
+            # backtick value is always suspicious).
+            "ok`whoami`",
+            # Spaces in the middle — unambiguous red flag since
+            # legitimate Snowflake identifiers don't have spaces.
+            "ok DROP DATABASE production",
+            # Whitespace-only — not legal SQL identifier; would have
+            # expanded to ``CLONE ;`` with the original code.
+            # (Pure empty string is covered separately by
+            # ``test_missing_backup_name_raises_distinct_error`` — it
+            # hits a different error slug so the operator can
+            # distinguish "malformed state file" from "state file
+            # contains injection attempt".)
+            " ",
+            # Starting with a non-alpha char — not a valid SQL identifier
+            # in any dialect.
+            "1abc",
+            "_abc",  # valid start char (_), but let's confirm — actually _ IS allowed
+        ],
+    )
+    def test_backup_name_with_metacharacters_refused(self, malicious_value):
+        """A state-file backup_name containing SQL metacharacters must
+        raise CLIError BEFORE any DDL is constructed or submitted.
+        This is the primary SQL-injection defence."""
+        # Skip the one entry that's a valid identifier (underscore
+        # start is allowed by the regex).
+        if malicious_value == "_abc":
+            snap = _snap(backup_name="_abc")
+            # Should NOT raise — _abc is a valid ident.
+            rollback._restore_snowflake(snap, dry_run=True)
+            return
+
+        snap = _snap(backup_name=malicious_value)
+        with pytest.raises(CLIError) as exc_info:
+            rollback._restore_snowflake(snap, dry_run=True)
+        # Must raise specifically the sql-injection gate error slug —
+        # NOT a downstream KeyError from the malformed value reaching
+        # the executor. If this test catches a different error, the
+        # validate_ident check moved or got removed.
+        assert "rollback_snowflake_invalid_identifier" in str(exc_info.value), (
+            f"expected validate_ident to refuse {malicious_value!r} at "
+            "the CLI boundary; got a different error → the injection "
+            "gate regressed."
+        )
+
+    @pytest.mark.parametrize(
+        "malicious_db",
+        [
+            "target; DROP DATABASE production",
+            "target' OR 1=1 --",
+            "target`whoami`",
+            "target DROP DATABASE production",
+        ],
+    )
+    def test_database_with_metacharacters_refused(self, malicious_db):
+        """Same gate must cover the ``database`` field — both flow
+        into the same f-string, both are attacker-authorable."""
+        snap = _snap()
+        snap["location"]["database"] = malicious_db
+        with pytest.raises(CLIError) as exc_info:
+            rollback._restore_snowflake(snap, dry_run=True)
+        assert "rollback_snowflake_invalid_identifier" in str(exc_info.value)
+
+    def test_legitimate_backup_name_accepted(self):
+        """Positive control: a realistic backup name (from the
+        docstring's own example) must pass the validator. If this
+        fails, the gate is over-restrictive and legitimate rollbacks
+        break."""
+        snap = _snap(backup_name="backup_silver_telco_subscriber360_v1_1714000000")
+        # Should not raise.
+        result = rollback._restore_snowflake(snap, dry_run=True)
+        assert result["status"] == "dry_run"
+        assert "backup_silver_telco_subscriber360_v1_1714000000" in result["ddl"]
+
+    def test_legitimate_database_name_accepted(self):
+        """Positive control: ``TELCO_LAB`` (our lab DB) must pass."""
+        snap = _snap(database="TELCO_LAB")
+        result = rollback._restore_snowflake(snap, dry_run=True)
+        assert result["status"] == "dry_run"
+        assert "TELCO_LAB" in result["ddl"]
+
+    def test_injection_gate_fires_before_provider_construction(self):
+        """The validate_ident check runs BEFORE the
+        ``SnowflakeProvider(...)`` instantiation. Otherwise a crafted
+        value could leak to the connection-pool construction path
+        first (not a vuln today, but defence-in-depth ordering)."""
+        snap = _snap(backup_name="ok; DROP DATABASE production")
+        mock_provider_cls = MagicMock()
+        with patch(
+            "fluid_build.providers.snowflake.SnowflakeProvider",
+            mock_provider_cls,
+        ):
+            with pytest.raises(CLIError, match="rollback_snowflake_invalid"):
+                rollback._restore_snowflake(snap, dry_run=False)
+        # Provider NEVER instantiated — the gate tripped first.
+        mock_provider_cls.assert_not_called()
+
+    def test_missing_backup_name_raises_distinct_error(self):
+        """Empty/missing backup_name must raise the missing-backup-name
+        slug (not the invalid-identifier slug). This lets operators
+        distinguish "state file is malformed" from "state file
+        contains injection attempt" — different failure modes warrant
+        different remediation."""
+        snap = _snap()
+        del snap["backup_name"]
+        with pytest.raises(CLIError, match="rollback_snowflake_missing_backup_name"):
+            rollback._restore_snowflake(snap, dry_run=True)
+
+
 class TestRestoreBigQueryRedshift:
     def test_bigquery_not_implemented_with_actionable_hint(self):
         """NotImplemented must surface as a CLIError with the
