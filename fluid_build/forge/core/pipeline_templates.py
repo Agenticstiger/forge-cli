@@ -2127,17 +2127,36 @@ pipeline {{
         // ═════════════════════════════════════════════════════════════
         stage('7 · apply') {{
             when {{ expression {{ return params.RUN_STAGE_7_APPLY }} }}
+            // SECURITY: user-supplied params routed through plain
+            // environment-block assignments as raw env vars — NOT
+            // Groovy-ternary-concatenated into a single string. The
+            // previous pattern set
+            //   APPLY_BUILD_FLAG = "--build " + params.APPLY_BUILD_ID
+            // then expanded `${{APPLY_BUILD_FLAG}}` UNQUOTED in the sh
+            // body, which IFS-word-splits on whitespace. A Jenkins user
+            // with Build-With-Parameters permission could set
+            //   APPLY_BUILD_ID="x --allow-data-loss --no-verify-digest"
+            // → the value split into 4 argv tokens → `fluid apply` saw
+            // --allow-data-loss and --no-verify-digest even when the
+            // Jenkins booleans ALLOW_DATA_LOSS and NO_VERIFY_DIGEST were
+            // false. Auth-gate bypass.
+            //
+            // Fix: env vars carry raw values; POSIX `set --` + if/then/fi
+            // composes argv so each "$VAR" expansion is one argv token.
+            // This matches the stage-11 pattern hardened in commit 8673544.
             environment {{
-                APPLY_BUILD_FLAG = "${{params.APPLY_BUILD_ID ? '--build ' + params.APPLY_BUILD_ID : ''}}"
-                APPLY_LOSS_FLAG  = "${{params.ALLOW_DATA_LOSS ? '--allow-data-loss' : ''}}"
-                APPLY_DIG_FLAG   = "${{params.NO_VERIFY_DIGEST ? '--no-verify-digest' : ''}}"
+                APPLY_BUILD_ID_VAL = "${{params.APPLY_BUILD_ID}}"
+                APPLY_MODE = "${{params.APPLY_MODE}}"
+                ALLOW_DATA_LOSS = "${{params.ALLOW_DATA_LOSS}}"
+                NO_VERIFY_DIGEST = "${{params.NO_VERIFY_DIGEST}}"
             }}
             steps {{
-                sh '''{CD}fluid apply runtime/plan.json \\
-                           --mode "${{APPLY_MODE}}" \\
-                           ${{APPLY_BUILD_FLAG}} ${{APPLY_LOSS_FLAG}} ${{APPLY_DIG_FLAG}} \\
-                           --env "${{FLUID_ENV:-dev}}" --yes \\
-                           --report runtime/apply-report.html'''
+                sh '''{CD}set -eu
+                    set -- runtime/plan.json --mode "$APPLY_MODE" --env "${{FLUID_ENV:-dev}}" --yes --report runtime/apply-report.html
+                    if [ -n "${{APPLY_BUILD_ID_VAL:-}}" ]; then set -- "$@" --build "$APPLY_BUILD_ID_VAL"; fi
+                    if [ "${{ALLOW_DATA_LOSS:-false}}" = "true" ]; then set -- "$@" --allow-data-loss; fi
+                    if [ "${{NO_VERIFY_DIGEST:-false}}" = "true" ]; then set -- "$@" --no-verify-digest; fi
+                    fluid apply "$@"'''
                 archiveArtifacts artifacts: '{P}runtime/apply-report.html', fingerprint: true, allowEmptyArchive: true
             }}
         }}

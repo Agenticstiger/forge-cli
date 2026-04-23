@@ -465,7 +465,17 @@ class TestJenkinsTemplateHardening:
         assert 'cd "examples/demo" && fluid' in content
         assert 'cd "examples/demo" && fluid validate' in content
         assert 'cd "examples/demo" && fluid plan' in content
-        assert 'cd "examples/demo" && fluid apply' in content
+        # Stage 7 (apply) uses POSIX ``set --`` composition since the
+        # security-hardening commit (auth-gate bypass via unquoted
+        # ${APPLY_BUILD_FLAG} was closed by refactoring to if/then/fi).
+        # The workdir prefix now applies to ``set -eu`` rather than
+        # directly to ``fluid apply``; the ``fluid apply "$@"`` on the
+        # last line of the set-- chain is what invokes the CLI.
+        assert 'cd "examples/demo" && set -eu' in content, (
+            "stage 7 sh body must start with 'cd <workdir> && set -eu' "
+            "to preserve workdir semantics under the POSIX set-- pattern"
+        )
+        assert 'fluid apply "$@"' in content
 
     def test_workdir_prefixes_archive_patterns(self):
         content = self._jenkinsfile(workdir="examples/demo")
@@ -723,6 +733,98 @@ class TestJenkinsTemplateStage11ScheduleSync:
         assert "${params." not in sh_body, (
             "stage 11 sh body leaks ${params.*} — that's a Groovy "
             "interpolation into sh, which is a shell-injection surface."
+        )
+
+    def _extract_stage_sh_body(self, content: str, stage_label: str) -> str:
+        """Return the text between ``sh '''`` and the closing ``'''``
+        inside the stage bracketed by ``stage('<stage_label>')`` and
+        the next ``stage(`` / ``post {`` boundary. Used by the
+        injection-boundary regression tests."""
+        start = content.index(f"stage('{stage_label}')")
+        tail = content[start:]
+        end = len(tail)
+        for needle in ("stage('", "post {"):
+            idx = tail.find(needle, 30)
+            if idx != -1 and idx < end:
+                end = idx
+        stage_body = tail[:end]
+        sh_idx = stage_body.find("sh '''")
+        assert sh_idx != -1, f"stage {stage_label!r} missing sh '''...''' block"
+        sh_end = stage_body.find("'''", sh_idx + 6)
+        assert sh_end != -1
+        return stage_body[sh_idx:sh_end]
+
+    def test_stage_7_apply_no_argument_smuggling_via_apply_build_id(self):
+        """Regression: stage 7 previously used the pattern
+        ``APPLY_BUILD_FLAG = "${params.APPLY_BUILD_ID ? '--build ' + params.APPLY_BUILD_ID : ''}"``
+        then expanded ``${APPLY_BUILD_FLAG}`` UNQUOTED inside ``sh '''...'''``.
+        A Jenkins user could set
+        ``APPLY_BUILD_ID="x --allow-data-loss --no-verify-digest"`` →
+        the value word-splits into 4 argv tokens → destructive-mode
+        flags leak through regardless of the corresponding Jenkins
+        booleans. Auth-gate bypass.
+
+        Fix: params route through plain ``environment {}`` assignments,
+        and the sh body uses POSIX ``set --`` with individually-quoted
+        ``$VAR`` expansions. This test is the regression guard."""
+        content = self._jenkinsfile()
+        sh_body = self._extract_stage_sh_body(content, "7 · apply")
+        # Pattern fingerprints that should NOT appear:
+        assert "${APPLY_BUILD_FLAG}" not in sh_body
+        assert "${APPLY_LOSS_FLAG}" not in sh_body
+        assert "${APPLY_DIG_FLAG}" not in sh_body
+        assert "${params." not in sh_body, (
+            "stage 7 sh body leaks ${params.*} — Groovy interpolation "
+            "into sh is a shell-injection surface."
+        )
+        # Pattern fingerprints that MUST appear:
+        assert "set -eu" in sh_body
+        assert "set -- runtime/plan.json" in sh_body
+        assert 'if [ -n "${APPLY_BUILD_ID_VAL:-}" ]' in sh_body
+        assert 'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]' in sh_body
+        assert 'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]' in sh_body
+        assert 'fluid apply "$@"' in sh_body
+
+    def test_stage_7_routes_params_through_plain_environment_block(self):
+        """The env block must carry raw param values — NOT Groovy
+        ternary-concatenated strings. The fix is the boundary between
+        Groovy interpolation (safe inside env assignments) and shell
+        interpretation (safe because we quote every $VAR expansion)."""
+        content = self._jenkinsfile()
+        marker = "stage('7 · apply')"
+        assert marker in content
+        tail = content[content.index(marker) :]
+        # Isolate the stage-7 environment{} block via brace-depth
+        # counting (the first `}` could be the closer of `${VAR}` inside
+        # an assignment, not the closer of the environment block itself).
+        # Use "environment {\n" to skip any literal `environment {}` in
+        # a comment; the real block opens a brace then a newline.
+        env_start = tail.find("environment {\n")
+        depth = 0
+        i = env_start
+        env_end = None
+        while i < len(tail):
+            c = tail[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    env_end = i + 1
+                    break
+            i += 1
+        assert env_end is not None, "could not find closing `}` of stage 7 environment block"
+        env_block = tail[env_start:env_end]
+        # Raw values — good:
+        assert 'APPLY_BUILD_ID_VAL = "${params.APPLY_BUILD_ID}"' in env_block
+        assert 'APPLY_MODE = "${params.APPLY_MODE}"' in env_block
+        assert 'ALLOW_DATA_LOSS = "${params.ALLOW_DATA_LOSS}"' in env_block
+        assert 'NO_VERIFY_DIGEST = "${params.NO_VERIFY_DIGEST}"' in env_block
+        # Ternary concatenation — must not reappear:
+        assert "? '--build '" not in env_block, (
+            "Stage 7 env block regressed to ternary concatenation — "
+            "unquoted expansion downstream would reintroduce the auth-"
+            "gate bypass."
         )
 
 
