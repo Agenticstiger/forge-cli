@@ -40,7 +40,7 @@ The templates support:
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import cprint
 
@@ -492,6 +492,293 @@ class BasePipelineTemplate:
             ]
         lines.append("")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # 11-stage pipeline helpers (Phase 7-rest)
+    #
+    # ``_stage_specs()`` returns the canonical, provider-neutral list of
+    # the 11 pipeline stages. Every CI-system subclass iterates this list
+    # and wraps ``_render_stage_command(spec, config)`` in its native
+    # primitive (GitHub Actions step, GitLab job, Azure stage, etc.).
+    #
+    # Keeping the command strings here — not in each subclass — ensures
+    # that upgrading the canonical contract (e.g. "stage 6 now passes a
+    # new flag") propagates to every CI system without N-way drift.
+    # JenkinsTemplate predates this helper and keeps its own inline
+    # renderer for historical reasons; the two are kept in lockstep via
+    # the assertions in ``tests/test_pipeline_templates_branches.py``.
+    # ------------------------------------------------------------------
+
+    def _stage_specs(self) -> List["StageSpec"]:
+        """Return the 11 pipeline stages in order.
+
+        Toggle defaults follow the same semantics Jenkins uses:
+        stages 10 (publish) and 11 (schedule-sync) default OFF so they
+        must be opt-in per run, matching the "don't push by default"
+        principle. All structural stages (1-9) default ON.
+
+        Stage 3 (generate artifacts) is controlled by the subclass's
+        :attr:`config.generates_artifacts` rather than the static default
+        here — the subclass applies the override when rendering.
+        """
+        return [
+            StageSpec(
+                num=1,
+                slug="bundle",
+                display="bundle",
+                toggle_param="RUN_STAGE_1_BUNDLE",
+                default_run=True,
+                command=(
+                    'fluid bundle "${CONTRACT:-contract.fluid.yaml}" '
+                    "--format tgz --out runtime/bundle.tgz"
+                ),
+            ),
+            StageSpec(
+                num=2,
+                slug="validate",
+                display="validate",
+                toggle_param="RUN_STAGE_2_VALIDATE",
+                default_run=True,
+                command=('fluid validate "${CONTRACT:-contract.fluid.yaml}" ' "--strict"),
+            ),
+            StageSpec(
+                num=3,
+                slug="generate_artifacts",
+                display="generate artifacts",
+                toggle_param="RUN_STAGE_3_GENERATE_ARTIFACTS",
+                default_run=True,  # overridden by config.generates_artifacts at render time
+                command=(
+                    'fluid generate artifacts "${CONTRACT:-contract.fluid.yaml}" '
+                    "--out dist/artifacts/"
+                ),
+            ),
+            StageSpec(
+                num=4,
+                slug="validate_artifacts",
+                display="validate artifacts",
+                toggle_param="RUN_STAGE_4_VALIDATE_ARTIFACTS",
+                default_run=True,
+                command="fluid validate-artifacts dist/artifacts/ --strict",
+            ),
+            StageSpec(
+                num=5,
+                slug="diff",
+                display="diff (drift gate)",
+                toggle_param="RUN_STAGE_5_DIFF",
+                default_run=True,
+                command=(
+                    'fluid diff "${CONTRACT:-contract.fluid.yaml}" '
+                    '--exit-on-drift --env "${FLUID_ENV:-dev}"'
+                ),
+            ),
+            StageSpec(
+                num=6,
+                slug="plan",
+                display="plan",
+                toggle_param="RUN_STAGE_6_PLAN",
+                default_run=True,
+                command=(
+                    'fluid plan "${CONTRACT:-contract.fluid.yaml}" '
+                    '--out runtime/plan.json --env "${FLUID_ENV:-dev}"'
+                ),
+            ),
+            StageSpec(
+                num=7,
+                slug="apply",
+                display="apply",
+                toggle_param="RUN_STAGE_7_APPLY",
+                default_run=True,
+                # Stage 7 uses POSIX ``set --`` + if/then/fi so
+                # parameter-controlled flags (mode, allow-data-loss,
+                # no-verify-digest, build-id) stay as individual argv
+                # tokens regardless of unquoted env-var expansion. This
+                # is the security-hardened pattern from stage 11 applied
+                # here — avoids the ``${APPLY_BUILD_FLAG}`` argument-
+                # smuggling bug fixed in commit D2.
+                command=(
+                    "set -eu; "
+                    'set -- runtime/plan.json --mode "${APPLY_MODE:-amend}" '
+                    '--env "${FLUID_ENV:-dev}" --yes '
+                    "--report runtime/apply-report.html; "
+                    'if [ -n "${APPLY_BUILD_ID:-}" ]; then '
+                    'set -- "$@" --build "$APPLY_BUILD_ID"; fi; '
+                    'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]; then '
+                    'set -- "$@" --allow-data-loss; fi; '
+                    'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]; then '
+                    'set -- "$@" --no-verify-digest; fi; '
+                    'fluid apply "$@"'
+                ),
+            ),
+            StageSpec(
+                num=8,
+                slug="policy_apply",
+                display="policy apply",
+                toggle_param="RUN_STAGE_8_POLICY_APPLY",
+                default_run=True,
+                # Self-gates on bindings.json existence so reference-only
+                # contracts (that delegate policy upstream) skip cleanly.
+                command=(
+                    "if [ -f dist/artifacts/policy/bindings.json ]; then "
+                    "fluid policy-apply dist/artifacts/policy/bindings.json "
+                    '--mode enforce --env "${FLUID_ENV:-dev}"; '
+                    "fi"
+                ),
+            ),
+            StageSpec(
+                num=9,
+                slug="verify",
+                display="verify",
+                toggle_param="RUN_STAGE_9_VERIFY",
+                default_run=True,
+                command=(
+                    'fluid verify "${CONTRACT:-contract.fluid.yaml}" --strict '
+                    '--env "${FLUID_ENV:-dev}" --report runtime/verify-report.json'
+                ),
+            ),
+            StageSpec(
+                num=10,
+                slug="publish",
+                display="publish",
+                toggle_param="RUN_STAGE_10_PUBLISH",
+                default_run=False,  # opt-in — typically branch-gated to main
+                # ``PUBLISH_TARGETS`` is a space-separated list the shell
+                # expands into ``--target X --target Y ...``. Falls back
+                # to ``--target ${CATALOG:-datamesh-manager}`` so legacy
+                # single-target config keeps working.
+                command=(
+                    'if [ -n "${PUBLISH_TARGETS:-}" ]; then '
+                    'TARGETS=""; for t in $PUBLISH_TARGETS; do '
+                    'TARGETS="$TARGETS --target $t"; done; '
+                    'fluid publish "${CONTRACT:-contract.fluid.yaml}" $TARGETS '
+                    '--env "${FLUID_ENV:-dev}"; '
+                    "else "
+                    'fluid publish "${CONTRACT:-contract.fluid.yaml}" '
+                    '--target "${CATALOG:-datamesh-manager}" '
+                    '--env "${FLUID_ENV:-dev}"; '
+                    "fi"
+                ),
+            ),
+            StageSpec(
+                num=11,
+                slug="schedule_sync",
+                display="schedule sync",
+                toggle_param="RUN_STAGE_11_SCHEDULE_SYNC",
+                default_run=False,  # opt-in — Path-A only
+                # Scheduler-variant params (SCHEDULER, SCHEDULER_DESTINATION,
+                # SCHEDULER_ENVIRONMENT_NAME, SCHEDULER_LOCATION,
+                # SCHEDULER_WORKSPACE, SCHEDULE_SYNC_DRY_RUN) flow through
+                # env vars. Same POSIX ``set --`` + if/then/fi pattern
+                # as stage 7 so empty params never reach argv. This is
+                # the security-hardened Jenkins stage-11 pattern.
+                command=(
+                    "set -eu; "
+                    'set -- --scheduler "$SCHEDULER" '
+                    "--dags-dir dist/artifacts/schedule/ "
+                    '--env "${FLUID_ENV:-dev}"; '
+                    'if [ -n "${SCHEDULER_DESTINATION:-}" ]; then '
+                    'set -- "$@" --destination "$SCHEDULER_DESTINATION"; fi; '
+                    'if [ -n "${SCHEDULER_ENVIRONMENT_NAME:-}" ]; then '
+                    'set -- "$@" --environment-name "$SCHEDULER_ENVIRONMENT_NAME"; fi; '
+                    'if [ -n "${SCHEDULER_LOCATION:-}" ]; then '
+                    'set -- "$@" --location "$SCHEDULER_LOCATION"; fi; '
+                    'if [ -n "${SCHEDULER_WORKSPACE:-}" ]; then '
+                    'set -- "$@" --workspace "$SCHEDULER_WORKSPACE"; fi; '
+                    'if [ "${SCHEDULE_SYNC_DRY_RUN:-false}" = "true" ]; then '
+                    'set -- "$@" --dry-run; fi; '
+                    'fluid schedule-sync "$@"'
+                ),
+            ),
+        ]
+
+    def _render_stage_command(self, spec: "StageSpec", config: "PipelineConfig") -> str:
+        """Return the fully-rendered sh command body for a stage.
+
+        When ``config.workdir`` is set (subfolder checkout), prepends
+        ``cd "<workdir>" && `` so the fluid CLI sees the contract file
+        regardless of the CI system's default working directory. For a
+        compound command (containing ``; `` or starting with ``set -eu``),
+        the ``cd`` and the command are joined inside a single-line
+        equivalent that keeps the compound structure intact under POSIX
+        sh — wrapping in parentheses would spawn a subshell and prevent
+        ``set -eu`` from propagating to parent shell flags.
+
+        Each sh body uses ``"${CONTRACT:-contract.fluid.yaml}"`` +
+        ``"${FLUID_ENV:-dev}"`` defaults so Build Now works without the
+        operator pre-setting every env var. Credential-bearing env vars
+        (SNOWFLAKE_*, AWS_*, DMM_*) are NOT defaulted here — they come
+        from the CI system's secret store per the credential banner.
+        """
+        body = spec.command
+        if config.workdir:
+            # Escape double-quotes in workdir just in case (defence in
+            # depth — argparse rejects most garbage upstream, but the
+            # generated file is ultimately shell-interpreted).
+            safe_workdir = config.workdir.replace('"', '\\"')
+            body = f'cd "{safe_workdir}" && {body}'
+        return body
+
+    def _stage_default_run(self, spec: "StageSpec", config: "PipelineConfig") -> bool:
+        """Return whether a stage should run by default for this config.
+
+        Stage 3 (generate artifacts) is the one override: it turns OFF
+        for reference-only contracts (where ``config.generates_artifacts``
+        is False — the contract points at externally-owned dbt/Airflow
+        artifacts and fluid wouldn't own them). All other stages follow
+        the static default on the :class:`StageSpec`.
+        """
+        if spec.slug == "generate_artifacts":
+            return bool(config.generates_artifacts)
+        return spec.default_run
+
+
+@dataclass(frozen=True)
+class StageSpec:
+    """Canonical spec for one of the 11 pipeline stages.
+
+    Immutable so subclasses can't mutate the shared list they receive
+    from :meth:`BasePipelineTemplate._stage_specs`. Each subclass
+    iterates the specs in order and wraps
+    :meth:`BasePipelineTemplate._render_stage_command(spec, config)`
+    in its native CI primitive (GitHub Actions ``steps:``, GitLab
+    ``script:``, Azure DevOps ``steps:``, Bitbucket ``script:``,
+    CircleCI ``steps:``, Tekton ``taskSpec.steps``).
+    """
+
+    num: int
+    """1-11."""
+
+    slug: str
+    """snake_case identifier; matches the toggle-param suffix and test
+    assertion strings. Example: ``bundle``, ``generate_artifacts``,
+    ``schedule_sync``."""
+
+    display: str
+    """Human-readable stage name for display in CI UI. Example:
+    ``bundle``, ``generate artifacts``, ``schedule sync``. Note the
+    spaces — this is the label that appears in pipeline visualisations
+    and build logs."""
+
+    toggle_param: str
+    """UPPER_SNAKE boolean parameter name that each CI system exposes
+    to let operators skip the stage. Example: ``RUN_STAGE_1_BUNDLE``.
+    Systems that support per-stage conditionals (Jenkins, GitHub
+    Actions, GitLab, Azure DevOps, CircleCI, Tekton) emit ``when:``
+    / ``rules:`` / ``condition:`` clauses referencing this name;
+    systems that don't (Bitbucket) ignore the toggle and emit the
+    stage unconditionally."""
+
+    default_run: bool
+    """Whether the stage runs by default when the operator doesn't
+    override the toggle param. True for stages 1-9 (structural);
+    False for stages 10 (publish) and 11 (schedule-sync) — both are
+    opt-in because they push beyond the CI environment."""
+
+    command: str
+    """Shell body executed by the stage. Uses POSIX sh syntax
+    (``set --`` + ``if/then/fi``, not bash arrays) so it runs under
+    any CI system's default shell. References env vars with the
+    ``${VAR:-default}`` expansion idiom so fresh environments work
+    without every parameter pre-set."""
 
 
 class GitHubActionsTemplate(BasePipelineTemplate):

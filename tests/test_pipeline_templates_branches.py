@@ -23,6 +23,7 @@ from fluid_build.forge.core.pipeline_templates import (
     PipelineConfig,
     PipelineProvider,
     PipelineTemplateGenerator,
+    StageSpec,
 )
 
 # ── Enum tests ──────────────────────────────────────────────────────
@@ -723,3 +724,226 @@ class TestJenkinsTemplateStage11ScheduleSync:
             "stage 11 sh body leaks ${params.*} — that's a Groovy "
             "interpolation into sh, which is a shell-injection surface."
         )
+
+
+class TestStageSpecsHelper:
+    """Canonical 11-stage spec list + per-stage command renderer.
+
+    The :meth:`BasePipelineTemplate._stage_specs` helper is the single
+    source of truth for the 11-stage pipeline contract shared across
+    every non-Jenkins CI template. Each subclass (GitHub Actions,
+    GitLab, Azure DevOps, Bitbucket, CircleCI, Tekton) iterates the
+    spec list and wraps :meth:`BasePipelineTemplate._render_stage_command`
+    in its native CI primitive. If these tests fail, every CI system
+    will silently drift off-contract — which is the failure mode this
+    test class is designed to prevent.
+    """
+
+    def _bt(self):
+        return BasePipelineTemplate()
+
+    def _cfg(self, **kwargs):
+        defaults = {
+            "provider": PipelineProvider.JENKINS,
+            "complexity": PipelineComplexity.BASIC,
+        }
+        defaults.update(kwargs)
+        return PipelineConfig(**defaults)
+
+    def test_eleven_stages_in_order(self):
+        specs = self._bt()._stage_specs()
+        assert len(specs) == 11
+        assert [s.num for s in specs] == list(range(1, 12))
+
+    def test_stage_slugs_match_contract(self):
+        expected = [
+            "bundle",
+            "validate",
+            "generate_artifacts",
+            "validate_artifacts",
+            "diff",
+            "plan",
+            "apply",
+            "policy_apply",
+            "verify",
+            "publish",
+            "schedule_sync",
+        ]
+        assert [s.slug for s in self._bt()._stage_specs()] == expected
+
+    def test_stage_display_names(self):
+        """Display names must include the human-readable spaces that
+        CI systems use in their stage labels. A slug of
+        ``generate_artifacts`` renders as ``generate artifacts`` in
+        the pipeline UI — dash-case or snake-case in the UI looks off."""
+        displays = [s.display for s in self._bt()._stage_specs()]
+        assert "generate artifacts" in displays
+        assert "validate artifacts" in displays
+        assert "policy apply" in displays
+        assert "schedule sync" in displays
+
+    def test_toggle_param_naming_convention(self):
+        """Every spec has a ``RUN_STAGE_<N>_<SLUG_UPPER>`` param name.
+        CI systems use these identifiers to let operators skip stages
+        from the Build-With-Parameters UI. Drift in the naming
+        convention breaks user muscle memory across systems."""
+        for s in self._bt()._stage_specs():
+            assert s.toggle_param == f"RUN_STAGE_{s.num}_{s.slug.upper()}", (
+                f"stage {s.num} has non-canonical toggle param "
+                f"{s.toggle_param!r} (expected "
+                f"RUN_STAGE_{s.num}_{s.slug.upper()})"
+            )
+
+    def test_structural_stages_default_on(self):
+        """Stages 1-9 (the structural spine of the pipeline) default
+        to running. An operator running Build Now with zero overrides
+        should get the full validate→plan→apply→verify flow."""
+        for s in self._bt()._stage_specs()[0:9]:
+            assert s.default_run is True, (
+                f"stage {s.num} ({s.slug}) defaults off — structural "
+                "stages 1-9 must default to running"
+            )
+
+    def test_publish_and_schedule_sync_default_off(self):
+        """Stages 10 (publish) and 11 (schedule-sync) push beyond the
+        CI environment (to catalogs / scheduler control planes). Both
+        must be opt-in per run — defaulting them on would push every
+        build to production catalogs and DAG storage."""
+        specs = self._bt()._stage_specs()
+        assert specs[9].default_run is False  # publish
+        assert specs[10].default_run is False  # schedule-sync
+
+    def test_spec_is_frozen(self):
+        """StageSpec is frozen so subclasses can't mutate their copy
+        of the shared list and poison the renderer for other templates
+        generated later in the same process."""
+        import dataclasses
+
+        spec = StageSpec(
+            num=1,
+            slug="x",
+            display="x",
+            toggle_param="RUN_STAGE_1_X",
+            default_run=True,
+            command="echo x",
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            spec.num = 99  # type: ignore[misc]
+
+    def test_render_applies_workdir_prefix(self):
+        """When config.workdir is set, every stage command is
+        prefixed with ``cd "<workdir>" && ``. CI systems that check
+        out at SCM root (Jenkins, GitHub Actions without
+        working-directory) rely on this."""
+        bt = self._bt()
+        spec = bt._stage_specs()[0]  # bundle
+        body = bt._render_stage_command(spec, self._cfg(workdir="examples/demo"))
+        assert body.startswith('cd "examples/demo" && ')
+
+    def test_render_no_workdir_no_prefix(self):
+        bt = self._bt()
+        body = bt._render_stage_command(bt._stage_specs()[0], self._cfg())
+        assert 'cd "' not in body
+
+    def test_render_escapes_double_quotes_in_workdir(self):
+        """Defence-in-depth: if someone constructs a PipelineConfig
+        with a workdir containing a double-quote (argparse rejects
+        this for user input, but programmatic callers could), the
+        renderer escapes it so the generated ``cd`` doesn't break
+        out of its quoting."""
+        bt = self._bt()
+        body = bt._render_stage_command(bt._stage_specs()[0], self._cfg(workdir='odd"dir'))
+        assert 'cd "odd\\"dir" && ' in body
+
+    def test_stage_3_off_for_reference_only_contracts(self):
+        """Stage 3 (generate artifacts) is the one spec whose default
+        follows the per-config flag rather than the static spec
+        default. Reference-only contracts (pointing at externally-
+        owned dbt/Airflow projects) set generates_artifacts=False so
+        stage 3 is omitted — fluid doesn't own those artifacts and
+        emitting them would surface spurious 'nothing to emit'
+        failures."""
+        bt = self._bt()
+        s3 = bt._stage_specs()[2]
+        assert s3.slug == "generate_artifacts"
+        assert bt._stage_default_run(s3, self._cfg(generates_artifacts=True)) is True
+        assert bt._stage_default_run(s3, self._cfg(generates_artifacts=False)) is False
+
+    def test_stage_7_uses_injection_proof_pattern(self):
+        """Stage 7 (apply) assembles argv via POSIX ``set --`` and
+        ``if/then/fi`` so operator-supplied flags (mode, allow-data-
+        loss, no-verify-digest, build-id) flow through env vars as
+        whole argv tokens. This closes the argument-smuggling surface
+        that the Jenkins ``${APPLY_BUILD_FLAG}`` pattern previously
+        had (see tech-debt commit D2)."""
+        bt = self._bt()
+        s7 = next(s for s in bt._stage_specs() if s.num == 7)
+        assert "set -eu" in s7.command
+        assert "set -- runtime/plan.json" in s7.command
+        # The explicit APPLY_* env-var references mean CI systems
+        # must route Build-With-Parameters values through env, not
+        # through template interpolation.
+        assert 'if [ -n "${APPLY_BUILD_ID:-}" ]' in s7.command
+        assert 'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]' in s7.command
+        assert 'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]' in s7.command
+        # Regression guard: the old concatenation pattern must not
+        # reappear. If this ever fails, the helper has drifted back
+        # into the argument-smuggling shape.
+        assert "${APPLY_BUILD_FLAG}" not in s7.command
+
+    def test_stage_11_uses_injection_proof_pattern(self):
+        """Stage 11 (schedule-sync) assembles argv the same way stage 7
+        does. Regression guard against the same class of bug on the
+        scheduler-variant params."""
+        bt = self._bt()
+        s11 = next(s for s in bt._stage_specs() if s.num == 11)
+        assert 'set -- --scheduler "$SCHEDULER"' in s11.command
+        for var in (
+            "SCHEDULER_DESTINATION",
+            "SCHEDULER_ENVIRONMENT_NAME",
+            "SCHEDULER_LOCATION",
+            "SCHEDULER_WORKSPACE",
+            "SCHEDULE_SYNC_DRY_RUN",
+        ):
+            assert f"${{{var}" in s11.command, (
+                f"stage 11 command missing ${{{var}:-}} expansion; "
+                "scheduler-variant param would be ignored"
+            )
+
+    def test_stage_10_publish_supports_multi_target(self):
+        """Stage 10's PUBLISH_TARGETS env var expands a space-separated
+        list into ``--target X --target Y ...``. Falls back to a
+        single ``--target ${CATALOG:-datamesh-manager}`` for legacy
+        single-target configs. Both paths must be present so the
+        rendered sh works regardless of which env var the operator
+        sets."""
+        bt = self._bt()
+        s10 = next(s for s in bt._stage_specs() if s.num == 10)
+        assert "PUBLISH_TARGETS" in s10.command
+        assert "CATALOG:-datamesh-manager" in s10.command
+        assert "--target" in s10.command
+
+    def test_stage_8_self_gates_on_bindings_json(self):
+        """Stage 8 (policy apply) is a no-op when bindings.json is
+        absent. Reference-only contracts delegate policy to upstream,
+        so skip-silently is the correct behaviour rather than erroring
+        the build."""
+        bt = self._bt()
+        s8 = next(s for s in bt._stage_specs() if s.num == 8)
+        assert "if [ -f dist/artifacts/policy/bindings.json ]" in s8.command
+
+    def test_every_stage_has_sensible_contract_fallback(self):
+        """Every stage that references a contract path uses the
+        ``${CONTRACT:-contract.fluid.yaml}`` fallback so Build Now
+        works without the operator pre-setting CONTRACT. Stages that
+        operate on bundle.tgz / plan.json / dist/artifacts don't need
+        this (they use fixed paths)."""
+        bt = self._bt()
+        contract_ref_stages = {"bundle", "validate", "diff", "plan", "verify", "publish"}
+        for s in bt._stage_specs():
+            if s.slug in contract_ref_stages:
+                assert "${CONTRACT:-contract.fluid.yaml}" in s.command, (
+                    f"stage {s.num} ({s.slug}) references contract but "
+                    "doesn't use the ${CONTRACT:-contract.fluid.yaml} "
+                    "fallback — Build Now would fail without a pre-set env var"
+                )
