@@ -26,13 +26,29 @@ from ._logging import info
 COMMAND = "policy-apply"
 
 
-def register(subparsers: argparse._SubParsersAction):
-    p = subparsers.add_parser(COMMAND, help="Apply compiled IAM bindings")
-    p.add_argument("bindings", help="runtime/policy/bindings.json")
-    p.add_argument(
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Populate a pre-created parser with the policy-apply args.
+
+    Shared between the legacy ``fluid policy-apply`` top-level command
+    and the new ``fluid policy apply`` subcommand so the argument
+    surface stays single-sourced.
+    """
+    parser.add_argument("bindings", help="runtime/policy/bindings.json")
+    parser.add_argument(
         "--mode", choices=["check", "enforce"], default="check", help="dry-run or enforce"
     )
-    p.set_defaults(cmd=COMMAND, func=run)
+    parser.set_defaults(cmd=COMMAND, func=run)
+
+
+def register(subparsers: argparse._SubParsersAction):
+    """Register the legacy top-level ``fluid policy-apply`` command.
+
+    New code should prefer ``fluid policy apply``. This surface is
+    kept as a deprecation alias for one release window so existing
+    CI templates that call ``fluid policy-apply`` continue to work.
+    """
+    p = subparsers.add_parser(COMMAND, help="Apply compiled IAM bindings")
+    _add_arguments(p)
 
 
 def _resolve_from_bindings(data: dict) -> tuple[str, str]:
