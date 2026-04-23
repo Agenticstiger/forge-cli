@@ -1,4 +1,5 @@
-# Production overlay — applied with: fluid compile contract.fluid.yaml --env prod
+# Production overlay — applied with: fluid bundle contract.fluid.yaml --format yaml --env prod
+# (renamed from ``fluid compile ... --env prod`` in 0.7.3).
 # Overrides binding location for the production GCP project.
 
 exposes:

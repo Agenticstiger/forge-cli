@@ -24,17 +24,23 @@ bitcoin-multifile/
 ## Usage
 
 ```bash
-# Compile to a single document (inspect what the engine will see)
-fluid compile contract.fluid.yaml
+# Bundle to a single document (inspect what the engine will see)
+fluid bundle contract.fluid.yaml --format yaml
 
-# Compile with production overlay
-fluid compile contract.fluid.yaml --env prod --out contract.bundled.yaml
+# Bundle with production overlay
+fluid bundle contract.fluid.yaml --format yaml --env prod --out contract.bundled.yaml
 
 # All existing commands work transparently (refs resolve automatically)
 fluid validate contract.fluid.yaml
 fluid plan contract.fluid.yaml --out plan.json
 fluid apply contract.fluid.yaml --yes
 ```
+
+> **Note:** `fluid compile` was renamed to `fluid bundle --format yaml` in 0.7.3.
+> The new `fluid bundle --format tgz` (default) emits a content-addressable
+> signed archive for the 11-stage production pipeline — the `--format yaml`
+> path above is the exact drop-in replacement for the legacy single-document
+> output.
 
 ## Why Split?
 

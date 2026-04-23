@@ -229,8 +229,10 @@ base contract's `exposes` list before any generation happens. This means:
 - All other fields (`exposeId`, `schema`, `qos`, `lifecycle`) are untouched
 - Both the ODPS product record and the ODCS contracts see the merged result
 
-This is the same mechanism used by `fluid compile --env staging`, so your
-CI validation step and your publish step are always consistent.
+This is the same mechanism used by `fluid bundle --format yaml --env staging`
+(formerly `fluid compile --env staging`, renamed in 0.7.3 when the bundle
+command absorbed the compile surface), so your CI validation step and your
+publish step are always consistent.
 
 ---
 
