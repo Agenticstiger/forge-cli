@@ -4,8 +4,9 @@ id: crypto.bitcoin_prices_gcp_governed
 name: Bitcoin Price Index (Multi-File Example)
 description: >
   Same Bitcoin price tracker as the single-file example, but split across
-  multiple files using $ref composition. Run `fluid compile contract.fluid.yaml`
-  to see the fully-resolved output.
+  multiple files using $ref composition. Run
+  `fluid bundle contract.fluid.yaml --format yaml` to see the fully-resolved
+  output (formerly `fluid compile contract.fluid.yaml`, renamed in 0.7.3).
 domain: finance
 
 metadata:
