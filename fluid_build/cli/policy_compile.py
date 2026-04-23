@@ -24,12 +24,27 @@ from ._logging import info
 COMMAND = "policy-compile"
 
 
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Populate a pre-created parser with the policy-compile args.
+
+    Shared between the legacy ``fluid policy-compile`` top-level
+    command and the new ``fluid policy compile`` subcommand so the
+    argument surface stays single-sourced.
+    """
+    parser.add_argument("contract", help="contract.fluid.yaml")
+    parser.add_argument("--env", help="overlay env")
+    parser.add_argument("--out", default="runtime/policy/bindings.json", help="bindings path")
+    parser.set_defaults(cmd=COMMAND, func=run)
+
+
 def register(subparsers: argparse._SubParsersAction):
+    """Register the legacy top-level ``fluid policy-compile`` command.
+
+    New code should prefer ``fluid policy compile``; this is a
+    deprecation-aliased surface kept for one release.
+    """
     p = subparsers.add_parser(COMMAND, help="Compile accessPolicy → provider IAM bindings")
-    p.add_argument("contract", help="contract.fluid.yaml")
-    p.add_argument("--env", help="overlay env")
-    p.add_argument("--out", default="runtime/policy/bindings.json", help="bindings path")
-    p.set_defaults(cmd=COMMAND, func=run)
+    _add_arguments(p)
 
 
 def run(args, logger: logging.Logger) -> int:
