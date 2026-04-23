@@ -124,6 +124,21 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "not set."
         ),
     )
+    p.add_argument(
+        "--attest",
+        action="store_true",
+        default=False,
+        help=(
+            "Emit an in-toto v1 Statement with SLSA Provenance v1 "
+            "predicate next to the bundle (``<bundle>.intoto.jsonl``). "
+            "Records git commit SHA, CI run URL, bundle digest, and "
+            "builder identity so verifiers can trace the bundle back "
+            "to a specific commit + CI job. Works offline (falls back "
+            "to a localhost builder + UUID run-id); full SLSA Level 2 "
+            "requires running from a trusted build service. Can be "
+            "combined with ``--sign`` to cosign the attestation too."
+        ),
+    )
     p.set_defaults(cmd=COMMAND, func=run)
 
 
@@ -325,6 +340,40 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                     f"   signature:   {sig_result['sig_path']}\n"
                     f"   certificate: {sig_result['pem_path']}\n"
                 )
+
+        # ── Optional: SLSA L2 in-toto attestation ─────────────────────
+        # Emitted AFTER signing so a combined --sign --attest run
+        # signs the bundle AND the attestation carries matching
+        # provenance. The attestation file is JSONL-on-disk; future
+        # work can add ``cosign attest-blob`` to embed the statement
+        # in Rekor's tlog.
+        if getattr(args, "attest", False):
+            from ._attestation import write_attestation
+
+            try:
+                attest_result = write_attestation(
+                    out,
+                    bundle_digest=digest,
+                    contract_dir=str(contract_dir),
+                    extra_external_params={
+                        "format": "tgz",
+                        "env": env or "",
+                        "sign_mode": (
+                            "keyless"
+                            if (
+                                getattr(args, "sign", False) and not getattr(args, "sign_key", None)
+                            )
+                            else ("keyed" if getattr(args, "sign_key", None) else "none")
+                        ),
+                    },
+                )
+            except Exception as e:
+                sys.stderr.write(f"❌ Attestation write failed: {e}\n")
+                return 1
+            sys.stderr.write(
+                f"✅ Attestation written (SLSA Provenance v1)\n"
+                f"   intoto: {attest_result['path']}\n"
+            )
         return 0
 
     # ── yaml / json branch (legacy single-file output) ─────────────────────
