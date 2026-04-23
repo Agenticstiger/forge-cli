@@ -81,6 +81,9 @@ def _args(**overrides) -> argparse.Namespace:
         "state_file": "",
         "dry_run": True,
         "yes": False,
+        # ``--list`` defaults to off so existing restore tests pick
+        # up a sensible value even though they predate the flag.
+        "list_snapshots": False,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -580,3 +583,177 @@ class TestArgparseRegistration:
         assert ns.product == "silver.telco.subscriber360_v1"
         assert ns.snapshot == "backup_silver_telco_subscriber360_v1_1714000000"
         assert ns.dry_run is True
+
+
+# ---------------------------------------------------------------------------
+# --list discovery (G6)
+# ---------------------------------------------------------------------------
+
+
+class TestListSnapshots:
+    """``fluid rollback --list`` mirrors ``terraform state list`` / ``git
+    reflog`` — read-only discovery of available snapshots before running
+    a destructive restore. These tests pin the behaviour operators
+    depend on:
+
+    * no --env / --product required (differs from restore path)
+    * works when state file doesn't exist (prints helpful message,
+      returns exit 0 — not a hard error)
+    * filters on --env + --product when provided
+    * ordering is newest-first (most likely restore target on top)
+    """
+
+    def test_list_missing_state_file_returns_0(self, tmp_path):
+        """A fresh workspace with no prior ``apply --mode replace`` has
+        no state file. ``--list`` must not fail — it's a discovery
+        verb, and "nothing to list" is a valid outcome."""
+        args = _args(
+            list_snapshots=True,
+            state_file=str(tmp_path / "does-not-exist.json"),
+            env=None,
+            product=None,
+        )
+        result = rollback.run(args, None)
+        assert result == 0
+
+    def test_list_without_filters_shows_all(self, tmp_path, capsys):
+        """Without --env/--product, --list prints every recorded
+        snapshot. Uses the full state file so the test exercises the
+        table-rendering path end-to-end."""
+        state_path = tmp_path / "state.json"
+        state_path.write_text(
+            json.dumps(
+                _state(
+                    snapshots=[
+                        _snap(env="dev", backup_name="backup_v1_1001"),
+                        _snap(env="prod", backup_name="backup_v1_1002"),
+                    ]
+                )
+            ),
+            encoding="utf-8",
+        )
+        args = _args(
+            list_snapshots=True,
+            state_file=str(state_path),
+            env=None,
+            product=None,
+        )
+        result = rollback.run(args, None)
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "backup_v1_1001" in out
+        assert "backup_v1_1002" in out
+        assert "2 snapshot(s)" in out
+
+    def test_list_env_filter_narrows(self, tmp_path, capsys):
+        """``--list --env prod`` shows only prod snapshots. Essential
+        for operators running across multi-env deployments who want
+        to scope discovery before restore."""
+        state_path = tmp_path / "state.json"
+        state_path.write_text(
+            json.dumps(
+                _state(
+                    snapshots=[
+                        _snap(env="dev", backup_name="backup_dev_1"),
+                        _snap(env="prod", backup_name="backup_prod_1"),
+                    ]
+                )
+            ),
+            encoding="utf-8",
+        )
+        args = _args(list_snapshots=True, state_file=str(state_path), env="prod", product=None)
+        rollback.run(args, None)
+        out = capsys.readouterr().out
+        assert "backup_prod_1" in out
+        assert "backup_dev_1" not in out
+
+    def test_list_product_filter_narrows(self, tmp_path, capsys):
+        """``--list --product X`` shows only snapshots matching that
+        product ID. Required for monorepos with many products in
+        the same state file."""
+        state_path = tmp_path / "state.json"
+        state_path.write_text(
+            json.dumps(
+                _state(
+                    snapshots=[
+                        _snap(product="silver.telco.a", backup_name="backup_a"),
+                        _snap(product="silver.telco.b", backup_name="backup_b"),
+                    ]
+                )
+            ),
+            encoding="utf-8",
+        )
+        args = _args(
+            list_snapshots=True,
+            state_file=str(state_path),
+            env=None,
+            product="silver.telco.a",
+        )
+        rollback.run(args, None)
+        out = capsys.readouterr().out
+        assert "backup_a" in out
+        assert "backup_b" not in out
+
+    def test_list_empty_result_prints_actionable_message(self, tmp_path, capsys):
+        """Filters with no matches print a helpful message (not silent
+        exit). Gives the operator a hint that filter values may not
+        match recorded state — the most common "no results" cause."""
+        state_path = tmp_path / "state.json"
+        state_path.write_text(
+            json.dumps(_state(snapshots=[_snap(env="dev")])),
+            encoding="utf-8",
+        )
+        args = _args(
+            list_snapshots=True,
+            state_file=str(state_path),
+            env="prod",  # filter doesn't match any snapshot
+            product=None,
+        )
+        result = rollback.run(args, None)
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "no snapshots found" in out
+        assert "prod" in out  # the filter value is echoed back
+
+    def test_list_is_read_only_no_restore_invoked(self, tmp_path, monkeypatch):
+        """Regression guard: ``--list`` must NOT dispatch to the
+        provider restore helpers. If this fires, it means the ``run``
+        function fell through to the restore code path — a bug where
+        a read-only discovery could trigger a destructive restore.
+        """
+        called = []
+
+        def _tripwire(snapshot, *, dry_run):
+            called.append(snapshot)
+            return {}
+
+        monkeypatch.setattr(rollback, "_restore_snowflake", _tripwire)
+        state_path = tmp_path / "state.json"
+        state_path.write_text(json.dumps(_state(snapshots=[_snap()])), encoding="utf-8")
+        args = _args(
+            list_snapshots=True,
+            state_file=str(state_path),
+            env="dev",
+            product="silver.telco.subscriber360_v1",
+        )
+        rollback.run(args, None)
+        assert called == [], "rollback --list must not invoke the provider restore path"
+
+
+class TestRestoreModeRequiresEnvAndProduct:
+    """The non-list path enforces ``--env`` and ``--product`` in the
+    body of ``run()`` (rather than via ``required=True`` on argparse)
+    so ``--list`` can run without them. These tests pin that the
+    restore path still fails loud if either is missing."""
+
+    def test_missing_env_raises_clierror(self, state_file):
+        args = _args(env=None, state_file=str(state_file), dry_run=True, yes=True)
+        with pytest.raises(CLIError) as exc:
+            rollback.run(args, None)
+        assert exc.value.event == "rollback_env_required"
+
+    def test_missing_product_raises_clierror(self, state_file):
+        args = _args(product=None, state_file=str(state_file), dry_run=True, yes=True)
+        with pytest.raises(CLIError) as exc:
+            rollback.run(args, None)
+        assert exc.value.event == "rollback_product_required"

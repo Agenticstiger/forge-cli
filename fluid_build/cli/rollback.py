@@ -93,24 +93,46 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         ),
         epilog=(
             "Examples:\n"
+            "  # Discovery: list all snapshots (newest first)\n"
+            "  fluid rollback --list\n\n"
+            "  # Discovery: narrow to one env + product\n"
+            "  fluid rollback --list --env dev --product silver.telco.subscriber360_v1\n\n"
             "  # Dry-run: inspect which snapshot would be restored\n"
             "  fluid rollback --env dev --product silver.telco.subscriber360_v1 --dry-run\n\n"
             "  # Restore the most recent snapshot\n"
-            "  fluid rollback --env dev --product silver.telco.subscriber360_v1\n\n"
+            "  fluid rollback --env dev --product silver.telco.subscriber360_v1 --yes\n\n"
             "  # Restore a specific named snapshot\n"
-            "  fluid rollback --env dev --product silver.telco.subscriber360_v1 \\\n"
+            "  fluid rollback --env dev --product silver.telco.subscriber360_v1 --yes \\\n"
             "      --snapshot backup_silver_telco_subscriber360_v1_1714000000\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
+        "--list",
+        dest="list_snapshots",
+        action="store_true",
+        default=False,
+        help=(
+            "List available snapshots from ``.fluid/rollback-state.json`` "
+            "without performing any restore. Optionally narrow with "
+            "``--env`` and/or ``--product``. Mirrors ``terraform state "
+            "list`` / ``git reflog`` — always check what's available "
+            "before running a destructive restore. Implies no state "
+            "mutation; safe to run in any env."
+        ),
+    )
+    p.add_argument(
         "--env",
-        required=True,
+        # Not ``required=True`` any more — ``--list`` is a discovery
+        # verb that works across all envs. For restore mode, we
+        # enforce the requirement inside ``run()`` below so the
+        # argparse error doesn't fire for ``rollback --list`` alone.
         help="Environment the product was applied to (dev | staging | prod).",
     )
     p.add_argument(
         "--product",
-        required=True,
+        # Same as ``--env`` — optional for ``--list``, required for
+        # restore. Enforced in ``run()``.
         help="Product ID (matches the ``id`` field in the contract).",
     )
     p.add_argument(
@@ -501,9 +523,135 @@ _RESTORE_DISPATCH = {
 # ---------------------------------------------------------------------------
 
 
+def _print_snapshot_list(
+    snapshots: List[Dict[str, Any]],
+    *,
+    env_filter: Optional[str],
+    product_filter: Optional[str],
+) -> None:
+    """Print a human-readable table of snapshots, newest first.
+
+    Optionally narrows to ``env_filter`` / ``product_filter`` matches.
+    Prints to stdout — not through ``logger`` — because this is a
+    discovery command meant to be consumed by humans + piped to
+    ``grep`` / ``head``; structured log output would hinder both.
+
+    Columns: ``timestamp``, ``env``, ``product_id``, ``mode``,
+    ``provider``, ``backup_name``. These are the same five fields
+    needed to run ``fluid rollback ... --snapshot <name>`` so the
+    list output doubles as a worksheet for the subsequent restore
+    command.
+    """
+    filtered = [
+        s
+        for s in snapshots
+        if (env_filter is None or s.get("env") == env_filter)
+        and (product_filter is None or s.get("product_id") == product_filter)
+    ]
+    # Snapshots are appended in chronological order; newest last.
+    # Reverse so the most recent (and most likely target for
+    # restore) is printed first — matches ``git reflog`` behaviour.
+    filtered = list(reversed(filtered))
+
+    if not filtered:
+        if env_filter or product_filter:
+            cprint(
+                f"[rollback] no snapshots found for env={env_filter!r} "
+                f"product={product_filter!r}. Either no "
+                f"``apply --mode replace*`` has run, or the filters "
+                f"don't match the recorded state.",
+                markup=False,
+            )
+        else:
+            cprint(
+                "[rollback] no snapshots recorded yet. The state "
+                "file is created on the first ``apply --mode "
+                "replace`` / ``replace-and-build`` invocation.",
+                markup=False,
+            )
+        return
+
+    # Plain ASCII table; Rich is optional + we don't want to require
+    # it for a read-only discovery path that may run in hardened CI
+    # environments where Rich isn't installed.
+    header = f"{'#':>3}  {'timestamp':<26}  {'env':<8}  {'mode':<20}  {'product_id':<42}  {'backup_name'}"
+    cprint(header, markup=False)
+    cprint("-" * len(header), markup=False)
+    for idx, snap in enumerate(filtered):
+        # ``idx`` is shown as a 1-based row number because that's
+        # what operators see in human output; ``--snapshot`` still
+        # takes the backup_name string, not the index (indexes
+        # shift as new snapshots are appended).
+        cprint(
+            f"{idx + 1:>3}  "
+            f"{snap.get('timestamp', '—'):<26}  "
+            f"{snap.get('env', '—'):<8}  "
+            f"{snap.get('mode', '—'):<20}  "
+            f"{snap.get('product_id', '—'):<42}  "
+            f"{snap.get('backup_name', '—')}",
+            markup=False,
+        )
+    cprint(
+        f"\n[rollback] {len(filtered)} snapshot(s). "
+        "Restore with: "
+        "fluid rollback --env <ENV> --product <ID> "
+        "--snapshot <BACKUP_NAME> --yes",
+        markup=False,
+    )
+
+
 def run(args: argparse.Namespace, _logger: Optional[logging.Logger] = None) -> int:
-    product = _validate_product_id(args.product)
     state_path = Path(args.state_file).resolve()
+
+    # --list: discovery-only path. No env/product required; no
+    # destructive action taken. Read state, filter, print. Returns
+    # 0 even when the state file doesn't exist — "nothing to list"
+    # is not a failure.
+    if getattr(args, "list_snapshots", False):
+        if not state_path.exists():
+            cprint(
+                f"[rollback] no state file at {state_path}. "
+                "The file is created on the first ``apply --mode "
+                "replace`` / ``replace-and-build`` invocation.",
+                markup=False,
+            )
+            return 0
+        data = _read_state(state_path)
+        _print_snapshot_list(
+            data.get("snapshots", []),
+            env_filter=args.env,
+            product_filter=args.product,
+        )
+        return 0
+
+    # Restore path: --env and --product are required. Enforce here
+    # rather than via ``required=True`` on the argparse call so that
+    # ``rollback --list`` works without them. This mirrors how
+    # kubectl / terraform enforce required args in subcommand
+    # dispatcher bodies for flags that are mode-dependent.
+    if not args.env:
+        raise CLIError(
+            2,
+            "rollback_env_required",
+            {
+                "hint": (
+                    "--env is required for restore. Use "
+                    "``fluid rollback --list`` for read-only discovery."
+                )
+            },
+        )
+    if not args.product:
+        raise CLIError(
+            2,
+            "rollback_product_required",
+            {
+                "hint": (
+                    "--product is required for restore. Use "
+                    "``fluid rollback --list`` for read-only discovery."
+                )
+            },
+        )
+    product = _validate_product_id(args.product)
 
     data = _read_state(state_path)
     snapshot = _select_snapshot(
