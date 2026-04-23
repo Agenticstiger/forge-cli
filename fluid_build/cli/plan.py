@@ -83,6 +83,22 @@ except ImportError:
 COMMAND = "plan"
 
 
+def _default_fluid_version() -> str:
+    """Return the latest bundled FLUID schema version (dynamic lookup).
+
+    Used as the fallback when a contract doesn't declare ``fluidVersion``
+    — instead of hardcoding a number that goes stale every release, we
+    ask ``SchemaManager`` which version is the newest bundled schema on
+    disk. When we ship 0.8.x, the fallback tracks it automatically.
+
+    Lazy-imported so ``plan.py``'s module load doesn't pull the full
+    schema_manager graph for ``--help`` invocations.
+    """
+    from fluid_build.schema_manager import SchemaManager
+
+    return SchemaManager.latest_bundled_version()
+
+
 def write_json_idempotent(path: str, obj: Any) -> None:
     """
     Idempotent file write - only writes if content changed.
@@ -531,17 +547,24 @@ def _plan_with_provider_actions(
             logger,
             "no_actions_generated",
             contract_id=contract.get("id"),
-            message="No actions could be parsed or inferred from contract",
+            detail="No actions could be parsed or inferred from contract",
         )
         return {
-            "format_version": contract.get("fluidVersion", "0.7.1"),
+            "format_version": contract.get("fluidVersion", _default_fluid_version()),
             "generated_at": time.time(),
-            "contract": {
+            # Stage-7 apply needs the FULL contract to dispatch (provider
+            # platform, binding.location, exposes, builds). Stripping it
+            # here broke the canonical ``fluid plan → fluid apply plan.json``
+            # flow because apply couldn't resolve the provider. Keep the
+            # stripped metadata as ``contract_metadata`` for consumers that
+            # only want identity (viz-plan, audit logs).
+            "contract": contract,
+            "contract_metadata": {
                 "id": contract.get("id"),
                 "name": contract.get("name")
                 or contract.get("metadata", {}).get("name")
                 or "Unknown",
-                "version": contract.get("fluidVersion", "0.7.1"),
+                "version": contract.get("fluidVersion", _default_fluid_version()),
             },
             "actions": [],
             "total_actions": 0,
@@ -566,29 +589,45 @@ def _plan_with_provider_actions(
                     ordered.append(action)
                     break
 
-    # Convert to plan format
+    # Convert to plan format.
+    # Emit BOTH ``op`` AND ``action_type`` for each action:
+    #   - ``op`` is what ``fluid apply``'s provider dispatcher reads
+    #     (see cli/apply.py::_actions_from_source which emits op=action.action_type.value
+    #     on the yaml-contract → provider path). stage-7 apply fails loud
+    #     with "Action missing required 'op' field" if omitted.
+    #   - ``action_type`` is preserved for display/viz tooling
+    #     (plan.py::_display_plan_*, viz_provider_actions.py) that still
+    #     keys on action_type first (with op fallback). Dropping it would
+    #     silently change plan.html labels.
+    # Both hold the same string — ``action.action_type.value`` — so this
+    # is just schema surface, not extra data.
     plan_actions = []
     for i, action in enumerate(ordered):
+        op_value = action.action_type.value
         plan_actions.append(
             {
                 "step": i + 1,
                 "action_id": action.action_id,
-                "action_type": action.action_type.value,
+                "op": op_value,
+                "action_type": op_value,
                 "provider": action.provider,
                 "params": action.params,
                 "depends_on": action.depends_on,
-                "description": action.description
-                or f"{action.action_type.value} on {action.provider}",
+                "description": action.description or f"{op_value} on {action.provider}",
             }
         )
 
     return {
-        "format_version": contract.get("fluidVersion", "0.7.1"),
+        "format_version": contract.get("fluidVersion", _default_fluid_version()),
         "generated_at": time.time(),
-        "contract": {
+        # Embed full contract so stage-7 apply can resolve provider,
+        # binding, exposes, builds without re-reading the source file.
+        # ``contract_metadata`` preserved for identity-only consumers.
+        "contract": contract,
+        "contract_metadata": {
             "id": contract.get("id"),
             "name": contract.get("name") or contract.get("metadata", {}).get("name") or "Unknown",
-            "version": contract.get("fluidVersion", "0.7.1"),
+            "version": contract.get("fluidVersion", _default_fluid_version()),
         },
         "actions": plan_actions,
         "total_actions": len(plan_actions),
@@ -639,7 +678,7 @@ def _plan_legacy(contract: Dict[str, Any], args, logger: logging.Logger) -> Dict
             logger,
             "provider_plan_not_implemented",
             provider=type(provider).__name__,
-            message="Provider does not implement plan() method. Using basic fallback.",
+            detail="Provider does not implement plan() method. Using basic fallback.",
         )
         actions = [
             {"op": "ensure_dataset", "description": "Create dataset/database"},
@@ -652,7 +691,9 @@ def _plan_legacy(contract: Dict[str, Any], args, logger: logging.Logger) -> Dict
     return {
         "format_version": "0.5.7",
         "generated_at": time.time(),
-        "contract": {
+        # Embed full contract (see rationale in _plan_with_provider_actions).
+        "contract": contract,
+        "contract_metadata": {
             "id": contract.get("id"),
             "name": contract.get("name") or contract.get("metadata", {}).get("name") or "Unknown",
             "version": contract.get("fluidVersion", "0.5.7"),

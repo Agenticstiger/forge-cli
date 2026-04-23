@@ -325,6 +325,120 @@ class TestRun(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Action schema (Phase 6D — plan.py → apply.py dispatch invariant)
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultFluidVersionIsDynamic(unittest.TestCase):
+    """Lock the invariant: the fluidVersion fallback in plan.py is NEVER
+    a hardcoded string. It always tracks ``SchemaManager.latest_bundled_version()``
+    — which scans ``fluid_build/schemas/fluid-schema-*.json`` and returns
+    the newest version on disk.
+
+    Without this: when we ship 0.8.0, contracts without an explicit
+    ``fluidVersion`` would default to the hardcoded 0.7.1 forever.
+    Stale defaults silently route new contracts through old code paths.
+    """
+
+    def test_default_version_matches_schema_manager_latest(self):
+        from fluid_build.cli.plan import _default_fluid_version
+        from fluid_build.schema_manager import SchemaManager
+
+        # The helper MUST delegate to SchemaManager (not hardcoded).
+        assert _default_fluid_version() == SchemaManager.latest_bundled_version()
+
+    def test_default_version_is_not_a_stale_literal(self):
+        """Regression: if someone re-adds a hardcoded fallback, catch it."""
+        from fluid_build.cli.plan import _default_fluid_version
+
+        # The fallback must be a real semver-shaped string (not empty,
+        # not the word "unknown", not "0.0.0+unknown").
+        v = _default_fluid_version()
+        self.assertRegex(v, r"^\d+\.\d+\.\d+")
+        # Must not be older than 0.7.2 (minimum bundled schema version
+        # as of Phase 7). If we ever drop below this, something's wrong
+        # with the schemas directory or _discover_bundled_versions.
+        major, minor, patch = (int(x) for x in v.split(".")[:3])
+        assert (major, minor, patch) >= (
+            0,
+            7,
+            2,
+        ), f"latest bundled version regressed to {v}"
+
+
+class TestPlanEmitsOpField(unittest.TestCase):
+    """Pin the schema contract between ``fluid plan`` and ``fluid apply``.
+
+    Stage-7 apply's provider dispatcher reads ``action.op`` to decide
+    which handler runs. If plan.py emits only ``action_type`` (as it
+    did before Phase 6D), every action in every plan.json fails with:
+
+        {"event": "action_failed", "action_id": "action_0", "op": null,
+         "error": "Action missing required 'op' field"}
+
+    Regression-critical: this test fires the instant anyone removes
+    ``op`` from the emitted action dict.
+    """
+
+    @patch("fluid_build.cli.plan._display_plan_simple")
+    @patch("fluid_build.cli.plan.ProviderActionParser")
+    @patch("fluid_build.cli.plan._should_use_provider_actions")
+    @patch("fluid_build.cli.plan.load_contract_with_overlay")
+    def test_plan_with_provider_actions_emits_op(
+        self,
+        mock_load,
+        mock_should_use,
+        mock_parser_cls,
+        _mock_display,
+    ):
+        """``_plan_with_provider_actions`` (0.7.1+ path) must emit
+        BOTH ``op`` (for apply dispatch) and ``action_type`` (for
+        display/viz tooling) on every action."""
+        from unittest.mock import MagicMock
+
+        mock_load.return_value = _minimal_contract(version="0.7.1")
+        mock_should_use.return_value = True
+
+        # Fake a ProviderAction with action_type.value = "ensure_table"
+        fake_action = MagicMock()
+        fake_action.action_id = "action_0"
+        fake_action.action_type.value = "ensure_table"
+        fake_action.provider = "snowflake"
+        fake_action.params = {"table": "orders"}
+        fake_action.depends_on = []
+        fake_action.description = None
+
+        parser = MagicMock()
+        parser.parse.return_value = [fake_action]
+        parser.build_dependency_graph.return_value = {"has_cycles": False}
+        parser.get_execution_order.return_value = [["action_0"]]
+        mock_parser_cls.return_value = parser
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, "plan.json")
+            args = _make_args(out=out_path)
+            rc = run(args, LOG)
+            self.assertEqual(rc, 0)
+
+            plan = json.load(open(out_path))
+            actions = plan.get("actions", [])
+            self.assertEqual(len(actions), 1)
+
+            a = actions[0]
+            # Phase 6D invariant: both fields present, same value.
+            self.assertEqual(
+                a.get("op"),
+                "ensure_table",
+                "plan.json action missing 'op' field — breaks stage-7 apply dispatch",
+            )
+            self.assertEqual(
+                a.get("action_type"),
+                "ensure_table",
+                "plan.json action missing 'action_type' — breaks plan.html viz",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Plan-binding digests + SchedulePlanner (Phase 6B wiring)
 # ---------------------------------------------------------------------------
 

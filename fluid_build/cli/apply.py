@@ -399,7 +399,15 @@ def _actions_from_source(src: str, env: str | None, provider, logger: logging.Lo
         provider_actions = parser.parse(contract)
 
         if provider_actions:
-            logger.info(f"Parsed {len(provider_actions)} provider actions from 0.7.1 contract")
+            # Stamp each action with the CURRENT latest bundled schema
+            # version rather than a hardcoded literal. When the schema
+            # ships 0.8.x, the metadata tracks it automatically.
+            from fluid_build.schema_manager import SchemaManager
+
+            latest_version = SchemaManager.latest_bundled_version()
+            logger.info(
+                f"Parsed {len(provider_actions)} provider actions " f"(schema {latest_version})"
+            )
             return [
                 {
                     "op": action.action_type.value,
@@ -407,7 +415,7 @@ def _actions_from_source(src: str, env: str | None, provider, logger: logging.Lo
                     "provider": action.provider,
                     "params": action.params,
                     "depends_on": action.depends_on,
-                    "metadata": {"type": "provider_action", "version": "0.7.1"},
+                    "metadata": {"type": "provider_action", "version": latest_version},
                 }
                 for action in provider_actions
             ]
@@ -553,8 +561,36 @@ def run(args, logger: logging.Logger) -> int:
             _verify_plan_digests(plan_data, args, logger)
 
             contract = plan_data.get("contract", {})
-            plan = ExecutionPlan(**plan_data.get("plan", {}))
-            use_simple_mode = False
+
+            # --- Plan-format detection ---
+            # Two plan.json shapes exist today:
+            #
+            # 1. plan.py output (Phase-6C canonical form): flat dict with
+            #    top-level ``actions`` + ``total_actions`` + full ``contract``.
+            #    Route to SIMPLE mode — provider detection + action dispatch
+            #    walks the embedded contract the same way yaml-loaded contracts
+            #    do.
+            # 2. Legacy orchestration format: nested ``plan`` sub-key with
+            #    ``contract_path`` + ``environment`` + ``phases``. Route to
+            #    COMPLEX mode — FluidOrchestrationEngine consumes the
+            #    ExecutionPlan dataclass directly.
+            #
+            # Heuristic: presence of ``plan_data["plan"]["phases"]`` identifies
+            # the legacy format. Anything else is the flat plan.py shape.
+            legacy_nested_plan = plan_data.get("plan")
+            has_legacy_orchestration_plan = (
+                isinstance(legacy_nested_plan, dict) and "phases" in legacy_nested_plan
+            )
+
+            if has_legacy_orchestration_plan:
+                plan = ExecutionPlan(**legacy_nested_plan)
+                use_simple_mode = False
+            else:
+                # plan.py flat format. Simple-mode path handles actions via
+                # ``_actions_from_source`` which reads plan_data["actions"]
+                # when args.contract is a .json file.
+                plan = None
+                use_simple_mode = True
         else:
             # Load contract
             logger.info(f"Loading FLUID contract: {args.contract}")
