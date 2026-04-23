@@ -18,13 +18,22 @@
 This package shadows the historical ``util.py`` module (Python resolves
 ``from .util import X`` to the package, not the sibling file) so the
 three helpers that used to live at module scope — ``backtick``,
-``map_type``, ``create_table_ddl`` — are re-exported here for
-``providers/snowflake/snowflake.py`` (which imports them as
-``from .util import backtick, map_type``).
+``map_type``, ``create_table_ddl`` — are re-exported here.
 
-The legacy ``util.py`` file is kept on disk because it's a self-
-contained reference, but Python import resolution ignores it in favor
-of this package.
+Historical context: these helpers were originally imported by the
+legacy ``providers/snowflake/snowflake.py`` ``SnowflakeProvider`` class
+(removed in the Phase 7-rest tech-debt cleanup — the class was dead
+code after ``providers/snowflake/__init__.py`` aliased
+``SnowflakeProviderEnhanced`` as the public ``SnowflakeProvider``).
+The re-exports stay because third-party callers may rely on
+``from fluid_build.providers.snowflake.util import backtick``, and
+the helpers are self-contained + tiny — cheaper to keep than to audit
+downstream users.
+
+The sibling ``util.py`` file (same directory) is kept on disk as a
+pure reference implementation that duplicates the contents of this
+``__init__.py``; Python's import resolution ignores ``util.py`` in
+favor of this package.
 """
 
 from __future__ import annotations
