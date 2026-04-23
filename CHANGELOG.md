@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`fluid compile` renamed to `fluid bundle --format yaml`.** The
+  legacy `fluid compile` top-level command was removed when the
+  11-stage pipeline landed (`cli/compile.py` → `cli/bundle.py`). The
+  canonical bundle command is `fluid bundle --format tgz` (signed,
+  content-addressable archive used as the root of trust by every
+  downstream pipeline stage); `fluid bundle --format yaml` is the
+  drop-in replacement for the old single-document compile behaviour.
+  Any CI scripts, docs, or muscle memory targeting `fluid compile`
+  needs a one-line update. See `examples/0.7.1/bitcoin-multifile/`
+  for the updated usage pattern.
+- **`policy-check` / `policy-compile` / `policy-apply` → `fluid policy
+  {check,compile,apply}` subcommand group.** The three top-level
+  hyphenated forms are easily confused (all start with `policy-`,
+  all do different things). They're now grouped under a single
+  `fluid policy` umbrella mirroring `fluid auth` / `fluid generate`.
+  Legacy hyphenated forms remain registered for one release; plan
+  to migrate before the next minor.
+- **`fluid rollback --list`** — new read-only discovery flag for
+  enumerating available snapshots before committing to a restore.
+  Mirrors `terraform state list` / `git reflog`.
+
 ## [0.7.11] — 2026-04-16
 
 Tooling release. No user-facing CLI behavior changes; ships a refactored release pipeline and a few packaging fixes.
