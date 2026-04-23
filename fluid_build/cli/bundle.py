@@ -97,6 +97,33 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "stage of the 11-stage pipeline."
         ),
     )
+    p.add_argument(
+        "--sign",
+        action="store_true",
+        default=False,
+        help=(
+            "Sign the output tgz with Sigstore cosign. Default mode is "
+            "keyless OIDC — works on GitHub Actions, GitLab CI, "
+            "CircleCI, and GCP WIF out-of-the-box (cosign auto-detects). "
+            "For Bitbucket Pipelines / air-gapped / regulatory setups, "
+            "pair with ``--sign-key <path-or-kms-uri>``. "
+            "Writes ``<bundle>.sig`` (+ ``<bundle>.pem`` in keyless mode) "
+            "next to the bundle. Requires the ``cosign`` binary on PATH; "
+            "fails loud if absent. Ignored for yaml/json output."
+        ),
+    )
+    p.add_argument(
+        "--sign-key",
+        default=None,
+        help=(
+            "Keyed-mode signing key reference. Pass a local file path to "
+            "a cosign.key OR a KMS URI (awskms://, gcpkms://, azurekms://, "
+            "hashivault://, k8s://, pkcs11://, file://). Selects keyed "
+            "mode over the default keyless OIDC. Requires COSIGN_PASSWORD "
+            "env var for encrypted local keys. Ignored when --sign is "
+            "not set."
+        ),
+    )
     p.set_defaults(cmd=COMMAND, func=run)
 
 
@@ -260,6 +287,44 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
         sys.stderr.write(f"✅ Bundle written to {out}\n")
         sys.stderr.write(f"   digest: {digest}\n")
+
+        # ── Optional: Sigstore cosign keyless signing ─────────────────
+        # Runs after tgz emission so the digest is already stable. A
+        # cosign-unavailable or cosign-failed state returns a non-zero
+        # exit so CI stops — signing is opt-in; if the operator asked
+        # for it, silent skip would be the wrong default.
+        if getattr(args, "sign", False):
+            from ._signing import cosign_available, sign_bundle
+
+            if not cosign_available():
+                sys.stderr.write(
+                    "❌ --sign requires the cosign binary on PATH.\n"
+                    "   Install from https://docs.sigstore.dev/cosign/installation/\n"
+                )
+                return 2
+            key_ref = getattr(args, "sign_key", None)
+            try:
+                sig_result = sign_bundle(out, key_ref=key_ref)
+            except Exception as e:
+                sys.stderr.write(f"❌ Cosign signing raised: {e}\n")
+                return 1
+            if sig_result["exit_code"] != 0:
+                sys.stderr.write(
+                    f"❌ cosign sign-blob exit {sig_result['exit_code']}: "
+                    f"{sig_result.get('stderr_tail', '')[:500]}\n"
+                )
+                return 1
+            # Keyless mode emits sig + cert; keyed mode emits sig only.
+            if sig_result.get("key_mode") == "keyed":
+                sys.stderr.write(
+                    f"✅ Bundle signed (keyed mode)\n" f"   signature: {sig_result['sig_path']}\n"
+                )
+            else:
+                sys.stderr.write(
+                    f"✅ Bundle signed (keyless OIDC)\n"
+                    f"   signature:   {sig_result['sig_path']}\n"
+                    f"   certificate: {sig_result['pem_path']}\n"
+                )
         return 0
 
     # ── yaml / json branch (legacy single-file output) ─────────────────────

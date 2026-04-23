@@ -542,6 +542,7 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     _try_register(sp, "bundle", "bundle")
     _try_register(sp, "validate_artifacts", "validate-artifacts")
     _try_register(sp, "schedule_sync", "schedule-sync")
+    _try_register(sp, "verify_signature", "verify-signature")
     # The hidden ``fluid compile`` alias was removed when the 11-stage
     # pipeline landed. Users running ``fluid compile`` now get the standard
     # argparse "invalid choice" error, which is the desired signal.
