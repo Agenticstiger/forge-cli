@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Fixed
+
+## [0.8.0] — 2026-04-25
+
 ### Changed
 
 - **`fluid compile` renamed to `fluid bundle --format yaml`.** The
@@ -146,37 +154,6 @@ Also the first release published from the `Agenticstiger/forge-cli` repository v
 ### Deprecated
 - DCS 0.9.3 data contract format — use `--contract-format dcs` for backward compatibility. Entropy Data removing DCS support after 2026-12-31.
 
-## [Unreleased]
-
-### Added
-- **Multi-file contract composition via `$ref`** — split contracts across multiple files using `$ref` pointers (OpenAPI-style). Refs resolve transparently in all commands (validate, plan, apply, execute). Supports external file refs, JSON pointer fragments (`file.yaml#/section`), nested/transitive refs, and subdirectory resolution. Circular reference detection and depth limiting protect against malformed contracts.
-- **`fluid compile` command** — bundle a multi-file contract into a single resolved document. Supports `--out` for file output, `--env` for overlay application, and `--format json|yaml` for output format control. Equivalent to `swagger-cli bundle` for OpenAPI.
-- **`compile_contract()` API** — programmatic entry point for $ref resolution in `fluid_build.loader`.
-- **`RefResolutionError` exception** — clear error type for $ref failures (missing files, circular refs, invalid pointers).
-- Multi-file contract example: `examples/0.7.1/bitcoin-multifile/` demonstrating team-owned fragments.
-- "What is FLUID?" section in README
-- CI status badge in README
-- `.secrets.baseline` for detect-secrets scanning
-- `.pre-commit-config.yaml` with detect-secrets, black, and ruff hooks
-- `.github/CODEOWNERS` for code review ownership
-- `THIRD_PARTY_LICENSES.md` documenting all dependency licenses
-- `CHANGELOG.md` (this file)
-- CLI smoke tests (`tests/cli/test_cli_smoke.py` — 28 tests)
-- Config manager tests (`tests/test_config_manager.py` — 45 tests)
-- `docs/HOW_IT_WORKS.md` — architecture overview of SDK + CLI
-
-### Fixed
-- Removed hardcoded default password (`'admin'`) in Apache Atlas connector — now requires explicit config or `ATLAS_USERNAME`/`ATLAS_PASSWORD` env vars
-- Replaced 17 occurrences of hardcoded AWS account ID `123456789012` with `YOUR_AWS_ACCOUNT_ID` placeholder
-- AWS Glue/SageMaker fallback role ARNs now use `self.account_id` instead of hardcoded values
-
-### Removed
-- `fluid_build/cli/admin.py` — internal admin/diagnostics command (not for public use)
-- `fluid_build/cli/analytics.py` — internal telemetry module (dead code)
-
-### Changed
-- Bandit security scan in CI now blocks on failures (removed `|| true` fallback)
-
 ## [0.7.1] — 2026-01-30
 
 ### Added
@@ -211,7 +188,10 @@ Also the first release published from the `Agenticstiger/forge-cli` repository v
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.7.9...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.7.10...v0.8.0
+[0.7.11]: https://github.com/Agenticstiger/forge-cli/compare/v0.7.10...v0.7.11
+[0.7.10]: https://github.com/Agenticstiger/forge-cli/compare/v0.7.9...v0.7.10
 [0.7.9]: https://github.com/Agenticstiger/forge-cli/compare/v0.7.8...v0.7.9
 [0.7.8]: https://github.com/Agenticstiger/forge-cli/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/Agenticstiger/forge-cli/compare/v0.7.6...v0.7.7
