@@ -847,44 +847,101 @@ class DataMeshManagerProvider(BaseProvider):
     def _ensure_odps_input_port_contract_ids(
         odps_payload: Dict[str, Any], fluid: Mapping[str, Any]
     ) -> None:
-        """Backfill ODPS input-port contract IDs from FLUID consumes when missing.
+        """Backfill/promote ODPS input-port contract IDs from FLUID ``consumes``.
 
-        Entropy's ODPS product API requires ``inputPorts[].contractId``. The
-        upstream ODPS renderer intentionally keeps contract IDs explicit-only,
-        so the DMM provider overlays deterministic references here using the
-        canonical consume reference ``{productId}.{exposeId}``.
+        Entropy's ODPS product API requires ``inputPorts[].contractId``. Two
+        cases this function handles:
+
+        1. **Backfill** — port has no ``contractId``. Set it to the canonical
+           ``{productId}.{exposeId}`` address for the bronze expose the silver
+           is consuming. This is the published ODCS contract location and is
+           what the DMM UI dereferences to render a resolved lineage link.
+
+        2. **Promote** — port already has a ``contractId``, but it's just the
+           upstream product reference (e.g. ``bronze.telco.party_v1``) because
+           the upstream ODPS renderer in ``OdpsStandardProvider._extract_input_ports``
+           falls back to ``canonical["reference"]`` when no explicit
+           ``contract_id`` was authored. That value is a *product* ID, not a
+           *contract* ID — DMM stores contracts at ``{productId}.{exposeId}``,
+           so a reference to the bare product ID 404s in the UI. Promote it to
+           the expose-level form when we can prove better (i.e. the canonical
+           consumes entry carries an ``exposeId`` / port ``id`` we can splice on).
+
+        An explicit FLUID ``consumes[].contractId`` is always respected — that's
+        the operator deliberately naming a non-canonical contract, so we don't
+        second-guess it even if it looks like the product reference.
         """
         input_ports = odps_payload.get("inputPorts")
         if not isinstance(input_ports, list) or not input_ports:
             return
 
         canonical_ports = consumes_to_canonical_ports(fluid, logger=LOG)
-        contract_ids_by_id: Dict[str, str] = {}
+        # Track three variants per canonical port so we can distinguish
+        # "explicit operator intent" from "we can promote" from "nothing to do".
+        explicit_contract_ids: Dict[str, str] = {}
+        promoted_contract_ids: Dict[str, str] = {}
+        product_references: Dict[str, str] = {}
         for canonical in canonical_ports:
             port_id = canonical.get("id")
             if not port_id:
                 continue
+            port_id = str(port_id)
 
-            contract_id = canonical.get("contract_id")
-            if not contract_id:
-                reference = canonical.get("reference")
-                if reference:
-                    contract_id = f"{reference}.{port_id}"
+            explicit = canonical.get("contract_id")
+            if explicit:
+                explicit_contract_ids[port_id] = str(explicit)
 
-            if contract_id:
-                contract_ids_by_id[str(port_id)] = str(contract_id)
+            reference = canonical.get("reference")
+            if reference:
+                product_references[port_id] = str(reference)
+                promoted_contract_ids[port_id] = f"{reference}.{port_id}"
 
         for port in input_ports:
-            if not isinstance(port, dict) or port.get("contractId"):
+            if not isinstance(port, dict):
                 continue
 
             port_id = port.get("id") or port.get("name")
             if not port_id:
                 continue
+            port_id = str(port_id)
 
-            contract_id = contract_ids_by_id.get(str(port_id))
-            if contract_id:
-                port["contractId"] = contract_id
+            existing = port.get("contractId")
+
+            # Case 0: explicit contract_id from FLUID consumes — operator intent wins.
+            explicit = explicit_contract_ids.get(port_id)
+            if explicit:
+                if existing != explicit:
+                    port["contractId"] = explicit
+                continue
+
+            promoted = promoted_contract_ids.get(port_id)
+            if not promoted:
+                # No canonical mapping for this port (orphan input). Leave as-is.
+                continue
+
+            # Case 1: backfill — port had no contractId at all.
+            if not existing:
+                port["contractId"] = promoted
+                continue
+
+            # Case 2: promote — existing is just the product-level reference.
+            #
+            # DMM's UI dereferences ``contractId`` against
+            # ``/api/datacontracts/{id}``; the bare product ID only resolves at
+            # ``/api/dataproducts/{id}`` and so renders as an unresolved link.
+            # Rewrite it to the expose-level form (``{productId}.{exposeId}``),
+            # which is where ``_publish_odcs_per_expose`` actually PUT the ODCS
+            # contract. Anything else the operator set is left alone.
+            reference = product_references.get(port_id)
+            if existing == reference and promoted != existing:
+                port["contractId"] = promoted
+                LOG.debug(
+                    "Promoted input port %s contractId %r -> %r "
+                    "(product-level -> expose-level)",
+                    port_id,
+                    existing,
+                    promoted,
+                )
 
     @staticmethod
     def _ensure_odps_input_port_source_system_custom_property(
