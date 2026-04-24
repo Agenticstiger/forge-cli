@@ -84,6 +84,28 @@ def _expected_input_refs(contract: dict) -> list[str]:
     ]
 
 
+def _expected_dmm_input_contract_ids(contract: dict) -> list[str]:
+    """DMM's ODPS overlay promotes ``consumes: {productId, exposeId}`` references
+    to the expose-level ``{productId}.{exposeId}`` published address. See
+    ``DataMeshManagerProvider._ensure_odps_input_port_contract_ids`` for the
+    promotion rule; other ODPS emitters (OdpsStandardProvider, official
+    OPDS) keep the bare product-level reference.
+    """
+    refs: list[str] = []
+    for consume in contract.get("consumes", []):
+        explicit = consume.get("contractId") or consume.get("contract_id")
+        if explicit:
+            refs.append(explicit)
+            continue
+        reference = consume.get("productId") or consume.get("ref")
+        port_id = consume.get("exposeId") or consume.get("id")
+        if reference and port_id:
+            refs.append(f"{reference}.{port_id}")
+        elif reference:
+            refs.append(reference)
+    return refs
+
+
 @pytest.mark.parametrize(("fixture_name", "expected_version"), ALL_FIXTURES)
 def test_compatibility_fixtures_validate_offline(fixture_name: str, expected_version: str):
     contract = _load_contract(fixture_name)
@@ -173,6 +195,10 @@ def test_lineage_fixtures_preserve_input_ports_across_odps_exports(
     contract = _load_contract(fixture_name)
     expected_ids = _expected_input_ids(contract)
     expected_refs = _expected_input_refs(contract)
+    # DMM's overlay promotes product-level contractIds to the expose-level
+    # ``{productId}.{exposeId}`` address the ODCS contract is actually
+    # published at. See ``_ensure_odps_input_port_contract_ids``.
+    expected_dmm_contract_ids = _expected_dmm_input_contract_ids(contract)
 
     odps_standard = OdpsStandardProvider().render(contract)
     dmm_odps = DataMeshManagerProvider(
@@ -183,13 +209,20 @@ def test_lineage_fixtures_preserve_input_ports_across_odps_exports(
     # ODPS-Bitol v1.0.0 InputPort forbids ``id`` and ``reference``; the
     # identifier travels via ``name`` and the reference is folded into
     # ``contractId`` (synthesized when no explicit contractId is provided).
+    # The raw OdpsStandardProvider uses the bare product reference as the
+    # synthetic contractId — no DMM-specific promotion applied.
     assert [port["name"] for port in odps_standard["inputPorts"]] == expected_ids
     assert [port["contractId"] for port in odps_standard["inputPorts"]] == expected_refs
     # DMM ``provider_hint="odps"`` delegates to OdpsStandardProvider → same
-    # v1.0.0 shape. DMM's overlay adds sourceSystem to ``customProperties``
-    # so the data isn't lost, but the InputPort itself is v1.0.0-conformant.
+    # v1.0.0 shape, but the DMM-specific overlay then promotes product-level
+    # contractIds to the ``{productId}.{exposeId}`` form so lineage links
+    # resolve in the DMM UI (contracts live at
+    # ``/api/datacontracts/{productId}.{exposeId}``, not at
+    # ``/api/datacontracts/{productId}``).
     assert [port["name"] for port in dmm_odps["inputPorts"]] == expected_ids
-    assert [port["contractId"] for port in dmm_odps["inputPorts"]] == expected_refs
+    assert (
+        [port["contractId"] for port in dmm_odps["inputPorts"]] == expected_dmm_contract_ids
+    )
     # OdpsProvider (legacy OPDS/Linux Foundation emitter) is a DIFFERENT
     # provider — keeps its legacy {id, reference} shape. Not part of the
     # ODPS-Bitol schema contract.

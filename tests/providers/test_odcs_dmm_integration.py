@@ -356,6 +356,147 @@ class TestPublishOneOdcsIntegration:
 
 
 # ===========================================================================
+# 4b. Product umbrella ODCS contract (Option C.1 — resolution target)
+# ===========================================================================
+
+
+class TestProductUmbrellaContract:
+    """The umbrella contract PUTs a thin ODCS stub at ``{product_id}`` so
+    lineage references pointing at the bare product ID still resolve to a
+    valid ``/api/datacontracts/{id}`` in the DMM UI.
+
+    Per-expose contracts (``{product_id}.{expose_id}``) remain the real
+    carriers of schema. The umbrella is advertisement-only:
+    ``schema: []`` + ``customProperties.umbrella: true``.
+    """
+
+    def _stub_provider(self, provider):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = ""
+
+        def fake_request(method, path, *, json_body=None):
+            return mock_resp
+
+        provider._request = fake_request
+        provider._ensure_team = lambda fluid, team_id: None
+        return provider
+
+    def test_dry_run_preview_includes_umbrella(self):
+        provider = _make_provider()
+        result = provider._publish_one(_BITCOIN_CONTRACT, dry_run=True, publish_contract=True)
+
+        assert "odcs_product_umbrella" in result
+        umbrella = result["odcs_product_umbrella"]
+        assert umbrella["method"] == "PUT"
+        assert umbrella["url"].endswith(f"/api/datacontracts/{_PRODUCT_ID}")
+        assert umbrella["umbrella"] is True
+
+    def test_umbrella_body_is_valid_odcs_stub(self):
+        provider = _make_provider()
+        result = provider._publish_one(_BITCOIN_CONTRACT, dry_run=True, publish_contract=True)
+
+        payload = result["odcs_product_umbrella"]["payload"]
+        # ODCS v3.1.0 required fields
+        assert payload["apiVersion"] == "v3.1.0"
+        assert payload["kind"] == "DataContract"
+        assert payload["id"] == _PRODUCT_ID
+        assert payload["version"] == "1.0.0"
+        assert payload["status"] == "active"
+
+    def test_umbrella_schema_is_intentionally_empty(self):
+        provider = _make_provider()
+        result = provider._publish_one(_BITCOIN_CONTRACT, dry_run=True, publish_contract=True)
+
+        payload = result["odcs_product_umbrella"]["payload"]
+        # The umbrella is a pointer, not a queryable surface — a populated
+        # schema would be misleading.
+        assert payload["schema"] == []
+
+    def test_umbrella_advertises_umbrella_flag(self):
+        provider = _make_provider()
+        result = provider._publish_one(_BITCOIN_CONTRACT, dry_run=True, publish_contract=True)
+
+        props = result["odcs_product_umbrella"]["payload"]["customProperties"]
+        assert {"property": "umbrella", "value": True} in props
+
+    def test_umbrella_lists_member_contracts(self):
+        provider = _make_provider()
+        result = provider._publish_one(_BITCOIN_CONTRACT, dry_run=True, publish_contract=True)
+
+        props = result["odcs_product_umbrella"]["payload"]["customProperties"]
+        member_prop = next(p for p in props if p["property"] == "memberContracts")
+        # Each expose becomes a member contract at {product_id}.{expose_id}
+        assert f"{_PRODUCT_ID}.bitcoin_prices_table" in member_prop["value"]
+        assert f"{_PRODUCT_ID}.bitcoin_prices_table_v2" in member_prop["value"]
+
+    def test_umbrella_purpose_names_the_resolution_convention(self):
+        provider = _make_provider()
+        result = provider._publish_one(_BITCOIN_CONTRACT, dry_run=True, publish_contract=True)
+
+        purpose = result["odcs_product_umbrella"]["payload"]["description"]["purpose"]
+        # The purpose string must tell a human reading the stub in the UI
+        # *why* it's empty, so they know where the real schemas live.
+        assert _PRODUCT_ID in purpose
+        assert "per-expose" in purpose or "expose" in purpose
+
+    def test_publish_contract_true_puts_umbrella(self):
+        provider = _make_provider()
+        self._stub_provider(provider)
+
+        put_urls: list[str] = []
+        original_request = provider._request
+
+        def capturing_request(method, path, *, json_body=None):
+            put_urls.append(path)
+            return original_request(method, path, json_body=json_body)
+
+        provider._request = capturing_request
+
+        provider._publish_one(_BITCOIN_CONTRACT, publish_contract=True)
+
+        # Must PUT the umbrella at /api/datacontracts/{product_id} exactly once
+        umbrella_puts = [u for u in put_urls if u == f"/api/datacontracts/{_PRODUCT_ID}"]
+        assert len(umbrella_puts) == 1
+
+    def test_publish_contract_false_skips_umbrella(self):
+        provider = _make_provider()
+        self._stub_provider(provider)
+
+        result = provider._publish_one(_BITCOIN_CONTRACT, publish_contract=False)
+        assert "odcs_product_umbrella" not in result
+
+    def test_umbrella_put_failure_is_non_fatal(self):
+        """If umbrella PUT fails, publish still reports success for the
+        product + per-expose contracts — unresolved product-level links are
+        strictly no worse than the pre-umbrella baseline."""
+        from fluid_build.providers.base import ProviderError
+
+        provider = _make_provider()
+
+        def flaky_request(method, path, *, json_body=None):
+            if path == f"/api/datacontracts/{_PRODUCT_ID}":
+                raise ProviderError("simulated umbrella PUT failure")
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.text = ""
+            return resp
+
+        provider._request = flaky_request
+        provider._ensure_team = lambda fluid, team_id: None
+
+        result = provider._publish_one(_BITCOIN_CONTRACT, publish_contract=True)
+
+        # Product + per-expose contracts succeeded
+        assert result["success"] is True
+        assert all(r["success"] for r in result["odcs_contracts"])
+        # Umbrella is reported as failed but didn't abort the publish
+        umbrella = result["odcs_product_umbrella"]
+        assert umbrella["success"] is False
+        assert umbrella["error_type"] == "UMBRELLA_PUT_FAILED"
+
+
+# ===========================================================================
 # 5. OdcsProvider reads expose-level qos block
 # ===========================================================================
 

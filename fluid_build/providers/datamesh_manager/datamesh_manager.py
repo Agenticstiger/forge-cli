@@ -422,6 +422,9 @@ class DataMeshManagerProvider(BaseProvider):
             # Also preview per-expose ODCS contracts so the caller can inspect them
             if publish_contract:
                 result["odcs_contracts"] = self._preview_odcs_per_expose(fluid, product_id)
+                result["odcs_product_umbrella"] = self._preview_product_umbrella_contract(
+                    fluid, product_id
+                )
             return result
 
         # Ensure team exists
@@ -456,6 +459,19 @@ class DataMeshManagerProvider(BaseProvider):
                 validation_mode=validation_mode,
             )
             result["odcs_contracts"] = odcs_results
+
+            # Publish a thin umbrella ODCS contract at ``{product_id}`` so any
+            # lineage reference that points at the bare product ID (rather than
+            # at a specific ``{product_id}.{expose_id}``) still resolves in the
+            # DMM UI. This is defensive: ``_ensure_odps_input_port_contract_ids``
+            # promotes product-level contract IDs to expose-level at publish
+            # time, so our own pipeline should not emit product-level
+            # references. But hand-written silvers, stale pipelines, or
+            # cross-repo consumers that spell ``contractId: bronze.telco.party_v1``
+            # literally would otherwise render as a broken link. See
+            # ``_render_product_umbrella_contract`` for the stub body shape.
+            umbrella_result = self._publish_product_umbrella_contract(fluid, product_id)
+            result["odcs_product_umbrella"] = umbrella_result
 
         return result
 
@@ -671,6 +687,167 @@ class DataMeshManagerProvider(BaseProvider):
             "servers": len(servers) if isinstance(servers, list) else 0,
             "sla_properties": len(sla_properties) if isinstance(sla_properties, list) else 0,
         }
+
+    # ---- Umbrella ODCS contract (product-level resolution target) ---------
+
+    # ODCS v3.1.0 is the spec forge-cli targets when publishing per-expose
+    # contracts via ``OdcsProvider``. Keep the umbrella in lockstep so a
+    # future ODCS spec bump only needs to be made in one place here (the
+    # umbrella does not use ``OdcsProvider.render`` because it has no
+    # corresponding expose to extract schema from).
+    _UMBRELLA_ODCS_API_VERSION = "v3.1.0"
+
+    def _render_product_umbrella_contract(
+        self, fluid: Mapping[str, Any], product_id: str
+    ) -> Dict[str, Any]:
+        """Render a minimal ODCS v3.1.0 contract at ``{product_id}``.
+
+        Why this exists: DMM's UI renders ``inputPorts[].contractId`` as a
+        resolved link if and only if that id maps to an existing
+        ``/api/datacontracts/{id}``. forge-cli's canonical address for a
+        product's contracts is ``{product_id}.{expose_id}`` (one per expose
+        port) — there is no per-product contract by default, so any lineage
+        reference that points at just ``{product_id}`` 404s and renders as an
+        unresolved link.
+
+        The umbrella contract fills that gap: it's a thin stub that advertises
+        "the real schemas are published as one contract per expose; see
+        members" so the UI has a valid resolution target and a human landing
+        on the page understands why it's empty.
+
+        Intentional shape choices:
+          * ``schema: []`` (empty) — an umbrella does not describe a
+            queryable surface; it's a resolution pointer. A non-empty schema
+            would be a *lie* (there is no table with these columns).
+          * ``description.purpose`` names the convention explicitly so the
+            reader isn't left wondering why the contract is empty.
+          * ``customProperties`` advertises ``umbrella: true`` so downstream
+            tooling can filter umbrellas out of "list my real contracts"
+            queries.
+        """
+        metadata = fluid.get("metadata") or {}
+        product_name = metadata.get("name") or fluid.get("name") or product_id
+        product_description = metadata.get("description") or fluid.get("description") or ""
+        status = _STATUS_MAP.get(str(metadata.get("status", "active")).lower(), "active")
+        version = str(metadata.get("version") or "1.0.0")
+
+        # Enumerate member exposes so consumers landing on the umbrella can
+        # see which per-expose contracts to dereference instead. This is NOT
+        # an ODCS schema — it's a reference list carried in customProperties,
+        # which is the only free-form field the v3.1.0 spec allows.
+        member_expose_ids: List[str] = []
+        for expose in fluid.get("exposes", []) or []:
+            if not isinstance(expose, Mapping):
+                continue
+            expose_id = expose.get("exposeId") or expose.get("id")
+            if expose_id:
+                member_expose_ids.append(str(expose_id))
+
+        purpose_lines = [
+            (
+                f"Umbrella resolution contract for data product '{product_id}'. "
+                "The product's actual per-expose schemas are published as one "
+                f"ODCS contract per output port, at '{product_id}.{{exposeId}}'."
+            )
+        ]
+        if product_description:
+            purpose_lines.append(str(product_description))
+        if member_expose_ids:
+            member_list = ", ".join(f"{product_id}.{eid}" for eid in member_expose_ids)
+            purpose_lines.append(f"Member contracts: {member_list}.")
+
+        body: Dict[str, Any] = {
+            "apiVersion": self._UMBRELLA_ODCS_API_VERSION,
+            "kind": "DataContract",
+            "id": product_id,
+            "version": version,
+            "status": status,
+            "name": product_name,
+            "description": {
+                "purpose": " ".join(purpose_lines),
+                "usage": (
+                    "Reference the per-expose contracts "
+                    f"('{product_id}.{{exposeId}}') for binding schemas. "
+                    "This umbrella is a resolution target only — its schema is "
+                    "intentionally empty."
+                ),
+            },
+            "schema": [],
+            "customProperties": [
+                {"property": "umbrella", "value": True},
+                {
+                    "property": "memberContracts",
+                    "value": [f"{product_id}.{eid}" for eid in member_expose_ids],
+                },
+            ],
+        }
+
+        team_obj = fluid.get("owner")
+        if isinstance(team_obj, Mapping):
+            team = team_obj.get("team") or team_obj.get("name")
+            if team:
+                body["team"] = str(team)
+
+        tags = metadata.get("tags") or fluid.get("tags")
+        if isinstance(tags, list) and tags:
+            body["tags"] = list(tags)
+
+        domain = metadata.get("domain") or fluid.get("domain")
+        if domain:
+            body["domain"] = str(domain)
+
+        return body
+
+    def _preview_product_umbrella_contract(
+        self, fluid: Mapping[str, Any], product_id: str
+    ) -> Dict[str, Any]:
+        """Dry-run preview for the umbrella contract — no HTTP calls."""
+        body = self._render_product_umbrella_contract(fluid, product_id)
+        return {
+            "method": "PUT",
+            "url": f"{self.api_url}/api/datacontracts/{product_id}",
+            "payload": body,
+            "umbrella": True,
+        }
+
+    def _publish_product_umbrella_contract(
+        self, fluid: Mapping[str, Any], product_id: str
+    ) -> Dict[str, Any]:
+        """PUT the umbrella ODCS stub at ``/api/datacontracts/{product_id}``.
+
+        Returns a result dict with ``success``, ``contract_id``, and either
+        ``status_code`` (on success) or ``error`` / ``error_type`` (on
+        failure). A failure here is logged but does NOT propagate — a missing
+        umbrella just means product-level lineage links render unresolved in
+        the UI (pre-umbrella behavior), which is strictly no worse than
+        skipping the call.
+        """
+        body = self._render_product_umbrella_contract(fluid, product_id)
+        try:
+            resp = self._request("PUT", f"/api/datacontracts/{product_id}", json_body=body)
+            self._log.info(
+                "Published umbrella contract %s (HTTP %s)", product_id, resp.status_code
+            )
+            return {
+                "contract_id": product_id,
+                "success": True,
+                "status_code": resp.status_code,
+                "url": f"{self.api_url}/datacontracts/{product_id}",
+                "umbrella": True,
+            }
+        except ProviderError as exc:
+            self._log.warning(
+                "Failed to publish umbrella contract %s (non-fatal): %s",
+                product_id,
+                exc,
+            )
+            return {
+                "contract_id": product_id,
+                "success": False,
+                "error": str(exc),
+                "error_type": "UMBRELLA_PUT_FAILED",
+                "umbrella": True,
+            }
 
     # ---- mapping: FLUID -> Entropy Data Product ----------------------------
 
