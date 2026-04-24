@@ -421,12 +421,32 @@ class TestJenkinsPipelineTemplateGenerator:
         assert "'enforce'" in content
         assert "'check'" in content
 
-    def test_output_contains_bundle_format_choice(self, generator):
-        """Stage 1 bundle format is user-selectable."""
+    def test_stage1_bundle_format_is_tgz_and_not_parameterized(self, generator):
+        """Stage 1 hardcodes ``--format tgz``.
+
+        The pipeline's downstream stages (4: validate artifacts, 6: plan
+        bundleDigest, 7: apply plan-binding verification) all require the
+        tgz MANIFEST.json. A ``yaml`` / ``json`` bundle would break every
+        stage after 1, so making format a pipeline parameter is a footgun —
+        the previous template exposed ``BUNDLE_FORMAT`` with an invalid
+        ``'yaml-single-file'`` choice that ``fluid bundle`` would reject
+        outright (valid choices are ``{yaml, json, tgz}``). Keep the
+        format pinned to tgz here; operators who need yaml/json bundles
+        run ``fluid bundle`` out-of-band.
+        """
         content = self._generate(generator)["Jenkinsfile"]
-        assert "name: 'BUNDLE_FORMAT'" in content
-        assert "'tgz'" in content
-        assert "'yaml-single-file'" in content
+        # The BUNDLE_FORMAT choice parameter was removed — the pipeline now
+        # hardcodes tgz.
+        assert "name: 'BUNDLE_FORMAT'" not in content, (
+            "BUNDLE_FORMAT should no longer be a pipeline parameter; " "Stages 4/6/7 require tgz."
+        )
+        # The obsolete, invalid choice must not reappear.
+        assert "'yaml-single-file'" not in content, (
+            "'yaml-single-file' is not a valid `fluid bundle --format` choice "
+            "(valid: {yaml, json, tgz}). Template regressed."
+        )
+        # And the bundle step itself passes an explicit --format tgz.
+        assert "--format tgz --out runtime/bundle.tgz" in content
 
     @pytest.mark.parametrize("complexity", ["basic", "standard", "advanced", "enterprise"])
     def test_all_complexity_levels(self, generator, complexity):

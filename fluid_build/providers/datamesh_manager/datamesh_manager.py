@@ -422,6 +422,9 @@ class DataMeshManagerProvider(BaseProvider):
             # Also preview per-expose ODCS contracts so the caller can inspect them
             if publish_contract:
                 result["odcs_contracts"] = self._preview_odcs_per_expose(fluid, product_id)
+                result["odcs_product_umbrella"] = self._preview_product_umbrella_contract(
+                    fluid, product_id
+                )
             return result
 
         # Ensure team exists
@@ -456,6 +459,19 @@ class DataMeshManagerProvider(BaseProvider):
                 validation_mode=validation_mode,
             )
             result["odcs_contracts"] = odcs_results
+
+            # Publish a thin umbrella ODCS contract at ``{product_id}`` so any
+            # lineage reference that points at the bare product ID (rather than
+            # at a specific ``{product_id}.{expose_id}``) still resolves in the
+            # DMM UI. This is defensive: ``_ensure_odps_input_port_contract_ids``
+            # promotes product-level contract IDs to expose-level at publish
+            # time, so our own pipeline should not emit product-level
+            # references. But hand-written silvers, stale pipelines, or
+            # cross-repo consumers that spell ``contractId: bronze.telco.party_v1``
+            # literally would otherwise render as a broken link. See
+            # ``_render_product_umbrella_contract`` for the stub body shape.
+            umbrella_result = self._publish_product_umbrella_contract(fluid, product_id)
+            result["odcs_product_umbrella"] = umbrella_result
 
         return result
 
@@ -672,6 +688,175 @@ class DataMeshManagerProvider(BaseProvider):
             "sla_properties": len(sla_properties) if isinstance(sla_properties, list) else 0,
         }
 
+    # ---- Umbrella ODCS contract (product-level resolution target) ---------
+
+    # ODCS v3.1.0 is the spec forge-cli targets when publishing per-expose
+    # contracts via ``OdcsProvider``. Keep the umbrella in lockstep so a
+    # future ODCS spec bump only needs to be made in one place here (the
+    # umbrella does not use ``OdcsProvider.render`` because it has no
+    # corresponding expose to extract schema from).
+    _UMBRELLA_ODCS_API_VERSION = "v3.1.0"
+
+    def _render_product_umbrella_contract(
+        self, fluid: Mapping[str, Any], product_id: str
+    ) -> Dict[str, Any]:
+        """Render a minimal ODCS v3.1.0 contract at ``{product_id}``.
+
+        Why this exists: DMM's UI renders ``inputPorts[].contractId`` as a
+        resolved link if and only if that id maps to an existing
+        ``/api/datacontracts/{id}``. forge-cli's canonical address for a
+        product's contracts is ``{product_id}.{expose_id}`` (one per expose
+        port) — there is no per-product contract by default, so any lineage
+        reference that points at just ``{product_id}`` 404s and renders as an
+        unresolved link.
+
+        The umbrella contract fills that gap: it's a thin stub that advertises
+        "the real schemas are published as one contract per expose; see
+        members" so the UI has a valid resolution target and a human landing
+        on the page understands why it's empty.
+
+        Intentional shape choices:
+          * ``schema: []`` (empty) — an umbrella does not describe a
+            queryable surface; it's a resolution pointer. A non-empty schema
+            would be a *lie* (there is no table with these columns).
+          * ``description.purpose`` names the convention explicitly so the
+            reader isn't left wondering why the contract is empty.
+          * ``customProperties`` advertises ``umbrella: true`` so downstream
+            tooling can filter umbrellas out of "list my real contracts"
+            queries.
+        """
+        metadata = fluid.get("metadata") or {}
+        product_name = metadata.get("name") or fluid.get("name") or product_id
+        product_description = metadata.get("description") or fluid.get("description") or ""
+        status = _STATUS_MAP.get(str(metadata.get("status", "active")).lower(), "active")
+        version = str(metadata.get("version") or "1.0.0")
+
+        # Enumerate member exposes so consumers landing on the umbrella can
+        # see which per-expose contracts to dereference instead. This is NOT
+        # an ODCS schema — it's a reference list carried in customProperties,
+        # which is the only free-form field the v3.1.0 spec allows.
+        member_expose_ids: List[str] = []
+        for expose in fluid.get("exposes", []) or []:
+            if not isinstance(expose, Mapping):
+                continue
+            expose_id = expose.get("exposeId") or expose.get("id")
+            if expose_id:
+                member_expose_ids.append(str(expose_id))
+
+        purpose_lines = [
+            (
+                f"Umbrella resolution contract for data product '{product_id}'. "
+                "The product's actual per-expose schemas are published as one "
+                f"ODCS contract per output port, at '{product_id}.{{exposeId}}'."
+            )
+        ]
+        if product_description:
+            purpose_lines.append(str(product_description))
+        if member_expose_ids:
+            member_list = ", ".join(f"{product_id}.{eid}" for eid in member_expose_ids)
+            purpose_lines.append(f"Member contracts: {member_list}.")
+
+        body: Dict[str, Any] = {
+            "apiVersion": self._UMBRELLA_ODCS_API_VERSION,
+            "kind": "DataContract",
+            "id": product_id,
+            "version": version,
+            "status": status,
+            "name": product_name,
+            "description": {
+                "purpose": " ".join(purpose_lines),
+                "usage": (
+                    "Reference the per-expose contracts "
+                    f"('{product_id}.{{exposeId}}') for binding schemas. "
+                    "This umbrella is a resolution target only — its schema is "
+                    "intentionally empty."
+                ),
+            },
+            "schema": [],
+            "customProperties": [
+                {"property": "umbrella", "value": True},
+                {
+                    "property": "memberContracts",
+                    "value": [f"{product_id}.{eid}" for eid in member_expose_ids],
+                },
+            ],
+        }
+
+        # Team: use the same derivation as per-expose contracts / the product
+        # itself so the umbrella lands under the same team in DMM. ODCS v3.1.0
+        # accepts ``team: { name: <id> }`` (nested object), which matches the
+        # shape DMM's per-expose contract endpoint returns. A bare string here
+        # is rejected as an unknown teamId.
+        try:
+            team_id = self._derive_team_id(fluid)
+        except Exception:  # pragma: no cover — defensive, should not happen
+            team_id = None
+        if team_id:
+            body["team"] = {"name": str(team_id)}
+
+        tags = metadata.get("tags") or fluid.get("tags")
+        if isinstance(tags, list) and tags:
+            body["tags"] = list(tags)
+
+        # NOTE: intentionally do NOT emit ``domain`` on the umbrella.
+        # DMM's ODCS validator treats certain top-level fields (e.g. bare
+        # ``domain``) as team/owner references and 422s on unknown IDs
+        # (observed: ``The owner '<domain>' is not a known team ID``).
+        # The umbrella is a resolution stub — domain metadata already lives
+        # on the data product and per-expose contracts, so adding it here
+        # provides no value and trips the validator.
+
+        return body
+
+    def _preview_product_umbrella_contract(
+        self, fluid: Mapping[str, Any], product_id: str
+    ) -> Dict[str, Any]:
+        """Dry-run preview for the umbrella contract — no HTTP calls."""
+        body = self._render_product_umbrella_contract(fluid, product_id)
+        return {
+            "method": "PUT",
+            "url": f"{self.api_url}/api/datacontracts/{product_id}",
+            "payload": body,
+            "umbrella": True,
+        }
+
+    def _publish_product_umbrella_contract(
+        self, fluid: Mapping[str, Any], product_id: str
+    ) -> Dict[str, Any]:
+        """PUT the umbrella ODCS stub at ``/api/datacontracts/{product_id}``.
+
+        Returns a result dict with ``success``, ``contract_id``, and either
+        ``status_code`` (on success) or ``error`` / ``error_type`` (on
+        failure). A failure here is logged but does NOT propagate — a missing
+        umbrella just means product-level lineage links render unresolved in
+        the UI (pre-umbrella behavior), which is strictly no worse than
+        skipping the call.
+        """
+        body = self._render_product_umbrella_contract(fluid, product_id)
+        try:
+            resp = self._request("PUT", f"/api/datacontracts/{product_id}", json_body=body)
+            self._log.info("Published umbrella contract %s (HTTP %s)", product_id, resp.status_code)
+            return {
+                "contract_id": product_id,
+                "success": True,
+                "status_code": resp.status_code,
+                "url": f"{self.api_url}/datacontracts/{product_id}",
+                "umbrella": True,
+            }
+        except ProviderError as exc:
+            self._log.warning(
+                "Failed to publish umbrella contract %s (non-fatal): %s",
+                product_id,
+                exc,
+            )
+            return {
+                "contract_id": product_id,
+                "success": False,
+                "error": str(exc),
+                "error_type": "UMBRELLA_PUT_FAILED",
+                "umbrella": True,
+            }
+
     # ---- mapping: FLUID -> Entropy Data Product ----------------------------
 
     def _to_data_product(
@@ -847,44 +1032,100 @@ class DataMeshManagerProvider(BaseProvider):
     def _ensure_odps_input_port_contract_ids(
         odps_payload: Dict[str, Any], fluid: Mapping[str, Any]
     ) -> None:
-        """Backfill ODPS input-port contract IDs from FLUID consumes when missing.
+        """Backfill/promote ODPS input-port contract IDs from FLUID ``consumes``.
 
-        Entropy's ODPS product API requires ``inputPorts[].contractId``. The
-        upstream ODPS renderer intentionally keeps contract IDs explicit-only,
-        so the DMM provider overlays deterministic references here using the
-        canonical consume reference ``{productId}.{exposeId}``.
+        Entropy's ODPS product API requires ``inputPorts[].contractId``. Two
+        cases this function handles:
+
+        1. **Backfill** — port has no ``contractId``. Set it to the canonical
+           ``{productId}.{exposeId}`` address for the bronze expose the silver
+           is consuming. This is the published ODCS contract location and is
+           what the DMM UI dereferences to render a resolved lineage link.
+
+        2. **Promote** — port already has a ``contractId``, but it's just the
+           upstream product reference (e.g. ``bronze.telco.party_v1``) because
+           the upstream ODPS renderer in ``OdpsStandardProvider._extract_input_ports``
+           falls back to ``canonical["reference"]`` when no explicit
+           ``contract_id`` was authored. That value is a *product* ID, not a
+           *contract* ID — DMM stores contracts at ``{productId}.{exposeId}``,
+           so a reference to the bare product ID 404s in the UI. Promote it to
+           the expose-level form when we can prove better (i.e. the canonical
+           consumes entry carries an ``exposeId`` / port ``id`` we can splice on).
+
+        An explicit FLUID ``consumes[].contractId`` is always respected — that's
+        the operator deliberately naming a non-canonical contract, so we don't
+        second-guess it even if it looks like the product reference.
         """
         input_ports = odps_payload.get("inputPorts")
         if not isinstance(input_ports, list) or not input_ports:
             return
 
         canonical_ports = consumes_to_canonical_ports(fluid, logger=LOG)
-        contract_ids_by_id: Dict[str, str] = {}
+        # Track three variants per canonical port so we can distinguish
+        # "explicit operator intent" from "we can promote" from "nothing to do".
+        explicit_contract_ids: Dict[str, str] = {}
+        promoted_contract_ids: Dict[str, str] = {}
+        product_references: Dict[str, str] = {}
         for canonical in canonical_ports:
             port_id = canonical.get("id")
             if not port_id:
                 continue
+            port_id = str(port_id)
 
-            contract_id = canonical.get("contract_id")
-            if not contract_id:
-                reference = canonical.get("reference")
-                if reference:
-                    contract_id = f"{reference}.{port_id}"
+            explicit = canonical.get("contract_id")
+            if explicit:
+                explicit_contract_ids[port_id] = str(explicit)
 
-            if contract_id:
-                contract_ids_by_id[str(port_id)] = str(contract_id)
+            reference = canonical.get("reference")
+            if reference:
+                product_references[port_id] = str(reference)
+                promoted_contract_ids[port_id] = f"{reference}.{port_id}"
 
         for port in input_ports:
-            if not isinstance(port, dict) or port.get("contractId"):
+            if not isinstance(port, dict):
                 continue
 
             port_id = port.get("id") or port.get("name")
             if not port_id:
                 continue
+            port_id = str(port_id)
 
-            contract_id = contract_ids_by_id.get(str(port_id))
-            if contract_id:
-                port["contractId"] = contract_id
+            existing = port.get("contractId")
+
+            # Case 0: explicit contract_id from FLUID consumes — operator intent wins.
+            explicit = explicit_contract_ids.get(port_id)
+            if explicit:
+                if existing != explicit:
+                    port["contractId"] = explicit
+                continue
+
+            promoted = promoted_contract_ids.get(port_id)
+            if not promoted:
+                # No canonical mapping for this port (orphan input). Leave as-is.
+                continue
+
+            # Case 1: backfill — port had no contractId at all.
+            if not existing:
+                port["contractId"] = promoted
+                continue
+
+            # Case 2: promote — existing is just the product-level reference.
+            #
+            # DMM's UI dereferences ``contractId`` against
+            # ``/api/datacontracts/{id}``; the bare product ID only resolves at
+            # ``/api/dataproducts/{id}`` and so renders as an unresolved link.
+            # Rewrite it to the expose-level form (``{productId}.{exposeId}``),
+            # which is where ``_publish_odcs_per_expose`` actually PUT the ODCS
+            # contract. Anything else the operator set is left alone.
+            reference = product_references.get(port_id)
+            if existing == reference and promoted != existing:
+                port["contractId"] = promoted
+                LOG.debug(
+                    "Promoted input port %s contractId %r -> %r " "(product-level -> expose-level)",
+                    port_id,
+                    existing,
+                    promoted,
+                )
 
     @staticmethod
     def _ensure_odps_input_port_source_system_custom_property(

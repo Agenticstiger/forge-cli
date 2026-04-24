@@ -262,12 +262,21 @@ def test_apply_dry_run_odps_maps_consumes_to_top_level_input_ports():
     # InputPort and are stripped from the artifact. The DMM overlay's
     # ``_ensure_odps_input_port_source_system_custom_property`` preserves
     # the lineage ref via customProperties instead.
+    #
+    # ``contractId`` is promoted from the upstream ``reference`` (bare
+    # product ID, e.g. ``bizlab.teleforge.subscriber_usage_daily_lineage_local``)
+    # to the expose-level ``{productId}.{exposeId}`` form — that's where
+    # ``_publish_odcs_per_expose`` actually PUT the ODCS contract, so the
+    # DMM UI can dereference the link. See
+    # ``_ensure_odps_input_port_contract_ids`` for the promotion rule.
     input_ports = result["payload"].get("inputPorts", [])
     assert input_ports == [
         {
             "name": "subscriber_usage_daily",
             "version": "1",
-            "contractId": "bizlab.teleforge.subscriber_usage_daily_lineage_local",
+            "contractId": (
+                "bizlab.teleforge.subscriber_usage_daily_lineage_local." "subscriber_usage_daily"
+            ),
             "customProperties": [
                 {
                     "property": "sourceSystem",
@@ -278,7 +287,9 @@ def test_apply_dry_run_odps_maps_consumes_to_top_level_input_ports():
         {
             "name": "billing_health_daily",
             "version": "1",
-            "contractId": "bizlab.teleforge.billing_health_daily_lineage_local",
+            "contractId": (
+                "bizlab.teleforge.billing_health_daily_lineage_local." "billing_health_daily"
+            ),
             "customProperties": [
                 {
                     "property": "sourceSystem",
@@ -287,6 +298,72 @@ def test_apply_dry_run_odps_maps_consumes_to_top_level_input_ports():
             ],
         },
     ]
+
+
+def test_apply_dry_run_odps_promotes_product_level_contract_id_to_expose_level():
+    """Regression test for the DMM UI "unresolved inputPort contractId" gap.
+
+    A1/A2 silvers declare ``consumes: { productId, exposeId }``; the upstream
+    OdpsStandardProvider falls back to ``canonical["reference"]`` (the bare
+    product ID) when no explicit ``contract_id`` is authored, which renders
+    as an unresolved link in DMM because contracts live at
+    ``/api/datacontracts/{productId}.{exposeId}``, not at
+    ``/api/datacontracts/{productId}``. The DMM provider overlay must promote
+    the product-level contractId to the expose-level form so the UI can
+    dereference it.
+    """
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+
+    result = provider.apply(
+        _sample_odps_consumes_contract(),
+        dry_run=True,
+        provider_hint="odps",
+    )
+
+    input_ports = result["payload"].get("inputPorts", [])
+    contract_ids = {port["name"]: port["contractId"] for port in input_ports}
+
+    # Each port's contractId must point at the expose-level published address,
+    # not the bare product ID.
+    assert contract_ids == {
+        "subscriber_usage_daily": (
+            "bizlab.teleforge.subscriber_usage_daily_lineage_local.subscriber_usage_daily"
+        ),
+        "billing_health_daily": (
+            "bizlab.teleforge.billing_health_daily_lineage_local.billing_health_daily"
+        ),
+    }
+
+
+def test_apply_dry_run_odps_preserves_explicit_consumes_contract_id():
+    """Explicit FLUID ``consumes[].contractId`` must win over promotion.
+
+    If the operator spells out ``contractId: bronze.telco.party_v1.custom``,
+    respect it — even if it doesn't match the canonical
+    ``{productId}.{exposeId}`` form. Promotion is a fallback for the common
+    case where the author only supplied ``productId`` + ``exposeId``.
+    """
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+
+    contract = _sample_odps_consumes_contract()
+    # Operator explicitly pins to a non-canonical contract id.
+    contract["consumes"][0][
+        "contractId"
+    ] = "bizlab.teleforge.subscriber_usage_daily_lineage_local.custom_view"
+
+    result = provider.apply(contract, dry_run=True, provider_hint="odps")
+
+    input_ports = result["payload"].get("inputPorts", [])
+    contract_ids = {port["name"]: port["contractId"] for port in input_ports}
+
+    # Explicit contract_id wins for the first port; the second port still
+    # gets the canonical promotion.
+    assert contract_ids["subscriber_usage_daily"] == (
+        "bizlab.teleforge.subscriber_usage_daily_lineage_local.custom_view"
+    )
+    assert contract_ids["billing_health_daily"] == (
+        "bizlab.teleforge.billing_health_daily_lineage_local.billing_health_daily"
+    )
 
 
 def test_apply_dry_run_odps_preserves_input_port_source_system_metadata():

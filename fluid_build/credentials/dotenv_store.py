@@ -27,7 +27,7 @@ from typing import Dict, Optional
 logger = logging.getLogger(__name__)
 
 try:
-    from dotenv import dotenv_values, load_dotenv
+    from dotenv import dotenv_values
 
     DOTENV_AVAILABLE = True
 except ImportError:
@@ -65,6 +65,16 @@ class DotEnvCredentialStore:
         self.environment = environment or os.environ.get("FLUID_ENV", "dev")
         self._cache: Optional[Dict[str, str]] = None
         self._loaded = False
+        # Snapshot env vars the operator set BEFORE this store runs. ``load()``
+        # uses this snapshot to decide which keys ``.env`` is allowed to push
+        # into ``os.environ``: preexisting keys represent the operator's
+        # explicit intent (e.g. ``set -a; . fluid.local.env; set +a``) and must
+        # not be clobbered by a project ``.env`` placeholder like
+        # ``DMM_API_KEY=``. The secrets-file override path in
+        # ``cli._common.hydrate_dotenv`` is a separate, explicit override
+        # (``load_dotenv(path, override=True)``) and still wins — that's the
+        # documented way to push operator-supplied values in.
+        self._preexisting_env_keys = frozenset(os.environ)
 
         logger.debug(f"Initialized .env store: {self.project_root} (env: {self.environment})")
 
@@ -93,11 +103,24 @@ class DotEnvCredentialStore:
                 try:
                     values = dotenv_values(env_file)
                     combined.update(values)
-
-                    # Also load into os.environ for backward compatibility
-                    load_dotenv(env_file, override=True)
                 except Exception as e:
                     logger.warning(f"Failed to load {env_file}: {e}")
+
+        # Export to ``os.environ`` for backward compatibility, but never
+        # override an env var the operator set BEFORE this store ran. Previous
+        # behavior called ``load_dotenv(path, override=True)`` per file, which
+        # silently clobbered shell-set values (e.g. a valid ``DMM_API_KEY``
+        # sourced from ``fluid.local.env``) with empty placeholders from
+        # project ``.env``. The explicit override path for operator secrets is
+        # ``cli._common.hydrate_dotenv`` (loads ``FLUID_SECRETS_FILE`` with
+        # ``override=True`` AFTER this store runs) — that still works and is
+        # the documented way to push operator values into the process.
+        for key, value in combined.items():
+            if value is None:
+                continue
+            if key in self._preexisting_env_keys:
+                continue
+            os.environ[key] = value
 
         self._cache = combined
         self._loaded = True
