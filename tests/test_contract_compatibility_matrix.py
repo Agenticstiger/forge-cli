@@ -220,9 +220,7 @@ def test_lineage_fixtures_preserve_input_ports_across_odps_exports(
     # ``/api/datacontracts/{productId}.{exposeId}``, not at
     # ``/api/datacontracts/{productId}``).
     assert [port["name"] for port in dmm_odps["inputPorts"]] == expected_ids
-    assert (
-        [port["contractId"] for port in dmm_odps["inputPorts"]] == expected_dmm_contract_ids
-    )
+    assert [port["contractId"] for port in dmm_odps["inputPorts"]] == expected_dmm_contract_ids
     # OdpsProvider (legacy OPDS/Linux Foundation emitter) is a DIFFERENT
     # provider — keeps its legacy {id, reference} shape. Not part of the
     # ODPS-Bitol schema contract.

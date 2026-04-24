@@ -275,8 +275,7 @@ def test_apply_dry_run_odps_maps_consumes_to_top_level_input_ports():
             "name": "subscriber_usage_daily",
             "version": "1",
             "contractId": (
-                "bizlab.teleforge.subscriber_usage_daily_lineage_local."
-                "subscriber_usage_daily"
+                "bizlab.teleforge.subscriber_usage_daily_lineage_local." "subscriber_usage_daily"
             ),
             "customProperties": [
                 {
@@ -289,8 +288,7 @@ def test_apply_dry_run_odps_maps_consumes_to_top_level_input_ports():
             "name": "billing_health_daily",
             "version": "1",
             "contractId": (
-                "bizlab.teleforge.billing_health_daily_lineage_local."
-                "billing_health_daily"
+                "bizlab.teleforge.billing_health_daily_lineage_local." "billing_health_daily"
             ),
             "customProperties": [
                 {
@@ -349,9 +347,9 @@ def test_apply_dry_run_odps_preserves_explicit_consumes_contract_id():
 
     contract = _sample_odps_consumes_contract()
     # Operator explicitly pins to a non-canonical contract id.
-    contract["consumes"][0]["contractId"] = (
-        "bizlab.teleforge.subscriber_usage_daily_lineage_local.custom_view"
-    )
+    contract["consumes"][0][
+        "contractId"
+    ] = "bizlab.teleforge.subscriber_usage_daily_lineage_local.custom_view"
 
     result = provider.apply(contract, dry_run=True, provider_hint="odps")
 

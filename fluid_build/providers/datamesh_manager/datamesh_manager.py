@@ -835,9 +835,7 @@ class DataMeshManagerProvider(BaseProvider):
         body = self._render_product_umbrella_contract(fluid, product_id)
         try:
             resp = self._request("PUT", f"/api/datacontracts/{product_id}", json_body=body)
-            self._log.info(
-                "Published umbrella contract %s (HTTP %s)", product_id, resp.status_code
-            )
+            self._log.info("Published umbrella contract %s (HTTP %s)", product_id, resp.status_code)
             return {
                 "contract_id": product_id,
                 "success": True,
@@ -1123,8 +1121,7 @@ class DataMeshManagerProvider(BaseProvider):
             if existing == reference and promoted != existing:
                 port["contractId"] = promoted
                 LOG.debug(
-                    "Promoted input port %s contractId %r -> %r "
-                    "(product-level -> expose-level)",
+                    "Promoted input port %s contractId %r -> %r " "(product-level -> expose-level)",
                     port_id,
                     existing,
                     promoted,

@@ -510,7 +510,9 @@ class TestProductUmbrellaContract:
         payload = result["odcs_product_umbrella"]["payload"]
         # Team must be present AND nested — bare string fails DMM validation.
         assert "team" in payload, "umbrella must carry team so DMM renders it under the right team"
-        assert isinstance(payload["team"], dict), f"team must be nested dict, got {type(payload['team'])}"
+        assert isinstance(
+            payload["team"], dict
+        ), f"team must be nested dict, got {type(payload['team'])}"
         assert payload["team"]["name"] == "data-engineering"
 
     def test_umbrella_does_not_emit_bare_domain(self):

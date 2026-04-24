@@ -438,8 +438,7 @@ class TestJenkinsPipelineTemplateGenerator:
         # The BUNDLE_FORMAT choice parameter was removed — the pipeline now
         # hardcodes tgz.
         assert "name: 'BUNDLE_FORMAT'" not in content, (
-            "BUNDLE_FORMAT should no longer be a pipeline parameter; "
-            "Stages 4/6/7 require tgz."
+            "BUNDLE_FORMAT should no longer be a pipeline parameter; " "Stages 4/6/7 require tgz."
         )
         # The obsolete, invalid choice must not reappear.
         assert "'yaml-single-file'" not in content, (
