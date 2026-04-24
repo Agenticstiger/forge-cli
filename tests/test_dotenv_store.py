@@ -97,6 +97,50 @@ class TestDotEnvCredentialStore:
         assert "SNOWFLAKE_PASS" in content
         assert "DO NOT commit" in content
 
+    def test_load_does_not_override_preexisting_env(self, tmp_path, monkeypatch):
+        """Regression: project ``.env`` must not clobber shell-set env vars.
+
+        The lab repro: operator does ``set -a; . fluid.local.env; set +a`` so
+        ``os.environ["DMM_API_KEY"]`` is a valid live key. Then the project
+        ``.env`` is loaded — previously ``load_dotenv(..., override=True)``
+        clobbered the shell-set key with the empty placeholder
+        ``DMM_API_KEY=`` from ``.env``, making ``fluid publish`` fail with
+        "Catalog health check failed - endpoint not accessible". Shell-set
+        values must win.
+        """
+        # Simulate shell-set env ("from_shell") before the store runs.
+        monkeypatch.setenv("TEST_PREEXISTING_KEY", "from_shell")
+        # Project .env has a different (or empty) value for the same key.
+        (tmp_path / ".env").write_text(
+            "TEST_PREEXISTING_KEY=from_dotenv\nTEST_NEW_KEY=from_dotenv\n"
+        )
+
+        store = DotEnvCredentialStore(project_root=tmp_path)
+        combined = store.load()
+
+        # The ``combined`` dict still reflects what ``.env`` contains — callers
+        # that want the ``.env`` value explicitly can still get at it.
+        assert combined["TEST_PREEXISTING_KEY"] == "from_dotenv"
+        # But ``os.environ`` is NOT clobbered — the shell value survives.
+        assert os.environ["TEST_PREEXISTING_KEY"] == "from_shell"
+        # Keys that were NOT preexisting get loaded as before.
+        assert os.environ.get("TEST_NEW_KEY") == "from_dotenv"
+
+    def test_load_preserves_empty_preexisting_env(self, tmp_path, monkeypatch):
+        """A shell var set to empty string is still operator intent — preserve it.
+
+        Edge case: operator explicitly unsets a var via ``export FOO=``. The
+        empty string MUST NOT be clobbered by a ``.env`` value; ``FOO=`` in the
+        shell means "I specifically want this empty."
+        """
+        monkeypatch.setenv("TEST_EMPTY_PREEXISTING", "")
+        (tmp_path / ".env").write_text("TEST_EMPTY_PREEXISTING=fallback\n")
+
+        store = DotEnvCredentialStore(project_root=tmp_path)
+        store.load()
+
+        assert os.environ["TEST_EMPTY_PREEXISTING"] == ""
+
 
 class TestEnsureGitignore:
     @pytest.mark.skipif(not HAS_DOTENV, reason="python-dotenv not installed")

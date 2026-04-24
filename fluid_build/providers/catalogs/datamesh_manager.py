@@ -121,10 +121,28 @@ class DataMeshManagerCatalogProvider(BaseCatalogProvider):
             return False
 
     async def health_check(self) -> bool:
+        """Ping the catalog with a cheap read to confirm auth + reachability.
+
+        Surfaces the underlying exception at ``WARNING`` before returning
+        ``False`` so the generic "endpoint not accessible" error downstream
+        is debuggable. Common causes and what they look like here:
+
+        - 403 from Entropy: ``DMM_API_KEY`` missing/stale (or the project's
+          project ``.env`` clobbered a shell-set key — see
+          ``credentials/dotenv_store.py`` for the override semantics).
+        - 5xx / connection refused: server not running on ``DMM_API_URL``.
+        - DNS / TLS / proxy: network layer wrong URL or blocked egress.
+        """
         try:
             self._provider.list_products()
             return True
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 — we deliberately log any
+            LOG.warning(
+                "Catalog %s health check failed: %s: %s",
+                self.name,
+                type(exc).__name__,
+                exc,
+            )
             return False
 
     # -- helpers ------------------------------------------------------------
