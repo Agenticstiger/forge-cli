@@ -22,12 +22,14 @@ fluid dmm publish contract.fluid.yaml --with-contract
 
 - **Publish data products** via `PUT /api/dataproducts/{id}`
 - **Publish data contracts** via `PUT /api/datacontracts/{id}`
+- **Publish product-to-product lineage** via `Access` resources derived from `consumes[]`
 - **Auto-create teams** when they don't exist
-- **Input/output port mapping** from FLUID expects/exposes
+- **Input/output port mapping** from FLUID expects/exposes plus explicit source-system consumes
 - **PII detection** from schema field classification
 - **Multi-provider location** mapping (BigQuery, Snowflake, S3, Kafka, Redshift, etc.)
 - **Dry-run mode** for previewing API payloads
 - **Retry with backoff** for transient failures (429, 5xx)
+- **Safe defaults** — plain HTTP is limited to local endpoints, API error bodies are redacted, and Access auto-approval is opt-in
 - **Catalog adapter** — also works via `fluid publish --catalog datamesh-manager`
 
 ## CLI Commands
@@ -91,7 +93,11 @@ Input/output ports are mapped with:
 - **type** — provider name → platform type (gcp→BigQuery, snowflake→Snowflake, etc.)
 - **location** — assembled from provider-specific config (project.dataset.table, s3://bucket/key, etc.)
 - **containsPii** — detected from schema field `classification: pii` or `pii: true`
-- **sourceSystemId** — from `source_system` or `sourceSystem` field
+- **ODPS display names** — DMM ODPS output ports keep their technical identifier in `name`; the publisher also writes `customProperties[displayName]` from the FLUID expose title/name so Entropy renders named output ports in Access and lineage views.
+- **Access lineage** — each product-to-product `consumes[]` entry becomes an Entropy `Access` agreement from the provider data product/output port to the consumer data product. This is the first-class product-to-product graph edge.
+- **Access approval** — production-safe default is create-only. Set `DMM_AUTO_APPROVE_ACCESS=true`, pass `--auto-approve-access`, or configure `auto_approve_access: true` only for local sandboxes or policies that intentionally auto-approve.
+- **ODPS input ports** — product-to-product `consumes[]` entries are intentionally removed from DMM ODPS input ports to avoid mirroring upstream products as SourceSystems. Explicit source-system consumes remain as input ports.
+- **sourceSystem** — preserved when explicitly authored. Set `DMM_ODPS_LINEAGE_MODE=source-system` or catalog config `odps_lineage_mode: source-system` only for legacy DMM servers that require SourceSystem custom properties for retained ODPS input ports.
 
 ## Using via `fluid publish`
 
@@ -104,6 +110,8 @@ catalogs:
     endpoint: https://api.entropy-data.com
     auth:
       api_key: ${DMM_API_KEY}
+    odps_lineage_mode: contract
+    auto_approve_access: false
     enabled: true
 
 # Then publish

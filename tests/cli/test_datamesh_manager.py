@@ -728,12 +728,14 @@ class TestCmdPublishEndToEnd:
         #   4. Printing the dry-run result does not raise
         assert code == 0
 
-    def test_publish_dry_run_payload_preserves_inputports_from_consumes(self):
-        """The ODPS-Bitol renderer path must surface FLUID ``consumes[]``
-        as ``inputPorts`` on the DMM payload. This is the integration-level
-        cousin of the unit test in ``test_odps_standard`` — the difference
-        is that this test walks through the real DMM provider and the real
-        loader, so any wiring drift between them surfaces here first."""
+    def test_publish_dry_run_payload_maps_product_consumes_to_access(self):
+        """DMM publishes product-to-product ``consumes[]`` as Access edges.
+
+        The raw ODPS-Bitol renderer still emits inputPorts, but Entropy CE
+        requires input-port ``sourceSystem`` values to resolve to SourceSystem
+        entities. Keeping product consumes as inputPorts duplicates graph nodes,
+        so the DMM provider removes those ports and emits Access agreements.
+        """
         import yaml
 
         with self._FIXTURE.open("r", encoding="utf-8") as fh:
@@ -753,41 +755,19 @@ class TestCmdPublishEndToEnd:
         assert payload["kind"] == "DataProduct"
         assert payload["id"] == fixture_contract["id"]
 
-        # ODPS-Bitol v1.0.0 InputPort forbids ``id`` and ``reference``; the
-        # identifier travels via ``name`` and the upstream source's canonical
-        # name is folded into ``contractId`` (synthesized by OdpsStandardProvider
-        # when the FLUID consume didn't declare one explicitly).
-        expected_refs = [c["productId"] for c in fixture_contract["consumes"]]
-        expected_ids = [c["exposeId"] for c in fixture_contract["consumes"]]
-        actual_ids = [p["name"] for p in payload["inputPorts"]]
-        assert actual_ids == expected_ids
+        assert "inputPorts" not in payload
 
-        # DMM overlay preserves the upstream source as a customProperties
-        # entry (sourceSystem), since v1.0.0 InputPort doesn't permit
-        # a ``reference`` field directly. Assert both the contractId
-        # synthesis and the sourceSystem preservation.
-        for port, consume, expected_ref in zip(
-            payload["inputPorts"], fixture_contract["consumes"], expected_refs
-        ):
-            # contractId is the upstream source ref (name-synthesis fallback
-            # of the OdpsStandardProvider chain).
-            assert expected_ref in port["contractId"], (
-                f"contractId should reflect upstream source; "
-                f"got {port['contractId']!r}, expected to contain {expected_ref!r}"
+        expected_edges = {
+            (consume["productId"], consume["exposeId"]) for consume in fixture_contract["consumes"]
+        }
+        actual_edges = {
+            (
+                preview["payload"]["provider"]["dataProductId"],
+                preview["payload"]["provider"]["outputPortId"],
             )
-            props = port.get("customProperties") or []
-            source_system = next(
-                (p.get("value") for p in props if p.get("property") == "sourceSystem"),
-                None,
-            )
-            assert source_system == expected_ref, (
-                f"sourceSystem customProperty should carry the upstream "
-                f"productId {expected_ref!r}; got {source_system!r}"
-            )
-            # Schema-forbidden fields must NOT appear.
-            assert "id" not in port
-            assert "reference" not in port
-            assert "required" not in port
+            for preview in result["access_agreements"]
+        }
+        assert actual_edges == expected_edges
 
 
 # ---------------------------------------------------------------------------

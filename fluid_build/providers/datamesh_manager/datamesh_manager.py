@@ -36,10 +36,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from collections.abc import Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from fluid_build.providers.base import BaseProvider, ProviderError
 from fluid_build.util.contract import consumes_to_canonical_ports
@@ -75,6 +77,28 @@ _DEFAULT_API_URL = "https://api.entropy-data.com"
 _TIMEOUT = 30  # seconds
 _DEFAULT_DPS_SPECIFICATION = "0.0.1"
 _DEFAULT_ODPS_SPECIFICATION = "odps"
+_DEFAULT_ODPS_LINEAGE_MODE = "contract"
+_ACCESS_ID_UNSAFE = re.compile(r"[^A-Za-z0-9._~-]+")
+_LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal"}
+_SECRET_ERROR_PATTERNS = (
+    re.compile(r"(?i)(x-api-key|api[_-]?key|password|token|secret)([\"'\s:=]+)([^\"'\s,;}]+)"),
+    re.compile(r"ed_live_[A-Za-z0-9_]+"),
+)
+
+_ODPS_LINEAGE_MODE_ALIASES: Dict[str, str] = {
+    "contract": "contract",
+    "contract-id": "contract",
+    "contract_id": "contract",
+    "contractid": "contract",
+    "product": "contract",
+    "product-lineage": "contract",
+    "source-system": "source-system",
+    "source_system": "source-system",
+    "sourcesystem": "source-system",
+    "legacy": "source-system",
+    "compat": "source-system",
+    "compatibility": "source-system",
+}
 
 _STATUS_MAP: Dict[str, str] = {
     "draft": "draft",
@@ -128,6 +152,8 @@ class DataMeshManagerProvider(BaseProvider):
         *,
         api_key: Optional[str] = None,
         api_url: Optional[str] = None,
+        odps_lineage_mode: Optional[str] = None,
+        auto_approve_access: Optional[bool] = None,
         logger: Optional[logging.Logger] = None,
         **kwargs: Any,
     ) -> None:
@@ -136,7 +162,17 @@ class DataMeshManagerProvider(BaseProvider):
         self._log = logger or LOG
 
         self.api_key = api_key or os.getenv("DMM_API_KEY", "")
-        self.api_url = (api_url or os.getenv("DMM_API_URL", _DEFAULT_API_URL)).rstrip("/")
+        self.api_url = self._normalize_api_url(
+            api_url or os.getenv("DMM_API_URL", _DEFAULT_API_URL)
+        )
+        self.odps_lineage_mode = self._normalize_odps_lineage_mode(
+            odps_lineage_mode or os.getenv("DMM_ODPS_LINEAGE_MODE", _DEFAULT_ODPS_LINEAGE_MODE)
+        )
+        self.auto_approve_access = self._normalize_bool(
+            auto_approve_access,
+            env_value=os.getenv("DMM_AUTO_APPROVE_ACCESS"),
+            default=False,
+        )
 
         if not REQUESTS_AVAILABLE:
             raise ProviderError(
@@ -198,6 +234,8 @@ class DataMeshManagerProvider(BaseProvider):
         data_product_specification: Optional[str] = kw.get("data_product_specification")
         validate_generated_contracts: bool = kw.get("validate_generated_contracts", False)
         validation_mode: str = kw.get("validation_mode", "warn")
+        odps_lineage_mode: Optional[str] = kw.get("odps_lineage_mode")
+        auto_approve_access: Optional[bool] = kw.get("auto_approve_access")
 
         self._require_api_key()
 
@@ -218,6 +256,8 @@ class DataMeshManagerProvider(BaseProvider):
                 ),
                 validate_generated_contracts=validate_generated_contracts,
                 validation_mode=validation_mode,
+                odps_lineage_mode=odps_lineage_mode,
+                auto_approve_access=auto_approve_access,
             )
             results.append(result)
 
@@ -233,6 +273,66 @@ class DataMeshManagerProvider(BaseProvider):
             "validate_contract": False,
             "verify": True,
         }
+
+    @staticmethod
+    def _normalize_bool(
+        value: Optional[bool],
+        *,
+        env_value: Optional[str] = None,
+        default: bool = False,
+    ) -> bool:
+        if value is not None:
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
+        if env_value is None:
+            return default
+        return str(env_value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _normalize_api_url(value: str) -> str:
+        url = str(value or _DEFAULT_API_URL).strip().rstrip("/")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ProviderError(
+                f"Invalid Data Mesh Manager API URL {value!r}. Expected an http(s) URL."
+            )
+
+        allow_insecure = str(os.getenv("DMM_ALLOW_INSECURE_HTTP", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme == "http" and host not in _LOCAL_HTTP_HOSTS and not allow_insecure:
+            raise ProviderError(
+                "Refusing to send DMM credentials over plain HTTP to a non-local host "
+                f"({host!r}). Use https:// or set DMM_ALLOW_INSECURE_HTTP=true intentionally."
+            )
+        return url
+
+    @staticmethod
+    def _redact_error_body(body: str) -> str:
+        redacted = body[:500]
+        for pattern in _SECRET_ERROR_PATTERNS:
+            if pattern.groups >= 3:
+                redacted = pattern.sub(r"\1\2***REDACTED***", redacted)
+            else:
+                redacted = pattern.sub("***REDACTED***", redacted)
+        return redacted
+
+    @staticmethod
+    def _normalize_odps_lineage_mode(value: Optional[str]) -> str:
+        """Return the deterministic ODPS lineage strategy for DMM payloads."""
+        raw = str(value or _DEFAULT_ODPS_LINEAGE_MODE).strip().lower()
+        mode = _ODPS_LINEAGE_MODE_ALIASES.get(raw)
+        if not mode:
+            allowed = ", ".join(sorted({"contract", "source-system"}))
+            raise ProviderError(
+                f"Invalid DMM ODPS lineage mode {value!r}. Expected one of: {allowed}."
+            )
+        return mode
 
     # ---- extra public methods ---------------------------------------------
 
@@ -300,7 +400,11 @@ class DataMeshManagerProvider(BaseProvider):
         """
         self._require_api_key()
 
-        url = publish_url or f"{self.api_url}/api/test-results"
+        url = (
+            self._normalize_api_url(publish_url)
+            if publish_url
+            else f"{self.api_url}/api/test-results"
+        )
 
         # Build payload compatible with Entropy Data test-results API
         issues = getattr(report, "issues", [])
@@ -355,7 +459,7 @@ class DataMeshManagerProvider(BaseProvider):
             raise ProviderError(f"Failed to publish test results to {url}: {exc}") from exc
 
         if resp.status_code >= 400:
-            body = resp.text[:500]
+            body = self._redact_error_body(resp.text)
             raise ProviderError(f"Test results publish failed (HTTP {resp.status_code}): {body}")
 
         self._log.info("Published test results to %s (HTTP %s)", url, resp.status_code)
@@ -379,6 +483,8 @@ class DataMeshManagerProvider(BaseProvider):
         data_product_specification: Optional[str] = None,
         validate_generated_contracts: bool = False,
         validation_mode: str = "warn",
+        odps_lineage_mode: Optional[str] = None,
+        auto_approve_access: Optional[bool] = None,
     ) -> Dict[str, Any]:
         dp = self._to_data_product(
             fluid,
@@ -386,6 +492,15 @@ class DataMeshManagerProvider(BaseProvider):
         )
         product_id = dp.get("id") or self._extract_id(fluid)
         is_odps_payload = self._is_odps_payload(dp)
+        lineage_mode = self._normalize_odps_lineage_mode(
+            odps_lineage_mode or self.odps_lineage_mode
+        )
+        use_source_system_fallback = lineage_mode == "source-system"
+        approve_access = self._normalize_bool(
+            auto_approve_access,
+            env_value=os.getenv("DMM_AUTO_APPROVE_ACCESS"),
+            default=self.auto_approve_access,
+        )
 
         # Resolve team
         tid = team_id_override or self._derive_team_id(fluid)
@@ -395,8 +510,14 @@ class DataMeshManagerProvider(BaseProvider):
                 team_obj = {}
             team_obj.setdefault("name", tid)
             dp["team"] = team_obj
+            self._ensure_odps_output_port_display_names(dp, fluid)
+            self._remove_odps_product_consume_input_ports(dp, fluid)
             self._ensure_odps_input_port_contract_ids(dp, fluid)
-            self._ensure_odps_input_port_source_system_custom_property(dp, fluid)
+            self._ensure_odps_input_port_source_system_custom_property(
+                dp,
+                fluid,
+                default_from_reference=use_source_system_fallback,
+            )
         else:
             dp["teamId"] = tid
 
@@ -419,6 +540,15 @@ class DataMeshManagerProvider(BaseProvider):
                 "url": f"{self.api_url}/api/dataproducts/{product_id}",
                 "payload": dp,
             }
+            access_previews = self._preview_access_agreements(
+                fluid,
+                product_id,
+                auto_approve_access=approve_access,
+            )
+            if access_previews:
+                result["access_agreements"] = access_previews
+            if is_odps_payload:
+                result["odps_lineage_mode"] = lineage_mode
             # Also preview per-expose ODCS contracts so the caller can inspect them
             if publish_contract:
                 result["odcs_contracts"] = self._preview_odcs_per_expose(fluid, product_id)
@@ -431,12 +561,11 @@ class DataMeshManagerProvider(BaseProvider):
         if create_team:
             self._ensure_team(fluid, tid)
 
-        # Ensure upstream SourceSystem entities exist so inputPorts[].sourceSystemId
-        # resolves on the server side. DMM's DPS schema treats sourceSystemId as a
-        # foreign key — the product PUT fails with a 500 if the referenced
-        # SourceSystem is missing.
         if is_odps_payload:
-            self._ensure_source_systems(fluid, tid)
+            self._ensure_source_systems(
+                fluid,
+                tid,
+            )
 
         # PUT data product
         resp = self._request("PUT", f"/api/dataproducts/{product_id}", json_body=dp)
@@ -449,6 +578,8 @@ class DataMeshManagerProvider(BaseProvider):
             "status_code": resp.status_code,
             "url": f"{self.api_url}/dataproducts/{product_id}",
         }
+        if is_odps_payload:
+            result["odps_lineage_mode"] = lineage_mode
 
         # Publish one ODCS data contract per expose, linked via dataContractId
         if publish_contract:
@@ -473,7 +604,172 @@ class DataMeshManagerProvider(BaseProvider):
             umbrella_result = self._publish_product_umbrella_contract(fluid, product_id)
             result["odcs_product_umbrella"] = umbrella_result
 
+        access_results = self._publish_access_agreements(
+            fluid,
+            product_id,
+            auto_approve_access=approve_access,
+        )
+        if access_results:
+            result["access_agreements"] = access_results
+
         return result
+
+    # ---- Access agreements / product-to-product lineage --------------------
+
+    def _preview_access_agreements(
+        self,
+        fluid: Mapping[str, Any],
+        consumer_product_id: str,
+        *,
+        auto_approve_access: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return Entropy Access payloads generated from FLUID ``consumes``.
+
+        Entropy models product-to-product graph edges as Access resources. The
+        ODPS ``inputPorts[].contractId`` field is still important, but it points
+        to the upstream data contract; it is not the graph edge itself.
+        """
+        previews: List[Dict[str, Any]] = []
+        for payload in self._build_access_agreements(fluid, consumer_product_id):
+            preview = {
+                "method": "PUT",
+                "url": f"{self.api_url}/api/access/{payload['id']}",
+                "auto_approve": auto_approve_access,
+                "payload": payload,
+            }
+            if auto_approve_access:
+                preview["approve_url"] = f"{self.api_url}/api/access/{payload['id']}/approve"
+            previews.append(preview)
+        return previews
+
+    def _publish_access_agreements(
+        self,
+        fluid: Mapping[str, Any],
+        consumer_product_id: str,
+        *,
+        auto_approve_access: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Create Entropy Access agreements for FLUID ``consumes``."""
+        payloads = self._build_access_agreements(fluid, consumer_product_id)
+        results: List[Dict[str, Any]] = []
+
+        for payload in payloads:
+            access_id = payload["id"]
+            provider = payload.get("provider", {})
+            try:
+                put_resp = self._request("PUT", f"/api/access/{access_id}", json_body=payload)
+                approve_resp = None
+                if auto_approve_access:
+                    approve_resp = self._request("POST", f"/api/access/{access_id}/approve")
+                self._log.info(
+                    "Published Access lineage %s -> %s.%s (HTTP %s%s)",
+                    consumer_product_id,
+                    provider.get("dataProductId"),
+                    provider.get("outputPortId"),
+                    put_resp.status_code,
+                    f"/{approve_resp.status_code}" if approve_resp is not None else "",
+                )
+                result = {
+                    "access_id": access_id,
+                    "success": True,
+                    "status_code": put_resp.status_code,
+                    "auto_approved": auto_approve_access,
+                    "provider_data_product_id": provider.get("dataProductId"),
+                    "provider_output_port_id": provider.get("outputPortId"),
+                    "consumer_data_product_id": consumer_product_id,
+                    "url": f"{self.api_url}/access/{access_id}",
+                }
+                if approve_resp is not None:
+                    result["approval_status_code"] = approve_resp.status_code
+                results.append(result)
+            except ProviderError as exc:
+                self._log.error("Failed to publish Access lineage %s: %s", access_id, exc)
+                raise
+
+        return results
+
+    def _build_access_agreements(
+        self,
+        fluid: Mapping[str, Any],
+        consumer_product_id: str,
+        *,
+        start_date: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Build Entropy Access resources from canonical FLUID consume refs."""
+        effective_start_date = start_date or datetime.utcnow().date().isoformat()
+        payloads: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for canonical in consumes_to_canonical_ports(fluid, logger=LOG):
+            provider_product_id = canonical.get("reference")
+            provider_output_port_id = canonical.get("id")
+            if not provider_product_id or not provider_output_port_id:
+                continue
+
+            provider_product_id = str(provider_product_id)
+            provider_output_port_id = str(provider_output_port_id)
+            access_id = self._access_agreement_id(
+                consumer_product_id,
+                provider_product_id,
+                provider_output_port_id,
+            )
+            if access_id in seen:
+                continue
+            seen.add(access_id)
+
+            purpose = canonical.get("description") or (
+                f"{consumer_product_id} consumes "
+                f"{provider_product_id}.{provider_output_port_id}."
+            )
+
+            tags = ["fluid", "lineage"]
+            for tag in canonical.get("tags") or []:
+                tag = str(tag)
+                if tag not in tags:
+                    tags.append(tag)
+
+            custom = {
+                "managedBy": "forge-cli",
+                "source": "fluid.consumes",
+                "providerContractId": (
+                    str(canonical.get("contract_id"))
+                    if canonical.get("contract_id")
+                    else f"{provider_product_id}.{provider_output_port_id}"
+                ),
+            }
+            if canonical.get("version_constraint"):
+                custom["versionConstraint"] = str(canonical["version_constraint"])
+
+            payloads.append(
+                {
+                    "id": access_id,
+                    "info": {
+                        "purpose": str(purpose),
+                        "startDate": effective_start_date,
+                    },
+                    "provider": {
+                        "dataProductId": provider_product_id,
+                        "outputPortId": provider_output_port_id,
+                    },
+                    "consumer": {
+                        "dataProductId": consumer_product_id,
+                    },
+                    "tags": tags,
+                    "custom": custom,
+                }
+            )
+
+        return payloads
+
+    @staticmethod
+    def _access_agreement_id(
+        consumer_product_id: str,
+        provider_product_id: str,
+        provider_output_port_id: str,
+    ) -> str:
+        raw = f"{consumer_product_id}__uses__{provider_product_id}__{provider_output_port_id}"
+        access_id = _ACCESS_ID_UNSAFE.sub("_", raw).strip("_")
+        return access_id or str(uuid.uuid4())
 
     # ---- ODCS per-expose publishing ---------------------------------------
 
@@ -1006,6 +1302,52 @@ class DataMeshManagerProvider(BaseProvider):
             and "info" not in payload
         )
 
+    @staticmethod
+    def _ensure_odps_output_port_display_names(
+        odps_payload: Dict[str, Any], fluid: Mapping[str, Any]
+    ) -> None:
+        """Add DMM display names without leaving the official ODPS shape.
+
+        ODPS-Bitol output ports use ``name`` as the technical identifier. Entropy
+        CE stores that value as ``output_port.external_id``; several UI paths
+        render ``output_port.name`` and treat a missing value as "deleted".
+        ``customProperties[displayName]`` is accepted by Entropy's ODPS importer
+        and remains valid ODPS, so use it to populate the DMM display label.
+        """
+        output_ports = odps_payload.get("outputPorts")
+        if not isinstance(output_ports, list) or not output_ports:
+            return
+
+        display_name_by_port: Dict[str, str] = {}
+        for expose in fluid.get("exposes", []):
+            if not isinstance(expose, Mapping):
+                continue
+            expose_id = expose.get("exposeId") or expose.get("id") or expose.get("name")
+            if not expose_id:
+                continue
+            display_name = expose.get("title") or expose.get("name") or expose_id
+            display_name_by_port[str(expose_id)] = str(display_name)
+
+        for port in output_ports:
+            if not isinstance(port, dict):
+                continue
+            port_name = port.get("name")
+            if not port_name:
+                continue
+            display_name = display_name_by_port.get(str(port_name), str(port_name))
+
+            props = port.get("customProperties")
+            if not isinstance(props, list):
+                props = []
+
+            has_display_name = any(
+                isinstance(prop, Mapping) and str(prop.get("property", "")).lower() == "displayname"
+                for prop in props
+            )
+            if not has_display_name:
+                props.append({"property": "displayName", "value": display_name})
+            port["customProperties"] = props
+
     def _resolve_data_product_specification(
         self,
         value: Optional[str],
@@ -1029,6 +1371,45 @@ class DataMeshManagerProvider(BaseProvider):
         return self.DATA_PRODUCT_SPEC_DPS
 
     @staticmethod
+    def _remove_odps_product_consume_input_ports(
+        odps_payload: Dict[str, Any], fluid: Mapping[str, Any]
+    ) -> None:
+        """Remove product-to-product consumes from ODPS input ports.
+
+        Entropy's graph uses Access resources for product-to-product lineage.
+        The local CE ODPS importer also requires ``sourceSystem`` custom
+        properties on every input port to resolve to SourceSystem entities. If
+        we keep product consumes as ODPS input ports, those upstream products
+        have to be mirrored as SourceSystems and the UI renders duplicate graph
+        nodes. Explicit source-system consumes remain as input ports.
+        """
+        input_ports = odps_payload.get("inputPorts")
+        if not isinstance(input_ports, list) or not input_ports:
+            return
+
+        product_port_names: set[str] = set()
+        for canonical in consumes_to_canonical_ports(fluid, logger=LOG):
+            if not canonical.get("reference") or canonical.get("source_system_id"):
+                continue
+            for key in ("id", "name"):
+                value = canonical.get(key)
+                if value:
+                    product_port_names.add(str(value))
+
+        if not product_port_names:
+            return
+
+        retained = [
+            port
+            for port in input_ports
+            if not (isinstance(port, Mapping) and str(port.get("name", "")) in product_port_names)
+        ]
+        if retained:
+            odps_payload["inputPorts"] = retained
+        else:
+            odps_payload.pop("inputPorts", None)
+
+    @staticmethod
     def _ensure_odps_input_port_contract_ids(
         odps_payload: Dict[str, Any], fluid: Mapping[str, Any]
     ) -> None:
@@ -1039,8 +1420,9 @@ class DataMeshManagerProvider(BaseProvider):
 
         1. **Backfill** — port has no ``contractId``. Set it to the canonical
            ``{productId}.{exposeId}`` address for the bronze expose the silver
-           is consuming. This is the published ODCS contract location and is
-           what the DMM UI dereferences to render a resolved lineage link.
+           is consuming. This is the published ODCS contract location. Entropy
+           product-to-product graph edges are published separately as Access
+           resources from the same FLUID ``consumes`` entries.
 
         2. **Promote** — port already has a ``contractId``, but it's just the
            upstream product reference (e.g. ``bronze.telco.party_v1``) because
@@ -1111,9 +1493,10 @@ class DataMeshManagerProvider(BaseProvider):
 
             # Case 2: promote — existing is just the product-level reference.
             #
-            # DMM's UI dereferences ``contractId`` against
+            # DMM dereferences ``contractId`` against
             # ``/api/datacontracts/{id}``; the bare product ID only resolves at
-            # ``/api/dataproducts/{id}`` and so renders as an unresolved link.
+            # ``/api/dataproducts/{id}`` and so renders as an unresolved
+            # contract link.
             # Rewrite it to the expose-level form (``{productId}.{exposeId}``),
             # which is where ``_publish_odcs_per_expose`` actually PUT the ODCS
             # contract. Anything else the operator set is left alone.
@@ -1129,16 +1512,18 @@ class DataMeshManagerProvider(BaseProvider):
 
     @staticmethod
     def _ensure_odps_input_port_source_system_custom_property(
-        odps_payload: Dict[str, Any], fluid: Mapping[str, Any]
+        odps_payload: Dict[str, Any],
+        fluid: Mapping[str, Any],
+        *,
+        default_from_reference: bool = True,
     ) -> None:
-        """Backfill ODPS input-port ``customProperties[sourceSystem]``.
+        """Attach ODPS input-port ``customProperties[sourceSystem]`` when requested.
 
-        DMM resolves upstream lineage via a ``sourceSystem`` custom property
-        on each input port (verified by probing the live server: a port
-        missing this key returns ``500 "Custom Property sourceSystem could
-        not be found"``, and a top-level ``sourceSystemId`` is ignored).
-        Fill it from the FLUID ``consumes`` reference — the upstream
-        ``productId`` is the canonical identifier.
+        The default DMM publish path uses ``contractId`` for product-to-product
+        lineage and should not invent SourceSystems from upstream product IDs.
+        ``default_from_reference=True`` is the explicit legacy compatibility
+        mode for DMM deployments that still require a ``sourceSystem`` custom
+        property on every input port.
         """
         input_ports = odps_payload.get("inputPorts")
         if not isinstance(input_ports, list) or not input_ports:
@@ -1150,7 +1535,9 @@ class DataMeshManagerProvider(BaseProvider):
             port_id = canonical.get("id")
             if not port_id:
                 continue
-            sys_id = canonical.get("source_system_id") or canonical.get("reference")
+            sys_id = canonical.get("source_system_id")
+            if not sys_id and default_from_reference:
+                sys_id = canonical.get("reference")
             if sys_id:
                 source_system_by_port[str(port_id)] = str(sys_id)
 
@@ -1166,7 +1553,7 @@ class DataMeshManagerProvider(BaseProvider):
 
             port_id = port.get("id") or port.get("name")
             fallback = source_system_by_port.get(str(port_id)) if port_id else None
-            if not fallback:
+            if not fallback and default_from_reference:
                 fallback = port.get("reference")
             if not fallback:
                 continue
@@ -2008,20 +2395,47 @@ class DataMeshManagerProvider(BaseProvider):
             resp = self._request("PUT", f"/api/teams/{team_id}", json_body=team)
             self._log.info("Created/updated team %s (%s)", team_id, resp.status_code)
         except ProviderError as exc:
+            if team.get("members") and self._is_missing_team_member_error(exc):
+                fallback_team = dict(team)
+                fallback_team.pop("members", None)
+                try:
+                    resp = self._request("PUT", f"/api/teams/{team_id}", json_body=fallback_team)
+                    self._log.info(
+                        "Created/updated team %s without members because this DMM "
+                        "server requires users to exist before team membership (%s)",
+                        team_id,
+                        resp.status_code,
+                    )
+                    return
+                except ProviderError as retry_exc:
+                    self._log.warning("Could not create team %s: %s", team_id, retry_exc)
+                    return
             self._log.warning("Could not create team %s: %s", team_id, exc)
 
-    def _ensure_source_systems(self, fluid: Mapping[str, Any], team_id: str) -> None:
-        """Upsert a SourceSystem per unique upstream reference in ``consumes``.
+    @staticmethod
+    def _is_missing_team_member_error(exc: ProviderError) -> bool:
+        message = str(exc).lower()
+        return "/api/teams/" in message and "user " in message and " not found" in message
 
-        DMM's DPS schema requires each ``inputPort.sourceSystemId`` to resolve
-        to an existing SourceSystem entity. We treat the upstream ``productId``
-        as the natural SourceSystem id — one upsert per distinct reference.
-        Idempotent: GET first, PUT only when missing.
+    def _ensure_source_systems(
+        self,
+        fluid: Mapping[str, Any],
+        team_id: str,
+        *,
+        default_from_reference: bool = False,
+    ) -> None:
+        """Upsert SourceSystem entities referenced by ODPS input ports.
+
+        Only explicitly authored ``sourceSystem`` fields become SourceSystem
+        entities. Compatibility mode may still add a ``sourceSystem`` custom
+        property from an upstream product reference to satisfy local CE
+        validation, but creating SourceSystem rows for those product IDs causes
+        duplicate graph nodes next to the real Access lineage edges.
         """
         canonical_ports = consumes_to_canonical_ports(fluid, logger=LOG)
         seen: set = set()
         for canonical in canonical_ports:
-            sys_id = canonical.get("source_system_id") or canonical.get("reference")
+            sys_id = canonical.get("source_system_id")
             if not sys_id or sys_id in seen:
                 continue
             seen.add(sys_id)
@@ -2132,7 +2546,7 @@ class DataMeshManagerProvider(BaseProvider):
             raise ProviderError(f"HTTP request failed: {url} — {exc}") from exc
 
         if resp.status_code >= 400:
-            body = resp.text[:500]
+            body = self._redact_error_body(resp.text)
             raise ProviderError(
                 f"Entropy Data API error {resp.status_code} on {method} {path}: {body}"
             )

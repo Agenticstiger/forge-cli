@@ -65,7 +65,7 @@ class OdpsStandardProvider(BaseProvider):
 
         # Configuration
         self.include_custom_properties = os.getenv("ODPS_INCLUDE_CUSTOM", "true").lower() == "true"
-        self.default_port_version = os.getenv("ODPS_DEFAULT_PORT_VERSION", "1")
+        self.default_port_version = os.getenv("ODPS_DEFAULT_PORT_VERSION", "1.0.0")
 
     @property
     def name(self) -> str:
@@ -387,12 +387,14 @@ class OdpsStandardProvider(BaseProvider):
             ODPS output port dictionary
         """
         expose_id = self._extract_expose_id(expose)
+        metadata = fluid.get("metadata") if isinstance(fluid.get("metadata"), Mapping) else {}
+        port_version = expose.get("version") or metadata.get("version") or self.default_port_version
         # ODPS-Bitol v1.0.0 OutputPort (``additionalProperties: false``) does
         # NOT permit an ``id`` field. The expose identifier travels via
         # ``name`` instead. Keep ``id`` OUT of the emitted port dict.
         port = {
             "name": expose_id,
-            "version": str(expose.get("version", self.default_port_version)),
+            "version": str(port_version),
             "description": expose.get("description", ""),
         }
 

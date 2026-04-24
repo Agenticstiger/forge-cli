@@ -93,6 +93,23 @@ def add_parser(subparsers):
         ),
     )
     pub.add_argument(
+        "--odps-lineage-mode",
+        choices=["contract", "source-system"],
+        help=(
+            "ODPS input lineage strategy. 'contract' uses inputPorts[].contractId "
+            "for product-to-product lineage; 'source-system' enables legacy "
+            "SourceSystem compatibility."
+        ),
+    )
+    pub.add_argument(
+        "--auto-approve-access",
+        action="store_true",
+        help=(
+            "Automatically approve Entropy Access agreements generated from consumes[]. "
+            "Use only for local sandboxes; production workflows should review Access separately."
+        ),
+    )
+    pub.add_argument(
         "--validate-generated-contracts",
         action="store_true",
         help="Validate generated ODCS contracts locally before PUT.",
@@ -177,6 +194,10 @@ def _make_provider(args) -> DataMeshManagerProvider:
         kwargs["api_key"] = args.api_key
     if getattr(args, "api_url", None):
         kwargs["api_url"] = args.api_url
+    if getattr(args, "odps_lineage_mode", None):
+        kwargs["odps_lineage_mode"] = args.odps_lineage_mode
+    if getattr(args, "auto_approve_access", False):
+        kwargs["auto_approve_access"] = True
     return DataMeshManagerProvider(**kwargs)
 
 
@@ -265,6 +286,8 @@ def _cmd_publish(args, logger=None):
             provider_hint=provider_hint,
             validate_generated_contracts=getattr(args, "validate_generated_contracts", False),
             validation_mode=getattr(args, "validation_mode", "warn"),
+            odps_lineage_mode=getattr(args, "odps_lineage_mode", None),
+            auto_approve_access=getattr(args, "auto_approve_access", False),
         )
 
         if args.dry_run:

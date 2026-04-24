@@ -20,6 +20,7 @@ import requests
 
 from fluid_build.cli.datamesh_manager import _cmd_publish, _publish_exit_code
 from fluid_build.providers.base import ProviderError
+from fluid_build.providers.catalogs.datamesh_manager import DataMeshManagerCatalogProvider
 from fluid_build.providers.datamesh_manager import DataMeshManagerProvider
 
 
@@ -204,6 +205,32 @@ def test_apply_dry_run_sets_per_expose_contract_ids_for_odps():
     assert contract_ids == ["sales-product.orders", "sales-product.customers"]
 
 
+def test_apply_dry_run_sets_odps_output_port_display_names_for_dmm():
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+    contract = _sample_contract_with_exposes()
+    contract["exposes"][0]["title"] = "Orders"
+    contract["exposes"][1]["title"] = "Customers"
+
+    result = provider.apply(
+        contract,
+        dry_run=True,
+        publish_contract=True,
+        provider_hint="odps",
+    )
+
+    output_ports = result["payload"].get("outputPorts", [])
+    assert "id" not in output_ports[0]
+    display_names = {
+        port["name"]: next(
+            prop["value"]
+            for prop in port.get("customProperties", [])
+            if prop.get("property") == "displayName"
+        )
+        for port in output_ports
+    }
+    assert display_names == {"orders": "Orders", "customers": "Customers"}
+
+
 def test_apply_dry_run_odps_includes_top_level_tags_when_metadata_missing():
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
@@ -243,7 +270,7 @@ def test_apply_dry_run_odps_sets_output_port_type_from_binding_platform():
     assert output_ports[0]["type"] == "bigquery"
 
 
-def test_apply_dry_run_odps_maps_consumes_to_top_level_input_ports():
+def test_apply_dry_run_odps_maps_product_consumes_to_access_not_input_ports():
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
     result = provider.apply(
@@ -252,70 +279,238 @@ def test_apply_dry_run_odps_maps_consumes_to_top_level_input_ports():
         provider_hint="odps",
     )
 
-    # ODPS-Bitol v1.0.0 InputPort (``additionalProperties: false``) permits
-    # only: name, version, contractId, tags, customProperties,
-    # authoritativeDefinitions. The upstream OdpsStandardProvider emits
-    # the conformant base shape; DMM overlays the ``sourceSystem`` custom
-    # property so Entropy's ODPS product PUT carries that lineage hint.
-    #
-    # ``id``, ``description``, ``reference`` are NOT permitted on v1.0.0
-    # InputPort and are stripped from the artifact. The DMM overlay's
-    # ``_ensure_odps_input_port_source_system_custom_property`` preserves
-    # the lineage ref via customProperties instead.
-    #
-    # ``contractId`` is promoted from the upstream ``reference`` (bare
-    # product ID, e.g. ``bizlab.teleforge.subscriber_usage_daily_lineage_local``)
-    # to the expose-level ``{productId}.{exposeId}`` form — that's where
-    # ``_publish_odcs_per_expose`` actually PUT the ODCS contract, so the
-    # DMM UI can dereference the link. See
-    # ``_ensure_odps_input_port_contract_ids`` for the promotion rule.
-    input_ports = result["payload"].get("inputPorts", [])
-    assert input_ports == [
+    # Product-to-product consumes are Entropy Access agreements, not ODPS
+    # inputPorts. Keeping them as inputPorts forces the local CE importer to
+    # mirror upstream products as SourceSystems, which renders duplicate graph
+    # nodes next to the real product lineage.
+    assert "inputPorts" not in result["payload"]
+    assert len(result["access_agreements"]) == 2
+
+
+def test_build_access_agreements_maps_consumes_to_entropy_lineage_edges():
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+
+    payloads = provider._build_access_agreements(
+        _sample_odps_consumes_contract(),
+        "bizlab.teleforge.subscriber_health_360_lineage_local",
+        start_date="2026-04-24",
+    )
+
+    assert payloads == [
         {
-            "name": "subscriber_usage_daily",
-            "version": "1",
-            "contractId": (
-                "bizlab.teleforge.subscriber_usage_daily_lineage_local." "subscriber_usage_daily"
+            "id": (
+                "bizlab.teleforge.subscriber_health_360_lineage_local__uses__"
+                "bizlab.teleforge.subscriber_usage_daily_lineage_local__subscriber_usage_daily"
             ),
-            "customProperties": [
-                {
-                    "property": "sourceSystem",
-                    "value": "bizlab.teleforge.subscriber_usage_daily_lineage_local",
-                }
-            ],
+            "info": {
+                "purpose": "Supply daily subscriber usage features to the health model.",
+                "startDate": "2026-04-24",
+            },
+            "provider": {
+                "dataProductId": "bizlab.teleforge.subscriber_usage_daily_lineage_local",
+                "outputPortId": "subscriber_usage_daily",
+            },
+            "consumer": {
+                "dataProductId": "bizlab.teleforge.subscriber_health_360_lineage_local",
+            },
+            "tags": ["fluid", "lineage"],
+            "custom": {
+                "managedBy": "forge-cli",
+                "source": "fluid.consumes",
+                "providerContractId": (
+                    "bizlab.teleforge.subscriber_usage_daily_lineage_local."
+                    "subscriber_usage_daily"
+                ),
+            },
         },
         {
-            "name": "billing_health_daily",
-            "version": "1",
-            "contractId": (
-                "bizlab.teleforge.billing_health_daily_lineage_local." "billing_health_daily"
+            "id": (
+                "bizlab.teleforge.subscriber_health_360_lineage_local__uses__"
+                "bizlab.teleforge.billing_health_daily_lineage_local__billing_health_daily"
             ),
-            "customProperties": [
-                {
-                    "property": "sourceSystem",
-                    "value": "bizlab.teleforge.billing_health_daily_lineage_local",
-                }
-            ],
+            "info": {
+                "purpose": "Supply payment behavior and overdue indicators to the health model.",
+                "startDate": "2026-04-24",
+            },
+            "provider": {
+                "dataProductId": "bizlab.teleforge.billing_health_daily_lineage_local",
+                "outputPortId": "billing_health_daily",
+            },
+            "consumer": {
+                "dataProductId": "bizlab.teleforge.subscriber_health_360_lineage_local",
+            },
+            "tags": ["fluid", "lineage"],
+            "custom": {
+                "managedBy": "forge-cli",
+                "source": "fluid.consumes",
+                "providerContractId": (
+                    "bizlab.teleforge.billing_health_daily_lineage_local.billing_health_daily"
+                ),
+            },
         },
     ]
 
 
-def test_apply_dry_run_odps_promotes_product_level_contract_id_to_expose_level():
-    """Regression test for the DMM UI "unresolved inputPort contractId" gap.
-
-    A1/A2 silvers declare ``consumes: { productId, exposeId }``; the upstream
-    OdpsStandardProvider falls back to ``canonical["reference"]`` (the bare
-    product ID) when no explicit ``contract_id`` is authored, which renders
-    as an unresolved link in DMM because contracts live at
-    ``/api/datacontracts/{productId}.{exposeId}``, not at
-    ``/api/datacontracts/{productId}``. The DMM provider overlay must promote
-    the product-level contractId to the expose-level form so the UI can
-    dereference it.
-    """
+def test_apply_dry_run_previews_access_agreements_for_consumes():
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
     result = provider.apply(
         _sample_odps_consumes_contract(),
+        dry_run=True,
+        provider_hint="odps",
+    )
+
+    access_previews = result["access_agreements"]
+    assert len(access_previews) == 2
+    first = access_previews[0]
+    assert first["method"] == "PUT"
+    assert first["url"].endswith(
+        "/api/access/"
+        "bizlab.teleforge.subscriber_health_360_lineage_local__uses__"
+        "bizlab.teleforge.subscriber_usage_daily_lineage_local__subscriber_usage_daily"
+    )
+    assert first["auto_approve"] is False
+    assert "approve_url" not in first
+    assert first["payload"]["provider"] == {
+        "dataProductId": "bizlab.teleforge.subscriber_usage_daily_lineage_local",
+        "outputPortId": "subscriber_usage_daily",
+    }
+    assert first["payload"]["consumer"] == {
+        "dataProductId": "bizlab.teleforge.subscriber_health_360_lineage_local",
+    }
+
+
+def test_apply_publishes_access_agreements_without_approval_by_default():
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+    response = MagicMock(status_code=200)
+
+    with (
+        patch.object(provider, "_ensure_team"),
+        patch.object(provider, "_ensure_source_systems"),
+        patch.object(provider, "_request", return_value=response) as request,
+    ):
+        result = provider.apply(_sample_odps_consumes_contract(), provider_hint="odps")
+
+    paths = [call.args[1] for call in request.call_args_list]
+    assert (
+        "/api/access/"
+        "bizlab.teleforge.subscriber_health_360_lineage_local__uses__"
+        "bizlab.teleforge.subscriber_usage_daily_lineage_local__subscriber_usage_daily"
+    ) in paths
+    assert not any(path.endswith("/approve") for path in paths)
+    assert result["access_agreements"][0]["success"] is True
+    assert result["access_agreements"][0]["auto_approved"] is False
+
+
+def test_apply_publishes_and_approves_access_agreements_when_explicit():
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+    response = MagicMock(status_code=200)
+
+    with (
+        patch.object(provider, "_ensure_team"),
+        patch.object(provider, "_ensure_source_systems"),
+        patch.object(provider, "_request", return_value=response) as request,
+    ):
+        result = provider.apply(
+            _sample_odps_consumes_contract(),
+            provider_hint="odps",
+            auto_approve_access=True,
+        )
+
+    paths = [call.args[1] for call in request.call_args_list]
+    assert (
+        "/api/access/"
+        "bizlab.teleforge.subscriber_health_360_lineage_local__uses__"
+        "bizlab.teleforge.subscriber_usage_daily_lineage_local__subscriber_usage_daily"
+        "/approve"
+    ) in paths
+    assert result["access_agreements"][0]["success"] is True
+    assert result["access_agreements"][0]["auto_approved"] is True
+
+
+def test_apply_dry_run_odps_source_system_mode_does_not_restore_product_input_ports():
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+
+    result = provider.apply(
+        _sample_odps_consumes_contract(),
+        dry_run=True,
+        provider_hint="odps",
+        odps_lineage_mode="source-system",
+    )
+
+    assert result["odps_lineage_mode"] == "source-system"
+    assert "inputPorts" not in result["payload"]
+    assert len(result["access_agreements"]) == 2
+
+
+def test_catalog_provider_passes_odps_lineage_mode_to_dmm_provider():
+    catalog = DataMeshManagerCatalogProvider(
+        {
+            "auth": {"api_key": "dummy"},
+            "endpoint": "https://api.entropy-data.com",
+            "odps_lineage_mode": "source-system",
+        }
+    )
+
+    assert catalog._provider.odps_lineage_mode == "source-system"
+
+
+def test_catalog_provider_passes_explicit_access_auto_approval_to_dmm_provider():
+    catalog = DataMeshManagerCatalogProvider(
+        {
+            "auth": {"api_key": "dummy"},
+            "endpoint": "https://api.entropy-data.com",
+            "auto_approve_access": "true",
+        }
+    )
+
+    assert catalog._provider.auto_approve_access is True
+
+
+def test_apply_odps_default_lineage_mode_does_not_upsert_product_references():
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+    response = MagicMock(status_code=200)
+
+    with (
+        patch.object(provider, "_ensure_team"),
+        patch.object(provider, "_ensure_source_systems") as ensure_sources,
+        patch.object(provider, "_request", return_value=response),
+    ):
+        provider.apply(_sample_odps_consumes_contract(), provider_hint="odps")
+
+    ensure_sources.assert_called_once_with(
+        _sample_odps_consumes_contract(),
+        "bizlab",
+    )
+
+
+def test_apply_odps_source_system_mode_does_not_upsert_product_references():
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+    response = MagicMock(status_code=200)
+
+    with (
+        patch.object(provider, "_ensure_team"),
+        patch.object(provider, "_ensure_source_systems") as ensure_sources,
+        patch.object(provider, "_request", return_value=response),
+    ):
+        provider.apply(
+            _sample_odps_consumes_contract(),
+            provider_hint="odps",
+            odps_lineage_mode="source-system",
+        )
+
+    ensure_sources.assert_called_once_with(
+        _sample_odps_consumes_contract(),
+        "bizlab",
+    )
+
+
+def test_apply_dry_run_odps_promotes_only_retained_source_system_input_ports():
+    """Product consumes are Access-only; explicit source-system ports remain."""
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+
+    result = provider.apply(
+        _sample_odps_consumes_with_source_system_contract(),
         dry_run=True,
         provider_hint="odps",
     )
@@ -323,46 +518,26 @@ def test_apply_dry_run_odps_promotes_product_level_contract_id_to_expose_level()
     input_ports = result["payload"].get("inputPorts", [])
     contract_ids = {port["name"]: port["contractId"] for port in input_ports}
 
-    # Each port's contractId must point at the expose-level published address,
-    # not the bare product ID.
     assert contract_ids == {
         "subscriber_usage_daily": (
             "bizlab.teleforge.subscriber_usage_daily_lineage_local.subscriber_usage_daily"
-        ),
-        "billing_health_daily": (
-            "bizlab.teleforge.billing_health_daily_lineage_local.billing_health_daily"
-        ),
+        )
     }
 
 
-def test_apply_dry_run_odps_preserves_explicit_consumes_contract_id():
-    """Explicit FLUID ``consumes[].contractId`` must win over promotion.
-
-    If the operator spells out ``contractId: bronze.telco.party_v1.custom``,
-    respect it — even if it doesn't match the canonical
-    ``{productId}.{exposeId}`` form. Promotion is a fallback for the common
-    case where the author only supplied ``productId`` + ``exposeId``.
-    """
+def test_apply_dry_run_odps_product_consume_with_explicit_contract_id_is_access_only():
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
     contract = _sample_odps_consumes_contract()
-    # Operator explicitly pins to a non-canonical contract id.
     contract["consumes"][0][
         "contractId"
     ] = "bizlab.teleforge.subscriber_usage_daily_lineage_local.custom_view"
 
     result = provider.apply(contract, dry_run=True, provider_hint="odps")
 
-    input_ports = result["payload"].get("inputPorts", [])
-    contract_ids = {port["name"]: port["contractId"] for port in input_ports}
-
-    # Explicit contract_id wins for the first port; the second port still
-    # gets the canonical promotion.
-    assert contract_ids["subscriber_usage_daily"] == (
+    assert "inputPorts" not in result["payload"]
+    assert result["access_agreements"][0]["payload"]["custom"]["providerContractId"] == (
         "bizlab.teleforge.subscriber_usage_daily_lineage_local.custom_view"
-    )
-    assert contract_ids["billing_health_daily"] == (
-        "bizlab.teleforge.billing_health_daily_lineage_local.billing_health_daily"
     )
 
 
@@ -500,6 +675,28 @@ def test_request_wraps_retry_error_as_provider_error():
         provider._request("PUT", "/api/datacontracts/x.y", json_body={"id": "x.y"})
 
     assert "HTTP request failed" in str(excinfo.value)
+
+
+def test_provider_rejects_plain_http_remote_api_url():
+    with pytest.raises(ProviderError) as excinfo:
+        DataMeshManagerProvider(api_key="dummy", api_url="http://catalog.example.com")
+
+    assert "plain HTTP to a non-local host" in str(excinfo.value)
+
+
+def test_request_redacts_secret_like_error_body():
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+    response = MagicMock(status_code=403, text='{"api_key":"ed_live_supersecret"}')
+    session = MagicMock()
+    session.request.return_value = response
+    provider._session_instance = session
+
+    with pytest.raises(ProviderError) as excinfo:
+        provider._request("PUT", "/api/dataproducts/x", json_body={"id": "x"})
+
+    message = str(excinfo.value)
+    assert "ed_live_supersecret" not in message
+    assert "***REDACTED***" in message
 
 
 def test_publish_exit_code_strict_mode_on_invalid_contract():

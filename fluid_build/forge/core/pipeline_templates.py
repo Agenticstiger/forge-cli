@@ -154,6 +154,29 @@ class PipelineConfig:
     # mode; teams that need multi-env Jenkinsfiles use two generated
     # files instead of one multi-branch file.
     install_mode: str = "pypi"
+    # Opt-in fallback catalog target baked into the Jenkins Stage 10
+    # publish shell as ``${PUBLISH_TARGETS:-<value>}``. Left ``None`` by
+    # default, which preserves the original ``${PUBLISH_TARGETS}`` (no
+    # fallback) form — matches behaviour before this flag was added.
+    #
+    # Set this (via ``fluid generate ci --default-publish-target X``) when
+    # you expect the first Pipeline-from-SCM build Jenkins auto-triggers
+    # to publish to a specific catalog. On that first build, the
+    # ``parameters { }`` block's defaults are parsed but NOT exported as
+    # env vars, so ``${PUBLISH_TARGETS}`` is empty; without this
+    # fallback the CLI would use its built-in ``fluid-command-center``
+    # default, which may not be reachable. Common values:
+    # ``datamesh-manager``, ``horizon``, ``datahub``, ``collibra``.
+    # Only the Jenkins template consumes this today.
+    default_publish_target: Optional[str] = None
+    # Jenkins-only generation defaults for the stage-9 verify strictness,
+    # stage-10 publish toggle, and whether stage 10 passes an explicit
+    # ``--env`` flag to ``fluid publish``. These exist so scenario-specific
+    # launchpads can ask ``fluid generate ci`` to emit the intended default
+    # behavior directly instead of patching the generated Jenkinsfile text.
+    verify_strict_default: bool = True
+    publish_stage_default: bool = False
+    publish_include_env: bool = True
 
     def __post_init__(self):
         if self.environments is None:
@@ -2323,6 +2346,30 @@ class JenkinsTemplate(BasePipelineTemplate):
         # generation to upstream — omit stage 3 entirely in that case.
         stage_3_enabled_default = "true" if config.generates_artifacts else "false"
 
+        # Stage 10 ``PUBLISH_TARGETS`` rendering.
+        #
+        # Default (``config.default_publish_target is None``): emit the
+        # bare ``${PUBLISH_TARGETS}`` form — same as before this flag
+        # existed.
+        #
+        # Opt-in (``--default-publish-target X``): emit the
+        # ``${PUBLISH_TARGETS:-X}`` shell-level fallback so the very
+        # first Pipeline-from-SCM build Jenkins auto-triggers
+        # (before the parameters block is exported as env vars)
+        # still publishes to the intended catalog.
+        _pub_target = (config.default_publish_target or "").strip()
+        PUBLISH_TARGETS_EXPANSION = (
+            f"PUBLISH_TARGETS:-{_pub_target}" if _pub_target else "PUBLISH_TARGETS"
+        )
+        verify_strict_default = "true" if config.verify_strict_default else "false"
+        publish_stage_default = "true" if config.publish_stage_default else "false"
+        publish_command = (
+            '''fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS} \\
+                         --env "${FLUID_ENV:-dev}"'''
+            if config.publish_include_env
+            else """fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS}"""
+        )
+
         # --- Install-mode dispatch --------------------------------------
         # Pick the Setup stage's pip-install shell body based on
         # ``config.install_mode``. The generated Jenkinsfile carries only
@@ -2514,11 +2561,11 @@ EOM
         // ── Stage 9 — verify ───────────────────────────────────────
         booleanParam(name: 'RUN_STAGE_9_VERIFY', defaultValue: true,
                      description: 'Stage 9: post-apply reconciliation vs live warehouse.')
-        booleanParam(name: 'VERIFY_STRICT',      defaultValue: true,
+        booleanParam(name: 'VERIFY_STRICT',      defaultValue: {verify_strict_default},
                      description: 'Stage 9: --strict (fail on any schema mismatch, including silent type coercions).')
 
         // ── Stage 10 — publish ─────────────────────────────────────
-        booleanParam(name: 'RUN_STAGE_10_PUBLISH', defaultValue: false,
+        booleanParam(name: 'RUN_STAGE_10_PUBLISH', defaultValue: {publish_stage_default},
                      description: 'Stage 10: push catalog artifacts to one or more targets. Opt-in — typically gated to main branch.')
         string(name: 'PUBLISH_TARGETS',
                defaultValue: 'datamesh-manager',
@@ -2828,12 +2875,20 @@ pipeline {{
             steps {{
                 // PUBLISH_TARGETS is a space-separated string; shell
                 // iterates it word-split into a list of --target flags.
+                // The ``${{PUBLISH_TARGETS:-X}}`` shell fallback (opt-in
+                // via ``fluid generate ci --default-publish-target X``)
+                // protects the first Pipeline-from-SCM build Jenkins
+                // auto-triggers: the ``parameters {{ }}`` block isn't
+                // exported as env vars on that first run, so without a
+                // shell fallback the CLI's built-in target
+                // (``fluid-command-center``) is used — which may not be
+                // reachable. When no fallback is configured the bare
+                // ``${{PUBLISH_TARGETS}}`` form is emitted.
                 sh '''{CD}TARGET_FLAGS=""; \\
-                       for t in ${{PUBLISH_TARGETS}}; do \\
+                       for t in ${{{PUBLISH_TARGETS_EXPANSION}}}; do \\
                          TARGET_FLAGS="${{TARGET_FLAGS}} --target $t"; \\
                        done; \\
-                       fluid publish "${{CONTRACT:-contract.fluid.yaml}}" ${{TARGET_FLAGS}} \\
-                         --env "${{FLUID_ENV:-dev}}"'''
+                       {publish_command}'''
             }}
         }}
 
