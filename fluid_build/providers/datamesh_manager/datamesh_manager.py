@@ -782,19 +782,29 @@ class DataMeshManagerProvider(BaseProvider):
             ],
         }
 
-        team_obj = fluid.get("owner")
-        if isinstance(team_obj, Mapping):
-            team = team_obj.get("team") or team_obj.get("name")
-            if team:
-                body["team"] = str(team)
+        # Team: use the same derivation as per-expose contracts / the product
+        # itself so the umbrella lands under the same team in DMM. ODCS v3.1.0
+        # accepts ``team: { name: <id> }`` (nested object), which matches the
+        # shape DMM's per-expose contract endpoint returns. A bare string here
+        # is rejected as an unknown teamId.
+        try:
+            team_id = self._derive_team_id(fluid)
+        except Exception:  # pragma: no cover — defensive, should not happen
+            team_id = None
+        if team_id:
+            body["team"] = {"name": str(team_id)}
 
         tags = metadata.get("tags") or fluid.get("tags")
         if isinstance(tags, list) and tags:
             body["tags"] = list(tags)
 
-        domain = metadata.get("domain") or fluid.get("domain")
-        if domain:
-            body["domain"] = str(domain)
+        # NOTE: intentionally do NOT emit ``domain`` on the umbrella.
+        # DMM's ODCS validator treats certain top-level fields (e.g. bare
+        # ``domain``) as team/owner references and 422s on unknown IDs
+        # (observed: ``The owner '<domain>' is not a known team ID``).
+        # The umbrella is a resolution stub — domain metadata already lives
+        # on the data product and per-expose contracts, so adding it here
+        # provides no value and trips the validator.
 
         return body
 

@@ -495,6 +495,37 @@ class TestProductUmbrellaContract:
         assert umbrella["success"] is False
         assert umbrella["error_type"] == "UMBRELLA_PUT_FAILED"
 
+    def test_umbrella_team_is_nested_object_not_bare_string(self):
+        """DMM's ODCS validator rejects ``team: "<id>"`` as an unknown team
+        reference. The spec shape DMM's own per-expose GET returns is
+        ``team: {name: "<id>"}``, so the umbrella must match it.
+
+        Regression for E2E failure: PUT /api/datacontracts/bronze.telco.party_v1
+        → 422 "The owner 'telco' is not a known team ID" when the umbrella
+        emitted ``domain: "telco"`` and a bare-string team.
+        """
+        provider = _make_provider()
+        result = provider._publish_one(_BITCOIN_CONTRACT, dry_run=True, publish_contract=True)
+
+        payload = result["odcs_product_umbrella"]["payload"]
+        # Team must be present AND nested — bare string fails DMM validation.
+        assert "team" in payload, "umbrella must carry team so DMM renders it under the right team"
+        assert isinstance(payload["team"], dict), f"team must be nested dict, got {type(payload['team'])}"
+        assert payload["team"]["name"] == "data-engineering"
+
+    def test_umbrella_does_not_emit_bare_domain(self):
+        """DMM's ODCS validator treats bare ``domain`` as a team/owner reference
+        and 422s on unknown IDs. The umbrella is a resolution stub — domain
+        metadata already lives on the data product + per-expose contracts, so
+        emitting it here adds no value and trips the validator."""
+        provider = _make_provider()
+        result = provider._publish_one(_BITCOIN_CONTRACT, dry_run=True, publish_contract=True)
+
+        payload = result["odcs_product_umbrella"]["payload"]
+        # _BITCOIN_CONTRACT has domain="finance"; umbrella must not propagate it
+        # at the top level where DMM misreads it as an owner.
+        assert "domain" not in payload
+
 
 # ===========================================================================
 # 5. OdcsProvider reads expose-level qos block
