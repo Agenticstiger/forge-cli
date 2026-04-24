@@ -395,8 +395,13 @@ jobs:
           BASE=$(echo "$VERSION" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
 
           # Pull lines from '## [BASE]' to (but not including) the next '## ['.
-          NOTES=$(awk -v ver="## [$BASE]" '
-            $0 ~ "^"ver {flag=1; next}
+          # Build the regex inside awk's BEGIN so "\\[" yields a literal-[
+          # in the compiled ERE. Inlining `## [$BASE]` directly gets
+          # parsed as an ERE character class, not a literal, which is why
+          # every prior release body silently fell back to `git log`.
+          NOTES=$(awk -v base="$BASE" '
+            BEGIN { ver = "^## \\[" base "\\]" }
+            $0 ~ ver {flag=1; next}
             /^## \[/ && flag {exit}
             flag {print}
           ' CHANGELOG.md || true)
