@@ -162,7 +162,9 @@ class DataMeshManagerProvider(BaseProvider):
         self._log = logger or LOG
 
         self.api_key = api_key or os.getenv("DMM_API_KEY", "")
-        self.api_url = self._normalize_api_url(api_url or os.getenv("DMM_API_URL", _DEFAULT_API_URL))
+        self.api_url = self._normalize_api_url(
+            api_url or os.getenv("DMM_API_URL", _DEFAULT_API_URL)
+        )
         self.odps_lineage_mode = self._normalize_odps_lineage_mode(
             odps_lineage_mode or os.getenv("DMM_ODPS_LINEAGE_MODE", _DEFAULT_ODPS_LINEAGE_MODE)
         )
@@ -398,7 +400,11 @@ class DataMeshManagerProvider(BaseProvider):
         """
         self._require_api_key()
 
-        url = self._normalize_api_url(publish_url) if publish_url else f"{self.api_url}/api/test-results"
+        url = (
+            self._normalize_api_url(publish_url)
+            if publish_url
+            else f"{self.api_url}/api/test-results"
+        )
 
         # Build payload compatible with Entropy Data test-results API
         issues = getattr(report, "issues", [])
@@ -1335,8 +1341,7 @@ class DataMeshManagerProvider(BaseProvider):
                 props = []
 
             has_display_name = any(
-                isinstance(prop, Mapping)
-                and str(prop.get("property", "")).lower() == "displayname"
+                isinstance(prop, Mapping) and str(prop.get("property", "")).lower() == "displayname"
                 for prop in props
             )
             if not has_display_name:

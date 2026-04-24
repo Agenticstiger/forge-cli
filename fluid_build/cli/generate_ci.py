@@ -207,7 +207,7 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         default=None,
         help=(
             "Whether the generated Jenkins Stage 10 command includes "
-            "``--env \\\"${FLUID_ENV:-dev}\\\"`` on ``fluid publish``. "
+            '``--env \\"${FLUID_ENV:-dev}\\"`` on ``fluid publish``. '
             "When omitted, Jenkinsfiles preserve the current default of true. "
             "Only the Jenkins template consumes this today."
         ),

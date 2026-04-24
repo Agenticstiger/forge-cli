@@ -66,8 +66,7 @@ class DataMeshManagerCatalogProvider(BaseCatalogProvider):
             or config.get("lineage_mode")
         )
         self._auto_approve_access = _as_bool(
-            config.get("auto_approve_access")
-            or config.get("autoApproveAccess")
+            config.get("auto_approve_access") or config.get("autoApproveAccess")
         )
         self._provider = DataMeshManagerProvider(
             api_key=api_key or None,

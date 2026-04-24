@@ -19,8 +19,8 @@ import pytest
 import requests
 
 from fluid_build.cli.datamesh_manager import _cmd_publish, _publish_exit_code
-from fluid_build.providers.catalogs.datamesh_manager import DataMeshManagerCatalogProvider
 from fluid_build.providers.base import ProviderError
+from fluid_build.providers.catalogs.datamesh_manager import DataMeshManagerCatalogProvider
 from fluid_build.providers.datamesh_manager import DataMeshManagerProvider
 
 

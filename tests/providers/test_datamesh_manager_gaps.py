@@ -27,10 +27,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from fluid_build.providers.base import ProviderError
 from fluid_build.providers.datamesh_manager.datamesh_manager import (
     DataMeshManagerProvider,
 )
-from fluid_build.providers.base import ProviderError
 
 # ---------------------------------------------------------------------------
 # Helpers

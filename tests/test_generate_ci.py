@@ -269,12 +269,7 @@ class TestGenerateCIJenkins:
         the parameters block is exported as env vars) still publishes
         to the intended catalog."""
         monkeypatch.chdir(tmp_path)
-        assert (
-            generate_ci_run(
-                _make_args(default_publish_target="datamesh-manager"), _logger
-            )
-            == 0
-        )
+        assert generate_ci_run(_make_args(default_publish_target="datamesh-manager"), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()
         assert "for t in ${PUBLISH_TARGETS:-datamesh-manager}" in content
 
@@ -282,15 +277,11 @@ class TestGenerateCIJenkins:
         """The flag isn't hard-coded to datamesh-manager — operators on
         Horizon / DataHub / Collibra pick their own primary catalog."""
         monkeypatch.chdir(tmp_path)
-        assert (
-            generate_ci_run(_make_args(default_publish_target="horizon"), _logger) == 0
-        )
+        assert generate_ci_run(_make_args(default_publish_target="horizon"), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()
         assert "for t in ${PUBLISH_TARGETS:-horizon}" in content
 
-    def test_default_publish_target_empty_string_treated_as_unset(
-        self, tmp_path, monkeypatch
-    ):
+    def test_default_publish_target_empty_string_treated_as_unset(self, tmp_path, monkeypatch):
         """An empty or whitespace-only value is treated the same as
         omitting the flag — bare ``${PUBLISH_TARGETS}`` form, no
         surprise ``:-`` expansion with nothing on the right side.
@@ -304,25 +295,19 @@ class TestGenerateCIJenkins:
         assert "for t in ${PUBLISH_TARGETS}" in content
         assert "for t in ${PUBLISH_TARGETS:-" not in content
 
-    def test_verify_strict_default_override_flips_parameter_default(
-        self, tmp_path, monkeypatch
-    ):
+    def test_verify_strict_default_override_flips_parameter_default(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(verify_strict_default=False), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()
         assert "name: 'VERIFY_STRICT',      defaultValue: false" in content
 
-    def test_publish_stage_default_override_flips_parameter_default(
-        self, tmp_path, monkeypatch
-    ):
+    def test_publish_stage_default_override_flips_parameter_default(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(publish_stage_default=True), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()
         assert "name: 'RUN_STAGE_10_PUBLISH', defaultValue: true" in content
 
-    def test_publish_include_env_override_omits_stage_10_env_flag(
-        self, tmp_path, monkeypatch
-    ):
+    def test_publish_include_env_override_omits_stage_10_env_flag(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(publish_include_env=False), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()

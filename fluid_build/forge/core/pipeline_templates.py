@@ -2367,7 +2367,7 @@ class JenkinsTemplate(BasePipelineTemplate):
             '''fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS} \\
                          --env "${FLUID_ENV:-dev}"'''
             if config.publish_include_env
-            else '''fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS}'''
+            else """fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS}"""
         )
 
         # --- Install-mode dispatch --------------------------------------
