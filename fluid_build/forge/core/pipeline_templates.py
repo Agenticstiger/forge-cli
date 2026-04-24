@@ -2455,9 +2455,12 @@ EOM
         // ── Stage 1 — bundle ────────────────────────────────────────
         booleanParam(name: 'RUN_STAGE_1_BUNDLE',  defaultValue: true,
                      description: 'Stage 1: deterministic tgz bundle + MANIFEST.json (SHA-256).')
-        choice(name: 'BUNDLE_FORMAT',
-               choices: ['tgz', 'yaml-single-file'],
-               description: 'Stage 1 output format.')
+        // BUNDLE_FORMAT is intentionally not a parameter: Stages 4 (validate
+        // artifacts), 6 (plan → bundleDigest), and 7 (apply → plan-binding
+        // verification) all require the tgz MANIFEST.json. yaml/json bundles
+        // are valid for `fluid bundle` but would break every downstream stage
+        // in this pipeline. Operators who need a single-file YAML resolve
+        // should run `fluid bundle --format yaml` out-of-band.
 
         // ── Stage 2 — validate ─────────────────────────────────────
         booleanParam(name: 'RUN_STAGE_2_VALIDATE', defaultValue: true,
@@ -2603,7 +2606,7 @@ pipeline {{
             when {{ expression {{ return params.RUN_STAGE_1_BUNDLE }} }}
             steps {{
                 sh '''{CD}mkdir -p runtime
-                       fluid bundle "${{CONTRACT:-contract.fluid.yaml}}" --format "${{BUNDLE_FORMAT}}" --out runtime/bundle.tgz'''
+                       fluid bundle "${{CONTRACT:-contract.fluid.yaml}}" --format tgz --out runtime/bundle.tgz'''
                 archiveArtifacts artifacts: '{P}runtime/bundle.tgz', fingerprint: true, allowEmptyArchive: true
             }}
         }}
