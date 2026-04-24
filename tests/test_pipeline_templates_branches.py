@@ -124,6 +124,15 @@ class TestPipelineConfig:
         assert cfg.enable_performance_monitoring is True
         assert cfg.enable_marketplace_publishing is False
 
+    def test_jenkins_generation_defaults_preserved(self):
+        cfg = PipelineConfig(
+            provider=PipelineProvider.JENKINS,
+            complexity=PipelineComplexity.BASIC,
+        )
+        assert cfg.verify_strict_default is True
+        assert cfg.publish_stage_default is False
+        assert cfg.publish_include_env is True
+
 
 # ── BasePipelineTemplate tests ──────────────────────────────────────
 
@@ -537,6 +546,22 @@ class TestJenkinsTemplateHardening:
         assert "sh 'FLUID_ENV=" not in content
         # POSIX default expansion form used throughout.
         assert '--env "${FLUID_ENV:-dev}"' in content
+
+    def test_verify_strict_default_can_be_overridden(self):
+        content = self._jenkinsfile(verify_strict_default=False)
+        assert "name: 'VERIFY_STRICT',      defaultValue: false" in content
+
+    def test_publish_stage_default_can_be_overridden(self):
+        content = self._jenkinsfile(publish_stage_default=True)
+        assert "name: 'RUN_STAGE_10_PUBLISH', defaultValue: true" in content
+
+    def test_publish_stage_can_omit_env_flag(self):
+        content = self._jenkinsfile(publish_include_env=False)
+        stage_10 = content[content.index("stage('10 · publish')") :]
+        stage_10 = stage_10[: stage_10.index("stage('11 · schedule sync')")]
+        assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS}' in stage_10
+        assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS} \\' not in stage_10
+        assert '--env "${FLUID_ENV:-dev}"' not in stage_10
 
     def test_doctor_not_extended(self):
         """``fluid doctor --extended`` requires scripts/diagnose.sh which
@@ -1070,6 +1095,53 @@ class TestStageSpecsHelper:
         assert "PUBLISH_TARGETS" in s10.command
         assert "CATALOG:-datamesh-manager" in s10.command
         assert "--target" in s10.command
+
+    def test_jenkins_stage_10_default_publish_target_opt_in(self):
+        """``config.default_publish_target`` is opt-in. When unset,
+        Stage 10's Jenkinsfile shell uses the bare ``${PUBLISH_TARGETS}``
+        form — matching behaviour before the flag was introduced — so
+        existing pipelines keep rendering identically.
+
+        When set to a non-empty value the shell switches to
+        ``${PUBLISH_TARGETS:-<value>}``, giving the first
+        Pipeline-from-SCM build Jenkins auto-triggers a sane fallback
+        before the ``parameters { }`` block's defaults are exported as
+        env vars. Whitespace-only values are treated as unset."""
+        from fluid_build.forge.core.pipeline_templates import (
+            JenkinsTemplate,
+            PipelineComplexity,
+            PipelineConfig,
+            PipelineProvider,
+        )
+
+        def _render(default_publish_target):
+            cfg = PipelineConfig(
+                provider=PipelineProvider.JENKINS,
+                complexity=PipelineComplexity.STANDARD,
+                default_publish_target=default_publish_target,
+            )
+            return JenkinsTemplate().generate(cfg)["Jenkinsfile"]
+
+        # Unset / None -> bare form (backwards compatible default).
+        # The template's doc-comment legitimately mentions
+        # ``${PUBLISH_TARGETS:-X}`` as an example — only the actual
+        # shell ``for t in ...`` line should be asserted against.
+        bare = _render(None)
+        assert "for t in ${PUBLISH_TARGETS}" in bare
+        assert "for t in ${PUBLISH_TARGETS:-" not in bare
+
+        # Whitespace-only -> treated as unset.
+        whitespace = _render("   ")
+        assert "for t in ${PUBLISH_TARGETS}" in whitespace
+        assert "for t in ${PUBLISH_TARGETS:-" not in whitespace
+
+        # Opt-in with specific catalog -> shell fallback injected.
+        opted = _render("datamesh-manager")
+        assert "for t in ${PUBLISH_TARGETS:-datamesh-manager}" in opted
+
+        # Arbitrary catalog names are accepted verbatim.
+        horizon = _render("horizon")
+        assert "for t in ${PUBLISH_TARGETS:-horizon}" in horizon
 
     def test_stage_8_self_gates_on_bindings_json(self):
         """Stage 8 (policy apply) is a no-op when bindings.json is

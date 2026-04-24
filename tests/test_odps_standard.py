@@ -121,14 +121,14 @@ def test_provider_render_maps_consumes_to_input_ports():
     assert result["inputPorts"] == [
         {
             "name": "subscriber_usage_daily",
-            "version": "1",
+            "version": "1.0.0",
             # contractId synthesized from reference (consume had no explicit
             # contractId; reference is the upstream source's canonical name).
             "contractId": "bizlab.teleforge.subscriber_usage_daily_lineage_local",
         },
         {
             "name": "billing_health_daily",
-            "version": "1",
+            "version": "1.0.0",
             "contractId": "bizlab.teleforge.billing_health_daily_lineage_local",
         },
     ]

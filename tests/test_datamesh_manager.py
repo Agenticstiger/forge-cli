@@ -60,6 +60,8 @@ def _make_args(**kwargs):
         no_create_team=False,
         contract_format="odcs",
         data_product_spec=None,
+        odps_lineage_mode=None,
+        auto_approve_access=False,
         provider=None,
         validate_generated_contracts=False,
         validation_mode="warn",
@@ -154,6 +156,14 @@ class TestAddParser:
         args = parent.parse_args(["datamesh-manager", "publish", "c.yaml", "--api-key", "my-key"])
         assert args.api_key == "my-key"
 
+    def test_publish_odps_lineage_mode_flag(self):
+        parent, subs = self._make_subparsers()
+        add_parser(subs)
+        args = parent.parse_args(
+            ["datamesh-manager", "publish", "c.yaml", "--odps-lineage-mode", "source-system"]
+        )
+        assert args.odps_lineage_mode == "source-system"
+
     def test_delete_yes_flag(self):
         parent, subs = self._make_subparsers()
         add_parser(subs)
@@ -200,6 +210,20 @@ class TestMakeProvider:
             MockProvider.return_value = MagicMock()
             _make_provider(args)
         MockProvider.assert_called_once_with(api_key="k", api_url="https://u")
+
+    def test_with_odps_lineage_mode(self):
+        args = _make_args(odps_lineage_mode="source-system")
+        with patch("fluid_build.cli.datamesh_manager.DataMeshManagerProvider") as MockProvider:
+            MockProvider.return_value = MagicMock()
+            _make_provider(args)
+        MockProvider.assert_called_once_with(odps_lineage_mode="source-system")
+
+    def test_with_auto_approve_access(self):
+        args = _make_args(auto_approve_access=True)
+        with patch("fluid_build.cli.datamesh_manager.DataMeshManagerProvider") as MockProvider:
+            MockProvider.return_value = MagicMock()
+            _make_provider(args)
+        MockProvider.assert_called_once_with(auto_approve_access=True)
 
 
 # ---------------------------------------------------------------------------

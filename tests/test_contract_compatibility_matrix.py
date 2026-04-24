@@ -195,15 +195,11 @@ def test_lineage_fixtures_preserve_input_ports_across_odps_exports(
     contract = _load_contract(fixture_name)
     expected_ids = _expected_input_ids(contract)
     expected_refs = _expected_input_refs(contract)
-    # DMM's overlay promotes product-level contractIds to the expose-level
-    # ``{productId}.{exposeId}`` address the ODCS contract is actually
-    # published at. See ``_ensure_odps_input_port_contract_ids``.
-    expected_dmm_contract_ids = _expected_dmm_input_contract_ids(contract)
-
     odps_standard = OdpsStandardProvider().render(contract)
-    dmm_odps = DataMeshManagerProvider(
+    dmm_result = DataMeshManagerProvider(
         api_key="dummy", api_url="https://api.entropy-data.com"
-    ).apply(contract, dry_run=True, provider_hint="odps")["payload"]
+    ).apply(contract, dry_run=True, provider_hint="odps")
+    dmm_odps = dmm_result["payload"]
     official_opds = OdpsProvider().render(contract)["artifacts"]["product"]["_legacy"]
 
     # ODPS-Bitol v1.0.0 InputPort forbids ``id`` and ``reference``; the
@@ -213,14 +209,18 @@ def test_lineage_fixtures_preserve_input_ports_across_odps_exports(
     # synthetic contractId — no DMM-specific promotion applied.
     assert [port["name"] for port in odps_standard["inputPorts"]] == expected_ids
     assert [port["contractId"] for port in odps_standard["inputPorts"]] == expected_refs
-    # DMM ``provider_hint="odps"`` delegates to OdpsStandardProvider → same
-    # v1.0.0 shape, but the DMM-specific overlay then promotes product-level
-    # contractIds to the ``{productId}.{exposeId}`` form so lineage links
-    # resolve in the DMM UI (contracts live at
-    # ``/api/datacontracts/{productId}.{exposeId}``, not at
-    # ``/api/datacontracts/{productId}``).
-    assert [port["name"] for port in dmm_odps["inputPorts"]] == expected_ids
-    assert [port["contractId"] for port in dmm_odps["inputPorts"]] == expected_dmm_contract_ids
+    # DMM removes product-to-product consumes from the ODPS inputPorts and
+    # publishes them as first-class Entropy Access agreements instead. This
+    # avoids mirroring upstream products as SourceSystems in the DMM graph.
+    assert "inputPorts" not in dmm_odps
+    access_edges = {
+        (
+            preview["payload"]["provider"]["dataProductId"],
+            preview["payload"]["provider"]["outputPortId"],
+        )
+        for preview in dmm_result["access_agreements"]
+    }
+    assert access_edges == set(zip(expected_refs, expected_ids))
     # OdpsProvider (legacy OPDS/Linux Foundation emitter) is a DIFFERENT
     # provider — keeps its legacy {id, reference} shape. Not part of the
     # ODPS-Bitol schema contract.

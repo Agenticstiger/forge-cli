@@ -32,6 +32,12 @@ from .base import BaseCatalogProvider, CatalogAsset, PublishResult
 LOG = logging.getLogger(__name__)
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class DataMeshManagerCatalogProvider(BaseCatalogProvider):
     """Catalog adapter for Entropy Data / Data Mesh Manager."""
 
@@ -54,9 +60,20 @@ class DataMeshManagerCatalogProvider(BaseCatalogProvider):
             or "odps"
         )
         self._provider_hint = config.get("provider_hint") or "odps"
+        self._odps_lineage_mode = (
+            config.get("odps_lineage_mode")
+            or config.get("odpsLineageMode")
+            or config.get("lineage_mode")
+        )
+        self._auto_approve_access = _as_bool(
+            config.get("auto_approve_access")
+            or config.get("autoApproveAccess")
+        )
         self._provider = DataMeshManagerProvider(
             api_key=api_key or None,
             api_url=api_url or None,
+            odps_lineage_mode=self._odps_lineage_mode,
+            auto_approve_access=self._auto_approve_access,
         )
 
     # -- BaseCatalogProvider interface --------------------------------------
@@ -70,6 +87,7 @@ class DataMeshManagerCatalogProvider(BaseCatalogProvider):
                 publish_contract=True,
                 data_product_specification=self._data_product_specification,
                 provider_hint=self._provider_hint,
+                auto_approve_access=self._auto_approve_access,
             )
         except Exception as exc:
             if self._should_retry_with_odps(exc):
@@ -78,6 +96,7 @@ class DataMeshManagerCatalogProvider(BaseCatalogProvider):
                     publish_contract=True,
                     data_product_specification="odps",
                     provider_hint="odps",
+                    auto_approve_access=self._auto_approve_access,
                 )
             else:
                 return PublishResult(

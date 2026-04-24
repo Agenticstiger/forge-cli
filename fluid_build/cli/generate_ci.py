@@ -160,6 +160,58 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
             "systems ignore it."
         ),
     )
+    p.add_argument(
+        "--default-publish-target",
+        default=None,
+        metavar="TARGET",
+        help=(
+            "Opt-in fallback catalog target baked into Stage 10's\n"
+            "publish shell as ``${PUBLISH_TARGETS:-<TARGET>}``. When\n"
+            "omitted (the default), Stage 10 emits the bare\n"
+            "``${PUBLISH_TARGETS}`` form with no shell fallback.\n"
+            "\n"
+            "Matters for the first Pipeline-from-SCM build Jenkins\n"
+            "auto-triggers after a job is created: the parameters\n"
+            "block's defaults are not exported as env vars to that\n"
+            "first build, so without this flag the CLI publishes to\n"
+            "its built-in default (``fluid-command-center``) which\n"
+            "may not be reachable. Pick the value that matches your\n"
+            "team's primary catalog (e.g. ``datamesh-manager``,\n"
+            "``horizon``, ``datahub``, ``collibra``).\n"
+            "Only the Jenkins template consumes this today."
+        ),
+    )
+    p.add_argument(
+        "--verify-strict-default",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Default value for Jenkins parameter VERIFY_STRICT. "
+            "When omitted, generated Jenkinsfiles preserve the current "
+            "default of true. Only the Jenkins template consumes this today."
+        ),
+    )
+    p.add_argument(
+        "--publish-stage-default",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Default value for Jenkins parameter RUN_STAGE_10_PUBLISH. "
+            "When omitted, generated Jenkinsfiles preserve the current "
+            "default of false. Only the Jenkins template consumes this today."
+        ),
+    )
+    p.add_argument(
+        "--publish-include-env",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Whether the generated Jenkins Stage 10 command includes "
+            "``--env \\\"${FLUID_ENV:-dev}\\\"`` on ``fluid publish``. "
+            "When omitted, Jenkinsfiles preserve the current default of true. "
+            "Only the Jenkins template consumes this today."
+        ),
+    )
     p.set_defaults(generate_sub="ci", func=_run_from_generate)
 
 
@@ -320,12 +372,35 @@ def run(args, logger: logging.Logger) -> int:
         generates_artifacts = not (no_generate_flag or _contract_is_reference_only(contract_path))
 
         install_mode = getattr(args, "install_mode", "pypi") or "pypi"
+        # ``--default-publish-target`` is opt-in: None/empty → emit the
+        # bare ``${PUBLISH_TARGETS}`` form (pre-flag behaviour). A
+        # non-empty value activates the ``${PUBLISH_TARGETS:-<value>}``
+        # shell fallback.
+        raw_default_publish = getattr(args, "default_publish_target", None)
+        default_publish_target = (
+            raw_default_publish.strip()
+            if isinstance(raw_default_publish, str) and raw_default_publish.strip()
+            else None
+        )
+        verify_strict_default_arg = getattr(args, "verify_strict_default", None)
+        publish_stage_default_arg = getattr(args, "publish_stage_default", None)
+        publish_include_env_arg = getattr(args, "publish_include_env", None)
         config = PipelineConfig(
             provider=provider,
             complexity=complexity,
             workdir=_git_prefix(),
             generates_artifacts=generates_artifacts,
             install_mode=install_mode,
+            default_publish_target=default_publish_target,
+            verify_strict_default=(
+                True if verify_strict_default_arg is None else bool(verify_strict_default_arg)
+            ),
+            publish_stage_default=(
+                False if publish_stage_default_arg is None else bool(publish_stage_default_arg)
+            ),
+            publish_include_env=(
+                True if publish_include_env_arg is None else bool(publish_include_env_arg)
+            ),
         )
         files = PipelineTemplateGenerator().generate_pipeline(config)
         if not files:

@@ -52,12 +52,20 @@ def _make_args(
     system: str = "jenkins",
     out: Optional[str] = None,
     install_mode: str = "pypi",
+    default_publish_target: Optional[str] = None,
+    verify_strict_default: Optional[bool] = None,
+    publish_stage_default: Optional[bool] = None,
+    publish_include_env: Optional[bool] = None,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         system=system,
         out=out,
         contract="contract.fluid.yaml",
         install_mode=install_mode,
+        default_publish_target=default_publish_target,
+        verify_strict_default=verify_strict_default,
+        publish_stage_default=publish_stage_default,
+        publish_include_env=publish_include_env,
     )
 
 
@@ -239,6 +247,90 @@ class TestGenerateCIJenkins:
     def test_returns_zero_on_success(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(), _logger) == 0
+
+    def test_default_publish_target_omitted_emits_bare_form(self, tmp_path, monkeypatch):
+        """Without ``--default-publish-target``, Stage 10's shell uses
+        the bare ``${PUBLISH_TARGETS}`` form — backwards-compatible with
+        every Jenkinsfile generated before the flag existed.
+
+        We check the actual shell-loop line rather than a bare substring
+        because the surrounding groovy comment block legitimately
+        documents the opt-in ``${PUBLISH_TARGETS:-X}`` example."""
+        monkeypatch.chdir(tmp_path)
+        assert generate_ci_run(_make_args(), _logger) == 0
+        content = (tmp_path / "Jenkinsfile").read_text()
+        assert "for t in ${PUBLISH_TARGETS}" in content
+        assert "for t in ${PUBLISH_TARGETS:-" not in content
+
+    def test_default_publish_target_opt_in_emits_shell_fallback(self, tmp_path, monkeypatch):
+        """With ``--default-publish-target datamesh-manager``, Stage 10's
+        shell emits ``${PUBLISH_TARGETS:-datamesh-manager}`` so the
+        first Pipeline-from-SCM build Jenkins auto-triggers (before
+        the parameters block is exported as env vars) still publishes
+        to the intended catalog."""
+        monkeypatch.chdir(tmp_path)
+        assert (
+            generate_ci_run(
+                _make_args(default_publish_target="datamesh-manager"), _logger
+            )
+            == 0
+        )
+        content = (tmp_path / "Jenkinsfile").read_text()
+        assert "for t in ${PUBLISH_TARGETS:-datamesh-manager}" in content
+
+    def test_default_publish_target_accepts_arbitrary_catalog(self, tmp_path, monkeypatch):
+        """The flag isn't hard-coded to datamesh-manager — operators on
+        Horizon / DataHub / Collibra pick their own primary catalog."""
+        monkeypatch.chdir(tmp_path)
+        assert (
+            generate_ci_run(_make_args(default_publish_target="horizon"), _logger) == 0
+        )
+        content = (tmp_path / "Jenkinsfile").read_text()
+        assert "for t in ${PUBLISH_TARGETS:-horizon}" in content
+
+    def test_default_publish_target_empty_string_treated_as_unset(
+        self, tmp_path, monkeypatch
+    ):
+        """An empty or whitespace-only value is treated the same as
+        omitting the flag — bare ``${PUBLISH_TARGETS}`` form, no
+        surprise ``:-`` expansion with nothing on the right side.
+
+        Again we check the actual shell-loop line rather than a bare
+        substring because the template's doc-comment legitimately
+        mentions ``${PUBLISH_TARGETS:-X}`` as an example."""
+        monkeypatch.chdir(tmp_path)
+        assert generate_ci_run(_make_args(default_publish_target="   "), _logger) == 0
+        content = (tmp_path / "Jenkinsfile").read_text()
+        assert "for t in ${PUBLISH_TARGETS}" in content
+        assert "for t in ${PUBLISH_TARGETS:-" not in content
+
+    def test_verify_strict_default_override_flips_parameter_default(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        assert generate_ci_run(_make_args(verify_strict_default=False), _logger) == 0
+        content = (tmp_path / "Jenkinsfile").read_text()
+        assert "name: 'VERIFY_STRICT',      defaultValue: false" in content
+
+    def test_publish_stage_default_override_flips_parameter_default(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        assert generate_ci_run(_make_args(publish_stage_default=True), _logger) == 0
+        content = (tmp_path / "Jenkinsfile").read_text()
+        assert "name: 'RUN_STAGE_10_PUBLISH', defaultValue: true" in content
+
+    def test_publish_include_env_override_omits_stage_10_env_flag(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        assert generate_ci_run(_make_args(publish_include_env=False), _logger) == 0
+        content = (tmp_path / "Jenkinsfile").read_text()
+        assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS}' in content
+        assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS} \\' not in content
+        stage_10 = content[content.index("stage('10 · publish')") :]
+        stage_10 = stage_10[: stage_10.index("stage('11 · schedule sync')")]
+        assert '--env "${FLUID_ENV:-dev}"' not in stage_10
 
 
 class TestGenerateCIStaticSystems:
