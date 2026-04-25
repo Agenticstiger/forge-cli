@@ -251,16 +251,16 @@ class ProjectDeployer:
         has_dbt = (self.project_path / "dbt_project.yml").exists()
 
         if has_dbt:
-            base_image = "python:3.9-slim"
+            base_image = "python:3.10-slim"
             install_cmd = "pip install dbt-core dbt-bigquery"
         elif has_requirements:
-            base_image = "python:3.9-slim"
+            base_image = "python:3.10-slim"
             install_cmd = "pip install -r requirements.txt"
         elif has_package_json:
             base_image = "node:16-alpine"
             install_cmd = "npm install"
         else:
-            base_image = "python:3.9-slim"
+            base_image = "python:3.10-slim"
             install_cmd = "# No dependencies found"
 
         return f"""
@@ -462,7 +462,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.9'
+        python-version: '3.10'
     
     - name: Install dependencies
       run: |
@@ -535,7 +535,7 @@ before_script:
 
 test:
   stage: test
-  image: python:3.9
+  image: python:3.10
   script:
     - pip install -r requirements.txt
     - python -m pytest tests/
@@ -589,7 +589,7 @@ stages:
     steps:
     - task: UsePythonVersion@0
       inputs:
-        versionSpec: '3.9'
+        versionSpec: '3.10'
     
     - script: |
         python -m pip install --upgrade pip

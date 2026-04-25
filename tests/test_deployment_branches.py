@@ -154,7 +154,7 @@ class TestGenerateDockerfile:
     def test_with_requirements(self, deployer):
         content = deployer._generate_dockerfile()
         assert "pip install -r requirements.txt" in content
-        assert "python:3.9-slim" in content
+        assert "python:3.10-slim" in content
 
     def test_with_package_json(self, tmp_path):
         (tmp_path / "package.json").write_text("{}")

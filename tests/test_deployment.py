@@ -92,7 +92,7 @@ class TestProjectDeployer:
         (tmp_path / "requirements.txt").write_text("flask\n")
         deployer = ProjectDeployer(tmp_path)
         dockerfile = deployer._generate_dockerfile()
-        assert "python:3.9-slim" in dockerfile
+        assert "python:3.10-slim" in dockerfile
         assert "pip install -r requirements.txt" in dockerfile
 
     def test_generate_dockerfile_node(self, tmp_path):

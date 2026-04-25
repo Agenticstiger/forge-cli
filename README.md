@@ -8,7 +8,7 @@
 
 **The declarative control plane for data engineering in the Agentic Era.**
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://python.org)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/Agenticstiger/forge-cli/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/data-product-forge.svg)](https://pypi.org/project/data-product-forge/)
 [![CI](https://github.com/Agenticstiger/forge-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Agenticstiger/forge-cli/actions/workflows/ci.yml)
@@ -115,7 +115,7 @@ Choose your platform below for step-by-step instructions.
 
 | Requirement | Version |
 |-------------|---------|
-| **Python** | 3.9 or higher |
+| **Python** | 3.10 or higher |
 | **pip** | Latest recommended |
 | **Git** | Any recent version |
 
@@ -137,7 +137,7 @@ brew install python git
 #### 2. Verify Python
 
 ```bash
-python3 --version   # Should print Python 3.9+
+python3 --version   # Should print Python 3.10+
 ```
 
 #### 3. Clone and install
@@ -182,7 +182,7 @@ sudo apt install -y python3 python3-venv python3-pip git build-essential
 #### 2. Verify Python
 
 ```bash
-python3 --version   # Should print Python 3.9+
+python3 --version   # Should print Python 3.10+
 ```
 
 #### 3. Clone and install
@@ -219,7 +219,7 @@ fluid validate examples/01-hello-world/contract.fluid.yaml
 
 #### 1. Install Python
 
-Download and install Python 3.9+ from [python.org](https://www.python.org/downloads/).
+Download and install Python 3.10+ from [python.org](https://www.python.org/downloads/).
 
 > **Important:** Check **"Add Python to PATH"** during installation.
 
@@ -238,7 +238,7 @@ choco install git
 #### 3. Verify prerequisites
 
 ```powershell
-python --version   # Should print Python 3.9+
+python --version   # Should print Python 3.10+
 git --version
 ```
 

@@ -199,7 +199,7 @@ TEST SUITE SUMMARIES
 
 ### Prerequisites
 
-- **Python 3.9+** with required packages
+- **Python 3.10+** with required packages
 - **Virtual environment** (recommended)
 - **Cloud CLI tools** (optional, for integration tests)
 

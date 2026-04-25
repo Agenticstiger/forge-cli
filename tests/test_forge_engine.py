@@ -462,7 +462,7 @@ class TestRunInteractive:
             "_execute_generation",
         ]
         patches = []
-        for method, retval in zip(step_methods, results):
+        for method, retval in zip(step_methods, results, strict=True):
             p = patch.object(engine, method, return_value=retval)
             patches.append(p)
         return patches

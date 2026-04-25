@@ -769,7 +769,7 @@ fluid-provider-sdk/
 name = "fluid-provider-sdk"
 version = "0.1.0"
 description = "SDK for building FLUID data product providers"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = []  # Zero dependencies!
 
 [project.urls]

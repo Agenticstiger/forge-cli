@@ -369,7 +369,7 @@ jobs:
       - uses: actions/checkout@v2
       - uses: actions/setup-python@v2
         with:
-          python-version: '3.9'
+          python-version: '3.10'
       - run: pip install -e .
       - run: pip install pytest pytest-cov
       - run: pytest tests/cli/test_init.py tests/cli/test_init_integration.py -v

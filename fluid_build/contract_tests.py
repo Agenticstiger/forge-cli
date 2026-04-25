@@ -91,7 +91,7 @@ def _require_duckdb():
     except Exception as e:
         raise LocalProviderError(
             "duckdb not installed. Install it with: pip install duckdb\n"
-            "Alternatively pin a compatible Python (3.9+) and DuckDB version."
+            "Alternatively pin a compatible Python (3.10+) and DuckDB version."
         ) from e
 
 

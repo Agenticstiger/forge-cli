@@ -134,7 +134,7 @@ class TestSystemPromptSnapshot:
         if actual != expected:
             # Emit the first divergence so the diff is obvious without
             # dumping 13 KB of context.
-            for i, (a, b) in enumerate(zip(expected, actual)):
+            for i, (a, b) in enumerate(zip(expected, actual, strict=False)):
                 if a != b:
                     context_before = expected[max(0, i - 40) : i]
                     pytest.fail(

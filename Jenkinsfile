@@ -131,7 +131,7 @@ pipeline {
                     
                     # Find available Python 3 by actually testing it
                     PYTHON_CMD=""
-                    for py in python3.11 python3.10 python3.9 python3.8 python3; do
+                    for py in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
                         if $py --version >/dev/null 2>&1; then
                             PYTHON_CMD=$py
                             echo "Found working Python: $PYTHON_CMD"
@@ -140,8 +140,8 @@ pipeline {
                     done
                     
                     if [ -z "$PYTHON_CMD" ]; then
-                        echo "ERROR: Python 3.8+ not found!"
-                        echo "Tried: python3.11, python3.10, python3.9, python3.8, python3"
+                        echo "ERROR: Python 3.10+ not found!"
+                        echo "Tried: python3.14, python3.13, python3.12, python3.11, python3.10, python3"
                         exit 1
                     fi
                     

@@ -383,7 +383,7 @@ def _discover_entrypoints(logger: Optional[logging.Logger]) -> None:
     """
     EP_GROUP = "fluid_build.providers"
     try:
-        # Python >=3.12 returns SelectableGroups; 3.9-3.11 returns dict
+        # Python >=3.12 returns SelectableGroups; 3.10-3.11 returns dict
         all_eps = importlib.metadata.entry_points()
         if isinstance(all_eps, dict):
             eps = all_eps.get(EP_GROUP, [])

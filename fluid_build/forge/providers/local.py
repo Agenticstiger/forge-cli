@@ -61,7 +61,7 @@ class LocalProvider(InfrastructureProvider):
         config["setup_venv"] = setup_venv
 
         if setup_venv:
-            python_version = Prompt.ask("Python version", default="3.9")
+            python_version = Prompt.ask("Python version", default="3.10")
             config["python_version"] = python_version
 
         # Database
@@ -117,11 +117,12 @@ class LocalProvider(InfrastructureProvider):
                 )
 
         # Check Python version
-        python_version = config.get("python_version", "3.9")
+        python_version = str(config.get("python_version", "3.10"))
         try:
-            if float(python_version) < 3.8:
-                errors.append(f"Python {python_version} is not supported - minimum version is 3.8")
-        except ValueError:
+            major, minor = (int(part) for part in python_version.split(".", 2)[:2])
+            if (major, minor) < (3, 10):
+                errors.append(f"Python {python_version} is not supported - minimum version is 3.10")
+        except (TypeError, ValueError):
             warnings.append(f"Invalid Python version format: {python_version}")
 
         return len(errors) == 0, errors + [f"Warning: {w}" for w in warnings]
@@ -141,7 +142,7 @@ class LocalProvider(InfrastructureProvider):
 
         # Check Python
         if not shutil.which("python3") and not shutil.which("python"):
-            errors.append("Python not found - install Python 3.8+")
+            errors.append("Python not found - install Python 3.10+")
 
         # Check Git
         if not shutil.which("git"):
@@ -158,7 +159,7 @@ class LocalProvider(InfrastructureProvider):
         files = {}
 
         # Dockerfile
-        dockerfile = """FROM python:3.9-slim
+        dockerfile = """FROM python:3.10-slim
 
 WORKDIR /app
 
@@ -338,7 +339,7 @@ mypy>=1.0.0
         files["requirements.txt"] = requirements
 
         # setup.py for development
-        python_version = config.get("python_version", "3.9")
+        python_version = config.get("python_version", "3.10")
         setup_py = f'''"""Setup configuration for local development"""
 
 from setuptools import setup, find_packages

@@ -1213,7 +1213,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         {
                             "name": "Set up Python",
                             "uses": _pin_action("actions/setup-python@v5"),
-                            "with": {"python-version": "3.9"},
+                            "with": {"python-version": "3.10"},
                         },
                         {"name": "Install FLUID", "run": "pip install --quiet data-product-forge"},
                         *self._get_oidc_steps(config.oidc_provider),
@@ -1284,7 +1284,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         {
                             "name": "Setup Python",
                             "uses": _pin_action("actions/setup-python@v5"),
-                            "with": {"python-version": "3.9"},
+                            "with": {"python-version": "3.10"},
                         },
                         {
                             "name": "Install Dependencies",
@@ -1309,7 +1309,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         {
                             "name": "Setup Python",
                             "uses": _pin_action("actions/setup-python@v5"),
-                            "with": {"python-version": "3.9"},
+                            "with": {"python-version": "3.10"},
                         },
                         {
                             "name": "Install Dependencies",
@@ -1343,7 +1343,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         {
                             "name": "Setup Python",
                             "uses": _pin_action("actions/setup-python@v5"),
-                            "with": {"python-version": "3.9"},
+                            "with": {"python-version": "3.10"},
                         },
                         {
                             "name": "Install Dependencies",
@@ -1367,7 +1367,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         {
                             "name": "Setup Python",
                             "uses": _pin_action("actions/setup-python@v5"),
-                            "with": {"python-version": "3.9"},
+                            "with": {"python-version": "3.10"},
                         },
                         {
                             "name": "Install Dependencies",
@@ -1403,7 +1403,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                 {
                     "name": "Setup Python",
                     "uses": _pin_action("actions/setup-python@v5"),
-                    "with": {"python-version": "3.9"},
+                    "with": {"python-version": "3.10"},
                 },
                 {"name": "Install Dependencies", "run": "pip install --quiet data-product-forge"},
                 *self._get_oidc_steps(config.oidc_provider),

@@ -412,7 +412,7 @@ def _columns_equal(
     """
     if len(existing) != len(desired):
         return False
-    for a, b in zip(existing, desired):
+    for a, b in zip(existing, desired, strict=True):
         if a.get("Name", "").lower() != b.get("Name", "").lower():
             return False
         if a.get("Type", "").lower() != b.get("Type", "").lower():

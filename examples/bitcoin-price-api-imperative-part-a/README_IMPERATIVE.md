@@ -44,7 +44,7 @@ This is the **imperative implementation** of the Bitcoin Price API data product.
 ## 🚀 Quick Start
 
 ### Prerequisites
-- Python 3.9+
+- Python 3.10+
 - GCP account with BigQuery API enabled
 - `gcloud` CLI authenticated
 - Virtual environment recommended

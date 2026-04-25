@@ -193,12 +193,12 @@ class TestLocalProviderValidateConfiguration(unittest.TestCase):
 
     @patch("fluid_build.forge.providers.local.shutil.which", return_value="/usr/bin/docker")
     def test_valid_config_with_docker_present(self, _mock_which):
-        config = {"use_docker": True, "python_version": "3.9"}
+        config = {"use_docker": True, "python_version": "3.10"}
         is_valid, errors = self.provider.validate_configuration(config)
         self.assertTrue(is_valid)
 
     def test_old_python_version_error(self):
-        config = {"python_version": "3.6"}
+        config = {"python_version": "3.9"}
         is_valid, errors = self.provider.validate_configuration(config)
         self.assertFalse(is_valid)
         error_text = " ".join(errors)
@@ -212,7 +212,7 @@ class TestLocalProviderValidateConfiguration(unittest.TestCase):
         self.assertIn("Invalid Python version", combined)
 
     def test_use_docker_false_no_docker_check(self):
-        config = {"use_docker": False, "python_version": "3.9"}
+        config = {"use_docker": False, "python_version": "3.10"}
         is_valid, errors = self.provider.validate_configuration(config)
         self.assertTrue(is_valid)
 
@@ -307,14 +307,14 @@ class TestLocalProviderGenerateConfig(unittest.TestCase):
 
     def test_generate_config_python_setup_produces_pyproject_toml(self):
         ctx = _make_context(
-            provider_config={"use_docker": False, "setup_venv": True, "python_version": "3.9"}
+            provider_config={"use_docker": False, "setup_venv": True, "python_version": "3.10"}
         )
         files = self.provider.generate_config(ctx)
         self.assertIn("pyproject.toml", files)
 
     def test_generate_config_python_setup_produces_setup_py(self):
         ctx = _make_context(
-            provider_config={"use_docker": False, "setup_venv": True, "python_version": "3.9"}
+            provider_config={"use_docker": False, "setup_venv": True, "python_version": "3.10"}
         )
         files = self.provider.generate_config(ctx)
         self.assertIn("setup.py", files)

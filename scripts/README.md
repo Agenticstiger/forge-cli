@@ -79,7 +79,7 @@ If your paths differ, set `CONTRACT_GCP`, `BASELINE_SCHEMA`, and `CONTRACT_LOCAL
 ## ✅ Prerequisites
 
 * **Bash** on macOS/Linux (Windows WSL is fine).
-* **Python 3.9+** (project virtualenv recommended).
+* **Python 3.10+** (project virtualenv recommended).
 * **Installed CLI** for your project (`fluid_build` Python package visible in the venv).
 * Optional but recommended:
 

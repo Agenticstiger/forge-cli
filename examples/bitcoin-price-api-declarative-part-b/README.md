@@ -138,7 +138,7 @@ python3 -m fluid_build policy-check contract.fluid.yaml.full
 
 Same as Part A:
 - GCP project with free tier enabled (`<<YOUR_PROJECT_HERE>>`)
-- Python 3.9+
+- Python 3.10+
 - `fluid_build` CLI installed
 - GCP authentication configured
 

@@ -174,7 +174,7 @@ class TestGenerateDockerfile:
     def test_default_uses_python_slim_base(self, tmp_path):
         deployer = _make_deployer(tmp_path)
         content = deployer._generate_dockerfile()
-        assert "python:3.9-slim" in content
+        assert "python:3.10-slim" in content
         assert "FROM" in content
 
     def test_has_healthcheck_directive(self, tmp_path):

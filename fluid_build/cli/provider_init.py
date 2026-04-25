@@ -154,7 +154,7 @@ def _gen_pyproject(name: str, slug: str, pkg: str, desc: str, author: str, cls: 
         version = "0.1.0"
         description = "{desc}"
         authors = [{{name = "{author}"}}]
-        requires-python = ">=3.9"
+        requires-python = ">=3.10"
         dependencies = [
             "fluid-provider-sdk>=0.1.0",
         ]

@@ -305,7 +305,7 @@ def execute_sql(action: Dict[str, Any]) -> Dict[str, Any]:
             if cursor.description:
                 rows = cursor.fetchall()
                 columns = [desc[0] for desc in cursor.description]
-                results = [dict(zip(columns, row)) for row in rows]
+                results = [dict(zip(columns, row, strict=True)) for row in rows]
             else:
                 results = []
 

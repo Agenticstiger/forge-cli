@@ -47,7 +47,7 @@ All PRs to `main` must pass these checks before merge:
 | Check | What it does |
 |-------|-------------|
 | **Lint & Format** | `ruff check` + `black --check` (Python 3.12) |
-| **Test Matrix** | `pytest` on Python 3.9, 3.10, 3.11, 3.12 (randomized order) |
+| **Test Matrix** | `pytest` on Python 3.10, 3.11, 3.12, 3.13, 3.14 (randomized order) |
 | **Coverage Gates** | Core 80%, local providers 50%, cloud providers 20% (Python 3.12) |
 | **Security Scan** | `bandit` with medium severity threshold |
 | **Build Smoke Test** | Wheel build + install verification |
@@ -140,7 +140,7 @@ The documentation site lives in a separate repo. To create a companion docs PR:
 
 ## Coding Standards
 
-- **Python 3.9+** — no walrus operators in hot paths, use `from __future__ import annotations` sparingly.
+- **Python 3.10+** — no walrus operators in hot paths, use `from __future__ import annotations` sparingly.
 - **Type hints** on all public function signatures.
 - **Logging** — use `logging.getLogger(__name__)` in production code, never bare `print()`.
 - **No bare `except:`** — always catch specific exceptions.
@@ -226,7 +226,7 @@ def _make_contract(name="test", version="1.0", **overrides):
 
 ### Async Tests
 
-We support Python 3.9+ which requires manual async handling (no `@pytest.mark.asyncio`). Use this pattern:
+Use this manual async handling pattern for compatibility with the lightweight test helpers:
 
 ```python
 import asyncio

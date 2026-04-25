@@ -127,6 +127,6 @@ fluid publish contract.fluid.yaml --catalog datamesh-manager
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
 - `requests` library (`pip install requests`)
 - Entropy Data API key (free tier available)

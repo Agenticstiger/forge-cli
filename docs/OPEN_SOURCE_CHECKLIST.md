@@ -201,7 +201,7 @@ The following workflow files should already be in `.github/workflows/`:
 
 | File | Trigger | Purpose |
 |------|---------|---------|
-| `ci.yml` | Push/PR to `main` | Lint, test matrix (3.9-3.12), security scan, license check, build smoke test |
+| `ci.yml` | Push/PR to `main` | Lint, test matrix (3.10-3.14), security scan, license check, build smoke test |
 | `build-profiles.yml` | Push to `main` | Build alpha/beta/stable wheels, upload as artifacts |
 | `release.yml` | Tag `v*.*.*` or manual | Publish to PyPI/TestPyPI, GitHub Release, Docker to GHCR |
 
