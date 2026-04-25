@@ -137,7 +137,7 @@
 | **7.1** Increase Test Coverage to 95% | P1 | ❌ | **264 tests pass** (191 provider + 28 CLI smoke + 45 config manager). No `fail_under` threshold enforced in CI. Coverage not measured against 95% target. |
 | **7.2** Add Property-Based Tests | P2 | ❌ | Hypothesis not installed. 0 property-based tests. |
 | **7.3** Add Performance Benchmarks | P2 | ❌ | `pytest-benchmark` not installed. 0 benchmark tests. |
-| **7.4** Setup GitHub Actions CI | P0 | 🟡 | `.github/workflows/ci.yml` exists. Tests on Py 3.9–3.12, runs `ruff`, `black`, `pytest`, uploads coverage to Codecov. CI status badge added to README. Bandit now **blocks on failures** (removed `|| true`). **Remaining gap:** no `fail_under` coverage threshold. |
+| **7.4** Setup GitHub Actions CI | P0 | 🟡 | `.github/workflows/ci.yml` exists. Tests on Py 3.10–3.14, runs `ruff`, `black`, `pytest`, uploads coverage to Codecov. CI status badge added to README. Bandit now **blocks on failures** (removed `|| true`). **Remaining gap:** no `fail_under` coverage threshold. |
 
 ### Remaining work — Epic 7
 - [ ] Run `pytest --cov=fluid_build --cov-report=html` to measure current coverage %

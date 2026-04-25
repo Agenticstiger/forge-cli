@@ -418,7 +418,7 @@ solid foundation for building data products with best practices and modern tooli
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.10+
 - SQL database (for local development)
 - Git
 

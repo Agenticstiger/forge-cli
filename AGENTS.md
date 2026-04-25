@@ -169,7 +169,7 @@ make demo           # validate → plan → apply on example contract
 
 ### Code Conventions
 
-- Python 3.9+ target
+- Python 3.10+ target
 - Line length: 100 (Ruff + Black)
 - Type hints encouraged but not enforced (`mypy` runs with `ignore_missing_imports`)
 - Logging via `fluid_build/structured_logging.py` (structured JSON logs)

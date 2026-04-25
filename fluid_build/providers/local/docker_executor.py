@@ -33,7 +33,7 @@ class DockerExecutor:
     """Execute operations in Docker containers."""
 
     def __init__(
-        self, logger: Optional[logging.Logger] = None, default_image: str = "python:3.9-slim"
+        self, logger: Optional[logging.Logger] = None, default_image: str = "python:3.10-slim"
     ):
         """
         Initialize Docker executor.
@@ -75,7 +75,7 @@ class DockerExecutor:
 
         Args:
             script: Python script content
-            image: Docker image (default: python:3.9-slim)
+            image: Docker image (default: python:3.10-slim)
             volumes: Volume mounts {host_path: container_path}
             env_vars: Environment variables
             requirements: Python packages to install
@@ -320,7 +320,7 @@ version: '3.8'
 
 x-airflow-common:
   &airflow-common
-  image: apache/airflow:2.7.3-python3.9
+  image: apache/airflow:2.7.3-python3.10
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor

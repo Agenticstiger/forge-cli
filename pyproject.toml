@@ -8,7 +8,7 @@ name = "data-product-forge"
 dynamic = ["version"]
 description = "FLUID Build System: plan/apply/visualize data products across providers (GCP, Snowflake, Local) with policy & contract tests."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Agentics Transformation Pty Ltd" }]
@@ -20,10 +20,11 @@ classifiers = [
   "Intended Audience :: Developers",
   "Intended Audience :: Information Technology",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Build Tools",
   "Topic :: System :: Systems Administration",
 ]
@@ -181,7 +182,7 @@ fluid_build = ["providers/**/test_*"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 # T201 (flake8-print) is enabled for ``fluid_build/`` so stray ``print``
@@ -233,10 +234,10 @@ skips = ["B608", "B324", "B310", "B113"]
 
 [tool.black]
 line-length = 100
-target-version = ["py39"]
+target-version = ["py310"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 warn_unused_ignores = true
 disallow_untyped_defs = false
 ignore_missing_imports = true

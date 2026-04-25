@@ -164,7 +164,7 @@ Complete test results in JSON format:
     "project": "my-test-project",
     "region": "us-central1",
     "dry_run": false,
-    "python_version": "3.9.7"
+    "python_version": "3.10.14"
   },
   "statistics": {
     "total_tests": 25,
@@ -460,7 +460,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          python-version: '3.10'
       
       - name: Install dependencies
         run: pip install -r requirements.txt

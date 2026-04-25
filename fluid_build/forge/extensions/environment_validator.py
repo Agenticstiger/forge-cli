@@ -90,8 +90,8 @@ class EnvironmentValidatorExtension(Extension):
                     version_parts = version_str.split("Python 3.")[1].split(".")
                     if len(version_parts) >= 1:
                         minor_version = int(version_parts[0])
-                        if minor_version < 8:
-                            issues.append(f"Python version {version_str} is below minimum 3.8")
+                        if minor_version < 10:
+                            issues.append(f"Python version {version_str} is below minimum 3.10")
                 else:
                     issues.append("Could not determine Python version")
             else:

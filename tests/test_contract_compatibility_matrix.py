@@ -220,7 +220,7 @@ def test_lineage_fixtures_preserve_input_ports_across_odps_exports(
         )
         for preview in dmm_result["access_agreements"]
     }
-    assert access_edges == set(zip(expected_refs, expected_ids))
+    assert access_edges == set(zip(expected_refs, expected_ids, strict=True))
     # OdpsProvider (legacy OPDS/Linux Foundation emitter) is a DIFFERENT
     # provider — keeps its legacy {id, reference} shape. Not part of the
     # ODPS-Bitol schema contract.

@@ -529,7 +529,7 @@ class OpenAIProvider(LlmProvider):
                 "tool_call_id": tc["id"],
                 "content": json.dumps(result, default=str),
             }
-            for tc, result in zip(tool_calls, results)
+            for tc, result in zip(tool_calls, results, strict=True)
         ]
         return [assistant_msg] + tool_msgs
 
@@ -757,7 +757,7 @@ class AnthropicProvider(LlmProvider):
                 "tool_use_id": tc["id"],
                 "content": json.dumps(result, default=str),
             }
-            for tc, result in zip(tool_calls, results)
+            for tc, result in zip(tool_calls, results, strict=True)
         ]
         return [
             {"role": "assistant", "content": assistant_content},
@@ -962,7 +962,7 @@ class GeminiProvider(LlmProvider):
                     "response": {"result": result},
                 }
             }
-            for tc, result in zip(tool_calls, results)
+            for tc, result in zip(tool_calls, results, strict=True)
         ]
         return [
             {"role": "model", "content": model_parts},

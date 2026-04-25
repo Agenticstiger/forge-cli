@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Dropped Python 3.9 support, raised the package baseline to Python 3.10,
+  and expanded CI/package classifiers through Python 3.14.
+
 ### Fixed
 
 ## [0.8.0] — 2026-04-25

@@ -127,7 +127,7 @@ class GlueConfiguration:
 
     role_arn: str
     glue_version: str = "4.0"
-    python_version: str = "3.9"
+    python_version: str = "3.10"
     worker_type: str = "G.1X"
     number_of_workers: int = 10
     max_capacity: Optional[int] = None
@@ -181,7 +181,7 @@ class LambdaConfiguration:
     """Lambda-specific configuration."""
 
     function_name: str
-    runtime: str = "python3.9"
+    runtime: str = "python3.10"
     handler: str = "lambda_function.lambda_handler"
     code: Dict[str, str] = field(default_factory=dict)
     description: str = ""

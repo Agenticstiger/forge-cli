@@ -49,7 +49,7 @@
 - [x] Glue job support — `glue.ensure_job` implemented in `provider.py` and `actions/glue.py`
 
 ### Testing & Quality
-- [x] CI pipeline — `ci.yml` has lint, test matrix (3.9–3.12), security scan, license check, build smoke test
+- [x] CI pipeline — `ci.yml` has lint, test matrix (3.10–3.14), security scan, license check, build smoke test
 - [x] Bandit blocking — security scan fails the build (no `|| true`)
 - [x] CI badge — present in README
 

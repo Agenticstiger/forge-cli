@@ -113,7 +113,7 @@ class MLPipelineTemplate(ProjectTemplate):
                             "script": "src/pipelines/training/train_pipeline.py",
                             "requirements": "requirements.txt",
                             "environment": {
-                                "python_version": "3.9",
+                                "python_version": "3.10",
                                 "packages": ["scikit-learn", "tensorflow", "mlflow"],
                             },
                         },
