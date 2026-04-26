@@ -15,7 +15,7 @@
 """CLI command ``fluid generate`` — unified entry point for artifact generation.
 
 Subcommands:
-    fluid generate speed-transformation   Generate transformation artifacts (dbt, SQL, ...)
+    fluid generate transformation         Generate transformation artifacts (dbt, SQL, ...)
     fluid generate schedule               Generate schedule artifacts (Airflow, Dagster, Prefect)
     fluid generate ci                     Generate CI/CD pipelines (GitHub Actions, GitLab CI)
     fluid generate standard               Export to data product standards (OPDS, ODCS, ODPS, ODPS-Bitol)
@@ -42,6 +42,8 @@ def register(subparsers: argparse._SubParsersAction):
 
         Subcommands:
           speed-transformation   Generate transformation engine artifacts (dbt, SQL, etc.)
+          transformation         Friendly alias for speed-transformation
+          dbt                    Alias for transformation when generating dbt projects
           schedule               Generate schedule/orchestration artifacts (Airflow, Dagster, Prefect)
           ci                     Generate CI/CD pipelines (GitHub Actions, GitLab CI)
           standard               Export to data product standards (OPDS, ODCS, ODPS, ODPS-Bitol)
@@ -52,7 +54,7 @@ def register(subparsers: argparse._SubParsersAction):
         epilog="""
 Examples:
   # Generate transformation artifacts
-  fluid generate speed-transformation
+  fluid generate transformation
 
   # Generate schedule artifacts
   fluid generate schedule
@@ -64,7 +66,7 @@ Examples:
   fluid generate standard contract.fluid.yaml --format opds
 
   # List available engines/schedulers/formats
-  fluid generate speed-transformation --list
+  fluid generate transformation --list
   fluid generate schedule --list
   fluid generate standard --list
         """,
@@ -104,7 +106,7 @@ def run(args: Any, logger: logging.Logger) -> int:
     """Route to the appropriate subcommand."""
     sub = getattr(args, "generate_sub", None)
 
-    if sub == "speed-transformation":
+    if sub in {"speed-transformation", "transformation", "dbt"}:
         from . import generate_speed_transformation
 
         return generate_speed_transformation.run(args, logger)
@@ -140,13 +142,13 @@ def run(args: Any, logger: logging.Logger) -> int:
         # Bare `fluid generate` — show help
         cprint("Usage: fluid generate <subcommand>\n")
         cprint("Subcommands:")
-        cprint("  speed-transformation   Generate transformation artifacts (dbt, SQL, etc.)")
+        cprint("  transformation         Generate transformation artifacts (dbt, SQL, etc.)")
         cprint("  schedule               Generate schedule artifacts (Airflow, Dagster, Prefect)")
         cprint("  ci                     Generate CI/CD pipelines (GitHub Actions, GitLab CI)")
         cprint("  standard               Export to standards (OPDS, ODCS, ODPS, ODPS-Bitol)")
         cprint("")
         cprint("Examples:")
-        cprint("  fluid generate speed-transformation")
+        cprint("  fluid generate transformation")
         cprint("  fluid generate schedule")
         cprint("  fluid generate ci --system github")
         cprint("  fluid generate standard contract.fluid.yaml --format opds")

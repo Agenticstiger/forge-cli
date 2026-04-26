@@ -89,7 +89,7 @@ def main() -> int:
         print(f"pre-flight FAIL: CONTRACT not found: {CONTRACT}")
         return 2
 
-    print(f"Phase-6B smoke")
+    print("Phase-6B smoke")
     print(f"  FLUID_BIN   = {FLUID_BIN}")
     print(f"  CONTRACT    = {CONTRACT}")
     print(f"  ENV_DEV     = {ENV_DEV}")

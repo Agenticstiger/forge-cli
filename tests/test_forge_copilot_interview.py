@@ -43,8 +43,10 @@ class FakeConsole:
     def __init__(self, answers=None):
         self.answers = list(answers or [])
         self.index = 0
+        self.prompts = []
 
     def input(self, _prompt=""):
+        self.prompts.append(_prompt)
         if self.index >= len(self.answers):
             return ""
         answer = self.answers[self.index]
@@ -136,12 +138,10 @@ class TestAdaptiveCopilotInterview:
         ],
     )
     def test_interview_caps_round_questions_at_two(self, _mock_decision):
-        # Bootstrap asks up to 4 optional questions (byot, engine, schedule,
-        # data_modeling_technique) before the LLM-driven dynamic round.
-        # Provide empty strings to skip those (the modeling-technique
-        # picker has a default of "data_vault_2"), then the real answers
-        # for the two dynamic questions.
-        console = FakeConsole(["", "", "", "", "dashboards", "table"])
+        # Bootstrap asks the grouped delivery setup first (data model,
+        # transformation). Provide empty strings for the safe defaults,
+        # then the real answers for the two dynamic questions.
+        console = FakeConsole(["", "", "dashboards", "table"])
         state = run_adaptive_copilot_interview(
             initial_context={
                 "project_goal": "Orders analytics",
@@ -190,6 +190,94 @@ class TestAdaptiveCopilotInterview:
         assert state.normalized_context["provider"] == "snowflake"
         assert state.normalized_context["domain"] == "analytics"
         assert state.normalized_context["canonical_model"] == "hl7_fhir"
+
+    @patch(
+        "fluid_build.cli.forge_copilot_interview.request_interview_decision",
+        return_value=InterviewDecision(status="ready", reason="Delivery defaults are enough."),
+    )
+    def test_delivery_setup_defaults_to_dbt_without_scheduler(self, _mock_decision):
+        console = FakeConsole(["", ""])
+
+        state = run_adaptive_copilot_interview(
+            initial_context={
+                "project_goal": "Orders analytics",
+                "data_sources": "warehouse tables",
+            },
+            console=console,
+            llm_config=_llm_config(),
+            discovery_report=DiscoveryReport(workspace_roots=["/tmp/workspace"]),
+            capability_matrix={"providers": ["local"], "templates": {"analytics": {}}},
+        )
+
+        assert state.normalized_context["build_engine"] == "dbt"
+        assert "schedule_engine" not in state.normalized_context
+        assert not any(prompt.startswith("Scheduler") for prompt in console.prompts)
+        assert not any("orchestration" in prompt.lower() for prompt in console.prompts)
+        assert not any("generate_dbt" in prompt for prompt in console.prompts)
+        assert not any("data_vault_2" in prompt for prompt in console.prompts)
+
+    @patch(
+        "fluid_build.cli.forge_copilot_interview.request_interview_decision",
+        return_value=InterviewDecision(status="ready", reason="Delivery defaults are enough."),
+    )
+    def test_delivery_setup_uses_reporting_default_for_dashboard_wording(self, _mock_decision):
+        console = FakeConsole(["", ""])
+
+        state = run_adaptive_copilot_interview(
+            initial_context={
+                "project_goal": "Executive revenue dashboard",
+                "data_sources": "warehouse tables",
+            },
+            console=console,
+            llm_config=_llm_config(),
+            discovery_report=DiscoveryReport(workspace_roots=["/tmp/workspace"]),
+            capability_matrix={"providers": ["local"], "templates": {"analytics": {}}},
+        )
+
+        assert state.normalized_context["data_modeling_technique"] == "dimensional"
+        assert state.normalized_context["build_engine"] == "dbt"
+
+    def test_delivery_setup_scheduler_is_explicit_opt_in(self):
+        console = FakeConsole(["", "", "airflow"])
+
+        state = run_adaptive_copilot_interview(
+            initial_context={
+                "project_goal": "Orders analytics with an Airflow DAG",
+                "data_sources": "warehouse tables",
+                "use_case": "analytics",
+            },
+            console=console,
+            llm_config=_llm_config(),
+            discovery_report=DiscoveryReport(workspace_roots=["/tmp/workspace"]),
+            capability_matrix={"providers": ["local"], "templates": {"analytics": {}}},
+        )
+
+        assert state.normalized_context["build_engine"] == "dbt"
+        assert state.normalized_context["schedule_engine"] == "airflow"
+        assert not any("orchestration" in prompt.lower() for prompt in console.prompts)
+
+    @patch(
+        "fluid_build.cli.forge_copilot_interview.request_interview_decision",
+        return_value=InterviewDecision(status="ready", reason="Existing paths are enough."),
+    )
+    def test_delivery_setup_accepts_direct_existing_paths(self, _mock_decision):
+        console = FakeConsole(["", "/repo/dbt_models", "/repo/dags"])
+
+        state = run_adaptive_copilot_interview(
+            initial_context={
+                "project_goal": "Orders analytics with an existing daily schedule",
+                "data_sources": "warehouse tables",
+            },
+            console=console,
+            llm_config=_llm_config(),
+            discovery_report=DiscoveryReport(workspace_roots=["/tmp/workspace"]),
+            capability_matrix={"providers": ["local"], "templates": {"analytics": {}}},
+        )
+
+        assert state.normalized_context["byot_path"] == "/repo/dbt_models"
+        assert state.normalized_context["byos_path"] == "/repo/dags"
+        assert "build_engine" not in state.normalized_context
+        assert "schedule_engine" not in state.normalized_context
 
     @patch(
         "fluid_build.cli.forge_copilot_interview.request_interview_decision",
@@ -280,11 +368,10 @@ class TestAdaptiveCopilotInterview:
         ],
     )
     def test_unresolved_structured_input_is_preserved_in_transcript(self, _mock_decision):
-        # Bootstrap asks up to 4 optional questions (byot, engine, schedule,
-        # data_modeling_technique) before the LLM-driven dynamic round.
-        # Provide empty strings to skip those, then the real answer for
-        # the dynamic question.
-        console = FakeConsole(["", "", "", "", "spark jobs"])
+        # Bootstrap asks the grouped delivery setup first (data model,
+        # transformation). Provide empty strings for the safe defaults,
+        # then the real answer for the dynamic question.
+        console = FakeConsole(["", "", "spark jobs"])
         state = run_adaptive_copilot_interview(
             initial_context={
                 "project_goal": "Orders analytics",

@@ -24,6 +24,7 @@ __all__ = [
 ]  # Note: domain_agent/template modes are deprecated but kept for backward compat
 
 
+import json
 import logging
 import os
 import sys
@@ -40,6 +41,7 @@ from fluid_build.cli.forge_copilot_llm_providers import (
     PROVIDER_DISPLAY_NAMES,
     CopilotGenerationError,
     LlmConfig,
+    build_llm_run_plan,
     check_llm_readiness,
     detect_provider_from_api_key,
     get_catalog_default,
@@ -942,6 +944,10 @@ def run_ai_copilot_mode(
             "llm_provider": get_cli_arg_fn(args, "llm_provider"),
             "llm_model": get_cli_arg_fn(args, "llm_model"),
             "llm_endpoint": get_cli_arg_fn(args, "llm_endpoint"),
+            "llm_routing_model": get_cli_arg_fn(args, "llm_routing_model"),
+            "llm_routing_endpoint": get_cli_arg_fn(args, "llm_routing_endpoint"),
+            "tiered": bool(get_cli_arg_fn(args, "tiered", False)),
+            "require_llm": bool(get_cli_arg_fn(args, "require_llm", False)),
             "discover": get_cli_arg_fn(args, "discover", True),
             "discovery_path": get_cli_arg_fn(args, "discovery_path"),
             "memory": get_cli_arg_fn(args, "memory", True),
@@ -1052,10 +1058,37 @@ def run_ai_copilot_mode(
                 llm_cfg = runtime_inputs.get("llm_config")
                 if llm_cfg:
                     display = PROVIDER_DISPLAY_NAMES.get(llm_cfg.provider, llm_cfg.provider)
+                    plan_suffix = ""
+                    if getattr(llm_cfg, "routing_model", None):
+                        plan_suffix = f" · routing {llm_cfg.routing_model}"
+                    if bool(get_cli_arg_fn(args, "tiered", False)):
+                        plan_suffix += " · tiered"
                     console.print(
                         f"[dim]AI: [bold]{display}[/bold] / {llm_cfg.model}  "
+                        f"{plan_suffix}  "
                         f"(reset with [bold]fluid ai setup --clear[/bold])[/dim]"
                     )
+                    try:
+                        run_plan = build_llm_run_plan(
+                            llm_cfg,
+                            tiered=bool(get_cli_arg_fn(args, "tiered", False)),
+                        )
+                        logical_stage = next(
+                            (
+                                stage
+                                for stage in run_plan.get("stages", [])
+                                if stage.get("stage") == "logical_modeler"
+                            ),
+                            {},
+                        )
+                        routing_model = run_plan.get("routing_model")
+                        console.print(
+                            "[dim]AI plan: interview/self-check use "
+                            f"{routing_model}; logical modeling uses "
+                            f"{logical_stage.get('model')}; contract + dbt stay deterministic.[/dim]"
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 discovery = runtime_inputs.get("discovery_report")
                 if discovery:
                     _print_discovery_summary(console, discovery)
@@ -1102,6 +1135,7 @@ def run_ai_copilot_mode(
                 capability_matrix=runtime_inputs["capability_matrix"],
                 project_memory=runtime_inputs["project_memory"],
                 target_dir=_prelim_target,
+                quiet=getattr(args, "quiet", False),
             )
             copilot_options["interview_state"] = interview_state
             context = interview_state.finalize()
@@ -1697,6 +1731,7 @@ def _create_project_agent_loop(
 
         target_dir.mkdir(parents=True, exist_ok=True)
         contract_path = target_dir / "contract.fluid.yaml"
+        sidecar_path = target_dir / "contract.fluid.yaml.model.json"
         write_contract(contract, contract_path, command="fluid forge --agent-loop")
 
         if console:
@@ -1760,8 +1795,60 @@ def _create_project_minimal(
     Returns ``True`` on success, ``False`` on failure.  Never raises —
     errors are logged and a red panel is shown to the user.
     """
+    from pydantic import BaseModel
+
     from fluid_build.cli.forge_contract_factory import write_contract
     from fluid_build.cli.forge_copilot_llm_providers import CopilotGenerationError
+
+    def _write_ai_work_receipt(generation_result: Any) -> Optional[Path]:
+        """Persist a concise, user-facing AI run receipt."""
+        ai_run_plan = getattr(generation_result, "ai_run_plan", None)
+        provenance = getattr(generation_result, "provenance", None) or {}
+        if not ai_run_plan and not provenance:
+            return None
+        payload = {
+            "kind": "ForgeAIWorkReceipt",
+            "runPlan": ai_run_plan or provenance.get("ai_run_plan"),
+            "agentEvents": list(provenance.get("agent_events") or []),
+            "fallbackUsed": bool(provenance.get("fallback_used", False)),
+            "fallbackEvents": list(provenance.get("fallback_events") or []),
+            "repairUsed": bool(provenance.get("repair_used", False)),
+            "repairEvents": list(provenance.get("repair_events") or []),
+            "provenance": provenance,
+        }
+        receipt_path = target_dir / ".fluid" / "ai-work-receipt.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        return receipt_path
+
+    def _serialize_logical_model(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                json.loads(value)
+            except Exception:  # noqa: BLE001
+                return None
+            return value
+        if isinstance(value, BaseModel):
+            try:
+                return value.model_dump_json(indent=2, by_alias=True)
+            except Exception:  # noqa: BLE001
+                return None
+        if isinstance(value, dict):
+            try:
+                return json.dumps(value, indent=2, sort_keys=True)
+            except TypeError:
+                return None
+        if isinstance(value, list):
+            try:
+                return json.dumps(value, indent=2)
+            except TypeError:
+                return None
+        return None
 
     try:
         # Context is already normalized by the caller (run_ai_copilot_mode).
@@ -1790,6 +1877,17 @@ def _create_project_minimal(
                     )
         except Exception as exc:  # noqa: BLE001 — discovery is best-effort
             logger.debug("upstream_discovery_failed: %s", exc)
+
+        if dry_run:
+            if console:
+                try:
+                    console.print(
+                        f"[dim]DRY RUN: would generate and write {target_dir}/contract.fluid.yaml[/dim]"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            logger.info("DRY RUN: would generate minimal AI contract in %s", target_dir)
+            return True
 
         try:
             generation_result = copilot.generate_project_artifacts(context, options)
@@ -1824,21 +1922,12 @@ def _create_project_minimal(
         except Exception as exc:  # noqa: BLE001 — UI must never fail the run
             logger.debug("copilot_show_ai_analysis_failed", extra={"error": str(exc)})
 
-        if dry_run:
-            if console:
-                try:
-                    console.print(
-                        f"[dim]DRY RUN: would write {target_dir}/contract.fluid.yaml[/dim]"
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-            return True
-
         # Write the LLM-generated contract using the slice-4 envelope
         # writer.  write_contract injects metadata.provenance with the
         # correct 'fluid forge' command string.
         target_dir.mkdir(parents=True, exist_ok=True)
         contract_path = target_dir / "contract.fluid.yaml"
+        sidecar_path = target_dir / f"{contract_path.name}.model.json"
 
         # ── Fragment layout decision ─────────────────────────────
         from fluid_build.cli.forge_contract_fragments import (
@@ -1899,6 +1988,27 @@ def _create_project_minimal(
             fragment_files = {}
             write_contract(contract, contract_path, command="fluid forge")
 
+        logical_model = getattr(generation_result, "logical_model", None)
+        serialized_logical = _serialize_logical_model(logical_model)
+        if serialized_logical is not None:
+            sidecar_path.write_text(serialized_logical, encoding="utf-8")
+            if str(context.get("review_data_model", "")).lower() == "true":
+                try:
+                    from fluid_build.cli.forge_data_model import review_logical_model
+
+                    reviewed = review_logical_model(
+                        sidecar_path,
+                        logger,
+                        contract_path=contract_path,
+                    )
+                    if reviewed is not None:
+                        sidecar_path.write_text(
+                            reviewed.model_dump_json(indent=2, by_alias=True),
+                            encoding="utf-8",
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("logical_review_failed: %s", exc)
+
         # Write additional files (dbt models, SQL, etc.) — these were
         # previously ignored in the minimal path.
         #
@@ -1919,6 +2029,8 @@ def _create_project_minimal(
                 fpath = target_dir / rel_path
                 fpath.parent.mkdir(parents=True, exist_ok=True)
                 fpath.write_text(content, encoding="utf-8")
+
+        ai_receipt_path = _write_ai_work_receipt(generation_result)
 
         # Persist project memory the same way the legacy path does, so
         # subsequent forge runs in this product have the full history.
@@ -1968,9 +2080,11 @@ def _create_project_minimal(
                 if additional_files:
                     n = len(additional_files)
                     console.print(f"[green]   + {n} additional file{'s' if n != 1 else ''}[/green]")
+                if ai_receipt_path:
+                    console.print("[green]   + AI work receipt[/green]")
                 if engine_files:
                     console.print(
-                        "[dim]   Tip: use 'fluid generate speed-transformation' to re-generate transformations.[/dim]"
+                        "[dim]   Tip: use 'fluid generate transformation' to re-generate transformations.[/dim]"
                     )
                 if schedule_files:
                     console.print(
@@ -2125,7 +2239,7 @@ def _generate_engine_artifacts(
             )
 
         # Stamp the chosen technique onto the contract so downstream
-        # CLIs (``fluid generate speed-transformation``) can surface it
+        # CLIs (``fluid generate transformation``) can surface it
         # in their banner without re-running the interview. We use the
         # top-level ``labels`` map because FLUID 0.7.2 ``metadata``
         # declares ``additionalProperties: false`` — only ``labels``

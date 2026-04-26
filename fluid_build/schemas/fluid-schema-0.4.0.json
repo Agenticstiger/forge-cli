@@ -48,7 +48,7 @@
     },
     "description": {
       "type": "string",
-      "description": "A brief, business-focused description of the product's purpose."
+      "description": "A intent, business-focused description of the product's purpose."
     },
     "domain": {
       "type": "string",

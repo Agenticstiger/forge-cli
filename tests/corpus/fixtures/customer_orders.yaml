@@ -1,0 +1,47 @@
+## Demo golden corpus fixture.
+##
+## Format:
+##
+## ``intent`` (optional) — the input intent shape.
+## ``ddl`` (optional)  — DDL files the forge consumes.
+## ``tables`` (optional) — explicit table list.
+## ``expected``        — corpus constraints the run must satisfy.
+##
+## Constraint values support: ``int`` (exact), ``">= N"``,
+## ``"<= N"``, ``"> N"``, ``"< N"``, ``"== N"``, ``True`` /
+## ``False``, or a list of strings (set containment).
+
+intent:
+  data_product:
+    name: customer_orders
+    domain: commerce
+    description: |
+      Customer order events with line items and refund flags.
+      Used for revenue analytics and churn modelling.
+    owner: analytics@example.com
+  grain:
+    entity: order_line
+    time_dimension: order_date
+    description: One row per order line item.
+  dimensions:
+    entities: [customer, order]
+    attributes: [customer_id, order_id, refund_flag, order_date]
+  metrics:
+    - name: gross_revenue
+      description: Gross revenue before refunds.
+  modeling:
+    technique: data_vault_2
+
+expected:
+  hub_count: ">= 2"
+  link_count: ">= 1"
+  contains_hubs:
+    - hub_customer
+    - hub_order
+  validation_passes: true
+  dbt_model_count: ">= 1"
+  model_doc_contains:
+    - "```mermaid"
+    - "### Hubs"
+    - "### Links"
+  cost_under_usd: "<= 1.00"

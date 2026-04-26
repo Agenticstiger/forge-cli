@@ -210,7 +210,7 @@ def hydrate_dotenv(project_root: Path, environment: Optional[str] = None) -> Non
     env_logger = logging.getLogger("fluid.cli.env")
 
     try:
-        from fluid_build.credentials.dotenv_store import DotEnvCredentialStore
+        from fluid_build.credentials.dotenv_store import DotEnvCredentialStore, load_dotenv
     except ImportError:
         env_logger.debug("python-dotenv not installed; skipping env hydration")
         return
@@ -231,12 +231,6 @@ def hydrate_dotenv(project_root: Path, environment: Optional[str] = None) -> Non
     secrets_path = Path(secrets_file).expanduser()
     if not secrets_path.is_file():
         env_logger.debug("FLUID_SECRETS_FILE=%s does not point at a file; skipping", secrets_path)
-        return
-
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        env_logger.debug("python-dotenv not available; cannot load FLUID_SECRETS_FILE")
         return
 
     try:

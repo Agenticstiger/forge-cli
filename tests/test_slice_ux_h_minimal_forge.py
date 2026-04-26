@@ -51,6 +51,7 @@ regression test here:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -168,6 +169,21 @@ def _fake_generation_result() -> Any:
         attempt_reports=[],
         scaffold_decision=None,
         project_memory=None,
+        provenance={
+            "mode": "staged",
+            "agent_events": [{"stage": "logical", "agent": "LogicalAgent", "mode": "llm"}],
+            "fallback_used": False,
+            "repair_used": False,
+        },
+        ai_run_plan={
+            "provider": "openai",
+            "primary_model": "gpt-4.1-mini",
+            "routing_model": "gpt-4.1-nano",
+            "stages": [
+                {"stage": "logical_modeler", "mode": "llm", "model": "gpt-4.1-mini"},
+                {"stage": "transformation", "mode": "deterministic_from_sidecar", "model": None},
+            ],
+        },
     )
 
 
@@ -218,6 +234,12 @@ class TestDefaultMinimalForge:
         doc = yaml.safe_load(contract_path.read_text())
         assert doc.get("metadata", {}).get("provenance", {}).get("kind") == ("ContractMetadata")
         assert doc["metadata"]["provenance"]["generated_by"]["command"] == "fluid forge"
+
+        ai_receipt = tmp_path / ".fluid" / "ai-work-receipt.json"
+        assert ai_receipt.is_file()
+        receipt_doc = json.loads(ai_receipt.read_text())
+        assert receipt_doc["kind"] == "ForgeAIWorkReceipt"
+        assert receipt_doc["runPlan"]["stages"][1]["mode"] == "deterministic_from_sidecar"
 
     def test_minimal_does_not_create_engine_tree(self, tmp_path: Path):
         """None of the opinionated engine template directories must
@@ -277,6 +299,22 @@ class TestDefaultMinimalForge:
         fake.create_project.assert_not_called()
         # The minimal path calls generate_project_artifacts directly.
         fake.generate_project_artifacts.assert_called_once()
+
+    def test_minimal_dry_run_does_not_call_llm_generation(self, tmp_path: Path):
+        """Dry-run must not probe an LLM provider or local Ollama service."""
+        fake = _make_fake_copilot()
+        args = _build_args(tmp_path, dry_run=True)
+        logger = logging.getLogger("test_slice_ux_h.dry_run_no_llm")
+
+        with patch("fluid_build.cli.forge.CopilotAgent", return_value=fake):
+            from fluid_build.cli.forge import run_ai_copilot_mode
+
+            rc = run_ai_copilot_mode(args, logger)
+
+        assert rc == 0
+        fake.create_project.assert_not_called()
+        fake.generate_project_artifacts.assert_not_called()
+        assert not (tmp_path / "contract.fluid.yaml").exists()
 
 
 # ---------------------------------------------------------------------------

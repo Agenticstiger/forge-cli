@@ -47,8 +47,14 @@ def generate_project_yml(contract: Dict[str, Any], build: Dict[str, Any]) -> str
     # Materializations per layer
     materializations = properties.get("materializations", {})
     staging_mat = materializations.get("staging", "view")
-    intermediate_mat = materializations.get("intermediate", "view")
     marts_mat = materializations.get("marts", "table")
+    include_intermediate = _should_include_intermediate_layer(contract, properties)
+    model_config: Dict[str, Any] = {"staging": {"+materialized": staging_mat}}
+    if include_intermediate:
+        model_config["intermediate"] = {
+            "+materialized": materializations.get("intermediate", "view"),
+        }
+    model_config["marts"] = {"+materialized": marts_mat}
 
     data: Dict[str, Any] = {
         "name": project_name,
@@ -63,13 +69,7 @@ def generate_project_yml(contract: Dict[str, Any], build: Dict[str, Any]) -> str
         "snapshot-paths": ["snapshots"],
         "target-path": "target",
         "clean-targets": ["target", "dbt_packages"],
-        "models": {
-            project_name: {
-                "staging": {"+materialized": staging_mat},
-                "intermediate": {"+materialized": intermediate_mat},
-                "marts": {"+materialized": marts_mat},
-            },
-        },
+        "models": {project_name: model_config},
     }
 
     # Variables from contract
@@ -78,3 +78,16 @@ def generate_project_yml(contract: Dict[str, Any], build: Dict[str, Any]) -> str
         data["vars"] = dbt_vars
 
     return _HEADER + yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+
+def _should_include_intermediate_layer(
+    contract: Dict[str, Any], properties: Dict[str, Any]
+) -> bool:
+    materializations = properties.get("materializations", {})
+    if isinstance(materializations, dict) and "intermediate" in materializations:
+        return True
+    if properties.get("include_intermediate_layer") is True:
+        return True
+    labels = contract.get("labels", {})
+    technique = str(labels.get("dataModelingTechnique", "")).replace("-", "_").lower()
+    return technique == "data_vault_2"

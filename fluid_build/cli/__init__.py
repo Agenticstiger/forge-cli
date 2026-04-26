@@ -24,6 +24,7 @@ from typing import List, Optional
 
 from fluid_build.cli.console import cprint, info, warning
 from fluid_build.cli.console import error as console_error
+from fluid_build.cli.forge_banner import compact_next_line
 from fluid_build.observability import install_secret_redacting_filter
 
 from ._common import CLIError
@@ -153,7 +154,11 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
     p.add_argument("--no-color", action="store_true", help="Disable colored output")
     from fluid_build import __version__ as _ver
 
-    p.add_argument("--version", action="version", version=f"FLUID Forge CLI v{_ver}")
+    version_text = f"FLUID Forge CLI v{_ver}"
+    next_line = compact_next_line()
+    if next_line:
+        version_text = f"{version_text}\n{next_line}"
+    p.add_argument("--version", action="version", version=version_text)
 
     # Production and monitoring options
     prod_group = p.add_argument_group("Production & Monitoring")
@@ -212,11 +217,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 0
 
         # Per-command help intercept:  fluid <cmd> --help / -h
+        #
+        # Only fires for top-level command help (exactly two tokens like
+        # ``fluid forge --help``). Deeper chains such as ``fluid forge
+        # data-model --help`` or ``fluid forge data-model from-intent
+        # --help`` must fall through to argparse so the subparser emits
+        # its own help — otherwise users can never see the data-model
+        # subcommand flags.
         _help_flags = {"-h", "--help"}
         if (
             HELP_RICH_AVAILABLE
-            and len(argv) >= 2
-            and _help_flags & set(argv)
+            and len(argv) == 2
+            and argv[1] in _help_flags
             and argv[0] not in _help_flags
         ):
             cmd_name = argv[0]

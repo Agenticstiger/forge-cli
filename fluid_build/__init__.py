@@ -19,10 +19,20 @@ Version and feature detection for staged release management.
 """
 
 import os
+import re
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
 import yaml
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:  # pragma: no cover - optional fallback
+        tomllib = None  # type: ignore[assignment]
 
 try:
     from importlib.metadata import PackageNotFoundError
@@ -30,8 +40,47 @@ try:
 
     __version__ = _pkg_version("data-product-forge")
 except PackageNotFoundError:
+
+    def _version_from_git_checkout() -> Optional[str]:
+        repo_root = Path(__file__).resolve().parent.parent
+        try:
+            raw = subprocess.check_output(
+                ["git", "describe", "--tags", "--always", "--dirty"],
+                cwd=repo_root,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        except Exception:
+            return None
+
+        if raw.startswith("v"):
+            raw = raw[1:]
+        raw = raw.removesuffix("-dirty")
+        match = re.match(r"(?P<tag>[^-]+)-(?P<distance>\d+)-g(?P<sha>[0-9a-f]+)$", raw)
+        if match:
+            return f"{match.group('tag')}.dev{match.group('distance')}"
+        return raw or None
+
+    def _fallback_version() -> str:
+        git_version = _version_from_git_checkout()
+        if git_version:
+            return git_version
+
+        if tomllib is not None:
+            pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+            try:
+                data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+                fallback = (
+                    ((data.get("tool") or {}).get("setuptools_scm") or {}).get("fallback_version")
+                ) or "0.0.0+source"
+                if fallback != "0.0.0+unknown":
+                    return str(fallback)
+            except Exception:
+                pass
+        return "0.0.0+source"
+
     # Editable / source checkout before the package is installed.
-    __version__ = "0.0.0+unknown"
+    __version__ = _fallback_version()
 
 __all__ = [
     "__version__",

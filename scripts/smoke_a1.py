@@ -44,7 +44,6 @@ import sys
 import tempfile
 from typing import List
 
-
 FLUID_BIN = os.environ.get(
     "FLUID_BIN",
     os.path.join(
@@ -102,7 +101,7 @@ def main() -> int:
     print("A1 smoke — new 11-stage flag surface")
     print(f"  FLUID_BIN   = {FLUID_BIN}")
     print(f"  A1_DIR      = {A1_DIR}")
-    print(f"  CONTRACT    = contract.fluid.yaml (in A1_DIR)")
+    print("  CONTRACT    = contract.fluid.yaml (in A1_DIR)")
     print(f"  BUILD_ID    = {BUILD_ID}")
 
     results: dict = {}

@@ -30,8 +30,12 @@ __all__ = [
     "check_llm_readiness",
     "clear_api_key_from_keyring",
     "get_catalog_default",
+    "get_catalog_routing_model",
+    "get_catalog_tier_models",
+    "build_llm_run_plan",
     "detect_ollama_available",
     "detect_provider_from_api_key",
+    "has_llm_api_key",
     "get_llm_provider",
     "normalize_llm_provider_name",
     "query_ollama_models",
@@ -45,6 +49,7 @@ __all__ = [
     "streaming_is_enabled",
     "detect_provider_from_api_key",
     "check_llm_readiness",
+    "live_provider_models",
 ]
 
 import json
@@ -53,7 +58,7 @@ import os
 import re
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional
 
@@ -61,9 +66,7 @@ import httpx
 
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.forge_copilot_response_schema import (
-    FORGE_RESPONSE_SCHEMA,
     anthropic_tool_definition,
-    gemini_response_schema_config,
     ollama_supports_structured_output,
     openai_response_format,
 )
@@ -106,6 +109,44 @@ def _get_temperature() -> float:
         return max(0.0, min(2.0, float(raw)))
     except ValueError:
         return 0.0
+
+
+# Anthropic deprecated the ``temperature`` parameter on newer models
+# (opus-4-7 onward, plus reasoning-style models). Sending it produces
+# ``400 invalid_request_error: 'temperature' is deprecated for this
+# model.`` Detection is by model-name prefix because Anthropic doesn't
+# advertise this as a structured capability flag — the API just
+# rejects the request. Update this set as more models join.
+_ANTHROPIC_TEMPERATURE_DEPRECATED_PREFIXES = (
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+)
+
+
+def _model_deprecates_temperature(model: str) -> bool:
+    """Return True when the Anthropic model rejects ``temperature``.
+
+    Used by :class:`AnthropicProvider.build_request` to skip the
+    field for models in the deprecated set. Conservative — defaults
+    to False (still send temperature) for unknown models so older
+    Sonnet / Haiku continue to work.
+    """
+    if not model:
+        return False
+    lowered = model.strip().lower()
+    return any(lowered.startswith(prefix) for prefix in _ANTHROPIC_TEMPERATURE_DEPRECATED_PREFIXES)
+
+
+def _get_timeout_seconds(args: Any, env: Mapping[str, str]) -> int:
+    raw = getattr(args, "llm_timeout_seconds", None) or env.get("FLUID_LLM_TIMEOUT_SECONDS")
+    if raw in (None, ""):
+        return 120
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 120
+    return max(1, min(3600, value))
 
 
 def streaming_is_enabled() -> bool:
@@ -189,6 +230,9 @@ class LlmConfig:
     # env vars, or from provider-specific defaults if available.
     routing_model: Optional[str] = None
     routing_endpoint: Optional[str] = None
+    model_source: str = "catalog"
+    model_resolution_notes: List[str] = field(default_factory=list)
+    tier_models: Dict[str, str] = field(default_factory=dict)
 
     def for_routing(self) -> "LlmConfig":
         """Return a shallow copy configured for the routing model.
@@ -261,6 +305,23 @@ class LlmProvider(ABC):
         their specific response shapes.
         """
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+    def list_available_models(
+        self, api_key: Optional[str], env: Mapping[str, str]
+    ) -> Optional[List[str]]:
+        """Return live provider model ids when a model-list API exists.
+
+        Providers without a lightweight list endpoint return ``None``.
+        Callers should treat that as "preflight unavailable", not as
+        "this provider has no models".
+        """
+        return None
+
+    def choose_available_model(
+        self, requested_model: str, available_models: List[str]
+    ) -> Optional[str]:
+        """Pick a live replacement for a stale catalog default."""
+        return requested_model if requested_model in available_models else None
 
     # ------------------------------------------------------------------
     # Streaming (slice UX-I)
@@ -377,6 +438,22 @@ class OpenAIProvider(LlmProvider):
                 base,
             )
         return base + "/chat/completions"
+
+    def list_available_models(
+        self, api_key: Optional[str], env: Mapping[str, str]
+    ) -> Optional[List[str]]:
+        if not api_key:
+            return None
+        base = env.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        response = httpx.get(
+            f"{base}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        models = payload.get("data") or []
+        return [str(item.get("id")) for item in models if isinstance(item, dict) and item.get("id")]
 
     def build_request(
         self, config: LlmConfig, system_prompt: str, user_prompt: str
@@ -542,6 +619,23 @@ class OllamaProvider(OpenAIProvider):
         host = env.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
         return host + "/v1/chat/completions"
 
+    def list_available_models(
+        self, api_key: Optional[str], env: Mapping[str, str]
+    ) -> Optional[List[str]]:
+        response = httpx.get(f"{_ollama_host(env)}/api/tags", timeout=2.0)
+        response.raise_for_status()
+        result: List[str] = []
+        for item in response.json().get("models") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            result.append(name)
+            if name.endswith(":latest"):
+                result.append(name.removesuffix(":latest"))
+        return result
+
     def build_request(
         self, config: LlmConfig, system_prompt: str, user_prompt: str
     ) -> tuple[Dict[str, str], Dict[str, Any]]:
@@ -565,10 +659,42 @@ class OllamaProvider(OpenAIProvider):
 
 class AnthropicProvider(LlmProvider):
     name = "anthropic"
-    default_model = "claude-3-5-sonnet-latest"
+    default_model = "claude-sonnet-4-6"
 
     def default_endpoint(self, model: str, env: Mapping[str, str]) -> str:
         return "https://api.anthropic.com/v1/messages"
+
+    def list_available_models(
+        self, api_key: Optional[str], env: Mapping[str, str]
+    ) -> Optional[List[str]]:
+        if not api_key:
+            return None
+        response = httpx.get(
+            "https://api.anthropic.com/v1/models",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        models = payload.get("data") or []
+        return [str(item.get("id")) for item in models if isinstance(item, dict) and item.get("id")]
+
+    def choose_available_model(
+        self, requested_model: str, available_models: List[str]
+    ) -> Optional[str]:
+        if requested_model in available_models:
+            return requested_model
+        requested = requested_model.lower()
+        for family in ("sonnet", "opus", "haiku"):
+            if family not in requested:
+                continue
+            for model in available_models:
+                if family in model.lower():
+                    return model
+        return available_models[0] if available_models else None
 
     def build_request(
         self, config: LlmConfig, system_prompt: str, user_prompt: str
@@ -586,6 +712,25 @@ class AnthropicProvider(LlmProvider):
         # of the normal input cost and ~50-80% faster TTFT.
         # ``build_system_prompt`` is memoized upstream so the prefix
         # is stable across retries and non-interactive reruns.
+        # Pin sampling temperature explicitly for the Anthropic API.
+        # Without this, the request would inherit the provider-side
+        # default (typically 1.0 on Claude), which makes structured
+        # contract generation non-deterministic — a regression
+        # against the determinism-ladder contract we advertise via
+        # ``--deterministic`` and ``FLUID_LLM_TEMPERATURE``. The
+        # Anthropic API does not yet expose a public ``seed``
+        # parameter, so OpenAI-style seeding is omitted; the
+        # ``--deterministic`` flag's audit-trail metadata records
+        # this provider gap so users know byte-stability is
+        # OpenAI-only today.
+        #
+        # NOTE — Newer Claude models (opus-4-7+, the o-series-style
+        # reasoning models) DEPRECATED the ``temperature`` parameter.
+        # Sending it returns ``400 invalid_request_error: 'temperature'
+        # is deprecated for this model.``  We detect the deprecated
+        # set and skip the field for those models. The catalog tier
+        # ``deep`` points at ``claude-opus-4-7`` so this gate is
+        # exactly what makes ``--tiered`` work end-to-end.
         payload: Dict[str, Any] = {
             "model": config.model,
             "max_tokens": 8192,
@@ -598,6 +743,8 @@ class AnthropicProvider(LlmProvider):
             ],
             "messages": [{"role": "user", "content": user_prompt}],
         }
+        if not _model_deprecates_temperature(config.model):
+            payload["temperature"] = _get_temperature()
         # Slice UX-I: force the model to emit its response via a
         # single ``emit_forge_contract`` tool call.  The tool's
         # ``input_schema`` is the response envelope JSON Schema, so
@@ -774,6 +921,32 @@ class GeminiProvider(LlmProvider):
         return (
             f"https://generativelanguage.googleapis.com/v1beta/models/{safe_model}:generateContent"
         )
+
+    def list_available_models(
+        self, api_key: Optional[str], env: Mapping[str, str]
+    ) -> Optional[List[str]]:
+        if not api_key:
+            return None
+        response = httpx.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": api_key},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result: List[str] = []
+        for item in payload.get("models") or []:
+            if not isinstance(item, dict):
+                continue
+            methods = item.get("supportedGenerationMethods") or []
+            if methods and "generateContent" not in methods:
+                continue
+            name = str(item.get("name") or "")
+            if name.startswith("models/"):
+                name = name.removeprefix("models/")
+            if name:
+                result.append(name)
+        return result
 
     def build_request(
         self, config: LlmConfig, system_prompt: str, user_prompt: str
@@ -984,7 +1157,7 @@ BUILTIN_LLM_PROVIDERS: Dict[str, LlmProvider] = {
 
 
 def _sync_provider_defaults_from_catalog() -> None:
-    """Override provider class ``default_model`` attrs with the catalog flagship.
+    """Override provider class ``default_model`` attrs with catalog defaults.
 
     Called once at module import time.  This makes the catalog the
     single source of truth for model defaults — the hardcoded strings
@@ -998,9 +1171,9 @@ def _sync_provider_defaults_from_catalog() -> None:
             if name == "claude":
                 continue  # alias for anthropic, shares the same instance
             entry = providers_data.get(name, {})
-            flagship = entry.get("flagship") or entry.get("default")
-            if flagship:
-                provider.default_model = flagship
+            default_model = entry.get("default") or entry.get("flagship")
+            if default_model:
+                provider.default_model = default_model
     except Exception:  # noqa: BLE001 — never break import
         pass
 
@@ -1041,6 +1214,49 @@ def get_llm_provider(name: str) -> LlmProvider:
 # ---------------------------------------------------------------------------
 
 
+def _env_flag(env: Mapping[str, str], name: str, *, default: bool = False) -> bool:
+    raw = env.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _tiered_mode_requested(args: Any, env: Mapping[str, str]) -> bool:
+    return bool(getattr(args, "tiered", False)) or _env_flag(env, "FLUID_TIERED")
+
+
+def _model_preflight_requested(args: Any, env: Mapping[str, str]) -> bool:
+    return (
+        bool(getattr(args, "require_llm", False))
+        or _env_flag(env, "FLUID_LLM_MODEL_PREFLIGHT")
+        or _tiered_mode_requested(args, env)
+    )
+
+
+def live_provider_models(
+    provider_name: str,
+    *,
+    api_key: Optional[str] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[List[str]]:
+    """Fetch live provider model ids when supported by the adapter."""
+    env = dict(environ or os.environ)
+    provider = get_llm_provider(provider_name)
+    return provider.list_available_models(api_key or _resolve_api_key(provider.name, env), env)
+
+
+def has_llm_api_key(
+    provider_name: str,
+    environ: Optional[Mapping[str, str]] = None,
+) -> bool:
+    """Return whether the provider can resolve credentials without exposing them."""
+    env = dict(environ or os.environ)
+    provider = get_llm_provider(provider_name)
+    if provider.name == "ollama":
+        return detect_ollama_available(env)
+    return bool(_resolve_api_key(provider.name, env))
+
+
 def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -> LlmConfig:
     """Resolve provider, model, endpoint, and API key from flags and env vars."""
     env = dict(environ or os.environ)
@@ -1057,10 +1273,13 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
     explicit_model = getattr(args, "llm_model", None) or env.get("FLUID_LLM_MODEL")
     if explicit_model:
         model = resolve_model_name(provider.name, explicit_model)
+        model_source = "explicit"
     elif provider.name == "ollama":
         model = resolve_ollama_model(env)
+        model_source = "ollama"
     else:
         model = catalog_default or provider.default_model
+        model_source = "catalog"
 
     if not model:
         raise CopilotGenerationError(
@@ -1071,10 +1290,6 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
                 "Or pass --llm-model on the command line",
             ],
         )
-
-    endpoint = getattr(args, "llm_endpoint", None) or env.get("FLUID_LLM_ENDPOINT")
-    if not endpoint:
-        endpoint = provider.default_endpoint(model, env)
 
     api_key = _resolve_api_key(provider.name, env)
     if provider.name != "ollama" and not api_key:
@@ -1088,6 +1303,79 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
             ],
         )
 
+    model_notes: List[str] = []
+    preflight_requested = _model_preflight_requested(args, env)
+    available_models: Optional[List[str]] = None
+
+    def _available_models() -> Optional[List[str]]:
+        nonlocal available_models
+        if available_models is not None:
+            return available_models
+        try:
+            available_models = provider.list_available_models(api_key, env)
+        except Exception as exc:  # noqa: BLE001
+            raise CopilotGenerationError(
+                "copilot_llm_model_preflight_failed",
+                f"Could not preflight {provider.name} model availability: {exc}",
+                suggestions=[
+                    "Check the provider API key and network connectivity",
+                    "For Ollama, start the local Ollama server and pull the requested model",
+                    "Pass --llm-model with a known available model",
+                    "Unset FLUID_LLM_MODEL_PREFLIGHT for non-strict local experimentation",
+                ],
+            ) from exc
+        return available_models
+
+    if preflight_requested:
+        available = _available_models()
+        if available is not None and not available:
+            raise CopilotGenerationError(
+                "copilot_llm_model_unavailable",
+                f"No {provider.name} models are available for strict LLM mode.",
+                suggestions=[
+                    "Pass --llm-model with an available model",
+                    "For Ollama, run `ollama list` and pull a local model first",
+                ],
+                context={"provider": provider.name, "model": model},
+            )
+        if available is not None and model not in available:
+            if explicit_model:
+                raise CopilotGenerationError(
+                    "copilot_llm_model_unavailable",
+                    f"Explicit {provider.name} model '{model}' is not available to this key.",
+                    suggestions=[
+                        f"Available models include: {', '.join(available[:5])}",
+                        "Choose a model returned by the provider's live model list",
+                    ],
+                    context={"provider": provider.name, "model": model},
+                )
+            replacement = provider.choose_available_model(model, available)
+            if replacement is None:
+                raise CopilotGenerationError(
+                    "copilot_llm_model_unavailable",
+                    f"Configured {provider.name} model '{model}' is not available to this key.",
+                    suggestions=[
+                        f"Available models include: {', '.join(available[:5])}",
+                        "Pass --llm-model with an available model",
+                    ],
+                    context={"provider": provider.name, "model": model},
+                )
+            model_notes.append(
+                f"catalog model '{model}' was unavailable; using live model '{replacement}'"
+            )
+            LOG.warning(
+                "llm_model_preflight_replaced: provider=%s catalog_model=%s live_model=%s",
+                provider.name,
+                model,
+                replacement,
+            )
+            model = replacement
+            model_source = "live_preflight"
+
+    endpoint = getattr(args, "llm_endpoint", None) or env.get("FLUID_LLM_ENDPOINT")
+    if not endpoint:
+        endpoint = provider.default_endpoint(model, env)
+
     # Slice UX-J: resolve the optional routing model for cheap tasks
     # (interview clarification, classification, etc.).  Env vars take
     # precedence, then provider-specific defaults kick in.
@@ -1095,16 +1383,57 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
     routing_endpoint = getattr(args, "llm_routing_endpoint", None) or env.get(
         "FLUID_LLM_ROUTING_ENDPOINT"
     )
+    explicit_routing_model = bool(routing_model)
     if not routing_model:
         routing_model = _default_routing_model(provider.name, model)
+
+    tier_models = (
+        get_catalog_tier_models(provider.name) if _tiered_mode_requested(args, env) else {}
+    )
+    if preflight_requested:
+        available = _available_models()
+        if available is not None:
+            models_to_check: Dict[str, str] = {}
+            if routing_model:
+                models_to_check["routing"] = resolve_model_name(provider.name, routing_model)
+            for tier_name, tier_model in tier_models.items():
+                models_to_check[f"tier:{tier_name}"] = resolve_model_name(provider.name, tier_model)
+            for role, candidate in sorted(models_to_check.items()):
+                if not candidate or candidate == model:
+                    continue
+                if candidate not in available:
+                    if role == "routing" and not explicit_routing_model:
+                        model_notes.append(
+                            f"catalog routing model '{candidate}' was unavailable; "
+                            "using the primary model for routing"
+                        )
+                        routing_model = None
+                        continue
+                    raise CopilotGenerationError(
+                        "copilot_llm_model_unavailable",
+                        (
+                            f"Resolved {provider.name} {role} model '{candidate}' is not "
+                            "available to this key."
+                        ),
+                        suggestions=[
+                            f"Available models include: {', '.join(available[:5])}",
+                            "Run `fluid ai models` to inspect the configured model tiers",
+                            "Pass --llm-model / --llm-routing-model or update ~/.fluid/llm_models.json",
+                        ],
+                        context={"provider": provider.name, "model": candidate, "role": role},
+                    )
 
     return LlmConfig(
         provider=provider.name,
         model=model,
         endpoint=endpoint,
         api_key=api_key,
+        timeout_seconds=_get_timeout_seconds(args, env),
         routing_model=routing_model,
         routing_endpoint=routing_endpoint,
+        model_source=model_source,
+        model_resolution_notes=model_notes,
+        tier_models=tier_models,
     )
 
 
@@ -1157,7 +1486,6 @@ def call_llm(
 ) -> str:
     """Call the configured provider and return free-form response text."""
     headers, payload = provider.build_request(config, system_prompt, user_prompt)
-    last_exc: Optional[Exception] = None
 
     _LLM_REQUEST_SUGGESTIONS = [
         "Check the selected model and endpoint are correct",
@@ -1172,7 +1500,6 @@ def call_llm(
                 response.raise_for_status()
             break
         except httpx.HTTPStatusError as exc:
-            last_exc = exc
             if exc.response.status_code in _TRANSIENT_STATUS_CODES and attempt < _LLM_MAX_RETRIES:
                 delay = _LLM_RETRY_BASE_SECONDS * (2**attempt)
                 LOG.info(
@@ -1587,20 +1914,140 @@ def _load_model_catalog() -> Dict[str, Any]:
 
 
 def get_catalog_default(provider: str) -> Optional[str]:
-    """Return the catalog's default (flagship) model for *provider*."""
+    """Return the catalog's default model for *provider*."""
     catalog = _load_model_catalog()
     entry = catalog.get("providers", {}).get(provider)
     if entry:
-        # v2 schema uses "flagship" as the primary default; fall back to "default"
-        return entry.get("flagship") or entry.get("default")
+        return entry.get("default") or entry.get("flagship")
     return None
 
 
+def get_catalog_routing_model(provider_name: str, strong_model: str = "") -> Optional[str]:
+    """Return the catalog routing model when it differs from *strong_model*."""
+    return _default_routing_model(provider_name, strong_model or "")
+
+
 def get_catalog_tier_model(provider_name: str, tier: str = "flagship") -> Optional[str]:
-    """Return the model for a given tier (``flagship`` or ``balanced``)."""
+    """Return the model for a given tier with v1/v2 compatibility mapping."""
     catalog = _load_model_catalog()
+    tier_entry = catalog.get("tiers", {}).get(provider_name, {})
+    if tier in tier_entry:
+        return tier_entry.get(tier)
     entry = catalog.get("providers", {}).get(provider_name, {})
-    return entry.get(tier) or entry.get("flagship") or entry.get("default")
+    legacy_tier = {
+        "deep": "flagship",
+        "balanced": "balanced",
+        "fast": "routing",
+    }.get(tier, tier)
+    return (
+        entry.get(legacy_tier) or entry.get(tier) or entry.get("flagship") or entry.get("default")
+    )
+
+
+def get_catalog_tier_models(provider_name: str) -> Dict[str, str]:
+    """Return non-empty configured tier models for *provider_name*.
+
+    The result is intentionally small and explicit: only ``deep``,
+    ``balanced``, and ``fast`` are returned, and provider-schema fallback
+    is applied for older catalog shapes. This gives command help,
+    preflight, receipts, and stage agents one shared view of the model
+    tiers instead of each caller re-walking ``llm_models.json``.
+    """
+    result: Dict[str, str] = {}
+    for tier in ("deep", "balanced", "fast"):
+        model = get_catalog_tier_model(provider_name, tier)
+        if isinstance(model, str) and model.strip():
+            result[tier] = model.strip()
+    return result
+
+
+def has_distinct_tier_models(provider_name: str) -> bool:
+    """Return ``True`` iff the provider's tier map exposes ≥2 distinct models.
+
+    The plan promises that ``--tiered`` (or
+    ``copilot.tiered: true`` in ``ai_config.json``) silently
+    collapses to single-model with a one-line warning when the
+    selected provider has no distinct tiers — so we never crash, and
+    we never bill the deep tier for a stage that can't actually
+    benefit. Today ``llm_models.json`` ships Ollama with
+    ``deep == balanced == llama3.1`` (only ``fast`` differs). When a
+    future config or a user override flattens all three tiers to a
+    single model, the helper reports ``False`` and the caller
+    downgrades to single-model mode without surfacing a misleading
+    "deep" indicator on every stage banner.
+
+    Pure read against the catalog — no I/O on the hot path beyond the
+    cached ``_load_model_catalog`` call ``get_catalog_tier_model``
+    already uses.
+    """
+    catalog = _load_model_catalog()
+    tier_entry = catalog.get("tiers", {}).get(provider_name, {})
+    distinct = {value for value in tier_entry.values() if isinstance(value, str) and value.strip()}
+    return len(distinct) >= 2
+
+
+def build_llm_run_plan(config: LlmConfig, *, tiered: bool = False) -> Dict[str, Any]:
+    """Build the user-facing plan for an AI forge run.
+
+    The plan is deliberately honest: deterministic stages are marked
+    deterministic even when a provider has a balanced tier configured.
+    That prevents the UX from implying "balanced executes" for dbt SQL,
+    which is generated deterministically from the logical sidecar.
+    """
+    tier_models = config.tier_models or (get_catalog_tier_models(config.provider) if tiered else {})
+    logical_model = tier_models.get("deep") if tiered else None
+    logical_model = logical_model or config.model
+    routing_model = config.routing_model or config.model
+    return {
+        "provider": config.provider,
+        "primary_model": config.model,
+        "routing_model": routing_model,
+        "tiered": bool(tiered),
+        "tier_models": dict(tier_models),
+        "policy": (
+            "LLM stages handle semantic/modeling judgement; contract forging, "
+            "dbt SQL generation, and validation remain deterministic from the "
+            "logical sidecar."
+        ),
+        "stages": [
+            {
+                "stage": "interview",
+                "mode": "llm_routing",
+                "tier": "fast",
+                "model": routing_model,
+            },
+            {
+                "stage": "logical_modeler",
+                "mode": "strict_llm_or_llm",
+                "tier": "deep" if tiered else "primary",
+                "model": logical_model,
+            },
+            {
+                "stage": "contract_forge",
+                "mode": "deterministic",
+                "tier": None,
+                "model": None,
+            },
+            {
+                "stage": "transformation",
+                "mode": "deterministic_from_sidecar",
+                "tier": None,
+                "model": None,
+            },
+            {
+                "stage": "validator",
+                "mode": "deterministic",
+                "tier": None,
+                "model": None,
+            },
+            {
+                "stage": "self_eval",
+                "mode": "llm_routing",
+                "tier": "fast",
+                "model": routing_model,
+            },
+        ],
+    }
 
 
 def model_supports_structured_output(provider_name: str, model: str) -> bool:

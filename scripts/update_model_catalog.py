@@ -118,12 +118,14 @@ def pick_flagship_and_balanced(
             continue
         intelligence = m.get("evaluations", {}).get("intelligence_index") or 0
         input_price = m.get("pricing", {}).get("input_per_million_tokens") or 999
-        candidates.append({
-            "id": model_id,
-            "intelligence": intelligence,
-            "input_price": input_price,
-            "efficiency": intelligence / max(input_price, 0.001),
-        })
+        candidates.append(
+            {
+                "id": model_id,
+                "intelligence": intelligence,
+                "input_price": input_price,
+                "efficiency": intelligence / max(input_price, 0.001),
+            }
+        )
 
     if not candidates:
         return None, None
@@ -196,7 +198,7 @@ def main():
     dry_run = "--dry-run" in sys.argv
     api_key = os.environ.get("ARTIFICIAL_ANALYSIS_API_KEY")
 
-    print(f"Fetching model data from Artificial Analysis API...")
+    print("Fetching model data from Artificial Analysis API...")
     api_models = fetch_models_from_api(api_key)
 
     catalog = build_catalog(api_models)
@@ -216,7 +218,9 @@ def main():
         # Show what changed
         for provider in ("openai", "anthropic", "gemini"):
             entry = catalog.get("providers", {}).get(provider, {})
-            print(f"  {provider}: flagship={entry.get('flagship')}, balanced={entry.get('balanced')}")
+            print(
+                f"  {provider}: flagship={entry.get('flagship')}, balanced={entry.get('balanced')}"
+            )
 
 
 if __name__ == "__main__":

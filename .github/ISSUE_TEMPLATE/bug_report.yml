@@ -94,3 +94,53 @@ body:
         - aws
         - odps
         - N/A
+
+  - type: dropdown
+    id: source-catalog
+    attributes:
+      label: Source Catalog
+      description: |
+        If the bug involves `fluid forge data-model from-source` (V1.5
+        catalog integration), pick the catalog you're reading FROM.
+        Leave on "N/A" for any non-catalog bug.
+      options:
+        - N/A
+        - snowflake (Horizon)
+        - databricks (Unity)
+        - bigquery
+        - dataplex
+        - aws (Glue)
+        - datahub
+        - datamesh_manager
+
+  - type: input
+    id: catalog-version
+    attributes:
+      label: Catalog Version / Edition
+      description: |
+        Only required for catalog bugs. The catalog SDK or API
+        version. Examples — Snowflake: account edition (Standard /
+        Enterprise / Business Critical) and Snowflake version from
+        `SELECT CURRENT_VERSION()`. Databricks: workspace tier
+        (Standard / Premium / Enterprise) and runtime if relevant.
+        BigQuery / Dataplex: leave blank (versionless). Glue:
+        region (e.g. `us-east-1`). DataHub: server version
+        (Profile → About). Data Mesh Manager: SaaS version (footer).
+      placeholder: "e.g. Snowflake Enterprise 8.18.1"
+
+  - type: textarea
+    id: catalog-snippet
+    attributes:
+      label: Redacted INFORMATION_SCHEMA snippet (optional)
+      description: |
+        For catalog bugs, paste a redacted output from
+        `INFORMATION_SCHEMA.COLUMNS` (or the equivalent on your
+        catalog) for the table that triggered the bug. Strip
+        descriptions / tags / PII / account IDs. This is the
+        single most useful piece of context for catalog-bug triage —
+        it shows the exact metadata shape forge-cli received.
+      render: shell
+      placeholder: |
+        TABLE_NAME=orders
+        COLUMN_NAME=customer_id  DATA_TYPE=NUMBER  IS_NULLABLE=NO  COMMENT=<redacted>
+        ...

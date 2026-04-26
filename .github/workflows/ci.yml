@@ -26,6 +26,13 @@ jobs:
       - run: pip install ruff "black==24.10.0"
       - name: Ruff check
         run: ruff check fluid_build/ tests/
+      - name: Dead-code gate for staged forge modules
+        run: |
+          ruff check fluid_build/copilot fluid_build/forge_datamodel \
+            --isolated \
+            --select F401,F841,F811,B007 \
+            --target-version py310 \
+            --line-length 100
       - name: Black check
         run: black --check fluid_build/ tests/
 
@@ -82,6 +89,29 @@ jobs:
         run: |
           python -m coverage report --fail-under=70 \
             --omit="fluid_build/providers/*,fluid_build/cli/provider_action_executor.py"
+
+      # V1 staged forge data-model pipeline gets its own tighter gate.
+      # The new modules (``fluid_build/copilot/*`` + ``fluid_build/forge_datamodel/*``)
+      # were built greenfield with comprehensive tests as they landed,
+      # so a ≥80% floor is achievable from day one and pins the contract
+      # that the v2 hardening cycle needs to maintain. The existing 70%
+      # core gate above keeps stable for the broader codebase.
+      #
+      # Deliberately excluded from this V1 gate:
+      # - ``copilot/agents/{scaffold,conceptual}_agent.py`` — deprecated
+      #   in v1.0 (composition helpers only; coordinator routes through
+      #   LogicalAgent / ModelerAgent directly).
+      # - ``copilot/store/backends/postgres.py`` — exercised only when
+      #   a Postgres DSN is supplied; non-CI CI default never reaches it.
+      # - ``forge_datamodel/from_ddl/{snowflake_dumper,profiler}.py`` —
+      #   require Snowflake creds / pyarrow extra respectively, both
+      #   optional install paths.
+      - name: "Coverage gate: V1 staged forge modules (≥80%)"
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m coverage report --fail-under=80 \
+            --include="fluid_build/copilot/*,fluid_build/forge_datamodel/*" \
+            --omit="fluid_build/copilot/agents/scaffold_agent.py,fluid_build/copilot/agents/conceptual_agent.py,fluid_build/copilot/store/backends/postgres.py,fluid_build/forge_datamodel/from_ddl/snowflake_dumper.py,fluid_build/forge_datamodel/from_ddl/profiler.py"
 
       - name: "Coverage gate: local providers — no credentials (≥50%)"
         if: matrix.python-version == '3.12'

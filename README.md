@@ -81,6 +81,32 @@ That's it. You just deployed a **versioned, governed, and orchestrated Data Prod
 > **Want to move from local to Google Cloud?**
 > `pip install "data-product-forge[gcp]"` → change `platform: local` to `platform: gcp` → run `fluid apply`. **Done.**
 
+### From an existing catalog — `fluid forge data-model from-source` (V1.5)
+
+Already have your tables registered in **Snowflake Horizon, Databricks Unity, BigQuery, Dataplex, AWS Glue, DataHub, or Data Mesh Manager**? Forge a Fluid contract directly from the metadata you've already curated — descriptions, tags, lineage, classifications, ownership — instead of re-typing it.
+
+```bash
+# 1. Install the catalog extra (or use [catalogs] for all of them).
+pip install "data-product-forge[snowflake]"
+
+# 2. One-time source setup (saves to ~/.fluid/sources.yaml; secrets to OS keyring).
+fluid ai setup --source snowflake --name snowflake-prod
+
+# 3. Forge a Data Vault 2.0 model from a schema.
+fluid forge data-model from-source \
+  --source snowflake --credential-id snowflake-prod \
+  --database BIZ_LAB --schema SEEDED \
+  --technique data-vault-2 \
+  -o biz_lab.fluid.yaml
+
+# 4. Generate dbt transformations from the same contract.
+fluid generate speed-transformation biz_lab.fluid.yaml -o ./dbt_biz_lab
+```
+
+Three guarantees that hold across every catalog: **read-only metadata access** (no `SELECT *` against any data table), **per-call credentials** (the MCP server never holds your secrets), and **full audit trail** (every catalog read writes a redacted event under `~/.fluid/store/audit/`).
+
+The same flow is exposed via the MCP `forge_from_source` tool — Claude Code, Cursor, and any MCP client can drive a catalog forge from inside the editor. See the [catalogs walkthrough](https://agenticstiger.github.io/forge_docs/cli/catalogs/) for per-catalog privilege grants and end-to-end demos.
+
 ### From dev to CI — `fluid generate ci`
 
 When you're ready to run the full 11-stage pipeline in CI instead of manually, one command emits the pipeline file for your CI system:
@@ -407,6 +433,34 @@ fluid forge                                  # 🤖 Interactive, AI-powered proj
 fluid generate-airflow contract.fluid.yaml   # Compile contract → native Airflow DAG
 fluid generate-pipeline contract.fluid.yaml  # Scaffold transformation code
 ```
+
+### Staged Forge Pipeline (v1.0)
+
+```bash
+# Forge a reviewable data-model contract from an intent or DDL files.
+# OSI v0.1.1 semantics + Logical IR sidecar are emitted alongside the contract.
+fluid forge data-model from-intent intent.yaml -o customer_orders.fluid.yaml
+fluid forge data-model from-ddl --ddl legacy/*.sql -o customer_orders.fluid.yaml \
+    --source-type snowflake --technique data-vault-2
+
+# Validate, diff, dump-DDL companions
+fluid forge data-model validate customer_orders.fluid.yaml
+fluid forge data-model diff old.model.json new.model.json
+fluid forge data-model dump-ddl --database BIZ_LAB --schema SEEDED -o /tmp/biz_lab.sql
+
+# Memory + roadmap
+fluid memory show project|team|episodic|semantic
+fluid memory search "<query>" --ns memory/semantic --mode hybrid
+fluid roadmap
+
+# MCP server (Claude Code, Cursor, …)
+fluid mcp serve
+```
+
+Detailed usage: [`docs/forge-data-model.md`](docs/forge-data-model.md).
+Provider matrix + setup: [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
+OSI semantics shape: [`docs/OSI.md`](docs/OSI.md).
+Migration from pre-v1.0: [`docs/MIGRATION.md`](docs/MIGRATION.md).
 
 ### Governance & Compliance
 

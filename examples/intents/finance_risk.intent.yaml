@@ -1,0 +1,41 @@
+data_product:
+  name: finance_risk_exposure
+  domain: finance
+  description: Exposure, counterparty, portfolio, and risk measure analytics.
+  owner: risk-analytics
+business_context:
+  problem_statement: Risk teams need consistent exposure and limit monitoring.
+  decision_supported: Counterparty review, portfolio limits, and capital planning.
+  consumer: risk analysts
+grain:
+  entity: exposure_position
+  time_dimension: as_of_date
+  description: One row per exposure position at the reporting date.
+dimensions:
+  entities:
+    - counterparty
+    - portfolio
+    - instrument
+    - region
+  attributes:
+    - name
+    - rating
+    - segment
+    - status
+metrics:
+  - name: exposure_amount
+    description: Current exposure amount.
+  - name: expected_loss
+    description: Probability-weighted expected loss.
+  - name: limit_utilization
+    description: Exposure divided by approved limit.
+data_sources:
+  - source_name: risk_positions
+    source_type: warehouse
+    description: Daily exposure positions and counterparty attributes.
+business_rules:
+  - Report exposure in base currency.
+  - Use approved counterparty hierarchy for rollups.
+modeling:
+  technique: dimensional
+  scd_policy_default: type2

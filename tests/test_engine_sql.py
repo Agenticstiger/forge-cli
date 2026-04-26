@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2024-2026 Agentics Transformation Ltd
-
 """Tests for the SQL transformation engine."""
 
 import pytest

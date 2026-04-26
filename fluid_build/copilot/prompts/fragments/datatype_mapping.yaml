@@ -1,0 +1,3 @@
+Map logical types consistently across target SQL dialects.
+Preserve precision/scale where possible and call out lossy conversions.
+

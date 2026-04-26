@@ -32,13 +32,14 @@ class TestSaveAndLoadConfig:
         with (
             patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file),
             patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path),
+            patch("fluid_build.cli.ai_setup._save_key_to_keyring", return_value=True),
         ):
             assert _save_ai_config("openai", "gpt-4o", api_key="sk-test123")
             loaded = _load_ai_config()
             assert loaded is not None
             assert loaded["provider"] == "openai"
             assert loaded["model"] == "gpt-4o"
-            assert loaded["api_key"] == "sk-test123"
+            assert "api_key" not in loaded
 
     def test_save_sets_permissions_600(self, tmp_path):
         from fluid_build.cli.ai_setup import _save_ai_config
@@ -47,6 +48,7 @@ class TestSaveAndLoadConfig:
         with (
             patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file),
             patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path),
+            patch("fluid_build.cli.ai_setup._save_key_to_keyring", return_value=True),
         ):
             _save_ai_config("gemini", "gemini-2.5-flash", api_key="AIzaFake")
             mode = config_file.stat().st_mode
@@ -54,6 +56,37 @@ class TestSaveAndLoadConfig:
             assert mode & stat.S_IWUSR  # owner write
             assert not (mode & stat.S_IRGRP)  # no group read
             assert not (mode & stat.S_IROTH)  # no other read
+
+    def test_save_plaintext_key_requires_explicit_opt_in(self, tmp_path):
+        from fluid_build.cli.ai_setup import _load_ai_config, _save_ai_config
+
+        config_file = tmp_path / "ai_config.json"
+        with (
+            patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file),
+            patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path),
+            patch("fluid_build.cli.ai_setup._save_key_to_keyring", return_value=False),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            assert _save_ai_config("openai", "gpt-4o", api_key="sk-test123")
+            loaded = _load_ai_config()
+            assert loaded is not None
+            assert loaded["provider"] == "openai"
+            assert "api_key" not in loaded
+
+    def test_save_plaintext_key_when_operator_opts_in(self, tmp_path):
+        from fluid_build.cli.ai_setup import _load_ai_config, _save_ai_config
+
+        config_file = tmp_path / "ai_config.json"
+        with (
+            patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file),
+            patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path),
+            patch("fluid_build.cli.ai_setup._save_key_to_keyring", return_value=False),
+            patch.dict("os.environ", {"FLUID_ALLOW_PLAINTEXT_AI_SECRETS": "1"}, clear=True),
+        ):
+            assert _save_ai_config("openai", "gpt-4o", api_key="sk-test123")
+            loaded = _load_ai_config()
+            assert loaded is not None
+            assert loaded["api_key"] == "sk-test123"
 
     def test_load_returns_none_when_no_file(self, tmp_path):
         from fluid_build.cli.ai_setup import _load_ai_config
@@ -318,8 +351,10 @@ class TestModelCatalogIntegrity:
 
         # OpenAI gpt-4.1 should support it (per catalog)
         assert model_supports_structured_output("openai", "gpt-4.1") is True
-        # Gemini shouldn't (nested freeform issue)
-        assert model_supports_structured_output("gemini", "gemini-2.5-pro") is False
+        # Gemini 2.5 Pro: structured output was flipped on (H4) — the
+        # nested-freeform issue was resolved in the 2.5 line, and the
+        # forge data-model pipeline requires strict JSON on every stage.
+        assert model_supports_structured_output("gemini", "gemini-2.5-pro") is True
         # Unknown model → False
         assert model_supports_structured_output("openai", "unknown-model-xyz") is False
 

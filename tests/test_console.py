@@ -45,6 +45,11 @@ class TestCprint:
         cprint()
         # Should not crash
 
+    def test_redacts_secret_like_values(self, capsys) -> None:
+        cprint("token=live-token password:super-secret")
+
+        assert capsys.readouterr().out == "token=<redacted> password:<redacted>\n"
+
 
 class TestHelpers:
     def test_info(self, capsys):
@@ -66,6 +71,11 @@ class TestHelpers:
         error("something broke")
         captured = capsys.readouterr()
         assert "something broke" in captured.err
+
+    def test_error_redacts_secret_like_values(self, capsys) -> None:
+        error("api_key=live-key")
+
+        assert capsys.readouterr().err == "❌ api_key=<redacted>\n"
 
     def test_heading(self, capsys):
         heading("My Section")

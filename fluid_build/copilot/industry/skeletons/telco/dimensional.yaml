@@ -1,0 +1,63 @@
+# TMF SID-aligned Kimball dimensional skeleton for telecommunications.
+# Complements telco/data_vault_2.yaml for teams that forge analytics
+# marts directly instead of going through a raw-vault intermediate.
+industry: telecommunications
+technique: dimensional
+description: "TMF SID dimensional — usage + subscription facts with customer/product/resource dims"
+
+grain_statement: "One row per CDR (call detail record) usage event on a subscription"
+
+facts:
+  - name: fact_usage
+    grain_statement: "One row per CDR (voice minute, data session, SMS) on a subscription"
+    measures:
+      - {name: duration_seconds, data_type: int}
+      - {name: bytes_transferred, data_type: bigint}
+      - {name: rated_amount, data_type: decimal(18,4)}
+      - {name: event_count, data_type: int}
+    foreign_keys: [dim_subscription_key, dim_customer_key, dim_product_key, dim_resource_key, dim_date_key]
+    degenerate_dimensions: [cdr_id, imsi]
+
+  - name: fact_subscription_event
+    grain_statement: "One row per subscription lifecycle event (activation, suspension, upgrade, churn)"
+    measures:
+      - {name: mrr_delta, data_type: decimal(18,4)}
+      - {name: event_indicator, data_type: int}
+    foreign_keys: [dim_subscription_key, dim_customer_key, dim_product_key, dim_date_key]
+    degenerate_dimensions: [event_id, reason_code]
+
+  - name: fact_bill
+    grain_statement: "One row per billing-cycle invoice line for a subscription"
+    measures:
+      - {name: billed_amount, data_type: decimal(18,4)}
+      - {name: discount_amount, data_type: decimal(18,4)}
+      - {name: tax_amount, data_type: decimal(18,4)}
+    foreign_keys: [dim_subscription_key, dim_customer_key, dim_product_key, dim_date_key]
+    degenerate_dimensions: [invoice_id, invoice_line_number]
+
+dimensions:
+  - name: dim_customer
+    slowly_changing_type: type2
+    natural_keys: [party_id]
+  - name: dim_subscription
+    slowly_changing_type: type2
+    natural_keys: [subscription_id]
+  - name: dim_product
+    slowly_changing_type: type2
+    natural_keys: [product_offering_id]
+  - name: dim_resource
+    slowly_changing_type: type1
+    natural_keys: [resource_id]
+  - name: dim_date
+    slowly_changing_type: type1
+    natural_keys: [date]
+
+conformed_dimensions: [dim_customer, dim_subscription, dim_product, dim_resource, dim_date]
+degenerate_dims: [cdr_id, imsi, event_id, reason_code, invoice_id, invoice_line_number]
+
+slowly_changing:
+  dim_customer: type2
+  dim_subscription: type2
+  dim_product: type2
+  dim_resource: type1
+  dim_date: type1

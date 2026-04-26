@@ -253,7 +253,7 @@ def build_system_prompt(
         + "\n"
         + _DEFAULT_GUIDANCE.get("agent_policy", "")
         + "\n"
-        + "Follow the seed_contract structure exactly as a reference for the correct schema shape.\n"
+        + "Follow the seed_contract structure exactly as a reference for the correct schema shape.\n"  # nosec B608
         f"Allowed providers: {providers}.\n"
         "Only use build engines from the provided capability matrix.\n\n"
         # --- Upstream-driven transformation SQL ---
@@ -398,6 +398,13 @@ def build_clarification_system_prompt(capability_matrix: Mapping[str, Any]) -> s
         "Treat transcript.raw_input as primary evidence of user intent and transcript.resolved_value as a helpful local guess.\n"
         "If local matching is uncertain, prefer inferring from the raw wording over asking a rigid repeat question.\n"
         "Canonical use_case values: analytics, etl_pipeline, streaming, ml_pipeline, data_platform, other.\n"
+        "Treat data_modeling_technique, build_engine, and schedule_engine as three separate decisions: "
+        "data model shape, transformation code generator, and optional scheduler.\n"
+        "When asking users, use plain labels such as history/reporting for data model shape, "
+        "dbt/SQL/Spark for transformation, and Airflow/Dagster/Prefect for scheduler. "
+        "Do not expose internal values like data_vault_2 or generate_dbt in the prompt text.\n"
+        "Default build_engine to dbt when the user has not asked for a different transformation engine. "
+        "Do not infer a scheduler from build_engine=dbt.\n"
         "Canonical schedule_engine values: airflow, dagster, prefect.\n"
         "Canonical trigger_type values: cron, event, manual, streaming.\n"
         "Canonical jurisdiction values: EU, US, UK, CA, AU, JP, CN, IN, BR, Global, Multi-Region.\n"
@@ -468,8 +475,9 @@ def build_clarification_user_prompt(
             "If there was a generation failure, only ask questions that directly reduce that ambiguity.",
             "If existing_products are listed and the user's project_goal is semantically similar to an existing product, "
             "flag it in your reason field and ask: 'This looks similar to <existing_id>. Are you extending it or creating something new?'",
-            "If the user mentioned scheduling, DAGs, orchestration, or pipelines, infer schedule_engine and trigger_type. "
-            "Available schedulers: airflow, dagster, prefect. Default trigger_type is 'cron' for batch workloads.",
+            "If the user explicitly wants scheduling or mentions DAGs, infer schedule_engine and trigger_type. "
+            "Available schedulers: airflow, dagster, prefect. Default trigger_type is 'cron' for batch workloads. "
+            "Do not ask an orchestration question after schedule_engine has already been answered.",
             "If the domain is healthcare, finance, or the user mentions compliance, GDPR, HIPAA, CCPA, or data residency, "
             "ask about jurisdiction and regulatory requirements. Canonical jurisdiction values: EU, US, UK, CA, AU, JP, Global.",
             "If data involves PII, PHI, or financial records, infer data_sensitivity as confidential or restricted "

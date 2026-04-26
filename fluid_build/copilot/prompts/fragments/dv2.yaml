@@ -1,0 +1,157 @@
+You are producing a Data Vault 2.0 logical model (hubs, links, satellites).
+
+## Mandatory naming conventions (STRICT)
+
+Every table name MUST be lowercase snake_case with the correct prefix. No
+PascalCase, no camelCase, no spaces, no hyphens. The validator WILL reject
+output that violates this.
+
+- Hubs:       `hub_<business_entity>`        e.g. `hub_customer`, `hub_product`, `hub_service`
+- Links:      `lnk_<relationship_name>`      e.g. `lnk_order_customer`, `lnk_service_subscription`
+- Satellites: `sat_<hub>_<descriptor>`       e.g. `sat_customer_profile`, `sat_order_status`
+- PITs:       `pit_<hub>`                    e.g. `pit_customer`
+- Bridges:    `br_<hubs>`                    e.g. `br_customer_product`
+
+INCORRECT (reject these shapes in your own output):
+    HubCustomer, Hub_Customer, HUB_CUSTOMER, hubcustomer, customer_hub,
+    LnkOrderCustomer, SatCustomerProfile, Link_Order_Customer
+
+CORRECT:
+    hub_customer, lnk_order_customer, sat_customer_profile
+
+## Schema shape
+
+Return a JSON object matching `DV2Model`:
+
+```
+{
+  "hubs": [
+    {
+      "entity_name": "Customer",                       // business label, free text
+      "hub_table_name": "hub_customer",                // MUST match hub_* snake_case
+      "business_key_columns": ["customer_id"],
+      "mapped_source_tables": ["raw.customers"],
+      "description": "..."
+    }
+  ],
+  "links": [
+    {
+      "link_name": "OrderCustomer",                    // business label, free text
+      "link_table_name": "lnk_order_customer",         // MUST match lnk_* snake_case
+      "hubs_involved": ["hub_customer", "hub_order"],
+      "join_keys": [
+        {
+          "table1": "orders",
+          "column1": "customer_id",
+          "table2": "customers",
+          "column2": "customer_id",
+          "reasoning": "Orders reference the customer business key."
+        }
+      ],
+      "relationships": [
+        {
+          "source_entity": "Order",
+          "target_entity": "Customer",
+          "relationship_type": "many_to_one",
+          "join_condition": "orders.customer_id = customers.customer_id",
+          "reasoning": "Orders reference customers by customer_id."
+        }
+      ]
+    }
+  ],
+  "satellites": [
+    {
+      "entity_name": "CustomerProfile",                // business label, free text
+      "satellite_table_name": "sat_customer_profile",  // MUST match sat_* snake_case
+      "parent_hub": "hub_customer",                    // MUST reference an existing hub_* table name
+      "attributes": ["first_name", "last_name", "email"],
+      "change_tracking": "type2"                       // default; use "type1" or "append_only" only when justified
+    }
+  ],
+  "hash_key_strategy": {
+    "algorithm": "md5",       // or "sha256"
+    "delimiter": "||",
+    "null_token": "__NULL__",
+    "upper_case": true
+  }
+}
+```
+
+## Top-level `LogicalDraft` shape
+
+Return a single JSON object with these top-level keys:
+
+- `technique`: **must be exactly** `"data_vault_2"`.
+- `dv2`: the `DV2Model` object (shown above).
+- `dimensional`: **must be `null`** — do NOT return `{}`. This branch
+  belongs to Kimball and MUST be omitted / nulled out for a DV2 draft.
+- `osi`: the OSI semantic model (generated elsewhere — pass through what
+  you received upstream).
+- `conceptual`, `source_summary`: pass through or populate per the
+  upstream input.
+
+## Modeling rules
+
+- Every business-key entity gets ONE hub. Do not invent synthetic hubs for
+  attributes that belong on a satellite.
+- Every relationship that spans two or more hubs goes in a link. Do not
+  collapse relationships into satellites.
+- Every link relationship MUST include `relationship_type`. Use one of
+  `"association"`, `"one_to_one"`, `"one_to_many"`, `"many_to_one"`, or
+  `"many_to_many"`; if the intent does not state cardinality, use
+  `"association"`.
+- Every descriptive attribute set goes on a satellite whose `parent_hub`
+  references an existing hub table name.
+- Default `change_tracking` is `"type2"` (track history). Use `"type1"` only
+  when the business explicitly says history is not needed; use
+  `"append_only"` only for immutable event streams.
+- `business_key_columns` MUST be the natural/business keys, NOT surrogate
+  IDs. If the source only has a surrogate, still list it but flag the lack
+  of a natural key in `description`.
+- Prefer coverage of the canonical model (TMF SID for telco, NRF ARTS for
+  retail, HL7 FHIR for healthcare, ISO 20022 for finance) when an industry
+  skeleton is supplied in the input.
+
+Return strict JSON only. No prose, no markdown fences.
+
+## Link join key contract (STRICT)
+
+`join_keys` MUST be an array of objects. Never emit a bare string, never
+emit an array of column names, and never use a two-element tuple/list.
+
+INCORRECT (validator rejects these):
+
+```
+"join_keys": ["customer_id"]
+"join_keys": [["orders.customer_id", "customers.customer_id"]]
+```
+
+CORRECT:
+
+```
+"join_keys": [
+  {
+    "table1": "orders",
+    "column1": "customer_id",
+    "table2": "customers",
+    "column2": "customer_id",
+    "reasoning": "Orders reference customers by customer_id."
+  }
+]
+```
+
+If the intent does not name physical tables, derive stable lowercase
+table names from the business entities. For example, hubs
+`hub_party` and `hub_account` joined by `party_id` should produce:
+
+```
+"join_keys": [
+  {
+    "table1": "party",
+    "column1": "party_id",
+    "table2": "account",
+    "column2": "party_id",
+    "reasoning": "Accounts are associated with parties by party_id."
+  }
+]
+```

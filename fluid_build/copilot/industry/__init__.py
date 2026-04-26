@@ -1,0 +1,43 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Typed industry packs for staged data-model forging.
+
+Wraps the existing ``fluid_build.cli.industry_skills`` YAML catalog in a
+Pydantic-typed :class:`IndustryPack`.  Stages (Modeler/Logical) consume
+the pack structurally instead of parsing a free-text prompt fragment.
+
+Public exports:
+
+* :class:`IndustryPack` — typed industry + canonical-model + compliance
+* :class:`IndustryPackCompiler` — ``compile(name)`` → :class:`IndustryPack`
+"""
+
+from __future__ import annotations
+
+from fluid_build.copilot.industry.compiler import IndustryPackCompiler
+from fluid_build.copilot.industry.pack import (
+    CanonicalModel,
+    ComplianceProfile,
+    IndustryDomain,
+    IndustryPack,
+)
+
+__all__ = [
+    "CanonicalModel",
+    "ComplianceProfile",
+    "IndustryDomain",
+    "IndustryPack",
+    "IndustryPackCompiler",
+]

@@ -27,11 +27,19 @@ from typing import Dict, Optional
 logger = logging.getLogger(__name__)
 
 try:
-    from dotenv import dotenv_values
+    from dotenv import dotenv_values, load_dotenv
 
     DOTENV_AVAILABLE = True
 except ImportError:
     DOTENV_AVAILABLE = False
+
+    # Provide a no-op ``load_dotenv`` so callers (``cli/_common.hydrate_dotenv``)
+    # that ``from fluid_build.credentials.dotenv_store import load_dotenv`` keep
+    # importing cleanly when ``python-dotenv`` is absent. The helper logs a
+    # debug skip in that path and returns early, so a missing optional dep is
+    # graceful rather than a hard ImportError on every CLI invocation.
+    def load_dotenv(*args, **kwargs):  # type: ignore[no-redef]
+        return False
 
 
 class DotEnvCredentialStore:

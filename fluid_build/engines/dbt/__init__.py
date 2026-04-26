@@ -31,7 +31,7 @@ from .models import generate_models
 from .profiles import generate_profiles
 from .project_yml import generate_project_yml
 from .schema_yml import generate_schema_yml
-from .sources import generate_sources
+from .sources import generate_sources, generate_sources_from_logical_model
 
 try:
     from fluid_build.util.contract import get_build_engine, get_exposes
@@ -60,6 +60,7 @@ class DbtEngine(TransformationEngine):
         schema_context: Optional[Dict[str, Any]] = None,
         transformation_intent: Optional[TransformationIntent] = None,
         workspace_root: Optional[Path] = None,
+        output_dir: Optional[Path] = None,
         mesh_hub: Optional[str] = None,
     ) -> GenerationResult:
         files: GenerationResult = {}
@@ -77,6 +78,12 @@ class DbtEngine(TransformationEngine):
         )
         if sources_content:
             files["models/sources.yml"] = sources_content
+        elif transformation_intent and transformation_intent.user_data_model:
+            logical_sources = generate_sources_from_logical_model(
+                transformation_intent.user_data_model
+            )
+            if logical_sources:
+                files["models/sources.yml"] = logical_sources
 
         # SQL model files
         model_files = generate_models(
@@ -88,27 +95,23 @@ class DbtEngine(TransformationEngine):
         files.update(model_files)
 
         # models/<layer>/schema.yml — per-model dbt tests. We skip this
-        # when a modeling technique is set because the LLM pipeline owns
-        # the model set under that path; if we also emit schema.yml
-        # here, dbt rejects the project with "two schema.yml entries
-        # for the same resource". The LLM ships its own schema.yml via
-        # ``additional_files`` (system prompt mandates it).
+        # when a modeling technique is set because the staged builder owns
+        # the model set under that path; emitting a generic schema.yml here
+        # can collide with provider-authored or scaffold-authored model docs.
         technique = transformation_intent.data_modeling_technique if transformation_intent else None
         if technique not in {"data_vault_2", "dimensional"}:
             schema_files = generate_schema_yml(contract, mesh_hub=mesh_hub)
             files.update(schema_files)
         elif mesh_hub:
-            # DV2 / dimensional techniques own schema.yml themselves
-            # (the LLM pipeline emits it via additional_files). But
-            # dependencies.yml is orthogonal to schema.yml, so we
-            # still emit it when mesh_hub is set — the LLM pipeline
-            # doesn't touch this file.
+            # DV2 / dimensional techniques own schema.yml themselves.
+            # dependencies.yml is orthogonal to schema.yml, so we still
+            # emit it when mesh_hub is set.
             from .schema_yml import _mesh_only_output
 
             files.update(_mesh_only_output(mesh_hub))
 
         # profiles.yml
-        profiles_content = generate_profiles(contract, build)
+        profiles_content = generate_profiles(contract, build, output_dir=output_dir)
         if profiles_content:
             files["profiles.yml"] = profiles_content
 

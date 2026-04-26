@@ -48,11 +48,9 @@ sub-items, each tested in its own class here:
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Dict, Iterator, List
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
 
 from fluid_build.cli.forge_copilot_interview import (
@@ -70,8 +68,6 @@ from fluid_build.cli.forge_copilot_llm_providers import (
 )
 from fluid_build.cli.forge_copilot_response_schema import (
     FORGE_RESPONSE_SCHEMA,
-    anthropic_tool_definition,
-    gemini_response_schema_config,
     ollama_supports_structured_output,
     openai_response_format,
 )
@@ -499,10 +495,13 @@ class TestStructuredOutputs:
         assert "responseSchema" not in payload["generationConfig"]
 
     def test_ollama_supports_structured_output_reads_catalog(self):
-        """Ollama structured output support is now catalog-driven, not
-        a hardcoded allowlist.  Unknown models return False."""
-        # Ollama models list in the catalog is empty (dynamic),
-        # so no model is marked as structured_output capable.
+        """Ollama structured output support is catalog-driven.
+
+        Gemma 4 is explicitly pinned because it is part of the local
+        provider E2E matrix; unknown models still return False.
+        """
+        assert ollama_supports_structured_output("gemma4") is True
+        assert ollama_supports_structured_output("gemma4:latest") is True
         assert ollama_supports_structured_output("some-random-model") is False
 
     def test_ollama_build_request_drops_response_format_for_unknown_models(self, monkeypatch):
@@ -515,6 +514,12 @@ class TestStructuredOutputs:
         # recognized as structured-output-capable → format dropped.
         assert "response_format" not in payload
 
+    def test_ollama_build_request_enables_json_object_for_gemma4(self, monkeypatch):
+        monkeypatch.delenv("FLUID_LLM_STRUCTURED_OUTPUTS", raising=False)
+        cfg = _base_config("ollama", "gemma4:latest", "http://localhost:11434/v1/chat/completions")
+        _, payload = OllamaProvider().build_request(cfg, "sys", "usr")
+        assert payload["response_format"] == {"type": "json_object"}
+
     def test_ollama_build_request_also_drops_for_known_names_without_catalog_entry(
         self, monkeypatch
     ):
@@ -524,8 +529,8 @@ class TestStructuredOutputs:
         monkeypatch.delenv("FLUID_LLM_STRUCTURED_OUTPUTS", raising=False)
         cfg = _base_config("ollama", "llama3.1", "http://localhost:11434/v1/chat/completions")
         _, payload = OllamaProvider().build_request(cfg, "sys", "usr")
-        # Ollama's models list is empty in the catalog (dynamic),
-        # so the capability check returns False → no response_format.
+        # llama3.1 is not explicitly pinned in the catalog, so the
+        # capability check returns False → no response_format.
         assert "response_format" not in payload
 
     def test_kill_switch_disables_structured_outputs(self, monkeypatch):

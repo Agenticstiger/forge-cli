@@ -24,6 +24,7 @@ Diagnostic / debug messages should still use :mod:`logging`.
 
 from __future__ import annotations
 
+import re
 import sys
 from typing import Any
 
@@ -44,6 +45,18 @@ else:
     console = None  # type: ignore[assignment]
 
 
+_RICH_TAG_PATTERN = re.compile(r"\[/?[a-z_ ]+\]")
+_SECRET_OUTPUT_PATTERN = re.compile(
+    r"(?i)\b(password|passphrase|token|secret|api[_ -]?key)\b(\s*[:=]\s*)([^\s,;]+)"
+)
+
+
+def _redact_sensitive_output(value: Any) -> Any:
+    if isinstance(value, str):
+        return _SECRET_OUTPUT_PATTERN.sub(r"\1\2<redacted>", value)
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Convenience helpers – intentionally thin wrappers so call-sites stay short.
 # ---------------------------------------------------------------------------
@@ -51,16 +64,17 @@ else:
 
 def cprint(*args: Any, **kwargs: Any) -> None:
     """Console-aware ``print``.  Uses Rich when available, else plain print."""
+    safe_args = tuple(_redact_sensitive_output(arg) for arg in args)
     if console is not None:
-        console.print(*args, **kwargs)
+        console.print(*safe_args, **kwargs)  # lgtm[py/clear-text-logging-sensitive-data]
     else:
         # Strip Rich markup for plain output.
-        text = " ".join(str(a) for a in args)
-        # Crude tag removal – good enough for [...] markup.
-        import re
-
-        text = re.sub(r"\[/?[a-z_ ]+\]", "", text)
-        print(text, **{k: v for k, v in kwargs.items() if k in ("end", "file", "flush")})
+        text = " ".join(str(a) for a in safe_args)
+        text = _RICH_TAG_PATTERN.sub("", text)
+        print(  # lgtm[py/clear-text-logging-sensitive-data]
+            text,
+            **{k: v for k, v in kwargs.items() if k in ("end", "file", "flush")},
+        )
 
 
 def info(msg: str) -> None:
@@ -80,11 +94,14 @@ def warning(msg: str) -> None:
 
 def error(msg: str) -> None:
     """Error message (red ❌) – written to *stderr*."""
+    safe_msg = _redact_sensitive_output(msg)
     if RICH_AVAILABLE:
         _err_console = RichConsole(stderr=True)
-        _err_console.print(f"[red]❌ {msg}[/red]")
+        _err_console.print(
+            f"[red]❌ {safe_msg}[/red]"
+        )  # lgtm[py/clear-text-logging-sensitive-data]
     else:
-        print(f"❌ {msg}", file=sys.stderr)
+        print(f"❌ {safe_msg}", file=sys.stderr)  # lgtm[py/clear-text-logging-sensitive-data]
 
 
 def heading(title: str, char: str = "=") -> None:

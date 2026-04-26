@@ -1,0 +1,67 @@
+# NRF ARTS-aligned Data Vault 2.0 skeleton for retail.
+# Complements retail/dimensional.yaml for teams that want a raw-vault
+# layer in front of their Kimball marts (integration-first pattern).
+industry: retail
+technique: data_vault_2
+description: "NRF ARTS retail canonical — Customer, Product, Store, Transaction, Promotion hubs"
+
+hubs:
+  - entity_name: customer
+    hub_table_name: hub_customer
+    business_key_columns: [customer_id]
+    description: "NRF ARTS Customer / loyalty-program member"
+  - entity_name: product
+    hub_table_name: hub_product
+    business_key_columns: [sku]
+    description: "NRF ARTS Product (SKU-grain merchandise catalog entry)"
+  - entity_name: store
+    hub_table_name: hub_store
+    business_key_columns: [store_id]
+    description: "NRF ARTS Store (brick-and-mortar or online outlet)"
+  - entity_name: transaction
+    hub_table_name: hub_transaction
+    business_key_columns: [transaction_id]
+    description: "NRF ARTS Retail transaction header"
+  - entity_name: promotion
+    hub_table_name: hub_promotion
+    business_key_columns: [promotion_id]
+    description: "NRF ARTS Promotion / discount campaign"
+
+links:
+  - link_name: transaction_customer
+    link_table_name: lnk_transaction_customer
+    hubs_involved: [hub_transaction, hub_customer]
+  - link_name: transaction_line
+    link_table_name: lnk_transaction_line
+    hubs_involved: [hub_transaction, hub_product, hub_store]
+  - link_name: transaction_promotion
+    link_table_name: lnk_transaction_promotion
+    hubs_involved: [hub_transaction, hub_promotion]
+
+satellites:
+  - entity_name: customer_profile
+    satellite_table_name: sat_customer_profile
+    parent_hub: hub_customer
+    change_tracking: type2
+  - entity_name: product_attributes
+    satellite_table_name: sat_product_attributes
+    parent_hub: hub_product
+    change_tracking: type2
+  - entity_name: store_profile
+    satellite_table_name: sat_store_profile
+    parent_hub: hub_store
+    change_tracking: type2
+  - entity_name: transaction_header
+    satellite_table_name: sat_transaction_header
+    parent_hub: hub_transaction
+    change_tracking: type1
+  - entity_name: promotion_detail
+    satellite_table_name: sat_promotion_detail
+    parent_hub: hub_promotion
+    change_tracking: type2
+
+hash_key_strategy:
+  algorithm: md5
+  delimiter: "||"
+  null_token: "__NULL__"
+  upper_case: true

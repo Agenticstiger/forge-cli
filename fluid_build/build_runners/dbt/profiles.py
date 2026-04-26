@@ -231,7 +231,7 @@ def _create_temp_dbt_profiles_dir(
     )
     # The profile may carry a literal password. The tempdir is 0o700 by default
     # but the file inherits the process umask — force 0o600 so another local
-    # user cannot read it during the brief lifetime of the run.
+    # user cannot read it during the intent lifetime of the run.
     try:
         os.chmod(profiles_path, 0o600)
     except OSError:

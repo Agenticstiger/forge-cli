@@ -19,6 +19,7 @@ from __future__ import annotations
 __all__ = [
     "DiscoveryReport",
     "discover_local_context",
+    "parse_ddl_files",
 ]
 
 import json
@@ -128,6 +129,7 @@ class DiscoveryReport:
             "readmes": self.readmes,
             "existing_contracts": self.existing_contracts,
             "sample_files": self.sample_files,
+            "user_data_models": self.user_data_models,
             "provider_hints": self.provider_hints,
             "build_constraints": self.build_constraints,
             "discovery_warnings": self.discovery_warnings,
@@ -255,6 +257,32 @@ def discover_local_context(
 
             if suffix == ".sql" and len(report.sql_files) < MAX_SQL_FILES:
                 report.sql_files.append(_summarize_sql_file(path))
+                if "models" in {part.lower() for part in path.parts}:
+                    try:
+                        from .forge_copilot_schema_inference import summarize_user_data_model
+
+                        model_summary = summarize_user_data_model(path)
+                        if model_summary:
+                            report.user_data_models.append(model_summary)
+                    except Exception as exc:  # noqa: BLE001
+                        report.discovery_warnings.append(
+                            f"Could not inspect data model {path.name}: {exc}"
+                        )
+                continue
+
+            if suffix in {".yaml", ".yml", ".json"} and "models" in {
+                part.lower() for part in path.parts
+            }:
+                try:
+                    from .forge_copilot_schema_inference import summarize_user_data_model
+
+                    model_summary = summarize_user_data_model(path)
+                    if model_summary:
+                        report.user_data_models.append(model_summary)
+                except Exception as exc:  # noqa: BLE001
+                    report.discovery_warnings.append(
+                        f"Could not inspect data model {path.name}: {exc}"
+                    )
                 continue
 
             if (
@@ -402,6 +430,34 @@ def rescan_sample_data(
                 except Exception as exc:  # noqa: BLE001
                     if logger:
                         logger.debug("rescan_data_model_failed: %s", exc)
+
+
+def parse_ddl_files(
+    paths: Iterable[Path], *, dialect: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Parse DDL files into compact summaries for the staged data-model path."""
+    from fluid_build.forge_datamodel.from_ddl.parser import parse_ddl_text
+
+    results: List[Dict[str, Any]] = []
+    for path in paths:
+        try:
+            ddl_text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        parsed = parse_ddl_text(ddl_text, dialect=dialect)
+        if not parsed.tables:
+            continue
+        results.append(
+            {
+                "path": str(path),
+                "tables": len(parsed.tables),
+                "columns": {
+                    table.name: {column.name: column.logical_type for column in table.columns}
+                    for table in parsed.tables
+                },
+            }
+        )
+    return results
 
 
 # ---------------------------------------------------------------------------

@@ -374,7 +374,12 @@ class CopilotAgentBase(CopilotProjectMemoryMixin, CopilotLegacyScaffoldMixin, AI
     ) -> CopilotGenerationResult:
         """Generate and validate copilot artifacts via the LLM runtime."""
         context = normalize_copilot_context(context)
-        runtime_inputs = self.prepare_runtime_inputs(copilot_options)
+        options = dict(copilot_options or {})
+        if options.get("tiered"):
+            context["tiered"] = True
+        if options.get("require_llm"):
+            context["require_llm"] = True
+        runtime_inputs = self.prepare_runtime_inputs(options)
 
         # Load team memory from workspace root (if available).
         team_memory_payload = None

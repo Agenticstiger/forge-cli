@@ -53,6 +53,7 @@ from .forge_dialogs import (
 INTERVIEW_MAX_ROUNDS = 3
 INTERVIEW_MAX_QUESTIONS_PER_ROUND = 2
 INTERVIEW_TRANSCRIPT_WINDOW = 6
+KNOWN_SCHEDULER_ENGINES = ("airflow", "dagster", "prefect")
 
 # Slice UX-I: the set of context slots that together are sufficient for
 # the generation LLM to produce a defensible contract WITHOUT a
@@ -128,6 +129,10 @@ SUMMARY_FIELDS = {
     "byot_path",
     "transformation_engine",
     "user_data_model",
+    "data_model_source",
+    "data_model_paths",
+    "data_model_description",
+    "review_data_model",
     "schedule_engine",
     "byos_path",
     "data_modeling_technique",
@@ -154,6 +159,10 @@ SCALAR_FIELDS = {
     "byot_path",
     "transformation_engine",
     "user_data_model",
+    "data_model_source",
+    "data_model_paths",
+    "data_model_description",
+    "review_data_model",
     "schedule_engine",
     "byos_path",
     "data_modeling_technique",
@@ -168,6 +177,11 @@ _DATA_VAULT_2_ALIASES = {
     "dv 2",
     "dv2.0",
     "dv 2.0",
+    "history",
+    "change history",
+    "audit history",
+    "raw vault",
+    "historical",
     "data vault",
     "data vault 2",
     "data vault 2.0",
@@ -181,8 +195,26 @@ _DIMENSIONAL_ALIASES = {
     "dimensional modeling",
     "dim",
     "kimball",
+    "reporting",
+    "bi",
+    "dashboard",
+    "dashboards",
+    "analytics",
+    "star model",
     "star",
     "star schema",
+}
+_DATA_MODEL_SOURCE_ALIASES = {
+    "ddl": "ddl",
+    "sql": "ddl",
+    "intent": "intent",
+    "yaml": "intent",
+    "samples": "samples",
+    "sample": "samples",
+    "chat": "chat",
+    "describe": "chat",
+    "blank": "blank",
+    "none": "blank",
 }
 
 
@@ -377,6 +409,16 @@ def normalize_interview_value(field_name: str, value: Any) -> Any:
         if text in {"data_vault_2", "dimensional"}:
             return text
         return None
+    if key == "data_model_source":
+        text = str(value or "").strip().lower()
+        return _DATA_MODEL_SOURCE_ALIASES.get(text) or None
+    if key == "review_data_model":
+        text = str(value or "").strip().lower()
+        if text in {"yes", "y", "true", "1"}:
+            return "true"
+        if text in {"no", "n", "false", "0"}:
+            return "false"
+        return None
     if key in LIST_LIKE_FIELDS:
         return _listify_strings(value)
     if key in SCALAR_FIELDS:
@@ -510,8 +552,16 @@ def run_adaptive_copilot_interview(
     project_memory: Optional[Any] = None,
     previous_failure: Optional[List[str]] = None,
     target_dir: Optional[Path] = None,
+    quiet: bool = False,
 ) -> CopilotInterviewState:
-    """Run the multi-round adaptive interview, calling the LLM for dynamic questions."""
+    """Run the multi-round adaptive interview, calling the LLM for dynamic questions.
+
+    ``quiet`` is forwarded to ``print_v2_banner("init_copilot")`` so the
+    ``fluid init copilot --quiet`` flag suppresses the banner consistently
+    with every other forge surface. The env-var path
+    (``FLUID_QUIET=1`` / ``FLUID_NONINTERACTIVE=1``) is honoured by
+    ``forge_banner.banner_enabled`` regardless of this kwarg.
+    """
     from .forge_ui import print_interview_phase
 
     state = bootstrap_interview_state(
@@ -528,6 +578,12 @@ def run_adaptive_copilot_interview(
         discovery_report=discovery_report,
         target_dir=target_dir,
     )
+    try:
+        from .forge_banner import print_v2_banner
+
+        print_v2_banner("init_copilot", quiet=quiet)
+    except Exception:  # noqa: BLE001
+        pass
 
     # Slice UX-I: short-circuit the clarification LLM round if the
     # bootstrap questions + discovery + project memory already filled
@@ -710,31 +766,14 @@ def _ask_bootstrap_questions(
                 resolution_status="matched",
             )
 
-    # ── BYOT: Bring Your Own Transformation ─────────────────────────
-    if not state.normalized_context.get("byot_path"):
-        _ask_byot_question(state, console)
-
-    # ── Engine selection (ask once, remember via copilot memory) ─────
-    if not state.normalized_context.get("build_engine") and not state.normalized_context.get(
-        "byot_path"
+    if not state.normalized_context.get("data_model_source") and (
+        discovery_report.user_data_models
+        or discovery_report.sql_files
+        or discovery_report.sample_files
     ):
-        _ask_engine_selection(state, console, discovery_report=discovery_report)
+        _ask_data_model_question(state, console, discovery_report=discovery_report)
 
-    # ── Schedule selection ────────────────────────────────────────────
-    if not state.normalized_context.get("schedule_engine") and not state.normalized_context.get(
-        "byos_path"
-    ):
-        _ask_schedule_question(state, console, discovery_report=discovery_report)
-
-    # ── Data modeling technique ───────────────────────────────────────
-    # Only re-ask when the user hasn't explicitly answered.  The default
-    # ("data_vault_2") is applied in ``bootstrap_interview_state`` with
-    # ``source="default"``, which is the lowest precedence — so the user
-    # is presented the picker unless they (or a higher-precedence source
-    # like project_memory) already supplied an explicit choice.
-    _modeling_technique_source = state.field_sources.get("data_modeling_technique")
-    if _modeling_technique_source in (None, "default"):
-        _ask_data_modeling_technique(state, console)
+    _ask_delivery_setup(state, console, discovery_report=discovery_report)
 
     # Ask about data modeling if domain expertise has modeling standards
     domain_expertise = state.normalized_context.get("domain_expertise") or {}
@@ -757,6 +796,86 @@ def _ask_bootstrap_questions(
                 resolved_value="true",
                 resolution_status="matched",
             )
+
+
+def _ask_delivery_setup(
+    state: CopilotInterviewState,
+    console: Any,
+    *,
+    discovery_report: DiscoveryReport,
+) -> None:
+    """Collect data model, transformation, and scheduler choices together."""
+    if not console:
+        return
+    try:
+        console.print("\n[bold]Delivery setup[/bold]")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Only re-ask when the user hasn't explicitly answered. The default
+    # ("data_vault_2") is applied in ``bootstrap_interview_state`` with
+    # ``source="default"``, which is the lowest precedence.
+    modeling_technique_source = state.field_sources.get("data_modeling_technique")
+    if modeling_technique_source in (None, "default"):
+        _ask_data_modeling_technique(state, console)
+
+    if not state.normalized_context.get("byot_path") and not state.normalized_context.get(
+        "build_engine"
+    ):
+        _ask_transformation_delivery(state, console, discovery_report=discovery_report)
+
+    if (
+        not state.normalized_context.get("schedule_engine")
+        and not state.normalized_context.get("byos_path")
+        and _should_prompt_for_scheduler(state)
+    ):
+        _ask_scheduler_delivery(state, console, discovery_report=discovery_report)
+
+
+def _suggest_modeling_default(state: CopilotInterviewState) -> str:
+    """Choose a friendly modeling default from the user's wording."""
+    text = " ".join(
+        str(state.normalized_context.get(key) or "")
+        for key in (
+            "project_goal",
+            "use_case",
+            "use_case_other",
+            "data_sources",
+            "domain",
+            "data_model_description",
+        )
+    ).lower()
+    dimensional_tokens = (
+        "dashboard",
+        "dashboards",
+        "report",
+        "reporting",
+        "bi",
+        "metric",
+        "metrics",
+        "kpi",
+        "scorecard",
+        "analytics",
+        "star schema",
+        "kimball",
+    )
+    history_tokens = (
+        "audit",
+        "lineage",
+        "history",
+        "historical",
+        "raw vault",
+        "integration",
+        "regulatory",
+        "compliance",
+        "governed",
+        "cdc",
+    )
+    if any(token in text for token in dimensional_tokens):
+        return "dimensional"
+    if any(token in text for token in history_tokens):
+        return "data_vault_2"
+    return "data_vault_2"
 
 
 def _scaffold_data_dirs_and_prompt(
@@ -876,6 +995,462 @@ def _ask_byot_question(
             pass
 
 
+def _ask_transformation_delivery(
+    state: CopilotInterviewState,
+    console: Any,
+    *,
+    discovery_report: DiscoveryReport,
+) -> None:
+    """Ask for the transformation code path without mixing in scheduling."""
+    choices = [
+        {
+            "label": "Generate dbt SQL models",
+            "value": "generate_dbt",
+            "aliases": ["dbt", "generate", "generate dbt", "sql models", "sql"],
+        },
+        {
+            "label": "Choose another transformation engine",
+            "value": "choose_engine",
+            "aliases": ["other", "engine", "another engine", "spark", "dataform"],
+        },
+        {
+            "label": "Use existing transformation code",
+            "value": "existing",
+            "aliases": ["existing", "byot", "path", "repo", "git"],
+        },
+    ]
+    raw_answer = ask_friendly_text(
+        console,
+        "Transformation [dbt / other / existing]",
+        required=False,
+        default="dbt",
+    )
+    match = resolve_choice_input(
+        field_name="transformation_delivery",
+        raw_input=raw_answer,
+        choices=choices,
+        allow_skip=True,
+    )
+    raw_input = (match.raw_input or "").strip()
+    if raw_input and _looks_like_existing_artifact_ref(raw_input):
+        trimmed = raw_input
+        state.apply_patch({"byot_path": trimmed}, source="interactive")
+        state.record_turn(
+            role="user",
+            content=trimmed,
+            field="byot_path",
+            question_id="bootstrap_byot",
+            raw_input=match.raw_input,
+            resolved_value=trimmed,
+            resolution_status=match.status or "matched",
+        )
+        return
+    value = match.value if match.status in {"matched", "confirmed", "custom"} else None
+    if not value and raw_input:
+        trimmed = raw_input
+        state.apply_patch({"byot_path": trimmed}, source="interactive")
+        state.record_turn(
+            role="user",
+            content=trimmed,
+            field="byot_path",
+            question_id="bootstrap_byot",
+            raw_input=match.raw_input,
+            resolved_value=trimmed,
+            resolution_status=match.status or "matched",
+        )
+        return
+    if value == "existing":
+        _ask_byot_question(state, console)
+        return
+    if value == "choose_engine":
+        _ask_engine_selection(state, console, discovery_report=discovery_report)
+        return
+
+    state.apply_patch({"build_engine": "dbt"}, source="interactive")
+    state.record_turn(
+        role="user",
+        content="dbt",
+        field="build_engine",
+        question_id="bootstrap_transformation",
+        raw_input=match.raw_input or "",
+        resolved_value="dbt",
+        resolution_status=match.status or "matched",
+    )
+
+
+def _ask_scheduler_delivery(
+    state: CopilotInterviewState,
+    console: Any,
+    *,
+    discovery_report: DiscoveryReport,
+) -> None:
+    """Ask the optional scheduler decision once; blank means no scheduler."""
+    try:
+        from fluid_build.schedulers import list_schedulers, list_schedulers_for_platform
+
+        provider = state.normalized_context.get("provider", "")
+        available = list_schedulers_for_platform(provider) if provider else list_schedulers()
+    except ImportError:
+        available = []
+    available = sorted({*available, *KNOWN_SCHEDULER_ENGINES})
+
+    choices = [{"label": "No scheduler", "value": "none", "aliases": ["no", "none", "skip"]}]
+    choices.extend(
+        {
+            "label": scheduler.title(),
+            "value": scheduler,
+            "aliases": [scheduler.replace("_", " "), scheduler],
+        }
+        for scheduler in available
+    )
+    choices.append(
+        {
+            "label": "Use existing schedule/DAG",
+            "value": "existing",
+            "aliases": ["existing", "byos", "dag", "schedule path"],
+        }
+    )
+
+    scheduler_options = ["none", *available, "existing"]
+    raw_answer = ask_friendly_text(
+        console,
+        "Scheduler [" + " / ".join(scheduler_options) + "]",
+        required=False,
+        default="none",
+    )
+    match = resolve_choice_input(
+        field_name="schedule_delivery",
+        raw_input=raw_answer,
+        choices=choices,
+        allow_skip=True,
+    )
+    raw_input = (match.raw_input or "").strip()
+    if raw_input and _looks_like_existing_artifact_ref(raw_input):
+        trimmed = raw_input
+        state.apply_patch({"byos_path": trimmed}, source="interactive")
+        state.record_turn(
+            role="user",
+            content=trimmed,
+            field="byos_path",
+            question_id="bootstrap_byos",
+            raw_input=match.raw_input,
+            resolved_value=trimmed,
+            resolution_status=match.status or "matched",
+        )
+        return
+    value = match.value if match.status in {"matched", "confirmed", "custom"} else None
+    if not value and raw_input:
+        trimmed = raw_input
+        state.apply_patch({"byos_path": trimmed}, source="interactive")
+        state.record_turn(
+            role="user",
+            content=trimmed,
+            field="byos_path",
+            question_id="bootstrap_byos",
+            raw_input=match.raw_input,
+            resolved_value=trimmed,
+            resolution_status=match.status or "matched",
+        )
+        return
+    if not value or value == "none":
+        state.record_turn(
+            role="user",
+            content="none",
+            field="schedule_engine",
+            question_id="bootstrap_scheduler",
+            raw_input=match.raw_input or "",
+            resolved_value="",
+            resolution_status=match.status or "matched",
+        )
+        return
+    if value == "existing":
+        _ask_byos_question(state, console)
+        return
+
+    state.apply_patch({"schedule_engine": value}, source="interactive")
+    state.record_turn(
+        role="user",
+        content=value,
+        field="schedule_engine",
+        question_id="bootstrap_scheduler",
+        raw_input=match.raw_input or value,
+        resolved_value=value,
+        resolution_status=match.status or "matched",
+    )
+
+
+def _should_prompt_for_scheduler(state: CopilotInterviewState) -> bool:
+    """Return True only when the user has signaled scheduling intent."""
+    context = state.normalized_context
+    if (
+        context.get("schedule_engine")
+        or context.get("byos_path")
+        or context.get("orchestration_pattern")
+    ):
+        return True
+    text = " ".join(
+        str(context.get(key) or "")
+        for key in (
+            "project_goal",
+            "data_sources",
+            "use_case",
+            "use_case_other",
+            "refresh_cadence",
+            "trigger_type",
+            "output_kind",
+        )
+    ).lower()
+    if not text.strip():
+        return False
+    scheduler_tokens = (
+        "airflow",
+        "dagster",
+        "prefect",
+        " dag",
+        "dags",
+        "scheduler",
+        "scheduled",
+        "schedule",
+        "orchestration",
+        "orchestrate",
+        "cron",
+        "trigger",
+        "nightly",
+        "hourly",
+        "daily run",
+        "run daily",
+        "batch window",
+    )
+    return any(token in text for token in scheduler_tokens)
+
+
+def _looks_like_existing_artifact_ref(value: str) -> bool:
+    text = str(value or "").strip()
+    lower = text.lower()
+    return (
+        "/" in text or "\\" in text or "://" in text or lower.startswith(("git@", "./", "../", "~"))
+    )
+
+
+def _ask_data_model_question(
+    state: CopilotInterviewState,
+    console: Any,
+    *,
+    discovery_report: DiscoveryReport,
+) -> None:
+    # V1.5 — auto-discover configured metadata-source catalogs so
+    # users with an existing Snowflake / Unity / DataHub setup see
+    # "Use a catalog I have configured" as the first option (and
+    # the default when one is configured).
+    configured_sources = _list_configured_sources()
+
+    default = _default_data_model_source(discovery_report, configured_sources)
+
+    choices = []
+    if configured_sources:
+        # Catalog branch goes FIRST when something is configured
+        # — surfaces the highest-value option without scrolling.
+        first_label = (
+            f"Use a catalog I have configured "
+            f"({', '.join(configured_sources[:3])}"
+            + (f" + {len(configured_sources) - 3} more" if len(configured_sources) > 3 else "")
+            + ")"
+        )
+        choices.append({"label": first_label, "value": "source"})
+    choices.extend(
+        [
+            {"label": "DDL files", "value": "ddl"},
+            {"label": "Business intent", "value": "intent"},
+            {"label": "Sample data only", "value": "samples"},
+            {"label": "Describe it in chat", "value": "chat"},
+            {"label": "Start blank", "value": "blank"},
+        ]
+    )
+    if not configured_sources:
+        # Even when no source is configured, show the option so
+        # discovery is consistent — but route to the wizard hint
+        # rather than enumerating empty choices.
+        choices.append(
+            {
+                "label": "Configure a metadata source (Snowflake / Unity / BigQuery / Glue / DataHub / DMM)",
+                "value": "source-setup",
+            }
+        )
+
+    prompt = "Do you have a data model yet? " "[" + " / ".join(c["value"] for c in choices) + "]"
+    match = ask_flexible_choice(
+        console,
+        prompt=prompt,
+        field_name="data_model_source",
+        choices=choices,
+        required=False,
+        allow_skip=True,
+        default=default,
+    )
+    source = normalize_interview_value("data_model_source", match.value or default)
+    if not source:
+        return
+    state.apply_patch({"data_model_source": source}, source="interactive")
+    state.record_turn(
+        role="user",
+        content=match.label or source,
+        field="data_model_source",
+        question_id="bootstrap_data_model_source",
+        raw_input=match.raw_input or source,
+        resolved_value=source,
+        resolution_status=match.status or "matched",
+    )
+
+    if source == "ddl":
+        discovered = [
+            str(model.get("path"))
+            for model in discovery_report.user_data_models
+            if str(model.get("path", "")).lower().endswith(".sql")
+        ] or [entry.get("path") for entry in discovery_report.sql_files if entry.get("path")]
+        ddl_answer = ask_friendly_text(
+            console,
+            "Point me at the DDL file(s), or press Enter to use the discovered SQL files",
+            required=False,
+            default=" ".join(discovered[:4]) if discovered else None,
+        )
+        if ddl_answer:
+            state.apply_patch({"data_model_paths": ddl_answer}, source="interactive")
+    elif source == "intent":
+        discovered = [
+            str(model.get("path"))
+            for model in discovery_report.user_data_models
+            if str(model.get("path", "")).lower().endswith((".yaml", ".yml", ".json"))
+        ]
+        intent_answer = ask_friendly_text(
+            console,
+            "Point me at the intent file, or press Enter to keep using the discovered model files",
+            required=False,
+            default=discovered[0] if discovered else None,
+        )
+        if intent_answer:
+            state.apply_patch({"data_model_paths": intent_answer}, source="interactive")
+    elif source == "chat":
+        description = ask_friendly_text(
+            console,
+            "Describe the model in a sentence or two",
+            required=False,
+        )
+        if description:
+            state.apply_patch({"data_model_description": description}, source="interactive")
+    elif source == "source":
+        # V1.5 — user picked the catalog branch. Capture which
+        # configured source (when more than one is set up) plus the
+        # database/schema scope. The actual forge later runs through
+        # ``run_from_source_command`` (or the MCP forge_from_source
+        # tool) so this prompt is metadata-only.
+        chosen_source = configured_sources[0] if configured_sources else None
+        if len(configured_sources) > 1:
+            sub_match = ask_flexible_choice(
+                console,
+                prompt=("Which configured catalog? " f"[{' / '.join(configured_sources)}]"),
+                field_name="data_model_source_name",
+                choices=[{"label": s, "value": s} for s in configured_sources],
+                required=False,
+                allow_skip=True,
+                default=configured_sources[0],
+            )
+            chosen_source = sub_match.value or configured_sources[0]
+        if chosen_source:
+            state.apply_patch({"data_model_source_name": chosen_source}, source="interactive")
+        scope_answer = ask_friendly_text(
+            console,
+            "What scope should we forge from? (e.g. 'TELCO_LAB.TELCO_STAGE_LOAD' "
+            "for Snowflake, 'main.gold' for Unity, 'myproject.analytics' for "
+            "BigQuery; press Enter to skip)",
+            required=False,
+        )
+        if scope_answer:
+            state.apply_patch(
+                {"data_model_source_scope": scope_answer.strip()},
+                source="interactive",
+            )
+    elif source == "source-setup":
+        # User has no configured catalog yet — point them at the
+        # wizard. This is intentionally just a hint; the wizard
+        # itself runs as a separate ``fluid ai setup --source ...``
+        # command (Sprint C). For now, we surface the next-action
+        # so the user knows what to do.
+        try:
+            cprint = __import__("fluid_build.cli.console", fromlist=["cprint"]).cprint
+        except Exception:
+            cprint = print
+        cprint(
+            "No metadata-source catalog configured yet.\n"
+            "  Run: fluid ai setup --source snowflake   (or unity / bigquery / glue / datahub / datamesh_manager)\n"
+            "  Then re-run `fluid forge` and pick the catalog branch."
+        )
+        # Fall through to "blank" so the interview doesn't dead-end.
+        state.apply_patch({"data_model_source": "blank"}, source="interactive")
+
+    review_answer = ask_friendly_text(
+        console,
+        "Review the forged model before generation? (yes/no)",
+        required=False,
+        default="yes" if source in {"ddl", "intent", "chat"} else "no",
+    )
+    normalized_review = normalize_interview_value("review_data_model", review_answer)
+    if normalized_review is not None:
+        state.apply_patch({"review_data_model": normalized_review}, source="interactive")
+
+
+def _list_configured_sources() -> list[str]:
+    """Return the names of configured metadata-source catalogs.
+
+    Reads ``~/.fluid/sources.yaml`` if present and returns the list
+    of saved-source names. Empty list when the file is missing /
+    malformed / has no entries — the interview still works, just
+    without the catalog branch as a default.
+
+    Defensive: catches every exception so a corrupted YAML never
+    blocks the interview from running.
+    """
+    try:
+        from pathlib import Path
+
+        import yaml  # type: ignore
+
+        path = Path.home() / ".fluid" / "sources.yaml"
+        if not path.is_file():
+            return []
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return []
+        sources = data.get("sources")
+        if not isinstance(sources, dict):
+            return []
+        return [name for name in sources if isinstance(name, str)]
+    except Exception:  # noqa: BLE001 — defensive
+        return []
+
+
+def _default_data_model_source(
+    discovery_report: DiscoveryReport,
+    configured_sources: Optional[list[str]] = None,
+) -> Optional[str]:
+    # V1.5 — when a metadata-source catalog is configured, default
+    # to the catalog branch. This puts the highest-value option in
+    # front of users who already invested in Snowflake / Unity / etc.
+    # without making it harder for users with local DDL / intent.
+    if configured_sources:
+        return "source"
+    for model in discovery_report.user_data_models:
+        path = str(model.get("path", "")).lower()
+        if path.endswith(".sql"):
+            return "ddl"
+        if path.endswith((".yaml", ".yml", ".json")):
+            return "intent"
+    if discovery_report.sql_files:
+        return "ddl"
+    if discovery_report.sample_files:
+        return "samples"
+    return "blank"
+
+
 def _ask_engine_selection(
     state: CopilotInterviewState,
     console: Any,
@@ -899,7 +1474,7 @@ def _ask_engine_selection(
         choices_str = " / ".join(available)
         answer = ask_friendly_text(
             console,
-            f"What transformation engine? [{choices_str}]",
+            f"Transformation engine [{choices_str}]",
             required=False,
             default=available[0] if available else None,
         )
@@ -930,7 +1505,7 @@ def _ask_data_modeling_technique(
     state: CopilotInterviewState,
     console: Any,
 ) -> None:
-    """Ask the user to pick a data modeling technique (DV2 / Dimensional).
+    """Ask the user to pick a data modeling technique in business wording.
 
     Runs as a bootstrap question right after the schedule step when the
     current value came from the default precedence — so explicit answers
@@ -941,14 +1516,17 @@ def _ask_data_modeling_technique(
     if not console:
         return
 
+    default_value = _suggest_modeling_default(state)
+    default_label = "reporting" if default_value == "dimensional" else "history"
+
     choices = [
         {
-            "label": "Data Vault 2.0 (recommended)",
+            "label": "History / audit model",
             "value": "data_vault_2",
             "aliases": list(_DATA_VAULT_2_ALIASES),
         },
         {
-            "label": "Dimensional / Kimball",
+            "label": "Reporting / star model",
             "value": "dimensional",
             "aliases": list(_DIMENSIONAL_ALIASES),
         },
@@ -956,17 +1534,17 @@ def _ask_data_modeling_technique(
     match = ask_flexible_choice(
         console,
         prompt=(
-            "Which data modeling technique should the speed-transformation follow? "
-            "[dim](Data Vault 2.0 default — hub/link/satellite; Dimensional — star schema)[/dim]"
+            "Data model [history / reporting / not sure] "
+            "[dim](history keeps changes; reporting creates facts and dimensions)[/dim]"
         ),
         field_name="data_modeling_technique",
         choices=choices,
         required=False,
         allow_skip=True,
-        default="data_vault_2",
+        default=default_label,
     )
     resolved = match.value if match.status in {"matched", "confirmed", "custom"} else None
-    resolved = normalize_interview_value("data_modeling_technique", resolved) or "data_vault_2"
+    resolved = normalize_interview_value("data_modeling_technique", resolved) or default_value
 
     state.apply_patch({"data_modeling_technique": resolved}, source="interactive")
     state.record_turn(
@@ -978,103 +1556,6 @@ def _ask_data_modeling_technique(
         resolved_value=resolved,
         resolution_status=match.status or "matched",
     )
-
-
-def _ask_schedule_question(
-    state: CopilotInterviewState,
-    console: Any,
-    *,
-    discovery_report: DiscoveryReport,
-) -> None:
-    """Ask if user wants schedule generation, then which scheduler and BYOS."""
-    # If the domain agent already set an orchestration_pattern, the user has
-    # implicitly opted in to scheduling — skip the yes/no question.
-    orch_pattern = state.normalized_context.get("orchestration_pattern")
-    if orch_pattern:
-        state.record_turn(
-            role="user",
-            content="yes",
-            field="wants_schedule",
-            question_id="bootstrap_wants_schedule",
-            raw_input=f"(inferred from orchestration_pattern={orch_pattern})",
-            resolved_value="true",
-            resolution_status="inferred",
-        )
-    else:
-        answer = ask_friendly_text(
-            console,
-            "Do you want to generate a schedule/orchestration? (yes/no)",
-            required=False,
-        )
-        if not answer or answer.strip().lower() not in ("yes", "y", "yeah", "yep", "sure"):
-            return
-
-        state.record_turn(
-            role="user",
-            content="yes",
-            field="wants_schedule",
-            question_id="bootstrap_wants_schedule",
-            raw_input=answer,
-            resolved_value="true",
-            resolution_status="matched",
-        )
-
-    # Ask which scheduler
-    _ask_scheduler_selection(state, console, discovery_report=discovery_report)
-
-    # Ask BYOS (Bring Your Own Schedule)
-    if not state.normalized_context.get("byos_path"):
-        _ask_byos_question(state, console)
-
-
-def _ask_scheduler_selection(
-    state: CopilotInterviewState,
-    console: Any,
-    *,
-    discovery_report: DiscoveryReport,
-) -> None:
-    """Ask which schedule engine to use, filtered by platform."""
-    try:
-        from fluid_build.schedulers import list_schedulers, list_schedulers_for_platform
-
-        # Filter by platform if known
-        provider = state.normalized_context.get("provider", "")
-        if provider:
-            available = list_schedulers_for_platform(provider)
-        else:
-            available = list_schedulers()
-
-        if not available:
-            return
-
-        choices_str = " / ".join(available)
-        answer = ask_friendly_text(
-            console,
-            f"What scheduler? [{choices_str}]",
-            required=False,
-            default=available[0] if available else None,
-        )
-        if answer:
-            scheduler_name = answer.strip().lower()
-            if scheduler_name in available:
-                state.apply_patch({"schedule_engine": scheduler_name}, source="interactive")
-                state.record_turn(
-                    role="user",
-                    content=scheduler_name,
-                    field="schedule_engine",
-                    question_id="bootstrap_scheduler",
-                    raw_input=answer,
-                    resolved_value=scheduler_name,
-                    resolution_status="matched",
-                )
-            elif scheduler_name:
-                # Accept unknown names — the contract schema supports custom
-                state.apply_patch({"schedule_engine": scheduler_name}, source="interactive")
-        elif available:
-            # Default to first available scheduler
-            state.apply_patch({"schedule_engine": available[0]}, source="interactive")
-    except ImportError:
-        pass  # schedulers module not available
 
 
 def _ask_byos_question(

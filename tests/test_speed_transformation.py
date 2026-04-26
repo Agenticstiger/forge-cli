@@ -89,12 +89,12 @@ class TestInterviewTechnique:
 
 
 # ---------------------------------------------------------------------------
-# 2. CLI rename — only speed-transformation exists; no legacy alias.
+# 2. CLI rename — transformation/dbt aliases route to the same generator.
 # ---------------------------------------------------------------------------
 
 
 class TestCliRename:
-    def test_speed_transformation_registered(self):
+    def test_transformation_aliases_registered(self):
         import argparse
 
         from fluid_build.cli import generate_speed_transformation
@@ -104,9 +104,8 @@ class TestCliRename:
         generate_speed_transformation.register_subcommand(sub)
         choices = sub.choices or {}
         assert "speed-transformation" in choices
-        # No legacy alias — the old ``transformation`` name must not be
-        # registered. Dropping the alias keeps the CLI surface clean.
-        assert "transformation" not in choices
+        assert "transformation" in choices
+        assert "dbt" in choices
 
     def test_speed_transformation_runs(self, capsys):
         from fluid_build.cli import generate_speed_transformation
@@ -394,8 +393,8 @@ class TestEngineThreading:
         intent = TransformationIntent(data_modeling_technique="data_vault_2")
         assert intent.data_modeling_technique == "data_vault_2"
 
-    def test_dbt_dv2_emits_no_skeleton_files(self):
-        """DV2 technique → engine skips staging/mart skeletons; LLM owns it."""
+    def test_dbt_dv2_without_stages_falls_back_to_compile_safe_models(self):
+        """DV2 technique without a sidecar plan still emits non-empty dbt SQL."""
         from fluid_build.engines.base import TransformationIntent
         from fluid_build.engines.dbt.models import generate_models
 
@@ -431,10 +430,13 @@ class TestEngineThreading:
         }
         intent = TransformationIntent(data_modeling_technique="data_vault_2")
         files = generate_models(contract, contract["builds"][0], transformation_intent=intent)
-        assert files == {}, "engine must not emit DV2 skeletons — LLM owns staging + marts"
+        names = sorted(files.keys())
+        assert "models/staging/stg_party_source.sql" in names
+        assert "models/staging/stg_account_source.sql" in names
+        assert "models/marts/mart.sql" in names
 
-    def test_dbt_dimensional_emits_no_skeleton_files(self):
-        """Dimensional technique → engine skips staging/mart skeletons; LLM owns it."""
+    def test_dbt_dimensional_without_stages_falls_back_to_compile_safe_models(self):
+        """Dimensional technique without a sidecar plan still emits non-empty dbt SQL."""
         from fluid_build.engines.base import TransformationIntent
         from fluid_build.engines.dbt.models import generate_models
 
@@ -461,7 +463,9 @@ class TestEngineThreading:
         }
         intent = TransformationIntent(data_modeling_technique="dimensional")
         files = generate_models(contract, contract["builds"][0], transformation_intent=intent)
-        assert files == {}, "engine must not emit dimensional skeletons — LLM owns staging + marts"
+        names = sorted(files.keys())
+        assert "models/staging/stg_party_source.sql" in names
+        assert "models/marts/mart.sql" in names
 
     def test_dbt_engine_skips_schema_yml_when_technique_set(self):
         """Engine must skip marts/schema.yml emission — LLM ships its own."""

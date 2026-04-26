@@ -111,6 +111,26 @@ def load_compiled_skills(workspace_root: Path) -> Optional[Dict[str, Any]]:
         except Exception as exc:  # noqa: BLE001
             LOG.debug("Failed to on-the-fly compile skills: %s", exc)
 
+    # --- Last-resort fallback: staged store (team-shared skills) ---
+    # When the workspace has neither .fluid/skills.compiled.json nor
+    # .fluid/skills.yaml, a teammate may still have published compiled
+    # skills to a shared store (FLUID_STORE_BACKEND=sqlite/postgres).
+    # This reads that mirror without bringing the file back; the caller
+    # is still encouraged to run ``fluid skills compile`` locally.
+    try:
+        from fluid_build.copilot.store.skills import load_skills_from_store_best_effort
+
+        payload = load_skills_from_store_best_effort(workspace_root)
+        if payload:
+            LOG.debug(
+                "Loaded compiled skills from staged store (no local "
+                ".fluid/skills.compiled.json) — run 'fluid skills "
+                "compile' to persist a local copy."
+            )
+            return payload
+    except Exception as exc:  # noqa: BLE001 — last-resort must never raise
+        LOG.debug("staged-store skills fallback failed: %s", exc)
+
     return None
 
 
@@ -142,4 +162,16 @@ def write_compiled_skills(workspace_root: Path, compiled: Dict[str, Any]) -> Pat
     # Invalidate the in-memory cache so the next load picks up the
     # fresh file.
     clear_compiled_skills_cache()
+
+    # Best-effort mirror to the staged ``skills/*`` namespace so that
+    # teams using a shared store backend get replicated skills for free.
+    # Failures are swallowed — the file is the canonical source of
+    # truth and the mirror is purely additive.
+    try:
+        from fluid_build.copilot.store.skills import mirror_skills_to_store
+
+        mirror_skills_to_store(workspace_root, compiled)
+    except Exception as exc:  # noqa: BLE001 — mirror must never block file write
+        LOG.debug("skills store mirror raised unexpectedly: %s", exc)
+
     return out_path

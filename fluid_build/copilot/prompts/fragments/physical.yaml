@@ -1,0 +1,3 @@
+Produce a physical transformation plan for the chosen engine.
+Return stage SQL, dependencies, and any additional files needed for generation.
+

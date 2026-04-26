@@ -1,0 +1,71 @@
+# HL7 FHIR-aligned Kimball dimensional skeleton for healthcare.
+# Complements healthcare/data_vault_2.yaml for teams that forge clinical
+# analytics marts directly (population health / quality reporting).
+#
+# PHI-sensitive columns (names, addresses, full DOB) should be masked
+# in SAT tables downstream — this skeleton intentionally carries only
+# role-based references (patient_id surrogate, age_bucket, postal_area)
+# so a Kimball mart forged from it is HIPAA-safe by default.
+industry: healthcare
+technique: dimensional
+description: "HL7 FHIR dimensional — encounter + observation facts with patient/practitioner/organization dims"
+
+grain_statement: "One row per clinical observation recorded during a patient encounter"
+
+facts:
+  - name: fact_encounter
+    grain_statement: "One row per clinical encounter (inpatient stay, outpatient visit, ED visit, telehealth session)"
+    measures:
+      - {name: length_of_stay_hours, data_type: decimal(10,2)}
+      - {name: charged_amount, data_type: decimal(18,4)}
+      - {name: readmission_flag, data_type: int}
+    foreign_keys: [dim_patient_key, dim_practitioner_key, dim_organization_key, dim_date_key]
+    degenerate_dimensions: [encounter_id, admission_type_code]
+
+  - name: fact_observation
+    grain_statement: "One row per clinical observation (lab result, vital sign, assessment score)"
+    measures:
+      - {name: value_numeric, data_type: decimal(18,4)}
+      - {name: value_indicator, data_type: int}
+      - {name: out_of_range_flag, data_type: int}
+    foreign_keys: [dim_patient_key, dim_practitioner_key, dim_observation_type_key, dim_date_key]
+    degenerate_dimensions: [observation_id, encounter_id]
+
+  - name: fact_medication_admin
+    grain_statement: "One row per medication administration event during an encounter"
+    measures:
+      - {name: dose_amount, data_type: decimal(18,4)}
+      - {name: adverse_event_flag, data_type: int}
+    foreign_keys: [dim_patient_key, dim_practitioner_key, dim_medication_key, dim_date_key]
+    degenerate_dimensions: [admin_id, encounter_id]
+
+dimensions:
+  - name: dim_patient
+    slowly_changing_type: type2
+    natural_keys: [patient_id]
+  - name: dim_practitioner
+    slowly_changing_type: type2
+    natural_keys: [practitioner_id]
+  - name: dim_organization
+    slowly_changing_type: type2
+    natural_keys: [organization_id]
+  - name: dim_observation_type
+    slowly_changing_type: type1
+    natural_keys: [loinc_code]
+  - name: dim_medication
+    slowly_changing_type: type2
+    natural_keys: [rxnorm_code]
+  - name: dim_date
+    slowly_changing_type: type1
+    natural_keys: [date]
+
+conformed_dimensions: [dim_patient, dim_practitioner, dim_organization, dim_observation_type, dim_medication, dim_date]
+degenerate_dims: [encounter_id, observation_id, admin_id, admission_type_code]
+
+slowly_changing:
+  dim_patient: type2
+  dim_practitioner: type2
+  dim_organization: type2
+  dim_observation_type: type1
+  dim_medication: type2
+  dim_date: type1

@@ -60,7 +60,7 @@ import functools
 import logging
 import os
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Dict, Optional
 
 from fluid_build.observability.secret_redactor import redact_secret_text
 
@@ -251,4 +251,73 @@ def traced_stage(stage_name: str) -> Callable[[Callable[..., int]], Callable[...
     return decorator
 
 
-__all__ = ["traced_stage"]
+class _NoOpSpan:
+    """Null-object span used when OTEL is disabled.
+
+    Returned by :func:`traced_span` so call sites can use ``with
+    traced_span(...) as span:`` unconditionally; when tracing is off
+    the methods do nothing and overhead is a few attribute lookups.
+    """
+
+    def set_attribute(self, _key: str, _value: Any) -> None:  # noqa: D401
+        return None
+
+    def set_status(self, _status: Any) -> None:  # noqa: D401
+        return None
+
+    def __enter__(self) -> "_NoOpSpan":
+        return self
+
+    def __exit__(self, *_exc: Any) -> bool:
+        return False
+
+
+def traced_span(name: str, attributes: Optional[Dict[str, Any]] = None) -> Any:
+    """Open a child span; no-op when OTEL disabled.
+
+    Use this inside internal orchestrators (e.g. the staged-agent
+    coordinator) to emit nested spans that roll up under the top-level
+    ``fluid.<stage>`` CLI span opened by :func:`traced_stage`. When
+    OTEL is disabled, returns a :class:`_NoOpSpan` with zero overhead
+    beyond one env-var lookup.
+
+    The ``attributes`` mapping is scrubbed through :func:`_safe_attr`
+    so secret-shaped values are redacted before emission.
+    """
+    tracer = _get_tracer()
+    if tracer is None:
+        return _NoOpSpan()
+    cm = tracer.start_as_current_span(name)
+    if attributes:
+        # ``start_as_current_span`` returns a context manager; we can't
+        # set attributes until ``__enter__`` gives us the span, so wrap
+        # in a tiny shim that applies them on entry.
+        return _AttributedSpan(cm, {k: _safe_attr(v) for k, v in attributes.items()})
+    return cm
+
+
+class _AttributedSpan:
+    """Context manager that sets attributes after span enter.
+
+    OTEL's ``start_as_current_span`` returns a context manager — the
+    span object isn't available until ``__enter__``. This wrapper lets
+    :func:`traced_span` accept an ``attributes`` dict and apply it
+    atomically at entry, matching the ergonomics of :func:`traced_stage`.
+    """
+
+    def __init__(self, inner_cm: Any, attributes: Dict[str, Any]) -> None:
+        self._inner_cm = inner_cm
+        self._attributes = attributes
+        self._span: Any = None
+
+    def __enter__(self) -> Any:
+        self._span = self._inner_cm.__enter__()
+        for k, v in self._attributes.items():
+            self._span.set_attribute(k, v)
+        return self._span
+
+    def __exit__(self, *exc: Any) -> bool:
+        return bool(self._inner_cm.__exit__(*exc))
+
+
+__all__ = ["traced_stage", "traced_span"]
