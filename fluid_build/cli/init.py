@@ -683,7 +683,7 @@ def _ai_mode(args, logger: logging.Logger) -> int:
         # Inject target dir so the forge wrapper writes there.
         args.target_dir = str(target)
         if not hasattr(args, "non_interactive"):
-            args.non_interactive = False
+            args.non_interactive = bool(getattr(args, "yes", False))
 
         result = run_ai_copilot_mode(args, logger)
 
@@ -739,6 +739,8 @@ def detect_mode(args, logger: logging.Logger) -> Optional[str]:
         return "blank"
     if args.template:
         return "template"
+    if getattr(args, "yes", False):
+        return "ai"
 
     cwd = Path.cwd()
     is_first_time = not (Path.home() / ".fluid").exists()

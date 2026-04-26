@@ -108,6 +108,18 @@ LOG = logging.getLogger("fluid.cli.forge")
 class ForgeError(CLIError):
     """Base exception for Forge command errors."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        event: str = "forge_error",
+        context: Optional[Dict[str, Any]] = None,
+        exit_code: int = 1,
+    ):
+        payload = {"error": message, **(context or {})}
+        super().__init__(exit_code, event, payload)
+        self.message = message
+
 
 class InvalidProjectNameError(ForgeError):
     """Invalid project name format."""

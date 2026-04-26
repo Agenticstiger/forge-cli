@@ -55,6 +55,7 @@ class TestDetectMode:
             blank=False,
             template=None,
             name=None,
+            yes=False,
         )
         defaults.update(kwargs)
         a = MagicMock()
@@ -82,6 +83,15 @@ class TestDetectMode:
 
         result = detect_mode(self._args(template="starter"), MagicMock())
         assert result == "template"
+
+    def test_yes_uses_default_ai_mode_without_prompting(self):
+        from fluid_build.cli.init import detect_mode
+
+        with patch("fluid_build.cli.init._ask_creation_mode") as mock_menu:
+            result = detect_mode(self._args(name="seeded-demo", yes=True), MagicMock())
+
+        assert result == "ai"
+        mock_menu.assert_not_called()
 
     def test_existing_contract_returns_none(self, tmp_path):
         """If contract.fluid.yaml already exists, detect_mode returns None."""
