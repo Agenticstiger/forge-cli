@@ -21,6 +21,7 @@ import re
 import sys
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 TEMPLATES_PATH = (
     Path(__file__).resolve().parent.parent
@@ -30,13 +31,26 @@ TEMPLATES_PATH = (
     / "pipeline_templates.py"
 )
 
+GITHUB_API_HOST = "api.github.com"
+
+
+def _github_api_json(url: str) -> object:
+    """Fetch JSON from the GitHub API after enforcing the expected origin."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.netloc != GITHUB_API_HOST:
+        raise ValueError(f"Refusing non-GitHub API URL: {url}")
+    req = urllib.request.Request(url, headers=_gh_headers())
+    with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310
+        return json.loads(resp.read())
+
+
 # Regex to parse PINNED_ACTIONS entries (single line, inside the dict):
 #   "owner/repo@vTag": "owner/repo@sha",  # vX.Y.Z
 ENTRY_RE = re.compile(
     r'^\s*"(?P<owner>[A-Za-z0-9_-]+)/(?P<repo>[A-Za-z0-9_/-]+)@(?P<tag>v[\w.]+)"'
-    r'\s*:\s*'
+    r"\s*:\s*"
     r'"[A-Za-z0-9_/-]+@(?P<sha>[0-9a-f]{40})"'
-    r'\s*,?\s*#\s*(?P<pinned_version>v[\S]+)',
+    r"\s*,?\s*#\s*(?P<pinned_version>v[\S]+)",
     re.MULTILINE,
 )
 
@@ -55,10 +69,8 @@ def get_latest_release_sha(owner: str, repo: str, tag_prefix: str) -> dict | Non
     # Strip sub-path from repo (e.g., "codeql-action/upload-sarif" -> "codeql-action")
     base_repo = repo.split("/")[0]
     url = f"https://api.github.com/repos/{owner}/{base_repo}/releases?per_page=30"
-    req = urllib.request.Request(url, headers=_gh_headers())
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            releases = json.loads(resp.read())
+        releases = _github_api_json(url)
     except Exception as e:
         print(f"  WARNING: Could not fetch releases for {owner}/{base_repo}: {e}")
         return None
@@ -73,18 +85,14 @@ def get_latest_release_sha(owner: str, repo: str, tag_prefix: str) -> dict | Non
         if tag.startswith(major + ".") or tag == major:
             # Get the commit SHA for this tag
             tag_url = f"https://api.github.com/repos/{owner}/{base_repo}/git/ref/tags/{tag}"
-            tag_req = urllib.request.Request(tag_url, headers=_gh_headers())
             try:
-                with urllib.request.urlopen(tag_req, timeout=15) as tag_resp:
-                    tag_data = json.loads(tag_resp.read())
+                tag_data = _github_api_json(tag_url)
                 sha = tag_data["object"]["sha"]
                 # If it's an annotated tag, dereference to commit
                 if tag_data["object"]["type"] == "tag":
                     deref_url = tag_data["object"]["url"]
-                    deref_req = urllib.request.Request(deref_url, headers=_gh_headers())
-                    with urllib.request.urlopen(deref_req, timeout=15) as deref_resp:
-                        deref_data = json.loads(deref_resp.read())
-                        sha = deref_data["object"]["sha"]
+                    deref_data = _github_api_json(deref_url)
+                    sha = deref_data["object"]["sha"]
                 return {"tag": tag, "sha": sha}
             except Exception as e:
                 print(f"  WARNING: Could not resolve tag {tag} for {owner}/{base_repo}: {e}")
@@ -118,9 +126,7 @@ def main() -> int:
             print(f"  OK {display:<54} {pinned_version} (current)")
         else:
             stale.append((display, pinned_version, latest["tag"], latest["sha"]))
-            print(
-                f"  STALE {display:<51} pinned={pinned_version} latest={latest['tag']}"
-            )
+            print(f"  STALE {display:<51} pinned={pinned_version} latest={latest['tag']}")
 
     print()
     if stale:

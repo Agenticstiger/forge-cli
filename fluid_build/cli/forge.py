@@ -37,6 +37,7 @@ from fluid_build.cli.artifact_scan import diff_snapshots, snapshot_workspace
 from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_agents import DOMAIN_AGENTS
+from fluid_build.cli.forge_banner import print_v2_banner
 from fluid_build.cli.forge_context import (
     get_cli_arg as _get_cli_arg,
 )
@@ -74,6 +75,7 @@ from fluid_build.cli.forge_copilot_runtime import (
     resolve_llm_config,
 )
 from fluid_build.cli.forge_copilot_taxonomy import normalize_copilot_context
+from fluid_build.cli.forge_data_model import register_forge_subcommand
 from fluid_build.cli.forge_dialogs import ask_confirmation, ask_dialog_question
 from fluid_build.cli.forge_modes import (
     _scaffold_ci_pipeline,
@@ -104,7 +106,46 @@ LOG = logging.getLogger("fluid.cli.forge")
 
 
 class ForgeError(CLIError):
-    """Base exception for Forge command errors."""
+    """Base exception for Forge command errors.
+
+    Two positional-argument shapes are accepted so callers using the
+    pre-925668a ``ForgeError(exit_code, message)`` form keep working
+    alongside the modern ``ForgeError(message, exit_code=...)`` form.
+    The keyword-only ``exit_code`` always wins when both are supplied.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        event: str = "forge_error",
+        context: Optional[Dict[str, Any]] = None,
+        exit_code: int = 1,
+    ):
+        if len(args) == 1:
+            message = str(args[0])
+        elif len(args) == 2:
+            # Legacy positional shape ``ForgeError(exit_code, message)``.
+            # Accept it so older callers + tests that haven't migrated
+            # don't blow up with ``TypeError: takes 2 positional args
+            # but 3 were given``.  Keyword ``exit_code`` overrides the
+            # positional one when both are supplied.
+            exit_code = exit_code if exit_code != 1 else int(args[0])
+            message = str(args[1])
+        else:
+            raise TypeError(
+                f"{type(self).__name__} expects 1 (message) or 2 (exit_code, message) "
+                f"positional arguments; got {len(args)}"
+            )
+        payload = {"error": message, **(context or {})}
+        super().__init__(exit_code, event, payload)
+        self.message = message
+
+    def __str__(self) -> str:
+        # ``CLIError`` passes the ``event`` string to ``Exception.__init__``,
+        # which makes ``str(err)`` return the event key (``"forge_error"``).
+        # Override so callers / tests that look at the rendered string see
+        # the operator-facing message instead.
+        return self.message
 
 
 class InvalidProjectNameError(ForgeError):
@@ -210,6 +251,8 @@ def register(subparsers: argparse._SubParsersAction):
         add_help=False,
     )
     parser.add_argument("--help", "-h", action="store_true", help="Show this help message")
+    forge_subparsers = parser.add_subparsers(dest="forge_subcommand")
+    register_forge_subcommand(forge_subparsers)
 
     # --- Primary flags ---
     parser.add_argument(
@@ -253,8 +296,50 @@ def register(subparsers: argparse._SubParsersAction):
     )
     parser.add_argument("--llm-model", help="Model identifier for copilot")
     parser.add_argument(
+        "--llm-routing-model",
+        help="Fast/cheap model for interview clarification and AI self-evaluation",
+    )
+    parser.add_argument(
+        "--llm-routing-endpoint",
+        help="HTTP endpoint override for the routing model",
+    )
+    parser.add_argument(
         "--llm-endpoint",
         help="Exact HTTP endpoint override for the selected LLM adapter",
+    )
+    parser.add_argument(
+        "--tiered",
+        action="store_true",
+        help="Use provider-local model tiers: deep for modeling, fast for routing",
+    )
+    parser.add_argument(
+        "--require-llm",
+        action="store_true",
+        help="Fail if the configured LLM cannot run; do not fall back to non-AI paths.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "Bypass the LLM response cache. Useful when iterating on prompts "
+            "or comparing model output. (Same flag is on `fluid forge data-model`.)"
+        ),
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help=(
+            "Force temperature=0 + cache off + tiering off + audit-trail "
+            "metadata. Use for byte-stable proof-of-determinism reports."
+        ),
+    )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help=(
+            "Force the heuristic-only forge path; never call any LLM. "
+            "Equivalent to `--blank` for the full no-AI experience."
+        ),
     )
 
     # --- Discovery ---
@@ -540,6 +625,19 @@ def run(args, logger: logging.Logger) -> int:
     """Main entry point for ``fluid forge``."""
     console = Console() if RICH_AVAILABLE else None
     try:
+        if getattr(args, "forge_subcommand", None) == "data-model":
+            from fluid_build.cli.forge_data_model import run as run_data_model
+
+            quiet = getattr(args, "quiet", False)
+            if getattr(args, "data_model_action", None) == "from-intent" and (
+                getattr(args, "example", None)
+                or getattr(args, "schema", False)
+                or getattr(args, "validate_intent", None)
+            ):
+                quiet = True
+            print_v2_banner("forge_data_model", quiet=quiet)
+            return run_data_model(args, logger)
+
         # --- Help ---
         if getattr(args, "help", False):
             if console:
@@ -563,6 +661,17 @@ def run(args, logger: logging.Logger) -> int:
         # produce a receipt.
         scan_root = Path.cwd()
         before_snapshot = snapshot_workspace(scan_root)
+
+        # --- Top-level flag aliases ---
+        # ``--no-llm`` and ``--deterministic`` were added at the
+        # top-level forge surface so operators can opt out of AI
+        # without remembering ``--blank``.  Both currently route
+        # through the existing blank-mode path because the AI
+        # copilot doesn't yet honour the flags directly; data-model
+        # subcommands still consume them natively.  Wiring the AI
+        # copilot to read them is tracked as a follow-up.
+        if get_cli_arg(args, "no_llm", False) or get_cli_arg(args, "deterministic", False):
+            args.blank = True
 
         # --- Determine effective mode ---
         is_blank = get_cli_arg(args, "blank", False)
@@ -652,15 +761,41 @@ def run(args, logger: logging.Logger) -> int:
         logger.info("Forge cancelled by user")
         return 130
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Forge command failed")
-        if console:
-            console.print(
-                f"[red]Forge failed: {exc}[/red]\n"
-                f"[dim]Run 'fluid doctor' to diagnose, or see {_DOCS_URL}[/dim]"
-            )
+        # World-class error UX — every typed Fluid error carries
+        # ``suggestions``; we surface those instead of a raw stack
+        # trace. Stack trace is logged at DEBUG for triage, but the
+        # operator-facing output is just the message + actionable
+        # next steps.
+        from fluid_build.errors import FluidError
+
+        logger.debug("Forge command failed", exc_info=True)
+        suggestions = getattr(exc, "suggestions", None) or []
+        message = getattr(exc, "message", None) or str(exc)
+        if isinstance(exc, FluidError):
+            # Typed Fluid error — clean message + suggestions.
+            if console:
+                console.print(f"[red]Forge failed:[/red] {message}")
+                if suggestions:
+                    console.print("[bold]Next actions:[/bold]")
+                    for s in suggestions:
+                        console.print(f"  • {s}")
+            else:
+                console_error(f"Forge failed: {message}")
+                if suggestions:
+                    cprint("Next actions:")
+                    for s in suggestions:
+                        cprint(f"  - {s}")
         else:
-            console_error(f"Forge failed: {exc}")
-            cprint(f"Run 'fluid doctor' to diagnose, or see {_DOCS_URL}")
+            # Unexpected — full message; suggest doctor.
+            logger.exception("Forge command failed")
+            if console:
+                console.print(
+                    f"[red]Forge failed: {exc}[/red]\n"
+                    f"[dim]Run 'fluid doctor' to diagnose, or see {_DOCS_URL}[/dim]"
+                )
+            else:
+                console_error(f"Forge failed: {exc}")
+                cprint(f"Run 'fluid doctor' to diagnose, or see {_DOCS_URL}")
         return 1
 
 

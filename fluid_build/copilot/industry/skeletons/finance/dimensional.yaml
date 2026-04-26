@@ -1,0 +1,50 @@
+# ISO 20022-aligned dimensional skeleton for financial services.
+industry: finance
+technique: dimensional
+description: "ISO 20022 canonical — transaction fact + position fact with reference dims"
+
+grain_statement: "One row per ISO 20022 payment/settlement message; position fact at period-close snapshot grain"
+
+facts:
+  - name: fact_transaction
+    grain_statement: "One row per financial transaction (ISO 20022 pain.001 / pacs.008 / pacs.009 message)"
+    measures:
+      - {name: amount, data_type: decimal(18,4)}
+      - {name: fee_amount, data_type: decimal(18,4)}
+      - {name: fx_rate, data_type: decimal(18,8)}
+    foreign_keys: [dim_account_key, dim_counterparty_key, dim_instrument_key, dim_currency_key, dim_date_key]
+    degenerate_dimensions: [message_id, end_to_end_id]
+
+  - name: fact_position
+    grain_statement: "One row per account balance snapshot at period close"
+    measures:
+      - {name: balance, data_type: decimal(18,4)}
+      - {name: accrued_interest, data_type: decimal(18,4)}
+    foreign_keys: [dim_account_key, dim_instrument_key, dim_currency_key, dim_date_key]
+
+dimensions:
+  - name: dim_account
+    slowly_changing_type: type2
+    natural_keys: [account_id]
+  - name: dim_counterparty
+    slowly_changing_type: type2
+    natural_keys: [counterparty_id]
+  - name: dim_instrument
+    slowly_changing_type: type2
+    natural_keys: [isin]
+  - name: dim_currency
+    slowly_changing_type: type1
+    natural_keys: [currency_code]
+  - name: dim_date
+    slowly_changing_type: type1
+    natural_keys: [date]
+
+conformed_dimensions: [dim_account, dim_counterparty, dim_instrument, dim_currency, dim_date]
+degenerate_dims: [message_id, end_to_end_id]
+
+slowly_changing:
+  dim_account: type2
+  dim_counterparty: type2
+  dim_instrument: type2
+  dim_currency: type1
+  dim_date: type1

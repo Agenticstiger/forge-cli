@@ -1,0 +1,59 @@
+# TMF SID-aligned Data Vault 2.0 skeleton for telecommunications.
+# Loaded by fluid_build.copilot.industry.compiler.IndustryPackCompiler and
+# merged into DV2Model as the modeler's starting point.
+industry: telecommunications
+technique: data_vault_2
+description: "TMF SID canonical model — Party / Product / Service / Resource"
+
+hubs:
+  - entity_name: party
+    hub_table_name: hub_party
+    business_key_columns: [party_id]
+    description: "Customer / account party (TMF SID Party)"
+  - entity_name: product_offering
+    hub_table_name: hub_product_offering
+    business_key_columns: [product_offering_id]
+    description: "TMF SID Product Offering catalog entry"
+  - entity_name: service
+    hub_table_name: hub_service
+    business_key_columns: [service_id]
+    description: "TMF SID Service (active service instance)"
+  - entity_name: resource
+    hub_table_name: hub_resource
+    business_key_columns: [resource_id]
+    description: "TMF SID Resource (network element, port, physical/logical resource)"
+
+links:
+  - link_name: party_product
+    link_table_name: lnk_party_product
+    hubs_involved: [hub_party, hub_product_offering]
+  - link_name: service_resource
+    link_table_name: lnk_service_resource
+    hubs_involved: [hub_service, hub_resource]
+  - link_name: party_service
+    link_table_name: lnk_party_service
+    hubs_involved: [hub_party, hub_service]
+
+satellites:
+  - entity_name: party_profile
+    satellite_table_name: sat_party_profile
+    parent_hub: hub_party
+    change_tracking: type2
+  - entity_name: product_offering_detail
+    satellite_table_name: sat_product_offering_detail
+    parent_hub: hub_product_offering
+    change_tracking: type2
+  - entity_name: service_status
+    satellite_table_name: sat_service_status
+    parent_hub: hub_service
+    change_tracking: type2
+  - entity_name: resource_status
+    satellite_table_name: sat_resource_status
+    parent_hub: hub_resource
+    change_tracking: type2
+
+hash_key_strategy:
+  algorithm: md5
+  delimiter: "||"
+  null_token: "__NULL__"
+  upper_case: true

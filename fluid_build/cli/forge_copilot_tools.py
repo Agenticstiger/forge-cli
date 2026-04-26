@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -433,6 +434,101 @@ _register(
 )
 
 
+# ---- forge_data_model -----------------------------------------------------
+
+
+def _dispatch_forge_data_model(
+    *,
+    context: Optional[Dict[str, Any]] = None,
+    intent: Optional[Dict[str, Any]] = None,
+    ddl_paths: Optional[List[str]] = None,
+    technique: str = "data_vault_2",
+    workspace_root: Optional[Path] = None,
+    **_kw: Any,
+) -> Dict[str, Any]:
+    """Forge a logical model + contract using the staged coordinator."""
+    from fluid_build.copilot.agents.base import StageSession
+    from fluid_build.copilot.agents.coordinator import StageCoordinator
+    from fluid_build.copilot.schemas.intent import BusinessIntent
+    from fluid_build.copilot.store.factory import resolve_store
+    from fluid_build.forge_datamodel.from_ddl.parser import parse_ddl_text
+
+    root = (workspace_root or Path.cwd()).resolve()
+    session = StageSession(store=resolve_store(workspace_root=root), workspace_root=root)
+    coordinator = StageCoordinator()
+
+    if ddl_paths:
+        tables = []
+        for raw_path in ddl_paths:
+            path = (Path(raw_path) if Path(raw_path).is_absolute() else root / raw_path).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError:
+                continue
+            if not path.exists():
+                continue
+            parsed = parse_ddl_text(path.read_text(encoding="utf-8"))
+            tables.extend(parsed.tables)
+        result = coordinator.from_tables(
+            session,
+            name=str((context or {}).get("project_goal") or "forged_data_model"),
+            tables=tables,
+            technique=technique,
+            include_physical=True,
+        )
+    else:
+        payload = intent or {}
+        if not payload:
+            payload = {
+                "data_product": {
+                    "name": str((context or {}).get("project_goal") or "forged_data_model"),
+                    "domain": str((context or {}).get("domain") or "analytics"),
+                    "description": str((context or {}).get("project_goal") or "forged data model"),
+                    "owner": str((context or {}).get("owner_team") or "data-team"),
+                }
+            }
+        business_intent = BusinessIntent.model_validate(payload)
+        result = coordinator.from_intent(
+            session,
+            intent=business_intent,
+            technique=technique,
+            include_physical=True,
+        )
+
+    return {
+        "contract": result.contract,
+        "logical_model": result.logical.model_dump(mode="json", by_alias=True),
+        "physical": (
+            result.physical.model_dump(mode="json", by_alias=True) if result.physical else None
+        ),
+    }
+
+
+_FORGE_DATA_MODEL_TOOL: Dict[str, Any] = {
+    "name": "forge_data_model",
+    "description": (
+        "Forge a reviewable logical data model plus a FLUID contract boundary "
+        "using either a business intent or raw DDL files."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "context": {"type": "object", "additionalProperties": True, "properties": {}},
+            "intent": {"type": "object", "additionalProperties": True, "properties": {}},
+            "ddl_paths": {"type": "array", "items": {"type": "string"}},
+            "technique": {"type": "string"},
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+    "impl": _dispatch_forge_data_model,
+}
+
+
+def _staged_tool_enabled() -> bool:
+    return os.environ.get("FLUID_FORGE_STAGED_TOOL_LOOP") == "1"
+
+
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
@@ -486,13 +582,16 @@ _register(
 
 def get_tool_definitions() -> List[Dict[str, Any]]:
     """Return the tool definitions in the shape providers expect."""
+    tool_values = list(TOOL_REGISTRY.values())
+    if _staged_tool_enabled():
+        tool_values.append(_FORGE_DATA_MODEL_TOOL)
     return [
         {
             "name": t["name"],
             "description": t["description"],
             "input_schema": t["input_schema"],
         }
-        for t in TOOL_REGISTRY.values()
+        for t in tool_values
     ]
 
 
@@ -516,6 +615,8 @@ def dispatch_tool_call(
     explicitly.
     """
     tool = TOOL_REGISTRY.get(name)
+    if tool is None and name == _FORGE_DATA_MODEL_TOOL["name"] and _staged_tool_enabled():
+        tool = _FORGE_DATA_MODEL_TOOL
     if not tool:
         LOG.warning("Unknown tool call: %s", name)
         return {"error": f"Unknown tool: {name}"}

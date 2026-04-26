@@ -1,0 +1,64 @@
+name: AI Provider Matrix
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-provider-matrix-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  provider:
+    name: Strict provider E2E (${{ matrix.provider }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [gemini, openai, anthropic]
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      FLUID_E2E_LLM_PROVIDERS: ${{ matrix.provider }}
+      FLUID_E2E_REQUIRE_ALL_REQUESTED_PROVIDERS: "1"
+      FLUID_E2E_PROVIDER_RUNS: "2"
+      FLUID_E2E_PROVIDER_SCENARIOS: "retail_dimensional,telco_dv2"
+      FLUID_E2E_MAX_REPAIR_RATE: "0"
+      FLUID_E2E_SCORECARD_TRENDS: "1"
+      FLUID_E2E_SCORECARD_HISTORY: "1"
+      FLUID_QUIET: "1"
+      FLUID_NONINTERACTIVE: "1"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install forge-cli and dbt gate dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,local]" dbt-duckdb
+
+      - name: Run strict hosted-provider E2E
+        run: |
+          PYTHONPATH=. python scripts/e2e_all_modes.py --phases 7
+
+      - name: Upload provider scorecard
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ai-provider-matrix-${{ matrix.provider }}
+          path: |
+            .fluid/e2e_report/**
+          retention-days: 14

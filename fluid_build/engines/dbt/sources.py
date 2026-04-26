@@ -140,6 +140,55 @@ def generate_sources(
     )
 
 
+def generate_sources_from_logical_model(logical_model: Mapping[str, Any]) -> Optional[str]:
+    """Generate dbt sources from a forged DDL logical sidecar.
+
+    DDL-driven models do not have ``consumes[]`` lineage yet, but their OSI
+    datasets still carry the source table names and columns. Emitting a
+    ``raw`` source block lets generated models use ``source('raw', table)``
+    in production while the model SQL guards missing local relations for
+    offline smoke runs.
+    """
+    source_summary = logical_model.get("source_summary") or {}
+    if source_summary.get("source_kind") != "ddl":
+        return None
+    osi = logical_model.get("osi") or {}
+    datasets = osi.get("datasets") or []
+    tables: List[Dict[str, Any]] = []
+    for dataset in datasets:
+        if not isinstance(dataset, Mapping):
+            continue
+        name = str(dataset.get("source") or dataset.get("name") or "").strip()
+        if not name:
+            continue
+        entry: Dict[str, Any] = {"name": name}
+        fields = dataset.get("fields") or []
+        columns = []
+        for field in fields:
+            if isinstance(field, Mapping) and field.get("name"):
+                columns.append({"name": str(field["name"])})
+        if columns:
+            entry["columns"] = columns
+        tables.append(entry)
+    if not tables:
+        return None
+
+    source_def: Dict[str, Any] = {
+        "version": 2,
+        "sources": [
+            {
+                "name": "raw",
+                "description": "Source tables inferred from the forged DDL sidecar",
+                "schema": "{{ env_var('FLUID_SOURCE_SCHEMA', env_var('SNOWFLAKE_STAGE_SCHEMA', target.schema)) }}",
+                "tables": tables,
+            }
+        ],
+    }
+    return _HEADER + yaml.dump(
+        source_def, default_flow_style=False, sort_keys=False, allow_unicode=True
+    )
+
+
 # ---------------------------------------------------------------------------
 # Binding resolution
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@
 from unittest.mock import patch
 
 from fluid_build.cli.console import (
+    _redact_str,
     cprint,
     detail,
     error,
@@ -44,6 +45,11 @@ class TestCprint:
     def test_empty_call(self, capsys):
         cprint()
         # Should not crash
+
+    def test_redacts_secret_like_values(self) -> None:
+        assert _redact_str("token=live-token password:super-secret") == (
+            "token=<redacted> password:<redacted>"
+        )
 
 
 class TestHelpers:

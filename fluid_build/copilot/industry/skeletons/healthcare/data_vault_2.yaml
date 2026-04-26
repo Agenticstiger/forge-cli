@@ -1,0 +1,58 @@
+# HL7 FHIR-aligned Data Vault 2.0 skeleton for healthcare.
+# sha256 + PHI retention defaults reflect HIPAA defense-in-depth.
+industry: healthcare
+technique: data_vault_2
+description: "HL7 FHIR canonical — Patient, Encounter, Observation, Practitioner"
+
+hubs:
+  - entity_name: patient
+    hub_table_name: hub_patient
+    business_key_columns: [patient_id]
+    description: "FHIR Patient resource"
+  - entity_name: encounter
+    hub_table_name: hub_encounter
+    business_key_columns: [encounter_id]
+    description: "FHIR Encounter resource"
+  - entity_name: observation
+    hub_table_name: hub_observation
+    business_key_columns: [observation_id]
+    description: "FHIR Observation resource"
+  - entity_name: practitioner
+    hub_table_name: hub_practitioner
+    business_key_columns: [practitioner_id]
+    description: "FHIR Practitioner resource"
+
+links:
+  - link_name: patient_encounter
+    link_table_name: lnk_patient_encounter
+    hubs_involved: [hub_patient, hub_encounter]
+  - link_name: encounter_observation
+    link_table_name: lnk_encounter_observation
+    hubs_involved: [hub_encounter, hub_observation]
+  - link_name: encounter_practitioner
+    link_table_name: lnk_encounter_practitioner
+    hubs_involved: [hub_encounter, hub_practitioner]
+
+satellites:
+  - entity_name: patient_demographics
+    satellite_table_name: sat_patient_demographics
+    parent_hub: hub_patient
+    change_tracking: type2
+  - entity_name: encounter_status
+    satellite_table_name: sat_encounter_status
+    parent_hub: hub_encounter
+    change_tracking: type2
+  - entity_name: observation_value
+    satellite_table_name: sat_observation_value
+    parent_hub: hub_observation
+    change_tracking: type2
+  - entity_name: practitioner_profile
+    satellite_table_name: sat_practitioner_profile
+    parent_hub: hub_practitioner
+    change_tracking: type2
+
+hash_key_strategy:
+  algorithm: sha256
+  delimiter: "||"
+  null_token: "__NULL__"
+  upper_case: true

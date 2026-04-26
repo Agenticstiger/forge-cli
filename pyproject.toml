@@ -42,6 +42,14 @@ dependencies = [
   "requests>=2.32.5",  # For Data Mesh Manager catalog publishing and shared HTTP helpers
   "python-dotenv>=1.0",  # .env file credential loading in fluid_build.credentials.dotenv_store
   "cryptography>=42.0",  # Fernet-encrypted credential store in fluid_build.credentials.encrypted_store
+  # OS keyring is now a hard dependency (Issue 5).  Catalog source
+  # secrets default to the OS keyring (encrypted-at-rest); the
+  # legacy plaintext YAML fallback is gated behind
+  # FLUID_ALLOW_PLAINTEXT_SOURCE_SECRETS=1 *and* file chmod 600.
+  # Making keyring core eliminates the "I added a source via the
+  # wizard but resolution fails because keyring isn't installed"
+  # first-time UX trap.
+  "keyring>=24.0",
   # Optional UX nicety on Windows; no-op elsewhere
   "colorama>=0.4.6; platform_system == 'Windows'",
 ]
@@ -64,6 +72,11 @@ gcp = [
   "google-auth-oauthlib>=1.2",
   "google-cloud-bigquery>=3.20",
   "google-cloud-storage>=2.16",
+  # V1.5 — Dataplex metadata source catalog. Optional within the
+  # gcp extra so users wanting BigQuery alone don't pay for the
+  # Dataplex SDK. Pulled in by default because most BigQuery
+  # adopters also use Dataplex tagging.
+  "google-cloud-dataplex>=1.0",
   # optional; gated for 3.10+ environments where wheel support exists
   "google-cloud-iam>=2.15 ; python_version >= '3.10'",
   # optional runtime helpers (dbt) — also 3.10+ where ecosystem is healthiest
@@ -98,6 +111,63 @@ copilot = [
   "fastavro>=1.9",
 ]
 
+# Optional embedding-backed semantic search for the memory/semantic namespace.
+# When this extra is installed AND the backing store is a SqliteBackend,
+# ``VectorBackend`` upgrades from stdlib ``difflib`` ranking to a real
+# vector index (via ``sqlite-vec``). Without the extra it silently
+# falls back to the stdlib path — no crash, no import error.
+vector = [
+  "sqlite-vec>=0.1",
+]
+
+# Postgres-backed staged memory store.
+postgres = [
+  "psycopg[binary]>=3.1",
+]
+
+# V1.5 metadata-source catalog adapters.
+#
+# Each ``[<name>]`` extra installs ONE catalog adapter's SDK. The
+# umbrella ``[catalogs]`` extra installs all of them so a user
+# wanting "every catalog" can do ``pip install
+# "data-product-forge[catalogs]"`` once. Each adapter's import is
+# lazy (inside the adapter's connection helper), so installing the
+# extra without configuring the matching catalog causes zero
+# runtime cost.
+
+# Databricks Unity Catalog metadata reader.
+databricks = [
+  "databricks-sdk>=0.20",
+]
+
+# DataHub metadata reader.
+datahub = [
+  "acryl-datahub>=0.13",
+]
+
+# OS keyring for the V1.5 credential resolver.
+#
+# As of Issue 5, ``keyring`` is a HARD core dependency (declared in
+# the top-level ``dependencies`` list above).  This empty extra is
+# kept as a backwards-compatibility alias so existing
+# ``pip install "data-product-forge[keyring]"`` invocations and
+# ``data-product-forge[catalogs]`` (which references it) keep
+# working without warnings.
+keyring = []
+
+# Umbrella: every metadata-source catalog adapter + the keyring
+# integration. Gives users one ``pip install`` to wire up
+# Snowflake / Unity / BigQuery+Dataplex / Glue / DataHub / DMM.
+catalogs = [
+  "data-product-forge[snowflake]",
+  "data-product-forge[gcp]",  # bigquery + dataplex
+  "data-product-forge[databricks]",
+  "data-product-forge[datahub]",
+  "data-product-forge[keyring]",
+  # AWS Glue uses boto3 which is already lazy-imported by the
+  # existing AWS provider — no new top-level extra needed.
+]
+
 # Docs toolchain (optional; if you’ll publish docs)
 docs = [
   "mkdocs>=1.6",
@@ -119,7 +189,7 @@ dev = [
 
 # One-shot install for contributors
 all = [
-  "data-product-forge[local,gcp,snowflake,viz,opds,tui,copilot,docs,dev]"
+  "data-product-forge[local,gcp,snowflake,viz,opds,tui,copilot,vector,postgres,docs,dev]"
 ]
 
 [project.scripts]
@@ -161,8 +231,19 @@ include = ["fluid_build*"]
 fluid_build = [
   "build-manifest.yaml",
   "features.yaml",
+  # ``cli/llm_models.json`` is the provider/tier catalog that
+  # ``forge_copilot_llm_providers`` loads at runtime; without this glob the
+  # file silently drops from the wheel and any fresh ``pip install`` of the
+  # published package falls back to the built-in defaults. Kept as a
+  # file-level pattern (``cli/*.json``) — not ``cli/**/*.json`` — because
+  # the ``cli/agent_specs`` and ``cli/industry_skills`` subtrees already
+  # have their own YAML-only globs above and no other ``cli/**`` directory
+  # should accidentally sweep in test fixtures.
+  "cli/*.json",
   "cli/agent_specs/**/*.yaml",
   "cli/industry_skills/**/*.yaml",
+  "copilot/**/*.yaml",
+  "copilot/**/*.md",
   "schemas/**/*.json",
   "schemas/**/*.yaml",
   "templates/**/*",
@@ -173,10 +254,21 @@ fluid_build = [
   "providers/**/*.json",
   "providers/**/*.yaml",
 ]
-# Avoid shipping compiled junk, stale backups, and test fixtures
+# Avoid shipping compiled junk, stale backups, and test fixtures.
+#
+# ``providers/**/test_*`` matches *directories* named ``test_*``; the
+# explicit ``test_*.json`` / ``test_*.yaml`` file-prefix patterns below
+# catch the common case of per-provider fixture files colocated with the
+# shipped provider (e.g. ``providers/aws/test_fluid_0.7.1_contract.json``).
+# Without those, the provider-data globs above would sweep the fixtures
+# into the wheel, bloating it and leaking internal test artifacts.
 [tool.setuptools.exclude-package-data]
 "*" = ["*.pyc", "*.pyo", "*~", "*.bak", "*.old", "__pycache__/*"]
-fluid_build = ["providers/**/test_*"]
+fluid_build = [
+  "providers/**/test_*",
+  "providers/**/test_*.json",
+  "providers/**/test_*.yaml",
+]
 
 # ---- Tooling configs consolidated here ----
 

@@ -308,7 +308,15 @@ def load_context(
             raise context_error_cls("Context file too large (max 1MB)")
 
         with open(context_path, encoding="utf-8") as handle:
-            if context_path.suffix in {".yaml", ".yml"}:
+            if context_path.suffix in {".md", ".markdown", ".txt"}:
+                content = handle.read().strip()
+                if not content:
+                    raise context_error_cls("Context file is empty")
+                context = {
+                    "project_goal": content,
+                    "description": content,
+                }
+            elif context_path.suffix in {".yaml", ".yml"}:
                 context = yaml.safe_load(handle)
             elif context_path.suffix == ".json":
                 context = json.load(handle)

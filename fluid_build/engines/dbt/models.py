@@ -78,34 +78,15 @@ def _generate_hybrid(
 
     Three code paths, in priority order:
 
-    1. ``transformation_intent.stages`` non-empty → render directly from
-       the LLM-supplied stages (proper AI-driven path).
-    2. ``transformation_intent.data_modeling_technique`` set (DV2 or
-       Dimensional) → *no skeletons*. The LLM pipeline owns every
-       staging/mart file via ``additional_files``; the Phase-7
-       validation guardrail catches LLM failures and repairs them.
-    3. Untyped / legacy → classic ``stg_`` + mart skeletons with
+    1. ``transformation_intent.stages`` non-empty -> render directly from
+       the forged logical sidecar's transform plan.
+    2. Any missing/legacy transform plan -> classic ``stg_`` + mart skeletons with
        NULL-cast column projections so dbt compiles.
-
-    Path (2) exists because the previous DV2/Dimensional skeleton
-    emitters caused three distinct real-world failures on B1:
-      - "hub_<consumeId>" is semantically wrong (DV2 hubs are business
-        entities, not source tables).
-      - Placeholder SQL such as ``<business_key>`` doesn't compile.
-      - Stub-file names contaminated the LLM context; downstream
-        LLM-authored links referenced hub names that never had a real
-        implementation.
-    Skipping skeletons resolves all three.
     """
     files: GenerationResult = {}
 
     if transformation_intent and transformation_intent.stages:
         return _generate_from_intent(contract, transformation_intent)
-
-    technique = transformation_intent.data_modeling_technique if transformation_intent else None
-    if technique in {"data_vault_2", "dimensional"}:
-        # LLM owns staging + marts; no skeleton files from the engine.
-        return files
 
     # Untyped path — classic staging + mart skeletons.
     consumes = contract.get("consumes", [])
@@ -140,7 +121,7 @@ def _staging_skeleton(source_id: str) -> str:
         f"select\n"
         f"    *\n"
         f"    -- TODO: Add column cleaning and standardization\n\n"
-        f"from {{{{ source('raw', '{source_id}') }}}}\n"
+        f"from {{{{ source('raw', '{source_id}') }}}}\n"  # nosec B608
     )
 
 
@@ -225,7 +206,7 @@ def _generate_multi_stage(
             # Wrap user SQL with config macro
             content = (
                 f"{_HEADER}"
-                f"{{{{ config(materialized='{materialization}') }}}}\n\n"
+                f"{{{{ config(materialized='{materialization}') }}}}\n\n"  # nosec B608
                 f"{stage_sql.strip()}\n"
             )
         else:
@@ -233,7 +214,7 @@ def _generate_multi_stage(
             ref_lines = "".join(f"-- depends on: {{{{ ref('{dep}') }}}}\n" for dep in depends_on)
             content = (
                 f"{_HEADER}"
-                f"{{{{ config(materialized='{materialization}') }}}}\n\n"
+                f"{{{{ config(materialized='{materialization}') }}}}\n\n"  # nosec B608
                 f"{ref_lines}"
                 f"select\n"
                 f"    *\n"

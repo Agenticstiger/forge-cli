@@ -29,6 +29,7 @@ __all__ = [
     "run_ai_setup_interactive",
     "run_ai_setup_inline",
     "set_session_env",
+    "show_ai_models",
     "show_ai_status",
 ]
 
@@ -38,14 +39,19 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from fluid_build.cli.forge_banner import print_v2_banner
 from fluid_build.cli.forge_copilot_llm_providers import (
     BUILTIN_LLM_PROVIDERS,
     PROVIDER_DISPLAY_NAMES,
     PROVIDER_ENV_VARS,
     LlmConfig,
+    build_llm_run_plan,
     check_llm_readiness,
     detect_ollama_available,
     detect_provider_from_api_key,
+    get_catalog_default,
+    get_catalog_routing_model,
+    get_catalog_tier_models,
 )
 from fluid_build.cli.forge_dialogs import ask_confirmation
 
@@ -83,6 +89,7 @@ def _sanitize_ollama_host(host: str) -> str:
 
 # Keyring key prefix used when persisting API keys.
 _KEYRING_PREFIX = "llm_api_key"
+_PLAINTEXT_AI_SECRETS_ENV = "FLUID_ALLOW_PLAINTEXT_AI_SECRETS"
 
 # Session-level flag: True once user explicitly skips AI setup.
 # Prevents re-prompting within the same process.
@@ -100,6 +107,16 @@ _CONFIG_DIR = Path.home() / ".fluid"
 _CONFIG_FILE = _CONFIG_DIR / "ai_config.json"
 
 
+def _allow_plaintext_ai_secrets() -> bool:
+    """Return True when the operator explicitly opts into plaintext key persistence."""
+    return os.environ.get(_PLAINTEXT_AI_SECRETS_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _save_ai_config(
     provider: str,
     model: str,
@@ -108,13 +125,13 @@ def _save_ai_config(
     endpoint: Optional[str] = None,
     ollama_host: Optional[str] = None,
 ) -> bool:
-    """Save full AI config to ``~/.fluid/ai_config.json``.
+    """Save non-sensitive AI config to ``~/.fluid/ai_config.json``.
 
-    This is the **primary** persistence store for AI configuration.
-    API keys are stored here (file is chmod 600) so the config is
-    self-contained and doesn't depend on the OS keychain working.
-    Same approach as ``gh`` (``~/.config/gh/hosts.yml``) and
-    ``dbt`` (``~/.dbt/profiles.yml``).
+    Provider and model choices live in the JSON file. API keys are
+    persisted to the OS keyring whenever possible. Plaintext key
+    fallback is intentionally opt-in via ``FLUID_ALLOW_PLAINTEXT_AI_SECRETS=1``
+    so automated and agent-facing workflows don't quietly leave live
+    provider tokens on disk.
     """
     import json
     import stat
@@ -123,7 +140,14 @@ def _save_ai_config(
         _CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         data: dict = {"provider": provider, "model": model}
         if api_key:
-            data["api_key"] = api_key
+            saved_to_keyring = _save_key_to_keyring(provider, api_key)
+            if saved_to_keyring:
+                LOG.debug("Saved API key to keyring; not writing it to %s", _CONFIG_FILE)
+            elif _allow_plaintext_ai_secrets():
+                data["api_key"] = api_key
+                LOG.warning("Plaintext local AI credential fallback is enabled.")
+            else:
+                LOG.debug("Keyring unavailable; sensitive AI value was not persisted.")
         if endpoint:
             data["endpoint"] = endpoint
         if ollama_host:
@@ -139,9 +163,34 @@ def _save_ai_config(
 
 
 def _load_ai_config() -> Optional[dict]:
-    """Load saved AI preferences.  Returns None if no config exists."""
+    """Load saved AI preferences.  Returns None if no config exists.
+
+    Lookup order (Sprint #7 wiring):
+
+    1. ``~/.fluid/config.yaml`` ``llm:`` section (unified path —
+       new operators land here on first ``fluid ai setup`` call).
+    2. ``~/.fluid/ai_config.json`` (legacy v1.5 file — pre-existing
+       installs continue to work without re-migrating).
+    3. ``None`` — no config saved yet.
+    """
     import json
 
+    # 1. Unified config — new operators.
+    try:
+        from fluid_build.copilot.unified_config import load_unified_config
+
+        cfg = load_unified_config()
+        if cfg is not None and cfg.llm and cfg.llm.provider:
+            data: dict = {"provider": cfg.llm.provider}
+            if cfg.llm.model:
+                data["model"] = cfg.llm.model
+            if cfg.llm.tiered:
+                data["tiered"] = cfg.llm.tiered
+            return data
+    except Exception:  # pragma: no cover — defensive
+        pass
+
+    # 2. Legacy ``~/.fluid/ai_config.json`` — pre-existing installs.
     try:
         if not _CONFIG_FILE.exists():
             return None
@@ -430,8 +479,22 @@ def _prompt_for_api_key(console: Any) -> Optional[LlmConfig]:
         saved = _save_key_to_keyring(provider_choice, raw)
         if saved:
             console.print("[green]Saved to system keychain (you won't be asked again).[/green]")
+            api_key_for_config = None
+        elif _allow_plaintext_ai_secrets():
+            console.print(
+                f"[yellow]System keychain unavailable; saved key to {_CONFIG_FILE} "
+                "because FLUID_ALLOW_PLAINTEXT_AI_SECRETS is enabled.[/yellow]"
+            )
+            api_key_for_config = raw
         else:
-            console.print(f"[green]Saved to {_CONFIG_FILE} (you won't be asked again).[/green]")
+            console.print(
+                "[yellow]System keychain unavailable; provider/model will be saved, "
+                "but the API key will only be used for this process. Export the "
+                "provider API key env var, install a keyring backend, or set "
+                "FLUID_ALLOW_PLAINTEXT_AI_SECRETS=1 to opt into local plaintext "
+                "persistence.[/yellow]"
+            )
+            api_key_for_config = None
 
         set_session_env(provider_choice, raw)
 
@@ -451,7 +514,7 @@ def _prompt_for_api_key(console: Any) -> Optional[LlmConfig]:
         )
         model = get_catalog_tier_model(provider_choice, tier) or provider.default_model
 
-        _save_ai_config(provider_choice, model, api_key=raw)
+        _save_ai_config(provider_choice, model, api_key=api_key_for_config)
 
         env = dict(os.environ)
         LOG.info("AI setup: configured provider=%s model=%s tier=%s", provider_choice, model, tier)
@@ -600,7 +663,7 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
 
     Resolves an LLM config in this priority order:
 
-        1. saved config file (``~/.fluid/ai_config.json``)
+        1. saved config file + OS keyring (``~/.fluid/ai_config.json``)
         2. cloud provider env vars (``OPENAI_API_KEY`` etc.)
         3. explicit ``OLLAMA_HOST`` env var
         4. auto-detected local Ollama (with user confirmation on TTY)
@@ -613,7 +676,7 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
         LOG.debug("AI setup was skipped earlier in this session")
         return None
 
-    # 1. Check saved config file (primary persistence store).
+    # 1. Check saved provider/model config and OS-keyring secret.
     saved = _load_ai_config()
     if saved and saved.get("provider"):
         pname = saved["provider"]
@@ -630,7 +693,7 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
                     console.print(f"[dim]Using Ollama ({config.model}).[/dim]")
                 LOG.info("Inline AI setup: loaded ollama from config")
                 return config
-            # Cloud provider — key is in config file (primary) or keyring (fallback).
+            # Cloud provider — key is in keyring, env, or legacy plaintext config.
             api_key = saved.get("api_key") or _load_key_from_keyring(pname)
             if api_key:
                 set_session_env(pname, api_key)
@@ -737,6 +800,83 @@ def show_ai_status(console: Any) -> None:
         )
 
 
+def _provider_model_plan(provider_name: str) -> dict:
+    """Build a display-safe model plan for one provider."""
+    provider = BUILTIN_LLM_PROVIDERS[provider_name]
+    model = get_catalog_default(provider_name) or provider.default_model
+    routing_model = get_catalog_routing_model(provider_name, model)
+    tier_models = get_catalog_tier_models(provider_name)
+    cfg = LlmConfig(
+        provider=provider.name,
+        model=model,
+        endpoint=provider.default_endpoint(model, dict(os.environ)),
+        api_key=None,
+        routing_model=routing_model,
+        tier_models=tier_models,
+    )
+    return build_llm_run_plan(cfg, tiered=bool(tier_models))
+
+
+def show_ai_models(
+    console: Any,
+    *,
+    provider_filter: Optional[str] = None,
+    as_json: bool = False,
+) -> None:
+    """Display bundled LLM model defaults, routing, and tier plans."""
+    import json
+
+    provider_names = [
+        name
+        for name in ("gemini", "openai", "anthropic", "ollama")
+        if name in BUILTIN_LLM_PROVIDERS
+    ]
+    if provider_filter:
+        requested = provider_filter.strip().lower()
+        if requested == "claude":
+            requested = "anthropic"
+        provider_names = [name for name in provider_names if name == requested]
+
+    plans = {name: _provider_model_plan(name) for name in provider_names}
+    if as_json:
+        text = json.dumps(plans, indent=2, sort_keys=True)
+        sys.stdout.write(text + "\n")
+        return
+
+    if not console or not RICH_AVAILABLE:
+        from fluid_build.cli.console import cprint
+
+        for name, plan in plans.items():
+            tiers = plan.get("tier_models") or {}
+            tier_text = ", ".join(f"{k}={v}" for k, v in tiers.items()) or "single model"
+            cprint(
+                f"{name}: primary={plan.get('primary_model')} "
+                f"routing={plan.get('routing_model')} tiers={tier_text}"
+            )
+        return
+
+    table = Table(title="AI Model Plan", border_style="cyan")
+    table.add_column("Provider", style="cyan", no_wrap=True)
+    table.add_column("Role", style="bright_white", no_wrap=True)
+    table.add_column("Model", overflow="fold")
+    for name, plan in plans.items():
+        tiers = plan.get("tier_models") or {}
+        provider_label = PROVIDER_DISPLAY_NAMES.get(name, name)
+        rows = [
+            ("primary", plan.get("primary_model")),
+            ("routing", plan.get("routing_model")),
+            ("deep", tiers.get("deep")),
+            ("balanced", tiers.get("balanced")),
+            ("fast", tiers.get("fast")),
+        ]
+        for index, (role, model) in enumerate(rows):
+            table.add_row(provider_label if index == 0 else "", role, str(model or "--"))
+    console.print(table)
+    console.print(
+        "[dim]Contract forging, dbt SQL generation, and validation are deterministic from the logical sidecar.[/dim]"
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI registration -- ``fluid ai setup``
 # ---------------------------------------------------------------------------
@@ -749,13 +889,66 @@ def register(subparsers) -> None:
         help="Configure AI / LLM settings for Forge Copilot",
     )
     ai_sub = parser.add_subparsers(dest="ai_action")
-    setup_parser = ai_sub.add_parser("setup", help="Interactive LLM provider setup")
+    setup_parser = ai_sub.add_parser(
+        "setup", help="Interactive LLM provider OR metadata-source setup"
+    )
     setup_parser.add_argument(
         "--clear",
         action="store_true",
         help="Clear saved API keys from keychain",
     )
-    ai_sub.add_parser("status", help="Show current AI configuration")
+    setup_parser.add_argument(
+        "--source",
+        choices=[
+            "snowflake",
+            "unity",
+            "bigquery",
+            "dataplex",
+            "glue",
+            "datahub",
+            "datamesh_manager",
+        ],
+        default=None,
+        help=(
+            "V1.5 — configure a metadata-source catalog instead of "
+            "the LLM provider. Walks you through auth-method choice "
+            "(key-pair / OAuth / token / etc.), captures the "
+            "credentials, saves to OS keyring + ~/.fluid/sources.yaml, "
+            "and tests the connection. Use the saved name as "
+            "--credential-id on `fluid forge data-model from-source`."
+        ),
+    )
+    setup_parser.add_argument(
+        "--name",
+        default=None,
+        help=(
+            "Saved name for the source / LLM config. Defaults to "
+            "'<source>-prod' for source setup."
+        ),
+    )
+    setup_parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Suppress the v2-preview banner (also honours $FLUID_QUIET / $FLUID_NONINTERACTIVE).",
+    )
+    status_parser = ai_sub.add_parser("status", help="Show current AI + source configuration")
+    status_parser.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="Suppress the v2-preview banner (also honours $FLUID_QUIET / $FLUID_NONINTERACTIVE).",
+    )
+    models_parser = ai_sub.add_parser(
+        "models",
+        help="Show provider defaults, routing model, and tiered model plan",
+    )
+    models_parser.add_argument(
+        "--provider",
+        choices=["gemini", "openai", "anthropic", "claude", "ollama"],
+        help="Limit output to one provider",
+    )
+    models_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     parser.set_defaults(func=_run_ai_command)
 
 
@@ -784,11 +977,43 @@ def _run_ai_command(args, logger: logging.Logger) -> int:
 
                 cprint("Cleared saved AI config and API keys.")
             return 0
+
+        # V1.5 — metadata-source catalog wizard.
+        # Routes to the dedicated source-setup module when --source
+        # is set; otherwise falls through to the legacy LLM-provider
+        # wizard. Kept as a single ``setup`` subcommand (rather
+        # than a separate ``setup-source`` verb) so the operator's
+        # mental model is "fluid ai setup configures my AI / data
+        # plumbing" — one place for both.
+        source = getattr(args, "source", None)
+        if source:
+            from fluid_build.cli.ai_source_setup import setup_source
+
+            rc = setup_source(source, name=getattr(args, "name", None), console=console)
+            if rc == 0:
+                print_v2_banner("ai_setup", quiet=getattr(args, "quiet", False))
+            return rc
+
         result = run_ai_setup_interactive(console)
+        if result is not None:
+            print_v2_banner("ai_setup", quiet=getattr(args, "quiet", False))
         return 0 if result else 1
 
     if action == "status":
         show_ai_status(console)
+        # V1.5 — also surface configured metadata-source catalogs
+        # so ``fluid ai status`` is one stop for "what's wired up".
+        from fluid_build.cli.ai_source_setup import show_source_status
+
+        show_source_status(console)
+        return 0
+
+    if action == "models":
+        show_ai_models(
+            console,
+            provider_filter=getattr(args, "provider", None),
+            as_json=bool(getattr(args, "json", False)),
+        )
         return 0
 
     # No subcommand -- default to showing status

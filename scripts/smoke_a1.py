@@ -30,7 +30,7 @@ SAFETY:
 
 USAGE:
   # Must source both launchpads first so $GREENFIELD_WORKSPACE etc resolve.
-  source .../snowflake-biz-lab/runtime/generated/launchpad.local.sh
+  source .../your-lab-workspace/runtime/generated/launchpad.local.sh
   export FLUID_DEV_BIN="$LAB_REPO/.venv.fluid-dev/bin/fluid"
   python3 /path/to/smoke_a1.py
 """
@@ -43,7 +43,6 @@ import subprocess
 import sys
 import tempfile
 from typing import List
-
 
 FLUID_BIN = os.environ.get(
     "FLUID_BIN",
@@ -102,7 +101,7 @@ def main() -> int:
     print("A1 smoke — new 11-stage flag surface")
     print(f"  FLUID_BIN   = {FLUID_BIN}")
     print(f"  A1_DIR      = {A1_DIR}")
-    print(f"  CONTRACT    = contract.fluid.yaml (in A1_DIR)")
+    print("  CONTRACT    = contract.fluid.yaml (in A1_DIR)")
     print(f"  BUILD_ID    = {BUILD_ID}")
 
     results: dict = {}

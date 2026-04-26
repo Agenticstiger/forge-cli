@@ -1,8 +1,30 @@
 {
   "schema_version": 2,
-  "updated_at": "2026-04-12",
+  "updated_at": "2026-04-24",
   "source": "https://artificialanalysis.ai",
   "default_provider": "gemini",
+  "tiers": {
+    "anthropic": {
+      "deep": "claude-opus-4-7",
+      "balanced": "claude-sonnet-4-6",
+      "fast": "claude-haiku-4-5-20251001"
+    },
+    "openai": {
+      "deep": "gpt-4.1",
+      "balanced": "gpt-4.1-mini",
+      "fast": "gpt-4.1-nano"
+    },
+    "gemini": {
+      "deep": "gemini-2.5-pro",
+      "balanced": "gemini-2.5-flash",
+      "fast": "gemini-2.5-flash"
+    },
+    "ollama": {
+      "deep": "gemma4:latest",
+      "balanced": "gemma4:latest",
+      "fast": "gemma4:latest"
+    }
+  },
   "providers": {
     "gemini": {
       "flagship": "gemini-2.5-pro",
@@ -10,43 +32,47 @@
       "routing": "gemini-2.5-flash",
       "default": "gemini-2.5-pro",
       "models": [
-        {"id": "gemini-2.5-pro", "aliases": ["gemini-pro"], "capabilities": {"structured_output": false, "tool_use": true, "streaming": true}},
-        {"id": "gemini-2.5-flash", "aliases": ["gemini", "flash", "gemini-flash"], "capabilities": {"structured_output": false, "tool_use": true, "streaming": true}}
+        {"id": "gemini-2.5-pro", "aliases": ["gemini-pro"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
+        {"id": "gemini-2.5-flash", "aliases": ["gemini", "flash", "gemini-flash"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}}
       ]
     },
     "openai": {
       "flagship": "gpt-4.1",
-      "balanced": "gpt-4o-mini",
-      "routing": "gpt-4.1-mini",
-      "default": "gpt-4.1",
+      "balanced": "gpt-4.1-mini",
+      "routing": "gpt-4.1-nano",
+      "default": "gpt-4.1-mini",
       "models": [
-        {"id": "gpt-4.1", "aliases": ["gpt41"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
-        {"id": "gpt-4.1-mini", "aliases": ["gpt41-mini"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
-        {"id": "gpt-4.1-nano", "aliases": ["gpt41-nano", "nano"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
-        {"id": "gpt-4o", "aliases": ["gpt4", "gpt4o", "gpt-4"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
-        {"id": "gpt-4o-mini", "aliases": ["gpt4o-mini", "gpt4-mini", "mini"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
-        {"id": "o3", "aliases": [], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
-        {"id": "o3-mini", "aliases": [], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
-        {"id": "o4-mini", "aliases": ["o4"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}}
+        {"id": "gpt-4.1", "aliases": ["gpt41"], "tier": "deep", "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
+        {"id": "gpt-4.1-mini", "aliases": ["gpt41-mini"], "tier": "balanced", "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
+        {"id": "gpt-4.1-nano", "aliases": ["gpt41-nano", "nano"], "tier": "fast", "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
+        {"id": "gpt-4o", "aliases": ["gpt4", "gpt4o", "gpt-4"], "tier": "deep-legacy", "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
+        {"id": "gpt-4o-mini", "aliases": ["gpt4o-mini", "gpt4-mini", "mini"], "tier": "fast-legacy", "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
+        {"id": "o3", "aliases": [], "tier": "reasoning-deep", "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
+        {"id": "o3-mini", "aliases": [], "tier": "reasoning-balanced", "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
+        {"id": "o4-mini", "aliases": ["o4"], "tier": "reasoning-fast", "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}}
       ]
     },
     "anthropic": {
-      "flagship": "claude-sonnet-4-5-20250514",
+      "flagship": "claude-sonnet-4-6",
       "balanced": "claude-haiku-4-5-20251001",
       "routing": "claude-haiku-4-5-20251001",
-      "default": "claude-sonnet-4-5-20250514",
+      "default": "claude-sonnet-4-6",
       "models": [
-        {"id": "claude-sonnet-4-5-20250514", "aliases": ["claude", "sonnet", "claude-sonnet", "claude-4.5-sonnet"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
+        {"id": "claude-sonnet-4-6", "aliases": ["claude", "sonnet", "claude-sonnet", "claude-4.6-sonnet"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
+        {"id": "claude-sonnet-4-5-20250929", "aliases": ["claude-4.5-sonnet"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
         {"id": "claude-haiku-4-5-20251001", "aliases": ["haiku", "claude-haiku", "claude-4.5-haiku"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
-        {"id": "claude-opus-4-0-20250514", "aliases": ["opus", "claude-opus", "claude-4-opus"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}}
+        {"id": "claude-opus-4-7", "aliases": ["opus", "claude-opus", "claude-4.7-opus"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}},
+        {"id": "claude-opus-4-1-20250805", "aliases": ["claude-4.1-opus"], "capabilities": {"structured_output": true, "tool_use": true, "streaming": true}}
       ]
     },
     "ollama": {
-      "flagship": "llama3.1",
-      "balanced": "llama3.1",
-      "routing": "llama3.1:8b",
-      "default": "llama3.1",
-      "models": []
+      "flagship": "gemma4:latest",
+      "balanced": "gemma4:latest",
+      "routing": "gemma4:latest",
+      "default": "gemma4:latest",
+      "models": [
+        {"id": "gemma4:latest", "aliases": ["gemma4", "gemma-4"], "capabilities": {"structured_output": true, "tool_use": false, "streaming": true}}
+      ]
     }
   }
 }

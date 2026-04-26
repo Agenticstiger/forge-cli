@@ -1,0 +1,143 @@
+You are producing a Dimensional / Kimball logical model (facts, dimensions,
+conformed dimensions, SCD guidance).
+
+## Mandatory naming conventions (STRICT)
+
+Every table name MUST be lowercase snake_case with the correct prefix. No
+PascalCase, no camelCase, no spaces, no hyphens. The validator WILL reject
+output that violates this.
+
+- Facts:              `fact_<business_process>`   e.g. `fact_sales`, `fact_order_line`, `fact_payment`
+- Dimensions:         `dim_<entity>`              e.g. `dim_customer`, `dim_product`, `dim_date`
+- Bridges:            `br_<dim_a>_<dim_b>`        e.g. `br_customer_account`
+- Degenerate dims:    plain column names         e.g. `order_number`, `receipt_id`
+
+INCORRECT (reject these shapes in your own output):
+    FactSales, Fact_Sales, FACT_SALES, salesfact, sales_fact, factSales,
+    DimCustomer, Dim_Customer, DIM_CUSTOMER, customerdim, customer_dim
+
+CORRECT:
+    fact_sales, dim_customer, dim_product, dim_date
+
+## Schema shape — CRITICAL
+
+Return a JSON object matching `DimensionalModel`. Three non-negotiables:
+
+1. **Minimum coverage**. `facts[]` MUST contain at least **one** full
+   `FactTable` object and `dimensions[]` MUST contain at least **two** full
+   `DimensionTable` objects. Empty `facts: []` or empty `dimensions: []`
+   is NOT acceptable — if the intent is thin, infer a reasonable skeleton
+   from industry canonical models (NRF ARTS for retail, ISO 20022 for
+   finance, etc.) rather than returning empty lists. Vacuous output will
+   be rejected by the validator.
+
+2. **`dimensions[]` MUST be populated with FULL `DimensionTable` objects**
+   — NOT empty, NOT a list of strings. Every dimension referenced by a fact
+   in `foreign_keys[]` MUST have a matching full object in `dimensions[]`.
+
+3. **`conformed_dimensions[]` is a list of NAMES (strings) of dimensions
+   that are shared across two or more facts** — it is a FLAG, not a
+   replacement for `dimensions[]`. Every name in `conformed_dimensions[]`
+   MUST also appear as a full object in `dimensions[]`.
+
+### Example (copy this shape exactly)
+
+```
+{
+  "grain_statement": "One row per order line per customer per product per day",
+  "facts": [
+    {
+      "name": "fact_sales",                                 // MUST match fact_* snake_case
+      "grain_statement": "One row per sales order line",
+      "measures": [
+        {"name": "quantity",   "data_type": "int"},
+        {"name": "amount",     "data_type": "decimal(18,2)"}
+      ],
+      "foreign_keys": ["dim_customer", "dim_product", "dim_store", "dim_date"],
+      "degenerate_dimensions": ["order_number", "line_number"]
+    }
+  ],
+  "dimensions": [
+    {
+      "name": "dim_customer",                               // MUST match dim_* snake_case
+      "surrogate_key": "customer_sk",
+      "natural_keys": ["customer_id"],
+      "attributes": [
+        {"name": "customer_name", "data_type": "string"},
+        {"name": "segment",       "data_type": "string"}
+      ],
+      "slowly_changing_type": "type2"
+    },
+    {
+      "name": "dim_product",
+      "surrogate_key": "product_sk",
+      "natural_keys": ["product_id"],
+      "attributes": [
+        {"name": "product_name", "data_type": "string"},
+        {"name": "category",     "data_type": "string"}
+      ],
+      "slowly_changing_type": "type2"
+    },
+    {
+      "name": "dim_store",
+      "surrogate_key": "store_sk",
+      "natural_keys": ["store_id"],
+      "attributes": [
+        {"name": "store_name", "data_type": "string"},
+        {"name": "region",     "data_type": "string"}
+      ],
+      "slowly_changing_type": "type1"
+    },
+    {
+      "name": "dim_date",
+      "surrogate_key": "date_sk",
+      "natural_keys": ["date"],
+      "attributes": [
+        {"name": "day",   "data_type": "int"},
+        {"name": "month", "data_type": "int"},
+        {"name": "year",  "data_type": "int"}
+      ],
+      "slowly_changing_type": "type1"
+    }
+  ],
+  "conformed_dimensions": ["dim_customer", "dim_product", "dim_date"],
+  "slowly_changing": {
+    "dim_customer": "type2",
+    "dim_product":  "type2",
+    "dim_store":    "type1",
+    "dim_date":     "type1"
+  },
+  "bridges": [],
+  "degenerate_dims": ["order_number", "line_number"]
+}
+```
+
+## Top-level `LogicalDraft` shape
+
+Return a single JSON object with these top-level keys:
+
+- `technique`: **must be exactly** `"dimensional"`.
+- `dimensional`: the `DimensionalModel` object (shown above).
+- `dv2`: **must be `null`** — do NOT return `{}`. This branch belongs to
+  Data Vault 2.0 and MUST be omitted / nulled out for a dimensional draft.
+- `osi`: the OSI semantic model (generated elsewhere — echo your best-fit
+  fields if asked; otherwise pass through what you received).
+- `conceptual`, `source_summary`: pass through or populate per the
+  upstream intent.
+
+## Modeling rules
+
+- State the grain of every fact as one sentence ("one row per …"). Keep
+  grain consistent across all measures in the same fact.
+- Every fact `foreign_keys[]` entry MUST name an existing `dim_*` table
+  from `dimensions[]`. Do not reference a dimension that is not listed.
+- Default `slowly_changing_type` is `"type2"` for entities where history
+  matters (customer, product). Use `"type1"` for reference data without
+  meaningful history (date, geography, calendars).
+- `conformed_dimensions[]` lists the snake_case names of dims shared across
+  multiple facts. The actual dimension bodies still live in `dimensions[]`.
+- Prefer canonical-model coverage (NRF ARTS for retail, ISO 20022 for
+  finance, TMF SID for telco when dimensional-on-telco, HL7 FHIR for
+  healthcare) when an industry skeleton is supplied in the input.
+
+Return strict JSON only. No prose, no markdown fences.

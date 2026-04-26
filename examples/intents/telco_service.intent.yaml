@@ -1,0 +1,42 @@
+data_product:
+  name: telco_service_health
+  domain: telecommunications
+  description: Customer service, subscription, device, and trouble ticket model.
+  owner: network-analytics
+business_context:
+  problem_statement: Service operations need governed churn, quality, and ticket analytics.
+  decision_supported: Retention, network quality triage, and service assurance.
+  consumer: service operations analysts
+grain:
+  entity: service
+  time_dimension: service_start_date
+  description: One row per active service relationship.
+dimensions:
+  entities:
+    - account
+    - party
+    - subscription
+    - device
+    - trouble_ticket
+  attributes:
+    - status
+    - type
+    - segment
+    - region
+metrics:
+  - name: active_services
+    description: Count of active services.
+  - name: open_tickets
+    description: Count of unresolved trouble tickets.
+  - name: monthly_recurring_revenue
+    description: Recurring service revenue.
+data_sources:
+  - source_name: telco_stage_load
+    source_type: snowflake
+    description: Seeded telco source tables.
+business_rules:
+  - Treat service status as the authoritative active/inactive indicator.
+  - Keep account-party relationships historized.
+modeling:
+  technique: data_vault_2
+  hash_key_algorithm: sha256

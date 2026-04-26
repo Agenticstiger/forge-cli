@@ -1,0 +1,23 @@
+data_product:
+  name: customer_orders
+  domain: retail
+  description: Order facts and customer dimensions for analytics.
+grain:
+  entity: order_line
+  time_dimension: order_date
+  description: One row per order line.
+dimensions:
+  entities:
+    - customer
+    - product
+    - store
+  attributes:
+    - name
+    - category
+metrics:
+  - name: total_revenue
+    description: Sum of order line revenue.
+business_rules:
+  - Exclude voided order lines.
+modeling:
+  technique: dimensional

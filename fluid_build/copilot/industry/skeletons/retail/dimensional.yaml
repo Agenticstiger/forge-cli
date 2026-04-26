@@ -1,0 +1,51 @@
+# NRF ARTS-aligned Kimball dimensional skeleton for retail.
+# Loaded by fluid_build.copilot.industry.compiler.IndustryPackCompiler and
+# merged into DimensionalModel as the modeler's starting point.
+industry: retail
+technique: dimensional
+description: "NRF ARTS retail canonical — sales-line + transaction facts, conformed dims"
+
+grain_statement: "One row per sales line item on a retail transaction; transaction fact at header grain"
+
+facts:
+  - name: fact_sales_line
+    grain_statement: "One row per line item on a retail sales transaction"
+    measures:
+      - {name: net_amount, data_type: decimal(18,4)}
+      - {name: gross_amount, data_type: decimal(18,4)}
+      - {name: quantity, data_type: int}
+      - {name: discount_amount, data_type: decimal(18,4)}
+    foreign_keys: [dim_customer_key, dim_product_key, dim_store_key, dim_date_key]
+    degenerate_dimensions: [transaction_id, line_number]
+
+  - name: fact_transaction
+    grain_statement: "One row per completed retail transaction (header)"
+    measures:
+      - {name: total_amount, data_type: decimal(18,4)}
+      - {name: item_count, data_type: int}
+      - {name: tax_amount, data_type: decimal(18,4)}
+    foreign_keys: [dim_customer_key, dim_store_key, dim_date_key]
+    degenerate_dimensions: [transaction_id]
+
+dimensions:
+  - name: dim_customer
+    slowly_changing_type: type2
+    natural_keys: [customer_id]
+  - name: dim_product
+    slowly_changing_type: type2
+    natural_keys: [sku]
+  - name: dim_store
+    slowly_changing_type: type1
+    natural_keys: [store_id]
+  - name: dim_date
+    slowly_changing_type: type1
+    natural_keys: [date]
+
+conformed_dimensions: [dim_customer, dim_product, dim_store, dim_date]
+degenerate_dims: [transaction_id, line_number]
+
+slowly_changing:
+  dim_customer: type2
+  dim_product: type2
+  dim_store: type1
+  dim_date: type1

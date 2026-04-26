@@ -51,7 +51,7 @@ def print_first_run_help(parser: argparse.ArgumentParser) -> None:
     console = Console()
     console.print()
 
-    # Welcome — warm but brief
+    # Welcome — warm but intent
     console.print(
         Panel(
             "[bold bright_cyan]🌊 Welcome to FLUID Forge![/bold bright_cyan]\n\n"
@@ -228,52 +228,11 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
         ],
     )
 
-    # ── Pipeline Stages (11-stage production flow) ──────────────────
-    # Every stage of the canonical 11-stage production pipeline
-    # surfaced in order so operators discover the full surface from
-    # ``fluid --help`` alone. Mirrors how Terraform keeps every state
-    # verb (state / import / taint / refresh) on the top-level help
-    # rather than hiding them behind subcommand tree exploration.
     console.print(
-        "  ▸ [bold bright_blue]Pipeline Stages[/bold bright_blue]  "
-        "[dim](11-stage production flow — each command is a CI stage gate)[/dim]"
+        "  [dim]Production path: bundle → validate → generate artifacts → diff → "
+        "plan → apply → verify → publish. Run [bright_cyan]fluid roadmap[/bright_cyan] "
+        "for the full gate list.[/dim]"
     )
-    stages_tbl = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False)
-    stages_tbl.add_column(style="bright_blue bold", min_width=24, max_width=24)
-    stages_tbl.add_column(style="bright_white")
-    stages_tbl.add_row(
-        "  bundle",
-        "1 · Package contract + sources into signed tgz bundle  [dim]--sign · --attest · --format tgz[/dim]",
-    )
-    stages_tbl.add_row(
-        "  validate", "2 · Check contract syntax and provider rules  [dim]--strict · --report[/dim]"
-    )
-    stages_tbl.add_row(
-        "  generate artifacts", "3 · Fanout: ODCS + ODPS-Bitol + schedule + policy bindings"
-    )
-    stages_tbl.add_row(
-        "  validate-artifacts", "4 · Verify MANIFEST SHA-256 + per-format schema checks"
-    )
-    stages_tbl.add_row("  diff", "5 · Detect drift from deployed state  [dim]--exit-on-drift[/dim]")
-    stages_tbl.add_row(
-        "  plan", "6 · Plan execution  [dim]--html (mermaid DAG) · --env · --out[/dim]"
-    )
-    stages_tbl.add_row(
-        "  apply", "7 · Deploy end-to-end  [dim]--mode · --allow-data-loss · --yes[/dim]"
-    )
-    stages_tbl.add_row(
-        "  policy-apply", "8 · Enforce IAM/GRANT bindings  [dim]--mode check|enforce[/dim]"
-    )
-    stages_tbl.add_row(
-        "  verify", "9 · Confirm deployed state matches the contract  [dim]--strict[/dim]"
-    )
-    stages_tbl.add_row(
-        "  publish", "10 · Publish to enterprise data catalogs  [dim]--target (repeatable)[/dim]"
-    )
-    stages_tbl.add_row(
-        "  schedule-sync", "11 · Push DAGs to airflow/composer/mwaa/astronomer/prefect/dagster"
-    )
-    console.print(stages_tbl)
     console.print()
 
     # ── Quality & Governance ────────────────────────────────────────
@@ -314,6 +273,7 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
         "bright_white",
         [
             ("config", "Get/set default provider, project, region"),
+            ("ai", "Configure LLMs and inspect model tiers  [dim]setup · status · models[/dim]"),
             ("split", "Split contract into composable fragments"),
             ("auth", "Manage cloud provider credentials  [dim]login · status · logout[/dim]"),
             ("doctor", "Check system health & dependencies"),
@@ -380,6 +340,10 @@ def print_forge_help() -> None:
     console.print(
         "  [bold]USAGE[/bold]   [bright_cyan]fluid forge[/bright_cyan] [dim][OPTIONS][/dim]"
     )
+    console.print(
+        "          [bright_cyan]fluid forge data-model[/bright_cyan] "
+        "[bright_green]<from-ddl|from-intent|from-source|validate|diff|dump-ddl|learn>[/bright_green] [dim][OPTIONS][/dim]"
+    )
     console.print()
 
     def _group_table(title: str, rows: list) -> None:
@@ -391,6 +355,19 @@ def print_forge_help() -> None:
             tbl.add_row(f"    {opt}", desc)
         console.print(tbl)
         console.print()
+
+    _group_table(
+        "Subcommands",
+        [
+            ("data-model from-ddl", "Forge a data model from existing DDL files"),
+            ("data-model from-intent", "Forge a data model from a business intent"),
+            ("data-model from-source", "Forge from a configured metadata catalog"),
+            ("data-model validate", "Validate a forged contract or logical sidecar"),
+            ("data-model diff", "Diff two forged logical sidecars"),
+            ("data-model dump-ddl", "Dump DDL from a Snowflake/BigQuery/Postgres source"),
+            ("data-model learn", "Learn reusable modeling memory from a sidecar"),
+        ],
+    )
 
     _group_table(
         "Project",
@@ -410,7 +387,10 @@ def print_forge_help() -> None:
         [
             ("--llm-provider NAME", "LLM provider (openai, anthropic, claude, gemini, ollama)"),
             ("--llm-model NAME", "Model identifier"),
+            ("--llm-routing-model NAME", "Fast model for interview and AI self-checks"),
             ("--llm-endpoint URL", "HTTP endpoint override"),
+            ("--tiered", "Use provider-local deep/fast model tiers"),
+            ("--require-llm", "Fail loudly if AI cannot run"),
         ],
     )
 
@@ -440,8 +420,17 @@ def print_forge_help() -> None:
         ("fluid forge", "AI copilot (interactive)"),
         ("fluid forge --provider gcp", "Target GCP"),
         ("fluid forge --domain finance", "Finance domain expertise"),
-        ("fluid forge --llm-provider ollama --llm-model llama3.1", "Use local Ollama model"),
+        ("fluid forge --llm-provider ollama --llm-model gemma4", "Use local Ollama model"),
         ("fluid forge --blank --target-dir ./out", "Empty scaffold"),
+        (
+            "fluid forge data-model from-intent intent.yaml -o contract.fluid.yaml",
+            "Forge a data model from an intent",
+        ),
+        (
+            "fluid forge data-model from-ddl --ddl schema.sql -o contract.fluid.yaml",
+            "Forge a data model from DDL",
+        ),
+        ("fluid forge data-model --help", "Data-model subcommand reference"),
     ]
     for cmd, desc in examples:
         console.print(f"    [bright_cyan]{cmd}[/bright_cyan]  [dim]{desc}[/dim]")

@@ -32,7 +32,21 @@ def _make_init_args(**overrides):
         no_run=False,
         no_dag=False,
         dry_run=False,
-        yes=True,
+        # ``yes=False`` keeps ``detect_mode`` exercising its
+        # contract-/dbt-/terraform-/sql-detection branches.  Tests
+        # that intentionally exercise the ``--yes`` short-circuit
+        # override this with ``yes=True`` per-call.
+        yes=False,
+        # ``non_interactive=True`` is required for ``TestRunFunction``
+        # tests because ``run()``'s post-mode-dispatch
+        # ``_offer_first_forge`` reads from stdin under
+        # ``non_interactive=False``, which raises
+        # ``pytest: reading from stdin while output is captured`` on
+        # Python 3.14 (the older 3.10–3.13 releases happened to
+        # tolerate it through a different capsys path).  Setting it
+        # in the shared default keeps the suite version-stable
+        # without requiring per-test patches.
+        non_interactive=True,
         target_dir=None,
     )
     defaults.update(overrides)

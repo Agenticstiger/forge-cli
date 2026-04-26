@@ -86,7 +86,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "policy failure, not as a masked build error)."
         ),
     )
-    sub = parser.add_subparsers(dest="policy_cmd", required=True, metavar="SUBCOMMAND")
+    # ``required=False`` so a bare ``fluid policy`` doesn't blow up
+    # with the bare-bones argparse "the following arguments are
+    # required: SUBCOMMAND" error.  ``_dispatch`` catches the
+    # ``policy_cmd is None`` case and renders a Rich-friendly panel
+    # listing the verbs.
+    sub = parser.add_subparsers(dest="policy_cmd", required=False, metavar="SUBCOMMAND")
 
     # ── check ───────────────────────────────────────────────────────
     # Static linter — no cloud calls, no state mutation. Safe to run
@@ -154,12 +159,9 @@ def _dispatch(args: argparse.Namespace, logger: logging.Logger) -> int:
     """
     sub = getattr(args, "policy_cmd", None)
     if not sub:
-        cprint(
-            "[policy] specify a subcommand: check · compile · apply\n"
-            "         (run ``fluid policy --help`` for details)",
-            markup=False,
-        )
-        return 2
+        # Bare ``fluid policy`` — render an intuitive guide instead of
+        # the old one-line "specify a subcommand" message.
+        return _render_policy_guide()
     # The sub-parser's ``_add_arguments`` already set args.func to
     # the right per-verb run function. If it didn't (defensive
     # guard — can happen if a subcommand's module is re-registered
@@ -172,3 +174,71 @@ def _dispatch(args: argparse.Namespace, logger: logging.Logger) -> int:
         )
         return 2
     return args.func(args, logger)
+
+
+def _render_policy_guide() -> int:
+    """Render an intuitive guide for ``fluid policy`` with no
+    subcommand.  Detects ``contract.fluid.yaml`` in the cwd and
+    promotes ``check`` when one is present (the canonical
+    starting move for an existing contract).
+    """
+
+    from pathlib import Path
+
+    from fluid_build.cli._subcommand_guide import (
+        SubcommandEntry,
+        SubcommandGuide,
+        SubcommandHint,
+        render_subcommand_guide,
+    )
+
+    entries = [
+        SubcommandEntry(
+            name="check",
+            description=(
+                "Lint contract for accessPolicy / dataClassification / "
+                "lifecycle / schema-evolution violations.  No cloud calls."
+            ),
+            example="fluid policy check contract.fluid.yaml",
+        ),
+        SubcommandEntry(
+            name="compile",
+            description=(
+                "Compile accessPolicy → provider IAM bindings "
+                "(Snowflake GRANTs, BigQuery IAM, AWS bucket policy + Glue grants)."
+            ),
+            example="fluid policy compile contract.fluid.yaml -o bindings.json",
+        ),
+        SubcommandEntry(
+            name="apply",
+            description=(
+                "Deploy compiled IAM bindings to the warehouse "
+                "(stage 8 of the 11-stage pipeline)."
+            ),
+            example="fluid policy apply bindings.json --mode check",
+        ),
+    ]
+
+    def _detect_hint() -> "SubcommandHint | None":
+        contract_in_cwd = Path.cwd() / "contract.fluid.yaml"
+        if contract_in_cwd.is_file():
+            return SubcommandHint(
+                subcommand="check",
+                rationale=(
+                    "found contract.fluid.yaml in cwd — start by linting it "
+                    "before compiling / applying bindings."
+                ),
+            )
+        return None
+
+    guide = SubcommandGuide(
+        command_path="fluid policy",
+        headline=(
+            "Lint, compile, and deploy access-policy + IAM bindings declared "
+            "in a Fluid contract — static check first, then compile, then apply."
+        ),
+        entries=entries,
+        hint_provider=_detect_hint,
+        quick_start="fluid policy check contract.fluid.yaml",
+    )
+    return render_subcommand_guide(guide)

@@ -669,6 +669,16 @@ class TestLoadContext:
         ctx = load_context(str(f))
         assert ctx["project_goal"] == "test"
 
+    def test_load_markdown_file_as_freeform_context(self, tmp_path):
+        from fluid_build.cli.forge import load_context
+
+        f = tmp_path / "prompt.md"
+        f.write_text("# Telco prompt\nUse seeded Snowflake data.", encoding="utf-8")
+        ctx = load_context(str(f))
+
+        assert ctx["project_goal"].startswith("# Telco prompt")
+        assert ctx["description"] == ctx["project_goal"]
+
     def test_load_nonexistent_file(self):
         from fluid_build.cli.forge import load_context
 

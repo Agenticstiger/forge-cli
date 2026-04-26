@@ -531,8 +531,14 @@ def _ensure_workspace(args, logger: logging.Logger) -> None:
 
     # Determine workspace name: CLI arg → interactive prompt → directory name.
     ws_name = getattr(args, "name", None)
-    is_yes = getattr(args, "yes", False)
-    if not ws_name and RICH_AVAILABLE and not is_yes:
+    is_non_interactive = (
+        getattr(args, "yes", False)
+        or getattr(args, "template", None)
+        or getattr(args, "quickstart", False)
+        or getattr(args, "scan", False)
+        or getattr(args, "blank", False)
+    )
+    if not ws_name and RICH_AVAILABLE and not is_non_interactive:
         ws_name = Prompt.ask("Workspace name", default=cwd.name)
     ws_name = ws_name or cwd.name
 
@@ -683,7 +689,7 @@ def _ai_mode(args, logger: logging.Logger) -> int:
         # Inject target dir so the forge wrapper writes there.
         args.target_dir = str(target)
         if not hasattr(args, "non_interactive"):
-            args.non_interactive = False
+            args.non_interactive = bool(getattr(args, "yes", False))
 
         result = run_ai_copilot_mode(args, logger)
 
@@ -739,6 +745,8 @@ def detect_mode(args, logger: logging.Logger) -> Optional[str]:
         return "blank"
     if args.template:
         return "template"
+    if getattr(args, "yes", False):
+        return "ai"
 
     cwd = Path.cwd()
     is_first_time = not (Path.home() / ".fluid").exists()

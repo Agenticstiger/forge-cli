@@ -251,16 +251,17 @@ class GovernanceValidator:
         """Get all table-level tags"""
         try:
             self.cursor.execute(
-                f"""
+                """
                 SELECT TAG_NAME, TAG_VALUE
                 FROM TABLE(
                     INFORMATION_SCHEMA.TAG_REFERENCES_ALL_COLUMNS(
-                        '{self.full_table}', 'TABLE'
+                        %s, 'TABLE'
                     )
                 )
                 WHERE LEVEL = 'TABLE'
                 ORDER BY TAG_NAME
-            """
+            """,
+                (self.full_table,),
             )
             return [{"name": row[0], "value": row[1]} for row in self.cursor.fetchall()]
         except Exception as e:
@@ -271,17 +272,18 @@ class GovernanceValidator:
         """Get column tag counts - returns {column_name: tag_count}"""
         try:
             self.cursor.execute(
-                f"""
+                """
                 SELECT COLUMN_NAME, COUNT(*) as tag_count
                 FROM TABLE(
                     INFORMATION_SCHEMA.TAG_REFERENCES_ALL_COLUMNS(
-                        '{self.full_table}', 'TABLE'
+                        %s, 'TABLE'
                     )
                 )
                 WHERE LEVEL = 'COLUMN'
                 GROUP BY COLUMN_NAME
                 ORDER BY COLUMN_NAME
-            """
+            """,
+                (self.full_table,),
             )
             return {row[0]: row[1] for row in self.cursor.fetchall()}
         except Exception as e:

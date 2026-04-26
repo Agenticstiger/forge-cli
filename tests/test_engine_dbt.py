@@ -145,6 +145,21 @@ class TestProjectYml:
         assert data["config-version"] == 2
         assert data["models"]["test_product_v1"]["staging"]["+materialized"] == "view"
         assert data["models"]["test_product_v1"]["marts"]["+materialized"] == "table"
+        assert "intermediate" not in data["models"]["test_product_v1"]
+
+    def test_dv2_projects_include_intermediate_layer(self, minimal_contract):
+        minimal_contract["labels"] = {"dataModelingTechnique": "data_vault_2"}
+        build = minimal_contract["builds"][0]
+        content = generate_project_yml(minimal_contract, build)
+        data = yaml.safe_load(content)
+        assert data["models"]["test_product_v1"]["intermediate"]["+materialized"] == "view"
+
+    def test_explicit_intermediate_materialization_is_preserved(self, minimal_contract):
+        build = minimal_contract["builds"][0]
+        build["properties"]["materializations"]["intermediate"] = "table"
+        content = generate_project_yml(minimal_contract, build)
+        data = yaml.safe_load(content)
+        assert data["models"]["test_product_v1"]["intermediate"]["+materialized"] == "table"
 
     def test_with_vars(self, minimal_contract):
         build = minimal_contract["builds"][0]
@@ -477,6 +492,13 @@ class TestProfiles:
         data = yaml.safe_load(content)
         profile = list(data.values())[0]
         assert profile["outputs"]["dev"]["type"] == "duckdb"
+
+    def test_local_platform_uses_project_local_duckdb_path(self, minimal_contract, tmp_path):
+        build = minimal_contract["builds"][0]
+        content = generate_profiles(minimal_contract, build, output_dir=tmp_path)
+        data = yaml.safe_load(content)
+        profile = list(data.values())[0]
+        assert profile["outputs"]["dev"]["path"] == str((tmp_path / "dev.duckdb").resolve())
 
     def test_gcp_platform(self, minimal_contract):
         build = minimal_contract["builds"][0]

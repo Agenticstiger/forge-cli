@@ -1,0 +1,72 @@
+# ISO 20022-aligned One Big Table (OBT) skeleton for financial services.
+#
+# OBT is a degenerate dimensional form: a single wide fact with all
+# relevant descriptive attributes inlined as columns (no dimension
+# tables, no joins). It's the right choice for:
+#   * BigQuery / Snowflake analytics where wide scans are cheap
+#   * Rapid self-service dashboards on raw transactional data
+#   * Regulatory reporting where the report row IS the unit of audit
+#
+# Technique handler: the IndustryPackCompiler maps one_big_table →
+# DimensionalModel with a single fact row and all attributes folded
+# in as measures/degenerate_dims — it is Kimball without conformed
+# dims, not a separate IR.
+industry: finance
+technique: one_big_table
+description: "ISO 20022 one-big-table — fully-denormalized payment / settlement event wide-fact"
+
+grain_statement: "One row per ISO 20022 message (payment initiation, clearing, settlement) with all party/instrument/event attributes inlined"
+
+facts:
+  - name: fact_payment_event_obt
+    grain_statement: "One row per ISO 20022 payment-ecosystem message with all party/instrument/event/status attributes inlined"
+    measures:
+      - {name: amount, data_type: decimal(18,4)}
+      - {name: fee_amount, data_type: decimal(18,4)}
+      - {name: fx_rate, data_type: decimal(18,8)}
+      - {name: settlement_amount, data_type: decimal(18,4)}
+      - {name: days_to_settle, data_type: int}
+    foreign_keys: []
+    degenerate_dimensions:
+      # ISO 20022 message identifiers
+      - message_id
+      - end_to_end_id
+      - instruction_id
+      - message_type_code           # pain.001 / pacs.008 / pacs.009 / camt.054
+      # Payer / payee party attributes (inlined — no dim_counterparty)
+      - payer_party_id
+      - payer_party_name
+      - payer_country_code
+      - payer_lei                   # Legal Entity Identifier
+      - payee_party_id
+      - payee_party_name
+      - payee_country_code
+      - payee_lei
+      # Account attributes (inlined — no dim_account)
+      - payer_account_id
+      - payer_account_iban
+      - payer_account_bic
+      - payee_account_id
+      - payee_account_iban
+      - payee_account_bic
+      # Instrument + currency (inlined — no dim_instrument / dim_currency)
+      - instrument_type_code
+      - settlement_currency_code
+      - original_currency_code
+      # Event + timestamps
+      - event_status_code           # ACCP / ACSC / RJCT etc.
+      - booking_datetime
+      - value_datetime
+      - settlement_datetime
+      # Date roles (conformed in Kimball — flat in OBT)
+      - booking_date
+      - value_date
+      - settlement_date
+
+dimensions: []
+conformed_dimensions: []
+degenerate_dims:
+  - message_id
+  - end_to_end_id
+  - instruction_id
+slowly_changing: {}

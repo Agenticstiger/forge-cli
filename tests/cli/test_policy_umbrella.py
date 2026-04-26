@@ -59,14 +59,23 @@ class TestPolicyUmbrellaRegistration:
         """``fluid policy`` must appear in the top-level subparser map.
         Regression on the bootstrap line that adds it; without this
         the umbrella is invisible and the code review's G4 fix is
-        silently undone."""
+        silently undone.
+
+        Previously this test relied on argparse raising ``SystemExit``
+        because ``policy_cmd`` was ``required=True``.  The
+        no-subcommand UX revamp flipped that to ``required=False`` so
+        bare ``fluid policy`` renders a friendly guide instead of a
+        bare argparse error — so we now assert the parser parses
+        ``policy`` cleanly and stamps ``args.command == "policy"``,
+        which is sufficient proof that the umbrella is registered.
+        """
         parser = _build_root_parser()
-        # Parse just the command name to confirm argparse accepts it.
-        # ``policy`` with no subcommand triggers the required=True
-        # error (SystemExit 2); we catch that — proof that the parser
-        # recognises ``policy`` as a valid top-level verb.
-        with pytest.raises(SystemExit):
-            parser.parse_args(["policy"])
+        args = parser.parse_args(["policy"])
+        assert args.command == "policy"
+        # No subcommand selected → ``args.policy_cmd`` is ``None``;
+        # the dispatcher's ``_dispatch`` handler will render the
+        # friendly guide when called with this namespace.
+        assert getattr(args, "policy_cmd", "missing") is None
 
     @pytest.mark.parametrize("sub", ["check", "compile", "apply"])
     def test_each_subcommand_is_parseable(self, sub):

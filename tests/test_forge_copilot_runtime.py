@@ -36,10 +36,14 @@ from fluid_build.cli.forge_copilot_llm_providers import (
     OpenAIProvider,
     _parse_param_size,
     _resolve_api_key,
+    build_llm_run_plan,
     call_llm,
     check_llm_readiness,
     clear_api_key_from_keyring,
     detect_provider_from_api_key,
+    get_catalog_default,
+    has_llm_api_key,
+    live_provider_models,
     resolve_llm_config,
     resolve_model_name,
     resolve_ollama_model,
@@ -229,6 +233,195 @@ class TestResolveLlmConfig:
         assert config.provider == "ollama"
         assert config.api_key is None
         assert config.endpoint == "http://localhost:11434/v1/chat/completions"
+
+    def test_llm_timeout_seconds_can_be_configured_from_env(self):
+        args = SimpleNamespace(llm_provider="ollama", llm_model=None, llm_endpoint=None)
+
+        config = resolve_llm_config(
+            args,
+            environ={
+                "OLLAMA_HOST": "http://localhost:11434",
+                "FLUID_LLM_TIMEOUT_SECONDS": "600",
+            },
+        )
+
+        assert config.timeout_seconds == 600
+
+    def test_required_llm_preflight_replaces_stale_anthropic_catalog_default(self):
+        args = SimpleNamespace(
+            llm_provider="anthropic",
+            llm_model=None,
+            llm_endpoint=None,
+            require_llm=True,
+        )
+        response = MagicMock()
+        response.json.return_value = {
+            "data": [
+                {"id": "claude-sonnet-4-6"},
+                {"id": "claude-haiku-4-5-20251001"},
+            ]
+        }
+        response.raise_for_status = MagicMock()
+
+        with (
+            patch(
+                "fluid_build.cli.forge_copilot_llm_providers.get_catalog_default",
+                return_value="claude-sonnet-4-5-20250514",
+            ),
+            patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response),
+        ):
+            config = resolve_llm_config(
+                args,
+                environ={"ANTHROPIC_API_KEY": "sk-ant-test"},
+            )
+
+        assert config.model == "claude-sonnet-4-6"
+        assert config.model_source == "live_preflight"
+        assert config.model_resolution_notes
+
+    def test_required_llm_preflight_rejects_unavailable_explicit_model(self):
+        args = SimpleNamespace(
+            llm_provider="anthropic",
+            llm_model="claude-missing",
+            llm_endpoint=None,
+            require_llm=True,
+        )
+        response = MagicMock()
+        response.json.return_value = {"data": [{"id": "claude-sonnet-4-6"}]}
+        response.raise_for_status = MagicMock()
+
+        with patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response):
+            with pytest.raises(CopilotGenerationError, match="copilot_llm_model_unavailable"):
+                resolve_llm_config(args, environ={"ANTHROPIC_API_KEY": "sk-ant-test"})
+
+    def test_required_llm_preflight_rejects_unavailable_openai_model(self):
+        args = SimpleNamespace(
+            llm_provider="openai",
+            llm_model="gpt-missing",
+            llm_endpoint=None,
+            require_llm=True,
+        )
+        response = MagicMock()
+        response.json.return_value = {"data": [{"id": "gpt-4o-mini"}]}
+        response.raise_for_status = MagicMock()
+
+        with patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response):
+            with pytest.raises(CopilotGenerationError, match="copilot_llm_model_unavailable"):
+                resolve_llm_config(args, environ={"OPENAI_API_KEY": "sk-test"})
+
+    def test_tiered_preflight_rejects_unavailable_resolved_tier_model(self):
+        args = SimpleNamespace(
+            llm_provider="openai",
+            llm_model=None,
+            llm_endpoint=None,
+            llm_routing_model=None,
+            llm_routing_endpoint=None,
+            require_llm=False,
+            tiered=True,
+        )
+        response = MagicMock()
+        response.json.return_value = {
+            "data": [
+                {"id": "gpt-4.1"},
+                {"id": "gpt-4.1-mini"},
+                {"id": "gpt-4.1-nano"},
+            ]
+        }
+        response.raise_for_status = MagicMock()
+        tier_models = {
+            "deep": "gpt-4.1",
+            "balanced": "gpt-missing-balanced",
+            "fast": "gpt-4.1-nano",
+        }
+
+        with (
+            patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response),
+            patch(
+                "fluid_build.cli.forge_copilot_llm_providers.get_catalog_tier_models",
+                return_value=tier_models,
+            ),
+        ):
+            with pytest.raises(CopilotGenerationError) as exc:
+                resolve_llm_config(args, environ={"OPENAI_API_KEY": "sk-test"})
+
+        assert exc.value.event == "copilot_llm_model_unavailable"
+        assert exc.value.context["role"] == "tier:balanced"
+
+    def test_ai_run_plan_is_honest_about_deterministic_stages(self):
+        cfg = LlmConfig(
+            provider="openai",
+            model="gpt-4.1-mini",
+            endpoint="https://api.openai.com/v1/chat/completions",
+            api_key="test",
+            routing_model="gpt-4.1-nano",
+            tier_models={
+                "deep": "gpt-4.1",
+                "balanced": "gpt-4.1-mini",
+                "fast": "gpt-4.1-nano",
+            },
+        )
+
+        plan = build_llm_run_plan(cfg, tiered=True)
+
+        stages = {stage["stage"]: stage for stage in plan["stages"]}
+        assert stages["logical_modeler"]["model"] == "gpt-4.1"
+        assert stages["transformation"]["mode"] == "deterministic_from_sidecar"
+        assert stages["transformation"]["model"] is None
+        assert stages["contract_forge"]["mode"] == "deterministic"
+
+    def test_gemini_live_model_list_strips_prefix_and_filters_generation_models(self):
+        response = MagicMock()
+        response.json.return_value = {
+            "models": [
+                {
+                    "name": "models/gemini-2.5-flash",
+                    "supportedGenerationMethods": ["generateContent"],
+                },
+                {
+                    "name": "models/gemini-embedding-exp",
+                    "supportedGenerationMethods": ["embedContent"],
+                },
+            ]
+        }
+        response.raise_for_status = MagicMock()
+
+        with patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response):
+            assert live_provider_models("gemini", environ={"GEMINI_API_KEY": "gemini-test"}) == [
+                "gemini-2.5-flash"
+            ]
+
+    def test_required_llm_preflight_accepts_local_ollama_latest_alias(self):
+        args = SimpleNamespace(
+            llm_provider="ollama",
+            llm_model="gemma4",
+            llm_endpoint=None,
+            require_llm=True,
+        )
+        response = MagicMock()
+        response.json.return_value = {"models": [{"name": "gemma4:latest"}]}
+        response.raise_for_status = MagicMock()
+
+        with patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response):
+            config = resolve_llm_config(args, environ={"OLLAMA_HOST": "http://localhost:11434"})
+
+        assert config.provider == "ollama"
+        assert config.model == "gemma4:latest"
+        assert config.endpoint == "http://localhost:11434/v1/chat/completions"
+
+    def test_required_llm_preflight_rejects_unavailable_ollama_model(self):
+        args = SimpleNamespace(
+            llm_provider="ollama",
+            llm_model="missing-local-model",
+            llm_endpoint=None,
+            require_llm=True,
+        )
+        response = MagicMock()
+        response.json.return_value = {"models": [{"name": "gemma4:latest"}]}
+        response.raise_for_status = MagicMock()
+
+        with patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response):
+            with pytest.raises(CopilotGenerationError, match="copilot_llm_model_unavailable"):
+                resolve_llm_config(args, environ={"OLLAMA_HOST": "http://localhost:11434"})
 
 
 class TestCheckLlmReadiness:
@@ -999,6 +1192,24 @@ class TestDetectProviderFromApiKey:
         assert detect_provider_from_api_key("  sk-ant-api03-abc  ") == "anthropic"
 
 
+class TestHasLlmApiKey:
+    def test_provider_specific_env_keys(self):
+        assert has_llm_api_key("openai", {"OPENAI_API_KEY": "sk-test"}) is True
+        assert has_llm_api_key("anthropic", {"ANTHROPIC_API_KEY": "sk-ant-test"}) is True
+        assert has_llm_api_key("gemini", {"GEMINI_API_KEY": "AIza-test"}) is True
+        assert has_llm_api_key("gemini", {"GOOGLE_API_KEY": "AIza-test"}) is True
+
+    def test_generic_fluid_key_counts_for_hosted_provider(self):
+        assert has_llm_api_key("openai", {"FLUID_LLM_API_KEY": "sk-test"}) is True
+
+    def test_missing_hosted_key_is_false(self, monkeypatch):
+        monkeypatch.setattr(
+            "fluid_build.cli.forge_copilot_llm_providers._get_api_key_from_keyring",
+            lambda provider: None,
+        )
+        assert has_llm_api_key("anthropic", {}) is False
+
+
 class TestKeyringResolution:
     """Tests for keyring-backed API key resolution."""
 
@@ -1114,17 +1325,23 @@ class TestOllamaModelResolution:
             side_effect=Exception("connection refused"),
         ):
             result = resolve_ollama_model({})
-        assert result == "llama3.1"
+        assert result == "gemma4:latest"
 
     def test_resolve_falls_back_when_no_models(self):
         with patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get") as mock_get:
             mock_get.return_value = MagicMock(status_code=200, json=lambda: {"models": []})
             mock_get.return_value.raise_for_status = MagicMock()
             result = resolve_ollama_model({})
-        assert result == "llama3.1"
+        assert result == "gemma4:latest"
 
 
 class TestModelCatalog:
+    def test_anthropic_default_is_current_sonnet_model(self):
+        assert get_catalog_default("anthropic") == "claude-sonnet-4-6"
+
+    def test_openai_default_is_runnable_balanced_model(self):
+        assert get_catalog_default("openai") == "gpt-4.1-mini"
+
     def test_resolve_exact_id(self):
         assert resolve_model_name("openai", "gpt-4o") == "gpt-4o"
 
@@ -1132,7 +1349,7 @@ class TestModelCatalog:
         assert resolve_model_name("openai", "gpt4o") == "gpt-4o"
 
     def test_resolve_anthropic_alias(self):
-        assert resolve_model_name("anthropic", "sonnet") == "claude-sonnet-4-5-20250514"
+        assert resolve_model_name("anthropic", "sonnet") == "claude-sonnet-4-6"
 
     def test_resolve_anthropic_haiku(self):
         assert resolve_model_name("anthropic", "haiku") == "claude-haiku-4-5-20251001"
@@ -1144,7 +1361,7 @@ class TestModelCatalog:
         assert resolve_model_name("openai", "my-custom-finetune") == "my-custom-finetune"
 
     def test_case_insensitive(self):
-        assert resolve_model_name("anthropic", "Opus") == "claude-opus-4-0-20250514"
+        assert resolve_model_name("anthropic", "Opus") == "claude-opus-4-7"
 
     def test_empty_input(self):
         assert resolve_model_name("openai", "") == ""

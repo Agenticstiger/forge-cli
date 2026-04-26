@@ -29,6 +29,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from fluid_build.cli._common import redact_secrets, resolve_provider_from_contract
@@ -87,6 +88,7 @@ from fluid_build.cli.forge_copilot_llm_providers import (  # noqa: F401
     LlmProvider,
     OllamaProvider,
     OpenAIProvider,
+    build_llm_run_plan,
     call_llm,
     call_llm_streaming,
     get_llm_provider,
@@ -162,6 +164,8 @@ class CopilotGenerationResult:
     scaffold_decision: Optional[ScaffoldDecisionReport] = None
     project_memory: Optional[CopilotMemorySnapshot] = None
     provenance: Optional[Dict[str, Any]] = None
+    logical_model: Optional[Dict[str, Any]] = None
+    ai_run_plan: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +221,7 @@ def _system_prompt_cache_key(capability_matrix: Mapping[str, Any]) -> Optional[s
     except Exception:  # noqa: BLE001 — defensive
         return None
     engines_hash = hash(tuple(sorted(KNOWN_BUILD_ENGINES)))
-    return f"{hashlib.sha1(blob.encode('utf-8')).hexdigest()}:{engines_hash}"
+    return f"{hashlib.sha1(blob.encode('utf-8'), usedforsecurity=False).hexdigest()}:{engines_hash}"
 
 
 def build_system_prompt(capability_matrix: Mapping[str, Any]) -> str:
@@ -627,8 +631,27 @@ def generate_copilot_artifacts(
     max_attempts: int = 3,
 ) -> CopilotGenerationResult:
     """Generate and validate copilot artifacts with a repair loop."""
+    if not bool(os.environ.get("FLUID_FORGE_LEGACY_COPILOT")) and _should_use_staged_copilot(
+        context, discovery_report
+    ):
+        staged_result = _generate_staged_copilot_artifacts(
+            context,
+            llm_config=llm_config,
+            discovery_report=discovery_report,
+            project_memory=project_memory,
+            team_memory=team_memory,
+            capability_matrix=capability_matrix,
+            logger=logger,
+        )
+        if staged_result is not None:
+            return staged_result
+
     capabilities = dict(capability_matrix or build_capability_matrix())
     provider_adapter = get_llm_provider(llm_config.provider)
+    ai_run_plan = build_llm_run_plan(
+        llm_config,
+        tiered=bool(context.get("tiered") or os.environ.get("FLUID_TIERED")),
+    )
 
     # Apply team memory defaults to context gaps (team memory sits between
     # explicit user input and project/personal memory in precedence).
@@ -737,6 +760,7 @@ def generate_copilot_artifacts(
             provenance = {
                 "llm_provider": llm_config.provider,
                 "llm_model": llm_config.model,
+                "ai_run_plan": ai_run_plan,
                 "system_prompt_hash": hashlib.sha256(system_prompt.encode()).hexdigest()[:16],
                 "user_prompt_hash": hashlib.sha256(user_prompt.encode()).hexdigest()[:16],
                 "discovery_hash": hashlib.sha256(
@@ -756,6 +780,7 @@ def generate_copilot_artifacts(
                 scaffold_decision=scaffold_decision,
                 project_memory=project_memory,
                 provenance=provenance,
+                ai_run_plan=ai_run_plan,
             )
 
         previous_errors = build_structured_repair_feedback(validation_errors)
@@ -782,6 +807,386 @@ def generate_copilot_artifacts(
         ],
         context={"failure_class": failure_class, "attempt_summaries": attempt_summaries[:3]},
     )
+
+
+def _generate_staged_copilot_artifacts(
+    context: Mapping[str, Any],
+    *,
+    llm_config: LlmConfig,
+    discovery_report: DiscoveryReport,
+    project_memory: Optional[CopilotMemorySnapshot] = None,
+    team_memory: Optional[Dict[str, Any]] = None,
+    capability_matrix: Optional[Mapping[str, Any]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Optional[CopilotGenerationResult]:
+    """Use the staged coordinator when we have enough context to do so safely."""
+    try:
+        from fluid_build.copilot.agents.base import StageSession
+        from fluid_build.copilot.agents.coordinator import StageCoordinator
+        from fluid_build.copilot.schemas.intent import (
+            BusinessContext,
+            BusinessIntent,
+            Consumption,
+            DataProduct,
+            DataSource,
+            Dimensions,
+            Grain,
+            Metric,
+            ModelingPreferences,
+        )
+        from fluid_build.copilot.store.factory import resolve_store
+        from fluid_build.forge_datamodel.from_ddl.parser import TableDefinition
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger.debug("staged_copilot_unavailable: %s", exc)
+        return None
+
+    capabilities = dict(capability_matrix or build_capability_matrix())
+    scaffold_decision = _build_scaffold_decision(
+        context,
+        discovery_report,
+        capabilities,
+        project_memory=project_memory,
+    )
+
+    technique = _normalize_stage_technique(context.get("data_modeling_technique"))
+    if technique is None:
+        technique = "data_vault_2"
+
+    session = StageSession(
+        store=resolve_store(workspace_root=Path.cwd()),
+        workspace_root=Path.cwd(),
+        llm_config=llm_config,
+        tiered=bool(context.get("tiered") or os.environ.get("FLUID_TIERED")),
+        require_llm=bool(context.get("require_llm")),
+        capability_matrix=capabilities,
+        project_memory=project_memory.to_prompt_payload() if project_memory else None,
+        team_memory=team_memory,
+        discovery_report=discovery_report,
+    )
+    coordinator = StageCoordinator()
+    staged_engine = _resolve_staged_engine(
+        context,
+        capabilities,
+        project_memory=project_memory,
+        team_memory=team_memory,
+    )
+
+    source = _select_staged_source(context, discovery_report)
+    coordinator_result = None
+    if source["kind"] == "ddl":
+        ddl_tables: List[TableDefinition] = source["tables"]
+        if ddl_tables:
+            coordinator_result = coordinator.from_tables(
+                session,
+                name=_stage_product_name(context),
+                tables=ddl_tables,
+                technique=technique,
+                source_type=source.get("source_type"),
+                engine=staged_engine,
+                include_physical=True,
+            )
+    elif source["kind"] == "intent_file":
+        from fluid_build.forge_datamodel.from_intent.intent_loader import load_business_intent
+
+        intent = load_business_intent(source["path"])
+        coordinator_result = coordinator.from_intent(
+            session,
+            intent=intent,
+            technique=technique,
+            engine=staged_engine,
+            include_physical=True,
+        )
+    if coordinator_result is None:
+        intent = _build_business_intent_from_context(context, discovery_report, technique=technique)
+        coordinator_result = coordinator.from_intent(
+            session,
+            intent=intent,
+            technique=technique,
+            engine=staged_engine,
+            include_physical=True,
+        )
+
+    physical = coordinator_result.physical
+    if physical is None:
+        return None
+
+    readme_markdown = physical.readme.readme_markdown if physical.readme else ""
+    additional_files = dict(physical.additional_files or {})
+    additional_files.update(_transform_plan_to_files(physical.transform_plan, technique=technique))
+    suggestions = {
+        "recommended_template": scaffold_decision.template,
+        "recommended_provider": scaffold_decision.provider,
+        "recommended_patterns": [technique, staged_engine],
+        "architecture_suggestions": [
+            f"Use the staged {technique.replace('_', ' ')} modeling flow as the contract boundary.",
+            "Review the logical sidecar before regenerating physical transformations.",
+        ],
+        "best_practices": [
+            "Keep the .model.json sidecar under version control for review and drift detection.",
+            "Regenerate transformations from the sidecar instead of editing generated SQL by hand.",
+        ],
+        "technology_stack": [staged_engine, scaffold_decision.provider],
+        "description": physical.contract.get("description") or physical.logical.description,
+        "domain": physical.contract.get("domain") or context.get("domain") or "analytics",
+        "owner": ((physical.contract.get("metadata") or {}).get("owner") or {}).get(
+            "team", "data-team"
+        ),
+    }
+    provenance = {
+        "mode": "staged",
+        "llm_provider": llm_config.provider,
+        "llm_model": llm_config.model,
+        "ai_run_plan": build_llm_run_plan(llm_config, tiered=session.tiered),
+        "agent_events": list(session.agent_events),
+        "fallback_used": bool(session.fallback_used),
+        "fallback_events": list(session.fallback_events),
+        "repair_used": bool(session.repair_used),
+        "repair_events": list(session.repair_events),
+        "data_model_source": source["kind"],
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    return CopilotGenerationResult(
+        suggestions=suggestions,
+        contract=physical.contract,
+        readme_markdown=readme_markdown,
+        additional_files=additional_files,
+        discovery_report=discovery_report,
+        attempt_reports=[
+            GenerationAttemptReport(
+                attempt=1,
+                raw_provider=llm_config.provider,
+                raw_model=llm_config.model,
+                validation_warnings=["staged_coordinator"],
+            )
+        ],
+        scaffold_decision=scaffold_decision,
+        project_memory=project_memory,
+        provenance=provenance,
+        logical_model=coordinator_result.logical.model_dump(mode="json", by_alias=True),
+        ai_run_plan=provenance["ai_run_plan"],
+    )
+
+
+def _should_use_staged_copilot(
+    context: Mapping[str, Any],
+    discovery_report: DiscoveryReport,
+) -> bool:
+    if os.environ.get("FLUID_FORGE_STAGED_COPILOT") == "1":
+        return True
+    for key in (
+        "data_model_source",
+        "data_model_paths",
+        "data_model_description",
+        "review_data_model",
+    ):
+        if context.get(key):
+            return True
+    return bool(discovery_report.user_data_models)
+
+
+def _resolve_staged_engine(
+    context: Mapping[str, Any],
+    capability_matrix: Mapping[str, Any],
+    *,
+    project_memory: Optional[CopilotMemorySnapshot] = None,
+    team_memory: Optional[Dict[str, Any]] = None,
+) -> str:
+    explicit = str(context.get("build_engine") or "").strip()
+    if explicit:
+        return explicit
+
+    remembered = list(getattr(project_memory, "build_engines", []) or [])
+    if remembered:
+        return str(remembered[0])
+
+    team_defaults = ((team_memory or {}).get("conventions") or {}).get("defaults") or {}
+    team_engine = str(team_defaults.get("build_engine") or "").strip()
+    if team_engine:
+        return team_engine
+
+    engines = [str(engine).strip() for engine in (capability_matrix.get("build_engines") or [])]
+    engines = [engine for engine in engines if engine]
+    if "sql" in engines:
+        return "sql"
+    if engines:
+        return engines[0]
+    return "sql"
+
+
+def _stage_product_name(context: Mapping[str, Any]) -> str:
+    goal = str(context.get("project_goal") or context.get("name") or "forged_data_model")
+    value = "".join(ch.lower() if ch.isalnum() else "_" for ch in goal).strip("_")
+    return value or "forged_data_model"
+
+
+def _normalize_stage_technique(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower().replace("-", "_")
+    if text in {"data_vault_2", "dimensional"}:
+        return text
+    return None
+
+
+def _select_staged_source(
+    context: Mapping[str, Any],
+    discovery_report: DiscoveryReport,
+) -> Dict[str, Any]:
+    from fluid_build.forge_datamodel.from_ddl.parser import parse_ddl_text
+
+    raw_source = str(context.get("data_model_source") or "").strip().lower()
+    explicit_paths = context.get("data_model_paths") or context.get("data_model_path") or []
+    if isinstance(explicit_paths, str):
+        explicit_paths = [segment for segment in explicit_paths.split() if segment]
+    explicit_paths = [str(path) for path in explicit_paths]
+
+    if raw_source == "intent" and explicit_paths:
+        candidate = Path(explicit_paths[0]).expanduser()
+        if candidate.exists():
+            return {"kind": "intent_file", "path": str(candidate)}
+
+    ddl_candidates: List[Path] = []
+    if raw_source == "ddl":
+        ddl_candidates.extend(Path(path).expanduser() for path in explicit_paths)
+    if not ddl_candidates:
+        for model in getattr(discovery_report, "user_data_models", []) or []:
+            path = Path(str(model.get("path") or ""))
+            if path.suffix.lower() == ".sql" and path.exists():
+                ddl_candidates.append(path)
+        for sql_file in discovery_report.sql_files:
+            path = Path(str(sql_file.get("path") or ""))
+            if path.exists():
+                ddl_candidates.append(path)
+
+    tables = []
+    for path in ddl_candidates:
+        try:
+            ddl_text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        parsed = parse_ddl_text(ddl_text, dialect=context.get("source_type"))
+        tables.extend(parsed.tables)
+
+    if tables:
+        return {"kind": "ddl", "tables": tables, "source_type": context.get("source_type")}
+    return {"kind": raw_source or "intent"}
+
+
+def _build_business_intent_from_context(
+    context: Mapping[str, Any],
+    discovery_report: DiscoveryReport,
+    *,
+    technique: str,
+):
+    from fluid_build.copilot.schemas.intent import (
+        BusinessContext,
+        BusinessIntent,
+        Consumption,
+        DataProduct,
+        DataSource,
+        Dimensions,
+        Grain,
+        Metric,
+        ModelingPreferences,
+    )
+
+    goal = str(context.get("project_goal") or "Data Product").strip()
+    domain = str(context.get("domain") or "analytics").strip()
+    problem_statement = str(
+        context.get("problem_statement")
+        or context.get("data_model_description")
+        or context.get("data_sources")
+        or goal
+    )
+    data_sources_text = str(context.get("data_sources") or "")
+    metrics = _split_csvish(context.get("metrics") or context.get("measures"))
+    dimensions = _split_csvish(context.get("dimensions"))
+    use_cases = _split_csvish(context.get("use_case")) or _split_csvish(context.get("use_cases"))
+    sample_sources = [
+        DataSource(
+            source_name=Path(str(sample.get("path") or "")).stem,
+            source_type=str(sample.get("format") or "file"),
+            description=str(sample.get("path") or ""),
+        )
+        for sample in (discovery_report.sample_files or [])[:6]
+    ]
+    grain_entity = str(context.get("grain_entity") or "").strip() or (
+        dimensions[0] if dimensions else _stage_product_name(context)
+    )
+    intent = BusinessIntent(
+        data_product=DataProduct(
+            name=_stage_product_name(context),
+            domain=domain,
+            description=str(context.get("description") or goal),
+            owner=str(context.get("owner_team") or "data-team"),
+        ),
+        business_context=BusinessContext(
+            problem_statement=problem_statement,
+            decision_supported=str(context.get("decision_supported") or ""),
+            consumer=str(context.get("consumer") or ""),
+        ),
+        metrics=[
+            Metric(name=name, description=f"Metric requested for {name}.") for name in metrics
+        ],
+        grain=Grain(
+            entity=grain_entity,
+            description=str(context.get("grain_description") or f"Primary grain for {goal}."),
+            time_dimension=str(context.get("time_dimension") or ""),
+        ),
+        dimensions=Dimensions(
+            entities=dimensions,
+            attributes=_split_csvish(context.get("dimension_attributes")),
+        ),
+        data_sources=sample_sources
+        or [
+            DataSource(
+                source_name=(data_sources_text or "source").split(",")[0].strip() or "source",
+                source_type="context",
+                description=data_sources_text or "Context-supplied data source description.",
+            )
+        ],
+        consumption=Consumption(
+            use_cases=use_cases,
+            output_format=_split_csvish(context.get("output_format")) or ["table"],
+            refresh_frequency=str(context.get("refresh_frequency") or ""),
+        ),
+        business_rules=_split_multiline(context.get("business_rules")),
+        modeling=ModelingPreferences(
+            technique=technique,
+            hash_key_algorithm="md5" if technique == "data_vault_2" else None,
+            scd_policy_default="type2" if technique == "dimensional" else None,
+        ),
+    )
+    return intent
+
+
+def _split_csvish(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items = [str(item).strip() for item in value]
+    else:
+        text = str(value).replace("\n", ",")
+        items = [segment.strip() for segment in text.split(",")]
+    return [item for item in items if item]
+
+
+def _split_multiline(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [line.strip() for line in str(value).splitlines() if line.strip()]
+
+
+def _transform_plan_to_files(transform_plan: Any, *, technique: str) -> Dict[str, str]:
+    files: Dict[str, str] = {}
+    for build in getattr(transform_plan, "builds", []) or []:
+        layer = build.layer or ("marts" if technique == "dimensional" else "raw_vault")
+        path = f"dbt_project/models/{layer}/{build.name}.sql"
+        files[path] = build.sql or "-- generated by staged builder\nselect 1 as placeholder"
+    return files
 
 
 def suggest_scaffold(

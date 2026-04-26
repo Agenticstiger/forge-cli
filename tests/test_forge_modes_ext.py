@@ -995,7 +995,7 @@ class TestCreateSessionLlmConfig:
         assert config is not None
         assert config.provider == "anthropic"
         assert config.api_key == "sk-ant-api03-test123"
-        assert config.model == "claude-sonnet-4-5-20250514"
+        assert config.model == "claude-sonnet-4-6"
 
     def test_openai_key_auto_detected(self):
         from fluid_build.cli.forge_copilot_llm_providers import get_catalog_default

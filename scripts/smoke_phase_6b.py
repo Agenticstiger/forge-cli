@@ -25,7 +25,7 @@ SAFETY:
     the ``env != dev`` branch without loading a prod overlay.
 
 USAGE:
-  cd ~/path/to/snowflake-biz-lab
+  cd ~/path/to/your/lab-workspace
   ./scripts/smoke_phase_6b.py
   CONTRACT=orders.fluid.yaml ./scripts/smoke_phase_6b.py
   FLUID_BIN=/abs/path/fluid ./scripts/smoke_phase_6b.py
@@ -89,7 +89,7 @@ def main() -> int:
         print(f"pre-flight FAIL: CONTRACT not found: {CONTRACT}")
         return 2
 
-    print(f"Phase-6B smoke")
+    print("Phase-6B smoke")
     print(f"  FLUID_BIN   = {FLUID_BIN}")
     print(f"  CONTRACT    = {CONTRACT}")
     print(f"  ENV_DEV     = {ENV_DEV}")

@@ -29,6 +29,7 @@ import sys
 from typing import Any, Dict
 
 from fluid_build.cli.console import cprint
+from fluid_build.cli.forge_banner import compact_next_line
 
 from .. import __version__ as CLI_VERSION
 from ..schema_manager import FluidSchemaManager
@@ -224,6 +225,9 @@ API: {cli_info["api_version"]}
 • Latest: {spec_info['latest']}"""
 
         console.print(Panel(version_text, title="📦 Version Information", border_style="cyan"))
+        next_line = compact_next_line()
+        if next_line:
+            console.print(next_line)
 
         # Features table
         features = version_info["features"]
@@ -282,6 +286,9 @@ API: {cli_info["api_version"]}
         cprint("=" * 60)
         cprint(f"Version: {cli_info['version']}")
         cprint(f"API: {cli_info['api_version']}")
+        next_line = compact_next_line()
+        if next_line:
+            cprint(next_line)
         cprint(f"\nSupported Specifications: {', '.join(spec_info['supported'])}")
         cprint(f"Default: {spec_info['default']}")
         cprint(f"Latest: {spec_info['latest']}")

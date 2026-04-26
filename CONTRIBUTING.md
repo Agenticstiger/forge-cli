@@ -266,6 +266,204 @@ If you're building a new provider:
 4. Include at least one working example contract.
 5. See the [provider documentation](https://agenticstiger.github.io/forge_docs/providers/) for internals.
 
+## Adding a Catalog Adapter
+
+Catalog adapters are the **source-side** complement to providers:
+they pull metadata FROM an existing catalog (Snowflake Horizon,
+Databricks Unity, BigQuery, Glue, DataHub, etc.) and feed it into
+forge-cli's staged pipeline. Each adapter is roughly 200 LOC and
+follows nine reusable patterns documented in
+`fluid_build/copilot/catalog/_patterns.py`.
+
+A community contributor with a weekend can ship a new adapter.
+Here's the path.
+
+### 1. Decide what to wrap
+
+Pick a catalog with a Python SDK (e.g. Apache Atlas's `atlasclient`,
+Alation's REST API, OpenMetadata's `python-client`). The adapter is
+typically a thin wrapper around 4-6 SDK calls.
+
+### 2. Implement the ABC
+
+The interface is `fluid_build.copilot.catalog.base.CatalogAdapter`:
+
+```python
+from fluid_build.copilot.catalog.base import CatalogAdapter
+from fluid_build.copilot.catalog.models import (
+    CatalogTable, CatalogColumn, CatalogLineage, GlossaryTerm, CatalogScope,
+)
+from fluid_build.copilot.catalog.credentials import (
+    CredentialResolver, AtlasCredentials,    # add to credentials.py
+)
+
+
+class AtlasCatalogAdapter(CatalogAdapter):
+    name = "atlas"
+
+    def __init__(self, *, credentials: AtlasCredentials) -> None:
+        self.credentials = credentials
+        self._client = None  # lazy-initialised in _client()
+
+    @classmethod
+    def from_resolver(
+        cls,
+        resolver: CredentialResolver,
+        *,
+        credential_id: str | None = None,
+        inline_credentials: dict | None = None,
+    ) -> "AtlasCatalogAdapter":
+        creds = resolver.resolve(
+            "atlas",
+            credential_id=credential_id,
+            inline=inline_credentials,
+            credential_type=AtlasCredentials,
+        )
+        return cls(credentials=creds)
+
+    def _client(self):
+        # Lazy SDK import — keeps `fluid --help` fast and lets users
+        # `pip install data-product-forge` without atlasclient.
+        if self._client is None:
+            try:
+                import atlasclient  # type: ignore[import-not-found]
+            except ImportError as exc:
+                raise CatalogConfigError(
+                    "atlasclient missing. Install with: "
+                    'pip install "data-product-forge[atlas]"',
+                    suggestions=['pip install "data-product-forge[atlas]"'],
+                ) from exc
+            self._client = atlasclient.Atlas(...)
+        return self._client
+
+    def list_tables(self, scope: CatalogScope) -> list[CatalogTable]: ...
+    def get_table(self, fqn: str) -> CatalogTable: ...
+    def get_lineage(self, fqn: str) -> CatalogLineage: ...
+    def list_glossary_terms(self, scope: CatalogScope) -> list[GlossaryTerm]: ...
+
+    def audit_context(self) -> dict:
+        # Non-secret fields only — credentials NEVER appear here.
+        return {
+            "catalog_name": self.name,
+            "host": self.credentials.host,
+        }
+```
+
+### 3. Honour the nine patterns
+
+Read `fluid_build/copilot/catalog/_patterns.py`. Reuse the helpers:
+
+- `validate_and_quote_identifier(...)` — defends against SQL injection
+  in identifier strings.
+- `safe_metadata_call(...)` — soft-fails on optional reads
+  (lineage / glossary / tags) so a forge isn't blocked when the
+  user lacks one privilege.
+- `translate_permission_or_connection_error(...)` — maps
+  vendor-specific exceptions into typed `CatalogPermissionError` /
+  `CatalogConnectionError` with `suggestions: list[str]` carrying
+  the next-action.
+
+### 4. Add the credential class
+
+Edit `fluid_build/copilot/catalog/credentials.py`:
+
+```python
+class AtlasCredentials(BaseModel):
+    host: str                                 # non-sensitive
+    auth_method: Literal["pat", "basic"] = "pat"
+    token: SecretStr | None = None            # SecretStr for safety
+    username: str | None = None
+    password: SecretStr | None = None
+```
+
+The `CredentialResolver` chain (inline → keyring → sources.yaml →
+env vars) is built-in; just register the env-var names in the
+resolver's per-catalog table.
+
+### 5. Register the optional extra
+
+Edit `pyproject.toml`:
+
+```toml
+[project.optional-dependencies]
+atlas = ["atlasclient>=1.2"]
+catalogs = [..., "atlasclient>=1.2"]
+```
+
+### 6. Wire the dispatch
+
+Two register sites — both already have an `_SOURCE_ADAPTERS` dict:
+
+- `fluid_build/cli/forge_data_model.py::_build_catalog_adapter` —
+  dispatches `--source-type atlas` from the CLI.
+- `fluid_build/cli/mcp.py::_SOURCE_ADAPTERS` — dispatches the MCP
+  `forge_from_source` tool.
+
+Add one entry to each:
+
+```python
+"atlas": AtlasCatalogAdapter,
+```
+
+### 7. Write the test file
+
+`tests/copilot/catalog/test_catalog_adapter_atlas.py`. Stub the SDK
+via `sys.modules` so the adapter can be tested without
+`atlasclient` installed:
+
+```python
+@pytest.fixture
+def atlas_sdk_stub(monkeypatch):
+    fake = ModuleType("atlasclient")
+    fake.Atlas = MagicMock(name="atlasclient.Atlas")
+    monkeypatch.setitem(sys.modules, "atlasclient", fake)
+    yield fake.Atlas
+```
+
+The 5 existing adapter test files
+(`test_catalog_adapter_{bigquery,dataplex,glue,datahub,dmm}.py`)
+are templates — copy the closest one and edit. Every adapter
+ships with classes for: `TestFromResolver`, `TestLazyImport`,
+`TestAuditContext`, `TestListTables`, `TestErrorTranslation`,
+plus catalog-specific tests.
+
+### 8. Pin the public API
+
+Add the new class to `tests/test_public_api_stability.py`:
+
+```python
+("fluid_build.copilot.catalog.atlas", "AtlasCatalogAdapter"),
+("fluid_build.copilot.catalog", "AtlasCredentials"),
+```
+
+This stops a future refactor from silently renaming or removing
+your adapter.
+
+### 9. Document it
+
+Add a page to the `forge_docs` repo:
+`forge_docs/docs/cli/catalogs/atlas.md`. Use any of the existing
+catalog pages as a template — they share the same structure
+(install, privileges, auth methods, setup, end-to-end demo, what
+lands where, common errors).
+
+Then add a row to the catalog index table at
+`forge_docs/docs/cli/catalogs/README.md`.
+
+### 10. Submit a PR
+
+Branch name: `feat/atlas-catalog-adapter`.
+
+The PR template asks for:
+- 5+ tests passing in `tests/copilot/catalog/`
+- Public API entry added (test_public_api_stability.py)
+- Docs page in `forge_docs/`
+- A redacted INFORMATION_SCHEMA snippet showing what your adapter
+  reads (helps reviewers verify the read-only contract).
+
+CI runs the full forge-cli test suite plus the per-adapter tests
+you wrote. Coverage gate is ≥80% on `fluid_build/copilot/catalog/`.
+
 ## Development Setup
 
 ```bash
