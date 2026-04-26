@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from importlib import resources
-from typing import Iterable, Optional
+from typing import Optional
 
 from fluid_build.cli.console import cprint
 

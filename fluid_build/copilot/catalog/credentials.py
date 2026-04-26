@@ -689,6 +689,36 @@ class CredentialResolver:
                 # ``private_key_passphrase``, ``refresh_token``,
                 # ``api_key`` etc.  The reserved set below is the only
                 # exception (``source_type`` etc.).
+                #
+                # Trade-off (intentional, documented):
+                #
+                # The substring detection is name-based, not value-based.
+                # Field names that DON'T contain one of the
+                # ``_SECRET_TOKENS`` substrings — for example AWS's
+                # ``access_key_id`` (an account identifier, but not a
+                # secret in the IAM sense), Snowflake's ``account``
+                # (a host hint), or any unknown adapter field that
+                # happens to be sensitive in some deployment but is
+                # named neutrally — will land in the non-sensitive
+                # ``config`` bucket and bypass the plaintext gate.
+                # That's accepted because:
+                #
+                # 1. The Pydantic credential models annotate every
+                #    *secret* field as :class:`SecretStr`; sensitive
+                #    values that pass through the resolver still get
+                #    the ``repr()`` / serialisation guard from Pydantic.
+                # 2. The keyring path (the recommended one) doesn't
+                #    use this gate at all — secrets there live in
+                #    encrypted-at-rest OS storage.
+                # 3. ``FLUID_ALLOW_PLAINTEXT_SOURCE_SECRETS`` plus
+                #    chmod 600 is the operator's explicit opt-in to
+                #    "yes, my YAML can hold secrets"; the gate's job
+                #    is to refuse the obvious cases by default, not
+                #    to inspect arbitrary values for entropy.
+                #
+                # Adapter authors adding a new secret-bearing field
+                # whose name doesn't already match one of
+                # ``_SECRET_TOKENS`` should extend the tuple below.
                 _RESERVED = {"source_type", "credential_id", "type"}
                 _SECRET_TOKENS = (
                     "password",

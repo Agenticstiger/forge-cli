@@ -75,7 +75,10 @@ except PackageNotFoundError:
                 ) or "0.0.0+source"
                 if fallback != "0.0.0+unknown":
                     return str(fallback)
-            except Exception:
+            except Exception:  # noqa: BLE001 — pyproject.toml is optional in
+                # editable / wheel-stripped checkouts; any read or parse error
+                # here just means we fall back to the conservative
+                # ``0.0.0+source`` version sentinel below.  Nothing to log.
                 pass
         return "0.0.0+source"
 

@@ -48,7 +48,6 @@ docstring for the full template).
 
 from __future__ import annotations
 
-import logging
 import re
 from typing import Any, Dict, List, Optional
 
@@ -75,8 +74,6 @@ from fluid_build.copilot.catalog.models import (
     CatalogTable,
     GlossaryTerm,
 )
-
-_log = logging.getLogger(__name__)
 
 # BigQuery has DIFFERENT identifier rules per object kind:
 #
@@ -209,8 +206,10 @@ class BigQueryCatalogAdapter(CatalogAdapter):
             raise CatalogConnectionError(
                 message=f"BigQuery client construction failed: {exc}",
                 suggestions=[
-                    "Verify GOOGLE_APPLICATION_CREDENTIALS env var or run "
-                    "`gcloud auth application-default login`.",
+                    (
+                        "Verify GOOGLE_APPLICATION_CREDENTIALS env var or run "
+                        "`gcloud auth application-default login`."
+                    ),
                     "Confirm the service account has roles/bigquery.metadataViewer.",
                 ],
                 original_error=exc,

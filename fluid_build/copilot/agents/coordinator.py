@@ -1017,9 +1017,7 @@ class StageCoordinator:
             except Exception:  # pragma: no cover — defensive
                 pass
         except Exception as exc:  # pragma: no cover — defensive
-            import logging
-
-            logging.getLogger(__name__).debug(
+            _log.debug(
                 "pre-emit conformance skipped due to %s",
                 exc,
                 exc_info=True,

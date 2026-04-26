@@ -473,15 +473,23 @@ def build_clarification_user_prompt(
             "Prefer inferring canonical_model and supporting_standards from domain-specific wording before asking an extra question.",
             "Assume the user may answer with fuzzy wording and use transcript raw_input plus resolved values together.",
             "If there was a generation failure, only ask questions that directly reduce that ambiguity.",
-            "If existing_products are listed and the user's project_goal is semantically similar to an existing product, "
-            "flag it in your reason field and ask: 'This looks similar to <existing_id>. Are you extending it or creating something new?'",
-            "If the user explicitly wants scheduling or mentions DAGs, infer schedule_engine and trigger_type. "
-            "Available schedulers: airflow, dagster, prefect. Default trigger_type is 'cron' for batch workloads. "
-            "Do not ask an orchestration question after schedule_engine has already been answered.",
-            "If the domain is healthcare, finance, or the user mentions compliance, GDPR, HIPAA, CCPA, or data residency, "
-            "ask about jurisdiction and regulatory requirements. Canonical jurisdiction values: EU, US, UK, CA, AU, JP, Global.",
-            "If data involves PII, PHI, or financial records, infer data_sensitivity as confidential or restricted "
-            "and suggest agentPolicy constraints (canStore=false, deniedUseCases=[training, fine_tuning]).",
+            (
+                "If existing_products are listed and the user's project_goal is semantically similar to an existing product, "
+                "flag it in your reason field and ask: 'This looks similar to <existing_id>. Are you extending it or creating something new?'"
+            ),
+            (
+                "If the user explicitly wants scheduling or mentions DAGs, infer schedule_engine and trigger_type. "
+                "Available schedulers: airflow, dagster, prefect. Default trigger_type is 'cron' for batch workloads. "
+                "Do not ask an orchestration question after schedule_engine has already been answered."
+            ),
+            (
+                "If the domain is healthcare, finance, or the user mentions compliance, GDPR, HIPAA, CCPA, or data residency, "
+                "ask about jurisdiction and regulatory requirements. Canonical jurisdiction values: EU, US, UK, CA, AU, JP, Global."
+            ),
+            (
+                "If data involves PII, PHI, or financial records, infer data_sensitivity as confidential or restricted "
+                "and suggest agentPolicy constraints (canStore=false, deniedUseCases=[training, fine_tuning])."
+            ),
         ],
     }
     if team_memory:

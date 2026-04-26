@@ -271,8 +271,10 @@ class DataMeshManagerCatalogAdapter(CatalogAdapter):
             not_found_markers=("404", "Not Found", "does not exist"),
             connection_suggestions=[
                 "Verify DMM_API_URL is correct and reachable from this host.",
-                "Test the token: "
-                "curl -H 'Authorization: Bearer <token>' <server>/api/data-products",
+                (
+                    "Test the token: curl -H 'Authorization: Bearer <token>' "
+                    "<server>/api/data-products"
+                ),
             ],
         )
 

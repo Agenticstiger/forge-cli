@@ -1731,7 +1731,6 @@ def _create_project_agent_loop(
 
         target_dir.mkdir(parents=True, exist_ok=True)
         contract_path = target_dir / "contract.fluid.yaml"
-        sidecar_path = target_dir / "contract.fluid.yaml.model.json"
         write_contract(contract, contract_path, command="fluid forge --agent-loop")
 
         if console:

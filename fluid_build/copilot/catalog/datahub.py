@@ -135,7 +135,7 @@ class DataHubCatalogAdapter(CatalogAdapter):
                 message=f"DataHub graph client construction failed: {exc}",
                 suggestions=[
                     "Verify DATAHUB_GMS_HOST / DATAHUB_GMS_TOKEN env vars.",
-                    "Test connectivity: curl -H 'Authorization: Bearer <token>' " "<server>/config",
+                    "Test connectivity: curl -H 'Authorization: Bearer <token>' <server>/config",
                 ],
                 original_error=exc,
             ) from exc
