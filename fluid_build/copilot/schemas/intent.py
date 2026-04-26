@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Business intent schemas ported from Model AI's agent input models."""
+"""Business intent schemas for agent-guided data-product modeling."""
 
 from __future__ import annotations
 

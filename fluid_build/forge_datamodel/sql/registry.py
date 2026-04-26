@@ -14,13 +14,10 @@
 
 """Inline logical-types and per-dialect physical-type registry.
 
-The tables below mirror the shape of Model AI's
-``tmp__data/logical_data_types_master_v1.json`` +
-``tmp__data/mappings/<db>.json`` but ship as Python dicts so forge-cli
-stays file-less. Each dialect entry covers the logical types the modeler
-is most likely to emit (≈25 core types per dialect); unknown logical
-types fall through to :func:`DialectMapper.map_type`'s pass-through
-behaviour with a warning.
+The tables below ship as Python dicts so forge-cli stays file-less. Each
+dialect entry covers the logical types the modeler is most likely to emit
+(≈25 core types per dialect); unknown logical types fall through to
+:func:`DialectMapper.map_type`'s pass-through behaviour with a warning.
 
 Adding a new dialect is a four-line contribution to :data:`DIALECTS`.
 Adding a new logical type means adding a new ``LogicalTypeSpec`` here
@@ -40,8 +37,8 @@ from typing import Any, Dict, List, Optional, TypedDict
 class LogicalTypeSpec(TypedDict, total=False):
     """One row in the logical-types master — category, qualifiers, defaults.
 
-    Fields align with Model AI's JSON shape so an operator who memorized
-    that spec sees the same keys here.
+    Fields are intentionally JSON-compatible so operators and generated
+    artifacts see the same keys across CLI surfaces.
     """
 
     id: str

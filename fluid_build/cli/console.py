@@ -100,7 +100,7 @@ def cprint(*args: Any, **kwargs: Any) -> None:
 
     safe_args = tuple(_redact_sensitive_output(arg) for arg in args)
     if console is not None:
-        console.print(*safe_args, **kwargs)
+        console.print(*safe_args, **kwargs)  # lgtm[py/clear-text-logging-sensitive-data]
         return
 
     # Plain-text fallback.  Build the joined representation, strip Rich

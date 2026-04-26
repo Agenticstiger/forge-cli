@@ -39,7 +39,7 @@ def generate_cache_key(
     params: Optional[Mapping[str, Any]] = None,
     capability_matrix: Optional[Mapping[str, Any]] = None,
 ) -> str:
-    """Port of Model AI's stable cache key, extended for capabilities.
+    """Stable cache key extended with provider capability metadata.
 
     Hash shape::
 

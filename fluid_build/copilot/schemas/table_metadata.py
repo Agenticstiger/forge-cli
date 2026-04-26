@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Comprehensive ``TableMetadata`` — Pydantic port of Model AI's 6-category
-table-metadata schema.
+"""Comprehensive ``TableMetadata`` schema for staged data-product modeling.
 
 The schema groups every property the downstream dbt / DDL / governance
 tooling needs into six MUST/RECOMMENDED sections so the LLM (or a
@@ -33,12 +32,11 @@ in one pass:
 - **F. Lifecycle & Governance** (RECOMMENDED) — retention, PII, owner,
   steward, SLAs, DQ checks, lineage, tags.
 
-Matches the Model AI spec at [`tools/table_metadata.py:70-121`
-](../../../../../Model%20AI/model-ai-core-main/packages/modelling/src/modelling/tools/table_metadata.py)
-so operators who came from that tooling see identical field names.
-This port is a Pydantic ``BaseModel`` (not a dataclass) to keep every
-copilot schema validatable via ``model_validate_json`` and emittable
-via ``model_dump(mode="json")`` — the standard forge-cli round-trip.
+The field names are intentionally stable and JSON-friendly so table
+metadata can round-trip through the staged store, generated artifacts,
+and copilot repair loop without custom encoders. This schema is a
+Pydantic ``BaseModel`` so every copilot schema remains validatable via
+``model_validate_json`` and emittable via ``model_dump(mode="json")``.
 """
 
 from __future__ import annotations
@@ -73,7 +71,8 @@ class ReferentialKey(BaseModel):
     """Outgoing reference from this table to another table's column.
 
     ``cardinality`` is a short human-readable hint such as ``"N:1"`` or
-    ``"1:1"`` — free-form today to stay compatible with Model AI output.
+    ``"1:1"`` — free-form today so agent output can preserve the author's
+    relationship wording without immediate schema rejection.
     """
 
     target_table: str
@@ -152,7 +151,7 @@ class DataQualityCheck(BaseModel):
 
 
 # ----------------------------------------------------------------------
-# Top-level schema — six categories, same field names as Model AI
+# Top-level schema — six categories with stable artifact field names
 # ----------------------------------------------------------------------
 
 

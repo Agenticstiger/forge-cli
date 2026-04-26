@@ -22,9 +22,8 @@ deterministic post-processor so the copilot can trust ``expression``
 values that survive the mapper.
 
 Shipped deliberately as stdlib-only Python data, not external JSON
-files. Model AI's reference implementation loads a ``tmp__data/`` folder
-at runtime; forge-cli's promise is "no external artefacts required to
-run", so the registry lives in code as a typed table.
+files. forge-cli's promise is "no external artefacts required to run",
+so the registry lives in code as a typed table.
 """
 
 from fluid_build.forge_datamodel.sql.dialect_mapper import (

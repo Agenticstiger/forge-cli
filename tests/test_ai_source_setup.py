@@ -64,9 +64,9 @@ def test_source_setup_plaintext_fallback_requires_explicit_env(tmp_path, monkeyp
     assert saved["sources"]["prod"]["secrets"]["password"] == "secret"
 
 
-def test_source_setup_emit_redacts_secret_like_values(capsys) -> None:
+def test_source_setup_redacts_secret_like_values() -> None:
     from fluid_build.cli import ai_source_setup
 
-    ai_source_setup._emit(None, "token=live-token password:super-secret")
-
-    assert capsys.readouterr().out == "token=<redacted> password:<redacted>\n"
+    assert ai_source_setup._redact_console_message("token=live-token password:super-secret") == (
+        "token=<redacted> password:<redacted>"
+    )

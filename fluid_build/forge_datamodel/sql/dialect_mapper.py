@@ -14,9 +14,6 @@
 
 """Deterministic logical → physical type mapping engine (D5).
 
-Port of Model AI's ``DataTypeMappingEngine``
-(``tools/datatype_mapping.py:39-215``) adapted for forge-cli:
-
 * **No external files.** The registry is bundled in
   :mod:`fluid_build.forge_datamodel.sql.registry`.
 * **Pydantic results** — :class:`MappingResult` /
@@ -24,9 +21,7 @@ Port of Model AI's ``DataTypeMappingEngine``
   round-trip them through the staged store without custom encoders.
 * **OSI-aware post-processor** — :meth:`fill_missing_dialects` takes a
   list of OSI ``expression.dialects[]`` the LLM produced and extends it
-  with any missing target dialects, deterministically. This is the
-  concrete v1.6+ deliverable called out at
-  `<~/.claude/plans/i-want-to-check-zany-elephant.md#milestone-v16-long-term-candidates>`_.
+  with any missing target dialects, deterministically.
 
 The engine is *advisory, not authoritative*: when the LLM has already
 emitted a physical type for ``SNOWFLAKE``, :meth:`fill_missing_dialects`
@@ -85,9 +80,8 @@ _DIALECT_ALIASES: Dict[str, str] = {
 class MappingResult(BaseModel):
     """Single logical→physical conversion outcome.
 
-    Mirrors Model AI's dataclass of the same name so operators moving
-    between the two tools see identical field names; swapped to Pydantic
-    so it round-trips through the staged store without custom encoders.
+    Uses stable, JSON-friendly field names so mapper results round-trip
+    through the staged store without custom encoders.
     """
 
     logical_type: str
@@ -184,8 +178,8 @@ class DialectMapper:
     ) -> MappingResult:
         """Map one logical type to the physical type for ``target_dialect``.
 
-        Pass-through behaviour (mirroring Model AI): if the dialect is
-        known but the logical type isn't in its mapping table, the
+        Pass-through behaviour: if the dialect is known but the logical
+        type isn't in its mapping table, the
         logical string is returned verbatim as ``physical_type`` with
         ``rule_id="pass-through"`` and a warning. Unknown *dialects*
         fail harder — ``supported=False`` plus an explanatory note —

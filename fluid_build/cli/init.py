@@ -531,8 +531,14 @@ def _ensure_workspace(args, logger: logging.Logger) -> None:
 
     # Determine workspace name: CLI arg → interactive prompt → directory name.
     ws_name = getattr(args, "name", None)
-    is_yes = getattr(args, "yes", False)
-    if not ws_name and RICH_AVAILABLE and not is_yes:
+    is_non_interactive = (
+        getattr(args, "yes", False)
+        or getattr(args, "template", None)
+        or getattr(args, "quickstart", False)
+        or getattr(args, "scan", False)
+        or getattr(args, "blank", False)
+    )
+    if not ws_name and RICH_AVAILABLE and not is_non_interactive:
         ws_name = Prompt.ask("Workspace name", default=cwd.name)
     ws_name = ws_name or cwd.name
 

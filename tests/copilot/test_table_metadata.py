@@ -14,14 +14,12 @@
 
 """Coverage for the 6-category ``TableMetadata`` schema (D4).
 
-This schema is the Pydantic port of Model AI's ``tools/table_metadata.py``
-dataclass. Tests pin:
+These tests pin:
 
 * **Minimal construction** — the four MUST identification fields are
   enough to build a valid instance; every other MUST field has a safe
   default so stubs can grow into complete records.
-* **Defaults** — match the Model AI spec exactly so tooling on either
-  side reads the same values back.
+* **Defaults** — stay stable so tooling reads the same values back.
 * **Sub-model nesting** — SurrogateKey, ReferentialKey, Partitioning,
   Index, SLA, DataQualityCheck all round-trip cleanly inside a parent
   TableMetadata.
@@ -84,10 +82,10 @@ class TestMinimalConstruction:
                 description="…",
             )
 
-    def test_defaults_match_model_ai_spec(self):
+    def test_defaults_match_table_metadata_contract(self):
         """Pin every non-None default so a downstream tool reading these
-        values gets the exact same shape it would from the Model AI
-        dataclass. This is the cross-tool compatibility contract."""
+        values gets the exact same shape. This is the compatibility
+        contract for generated artifacts and memory-backed repair."""
         table = _minimal()
 
         # B — Keys defaults

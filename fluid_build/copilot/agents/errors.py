@@ -14,10 +14,8 @@
 
 """Typed exception hierarchy for the forge-cli staged copilot pipeline.
 
-Ports the vocabulary from the Model AI reference codebase
-(``workflow/fluid_ddl_workflow/exceptions.py:4-37``) so operators and
-callers can branch on failure type without string-matching exception
-messages.
+The classes provide stable failure categories so operators and callers
+can branch on failure type without string-matching exception messages.
 
 These classes deliberately inherit from the repo-wide
 :class:`fluid_build.errors.FluidError` so every existing
