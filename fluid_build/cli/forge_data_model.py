@@ -65,7 +65,12 @@ def register_forge_subcommand(subparsers: argparse._SubParsersAction) -> None:
         COMMAND,
         help="Forge a reviewable data model contract and logical sidecar",
     )
-    data_model_sub = parser.add_subparsers(dest="data_model_action", required=True)
+    # ``required=False`` so a bare ``fluid forge data-model`` doesn't blow up
+    # with the bare-bones argparse "the following arguments are required:
+    # data_model_action" error.  ``run_data_model_command`` catches the
+    # ``data_model_action is None`` case and renders a Rich-friendly panel
+    # listing the subcommands instead.
+    data_model_sub = parser.add_subparsers(dest="data_model_action", required=False)
 
     from_ddl = data_model_sub.add_parser("from-ddl", help="Forge a data model from DDL")
     _add_common_generation_args(from_ddl)
@@ -441,8 +446,9 @@ def run(args: Any, logger: logging.Logger) -> int:
     """
     func = getattr(args, "data_model_func", None)
     if func is None:
-        cprint("No data-model action selected.")
-        return 1
+        # No subcommand — render an intuitive guide instead of the
+        # bare argparse "the following arguments are required" error.
+        return _render_data_model_guide()
     # Reset the run-level cost tracker so the summary reflects only
     # this invocation, not any prior in-process calls. Importing here
     # avoids paying the cost-module import on every CLI startup.
@@ -1368,3 +1374,135 @@ def _has_canonical_gaps(logical: LogicalDraft, industry_pack: Any) -> bool:
         return False
     summary = compute_canonical_coverage(logical, industry_pack)
     return summary is not None and not summary.is_clean
+
+
+# ---------------------------------------------------------------------
+# Friendly fallback when the user typed ``fluid forge data-model``
+# without a subcommand.  Replaces the bare-bones argparse error with
+# a Rich panel + cwd-aware "Recommended:" hint.
+# ---------------------------------------------------------------------
+
+
+def _render_data_model_guide() -> int:
+    """Render an intuitive guide for ``fluid forge data-model`` with no
+    subcommand.  Detects DDL files, intent files, and configured
+    metadata sources in the cwd / ``~/.fluid/sources.yaml`` and
+    promotes the most-relevant subcommand."""
+
+    from fluid_build.cli._subcommand_guide import (
+        SubcommandEntry,
+        SubcommandGuide,
+        hint_from_first_match,
+        render_subcommand_guide,
+    )
+
+    entries = [
+        SubcommandEntry(
+            name="from-intent",
+            description="Forge from a YAML/JSON business intent file (recommended for greenfield).",
+            example="fluid forge data-model from-intent intent.yaml -o contract.fluid.yaml",
+        ),
+        SubcommandEntry(
+            name="from-ddl",
+            description="Forge from existing DDL files (CREATE TABLE statements).",
+            example="fluid forge data-model from-ddl --ddl schema.sql -o contract.fluid.yaml",
+        ),
+        SubcommandEntry(
+            name="from-source",
+            description=(
+                "Forge from a configured metadata catalog "
+                "(Snowflake / Unity / BigQuery / Dataplex / Glue / DataHub / DMM)."
+            ),
+            example=(
+                "fluid forge data-model from-source --source snowflake "
+                "--credential-id <name> --database <db> --schema <schema> "
+                "-o contract.fluid.yaml"
+            ),
+        ),
+        SubcommandEntry(
+            name="validate",
+            description="Validate a forged contract or logical sidecar.",
+            example="fluid forge data-model validate contract.fluid.yaml",
+        ),
+        SubcommandEntry(
+            name="diff",
+            description="Diff two forged logical sidecars.",
+            example="fluid forge data-model diff a.model.json b.model.json",
+        ),
+        SubcommandEntry(
+            name="learn",
+            description=(
+                "Capture operator edits between an original forged contract "
+                "and a hand-edited version into memory/semantic."
+            ),
+            example=(
+                "fluid forge data-model learn "
+                "--original orig.fluid.yaml --edited final.fluid.yaml --name my_model"
+            ),
+        ),
+        SubcommandEntry(
+            name="dump-ddl",
+            description=(
+                "Dump DDL from a Snowflake database.schema to a .sql file "
+                "(useful as input for from-ddl)."
+            ),
+            example=(
+                "fluid forge data-model dump-ddl "
+                "--database <DB> --schema <SCHEMA> --output schema.sql"
+            ),
+        ),
+    ]
+
+    def _detect_hint() -> Any:
+        from pathlib import Path
+
+        from fluid_build.cli._subcommand_guide import SubcommandHint
+
+        cwd = Path.cwd()
+        # Intent files explicitly describe the data product the user wants.
+        intent_candidates = (
+            list(cwd.glob("*.intent.yaml"))
+            + list(cwd.glob("intent.yaml"))
+            + list(cwd.glob("intent.yml"))
+            + list(cwd.glob("intent.json"))
+        )
+        if intent_candidates:
+            return SubcommandHint(
+                subcommand="from-intent",
+                rationale=(
+                    f"found intent file ({intent_candidates[0].name}) " "in the current directory."
+                ),
+            )
+        # DDL files are the next-best signal.
+        ddl_candidates = list(cwd.glob("*.sql"))
+        if ddl_candidates:
+            return SubcommandHint(
+                subcommand="from-ddl",
+                rationale=(f"found {len(ddl_candidates)} DDL file(s) in the current directory."),
+            )
+        # Configured metadata sources are the next leverage point —
+        # fewest-keystrokes path to a real forge once nothing else is local.
+        sources_yaml = Path.home() / ".fluid" / "sources.yaml"
+        if sources_yaml.is_file():
+            return SubcommandHint(
+                subcommand="from-source",
+                rationale=(
+                    "you have a metadata-source catalog configured in " "~/.fluid/sources.yaml."
+                ),
+            )
+        return None
+
+    guide = SubcommandGuide(
+        command_path="fluid forge data-model",
+        headline=(
+            "Forge a reviewable data model contract from one of several "
+            "input shapes.  Pick the path that matches what you have."
+        ),
+        entries=entries,
+        hint_provider=_detect_hint,
+        quick_start=(
+            "fluid forge data-model from-intent --example "
+            "(prints a starter intent.yaml; also try --schema or --validate)"
+        ),
+    )
+    return render_subcommand_guide(guide)

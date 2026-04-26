@@ -156,7 +156,7 @@ the canonical Logical IR.
 ```bash
 fluid forge data-model validate customer_orders.fluid.yaml
 fluid forge data-model diff old.model.json new.model.json
-fluid forge data-model dump-ddl --database BIZ_LAB --schema SEEDED -o /tmp/biz_lab.sql
+fluid forge data-model dump-ddl --database <DATABASE> --schema <SCHEMA> -o /tmp/snapshot.sql
 ```
 
 `validate` runs the full Fluid 0.7.2 schema check + OSI conformance

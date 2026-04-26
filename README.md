@@ -95,12 +95,12 @@ fluid ai setup --source snowflake --name snowflake-prod
 # 3. Forge a Data Vault 2.0 model from a schema.
 fluid forge data-model from-source \
   --source snowflake --credential-id snowflake-prod \
-  --database BIZ_LAB --schema SEEDED \
+  --database <DATABASE> --schema <SCHEMA> \
   --technique data-vault-2 \
-  -o biz_lab.fluid.yaml
+  -o customer_orders.fluid.yaml
 
 # 4. Generate dbt transformations from the same contract.
-fluid generate speed-transformation biz_lab.fluid.yaml -o ./dbt_biz_lab
+fluid generate speed-transformation customer_orders.fluid.yaml -o ./dbt_customer_orders
 ```
 
 Three guarantees that hold across every catalog: **read-only metadata access** (no `SELECT *` against any data table), **per-call credentials** (the MCP server never holds your secrets), and **full audit trail** (every catalog read writes a redacted event under `~/.fluid/store/audit/`).
@@ -446,7 +446,7 @@ fluid forge data-model from-ddl --ddl legacy/*.sql -o customer_orders.fluid.yaml
 # Validate, diff, dump-DDL companions
 fluid forge data-model validate customer_orders.fluid.yaml
 fluid forge data-model diff old.model.json new.model.json
-fluid forge data-model dump-ddl --database BIZ_LAB --schema SEEDED -o /tmp/biz_lab.sql
+fluid forge data-model dump-ddl --database <DATABASE> --schema <SCHEMA> -o /tmp/snapshot.sql
 
 # Memory + roadmap
 fluid memory show project|team|episodic|semantic

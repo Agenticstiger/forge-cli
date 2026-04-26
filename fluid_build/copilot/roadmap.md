@@ -27,7 +27,7 @@ work:
 ### v1.0.1 follow-up (landed 2026-04-24)
 
 Sprint-local hardening that shipped the day after v1.0, driven by live
-Gemini biz-lab Phase-4 findings:
+Phase-4 Gemini integration findings:
 
 - **Retry envelope on every staged LLM call** — `BaseStageAgent.call()`
   now wraps provider dispatch in `retry_with_backoff` (3 attempts,
@@ -61,8 +61,8 @@ Gemini biz-lab Phase-4 findings:
   byte-stable across runs, and that the audit payload records the flag.
 - **`emit/ddl.py` field-name bug fixed** — `.logical_type` →
   `.data_type`; surfaced by the new end-to-end emit tests.
-- **Phase-4 biz-lab scenario runner hardened** — incremental flush after
-  each scenario (atomic `.tmp` + `os.replace`) plus a 1200s timeout so
+- **Phase-4 scenario runner hardened** — incremental flush after each
+  scenario (atomic `.tmp` + `os.replace`) plus a 1200s timeout so
   partial results survive a mid-run stall.
 - **Phase 6 (dbt parse gate) shipped + bug fix** — previously blocked
   pending cloud-warehouse access; unblocked by targeting the local
@@ -134,8 +134,8 @@ below. Directive from the user: "nothing left behind."
   `tests/copilot/test_vector_backend_upgrade.py`.
 
 **Still deferred (not this close-out):**
-- **Phase 5 — Snowflake biz-lab e2e** — blocked on external creds.
-- **Gate 0 — Gemini key rotation** — user declined.
+- **Phase 5 — Snowflake live-warehouse e2e** — blocked on external creds.
+- **Gate 0 — Gemini key rotation** — deferred.
 
 ### V1 world-class hardening (landed 2026-04-25)
 

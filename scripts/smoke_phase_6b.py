@@ -25,7 +25,7 @@ SAFETY:
     the ``env != dev`` branch without loading a prod overlay.
 
 USAGE:
-  cd ~/path/to/snowflake-biz-lab
+  cd ~/path/to/your/lab-workspace
   ./scripts/smoke_phase_6b.py
   CONTRACT=orders.fluid.yaml ./scripts/smoke_phase_6b.py
   FLUID_BIN=/abs/path/fluid ./scripts/smoke_phase_6b.py

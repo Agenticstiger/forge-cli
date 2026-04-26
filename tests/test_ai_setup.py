@@ -215,13 +215,26 @@ class TestCheckLlmReadiness:
     def test_not_ready_without_keys(self):
         from fluid_build.cli.forge_copilot_llm_providers import check_llm_readiness
 
-        # Patch the inline import target so the real config file is not read
-        # Also patch _infer_provider_from_env to avoid detecting local Ollama
+        # Patch every step in the resolution ladder so the real config
+        # file isn't read, no ambient Ollama is picked up, and no
+        # keyring entry leaks in.  The provider-precedence fix split
+        # ``_infer_provider_from_env`` into explicit / keyring /
+        # ambient helpers — ``check_llm_readiness`` calls them
+        # individually so every test-time Ollama install must be
+        # mocked at the ambient step.
         with (
             patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None),
             patch("fluid_build.cli.ai_setup._CONFIG_FILE", Path("/nonexistent/ai_config.json")),
             patch(
-                "fluid_build.cli.forge_copilot_llm_providers._infer_provider_from_env",
+                "fluid_build.cli.forge_copilot_llm_providers._infer_provider_from_explicit_keys",
+                return_value=None,
+            ),
+            patch(
+                "fluid_build.cli.forge_copilot_llm_providers._infer_provider_from_keyring",
+                return_value=None,
+            ),
+            patch(
+                "fluid_build.cli.forge_copilot_llm_providers._infer_provider_from_ambient",
                 return_value=None,
             ),
         ):

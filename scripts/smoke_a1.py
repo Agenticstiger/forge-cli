@@ -30,7 +30,7 @@ SAFETY:
 
 USAGE:
   # Must source both launchpads first so $GREENFIELD_WORKSPACE etc resolve.
-  source .../snowflake-biz-lab/runtime/generated/launchpad.local.sh
+  source .../your-lab-workspace/runtime/generated/launchpad.local.sh
   export FLUID_DEV_BIN="$LAB_REPO/.venv.fluid-dev/bin/fluid"
   python3 /path/to/smoke_a1.py
 """

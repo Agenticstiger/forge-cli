@@ -1019,6 +1019,20 @@ def _ask_transformation_delivery(
             "aliases": ["existing", "byot", "path", "repo", "git"],
         },
     ]
+    # Stage banner — the previous prompt was the modeling-technique
+    # question (history vs reporting); jumping straight to
+    # ``Transformation [dbt / other / existing]`` reads like the
+    # interview pivoted out of nowhere.  This one-liner names the
+    # stage so the operator knows we're now picking the build engine
+    # that will materialise the model.
+    if console is not None:
+        try:
+            console.print(
+                "\n[bold]Transformation engine[/bold]"
+                "  [dim]— pick the tool that will build your data model from sources.[/dim]"
+            )
+        except Exception:  # noqa: BLE001 — non-fatal banner
+            pass
     raw_answer = ask_friendly_text(
         console,
         "Transformation [dbt / other / existing]",
@@ -1240,8 +1254,10 @@ def _ask_data_model_question(
 ) -> None:
     # V1.5 — auto-discover configured metadata-source catalogs so
     # users with an existing Snowflake / Unity / DataHub setup see
-    # "Use a catalog I have configured" as the first option (and
-    # the default when one is configured).
+    # their catalog as the first option (and the default when one
+    # is configured).  The label surfaces the source TYPE so the
+    # operator can tell the credential id is reading from their
+    # ``~/.fluid/sources.yaml`` rather than a hardcoded constant.
     configured_sources = _list_configured_sources()
 
     default = _default_data_model_source(discovery_report, configured_sources)
@@ -1250,12 +1266,16 @@ def _ask_data_model_question(
     if configured_sources:
         # Catalog branch goes FIRST when something is configured
         # — surfaces the highest-value option without scrolling.
-        first_label = (
-            f"Use a catalog I have configured "
-            f"({', '.join(configured_sources[:3])}"
-            + (f" + {len(configured_sources) - 3} more" if len(configured_sources) > 3 else "")
-            + ")"
-        )
+        if len(configured_sources) == 1:
+            cred_id, source_type = configured_sources[0]
+            first_label = f"Use my {_format_source_label(cred_id, source_type)}"
+        else:
+            previewed = ", ".join(
+                _format_source_label(cred_id, source_type)
+                for cred_id, source_type in configured_sources[:3]
+            )
+            tail = f" + {len(configured_sources) - 3} more" if len(configured_sources) > 3 else ""
+            first_label = f"Use a catalog I have configured ({previewed}{tail})"
         choices.append({"label": first_label, "value": "source"})
     choices.extend(
         [
@@ -1359,9 +1379,9 @@ def _ask_data_model_question(
             state.apply_patch({"data_model_source_name": chosen_source}, source="interactive")
         scope_answer = ask_friendly_text(
             console,
-            "What scope should we forge from? (e.g. 'TELCO_LAB.TELCO_STAGE_LOAD' "
-            "for Snowflake, 'main.gold' for Unity, 'myproject.analytics' for "
-            "BigQuery; press Enter to skip)",
+            "What scope should we forge from? (e.g. '<database>.<schema>' "
+            "for Snowflake, '<catalog>.<schema>' for Unity, "
+            "'<project>.<dataset>' for BigQuery; press Enter to skip)",
             required=False,
         )
         if scope_answer:
@@ -1398,13 +1418,20 @@ def _ask_data_model_question(
         state.apply_patch({"review_data_model": normalized_review}, source="interactive")
 
 
-def _list_configured_sources() -> list[str]:
-    """Return the names of configured metadata-source catalogs.
+def _list_configured_sources() -> list[tuple[str, str]]:
+    """Return ``(credential_id, source_type)`` pairs for configured catalogs.
 
-    Reads ``~/.fluid/sources.yaml`` if present and returns the list
-    of saved-source names. Empty list when the file is missing /
+    Reads ``~/.fluid/sources.yaml`` if present and returns one tuple
+    per saved source.  Empty list when the file is missing /
     malformed / has no entries — the interview still works, just
     without the catalog branch as a default.
+
+    The source-type is plumbed through alongside the credential id
+    so the interview can render labels like
+    ``Snowflake source (<credential_id>)`` instead of bare
+    credential ids that read like a hardcoded constant.  When a
+    YAML entry is missing the ``source_type`` field, ``"source"``
+    is used as the generic fallback.
 
     Defensive: catches every exception so a corrupted YAML never
     blocks the interview from running.
@@ -1423,14 +1450,43 @@ def _list_configured_sources() -> list[str]:
         sources = data.get("sources")
         if not isinstance(sources, dict):
             return []
-        return [name for name in sources if isinstance(name, str)]
+        out: list[tuple[str, str]] = []
+        for name, entry in sources.items():
+            if not isinstance(name, str):
+                continue
+            source_type = ""
+            if isinstance(entry, dict):
+                raw = entry.get("source_type")
+                if isinstance(raw, str):
+                    source_type = raw.strip().lower()
+            out.append((name, source_type or "source"))
+        return out
     except Exception:  # noqa: BLE001 — defensive
         return []
 
 
+_SOURCE_TYPE_DISPLAY: dict[str, str] = {
+    "snowflake": "Snowflake",
+    "unity": "Unity Catalog",
+    "bigquery": "BigQuery",
+    "dataplex": "Dataplex",
+    "glue": "AWS Glue",
+    "datahub": "DataHub",
+    "datamesh_manager": "Data Mesh Manager",
+    "source": "Saved",
+}
+
+
+def _format_source_label(credential_id: str, source_type: str) -> str:
+    """Render a single configured source as ``<TypeName> source (<id>)``."""
+
+    pretty = _SOURCE_TYPE_DISPLAY.get(source_type, source_type.title() or "Saved")
+    return f"{pretty} source ({credential_id})"
+
+
 def _default_data_model_source(
     discovery_report: DiscoveryReport,
-    configured_sources: Optional[list[str]] = None,
+    configured_sources: Optional[list[tuple[str, str]]] = None,
 ) -> Optional[str]:
     # V1.5 — when a metadata-source catalog is configured, default
     # to the catalog branch. This puts the highest-value option in

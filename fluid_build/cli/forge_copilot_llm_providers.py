@@ -1640,7 +1640,20 @@ def _sanitize_model_for_url(model: str) -> str:
     return model
 
 
-def _infer_provider_from_env(env: Mapping[str, str]) -> Optional[str]:
+def _infer_provider_from_explicit_keys(env: Mapping[str, str]) -> Optional[str]:
+    """Return the provider when the operator supplied exactly one explicit
+    API-key env var.
+
+    Explicit keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY,
+    GOOGLE_API_KEY, OLLAMA_HOST) are deliberate per-run signals, so
+    they should beat the saved ``~/.fluid/ai_config.json`` provider.
+    Crucially, this helper does NOT auto-detect ambient Ollama on
+    ``localhost:11434`` — a stray ``ollama serve`` running in the
+    background must never override an explicit saved provider; that
+    discovery happens later in :func:`_infer_provider_from_ambient`,
+    which only fires once every other resolution step has failed.
+    """
+
     detected = []
     if env.get("OPENAI_API_KEY"):
         detected.append("openai")
@@ -1648,14 +1661,39 @@ def _infer_provider_from_env(env: Mapping[str, str]) -> Optional[str]:
         detected.append("anthropic")
     if env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY"):
         detected.append("gemini")
-    if env.get("OLLAMA_HOST") or detect_ollama_available(env):
+    if env.get("OLLAMA_HOST"):
         detected.append("ollama")
     if len(detected) == 1:
         return detected[0]
-    if not detected:
-        # No env vars found — check the keyring for any saved provider key.
-        return _infer_provider_from_keyring()
     return None
+
+
+def _infer_provider_from_ambient(env: Mapping[str, str]) -> Optional[str]:
+    """Last-resort detection: Ollama already running on localhost.
+
+    Only call this AFTER the saved config and the keyring have been
+    consulted — ambient services must not override an explicit
+    operator choice.  See :func:`check_llm_readiness` for the full
+    resolution ladder.
+    """
+
+    if detect_ollama_available(env):
+        return "ollama"
+    return None
+
+
+# Backwards-compatible alias for callers outside this module that
+# imported ``_infer_provider_from_env``.  The new code paths inside
+# :func:`check_llm_readiness` use the split functions above so the
+# saved config gets a chance to win over ambient Ollama.
+def _infer_provider_from_env(env: Mapping[str, str]) -> Optional[str]:
+    explicit = _infer_provider_from_explicit_keys(env)
+    if explicit:
+        return explicit
+    keyring_match = _infer_provider_from_keyring()
+    if keyring_match:
+        return keyring_match
+    return _infer_provider_from_ambient(env)
 
 
 def _infer_provider_from_keyring() -> Optional[str]:
@@ -1799,17 +1837,37 @@ class LlmReadinessCheck:
 def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadinessCheck:
     """Non-throwing check of whether an LLM provider is accessible.
 
-    Checks (in order): env vars, then ``~/.fluid/ai_config.json`` (which
-    contains the API key directly).  Used by ``fluid doctor`` and forge.
+    Resolution ladder (highest precedence first):
+
+    1. ``FLUID_LLM_PROVIDER`` env var — explicit selector wins everything.
+    2. Explicit API-key env vars (``OPENAI_API_KEY`` /
+       ``ANTHROPIC_API_KEY`` / ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``
+       / ``OLLAMA_HOST``) when exactly one is set — deliberate
+       per-run override.
+    3. ``~/.fluid/ai_config.json`` — the user's persisted choice from
+       ``fluid ai setup``.  This MUST beat ambient detection (e.g.
+       Ollama running on ``localhost:11434``); operators report
+       confusion when ``fluid doctor`` shows ``ollama`` despite
+       having configured Gemini / Anthropic / OpenAI explicitly.
+    4. Keyring — a saved provider key in the OS keyring.
+    5. Ambient Ollama on localhost — last-resort discovery.
+
+    Used by ``fluid doctor`` and forge.
     """
     env = dict(environ or os.environ)
 
-    provider_name = env.get("FLUID_LLM_PROVIDER") or _infer_provider_from_env(env)
     saved = None
     saved_model = None
     saved_key = None
 
-    # If env vars don't reveal a provider, check the saved config file
+    # Step 1 — explicit env-var selector.
+    provider_name = env.get("FLUID_LLM_PROVIDER")
+
+    # Step 2 — explicit API-key env vars (deliberate per-run override).
+    if not provider_name:
+        provider_name = _infer_provider_from_explicit_keys(env)
+
+    # Step 3 — saved ``~/.fluid/ai_config.json`` choice.
     if not provider_name:
         try:
             from fluid_build.cli.ai_setup import _load_ai_config
@@ -1820,6 +1878,30 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
                 saved_model = saved.get("model")
                 saved_key = saved.get("api_key")
                 LOG.debug("LLM readiness: found provider=%s in config file", provider_name)
+        except ImportError:
+            pass
+
+    # Step 4 — keyring fallback.
+    if not provider_name:
+        provider_name = _infer_provider_from_keyring()
+
+    # Step 5 — last-resort ambient discovery (Ollama on localhost).
+    if not provider_name:
+        provider_name = _infer_provider_from_ambient(env)
+
+    # Even when the provider was selected via env-var inference, we
+    # still want the saved config's model + key for the matching
+    # provider — that way ``GOOGLE_API_KEY=…`` plus a saved
+    # ``ai_config.json`` of ``{provider: gemini, model: gemini-2.5-pro}``
+    # honours the saved model.
+    if provider_name and saved is None:
+        try:
+            from fluid_build.cli.ai_setup import _load_ai_config
+
+            saved = _load_ai_config()
+            if saved and saved.get("provider") == provider_name:
+                saved_model = saved.get("model")
+                saved_key = saved.get("api_key")
         except ImportError:
             pass
 

@@ -20,8 +20,8 @@ before this helper, users had to ``snowsql -q "SELECT GET_DDL('SCHEMA',
 the right schema. With this helper the round-trip is:
 
     fluid forge data-model dump-ddl \\
-      --database BIZ_LAB --schema SEEDED --output /tmp/biz_lab.sql
-    fluid forge data-model from-ddl --ddl /tmp/biz_lab.sql ...
+      --database <DATABASE> --schema <SCHEMA> --output /tmp/snapshot.sql
+    fluid forge data-model from-ddl --ddl /tmp/snapshot.sql ...
 
 Connection resolution reuses :func:`get_connection_params` from the
 existing Snowflake provider — same env vars, same keyring, same

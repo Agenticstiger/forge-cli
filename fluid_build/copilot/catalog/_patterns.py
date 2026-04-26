@@ -14,12 +14,11 @@
 
 """Shared catalog-adapter patterns — applied uniformly to every adapter.
 
-Validated against the live ``TELCO_LAB`` Snowflake biz-lab smoke
-on 2026-04-25 (23 tables → 23 hubs / 33 links / 23 satellites / 23
-OSI datasets, end-to-end). Every pattern below is a direct lesson
-from that exercise. Sprint A's Snowflake + Unity adapters apply
-them; Sprint B's BigQuery / Dataplex / Glue / DataHub / DMM adapters
-must apply them too.
+Validated against a live Snowflake telco demo schema (23 tables →
+23 hubs / 33 links / 23 satellites / 23 OSI datasets, end-to-end).
+Every pattern below is a direct lesson from that exercise.  Sprint A's
+Snowflake + Unity adapters apply them; Sprint B's BigQuery / Dataplex /
+Glue / DataHub / DMM adapters must apply them too.
 
 The shared helpers exposed here are kept private to ``copilot.catalog``
 (prefixed with ``_``) — they're internal scaffolding for adapter
