@@ -1804,8 +1804,13 @@ def register(subparsers: argparse._SubParsersAction):
     # again would cause argparse conflicts. Auth providers are passed as
     # positional arguments to each verb instead (e.g., `fluid auth login gcp`).
 
-    # Create subcommands
-    sp = p.add_subparsers(dest="verb", required=True, help="Authentication action")
+    # Create subcommands.  ``required=False`` so a bare
+    # ``fluid auth`` doesn't blow up with the bare-bones argparse
+    # "the following arguments are required: verb" error.  ``run``
+    # catches the ``args.verb is None`` case and renders a
+    # Rich-friendly panel listing the verbs instead.
+    p.set_defaults(func=run)
+    sp = p.add_subparsers(dest="verb", required=False, help="Authentication action")
 
     _provider_names = "gcp, aws, azure, snowflake, databricks"
 
@@ -1880,6 +1885,11 @@ def register(subparsers: argparse._SubParsersAction):
 
 def run(args, logger: logging.Logger) -> int:
     """Main entry point for auth command with enhanced functionality"""
+    if getattr(args, "verb", None) is None:
+        # Bare ``fluid auth`` — render an intuitive guide instead of
+        # the legacy argparse "the following arguments are required"
+        # error.
+        return _render_auth_guide()
     try:
         # Simple config (since load_config is not available)
         config = {}
@@ -2540,3 +2550,78 @@ def _normalize_provider(provider: str) -> str:
         "microsoft": "azure",
     }
     return aliases.get(provider, provider)
+
+
+def _render_auth_guide() -> int:
+    """Render an intuitive guide for ``fluid auth`` with no verb.
+
+    Detects whether any provider is already authenticated (saved
+    auth file or keyring entry) and promotes ``status`` when the
+    operator already has credentials configured; otherwise points
+    them at ``login`` as the right starting move.
+    """
+
+    from pathlib import Path
+
+    from fluid_build.cli._subcommand_guide import (
+        SubcommandEntry,
+        SubcommandGuide,
+        SubcommandHint,
+        render_subcommand_guide,
+    )
+
+    entries = [
+        SubcommandEntry(
+            name="login",
+            description="Authenticate with a cloud / data-platform provider.",
+            example="fluid auth login gcp",
+        ),
+        SubcommandEntry(
+            name="status",
+            description="Show current auth status (omit provider to check all).",
+            example="fluid auth status",
+        ),
+        SubcommandEntry(
+            name="logout",
+            description="Sign out of a provider (clear local credentials).",
+            example="fluid auth logout aws",
+        ),
+        SubcommandEntry(
+            name="list",
+            description="List available authentication providers and aliases.",
+            example="fluid auth list",
+        ),
+        SubcommandEntry(
+            name="doctor",
+            description="Audit credential hygiene + recommend rotations.",
+            example="fluid auth doctor",
+        ),
+    ]
+
+    def _detect_hint() -> Any:
+        # Cheap detection: ``~/.fluid/auth.json`` exists, OR
+        # ``~/.fluid/store/audit/`` has a recent ``auth_*`` event.
+        # Avoids any keyring round-trip so the guide stays fast.
+        auth_json = Path.home() / ".fluid" / "auth.json"
+        ai_config = Path.home() / ".fluid" / "ai_config.json"
+        if auth_json.is_file() or ai_config.is_file():
+            return SubcommandHint(
+                subcommand="status",
+                rationale="you already have local auth state — see what's signed in.",
+            )
+        return SubcommandHint(
+            subcommand="login",
+            rationale="no local auth state yet — sign in to a provider first.",
+        )
+
+    guide = SubcommandGuide(
+        command_path="fluid auth",
+        headline=(
+            "Authenticate with cloud / data-platform providers "
+            "(gcp, aws, azure, snowflake, databricks)."
+        ),
+        entries=entries,
+        hint_provider=_detect_hint,
+        quick_start="fluid auth status",
+    )
+    return render_subcommand_guide(guide)

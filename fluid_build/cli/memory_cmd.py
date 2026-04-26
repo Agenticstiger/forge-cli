@@ -65,7 +65,13 @@ def _parse_duration(value: str) -> timedelta:
 
 def register(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(COMMAND, help="Inspect and manage staged memory/cache state")
-    sp = parser.add_subparsers(dest="memory_action", required=True)
+    # ``required=False`` so a bare ``fluid memory`` doesn't blow up
+    # with the bare-bones argparse "the following arguments are
+    # required: memory_action" error.  ``run`` catches the
+    # ``memory_action is None`` case and renders a Rich-friendly
+    # panel listing the subcommands instead.
+    parser.set_defaults(func=run)
+    sp = parser.add_subparsers(dest="memory_action", required=False)
 
     sp.add_parser("status", help="Show store status").set_defaults(func=run)
     show = sp.add_parser("show", help="Show a memory scope or namespace listing")
@@ -116,8 +122,13 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run(args, logger: logging.Logger) -> int:
-    store = resolve_store(workspace_root=Path.cwd())
     action = getattr(args, "memory_action", None)
+    if action is None:
+        # Bare ``fluid memory`` — render an intuitive guide instead
+        # of the legacy argparse "the following arguments are
+        # required" error.
+        return _render_memory_guide()
+    store = resolve_store(workspace_root=Path.cwd())
     if action == "status":
         return _run_status(store)
     if action == "show":
@@ -135,6 +146,71 @@ def run(args, logger: logging.Logger) -> int:
         cprint(json.dumps([record.value for record in results], indent=2, default=str))
         return 0
     return 1
+
+
+def _render_memory_guide() -> int:
+    """Render an intuitive guide for ``fluid memory`` with no
+    subcommand.  Detects existing ``~/.fluid/store/`` state and
+    promotes ``status`` when memory has already been written."""
+
+    from fluid_build.cli._subcommand_guide import (
+        SubcommandEntry,
+        SubcommandGuide,
+        SubcommandHint,
+        render_subcommand_guide,
+    )
+
+    entries = [
+        SubcommandEntry(
+            name="status",
+            description="Show staged-store backend + per-namespace record counts.",
+            example="fluid memory status",
+        ),
+        SubcommandEntry(
+            name="show",
+            description=(
+                "Show a memory scope (project / team / personal) or list the "
+                "records in a store namespace (episodic / semantic / history)."
+            ),
+            example="fluid memory show project",
+        ),
+        SubcommandEntry(
+            name="save",
+            description="Sync a memory scope (project / team / personal) into the staged store.",
+            example="fluid memory save --scope project",
+        ),
+        SubcommandEntry(
+            name="search",
+            description="Search a staged store namespace (exact / keyword / vector / hybrid).",
+            example='fluid memory search "<query>" --ns memory/semantic --mode hybrid',
+        ),
+        SubcommandEntry(
+            name="clear",
+            description="Clear staged store namespaces (optionally older-than a duration).",
+            example="fluid memory clear --ns memory/episodic --older-than 30d",
+        ),
+    ]
+
+    def _detect_hint() -> Any:
+        store_dir = Path.home() / ".fluid" / "store"
+        if store_dir.is_dir():
+            return SubcommandHint(
+                subcommand="status",
+                rationale="you already have memory state in ~/.fluid/store/.",
+            )
+        return None
+
+    guide = SubcommandGuide(
+        command_path="fluid memory",
+        headline=(
+            "Inspect and manage staged memory + cache state — project / team / "
+            "personal scopes plus the episodic / semantic / history namespaces."
+        ),
+        entries=entries,
+        hint_provider=_detect_hint,
+        quick_start="fluid memory status",
+    )
+    return render_subcommand_guide(guide)
 
 
 def _run_status(store) -> int:

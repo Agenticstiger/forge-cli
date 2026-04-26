@@ -697,7 +697,13 @@ def _build_policy_from_args(args) -> McpPolicy:
 
 def register(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(COMMAND, help="Serve staged forge tools over MCP stdio")
-    sp = parser.add_subparsers(dest="mcp_action", required=True)
+    # ``required=False`` so a bare ``fluid mcp`` doesn't blow up
+    # with the bare-bones argparse "the following arguments are
+    # required: mcp_action" error.  ``run`` catches the
+    # ``mcp_action is None`` case and renders a Rich-friendly panel
+    # describing the ``serve`` action.
+    parser.set_defaults(func=run)
+    sp = parser.add_subparsers(dest="mcp_action", required=False)
     serve = sp.add_parser("serve", help="Run the MCP stdio server")
     serve.add_argument(
         "--read-only",
@@ -766,10 +772,57 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run(args, logger: logging.Logger) -> int:
-    if getattr(args, "mcp_action", None) != "serve":
+    action = getattr(args, "mcp_action", None)
+    if action is None:
+        # Bare ``fluid mcp`` — render the friendly guide instead of
+        # exiting non-zero with a generic "subcommand required" error.
+        return _render_mcp_guide()
+    if action != "serve":
         return 1
     policy = _build_policy_from_args(args)
     return _serve_stdio(policy=policy, logger=logger)
+
+
+def _render_mcp_guide() -> int:
+    """Render an intuitive guide for ``fluid mcp`` with no
+    subcommand.  Today there's only one sub-action (``serve``),
+    so the panel doubles as a walkthrough of the most useful
+    flags rather than a multi-row picker.
+    """
+
+    from fluid_build.cli._subcommand_guide import (
+        SubcommandEntry,
+        SubcommandGuide,
+        render_subcommand_guide,
+    )
+
+    entries = [
+        SubcommandEntry(
+            name="serve",
+            description=(
+                "Run the MCP stdio server.  Exposes the staged forge tool "
+                "surface (catalog reads, contract regeneration, semantic "
+                "memory search) over JSON-RPC for Claude Code, Cursor, "
+                "Continue, and any MCP client."
+            ),
+            example="fluid mcp serve --read-only",
+        ),
+    ]
+    guide = SubcommandGuide(
+        command_path="fluid mcp",
+        headline=(
+            "Serve forge tools over the Model Context Protocol so MCP "
+            "clients can drive forge from inside the editor."
+        ),
+        entries=entries,
+        # Single-subcommand surface; the recommendation is implicit.
+        hint_provider=None,
+        quick_start=(
+            "fluid mcp serve --read-only "
+            "(safe default — denies any tool that mutates files or store namespaces)"
+        ),
+    )
+    return render_subcommand_guide(guide)
 
 
 # ----------------------------------------------------------------------
