@@ -32,7 +32,11 @@ def _make_init_args(**overrides):
         no_run=False,
         no_dag=False,
         dry_run=False,
-        yes=True,
+        # ``yes=False`` keeps ``detect_mode`` exercising its
+        # contract-/dbt-/terraform-/sql-detection branches.  Tests
+        # that intentionally exercise the ``--yes`` short-circuit
+        # override this with ``yes=True`` per-call.
+        yes=False,
         target_dir=None,
     )
     defaults.update(overrides)

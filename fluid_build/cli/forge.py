@@ -106,19 +106,46 @@ LOG = logging.getLogger("fluid.cli.forge")
 
 
 class ForgeError(CLIError):
-    """Base exception for Forge command errors."""
+    """Base exception for Forge command errors.
+
+    Two positional-argument shapes are accepted so callers using the
+    pre-925668a ``ForgeError(exit_code, message)`` form keep working
+    alongside the modern ``ForgeError(message, exit_code=...)`` form.
+    The keyword-only ``exit_code`` always wins when both are supplied.
+    """
 
     def __init__(
         self,
-        message: str,
-        *,
+        *args: Any,
         event: str = "forge_error",
         context: Optional[Dict[str, Any]] = None,
         exit_code: int = 1,
     ):
+        if len(args) == 1:
+            message = str(args[0])
+        elif len(args) == 2:
+            # Legacy positional shape ``ForgeError(exit_code, message)``.
+            # Accept it so older callers + tests that haven't migrated
+            # don't blow up with ``TypeError: takes 2 positional args
+            # but 3 were given``.  Keyword ``exit_code`` overrides the
+            # positional one when both are supplied.
+            exit_code = exit_code if exit_code != 1 else int(args[0])
+            message = str(args[1])
+        else:
+            raise TypeError(
+                f"{type(self).__name__} expects 1 (message) or 2 (exit_code, message) "
+                f"positional arguments; got {len(args)}"
+            )
         payload = {"error": message, **(context or {})}
         super().__init__(exit_code, event, payload)
         self.message = message
+
+    def __str__(self) -> str:
+        # ``CLIError`` passes the ``event`` string to ``Exception.__init__``,
+        # which makes ``str(err)`` return the event key (``"forge_error"``).
+        # Override so callers / tests that look at the rendered string see
+        # the operator-facing message instead.
+        return self.message
 
 
 class InvalidProjectNameError(ForgeError):
