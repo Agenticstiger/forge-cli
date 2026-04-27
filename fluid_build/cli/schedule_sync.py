@@ -269,6 +269,17 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "GitHub-only signers, or your GitLab OIDC issuer URL."
         ),
     )
+    p.add_argument(
+        "--git-commit-author",
+        default=None,
+        help=(
+            "Override the git commit author for git+ssh:// destinations, "
+            "in 'Name <email@host>' format. When unset, git uses the "
+            "runner's user.name/user.email from git config. Recommended "
+            "for CI / service-account use so commits are attributable to "
+            "a deterministic identity (e.g., 'fluid-bot <bot@example.com>')."
+        ),
+    )
     p.set_defaults(func=run)
 
 
@@ -490,6 +501,49 @@ def _require_dispatch_destination(dest: Optional[str], scheme: str) -> str:
     return dest
 
 
+# ``Name <email@host>`` — the email part forbids angle brackets, whitespace, and
+# the @ separator. Name is intentionally permissive (international names allowed)
+# but control characters are rejected explicitly below.
+_COMMIT_AUTHOR_PATTERN = re.compile(r"^(.+?)\s*<([^<>@\s]+@[^<>@\s]+)>$")
+
+
+def _parse_commit_author(value: str) -> Tuple[str, str]:
+    """Parse a ``Name <email@host>`` author string. Raises ``CLIError`` if invalid.
+
+    Used by ``--git-commit-author`` for the git+ssh dispatch path so a deterministic
+    identity (typically a service account) lands in the destination repo's history
+    instead of whatever the runner's ``git config user.*`` happens to be.
+    """
+    cleaned = (value or "").strip()
+    if not cleaned:
+        raise CLIError(2, "schedule_sync_commit_author_empty", {})
+    # Reject ASCII control characters and DEL outright — they could break the
+    # commit metadata format and have no business in an author identity.
+    for ch in cleaned:
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            raise CLIError(
+                2,
+                "schedule_sync_commit_author_control_char",
+                {"reason": "commit author may not contain control characters"},
+            )
+    match = _COMMIT_AUTHOR_PATTERN.match(cleaned)
+    if not match:
+        raise CLIError(
+            2,
+            "schedule_sync_commit_author_invalid",
+            {"value": value, "expected_format": "Name <email@host>"},
+        )
+    name = match.group(1).strip()
+    email = match.group(2).strip()
+    if not name:
+        raise CLIError(
+            2,
+            "schedule_sync_commit_author_invalid",
+            {"value": value, "reason": "name part is empty"},
+        )
+    return name, email
+
+
 def _run_subprocess(argv: List[str], *, timeout: int, dry_run: bool) -> Dict:
     """Execute ``argv`` with redacted logging and dry-run short-circuit.
 
@@ -593,6 +647,22 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
         clone_url = _git_ssh_clone_url(dest)
         commit_message = "sync Airflow DAGs from fluid schedule-sync"
 
+        commit_author_raw = getattr(args, "git_commit_author", None)
+        commit_author_argv: List[str] = []
+        if commit_author_raw:
+            author_name, author_email = _parse_commit_author(commit_author_raw)
+            # ``git -c key=value`` injects per-process config without persisting it.
+            # Each ``-c`` value goes after the ``-c`` flag as a single argv element,
+            # so the user-supplied name/email are positional values (not flag-shaped),
+            # and git resolves them as configuration regardless of leading hyphens.
+            commit_author_argv = [
+                "-c",
+                f"user.name={author_name}",
+                "-c",
+                f"user.email={author_email}",
+            ]
+        commit_argv = [git, *commit_author_argv, "commit", "-m", commit_message]
+
         def _planned(clone_dir: str) -> List[Dict]:
             return [
                 _run_subprocess(
@@ -628,7 +698,7 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
                     dry_run=True,
                 ),
                 _run_subprocess_with_cwd(
-                    [git, "commit", "-m", commit_message],
+                    commit_argv,
                     cwd=clone_dir,
                     timeout=args.timeout,
                     dry_run=True,
@@ -692,7 +762,7 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
                 return results
 
             for argv in (
-                [git, "commit", "-m", commit_message],
+                commit_argv,
                 [git, "push"],
             ):
                 result = _run_subprocess_with_cwd(

@@ -64,6 +64,7 @@ def _args(**overrides) -> argparse.Namespace:
         "verify_key": None,
         "verify_identity_regexp": ".*",
         "verify_oidc_issuer_regexp": ".*",
+        "git_commit_author": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -292,6 +293,47 @@ class TestGitSshCloneUrl:
     def test_rejects_unsafe_or_ambiguous_git_urls(self, url, match):
         with pytest.raises(CLIError, match=match):
             schedule_sync._git_ssh_clone_url(url)
+
+
+# -----------------------------------------------------------------------------
+# _parse_commit_author
+# -----------------------------------------------------------------------------
+
+
+class TestParseCommitAuthor:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("Fluid Bot <bot@example.com>", ("Fluid Bot", "bot@example.com")),
+            ("  Fluid Bot  <bot@example.com>  ", ("Fluid Bot", "bot@example.com")),
+            ("J Doe <j.doe+ci@example.org>", ("J Doe", "j.doe+ci@example.org")),
+            # Hyphen in email is allowed; the regex only forbids angle brackets,
+            # whitespace, and the @ separator inside the email parts.
+            ("Bot <-svc@example.com>", ("Bot", "-svc@example.com")),
+        ],
+    )
+    def test_accepts_valid_author_strings(self, value, expected):
+        assert schedule_sync._parse_commit_author(value) == expected
+
+    @pytest.mark.parametrize(
+        "value,match",
+        [
+            ("", "schedule_sync_commit_author_empty"),
+            ("   ", "schedule_sync_commit_author_empty"),
+            ("no-email-here", "schedule_sync_commit_author_invalid"),
+            ("name <missing-at-sign>", "schedule_sync_commit_author_invalid"),
+            ("<bot@example.com>", "schedule_sync_commit_author_invalid"),
+            (" <bot@example.com>", "schedule_sync_commit_author_invalid"),
+            # Newline in name — the kind of thing that could break commit metadata
+            # parsers if it ever reached git stdin.
+            ("Bot\nInjected <bot@example.com>", "schedule_sync_commit_author_control_char"),
+            ("Bot\rCarriage <bot@example.com>", "schedule_sync_commit_author_control_char"),
+            ("Bot\x00NUL <bot@example.com>", "schedule_sync_commit_author_control_char"),
+        ],
+    )
+    def test_rejects_invalid_or_dangerous_inputs(self, value, match):
+        with pytest.raises(CLIError, match=match):
+            schedule_sync._parse_commit_author(value)
 
 
 # -----------------------------------------------------------------------------
@@ -583,6 +625,45 @@ class TestAirflowDispatch:
         with pytest.raises(CLIError, match="schedule_sync_destination_required"):
             schedule_sync._airflow_dispatch(dags_dir, args)
 
+    def test_git_ssh_dry_run_threads_commit_author_into_commit_argv(self, dags_dir):
+        args = _args(
+            scheduler="airflow",
+            destination="git+ssh://git@github.com/org/repo.git",
+            dry_run=True,
+            git_commit_author="Fluid Bot <bot@example.com>",
+        )
+
+        with patch.object(schedule_sync, "_which_or_raise", side_effect=lambda b: f"/bin/{b}"):
+            results = schedule_sync._airflow_dispatch(dags_dir, args)
+
+        # The git-add and git-status argv stay unchanged. The commit argv must
+        # carry the per-process ``-c user.name=…`` and ``-c user.email=…`` so the
+        # destination repo's history attributes the commit to the deterministic
+        # service-account identity rather than the runner's git config.
+        assert results[4]["argv"] == [
+            "/bin/git",
+            "-c",
+            "user.name=Fluid Bot",
+            "-c",
+            "user.email=bot@example.com",
+            "commit",
+            "-m",
+            "sync Airflow DAGs from fluid schedule-sync",
+        ]
+        # Push remains author-agnostic — git push doesn't carry author metadata.
+        assert results[5]["argv"] == ["/bin/git", "push"]
+
+    def test_git_ssh_invalid_commit_author_rejected(self, dags_dir):
+        args = _args(
+            scheduler="airflow",
+            destination="git+ssh://git@github.com/org/repo.git",
+            dry_run=True,
+            git_commit_author="not a valid format",
+        )
+        with patch.object(schedule_sync, "_which_or_raise", side_effect=lambda b: f"/bin/{b}"):
+            with pytest.raises(CLIError, match="schedule_sync_commit_author_invalid"):
+                schedule_sync._airflow_dispatch(dags_dir, args)
+
 
 # -----------------------------------------------------------------------------
 # _mwaa_dispatch
@@ -798,6 +879,42 @@ class TestArgparseRegistration:
         assert ns.command == "schedule-sync"
         assert ns.scheduler == "airflow"
         assert ns.dry_run is True
+
+    def test_register_includes_git_commit_author_flag(self):
+        parser = argparse.ArgumentParser()
+        sp = parser.add_subparsers(dest="command")
+        schedule_sync.register(sp)
+
+        ns = parser.parse_args(
+            [
+                "schedule-sync",
+                "--scheduler",
+                "airflow",
+                "--dags-dir",
+                "/tmp/x",
+                "--destination",
+                "git+ssh://git@github.com/org/repo.git",
+                "--dry-run",
+                "--git-commit-author",
+                "Fluid Bot <bot@example.com>",
+            ]
+        )
+        assert ns.git_commit_author == "Fluid Bot <bot@example.com>"
+
+        # Default is None when the flag isn't supplied.
+        ns_default = parser.parse_args(
+            [
+                "schedule-sync",
+                "--scheduler",
+                "airflow",
+                "--dags-dir",
+                "/tmp/x",
+                "--destination",
+                "s3://b/d/",
+                "--dry-run",
+            ]
+        )
+        assert ns_default.git_commit_author is None
 
 
 # -----------------------------------------------------------------------------
