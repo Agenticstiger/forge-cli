@@ -14,9 +14,10 @@
 
 """Unified AI / LLM setup for the FLUID CLI.
 
-Provides three entry-points into the same underlying flow:
+Provides four entry-points into the same underlying flow:
 
 * ``fluid ai setup`` -- dedicated interactive command (like ``gh auth login``)
+* ``fluid ai test`` -- quick connectivity/model smoke test
 * ``run_ai_setup_inline()`` -- compact version triggered when forge starts
   without a configured provider
 * ``show_ai_status()`` -- display current config (used by ``fluid doctor``)
@@ -28,6 +29,7 @@ __all__ = [
     "register",
     "run_ai_setup_interactive",
     "run_ai_setup_inline",
+    "run_ai_test",
     "set_session_env",
     "show_ai_models",
     "show_ai_status",
@@ -38,12 +40,16 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
+
+import httpx
 
 from fluid_build.cli.forge_banner import print_v2_banner
 from fluid_build.cli.forge_copilot_llm_providers import (
     BUILTIN_LLM_PROVIDERS,
     PROVIDER_DISPLAY_NAMES,
     PROVIDER_ENV_VARS,
+    CopilotGenerationError,
     LlmConfig,
     build_llm_run_plan,
     check_llm_readiness,
@@ -97,6 +103,13 @@ _ai_setup_skipped = False
 
 # Key format hints shown when auto-detection fails.
 _KEY_FORMAT_HINTS = "Recognised formats: sk-... (OpenAI), sk-ant-... (Anthropic), AIza... (Gemini)"
+
+_AI_TEST_SYSTEM_PROMPT = "You are a FLUID CLI connectivity diagnostic. Reply with exactly FLUID_OK."
+_AI_TEST_USER_PROMPT = "Reply with exactly FLUID_OK."
+_AI_TEST_DEFAULT_TIMEOUT_SECONDS = 30
+_AI_TEST_DEFAULT_OUTPUT_TOKENS = 8
+_AI_TEST_GEMINI_OUTPUT_TOKENS = 256
+_AI_TEST_DISPLAY_LIMIT = 160
 
 
 # ---------------------------------------------------------------------------
@@ -187,8 +200,8 @@ def _load_ai_config() -> Optional[dict]:
             if cfg.llm.tiered:
                 data["tiered"] = cfg.llm.tiered
             return data
-    except Exception:  # pragma: no cover — defensive
-        pass
+    except Exception as exc:  # pragma: no cover — defensive
+        LOG.debug("Could not load unified AI config: %s", exc)
 
     # 2. Legacy ``~/.fluid/ai_config.json`` — pre-existing installs.
     try:
@@ -877,6 +890,353 @@ def show_ai_models(
     )
 
 
+def _coerce_ai_test_timeout(raw: Any) -> int:
+    if raw in (None, ""):
+        return _AI_TEST_DEFAULT_TIMEOUT_SECONDS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _AI_TEST_DEFAULT_TIMEOUT_SECONDS
+    return max(1, min(3600, value))
+
+
+def _normalize_ai_test_provider(value: Any) -> str:
+    provider = str(value or "").strip().lower().replace("-", "_")
+    return "anthropic" if provider == "claude" else provider
+
+
+def _safe_ai_test_display(value: Any, *, limit: int = _AI_TEST_DISPLAY_LIMIT) -> str:
+    text = str(value or "")
+    clean = "".join(ch if ch.isprintable() and ch != "\x1b" else "?" for ch in text)
+    if len(clean) > limit:
+        return clean[: limit - 1] + "…"
+    return clean
+
+
+def _http_error_name(exc: httpx.HTTPError) -> str:
+    return exc.__class__.__name__
+
+
+def _validate_ai_test_endpoint(provider_name: str, endpoint: str) -> Optional[str]:
+    parsed = urlsplit(str(endpoint or ""))
+    if parsed.username or parsed.password:
+        return "AI test endpoint URLs must not embed credentials."
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return "AI test endpoint must be an absolute HTTP(S) URL."
+    host = (parsed.hostname or "").lower()
+    if provider_name == "ollama":
+        if parsed.scheme != "http" or host not in {"localhost", "127.0.0.1", "::1"}:
+            return "Ollama AI test endpoints must stay on localhost."
+        return None
+    if parsed.scheme != "https":
+        return "Cloud AI test endpoints must use HTTPS to avoid sending API keys over plaintext."
+    return None
+
+
+def _resolve_cloud_api_key(provider: str, saved: Optional[dict] = None) -> Optional[str]:
+    if os.environ.get("FLUID_LLM_API_KEY"):
+        return os.environ["FLUID_LLM_API_KEY"]
+    if provider == "gemini":
+        for env_var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            if os.environ.get(env_var):
+                return os.environ[env_var]
+    env_var = PROVIDER_ENV_VARS.get(provider)
+    if env_var and os.environ.get(env_var):
+        return os.environ[env_var]
+    if saved and saved.get("api_key"):
+        return str(saved["api_key"])
+    key = _load_key_from_keyring(provider)
+    if key:
+        return key
+    try:
+        from fluid_build.cli.forge_copilot_llm_providers import _resolve_api_key
+
+        return _resolve_api_key(provider, {})
+    except Exception:  # noqa: BLE001 - best-effort compatibility with the Forge keyring namespace
+        LOG.debug("Could not read Forge LLM keyring namespace for provider=%s", provider)
+        return None
+
+
+def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[str]]:
+    provider_override = _normalize_ai_test_provider(getattr(args, "llm_provider", None))
+    model_override = getattr(args, "llm_model", None) or os.environ.get("FLUID_LLM_MODEL")
+    endpoint_override = getattr(args, "llm_endpoint", None) or os.environ.get("FLUID_LLM_ENDPOINT")
+    timeout = _coerce_ai_test_timeout(
+        getattr(args, "llm_timeout_seconds", None) or os.environ.get("FLUID_LLM_TIMEOUT_SECONDS")
+    )
+    saved = _load_ai_config() or {}
+
+    def _build_for_provider(
+        pname: str, *, allow_saved: bool = True
+    ) -> tuple[Optional[LlmConfig], Optional[str]]:
+        provider = BUILTIN_LLM_PROVIDERS.get(pname)
+        if not provider:
+            return None, f"Unsupported AI provider '{pname}'."
+        saved_for_provider = saved if allow_saved and saved.get("provider") == pname else {}
+        model = model_override or saved_for_provider.get("model") or provider.default_model
+        if pname == "ollama":
+            host = saved_for_provider.get("ollama_host")
+            if host and not os.environ.get("OLLAMA_HOST"):
+                os.environ["OLLAMA_HOST"] = _sanitize_ollama_host(str(host))
+            endpoint = endpoint_override or provider.default_endpoint(model, dict(os.environ))
+            endpoint_error = _validate_ai_test_endpoint(pname, endpoint)
+            if endpoint_error:
+                return None, endpoint_error
+            return (
+                LlmConfig(
+                    provider=pname,
+                    model=model,
+                    endpoint=endpoint,
+                    api_key=None,
+                    timeout_seconds=timeout,
+                ),
+                None,
+            )
+        api_key = _resolve_cloud_api_key(pname, saved_for_provider)
+        if not api_key:
+            return None, f"No API key found for {PROVIDER_DISPLAY_NAMES.get(pname, pname)}."
+        endpoint = endpoint_override or saved_for_provider.get("endpoint")
+        config = _make_cloud_config(pname, api_key, model=model, endpoint=endpoint)
+        endpoint_error = _validate_ai_test_endpoint(pname, config.endpoint)
+        if endpoint_error:
+            return None, endpoint_error
+        return (
+            config,
+            None,
+        )
+
+    if provider_override:
+        config, error = _build_for_provider(provider_override)
+        if config:
+            config.timeout_seconds = timeout
+        return config, error
+
+    if saved.get("provider"):
+        config, error = _build_for_provider(str(saved["provider"]))
+        if config:
+            config.timeout_seconds = timeout
+            return config, None
+        LOG.debug("Saved AI config was not test-ready: %s", error)
+
+    for pname, env_var in PROVIDER_ENV_VARS.items():
+        if os.environ.get(env_var) or (pname == "gemini" and os.environ.get("GEMINI_API_KEY")):
+            config, error = _build_for_provider(pname, allow_saved=False)
+            if config:
+                config.timeout_seconds = timeout
+            return config, error
+
+    if os.environ.get("OLLAMA_HOST") or detect_ollama_available(os.environ):
+        config, error = _build_for_provider("ollama", allow_saved=False)
+        if config:
+            config.timeout_seconds = timeout
+        return config, error
+
+    return None, "No AI provider configured. Run 'fluid ai setup' or set a provider API key."
+
+
+def _cap_ai_test_token_budget(config: LlmConfig, payload: dict) -> None:
+    provider_name = config.provider
+    if provider_name in {"openai", "ollama"}:
+        payload["max_tokens"] = _AI_TEST_DEFAULT_OUTPUT_TOKENS
+        return
+    if provider_name == "anthropic":
+        payload["max_tokens"] = min(
+            int(payload.get("max_tokens") or _AI_TEST_DEFAULT_OUTPUT_TOKENS),
+            _AI_TEST_DEFAULT_OUTPUT_TOKENS,
+        )
+        return
+    if provider_name == "gemini":
+        generation_config = payload.setdefault("generationConfig", {})
+        if not isinstance(generation_config, dict):
+            return
+        generation_config["maxOutputTokens"] = _AI_TEST_GEMINI_OUTPUT_TOKENS
+
+
+def _ai_test_token_budget_label(config: LlmConfig) -> str:
+    if config.provider == "gemini":
+        return f"{_AI_TEST_GEMINI_OUTPUT_TOKENS} tokens"
+    return f"{_AI_TEST_DEFAULT_OUTPUT_TOKENS} tokens"
+
+
+def _with_freeform_ai_test_payload(provider: Any, config: LlmConfig) -> tuple[dict, dict]:
+    old_value = os.environ.get("FLUID_LLM_STRUCTURED_OUTPUTS")
+    had_value = "FLUID_LLM_STRUCTURED_OUTPUTS" in os.environ
+    os.environ["FLUID_LLM_STRUCTURED_OUTPUTS"] = "0"
+    try:
+        headers, payload = provider.build_request(
+            config, _AI_TEST_SYSTEM_PROMPT, _AI_TEST_USER_PROMPT
+        )
+    finally:
+        if had_value:
+            os.environ["FLUID_LLM_STRUCTURED_OUTPUTS"] = old_value or ""
+        else:
+            os.environ.pop("FLUID_LLM_STRUCTURED_OUTPUTS", None)
+    payload = dict(payload)
+    _cap_ai_test_token_budget(config, payload)
+    return headers, payload
+
+
+def _check_ai_test_model_availability(
+    provider: Any, config: LlmConfig
+) -> tuple[str, Optional[list[str]]]:
+    try:
+        available = provider.list_available_models(config.api_key, dict(os.environ))
+    except httpx.HTTPStatusError as exc:
+        raise CopilotGenerationError(
+            "ai_test_model_preflight_failed",
+            f"Could not list {config.provider} models ({exc.response.status_code}).",
+            suggestions=[
+                "Check the provider API key and account permissions",
+                "Try again after confirming network access to the provider",
+            ],
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise CopilotGenerationError(
+            "ai_test_model_preflight_failed",
+            f"Could not list {config.provider} models ({_http_error_name(exc)}).",
+            suggestions=[
+                "Check network connectivity",
+                "For Ollama, start the local Ollama server",
+            ],
+        ) from exc
+    if available is None:
+        return "unavailable", None
+    if config.model not in available:
+        available_preview = ", ".join(_safe_ai_test_display(model) for model in available[:5])
+        raise CopilotGenerationError(
+            "ai_test_model_unavailable",
+            f"Configured {config.provider} model "
+            f"'{_safe_ai_test_display(config.model)}' was not returned by the provider.",
+            suggestions=[
+                f"Available models include: {available_preview or '(none)'}",
+                "Run `fluid ai models` to inspect bundled defaults",
+                "Re-run `fluid ai setup` or pass `fluid ai test --model <model>`",
+            ],
+        )
+    return "available", available
+
+
+def _run_ai_smoke_call(provider: Any, config: LlmConfig) -> tuple[str, dict]:
+    headers, payload = _with_freeform_ai_test_payload(provider, config)
+    try:
+        with httpx.Client(timeout=config.timeout_seconds) as client:
+            response = client.post(config.endpoint, headers=headers, json=payload)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise CopilotGenerationError(
+            "ai_test_request_failed",
+            f"AI test request failed ({exc.response.status_code}) for {config.provider}.",
+            suggestions=[
+                "Check the selected model and endpoint",
+                "Verify the API key has access to the configured model",
+            ],
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise CopilotGenerationError(
+            "ai_test_network_error",
+            f"AI test network error for {config.provider} ({_http_error_name(exc)}).",
+            suggestions=[
+                "Check network connectivity",
+                "For Ollama, start the local Ollama server",
+            ],
+        ) from exc
+
+    try:
+        response_json = response.json()
+        text = provider.extract_text(response_json).strip()
+        usage = provider.extract_usage(response_json)
+    except Exception as exc:  # noqa: BLE001
+        raise CopilotGenerationError(
+            "ai_test_response_invalid",
+            f"AI test response from {config.provider} could not be parsed.",
+            suggestions=["Try a different model or re-run `fluid ai setup`."],
+        ) from exc
+    if "FLUID_OK" not in text:
+        raise CopilotGenerationError(
+            "ai_test_unexpected_response",
+            f"AI test response from {config.provider} was not the expected diagnostic token.",
+            suggestions=["Try again, or choose a different model with `fluid ai setup`."],
+        )
+    return "FLUID_OK", usage
+
+
+def run_ai_test(console: Any, args: Any) -> bool:
+    """Run a quick configured-provider connectivity and model smoke test."""
+    config, config_error = _resolve_ai_test_config(args)
+    if not config:
+        message = config_error or "AI provider is not configured."
+        if console and RICH_AVAILABLE:
+            console.print(
+                Panel(
+                    f"[yellow]{message}[/yellow]\n\n"
+                    "Run [bold cyan]fluid ai setup[/bold cyan] to configure a provider.",
+                    title="AI Provider Test",
+                    border_style="yellow",
+                )
+            )
+        else:
+            from fluid_build.cli.console import cprint
+
+            cprint(f"AI Provider Test: {message}")
+        return False
+
+    provider = BUILTIN_LLM_PROVIDERS[config.provider]
+    label = PROVIDER_DISPLAY_NAMES.get(config.provider, config.provider)
+    try:
+        availability, available_models = _check_ai_test_model_availability(provider, config)
+        text, usage = _run_ai_smoke_call(provider, config)
+    except CopilotGenerationError as exc:
+        if console and RICH_AVAILABLE:
+            suggestions = "\n".join(f"- {s}" for s in exc.suggestions)
+            body = f"[red]{exc.message}[/red]"
+            if suggestions:
+                body += f"\n\n[dim]{suggestions}[/dim]"
+            console.print(Panel(body, title="AI Provider Test Failed", border_style="red"))
+        else:
+            from fluid_build.cli.console import cprint
+
+            cprint(f"AI Provider Test Failed: {exc.message}")
+        return False
+
+    endpoint = config.redacted_endpoint
+    usage_text = (
+        f"{usage.get('input_tokens', 0)} input / "
+        f"{usage.get('output_tokens', 0)} output / "
+        f"{usage.get('total_tokens', 0)} total"
+    )
+    output_cap = _ai_test_token_budget_label(config)
+    if console and RICH_AVAILABLE:
+        table = Table(title="AI Provider Test", border_style="green")
+        table.add_column("Check", style="cyan")
+        table.add_column("Result", style="green")
+        table.add_row("Provider", label)
+        table.add_row("Model", _safe_ai_test_display(config.model))
+        table.add_row("Endpoint", _safe_ai_test_display(endpoint))
+        table.add_row(
+            "Model availability",
+            (
+                "available"
+                if availability == "available"
+                else "not supported by this provider adapter"
+            ),
+        )
+        table.add_row("Live call", text)
+        table.add_row("Token usage", usage_text)
+        table.add_row("Output cap", output_cap)
+        if available_models:
+            table.caption = f"Provider returned {len(available_models)} available model(s)."
+        console.print(table)
+    else:
+        from fluid_build.cli.console import cprint
+
+        cprint(f"AI Provider Test: ready ({label}, {_safe_ai_test_display(config.model)})")
+        cprint(f"  Endpoint: {_safe_ai_test_display(endpoint)}")
+        cprint(f"  Model availability: {availability}")
+        cprint(f"  Live call: {text}")
+        cprint(f"  Token usage: {usage_text}; output cap: {output_cap}")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # CLI registration -- ``fluid ai setup``
 # ---------------------------------------------------------------------------
@@ -949,6 +1309,33 @@ def register(subparsers) -> None:
         help="Limit output to one provider",
     )
     models_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    test_parser = ai_sub.add_parser(
+        "test",
+        help="Run a quick configured-provider connectivity test",
+    )
+    test_parser.add_argument(
+        "--provider",
+        dest="llm_provider",
+        choices=["gemini", "openai", "anthropic", "claude", "ollama"],
+        help="Override the configured provider for this test",
+    )
+    test_parser.add_argument(
+        "--model",
+        dest="llm_model",
+        help="Override the configured model for this test",
+    )
+    test_parser.add_argument(
+        "--endpoint",
+        dest="llm_endpoint",
+        help="Override the provider endpoint for this test",
+    )
+    test_parser.add_argument(
+        "--timeout-seconds",
+        dest="llm_timeout_seconds",
+        type=int,
+        default=None,
+        help="HTTP timeout for the diagnostic request",
+    )
     parser.set_defaults(func=_run_ai_command)
 
 
@@ -1015,6 +1402,9 @@ def _run_ai_command(args, logger: logging.Logger) -> int:
             as_json=bool(getattr(args, "json", False)),
         )
         return 0
+
+    if action == "test":
+        return 0 if run_ai_test(console, args) else 1
 
     # No subcommand -- default to showing status
     show_ai_status(console)

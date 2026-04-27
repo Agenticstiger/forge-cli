@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import stat
 from pathlib import Path
@@ -281,6 +282,316 @@ class TestShowAiStatus:
         console = MagicMock()
         show_ai_status(console)
         console.print.assert_called()
+
+
+class TestAiTestCommand:
+    def test_register_exposes_ai_test_args(self):
+        from fluid_build.cli.ai_setup import register
+
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="cmd")
+        register(subparsers)
+
+        args = parser.parse_args(
+            [
+                "ai",
+                "test",
+                "--provider",
+                "openai",
+                "--model",
+                "operator-model",
+                "--timeout-seconds",
+                "7",
+            ]
+        )
+
+        assert args.cmd == "ai"
+        assert args.ai_action == "test"
+        assert args.llm_provider == "openai"
+        assert args.llm_model == "operator-model"
+        assert args.llm_timeout_seconds == 7
+
+    def test_resolve_test_config_uses_saved_provider_and_keyring(self):
+        from fluid_build.cli.ai_setup import _resolve_ai_test_config
+
+        args = argparse.Namespace(
+            llm_provider=None,
+            llm_model=None,
+            llm_endpoint=None,
+            llm_timeout_seconds=None,
+        )
+
+        with (
+            patch(
+                "fluid_build.cli.ai_setup._load_ai_config",
+                return_value={"provider": "openai", "model": "operator-model"},
+            ),
+            patch("fluid_build.cli.ai_setup._load_key_from_keyring", return_value="sk-test"),
+            patch("fluid_build.cli.ai_setup.detect_ollama_available", return_value=False),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            config, error = _resolve_ai_test_config(args)
+
+        assert error is None
+        assert config is not None
+        assert config.provider == "openai"
+        assert config.model == "operator-model"
+        assert config.api_key == "sk-test"
+        assert config.timeout_seconds == 30
+
+    def test_resolve_test_config_falls_back_to_forge_keyring_namespace(self):
+        from fluid_build.cli.ai_setup import _resolve_ai_test_config
+
+        args = argparse.Namespace(
+            llm_provider="openai",
+            llm_model="operator-model",
+            llm_endpoint=None,
+            llm_timeout_seconds=None,
+        )
+
+        with (
+            patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None),
+            patch("fluid_build.cli.ai_setup._load_key_from_keyring", return_value=None),
+            patch(
+                "fluid_build.cli.forge_copilot_llm_providers._resolve_api_key",
+                return_value="sk-test",
+            ),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            config, error = _resolve_ai_test_config(args)
+
+        assert error is None
+        assert config is not None
+        assert config.api_key == "sk-test"
+
+    def test_resolve_test_config_rejects_plaintext_cloud_endpoint(self):
+        from fluid_build.cli.ai_setup import _resolve_ai_test_config
+
+        args = argparse.Namespace(
+            llm_provider="openai",
+            llm_model=None,
+            llm_endpoint="http://api.example.test/v1/chat/completions",
+            llm_timeout_seconds=None,
+        )
+
+        with (
+            patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None),
+            patch("fluid_build.cli.ai_setup._load_key_from_keyring", return_value="sk-test"),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            config, error = _resolve_ai_test_config(args)
+
+        assert config is None
+        assert error is not None
+        assert "HTTPS" in error
+
+    def test_resolve_test_config_rejects_endpoint_embedded_credentials(self):
+        from fluid_build.cli.ai_setup import _resolve_ai_test_config
+
+        args = argparse.Namespace(
+            llm_provider="openai",
+            llm_model=None,
+            llm_endpoint="https://user:secret@api.example.test/v1/chat/completions",
+            llm_timeout_seconds=None,
+        )
+
+        with (
+            patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None),
+            patch("fluid_build.cli.ai_setup._load_key_from_keyring", return_value="sk-test"),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            config, error = _resolve_ai_test_config(args)
+
+        assert config is None
+        assert error is not None
+        assert "must not embed credentials" in error
+
+    def test_freeform_payload_disables_structured_outputs_and_caps_gemini(self):
+        from fluid_build.cli.ai_setup import _with_freeform_ai_test_payload
+        from fluid_build.cli.forge_copilot_llm_providers import LlmConfig
+
+        class FakeGemini:
+            def build_request(self, config, system_prompt, user_prompt):
+                assert system_prompt
+                assert user_prompt
+                assert config.provider == "gemini"
+                import os
+
+                assert os.environ["FLUID_LLM_STRUCTURED_OUTPUTS"] == "0"
+                return {"Content-Type": "application/json"}, {"generationConfig": {}}
+
+        config = LlmConfig(
+            provider="gemini",
+            model="operator-model",
+            endpoint="https://example.test",
+            api_key="AIza-test",
+        )
+
+        with patch.dict("os.environ", {"FLUID_LLM_STRUCTURED_OUTPUTS": "1"}, clear=True):
+            headers, payload = _with_freeform_ai_test_payload(FakeGemini(), config)
+            import os
+
+            assert os.environ["FLUID_LLM_STRUCTURED_OUTPUTS"] == "1"
+
+        assert headers["Content-Type"] == "application/json"
+        assert payload["generationConfig"]["maxOutputTokens"] == 256
+        assert "thinkingConfig" not in payload["generationConfig"]
+
+    def test_smoke_call_returns_fixed_success_token(self):
+        from fluid_build.cli.ai_setup import _run_ai_smoke_call
+        from fluid_build.cli.forge_copilot_llm_providers import LlmConfig
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"ok": True}
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def post(self, *args, **kwargs):
+                return FakeResponse()
+
+        provider = MagicMock()
+        provider.build_request.return_value = ({}, {})
+        provider.extract_text.return_value = "FLUID_OK with extra text"
+        provider.extract_usage.return_value = {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "total_tokens": 2,
+        }
+        config = LlmConfig(
+            provider="openai",
+            model="operator-model",
+            endpoint="https://example.test",
+            api_key="sk-test",
+        )
+
+        with patch("fluid_build.cli.ai_setup.httpx.Client", FakeClient):
+            text, usage = _run_ai_smoke_call(provider, config)
+
+        assert text == "FLUID_OK"
+        assert usage["total_tokens"] == 2
+
+    def test_smoke_call_network_error_does_not_echo_raw_url(self):
+        from fluid_build.cli.ai_setup import _run_ai_smoke_call
+        from fluid_build.cli.forge_copilot_llm_providers import (
+            CopilotGenerationError,
+            LlmConfig,
+        )
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def post(self, *args, **kwargs):
+                raise RuntimeError("should be replaced")
+
+        class HttpxErrorClient(FakeClient):
+            def post(self, *args, **kwargs):
+                import httpx
+
+                raise httpx.ConnectError("failed https://example.test/?key=secret")
+
+        provider = MagicMock()
+        provider.build_request.return_value = ({}, {})
+        config = LlmConfig(
+            provider="openai",
+            model="operator-model",
+            endpoint="https://example.test/?key=secret",
+            api_key="sk-test",
+        )
+
+        with (
+            patch("fluid_build.cli.ai_setup.httpx.Client", HttpxErrorClient),
+            pytest.raises(CopilotGenerationError) as exc_info,
+        ):
+            _run_ai_smoke_call(provider, config)
+
+        assert "secret" not in exc_info.value.message
+        assert "ConnectError" in exc_info.value.message
+
+    def test_model_availability_raises_when_configured_model_missing(self):
+        from fluid_build.cli.ai_setup import _check_ai_test_model_availability
+        from fluid_build.cli.forge_copilot_llm_providers import (
+            CopilotGenerationError,
+            LlmConfig,
+        )
+
+        provider = MagicMock()
+        provider.list_available_models.return_value = ["other-model"]
+        config = LlmConfig(
+            provider="openai",
+            model="operator-model",
+            endpoint="https://example.test",
+            api_key="sk-test",
+        )
+
+        with pytest.raises(CopilotGenerationError) as exc_info:
+            _check_ai_test_model_availability(provider, config)
+        assert "Configured openai model" in exc_info.value.message
+
+    def test_run_ai_test_success(self):
+        from fluid_build.cli.ai_setup import run_ai_test
+        from fluid_build.cli.forge_copilot_llm_providers import LlmConfig
+
+        args = argparse.Namespace()
+        config = LlmConfig(
+            provider="openai",
+            model="operator-model",
+            endpoint="https://api.openai.com/v1/chat/completions",
+            api_key="sk-test",
+        )
+
+        with (
+            patch("fluid_build.cli.ai_setup._resolve_ai_test_config", return_value=(config, None)),
+            patch(
+                "fluid_build.cli.ai_setup._check_ai_test_model_availability",
+                return_value=("available", ["operator-model"]),
+            ),
+            patch(
+                "fluid_build.cli.ai_setup._run_ai_smoke_call",
+                return_value=(
+                    "FLUID_OK",
+                    {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
+                ),
+            ),
+            patch("fluid_build.cli.console.cprint") as cprint,
+        ):
+            assert run_ai_test(None, args) is True
+
+        printed = "\n".join(call.args[0] for call in cprint.call_args_list)
+        assert "AI Provider Test: ready" in printed
+        assert "Token usage: 4 input / 1 output / 5 total" in printed
+
+    def test_run_ai_test_without_config_returns_false(self):
+        from fluid_build.cli.ai_setup import run_ai_test
+
+        with (
+            patch(
+                "fluid_build.cli.ai_setup._resolve_ai_test_config",
+                return_value=(None, "No AI provider configured."),
+            ),
+            patch("fluid_build.cli.console.cprint") as cprint,
+        ):
+            assert run_ai_test(None, argparse.Namespace()) is False
+
+        assert "No AI provider configured" in cprint.call_args.args[0]
 
 
 class TestModelCatalogIntegrity:
