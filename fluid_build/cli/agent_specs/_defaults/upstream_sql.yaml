@@ -1,0 +1,27 @@
+# Default upstream-SQL guidance injected into the forge-copilot system prompt.
+# Loaded once at module import by fluid_build.cli.forge_copilot_prompts.
+# Edit this file to tweak the upstream SQL prose without a Python change.
+# The snapshot test at tests/test_prompt_default_guidance.py locks the
+# composed prompt to byte-identical output, so any change here must be
+# accompanied by re-running the baseline capture script.
+system_prompt: |
+  UPSTREAM TRANSFORMATION SQL (required when consumes[] references upstream products):
+  When the user prompt contains 'upstream_products', the keys are productIds that you MAY reference from consumes[]. Each productId maps to an object whose 'exposes' keys are the exact exposeIds you must use in consumes[].exposeId, and whose schema tells you the column names/types available in each upstream source.
+  Whenever your contract declares consumes[] that point at entries in upstream_products AND uses engine='dbt' with pattern='hybrid-reference', you MUST also emit working dbt SQL in additional_files — NOT TODO skeletons. Use these exact paths:
+    additional_files['dbt_project/models/staging/stg_<consumeExposeId>.sql']
+    additional_files['dbt_project/models/marts/<buildModelName>.sql']
+  where <buildModelName> is the value you put in builds[0].properties.model.
+  STAGING MODELS must:
+    - start with "{{ config(materialized='view') }}"
+    - select the upstream columns named in upstream_products[productId].exposes[exposeId].schema
+    - rename columns to snake_case when the upstream uses SCREAMING_CASE, keep types intact
+    - read from {{ source('raw', '<consumeExposeId>') }}
+  MART MODEL must:
+    - start with "{{ config(materialized='table') }}"
+    - select EVERY column declared in exposes[0].contract.schema with the correct type
+    - JOIN the staging models via the obvious identifier columns (party_id, account_id, customer_id, subscription_id, service_id, etc.) — prefer INNER JOIN when the downstream column is 'required: true', LEFT JOIN otherwise
+    - compute aggregations (SUM, COUNT, MAX, AVG) when the downstream column name or type implies them (e.g. 'total_invoice_amount' → SUM(invoice.amount); 'number_of_trouble_tickets' → COUNT(DISTINCT trouble_ticket.id); 'last_interaction_at' → MAX(interaction.timestamp))
+    - apply a GROUP BY over the identifying keys when any aggregation is present
+    - NEVER emit 'cast(null as ...)' or '-- TODO' lines — real SELECT expressions only
+  Also emit additional_files['dbt_project/models/schema.yml'] with per-model column tests mirroring the exposes[].contract.schema (not_null for required columns; unique for single-column primary keys).
+  If upstream_products is empty or missing, fall back to normal contract generation — the dbt skeleton generator will run automatically.
