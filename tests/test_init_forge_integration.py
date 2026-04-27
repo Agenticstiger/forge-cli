@@ -534,6 +534,189 @@ class TestInitForgeHandover:
         assert (product2_dir / "contract.fluid.yaml").exists()
 
 
+class TestOfferFirstForgeHandoff:
+    """Card 69d4c9bf — Init → Forge handoff. Verifies the prompt text adapts to
+    the AI-config state and that AI setup runs inline before forge when no
+    config exists yet."""
+
+    def test_skips_when_contract_already_exists(self, tmp_path, logger, monkeypatch):
+        from fluid_build.cli.init import _offer_first_forge
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "contract.fluid.yaml").touch()
+
+        args = SimpleNamespace(target_dir=str(tmp_path), name=None)
+
+        with (
+            patch("fluid_build.cli.init.Confirm.ask") as mock_confirm,
+            patch("fluid_build.cli.forge.run") as mock_forge,
+        ):
+            _offer_first_forge(args, logger)
+
+        # No prompt, no forge invocation — handoff is suppressed.
+        mock_confirm.assert_not_called()
+        mock_forge.assert_not_called()
+
+    def test_uses_short_prompt_when_ai_already_configured(self, tmp_path, logger, monkeypatch):
+        from fluid_build.cli.init import _offer_first_forge
+
+        monkeypatch.chdir(tmp_path)
+        args = SimpleNamespace(target_dir=str(tmp_path), name=None, provider=None)
+
+        with (
+            patch("fluid_build.cli.init._is_ai_configured", return_value=True),
+            patch("fluid_build.cli.init.RICH_AVAILABLE", True),
+            patch("rich.prompt.Confirm.ask", return_value=False) as mock_confirm,
+            patch("fluid_build.cli.ai_setup.run_ai_setup_interactive") as mock_setup,
+        ):
+            _offer_first_forge(args, logger)
+
+        # Prompt was the short "Ready to create" form, not the AI-setup variant.
+        prompt_text = mock_confirm.call_args.args[0]
+        assert "Ready to create your first data product" in prompt_text
+        assert "Set up AI" not in prompt_text
+        # AI setup was NOT invoked because config already exists.
+        mock_setup.assert_not_called()
+
+    def test_uses_setup_prompt_and_runs_ai_setup_when_unconfigured(
+        self, tmp_path, logger, monkeypatch
+    ):
+        from fluid_build.cli.init import _offer_first_forge
+
+        monkeypatch.chdir(tmp_path)
+        args = SimpleNamespace(target_dir=str(tmp_path), name=None, provider=None)
+
+        forge_run_mock = MagicMock(return_value=0)
+
+        with (
+            patch("fluid_build.cli.init._is_ai_configured", return_value=False),
+            patch("fluid_build.cli.init.RICH_AVAILABLE", True),
+            patch("rich.prompt.Confirm.ask", return_value=True) as mock_confirm,
+            patch(
+                "fluid_build.cli.ai_setup.run_ai_setup_interactive",
+                return_value=MagicMock(provider="gemini", model="gemini-2.0-flash"),
+            ) as mock_setup,
+            patch("fluid_build.cli.forge.run", forge_run_mock),
+        ):
+            _offer_first_forge(args, logger)
+
+        # Prompt advertises BOTH actions when no AI config is present.
+        prompt_text = mock_confirm.call_args.args[0]
+        assert "Set up AI" in prompt_text
+        # AI setup is invoked first, forge runs second — the Tier-3.1 chain.
+        mock_setup.assert_called_once()
+        forge_run_mock.assert_called_once()
+
+    def test_user_declines_offer_skips_setup_and_forge(self, tmp_path, logger, monkeypatch):
+        from fluid_build.cli.init import _offer_first_forge
+
+        monkeypatch.chdir(tmp_path)
+        args = SimpleNamespace(target_dir=str(tmp_path), name=None, provider=None)
+
+        with (
+            patch("fluid_build.cli.init._is_ai_configured", return_value=False),
+            patch("fluid_build.cli.init.RICH_AVAILABLE", True),
+            patch("rich.prompt.Confirm.ask", return_value=False),
+            patch("fluid_build.cli.ai_setup.run_ai_setup_interactive") as mock_setup,
+            patch("fluid_build.cli.forge.run") as mock_forge,
+        ):
+            _offer_first_forge(args, logger)
+
+        # User declined — neither AI setup nor forge runs.
+        mock_setup.assert_not_called()
+        mock_forge.assert_not_called()
+
+    def test_continues_to_forge_when_ai_setup_skipped(self, tmp_path, logger, monkeypatch):
+        """If the user accepts the handoff but then skips the AI picker
+        inside run_ai_setup_interactive, forge still runs (in non-AI
+        fallback mode) — the user opted into product creation, so we
+        honour that intent."""
+        from fluid_build.cli.init import _offer_first_forge
+
+        monkeypatch.chdir(tmp_path)
+        args = SimpleNamespace(target_dir=str(tmp_path), name=None, provider=None)
+
+        forge_run_mock = MagicMock(return_value=0)
+
+        with (
+            patch("fluid_build.cli.init._is_ai_configured", return_value=False),
+            patch("fluid_build.cli.init.RICH_AVAILABLE", True),
+            patch("rich.prompt.Confirm.ask", return_value=True),
+            patch("fluid_build.cli.ai_setup.run_ai_setup_interactive", return_value=None),
+            patch("fluid_build.cli.forge.run", forge_run_mock),
+        ):
+            _offer_first_forge(args, logger)
+
+        # Forge still ran — declining the AI picker shouldn't abort the
+        # product-creation intent the user confirmed.
+        forge_run_mock.assert_called_once()
+
+
+class TestIsAiConfigured:
+    """Helper that decides whether the post-init handoff offers the AI-setup
+    variant or jumps straight to forge."""
+
+    def test_returns_true_when_saved_config_has_provider(self):
+        from fluid_build.cli.init import _is_ai_configured
+
+        with patch(
+            "fluid_build.cli.ai_setup._load_ai_config",
+            return_value={"provider": "gemini", "model": "gemini-2.0-flash"},
+        ):
+            assert _is_ai_configured() is True
+
+    def test_returns_true_when_provider_env_var_set(self, monkeypatch):
+        from fluid_build.cli.init import _is_ai_configured
+
+        # Make sure no saved config interferes.
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-fake")
+        with patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None):
+            assert _is_ai_configured() is True
+
+    def test_returns_true_for_gemini_alias_env_var(self, monkeypatch):
+        """``GEMINI_API_KEY`` is accepted as an alias for ``GOOGLE_API_KEY``
+        by the copilot provider resolver. The post-init handoff must agree
+        so a user who exports the alias doesn't get re-prompted to set AI
+        up."""
+        from fluid_build.cli.init import _is_ai_configured
+
+        for key in (
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GOOGLE_API_KEY",
+            "OLLAMA_HOST",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("GEMINI_API_KEY", "AIza-test-fake")
+        with patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None):
+            assert _is_ai_configured() is True
+
+    def test_returns_true_when_ollama_host_env_var_set(self, monkeypatch):
+        from fluid_build.cli.init import _is_ai_configured
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
+        with patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None):
+            assert _is_ai_configured() is True
+
+    def test_returns_false_when_no_config_or_env(self, monkeypatch):
+        from fluid_build.cli.init import _is_ai_configured
+
+        for key in (
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OLLAMA_HOST",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        with patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None):
+            assert _is_ai_configured() is False
+
+
 # ============================================================================
 # ERROR SCENARIOS
 # ============================================================================
