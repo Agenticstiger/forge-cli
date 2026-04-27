@@ -34,29 +34,38 @@ from typing import Any, Dict, Optional
 from fluid_build.cli.console import cprint, success
 from fluid_build.cli.console import error as console_error
 
+from .._path_safety import confine_to_workspace
+
 LOG = logging.getLogger("fluid.build_runners.python")
 
 
 def resolve_script_path(contract_path: Path, build: Dict[str, Any]) -> Optional[Path]:
-    """Resolve the script path for a build.
+    """Resolve the script path for a build, confined to the contract's workspace.
 
     Tries ``<repository>/<model>.py`` first, then ``<repository>/<model>``
-    (no extension). Returns ``None`` if neither exists. ``model`` defaults
-    to ``"ingest"``.
+    (no extension). Returns ``None`` if neither exists, or if the resolved
+    path escapes the contract's parent directory (path-traversal guard).
+    ``model`` defaults to ``"ingest"``.
     """
     repository = build.get("repository", "./")
     properties = build.get("properties", {})
     model = properties.get("model", "ingest")
+    build_id = str(build.get("id", "unknown"))
+    workspace_root = contract_path.parent
 
     # Try .py extension first
     script_path = contract_path.parent / repository / f"{model}.py"
     if script_path.exists():
-        return script_path
+        return confine_to_workspace(
+            script_path, workspace_root, build_id=build_id, kind="python", logger=LOG
+        )
 
     # Try without extension
     script_path = contract_path.parent / repository / model
     if script_path.exists():
-        return script_path
+        return confine_to_workspace(
+            script_path, workspace_root, build_id=build_id, kind="python", logger=LOG
+        )
 
     return None
 

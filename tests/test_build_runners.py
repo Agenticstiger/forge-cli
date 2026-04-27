@@ -133,6 +133,83 @@ class TestResolveScriptPath:
         result = resolve_script_path(contract_path, build)
         assert result == script_py
 
+    def test_rejects_path_traversal_via_repository_dotdot(self, tmp_path, caplog):
+        """A malicious ``repository: ../escape`` must not return a path
+        outside the contract's workspace, even when the target script
+        actually exists."""
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        outside_script = outside_dir / "ingest.py"
+        outside_script.touch()
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        contract_path = workspace / "contract.yaml"
+        contract_path.touch()
+
+        build = {
+            "id": "evil",
+            "repository": "../outside",
+            "properties": {"model": "ingest"},
+        }
+
+        with caplog.at_level("WARNING", logger="fluid.build_runners.python"):
+            result = resolve_script_path(contract_path, build)
+
+        assert result is None
+        assert any("build_runner_path_outside_workspace" in r.getMessage() for r in caplog.records)
+
+    def test_rejects_absolute_repository_outside_workspace(self, tmp_path, caplog):
+        outside_dir = tmp_path / "outside_abs"
+        outside_dir.mkdir()
+        outside_script = outside_dir / "ingest.py"
+        outside_script.touch()
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        contract_path = workspace / "contract.yaml"
+        contract_path.touch()
+
+        build = {
+            "id": "evil_abs",
+            "repository": str(outside_dir),
+            "properties": {"model": "ingest"},
+        }
+
+        with caplog.at_level("WARNING", logger="fluid.build_runners.python"):
+            result = resolve_script_path(contract_path, build)
+
+        assert result is None
+
+    def test_rejects_symlink_escaping_workspace(self, tmp_path, caplog):
+        """A symlink inside the workspace pointing outside is rejected
+        because ``Path.resolve`` follows symlinks before the confinement
+        check runs."""
+        outside_dir = tmp_path / "outside_sym"
+        outside_dir.mkdir()
+        outside_script = outside_dir / "ingest.py"
+        outside_script.touch()
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        contract_path = workspace / "contract.yaml"
+        contract_path.touch()
+
+        # symlink workspace/repo -> outside_sym
+        repo_link = workspace / "repo"
+        repo_link.symlink_to(outside_dir, target_is_directory=True)
+
+        build = {
+            "id": "evil_sym",
+            "repository": "repo",
+            "properties": {"model": "ingest"},
+        }
+
+        with caplog.at_level("WARNING", logger="fluid.build_runners.python"):
+            result = resolve_script_path(contract_path, build)
+
+        assert result is None
+
 
 class TestResolveDbtProjectPath:
     def test_returns_project_dir_when_dbt_project_exists(self, tmp_path):
@@ -156,6 +233,61 @@ class TestResolveDbtProjectPath:
         contract_path.touch()
 
         result = resolve_dbt_project_path(contract_path, build)
+        assert result is None
+
+    def test_rejects_path_traversal_via_repository_dotdot(self, tmp_path, caplog):
+        outside_dir = tmp_path / "outside_dbt"
+        outside_dir.mkdir()
+        (outside_dir / "dbt_project.yml").write_text("name: evil\nprofile: x\n")
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        contract_path = workspace / "contract.yaml"
+        contract_path.touch()
+
+        build = {"id": "evil", "engine": "dbt", "repository": "../outside_dbt"}
+
+        with caplog.at_level("WARNING", logger="fluid.build_runners.dbt.runner"):
+            result = resolve_dbt_project_path(contract_path, build)
+
+        assert result is None
+        assert any("build_runner_path_outside_workspace" in r.getMessage() for r in caplog.records)
+
+    def test_rejects_absolute_repository_outside_workspace(self, tmp_path, caplog):
+        outside_dir = tmp_path / "outside_dbt_abs"
+        outside_dir.mkdir()
+        (outside_dir / "dbt_project.yml").write_text("name: evil\nprofile: x\n")
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        contract_path = workspace / "contract.yaml"
+        contract_path.touch()
+
+        build = {"id": "evil_abs", "engine": "dbt", "repository": str(outside_dir)}
+
+        with caplog.at_level("WARNING", logger="fluid.build_runners.dbt.runner"):
+            result = resolve_dbt_project_path(contract_path, build)
+
+        assert result is None
+
+    def test_rejects_symlink_escaping_workspace(self, tmp_path, caplog):
+        outside_dir = tmp_path / "outside_dbt_sym"
+        outside_dir.mkdir()
+        (outside_dir / "dbt_project.yml").write_text("name: evil\nprofile: x\n")
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        contract_path = workspace / "contract.yaml"
+        contract_path.touch()
+
+        repo_link = workspace / "dbt_repo"
+        repo_link.symlink_to(outside_dir, target_is_directory=True)
+
+        build = {"id": "evil_sym", "engine": "dbt", "repository": "dbt_repo"}
+
+        with caplog.at_level("WARNING", logger="fluid.build_runners.dbt.runner"):
+            result = resolve_dbt_project_path(contract_path, build)
+
         assert result is None
 
 

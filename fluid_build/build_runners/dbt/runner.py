@@ -47,6 +47,7 @@ import yaml
 from fluid_build.cli.console import cprint, success
 from fluid_build.cli.console import error as console_error
 
+from .._path_safety import confine_to_workspace
 from ..base import SENSITIVE_ENV_KEY_RE, _resolve_env_placeholders
 from .profiles import (
     _load_dbt_project_config,
@@ -96,11 +97,22 @@ DBT_ENV_EXACT_KEYS = frozenset(
 
 
 def resolve_dbt_project_path(contract_path: Path, build: Dict[str, Any]) -> Optional[Path]:
-    """Resolve the dbt project root for a build."""
+    """Resolve the dbt project root for a build, confined to the contract's workspace.
+
+    Returns ``None`` if no ``dbt_project.yml`` is found, or if the resolved
+    path escapes the contract's parent directory (path-traversal guard).
+    """
     repository = build.get("repository", "./")
+    build_id = str(build.get("id", "unknown"))
     project_dir = (contract_path.parent / repository).resolve()
     if (project_dir / "dbt_project.yml").exists():
-        return project_dir
+        return confine_to_workspace(
+            project_dir,
+            contract_path.parent,
+            build_id=build_id,
+            kind="dbt",
+            logger=LOG,
+        )
     return None
 
 
