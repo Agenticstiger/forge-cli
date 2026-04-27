@@ -225,8 +225,15 @@ class ProviderActionExecutor:
             # high-level action handler was removed in favour of service-level dispatch.
             handler = GenericProviderActionHandler(provider_instance, self.logger)
         elif provider_name == "snowflake":
-            # TODO: Implement Snowflake handler
-            raise NotImplementedError("Snowflake provider action handler not yet implemented")
+            # Snowflake's first-class action path is the planner + provider.apply()
+            # flow in cli/apply.py, dispatched through SnowflakeProviderEnhanced's
+            # own abstract-op dispatcher (registerSchema, provisionDataset,
+            # scheduleTask, custom). This generic handler is the no-crash fallback
+            # for callers that route through ProviderActionExecutor instead — it
+            # invokes ``execute_<action_type>`` on the provider when present and
+            # reports ``status: not_implemented`` otherwise, matching the AWS
+            # branch above.
+            handler = GenericProviderActionHandler(provider_instance, self.logger)
         elif provider_name == "airflow":
             # Airflow actions are typically delegated/generated, not directly executed
             handler = AirflowActionHandler(self.logger)
