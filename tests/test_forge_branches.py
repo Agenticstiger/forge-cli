@@ -701,22 +701,21 @@ class TestRunFunction:
         assert result == 0
         mock_memory.assert_called_once()
 
-    @pytest.mark.xfail(
-        reason="Import-cycle with the copilot subsystem makes this dispatch return "
-        "1 rather than 0 across all supported Python versions; doesn't affect the "
-        "`fluid forge` happy path. Tracked for follow-up.",
-        strict=False,
-    )
     @patch("fluid_build.cli.forge.run_ai_copilot_mode", return_value=0)
-    def test_run_copilot_mode(self, _mock_copilot):
+    def test_run_copilot_mode(self, mock_copilot):
         from fluid_build.cli.forge import run
 
         args = MagicMock()
         args.help = False
         args.mode = "copilot"
+        # Skip inline LLM setup so the dispatch path doesn't depend on a saved
+        # provider config — without this, CI (no saved config) falls into the
+        # ``ask_confirmation`` branch and reads from a captured stdin.
+        args.non_interactive = True
         logger = logging.getLogger("test")
         result = run(args, logger)
         assert result == 0
+        mock_copilot.assert_called_once()
 
     @patch("fluid_build.cli.forge.run_ai_copilot_mode", return_value=0)
     def test_run_non_interactive_copilot(self, mock_copilot):

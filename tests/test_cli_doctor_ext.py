@@ -23,8 +23,6 @@ import argparse
 import unittest
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 # ---------------------------------------------------------------------------
 # _check_fluid_features() — supplementary branches
 # ---------------------------------------------------------------------------
@@ -361,13 +359,6 @@ class TestPrintFeatureChecksRich(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="The doctor result type changed shape across all supported Python "
-    "versions — these tests expect '.suggestions' / '.message' attributes on "
-    "what is now a plain str. Tracked as real test/code drift to repair "
-    "separately; not a release blocker.",
-    strict=False,
-)
 class TestRunExtra(unittest.TestCase):
     def _make_args(self, **kw):
         defaults = dict(

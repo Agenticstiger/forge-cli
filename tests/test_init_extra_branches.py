@@ -425,33 +425,23 @@ class TestRun:
 
         assert run(args, logger) == 1
 
-    @pytest.mark.xfail(
-        reason="Import-cycle with the copilot subsystem makes this dispatch return "
-        "1 rather than 0 across all supported Python versions; doesn't affect the "
-        "`fluid init` happy path. Tracked for follow-up.",
-        strict=False,
-    )
     @patch("fluid_build.cli.init._ask_industry", return_value=None)
     @patch("fluid_build.cli.init.blank_mode", return_value=0)
     @patch("fluid_build.cli.init.detect_mode", return_value="blank")
-    def test_blank_dispatch(self, _mock_dm, _mock_bl, _mock_ind, logger):
+    def test_blank_dispatch(self, _mock_dm, mock_bl, _mock_ind, logger):
         from fluid_build.cli.init import run
 
         assert run(SimpleNamespace(), logger) == 0
+        mock_bl.assert_called_once()
 
-    @pytest.mark.xfail(
-        reason="Import-cycle with the copilot subsystem makes this dispatch return "
-        "1 rather than 0 across all supported Python versions; doesn't affect the "
-        "`fluid init` happy path. Tracked for follow-up.",
-        strict=False,
-    )
     @patch("fluid_build.cli.init._ask_industry", return_value=None)
     @patch("fluid_build.cli.init.template_mode", return_value=0)
     @patch("fluid_build.cli.init.detect_mode", return_value="template")
-    def test_template_dispatch(self, _mock_dm, _mock_tm, _mock_ind, logger):
+    def test_template_dispatch(self, _mock_dm, mock_tm, _mock_ind, logger):
         from fluid_build.cli.init import run
 
         assert run(SimpleNamespace(), logger) == 0
+        mock_tm.assert_called_once()
 
     @patch("fluid_build.cli.init.detect_mode", return_value="unknown_xyz")
     def test_unknown_mode_returns_1(self, _mock_dm, logger):

@@ -642,12 +642,20 @@ def _print_copilot_readiness(readiness: LlmReadinessCheck, verbose: bool = False
         table.add_row("Endpoint", endpoint_text)
         table.add_row("Auth", auth_text)
         if verbose and readiness.error is not None:
-            table.add_row("Message", readiness.error.message)
+            # ``readiness.error`` is a plain string in current code paths; older
+            # paths populated a structured object with ``.message`` / ``.suggestions``.
+            # Tolerate both shapes — see the same dance in ``_print_doctor_next_steps``.
+            error = readiness.error
+            message_text = getattr(error, "message", None)
+            if message_text is None:
+                message_text = error if isinstance(error, str) else str(error)
+            table.add_row("Message", message_text)
         console.print(table)
-        if verbose and readiness.error is not None and readiness.error.suggestions:
+        error_suggestions = getattr(readiness.error, "suggestions", None)
+        if verbose and readiness.error is not None and error_suggestions:
             console.print(
                 Panel(
-                    "\n".join(f"• {item}" for item in readiness.error.suggestions),
+                    "\n".join(f"• {item}" for item in error_suggestions),
                     title="Copilot Suggestions",
                     border_style="yellow",
                 )
@@ -663,7 +671,11 @@ def _print_copilot_readiness(readiness: LlmReadinessCheck, verbose: bool = False
     cprint(f"Endpoint: {endpoint_text}")
     cprint(f"Auth:     {auth_text}")
     if verbose and readiness.error is not None:
-        cprint(f"Message:  {readiness.error.message}")
-        for suggestion in readiness.error.suggestions:
+        error = readiness.error
+        message_text = getattr(error, "message", None)
+        if message_text is None:
+            message_text = error if isinstance(error, str) else str(error)
+        cprint(f"Message:  {message_text}")
+        for suggestion in getattr(error, "suggestions", None) or []:
             cprint(f"  • {suggestion}")
     cprint()
