@@ -244,11 +244,11 @@ def build_system_prompt(
         "and optional measure (for simple), filter, inputMetrics (array of strings for derived/ratio), "
         "expr (for derived), numerator/denominator (for ratio), description.\n"
         "The semantics block enables AI agents and BI tools to generate correct queries without hallucination.\n\n"
-        # --- Sovereignty + agent-policy guidance (loaded from agent_specs/_defaults/) ---
-        # The two blocks below are expanded from YAML at import time so
-        # editing the prose doesn't require a Python change. Each block
-        # ends with one trailing newline from YAML ``|``; we add one
-        # more newline per block to reproduce the original ``\n\n`` gap.
+        # --- Default guidance loaded from agent_specs/_defaults/ ---
+        # These blocks are expanded from YAML at import time so editing
+        # the prose doesn't require a Python change. The mid-prompt YAML
+        # blocks end with one trailing newline from YAML ``|``; we add
+        # one more newline per block to reproduce the original ``\n\n`` gap.
         + _DEFAULT_GUIDANCE.get("sovereignty", "")
         + "\n"
         + _DEFAULT_GUIDANCE.get("agent_policy", "")
@@ -303,17 +303,8 @@ def build_system_prompt(
         "`additional_files['dbt_project/models/schema.yml']` listing every staging + "
         "mart model you authored, with per-column tests.\n\n"
         # --- Modeling-technique mandate ---
-        "MODELING TECHNIQUE MANDATE:\n"
-        "When the user prompt supplies `data_modeling_technique` + `data_modeling_guidance`, "
-        "every staging/mart SQL file you emit in `additional_files['dbt_project/models/...']` "
-        "MUST follow those rules — naming prefixes, key strategy, load-metadata columns, "
-        "insert-only vs SCD rules. Do not mix conventions across techniques in one run. "
-        "For `data_modeling_technique = 'data_vault_2'`, produce hub_/lnk_/sat_ models in "
-        "`models/staging/` (hubs + satellites) and `models/marts/` (links), with "
-        "`load_dts`, `record_source`, and md5-hash surrogate keys. For "
-        "`data_modeling_technique = 'dimensional'`, produce stg_ + dim_ + fct_ models with "
-        "dbt_utils.generate_surrogate_key() dimension keys and SCD type-2 metadata "
-        "(valid_from / valid_to / is_current) on historical dimensions.\n"
+        + _DEFAULT_GUIDANCE.get("technique_mandate", "")
+        + "\n"
     )
 
 
