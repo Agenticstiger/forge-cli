@@ -19,7 +19,7 @@ google-cloud-core>=2.4.1
 google-cloud-bigquery>=3.25.0
 google-cloud-storage>=2.18.2
 google-cloud-pubsub>=2.21.6
-google-cloud-dataform>=0.5.9
+google-cloud-dataform>=0.10.0
 google-cloud-datacatalog>=3.19.0
 google-cloud-bigquery-datapolicies>=0.4.0
 
