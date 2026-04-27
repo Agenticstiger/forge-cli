@@ -9,10 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`CHANGELOG required` CI job** — fails non-`chore`/non-`docs`/etc. PRs
+  that don't touch `CHANGELOG.md`. Exempt prefixes: `chore`, `docs`,
+  `test`, `ci`, `build`, `style`, `perf`, `refactor`, `revert`. Manual
+  override available via the `no-changelog` label. Closes the gap that
+  let 10/12 PRs in the v0.7.11 → v0.8.0 sprint ship without entries.
+
 ### Changed
 
 - Dropped Python 3.9 support, raised the package baseline to Python 3.10,
   and expanded CI/package classifiers through Python 3.14.
+- Branch protection on `main` tightened: 14 required status checks
+  (full Python matrix + CodeQL + analyzers + lint + license + docs),
+  CODEOWNERS reviews required, last-push approval required, stale
+  reviews dismissed on new push, conversation resolution required.
+  Admin override remains enabled per repo policy.
 
 ### Fixed
 

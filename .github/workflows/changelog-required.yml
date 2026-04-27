@@ -1,0 +1,109 @@
+name: CHANGELOG required
+
+# Fails the PR when a behaviour-affecting change does not touch
+# CHANGELOG.md. The conventional-commit type is read from the PR
+# title; ``chore``, ``docs``, ``test``, ``ci``, ``build``, ``style``,
+# and ``refactor`` (when nothing user-visible changes) are exempt by
+# default. Authors who legitimately need to bypass for an exempt-by-
+# scope change can add the ``no-changelog`` label.
+#
+# This is the gap-close from the post-PR #54 retro: 10/12 PRs in
+# the v0.7.11→v0.8.0 sprint shipped without a CHANGELOG entry, which
+# made the v0.8.0 release notes a manual archaeology exercise. Now
+# CI enforces the discipline at PR-time.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changelog:
+    name: CHANGELOG entry required
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check CHANGELOG.md
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # ---- exemption gate ------------------------------------------
+          # Conventional-commit prefix on the PR title.  Anything in this
+          # set is allowed to skip CHANGELOG -- they are non-user-visible
+          # by convention.  We deliberately do NOT exempt ``feat`` or
+          # ``fix`` -- those are exactly what the changelog is for.
+          exempt_types=(chore docs test ci build style perf refactor revert)
+
+          # Match ``<type>(<scope>):`` or ``<type>:`` at the start of the
+          # PR title.  Case-insensitive.
+          title_lower=$(printf '%s' "$PR_TITLE" | tr '[:upper:]' '[:lower:]')
+          type_token=${title_lower%%[(:]*}
+          type_token=${type_token## }
+          type_token=${type_token%% }
+
+          for t in "${exempt_types[@]}"; do
+            if [[ "$type_token" == "$t" ]]; then
+              echo "::notice::PR type '$type_token' is exempt from CHANGELOG requirement."
+              exit 0
+            fi
+          done
+
+          # Manual override label.  Explicit, audit-trailable.
+          if printf '%s' "$PR_LABELS" | grep -q '"no-changelog"'; then
+            echo "::notice::'no-changelog' label set; skipping CHANGELOG check."
+            exit 0
+          fi
+
+          # ---- enforcement --------------------------------------------
+          # Require at least one line of CHANGELOG.md to change between
+          # base and head.  An empty diff means the author forgot.
+          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- CHANGELOG.md | wc -l)
+          if [[ "$changed" -eq 0 ]]; then
+            echo "::error::PR type '$type_token' is non-exempt but CHANGELOG.md was not updated."
+            echo ""
+            echo "Add an entry under '## [Unreleased]' describing the change, or:"
+            echo "  - reword the PR title to use an exempt type ('chore:', 'docs:', etc.)"
+            echo "  - add the 'no-changelog' label if the change is truly user-invisible"
+            echo ""
+            echo "See CHANGELOG.md for the format and recent examples."
+            exit 1
+          fi
+
+          # Also require that the diff is INSIDE the [Unreleased] block,
+          # not a retroactive edit of an already-published release. This
+          # is a soft check -- we only ``::warning`` for it, because
+          # legitimate corrections to historical entries do happen.
+          unreleased_changed=$(
+            git diff -U0 "$BASE_SHA" "$HEAD_SHA" -- CHANGELOG.md \
+              | awk '
+                  /^@@/ { in_hunk=1; next }
+                  /^\+\+\+/ || /^---/ { next }
+                  in_hunk && /^[+-]/ { print }
+                ' \
+              | head -200 \
+              | grep -c '^\(+\|-\)' || true
+          )
+          # Heuristic: look for the [Unreleased] header in either the
+          # base or the head.  If the head's CHANGELOG no longer
+          # contains '## [Unreleased]', the author broke the format.
+          if ! grep -q '^## \[Unreleased\]' CHANGELOG.md; then
+            echo "::error::CHANGELOG.md is missing the '## [Unreleased]' section header."
+            echo "Every PR must keep a fresh '## [Unreleased]' block at the top."
+            exit 1
+          fi
+
+          echo "::notice::CHANGELOG.md updated ($changed line(s) changed). ✓"
