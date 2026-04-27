@@ -511,6 +511,12 @@ class DataMeshManagerProvider(BaseProvider):
             team_obj.setdefault("name", tid)
             dp["team"] = team_obj
             self._ensure_odps_output_port_display_names(dp, fluid)
+            # Per Entropy's ``dataproduct-0.0.1.json`` schema, ``inputPorts``
+            # are reserved for source-system upstreams (sourceSystemId is a
+            # required field). Product-to-product lineage flows through
+            # Access agreements regardless of ``odps_lineage_mode``;
+            # representing it as inputPorts would create duplicate graph
+            # nodes next to the real edges.
             self._remove_odps_product_consume_input_ports(dp, fluid)
             self._ensure_odps_input_port_contract_ids(dp, fluid)
             self._ensure_odps_input_port_source_system_custom_property(
@@ -562,6 +568,10 @@ class DataMeshManagerProvider(BaseProvider):
             self._ensure_team(fluid, tid)
 
         if is_odps_payload:
+            # SourceSystem entities are upserted only for explicitly
+            # authored ``consumes[].sourceSystem`` fields. Product-to-product
+            # references stay out of the SourceSystem table — that lineage
+            # flows through Access agreements.
             self._ensure_source_systems(
                 fluid,
                 tid,
