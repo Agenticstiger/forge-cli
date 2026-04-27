@@ -43,10 +43,9 @@ def _latest_fluid_version() -> str:
 
 # Default-guidance directory under agent_specs/. Each ``.yaml`` file has
 # a single top-level key ``system_prompt`` whose value is injected into
-# ``build_system_prompt`` at a labelled slot.  Editing the YAML is the
+# one of the prompt builders at a labelled slot. Editing the YAML is the
 # supported way to adjust the prose — no Python change needed — but the
-# snapshot test at ``tests/test_prompt_default_guidance.py`` locks the
-# composed prompt to byte-identical output and will fail if drift is
+# prompt tests lock the composed output and will fail if drift is
 # unintentional.
 _DEFAULTS_DIR: Path = Path(__file__).with_name("agent_specs") / "_defaults"
 
@@ -76,6 +75,27 @@ def _load_default_guidance() -> Mapping[str, str]:
 
 
 _DEFAULT_GUIDANCE: Mapping[str, str] = _load_default_guidance()
+
+_AUXILIARY_PROMPT_NAMES = frozenset({"clarification", "evaluation"})
+_AUXILIARY_PROMPTS: Mapping[str, str] = {
+    name: _DEFAULT_GUIDANCE.get(name, "") for name in _AUXILIARY_PROMPT_NAMES
+}
+
+
+def _render_auxiliary_prompt(name: str, replacements: Mapping[str, str]) -> str:
+    text = _AUXILIARY_PROMPTS.get(name, "")
+    for key, value in replacements.items():
+        text = text.replace("${" + key + "}", value)
+    return text
+
+
+def _evaluation_prompt_spec() -> Mapping[str, Any]:
+    raw = _AUXILIARY_PROMPTS.get("evaluation", "{}")
+    try:
+        spec = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return spec if isinstance(spec, Mapping) else {}
 
 
 # Per-technique rule sheets injected into the user prompt. Keyed by the
@@ -254,7 +274,7 @@ def build_system_prompt(
         + "\n"
         + _DEFAULT_GUIDANCE.get("agent_policy", "")
         + "\n"
-        + "Follow the seed_contract structure exactly as a reference for the correct schema shape.\n"  # nosec B608
+        + "Follow the seed_contract structure exactly as a reference for the correct schema shape.\n"  # noqa: S608  # nosec B608
         f"Allowed providers: {providers}.\n"
         "Only use build engines from the provided capability matrix.\n\n"
         # --- Upstream-driven transformation SQL ---
@@ -315,26 +335,18 @@ def build_evaluation_prompt(
     goal = context.get("project_goal") or context.get("description") or ""
     use_case = context.get("use_case") or ""
     data_sources = context.get("data_sources") or ""
+    prompt_spec = _evaluation_prompt_spec()
     return json.dumps(
         {
-            "task": "Evaluate this FLUID contract against the user's requirements.",
+            "task": prompt_spec.get("task", ""),
             "user_requirements": {
                 "project_goal": goal,
                 "use_case": use_case,
                 "data_sources": data_sources,
             },
             "contract": _truncate_contract_for_eval(contract),
-            "evaluation_criteria": [
-                "Completeness: Does the contract cover all data sources and use cases mentioned?",
-                "Entity modeling: Are primary keys, measures, dimensions, and time grains sensible?",
-                "Production-readiness: Are bindings, triggers, and engine choices appropriate?",
-                "Semantic quality: Are names, descriptions, and business vocabulary clear?",
-            ],
-            "response_format": {
-                "score": "integer 1-10 (10 = excellent)",
-                "issues": "list of specific problems found (empty if score >= 7)",
-                "suggestions": "list of concrete improvements",
-            },
+            "evaluation_criteria": prompt_spec.get("evaluation_criteria", []),
+            "response_format": prompt_spec.get("response_format", {}),
         },
         indent=2,
         sort_keys=True,
@@ -346,43 +358,13 @@ def build_clarification_system_prompt(capability_matrix: Mapping[str, Any]) -> s
     providers = ", ".join(capability_matrix.get("providers") or [])
     templates = ", ".join(sorted((capability_matrix.get("templates") or {}).keys()))
     fv = _latest_fluid_version()
-    return (
-        "You are FLUID Forge Copilot Interview Planner.\n"
-        f"Your job is to ask the fewest high-signal questions needed to generate a strong FLUID {fv} contract.\n"
-        "Return strict JSON only. Do not use markdown fences.\n"
-        "Never ask for secrets, passwords, API keys, access tokens, or raw credentials.\n"
-        "Use discovery and project memory as context, but explicit current-run user input takes precedence.\n"
-        "Ask at most 2 questions in a round. Prefer choices when the taxonomy is stable.\n"
-        "Users may answer imperfectly with partial phrases, synonyms, abbreviations, or adjacent concepts.\n"
-        "Treat transcript.raw_input as primary evidence of user intent and transcript.resolved_value as a helpful local guess.\n"
-        "If local matching is uncertain, prefer inferring from the raw wording over asking a rigid repeat question.\n"
-        "Canonical use_case values: analytics, etl_pipeline, streaming, ml_pipeline, data_platform, other.\n"
-        "Treat data_modeling_technique, build_engine, and schedule_engine as three separate decisions: "
-        "data model shape, transformation code generator, and optional scheduler.\n"
-        "When asking users, use plain labels such as history/reporting for data model shape, "
-        "dbt/SQL/Spark for transformation, and Airflow/Dagster/Prefect for scheduler. "
-        "Do not expose internal values like data_vault_2 or generate_dbt in the prompt text.\n"
-        "Default build_engine to dbt when the user has not asked for a different transformation engine. "
-        "Do not infer a scheduler from build_engine=dbt.\n"
-        "Canonical schedule_engine values: airflow, dagster, prefect.\n"
-        "Canonical trigger_type values: cron, event, manual, streaming.\n"
-        "Canonical jurisdiction values: EU, US, UK, CA, AU, JP, CN, IN, BR, Global, Multi-Region.\n"
-        "Canonical regulatory_framework values: GDPR, CCPA, CPRA, HIPAA, PIPEDA, LGPD, PDPA, POPIA, DPA, APPI.\n"
-        "Canonical data_sensitivity values: public, internal, confidential, restricted.\n"
-        "Canonical model values include: tmf_sid, nrf_arts, gs1_gdm, adobe_xdm, hl7_fhir, omop_cdm.\n"
-        "Supporting standards include: gs1_gdm, gs1_epcis_cbv.\n"
-        "For telco, retail, and healthcare requests, infer modeling standards from the raw wording whenever possible "
-        "and only ask a modeling-standard question when the choice is still ambiguous.\n"
-        "Allowed providers: " + providers + ". Known templates: " + templates + ".\n"
-        "Return a JSON object with keys: status, reason, context_patch, assumptions, questions.\n"
-        "status must be either 'ask' or 'ready'.\n"
-        "questions must be an array of objects with: id, field, prompt, type, choices, required, allow_skip.\n"
-        "Supported question types are 'text' and 'choice'.\n"
-        "Use context_patch to normalize obvious values from existing evidence.\n"
-        "Use assumptions only for bounded defaults that are safe to surface to the user.\n"
-        "Mark status='ready' when enough intent is known to generate a defensible contract without more questioning.\n"
-        "If existing_products are listed in the interview state and the user's project_goal is semantically similar "
-        "to an existing product, flag it in your reason and ask whether they are extending it or creating something new."
+    return _render_auxiliary_prompt(
+        "clarification",
+        {
+            "fluid_version": fv,
+            "providers": providers,
+            "templates": templates,
+        },
     )
 
 
