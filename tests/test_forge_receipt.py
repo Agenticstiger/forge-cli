@@ -177,3 +177,34 @@ class TestForgeBlankReceipt:
             "total_tokens": 256,
             "hit_rate": 0.25,
         }
+
+    def test_receipt_omits_performance_when_no_llm_was_used(
+        self, fluid_home, workspace_dir, monkeypatch
+    ):
+        """Blank-mode runs (or any run that didn't hit an LLM) must not
+        carry an empty ``performance`` block in the receipt."""
+        logger = logging.getLogger("test.forge_receipt")
+        args = _build_forge_args(blank=False, target_dir="no-cache-product")
+        before_snapshot = forge_module.snapshot_workspace(workspace_dir)
+        product_root = workspace_dir / "no-cache-product"
+        product_root.mkdir()
+        (product_root / "contract.fluid.yaml").write_text(
+            "contract:\n  name: no-cache-product\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            forge_module,
+            "get_cumulative_prompt_cache_metrics",
+            lambda: {"read_tokens": 0, "total_tokens": 0, "hit_rate": 0.0},
+        )
+
+        forge_module._write_forge_receipt(
+            flow="copilot",
+            args=args,
+            before_snapshot=before_snapshot,
+            scan_root=workspace_dir,
+            logger=logger,
+        )
+
+        doc = json.loads(product_forge_receipt_path(product_root).read_text())
+        assert "performance" not in doc

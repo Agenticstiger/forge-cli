@@ -1522,6 +1522,14 @@ def _coerce_nonnegative_int(value: Any) -> int:
 
 
 def _prompt_cache_metrics(read_tokens: Any, total_tokens: Any) -> Dict[str, Any]:
+    """Compose normalised prompt-cache metrics.
+
+    ``total_tokens`` is the per-call total INPUT-side token count
+    (cached + uncached), so ``hit_rate = read / total`` always means
+    "fraction of input that was a cache hit." Each provider's
+    ``extract_prompt_cache`` is responsible for reconciling its own
+    accounting to this convention before calling here.
+    """
     read = _coerce_nonnegative_int(read_tokens)
     total = _coerce_nonnegative_int(total_tokens)
     return {
@@ -1542,6 +1550,9 @@ def get_cumulative_prompt_cache_metrics() -> Dict[str, Any]:
 def _record_prompt_cache_usage(metrics: Mapping[str, Any]) -> None:
     read = _coerce_nonnegative_int(metrics.get("read_tokens"))
     total = _coerce_nonnegative_int(metrics.get("total_tokens"))
+    # Streaming hooks call this for every event; provider extractors
+    # return zeros for events that don't carry usage. Short-circuit so
+    # we don't over-count cumulative metrics across a single stream.
     if not read and not total:
         return
     _cumulative_prompt_cache["read_tokens"] += read
@@ -1559,7 +1570,9 @@ def _record_prompt_cache_usage(metrics: Mapping[str, Any]) -> None:
     )
 
 
-def _record_prompt_cache_from_response(provider: LlmProvider, response_json: Mapping[str, Any]) -> None:
+def _record_prompt_cache_from_response(
+    provider: LlmProvider, response_json: Mapping[str, Any]
+) -> None:
     try:
         _record_prompt_cache_usage(provider.extract_prompt_cache(dict(response_json)))
     except Exception as exc:  # noqa: BLE001 — metrics must never break generation
@@ -1567,7 +1580,13 @@ def _record_prompt_cache_from_response(provider: LlmProvider, response_json: Map
 
 
 def reset_token_usage() -> None:
-    """Reset cumulative token counters (useful for testing)."""
+    """Reset both cumulative token counters and prompt-cache metrics.
+
+    Called from ``forge.run`` at the top of each invocation and used
+    extensively by tests; resets ``_cumulative_usage`` and
+    ``_cumulative_prompt_cache`` together so callers don't have to
+    track them separately.
+    """
     _cumulative_usage.update({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
     _cumulative_prompt_cache.update({"read_tokens": 0, "total_tokens": 0})
 
