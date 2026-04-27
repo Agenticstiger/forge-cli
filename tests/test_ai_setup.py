@@ -922,6 +922,130 @@ class TestModelCatalogIntegrity:
         assert isinstance(balanced, str) and len(balanced) > 0
 
 
+class TestGeminiIsDefaultProvider:
+    """Card 69da8d7e — Gemini is the default in every layer of the AI setup
+    surface. Locked in across:
+
+    1. ``llm_models.json`` catalog — ``default_provider == "gemini"``.
+    2. ``_prompt_for_api_key`` numbered menu — Gemini's free path is the
+       first option and ``default=1`` selects it.
+    3. ``resolve_llm_config`` resolution chain — when no flag, env var, or
+       env-var-inferred provider is present, the fallback is ``"gemini"``.
+
+    The card was filed when OpenAI was the default everywhere; this suite
+    prevents accidental regression to that state.
+    """
+
+    def test_catalog_default_provider_is_gemini(self):
+        from fluid_build.cli.forge_copilot_llm_providers import _load_model_catalog
+
+        catalog = _load_model_catalog()
+        assert catalog.get("default_provider") == "gemini", (
+            "llm_models.json default_provider regressed away from gemini — "
+            "card 69da8d7e fix lost. Update both the catalog AND any UI copy."
+        )
+
+    def test_prompt_for_api_key_lists_gemini_first_with_default_one(self):
+        """The picker source-of-truth: gemini_free is index 0 of the
+        choices list, so ``default=1`` selects it."""
+        import fluid_build.cli.ai_setup as mod
+
+        src = Path(mod.__file__).read_text()
+        # Locate the choices list passed to ask_numbered_choice.
+        marker = '"How do you want to connect?"'
+        assert marker in src, "ask_numbered_choice prompt copy changed; update test"
+        idx = src.index(marker)
+        snippet = src[idx : idx + 1200]
+        first_choice_pos = snippet.index('("')
+        # The first tuple inside the list must be the gemini-free path.
+        assert snippet[first_choice_pos : first_choice_pos + 80].startswith('("gemini_free"'), (
+            "AI-setup picker first option regressed away from "
+            "Google Gemini (free) — card 69da8d7e fix lost"
+        )
+        # And the default must point at index 1 (1-based) i.e. that first row.
+        assert "default=1" in snippet, "ask_numbered_choice default= regressed"
+
+    def test_resolve_llm_config_falls_back_to_gemini_when_unconfigured(self, monkeypatch):
+        """With no flags, no FLUID_LLM_PROVIDER, no inferable provider env,
+        and no API key already saved in the keyring, resolve_llm_config
+        should pick gemini and surface the missing-API-key error rather
+        than silently dropping to OpenAI."""
+        from fluid_build.cli.forge_copilot_llm_providers import (
+            CopilotGenerationError,
+            resolve_llm_config,
+        )
+
+        # Strip every env var that could short-circuit the fallback.
+        for key in (
+            "FLUID_LLM_PROVIDER",
+            "FLUID_LLM_MODEL",
+            "FLUID_LLM_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OLLAMA_HOST",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        args = argparse.Namespace(llm_provider=None, llm_model=None, llm_endpoint=None)
+
+        with (
+            patch(
+                "fluid_build.cli.forge_copilot_llm_providers." "_infer_provider_from_keyring",
+                return_value=None,
+            ),
+            patch(
+                "fluid_build.cli.forge_copilot_llm_providers.detect_ollama_available",
+                return_value=False,
+            ),
+            patch(
+                "fluid_build.cli.forge_copilot_llm_providers._resolve_api_key",
+                return_value=None,
+            ),
+        ):
+            with pytest.raises(CopilotGenerationError) as exc_info:
+                resolve_llm_config(args, environ={})
+
+        # The error message — not just the event slug — must specifically
+        # mention the gemini adapter, proving the fallback resolved to
+        # gemini before the API-key check fired. ``CopilotGenerationError``
+        # carries the user-facing detail string in ``message``.
+        message = getattr(exc_info.value, "message", "") or ""
+        assert "gemini" in message.lower(), message
+        assert "openai" not in message.lower(), message
+
+    def test_resolve_llm_config_explicit_keys_still_win_over_gemini_default(self, monkeypatch):
+        """The Gemini-first fallback is the *no-signal* default. Operators
+        who set OPENAI_API_KEY / ANTHROPIC_API_KEY / explicit
+        ``--llm-provider openai`` must still get the provider they asked
+        for. Otherwise the fallback would be a regression for everyone
+        who explicitly opts into a different provider."""
+        from fluid_build.cli.forge_copilot_llm_providers import _infer_provider_from_env
+
+        for key in (
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OLLAMA_HOST",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        # Explicit OpenAI key alone → openai wins.
+        env = {"OPENAI_API_KEY": "sk-fake-test"}
+        assert _infer_provider_from_env(env) == "openai"
+
+        # Explicit Anthropic key alone → anthropic wins.
+        env = {"ANTHROPIC_API_KEY": "sk-ant-fake-test"}
+        assert _infer_provider_from_env(env) == "anthropic"
+
+        # Explicit Gemini key alone → gemini wins (matches the default,
+        # but exercises the explicit-key path, not the no-signal fallback).
+        env = {"GEMINI_API_KEY": "AIza-fake-test"}
+        assert _infer_provider_from_env(env) == "gemini"
+
+
 class TestQueryOllamaModels:
     def test_returns_empty_when_httpx_not_installed(self):
         from fluid_build.cli.ai_setup import _query_ollama_models
