@@ -325,6 +325,26 @@ class TestInstantiateBlueprint:
 
         assert result == 1
 
+    def test_fetch_timeout_retries_and_returns_one(self):
+        import requests as real_requests
+
+        args = _args(blueprint_id="test-bp", params='{"x": 1}', interactive=False)
+        mock_console = MagicMock()
+
+        with (
+            patch.object(marketplace_module, "console", mock_console),
+            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+        ):
+            mock_requests.get.side_effect = real_requests.exceptions.Timeout("read timed out")
+            mock_requests.exceptions = real_requests.exceptions
+            result = instantiate_blueprint(
+                args, _logger(), "http://localhost:8000/api/v1/blueprints"
+            )
+
+        assert result == 1
+        assert mock_requests.get.call_count == marketplace_module.MARKETPLACE_HTTP_RETRIES + 1
+        assert "timed out after" in str(mock_console.print.call_args_list)
+
     def test_output_file_saved(self, tmp_path):
         output_file = tmp_path / "contract.json"
         args = _args(

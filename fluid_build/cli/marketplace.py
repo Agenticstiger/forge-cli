@@ -383,7 +383,7 @@ def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
     except requests.exceptions.RequestException as e:
         message = _format_marketplace_error(e)
         console.print(f"[red]❌ {message}[/red]")
-        logger.error("Failed to search blueprints: %s", message)
+        logger.error("Failed to search blueprints: %s", message, exc_info=True)
         return 1
 
 
@@ -484,7 +484,7 @@ def show_blueprint_info(args, logger: logging.Logger, api_url: str) -> int:
     except requests.exceptions.RequestException as e:
         message = _format_marketplace_error(e)
         console.print(f"[red]❌ {message}[/red]")
-        logger.error("Failed to get blueprint info: %s", message)
+        logger.error("Failed to get blueprint info: %s", message, exc_info=True)
         return 1
 
 
@@ -500,7 +500,7 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
     except requests.exceptions.RequestException as e:
         message = _format_marketplace_error(e)
         console.print(f"[red]❌ Failed to fetch blueprint: {message}[/red]")
-        logger.error("Failed to fetch blueprint: %s", message)
+        logger.error("Failed to fetch blueprint: %s", message, exc_info=True)
         return 1
 
     # Get parameters
@@ -568,7 +568,7 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
     except requests.exceptions.RequestException as e:
         message = _format_marketplace_error(e)
         console.print(f"[red]❌ Failed to instantiate blueprint: {message}[/red]")
-        logger.error("Blueprint instantiation failed: %s", message)
+        logger.error("Blueprint instantiation failed: %s", message, exc_info=True)
         return 1
 
 
