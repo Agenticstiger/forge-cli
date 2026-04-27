@@ -31,6 +31,7 @@ Enhanced with governance:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
@@ -42,6 +43,23 @@ from fluid_build.providers._sql_safety import (
 
 from ..util.config import resolve_env_templates as _resolve_env_templates
 from ..util.metadata import extract_snowflake_tags
+
+_SAFE_POLICY_SIGNATURE = re.compile(
+    r"^\(\s*[A-Za-z_][A-Za-z0-9_]*\s+[A-Za-z_][A-Za-z0-9_(),\s]*\)"
+    r"(\s+RETURNS\s+[A-Za-z_][A-Za-z0-9_]*)?$"
+)
+
+
+def _validate_policy_signature(signature: str) -> str:
+    """Validate a Snowflake policy signature like ``(val VARCHAR) RETURNS BOOLEAN``."""
+    if not isinstance(signature, str):
+        raise ValueError(f"Invalid policy signature: {signature!r}")
+    candidate = signature.strip()
+    if any(token in candidate for token in (";", "--", "/*", "*/")):
+        raise ValueError(f"Invalid policy signature: {signature!r}")
+    if not _SAFE_POLICY_SIGNATURE.match(candidate):
+        raise ValueError(f"Invalid policy signature: {signature!r}")
+    return candidate
 
 
 def _first_contract_value(contract: Mapping[str, Any], key: str) -> Optional[str]:
@@ -208,48 +226,291 @@ def _plan_iam(
                 }
             )
 
-    # Row-level security policies
-    row_level_security = security.get("row_level_security", [])
-    for policy in row_level_security:
-        table = policy.get("table")
-        role = policy.get("role")
-        condition = policy.get("condition")
+    # Row-level security policies — legacy shorthand:
+    #   security.row_level_security[*] = {table, role, condition, [apply_on]}
+    # The shorthand emits a per-(table, role) named policy so multi-role tables
+    # do not collide on a single policy name. When the entry includes `apply_on`
+    # (column or list of columns), an ALTER TABLE ADD ROW ACCESS POLICY action
+    # is emitted to bind the policy. Without `apply_on`, the policy is created
+    # but not applied (matches the historic behaviour to avoid surprise binds).
+    for policy in security.get("row_level_security", []) or []:
+        actions.extend(_emit_legacy_rls_actions(policy, account, database, logger))
 
-        if table and role and condition:
-            try:
-                safe_table = validate_ident(str(table))
-                safe_role_name = validate_ident(str(role))
-                safe_role = quote_string_literal(safe_role_name)
-                safe_condition = validate_sql_expression_allowlist(str(condition))
-            except ValueError as exc:
-                if logger is not None:
-                    logger.warning(
-                        "snowflake_row_level_security_skipped table=%r role=%r error=%s",
-                        table,
-                        role,
-                        exc,
-                    )
-                continue
+    # Named, reusable row-access policies:
+    #   security.policies.row_access[*] = {name, signature?, condition, comment?}
+    policies_block = security.get("policies", {}) or {}
+    for policy in policies_block.get("row_access", []) or []:
+        actions.extend(_emit_named_row_access_policy_actions(policy, account, database, logger))
 
-            safe_role_id = safe_role_name.lower()
-            actions.append(
-                {
-                    "id": f"rls_{safe_table}_{safe_role_id}",
-                    "op": "sf.sql.execute",
-                    "phase": "iam",
-                    "account": account,
-                    "database": database,
-                    "sql": (
-                        f"CREATE OR REPLACE ROW ACCESS POLICY {safe_table}_rls "
-                        "AS (val VARCHAR) RETURNS BOOLEAN -> "
-                        f"CASE WHEN CURRENT_ROLE() = {safe_role} "
-                        f"THEN {safe_condition} ELSE FALSE END"
-                    ),
-                    "comment": f"Row-level security for {safe_table}",
-                }
-            )
+    # Named, reusable masking policies:
+    #   security.policies.masking[*] = {name, signature?, body, comment?}
+    for policy in policies_block.get("masking", []) or []:
+        actions.extend(_emit_named_masking_policy_actions(policy, account, database, logger))
+
+    # Explicit applications of named policies:
+    #   security.policy_applications.row_access[*] = {table, policy, on: [cols]}
+    #   security.policy_applications.masking[*]    = {table, column, policy}
+    applications_block = security.get("policy_applications", {}) or {}
+    for application in applications_block.get("row_access", []) or []:
+        actions.extend(_emit_row_access_application_actions(application, account, database, logger))
+    for application in applications_block.get("masking", []) or []:
+        actions.extend(_emit_masking_application_actions(application, account, database, logger))
 
     return actions
+
+
+def _emit_legacy_rls_actions(
+    policy: Mapping[str, Any],
+    account: str,
+    database: Optional[str],
+    logger=None,
+) -> List[Dict[str, Any]]:
+    """Emit CREATE (and optional APPLY) actions for the legacy RLS shorthand."""
+    table = policy.get("table")
+    role = policy.get("role")
+    condition = policy.get("condition")
+
+    if not (table and role and condition):
+        return []
+
+    try:
+        safe_table = validate_ident(str(table))
+        safe_role_name = validate_ident(str(role))
+        safe_role = quote_string_literal(safe_role_name)
+        safe_condition = validate_sql_expression_allowlist(str(condition))
+    except ValueError as exc:
+        if logger is not None:
+            logger.warning(
+                "snowflake_row_level_security_skipped table=%r role=%r error=%s",
+                table,
+                role,
+                exc,
+            )
+        return []
+
+    role_id = safe_role_name.lower()
+    policy_name = f"{safe_table}_rls__{role_id}"
+    actions: List[Dict[str, Any]] = [
+        {
+            "id": f"rls_{safe_table}_{role_id}",
+            "op": "sf.sql.execute",
+            "phase": "iam",
+            "account": account,
+            "database": database,
+            "sql": (
+                f"CREATE OR REPLACE ROW ACCESS POLICY {policy_name} "
+                "AS (val VARCHAR) RETURNS BOOLEAN -> "
+                f"CASE WHEN CURRENT_ROLE() = {safe_role} "
+                f"THEN {safe_condition} ELSE FALSE END"
+            ),
+            "comment": f"Row-access policy for {safe_table} (role {safe_role_name})",
+        }
+    ]
+
+    apply_on = policy.get("apply_on") or policy.get("column") or policy.get("columns")
+    if apply_on is None:
+        return actions
+
+    columns = apply_on if isinstance(apply_on, list) else [apply_on]
+    try:
+        safe_columns = [validate_ident(str(c)) for c in columns if c]
+    except ValueError as exc:
+        if logger is not None:
+            logger.warning(
+                "snowflake_row_level_security_apply_skipped table=%r role=%r error=%s",
+                table,
+                role,
+                exc,
+            )
+        return actions
+
+    if not safe_columns:
+        return actions
+
+    actions.append(
+        {
+            "id": f"rls_apply_{safe_table}_{role_id}",
+            "op": "sf.sql.execute",
+            "phase": "iam",
+            "account": account,
+            "database": database,
+            "sql": (
+                f"ALTER TABLE {safe_table} ADD ROW ACCESS POLICY {policy_name} "
+                f"ON ({', '.join(safe_columns)})"
+            ),
+            "comment": f"Apply row-access policy {policy_name} to {safe_table}",
+        }
+    )
+    return actions
+
+
+def _emit_named_row_access_policy_actions(
+    policy: Mapping[str, Any],
+    account: str,
+    database: Optional[str],
+    logger=None,
+) -> List[Dict[str, Any]]:
+    """Emit CREATE for a named, reusable row-access policy."""
+    name = policy.get("name")
+    condition = policy.get("condition")
+    if not (name and condition):
+        return []
+
+    try:
+        safe_name = validate_ident(str(name))
+        safe_condition = validate_sql_expression_allowlist(str(condition))
+        safe_signature = _validate_policy_signature(
+            policy.get("signature") or "(val VARCHAR) RETURNS BOOLEAN"
+        )
+    except ValueError as exc:
+        if logger is not None:
+            logger.warning("snowflake_row_access_policy_skipped name=%r error=%s", name, exc)
+        return []
+
+    return [
+        {
+            "id": f"row_access_policy_{safe_name}",
+            "op": "sf.sql.execute",
+            "phase": "iam",
+            "account": account,
+            "database": database,
+            "sql": (
+                f"CREATE OR REPLACE ROW ACCESS POLICY {safe_name} "
+                f"AS {safe_signature} -> {safe_condition}"
+            ),
+            "comment": policy.get("comment") or f"Row-access policy {safe_name}",
+        }
+    ]
+
+
+def _emit_named_masking_policy_actions(
+    policy: Mapping[str, Any],
+    account: str,
+    database: Optional[str],
+    logger=None,
+) -> List[Dict[str, Any]]:
+    """Emit CREATE for a named, reusable masking policy."""
+    name = policy.get("name")
+    body = policy.get("body")
+    if not (name and body):
+        return []
+
+    try:
+        safe_name = validate_ident(str(name))
+        safe_body = validate_sql_expression_allowlist(str(body))
+        safe_signature = _validate_policy_signature(
+            policy.get("signature") or "(val VARCHAR) RETURNS VARCHAR"
+        )
+    except ValueError as exc:
+        if logger is not None:
+            logger.warning("snowflake_masking_policy_skipped name=%r error=%s", name, exc)
+        return []
+
+    return [
+        {
+            "id": f"masking_policy_{safe_name}",
+            "op": "sf.sql.execute",
+            "phase": "iam",
+            "account": account,
+            "database": database,
+            "sql": (
+                f"CREATE OR REPLACE MASKING POLICY {safe_name} "
+                f"AS {safe_signature} -> {safe_body}"
+            ),
+            "comment": policy.get("comment") or f"Masking policy {safe_name}",
+        }
+    ]
+
+
+def _emit_row_access_application_actions(
+    application: Mapping[str, Any],
+    account: str,
+    database: Optional[str],
+    logger=None,
+) -> List[Dict[str, Any]]:
+    """Emit ALTER TABLE ADD ROW ACCESS POLICY for an explicit application entry."""
+    table = application.get("table")
+    policy_name = application.get("policy")
+    on = application.get("on") or application.get("columns")
+    if not (table and policy_name and on):
+        return []
+
+    try:
+        safe_table = validate_ident(str(table))
+        safe_policy = validate_ident(str(policy_name))
+        columns = on if isinstance(on, list) else [on]
+        safe_columns = [validate_ident(str(c)) for c in columns if c]
+    except ValueError as exc:
+        if logger is not None:
+            logger.warning(
+                "snowflake_row_access_application_skipped " "table=%r policy=%r error=%s",
+                table,
+                policy_name,
+                exc,
+            )
+        return []
+
+    if not safe_columns:
+        return []
+
+    return [
+        {
+            "id": f"row_access_apply_{safe_table}_{safe_policy}",
+            "op": "sf.sql.execute",
+            "phase": "iam",
+            "account": account,
+            "database": database,
+            "sql": (
+                f"ALTER TABLE {safe_table} ADD ROW ACCESS POLICY {safe_policy} "
+                f"ON ({', '.join(safe_columns)})"
+            ),
+            "comment": f"Apply row-access policy {safe_policy} to {safe_table}",
+        }
+    ]
+
+
+def _emit_masking_application_actions(
+    application: Mapping[str, Any],
+    account: str,
+    database: Optional[str],
+    logger=None,
+) -> List[Dict[str, Any]]:
+    """Emit ALTER TABLE MODIFY COLUMN SET MASKING POLICY for an application entry."""
+    table = application.get("table")
+    column = application.get("column")
+    policy_name = application.get("policy")
+    if not (table and column and policy_name):
+        return []
+
+    try:
+        safe_table = validate_ident(str(table))
+        safe_column = validate_ident(str(column))
+        safe_policy = validate_ident(str(policy_name))
+    except ValueError as exc:
+        if logger is not None:
+            logger.warning(
+                "snowflake_masking_application_skipped " "table=%r column=%r policy=%r error=%s",
+                table,
+                column,
+                policy_name,
+                exc,
+            )
+        return []
+
+    return [
+        {
+            "id": f"masking_apply_{safe_table}_{safe_column}_{safe_policy}",
+            "op": "sf.sql.execute",
+            "phase": "iam",
+            "account": account,
+            "database": database,
+            "sql": (
+                f"ALTER TABLE {safe_table} MODIFY COLUMN {safe_column} "
+                f"SET MASKING POLICY {safe_policy}"
+            ),
+            "comment": (f"Apply masking policy {safe_policy} to {safe_table}.{safe_column}"),
+        }
+    ]
 
 
 def _plan_build(
