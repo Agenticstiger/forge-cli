@@ -303,8 +303,7 @@ def build_system_prompt(
         "`additional_files['dbt_project/models/schema.yml']` listing every staging + "
         "mart model you authored, with per-column tests.\n\n"
         # --- Modeling-technique mandate ---
-        + _DEFAULT_GUIDANCE.get("technique_mandate", "")
-        + "\n"
+        + _DEFAULT_GUIDANCE.get("technique_mandate", "") + "\n"
     )
 
 

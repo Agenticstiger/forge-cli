@@ -126,7 +126,9 @@ class TestDefaultGuidanceLoaded:
         ].strip(), "agent_policy guidance must not be empty — check _defaults/agent_policy.yaml"
         assert _DEFAULT_GUIDANCE[
             "technique_mandate"
-        ].strip(), "technique mandate guidance must not be empty — check _defaults/technique_mandate.yaml"
+        ].strip(), (
+            "technique mandate guidance must not be empty — check _defaults/technique_mandate.yaml"
+        )
 
 
 class TestSystemPromptSnapshot:
