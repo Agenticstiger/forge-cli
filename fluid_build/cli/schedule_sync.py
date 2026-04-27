@@ -71,6 +71,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -268,6 +269,17 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "GitHub-only signers, or your GitLab OIDC issuer URL."
         ),
     )
+    p.add_argument(
+        "--git-commit-author",
+        default=None,
+        help=(
+            "Override the git commit author for git+ssh:// destinations, "
+            "in 'Name <email@host>' format. When unset, git uses the "
+            "runner's user.name/user.email from git config. Recommended "
+            "for CI / service-account use so commits are attributable to "
+            "a deterministic identity (e.g., 'fluid-bot <bot@example.com>')."
+        ),
+    )
     p.set_defaults(func=run)
 
 
@@ -455,6 +467,83 @@ def _which_or_raise(binary: str) -> str:
     return resolved
 
 
+def _git_ssh_clone_url(dest: str) -> str:
+    """Normalize the advertised git+ssh URL into a URL git can clone safely."""
+    parsed = urlparse(dest)
+    if parsed.scheme != "git+ssh":
+        raise CLIError(2, "schedule_sync_git_ssh_invalid_scheme", {"destination": dest})
+    if not parsed.netloc:
+        raise CLIError(2, "schedule_sync_git_ssh_missing_host", {"destination": dest})
+    if not parsed.path or parsed.path == "/":
+        raise CLIError(2, "schedule_sync_git_ssh_missing_repo_path", {"destination": dest})
+    if parsed.password is not None:
+        raise CLIError(
+            2,
+            "schedule_sync_git_ssh_embedded_credentials",
+            {"hint": "use SSH keys/agent config instead of embedding passwords in URLs"},
+        )
+    if parsed.query or parsed.fragment or parsed.params:
+        raise CLIError(
+            2,
+            "schedule_sync_git_ssh_unsupported_url_component",
+            {"destination": dest},
+        )
+    return f"ssh://{parsed.netloc}{parsed.path}"
+
+
+def _require_dispatch_destination(dest: Optional[str], scheme: str) -> str:
+    if dest is None:
+        raise CLIError(
+            2,
+            "schedule_sync_destination_required",
+            {"scheduler": "airflow", "scheme": scheme},
+        )
+    return dest
+
+
+# ``Name <email@host>`` — the email part forbids angle brackets, whitespace, and
+# the @ separator. Name is intentionally permissive (international names allowed)
+# but control characters are rejected explicitly below.
+_COMMIT_AUTHOR_PATTERN = re.compile(r"^(.+?)\s*<([^<>@\s]+@[^<>@\s]+)>$")
+
+
+def _parse_commit_author(value: str) -> Tuple[str, str]:
+    """Parse a ``Name <email@host>`` author string. Raises ``CLIError`` if invalid.
+
+    Used by ``--git-commit-author`` for the git+ssh dispatch path so a deterministic
+    identity (typically a service account) lands in the destination repo's history
+    instead of whatever the runner's ``git config user.*`` happens to be.
+    """
+    cleaned = (value or "").strip()
+    if not cleaned:
+        raise CLIError(2, "schedule_sync_commit_author_empty", {})
+    # Reject ASCII control characters and DEL outright — they could break the
+    # commit metadata format and have no business in an author identity.
+    for ch in cleaned:
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            raise CLIError(
+                2,
+                "schedule_sync_commit_author_control_char",
+                {"reason": "commit author may not contain control characters"},
+            )
+    match = _COMMIT_AUTHOR_PATTERN.match(cleaned)
+    if not match:
+        raise CLIError(
+            2,
+            "schedule_sync_commit_author_invalid",
+            {"value": value, "expected_format": "Name <email@host>"},
+        )
+    name = match.group(1).strip()
+    email = match.group(2).strip()
+    if not name:
+        raise CLIError(
+            2,
+            "schedule_sync_commit_author_invalid",
+            {"value": value, "reason": "name part is empty"},
+        )
+    return name, email
+
+
 def _run_subprocess(argv: List[str], *, timeout: int, dry_run: bool) -> Dict:
     """Execute ``argv`` with redacted logging and dry-run short-circuit.
 
@@ -552,6 +641,141 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
 
     trailing_slash_src = str(dags_dir).rstrip("/") + "/"
 
+    def _git_ssh_dispatch(dest: str) -> List[Dict]:
+        git = _which_or_raise("git")
+        rsync = _which_or_raise("rsync")
+        clone_url = _git_ssh_clone_url(dest)
+        commit_message = "sync Airflow DAGs from fluid schedule-sync"
+
+        commit_author_raw = getattr(args, "git_commit_author", None)
+        commit_author_argv: List[str] = []
+        if commit_author_raw:
+            author_name, author_email = _parse_commit_author(commit_author_raw)
+            # ``git -c key=value`` injects per-process config without persisting it.
+            # Each ``-c`` value goes after the ``-c`` flag as a single argv element,
+            # so the user-supplied name/email are positional values (not flag-shaped),
+            # and git resolves them as configuration regardless of leading hyphens.
+            commit_author_argv = [
+                "-c",
+                f"user.name={author_name}",
+                "-c",
+                f"user.email={author_email}",
+            ]
+        commit_argv = [git, *commit_author_argv, "commit", "-m", commit_message]
+
+        def _planned(clone_dir: str) -> List[Dict]:
+            return [
+                _run_subprocess(
+                    [git, "clone", "--", clone_url, clone_dir],
+                    timeout=args.timeout,
+                    dry_run=True,
+                ),
+                _run_subprocess_with_cwd(
+                    [
+                        rsync,
+                        "-av",
+                        "--delete",
+                        "--exclude",
+                        ".git/",
+                        "--",
+                        trailing_slash_src,
+                        "./",
+                    ],
+                    cwd=clone_dir,
+                    timeout=args.timeout,
+                    dry_run=True,
+                ),
+                _run_subprocess_with_cwd(
+                    [git, "add", "--", "."],
+                    cwd=clone_dir,
+                    timeout=args.timeout,
+                    dry_run=True,
+                ),
+                _run_subprocess_with_cwd(
+                    [git, "status", "--porcelain"],
+                    cwd=clone_dir,
+                    timeout=args.timeout,
+                    dry_run=True,
+                ),
+                _run_subprocess_with_cwd(
+                    commit_argv,
+                    cwd=clone_dir,
+                    timeout=args.timeout,
+                    dry_run=True,
+                ),
+                _run_subprocess_with_cwd(
+                    [git, "push"],
+                    cwd=clone_dir,
+                    timeout=args.timeout,
+                    dry_run=True,
+                ),
+            ]
+
+        if args.dry_run:
+            return _planned("<schedule-sync-git-ssh-clone>")
+
+        results: List[Dict] = []
+        with tempfile.TemporaryDirectory(prefix="fluid-schedule-sync-") as tmp:
+            clone_dir = str(Path(tmp) / "repo")
+            clone_result = _run_subprocess(
+                [git, "clone", "--", clone_url, clone_dir],
+                timeout=args.timeout,
+                dry_run=False,
+            )
+            results.append(clone_result)
+            if clone_result["exit_code"] != 0:
+                return results
+
+            for argv in (
+                [
+                    rsync,
+                    "-av",
+                    "--delete",
+                    "--exclude",
+                    ".git/",
+                    "--",
+                    trailing_slash_src,
+                    "./",
+                ],
+                [git, "add", "--", "."],
+            ):
+                result = _run_subprocess_with_cwd(
+                    argv,
+                    cwd=clone_dir,
+                    timeout=args.timeout,
+                    dry_run=False,
+                )
+                results.append(result)
+                if result["exit_code"] != 0:
+                    return results
+
+            status = _run_subprocess_with_cwd(
+                [git, "status", "--porcelain"],
+                cwd=clone_dir,
+                timeout=args.timeout,
+                dry_run=False,
+            )
+            results.append(status)
+            if status["exit_code"] != 0:
+                return results
+            if not status.get("stdout_tail", "").strip():
+                return results
+
+            for argv in (
+                commit_argv,
+                [git, "push"],
+            ):
+                result = _run_subprocess_with_cwd(
+                    argv,
+                    cwd=clone_dir,
+                    timeout=args.timeout,
+                    dry_run=False,
+                )
+                results.append(result)
+                if result["exit_code"] != 0:
+                    return results
+        return results
+
     # SECURITY: every argv below that positions user-controlled strings
     # (remote_target, local_dest, dest) AFTER the ``rsync`` / ``scp`` /
     # ``aws`` binary and its option flags inserts ``--`` as the
@@ -591,7 +815,7 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
     elif scheme == "az":
         binary = _which_or_raise("az")
         # az://<container>/<path> → --destination <container> --destination-path <path>
-        assert dest is not None
+        dest = _require_dispatch_destination(dest, scheme)
         parsed = urlparse(dest)
         container = parsed.netloc
         blob_path = parsed.path.lstrip("/")
@@ -624,7 +848,7 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
     elif scheme == "file":
         binary = _which_or_raise("rsync")
         # Strip "file://" prefix for rsync (it doesn't understand the URL form).
-        assert dest is not None
+        dest = _require_dispatch_destination(dest, scheme)
         local_dest = dest
         if local_dest.startswith("file://"):
             local_dest = local_dest[len("file://") :]
@@ -643,7 +867,7 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
     elif scheme == "ssh":
         binary = _which_or_raise("rsync")
         # rsync over ssh: ssh://user@host/path → user@host:/path
-        assert dest is not None
+        dest = _require_dispatch_destination(dest, scheme)
         parsed = urlparse(dest)
         if not parsed.netloc:
             raise CLIError(2, "schedule_sync_ssh_missing_host", {"destination": dest})
@@ -661,7 +885,7 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
     elif scheme == "scp":
         binary = _which_or_raise("scp")
         # scp://user@host/path → user@host:/path
-        assert dest is not None
+        dest = _require_dispatch_destination(dest, scheme)
         parsed = urlparse(dest)
         if not parsed.netloc:
             raise CLIError(2, "schedule_sync_scp_missing_host", {"destination": dest})
@@ -675,21 +899,8 @@ def _airflow_dispatch(dags_dir: Path, args) -> List[Dict]:
         # versions.
         argv = [binary, "-r", "--", trailing_slash_src, remote_target]
     elif scheme == "git+ssh":
-        # We don't implement in-process git orchestration for this release —
-        # that needs a temp workdir, clone, rsync, git add/commit/push flow
-        # that is too stateful for stage-11's subprocess shape. Document
-        # the workaround and fail loud.
-        raise CLIError(
-            2,
-            "schedule_sync_git_ssh_not_implemented",
-            {
-                "hint": (
-                    "run ``git clone`` + ``rsync`` + ``git push`` in a "
-                    "preceding stage, then point --destination at the "
-                    "local clone path"
-                )
-            },
-        )
+        dest = _require_dispatch_destination(dest, scheme)
+        return _git_ssh_dispatch(dest)
     else:  # defensive — _validate_destination should have refused already
         raise CLIError(2, "schedule_sync_unhandled_scheme", {"scheme": scheme})
 

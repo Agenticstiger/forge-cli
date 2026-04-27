@@ -64,6 +64,7 @@ def _args(**overrides) -> argparse.Namespace:
         "verify_key": None,
         "verify_identity_regexp": ".*",
         "verify_oidc_issuer_regexp": ".*",
+        "git_commit_author": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -222,6 +223,9 @@ class TestValidateDestination:
             # file:// with hyphen-first netloc (rsync would parse as
             # option on the positional dest).
             "file://-pwn/path",
+            # git+ssh must keep the same argv-level hyphen guard as
+            # scp/ssh because the clone URL flows to git as argv.
+            "git+ssh://-oProxyCommand=id/org/repo.git",
         ],
     )
     def test_rejects_hyphen_netloc(self, url):
@@ -249,6 +253,87 @@ class TestValidateDestination:
             "ssh://user-a@host-b.example.com/remote/path", "airflow"
         )
         assert scheme == "ssh"
+
+
+# -----------------------------------------------------------------------------
+# _git_ssh_clone_url
+# -----------------------------------------------------------------------------
+
+
+class TestGitSshCloneUrl:
+    def test_normalizes_git_ssh_to_git_clone_url(self):
+        assert (
+            schedule_sync._git_ssh_clone_url("git+ssh://git@github.com/org/repo.git")
+            == "ssh://git@github.com/org/repo.git"
+        )
+
+    @pytest.mark.parametrize(
+        "url,match",
+        [
+            ("git+ssh:///org/repo.git", "schedule_sync_git_ssh_missing_host"),
+            ("git+ssh://git@github.com", "schedule_sync_git_ssh_missing_repo_path"),
+            (
+                "git+ssh://user:secret@github.com/org/repo.git",
+                "schedule_sync_git_ssh_embedded_credentials",
+            ),
+            (
+                "git+ssh://user:@github.com/org/repo.git",
+                "schedule_sync_git_ssh_embedded_credentials",
+            ),
+            (
+                "git+ssh://git@github.com/org/repo.git?branch=main",
+                "schedule_sync_git_ssh_unsupported_url_component",
+            ),
+            (
+                "git+ssh://git@github.com/org/repo.git#dags",
+                "schedule_sync_git_ssh_unsupported_url_component",
+            ),
+        ],
+    )
+    def test_rejects_unsafe_or_ambiguous_git_urls(self, url, match):
+        with pytest.raises(CLIError, match=match):
+            schedule_sync._git_ssh_clone_url(url)
+
+
+# -----------------------------------------------------------------------------
+# _parse_commit_author
+# -----------------------------------------------------------------------------
+
+
+class TestParseCommitAuthor:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("Fluid Bot <bot@example.com>", ("Fluid Bot", "bot@example.com")),
+            ("  Fluid Bot  <bot@example.com>  ", ("Fluid Bot", "bot@example.com")),
+            ("J Doe <j.doe+ci@example.org>", ("J Doe", "j.doe+ci@example.org")),
+            # Hyphen in email is allowed; the regex only forbids angle brackets,
+            # whitespace, and the @ separator inside the email parts.
+            ("Bot <-svc@example.com>", ("Bot", "-svc@example.com")),
+        ],
+    )
+    def test_accepts_valid_author_strings(self, value, expected):
+        assert schedule_sync._parse_commit_author(value) == expected
+
+    @pytest.mark.parametrize(
+        "value,match",
+        [
+            ("", "schedule_sync_commit_author_empty"),
+            ("   ", "schedule_sync_commit_author_empty"),
+            ("no-email-here", "schedule_sync_commit_author_invalid"),
+            ("name <missing-at-sign>", "schedule_sync_commit_author_invalid"),
+            ("<bot@example.com>", "schedule_sync_commit_author_invalid"),
+            (" <bot@example.com>", "schedule_sync_commit_author_invalid"),
+            # Newline in name — the kind of thing that could break commit metadata
+            # parsers if it ever reached git stdin.
+            ("Bot\nInjected <bot@example.com>", "schedule_sync_commit_author_control_char"),
+            ("Bot\rCarriage <bot@example.com>", "schedule_sync_commit_author_control_char"),
+            ("Bot\x00NUL <bot@example.com>", "schedule_sync_commit_author_control_char"),
+        ],
+    )
+    def test_rejects_invalid_or_dangerous_inputs(self, value, match):
+        with pytest.raises(CLIError, match=match):
+            schedule_sync._parse_commit_author(value)
 
 
 # -----------------------------------------------------------------------------
@@ -367,15 +452,217 @@ class TestAirflowDispatch:
         dd_idx = argv.index("--")
         assert dd_idx == len(argv) - 3
 
-    def test_git_ssh_not_implemented(self, dags_dir):
-        args = _args(scheduler="airflow", destination="git+ssh://git@github.com/org/repo.git")
-        with pytest.raises(CLIError, match="schedule_sync_git_ssh_not_implemented"):
-            schedule_sync._airflow_dispatch(dags_dir, args)
+    def test_git_ssh_dry_run_plans_clone_sync_commit_push(self, dags_dir):
+        args = _args(
+            scheduler="airflow",
+            destination="git+ssh://git@github.com/org/repo.git",
+            dry_run=True,
+        )
+
+        def _which(binary):
+            return f"/bin/{binary}"
+
+        with (
+            patch.object(schedule_sync, "_which_or_raise", side_effect=_which),
+            patch.object(schedule_sync.subprocess, "run") as subprocess_run,
+        ):
+            results = schedule_sync._airflow_dispatch(dags_dir, args)
+
+        subprocess_run.assert_not_called()
+        assert len(results) == 6
+        assert results[0]["argv"] == [
+            "/bin/git",
+            "clone",
+            "--",
+            "ssh://git@github.com/org/repo.git",
+            "<schedule-sync-git-ssh-clone>",
+        ]
+        rsync_argv = results[1]["argv"]
+        assert rsync_argv[:5] == ["/bin/rsync", "-av", "--delete", "--exclude", ".git/"]
+        assert "--" in rsync_argv
+        assert results[2]["argv"] == ["/bin/git", "add", "--", "."]
+        assert results[3]["argv"] == ["/bin/git", "status", "--porcelain"]
+        assert results[4]["argv"] == [
+            "/bin/git",
+            "commit",
+            "-m",
+            "sync Airflow DAGs from fluid schedule-sync",
+        ]
+        assert results[5]["argv"] == ["/bin/git", "push"]
+
+    def test_git_ssh_success_clones_syncs_commits_and_pushes(self, dags_dir):
+        args = _args(
+            scheduler="airflow",
+            destination="git+ssh://git@github.com/org/repo.git",
+            dry_run=False,
+        )
+        cwd_calls = []
+
+        def _which(binary):
+            return f"/bin/{binary}"
+
+        def _result(argv, *, exit_code=0, stdout=""):
+            return {
+                "argv": argv,
+                "exit_code": exit_code,
+                "stdout_tail": stdout,
+                "stderr_tail": "",
+                "duration_s": 0.0,
+                "dry_run": False,
+            }
+
+        def _run(argv, *, timeout, dry_run):
+            assert argv[:3] == ["/bin/git", "clone", "--"]
+            assert dry_run is False
+            return _result(argv)
+
+        def _run_cwd(argv, *, cwd, timeout, dry_run):
+            assert dry_run is False
+            cwd_calls.append((argv, cwd))
+            stdout = "M dag_one.py\n" if argv == ["/bin/git", "status", "--porcelain"] else ""
+            result = _result(argv, stdout=stdout)
+            result["cwd"] = cwd
+            return result
+
+        with (
+            patch.object(schedule_sync, "_which_or_raise", side_effect=_which),
+            patch.object(schedule_sync, "_run_subprocess", side_effect=_run),
+            patch.object(schedule_sync, "_run_subprocess_with_cwd", side_effect=_run_cwd),
+        ):
+            results = schedule_sync._airflow_dispatch(dags_dir, args)
+
+        assert len(results) == 6
+        assert [call[0] for call in cwd_calls] == [
+            [
+                "/bin/rsync",
+                "-av",
+                "--delete",
+                "--exclude",
+                ".git/",
+                "--",
+                str(dags_dir).rstrip("/") + "/",
+                "./",
+            ],
+            ["/bin/git", "add", "--", "."],
+            ["/bin/git", "status", "--porcelain"],
+            ["/bin/git", "commit", "-m", "sync Airflow DAGs from fluid schedule-sync"],
+            ["/bin/git", "push"],
+        ]
+        assert len({call[1] for call in cwd_calls}) == 1
+
+    def test_git_ssh_no_changes_skips_commit_and_push(self, dags_dir):
+        args = _args(
+            scheduler="airflow",
+            destination="git+ssh://git@github.com/org/repo.git",
+            dry_run=False,
+        )
+        cwd_argvs = []
+
+        def _result(argv, *, stdout=""):
+            return {
+                "argv": argv,
+                "exit_code": 0,
+                "stdout_tail": stdout,
+                "stderr_tail": "",
+                "duration_s": 0.0,
+                "dry_run": False,
+            }
+
+        def _run_cwd(argv, *, cwd, timeout, dry_run):
+            cwd_argvs.append(argv)
+            result = _result(argv)
+            result["cwd"] = cwd
+            return result
+
+        with (
+            patch.object(schedule_sync, "_which_or_raise", side_effect=lambda b: f"/bin/{b}"),
+            patch.object(
+                schedule_sync, "_run_subprocess", side_effect=lambda argv, **_: _result(argv)
+            ),
+            patch.object(schedule_sync, "_run_subprocess_with_cwd", side_effect=_run_cwd),
+        ):
+            results = schedule_sync._airflow_dispatch(dags_dir, args)
+
+        assert len(results) == 4
+        assert [
+            "/bin/git",
+            "commit",
+            "-m",
+            "sync Airflow DAGs from fluid schedule-sync",
+        ] not in cwd_argvs
+        assert ["/bin/git", "push"] not in cwd_argvs
+
+    def test_git_ssh_clone_failure_stops_workflow(self, dags_dir):
+        args = _args(
+            scheduler="airflow",
+            destination="git+ssh://git@github.com/org/repo.git",
+            dry_run=False,
+        )
+
+        def _clone_failure(argv, *, timeout, dry_run):
+            return {
+                "argv": argv,
+                "exit_code": 128,
+                "stdout_tail": "",
+                "stderr_tail": "clone failed",
+                "duration_s": 0.0,
+                "dry_run": False,
+            }
+
+        with (
+            patch.object(schedule_sync, "_which_or_raise", side_effect=lambda b: f"/bin/{b}"),
+            patch.object(schedule_sync, "_run_subprocess", side_effect=_clone_failure),
+            patch.object(schedule_sync, "_run_subprocess_with_cwd") as run_cwd,
+        ):
+            results = schedule_sync._airflow_dispatch(dags_dir, args)
+
+        assert len(results) == 1
+        assert results[0]["exit_code"] == 128
+        run_cwd.assert_not_called()
 
     def test_missing_destination_raises(self, dags_dir):
         args = _args(scheduler="airflow", destination=None)
         with pytest.raises(CLIError, match="schedule_sync_destination_required"):
             schedule_sync._airflow_dispatch(dags_dir, args)
+
+    def test_git_ssh_dry_run_threads_commit_author_into_commit_argv(self, dags_dir):
+        args = _args(
+            scheduler="airflow",
+            destination="git+ssh://git@github.com/org/repo.git",
+            dry_run=True,
+            git_commit_author="Fluid Bot <bot@example.com>",
+        )
+
+        with patch.object(schedule_sync, "_which_or_raise", side_effect=lambda b: f"/bin/{b}"):
+            results = schedule_sync._airflow_dispatch(dags_dir, args)
+
+        # The git-add and git-status argv stay unchanged. The commit argv must
+        # carry the per-process ``-c user.name=…`` and ``-c user.email=…`` so the
+        # destination repo's history attributes the commit to the deterministic
+        # service-account identity rather than the runner's git config.
+        assert results[4]["argv"] == [
+            "/bin/git",
+            "-c",
+            "user.name=Fluid Bot",
+            "-c",
+            "user.email=bot@example.com",
+            "commit",
+            "-m",
+            "sync Airflow DAGs from fluid schedule-sync",
+        ]
+        # Push remains author-agnostic — git push doesn't carry author metadata.
+        assert results[5]["argv"] == ["/bin/git", "push"]
+
+    def test_git_ssh_invalid_commit_author_rejected(self, dags_dir):
+        args = _args(
+            scheduler="airflow",
+            destination="git+ssh://git@github.com/org/repo.git",
+            dry_run=True,
+            git_commit_author="not a valid format",
+        )
+        with patch.object(schedule_sync, "_which_or_raise", side_effect=lambda b: f"/bin/{b}"):
+            with pytest.raises(CLIError, match="schedule_sync_commit_author_invalid"):
+                schedule_sync._airflow_dispatch(dags_dir, args)
 
 
 # -----------------------------------------------------------------------------
@@ -592,6 +879,42 @@ class TestArgparseRegistration:
         assert ns.command == "schedule-sync"
         assert ns.scheduler == "airflow"
         assert ns.dry_run is True
+
+    def test_register_includes_git_commit_author_flag(self):
+        parser = argparse.ArgumentParser()
+        sp = parser.add_subparsers(dest="command")
+        schedule_sync.register(sp)
+
+        ns = parser.parse_args(
+            [
+                "schedule-sync",
+                "--scheduler",
+                "airflow",
+                "--dags-dir",
+                "/tmp/x",
+                "--destination",
+                "git+ssh://git@github.com/org/repo.git",
+                "--dry-run",
+                "--git-commit-author",
+                "Fluid Bot <bot@example.com>",
+            ]
+        )
+        assert ns.git_commit_author == "Fluid Bot <bot@example.com>"
+
+        # Default is None when the flag isn't supplied.
+        ns_default = parser.parse_args(
+            [
+                "schedule-sync",
+                "--scheduler",
+                "airflow",
+                "--dags-dir",
+                "/tmp/x",
+                "--destination",
+                "s3://b/d/",
+                "--dry-run",
+            ]
+        )
+        assert ns_default.git_commit_author is None
 
 
 # -----------------------------------------------------------------------------
