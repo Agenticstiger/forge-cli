@@ -32,6 +32,7 @@ __all__ = [
     "get_catalog_default",
     "get_catalog_routing_model",
     "get_catalog_tier_models",
+    "get_cumulative_prompt_cache_metrics",
     "build_llm_run_plan",
     "detect_ollama_available",
     "detect_provider_from_api_key",
@@ -306,6 +307,10 @@ class LlmProvider(ABC):
         """
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
+    def extract_prompt_cache(self, response_json: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract prompt-cache usage from the provider response."""
+        return _prompt_cache_metrics(0, 0)
+
     def list_available_models(
         self, api_key: Optional[str], env: Mapping[str, str]
     ) -> Optional[List[str]]:
@@ -489,6 +494,23 @@ class OpenAIProvider(LlmProvider):
         out = usage.get("completion_tokens", 0)
         return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
 
+    def extract_prompt_cache(self, response_json: Dict[str, Any]) -> Dict[str, Any]:
+        usage = response_json.get("usage") or {}
+        details = usage.get("prompt_token_details") or usage.get("prompt_tokens_details") or {}
+        return _prompt_cache_metrics(
+            details.get("cached_tokens", 0),
+            usage.get("prompt_tokens", 0),
+        )
+
+    def build_streaming_request(
+        self, config: LlmConfig, system_prompt: str, user_prompt: str
+    ) -> tuple[str, Dict[str, str], Dict[str, Any]]:
+        headers, payload = self.build_request(config, system_prompt, user_prompt)
+        payload = dict(payload)
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+        return config.endpoint, headers, payload
+
     def iter_stream_chunks(self, response: httpx.Response) -> Iterator[str]:
         """Parse an OpenAI Chat Completions SSE stream.
 
@@ -516,6 +538,7 @@ class OpenAIProvider(LlmProvider):
                 event = json.loads(data)
             except json.JSONDecodeError:
                 continue
+            _record_prompt_cache_from_response(self, event)
             choices = event.get("choices") or []
             if not choices:
                 continue
@@ -782,6 +805,13 @@ class AnthropicProvider(LlmProvider):
         out = usage.get("output_tokens", 0)
         return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
 
+    def extract_prompt_cache(self, response_json: Dict[str, Any]) -> Dict[str, Any]:
+        usage = response_json.get("usage") or {}
+        read = usage.get("cache_read_input_tokens", 0)
+        created = usage.get("cache_creation_input_tokens", 0)
+        uncached = usage.get("input_tokens", 0)
+        return _prompt_cache_metrics(read, uncached + created + read)
+
     def iter_stream_chunks(self, response: httpx.Response) -> Iterator[str]:
         """Parse an Anthropic Messages API SSE stream.
 
@@ -815,6 +845,8 @@ class AnthropicProvider(LlmProvider):
                 event = json.loads(data)
             except json.JSONDecodeError:
                 continue
+            usage_source = event.get("message") if isinstance(event.get("message"), dict) else event
+            _record_prompt_cache_from_response(self, usage_source)
             event_type = event.get("type")
             if event_type == "content_block_delta":
                 delta = event.get("delta") or {}
@@ -995,6 +1027,13 @@ class GeminiProvider(LlmProvider):
         total = usage.get("totalTokenCount", inp + out)
         return {"input_tokens": inp, "output_tokens": out, "total_tokens": total}
 
+    def extract_prompt_cache(self, response_json: Dict[str, Any]) -> Dict[str, Any]:
+        usage = response_json.get("usageMetadata") or {}
+        return _prompt_cache_metrics(
+            usage.get("cachedContentTokenCount", 0),
+            usage.get("promptTokenCount", 0),
+        )
+
     # -- Streaming (slice UX-I) --------------------------------------------
 
     def _streaming_url(self, config: LlmConfig) -> str:
@@ -1041,6 +1080,7 @@ class GeminiProvider(LlmProvider):
                 event = json.loads(data)
             except json.JSONDecodeError:
                 continue
+            _record_prompt_cache_from_response(self, event)
             for candidate in event.get("candidates") or []:
                 content = candidate.get("content") or {}
                 for part in content.get("parts") or []:
@@ -1466,6 +1506,7 @@ _LLM_RETRY_BASE_SECONDS = 2.0
 # architecture.  If call_llm is ever invoked from threads, wrap updates
 # with a threading.Lock.
 _cumulative_usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+_cumulative_prompt_cache: Dict[str, int] = {"read_tokens": 0, "total_tokens": 0}
 
 
 def get_cumulative_token_usage() -> Dict[str, int]:
@@ -1473,9 +1514,81 @@ def get_cumulative_token_usage() -> Dict[str, int]:
     return dict(_cumulative_usage)
 
 
+def _coerce_nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _prompt_cache_metrics(read_tokens: Any, total_tokens: Any) -> Dict[str, Any]:
+    """Compose normalised prompt-cache metrics.
+
+    ``total_tokens`` is the per-call total INPUT-side token count
+    (cached + uncached), so ``hit_rate = read / total`` always means
+    "fraction of input that was a cache hit." Each provider's
+    ``extract_prompt_cache`` is responsible for reconciling its own
+    accounting to this convention before calling here.
+    """
+    read = _coerce_nonnegative_int(read_tokens)
+    total = _coerce_nonnegative_int(total_tokens)
+    return {
+        "read_tokens": read,
+        "total_tokens": total,
+        "hit_rate": (read / total) if total else 0.0,
+    }
+
+
+def get_cumulative_prompt_cache_metrics() -> Dict[str, Any]:
+    """Return cumulative prompt-cache metrics across all LLM calls in this process."""
+    return _prompt_cache_metrics(
+        _cumulative_prompt_cache["read_tokens"],
+        _cumulative_prompt_cache["total_tokens"],
+    )
+
+
+def _record_prompt_cache_usage(metrics: Mapping[str, Any]) -> None:
+    read = _coerce_nonnegative_int(metrics.get("read_tokens"))
+    total = _coerce_nonnegative_int(metrics.get("total_tokens"))
+    # Streaming hooks call this for every event; provider extractors
+    # return zeros for events that don't carry usage. Short-circuit so
+    # we don't over-count cumulative metrics across a single stream.
+    if not read and not total:
+        return
+    _cumulative_prompt_cache["read_tokens"] += read
+    _cumulative_prompt_cache["total_tokens"] += total
+    cumulative = get_cumulative_prompt_cache_metrics()
+    LOG.info(
+        "LLM prompt cache usage: read_tokens=%s total_tokens=%s hit_rate=%.4f "
+        "cumulative_read_tokens=%s cumulative_total_tokens=%s cumulative_hit_rate=%.4f",
+        read,
+        total,
+        (read / total) if total else 0.0,
+        cumulative["read_tokens"],
+        cumulative["total_tokens"],
+        cumulative["hit_rate"],
+    )
+
+
+def _record_prompt_cache_from_response(
+    provider: LlmProvider, response_json: Mapping[str, Any]
+) -> None:
+    try:
+        _record_prompt_cache_usage(provider.extract_prompt_cache(dict(response_json)))
+    except Exception as exc:  # noqa: BLE001 — metrics must never break generation
+        LOG.debug("prompt_cache_metrics_extract_failed", extra={"error": str(exc)})
+
+
 def reset_token_usage() -> None:
-    """Reset cumulative token counters (useful for testing)."""
+    """Reset both cumulative token counters and prompt-cache metrics.
+
+    Called from ``forge.run`` at the top of each invocation and used
+    extensively by tests; resets ``_cumulative_usage`` and
+    ``_cumulative_prompt_cache`` together so callers don't have to
+    track them separately.
+    """
     _cumulative_usage.update({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+    _cumulative_prompt_cache.update({"read_tokens": 0, "total_tokens": 0})
 
 
 def call_llm(
@@ -1535,6 +1648,7 @@ def call_llm(
         _cumulative_usage["input_tokens"] += usage.get("input_tokens", 0)
         _cumulative_usage["output_tokens"] += usage.get("output_tokens", 0)
         _cumulative_usage["total_tokens"] += usage.get("total_tokens", 0)
+        _record_prompt_cache_from_response(provider, resp_json)
         return provider.extract_text(resp_json)
     except CopilotGenerationError:
         raise

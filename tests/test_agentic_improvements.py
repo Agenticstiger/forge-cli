@@ -211,6 +211,34 @@ class TestExtractUsage:
         usage = provider.extract_usage({"choices": [{"message": {"content": "hi"}}]})
         assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
+    def test_openai_prompt_cache_usage(self):
+        from fluid_build.cli.forge_copilot_llm_providers import OpenAIProvider
+
+        provider = OpenAIProvider()
+        metrics = provider.extract_prompt_cache(
+            {
+                "usage": {
+                    "prompt_tokens": 100,
+                    "prompt_token_details": {"cached_tokens": 40},
+                }
+            }
+        )
+        assert metrics == {"read_tokens": 40, "total_tokens": 100, "hit_rate": 0.4}
+
+    def test_openai_prompt_cache_usage_accepts_plural_details_key(self):
+        from fluid_build.cli.forge_copilot_llm_providers import OpenAIProvider
+
+        provider = OpenAIProvider()
+        metrics = provider.extract_prompt_cache(
+            {
+                "usage": {
+                    "prompt_tokens": 200,
+                    "prompt_tokens_details": {"cached_tokens": 50},
+                }
+            }
+        )
+        assert metrics == {"read_tokens": 50, "total_tokens": 200, "hit_rate": 0.25}
+
     def test_anthropic_usage(self):
         from fluid_build.cli.forge_copilot_llm_providers import AnthropicProvider
 
@@ -222,6 +250,21 @@ class TestExtractUsage:
             }
         )
         assert usage == {"input_tokens": 200, "output_tokens": 80, "total_tokens": 280}
+
+    def test_anthropic_prompt_cache_usage(self):
+        from fluid_build.cli.forge_copilot_llm_providers import AnthropicProvider
+
+        provider = AnthropicProvider()
+        metrics = provider.extract_prompt_cache(
+            {
+                "usage": {
+                    "input_tokens": 80,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 20,
+                }
+            }
+        )
+        assert metrics == {"read_tokens": 20, "total_tokens": 100, "hit_rate": 0.2}
 
     def test_gemini_usage(self):
         from fluid_build.cli.forge_copilot_llm_providers import GeminiProvider
@@ -238,6 +281,20 @@ class TestExtractUsage:
             }
         )
         assert usage == {"input_tokens": 300, "output_tokens": 120, "total_tokens": 420}
+
+    def test_gemini_prompt_cache_usage(self):
+        from fluid_build.cli.forge_copilot_llm_providers import GeminiProvider
+
+        provider = GeminiProvider()
+        metrics = provider.extract_prompt_cache(
+            {
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "cachedContentTokenCount": 25,
+                }
+            }
+        )
+        assert metrics == {"read_tokens": 25, "total_tokens": 100, "hit_rate": 0.25}
 
     def test_gemini_missing_usage(self):
         from fluid_build.cli.forge_copilot_llm_providers import GeminiProvider
@@ -266,6 +323,11 @@ class TestExtractUsage:
             "input_tokens": 0,
             "output_tokens": 0,
             "total_tokens": 0,
+        }
+        assert LlmProvider.extract_prompt_cache(None, {}) == {
+            "read_tokens": 0,
+            "total_tokens": 0,
+            "hit_rate": 0.0,
         }
 
 
