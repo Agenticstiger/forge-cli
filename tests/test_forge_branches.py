@@ -708,6 +708,10 @@ class TestRunFunction:
         args = MagicMock()
         args.help = False
         args.mode = "copilot"
+        # Skip inline LLM setup so the dispatch path doesn't depend on a saved
+        # provider config — without this, CI (no saved config) falls into the
+        # ``ask_confirmation`` branch and reads from a captured stdin.
+        args.non_interactive = True
         logger = logging.getLogger("test")
         result = run(args, logger)
         assert result == 0
