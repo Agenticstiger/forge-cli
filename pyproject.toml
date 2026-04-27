@@ -341,6 +341,14 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short --strict-markers --disable-warnings"
+# Default ``@pytest.mark.xfail`` to ``strict=True`` so an XPASS fails the
+# build the moment the underlying issue is fixed. Otherwise XPASSes are
+# silent (the test passes without any signal), which is how PR #53 ended
+# up unmarking xfails on a Python-3.14 regression that was still real —
+# nobody noticed until a downstream PR (#55) tripped the same wire.
+# Tests that *intentionally* want non-strict (e.g. flaky-on-some-runners
+# checks) must override with ``strict=False`` explicitly on the marker.
+xfail_strict = true
 markers = [
     "unit: Unit tests (fast, no I/O)",
     "integration: Integration tests (may need network/files)",
