@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import fluid_build.cli.marketplace as marketplace_module
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.marketplace import (
     COMMAND,
@@ -232,6 +233,10 @@ class TestSearchBlueprints:
             )
             result = search_blueprints(args, logger, "http://api")
         assert result == 0
+        assert (
+            mock_requests.get.call_args.kwargs["timeout"]
+            == marketplace_module.MARKETPLACE_HTTP_TIMEOUT_SECONDS
+        )
 
     @patch("fluid_build.cli.marketplace.console", MagicMock())
     def test_search_empty_results(self, logger):
@@ -303,6 +308,66 @@ class TestSearchBlueprints:
             )
             result = search_blueprints(args, logger, "http://api")
         assert result == 1
+
+    def test_search_timeout_retries_and_returns_one(self, logger):
+        import requests as real_requests
+
+        from fluid_build.cli.marketplace import search_blueprints
+
+        args = SimpleNamespace(
+            query="test",
+            category=None,
+            tags=None,
+            maturity=None,
+            state="published",
+            sort="downloads",
+            limit=20,
+        )
+        with (
+            patch("fluid_build.cli.marketplace.console") as mock_console,
+            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+        ):
+            mock_requests.get.side_effect = real_requests.exceptions.Timeout("read timed out")
+            mock_requests.exceptions = real_requests.exceptions
+            result = search_blueprints(args, logger, "http://api")
+
+        assert result == 1
+        assert mock_requests.get.call_count == marketplace_module.MARKETPLACE_HTTP_RETRIES + 1
+        assert "timed out after" in str(mock_console.print.call_args_list)
+
+    def test_search_http_error_reports_status(self, logger):
+        import requests as real_requests
+
+        from fluid_build.cli.marketplace import search_blueprints
+
+        args = SimpleNamespace(
+            query="test",
+            category=None,
+            tags=None,
+            maturity=None,
+            state="published",
+            sort="downloads",
+            limit=20,
+        )
+        response = MagicMock()
+        response.status_code = 503
+        response.text = "service unavailable"
+        error = real_requests.exceptions.HTTPError("server error")
+        error.response = response
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status.side_effect = error
+
+        with (
+            patch("fluid_build.cli.marketplace.console") as mock_console,
+            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+        ):
+            mock_requests.get.return_value = mock_response
+            mock_requests.exceptions = real_requests.exceptions
+            result = search_blueprints(args, logger, "http://api")
+
+        assert result == 1
+        assert "HTTP 503" in str(mock_console.print.call_args_list)
 
 
 # ── list_categories ─────────────────────────────────────────────────
