@@ -429,6 +429,12 @@ def test_apply_publishes_and_approves_access_agreements_when_explicit():
 
 
 def test_apply_dry_run_odps_source_system_mode_does_not_restore_product_input_ports():
+    """Per Entropy's canonical ``dataproduct-0.0.1.json`` schema, inputPorts
+    represent source-system upstreams and require ``sourceSystemId``.
+    Product-to-product lineage flows through Access agreements regardless
+    of ``odps_lineage_mode`` — putting product references back on
+    inputPorts in source-system mode would double-count upstreams in the
+    Entropy graph (one Access edge + one phantom SourceSystem node)."""
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
     result = provider.apply(
@@ -468,6 +474,11 @@ def test_catalog_provider_passes_explicit_access_auto_approval_to_dmm_provider()
 
 
 def test_apply_odps_default_lineage_mode_does_not_upsert_product_references():
+    """SourceSystem entities are reserved for explicit
+    ``consumes[].sourceSystem`` fields — never invented from product
+    references. This locks in the canonical Entropy model where inputPorts
+    + SourceSystems represent external systems, while data-product-to-
+    data-product lineage flows through Access agreements."""
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
     response = MagicMock(status_code=200)
 
@@ -485,6 +496,10 @@ def test_apply_odps_default_lineage_mode_does_not_upsert_product_references():
 
 
 def test_apply_odps_source_system_mode_does_not_upsert_product_references():
+    """Same invariant as the default mode: source-system mode does not
+    elevate product references into SourceSystem entities. Doing so would
+    duplicate upstream nodes in the Entropy graph next to the real Access
+    edges."""
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
     response = MagicMock(status_code=200)
 

@@ -887,6 +887,13 @@ class TestEnsureSourceSystems:
         assert put_paths == ["/api/sourcesystems/bss-crm"]
 
     def test_does_not_upsert_product_references_in_compatibility_mode(self):
+        """SourceSystem entities are reserved for explicitly authored
+        ``consumes[].sourceSystem`` fields. Auto-creating SourceSystem rows
+        from upstream product IDs would duplicate graph nodes next to the
+        real Access lineage edges. Locked in regardless of the ``default_
+        from_reference`` flag — that flag only affects the
+        ``customProperties[sourceSystem]`` overlay on retained inputPorts,
+        not the SourceSystem table itself."""
         fluid = {
             "consumes": [
                 {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
@@ -937,3 +944,146 @@ class TestEnsureSourceSystems:
         with patch.object(provider, "_request") as mock_request:
             provider._ensure_source_systems({}, team_id="telco-data-platform")
         assert mock_request.call_args_list == []
+
+
+class TestCanonicalLineageShape:
+    """Lock in the canonical Entropy lineage model (per ``dataproduct-0.0.1.json``):
+
+    * ``consumes[].productId`` (data-product reference) → **Access agreement** edge.
+      Never appears as an inputPort, never invents a SourceSystem entity.
+    * ``consumes[].sourceSystem`` (explicit external system) → **inputPort**
+      with ``sourceSystemId`` set, plus an upserted SourceSystem entity.
+
+    Entropy's native dataproduct schema requires ``inputPorts[].sourceSystemId``,
+    making the two upstream classes structurally distinct. Doubling them up
+    (e.g. inventing a SourceSystem from a product reference) creates duplicate
+    graph nodes next to the real Access edges in the UI. Card 69d2a9b2 was
+    filed against an older branch that emitted that hybrid shape; today's
+    ``main`` keeps the two paths cleanly separated.
+    """
+
+    @staticmethod
+    def _silver_with_two_product_upstreams() -> dict:
+        return {
+            "fluidVersion": "0.7.2",
+            "kind": "DataProduct",
+            "id": "silver.telco.subscriber360_v1",
+            "name": "Telco Subscriber 360",
+            "domain": "telco",
+            "metadata": {
+                "owner": {
+                    "team": "telco-customer-intelligence",
+                    "email": "ci@example.com",
+                }
+            },
+            "consumes": [
+                {
+                    "productId": "bronze.telco.party_v1",
+                    "exposeId": "account_source",
+                    "purpose": "account ledger",
+                },
+                {
+                    "productId": "bronze.telco.usage_v1",
+                    "exposeId": "usage_event_source",
+                    "purpose": "usage signal",
+                },
+            ],
+            "exposes": [
+                {
+                    "exposeId": "subscriber360_core",
+                    "kind": "table",
+                    "binding": {
+                        "platform": "snowflake",
+                        "format": "snowflake_table",
+                        "location": {
+                            "database": "TELCO_LAB",
+                            "schema": "GOLD",
+                            "table": "SUBSCRIBER_360_V1",
+                        },
+                    },
+                    "contract": {"schema": [{"name": "subscriber_id", "type": "string"}]},
+                },
+            ],
+        }
+
+    @staticmethod
+    def _silver_with_explicit_source_system() -> dict:
+        contract = TestCanonicalLineageShape._silver_with_two_product_upstreams()
+        contract["consumes"] = [
+            {
+                "productId": "bronze.telco.party_v1",
+                "exposeId": "account_source",
+                "purpose": "account ledger",
+            },
+            {
+                "exposeId": "salesforce_export",
+                "sourceSystem": "salesforce-prod",
+                "purpose": "CRM signal",
+            },
+        ]
+        return contract
+
+    @pytest.mark.parametrize("mode", ("contract", "source-system"))
+    def test_product_consumes_never_appear_as_input_ports(self, mode):
+        """Product-to-product lineage is Access-agreement-only in every
+        mode. Putting it on inputPorts would double-count upstream nodes
+        in the Entropy graph."""
+        provider = _make_provider()
+        result = provider._publish_one(
+            self._silver_with_two_product_upstreams(),
+            dry_run=True,
+            data_product_specification="odps",
+            odps_lineage_mode=mode,
+        )
+        payload = result["payload"]
+        assert payload.get("inputPorts") in (None, []), payload.get("inputPorts")
+        # Lineage flows through Access agreements regardless of mode.
+        access = result.get("access_agreements") or []
+        assert len(access) == 2
+        access_ids = {a["payload"]["id"] for a in access}
+        assert any("bronze.telco.party_v1" in i for i in access_ids)
+        assert any("bronze.telco.usage_v1" in i for i in access_ids)
+
+    @pytest.mark.parametrize("mode", ("contract", "source-system"))
+    def test_no_source_system_entities_are_created_from_product_references(self, mode):
+        """Locks in the design rule from ``_ensure_source_systems``'s
+        docstring: SourceSystem entities are reserved for explicit
+        ``consumes[].sourceSystem`` fields and are never invented from
+        upstream product IDs."""
+        provider = _make_provider()
+        session = MagicMock()
+        session.get.return_value = MagicMock(status_code=404)
+        put_resp = MagicMock(status_code=200)
+
+        with (
+            patch.object(provider, "_session", return_value=session),
+            patch.object(provider, "_request", return_value=put_resp) as mock_request,
+            patch.object(provider, "_ensure_team"),
+        ):
+            provider._publish_one(
+                self._silver_with_two_product_upstreams(),
+                dry_run=False,
+                data_product_specification="odps",
+                odps_lineage_mode=mode,
+                create_team=False,
+            )
+
+        put_paths = [c.args[1] for c in mock_request.call_args_list if c.args[0] == "PUT"]
+        assert not any(p.startswith("/api/sourcesystems/") for p in put_paths), put_paths
+
+    def test_explicit_source_system_consumes_are_kept_as_input_ports(self):
+        """When the contract author DOES author an external source system,
+        that consume IS an inputPort — the canonical Entropy model. The
+        source-system entity is upserted so Entropy can resolve it."""
+        provider = _make_provider()
+        result = provider._publish_one(
+            self._silver_with_explicit_source_system(),
+            dry_run=True,
+            data_product_specification="odps",
+        )
+        payload = result["payload"]
+        ports = payload.get("inputPorts") or []
+        # Only the explicit-source-system consume survives as an input
+        # port; the product-ref consume stays an Access agreement.
+        assert len(ports) == 1, ports
+        assert ports[0]["name"] == "salesforce_export"
