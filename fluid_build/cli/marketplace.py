@@ -56,6 +56,8 @@ COMMAND = "marketplace"
 
 # Default API endpoint (can be overridden via env or config)
 DEFAULT_API_URL = "http://localhost:8000/api/v1/blueprints-marketplace"
+MARKETPLACE_HTTP_TIMEOUT_SECONDS = 10
+MARKETPLACE_HTTP_RETRIES = 1
 
 # Fallback options when Command Center unavailable
 FALLBACK_OPTIONS = {
@@ -65,6 +67,72 @@ FALLBACK_OPTIONS = {
 }
 
 console = Console() if RICH_AVAILABLE else None
+
+
+def _requests_exception_type(name: str) -> type[BaseException] | None:
+    """Return a requests exception class, tolerating patched test doubles."""
+    exceptions = getattr(requests, "exceptions", None)
+    exc_type = getattr(exceptions, name, None)
+    if isinstance(exc_type, type) and issubclass(exc_type, BaseException):
+        return exc_type
+    return None
+
+
+def _is_requests_exception(exc: BaseException, name: str) -> bool:
+    exc_type = _requests_exception_type(name)
+    return bool(exc_type and isinstance(exc, exc_type))
+
+
+def _marketplace_request(request_func, url: str, logger: logging.Logger, **kwargs):
+    """Run a marketplace HTTP request with bounded timeout and one transient retry."""
+    timeout = kwargs.pop("timeout", MARKETPLACE_HTTP_TIMEOUT_SECONDS)
+    request_error = _requests_exception_type("RequestException") or Exception
+    transient_errors = tuple(
+        exc_type
+        for exc_type in (
+            _requests_exception_type("Timeout"),
+            _requests_exception_type("ConnectionError"),
+        )
+        if exc_type is not None
+    )
+
+    for attempt in range(MARKETPLACE_HTTP_RETRIES + 1):
+        try:
+            return request_func(url, timeout=timeout, **kwargs)
+        except request_error as exc:
+            is_transient = bool(transient_errors and isinstance(exc, transient_errors))
+            if not is_transient or attempt >= MARKETPLACE_HTTP_RETRIES:
+                raise
+            logger.warning("Marketplace request failed transiently; retrying once: %s", exc)
+
+    raise RuntimeError("unreachable marketplace retry state")  # pragma: no cover
+
+
+def _marketplace_get(url: str, logger: logging.Logger, **kwargs):
+    return _marketplace_request(requests.get, url, logger, **kwargs)
+
+
+def _marketplace_post(url: str, logger: logging.Logger, **kwargs):
+    return _marketplace_request(requests.post, url, logger, **kwargs)
+
+
+def _format_marketplace_error(exc: BaseException) -> str:
+    if _is_requests_exception(exc, "Timeout"):
+        return (
+            "Marketplace API request timed out after "
+            f"{MARKETPLACE_HTTP_TIMEOUT_SECONDS}s. Check the API URL or try again."
+        )
+    if _is_requests_exception(exc, "ConnectionError"):
+        return "Could not connect to the marketplace API. Check Command Center or FLUID_API_URL."
+
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code:
+        body = str(getattr(response, "text", "") or "").strip()
+        detail = f": {body[:200]}" if body else ""
+        return f"Marketplace API returned HTTP {status_code}{detail}"
+
+    return f"Marketplace API request failed: {exc}"
 
 
 def register(subparsers: argparse._SubParsersAction):
@@ -274,7 +342,7 @@ def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
         params["state"] = args.state
 
     try:
-        response = requests.get(api_url, params=params)
+        response = _marketplace_get(api_url, logger, params=params)
         response.raise_for_status()
         data = response.json()
 
@@ -313,8 +381,9 @@ def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
         return 0
 
     except requests.exceptions.RequestException as e:
-        console.print(f"[red]❌ API request failed: {e}[/red]")
-        logger.error(f"Failed to search blueprints: {e}")
+        message = _format_marketplace_error(e)
+        console.print(f"[red]❌ {message}[/red]")
+        logger.error("Failed to search blueprints: %s", message, exc_info=True)
         return 1
 
 
@@ -327,7 +396,7 @@ def show_blueprint_info(args, logger: logging.Logger, api_url: str) -> int:
         params["version"] = args.version
 
     try:
-        response = requests.get(f"{api_url}/{args.blueprint_id}", params=params)
+        response = _marketplace_get(f"{api_url}/{args.blueprint_id}", logger, params=params)
         response.raise_for_status()
         bp = response.json()
 
@@ -413,8 +482,9 @@ def show_blueprint_info(args, logger: logging.Logger, api_url: str) -> int:
         return 0
 
     except requests.exceptions.RequestException as e:
-        console.print(f"[red]❌ API request failed: {e}[/red]")
-        logger.error(f"Failed to get blueprint info: {e}")
+        message = _format_marketplace_error(e)
+        console.print(f"[red]❌ {message}[/red]")
+        logger.error("Failed to get blueprint info: %s", message, exc_info=True)
         return 1
 
 
@@ -424,11 +494,13 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
 
     # Get blueprint info first
     try:
-        response = requests.get(f"{api_url}/{args.blueprint_id}")
+        response = _marketplace_get(f"{api_url}/{args.blueprint_id}", logger)
         response.raise_for_status()
         bp = response.json()
     except requests.exceptions.RequestException as e:
-        console.print(f"[red]❌ Failed to fetch blueprint: {e}[/red]")
+        message = _format_marketplace_error(e)
+        console.print(f"[red]❌ Failed to fetch blueprint: {message}[/red]")
+        logger.error("Failed to fetch blueprint: %s", message, exc_info=True)
         return 1
 
     # Get parameters
@@ -461,7 +533,9 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
     }
 
     try:
-        response = requests.post(f"{api_url}/{args.blueprint_id}/instantiate", json=payload)
+        response = _marketplace_post(
+            f"{api_url}/{args.blueprint_id}/instantiate", logger, json=payload
+        )
         response.raise_for_status()
         result = response.json()
 
@@ -492,10 +566,9 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
         return 0
 
     except requests.exceptions.RequestException as e:
-        console.print(f"[red]❌ Failed to instantiate blueprint: {e}[/red]")
-        if hasattr(e.response, "text"):
-            console.print(f"[red]{e.response.text}[/red]")
-        logger.error(f"Blueprint instantiation failed: {e}")
+        message = _format_marketplace_error(e)
+        console.print(f"[red]❌ Failed to instantiate blueprint: {message}[/red]")
+        logger.error("Blueprint instantiation failed: %s", message, exc_info=True)
         return 1
 
 
