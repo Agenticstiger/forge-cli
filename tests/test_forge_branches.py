@@ -701,12 +701,6 @@ class TestRunFunction:
         assert result == 0
         mock_memory.assert_called_once()
 
-    @pytest.mark.xfail(
-        reason="Import-cycle with the copilot subsystem makes this dispatch return "
-        "1 rather than 0 across all supported Python versions; doesn't affect the "
-        "`fluid forge` happy path. Tracked for follow-up.",
-        strict=False,
-    )
     @patch("fluid_build.cli.forge.run_ai_copilot_mode", return_value=0)
     def test_run_copilot_mode(self, _mock_copilot):
         from fluid_build.cli.forge import run

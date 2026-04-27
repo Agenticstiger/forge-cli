@@ -425,12 +425,6 @@ class TestRun:
 
         assert run(args, logger) == 1
 
-    @pytest.mark.xfail(
-        reason="Import-cycle with the copilot subsystem makes this dispatch return "
-        "1 rather than 0 across all supported Python versions; doesn't affect the "
-        "`fluid init` happy path. Tracked for follow-up.",
-        strict=False,
-    )
     @patch("fluid_build.cli.init._ask_industry", return_value=None)
     @patch("fluid_build.cli.init.blank_mode", return_value=0)
     @patch("fluid_build.cli.init.detect_mode", return_value="blank")
@@ -439,12 +433,6 @@ class TestRun:
 
         assert run(SimpleNamespace(), logger) == 0
 
-    @pytest.mark.xfail(
-        reason="Import-cycle with the copilot subsystem makes this dispatch return "
-        "1 rather than 0 across all supported Python versions; doesn't affect the "
-        "`fluid init` happy path. Tracked for follow-up.",
-        strict=False,
-    )
     @patch("fluid_build.cli.init._ask_industry", return_value=None)
     @patch("fluid_build.cli.init.template_mode", return_value=0)
     @patch("fluid_build.cli.init.detect_mode", return_value="template")
