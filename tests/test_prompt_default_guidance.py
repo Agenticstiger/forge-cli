@@ -14,20 +14,19 @@
 
 """Locks the system prompt to a byte-identical baseline.
 
-``fluid_build/cli/forge_copilot_prompts.py`` loads the sovereignty and
-agent-policy prose from YAML under
+``fluid_build/cli/forge_copilot_prompts.py`` loads default prompt
+guidance from YAML under
 ``fluid_build/cli/agent_specs/_defaults/``. These tests guard three
 things:
 
-1. Both YAML files load cleanly at module import time.
-2. ``_DEFAULT_GUIDANCE`` exposes both keys (``sovereignty``,
-   ``agent_policy``) so the prompt composer never falls back to an
-   empty string silently.
+1. The default-guidance YAML files load cleanly at module import time.
+2. ``_DEFAULT_GUIDANCE`` exposes the required keys so the prompt
+   composer never falls back to an empty string silently.
 3. ``build_system_prompt`` output matches the snapshot at
    ``tests/data/forge_system_prompt_baseline.txt`` byte-for-byte.
 
-When a legitimate prose edit lands in either YAML file, regenerate the
-baseline with::
+When a legitimate prose edit lands in one of these YAML files,
+regenerate the baseline with::
 
     .venv/bin/python -c 'from fluid_build.cli.forge_copilot_runtime \\
       import build_system_prompt, clear_system_prompt_cache; \\
@@ -72,7 +71,7 @@ def _canonical_matrix() -> dict:
 
 
 class TestDefaultGuidanceFiles:
-    """The two YAML files must ship and parse cleanly."""
+    """The default-guidance YAML files must ship and parse cleanly."""
 
     def test_sovereignty_yaml_exists_and_loads(self):
         import yaml
@@ -97,21 +96,39 @@ class TestDefaultGuidanceFiles:
         assert isinstance(raw.get("system_prompt"), str)
         assert "agentpolicy" in raw["system_prompt"].lower().replace(" ", "")
 
+    def test_technique_mandate_yaml_exists_and_loads(self):
+        import yaml
+
+        path = _DEFAULTS_DIR / "technique_mandate.yaml"
+        assert path.exists(), f"expected {path} to ship with the package"
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert isinstance(raw, dict)
+        assert isinstance(raw.get("system_prompt"), str)
+        text = raw["system_prompt"].lower()
+        assert "modeling technique mandate" in text
+        assert "data_modeling_guidance" in text
+
 
 class TestDefaultGuidanceLoaded:
-    """``_DEFAULT_GUIDANCE`` must expose both keys non-empty."""
+    """``_DEFAULT_GUIDANCE`` must expose required keys non-empty."""
 
-    def test_guidance_map_has_both_keys(self):
+    def test_guidance_map_has_required_keys(self):
         from fluid_build.cli.forge_copilot_prompts import _DEFAULT_GUIDANCE
 
         assert "sovereignty" in _DEFAULT_GUIDANCE
         assert "agent_policy" in _DEFAULT_GUIDANCE
+        assert "technique_mandate" in _DEFAULT_GUIDANCE
         assert _DEFAULT_GUIDANCE[
             "sovereignty"
         ].strip(), "sovereignty guidance must not be empty — check _defaults/sovereignty.yaml"
         assert _DEFAULT_GUIDANCE[
             "agent_policy"
         ].strip(), "agent_policy guidance must not be empty — check _defaults/agent_policy.yaml"
+        assert _DEFAULT_GUIDANCE[
+            "technique_mandate"
+        ].strip(), (
+            "technique mandate guidance must not be empty — check _defaults/technique_mandate.yaml"
+        )
 
 
 class TestSystemPromptSnapshot:
