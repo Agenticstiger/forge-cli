@@ -527,3 +527,236 @@ def test_plan_actions_skips_unsafe_row_level_security_entries(field, value):
 
     assert not any(action["id"].startswith("rls_") for action in actions)
     logger.warning.assert_called_once()
+
+
+def test_plan_actions_emits_unique_policy_names_per_role_on_same_table():
+    """Multiple roles on the same table must not collide on a single policy name."""
+    contract = {
+        "security": {
+            "row_level_security": [
+                {"table": "orders", "role": "ANALYST", "condition": "region = 'US'"},
+                {"table": "orders", "role": "AUDITOR", "condition": "region = 'EU'"},
+            ]
+        }
+    }
+    actions = plan_actions(
+        contract,
+        account="acme-account",
+        warehouse="TRANSFORM_WH",
+        database="ANALYTICS",
+        schema="PUBLIC",
+    )
+
+    rls_actions = [a for a in actions if a["id"].startswith("rls_")]
+    assert {a["id"] for a in rls_actions} == {"rls_orders_analyst", "rls_orders_auditor"}
+    assert "orders_rls__analyst" in rls_actions[0]["sql"]
+    assert "orders_rls__auditor" in rls_actions[1]["sql"]
+    # Names are distinct so neither overwrites the other on apply.
+    assert "orders_rls__analyst" not in rls_actions[1]["sql"]
+
+
+def test_plan_actions_emits_apply_action_when_apply_on_is_provided():
+    contract = {
+        "security": {
+            "row_level_security": [
+                {
+                    "table": "orders",
+                    "role": "ANALYST",
+                    "condition": "CURRENT_ROLE() = 'ANALYST'",
+                    "apply_on": ["region"],
+                }
+            ]
+        }
+    }
+    actions = plan_actions(
+        contract,
+        account="acme-account",
+        warehouse="TRANSFORM_WH",
+        database="ANALYTICS",
+        schema="PUBLIC",
+    )
+
+    create = next(a for a in actions if a["id"] == "rls_orders_analyst")
+    apply_action = next(a for a in actions if a["id"] == "rls_apply_orders_analyst")
+    assert create["sql"].startswith("CREATE OR REPLACE ROW ACCESS POLICY orders_rls__analyst")
+    assert apply_action["sql"] == (
+        "ALTER TABLE orders ADD ROW ACCESS POLICY orders_rls__analyst ON (region)"
+    )
+
+
+def test_plan_actions_skips_apply_when_apply_on_is_unsafe():
+    logger = MagicMock()
+    contract = {
+        "security": {
+            "row_level_security": [
+                {
+                    "table": "orders",
+                    "role": "ANALYST",
+                    "condition": "region = 'US'",
+                    "apply_on": "region; DROP TABLE users",
+                }
+            ]
+        }
+    }
+    actions = plan_actions(
+        contract,
+        account="acme-account",
+        warehouse="TRANSFORM_WH",
+        database="ANALYTICS",
+        schema="PUBLIC",
+        logger=logger,
+    )
+
+    # CREATE still emitted; APPLY is dropped because the column is unsafe.
+    assert any(a["id"] == "rls_orders_analyst" for a in actions)
+    assert not any(a["id"].startswith("rls_apply_") for a in actions)
+    logger.warning.assert_called_once()
+
+
+def test_plan_actions_emits_named_row_access_policy():
+    contract = {
+        "security": {
+            "policies": {
+                "row_access": [
+                    {
+                        "name": "us_only",
+                        "signature": "(region VARCHAR) RETURNS BOOLEAN",
+                        "condition": "CURRENT_ROLE() = 'ANALYST' AND region = 'US'",
+                        "comment": "US-only access for analyst role",
+                    }
+                ]
+            },
+            "policy_applications": {
+                "row_access": [
+                    {"table": "orders", "policy": "us_only", "on": ["region"]},
+                ]
+            },
+        }
+    }
+    actions = plan_actions(
+        contract,
+        account="acme-account",
+        warehouse="TRANSFORM_WH",
+        database="ANALYTICS",
+        schema="PUBLIC",
+    )
+
+    create = next(a for a in actions if a["id"] == "row_access_policy_us_only")
+    apply_action = next(a for a in actions if a["id"] == "row_access_apply_orders_us_only")
+    assert create["sql"] == (
+        "CREATE OR REPLACE ROW ACCESS POLICY us_only "
+        "AS (region VARCHAR) RETURNS BOOLEAN -> "
+        "CURRENT_ROLE() = 'ANALYST' AND region = 'US'"
+    )
+    assert apply_action["sql"] == ("ALTER TABLE orders ADD ROW ACCESS POLICY us_only ON (region)")
+
+
+def test_plan_actions_emits_named_masking_policy_and_application():
+    contract = {
+        "security": {
+            "policies": {
+                "masking": [
+                    {
+                        "name": "hash_email",
+                        "signature": "(val VARCHAR) RETURNS VARCHAR",
+                        "body": (
+                            "CASE WHEN CURRENT_ROLE() IN ('ADMIN') "
+                            "THEN val ELSE SHA2(val, 256) END"
+                        ),
+                    }
+                ]
+            },
+            "policy_applications": {
+                "masking": [
+                    {"table": "customers", "column": "email", "policy": "hash_email"},
+                ]
+            },
+        }
+    }
+    actions = plan_actions(
+        contract,
+        account="acme-account",
+        warehouse="TRANSFORM_WH",
+        database="ANALYTICS",
+        schema="PUBLIC",
+    )
+
+    create = next(a for a in actions if a["id"] == "masking_policy_hash_email")
+    apply_action = next(a for a in actions if a["id"] == "masking_apply_customers_email_hash_email")
+    assert create["sql"] == (
+        "CREATE OR REPLACE MASKING POLICY hash_email "
+        "AS (val VARCHAR) RETURNS VARCHAR -> "
+        "CASE WHEN CURRENT_ROLE() IN ('ADMIN') THEN val ELSE SHA2(val, 256) END"
+    )
+    assert apply_action["sql"] == (
+        "ALTER TABLE customers MODIFY COLUMN email SET MASKING POLICY hash_email"
+    )
+
+
+@pytest.mark.parametrize(
+    ("policy_kind", "field", "value"),
+    [
+        ("row_access", "name", "us_only; DROP TABLE x"),
+        ("row_access", "condition", "1=1; DROP TABLE x"),
+        ("row_access", "signature", "(val VARCHAR); DROP TABLE x"),
+        ("masking", "name", "bad-name"),
+        ("masking", "body", "val; DROP TABLE x"),
+    ],
+)
+def test_plan_actions_skips_unsafe_named_policy_inputs(policy_kind, field, value):
+    logger = MagicMock()
+    base = {
+        "row_access": {"name": "ok", "condition": "CURRENT_ROLE() = 'ANALYST'"},
+        "masking": {"name": "ok", "body": "val"},
+    }[policy_kind]
+    bad = dict(base)
+    bad[field] = value
+    contract = {"security": {"policies": {policy_kind: [bad]}}}
+
+    actions = plan_actions(
+        contract,
+        account="acme-account",
+        warehouse="TRANSFORM_WH",
+        database="ANALYTICS",
+        schema="PUBLIC",
+        logger=logger,
+    )
+
+    prefix = "row_access_policy_" if policy_kind == "row_access" else "masking_policy_"
+    assert not any(a["id"].startswith(prefix) for a in actions)
+    logger.warning.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("application_kind", "field", "value"),
+    [
+        ("row_access", "table", "orders; DROP TABLE x"),
+        ("row_access", "policy", "us_only' OR 1=1"),
+        ("row_access", "on", ["region; --"]),
+        ("masking", "table", "customers; --"),
+        ("masking", "column", "email; --"),
+        ("masking", "policy", "hash_email; --"),
+    ],
+)
+def test_plan_actions_skips_unsafe_policy_applications(application_kind, field, value):
+    logger = MagicMock()
+    base = {
+        "row_access": {"table": "orders", "policy": "us_only", "on": ["region"]},
+        "masking": {"table": "customers", "column": "email", "policy": "hash_email"},
+    }[application_kind]
+    bad = dict(base)
+    bad[field] = value
+    contract = {"security": {"policy_applications": {application_kind: [bad]}}}
+
+    actions = plan_actions(
+        contract,
+        account="acme-account",
+        warehouse="TRANSFORM_WH",
+        database="ANALYTICS",
+        schema="PUBLIC",
+        logger=logger,
+    )
+
+    prefix = "row_access_apply_" if application_kind == "row_access" else "masking_apply_"
+    assert not any(a["id"].startswith(prefix) for a in actions)
+    logger.warning.assert_called_once()
