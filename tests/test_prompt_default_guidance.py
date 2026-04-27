@@ -108,6 +108,19 @@ class TestDefaultGuidanceFiles:
         assert "modeling technique mandate" in text
         assert "data_modeling_guidance" in text
 
+    def test_upstream_sql_yaml_exists_and_loads(self):
+        import yaml
+
+        path = _DEFAULTS_DIR / "upstream_sql.yaml"
+        assert path.exists(), f"expected {path} to ship with the package"
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert isinstance(raw, dict)
+        assert isinstance(raw.get("system_prompt"), str)
+        text = raw["system_prompt"].lower()
+        assert "upstream transformation sql" in text
+        assert "upstream_products" in text
+        assert "dbt_project/models/staging" in text
+
 
 class TestDefaultGuidanceLoaded:
     """``_DEFAULT_GUIDANCE`` must expose required keys non-empty."""
@@ -118,6 +131,7 @@ class TestDefaultGuidanceLoaded:
         assert "sovereignty" in _DEFAULT_GUIDANCE
         assert "agent_policy" in _DEFAULT_GUIDANCE
         assert "technique_mandate" in _DEFAULT_GUIDANCE
+        assert "upstream_sql" in _DEFAULT_GUIDANCE
         assert _DEFAULT_GUIDANCE[
             "sovereignty"
         ].strip(), "sovereignty guidance must not be empty — check _defaults/sovereignty.yaml"
@@ -129,6 +143,9 @@ class TestDefaultGuidanceLoaded:
         ].strip(), (
             "technique mandate guidance must not be empty — check _defaults/technique_mandate.yaml"
         )
+        assert _DEFAULT_GUIDANCE[
+            "upstream_sql"
+        ].strip(), "upstream SQL guidance must not be empty — check _defaults/upstream_sql.yaml"
 
 
 class TestSystemPromptSnapshot:
