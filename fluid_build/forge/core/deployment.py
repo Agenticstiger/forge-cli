@@ -36,7 +36,14 @@ from fluid_build.cli.console import cprint
 
 
 class DeploymentTarget(Enum):
-    """Supported deployment targets"""
+    """Deployment targets advertised by ``ProjectDeployer``.
+
+    The cloud targets (``GCP``, ``AWS``, ``AZURE``) are reserved for future
+    implementation — the corresponding ``_deploy_*`` methods currently return
+    a ``FAILED`` result with ``error="<target> deployment not implemented"``.
+    Callers should consult :meth:`supported_targets` before constructing a
+    ``DeploymentConfig`` to avoid runtime surprise.
+    """
 
     LOCAL = "local"
     DOCKER = "docker"
@@ -45,6 +52,21 @@ class DeploymentTarget(Enum):
     AWS = "aws"
     AZURE = "azure"
     CICD = "cicd"
+
+    @classmethod
+    def supported_targets(cls) -> List["DeploymentTarget"]:
+        """Targets with a working ``_deploy_*`` implementation today.
+
+        Stable contract — operators and CLI surfaces can call this to feed
+        ``--target`` choices and validation messages, instead of hardcoding
+        the list. Cloud targets (``GCP``, ``AWS``, ``AZURE``) are *not*
+        included until their respective ``_deploy_*`` methods ship.
+        """
+        return [cls.LOCAL, cls.DOCKER, cls.KUBERNETES, cls.CICD]
+
+    def is_supported(self) -> bool:
+        """Convenience predicate for the dispatcher and external callers."""
+        return self in self.supported_targets()
 
 
 class DeploymentStatus(Enum):
@@ -106,9 +128,40 @@ class ProjectDeployer:
         self.deployment_dir.mkdir(exist_ok=True)
 
     def deploy(self, config: DeploymentConfig) -> DeploymentResult:
-        """Deploy project to specified target"""
+        """Deploy project to specified target.
+
+        Cloud targets (``GCP``, ``AWS``, ``AZURE``) are advertised via the
+        :class:`DeploymentTarget` enum but are not yet wired to provider
+        implementations. Calling ``deploy()`` with one of those targets
+        short-circuits with a structured ``FAILED`` result before any
+        deployment package is built — preventing wasted work on a
+        guaranteed failure and surfacing the supported-target list to the
+        caller.
+        """
 
         deployment_id = self._generate_deployment_id()
+
+        # Short-circuit unsupported cloud targets before paying for package
+        # preparation. Keeps the API honest: enum advertises GCP/AWS/AZURE
+        # for forward-compatibility, but ``deploy()`` refuses them with an
+        # actionable hint instead of silently returning a generic FAILED.
+        if not config.target.is_supported():
+            supported = [t.value for t in DeploymentTarget.supported_targets()]
+            return DeploymentResult(
+                status=DeploymentStatus.FAILED,
+                deployment_id=deployment_id,
+                target=config.target,
+                error=(
+                    f"deployment_target_not_supported: '{config.target.value}' "
+                    f"is reserved for a future release; supported targets are "
+                    f"{supported}"
+                ),
+                logs=[
+                    f"Refused to deploy to {config.target.value!r} — not yet implemented.",
+                    f"Supported targets: {', '.join(supported)}.",
+                    "Use 'cicd' to scaffold pipeline files for cloud deploys today.",
+                ],
+            )
 
         try:
             # Prepare project for deployment
