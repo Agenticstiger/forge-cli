@@ -702,7 +702,7 @@ class TestRunFunction:
         mock_memory.assert_called_once()
 
     @patch("fluid_build.cli.forge.run_ai_copilot_mode", return_value=0)
-    def test_run_copilot_mode(self, _mock_copilot):
+    def test_run_copilot_mode(self, mock_copilot):
         from fluid_build.cli.forge import run
 
         args = MagicMock()
@@ -711,6 +711,7 @@ class TestRunFunction:
         logger = logging.getLogger("test")
         result = run(args, logger)
         assert result == 0
+        mock_copilot.assert_called_once()
 
     @patch("fluid_build.cli.forge.run_ai_copilot_mode", return_value=0)
     def test_run_non_interactive_copilot(self, mock_copilot):
