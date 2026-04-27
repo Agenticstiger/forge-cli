@@ -35,9 +35,12 @@ __all__ = [
     "show_ai_status",
 ]
 
+import json as _json
 import logging
 import os
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
@@ -108,8 +111,19 @@ _AI_TEST_SYSTEM_PROMPT = "You are a FLUID CLI connectivity diagnostic. Reply wit
 _AI_TEST_USER_PROMPT = "Reply with exactly FLUID_OK."
 _AI_TEST_DEFAULT_TIMEOUT_SECONDS = 30
 _AI_TEST_DEFAULT_OUTPUT_TOKENS = 8
+# Gemini Flash thinking-mode requires a higher output budget — even a 5-token
+# "FLUID_OK" reply is preceded by reasoning tokens that count against the cap.
+# Cloud providers without thinking mode (OpenAI, Anthropic, Ollama) stay at 8.
 _AI_TEST_GEMINI_OUTPUT_TOKENS = 256
 _AI_TEST_DISPLAY_LIMIT = 160
+
+# Exit codes for `fluid ai test` — see `--json` schema for parseable form.
+_AI_TEST_EXIT_OK = 0
+_AI_TEST_EXIT_CONFIG = 2
+_AI_TEST_EXIT_AUTH = 3
+_AI_TEST_EXIT_RESOURCE = 4
+_AI_TEST_EXIT_NETWORK = 5
+_AI_TEST_REPORT_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -1116,8 +1130,10 @@ def _check_ai_test_model_availability(
     return "available", available
 
 
-def _run_ai_smoke_call(provider: Any, config: LlmConfig) -> tuple[str, dict]:
+def _run_ai_smoke_call(provider: Any, config: LlmConfig) -> tuple[str, dict, int]:
+    """Issue the diagnostic call. Returns (text, usage, latency_ms)."""
     headers, payload = _with_freeform_ai_test_payload(provider, config)
+    started = time.perf_counter()
     try:
         with httpx.Client(timeout=config.timeout_seconds) as client:
             response = client.post(config.endpoint, headers=headers, json=payload)
@@ -1140,15 +1156,23 @@ def _run_ai_smoke_call(provider: Any, config: LlmConfig) -> tuple[str, dict]:
                 "For Ollama, start the local Ollama server",
             ],
         ) from exc
+    latency_ms = int((time.perf_counter() - started) * 1000)
 
     try:
         response_json = response.json()
-        text = provider.extract_text(response_json).strip()
-        usage = provider.extract_usage(response_json)
-    except Exception as exc:  # noqa: BLE001
+    except ValueError as exc:
         raise CopilotGenerationError(
             "ai_test_response_invalid",
-            f"AI test response from {config.provider} could not be parsed.",
+            f"AI test response from {config.provider} could not be parsed as JSON.",
+            suggestions=["Try a different model or re-run `fluid ai setup`."],
+        ) from exc
+    try:
+        text = provider.extract_text(response_json).strip()
+        usage = provider.extract_usage(response_json)
+    except Exception as exc:  # noqa: BLE001 — provider adapters raise heterogeneous errors
+        raise CopilotGenerationError(
+            "ai_test_response_invalid",
+            f"AI test response from {config.provider} did not match the expected schema.",
             suggestions=["Try a different model or re-run `fluid ai setup`."],
         ) from exc
     if "FLUID_OK" not in text:
@@ -1157,15 +1181,109 @@ def _run_ai_smoke_call(provider: Any, config: LlmConfig) -> tuple[str, dict]:
             f"AI test response from {config.provider} was not the expected diagnostic token.",
             suggestions=["Try again, or choose a different model with `fluid ai setup`."],
         )
-    return "FLUID_OK", usage
+    return "FLUID_OK", usage, latency_ms
 
 
-def run_ai_test(console: Any, args: Any) -> bool:
-    """Run a quick configured-provider connectivity and model smoke test."""
+# Map (error_code, http_status) → exit code. Status is None when there's no HTTP response.
+_AI_TEST_AUTH_STATUSES = frozenset({401, 403, 407})
+
+
+def _classify_ai_test_error(error_code: str, status_code: Optional[int]) -> int:
+    """Return the parseable exit code for a CopilotGenerationError.
+
+    0 OK / 2 config / 3 auth / 4 resource / 5 network. See AGENTS.md for the contract.
+    """
+    if error_code in {"ai_test_request_failed", "ai_test_model_preflight_failed"}:
+        if status_code is None:
+            return _AI_TEST_EXIT_NETWORK
+        if status_code in _AI_TEST_AUTH_STATUSES:
+            return _AI_TEST_EXIT_AUTH
+        if status_code == 429 or status_code >= 500:
+            return _AI_TEST_EXIT_NETWORK
+        return _AI_TEST_EXIT_RESOURCE
+    if error_code == "ai_test_network_error":
+        return _AI_TEST_EXIT_NETWORK
+    return _AI_TEST_EXIT_RESOURCE
+
+
+def _http_status_from_cause(exc: CopilotGenerationError) -> Optional[int]:
+    cause = exc.__cause__
+    if isinstance(cause, httpx.HTTPStatusError):
+        return cause.response.status_code
+    return None
+
+
+def _new_ai_test_report(
+    *,
+    ok: bool,
+    provider: Optional[str],
+    model: Optional[str],
+    endpoint: Optional[str],
+    availability: Optional[str],
+    live_call: Optional[str],
+    usage: Optional[dict],
+    output_cap: Optional[str],
+    latency_ms: Optional[int],
+    error_code: Optional[str] = None,
+    error_message: Optional[str] = None,
+    error_suggestions: Optional[list] = None,
+    exit_code: int = _AI_TEST_EXIT_OK,
+) -> dict:
+    """Build the stable JSON-output schema. Bumps `_AI_TEST_REPORT_VERSION` on changes."""
+    return {
+        "schema_version": _AI_TEST_REPORT_VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "ok": ok,
+        "exit_code": exit_code,
+        "provider": provider,
+        "model": _safe_ai_test_display(model) if model else None,
+        "endpoint": _safe_ai_test_display(endpoint) if endpoint else None,
+        "model_availability": availability,
+        "live_call": live_call,
+        "usage": usage,
+        "output_cap": output_cap,
+        "latency_ms": latency_ms,
+        "error": (
+            {
+                "code": error_code,
+                "message": error_message,
+                "suggestions": error_suggestions or [],
+            }
+            if error_code
+            else None
+        ),
+    }
+
+
+def run_ai_test(console: Any, args: Any) -> tuple[int, dict]:
+    """Run a configured-provider connectivity test.
+
+    Returns ``(exit_code, report)`` where ``exit_code`` is one of
+    ``_AI_TEST_EXIT_OK / _CONFIG / _AUTH / _RESOURCE / _NETWORK`` and
+    ``report`` is the JSON-output schema dict (see ``_new_ai_test_report``).
+    """
+    as_json = bool(getattr(args, "json", False))
     config, config_error = _resolve_ai_test_config(args)
     if not config:
         message = config_error or "AI provider is not configured."
-        if console and RICH_AVAILABLE:
+        report = _new_ai_test_report(
+            ok=False,
+            provider=None,
+            model=None,
+            endpoint=None,
+            availability=None,
+            live_call=None,
+            usage=None,
+            output_cap=None,
+            latency_ms=None,
+            error_code="ai_test_no_provider",
+            error_message=message,
+            error_suggestions=["Run `fluid ai setup` to configure a provider."],
+            exit_code=_AI_TEST_EXIT_CONFIG,
+        )
+        if as_json:
+            sys.stdout.write(_json.dumps(report, indent=2) + "\n")
+        elif console and RICH_AVAILABLE:
             console.print(
                 Panel(
                     f"[yellow]{message}[/yellow]\n\n"
@@ -1178,15 +1296,35 @@ def run_ai_test(console: Any, args: Any) -> bool:
             from fluid_build.cli.console import cprint
 
             cprint(f"AI Provider Test: {message}")
-        return False
+        return _AI_TEST_EXIT_CONFIG, report
 
     provider = BUILTIN_LLM_PROVIDERS[config.provider]
     label = PROVIDER_DISPLAY_NAMES.get(config.provider, config.provider)
+    endpoint = config.redacted_endpoint
+    output_cap = _ai_test_token_budget_label(config)
     try:
         availability, available_models = _check_ai_test_model_availability(provider, config)
-        text, usage = _run_ai_smoke_call(provider, config)
+        text, usage, latency_ms = _run_ai_smoke_call(provider, config)
     except CopilotGenerationError as exc:
-        if console and RICH_AVAILABLE:
+        exit_code = _classify_ai_test_error(exc.event, _http_status_from_cause(exc))
+        report = _new_ai_test_report(
+            ok=False,
+            provider=config.provider,
+            model=config.model,
+            endpoint=endpoint,
+            availability=None,
+            live_call=None,
+            usage=None,
+            output_cap=output_cap,
+            latency_ms=None,
+            error_code=exc.event,
+            error_message=exc.message,
+            error_suggestions=list(exc.suggestions or []),
+            exit_code=exit_code,
+        )
+        if as_json:
+            sys.stdout.write(_json.dumps(report, indent=2) + "\n")
+        elif console and RICH_AVAILABLE:
             suggestions = "\n".join(f"- {s}" for s in exc.suggestions)
             body = f"[red]{exc.message}[/red]"
             if suggestions:
@@ -1196,15 +1334,35 @@ def run_ai_test(console: Any, args: Any) -> bool:
             from fluid_build.cli.console import cprint
 
             cprint(f"AI Provider Test Failed: {exc.message}")
-        return False
+        return exit_code, report
 
-    endpoint = config.redacted_endpoint
-    usage_text = (
-        f"{usage.get('input_tokens', 0)} input / "
-        f"{usage.get('output_tokens', 0)} output / "
-        f"{usage.get('total_tokens', 0)} total"
+    report = _new_ai_test_report(
+        ok=True,
+        provider=config.provider,
+        model=config.model,
+        endpoint=endpoint,
+        availability=availability,
+        live_call=text,
+        usage={
+            "input_tokens": int(usage.get("input_tokens", 0) or 0),
+            "output_tokens": int(usage.get("output_tokens", 0) or 0),
+            "total_tokens": int(usage.get("total_tokens", 0) or 0),
+        },
+        output_cap=output_cap,
+        latency_ms=latency_ms,
+        exit_code=_AI_TEST_EXIT_OK,
     )
-    output_cap = _ai_test_token_budget_label(config)
+
+    if as_json:
+        sys.stdout.write(_json.dumps(report, indent=2) + "\n")
+        return _AI_TEST_EXIT_OK, report
+
+    usage_text = (
+        f"{report['usage']['input_tokens']} input / "
+        f"{report['usage']['output_tokens']} output / "
+        f"{report['usage']['total_tokens']} total"
+    )
+    latency_text = f"{latency_ms} ms"
     if console and RICH_AVAILABLE:
         table = Table(title="AI Provider Test", border_style="green")
         table.add_column("Check", style="cyan")
@@ -1221,6 +1379,7 @@ def run_ai_test(console: Any, args: Any) -> bool:
             ),
         )
         table.add_row("Live call", text)
+        table.add_row("Latency", latency_text)
         table.add_row("Token usage", usage_text)
         table.add_row("Output cap", output_cap)
         if available_models:
@@ -1233,8 +1392,9 @@ def run_ai_test(console: Any, args: Any) -> bool:
         cprint(f"  Endpoint: {_safe_ai_test_display(endpoint)}")
         cprint(f"  Model availability: {availability}")
         cprint(f"  Live call: {text}")
+        cprint(f"  Latency: {latency_text}")
         cprint(f"  Token usage: {usage_text}; output cap: {output_cap}")
-    return True
+    return _AI_TEST_EXIT_OK, report
 
 
 # ---------------------------------------------------------------------------
@@ -1336,6 +1496,15 @@ def register(subparsers) -> None:
         default=None,
         help="HTTP timeout for the diagnostic request",
     )
+    test_parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit a stable JSON report to stdout instead of the Rich table. "
+            "Schema: schema_version, ok, exit_code, provider, model, endpoint, "
+            "model_availability, live_call, usage, output_cap, latency_ms, error."
+        ),
+    )
     parser.set_defaults(func=_run_ai_command)
 
 
@@ -1404,7 +1573,8 @@ def _run_ai_command(args, logger: logging.Logger) -> int:
         return 0
 
     if action == "test":
-        return 0 if run_ai_test(console, args) else 1
+        exit_code, _report = run_ai_test(console, args)
+        return exit_code
 
     # No subcommand -- default to showing status
     show_ai_status(console)

@@ -477,10 +477,11 @@ class TestAiTestCommand:
         )
 
         with patch("fluid_build.cli.ai_setup.httpx.Client", FakeClient):
-            text, usage = _run_ai_smoke_call(provider, config)
+            text, usage, latency_ms = _run_ai_smoke_call(provider, config)
 
         assert text == "FLUID_OK"
         assert usage["total_tokens"] == 2
+        assert isinstance(latency_ms, int) and latency_ms >= 0
 
     def test_smoke_call_network_error_does_not_echo_raw_url(self):
         from fluid_build.cli.ai_setup import _run_ai_smoke_call
@@ -569,17 +570,25 @@ class TestAiTestCommand:
                 return_value=(
                     "FLUID_OK",
                     {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
+                    137,
                 ),
             ),
             patch("fluid_build.cli.console.cprint") as cprint,
         ):
-            assert run_ai_test(None, args) is True
+            exit_code, report = run_ai_test(None, args)
 
+        assert exit_code == 0
+        assert report["ok"] is True
+        assert report["exit_code"] == 0
+        assert report["latency_ms"] == 137
+        assert report["usage"] == {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5}
+        assert report["error"] is None
         printed = "\n".join(call.args[0] for call in cprint.call_args_list)
         assert "AI Provider Test: ready" in printed
         assert "Token usage: 4 input / 1 output / 5 total" in printed
+        assert "Latency: 137 ms" in printed
 
-    def test_run_ai_test_without_config_returns_false(self):
+    def test_run_ai_test_without_config_returns_config_exit_code(self):
         from fluid_build.cli.ai_setup import run_ai_test
 
         with (
@@ -589,9 +598,187 @@ class TestAiTestCommand:
             ),
             patch("fluid_build.cli.console.cprint") as cprint,
         ):
-            assert run_ai_test(None, argparse.Namespace()) is False
+            exit_code, report = run_ai_test(None, argparse.Namespace())
 
+        assert exit_code == 2
+        assert report["ok"] is False
+        assert report["exit_code"] == 2
+        assert report["error"]["code"] == "ai_test_no_provider"
         assert "No AI provider configured" in cprint.call_args.args[0]
+
+    def test_run_ai_test_json_output_emits_stable_schema(self, capsys):
+        from fluid_build.cli.ai_setup import run_ai_test
+        from fluid_build.cli.forge_copilot_llm_providers import LlmConfig
+
+        args = argparse.Namespace(json=True)
+        config = LlmConfig(
+            provider="gemini",
+            model="gemini-2.5-flash",
+            endpoint="https://generativelanguage.googleapis.com/v1beta/models/foo:generateContent",
+            api_key="AIza-test",
+        )
+
+        with (
+            patch("fluid_build.cli.ai_setup._resolve_ai_test_config", return_value=(config, None)),
+            patch(
+                "fluid_build.cli.ai_setup._check_ai_test_model_availability",
+                return_value=("available", ["gemini-2.5-flash"]),
+            ),
+            patch(
+                "fluid_build.cli.ai_setup._run_ai_smoke_call",
+                return_value=(
+                    "FLUID_OK",
+                    {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15},
+                    412,
+                ),
+            ),
+        ):
+            exit_code, report = run_ai_test(None, args)
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        parsed = json.loads(captured.out)
+        # Schema stability — every field a CI tool might depend on:
+        assert parsed["schema_version"] == 1
+        assert parsed["ok"] is True
+        assert parsed["exit_code"] == 0
+        assert parsed["provider"] == "gemini"
+        assert parsed["model"] == "gemini-2.5-flash"
+        assert parsed["model_availability"] == "available"
+        assert parsed["live_call"] == "FLUID_OK"
+        assert parsed["latency_ms"] == 412
+        assert parsed["usage"]["total_tokens"] == 15
+        assert parsed["error"] is None
+        assert parsed["timestamp"].endswith("Z")
+        # Mirrors the in-process report:
+        assert parsed == report
+
+    def test_run_ai_test_json_output_emits_error_on_failure(self, capsys):
+        from fluid_build.cli.ai_setup import run_ai_test
+        from fluid_build.cli.forge_copilot_llm_providers import (
+            CopilotGenerationError,
+            LlmConfig,
+        )
+
+        args = argparse.Namespace(json=True)
+        config = LlmConfig(
+            provider="openai",
+            model="operator-model",
+            endpoint="https://api.openai.com/v1/chat/completions",
+            api_key="sk-test",
+        )
+
+        # Simulate 401 from preflight
+        import httpx
+
+        request = httpx.Request("GET", "https://api.openai.com/v1/models")
+        response = httpx.Response(401, request=request)
+        cause = httpx.HTTPStatusError("unauthorized", request=request, response=response)
+        err = CopilotGenerationError(
+            "ai_test_model_preflight_failed",
+            "Could not list openai models (401).",
+            suggestions=["Check the provider API key and account permissions"],
+        )
+        err.__cause__ = cause
+
+        with (
+            patch("fluid_build.cli.ai_setup._resolve_ai_test_config", return_value=(config, None)),
+            patch(
+                "fluid_build.cli.ai_setup._check_ai_test_model_availability",
+                side_effect=err,
+            ),
+        ):
+            exit_code, report = run_ai_test(None, args)
+
+        assert exit_code == 3
+        captured = capsys.readouterr()
+        parsed = json.loads(captured.out)
+        assert parsed["ok"] is False
+        assert parsed["exit_code"] == 3
+        assert parsed["error"]["code"] == "ai_test_model_preflight_failed"
+        assert parsed["error"]["message"] == "Could not list openai models (401)."
+        assert "Check the provider API key" in parsed["error"]["suggestions"][0]
+        assert parsed["latency_ms"] is None
+
+    def test_classify_error_maps_status_codes(self):
+        from fluid_build.cli.ai_setup import _classify_ai_test_error
+
+        # Auth-class HTTP statuses
+        for status in (401, 403, 407):
+            assert _classify_ai_test_error("ai_test_request_failed", status) == 3
+        # Other 4xx → resource (e.g., 404 model not found, 400 bad payload)
+        for status in (400, 404, 422):
+            assert _classify_ai_test_error("ai_test_request_failed", status) == 4
+        # 5xx and 429 → network (transient)
+        for status in (500, 502, 503, 504, 429):
+            assert _classify_ai_test_error("ai_test_request_failed", status) == 5
+        # No status (transport failure) → network
+        assert _classify_ai_test_error("ai_test_network_error", None) == 5
+        # Resource-class events
+        for code in (
+            "ai_test_model_unavailable",
+            "ai_test_response_invalid",
+            "ai_test_unexpected_response",
+        ):
+            assert _classify_ai_test_error(code, None) == 4
+
+    def test_register_includes_json_flag(self):
+        from fluid_build.cli.ai_setup import register
+
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="cmd")
+        register(subparsers)
+
+        args = parser.parse_args(["ai", "test", "--json"])
+        assert args.json is True
+
+        args_no_json = parser.parse_args(["ai", "test"])
+        assert args_no_json.json is False
+
+    def test_smoke_call_invalid_json_raises_response_invalid(self):
+        from fluid_build.cli.ai_setup import _run_ai_smoke_call
+        from fluid_build.cli.forge_copilot_llm_providers import (
+            CopilotGenerationError,
+            LlmConfig,
+        )
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                raise ValueError("not JSON")
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def post(self, *args, **kwargs):
+                return FakeResponse()
+
+        provider = MagicMock()
+        provider.build_request.return_value = ({}, {})
+        config = LlmConfig(
+            provider="openai",
+            model="operator-model",
+            endpoint="https://example.test",
+            api_key="sk-test",
+        )
+
+        with (
+            patch("fluid_build.cli.ai_setup.httpx.Client", FakeClient),
+            pytest.raises(CopilotGenerationError) as exc_info,
+        ):
+            _run_ai_smoke_call(provider, config)
+
+        assert exc_info.value.event == "ai_test_response_invalid"
+        assert "JSON" in exc_info.value.message
 
 
 class TestModelCatalogIntegrity:
