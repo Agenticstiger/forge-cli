@@ -26,6 +26,7 @@ __all__ = [
 
 import json
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
 
 import yaml
@@ -77,9 +78,13 @@ def _load_default_guidance() -> Mapping[str, str]:
 _DEFAULT_GUIDANCE: Mapping[str, str] = _load_default_guidance()
 
 _AUXILIARY_PROMPT_NAMES = frozenset({"clarification", "evaluation"})
-_AUXILIARY_PROMPTS: Mapping[str, str] = {
-    name: _DEFAULT_GUIDANCE.get(name, "") for name in _AUXILIARY_PROMPT_NAMES
-}
+# ``MappingProxyType`` makes the auxiliary prompt map actually immutable post-import,
+# matching the ``Mapping[str, str]`` annotation rather than a mutable ``dict`` that
+# only appears immutable to type checkers. Mirrors stdlib's defensive idiom for
+# class ``__dict__`` and similar import-time-frozen singletons.
+_AUXILIARY_PROMPTS: Mapping[str, str] = MappingProxyType(
+    {name: _DEFAULT_GUIDANCE.get(name, "") for name in _AUXILIARY_PROMPT_NAMES}
+)
 
 
 def _render_auxiliary_prompt(name: str, replacements: Mapping[str, str]) -> str:

@@ -186,6 +186,17 @@ class TestDefaultGuidanceLoaded:
             "evaluation"
         ].strip(), "evaluation prompt must not be empty — check _defaults/evaluation.yaml"
 
+    def test_auxiliary_prompt_map_is_immutable(self):
+        # Defensive immutability: the map is wrapped in MappingProxyType so a
+        # caller (or accidental monkey-patch) can't mutate it post-import. The
+        # ``Mapping[str, str]`` annotation now matches runtime behaviour.
+        from fluid_build.cli.forge_copilot_prompts import _AUXILIARY_PROMPTS
+
+        with pytest.raises(TypeError):
+            _AUXILIARY_PROMPTS["clarification"] = "tampered"  # type: ignore[index]
+        with pytest.raises(TypeError):
+            del _AUXILIARY_PROMPTS["evaluation"]  # type: ignore[attr-defined]
+
 
 class TestAuxiliaryPromptComposition:
     """Auxiliary YAML prompt fragments must drive their prompt builders."""
