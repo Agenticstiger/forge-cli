@@ -425,19 +425,51 @@ class TestRun:
 
         assert run(args, logger) == 1
 
+    @patch("fluid_build.cli.init._offer_first_forge")
+    @patch("fluid_build.cli.init.print_next_steps")
+    @patch("fluid_build.cli.init._write_init_receipt")
+    @patch("fluid_build.cli.init._mark_first_run_complete")
+    @patch("fluid_build.cli.init._ensure_workspace")
     @patch("fluid_build.cli.init._ask_industry", return_value=None)
     @patch("fluid_build.cli.init.blank_mode", return_value=0)
     @patch("fluid_build.cli.init.detect_mode", return_value="blank")
-    def test_blank_dispatch(self, _mock_dm, mock_bl, _mock_ind, logger):
+    def test_blank_dispatch(
+        self,
+        _mock_dm,
+        mock_bl,
+        _mock_ind,
+        _mock_ews,
+        _mock_mfrc,
+        _mock_wir,
+        _mock_pns,
+        _mock_offer,
+        logger,
+    ):
         from fluid_build.cli.init import run
 
         assert run(SimpleNamespace(), logger) == 0
         mock_bl.assert_called_once()
 
+    @patch("fluid_build.cli.init._offer_first_forge")
+    @patch("fluid_build.cli.init.print_next_steps")
+    @patch("fluid_build.cli.init._write_init_receipt")
+    @patch("fluid_build.cli.init._mark_first_run_complete")
+    @patch("fluid_build.cli.init._ensure_workspace")
     @patch("fluid_build.cli.init._ask_industry", return_value=None)
     @patch("fluid_build.cli.init.template_mode", return_value=0)
     @patch("fluid_build.cli.init.detect_mode", return_value="template")
-    def test_template_dispatch(self, _mock_dm, mock_tm, _mock_ind, logger):
+    def test_template_dispatch(
+        self,
+        _mock_dm,
+        mock_tm,
+        _mock_ind,
+        _mock_ews,
+        _mock_mfrc,
+        _mock_wir,
+        _mock_pns,
+        _mock_offer,
+        logger,
+    ):
         from fluid_build.cli.init import run
 
         assert run(SimpleNamespace(), logger) == 0
