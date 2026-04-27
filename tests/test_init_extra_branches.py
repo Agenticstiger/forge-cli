@@ -425,19 +425,76 @@ class TestRun:
 
         assert run(args, logger) == 1
 
+    # ``test_blank_dispatch`` / ``test_template_dispatch`` exercise the routing
+    # logic in ``init.run`` — they assert that mode="blank" calls ``blank_mode``
+    # and mode="template" calls ``template_mode``.
+    #
+    # Originally these were ``@pytest.mark.xfail(reason="import-cycle with the
+    # copilot subsystem", strict=False)``. PR #53 removed the markers after they
+    # began XPASSing on the author's local 3.13 run. CI then went red on Python
+    # 3.14 (PR #55) and Python 3.11 (PR #56). The captured stdout revealed the
+    # actual root cause is *not* an import cycle: ``init.run`` calls
+    # ``_ensure_workspace`` before dispatch; ``_ensure_workspace`` interactively
+    # prompts ``Prompt.ask("Workspace name", ...)`` when no workspace exists
+    # and no ``--yes/--blank/--template`` flag is set; pytest's stdin capture
+    # raises ``OSError``; the outer ``except Exception`` returns 1.
+    #
+    # The flake-by-Python-version was actually a flake-by-random-seed:
+    # ``pytest-randomly`` reorders tests, and a prior test sometimes leaves a
+    # workspace artifact at cwd that lets ``_ensure_workspace`` short-circuit.
+    # When the random seed didn't put such a test first, the prompt fired and
+    # the dispatch test failed.
+    #
+    # The right fix is to mock the side-effecting / interactive helpers so the
+    # test stays focused on its actual subject (dispatch routing). After-mode
+    # post-processing (``_mark_first_run_complete``, ``_write_init_receipt``,
+    # ``print_next_steps``) and the ``_offer_first_forge`` interactive follow-up
+    # are likewise mocked because the test asserts nothing against them.
+    @patch("fluid_build.cli.init._offer_first_forge")
+    @patch("fluid_build.cli.init.print_next_steps")
+    @patch("fluid_build.cli.init._write_init_receipt")
+    @patch("fluid_build.cli.init._mark_first_run_complete")
+    @patch("fluid_build.cli.init._ensure_workspace")
     @patch("fluid_build.cli.init._ask_industry", return_value=None)
     @patch("fluid_build.cli.init.blank_mode", return_value=0)
     @patch("fluid_build.cli.init.detect_mode", return_value="blank")
-    def test_blank_dispatch(self, _mock_dm, mock_bl, _mock_ind, logger):
+    def test_blank_dispatch(
+        self,
+        _mock_dm,
+        mock_bl,
+        _mock_ind,
+        _mock_ews,
+        _mock_mfrc,
+        _mock_wir,
+        _mock_pns,
+        _mock_offer,
+        logger,
+    ):
         from fluid_build.cli.init import run
 
         assert run(SimpleNamespace(), logger) == 0
         mock_bl.assert_called_once()
 
+    @patch("fluid_build.cli.init._offer_first_forge")
+    @patch("fluid_build.cli.init.print_next_steps")
+    @patch("fluid_build.cli.init._write_init_receipt")
+    @patch("fluid_build.cli.init._mark_first_run_complete")
+    @patch("fluid_build.cli.init._ensure_workspace")
     @patch("fluid_build.cli.init._ask_industry", return_value=None)
     @patch("fluid_build.cli.init.template_mode", return_value=0)
     @patch("fluid_build.cli.init.detect_mode", return_value="template")
-    def test_template_dispatch(self, _mock_dm, mock_tm, _mock_ind, logger):
+    def test_template_dispatch(
+        self,
+        _mock_dm,
+        mock_tm,
+        _mock_ind,
+        _mock_ews,
+        _mock_mfrc,
+        _mock_wir,
+        _mock_pns,
+        _mock_offer,
+        logger,
+    ):
         from fluid_build.cli.init import run
 
         assert run(SimpleNamespace(), logger) == 0
