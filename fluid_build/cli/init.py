@@ -367,11 +367,52 @@ def run(args, logger: logging.Logger) -> int:
         return 1
 
 
-def _offer_first_forge(args, logger: logging.Logger) -> None:
-    """After successful init, offer to forge the first data product.
+def _is_ai_configured() -> bool:
+    """Return True if a saved AI config (or environment fallback) is usable.
 
-    Only shown when no contract.fluid.yaml exists yet in the target
-    directory — once forge creates one, this prompt is suppressed.
+    Mirrors the resolution order in :func:`ai_setup.run_ai_setup_inline`:
+    saved config → cloud provider env vars (including the
+    ``GEMINI_API_KEY`` alias for ``GOOGLE_API_KEY``) → ``OLLAMA_HOST``.
+    Used to decide whether the post-init handoff should offer to set AI
+    up before launching forge.
+    """
+    try:
+        from .ai_setup import PROVIDER_ENV_VARS, _load_ai_config
+    except Exception:  # pragma: no cover — import guard for partial installs
+        return False
+
+    saved = _load_ai_config()
+    if saved and saved.get("provider"):
+        return True
+
+    for env_var in PROVIDER_ENV_VARS.values():
+        if os.environ.get(env_var):
+            return True
+
+    # ``GEMINI_API_KEY`` is the user-facing alias for ``GOOGLE_API_KEY``
+    # accepted by the copilot provider resolver — keep the post-init
+    # handoff in sync so a user who pastes that env var doesn't get
+    # asked to "set up AI" again.
+    if os.environ.get("GEMINI_API_KEY"):
+        return True
+
+    return bool(os.environ.get("OLLAMA_HOST"))
+
+
+def _offer_first_forge(args, logger: logging.Logger) -> None:
+    """After successful init, offer the AI-setup → forge handoff.
+
+    Card 69d4c9bf — "Forge UX: Init → Forge handoff". Three states:
+
+    * Contract already exists in target dir → skip (forge already ran)
+    * AI config missing → "Set up AI and create your first data product?"
+      runs ``fluid ai setup`` inline, then ``fluid forge``
+    * AI config present → "Ready to create your first data product?"
+      jumps straight to ``fluid forge``
+
+    The two-step path matches the card's explicit ask: surface AI setup
+    as part of the post-init prompt rather than burying it inside forge's
+    inline-fallback path.
     """
     try:
         # Determine the product directory
@@ -383,47 +424,82 @@ def _offer_first_forge(args, logger: logging.Logger) -> None:
         if contract_path.exists():
             return
 
+        ai_ready = _is_ai_configured()
+        if ai_ready:
+            prompt_text = "Ready to create your first data product?"
+            prompt_rich = (
+                "\n[bold bright_cyan]Ready to create your first data product?" "[/bold bright_cyan]"
+            )
+        else:
+            prompt_text = "Set up AI and create your first data product?"
+            prompt_rich = (
+                "\n[bold bright_cyan]Set up AI and create your first data "
+                "product?[/bold bright_cyan]\n"
+                "[dim]Configures your LLM provider, then launches forge "
+                "to scaffold the contract.[/dim]"
+            )
+
         if RICH_AVAILABLE:
             from rich.prompt import Confirm
 
-            forge_now = Confirm.ask(
-                "\n[bold bright_cyan]Ready to create your first data product?[/bold bright_cyan]",
-                default=True,
-            )
+            proceed = Confirm.ask(prompt_rich, default=True)
         else:
-            answer = input("\nReady to create your first data product? [Y/n] ").strip().lower()
-            forge_now = answer in ("", "y", "yes")
+            answer = input(f"\n{prompt_text} [Y/n] ").strip().lower()
+            proceed = answer in ("", "y", "yes")
 
-        if forge_now:
-            cprint("")
-            # Build minimal args for forge
-            import argparse as _argparse
+        if not proceed:
+            return
 
-            from .forge import run as forge_run
+        # If AI isn't configured, run setup before forge so the user picks
+        # provider/model up front and forge skips its inline fallback.
+        if not ai_ready and RICH_AVAILABLE:
+            try:
+                from .ai_setup import run_ai_setup_interactive
 
-            forge_args = _argparse.Namespace(
-                target_dir=getattr(args, "target_dir", None) or getattr(args, "name", "."),
-                provider=getattr(args, "provider", None),
-                domain=None,
-                blank=False,
-                dry_run=False,
-                non_interactive=False,
-                context=None,
-                llm_provider=None,
-                llm_model=None,
-                llm_endpoint=None,
-                discover=True,
-                no_discover=False,
-                discovery_path=None,
-                memory=True,
-                no_memory=False,
-                save_memory=True,
-                show_memory=False,
-                reset_memory=False,
-                quiet=False,
-                verbose=False,
-            )
-            forge_run(forge_args, logger)
+                setup_result = run_ai_setup_interactive(console)
+                if setup_result is None:
+                    # User skipped the picker — let forge fall back to
+                    # template/blank rather than crash.
+                    cprint(
+                        "\nAI setup was skipped — continuing with forge in "
+                        "non-AI mode. Run 'fluid ai setup' anytime to enable AI."
+                    )
+            except Exception as setup_exc:  # pragma: no cover — defensive
+                logger.debug("Inline AI setup failed: %s", setup_exc)
+                cprint(
+                    "\nAI setup didn't complete — continuing with forge. "
+                    "Run 'fluid ai setup' to retry."
+                )
+
+        cprint("")
+        # Build minimal args for forge
+        import argparse as _argparse
+
+        from .forge import run as forge_run
+
+        forge_args = _argparse.Namespace(
+            target_dir=getattr(args, "target_dir", None) or getattr(args, "name", "."),
+            provider=getattr(args, "provider", None),
+            domain=None,
+            blank=False,
+            dry_run=False,
+            non_interactive=False,
+            context=None,
+            llm_provider=None,
+            llm_model=None,
+            llm_endpoint=None,
+            discover=True,
+            no_discover=False,
+            discovery_path=None,
+            memory=True,
+            no_memory=False,
+            save_memory=True,
+            show_memory=False,
+            reset_memory=False,
+            quiet=False,
+            verbose=False,
+        )
+        forge_run(forge_args, logger)
     except (KeyboardInterrupt, EOFError):
         cprint("\nYou can run 'fluid forge' anytime to create a data product.")
     except Exception as e:
