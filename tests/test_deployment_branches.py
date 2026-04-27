@@ -343,44 +343,46 @@ class TestDeploy:
                     result = deployer.deploy(cfg)
         assert result.status == DeploymentStatus.SUCCESS
 
-    def test_deploy_routes_to_gcp(self, deployer):
+    def test_deploy_with_gcp_short_circuits_with_unsupported_error(self, deployer):
+        """deploy(GCP) used to dispatch to _deploy_gcp (which itself returned
+        FAILED). The dispatcher now short-circuits unsupported targets BEFORE
+        package preparation, returning a structured FAILED with the
+        ``deployment_target_not_supported`` event slug."""
         cfg = DeploymentConfig(target=DeploymentTarget.GCP)
-        mock_result = DeploymentResult(
-            status=DeploymentStatus.SUCCESS,
-            deployment_id="abc",
-            target=DeploymentTarget.GCP,
-        )
-        with patch.object(deployer, "_prepare_deployment_package", return_value=Path("/tmp/fake")):
-            with patch.object(deployer, "_deploy_gcp", return_value=mock_result):
+        with patch.object(deployer, "_prepare_deployment_package") as prep:
+            with patch.object(deployer, "_deploy_gcp") as gcp_dispatch:
                 with patch.object(deployer, "_save_deployment_record"):
                     result = deployer.deploy(cfg)
-        assert result.status == DeploymentStatus.SUCCESS
+        # The short-circuit must run before package prep and the dispatcher.
+        prep.assert_not_called()
+        gcp_dispatch.assert_not_called()
+        assert result.status == DeploymentStatus.FAILED
+        assert "deployment_target_not_supported" in result.error
+        assert "gcp" in result.error
 
-    def test_deploy_routes_to_aws(self, deployer):
+    def test_deploy_with_aws_short_circuits_with_unsupported_error(self, deployer):
         cfg = DeploymentConfig(target=DeploymentTarget.AWS)
-        mock_result = DeploymentResult(
-            status=DeploymentStatus.SUCCESS,
-            deployment_id="abc",
-            target=DeploymentTarget.AWS,
-        )
-        with patch.object(deployer, "_prepare_deployment_package", return_value=Path("/tmp/fake")):
-            with patch.object(deployer, "_deploy_aws", return_value=mock_result):
+        with patch.object(deployer, "_prepare_deployment_package") as prep:
+            with patch.object(deployer, "_deploy_aws") as aws_dispatch:
                 with patch.object(deployer, "_save_deployment_record"):
                     result = deployer.deploy(cfg)
-        assert result.status == DeploymentStatus.SUCCESS
+        prep.assert_not_called()
+        aws_dispatch.assert_not_called()
+        assert result.status == DeploymentStatus.FAILED
+        assert "deployment_target_not_supported" in result.error
+        assert "aws" in result.error
 
-    def test_deploy_routes_to_azure(self, deployer):
+    def test_deploy_with_azure_short_circuits_with_unsupported_error(self, deployer):
         cfg = DeploymentConfig(target=DeploymentTarget.AZURE)
-        mock_result = DeploymentResult(
-            status=DeploymentStatus.SUCCESS,
-            deployment_id="abc",
-            target=DeploymentTarget.AZURE,
-        )
-        with patch.object(deployer, "_prepare_deployment_package", return_value=Path("/tmp/fake")):
-            with patch.object(deployer, "_deploy_azure", return_value=mock_result):
+        with patch.object(deployer, "_prepare_deployment_package") as prep:
+            with patch.object(deployer, "_deploy_azure") as azure_dispatch:
                 with patch.object(deployer, "_save_deployment_record"):
                     result = deployer.deploy(cfg)
-        assert result.status == DeploymentStatus.SUCCESS
+        prep.assert_not_called()
+        azure_dispatch.assert_not_called()
+        assert result.status == DeploymentStatus.FAILED
+        assert "deployment_target_not_supported" in result.error
+        assert "azure" in result.error
 
     def test_deploy_routes_to_cicd(self, deployer):
         cfg = DeploymentConfig(target=DeploymentTarget.CICD)

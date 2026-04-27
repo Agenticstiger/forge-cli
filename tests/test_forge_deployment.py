@@ -428,6 +428,104 @@ class TestDeployCloudStubs:
 
 
 # ---------------------------------------------------------------------------
+# DeploymentTarget.supported_targets / is_supported (advertised vs implemented)
+# ---------------------------------------------------------------------------
+
+
+class TestSupportedTargetsAdvertisement:
+    def test_supported_targets_excludes_cloud_stubs(self):
+        supported = DeploymentTarget.supported_targets()
+        assert DeploymentTarget.LOCAL in supported
+        assert DeploymentTarget.DOCKER in supported
+        assert DeploymentTarget.KUBERNETES in supported
+        assert DeploymentTarget.CICD in supported
+        assert DeploymentTarget.GCP not in supported
+        assert DeploymentTarget.AWS not in supported
+        assert DeploymentTarget.AZURE not in supported
+
+    def test_is_supported_predicate_matches_supported_targets(self):
+        for target in DeploymentTarget.supported_targets():
+            assert target.is_supported(), f"{target} should be supported"
+        for target in (
+            DeploymentTarget.GCP,
+            DeploymentTarget.AWS,
+            DeploymentTarget.AZURE,
+        ):
+            assert not target.is_supported(), f"{target} should NOT be supported"
+
+
+class TestDeployRefusesUnsupportedCloudTargets:
+    """``ProjectDeployer.deploy`` short-circuits cloud targets before package
+    preparation, returning a structured FAILED result with the supported list."""
+
+    def test_deploy_with_gcp_returns_structured_unsupported_error(self, tmp_path):
+        deployer = _make_deployer(tmp_path)
+        cfg = DeploymentConfig(target=DeploymentTarget.GCP)
+
+        result = deployer.deploy(cfg)
+
+        assert result.status == DeploymentStatus.FAILED
+        assert result.target == DeploymentTarget.GCP
+        assert "deployment_target_not_supported" in result.error
+        assert "gcp" in result.error
+        # Supported list is surfaced to the caller.
+        for supported_value in ("local", "docker", "kubernetes", "cicd"):
+            assert supported_value in result.error
+        assert any("not yet implemented" in line for line in result.logs)
+
+    def test_deploy_with_aws_returns_structured_unsupported_error(self, tmp_path):
+        deployer = _make_deployer(tmp_path)
+        cfg = DeploymentConfig(target=DeploymentTarget.AWS)
+
+        result = deployer.deploy(cfg)
+
+        assert result.status == DeploymentStatus.FAILED
+        assert "deployment_target_not_supported" in result.error
+        assert "aws" in result.error
+
+    def test_deploy_with_azure_returns_structured_unsupported_error(self, tmp_path):
+        deployer = _make_deployer(tmp_path)
+        cfg = DeploymentConfig(target=DeploymentTarget.AZURE)
+
+        result = deployer.deploy(cfg)
+
+        assert result.status == DeploymentStatus.FAILED
+        assert "deployment_target_not_supported" in result.error
+        assert "azure" in result.error
+
+    def test_deploy_short_circuits_before_package_preparation(self, tmp_path, monkeypatch):
+        """The unsupported-target check must run BEFORE
+        ``_prepare_deployment_package`` to avoid wasted I/O on a guaranteed
+        failure."""
+        deployer = _make_deployer(tmp_path)
+        cfg = DeploymentConfig(target=DeploymentTarget.GCP)
+
+        prepare_called = {"value": False}
+
+        def boom(*args, **kwargs):
+            prepare_called["value"] = True
+            raise AssertionError("_prepare_deployment_package should not run for GCP")
+
+        monkeypatch.setattr(deployer, "_prepare_deployment_package", boom)
+
+        result = deployer.deploy(cfg)
+
+        assert prepare_called["value"] is False
+        assert result.status == DeploymentStatus.FAILED
+        assert "deployment_target_not_supported" in result.error
+
+    def test_deploy_with_supported_target_does_not_short_circuit(self, tmp_path):
+        deployer = _make_deployer(tmp_path)
+        cfg = DeploymentConfig(target=DeploymentTarget.LOCAL)
+        result = deployer.deploy(cfg)
+        # Supported target reaches the real dispatcher (it may succeed or
+        # fail depending on tmp_path contents, but the early-return path
+        # should not have fired and the error must not mention
+        # ``deployment_target_not_supported``).
+        assert result.error is None or "deployment_target_not_supported" not in (result.error or "")
+
+
+# ---------------------------------------------------------------------------
 # ProjectDeployer._deploy_cicd
 # ---------------------------------------------------------------------------
 
