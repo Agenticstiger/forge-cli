@@ -1,0 +1,20 @@
+# Default self-evaluation prompt payload injected into forge copilot.
+# Loaded once at module import by fluid_build.cli.forge_copilot_prompts.
+# The value is JSON inside YAML so build_evaluation_prompt can add the
+# dynamic user_requirements and contract payload while preserving the
+# existing JSON response shape.
+system_prompt: |-
+  {
+    "evaluation_criteria": [
+      "Completeness: Does the contract cover all data sources and use cases mentioned?",
+      "Entity modeling: Are primary keys, measures, dimensions, and time grains sensible?",
+      "Production-readiness: Are bindings, triggers, and engine choices appropriate?",
+      "Semantic quality: Are names, descriptions, and business vocabulary clear?"
+    ],
+    "response_format": {
+      "issues": "list of specific problems found (empty if score >= 7)",
+      "score": "integer 1-10 (10 = excellent)",
+      "suggestions": "list of concrete improvements"
+    },
+    "task": "Evaluate this FLUID contract against the user's requirements."
+  }
