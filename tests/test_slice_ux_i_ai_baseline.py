@@ -64,6 +64,8 @@ from fluid_build.cli.forge_copilot_llm_providers import (
     OllamaProvider,
     OpenAIProvider,
     call_llm_streaming,
+    get_cumulative_prompt_cache_metrics,
+    reset_token_usage,
     streaming_is_enabled,
 )
 from fluid_build.cli.forge_copilot_response_schema import (
@@ -140,6 +142,7 @@ class TestStreamingLlmCalls:
     blocking ``extract_text`` path would return."""
 
     def test_openai_stream_parses_delta_events(self):
+        reset_token_usage()
         lines = [
             "data: " + json.dumps({"choices": [{"delta": {"content": "Hello "}}]}),
             "",
@@ -153,7 +156,34 @@ class TestStreamingLlmCalls:
         chunks = list(provider.iter_stream_chunks(_FakeStreamResponse(lines)))
         assert "".join(chunks) == "Hello world!"
 
+    def test_openai_stream_records_prompt_cache_usage(self):
+        reset_token_usage()
+        lines = [
+            "data: " + json.dumps({"choices": [{"delta": {"content": "Hello"}}]}),
+            "data: "
+            + json.dumps(
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "prompt_token_details": {"cached_tokens": 40},
+                    },
+                }
+            ),
+            "data: [DONE]",
+        ]
+
+        chunks = list(OpenAIProvider().iter_stream_chunks(_FakeStreamResponse(lines)))
+
+        assert "".join(chunks) == "Hello"
+        assert get_cumulative_prompt_cache_metrics() == {
+            "read_tokens": 40,
+            "total_tokens": 100,
+            "hit_rate": 0.4,
+        }
+
     def test_openai_stream_ignores_malformed_json(self):
+        reset_token_usage()
         lines = [
             "data: not-json-at-all",
             "data: " + json.dumps({"choices": [{"delta": {"content": "ok"}}]}),
@@ -215,7 +245,43 @@ class TestStreamingLlmCalls:
         result = "".join(chunks)
         assert json.loads(result) == {"recommended_template": "starter"}
 
+    def test_anthropic_stream_records_prompt_cache_usage(self):
+        reset_token_usage()
+        lines = [
+            "data: "
+            + json.dumps(
+                {
+                    "type": "message_start",
+                    "message": {
+                        "usage": {
+                            "input_tokens": 70,
+                            "cache_creation_input_tokens": 10,
+                            "cache_read_input_tokens": 20,
+                        }
+                    },
+                }
+            ),
+            "data: "
+            + json.dumps(
+                {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": "cached"},
+                }
+            ),
+            "data: " + json.dumps({"type": "message_stop"}),
+        ]
+
+        chunks = list(AnthropicProvider().iter_stream_chunks(_FakeStreamResponse(lines)))
+
+        assert "".join(chunks) == "cached"
+        assert get_cumulative_prompt_cache_metrics() == {
+            "read_tokens": 20,
+            "total_tokens": 100,
+            "hit_rate": 0.2,
+        }
+
     def test_gemini_stream_parses_candidates(self):
+        reset_token_usage()
         lines = [
             "data: " + json.dumps({"candidates": [{"content": {"parts": [{"text": "gemini "}]}}]}),
             "data: "
@@ -223,6 +289,30 @@ class TestStreamingLlmCalls:
         ]
         chunks = list(GeminiProvider().iter_stream_chunks(_FakeStreamResponse(lines)))
         assert "".join(chunks) == "gemini streaming"
+
+    def test_gemini_stream_records_prompt_cache_usage(self):
+        reset_token_usage()
+        lines = [
+            "data: "
+            + json.dumps(
+                {
+                    "candidates": [{"content": {"parts": [{"text": "gemini"}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 80,
+                        "cachedContentTokenCount": 20,
+                    },
+                }
+            ),
+        ]
+
+        chunks = list(GeminiProvider().iter_stream_chunks(_FakeStreamResponse(lines)))
+
+        assert "".join(chunks) == "gemini"
+        assert get_cumulative_prompt_cache_metrics() == {
+            "read_tokens": 20,
+            "total_tokens": 80,
+            "hit_rate": 0.25,
+        }
 
     def test_gemini_streaming_url_rewrites_endpoint(self):
         cfg = _base_config(
@@ -239,6 +329,7 @@ class TestStreamingLlmCalls:
         url, _, payload = OpenAIProvider().build_streaming_request(cfg, "sys", "usr")
         assert url == cfg.endpoint
         assert payload.get("stream") is True
+        assert payload.get("stream_options") == {"include_usage": True}
 
     def test_streaming_is_enabled_honours_env_kill_switch(self, monkeypatch):
         monkeypatch.delenv("FLUID_LLM_STREAMING", raising=False)

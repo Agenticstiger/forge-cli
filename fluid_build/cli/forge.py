@@ -59,6 +59,10 @@ from fluid_build.cli.forge_copilot_agent import (
     recommend_template_for_use_case,
 )
 from fluid_build.cli.forge_copilot_interview import build_interview_summary_from_context
+from fluid_build.cli.forge_copilot_llm_providers import (
+    get_cumulative_prompt_cache_metrics,
+    reset_token_usage,
+)
 from fluid_build.cli.forge_copilot_memory import (
     CopilotMemoryStore,
     resolve_copilot_memory_root,
@@ -661,6 +665,7 @@ def run(args, logger: logging.Logger) -> int:
         # produce a receipt.
         scan_root = Path.cwd()
         before_snapshot = snapshot_workspace(scan_root)
+        reset_token_usage()
 
         # --- Top-level flag aliases ---
         # ``--no-llm`` and ``--deterministic`` were added at the
@@ -922,8 +927,12 @@ def _write_forge_receipt(
             tool_version = ""
 
         command = _format_forge_command(args, flow)
+        payload = doc.to_payload()
+        performance = _forge_performance_payload()
+        if performance:
+            payload["performance"] = performance
         payload_bytes = dump_json_with_envelope(
-            doc.to_payload(),
+            payload,
             kind="ForgeReceipt",
             command=command,
             tool_version=str(tool_version),
@@ -935,6 +944,13 @@ def _write_forge_receipt(
         logger.debug("forge_receipt_written", extra={"path": str(receipt_path)})
     except Exception as exc:  # noqa: BLE001 — never abort forge on receipt failure
         logger.debug("forge_receipt_write_failed", extra={"error": str(exc)})
+
+
+def _forge_performance_payload() -> Dict[str, Any]:
+    metrics = get_cumulative_prompt_cache_metrics()
+    if metrics.get("total_tokens", 0) <= 0:
+        return {}
+    return {"prompt_cache": metrics}
 
 
 def _resolve_product_root(changed_entries, scan_root: Path) -> Optional[Path]:
