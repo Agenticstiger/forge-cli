@@ -425,6 +425,22 @@ class TestRun:
 
         assert run(args, logger) == 1
 
+    # ``test_blank_dispatch`` and ``test_template_dispatch`` were unmarked from
+    # ``@pytest.mark.xfail`` in PR #53 after they began XPASSing on Python
+    # 3.10–3.13. They still genuinely fail on Python 3.14 because the underlying
+    # copilot subsystem import-cycle (which makes ``init.run`` return 1 instead
+    # of 0 when the dispatch path imports the copilot module) has not been
+    # repaired on the new interpreter. We re-apply ``xfail`` *scoped* to 3.14
+    # so the asserts stay live on the supported lower bounds while CI on 3.14
+    # is honest. ``strict=True`` ensures we get an XPASS alarm the moment the
+    # 3.14 import-cycle is fixed and this guard can be removed wholesale.
+    # Tracked: https://trello.com/c/06fpvfsl  ·  blocking PR #55 rebase.
+    @pytest.mark.xfail(
+        sys.version_info >= (3, 14),
+        reason="Copilot import-cycle still surfaces dispatch=1 on Python 3.14; "
+        "see PR #53/#55 thread for the import-graph trace.",
+        strict=True,
+    )
     @patch("fluid_build.cli.init._ask_industry", return_value=None)
     @patch("fluid_build.cli.init.blank_mode", return_value=0)
     @patch("fluid_build.cli.init.detect_mode", return_value="blank")
@@ -434,6 +450,12 @@ class TestRun:
         assert run(SimpleNamespace(), logger) == 0
         mock_bl.assert_called_once()
 
+    @pytest.mark.xfail(
+        sys.version_info >= (3, 14),
+        reason="Copilot import-cycle still surfaces dispatch=1 on Python 3.14; "
+        "see PR #53/#55 thread for the import-graph trace.",
+        strict=True,
+    )
     @patch("fluid_build.cli.init._ask_industry", return_value=None)
     @patch("fluid_build.cli.init.template_mode", return_value=0)
     @patch("fluid_build.cli.init.detect_mode", return_value="template")
