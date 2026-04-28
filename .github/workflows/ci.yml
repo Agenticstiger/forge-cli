@@ -240,6 +240,20 @@ jobs:
         # Glob the test files so newly-added test_e2e_local_*.py and
         # test_local_live_*.py files are picked up automatically without
         # editing this workflow.
+        env:
+          # Windows hosts default stdout/stderr to cp1252 for non-TTY
+          # pipes (which is what subprocess.run captures here). The
+          # ``fluid`` banner uses 🌊 and box-drawing characters that
+          # cp1252 cannot encode, so the CLI crashes on startup. The
+          # canonical workaround is to force UTF-8 via PYTHONIOENCODING.
+          # Set on every OS for consistency — Linux and macOS already
+          # default to UTF-8, so this is a no-op there.
+          # The underlying fluid CLI should also handle this itself
+          # (reconfigure stdout to utf-8 with errors='replace' at boot).
+          # Tracked as Trello card xsdOYJ6E. When that fix lands the
+          # env var here can be removed and Windows users get a CLI
+          # that works in pipes without manual env setup.
+          PYTHONIOENCODING: utf-8
         run: |
           python -m pytest -v -m "integration and not slow" tests/test_e2e_local.py tests/test_e2e_local_apply.py tests/test_e2e_local_negative.py tests/providers/test_local_live_happy_path.py
       - name: Cleanup local artifacts (defensive)
