@@ -133,7 +133,14 @@ class TestFluidApplyMaterializesData:
 
         output_csv = hello_world_workspace / "runtime" / "out" / "hello-world-v1.csv"
 
-        rel = duckdb.read_csv(str(output_csv))
+        # ``all_varchar=True`` reads every column as VARCHAR so DuckDB
+        # never tries to materialise the TIMESTAMPTZ ``created_at``
+        # column. Without this, ``fetchall`` raises if the runtime is
+        # missing ``pytz`` (DuckDB requires it for tz-aware timestamps,
+        # and the [local] extra does not pull it in). Reading as text
+        # is sufficient for the schema + row count + literal-value
+        # assertions below.
+        rel = duckdb.read_csv(str(output_csv), all_varchar=True)
         rows = rel.fetchall()
         column_names = list(rel.columns)
 
@@ -194,7 +201,9 @@ class TestFluidApplyIdempotency:
             assert result.returncode == 0, result.stderr
 
         output_csv = hello_world_workspace / "runtime" / "out" / "hello-world-v1.csv"
-        row_count = duckdb.read_csv(str(output_csv)).count("*").fetchone()[0]
+        # ``all_varchar=True`` for the same reason as the schema test —
+        # avoids materialising TIMESTAMPTZ which needs pytz at runtime.
+        row_count = duckdb.read_csv(str(output_csv), all_varchar=True).count("*").fetchone()[0]
         assert row_count == 1, f"expected 1 row after two applies; got {row_count}"
 
 
