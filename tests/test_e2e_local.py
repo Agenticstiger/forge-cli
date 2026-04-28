@@ -50,10 +50,16 @@ def _fluid(*args: str, cwd: Path, env_overrides: dict | None = None) -> subproce
     Uses ``python -m fluid_build.cli`` rather than the installed ``fluid``
     script so the test works in editable installs and in CI without
     needing the entry-point script on PATH.
+
+    ``encoding='utf-8', errors='replace'`` is set on the parent side so
+    decoding the captured streams never raises on Windows where the
+    default locale is cp1252. Combined with ``PYTHONIOENCODING=utf-8``
+    on the child (set in CI), both ends of the pipe agree on UTF-8.
     """
     import os
 
     env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     if env_overrides:
         env.update(env_overrides)
     return subprocess.run(
@@ -62,6 +68,8 @@ def _fluid(*args: str, cwd: Path, env_overrides: dict | None = None) -> subproce
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=120,
     )
 

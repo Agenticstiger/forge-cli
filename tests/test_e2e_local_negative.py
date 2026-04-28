@@ -44,12 +44,15 @@ pytestmark = [pytest.mark.integration]
 
 def _fluid(*args: str, cwd: Path) -> subprocess.CompletedProcess:
     env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     return subprocess.run(
         [sys.executable, "-m", "fluid_build.cli", *args],
         cwd=cwd,
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
 

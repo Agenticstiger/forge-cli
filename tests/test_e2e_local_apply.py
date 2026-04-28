@@ -57,14 +57,22 @@ pytestmark.append(pytest.mark.skipif(not _have_duckdb(), reason="duckdb not inst
 
 
 def _fluid(*args: str, cwd: Path) -> subprocess.CompletedProcess:
-    """Invoke the ``fluid`` CLI as a subprocess against ``cwd``."""
+    """Invoke the ``fluid`` CLI as a subprocess against ``cwd``.
+
+    ``encoding='utf-8', errors='replace'`` is set on the parent side so
+    decoding the captured streams never raises on Windows where the
+    default locale is cp1252. ``PYTHONIOENCODING=utf-8`` is forced on
+    the child for the same reason."""
     env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     return subprocess.run(
         [sys.executable, "-m", "fluid_build.cli", *args],
         cwd=cwd,
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=120,
     )
 

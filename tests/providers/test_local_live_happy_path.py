@@ -25,6 +25,9 @@ Free, secret-less, runs in `ci.yml::duckdb-integration` on every PR.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -42,6 +45,27 @@ def _have_duckdb() -> bool:
 
 
 pytestmark.append(pytest.mark.skipif(not _have_duckdb(), reason="duckdb not installed"))
+
+
+def _fluid(*args: str, cwd: Path, timeout: int = 60) -> subprocess.CompletedProcess:
+    """Invoke the ``fluid`` CLI as a subprocess.
+
+    ``encoding='utf-8', errors='replace'`` plus ``PYTHONIOENCODING=utf-8``
+    keep both ends of the pipe agreeing on UTF-8 — needed on Windows
+    where the default locale is cp1252 and the fluid banner uses chars
+    outside that codepage."""
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return subprocess.run(
+        [sys.executable, "-m", "fluid_build.cli", *args],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
 
 
 @pytest.fixture
@@ -115,26 +139,15 @@ class TestLocalProviderEndToEnd:
         the canonical entry point is the CLI; testing the provider in
         isolation would let us miss CLI-specific bugs (env loading,
         contract resolution, schema-version routing)."""
-        import subprocess
-        import sys
-
         plan_out = workspace / "plan.json"
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "fluid_build.cli",
-                "--provider",
-                "local",
-                "plan",
-                str(hello_world_contract),
-                "--out",
-                str(plan_out),
-            ],
+        result = _fluid(
+            "--provider",
+            "local",
+            "plan",
+            str(hello_world_contract),
+            "--out",
+            str(plan_out),
             cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=60,
         )
         assert result.returncode == 0, (
             f"plan exited {result.returncode}\n" f"stdout: {result.stdout}\nstderr: {result.stderr}"
@@ -142,21 +155,10 @@ class TestLocalProviderEndToEnd:
         assert plan_out.exists(), "plan should produce an output file"
 
     def test_validate_smoke_contract(self, hello_world_contract: Path, workspace: Path) -> None:
-        import subprocess
-        import sys
-
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "fluid_build.cli",
-                "validate",
-                str(hello_world_contract),
-            ],
+        result = _fluid(
+            "validate",
+            str(hello_world_contract),
             cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=60,
         )
         assert result.returncode == 0, (
             f"validate exited {result.returncode}\n"
@@ -179,28 +181,18 @@ class TestLocalProviderDeterminism:
         self, hello_world_contract: Path, workspace: Path
     ) -> None:
         import json
-        import subprocess
-        import sys
 
         outputs = []
         for run_id in ("a", "b"):
             out = workspace / f"plan_{run_id}.json"
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "fluid_build.cli",
-                    "--provider",
-                    "local",
-                    "plan",
-                    str(hello_world_contract),
-                    "--out",
-                    str(out),
-                ],
+            result = _fluid(
+                "--provider",
+                "local",
+                "plan",
+                str(hello_world_contract),
+                "--out",
+                str(out),
                 cwd=workspace,
-                capture_output=True,
-                text=True,
-                timeout=60,
             )
             assert result.returncode == 0, result.stderr
             outputs.append(json.loads(out.read_text()))
