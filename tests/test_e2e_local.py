@@ -208,15 +208,36 @@ class TestFluidPlanProducesDeterministicArtifact:
 
 
 class TestFluidHelpReachesEverySubcommand:
-    """The CLI must present help for the documented subcommands.
+    """The CLI must present help for every documented subcommand.
 
     Catches the regression where a refactor breaks subparser registration
-    and `fluid validate` silently disappears from the help output.
-    """
+    and a command silently disappears from the help output. The list is
+    derived from the public ``fluid --help`` table in the README and
+    AGENTS.md — keep in sync when commands are added or removed."""
 
     @pytest.mark.parametrize(
         "subcommand",
-        ["init", "validate", "plan", "apply", "verify"],
+        [
+            # Core workflow
+            "init",
+            "forge",
+            "validate",
+            "plan",
+            "apply",
+            # Quality & governance
+            "policy-check",
+            "test",
+            # Safety & supply chain
+            "rollback",
+            # Utilities
+            "config",
+            "ai",
+            "split",
+            "auth",
+            "doctor",
+            "providers",
+            "version",
+        ],
     )
     def test_subcommand_help_succeeds(self, subcommand: str, tmp_path: Path) -> None:
         result = _fluid(subcommand, "--help", cwd=tmp_path)
@@ -227,3 +248,14 @@ class TestFluidHelpReachesEverySubcommand:
         assert (
             subcommand in result.stdout.lower()
         ), f"`fluid {subcommand} --help` did not mention '{subcommand}'"
+
+    def test_top_level_help_lists_core_commands(self, tmp_path: Path) -> None:
+        """``fluid --help`` itself must list the headline commands.
+
+        If a refactor accidentally hides ``init``/``apply`` from the
+        top-level help, contributors lose discoverability."""
+        result = _fluid("--help", cwd=tmp_path)
+        assert result.returncode == 0, result.stderr
+        out = result.stdout.lower()
+        for required in ("init", "validate", "plan", "apply"):
+            assert required in out, f"top-level `fluid --help` did not mention '{required}'"

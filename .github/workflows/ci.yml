@@ -211,9 +211,19 @@ jobs:
   # PRs can run it with full fidelity.
   # ──────────────────────────────────────────────────────────────
   duckdb-integration:
-    name: DuckDB end-to-end
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: DuckDB end-to-end (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      # Surface every OS-specific failure on every run instead of
+      # bailing on the first red. Cross-platform regressions are the
+      # whole point of the matrix.
+      fail-fast: false
+      matrix:
+        # ubuntu is the reference; macos catches pathlib + filesystem-case
+        # regressions; windows catches CRLF, path-separator, and shell-
+        # quoting regressions that contributors hit in the wild.
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -221,14 +231,17 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install with local extras
+        # `python -m pip` is more reliable on Windows than bare `pip`
+        # (the bare command's PATH resolution differs between shells).
         run: |
-          pip install --upgrade pip
-          pip install -e ".[dev,local]"
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,local]"
       - name: Run DuckDB end-to-end suite
+        # Glob the test files so newly-added test_e2e_local_*.py and
+        # test_local_live_*.py files are picked up automatically without
+        # editing this workflow.
         run: |
-          pytest -v -m "integration and not slow" \
-            tests/test_e2e_local.py \
-            tests/providers/test_local_live_happy_path.py
+          python -m pytest -v -m "integration and not slow" tests/test_e2e_local.py tests/test_e2e_local_apply.py tests/test_e2e_local_negative.py tests/providers/test_local_live_happy_path.py
       - name: Cleanup local artifacts (defensive)
         if: always()
         run: python scripts/cleanup_local_test_artifacts.py

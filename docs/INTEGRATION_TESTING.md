@@ -27,9 +27,11 @@ This is a hard platform guarantee, not a configuration knob. forge-cli relies on
 
 ## Tier 1 — DuckDB end-to-end (the free tier)
 
-What runs:
+What runs (across an OS matrix of Ubuntu, macOS, and Windows):
 
-- `tests/test_e2e_local.py` — full CLI dispatch via `python -m fluid_build.cli`. Tests `fluid init`, `fluid validate`, `fluid plan`, scaffold output, plan determinism, help text reachability.
+- `tests/test_e2e_local.py` — full CLI dispatch via `python -m fluid_build.cli`. Tests `fluid init` (quickstart), `fluid validate`, `fluid plan`, scaffold output, plan determinism, and `--help` reachability for **15 documented subcommands** (`init`, `forge`, `validate`, `plan`, `apply`, `policy-check`, `test`, `rollback`, `config`, `ai`, `split`, `auth`, `doctor`, `providers`, `version`).
+- `tests/test_e2e_local_apply.py` — exercises `fluid apply` end-to-end and **verifies the materialised output via the DuckDB Python API**: schema (column names), row count, the literal value emitted by the contract's SQL. Catches the `unknown_action_op` shape of regression where apply reports SUCCESS but produces nothing on disk. Also asserts apply-twice succeeds with consistent row count.
+- `tests/test_e2e_local_negative.py` — negative-path coverage. Asserts that malformed YAML, contracts missing required schema fields, unsupported `fluidVersion`, and missing contract paths all exit non-zero with informative errors. Proves the system fails *correctly*, not just that it succeeds.
 - `tests/providers/test_local_live_happy_path.py` — provider-level happy path against a real DuckDB engine in `tmp_path`.
 
 What this catches that mocked unit tests don't:
@@ -37,18 +39,24 @@ What this catches that mocked unit tests don't:
 - CLI dispatch regressions (a refactor breaks subparser registration; `fluid validate` silently disappears).
 - Schema validation regressions when the bundled examples drift from the schema.
 - Plan-binding hash drift (two identical `plan` runs should produce identical `planDigest`).
+- Apply pipeline regressions where the action dispatcher silently no-ops (the `unknown_action_op` shape).
+- Output-format regressions where the writer emits CSV that DuckDB itself can't read back.
+- Negative-path regressions where validation accidentally accepts under-specified contracts.
+- OS-specific path/encoding regressions on macOS and Windows.
 - The "60 Seconds to Magic" promise the README makes — the canonical first-run flow.
 
-How to run locally:
+How to run locally (single OS):
 
 ```bash
 pip install -e ".[dev,local]"
 pytest -v -m "integration and not slow" \
   tests/test_e2e_local.py \
+  tests/test_e2e_local_apply.py \
+  tests/test_e2e_local_negative.py \
   tests/providers/test_local_live_happy_path.py
 ```
 
-No env vars required. Total runtime under 5 minutes.
+No env vars required. Total runtime under 5 minutes per OS.
 
 ## Tier 2 — Cloud providers (the gated tier)
 
