@@ -59,6 +59,11 @@ def _fluid(*args: str, cwd: Path, env_overrides: dict | None = None) -> subproce
     import os
 
     env = os.environ.copy()
+    # Force UTF-8 on Windows so the child fluid CLI can both write its
+    # banner and read YAML files without hitting cp1252 codec errors.
+    # No-op on Linux/macOS. Tracked as Trello card xsdOYJ6E for the
+    # underlying fluid CLI bug.
+    env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     if env_overrides:
         env.update(env_overrides)

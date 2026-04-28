@@ -44,6 +44,10 @@ pytestmark = [pytest.mark.integration]
 
 def _fluid(*args: str, cwd: Path) -> subprocess.CompletedProcess:
     env = os.environ.copy()
+    # See test_e2e_local._fluid for the rationale on PYTHONUTF8 +
+    # PYTHONIOENCODING. No-op on Linux/macOS; required on Windows
+    # until Trello card xsdOYJ6E is resolved.
+    env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     return subprocess.run(
         [sys.executable, "-m", "fluid_build.cli", *args],
