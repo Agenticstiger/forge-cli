@@ -48,13 +48,27 @@ All PRs to `main` must pass these checks before merge:
 |-------|-------------|
 | **Lint & Format** | `ruff check` + `black --check` (Python 3.12) |
 | **Test Matrix** | `pytest` on Python 3.10, 3.11, 3.12, 3.13, 3.14 (randomized order) |
+| **DuckDB Integration** | Full `fluid init → validate → plan` end-to-end against the local DuckDB provider — runs on every PR including from forks (free, no secrets). See [`docs/INTEGRATION_TESTING.md`](docs/INTEGRATION_TESTING.md). |
 | **Coverage Gates** | Core 80%, local providers 50%, cloud providers 20% (Python 3.12) |
 | **Security Scan** | `bandit` with medium severity threshold |
 | **Build Smoke Test** | Wheel build + install verification |
 | **License Headers** | All maintained `.py` files except `examples/**` must have Apache 2.0 header |
+| **actionlint** | Validates `.github/workflows/*.yml` and refuses any change that would let fork PRs read cloud secrets |
 | **Docs Reminder** | Soft check — adds `needs-docs` label if no docs reference |
 
 PRs also require at least **1 approving review** from a [CODEOWNER](https://github.com/Agenticstiger/forge-cli/blob/main/.github/CODEOWNERS).
+
+### Cloud-touching changes (Snowflake / BigQuery / AWS)
+
+Cloud-provider integration tests do **not** run on community PRs — running them would let any contributor incur cloud cost on the project's accounts. Instead:
+
+- **Pre-merge**: a maintainer pushes the PR's commits to a `staging/PR-N` branch on the upstream repo, which triggers `integration.yml` against real cloud accounts. The maintainer comments the run result on the PR.
+- **Post-merge**: `integration.yml` re-runs automatically on `main` to catch any regression that slipped through review.
+- **Nightly**: a cron runs the full integration suite to detect external API drift.
+
+If you're contributing changes to `fluid_build/providers/{snowflake,gcp,aws}/`, you can validate them locally against your own cloud account before opening the PR. See [`docs/INTEGRATION_TESTING.md`](docs/INTEGRATION_TESTING.md) for the env vars and cost expectations per provider.
+
+Local DuckDB integration runs on every PR automatically — no maintainer action needed.
 
 ### Submitting Code
 

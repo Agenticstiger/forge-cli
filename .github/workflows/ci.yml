@@ -199,6 +199,40 @@ jobs:
           test -f smoke-test/contract.fluid.yaml || { echo "::error::scaffold failed"; exit 1; }
           echo "Scaffold verified"
 
+  # ──────────────────────────────────────────────────────────────
+  # DuckDB end-to-end integration. Free, secret-less, runs on every PR
+  # including from forks. Catches the kind of regressions mocked unit
+  # tests miss: CLI dispatch, schema validation, contract-loader env
+  # interpolation, plan-binding hash stability, the full 11-stage
+  # pipeline orchestration.
+  #
+  # IMPORTANT: this job MUST NOT reference any cloud secrets. The whole
+  # secret-scoping design depends on `ci.yml` being secret-free so fork
+  # PRs can run it with full fidelity.
+  # ──────────────────────────────────────────────────────────────
+  duckdb-integration:
+    name: DuckDB end-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with local extras
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,local]"
+      - name: Run DuckDB end-to-end suite
+        run: |
+          pytest -v -m "integration and not slow" \
+            tests/test_e2e_local.py \
+            tests/providers/test_local_live_happy_path.py
+      - name: Cleanup local artifacts (defensive)
+        if: always()
+        run: python scripts/cleanup_local_test_artifacts.py
+
   security:
     name: Security Scan
     runs-on: ubuntu-latest

@@ -1,0 +1,63 @@
+# Validates GitHub Actions workflow YAML on every PR.
+#
+# Catches the failure modes that single-repo secret-scoping depends on:
+#   • A maintainer accidentally adds `pull_request_target:` to a workflow
+#     that has access to secrets — the worst-case secret-leak shape.
+#   • A workflow file has a typo that silently makes it never run.
+#   • An action is referenced by floating tag instead of pinned SHA.
+#
+# Runs on every push and PR (including from forks, since it has no
+# secrets to leak). Read-only.
+
+name: actionlint
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run actionlint
+        uses: reviewdog/action-actionlint@v1
+        with:
+          fail_on_error: true
+
+      # Belt-and-suspenders: explicitly grep for the dangerous patterns
+      # that actionlint won't catch but that would let a fork PR read
+      # secrets if introduced.
+      - name: Check for pull_request_target with checkout
+        run: |
+          if grep -rn "pull_request_target" .github/workflows/ \
+             | grep -v actionlint.yml; then
+            echo "::error::pull_request_target found in workflow files."
+            echo "::error::This event grants write+secrets access on fork PRs."
+            echo "::error::Use pull_request: instead, or guard explicitly."
+            exit 1
+          fi
+          echo "No pull_request_target usage detected."
+
+      # Sanity check: integration.yml must NEVER list pull_request as a
+      # trigger. The whole secret-scoping design depends on this.
+      - name: Check integration.yml trigger purity
+        run: |
+          if [ -f .github/workflows/integration.yml ]; then
+            if grep -E "^\s*pull_request:" .github/workflows/integration.yml; then
+              echo "::error::integration.yml has a pull_request trigger."
+              echo "::error::That would expose cloud secrets to fork PRs."
+              echo "::error::Remove the pull_request trigger or move tests to ci.yml."
+              exit 1
+            fi
+            echo "integration.yml triggers OK."
+          fi

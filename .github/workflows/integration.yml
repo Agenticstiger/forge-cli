@@ -1,0 +1,271 @@
+# Integration tests against real cloud providers (Snowflake, BigQuery, AWS).
+#
+# Design principles (Phase-1 single-repo with secret-scoped workflows):
+#
+#   1. NEVER triggered by `pull_request:` or `pull_request_target:`.
+#      Fork PRs MUST NOT be able to incur cloud cost or read secrets.
+#      The free DuckDB integration in `ci.yml` covers PR-time signal.
+#
+#   2. Triggered only by:
+#      • `push` to `main`         — post-merge sanity (every merged PR)
+#      • `push` to `staging/**`   — maintainer pre-merge testing of community PRs
+#                                  (see docs/MAINTAINER_HANDBOOK.md)
+#      • `schedule`               — nightly catch-all for external API drift
+#      • `workflow_dispatch`      — manual maintainer trigger with provider selector
+#
+#   3. Each provider job is independent (one fail does not block others).
+#      Per-job timeouts + always-run cleanup steps prevent runaway cost.
+#
+#   4. All secrets accessed via OIDC where possible (BigQuery WIF, AWS IAM
+#      role with OIDC trust). Long-lived Snowflake password/PAT is the
+#      one exception until Snowflake supports OIDC for service users.
+#
+# See docs/INTEGRATION_TESTING.md for the contributor-facing view and
+# docs/MAINTAINER_HANDBOOK.md for the maintainer workflow.
+
+name: Integration
+
+on:
+  push:
+    branches:
+      - main
+      - "staging/**"
+  schedule:
+    # 04:00 UTC daily. Far enough from typical merge times that nightly
+    # failures are clearly attributable to external API drift, not the
+    # most-recently-merged commit.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      providers:
+        description: "Comma-separated providers to run (snowflake, bigquery, aws, all)"
+        type: string
+        default: "all"
+
+permissions:
+  contents: read
+  # OIDC access for cloud federation (BigQuery WIF, AWS IAM role).
+  id-token: write
+  # Auto-file an issue on cron failures.
+  issues: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Tag every cloud resource we provision so the orphan-sweep cron can
+  # find anything our own cleanup steps miss. The `forge-ci-ttl=24h`
+  # tag is what the daily sweep matches on.
+  FORGE_CI_RUN_TAG: "forge-ci-${{ github.run_id }}-${{ github.run_attempt }}"
+  FORGE_CI_TTL_TAG: "forge-ci-ttl=24h"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Snowflake — uses the test_snowflake_live_*.py suite that already
+  # exists, gated behind env vars. Promoted from skip-by-default to
+  # run-when-env-present.
+  # ──────────────────────────────────────────────────────────────
+  snowflake-integration:
+    name: Snowflake integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      contains(fromJSON('["all", "snowflake"]'), inputs.providers) ||
+      contains(inputs.providers, 'snowflake')
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with snowflake extras
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,snowflake]"
+
+      - name: Verify secrets are present (without leaking them)
+        run: |
+          # Confirm the Snowflake env block is wired up. Print only a
+          # 4-char redacted prefix so the log proves access without
+          # revealing the secret. Fail-fast if any required var is empty.
+          for var in SNOWFLAKE_ACCOUNT SNOWFLAKE_USER SNOWFLAKE_PASSWORD SNOWFLAKE_WAREHOUSE SNOWFLAKE_ROLE; do
+            value="${!var}"
+            if [ -z "$value" ]; then
+              echo "::error::$var is empty — Snowflake integration cannot run"
+              exit 1
+            fi
+            echo "$var: ${value:0:4}***"
+          done
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+
+      - name: Run Snowflake integration tests
+        timeout-minutes: 12
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+          # Run-scoped tag every test object should pick up via
+          # ProviderOptions.tags or contract metadata.tags.
+          FORGE_CI_RUN_TAG: ${{ env.FORGE_CI_RUN_TAG }}
+        run: |
+          pytest -v -m "integration and snowflake" \
+            tests/providers/test_snowflake_live_happy_path.py \
+            tests/providers/test_snowflake_governance_live.py
+
+      - name: Cleanup Snowflake test artifacts
+        if: always()
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          FORGE_CI_RUN_TAG: ${{ env.FORGE_CI_RUN_TAG }}
+        run: python scripts/cleanup_snowflake_test_artifacts.py
+
+  # ──────────────────────────────────────────────────────────────
+  # BigQuery — workload-identity OIDC, no static service-account key.
+  # ──────────────────────────────────────────────────────────────
+  bigquery-integration:
+    name: BigQuery integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      contains(fromJSON('["all", "bigquery"]'), inputs.providers) ||
+      contains(inputs.providers, 'bigquery')
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with gcp extras
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,gcp]"
+
+      # Workload-identity federation: short-lived token, no static key.
+      # The maintainer must configure a workload-identity pool that
+      # trusts this repo+ref combination.
+      - name: Authenticate to GCP via WIF
+        id: gcp-auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Run BigQuery integration tests
+        timeout-minutes: 12
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GCP_LOCATION: ${{ secrets.GCP_LOCATION }}
+          FORGE_CI_RUN_TAG: ${{ env.FORGE_CI_RUN_TAG }}
+        run: |
+          pytest -v -m "integration and gcp" \
+            tests/providers/test_bigquery_live_happy_path.py
+
+      - name: Cleanup BigQuery test artifacts
+        if: always()
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          FORGE_CI_RUN_TAG: ${{ env.FORGE_CI_RUN_TAG }}
+        run: python scripts/cleanup_bigquery_test_artifacts.py
+
+  # ──────────────────────────────────────────────────────────────
+  # AWS Glue — IAM role assumption via OIDC, no static keys.
+  # ──────────────────────────────────────────────────────────────
+  aws-integration:
+    name: AWS integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      contains(fromJSON('["all", "aws"]'), inputs.providers) ||
+      contains(inputs.providers, 'aws')
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with aws extras
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,aws]"
+
+      # OIDC role assumption: the role's trust policy must allow this
+      # repo+ref combination. Returns short-lived temporary credentials.
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_INTEGRATION_ROLE }}
+          role-session-name: forge-ci-${{ github.run_id }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Run AWS integration tests
+        timeout-minutes: 12
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_GLUE_DATABASE: ${{ secrets.AWS_GLUE_DATABASE }}
+          FORGE_CI_RUN_TAG: ${{ env.FORGE_CI_RUN_TAG }}
+        run: |
+          pytest -v -m "integration and aws" \
+            tests/providers/test_aws_live_happy_path.py
+
+      - name: Cleanup AWS test artifacts
+        if: always()
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_GLUE_DATABASE: ${{ secrets.AWS_GLUE_DATABASE }}
+          FORGE_CI_RUN_TAG: ${{ env.FORGE_CI_RUN_TAG }}
+        run: python scripts/cleanup_aws_test_artifacts.py
+
+  # ──────────────────────────────────────────────────────────────
+  # Cron-only: file an issue when the nightly run fails so external
+  # API drift gets noticed. Runs only when integration jobs failed AND
+  # the trigger was the nightly schedule.
+  # ──────────────────────────────────────────────────────────────
+  notify-on-cron-failure:
+    name: File issue on nightly failure
+    needs: [snowflake-integration, bigquery-integration, aws-integration]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const failed = [];
+            const jobs = ${{ toJSON(needs) }};
+            for (const [name, job] of Object.entries(jobs)) {
+              if (job.result === 'failure') failed.push(name);
+            }
+            if (failed.length === 0) return;
+            const body = [
+              '## Nightly integration failure',
+              '',
+              `Failed jobs: ${failed.map(j => '`' + j + '`').join(', ')}`,
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              '',
+              'Likely causes:',
+              '- External provider API change (Snowflake / BigQuery / AWS SDK)',
+              '- Test account hit a quota or billing alert',
+              '- Cleanup script left orphans that break the next run',
+              '',
+              'Triage steps in docs/MAINTAINER_HANDBOOK.md.'
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Nightly integration failure (${new Date().toISOString().slice(0, 10)})`,
+              body,
+              labels: ['integration-failure', 'ops']
+            });
