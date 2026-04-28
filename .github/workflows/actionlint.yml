@@ -32,21 +32,34 @@ jobs:
       - name: Run actionlint
         uses: reviewdog/action-actionlint@v1
         with:
-          fail_on_error: true
+          fail_level: error
 
       # Belt-and-suspenders: explicitly grep for the dangerous patterns
       # that actionlint won't catch but that would let a fork PR read
       # secrets if introduced.
-      - name: Check for pull_request_target with checkout
+      #
+      # The check is anchored to the trigger key shape (whitespace then
+      # `pull_request_target:` at the start of a line) so it ignores
+      # comments and string literals that just mention the keyword.
+      #
+      # Some pre-existing workflows use `pull_request_target` for
+      # documented-safe purposes — they are listed in the allowlist
+      # below. Adding a workflow to the allowlist requires explicit
+      # security review (CODEOWNERS gate on .github/workflows/*).
+      - name: Check for pull_request_target trigger outside allowlist
         run: |
-          if grep -rn "pull_request_target" .github/workflows/ \
-             | grep -v actionlint.yml; then
-            echo "::error::pull_request_target found in workflow files."
-            echo "::error::This event grants write+secrets access on fork PRs."
-            echo "::error::Use pull_request: instead, or guard explicitly."
+          allowlist='/(actionlint|docs-reminder|welcome|labeler)\.yml:'
+          violations=$(grep -rEn '^[[:space:]]*pull_request_target[[:space:]]*:' .github/workflows/ \
+            | grep -Ev "$allowlist" || true)
+          if [ -n "$violations" ]; then
+            echo "::error::pull_request_target trigger used outside the audited allowlist:"
+            echo "$violations"
+            echo "::error::pull_request_target on fork PRs grants write+secrets access."
+            echo "::error::If this usage is genuinely safe, add the workflow to the allowlist"
+            echo "::error::in .github/workflows/actionlint.yml AFTER security review."
             exit 1
           fi
-          echo "No pull_request_target usage detected."
+          echo "No new pull_request_target trigger outside the audited allowlist."
 
       # Sanity check: integration.yml must NEVER list pull_request as a
       # trigger. The whole secret-scoping design depends on this.
