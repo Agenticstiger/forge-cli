@@ -22,19 +22,13 @@ model's context window first, raising :class:`ContextOverflowError`
 immediately so the agent loop can compact / summarize / fail fast
 without paying for the failed call.
 
-Three tokenization paths, in falling order of accuracy:
-
-1. **tiktoken** (when ``[langchain]`` extra is installed) — exact for
-   OpenAI / Azure-OpenAI ``gpt-4*`` / ``gpt-3.5*`` / o-series models.
-   Approximate-but-close for everything else (we use the
-   ``cl100k_base`` encoding as a generic upper-bound when the model
-   isn't in tiktoken's catalog).
-2. **char/3.5 heuristic** — when tiktoken isn't installed. Tuned to
-   slightly *over*-estimate for English-heavy inputs so we err on
-   the side of "fail fast" rather than "bill the user for a doomed
-   call".
-3. **provider-specific override** via ``FLUID_TOKEN_COUNTER`` env
-   var (``"chars"`` / ``"tiktoken"`` / ``"none"``).
+Tokenization is a pure-Python ``len(text) / 3.5`` char heuristic —
+tuned to slightly *over*-estimate so we err on "fail fast" rather
+than "bill the user for a doomed call". For a CLI's pre-flight
+overflow check this is sufficient; we'd rather refuse a borderline
+prompt than ship an exact-tokenizer Rust extension. Modern context
+windows are 128K-1M tokens, so the ~10-20% heuristic error is far
+below the precision required to make a different decision.
 
 Context-window sizes are kept as a small in-process catalog rather
 than calling out to provider APIs — model context windows change
@@ -147,54 +141,21 @@ def estimate_tokens(text: str) -> int:
 
 
 def count_tokens(text: str, *, provider: str = "", model: str = "") -> int:
-    """Count tokens in ``text`` for the given ``provider`` / ``model``.
+    """Count tokens in ``text`` using the char-based heuristic.
 
-    Uses tiktoken when available (exact for OpenAI; approximate for
-    others via ``cl100k_base``) and falls back to the char-based
-    heuristic. Honors ``FLUID_TOKEN_COUNTER`` overrides:
+    Pure-Python, no external tokenizers. Provider/model arguments are
+    accepted for symmetry with the call sites but currently unused —
+    every supported provider uses a different tokenizer and shipping
+    each one (Rust-extension tiktoken for OpenAI, custom for Anthropic,
+    SentencePiece for Gemini) would bloat the CLI. The heuristic
+    over-estimates by ~10-20% which matches the desired fail-fast bias.
 
-    * ``chars`` — force the char-based heuristic
-    * ``tiktoken`` — force tiktoken (raises if not installed)
-    * ``none`` / unset — auto (tiktoken if available, char otherwise)
+    ``FLUID_TOKEN_COUNTER=chars`` is the only supported value today and
+    is honored implicitly (it's already the only path).
     """
     if not text:
         return 0
-
-    counter = os.environ.get("FLUID_TOKEN_COUNTER", "").strip().lower()
-    if counter == "chars":
-        return estimate_tokens(text)
-
-    try:
-        return _tiktoken_count(text, model=model, provider=provider)
-    except Exception as exc:  # noqa: BLE001
-        if counter == "tiktoken":
-            # Caller asked for tiktoken explicitly — surface the error
-            # rather than silently falling back to the char heuristic.
-            raise
-        LOG.debug("tiktoken count failed (%s); falling back to char heuristic", exc)
-        return estimate_tokens(text)
-
-
-def _tiktoken_count(text: str, *, model: str, provider: str) -> int:
-    """Inner helper — kept separate so ``count_tokens`` can fall back
-    cleanly if tiktoken isn't installed.
-
-    For OpenAI models, picks the model-matched encoding. For other
-    providers, uses ``cl100k_base`` (the OpenAI 2023+ encoding) as a
-    reasonable upper-bound — most modern tokenizers produce similar
-    counts on natural-language text.
-    """
-    import tiktoken  # noqa: PLC0415 — lazy: only imported when actually counting
-
-    encoding = None
-    if provider in {"openai", "azure-openai"} and model:
-        try:
-            encoding = tiktoken.encoding_for_model(model)
-        except KeyError:
-            encoding = None
-    if encoding is None:
-        encoding = tiktoken.get_encoding("cl100k_base")
-    return len(encoding.encode(text))
+    return estimate_tokens(text)
 
 
 # ---------------------------------------------------------------------------

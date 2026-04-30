@@ -81,53 +81,17 @@ class TestEstimateTokens:
 
 
 class TestCountTokens:
-    def test_empty_string_zero_regardless_of_path(self) -> None:
+    def test_empty_string_zero(self) -> None:
         assert count_tokens("", provider="openai", model="gpt-4o") == 0
 
-    def test_chars_override_forces_heuristic(self, monkeypatch) -> None:
-        monkeypatch.setenv("FLUID_TOKEN_COUNTER", "chars")
-        # Even if tiktoken is installed, the override forces our
-        # heuristic so test results are tiktoken-version-agnostic.
-        text = "a" * 700
+    def test_uses_char_heuristic(self) -> None:
+        text = "a" * 700  # 700 / 3.5 = 200 tokens (exact under the formula)
         assert count_tokens(text, provider="openai", model="gpt-4o") == 200
 
-    def test_tiktoken_path_when_available(self, monkeypatch) -> None:
-        # tiktoken is installed in the test venv (ships with the
-        # langchain extra); count for "hello world" is small but
-        # nonzero. Just check it returns a sensible positive integer.
-        monkeypatch.delenv("FLUID_TOKEN_COUNTER", raising=False)
-        n = count_tokens("hello world", provider="openai", model="gpt-4o")
-        assert isinstance(n, int)
-        assert 1 <= n <= 10  # generous bound, exact value is encoder-dependent
-
-    def test_tiktoken_force_raises_when_missing(self, monkeypatch) -> None:
-        """When the user demands tiktoken explicitly, fall-through to
-        the heuristic is *not* allowed — surface the import error so
-        they know their env isn't set up the way they think."""
-        monkeypatch.setenv("FLUID_TOKEN_COUNTER", "tiktoken")
-        # Simulate tiktoken being unavailable by monkeypatching the
-        # internal helper to raise.
-        from fluid_build.copilot.agents import token_budget as tb
-
-        def boom(*args, **kwargs):
-            raise ImportError("tiktoken not installed")
-
-        monkeypatch.setattr(tb, "_tiktoken_count", boom)
-        with pytest.raises(ImportError):
-            count_tokens("anything", provider="openai", model="gpt-4o")
-
-    def test_auto_falls_back_to_heuristic_when_tiktoken_breaks(
-        self, monkeypatch
-    ) -> None:
-        monkeypatch.delenv("FLUID_TOKEN_COUNTER", raising=False)
-        from fluid_build.copilot.agents import token_budget as tb
-
-        def boom(*args, **kwargs):
-            raise RuntimeError("tiktoken exploded")
-
-        monkeypatch.setattr(tb, "_tiktoken_count", boom)
-        # Falls back to estimate_tokens silently — no exception.
-        assert count_tokens("a" * 700, provider="openai", model="gpt-4o") == 200
+    def test_provider_and_model_args_are_accepted_but_unused(self) -> None:
+        # Symmetry with call sites — the heuristic ignores them.
+        assert count_tokens("hello", provider="anthropic", model="claude-opus-4-7") == 2
+        assert count_tokens("hello", provider="gemini", model="gemini-2.5-pro") == 2
 
 
 class TestCheckPromptFits:

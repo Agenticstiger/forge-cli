@@ -52,18 +52,12 @@ The decorator:
   so the schema and the impl are guaranteed consistent,
 * enforces the ``workspace_root`` security boundary — the kwarg is
   injected at dispatch time and is **never** exposed to the LLM
-  (``args_schema`` excludes it by construction),
-* exposes a langchain-compatible ``BaseTool`` (the
-  :class:`langchain_core.tools.BaseTool` returned by ``@tool``) so the
-  same registry feeds both the legacy provider path and the new
-  langchain-core ChatModel path without re-declaration.
+  (``args_schema`` excludes it by construction).
 
-The langchain-core dependency is imported lazily at decorator-call time
-so importing this module on the legacy path doesn't force the langchain
-extra to be installed. If the user opts into ``[langchain]`` and uses
-``@forge_tool``, the import succeeds and they get the BaseTool surface;
-if they don't, the legacy dict is still produced and the tool still
-works on the legacy dispatcher.
+Pure stdlib + Pydantic — no extra deps. The decorator is a plain
+declarative shim around the legacy dispatcher so existing CLI
+consumers keep working unchanged while contributors get the cleaner
+surface.
 """
 
 from __future__ import annotations
@@ -129,9 +123,6 @@ class ForgeTool:
     * ``workspace_root_aware``: if ``True``, dispatch will inject the
       caller's ``workspace_root`` as a kwarg. The args-schema does NOT
       include this field — the LLM cannot supply it.
-    * ``_lc_tool``: lazy-built langchain ``BaseTool`` instance. Populated
-      only when ``langchain_tool`` is accessed so the langchain extra
-      stays optional at import time.
     * ``tags``: optional taxonomy labels (used by the capability matrix
       to scope tool subsets per provider).
     """
@@ -142,7 +133,6 @@ class ForgeTool:
     impl: Callable[..., Any]
     workspace_root_aware: bool = False
     tags: List[str] = field(default_factory=list)
-    _lc_tool: Any = field(default=None, repr=False)
 
     @property
     def input_schema(self) -> Dict[str, Any]:
@@ -173,19 +163,6 @@ class ForgeTool:
             "input_schema": self.input_schema,
             "impl": self._legacy_impl,
         }
-
-    @property
-    def langchain_tool(self) -> Any:
-        """Return the langchain ``BaseTool`` for this forge tool.
-
-        Lazy because langchain-core is an optional extra; importing
-        the module shouldn't drag the dep in for users on the legacy
-        path. Once built, the BaseTool is cached so repeated access
-        is cheap.
-        """
-        if self._lc_tool is None:
-            self._lc_tool = self._build_langchain_tool()
-        return self._lc_tool
 
     def dispatch(
         self,
@@ -241,31 +218,6 @@ class ForgeTool:
                 "message": result.error_message,
             }
         return result.value
-
-    def _build_langchain_tool(self) -> Any:
-        """Build the langchain ``BaseTool`` instance.
-
-        Uses a thin closure that mirrors :meth:`dispatch` but skips
-        ``workspace_root`` injection — the langchain path expects the
-        forge dispatcher to scope the tool to a workspace at bind time
-        (see :func:`bind_workspace_root_to_lc_tools`), not at call time.
-        """
-        from langchain_core.tools import StructuredTool
-
-        impl = self.impl
-        args_schema = self.args_schema
-
-        def _runnable(**flat_kwargs: Any) -> Any:
-            args_model = args_schema.model_validate(flat_kwargs)
-            return impl(args_model)
-
-        return StructuredTool.from_function(
-            func=_runnable,
-            name=self.name,
-            description=self.description,
-            args_schema=args_schema,
-        )
-
 
 # ---------------------------------------------------------------------------
 # Module-level registry
