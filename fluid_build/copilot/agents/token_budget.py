@@ -97,6 +97,30 @@ DEFAULT_CONTEXT_WINDOWS: Dict[str, int] = {
     "gemini-2.0-flash": 1_000_000,
     "gemini-2.5-pro": 2_000_000,
     "gemini-2.5-flash": 1_000_000,
+    # Ollama-served local models. Windows are the model's design
+    # window; users running on small GPUs may have lower effective
+    # windows due to ``num_ctx`` env / Modelfile overrides — we pick
+    # the model-design value because the dispatcher has no way to
+    # know the per-server override at call time.
+    "llama3.1": 128_000,
+    "llama3.2": 128_000,
+    "llama3.3": 128_000,
+    "llama3": 8_192,
+    "qwen3-coder": 256_000,
+    "qwen3": 128_000,
+    "qwen2.5": 128_000,
+    "qwen": 32_768,
+    "gemma4": 128_000,
+    "gemma3": 128_000,
+    "gemma2": 8_192,
+    "gemma": 8_192,
+    "mistral": 32_768,
+    "mixtral": 32_768,
+    "deepseek-r1": 128_000,
+    "deepseek": 32_768,
+    "phi-4": 16_384,
+    "phi-3": 4_096,
+    "phi": 2_048,
     # Conservative fallback for unknown models — keeps surprises bounded.
     "_default": 32_000,
 }

@@ -310,10 +310,101 @@ CAPABILITY_CATALOG: Tuple[ProviderCapabilities, ...] = (
     ),
     ProviderCapabilities(
         provider="ollama",
+        model_prefix="qwen3-coder",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+        notes=(
+            "qwen3-coder is tuned for code generation; tool-use latency is "
+            "higher than llama3.x but accuracy on structured args is better.",
+        ),
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="qwen3",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="ollama",
         model_prefix="qwen",
         tool_use=True,
         structured_output=False,
         streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="gemma4",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+        notes=(
+            "gemma4 is the project's default Ollama model. Tool-use accuracy "
+            "is acceptable for the staged pipeline; the multi-turn agent loop "
+            "may need more iterations to converge than on hosted providers.",
+        ),
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="gemma3",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="gemma2",
+        tool_use=False,  # gemma2 predates tool-calling support
+        structured_output=False,
+        streaming=True,
+        notes=(
+            "gemma2 does not support tool calling. Use gemma3+ if you need "
+            "the multi-turn agent loop on Ollama.",
+        ),
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="gemma",
+        tool_use=False,
+        structured_output=False,
+        streaming=True,
+        notes=(
+            "Original Gemma (1.x) does not support tool calling. Use gemma3+ "
+            "for the agent loop.",
+        ),
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="mistral",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="mixtral",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="deepseek",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="phi",
+        tool_use=False,  # Phi family is too small to call tools reliably
+        structured_output=False,
+        streaming=True,
+        notes=(
+            "Phi-family models are too small for reliable tool calling. "
+            "Use them for completion-style prompts only.",
+        ),
     ),
 )
 

@@ -84,6 +84,7 @@ from fluid_build.cli.forge_copilot_llm_providers import (  # noqa: E402
     AnthropicProvider,
     GeminiProvider,
     LlmConfig,
+    OllamaProvider,
     OpenAIProvider,
     consume_streaming_usage,
 )
@@ -270,6 +271,38 @@ def _gemini_config() -> LlmConfig | None:
     )
 
 
+def _ollama_config() -> LlmConfig | None:
+    """Build an LlmConfig for a locally-running Ollama server.
+
+    Returns ``None`` when the local server isn't reachable so the
+    smoke test reports cleanly on machines without Ollama installed.
+    Honours ``FLUID_SMOKE_OLLAMA_MODEL`` so users with a different
+    pulled model can run the smoke without code edits.
+    """
+    base_url = os.environ.get("FLUID_OLLAMA_BASE_URL", "http://localhost:11434")
+    model = os.environ.get("FLUID_SMOKE_OLLAMA_MODEL", "gemma4:31b")
+    # Reachability check — three-second budget is enough for a local
+    # server that's actually up.
+    try:
+        probe = httpx.get(f"{base_url}/api/tags", timeout=3.0)
+        if probe.status_code != 200:
+            return None
+    except httpx.HTTPError:
+        return None
+    # ``OllamaProvider`` extends ``OpenAIProvider`` and routes through
+    # the OpenAI-compat ``/v1/chat/completions`` endpoint, so the
+    # smoke test points the LlmConfig there directly. (Note: Ollama
+    # does not require an API key — pass any non-empty value for
+    # parity with the OpenAI build_request shape.)
+    return LlmConfig(
+        provider="ollama",
+        model=model,
+        endpoint=f"{base_url}/v1/chat/completions",
+        api_key="ollama",  # any non-empty token; Ollama ignores it
+        timeout_seconds=180,  # local inference can be slow on big models
+    )
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -283,9 +316,11 @@ def main() -> int:
         ("Anthropic blocking", _anthropic_config, AnthropicProvider()),
         ("OpenAI blocking", _openai_config, OpenAIProvider()),
         ("Gemini blocking", _gemini_config, GeminiProvider()),
+        ("Ollama blocking", _ollama_config, OllamaProvider()),
         ("Anthropic streaming", _anthropic_config, AnthropicProvider()),
         ("OpenAI streaming", _openai_config, OpenAIProvider()),
         ("Gemini streaming", _gemini_config, GeminiProvider()),
+        ("Ollama streaming", _ollama_config, OllamaProvider()),
     ]
 
     for name, build_cfg, provider in tests:

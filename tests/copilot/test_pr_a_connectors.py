@@ -265,3 +265,74 @@ class TestCatalogFreshness:
         self, model: str, expected_window: int
     ) -> None:
         assert get_context_window(model) == expected_window
+
+
+# ---------------------------------------------------------------------------
+# Ollama coverage
+# ---------------------------------------------------------------------------
+
+
+class TestOllamaCatalogCoverage:
+    """Pin the project-default Ollama models in both catalogs.
+
+    The ``llm_models.json`` Ollama default is ``gemma4:latest``; the
+    user's local server (per the PR-A discovery) also runs
+    ``qwen3-coder:30b`` and ``gemma4:31b``. Both must resolve in the
+    capability catalog (no "not in catalog" warning) and produce a
+    reasonable context-window estimate (not the 32K fallback).
+    """
+
+    @pytest.mark.parametrize(
+        "model,expected_prefix,expected_tool_use",
+        [
+            ("gemma4:31b", "gemma4", True),
+            ("gemma4:latest", "gemma4", True),
+            ("gemma3:9b", "gemma3", True),
+            ("gemma2:9b", "gemma2", False),  # gemma2 predates tool calling
+            ("qwen3-coder:30b", "qwen3-coder", True),
+            ("qwen3:7b", "qwen3", True),
+            ("qwen2.5:14b", "qwen", True),  # qwen prefix matches qwen2.5
+            ("llama3.1:70b", "llama3.1", True),
+            ("llama3.2:3b", "llama3.2", True),
+            ("mistral:7b", "mistral", True),
+            ("mixtral:8x7b", "mixtral", True),
+            ("deepseek-r1:8b", "deepseek", True),
+            ("phi-4:14b", "phi", False),  # too small for reliable tool calls
+        ],
+    )
+    def test_capability_catalog_resolves_ollama_models(
+        self, model: str, expected_prefix: str, expected_tool_use: bool
+    ) -> None:
+        caps = assess_capabilities("ollama", model)
+        assert caps.model_prefix == expected_prefix, (
+            f"expected prefix {expected_prefix!r} for {model!r}, " f"got {caps.model_prefix!r}"
+        )
+        assert caps.tool_use is expected_tool_use
+        # Every catalogued Ollama entry should advertise streaming.
+        assert caps.streaming is True
+        # No Ollama entry advertises strict structured output today —
+        # they all run JSON mode without server-side schema.
+        assert caps.structured_output is False
+
+    @pytest.mark.parametrize(
+        "model,minimum_window",
+        [
+            ("gemma4:31b", 100_000),
+            ("gemma4:latest", 100_000),
+            ("qwen3-coder:30b", 200_000),
+            ("qwen3:7b", 100_000),
+            ("llama3.1:70b", 100_000),
+            ("llama3.2:3b", 100_000),
+            ("mistral:7b", 30_000),
+            ("mixtral:8x7b", 30_000),
+        ],
+    )
+    def test_token_budget_catalog_covers_ollama_models(
+        self, model: str, minimum_window: int
+    ) -> None:
+        # The Ollama prefix lookup should produce the model-design
+        # window, not the conservative 32K fallback.
+        window = get_context_window(model)
+        assert window >= minimum_window, (
+            f"{model} resolved to {window:,}-token window; " f"expected at least {minimum_window:,}"
+        )
