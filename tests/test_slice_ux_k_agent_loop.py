@@ -119,9 +119,7 @@ class TestToolRegistry:
             "validate_contract",
             "list_schedulers",
         }
-        assert expected.issubset(names), (
-            f"missing tools: {expected - names}"
-        )
+        assert expected.issubset(names), f"missing tools: {expected - names}"
 
     def test_tool_definitions_shape(self):
         defs = get_tool_definitions()
@@ -213,6 +211,7 @@ class TestToolRegistry:
         two registries.
         """
         from pydantic import BaseModel
+
         from fluid_build.cli.forge_tool import (
             FORGE_TOOL_REGISTRY,
             forge_tool,
@@ -230,15 +229,11 @@ class TestToolRegistry:
             def _impl(args):  # noqa: ARG001
                 raise FileNotFoundError(leaky_path)
 
-            result = dispatch_tool_call(
-                "leaky_via_forge_tool", {"payload": "trigger"}
-            )
+            result = dispatch_tool_call("leaky_via_forge_tool", {"payload": "trigger"})
             assert result.get("error") == "FileNotFoundError"
             assert leaky_path not in result.get("error", "")
             assert leaky_path not in result.get("message", "")
-            assert result.get("message") == (
-                "Tool 'leaky_via_forge_tool' failed — see server logs"
-            )
+            assert result.get("message") == ("Tool 'leaky_via_forge_tool' failed — see server logs")
         finally:
             FORGE_TOOL_REGISTRY.pop("leaky_via_forge_tool", None)
 
