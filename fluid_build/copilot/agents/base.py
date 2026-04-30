@@ -355,6 +355,25 @@ class BaseStageAgent:
             if cached is not None:
                 return output_schema.model_validate(cached.value)
 
+        # World-class agent layer: pre-flight token budget check.
+        # Submitting a prompt that's already too big for the model's
+        # context window guarantees a 4xx + retry storm. Counting
+        # locally first lets us raise ``ContextOverflowError``
+        # immediately so :func:`retry_with_backoff` fails fast (the
+        # error is in the non-retryable set) and the agent loop can
+        # compact the message history before re-attempting. Disable
+        # via ``capability_matrix["disable_token_preflight"]: True``
+        # for users who want to risk the API call.
+        from fluid_build.copilot.agents.token_budget import check_prompt_fits
+
+        check_prompt_fits(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            provider=provider.name,
+            model=config.model,
+            capability_matrix=session.capability_matrix or {},
+        )
+
         # World-class agent layer: opt-in langchain-core path. When
         # FLUID_USE_LANGCHAIN_PROVIDERS=1 (or capability_matrix has
         # ``use_langchain_providers: True``), the structured-output
