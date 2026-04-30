@@ -111,6 +111,29 @@ copilot = [
   "fastavro>=1.9",
 ]
 
+# World-class agent layer — opt-in via FLUID_USE_LANGCHAIN_PROVIDERS=1.
+#
+# Replaces the bespoke 2.4K-line provider abstraction with the
+# langchain-core ChatModel interface so:
+#   * provider parity is one upstream package away (Gemini structured
+#     output re-enabled, Ollama gets first-class tool_use, prompt caching
+#     uniform on Anthropic, extended-thinking ready),
+#   * streaming carries usage metadata (cost tracking stops lying),
+#   * @tool generates JSON Schema from the function signature instead
+#     of being hand-written twice.
+#
+# Kept as a separate extra so existing users on the legacy provider
+# path don't pay the install cost. Pin to the 0.3.x series — that's
+# the LangChain "stable agent runtime" line, no breaking 0.x→0.x jumps.
+langchain = [
+  "langchain-core>=0.3,<0.4",
+  "langchain-anthropic>=0.3,<0.4",
+  "langchain-openai>=0.3,<0.4",
+  "langchain-google-genai>=2.0,<3.0",
+  "langchain-ollama>=0.3,<0.4",
+  "tiktoken>=0.7",  # Pre-flight token estimation for ContextOverflowError
+]
+
 # Optional embedding-backed semantic search for the memory/semantic namespace.
 # When this extra is installed AND the backing store is a SqliteBackend,
 # ``VectorBackend`` upgrades from stdlib ``difflib`` ranking to a real
@@ -189,7 +212,7 @@ dev = [
 
 # One-shot install for contributors
 all = [
-  "data-product-forge[local,gcp,snowflake,viz,opds,tui,copilot,vector,postgres,docs,dev]"
+  "data-product-forge[local,gcp,snowflake,viz,opds,tui,copilot,langchain,vector,postgres,docs,dev]"
 ]
 
 [project.scripts]
