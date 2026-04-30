@@ -89,46 +89,34 @@ _COMPACT_KEEP_TAIL = 4  # Keep last N messages intact.
 _COMPACT_MAX_CHARS = 500  # Truncate old tool results to this length.
 
 
-def _compact_message_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Truncate old tool result messages to prevent context window overflow.
+def _compact_message_history(
+    messages: List[Dict[str, Any]],
+    *,
+    capability_matrix: Optional[Dict[str, Any]] = None,
+    summarizer: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    """Compact tool-heavy message history to prevent context overflow.
 
-    Keeps the first message (original user context) and the last
-    ``_COMPACT_KEEP_TAIL`` messages intact.  Messages in between have
-    their content truncated to ``_COMPACT_MAX_CHARS`` characters.
+    Delegates to :mod:`fluid_build.cli.forge_copilot_compaction` so
+    the strategy is pluggable: ``truncate`` (default, char-aware),
+    ``summarize`` (LLM-backed), or ``hybrid``. Pick via
+    ``capability_matrix["compaction_strategy"]`` or
+    ``FLUID_COMPACTION_STRATEGY`` env. The legacy
+    ``_COMPACT_KEEP_TAIL`` / ``_COMPACT_MAX_CHARS`` knobs are
+    preserved as the truncate-strategy defaults so existing operators
+    see the same behaviour unless they explicitly opt into the
+    summarize / hybrid strategies.
     """
-    if len(messages) <= _COMPACT_KEEP_TAIL + 1:
-        return messages
-
-    head = messages[:1]
-    tail = messages[-_COMPACT_KEEP_TAIL:]
-    middle = messages[1:-_COMPACT_KEEP_TAIL]
-
-    compacted_middle: List[Dict[str, Any]] = []
-    for msg in middle:
-        content = msg.get("content", "")
-        if isinstance(content, str) and len(content) > _COMPACT_MAX_CHARS:
-            msg = dict(msg)
-            msg["content"] = (
-                content[:_COMPACT_MAX_CHARS] + f" [truncated — {len(content)} chars total]"
-            )
-        elif isinstance(content, list):
-            # Anthropic-style content blocks — truncate text blocks.
-            new_blocks = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = block.get("text", "")
-                    if len(text) > _COMPACT_MAX_CHARS:
-                        block = dict(block)
-                        block["text"] = (
-                            text[:_COMPACT_MAX_CHARS] + f" [truncated — {len(text)} chars total]"
-                        )
-                new_blocks.append(block)
-            msg = dict(msg)
-            msg["content"] = new_blocks
-        compacted_middle.append(msg)
+    from fluid_build.cli.forge_copilot_compaction import compact_messages
 
     before = sum(len(json.dumps(m.get("content", ""))) for m in messages)
-    result = head + compacted_middle + tail
+    result = compact_messages(
+        messages,
+        capability_matrix=capability_matrix,
+        summarizer=summarizer,
+        keep_tail=_COMPACT_KEEP_TAIL,
+        truncate_chars=_COMPACT_MAX_CHARS,
+    )
     after = sum(len(json.dumps(m.get("content", ""))) for m in result)
     LOG.debug(
         "Compacted message history: %d messages, %d→%d chars",
