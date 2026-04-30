@@ -111,6 +111,7 @@ copilot = [
   "fastavro>=1.9",
 ]
 
+
 # Optional embedding-backed semantic search for the memory/semantic namespace.
 # When this extra is installed AND the backing store is a SqliteBackend,
 # ``VectorBackend`` upgrades from stdlib ``difflib`` ranking to a real

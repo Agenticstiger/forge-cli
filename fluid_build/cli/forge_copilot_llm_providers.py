@@ -57,6 +57,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -73,6 +74,64 @@ from fluid_build.cli.forge_copilot_response_schema import (
 )
 
 LOG = logging.getLogger("fluid.cli.forge_copilot.llm")
+
+
+# ---------------------------------------------------------------------------
+# Streaming usage capture
+#
+# Closes the "record_missing_usage on every streaming run" gap. SSE
+# streams from all three cloud providers carry token-usage events
+# (Anthropic ``message_delta.usage``, OpenAI final chunk's ``usage``
+# field when ``stream_options.include_usage`` is set, Gemini's
+# ``usageMetadata`` on the terminal chunk). The legacy
+# ``iter_stream_chunks`` discarded these. We now stash them in a
+# thread-local so the streaming caller (``BaseStageAgent._call_once``)
+# can pull them back out after the SSE iterator drains.
+#
+# Thread-local because providers are module-level singletons and the
+# coordinator runs stages in a ThreadPoolExecutor — using an instance
+# attribute would race across concurrent stages on the same provider.
+# ---------------------------------------------------------------------------
+
+
+_streaming_usage_state = threading.local()
+
+
+def _record_streaming_usage(
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> None:
+    """Stash a per-call usage record on the current thread.
+
+    Called from each provider's ``iter_stream_chunks`` when a
+    usage-bearing SSE event arrives. The record is read back via
+    :func:`consume_streaming_usage` after the SSE iterator drains;
+    callers should always pop (rather than peek) to avoid leaking
+    state across calls on long-lived threads.
+    """
+    _streaming_usage_state.usage = {
+        "input_tokens": int(input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+        "total_tokens": int((input_tokens or 0) + (output_tokens or 0)),
+        "cache_read_tokens": int(cache_read_tokens or 0),
+        "cache_write_tokens": int(cache_write_tokens or 0),
+    }
+
+
+def consume_streaming_usage() -> Optional[Dict[str, int]]:
+    """Pop the most recent streaming-usage record for this thread.
+
+    Returns ``None`` if no streaming call has recorded usage on the
+    current thread (or if the previous record has already been
+    consumed). Pops the value so a subsequent blocking call doesn't
+    accidentally see a stale streaming record.
+    """
+    usage = getattr(_streaming_usage_state, "usage", None)
+    _streaming_usage_state.usage = None
+    return usage
 
 
 def _structured_outputs_enabled() -> bool:
@@ -539,6 +598,17 @@ class OpenAIProvider(LlmProvider):
             except json.JSONDecodeError:
                 continue
             _record_prompt_cache_from_response(self, event)
+            # OpenAI streams a terminal chunk with the full request
+            # usage when ``stream_options.include_usage`` is set
+            # (we set it in ``build_streaming_request``). Capture it
+            # so the staged-agent layer's cost tracker stops calling
+            # ``record_missing_usage`` on every streamed call.
+            usage_block = event.get("usage")
+            if isinstance(usage_block, dict):
+                _record_streaming_usage(
+                    input_tokens=usage_block.get("prompt_tokens", 0) or 0,
+                    output_tokens=usage_block.get("completion_tokens", 0) or 0,
+                )
             choices = event.get("choices") or []
             if not choices:
                 continue
@@ -847,6 +917,26 @@ class AnthropicProvider(LlmProvider):
                 continue
             usage_source = event.get("message") if isinstance(event.get("message"), dict) else event
             _record_prompt_cache_from_response(self, usage_source)
+            # Anthropic streams usage in two places: the initial
+            # ``message_start`` event carries the input-token count
+            # (and any cache_read/cache_creation hits), and a final
+            # ``message_delta`` event carries the cumulative output
+            # tokens. We accumulate both so that by the time the
+            # iterator drains, the thread-local stash has the
+            # complete usage record for this call.
+            usage_block = (
+                (usage_source or {}).get("usage") if isinstance(usage_source, dict) else None
+            )
+            if isinstance(usage_block, dict):
+                prior = getattr(_streaming_usage_state, "usage", None) or {}
+                _record_streaming_usage(
+                    input_tokens=usage_block.get("input_tokens") or prior.get("input_tokens", 0),
+                    output_tokens=usage_block.get("output_tokens") or prior.get("output_tokens", 0),
+                    cache_read_tokens=usage_block.get("cache_read_input_tokens")
+                    or prior.get("cache_read_tokens", 0),
+                    cache_write_tokens=usage_block.get("cache_creation_input_tokens")
+                    or prior.get("cache_write_tokens", 0),
+                )
             event_type = event.get("type")
             if event_type == "content_block_delta":
                 delta = event.get("delta") or {}
@@ -1081,6 +1171,17 @@ class GeminiProvider(LlmProvider):
             except json.JSONDecodeError:
                 continue
             _record_prompt_cache_from_response(self, event)
+            # Gemini ships its terminal usage block in ``usageMetadata``
+            # on the last SSE event of the stream. Capture so the
+            # staged-agent layer's cost tracker stops calling
+            # ``record_missing_usage`` on every Gemini streaming run.
+            usage_md = event.get("usageMetadata")
+            if isinstance(usage_md, dict):
+                _record_streaming_usage(
+                    input_tokens=usage_md.get("promptTokenCount", 0) or 0,
+                    output_tokens=usage_md.get("candidatesTokenCount", 0) or 0,
+                    cache_read_tokens=usage_md.get("cachedContentTokenCount", 0) or 0,
+                )
             for candidate in event.get("candidates") or []:
                 content = candidate.get("content") or {}
                 for part in content.get("parts") or []:

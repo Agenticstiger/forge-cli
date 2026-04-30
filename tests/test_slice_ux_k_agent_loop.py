@@ -570,7 +570,16 @@ class TestReadSampleSchemaConfinement:
             r = real_stat(p, *a, **kw)
             return FakeStatResult(r)
 
-        monkeypatch.setattr(Path, "stat", lambda self: FakeStatResult(real_stat(str(self))))
+        # ``**kwargs`` absorbs Python 3.12+'s ``follow_symlinks=...``
+        # which pytest's internal cleanup path passes through
+        # ``Path.exists()`` → ``Path.stat()`` during teardown. Without
+        # it, Python 3.13 atexit cleanup raises ``TypeError: lambda
+        # got an unexpected keyword argument 'follow_symlinks'``.
+        monkeypatch.setattr(
+            Path,
+            "stat",
+            lambda self, **kwargs: FakeStatResult(real_stat(str(self))),
+        )
         result = dispatch_tool_call(
             "read_sample_schema",
             {"path": str(big)},
