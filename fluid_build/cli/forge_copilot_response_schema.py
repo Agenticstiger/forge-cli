@@ -232,9 +232,7 @@ def _harden_node(node: Any) -> Any:
 
     # Recurse into properties / items.
     if "properties" in node and isinstance(node["properties"], dict):
-        node["properties"] = {
-            k: _harden_node(v) for k, v in node["properties"].items()
-        }
+        node["properties"] = {k: _harden_node(v) for k, v in node["properties"].items()}
     if "items" in node:
         node["items"] = _harden_node(node["items"])
     if isinstance(node.get("oneOf"), list):

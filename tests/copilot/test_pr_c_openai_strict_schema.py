@@ -55,9 +55,7 @@ class TestHardenWalker:
         hardened = _harden_for_openai_strict(FORGE_RESPONSE_SCHEMA)
         properties = set(hardened["properties"].keys())
         required = set(hardened["required"])
-        assert properties == required, (
-            f"missing in required: {properties - required}"
-        )
+        assert properties == required, f"missing in required: {properties - required}"
 
     def test_free_form_object_becomes_json_encoded_string(self) -> None:
         """The legacy ``contract`` field is ``type: object``,
