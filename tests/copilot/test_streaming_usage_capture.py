@@ -31,6 +31,7 @@ from typing import List
 from fluid_build.cli.forge_copilot_llm_providers import (
     AnthropicProvider,
     GeminiProvider,
+    OllamaProvider,
     OpenAIProvider,
     consume_streaming_usage,
 )
@@ -117,6 +118,51 @@ class TestAnthropicStreamingUsage:
         assert usage["output_tokens"] == 15
         assert usage["cache_read_tokens"] == 80
         assert usage["cache_write_tokens"] == 40
+
+
+class TestOllamaStreamingUsage:
+    """``OllamaProvider`` extends ``OpenAIProvider`` so it inherits the
+    OpenAI SSE-usage-event parser. Verify that path actually fires
+    against an Ollama-shaped chat completions stream — recent Ollama
+    (>= 0.3.x) emits the OpenAI-compat terminal ``usage`` chunk when
+    ``stream_options.include_usage`` is set, which the OpenAI provider
+    requests by default in ``build_streaming_request``."""
+
+    def setup_method(self) -> None:
+        consume_streaming_usage()
+
+    def test_ollama_terminal_chunk_usage_is_captured(self) -> None:
+        provider = OllamaProvider()
+        # Recent Ollama emits OpenAI-compat usage on the last chunk
+        # when stream_options.include_usage is set (which OpenAIProvider
+        # already does in build_streaming_request).
+        sse_lines = [
+            'data: {"choices":[{"delta":{"content":"hi"}}]}',
+            'data: {"choices":[{"delta":{"content":" there"}}]}',
+            'data: {"choices":[],"usage":{"prompt_tokens":17,"completion_tokens":4,"total_tokens":21}}',
+            "data: [DONE]",
+        ]
+        text = "".join(provider.iter_stream_chunks(StubResponse(sse_lines)))
+        assert text == "hi there"
+        usage = consume_streaming_usage()
+        assert usage is not None
+        assert usage["input_tokens"] == 17
+        assert usage["output_tokens"] == 4
+        assert usage["total_tokens"] == 21
+
+    def test_ollama_without_usage_chunk_records_nothing(self) -> None:
+        """Older Ollama servers (< 0.3.x) don't emit a terminal usage
+        chunk. The stash should stay empty in that case so the cost
+        tracker records ``missing usage`` cleanly rather than reporting
+        garbage zeros."""
+        provider = OllamaProvider()
+        sse_lines = [
+            'data: {"choices":[{"delta":{"content":"hi"}}]}',
+            "data: [DONE]",
+        ]
+        text = "".join(provider.iter_stream_chunks(StubResponse(sse_lines)))
+        assert text == "hi"
+        assert consume_streaming_usage() is None
 
 
 class TestGeminiStreamingUsage:

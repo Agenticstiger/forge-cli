@@ -379,7 +379,7 @@ def _call_llm_with_tools(
             f"for {config.provider} model '{config.model}'.",
             suggestions=[
                 "Check the model supports tool use",
-                "Try --llm-model gpt-4o / claude-3-5-sonnet-latest / gemini-1.5-pro",
+                "Try --llm-model gpt-4.1-mini / claude-sonnet-4-6 / gemini-2.5-flash",
             ],
         ) from exc
     except httpx.HTTPError as exc:

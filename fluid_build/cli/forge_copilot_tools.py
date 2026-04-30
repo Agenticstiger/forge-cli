@@ -581,10 +581,34 @@ _register(
 
 
 def get_tool_definitions() -> List[Dict[str, Any]]:
-    """Return the tool definitions in the shape providers expect."""
-    tool_values = list(TOOL_REGISTRY.values())
-    if _staged_tool_enabled():
+    """Return the tool definitions in the shape providers expect.
+
+    Merges the legacy ``TOOL_REGISTRY`` (hand-written dict entries)
+    with the world-class ``FORGE_TOOL_REGISTRY`` (Pydantic-typed
+    ``@forge_tool`` registrations) so the LLM sees both. Names in the
+    legacy registry win on collision so existing tools keep their
+    exact wire shape until they're explicitly migrated.
+    """
+    from fluid_build.cli.forge_tool import FORGE_TOOL_REGISTRY
+
+    seen: set[str] = set()
+    tool_values: List[Dict[str, Any]] = []
+
+    for t in TOOL_REGISTRY.values():
+        if t["name"] in seen:
+            continue
+        seen.add(t["name"])
+        tool_values.append(t)
+
+    for forge_tool in FORGE_TOOL_REGISTRY.values():
+        if forge_tool.name in seen:
+            continue
+        seen.add(forge_tool.name)
+        tool_values.append(forge_tool.legacy_dict)
+
+    if _staged_tool_enabled() and _FORGE_DATA_MODEL_TOOL["name"] not in seen:
         tool_values.append(_FORGE_DATA_MODEL_TOOL)
+
     return [
         {
             "name": t["name"],
@@ -608,6 +632,14 @@ def dispatch_tool_call(
     return an error dict rather than raising so the agent loop can
     continue.
 
+    Resolution order:
+
+    1. Legacy ``TOOL_REGISTRY`` — hand-written dict entries.
+    2. ``FORGE_TOOL_REGISTRY`` — Pydantic-typed ``@forge_tool``
+       registrations (their ``legacy_dict["impl"]`` adapter handles
+       arg validation + workspace_root injection).
+    3. The staged ``_FORGE_DATA_MODEL_TOOL`` fallback when enabled.
+
     ``workspace_root`` (SECURITY_REVIEW S-003/S-004) is forwarded to
     every tool impl as a keyword argument. Tools that don't care
     absorb it via ``**_kw``; tools that must be confined
@@ -615,6 +647,18 @@ def dispatch_tool_call(
     explicitly.
     """
     tool = TOOL_REGISTRY.get(name)
+    if tool is None:
+        # Bridge to the world-class @forge_tool registry. The
+        # ``legacy_dict`` wrapper validates args via the Pydantic
+        # args_schema and routes through the typed dispatcher
+        # (returns ``{"error": ..., "message": ...}`` on failure
+        # without leaking the original exception text — same security
+        # posture as the legacy path).
+        from fluid_build.cli.forge_tool import FORGE_TOOL_REGISTRY
+
+        forge_tool = FORGE_TOOL_REGISTRY.get(name)
+        if forge_tool is not None:
+            tool = forge_tool.legacy_dict
     if tool is None and name == _FORGE_DATA_MODEL_TOOL["name"] and _staged_tool_enabled():
         tool = _FORGE_DATA_MODEL_TOOL
     if not tool:

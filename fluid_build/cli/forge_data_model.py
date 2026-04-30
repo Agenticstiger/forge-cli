@@ -1066,10 +1066,44 @@ def _resolve_optional_llm_config(args: Any, logger: logging.Logger):
     if not explicit:
         return None
     try:
-        return resolve_llm_config(args)
+        config = resolve_llm_config(args)
     except Exception as exc:  # noqa: BLE001
         logger.error("could_not_resolve_llm_config: %s", exc)
         raise
+    # Surface known capability gaps for the resolved (provider, model)
+    # combination *before* the run starts. ``staged_pipeline`` is the
+    # right profile for ``fluid forge data-model`` — each stage is a
+    # single LLM call, so we only require structured-output
+    # enforcement (not tool_use). ``FLUID_QUIET`` / ``FLUID_NONINTERACTIVE``
+    # suppress the print but still record warnings to telemetry.
+    try:
+        import os as _os
+
+        from fluid_build.copilot.agents.capability_catalog import (
+            emit_degradation_warnings,
+        )
+
+        quiet = (
+            bool(getattr(args, "quiet", False))
+            or _os.environ.get("FLUID_QUIET") == "1"
+            or _os.environ.get("FLUID_NONINTERACTIVE") == "1"
+        )
+        warnings = emit_degradation_warnings(
+            provider=config.provider,
+            model=config.model,
+            usage_profile="staged_pipeline",
+            quiet=quiet,
+        )
+        if warnings:
+            logger.info(
+                "capability_warnings_count=%d provider=%s model=%s",
+                len(warnings),
+                config.provider,
+                config.model,
+            )
+    except Exception as exc:  # noqa: BLE001 — diagnostic, never block
+        logger.debug("capability_warning_emit_failed: %s", exc)
+    return config
 
 
 def _normalize_technique(value: Optional[str]) -> Optional[str]:

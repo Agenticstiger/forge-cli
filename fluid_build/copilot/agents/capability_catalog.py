@@ -102,10 +102,40 @@ CAPABILITY_CATALOG: Tuple[ProviderCapabilities, ...] = (
         streaming=True,
         prompt_caching=True,
         extended_thinking=True,
-        notes=(
-            "Temperature is deprecated on Opus 4.7 — the langchain "
-            "provider drops it automatically.",
-        ),
+        notes=("Temperature is deprecated on Opus 4.7 — providers drop it " "automatically.",),
+    ),
+    ProviderCapabilities(
+        provider="anthropic",
+        model_prefix="claude-sonnet-4-7",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+        prompt_caching=True,
+        extended_thinking=True,
+    ),
+    ProviderCapabilities(
+        provider="anthropic",
+        model_prefix="claude-sonnet-4-6",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+        prompt_caching=True,
+    ),
+    ProviderCapabilities(
+        provider="anthropic",
+        model_prefix="claude-sonnet-4-5",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+        prompt_caching=True,
+    ),
+    ProviderCapabilities(
+        provider="anthropic",
+        model_prefix="claude-haiku-4-5",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+        prompt_caching=True,
     ),
     ProviderCapabilities(
         provider="anthropic",
@@ -153,11 +183,40 @@ CAPABILITY_CATALOG: Tuple[ProviderCapabilities, ...] = (
     ),
     ProviderCapabilities(
         provider="openai",
+        model_prefix="o4",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+        extended_thinking=True,
+    ),
+    ProviderCapabilities(
+        provider="openai",
         model_prefix="o3",
         tool_use=True,
         structured_output=True,
         streaming=True,
         extended_thinking=True,
+    ),
+    ProviderCapabilities(
+        provider="openai",
+        model_prefix="gpt-4.1-nano",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="openai",
+        model_prefix="gpt-4.1-mini",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="openai",
+        model_prefix="gpt-4.1",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
     ),
     ProviderCapabilities(
         provider="openai",
@@ -248,10 +307,101 @@ CAPABILITY_CATALOG: Tuple[ProviderCapabilities, ...] = (
     ),
     ProviderCapabilities(
         provider="ollama",
+        model_prefix="qwen3-coder",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+        notes=(
+            "qwen3-coder is tuned for code generation; tool-use latency is "
+            "higher than llama3.x but accuracy on structured args is better.",
+        ),
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="qwen3",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="ollama",
         model_prefix="qwen",
         tool_use=True,
         structured_output=False,
         streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="gemma4",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+        notes=(
+            "gemma4 is the project's default Ollama model. Tool-use accuracy "
+            "is acceptable for the staged pipeline; the multi-turn agent loop "
+            "may need more iterations to converge than on hosted providers.",
+        ),
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="gemma3",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="gemma2",
+        tool_use=False,  # gemma2 predates tool-calling support
+        structured_output=False,
+        streaming=True,
+        notes=(
+            "gemma2 does not support tool calling. Use gemma3+ if you need "
+            "the multi-turn agent loop on Ollama.",
+        ),
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="gemma",
+        tool_use=False,
+        structured_output=False,
+        streaming=True,
+        notes=(
+            "Original Gemma (1.x) does not support tool calling. Use gemma3+ "
+            "for the agent loop.",
+        ),
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="mistral",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="mixtral",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="deepseek",
+        tool_use=True,
+        structured_output=False,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="ollama",
+        model_prefix="phi",
+        tool_use=False,  # Phi family is too small to call tools reliably
+        structured_output=False,
+        streaming=True,
+        notes=(
+            "Phi-family models are too small for reliable tool calling. "
+            "Use them for completion-style prompts only.",
+        ),
     ),
 )
 
@@ -374,4 +524,39 @@ def format_degradation_warnings(
     for note in caps.notes:
         warnings.append(f"Note for {provider}/{model}: {note}")
 
+    return warnings
+
+
+def emit_degradation_warnings(
+    *,
+    provider: str,
+    model: str,
+    usage_profile: str = "staged_pipeline",
+    required: Optional[Iterable[str]] = None,
+    quiet: bool = False,
+) -> List[str]:
+    """Compute :func:`format_degradation_warnings` and print each line
+    via the standard CLI console (so it gets the usual Rich styling
+    + the secret-redaction filter from
+    :mod:`fluid_build.cli.console`).
+
+    Returns the warnings list (possibly empty) for callers that also
+    want to attach it to telemetry. ``quiet=True`` suppresses the
+    print but still returns the list — useful in tests and in the
+    ``FLUID_QUIET`` / ``FLUID_NONINTERACTIVE`` paths where the
+    caller already gates console output.
+    """
+    warnings = format_degradation_warnings(
+        provider=provider,
+        model=model,
+        usage_profile=usage_profile,
+        required=required,
+    )
+    if warnings and not quiet:
+        # Imported lazily to avoid a hard dep on ``rich``/console
+        # plumbing for users of the catalog who never want the print.
+        from fluid_build.cli import console as _console  # noqa: PLC0415
+
+        for line in warnings:
+            _console.warning(line)
     return warnings

@@ -456,7 +456,7 @@ def register(subparsers: argparse._SubParsersAction):
             "Use the multi-turn agent loop instead of the single-shot prompt. "
             "The LLM discovers your workspace, picks a template, builds and "
             "validates the contract iteratively via tool calls. "
-            "Requires a tool-use-capable model (gpt-4o, claude-3-5-sonnet, gemini-1.5-pro)."
+            "Requires a tool-use-capable model (gpt-4.1-mini, claude-sonnet-4-6, gemini-2.5-flash)."
         ),
     )
 

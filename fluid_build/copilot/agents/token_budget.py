@@ -68,12 +68,19 @@ DEFAULT_CONTEXT_WINDOWS: Dict[str, int] = {
     "claude-opus-4-7": 1_000_000,
     "claude-opus-4-6": 200_000,
     "claude-opus-4-5": 200_000,
+    "claude-sonnet-4-7": 200_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-sonnet-4-5": 200_000,
+    "claude-haiku-4-5": 200_000,
     "claude-3-5-sonnet": 200_000,
     "claude-3-5-haiku": 200_000,
     "claude-3-opus": 200_000,
     "claude-3-sonnet": 200_000,
     "claude-3-haiku": 200_000,
     # OpenAI
+    "gpt-4.1": 1_000_000,
+    "gpt-4.1-mini": 1_000_000,
+    "gpt-4.1-nano": 1_000_000,
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
     "gpt-4-turbo": 128_000,
@@ -83,11 +90,37 @@ DEFAULT_CONTEXT_WINDOWS: Dict[str, int] = {
     "o1-mini": 128_000,
     "o3": 200_000,
     "o3-mini": 200_000,
+    "o4-mini": 200_000,
     # Google Gemini
     "gemini-1.5-pro": 2_000_000,
     "gemini-1.5-flash": 1_000_000,
     "gemini-2.0-flash": 1_000_000,
     "gemini-2.5-pro": 2_000_000,
+    "gemini-2.5-flash": 1_000_000,
+    # Ollama-served local models. Windows are the model's design
+    # window; users running on small GPUs may have lower effective
+    # windows due to ``num_ctx`` env / Modelfile overrides — we pick
+    # the model-design value because the dispatcher has no way to
+    # know the per-server override at call time.
+    "llama3.1": 128_000,
+    "llama3.2": 128_000,
+    "llama3.3": 128_000,
+    "llama3": 8_192,
+    "qwen3-coder": 256_000,
+    "qwen3": 128_000,
+    "qwen2.5": 128_000,
+    "qwen": 32_768,
+    "gemma4": 128_000,
+    "gemma3": 128_000,
+    "gemma2": 8_192,
+    "gemma": 8_192,
+    "mistral": 32_768,
+    "mixtral": 32_768,
+    "deepseek-r1": 128_000,
+    "deepseek": 32_768,
+    "phi-4": 16_384,
+    "phi-3": 4_096,
+    "phi": 2_048,
     # Conservative fallback for unknown models — keeps surprises bounded.
     "_default": 32_000,
 }
