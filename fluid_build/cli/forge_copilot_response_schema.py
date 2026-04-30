@@ -169,22 +169,147 @@ FORGE_RESPONSE_SCHEMA: Dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
+def _harden_for_openai_strict(schema: Any) -> Any:
+    """Recursively rewrite a JSON Schema for OpenAI strict mode.
+
+    OpenAI's strict ``response_format = json_schema`` requires every
+    object node to declare ``additionalProperties: false`` AND list
+    every property under ``required``. The legacy
+    :data:`FORGE_RESPONSE_SCHEMA` has nested objects (``contract``,
+    ``additional_files``) that intentionally use
+    ``additionalProperties: true`` because the contract is free-form
+    and downstream semantic validation enforces shape. Sending that
+    schema to OpenAI strict mode returns a 400 with::
+
+        Invalid schema for response_format 'ForgeContract':
+        In context=('properties', 'contract'),
+        'additionalProperties' is required to be supplied and to be false.
+
+    This walker hardens the schema in place by:
+
+    * Setting ``additionalProperties: false`` on every object node.
+    * Forcing every key in ``properties`` to appear in ``required``.
+
+    The transform is non-destructive — the input schema is deep-copied
+    before mutation. The hardened shape is *stricter* than what the
+    LLM produced before (no padding fields allowed). For a free-form
+    field like ``contract``, the schema becomes "an object with these
+    exact required properties" — but since the legacy ``contract``
+    declares ``properties: {}``, the result is "an object with no
+    fields", which would refuse to match a real FLUID contract.
+
+    To handle that, when a node has ``additionalProperties: true`` AND
+    an empty ``properties: {}``, we rewrite it into a free-form
+    ``string`` so the LLM can return any JSON-encoded payload. The
+    caller is expected to ``json.loads`` it. This is how OpenAI
+    recommends handling free-form nested data under strict mode.
+    """
+    import copy
+
+    return _harden_node(copy.deepcopy(schema))
+
+
+def _harden_node(node: Any) -> Any:
+    if not isinstance(node, dict):
+        return node
+
+    # Free-form object → encode-as-string escape hatch. Preserves the
+    # ability for the LLM to return arbitrary nested data while
+    # keeping the schema strict-compatible.
+    if (
+        node.get("type") == "object"
+        and node.get("additionalProperties") is True
+        and not node.get("properties")
+    ):
+        rewritten: Dict[str, Any] = {
+            "type": "string",
+            "description": (
+                (node.get("description", "") or "")
+                + " (JSON-encoded string under OpenAI strict mode)"
+            ).strip(),
+        }
+        return rewritten
+
+    # Recurse into properties / items.
+    if "properties" in node and isinstance(node["properties"], dict):
+        node["properties"] = {
+            k: _harden_node(v) for k, v in node["properties"].items()
+        }
+    if "items" in node:
+        node["items"] = _harden_node(node["items"])
+    if isinstance(node.get("oneOf"), list):
+        node["oneOf"] = [_harden_node(x) for x in node["oneOf"]]
+    if isinstance(node.get("anyOf"), list):
+        node["anyOf"] = [_harden_node(x) for x in node["anyOf"]]
+    if isinstance(node.get("allOf"), list):
+        node["allOf"] = [_harden_node(x) for x in node["allOf"]]
+
+    # OpenAI strict invariants on object nodes.
+    if node.get("type") == "object":
+        node["additionalProperties"] = False
+        if "properties" in node and isinstance(node["properties"], dict):
+            # Strict mode requires every declared property to appear
+            # in ``required``. Existing required list takes precedence
+            # for ordering; we extend with anything missing.
+            existing = list(node.get("required") or [])
+            seen = set(existing)
+            for key in node["properties"].keys():
+                if key not in seen:
+                    existing.append(key)
+                    seen.add(key)
+            node["required"] = existing
+
+    return node
+
+
+def _strict_mode_enabled() -> bool:
+    """Return whether the OpenAI strict-schema walker is enabled.
+
+    Default OFF. Opt in via ``FLUID_OPENAI_STRICT_SCHEMA=1`` so the
+    rollout is observable before flipping the default. Closes the
+    pre-existing 400 on multi-property schemas without changing wire
+    behaviour for users who haven't hit the bug.
+    """
+    import os
+
+    return os.environ.get("FLUID_OPENAI_STRICT_SCHEMA", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def openai_response_format(model: str) -> Dict[str, Any]:
     """Build the OpenAI ``response_format`` directive for *model*.
 
     Uses strict ``json_schema`` mode for models the catalog marks as
     ``structured_output``-capable and falls back to the weaker
     ``json_object`` mode for older or unknown models.
+
+    When ``FLUID_OPENAI_STRICT_SCHEMA=1`` is set, the schema is run
+    through :func:`_harden_for_openai_strict` so it satisfies
+    OpenAI's strict-mode invariants (every object node has
+    ``additionalProperties: false`` and every property in
+    ``required``). Free-form nested objects are rewritten as
+    JSON-encoded strings so the LLM can still return arbitrary
+    payloads; the caller is responsible for ``json.loads`` on those
+    fields.
     """
     from fluid_build.cli.forge_copilot_llm_providers import model_supports_structured_output
 
     if model_supports_structured_output("openai", model):
+        schema = (
+            _harden_for_openai_strict(FORGE_RESPONSE_SCHEMA)
+            if _strict_mode_enabled()
+            else FORGE_RESPONSE_SCHEMA
+        )
         return {
             "type": "json_schema",
             "json_schema": {
                 "name": "ForgeContract",
                 "description": "FLUID Forge copilot response envelope.",
-                "schema": FORGE_RESPONSE_SCHEMA,
+                "schema": schema,
                 "strict": True,
             },
         }
