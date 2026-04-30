@@ -304,6 +304,20 @@ def run_copilot_agent_loop(
         result_msgs = provider_adapter.build_tool_result_messages(tool_calls, results)
         messages.extend(result_msgs)
 
+        # World-class agent layer: structured corrective feedback for
+        # any failed tool call. The legacy loop returned the typed
+        # error dict to the LLM but never told the model *what to do
+        # differently* — the LLM frequently retried the same broken
+        # call until the iteration cap fired. The corrective messages
+        # are deterministic per error class so behaviour is
+        # reproducible and security-safe (no server-side state
+        # quoted back to the model).
+        from fluid_build.cli.forge_copilot_corrective_feedback import (
+            build_corrective_messages,
+        )
+
+        messages.extend(build_corrective_messages(tool_calls, results))
+
     # Slice UX-L: update perf stats even on failure.
     if perf_stats is not None:
         perf_stats["agent_loop_rounds"] = max_iterations
