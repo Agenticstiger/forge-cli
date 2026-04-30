@@ -104,7 +104,8 @@ def build_default_summarizer(
         # when the user picked an unknown provider.
         return lambda blob: blob[:2000] + (
             f"\n[truncated — {len(blob)} chars total — unknown provider for summarizer]"
-            if len(blob) > 2000 else ""
+            if len(blob) > 2000
+            else ""
         )
 
     routing_config = LlmConfig(

@@ -120,9 +120,7 @@ class TestBuildDefaultSummarizer:
 
         def fake_post(url, headers=None, json=None, timeout=None):
             captured["payload"] = json
-            return _FakeResponse(
-                200, {"content": [{"type": "text", "text": "ok"}]}
-            )
+            return _FakeResponse(200, {"content": [{"type": "text", "text": "ok"}]})
 
         with patch("httpx.post", side_effect=fake_post):
             s = build_default_summarizer(_config())
