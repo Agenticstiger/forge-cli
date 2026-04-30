@@ -39,7 +39,6 @@ from fluid_build.copilot.agents.errors import (
     ContextOverflowError,
     ProviderAuthError,
     ProviderError,
-    RateLimitError,
     SchemaValidationError,
 )
 from fluid_build.copilot.industry.pack import IndustryPack

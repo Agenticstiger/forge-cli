@@ -39,7 +39,6 @@ infrequently and the catalog is overrideable per-call via
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict, Optional
 
 from fluid_build.copilot.agents.errors import ContextOverflowError
