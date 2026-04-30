@@ -202,6 +202,46 @@ class TestToolRegistry:
         assert leaky_path not in result.get("error", "")
         assert leaky_path not in result.get("message", "")
 
+    def test_forge_tool_failure_does_not_leak_path_via_bridge(self):
+        """S-013: same regression, but through the @forge_tool
+        registry bridge added in PR-A. PR-B migrated 6 tools to
+        @forge_tool, and the dispatch bridge in
+        ``dispatch_tool_call`` resolves them via
+        ``ForgeTool._legacy_impl`` — that path must apply the
+        ``see server logs`` redaction the legacy outer try/except
+        does, otherwise the security posture diverges between the
+        two registries.
+        """
+        from pydantic import BaseModel
+        from fluid_build.cli.forge_tool import (
+            FORGE_TOOL_REGISTRY,
+            forge_tool,
+        )
+
+        leaky_path = "/srv/forge/internal/secret-config.yaml"
+        FORGE_TOOL_REGISTRY.pop("leaky_via_forge_tool", None)
+
+        class _Args(BaseModel):
+            payload: str
+
+        try:
+
+            @forge_tool(name="leaky_via_forge_tool", args_schema=_Args)
+            def _impl(args):  # noqa: ARG001
+                raise FileNotFoundError(leaky_path)
+
+            result = dispatch_tool_call(
+                "leaky_via_forge_tool", {"payload": "trigger"}
+            )
+            assert result.get("error") == "FileNotFoundError"
+            assert leaky_path not in result.get("error", "")
+            assert leaky_path not in result.get("message", "")
+            assert result.get("message") == (
+                "Tool 'leaky_via_forge_tool' failed — see server logs"
+            )
+        finally:
+            FORGE_TOOL_REGISTRY.pop("leaky_via_forge_tool", None)
+
 
 # ---------------------------------------------------------------------------
 # TestProviderToolUse
