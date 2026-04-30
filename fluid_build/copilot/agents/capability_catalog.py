@@ -103,9 +103,42 @@ CAPABILITY_CATALOG: Tuple[ProviderCapabilities, ...] = (
         prompt_caching=True,
         extended_thinking=True,
         notes=(
-            "Temperature is deprecated on Opus 4.7 — the langchain "
-            "provider drops it automatically.",
+            "Temperature is deprecated on Opus 4.7 — providers drop it "
+            "automatically.",
         ),
+    ),
+    ProviderCapabilities(
+        provider="anthropic",
+        model_prefix="claude-sonnet-4-7",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+        prompt_caching=True,
+        extended_thinking=True,
+    ),
+    ProviderCapabilities(
+        provider="anthropic",
+        model_prefix="claude-sonnet-4-6",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+        prompt_caching=True,
+    ),
+    ProviderCapabilities(
+        provider="anthropic",
+        model_prefix="claude-sonnet-4-5",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+        prompt_caching=True,
+    ),
+    ProviderCapabilities(
+        provider="anthropic",
+        model_prefix="claude-haiku-4-5",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+        prompt_caching=True,
     ),
     ProviderCapabilities(
         provider="anthropic",
@@ -153,11 +186,40 @@ CAPABILITY_CATALOG: Tuple[ProviderCapabilities, ...] = (
     ),
     ProviderCapabilities(
         provider="openai",
+        model_prefix="o4",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+        extended_thinking=True,
+    ),
+    ProviderCapabilities(
+        provider="openai",
         model_prefix="o3",
         tool_use=True,
         structured_output=True,
         streaming=True,
         extended_thinking=True,
+    ),
+    ProviderCapabilities(
+        provider="openai",
+        model_prefix="gpt-4.1-nano",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="openai",
+        model_prefix="gpt-4.1-mini",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
+    ),
+    ProviderCapabilities(
+        provider="openai",
+        model_prefix="gpt-4.1",
+        tool_use=True,
+        structured_output=True,
+        streaming=True,
     ),
     ProviderCapabilities(
         provider="openai",
@@ -374,4 +436,39 @@ def format_degradation_warnings(
     for note in caps.notes:
         warnings.append(f"Note for {provider}/{model}: {note}")
 
+    return warnings
+
+
+def emit_degradation_warnings(
+    *,
+    provider: str,
+    model: str,
+    usage_profile: str = "staged_pipeline",
+    required: Optional[Iterable[str]] = None,
+    quiet: bool = False,
+) -> List[str]:
+    """Compute :func:`format_degradation_warnings` and print each line
+    via the standard CLI console (so it gets the usual Rich styling
+    + the secret-redaction filter from
+    :mod:`fluid_build.cli.console`).
+
+    Returns the warnings list (possibly empty) for callers that also
+    want to attach it to telemetry. ``quiet=True`` suppresses the
+    print but still returns the list — useful in tests and in the
+    ``FLUID_QUIET`` / ``FLUID_NONINTERACTIVE`` paths where the
+    caller already gates console output.
+    """
+    warnings = format_degradation_warnings(
+        provider=provider,
+        model=model,
+        usage_profile=usage_profile,
+        required=required,
+    )
+    if warnings and not quiet:
+        # Imported lazily to avoid a hard dep on ``rich``/console
+        # plumbing for users of the catalog who never want the print.
+        from fluid_build.cli import console as _console  # noqa: PLC0415
+
+        for line in warnings:
+            _console.warning(line)
     return warnings

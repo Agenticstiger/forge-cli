@@ -68,12 +68,19 @@ DEFAULT_CONTEXT_WINDOWS: Dict[str, int] = {
     "claude-opus-4-7": 1_000_000,
     "claude-opus-4-6": 200_000,
     "claude-opus-4-5": 200_000,
+    "claude-sonnet-4-7": 200_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-sonnet-4-5": 200_000,
+    "claude-haiku-4-5": 200_000,
     "claude-3-5-sonnet": 200_000,
     "claude-3-5-haiku": 200_000,
     "claude-3-opus": 200_000,
     "claude-3-sonnet": 200_000,
     "claude-3-haiku": 200_000,
     # OpenAI
+    "gpt-4.1": 1_000_000,
+    "gpt-4.1-mini": 1_000_000,
+    "gpt-4.1-nano": 1_000_000,
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
     "gpt-4-turbo": 128_000,
@@ -83,11 +90,13 @@ DEFAULT_CONTEXT_WINDOWS: Dict[str, int] = {
     "o1-mini": 128_000,
     "o3": 200_000,
     "o3-mini": 200_000,
+    "o4-mini": 200_000,
     # Google Gemini
     "gemini-1.5-pro": 2_000_000,
     "gemini-1.5-flash": 1_000_000,
     "gemini-2.0-flash": 1_000_000,
     "gemini-2.5-pro": 2_000_000,
+    "gemini-2.5-flash": 1_000_000,
     # Conservative fallback for unknown models — keeps surprises bounded.
     "_default": 32_000,
 }
