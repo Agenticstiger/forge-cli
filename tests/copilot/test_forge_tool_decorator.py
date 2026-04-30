@@ -46,10 +46,16 @@ from fluid_build.cli.forge_tool import (
 @pytest.fixture(autouse=True)
 def _reset_registry():
     """Each test gets a fresh registry — autouse so the decorator's
-    side effect doesn't leak across the suite."""
+    side effect doesn't leak across the suite. Save/restore so we
+    don't wipe out the production tools registered by
+    ``forge_copilot_tools`` import (under pytest-randomly other test
+    modules can share-load the same module and depend on those tools
+    being registered)."""
+    saved = dict(FORGE_TOOL_REGISTRY)
     FORGE_TOOL_REGISTRY.clear()
     yield
     FORGE_TOOL_REGISTRY.clear()
+    FORGE_TOOL_REGISTRY.update(saved)
 
 
 class EchoArgs(BaseModel):
