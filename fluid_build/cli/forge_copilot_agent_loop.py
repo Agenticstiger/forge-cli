@@ -204,6 +204,19 @@ def run_copilot_agent_loop(
     # call within this loop sees the same canonical root.
     ws_root: Path = (workspace_root or Path.cwd()).resolve()
 
+    # Build the default summarizer ONCE per loop. When the user opts
+    # into ``FLUID_COMPACTION_STRATEGY=summarize`` (or ``hybrid``),
+    # the compaction layer will invoke this on the middle-message
+    # blob to compress prior turns into a single summary message
+    # using the user's provider's fast tier (Haiku / 4.1-nano /
+    # gemini-flash). Built lazily — the closure makes no LLM call
+    # until compaction actually triggers.
+    from fluid_build.cli.forge_copilot_default_summarizer import (
+        build_default_summarizer,
+    )
+
+    default_summarizer = build_default_summarizer(llm_config)
+
     # Build the initial user message from the context.
     user_content = _build_initial_user_message(context, project_memory)
     messages: List[Dict[str, Any]] = [
@@ -216,7 +229,11 @@ def run_copilot_agent_loop(
 
         # Compact old messages to stay within context window limits.
         if iteration >= _COMPACT_AFTER:
-            messages = _compact_message_history(messages)
+            messages = _compact_message_history(
+                messages,
+                capability_matrix=dict(capability_matrix or {}),
+                summarizer=default_summarizer,
+            )
 
         # Call the LLM with the tool definitions. AGENT_SYSTEM_PROMPT is
         # cached at module-import time; FluidSchemaManager.latest_bundled_version()
