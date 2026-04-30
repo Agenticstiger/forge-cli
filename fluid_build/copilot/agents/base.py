@@ -450,11 +450,24 @@ class BaseStageAgent:
                             for _chunk in call:
                                 pass
                         raw = call.full_text
-                    # Streaming providers don't return a usage block on
-                    # the SSE wire (provider-specific); we fall back to
-                    # an empty raw_response so the cost tracker records
-                    # the call as missing-usage rather than crashing.
-                    raw_response = {}
+                    # Pull usage from the thread-local stash that each
+                    # provider's ``iter_stream_chunks`` populates from
+                    # the SSE usage events. Closes the streaming
+                    # ``record_missing_usage`` gap — cost summaries
+                    # now report accurate token counts for streamed
+                    # calls instead of silently under-reporting.
+                    from fluid_build.cli.forge_copilot_llm_providers import (
+                        consume_streaming_usage,
+                    )
+
+                    streamed_usage = consume_streaming_usage()
+                    # The stash returns a canonical
+                    # ``{input_tokens, output_tokens, total_tokens, ...}``
+                    # dict, which matches what each provider's
+                    # ``extract_usage`` produces on the blocking
+                    # path. Pass it through unchanged to skip
+                    # the provider-specific re-extraction below.
+                    raw_response = streamed_usage if streamed_usage else {}
                     parsed = safe_json_parse(raw)
                 else:
                     response = httpx.post(
@@ -493,7 +506,15 @@ class BaseStageAgent:
         from fluid_build.copilot.cost import get_run_tracker
 
         try:
-            usage = provider.extract_usage(raw_response) or {}
+            # When ``raw_response`` already contains the canonical
+            # streaming-usage shape (input_tokens / output_tokens),
+            # use it directly — the streaming path computed it from
+            # provider-specific SSE usage events and we don't want to
+            # double-extract.
+            if "input_tokens" in raw_response or "output_tokens" in raw_response:
+                usage = dict(raw_response) or {}
+            else:
+                usage = provider.extract_usage(raw_response) or {}
         except Exception:  # pragma: no cover — defensive
             usage = None
         if usage is None:
