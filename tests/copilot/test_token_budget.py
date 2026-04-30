@@ -59,10 +59,7 @@ class TestContextWindowCatalog:
         assert get_context_window("claude-opus-4-7-20260101") == 1_000_000
 
     def test_unknown_model_falls_back_to_default(self) -> None:
-        assert (
-            get_context_window("totally-novel-model-v9")
-            == DEFAULT_CONTEXT_WINDOWS["_default"]
-        )
+        assert get_context_window("totally-novel-model-v9") == DEFAULT_CONTEXT_WINDOWS["_default"]
 
 
 class TestEstimateTokens:

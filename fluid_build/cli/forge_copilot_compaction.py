@@ -156,9 +156,7 @@ def _truncate_one_message(
     if isinstance(content, str):
         return _truncate_string_content(msg, content, truncate_chars)
     if isinstance(content, list):
-        return _truncate_block_content(
-            msg, content, truncate_chars, tool_call_truncate_chars
-        )
+        return _truncate_block_content(msg, content, truncate_chars, tool_call_truncate_chars)
     return msg
 
 
@@ -170,9 +168,7 @@ def _truncate_string_content(
     if len(content) <= truncate_chars:
         return msg
     new_msg = dict(msg)
-    new_msg["content"] = (
-        content[:truncate_chars] + f" [truncated — {len(content)} chars total]"
-    )
+    new_msg["content"] = content[:truncate_chars] + f" [truncated — {len(content)} chars total]"
     return new_msg
 
 
@@ -192,9 +188,7 @@ def _truncate_block_content(
             text = block.get("text", "")
             if len(text) > truncate_chars:
                 block = dict(block)
-                block["text"] = (
-                    text[:truncate_chars] + f" [truncated — {len(text)} chars total]"
-                )
+                block["text"] = text[:truncate_chars] + f" [truncated — {len(text)} chars total]"
         elif block_type == "tool_use":
             # Preserve the tool name (LLM needs to remember what it
             # called) but shrink the arguments blob.
@@ -213,16 +207,13 @@ def _truncate_block_content(
             if isinstance(tr_content, str) and len(tr_content) > truncate_chars:
                 block = dict(block)
                 block["content"] = (
-                    tr_content[:truncate_chars]
-                    + f" [truncated — {len(tr_content)} chars total]"
+                    tr_content[:truncate_chars] + f" [truncated — {len(tr_content)} chars total]"
                 )
             elif isinstance(tr_content, list):
                 # Recurse into nested content blocks (e.g. structured
                 # tool result with text + image blocks).
                 block = dict(block)
-                block["content"] = [
-                    _truncate_one_block_text(b, truncate_chars) for b in tr_content
-                ]
+                block["content"] = [_truncate_one_block_text(b, truncate_chars) for b in tr_content]
         new_blocks.append(block)
     new_msg = dict(msg)
     new_msg["content"] = new_blocks
@@ -236,9 +227,7 @@ def _truncate_one_block_text(block: Any, truncate_chars: int) -> Any:
         text = block.get("text", "")
         if len(text) > truncate_chars:
             block = dict(block)
-            block["text"] = (
-                text[:truncate_chars] + f" [truncated — {len(text)} chars total]"
-            )
+            block["text"] = text[:truncate_chars] + f" [truncated — {len(text)} chars total]"
     return block
 
 
@@ -269,9 +258,7 @@ def summarize_messages(
         return msg_list
 
     if summarizer is None:
-        LOG.debug(
-            "summarize_messages called without a summarizer — falling back to truncate"
-        )
+        LOG.debug("summarize_messages called without a summarizer — falling back to truncate")
         return smart_truncate_messages(
             msg_list,
             keep_tail=keep_tail,

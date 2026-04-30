@@ -188,9 +188,7 @@ class TestWorkspaceRootInjection:
         # Even though the dispatcher is given a workspace_root, the
         # tool doesn't accept it (no kwarg in signature) — and the
         # dispatcher must not pass it through.
-        result = dispatch_forge_tool(
-            "echo", {"text": "hi"}, workspace_root=Path("/x")
-        )
+        result = dispatch_forge_tool("echo", {"text": "hi"}, workspace_root=Path("/x"))
         assert result.ok
         assert result.value == "hi"
 
@@ -236,9 +234,7 @@ class TestLegacyCompatibility:
             return "ok"
 
         legacy_impl = FORGE_TOOL_REGISTRY["lookup"].legacy_dict["impl"]
-        result = legacy_impl(
-            relative_path="x/", workspace_root=Path("/safe")
-        )
+        result = legacy_impl(relative_path="x/", workspace_root=Path("/safe"))
         assert result == "ok"
         assert captured["ws"] == Path("/safe")
         assert captured["path"] == "x/"
@@ -255,5 +251,3 @@ class TestLegacyCompatibility:
         result = legacy_impl()  # no ``text``
         assert isinstance(result, dict)
         assert result["error"] == "ToolValidationError"
-
-

@@ -156,9 +156,7 @@ class TestClassifyProviderError:
 
     @pytest.mark.parametrize("status", [500, 502, 503, 504, 529])
     def test_server_errors(self, status: int) -> None:
-        raw = _http_status_error(
-            status, body="upstream blew up", headers={"retry-after": "3"}
-        )
+        raw = _http_status_error(status, body="upstream blew up", headers={"retry-after": "3"})
         classified = classify_provider_error(raw, provider="anthropic")
         assert isinstance(classified, ProviderServerError)
         assert classified.status_code == status
@@ -283,9 +281,7 @@ class TestRetryWithBackoffTypedErrors:
                 # Provider asked us to wait a specific amount — we
                 # should sleep for exactly that, not the default
                 # exponential delay.
-                raise RateLimitError(
-                    "slow down", provider="anthropic", retry_after=11.5
-                )
+                raise RateLimitError("slow down", provider="anthropic", retry_after=11.5)
             return "ok"
 
         result = retry_with_backoff(rate_limited, jitter=0.0, sleep=sleep)

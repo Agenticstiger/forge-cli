@@ -36,9 +36,7 @@ class TestStrategyResolution:
 
     def test_capability_matrix_wins(self, monkeypatch) -> None:
         monkeypatch.setenv("FLUID_COMPACTION_STRATEGY", "summarize")
-        assert (
-            resolve_compaction_strategy({"compaction_strategy": "hybrid"}) == "hybrid"
-        )
+        assert resolve_compaction_strategy({"compaction_strategy": "hybrid"}) == "hybrid"
 
     def test_env_falls_through_when_no_capability(self, monkeypatch) -> None:
         monkeypatch.setenv("FLUID_COMPACTION_STRATEGY", "summarize")
@@ -89,7 +87,9 @@ class TestSmartTruncate:
                 {"type": "tool_use", "name": "discover_workspace", "input": big_input},
             ],
         )
-        msgs = [_msg("user", "head"), msg] + [_msg("user", f"t{i}") for i in range(DEFAULT_KEEP_TAIL)]
+        msgs = [_msg("user", "head"), msg] + [
+            _msg("user", f"t{i}") for i in range(DEFAULT_KEEP_TAIL)
+        ]
 
         out = smart_truncate_messages(msgs, tool_call_truncate_chars=200)
         compacted_msg = out[1]
@@ -108,7 +108,9 @@ class TestSmartTruncate:
                 {"type": "tool_result", "content": long_result},
             ],
         )
-        msgs = [_msg("user", "head"), msg] + [_msg("user", f"t{i}") for i in range(DEFAULT_KEEP_TAIL)]
+        msgs = [_msg("user", "head"), msg] + [
+            _msg("user", f"t{i}") for i in range(DEFAULT_KEEP_TAIL)
+        ]
         out = smart_truncate_messages(msgs, truncate_chars=300)
         block = out[1]["content"][0]
         assert "[truncated" in block["content"]

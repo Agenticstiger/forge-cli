@@ -144,7 +144,7 @@ class TestStreamingUsageThreadLocality:
     stage agents running in the coordinator's ThreadPoolExecutor."""
 
     def test_stash_is_isolated_per_thread(self) -> None:
-        from threading import Thread, Event
+        from threading import Event, Thread
 
         from fluid_build.cli.forge_copilot_llm_providers import (
             _record_streaming_usage,

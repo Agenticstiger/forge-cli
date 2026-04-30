@@ -94,8 +94,7 @@ TOOL_ERROR_GUIDANCE: Dict[str, str] = {
         "first to enumerate available files, then pass one of those."
     ),
     "PermissionError": (
-        "The path is not readable. Check the workspace permissions "
-        "or pick a different file."
+        "The path is not readable. Check the workspace permissions " "or pick a different file."
     ),
     "JSONDecodeError": (
         "Your arguments were not valid JSON. Tool argument blocks "
@@ -175,7 +174,12 @@ def build_corrective_messages(
     changing the loop.
     """
     messages: List[Dict[str, str]] = []
-    paired = list(zip(list(tool_calls), list(results)))
+    # ``strict=False`` is intentional — when the provider's
+    # ``extract_tool_calls`` and the dispatcher's results lists ever
+    # come in mismatched lengths (e.g. partial-stream truncation), we
+    # want to emit guidance for whatever pairs we have rather than
+    # raising mid-loop.
+    paired = list(zip(list(tool_calls), list(results), strict=False))
     for tc, result in paired:
         is_failure, error_class = diagnose_tool_failure(result)
         if not is_failure:

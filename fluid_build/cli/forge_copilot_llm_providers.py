@@ -924,16 +924,14 @@ class AnthropicProvider(LlmProvider):
             # tokens. We accumulate both so that by the time the
             # iterator drains, the thread-local stash has the
             # complete usage record for this call.
-            usage_block = (usage_source or {}).get("usage") if isinstance(
-                usage_source, dict
-            ) else None
+            usage_block = (
+                (usage_source or {}).get("usage") if isinstance(usage_source, dict) else None
+            )
             if isinstance(usage_block, dict):
                 prior = getattr(_streaming_usage_state, "usage", None) or {}
                 _record_streaming_usage(
-                    input_tokens=usage_block.get("input_tokens")
-                    or prior.get("input_tokens", 0),
-                    output_tokens=usage_block.get("output_tokens")
-                    or prior.get("output_tokens", 0),
+                    input_tokens=usage_block.get("input_tokens") or prior.get("input_tokens", 0),
+                    output_tokens=usage_block.get("output_tokens") or prior.get("output_tokens", 0),
                     cache_read_tokens=usage_block.get("cache_read_input_tokens")
                     or prior.get("cache_read_tokens", 0),
                     cache_write_tokens=usage_block.get("cache_creation_input_tokens")

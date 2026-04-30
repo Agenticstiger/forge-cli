@@ -348,9 +348,7 @@ def format_degradation_warnings(
     whether the run profile happens to need tool use.
     """
     caps = assess_capabilities(provider, model)
-    req = list(required) if required is not None else list(
-        required_capabilities_for(usage_profile)
-    )
+    req = list(required) if required is not None else list(required_capabilities_for(usage_profile))
 
     warnings: List[str] = []
 

@@ -121,10 +121,7 @@ class TestFormatDegradationWarnings:
         # o1 lacks tool_use — warn loudly.
         assert any("tool use" in w for w in warnings)
         # And surface the catalog note about not supporting streaming/tools.
-        assert any(
-            "do not support tool use" in w or "tool-use" in w.lower()
-            for w in warnings
-        )
+        assert any("do not support tool use" in w or "tool-use" in w.lower() for w in warnings)
 
     def test_unknown_provider_always_warns(self) -> None:
         warnings = format_degradation_warnings(
@@ -172,15 +169,11 @@ class TestCatalogShape:
         If a future entry forgets to enable it, this test catches the
         regression so users keep getting the ~90% input-cost discount."""
         for entry in CAPABILITY_CATALOG:
-            if entry.provider == "anthropic" and entry.model_prefix.startswith(
-                "claude-3-5"
-            ):
-                assert entry.prompt_caching, (
-                    f"Anthropic claude-3-5 entry missing prompt_caching: {entry}"
-                )
-            if entry.provider == "anthropic" and entry.model_prefix.startswith(
-                "claude-opus-4-7"
-            ):
-                assert entry.prompt_caching, (
-                    f"Anthropic claude-opus-4-7 missing prompt_caching: {entry}"
-                )
+            if entry.provider == "anthropic" and entry.model_prefix.startswith("claude-3-5"):
+                assert (
+                    entry.prompt_caching
+                ), f"Anthropic claude-3-5 entry missing prompt_caching: {entry}"
+            if entry.provider == "anthropic" and entry.model_prefix.startswith("claude-opus-4-7"):
+                assert (
+                    entry.prompt_caching
+                ), f"Anthropic claude-opus-4-7 missing prompt_caching: {entry}"

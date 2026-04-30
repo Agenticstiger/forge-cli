@@ -158,9 +158,7 @@ def _try_streaming(name: str, build_config, provider) -> Tuple[bool, Dict[str, A
 
     consume_streaming_usage()  # clear any leftover stash
     try:
-        url, headers, payload = provider.build_streaming_request(
-            config, PROMPT_SYSTEM, PROMPT_USER
-        )
+        url, headers, payload = provider.build_streaming_request(config, PROMPT_SYSTEM, PROMPT_USER)
     except Exception as exc:  # noqa: BLE001
         return False, {"reason": f"build_streaming_request failed: {exc}"}
 
@@ -194,12 +192,12 @@ def _try_streaming(name: str, build_config, provider) -> Tuple[bool, Dict[str, A
     return True, {
         "elapsed_seconds": round(elapsed, 2),
         "streaming_usage": streaming_usage,
-        "captured_input_tokens": streaming_usage.get("input_tokens", 0)
-        if streaming_usage
-        else None,
-        "captured_output_tokens": streaming_usage.get("output_tokens", 0)
-        if streaming_usage
-        else None,
+        "captured_input_tokens": (
+            streaming_usage.get("input_tokens", 0) if streaming_usage else None
+        ),
+        "captured_output_tokens": (
+            streaming_usage.get("output_tokens", 0) if streaming_usage else None
+        ),
         "stream_chars": len(full_text),
         "non_zero_usage": streaming_usage is not None
         and streaming_usage.get("input_tokens", 0) > 0
@@ -216,9 +214,7 @@ def _anthropic_config() -> LlmConfig | None:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         return None
-    model = os.environ.get(
-        "FLUID_SMOKE_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"
-    )
+    model = os.environ.get("FLUID_SMOKE_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
     return LlmConfig(
         provider="anthropic",
         model=model,
@@ -253,8 +249,7 @@ def _gemini_config() -> LlmConfig | None:
         provider="gemini",
         model=model,
         endpoint=(
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent"
+            f"https://generativelanguage.googleapis.com/v1beta/models/" f"{model}:generateContent"
         ),
         api_key=key,
         timeout_seconds=60,

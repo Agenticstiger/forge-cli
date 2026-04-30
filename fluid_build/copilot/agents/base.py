@@ -124,9 +124,9 @@ def retry_with_backoff(
                 break
             # Provider-supplied Retry-After wins over our default
             # exponential delay so we respect the upstream's pacing.
-            retry_after = getattr(exc, "retry_after", None) if isinstance(
-                exc, ProviderError
-            ) else None
+            retry_after = (
+                getattr(exc, "retry_after", None) if isinstance(exc, ProviderError) else None
+            )
             if retry_after is not None and retry_after > 0:
                 delay = float(retry_after)
             else:
@@ -431,9 +431,7 @@ class BaseStageAgent:
                         system_prompt,
                         user_prompt,
                     )
-                    self._inject_provider_schema(
-                        provider.name, stream_payload, output_schema
-                    )
+                    self._inject_provider_schema(provider.name, stream_payload, output_schema)
                     with httpx.stream(
                         "POST",
                         stream_url,
