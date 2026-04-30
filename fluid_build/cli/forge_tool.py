@@ -63,10 +63,13 @@ surface.
 from __future__ import annotations
 
 import inspect
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Type
 
 from pydantic import BaseModel
+
+LOG = logging.getLogger("fluid.cli.forge_tool")
 
 __all__ = [
     "FORGE_TOOL_REGISTRY",
@@ -206,6 +209,17 @@ class ForgeTool:
         with ``workspace_root`` mixed into ``kwargs``. We split the
         injected fields out, validate the rest through the args model,
         and run the real impl.
+
+        SECURITY_REVIEW S-013: the dict returned here flows verbatim
+        into the LLM-bound tool result via
+        ``provider_adapter.build_tool_result_messages``. Echoing the
+        raw exception text — paths, hostnames, env-var values,
+        config fragments quoted by derived ``CopilotGenerationError``
+        instances — is the exact regression the legacy
+        ``dispatch_tool_call`` outer ``try/except`` was hardened
+        against. Match that posture here: log the full detail
+        server-side, return a static "see server logs" message so
+        the LLM sees only the typed error class.
         """
         workspace_root = flat_kwargs.pop("workspace_root", None)
         # Drop any unknown injected kwargs the legacy plumbing might
@@ -213,9 +227,15 @@ class ForgeTool:
         # be in ``args_schema``.
         result = self.dispatch(flat_kwargs, workspace_root=workspace_root)
         if not result.ok:
+            LOG.warning(
+                "Tool %s failed: %s — %s",
+                self.name,
+                result.error_type,
+                result.error_message,
+            )
             return {
                 "error": result.error_type,
-                "message": result.error_message,
+                "message": f"Tool '{self.name}' failed — see server logs",
             }
         return result.value
 

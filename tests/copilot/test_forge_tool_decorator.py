@@ -257,3 +257,46 @@ class TestLegacyCompatibility:
         result = legacy_impl()  # no ``text``
         assert isinstance(result, dict)
         assert result["error"] == "ToolValidationError"
+        # SECURITY_REVIEW S-013: the LLM-bound message is the static
+        # "see server logs" string, never the raw Pydantic
+        # ValidationError text (which would echo the supplied args).
+        assert result["message"] == "Tool 'echo' failed — see server logs"
+
+    def test_legacy_impl_does_not_leak_exception_text_to_llm(self) -> None:
+        """SECURITY_REVIEW S-013 regression — mirrors the existing
+        ``test_tool_failure_does_not_leak_path_like_exception_text``
+        from ``tests/test_slice_ux_k_agent_loop.py`` against the new
+        ``@forge_tool`` dispatch path. A FileNotFoundError carrying a
+        filesystem path must NOT round-trip into the LLM-bound
+        ``message`` field."""
+        leaky_path = "/home/alice/.aws/credentials"
+
+        @forge_tool(name="leaky_demo", args_schema=EchoArgs)
+        def leaky(args):
+            raise FileNotFoundError(leaky_path)
+
+        legacy_impl = FORGE_TOOL_REGISTRY["leaky_demo"].legacy_dict["impl"]
+        result = legacy_impl(text="trigger")
+        assert result["error"] == "FileNotFoundError"
+        assert leaky_path not in result["error"]
+        assert leaky_path not in result["message"]
+        assert result["message"] == "Tool 'leaky_demo' failed — see server logs"
+
+    def test_in_process_dispatch_result_keeps_full_error_message(self) -> None:
+        """``ToolDispatchResult`` is the in-process surface (consumed
+        by the corrective-feedback layer to look up generic guidance
+        by error class — never serialized to the LLM). Keep the raw
+        ``error_message`` available for server-side telemetry +
+        tests; only ``_legacy_impl`` strips it for the wire."""
+
+        @forge_tool(name="boom_demo", args_schema=EchoArgs)
+        def boom(args):
+            raise RuntimeError("internal-detail-do-not-leak")
+
+        result = dispatch_forge_tool("boom_demo", {"text": "x"})
+        assert not result.ok
+        assert result.error_type == "RuntimeError"
+        # ``error_message`` IS allowed to carry detail because this
+        # surface is in-process only; the boundary that strips it is
+        # ``_legacy_impl`` (LLM-bound path).
+        assert "internal-detail-do-not-leak" in result.error_message
