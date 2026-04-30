@@ -104,7 +104,13 @@ def _final_response() -> Dict[str, Any]:
 
 class TestToolRegistry:
     def test_tools_registered(self):
-        assert len(TOOL_REGISTRY) >= 5
+        # The 6 canonical tools must be exposed to the LLM regardless
+        # of which registry they live in (legacy ``TOOL_REGISTRY`` vs
+        # the world-class ``FORGE_TOOL_REGISTRY`` populated by the
+        # ``@forge_tool`` decorator). Query through the unified
+        # ``get_tool_definitions`` surface so this test stays stable
+        # across the migration.
+        names = {d["name"] for d in get_tool_definitions()}
         expected = {
             "discover_workspace",
             "read_sample_schema",
@@ -113,7 +119,9 @@ class TestToolRegistry:
             "validate_contract",
             "list_schedulers",
         }
-        assert set(TOOL_REGISTRY.keys()) == expected
+        assert expected.issubset(names), (
+            f"missing tools: {expected - names}"
+        )
 
     def test_tool_definitions_shape(self):
         defs = get_tool_definitions()

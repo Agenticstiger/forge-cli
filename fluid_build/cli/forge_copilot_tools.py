@@ -16,12 +16,26 @@
 
 Each tool is a thin wrapper over an existing function in the forge
 copilot codebase.  The registry exposes them with JSON Schema input
-definitions so the LLM can call them via the provider's native
-tool-use protocol (OpenAI ``tools``, Anthropic ``tools``,
-Gemini ``functionDeclarations``).
+definitions (derived from Pydantic models via ``@forge_tool``) so the
+LLM can call them via the provider's native tool-use protocol
+(OpenAI ``tools``, Anthropic ``tools``, Gemini ``functionDeclarations``).
 
-Adding a new tool is intentional: define the schema, write a thin
-``_dispatch_<name>`` function, and register it in ``TOOL_REGISTRY``.
+Adding a new tool is one declaration:
+
+.. code-block:: python
+
+    class MyArgs(BaseModel):
+        path: str = Field(description="A path under the workspace.")
+
+    @forge_tool(name="my_tool", description="...", args_schema=MyArgs,
+                workspace_root_aware=True)
+    def my_tool(args: MyArgs, *, workspace_root):
+        ...
+
+The decorator handles registration in ``FORGE_TOOL_REGISTRY``,
+JSON Schema generation, args-model validation, ``workspace_root``
+injection (security), and the typed-error return shape that
+``dispatch_tool_call`` consumes.
 """
 
 from __future__ import annotations
@@ -33,6 +47,9 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from pydantic import BaseModel, Field
+
+from fluid_build.cli.forge_tool import forge_tool
 from fluid_build.schema_manager import FluidSchemaManager
 
 LOG = logging.getLogger("fluid.cli.forge_copilot.tools")
@@ -60,9 +77,14 @@ _INJECTION_PATTERN_RE = re.compile(
 _REDACTED_COLUMN = "<redacted-suspicious-text>"
 
 # ---------------------------------------------------------------------------
-# Tool definitions — {name, description, input_schema, impl}
+# Tool definitions — Pydantic args models + ``@forge_tool`` decorations.
 # ---------------------------------------------------------------------------
 
+# ``TOOL_REGISTRY`` is kept as an empty back-compat alias. Tools live in
+# ``FORGE_TOOL_REGISTRY`` (populated by ``@forge_tool``); ``dispatch_tool_call``
+# resolves through both. Tests / external consumers that mutate
+# ``TOOL_REGISTRY`` (e.g. ``patch.dict(TOOL_REGISTRY, {...})``) still work
+# — the bridge in ``dispatch_tool_call`` reads from it first.
 TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 
@@ -72,6 +94,10 @@ def _register(
     input_schema: Dict[str, Any],
     impl: Callable[..., Any],
 ) -> None:
+    """Back-compat shim — kept for any third-party code that imports it.
+
+    New tools should use ``@forge_tool`` instead.
+    """
     TOOL_REGISTRY[name] = {
         "name": name,
         "description": description,
@@ -80,14 +106,97 @@ def _register(
     }
 
 
-# ---- discover_workspace --------------------------------------------------
+# ---- Args models ----------------------------------------------------------
 
 
+class DiscoverWorkspaceArgs(BaseModel):
+    """Args for the ``discover_workspace`` tool.
+
+    The ``workspace_path`` field is retained for wire compatibility but
+    is intentionally ignored by the impl — the effective scope is the
+    caller-provided ``workspace_root`` (SECURITY_REVIEW S-004). Keeping
+    it in the schema means existing LLM agents that pass the field
+    don't get a validation error.
+    """
+
+    workspace_path: str = Field(
+        default=".",
+        description=(
+            "Ignored — retained for schema compatibility. The "
+            "workspace root is fixed by the invoking CLI."
+        ),
+    )
+
+
+class ReadSampleSchemaArgs(BaseModel):
+    path: str = Field(
+        description="Absolute or relative path to the sample file.",
+    )
+
+
+class ListTemplatesArgs(BaseModel):
+    use_case: str = Field(
+        default="",
+        description="Optional use-case hint (analytics, etl_pipeline, streaming, ml_pipeline).",
+    )
+    domain: str = Field(
+        default="",
+        description="Optional domain hint (finance, healthcare, retail, telco).",
+    )
+
+
+class ProposeContractArgs(BaseModel):
+    context: Dict[str, Any] = Field(
+        description="User context with project_goal, data_sources, use_case, etc.",
+    )
+    template: str = Field(
+        default="starter",
+        description="Template id from the capability matrix (e.g. 'starter', 'analytics').",
+    )
+    provider: str = Field(
+        default="local",
+        description="Provider id (e.g. 'local', 'gcp', 'aws', 'snowflake').",
+    )
+
+    # Permit nested free-form objects in ``context`` — the field is an
+    # arbitrary user-provided dict and the LLM should not be limited to
+    # a fixed schema for it.
+    model_config = {"extra": "allow"}
+
+
+class ValidateContractArgs(BaseModel):
+    contract: Dict[str, Any] = Field(
+        description="The FLUID contract to validate.",
+    )
+
+    model_config = {"extra": "allow"}
+
+
+class ListSchedulersArgs(BaseModel):
+    """No arguments — pass ``{}``."""
+
+    model_config = {"extra": "ignore"}
+
+
+# ---- discover_workspace ---------------------------------------------------
+
+
+@forge_tool(
+    name="discover_workspace",
+    description=(
+        "Scan the user's workspace for data files, SQL, dbt projects, "
+        "existing contracts, and infer provider hints.  Returns a "
+        "metadata-only report (no raw file contents or credentials).  "
+        "Scope is always the caller-provided workspace root; any "
+        "``workspace_path`` argument is ignored for safety."
+    ),
+    args_schema=DiscoverWorkspaceArgs,
+    workspace_root_aware=True,
+)
 def _dispatch_discover_workspace(
+    args: DiscoverWorkspaceArgs,  # noqa: ARG001 — schema-only, fields ignored by design
     *,
-    workspace_path: str = ".",  # noqa: ARG001 — accepted for schema compatibility, ignored
     workspace_root: Optional[Path] = None,
-    **_kw: Any,
 ) -> Dict[str, Any]:
     """Scan the workspace and return a metadata-only discovery report.
 
@@ -109,41 +218,23 @@ def _dispatch_discover_workspace(
     return report.to_prompt_payload()
 
 
-_register(
-    name="discover_workspace",
+# ---- read_sample_schema ---------------------------------------------------
+
+
+@forge_tool(
+    name="read_sample_schema",
     description=(
-        "Scan the user's workspace for data files, SQL, dbt projects, "
-        "existing contracts, and infer provider hints.  Returns a "
-        "metadata-only report (no raw file contents or credentials).  "
-        "Scope is always the caller-provided workspace root; any "
-        "``workspace_path`` argument is ignored for safety."
+        "Infer the schema of a single sample data file (CSV, JSON, "
+        "JSONL, Parquet, Avro).  The path is confined to the "
+        "workspace root and must use one of the supported extensions."
     ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "workspace_path": {
-                "type": "string",
-                "description": (
-                    "Ignored — retained for schema compatibility. The "
-                    "workspace root is fixed by the invoking CLI."
-                ),
-            },
-        },
-        "required": [],
-        "additionalProperties": False,
-    },
-    impl=_dispatch_discover_workspace,
+    args_schema=ReadSampleSchemaArgs,
+    workspace_root_aware=True,
 )
-
-
-# ---- read_sample_schema --------------------------------------------------
-
-
 def _dispatch_read_sample_schema(
+    args: ReadSampleSchemaArgs,
     *,
-    path: str,
     workspace_root: Optional[Path] = None,
-    **_kw: Any,
 ) -> Dict[str, Any]:
     """Infer the schema of a single sample file (CSV, JSON, Parquet, Avro).
 
@@ -156,6 +247,7 @@ def _dispatch_read_sample_schema(
     """
     from fluid_build.cli.forge_copilot_schema_inference import summarize_sample_file
 
+    path = args.path
     effective_root = (workspace_root or Path.cwd()).resolve()
 
     # Resolve the LLM-supplied path. Absolute paths stay absolute;
@@ -270,32 +362,21 @@ def _sanitize_schema_result(result: Dict[str, Any]) -> Dict[str, Any]:
     return sanitized
 
 
-_register(
-    name="read_sample_schema",
-    description=(
-        "Read a single data file and return its inferred schema "
-        "(column names, types, row count).  Supports CSV, JSON, "
-        "JSONL, Parquet, and Avro."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Absolute or relative path to the sample file.",
-            },
-        },
-        "required": ["path"],
-        "additionalProperties": False,
-    },
-    impl=_dispatch_read_sample_schema,
-)
-
-
 # ---- list_templates -------------------------------------------------------
 
 
-def _dispatch_list_templates(*, use_case: str = "", domain: str = "", **_kw: Any) -> Dict[str, Any]:
+@forge_tool(
+    name="list_templates",
+    description=(
+        "List the locally available templates, providers, and build "
+        "engines.  Returns the full capability matrix.  Use the "
+        "use_case and domain hints to narrow your template choice."
+    ),
+    args_schema=ListTemplatesArgs,
+)
+def _dispatch_list_templates(
+    args: ListTemplatesArgs,  # noqa: ARG001 — hints accepted for forward compat, not yet used
+) -> Dict[str, Any]:
     """Return the capability matrix (available templates, providers, engines)."""
     from fluid_build.cli.forge_copilot_runtime import build_capability_matrix
 
@@ -305,57 +386,10 @@ def _dispatch_list_templates(*, use_case: str = "", domain: str = "", **_kw: Any
     return matrix
 
 
-_register(
-    name="list_templates",
-    description=(
-        "List the locally available templates, providers, and build "
-        "engines.  Returns the full capability matrix.  Use the "
-        "use_case and domain hints to narrow your template choice."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "use_case": {
-                "type": "string",
-                "description": "Optional use-case hint (analytics, etl_pipeline, streaming, ml_pipeline).",
-            },
-            "domain": {
-                "type": "string",
-                "description": "Optional domain hint (finance, healthcare, retail, telco).",
-            },
-        },
-        "required": [],
-        "additionalProperties": False,
-    },
-    impl=_dispatch_list_templates,
-)
-
-
 # ---- propose_contract -----------------------------------------------------
 
 
-def _dispatch_propose_contract(
-    *,
-    context: Dict[str, Any],
-    template: str = "starter",
-    provider: str = "local",
-    **_kw: Any,
-) -> Dict[str, Any]:
-    """Build a seed contract scaffold from the given context."""
-    from fluid_build.cli.forge_copilot_discovery import DiscoveryReport
-    from fluid_build.cli.forge_copilot_runtime import build_seed_contract
-
-    # Build a minimal discovery report if one isn't available.
-    discovery = DiscoveryReport(workspace_roots=["."])
-    return build_seed_contract(
-        context=context,
-        discovery_report=discovery,
-        template_name=template,
-        provider_name=provider,
-    )
-
-
-_register(
+@forge_tool(
     name="propose_contract",
     description=(
         f"Generate a seed FLUID {_FV} contract scaffold for the given "
@@ -363,35 +397,36 @@ _register(
         "point — refine it based on the discovery report and user "
         "requirements before returning it as your final contract."
     ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "context": {
-                "type": "object",
-                "description": "User context with project_goal, data_sources, use_case, etc.",
-                "additionalProperties": True,
-                "properties": {},
-            },
-            "template": {
-                "type": "string",
-                "description": "Template id from the capability matrix (e.g. 'starter', 'analytics').",
-            },
-            "provider": {
-                "type": "string",
-                "description": "Provider id (e.g. 'local', 'gcp', 'aws', 'snowflake').",
-            },
-        },
-        "required": ["context"],
-        "additionalProperties": False,
-    },
-    impl=_dispatch_propose_contract,
+    args_schema=ProposeContractArgs,
 )
+def _dispatch_propose_contract(args: ProposeContractArgs) -> Dict[str, Any]:
+    """Build a seed contract scaffold from the given context."""
+    from fluid_build.cli.forge_copilot_discovery import DiscoveryReport
+    from fluid_build.cli.forge_copilot_runtime import build_seed_contract
+
+    # Build a minimal discovery report if one isn't available.
+    discovery = DiscoveryReport(workspace_roots=["."])
+    return build_seed_contract(
+        context=args.context,
+        discovery_report=discovery,
+        template_name=args.template,
+        provider_name=args.provider,
+    )
 
 
 # ---- validate_contract ----------------------------------------------------
 
 
-def _dispatch_validate_contract(*, contract: Dict[str, Any], **_kw: Any) -> Dict[str, Any]:
+@forge_tool(
+    name="validate_contract",
+    description=(
+        f"Validate a candidate FLUID {_FV} contract against the local "
+        "schema and capability matrix.  Returns {errors, warnings}.  "
+        "If errors is empty, the contract is valid."
+    ),
+    args_schema=ValidateContractArgs,
+)
+def _dispatch_validate_contract(args: ValidateContractArgs) -> Dict[str, Any]:
     """Validate a candidate FLUID contract and return errors + warnings."""
     from fluid_build.cli.forge_copilot_runtime import (
         build_capability_matrix,
@@ -402,36 +437,12 @@ def _dispatch_validate_contract(*, contract: Dict[str, Any], **_kw: Any) -> Dict
     # Wrap the contract in the envelope shape normalize expects.
     normalized = {
         "suggestions": {},
-        "contract": contract,
+        "contract": args.contract,
         "readme_markdown": "",
         "additional_files": {},
     }
     errors, warnings = validate_generated_result(normalized, capabilities=capabilities)
     return {"errors": errors, "warnings": warnings}
-
-
-_register(
-    name="validate_contract",
-    description=(
-        f"Validate a candidate FLUID {_FV} contract against the local "
-        "schema and capability matrix.  Returns {errors, warnings}.  "
-        "If errors is empty, the contract is valid."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "contract": {
-                "type": "object",
-                "description": "The FLUID contract to validate.",
-                "additionalProperties": True,
-                "properties": {},
-            },
-        },
-        "required": ["contract"],
-        "additionalProperties": False,
-    },
-    impl=_dispatch_validate_contract,
-)
 
 
 # ---- forge_data_model -----------------------------------------------------
@@ -540,7 +551,18 @@ _TRIGGER_TYPES = ["cron", "event", "manual", "streaming"]
 _cached_schedulers: Optional[Dict[str, Any]] = None
 
 
-def _dispatch_list_schedulers(**_kw: Any) -> Dict[str, Any]:
+@forge_tool(
+    name="list_schedulers",
+    description=(
+        "List available schedule/orchestration engines (e.g., Airflow, Dagster, Prefect) "
+        "and supported trigger types.  Use this when the user asks about scheduling, "
+        "DAGs, pipelines, or orchestration."
+    ),
+    args_schema=ListSchedulersArgs,
+)
+def _dispatch_list_schedulers(
+    args: ListSchedulersArgs,  # noqa: ARG001 — no inputs, model exists for schema-shape uniformity
+) -> Dict[str, Any]:
     """Return available scheduler engines and their supported platforms."""
     global _cached_schedulers
     if _cached_schedulers is not None:
@@ -561,23 +583,6 @@ def _dispatch_list_schedulers(**_kw: Any) -> Dict[str, Any]:
         return _cached_schedulers
     except ImportError:
         return {"schedulers": [], "trigger_types": _TRIGGER_TYPES}
-
-
-_register(
-    name="list_schedulers",
-    description=(
-        "List available schedule/orchestration engines (e.g., Airflow, Dagster, Prefect) "
-        "and supported trigger types.  Use this when the user asks about scheduling, "
-        "DAGs, pipelines, or orchestration."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {},
-        "required": [],
-        "additionalProperties": False,
-    },
-    impl=_dispatch_list_schedulers,
-)
 
 
 def get_tool_definitions() -> List[Dict[str, Any]]:
