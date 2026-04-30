@@ -52,9 +52,15 @@ from fluid_build.copilot.agents.token_budget import get_context_window
 
 @pytest.fixture(autouse=True)
 def _reset_forge_registry():
+    """Snapshot / restore so the production tools registered at
+    module-import time aren't wiped between tests under
+    pytest-randomly (see tests/copilot/test_forge_tool_decorator.py
+    for the same pattern)."""
+    saved = dict(FORGE_TOOL_REGISTRY)
     FORGE_TOOL_REGISTRY.clear()
     yield
     FORGE_TOOL_REGISTRY.clear()
+    FORGE_TOOL_REGISTRY.update(saved)
 
 
 class _EchoArgs(BaseModel):
