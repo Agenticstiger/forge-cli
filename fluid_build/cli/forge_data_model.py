@@ -1083,9 +1083,11 @@ def _resolve_optional_llm_config(args: Any, logger: logging.Logger):
             emit_degradation_warnings,
         )
 
-        quiet = bool(getattr(args, "quiet", False)) or _os.environ.get(
-            "FLUID_QUIET"
-        ) == "1" or _os.environ.get("FLUID_NONINTERACTIVE") == "1"
+        quiet = (
+            bool(getattr(args, "quiet", False))
+            or _os.environ.get("FLUID_QUIET") == "1"
+            or _os.environ.get("FLUID_NONINTERACTIVE") == "1"
+        )
         warnings = emit_degradation_warnings(
             provider=config.provider,
             model=config.model,

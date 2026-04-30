@@ -116,9 +116,7 @@ class TestDispatchToolCallBridge:
             return "ok"
 
         ws = Path("/tmp/safe-zone")
-        result = dispatch_tool_call(
-            "ws_demo", {"relative_path": "data/x"}, workspace_root=ws
-        )
+        result = dispatch_tool_call("ws_demo", {"relative_path": "data/x"}, workspace_root=ws)
         assert result == "ok"
         assert captured["ws"] == ws
 
@@ -240,9 +238,9 @@ class TestCatalogFreshness:
         self, model: str, expected_prefix: str
     ) -> None:
         provider = (
-            "anthropic" if model.startswith("claude") else
-            "gemini" if model.startswith("gemini") else
-            "openai"
+            "anthropic"
+            if model.startswith("claude")
+            else "gemini" if model.startswith("gemini") else "openai"
         )
         caps = assess_capabilities(provider, model)
         assert caps.model_prefix == expected_prefix

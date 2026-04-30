@@ -102,10 +102,7 @@ CAPABILITY_CATALOG: Tuple[ProviderCapabilities, ...] = (
         streaming=True,
         prompt_caching=True,
         extended_thinking=True,
-        notes=(
-            "Temperature is deprecated on Opus 4.7 — providers drop it "
-            "automatically.",
-        ),
+        notes=("Temperature is deprecated on Opus 4.7 — providers drop it " "automatically.",),
     ),
     ProviderCapabilities(
         provider="anthropic",
