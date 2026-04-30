@@ -34,7 +34,14 @@ from fluid_build.cli.forge_copilot_llm_providers import (
     LlmProvider,
     get_catalog_tier_model,
 )
-from fluid_build.copilot.agents.errors import AgentExecutionError
+from fluid_build.copilot.agents.errors import (
+    AgentExecutionError,
+    ContextOverflowError,
+    ProviderAuthError,
+    ProviderError,
+    RateLimitError,
+    SchemaValidationError,
+)
 from fluid_build.copilot.industry.pack import IndustryPack
 from fluid_build.copilot.schemas.stage_outputs import StructuredOutputModel
 from fluid_build.copilot.store.base import Store
@@ -57,6 +64,16 @@ RETRY_BASE_DELAY = 1.0
 RETRY_MAX_DELAY = 8.0
 RETRY_JITTER = 0.1
 
+# Errors that are pointless to retry — re-issuing the same request will
+# produce the same failure. The agent loop must compact the prompt
+# (ContextOverflow), surface to the user (Auth), or send corrective
+# feedback to the LLM (Schema), not retry blindly.
+_NON_RETRYABLE_ERRORS = (
+    ContextOverflowError,
+    ProviderAuthError,
+    SchemaValidationError,
+)
+
 
 def retry_with_backoff(
     func: Callable[[], _T],
@@ -68,26 +85,54 @@ def retry_with_backoff(
     sleep: Callable[[float], None] = time.sleep,
     retry_if: Optional[Callable[[Exception], bool]] = None,
 ) -> _T:
-    """Call ``func`` with exponential-backoff retry.
+    """Call ``func`` with typed-error-aware retry.
 
     Three attempts by default, delays ``base_delay * 2**(n-1)`` capped at
     ``max_delay`` with up to ``jitter * delay`` extra uniform noise.
     ``sleep`` is injectable so tests can stub it out without patching
     :mod:`time`.
+
+    Two behaviour upgrades over a generic exponential-backoff loop:
+
+    1. **Non-retryable errors fail fast.** :class:`ContextOverflowError`,
+       :class:`ProviderAuthError`, and :class:`SchemaValidationError`
+       guarantee the same failure on retry — re-raising immediately
+       saves credits and surfaces the underlying problem faster.
+
+    2. **Retry-After is honored.** When a :class:`ProviderError` carries
+       a server-supplied ``retry_after`` (parsed from the HTTP header),
+       we sleep for that duration instead of the default exponential
+       delay. This prevents hammering rate-limited endpoints into
+       longer cool-downs.
     """
     last_error: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
         try:
             return func()
         except Exception as exc:  # noqa: BLE001
+            # Honor the explicit retry_if predicate first when callers
+            # need stage-specific behaviour (e.g. the staged call() path
+            # disables retry for schema errors so they surface a repair
+            # event instead of being retried opaquely).
             if retry_if is not None and not retry_if(exc):
+                raise
+            # Fail fast on errors that cannot be helped by retry.
+            if isinstance(exc, _NON_RETRYABLE_ERRORS):
                 raise
             last_error = exc
             if attempt == attempts:
                 break
-            delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
-            if jitter:
-                delay += random.uniform(0, jitter * delay)
+            # Provider-supplied Retry-After wins over our default
+            # exponential delay so we respect the upstream's pacing.
+            retry_after = getattr(exc, "retry_after", None) if isinstance(
+                exc, ProviderError
+            ) else None
+            if retry_after is not None and retry_after > 0:
+                delay = float(retry_after)
+            else:
+                delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                if jitter:
+                    delay += random.uniform(0, jitter * delay)
             sleep(delay)
     assert last_error is not None
     raise last_error
@@ -339,59 +384,81 @@ class BaseStageAgent:
                 tty = False
             streaming_enabled = tty and not (quiet_env or quiet_cap)
 
+        # All httpx + parse failures are funneled through
+        # ``classify_provider_error`` / ``SchemaValidationError`` so
+        # ``retry_with_backoff`` can branch on operationally distinct
+        # failure modes (rate-limit honors Retry-After; context-overflow
+        # fails fast; auth surfaces immediately; schema errors route
+        # corrective feedback back to the LLM at the agent-loop layer).
+        from fluid_build.copilot.agents.error_classification import (
+            classify_provider_error,
+        )
+
         with AgentStatus(
             stage=self.stage,
             agent=type(self).__name__,
             provider=provider.name,
             model=config.model,
         ):
-            if streaming_enabled:
-                from fluid_build.copilot.streaming import (
-                    NullStreamHandler,
-                    StreamingCall,
-                )
+            try:
+                if streaming_enabled:
+                    from fluid_build.copilot.streaming import (
+                        NullStreamHandler,
+                        StreamingCall,
+                    )
 
-                stream_url, stream_headers, stream_payload = provider.build_streaming_request(
-                    config,
-                    system_prompt,
-                    user_prompt,
-                )
-                self._inject_provider_schema(provider.name, stream_payload, output_schema)
-                with httpx.stream(
-                    "POST",
-                    stream_url,
-                    headers=stream_headers,
-                    json=stream_payload,
-                    timeout=config.timeout_seconds,
-                ) as response:
+                    stream_url, stream_headers, stream_payload = provider.build_streaming_request(
+                        config,
+                        system_prompt,
+                        user_prompt,
+                    )
+                    self._inject_provider_schema(
+                        provider.name, stream_payload, output_schema
+                    )
+                    with httpx.stream(
+                        "POST",
+                        stream_url,
+                        headers=stream_headers,
+                        json=stream_payload,
+                        timeout=config.timeout_seconds,
+                    ) as response:
+                        response.raise_for_status()
+                        handler = cm.get("stream_handler") or NullStreamHandler()
+                        with StreamingCall(
+                            provider.iter_stream_chunks(response),
+                            handler,
+                        ) as call:
+                            for _chunk in call:
+                                pass
+                        raw = call.full_text
+                    # Streaming providers don't return a usage block on
+                    # the SSE wire (provider-specific); we fall back to
+                    # an empty raw_response so the cost tracker records
+                    # the call as missing-usage rather than crashing.
+                    raw_response = {}
+                    parsed = safe_json_parse(raw)
+                else:
+                    response = httpx.post(
+                        config.endpoint,
+                        headers=headers,
+                        json=payload,
+                        timeout=config.timeout_seconds,
+                    )
                     response.raise_for_status()
-                    handler = cm.get("stream_handler") or NullStreamHandler()
-                    with StreamingCall(
-                        provider.iter_stream_chunks(response),
-                        handler,
-                    ) as call:
-                        for _chunk in call:
-                            pass
-                    raw = call.full_text
-                # Streaming providers don't return a usage block on
-                # the SSE wire (provider-specific); we fall back to
-                # an empty raw_response so the cost tracker records
-                # the call as missing-usage rather than crashing.
-                raw_response = {}
-                parsed = safe_json_parse(raw)
+                    raw_response = response.json()
+                    raw = provider.extract_text(raw_response)
+                    parsed = safe_json_parse(raw)
+            except (httpx.HTTPError, httpx.HTTPStatusError) as exc:
+                raise classify_provider_error(exc, provider=provider.name) from exc
+            try:
                 result = output_schema.model_validate(parsed)
-            else:
-                response = httpx.post(
-                    config.endpoint,
-                    headers=headers,
-                    json=payload,
-                    timeout=config.timeout_seconds,
-                )
-                response.raise_for_status()
-                raw_response = response.json()
-                raw = provider.extract_text(raw_response)
-                parsed = safe_json_parse(raw)
-                result = output_schema.model_validate(parsed)
+            except ValidationError as exc:
+                raise SchemaValidationError(
+                    f"Stage '{self.stage}' output failed schema validation",
+                    schema_name=output_schema.__name__,
+                    validation_errors=list(exc.errors()),
+                    raw_output=raw if isinstance(raw, str) else "",
+                ) from exc
         # Record this call's token usage with the run-level cost
         # tracker so ``fluid forge data-model`` can print a per-run
         # cost summary at the end. Two failure modes to guard against:
