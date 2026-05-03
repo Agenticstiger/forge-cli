@@ -13,18 +13,20 @@
 # limitations under the License.
 
 # fluid_build/providers/local/planner.py
-"""
-Full planning engine for FLUID Local Provider.
+"""Planning engine for the FLUID local provider.
 
-Converts FLUID contracts into executable local actions with proper
-dependency resolution and resource ordering.
+Converts FLUID contracts into executable local actions in dependency
+order:
 
-Features:
-- Supports 0.4.0 and 0.5.7 contract formats
-- Full dependency graph construction
-- Topological sorting for execution order
-- Schema validation
-- Sample data hints for testing
+1. ``load_data`` — import upstreams into DuckDB.
+2. ``execute_sql`` — run build transformations.
+3. ``materialize`` — write ``exposes[]`` outputs.
+4. ``validate_schema`` — confirm schemas match contract expectations.
+
+Local does NOT use the cloud 6-phase scaffold (no IAM, no
+infrastructure provisioning, no replace-snapshots) so it doesn't
+subclass :class:`BasePlanner` — the local flow is file-based and
+runs in-memory.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# SDK contract helper (optional — falls back to util.contract)
+# SDK contract helper (optional)
 try:
     from fluid_provider_sdk import ContractHelper as _ContractHelper
 
@@ -41,35 +43,14 @@ try:
 except ImportError:
     _HAS_SDK_CONTRACT = False
 
-# Version-agnostic contract utilities (still used by private helpers)
-try:
-    from fluid_build.util.contract import (
-        get_builds,
-        get_consumes,
-        get_expose_id,
-        get_expose_location,
-        get_exposes,
-        get_primary_build,
-    )
-except ImportError:
-    # Fallback for older versions
-    def get_primary_build(contract):
-        return contract.get("build") or contract.get("builds", [{}])[0]
-
-    def get_builds(contract):
-        return contract.get("builds") or ([contract.get("build")] if contract.get("build") else [])
-
-    def get_consumes(contract):
-        return contract.get("consumes", [])
-
-    def get_exposes(contract):
-        return contract.get("exposes", [])
-
-    def get_expose_id(exp):
-        return exp.get("id", "output")
-
-    def get_expose_location(exp):
-        return exp.get("location") or {}
+from fluid_build.util.contract import (
+    get_builds,
+    get_consumes,
+    get_expose_id,
+    get_expose_location,
+    get_exposes,
+    get_primary_build,
+)
 
 
 def plan_actions(
@@ -77,6 +58,8 @@ def plan_actions(
     project: Optional[str] = None,
     region: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
+    *,
+    mode: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Generate local execution plan from FLUID contract.
@@ -87,16 +70,25 @@ def plan_actions(
     3. materialize - Write exposes[] outputs
     4. validate_schema - Check schemas match expectations
 
+    The optional ``mode`` argument carries the apply-time mode
+    (``replace`` / ``replace-and-build``). When destructive, SQL build
+    actions are stamped with ``mode="replace"`` so the executor can
+    pre-truncate the target before running the transform. The default
+    additive behavior (incremental append) is preserved when mode is
+    None or ``amend``.
+
     Args:
-        contract: FLUID contract (0.4.0 or 0.5.7 format)
+        contract: FLUID contract (0.7.x format)
         project: Project ID (for consistency with cloud providers)
         region: Region (for consistency with cloud providers)
         logger: Optional logger instance
+        mode: apply-time mode for destructive-vs-additive routing
 
     Returns:
         List of action dictionaries ready for apply()
     """
     log = logger or logging.getLogger(__name__)
+    is_destructive = (mode or "").lower() in ("replace", "replace-and-build")
 
     actions = []
     dependencies: Dict[str, Set[str]] = {}  # resource_id -> {dependency_ids}
@@ -197,6 +189,34 @@ def plan_actions(
 
         build_id = build.get("id") or f"build_{build_idx}"
 
+        # Acquisition builds (``pattern: acquisition`` + an engine like
+        # duckdb / dlt / airbyte / meltano / kafka-connect / debezium)
+        # are materialised by the engine-specific runners under
+        # ``build_runners/<engine>/`` — they don't go through the local
+        # provider's SQL planner. Skip them silently here so the local
+        # planner doesn't emit ``has no SQL, skipping`` noise on every
+        # SDP apply. The legacy warn-and-skip was both confusing
+        # (suggesting a bug in the contract) and misleading (the
+        # build runner had already handled it upstream).
+        pattern = (build.get("pattern") or "").strip().lower()
+        engine = (build.get("engine") or "").strip().lower()
+        _ACQUISITION_ENGINES = {
+            "duckdb",
+            "dlt",
+            "airbyte",
+            "meltano",
+            "kafka-connect",
+            "debezium",
+        }
+        if pattern == "acquisition" and engine in _ACQUISITION_ENGINES:
+            log.debug(
+                "local planner: skipping acquisition build '%s' (engine=%s) "
+                "— handled by build_runners/<engine>/, not the SQL planner",
+                build_id,
+                engine,
+            )
+            continue
+
         # Extract SQL from various formats
         sql_text = _extract_sql(build, contract, log)
 
@@ -256,6 +276,12 @@ def plan_actions(
                 "resource_id": build_id,
                 "table_name": output_table,
                 "depends_on": list(input_tables),
+                # ``mode`` is read by the executor — when "replace",
+                # the transform pre-truncates ``output_table`` before
+                # running the SQL so additive INSERTs from prior runs
+                # don't bleed through. None / "amend" keeps the legacy
+                # additive behavior.
+                "mode": "replace" if is_destructive else "amend",
                 "payload": {
                     "sql": sql_text,
                     "inputs": input_specs if input_specs else list(input_tables),
@@ -398,21 +424,21 @@ def _infer_format(path: str, explicit_format: Optional[str] = None) -> str:
 
 def _extract_sql(build: Dict[str, Any], contract: Dict[str, Any], logger) -> Optional[str]:
     """
-    Extract SQL from build specification (supports 0.4.0 and 0.5.7).
+    Extract SQL from build specification (v0.7.x).
 
     Tries multiple locations:
-    1. build.properties.sql (0.5.7 inline)
-    2. build.transformation.properties.model (0.4.0 file reference)
+    1. build.properties.sql (v0.7.x inline)
+    2. build.transformation.properties.model (legacy, removed)
     3. build.sql (simple format)
     """
     props = build.get("properties") or {}
 
-    # Try inline SQL (0.5.7)
+    # Try inline SQL (v0.7.x)
     inline_sql = props.get("sql")
     if isinstance(inline_sql, str) and inline_sql.strip():
         return inline_sql.strip()
 
-    # Try model file (0.4.0)
+    # Try model file (legacy, dropped)
     transformation = build.get("transformation") or {}
     trans_props = transformation.get("properties") or {}
     model_path = trans_props.get("model")
@@ -440,13 +466,13 @@ def _extract_input_tables(
     Determine which tables this build depends on.
 
     Checks:
-    1. build.properties.parameters.inputs (0.5.7)
+    1. build.properties.parameters.inputs (v0.7.x)
     2. build.inputs (explicit)
     3. All loaded tables (conservative default)
     """
     inputs = set()
 
-    # Check explicit inputs (0.5.7 format)
+    # Check explicit inputs (v0.7.x format)
     props = build.get("properties") or {}
     params = props.get("parameters") or {}
     param_inputs = params.get("inputs") or []

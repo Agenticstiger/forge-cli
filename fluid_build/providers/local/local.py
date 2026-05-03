@@ -208,7 +208,12 @@ class LocalProvider(BaseProvider):
             "auth": False,  # No auth needed for local
         }
 
-    def plan(self, contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def plan(
+        self,
+        contract: Dict[str, Any],
+        *,
+        mode: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Generate local execution plan from FLUID contract.
 
@@ -217,19 +222,33 @@ class LocalProvider(BaseProvider):
         - execute_sql: Run transformations
         - materialize: Write exposes[] outputs
 
+        The optional ``mode`` argument carries the apply-time mode
+        (``replace`` / ``replace-and-build`` etc.). Forwarded to the
+        planner so destructive modes can adjust materialisation
+        strategy (e.g. CREATE OR REPLACE TABLE for SQL transforms,
+        ``COPY ... TO`` overwriting for parquet sinks). Local SDP via
+        DuckDB acquisition already overwrites parquet implicitly via
+        ``COPY ... TO`` so this is mostly a no-op for SDP — but SQL
+        transforms (engine: sql, pattern: embedded-logic) honour it.
+
         Args:
-            contract: FLUID contract (0.4.0 or 0.5.7 format)
+            contract: FLUID contract (0.7.x format)
+            mode: apply-time mode; None for additive default
 
         Returns:
             List of actions ready for apply()
         """
-        self._log_info("local_plan_start", {"contract_id": contract.get("id")})
+        self._log_info("local_plan_start", {"contract_id": contract.get("id"), "mode": mode})
 
         # Import planner (lazy to avoid circular import)
         from .planner import plan_actions, validate_plan
 
         try:
-            actions = plan_actions(contract, self.project, self.region, self.logger)
+            try:
+                actions = plan_actions(contract, self.project, self.region, self.logger, mode=mode)
+            except TypeError:
+                # Older planner signature without mode kwarg.
+                actions = plan_actions(contract, self.project, self.region, self.logger)
 
             # Validate plan before returning
             is_valid, errors = validate_plan(actions, self.logger)
@@ -383,7 +402,7 @@ class LocalProvider(BaseProvider):
     def _derive_actions_from_contract(self, contract: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Build a single runnable SQL action for local execution:
-          - Load SQL from build (supports both 0.4.0 and 0.5.7 formats).
+          - Load SQL from build (v0.7.x canonical only formats).
           - Register consumes[*] files or parameters.inputs as DuckDB views.
           - Write to exposes[0] path if provided, else default under runtime/out/.
         """
@@ -395,16 +414,16 @@ class LocalProvider(BaseProvider):
         inputs_spec: List[Any] = []
 
         if build:
-            # Check for inline SQL in properties.sql (0.5.7) or properties.model file (0.4.0)
+            # Check for inline SQL in properties.sql (v0.7.x) or properties.model file (legacy, dropped)
             props = build.get("properties") or {}
 
-            # Try inline SQL first (0.5.7 embedded-logic pattern)
+            # Try inline SQL first (v0.7.x embedded-logic pattern)
             inline_sql = props.get("sql")
             if isinstance(inline_sql, str) and inline_sql.strip():
                 sql_text = inline_sql
                 self._log_info("local_sql_inline", {"length": len(sql_text)})
 
-                # Get inputs from parameters.inputs (0.5.7)
+                # Get inputs from parameters.inputs (v0.7.x)
                 params = props.get("parameters") or {}
                 param_inputs = params.get("inputs") or []
                 for inp in param_inputs:
@@ -418,7 +437,7 @@ class LocalProvider(BaseProvider):
                         if path and name:
                             inputs_spec.append({"path": path, "table": name})
             else:
-                # Try model file path (0.4.0)
+                # Try model file path (legacy, dropped)
                 trans = build.get("transformation") or {}
                 trans_props = trans.get("properties") or {}
                 model_path = trans_props.get("model")
@@ -819,10 +838,21 @@ class LocalProvider(BaseProvider):
     # ---------------------------- Logging -------------------------------- #
 
     def _log_info(self, msg: str, extra: Optional[Dict[str, Any]] = None) -> None:
-        """Log info with automatic secret redaction."""
+        """Log info with automatic secret redaction.
+
+        Emitted at DEBUG level so observability breadcrumbs
+        (``local_plan_start``, ``local_apply_end``, ``local_sql_begin``,
+        etc.) don't bleed into user-facing CLI output. Operators who
+        want them surface them with ``--debug`` / ``FLUID_LOG_LEVEL=DEBUG``
+        or by routing to a ``--log-file`` JSON sink.
+
+        UX hardening pass — the ``info`` level here was creating ~6
+        ``local_*_*`` event lines on every ``apply`` invocation, which
+        operators consistently flagged as noise.
+        """
         if self.logger:
             redacted_extra = redact_dict(extra) if extra else None
-            self.logger.info(msg, extra=_safe_extra(redacted_extra))
+            self.logger.debug(msg, extra=_safe_extra(redacted_extra))
 
     def _log_warn(self, msg: str, extra: Optional[Dict[str, Any]] = None) -> None:
         """Log warning with automatic secret redaction."""

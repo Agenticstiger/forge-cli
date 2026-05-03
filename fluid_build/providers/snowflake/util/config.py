@@ -546,61 +546,7 @@ def get_connection_params(
     return params
 
 
-def _get_connection_params_legacy(
-    account: str,
-    warehouse: str,
-    database: Optional[str] = None,
-    schema: Optional[str] = "PUBLIC",
-    user: Optional[str] = None,
-    **kwargs,
-) -> dict:
-    """
-    Legacy connection params builder (backward compatibility).
-
-    This is the original implementation that uses environment variables directly.
-    Kept for backward compatibility if credential resolver is not available.
-    """
-    # Resolve user
-    user = user or os.environ.get("SNOWFLAKE_USER") or os.environ.get("SF_USER")
-
-    if not user:
-        raise ValueError(
-            "Snowflake user not specified. "
-            "Provide via 'user' parameter or SNOWFLAKE_USER environment variable."
-        )
-
-    # Base parameters
-    params = {
-        "account": account,
-        "user": user,
-        "warehouse": warehouse,
-    }
-
-    if database:
-        params["database"] = database
-    if schema:
-        params["schema"] = schema
-
-    # Authentication method (priority order)
-    if "password" in kwargs:
-        params["password"] = kwargs["password"]
-    elif "SNOWFLAKE_PASSWORD" in os.environ:
-        params["password"] = os.environ["SNOWFLAKE_PASSWORD"]
-    elif "private_key" in kwargs:
-        params["private_key"] = kwargs["private_key"]
-    elif "token" in kwargs:
-        params["token"] = kwargs["token"]
-    elif "authenticator" in kwargs:
-        params["authenticator"] = kwargs["authenticator"]
-    elif os.environ.get("SNOWFLAKE_AUTHENTICATOR"):
-        params["authenticator"] = os.environ["SNOWFLAKE_AUTHENTICATOR"]
-    else:
-        # Default to external browser for SSO
-        params["authenticator"] = "externalbrowser"
-
-    # Optional parameters
-    for key in ["role", "application", "insecure_mode", "ocsp_response_cache_filename"]:
-        if key in kwargs:
-            params[key] = kwargs[key]
-
-    return params
+# ``_get_connection_params_legacy`` (the env-var-only fallback) was deleted —
+# every caller goes through ``get_connection_params`` above which delegates to
+# the unified credential resolver. The fallback was bit-rot: never invoked,
+# never tested, and duplicated 60 LOC of authenticator-priority logic.

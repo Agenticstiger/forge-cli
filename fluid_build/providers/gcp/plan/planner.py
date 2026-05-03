@@ -24,28 +24,102 @@ import logging
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
+from fluid_build.providers._planner_base import BasePlanner
+
 from ..util.logging import format_event
 from ..util.names import normalize_bucket_name, normalize_dataset_name
 
 
+class GcpPlanner(BasePlanner):
+    """GCP-specific planner — wires the 6-phase scaffold to the
+    BigQuery / Cloud Storage / Composer phase functions below.
+
+    The phase functions stay module-level (the test suite calls them
+    individually); this class wires them into the canonical phase
+    order owned by :class:`BasePlanner`.
+    """
+
+    _logger_name = "fluid.providers.gcp.planner"
+
+    def __init__(
+        self,
+        *,
+        project: str,
+        region: str,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        super().__init__(logger=logger)
+        self.project = project
+        self.region = region
+
+    def plan_infrastructure(self, contract):
+        return _plan_infrastructure(contract, self.project, self.region, self.logger)
+
+    def plan_iam(self, contract):
+        return _plan_iam_policies(contract, self.project, self.logger)
+
+    def plan_replace_snapshots(self, contract):
+        return _plan_replace_snapshots(contract, self.project, self.region, self.logger)
+
+    def plan_expose(self, contract, *, is_destructive):
+        return _plan_exposures(
+            contract,
+            self.project,
+            self.region,
+            self.logger,
+            is_destructive=is_destructive,
+        )
+
+    def plan_build(self, contract, *, is_destructive):
+        return _plan_build_transformations(
+            contract,
+            self.project,
+            self.region,
+            self.logger,
+            is_destructive=is_destructive,
+        )
+
+    def plan_schedule(self, contract):
+        return _plan_scheduling(contract, self.project, self.region, self.logger)
+
+
 def plan_actions(
-    contract: Mapping[str, Any], project: str, region: str, logger: Optional[logging.Logger] = None
+    contract: Mapping[str, Any],
+    project: str,
+    region: str,
+    logger: Optional[logging.Logger] = None,
+    *,
+    mode: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Generate GCP actions from FLUID contract.
 
-    Analyzes contract and produces ordered list of actions to:
-    1. Create necessary datasets and buckets
-    2. Set up IAM policies
-    3. Deploy transformation logic (dbt/Dataform)
-    4. Configure scheduling (Composer/Scheduler)
-    5. Expose data products (tables, APIs, streams)
+    Back-compat shim — constructs a :class:`GcpPlanner` and calls
+    :meth:`GcpPlanner.plan`. The 6-phase ordering, destructive-mode
+    handling, and CTAS backup emission live in
+    :class:`fluid_build.providers._planner_base.BasePlanner` so the
+    GCP provider stays in lockstep with Snowflake / AWS.
+
+    Phase order (set by ``BasePlanner.plan``):
+    1. Infrastructure — datasets and buckets.
+    2. IAM — service-account bindings, custom roles.
+    3. Replace snapshots — pre-flight CTAS per bigquery_table
+       (destructive modes only).
+    4. Expose — tables, APIs, streams.
+    5. Build — dbt / Dataform / SQL transforms.
+    6. Schedule — Composer DAGs / Cloud Scheduler.
+
+    For destructive modes (``replace`` / ``replace-and-build``),
+    SQL builds emit ``CREATE OR REPLACE TABLE … AS SELECT`` (BigQuery's
+    atomic replace) and a pre-flight CTAS backup is emitted per
+    ``bigquery_table`` expose for rollback.
 
     Args:
         contract: FLUID contract specification
         project: GCP project ID
         region: GCP region
         logger: Optional logger instance
+        mode: apply-time mode for destructive-vs-additive routing
 
     Returns:
         List of ordered actions to execute
@@ -53,45 +127,20 @@ def plan_actions(
     if logger is None:
         logger = logging.getLogger(__name__)
 
-    actions = []
-
-    # Validate contract structure
     contract_id = contract.get("id")
     if not contract_id:
         raise ValueError("Contract must have an 'id' field")
 
-    logger.debug(format_event("planning_started", contract_id=contract_id))
+    logger.debug(format_event("planning_started", contract_id=contract_id, mode=mode))
 
-    # Phase 1: Infrastructure setup (datasets, buckets)
-    infrastructure_actions = _plan_infrastructure(contract, project, region, logger)
-    actions.extend(infrastructure_actions)
-
-    # Phase 2: IAM and security policies
-    iam_actions = _plan_iam_policies(contract, project, logger)
-    actions.extend(iam_actions)
-
-    # Phase 3: Build transformations (dbt, Dataform)
-    build_actions = _plan_build_transformations(contract, project, region, logger)
-    actions.extend(build_actions)
-
-    # Phase 4: Expose data products
-    expose_actions = _plan_exposures(contract, project, region, logger)
-    actions.extend(expose_actions)
-
-    # Phase 5: Scheduling and orchestration
-    schedule_actions = _plan_scheduling(contract, project, region, logger)
-    actions.extend(schedule_actions)
+    planner = GcpPlanner(project=project, region=region, logger=logger)
+    actions = planner.plan(contract, mode=mode)
 
     logger.info(
         format_event(
             "planning_completed",
             contract_id=contract_id,
             total_actions=len(actions),
-            infrastructure_actions=len(infrastructure_actions),
-            iam_actions=len(iam_actions),
-            build_actions=len(build_actions),
-            expose_actions=len(expose_actions),
-            schedule_actions=len(schedule_actions),
         )
     )
 
@@ -120,7 +169,7 @@ def _plan_infrastructure(
         binding = exposure.get("binding", {})
 
         if binding:
-            # New 0.5.7 structure
+            # v0.7.x structure
             format_type = binding.get("format")
             properties = binding.get("location", {})
         else:
@@ -136,7 +185,7 @@ def _plan_infrastructure(
             if dataset_name and (dataset_project, dataset_name) not in datasets_created:
                 normalized_dataset = normalize_dataset_name(dataset_name)
 
-                # Support both 'region' (new v0.5.7) and 'location' (legacy) keys
+                # Read 'region' from binding properties (v0.7.x canonical)
                 dataset_location = properties.get("region") or properties.get("location", "US")
 
                 actions.append(
@@ -176,7 +225,7 @@ def _plan_infrastructure(
                 buckets_created.add((bucket_project, bucket_name))
 
     # Check build section for additional infrastructure needs
-    # Support both 0.5.7 (builds array) and 0.4.0 (build object)
+    # Support both v0.7.x builds array
     from fluid_build.util.contract import get_primary_build
 
     build_config = get_primary_build(contract) or {}
@@ -295,49 +344,253 @@ def _plan_iam_policies(
 
 
 def _plan_build_transformations(
-    contract: Mapping[str, Any], project: str, region: str, logger: logging.Logger
+    contract: Mapping[str, Any],
+    project: str,
+    region: str,
+    logger: logging.Logger,
+    *,
+    is_destructive: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Plan build transformation actions.
 
-    Sets up dbt, Dataform, or other transformation engines.
+    Sets up dbt, Dataform, or other transformation engines. When
+    ``is_destructive`` is True, the action is stamped with
+    ``mode="replace"`` so the dbt executor adds ``--full-refresh``
+    and SQL transforms emit ``CREATE OR REPLACE TABLE … AS SELECT``.
     """
     actions = []
+    apply_mode = "replace" if is_destructive else "amend"
 
-    # Support both 0.5.7 (builds array) and 0.4.0 (build object)
+    # Support both v0.7.x builds array
     from fluid_build.util.contract import get_primary_build
 
     build_config = get_primary_build(contract) or {}
     transformation = build_config.get("transformation", {})
 
-    if not transformation:
-        return actions
+    if transformation:
+        from .bq_modeler import plan_transformation_actions
 
-    from .bq_modeler import plan_transformation_actions
+        transformation_actions = plan_transformation_actions(
+            transformation, contract, project, region, logger
+        )
+        # Stamp ``mode`` on each emitted action so downstream executors
+        # (the GCP action handler + bq_modeler runtime) can route additive
+        # vs destructive paths consistently.
+        for action in transformation_actions:
+            action.setdefault("mode", apply_mode)
+        actions.extend(transformation_actions)
 
-    transformation_actions = plan_transformation_actions(
-        transformation, contract, project, region, logger
-    )
-    actions.extend(transformation_actions)
+    # Inline-SQL build path (mirrors the Snowflake planner's
+    # ``_plan_build`` SQL emission). For each ``builds[]`` entry with
+    # ``properties.sql`` AND outputs targeting a ``bigquery_table``
+    # expose, emit ``bq.sql.execute`` actions wrapping the SQL into
+    # INSERT INTO (additive) or CREATE OR REPLACE TABLE … AS SELECT
+    # (destructive). Multi-output builds emit one action per output.
+    for build_idx, build_entry in enumerate(contract.get("builds", []) or []):
+        if not isinstance(build_entry, Mapping):
+            continue
+        props = build_entry.get("properties", {})
+        if not isinstance(props, Mapping):
+            props = {}
+        sql_text = build_entry.get("sql") or props.get("sql")
+        if not sql_text:
+            continue
+        outputs = list(build_entry.get("outputs") or [])
+        if not outputs:
+            outputs = [None]
+        build_id = build_entry.get("id", f"build_{build_idx}")
+        for out_id in outputs:
+            wrapped = (
+                _bq_wrap_sql_for_target(
+                    sql_text=sql_text,
+                    contract=contract,
+                    target_output_id=out_id,
+                    default_project=project,
+                    is_destructive=is_destructive,
+                )
+                if out_id
+                else sql_text
+            )
+            action_id = build_id if len(outputs) == 1 else f"{build_id}__{out_id}"
+            actions.append(
+                {
+                    "id": action_id,
+                    "op": "bq.sql.execute",
+                    "phase": "build",
+                    "project": project,
+                    "sql": wrapped,
+                    "mode": apply_mode,
+                    "comment": build_entry.get("description") or build_entry.get("name"),
+                }
+            )
 
-    logger.debug(format_event("transformations_planned", actions=len(actions)))
+    logger.debug(format_event("transformations_planned", actions=len(actions), mode=apply_mode))
 
     return actions
 
 
+def _bq_wrap_sql_for_target(
+    *,
+    sql_text: str,
+    contract: Mapping[str, Any],
+    target_output_id: str,
+    default_project: str,
+    is_destructive: bool,
+) -> str:
+    """Wrap a build's SQL with INSERT or CTAS for a BigQuery target.
+
+    Mirrors :func:`fluid_build.providers.snowflake.plan.planner._wrap_sql_for_target`
+    using BigQuery's backtick-quoted identifier syntax. Pass-through
+    when the target expose isn't a ``bigquery_table`` binding or when
+    the SQL already declares its own sink (INSERT/CREATE/MERGE/etc).
+    """
+    target_expose = next(
+        (
+            ex
+            for ex in (contract.get("exposes") or [])
+            if isinstance(ex, Mapping)
+            and (ex.get("exposeId") == target_output_id or ex.get("id") == target_output_id)
+        ),
+        None,
+    )
+    if target_expose is None:
+        return sql_text
+    binding = target_expose.get("binding") or {}
+    if (binding.get("format") or "").lower() not in (
+        "bigquery_table",
+        "bigquery-table",
+    ):
+        return sql_text
+    location = binding.get("location") or {}
+    proj = location.get("project") or default_project
+    dataset = location.get("dataset") or location.get("schema")
+    table = location.get("table") or target_output_id
+    if not (proj and dataset and table):
+        return sql_text
+    upper_head = sql_text.lstrip().upper()[:32]
+    for kw in ("INSERT", "CREATE", "MERGE", "UPDATE", "DELETE", "COPY", "TRUNCATE"):
+        if upper_head.startswith(kw):
+            return sql_text
+    body = sql_text.rstrip().rstrip(";")
+    fqn = f"`{proj}.{dataset}.{table}`"
+    if is_destructive:
+        return f"CREATE OR REPLACE TABLE {fqn} AS\n{body}"
+    return f"INSERT INTO {fqn}\n{body}"
+
+
+def _plan_replace_snapshots(
+    contract: Mapping[str, Any],
+    project: str,
+    region: str,
+    logger: logging.Logger,
+) -> List[Dict[str, Any]]:
+    """Pre-flight CTAS backups for ``--mode replace`` against BigQuery.
+
+    For each ``bigquery_table`` expose, emit an action that runs
+    ``CREATE TABLE IF NOT EXISTS <backup> AS SELECT * FROM <orig>``
+    BEFORE the destructive replace fires. BigQuery has no CLONE so the
+    backup is a real copy (storage cost applies); the
+    ``IF NOT EXISTS`` guard keeps re-runs idempotent.
+
+    The action carries a ``rollback_snapshot`` marker so apply.py's
+    ``_rollback_writer`` can record the snapshot in
+    ``.fluid/rollback-state.json`` for ``fluid rollback``.
+
+    Skips exposes whose source table doesn't exist yet (first-run
+    replace) — the IF NOT EXISTS gate also covers the pre-existence
+    case but BigQuery raises if the SOURCE is absent. The backup
+    action is marked ``allow_failure: True`` so a missing source on
+    first-run replace soft-skips rather than aborting the plan.
+    """
+    import time as _time
+
+    actions: List[Dict[str, Any]] = []
+    backup_ts = int(_time.time())
+    for expose in contract.get("exposes", []) or []:
+        if not isinstance(expose, Mapping):
+            continue
+        binding = expose.get("binding") or {}
+        if (binding.get("format") or "").lower() not in (
+            "bigquery_table",
+            "bigquery-table",
+        ):
+            continue
+        location = binding.get("location") or {}
+        proj = location.get("project") or project
+        dataset = location.get("dataset") or location.get("schema")
+        table = location.get("table") or expose.get("exposeId")
+        if not (proj and dataset and table):
+            continue
+        backup = f"BACKUP_{table}_{backup_ts}"
+        sql = (
+            f"CREATE TABLE IF NOT EXISTS `{proj}.{dataset}.{backup}` AS "
+            f"SELECT * FROM `{proj}.{dataset}.{table}`"
+        )
+        actions.append(
+            {
+                "id": f"snapshot_{expose.get('exposeId')}",
+                "op": "bq.sql.execute",
+                "phase": "snapshot",
+                "project": proj,
+                "dataset": dataset,
+                "sql": sql,
+                "comment": f"pre-flight backup of {proj}.{dataset}.{table}",
+                "allow_failure": True,
+                "rollback_snapshot": {
+                    "backup_name": backup,
+                    "product_id": contract.get("id"),
+                    "expose_id": expose.get("exposeId"),
+                    "location": {
+                        "database": proj,
+                        "schema": dataset,
+                        "table": table,
+                        "backup_table": backup,
+                    },
+                },
+            }
+        )
+    return actions
+
+
 def _plan_exposures(
-    contract: Mapping[str, Any], project: str, region: str, logger: logging.Logger
+    contract: Mapping[str, Any],
+    project: str,
+    region: str,
+    logger: logging.Logger,
+    *,
+    is_destructive: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Plan data product exposure actions.
 
-    Creates tables, views, APIs, streams, etc.
+    Creates tables, views, APIs, streams, etc. When ``is_destructive``
+    is True and the expose is a target of a SQL build (listed in
+    ``builds[].outputs``), the ensure_table step is skipped because
+    the build's CREATE OR REPLACE TABLE handles materialisation.
     """
     actions = []
+    # Build the set of expose ids targeted by SQL builds; their
+    # ensure_table is skipped under destructive modes.
+    sql_build_targets: set = set()
+    if is_destructive:
+        for build_entry in contract.get("builds", []) or []:
+            if not isinstance(build_entry, Mapping):
+                continue
+            outputs = build_entry.get("outputs") or []
+            if outputs and (
+                build_entry.get("sql") or (build_entry.get("properties") or {}).get("sql")
+            ):
+                sql_build_targets.update(outputs)
 
     for exposure in contract.get("exposes", []):
         exposure_id = exposure.get("id") or exposure.get("exposeId")
         exposure.get("type") or exposure.get("kind")
+
+        # Skip ensure_table for destructive-mode SQL-build targets —
+        # CREATE OR REPLACE TABLE in the build phase materialises them.
+        if is_destructive and exposure_id in sql_build_targets:
+            continue
 
         # Support both old and new structures
         location = exposure.get("location", {})
@@ -354,7 +607,7 @@ def _plan_exposures(
             # Get schema from either old or new structure
             schema = exposure.get("schema", [])
             if not schema:
-                # Try new 0.5.7 structure
+                # Use v0.7.x structure
                 contract_def = exposure.get("contract", {})
                 schema = contract_def.get("schema", [])
 
@@ -461,6 +714,8 @@ def _get_resource_labels(
 
     if metadata.get("layer"):
         labels["fluid_layer"] = _sanitize_label_value(metadata["layer"])
+    if metadata.get("productType"):
+        labels["fluid_product_type"] = _sanitize_label_value(metadata["productType"])
 
     if metadata.get("owner", {}).get("team"):
         labels["fluid_team"] = _sanitize_label_value(metadata["owner"]["team"])
@@ -479,7 +734,7 @@ def _get_resource_labels(
         if safe_tag:
             labels[f"tag_{safe_tag}"] = "true"
 
-    # Add contract-level labels (v0.5.7 root labels)
+    # Add contract-level labels (v0.7.x root labels)
     for key, value in contract.get("labels", {}).items():
         sanitized_key = _sanitize_label_key(key)
         sanitized_value = _sanitize_label_value(str(value))

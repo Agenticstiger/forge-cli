@@ -549,9 +549,7 @@ def _auto_register_from_module(mod, logger: Optional[logging.Logger]) -> None:
 
 def _fallback_registers(logger: Optional[logging.Logger]) -> None:
     """Best-effort fallback imports if discovery yielded nothing."""
-    candidates = list(_DEFAULT_MODULES) + [
-        "fluid_build.providers.opds",  # legacy alias if present
-    ]
+    candidates = list(_DEFAULT_MODULES)
     for modname in candidates:
         try:
             mod = importlib.import_module(modname)

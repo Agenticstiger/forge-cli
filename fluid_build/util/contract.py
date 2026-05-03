@@ -184,6 +184,32 @@ def get_expose_contract(expose: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     return expose.get("contract")
 
 
+def get_consumes(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Return ``contract.consumes`` as a list of upstream-reference
+    dicts. Empty list when the contract declares none or carries a
+    malformed value.
+
+    Used by providers that need to enumerate upstream products (e.g.
+    the local planner emits a sources.yml entry per consume). Distinct
+    from :func:`consumes_to_canonical_ports` (below) which normalises
+    into the per-port shape used by the dataflow graph; this getter
+    returns the raw list.
+    """
+    consumes = contract.get("consumes")
+    return consumes if isinstance(consumes, list) else []
+
+
+def get_exposes(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Return ``contract.exposes`` as a list of port dicts. Empty list
+    when the contract declares none or carries a malformed value.
+
+    Mirror of :func:`get_consumes` for the downstream side. Providers
+    iterate this to plan provisioning per output port.
+    """
+    exposes = contract.get("exposes")
+    return exposes if isinstance(exposes, list) else []
+
+
 def get_consume_id(consume: Mapping[str, Any]) -> Optional[str]:
     """Return the consume's local port id.
 

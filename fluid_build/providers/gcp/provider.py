@@ -98,7 +98,55 @@ class GcpProvider(BaseProvider):
             "auth": True,  # Auth context reporting
         }
 
-    def plan(self, contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    def restore_ddl(self, snapshot: Mapping[str, Any]) -> List[str]:
+        """BigQuery restore via CTAS (BigQuery has no CLONE).
+
+        ``CREATE OR REPLACE TABLE <orig> AS SELECT * FROM <backup>``
+        is atomic. Storage cost applies (the backup is a real copy
+        of the data, not a metadata pointer).
+        """
+        location = snapshot.get("location") or {}
+        db = location.get("database")
+        sch = location.get("schema")
+        tbl = location.get("table")
+        backup = location.get("backup_table") or snapshot.get("backup_name")
+        if not (db and sch and tbl and backup):
+            return []
+        return [
+            f"CREATE OR REPLACE TABLE `{db}.{sch}.{tbl}` AS " f"SELECT * FROM `{db}.{sch}.{backup}`"
+        ]
+
+    def cleanup_backups(self, snapshots: List[Mapping[str, Any]]) -> None:
+        """Drop BigQuery backup tables (best-effort)."""
+        if not snapshots:
+            return
+        try:
+            from google.cloud import bigquery  # type: ignore
+        except Exception:  # pragma: no cover
+            return
+        client = bigquery.Client(project=self.project)
+        for snap in snapshots:
+            loc = snap.get("location") or {}
+            db = loc.get("database")
+            sch = loc.get("schema")
+            backup = loc.get("backup_table") or snap.get("backup_name")
+            if not (db and sch and backup):
+                continue
+            try:
+                client.delete_table(f"{db}.{sch}.{backup}", not_found_ok=True)
+            except Exception as exc:  # noqa: BLE001
+                self.warn_kv(
+                    event="backup_cleanup_drop_failed",
+                    table=f"{db}.{sch}.{backup}",
+                    error=str(exc),
+                )
+
+    def plan(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        mode: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Generate GCP actions from FLUID contract.
 
@@ -108,16 +156,32 @@ class GcpProvider(BaseProvider):
         - Pub/Sub topics and subscriptions
         - Composer DAGs and schedules
         - IAM policy bindings
+
+        The optional ``mode`` argument carries the apply-time mode.
+        For destructive modes (``replace`` / ``replace-and-build``)
+        the BigQuery actions emit ``CREATE OR REPLACE TABLE … AS SELECT``
+        instead of additive ``INSERT INTO``, with a pre-flight backup
+        CTAS for rollback.
         """
         self.debug_kv(
-            event="plan_started", contract_id=contract.get("id"), contract_name=contract.get("name")
+            event="plan_started",
+            contract_id=contract.get("id"),
+            contract_name=contract.get("name"),
+            mode=mode,
         )
 
         try:
-            actions = plan_actions(contract, self.project, self.region, self.logger)
+            try:
+                actions = plan_actions(contract, self.project, self.region, self.logger, mode=mode)
+            except TypeError:
+                # Older planner signature without mode kwarg.
+                actions = plan_actions(contract, self.project, self.region, self.logger)
 
             self.info_kv(
-                event="plan_completed", contract_id=contract.get("id"), actions_count=len(actions)
+                event="plan_completed",
+                contract_id=contract.get("id"),
+                actions_count=len(actions),
+                mode=mode,
             )
 
             return actions
@@ -155,7 +219,7 @@ class GcpProvider(BaseProvider):
                 # Redact action before logging (removes 'op' from spread to avoid duplicate)
                 redacted_action = redact_dict(action)
                 redacted_action.pop("op", None)  # Remove op to avoid duplicate with explicit op=op
-                redacted_action.pop("id", None)  # Remove id to avoid duplicate (0.5.7)
+                redacted_action.pop("id", None)  # Remove id to avoid duplicate (v0.7.x)
                 redacted_action.pop(
                     "action_id", None
                 )  # Remove action_id to avoid duplicate (0.7.1)
@@ -342,6 +406,143 @@ class GcpProvider(BaseProvider):
             "message": "Task scheduling handled by orchestration engine (Airflow/Composer)",
         }
 
+    def _register_schema_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``registerSchema`` (v0.7.1 abstract op) into a
+        BigQuery ``update_table_schema`` action.
+
+        The abstract op carries the new column set in ``params.schema``;
+        we route it to the BQ action handler which emits the ALTER TABLE
+        SET COLUMN sequence to converge live schema with the contract.
+        """
+        params = action.get("params", {})
+        binding = params.get("binding", {})
+        location_info = binding.get("location", {})
+        dataset = location_info.get("dataset")
+        table = location_info.get("table")
+        if not (dataset and table):
+            raise ProviderError(
+                "registerSchema requires both 'dataset' and 'table' in binding.location"
+            )
+        return self._execute_bigquery_action(
+            {
+                "op": "bq.update_table_schema",
+                "dataset": dataset,
+                "table": table,
+                "project": location_info.get("project") or self.project,
+                "schema": params.get("schema", []),
+            }
+        )
+
+    def _create_view_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``createView`` (v0.7.1 abstract op) into a
+        BigQuery ``ensure_view`` action with the SQL query the
+        contract author supplied in ``params.query``.
+        """
+        params = action.get("params", {})
+        binding = params.get("binding", {})
+        location_info = binding.get("location", {})
+        dataset = location_info.get("dataset")
+        view = location_info.get("table") or location_info.get("view")
+        query = params.get("query") or params.get("sql")
+        if not (dataset and view and query):
+            raise ProviderError(
+                "createView requires 'dataset', 'table'/'view', and 'query' in params"
+            )
+        return self._execute_bigquery_action(
+            {
+                "op": "bq.ensure_view",
+                "dataset": dataset,
+                "view": view,
+                "project": location_info.get("project") or self.project,
+                "query": query,
+            }
+        )
+
+    def _grant_access_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``grantAccess`` into ``iam.grant_role``.
+
+        ``params`` carries the principal (``role``, ``member``) and
+        the resource scope (``dataset``, ``table``, or ``project``).
+        """
+        params = action.get("params", {})
+        return self._execute_iam_action(
+            {
+                "op": "iam.grant_role",
+                "role": params.get("role"),
+                "member": params.get("member") or params.get("principal"),
+                "project": params.get("project") or self.project,
+                "resource": params.get("resource"),
+            }
+        )
+
+    def _revoke_access_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``revokeAccess`` into ``iam.revoke_role``."""
+        params = action.get("params", {})
+        return self._execute_iam_action(
+            {
+                "op": "iam.revoke_role",
+                "role": params.get("role"),
+                "member": params.get("member") or params.get("principal"),
+                "project": params.get("project") or self.project,
+                "resource": params.get("resource"),
+            }
+        )
+
+    def _update_policy_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``updatePolicy`` into ``iam.set_policy``.
+
+        The abstract op carries the full IAM policy document under
+        ``params.policy``; we forward it to the IAM action handler.
+        """
+        params = action.get("params", {})
+        return self._execute_iam_action(
+            {
+                "op": "iam.set_policy",
+                "project": params.get("project") or self.project,
+                "resource": params.get("resource"),
+                "policy": params.get("policy", {}),
+            }
+        )
+
+    def _publish_event_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``publishEvent`` (v0.7.1 abstract op) into a
+        Pub/Sub topic-publish action.
+
+        ``params`` carries the topic and message payload; routed
+        through the existing ``ps.publish`` handler.
+        """
+        params = action.get("params", {})
+        topic = params.get("topic")
+        if not topic:
+            raise ProviderError("publishEvent requires 'topic' in params")
+        return self._execute_pubsub_action(
+            {
+                "op": "ps.publish",
+                "topic": topic,
+                "project": params.get("project") or self.project,
+                "data": params.get("data") or params.get("payload") or {},
+                "attributes": params.get("attributes", {}),
+            }
+        )
+
+    def _custom_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``custom`` (v0.7.1 abstract op) into the
+        provider-specific operation the author embedded under
+        ``params.op``. The author is responsible for naming a
+        valid native op (e.g. ``bq.ensure_dataset``); we just
+        forward the params dict as the action.
+        """
+        params = action.get("params", {})
+        native_op = params.get("op")
+        if not native_op:
+            raise ProviderError(
+                "custom requires 'op' field naming the native operation to dispatch"
+            )
+        # Build a flat action dict with the native op; let the dispatcher route.
+        forwarded = dict(params)
+        forwarded["op"] = native_op
+        return self._execute_action(forwarded)
+
     def _execute_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """
         Dispatch action to appropriate service handler.
@@ -382,19 +583,32 @@ class GcpProvider(BaseProvider):
             return self._execute_dbt_action(action)
         elif op.startswith("dataform."):
             return self._execute_dataform_action(action)
-        # 0.7.1 provider actions (no prefix)
-        elif op == "provisionDataset":
-            return self._provision_dataset_071(action)
-        elif op == "scheduleTask":
-            return self._schedule_task_071(action)
-        else:
-            self.warn_kv(event="unknown_action_op", op=op, action_id=action.get("id"))
-            return {
-                "status": "skipped",
-                "op": op,
-                "reason": f"Unknown operation: {op}",
-                "changed": False,
-            }
+        # 0.7.1 provider actions (no prefix) — translate each abstract
+        # op into one or more native ``<service>.<verb>`` actions and
+        # dispatch through the corresponding service handler. The
+        # translation lives on this provider (not in the planner) so
+        # the abstract op semantics are pinned per-provider.
+        abstract_handlers = {
+            "provisionDataset": self._provision_dataset_071,
+            "scheduleTask": self._schedule_task_071,
+            "registerSchema": self._register_schema_071,
+            "createView": self._create_view_071,
+            "grantAccess": self._grant_access_071,
+            "revokeAccess": self._revoke_access_071,
+            "updatePolicy": self._update_policy_071,
+            "publishEvent": self._publish_event_071,
+            "custom": self._custom_071,
+        }
+        if op in abstract_handlers:
+            return abstract_handlers[op](action)
+
+        self.warn_kv(event="unknown_action_op", op=op, action_id=action.get("id"))
+        return {
+            "status": "skipped",
+            "op": op,
+            "reason": f"Unknown operation: {op}",
+            "changed": False,
+        }
 
     def _execute_bigquery_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """Execute BigQuery operations."""
@@ -410,6 +624,10 @@ class GcpProvider(BaseProvider):
             return with_retry(lambda: bigquery.ensure_view(action), self.logger)
         elif op == "bq.ensure_routine":
             return with_retry(lambda: bigquery.ensure_routine(action), self.logger)
+        elif op == "bq.update_table_schema":
+            return with_retry(lambda: bigquery.update_table_schema(action), self.logger)
+        elif op == "bq.execute_sql":
+            return bigquery.execute_sql(action)
         else:
             raise ProviderError(f"Unknown BigQuery operation: {op}")
 
@@ -438,6 +656,11 @@ class GcpProvider(BaseProvider):
             return with_retry(lambda: pubsub.ensure_topic(action), self.logger)
         elif op == "ps.ensure_subscription":
             return with_retry(lambda: pubsub.ensure_subscription(action), self.logger)
+        elif op == "ps.publish" or op == "ps.publish_message":
+            # ``publishEvent`` translation emits ``ps.publish``; the
+            # native handler is named ``publish_message``. Accept both
+            # so the abstract path doesn't silently no-op.
+            return pubsub.publish_message(action)
         else:
             raise ProviderError(f"Unknown Pub/Sub operation: {op}")
 
@@ -505,6 +728,12 @@ class GcpProvider(BaseProvider):
             return iam.bind_gcs_bucket(action)
         elif op == "iam.bind_pubsub_topic":
             return iam.bind_pubsub_topic(action)
+        elif op == "iam.grant_role":
+            return iam.grant_role(action)
+        elif op == "iam.revoke_role":
+            return iam.revoke_role(action)
+        elif op == "iam.set_policy":
+            return iam.set_policy(action)
         else:
             raise ProviderError(f"Unknown IAM operation: {op}")
 

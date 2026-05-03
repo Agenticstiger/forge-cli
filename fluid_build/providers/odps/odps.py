@@ -313,11 +313,13 @@ class OdpsProvider(BaseProvider):
     # ---------------- FLUID → OPDS Conversion ----------------
 
     def _contract_to_opds(self, contract: Mapping[str, Any]) -> Dict[str, Any]:
-        """
-        Convert a single FLUID contract to OPDS format.
+        """Convert a single FLUID contract to OPDS format.
 
-        Generates OPDS v4.1 compliant structure with nested product.details
-        and also includes legacy flat fields for backward compatibility.
+        Generates OPDS v4.1-compliant structure with nested
+        ``product.details`` AND mirrors the same fields at the top
+        level — the dual shape is part of the OPDS v4.1 spec for
+        round-trip compatibility with v4.0 readers, not a legacy
+        back-compat artefact of fluid.
 
         Args:
             contract: FLUID contract dictionary
@@ -420,7 +422,7 @@ class OdpsProvider(BaseProvider):
         for expose in exposes:
             if not isinstance(expose, dict):
                 continue
-            # Use field adapters for 0.5.7 compatibility
+            # Use canonical 0.7.x field accessors
             expose_id = get_expose_id(expose)
             expose_kind = get_expose_kind(expose)
             binding = get_expose_binding(expose)
@@ -433,7 +435,7 @@ class OdpsProvider(BaseProvider):
             else:
                 schema = expose.get("schema", [])
 
-            # Handle 0.5.7 format where schema is {"fields": [...]}
+            # Handle v0.7.x format where schema is {"fields": [...]}
             if isinstance(schema, dict) and "fields" in schema:
                 schema = schema["fields"]
 
@@ -461,7 +463,7 @@ class OdpsProvider(BaseProvider):
         """Extract input port information from the contract's ``consumes[]``.
 
         Delegates to the shared :func:`consumes_to_canonical_ports` helper so
-        that the 0.4.0 ↔ 0.7.x field adapters live in exactly one place. The
+        that the 0.7.x field adapters live in exactly one place. The
         output shape here is the OPDS v4.1 legacy ``inputPort`` dict, which
         differs from the ODPS-Bitol shape emitted by ``OdpsStandardProvider``.
         """
@@ -490,7 +492,7 @@ class OdpsProvider(BaseProvider):
 
         fields = []
         for field in schema:
-            # Handle both 0.4.0 (nullable) and 0.5.7 (required)
+            # Handle 0.7.x (required field)
             if "required" in field:
                 nullable = not field["required"]
             elif "nullable" in field:
@@ -571,7 +573,7 @@ class OdpsProvider(BaseProvider):
         """Extract SLA and quality information."""
         sla = {}
 
-        # Check for 0.5.7 qos at expose level (most specific)
+        # Check v0.7.x qos at expose level (most specific)
         exposes = contract.get("exposes", [])
         if exposes and len(exposes) > 0:
             first_expose = exposes[0]
@@ -585,7 +587,7 @@ class OdpsProvider(BaseProvider):
                 if "freshnessSLO" in qos:
                     sla["freshness"] = {"slo": qos["freshnessSLO"], "format": "ISO8601"}
 
-        # Extract from builds array (0.5.7) or build object (0.4.0)
+        # Extract from builds array (v0.7.x) or build object (legacy, dropped)
         builds = contract.get("builds", [])
         if builds and len(builds) > 0:
             build = builds[0]
@@ -624,14 +626,14 @@ class OdpsProvider(BaseProvider):
             "transformation": None,
         }
 
-        # Extract upstream dependencies - support both 0.4.0 (ref) and 0.5.7 (productId)
+        # Extract upstream dependencies - v0.7.x productId only
         consumes = contract.get("consumes", [])
         for consume in consumes:
             ref = consume.get("productId") or consume.get("ref")
             if ref:
                 lineage["upstream"].append(ref)
 
-        # Extract transformation information from builds array (0.5.7) or build object (0.4.0)
+        # Extract transformation information from builds array (v0.7.x) or build object (legacy, dropped)
         builds = contract.get("builds", [])
         if builds and len(builds) > 0:
             build = builds[0]
@@ -711,7 +713,7 @@ class OdpsProvider(BaseProvider):
             "originalId": contract.get("id"),
         }
 
-        # Preserve build/builds section (0.5.7 uses builds array, 0.4.0 uses build object)
+        # Preserve builds[] section (v0.7.x canonical)
         if "builds" in contract:
             extensions["builds"] = contract["builds"]
         elif "build" in contract:

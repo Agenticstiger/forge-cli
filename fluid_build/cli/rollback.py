@@ -410,9 +410,31 @@ def _restore_snowflake(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, 
             },
         ) from exc
 
-    ddl = f"CREATE OR REPLACE DATABASE {database} CLONE {backup_name};"
+    # The rollback writer always records table-level CLONE DDL
+    # in ``snapshot.ddl[]``. A snapshot without that field is
+    # malformed (or written by a pre-T3 build that's no longer
+    # supported); reject it loudly rather than silently emitting a
+    # database-level CLONE that could overwrite unrelated tables.
+    snapshot_ddl_list = snapshot.get("ddl") if isinstance(snapshot.get("ddl"), list) else []
+    if not snapshot_ddl_list:
+        raise CLIError(
+            2,
+            "rollback_snowflake_missing_ddl",
+            {
+                "backup_name": backup_name,
+                "database": database,
+                "hint": (
+                    "snapshot is missing the ``ddl`` array. "
+                    "Re-snapshot via ``fluid apply --mode replace`` and "
+                    "retry, or restore manually with the Snowflake "
+                    "Time Travel CLI."
+                ),
+            },
+        )
+    ddl_statements = [str(s).rstrip(";") + ";" for s in snapshot_ddl_list if s]
+    ddl = "\n".join(ddl_statements)
     cprint(
-        f"[rollback] snowflake CLONE plan:\n    {ddl}",
+        "[rollback] snowflake CLONE plan:\n    " + "\n    ".join(ddl_statements),
         markup=False,
     )
     if dry_run:
@@ -436,21 +458,31 @@ def _restore_snowflake(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, 
         ) from exc
 
     provider = SnowflakeProvider(database=database)
-    try:
-        result = provider.execute_sql(ddl)
-    except AttributeError:
-        # SnowflakeProvider.execute_sql is the public helper; if absent
-        # fall back to the internal _execute_sql method which the
-        # enhanced provider exposes.
+    last_result = None
+    for stmt in ddl_statements:
+        sql_action = {
+            "op": "sf.sql.execute",
+            "id": "rollback_restore",
+            "sql": stmt.rstrip(";"),
+            "account": provider.account,
+            "database": database,
+            "schema": location.get("schema") or "PUBLIC",
+        }
         try:
-            sql_action = {"op": "sf.sql.execute", "params": {"sql": ddl}}
-            result = provider._execute_sql_action(sql_action)
+            last_result = provider._execute_sql_action(sql_action)
         except Exception as exc:  # pragma: no cover — defensive
             raise CLIError(
                 2,
                 "rollback_snowflake_execute_failed",
-                {"error": str(exc), "ddl": ddl},
+                {"error": str(exc), "ddl": stmt},
             ) from exc
+        if isinstance(last_result, dict) and last_result.get("status") == "error":
+            raise CLIError(
+                2,
+                "rollback_snowflake_execute_failed",
+                {"error": last_result.get("error", "unknown"), "ddl": stmt},
+            )
+    result = last_result or {"status": "ok"}
 
     return {
         "status": "restored",

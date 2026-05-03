@@ -32,9 +32,11 @@ Enhanced with governance:
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
+from fluid_build.providers._planner_base import BasePlanner
 from fluid_build.providers._sql_safety import (
     quote_string_literal,
     validate_ident,
@@ -99,6 +101,77 @@ def _first_contract_value(contract: Mapping[str, Any], key: str) -> Optional[str
     return None
 
 
+class SnowflakePlanner(BasePlanner):
+    """Snowflake-specific planner — wires the 6-phase scaffold to the
+    Snowflake phase functions in this module.
+
+    The phase functions remain module-level (they're closures over a
+    lot of helper utilities and are referenced from tests) but the
+    public entry point is now this class. ``plan_actions`` below is
+    kept as a back-compat shim so existing callers
+    (``provider.plan()`` in ``provider_enhanced.py``) don't have to
+    change at the same time.
+    """
+
+    _logger_name = "fluid.providers.snowflake.planner"
+
+    def __init__(
+        self,
+        *,
+        account: str,
+        warehouse: str,
+        database: Optional[str],
+        schema: str,
+        logger=None,
+    ) -> None:
+        super().__init__(logger=logger)
+        self.account = account
+        self.warehouse = warehouse
+        self.database = database
+        self.schema = schema
+
+    def plan_infrastructure(self, contract):
+        return _plan_infrastructure(
+            contract,
+            self.account,
+            self.warehouse,
+            self.database,
+            self.schema,
+            self.logger,
+        )
+
+    def plan_iam(self, contract):
+        return _plan_iam(contract, self.account, self.database, self.schema, self.logger)
+
+    def plan_replace_snapshots(self, contract):
+        return _plan_replace_snapshots(
+            contract, self.account, self.database, self.schema, self.logger
+        )
+
+    def plan_expose(self, contract, *, is_destructive):
+        return _plan_expose(
+            contract,
+            self.account,
+            self.database,
+            self.schema,
+            self.logger,
+            is_destructive=is_destructive,
+        )
+
+    def plan_build(self, contract, *, is_destructive):
+        return _plan_build(
+            contract,
+            self.account,
+            self.database,
+            self.schema,
+            self.logger,
+            is_destructive=is_destructive,
+        )
+
+    def plan_schedule(self, contract):
+        return _plan_schedule(contract, self.account, self.database, self.schema, self.logger)
+
+
 def plan_actions(
     contract: Mapping[str, Any],
     account: str,
@@ -106,35 +179,42 @@ def plan_actions(
     database: Optional[str],
     schema: str,
     logger=None,
+    *,
+    mode: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Generate ordered action list from FLUID contract.
 
-    Phases ensure dependency ordering:
-    - Infrastructure must exist before schemas
-    - Schemas must exist before tables
-    - Tables must exist before views/streams
-    - IAM can run in parallel with build phase
-    - Schedule runs after all objects exist
+    Back-compat shim — constructs a :class:`SnowflakePlanner` and calls
+    :meth:`SnowflakePlanner.plan`. The 6-phase ordering, destructive-
+    mode handling, and rollback snapshot emission live in
+    :class:`fluid_build.providers._planner_base.BasePlanner` so all
+    providers stay in lockstep.
+
+    Phase order (set by ``BasePlanner.plan``):
+    1. Infrastructure — databases, schemas, warehouses.
+    2. IAM — roles, grants, row-level security.
+    3. Replace snapshots — pre-flight CLONE per snowflake_table
+       (destructive modes only).
+    4. Expose — tables, views, streams. Suppresses ensure_table when
+       Phase 5 will emit CREATE OR REPLACE.
+    5. Build — stored procs, UDFs, tasks, INSERT/CTAS SQL.
+    6. Schedule — task orchestration, pipes.
+
+    The optional ``mode`` argument carries the apply-time mode
+    (``amend`` / ``amend-and-build`` / ``replace`` / ``replace-and-build``
+    / ``dry-run`` / ``create-only``). Destructive modes flip the
+    build emitter from ``INSERT INTO`` to ``CREATE OR REPLACE TABLE …
+    AS SELECT`` and emit pre-flight CLONE snapshots.
     """
-    actions: List[Dict[str, Any]] = []
-
-    # Phase 1: Infrastructure (databases, schemas, warehouses)
-    actions.extend(_plan_infrastructure(contract, account, warehouse, database, schema, logger))
-
-    # Phase 2: IAM (roles, grants, row-level security)
-    actions.extend(_plan_iam(contract, account, database, schema, logger))
-
-    # Phase 3: Build (stored procedures, UDFs, tasks)
-    actions.extend(_plan_build(contract, account, database, schema, logger))
-
-    # Phase 4: Expose (tables, views, streams)
-    actions.extend(_plan_expose(contract, account, database, schema, logger))
-
-    # Phase 5: Schedule (task orchestration, pipes)
-    actions.extend(_plan_schedule(contract, account, database, schema, logger))
-
-    return actions
+    planner = SnowflakePlanner(
+        account=account,
+        warehouse=warehouse,
+        database=database,
+        schema=schema,
+        logger=logger,
+    )
+    return planner.plan(contract, mode=mode)
 
 
 def _plan_infrastructure(
@@ -513,14 +593,121 @@ def _emit_masking_application_actions(
     ]
 
 
-def _plan_build(
+def _plan_replace_snapshots(
     contract: Mapping[str, Any],
     account: str,
     database: Optional[str],
     schema: str,
     logger=None,
 ) -> List[Dict[str, Any]]:
-    """Phase 3: Create stored procedures, UDFs, tasks."""
+    """Pre-flight CLONE backups for ``--mode replace``.
+
+    For each snowflake_table expose, emit a ``sf.sql.execute`` action
+    that runs ``CREATE OR REPLACE TABLE <db>.<schema>.<backup> CLONE
+    <db>.<schema>.<table>`` BEFORE the destructive replace fires. The
+    CLONE is metadata-only (zero-copy) so the cost is negligible.
+
+    The backup name is ``BACKUP_<table>_<unix_ts>``. Apply records the
+    backup metadata in ``.fluid/rollback-state.json`` after a
+    successful run (via ``cli/_rollback_writer``) so ``fluid rollback``
+    can find it.
+
+    Skips:
+    * Exposes that aren't ``snowflake_table`` (CLONE only works for
+      tables / databases, not generic resources).
+    * Targets that don't exist yet (the planner can't know — Snowflake's
+      ``CREATE OR REPLACE TABLE … CLONE`` errors if the source is
+      missing). The action is wrapped in ``IF EXISTS`` semantics via
+      a guarded SQL preamble.
+    """
+    actions: List[Dict[str, Any]] = []
+    resolved_database = _first_contract_value(contract, "database") or database
+    resolved_schema = _first_contract_value(contract, "schema") or schema
+    backup_ts = int(time.time())
+
+    for expose in contract.get("exposes", []) or []:
+        if not isinstance(expose, Mapping):
+            continue
+        binding = expose.get("binding") or {}
+        if (binding.get("format") or "").lower() not in (
+            "snowflake_table",
+            "snowflake-table",
+        ):
+            continue
+        location = binding.get("location") or {}
+        db = _resolve_env_templates(location.get("database")) or resolved_database
+        sch = _resolve_env_templates(location.get("schema")) or resolved_schema
+        tbl = _resolve_env_templates(location.get("table")) or expose.get("exposeId")
+        if not (db and sch and tbl):
+            continue
+        try:
+            db_safe = validate_ident(str(db))
+            sch_safe = validate_ident(str(sch))
+            tbl_safe = validate_ident(str(tbl))
+        except ValueError:
+            continue
+        backup_name = f"BACKUP_{tbl_safe}_{backup_ts}"
+        # Bare zero-copy CLONE — atomic, metadata-only, microseconds.
+        # First-run replace (source doesn't exist yet) returns a
+        # Snowflake error; the action carries ``allow_failure=True``
+        # so the dispatcher records a soft-failure and continues
+        # rather than aborting the plan. The connector splits on
+        # ``;``, so an EXECUTE IMMEDIATE $$ … $$ block won't survive
+        # the round-trip.
+        sql = (
+            f"CREATE OR REPLACE TABLE {db_safe}.{sch_safe}.{backup_name} "
+            f"CLONE {db_safe}.{sch_safe}.{tbl_safe}"
+        )
+        actions.append(
+            {
+                "id": f"snapshot_{expose.get('exposeId')}",
+                "op": "sf.sql.execute",
+                "phase": "snapshot",
+                "account": account,
+                "database": db,
+                "schema": sch,
+                "sql": sql,
+                "comment": f"pre-flight backup of {db}.{sch}.{tbl}",
+                # When ``allow_failure`` is set the provider must treat
+                # this action's failure as a warning rather than aborting
+                # the whole plan. First-run replace is legitimate
+                # (nothing to back up).
+                "allow_failure": True,
+                # Metadata fields the rollback writer uses to record
+                # the snapshot in .fluid/rollback-state.json.
+                "rollback_snapshot": {
+                    "backup_name": backup_name,
+                    "product_id": contract.get("id"),
+                    "expose_id": expose.get("exposeId"),
+                    "location": {
+                        "database": db,
+                        "schema": sch,
+                        "table": tbl,
+                        "backup_table": backup_name,
+                    },
+                },
+            }
+        )
+    return actions
+
+
+def _plan_build(
+    contract: Mapping[str, Any],
+    account: str,
+    database: Optional[str],
+    schema: str,
+    logger=None,
+    *,
+    is_destructive: bool = False,
+) -> List[Dict[str, Any]]:
+    """Phase 3: Create stored procedures, UDFs, tasks.
+
+    When ``is_destructive`` is True (apply mode replace / replace-and-build),
+    SQL builds with ``outputs[]`` pointing at a snowflake_table expose
+    are wrapped as ``CREATE OR REPLACE TABLE <target> AS <sql>`` so the
+    target is atomically replaced. Otherwise the wrap is the additive
+    ``INSERT INTO <target> <sql>``.
+    """
     actions: List[Dict[str, Any]] = []
     resolved_database = _first_contract_value(contract, "database") or database
     resolved_schema = _first_contract_value(contract, "schema") or schema
@@ -628,20 +815,128 @@ def _plan_build(
             continue
 
         build_id = build_entry.get("id", f"build_{index}")
-        actions.append(
-            {
-                "id": build_id,
-                "op": "sf.sql.execute",
-                "phase": "build",
-                "account": account,
-                "database": _resolve_env_templates(build_database),
-                "schema": _resolve_env_templates(build_schema),
-                "sql": _resolve_env_templates(sql_text),
-                "comment": build_entry.get("description") or build_entry.get("name"),
-            }
-        )
+        # Per-output materialisation: a build with ``outputs: [a, b, c]``
+        # emits one ``sf.sql.execute`` action per output, each wrapping
+        # the user SQL with the appropriate target binding. Single-
+        # output builds (the common case) get one action; multi-output
+        # builds get N. Without this loop, only ``outputs[0]`` was
+        # materialised and outputs 1+ were silently dropped.
+        outputs = list(build_entry.get("outputs") or [])
+        if not outputs:
+            outputs = [None]  # fall through with no target — author writes their own sink
+        for output_idx, output_id in enumerate(outputs):
+            wrapped_sql = _wrap_sql_for_target(
+                sql_text=_resolve_env_templates(sql_text),
+                build_entry=build_entry,
+                contract=contract,
+                default_database=build_database,
+                default_schema=build_schema,
+                is_destructive=is_destructive,
+                target_output_id=output_id,
+            )
+            # Suffix the action id when the build has multiple outputs
+            # so each gets a stable, unique id (used by status / replay).
+            action_id = build_id if len(outputs) == 1 else f"{build_id}__{output_id}"
+            actions.append(
+                {
+                    "id": action_id,
+                    "op": "sf.sql.execute",
+                    "phase": "build",
+                    "account": account,
+                    "database": _resolve_env_templates(build_database),
+                    "schema": _resolve_env_templates(build_schema),
+                    "sql": wrapped_sql,
+                    "comment": build_entry.get("description") or build_entry.get("name"),
+                }
+            )
 
     return actions
+
+
+def _wrap_sql_for_target(
+    *,
+    sql_text: str,
+    build_entry: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    default_database: Optional[str],
+    default_schema: Optional[str],
+    is_destructive: bool = False,
+    target_output_id: Optional[str] = None,
+) -> str:
+    """Wrap the build's SQL so its result lands in the target table.
+
+    Resolves ``target_output_id`` (or ``build.outputs[0]`` if not given)
+    to the matching expose, reads ``binding.location.{database, schema,
+    table}``, and rewrites the SQL into either:
+
+    * ``INSERT INTO <db>.<schema>.<table> <user_sql>`` (additive,
+      default for ``--mode amend`` and amend-and-build).
+    * ``CREATE OR REPLACE TABLE <db>.<schema>.<table> AS <user_sql>``
+      (destructive, atomic, used for ``--mode replace`` and
+      replace-and-build). The CREATE OR REPLACE form atomically
+      replaces both schema AND data — no separate ensure_table step
+      is required.
+
+    Multi-output builds (``outputs: [a, b, c]``) call this function
+    once per output via the build-emission loop in ``_plan_build``.
+    Each call wraps the same user SQL but writes to a different target.
+
+    No-op (returns ``sql_text`` unchanged) when:
+
+    * No target_output_id is resolvable — caller is responsible for
+      the sink in the SQL itself.
+    * The matched expose isn't a ``snowflake_table`` binding — likely
+      a view / stream / different format that has its own emission
+      path elsewhere in the planner.
+    * The user SQL already contains an ``INSERT``, ``CREATE``, ``MERGE``,
+      ``UPDATE``, ``DELETE``, ``COPY``, or ``TRUNCATE`` keyword at the
+      top level — the author already declared a sink, don't double-wrap.
+    """
+    if target_output_id is None:
+        outputs = build_entry.get("outputs") or []
+        if not outputs:
+            return sql_text
+        target_output_id = outputs[0]
+
+    target_expose_id = target_output_id
+    target_expose = next(
+        (
+            ex
+            for ex in (contract.get("exposes") or [])
+            if isinstance(ex, Mapping)
+            and (ex.get("exposeId") == target_expose_id or ex.get("id") == target_expose_id)
+        ),
+        None,
+    )
+    if target_expose is None:
+        return sql_text
+
+    binding = target_expose.get("binding") or {}
+    if (binding.get("format") or "").lower() not in ("snowflake_table", "snowflake-table"):
+        return sql_text
+
+    location = binding.get("location") or {}
+    db = _resolve_env_templates(location.get("database")) or default_database
+    sch = _resolve_env_templates(location.get("schema")) or default_schema
+    tbl = _resolve_env_templates(location.get("table")) or target_expose_id
+    if not (db and sch and tbl):
+        return sql_text
+
+    db_safe = validate_ident(str(db))
+    sch_safe = validate_ident(str(sch))
+    tbl_safe = validate_ident(str(tbl))
+
+    upper_head = sql_text.lstrip().upper()[:32]
+    for kw in ("INSERT", "CREATE", "MERGE", "UPDATE", "DELETE", "COPY", "TRUNCATE"):
+        if upper_head.startswith(kw):
+            return sql_text  # author declared their own sink
+
+    # Strip a trailing semicolon to keep the wrapped statement clean.
+    body = sql_text.rstrip().rstrip(";")
+    fqn = f"{db_safe}.{sch_safe}.{tbl_safe}"
+    if is_destructive:
+        return f"CREATE OR REPLACE TABLE {fqn} AS\n{body}"
+    return f"INSERT INTO {fqn}\n{body}"
 
 
 def _plan_expose(
@@ -650,15 +945,42 @@ def _plan_expose(
     database: Optional[str],
     schema: str,
     logger=None,
+    *,
+    is_destructive: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Phase 4: Create tables, views, streams with governance metadata."""
+    """Phase 4: Create tables, views, streams with governance metadata.
+
+    When ``is_destructive`` is True, snowflake_table exposes that are
+    targets of a SQL build (i.e. listed in ``builds[].outputs``) are
+    skipped at this phase — the build's ``CREATE OR REPLACE TABLE …
+    AS SELECT`` materialises the table itself, so a separate
+    ensure_table would be redundant (and would race the CREATE OR
+    REPLACE if it ran first).
+    """
     actions: List[Dict[str, Any]] = []
     resolved_database = _first_contract_value(contract, "database") or database
     resolved_schema = _first_contract_value(contract, "schema") or schema
 
-    # Process exposes array (0.5.7/0.7.1 pattern)
+    # Build the set of expose ids targeted by SQL builds; their
+    # ensure_table is skipped under is_destructive.
+    sql_build_targets: set = set()
+    if is_destructive:
+        for build_entry in contract.get("builds", []) or []:
+            if not isinstance(build_entry, Mapping):
+                continue
+            outputs = build_entry.get("outputs") or []
+            if outputs and (
+                build_entry.get("sql") or (build_entry.get("properties") or {}).get("sql")
+            ):
+                sql_build_targets.update(outputs)
+
+    # Process exposes array (v0.7.x pattern)
     for expose in contract.get("exposes", []):
         expose_id = expose.get("exposeId", expose.get("id"))
+        if is_destructive and expose_id in sql_build_targets:
+            # CREATE OR REPLACE TABLE in the build phase handles
+            # materialisation atomically; skip ensure_table here.
+            continue
 
         # Extract tags from contract + expose (8 sources, mirrors GCP)
         table_tags = extract_snowflake_tags(contract, expose)

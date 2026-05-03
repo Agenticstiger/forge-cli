@@ -42,11 +42,11 @@ from typing import Any, Dict
 logger = logging.getLogger(__name__)
 
 
-class SovereigntyViolationError(Exception):
-    """Raised when sovereignty constraints are violated."""
-
-    pass
-
+# Re-export the typed catalog class so the AWS sovereignty validator
+# raises the SAME `SovereigntyViolationError` identity used elsewhere in
+# the codebase. Existing imports of this symbol stay valid; downstream
+# `except SovereigntyViolationError` blocks now see the typed Panel.
+from fluid_build.cli._errors import SovereigntyViolationError  # noqa: E402,F401
 
 # AWS region to jurisdiction mapping
 REGION_JURISDICTIONS = {
@@ -216,15 +216,18 @@ class SovereigntyValidator:
 
         if not actual_jurisdiction:
             raise SovereigntyViolationError(
-                f"Unknown AWS region: {region}. Cannot determine jurisdiction."
+                what=f"Unknown AWS region '{region}' — cannot determine jurisdiction",
+                why=f"region '{region}' is not in REGION_JURISDICTIONS; the deploy target's jurisdiction can't be verified.",
+                fix="Use an AWS region from the supported list, or update REGION_JURISDICTIONS to map this region.",
+                doc="https://forge.fluid.dev/ref/sovereignty",
+                extras={"region": region},
             )
 
         # Check if jurisdiction matches
         if actual_jurisdiction != required_jurisdiction:
-            raise SovereigntyViolationError(
-                f"Jurisdiction violation: Region '{region}' is in jurisdiction '{actual_jurisdiction}', "
-                f"but contract requires '{required_jurisdiction}'. "
-                f"Update binding.location.region to use a region in '{required_jurisdiction}'."
+            raise SovereigntyViolationError.for_connector(
+                connector=f"aws:{region}",
+                jurisdiction=str(required_jurisdiction),
             )
 
     def _validate_data_residency(self, sovereignty: Dict[str, Any], region: str) -> None:
@@ -243,9 +246,12 @@ class SovereigntyValidator:
             return
 
         if region not in allowed_regions:
-            raise SovereigntyViolationError(
-                f"Data residency violation: Region '{region}' is not in allowed list: {allowed_regions}. "
-                f"Update binding.location.region to use an allowed region."
+            from fluid_build.cli._errors import ResidencyViolationError
+
+            raise ResidencyViolationError.for_transfer(
+                from_region=str(region),
+                to_region="<denied>",
+                jurisdiction=", ".join(map(str, allowed_regions)),
             )
 
     def extract_tags(self, contract: Dict[str, Any]) -> Dict[str, str]:

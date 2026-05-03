@@ -109,28 +109,82 @@ class AwsProvider(BaseProvider):
             "auth": True,  # Auth context reporting
         }
 
-    def plan(self, contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    # ── Rollback surface ────────────────────────────────────────────
+
+    def restore_ddl(self, snapshot: Mapping[str, Any]) -> List[str]:
+        """AWS rollback uses S3 prefix-copy semantics, not SQL DDL.
+
+        Returns an empty list — the rollback CLI's S3 path handles the
+        prefix copy directly via ``aws.s3.copy_prefix``. The empty
+        list signals the rollback CLI to use the per-provider S3
+        executor instead of running SQL. Redshift snapshots route to
+        the dedicated :class:`RedshiftProvider` which does emit DDL.
+        """
+        return []
+
+    def cleanup_backups(self, snapshots: List[Mapping[str, Any]]) -> None:
+        """Delete S3 backup prefixes for aged-out snapshots."""
+        if not snapshots:
+            return
+        try:
+            import boto3  # type: ignore
+        except Exception:  # pragma: no cover
+            return
+        s3 = boto3.client("s3")
+        for snap in snapshots:
+            loc = snap.get("location") or {}
+            bucket = loc.get("database")  # bucket stored in ``database`` key
+            backup_prefix = loc.get("backup_table") or snap.get("backup_name")
+            if not (bucket and backup_prefix):
+                continue
+            try:
+                paginator = s3.get_paginator("list_objects_v2")
+                pages = paginator.paginate(Bucket=bucket, Prefix=f"{backup_prefix}/")
+                for page in pages:
+                    objects = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+                    if objects:
+                        s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+            except Exception as exc:  # noqa: BLE001
+                self.warn_kv(
+                    event="backup_cleanup_drop_failed",
+                    location=f"s3://{bucket}/{backup_prefix}",
+                    error=str(exc),
+                )
+
+    def plan(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        mode: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Generate AWS actions from FLUID contract.
 
-        Converts contract specifications into concrete AWS resource operations:
-        - S3 buckets and objects
-        - Glue databases, tables, crawlers
-        - Athena queries and workgroups
-        - Redshift clusters and schemas
-        - Lambda functions
-        - EventBridge rules and schedules
-        - IAM roles and policies
+        ``mode`` is the apply-time mode (``replace`` /
+        ``replace-and-build`` trigger pre-flight S3 prefix-copy backups).
+        Converts contract specifications into concrete AWS resource
+        operations: S3 buckets, Glue databases / tables / crawlers,
+        Athena queries / workgroups, Redshift schemas, Lambda functions,
+        EventBridge rules / schedules, IAM roles / policies.
         """
         self.debug_kv(
-            event="plan_started", contract_id=contract.get("id"), contract_name=contract.get("name")
+            event="plan_started",
+            contract_id=contract.get("id"),
+            contract_name=contract.get("name"),
+            mode=mode,
         )
 
         try:
             # Validate sovereignty constraints (FLUID 0.7.1)
             self._validate_sovereignty(contract)
 
-            actions = plan_actions(contract, self.account_id, self.region, self.logger)
+            # ``plan_actions`` constructs an :class:`AwsPlanner` and
+            # calls :meth:`BasePlanner.plan` which already runs the
+            # 6-phase scaffold (infrastructure / IAM / replace-snapshots
+            # / expose / build / schedule). Snapshots emit only when
+            # ``mode`` is destructive — :func:`is_destructive_mode`
+            # gates them inside :meth:`BasePlanner.plan`.
+            actions = plan_actions(contract, self.account_id, self.region, self.logger, mode=mode)
 
             # Add orchestration actions (FLUID 0.7.1)
             orchestration_actions = self._plan_orchestration(contract)
@@ -514,14 +568,246 @@ class AwsProvider(BaseProvider):
             return self._execute_secretsmanager_action(action)
         elif op.startswith("dbt."):
             return self._execute_dbt_action(action)
-        else:
-            self.warn_kv(event="unknown_action_op", op=op, action_id=action.get("id"))
+
+        # ── 0.7.1 abstract-op dispatch ───────────────────────────────
+        # Translate each abstract op into one or more native AWS
+        # actions (S3 / Glue / IAM / EventBridge) and dispatch through
+        # the corresponding service handler. Without this, abstract
+        # actions fell through to the warn-and-skip and the apply
+        # silently no-oped — pipeline reported SUCCESS but accomplished
+        # nothing. The translation lives on this provider so the
+        # abstract op semantics are pinned per-provider.
+        abstract_handlers = {
+            "provisionDataset": self._provision_dataset_071,
+            "scheduleTask": self._schedule_task_071,
+            "registerSchema": self._register_schema_071,
+            "createView": self._create_view_071,
+            "grantAccess": self._grant_access_071,
+            "revokeAccess": self._revoke_access_071,
+            "updatePolicy": self._update_policy_071,
+            "publishEvent": self._publish_event_071,
+            "custom": self._custom_071,
+        }
+        if op in abstract_handlers:
+            return abstract_handlers[op](action)
+
+        self.warn_kv(event="unknown_action_op", op=op, action_id=action.get("id"))
+        return {
+            "status": "skipped",
+            "op": op,
+            "reason": f"Unknown operation: {op}",
+            "changed": False,
+        }
+
+    # ========================================================================
+    # 0.7.1 Abstract Provider Actions (Phase 6F)
+    # ========================================================================
+    # Each handler translates an abstract op into one or more synthetic
+    # native sub-actions, dispatches each through the existing service
+    # handlers, then aggregates sub-results. Single-purpose methods so
+    # each translation is auditable in isolation.
+
+    def _provision_dataset_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``provisionDataset`` → ``glue.ensure_database`` +
+        optional ``glue.ensure_table``.
+
+        AWS's analogue of a BigQuery dataset is a Glue database;
+        backed by an S3 bucket prefix that the table-ensure step
+        creates / validates.
+        """
+        params = action.get("params", {})
+        binding = params.get("binding", {})
+        location_info = binding.get("location", {})
+        kind = params.get("kind", "table")
+
+        database = location_info.get("database") or location_info.get("dataset")
+        table = location_info.get("table")
+        bucket = location_info.get("bucket") or f"{self.account_id}-fluid-data"
+
+        if not database:
+            raise ProviderError(
+                "provisionDataset requires 'database' (or 'dataset') in binding.location"
+            )
+
+        # Step 1 — ensure Glue database.
+        self._execute_glue_action(
+            {
+                "op": "glue.ensure_database",
+                "database": database,
+                "location": f"s3://{bucket}/{database}/",
+            }
+        )
+
+        if not (table and kind in ("table", "view")):
             return {
-                "status": "skipped",
-                "op": op,
-                "reason": f"Unknown operation: {op}",
+                "status": "ok",
+                "op": "provisionDataset",
+                "database": database,
                 "changed": False,
             }
+
+        # Step 2 — ensure Glue table.
+        return self._execute_glue_action(
+            {
+                "op": "glue.ensure_table",
+                "database": database,
+                "table": table,
+                "location": f"s3://{bucket}/{database}/{table}/",
+                "schema": params.get("schema", []),
+                "contract": params.get("contract"),
+            }
+        )
+
+    def _schedule_task_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``scheduleTask`` → ``events.put_rule``.
+
+        AWS scheduling lives on EventBridge; the rule fires the
+        configured target (Lambda / Step Functions / Glue trigger)
+        on the cadence the contract author supplied.
+        """
+        params = action.get("params", {})
+        build_id = params.get("buildId", "unknown")
+        cron = params.get("cron") or params.get("schedule") or "rate(1 day)"
+        target = params.get("target") or {}
+
+        return self._execute_events_action(
+            {
+                "op": "events.put_rule",
+                "name": f"fluid-{build_id}",
+                "schedule_expression": cron,
+                "description": f"FLUID schedule for build {build_id}",
+                "targets": [target] if target else [],
+            }
+        )
+
+    def _register_schema_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``registerSchema`` → ``glue.update_table_schema``."""
+        params = action.get("params", {})
+        binding = params.get("binding", {})
+        location_info = binding.get("location", {})
+        database = location_info.get("database") or location_info.get("dataset")
+        table = location_info.get("table")
+        if not (database and table):
+            raise ProviderError(
+                "registerSchema requires 'database' and 'table' in binding.location"
+            )
+        return self._execute_glue_action(
+            {
+                "op": "glue.update_table_schema",
+                "database": database,
+                "table": table,
+                "schema": params.get("schema", []),
+            }
+        )
+
+    def _create_view_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``createView`` → ``athena.create_view`` (Athena
+        is the AWS view runtime; Glue's table catalog stores the
+        view definition).
+        """
+        params = action.get("params", {})
+        binding = params.get("binding", {})
+        location_info = binding.get("location", {})
+        database = location_info.get("database")
+        view = location_info.get("view") or location_info.get("table")
+        query = params.get("query") or params.get("sql")
+        if not (database and view and query):
+            raise ProviderError(
+                "createView requires 'database', 'view' (or 'table'), and 'query' in params"
+            )
+        return self._execute_athena_action(
+            {
+                "op": "athena.create_view",
+                "database": database,
+                "view": view,
+                "query": query,
+            }
+        )
+
+    def _grant_access_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``grantAccess`` → ``iam.attach_policy``."""
+        params = action.get("params", {})
+        return self._execute_iam_action(
+            {
+                "op": "iam.attach_policy",
+                "role_name": params.get("role") or params.get("principal"),
+                "policy_arn": params.get("policy_arn"),
+                "policy_document": params.get("policy", {}),
+                "resource": params.get("resource"),
+            }
+        )
+
+    def _revoke_access_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``revokeAccess`` → ``iam.detach_policy``."""
+        params = action.get("params", {})
+        return self._execute_iam_action(
+            {
+                "op": "iam.detach_policy",
+                "role_name": params.get("role") or params.get("principal"),
+                "policy_arn": params.get("policy_arn"),
+                "resource": params.get("resource"),
+            }
+        )
+
+    def _update_policy_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``updatePolicy`` → ``iam.put_role_policy``.
+
+        Author supplies the full IAM policy document under
+        ``params.policy``; we forward to the IAM action handler.
+        """
+        params = action.get("params", {})
+        return self._execute_iam_action(
+            {
+                "op": "iam.put_role_policy",
+                "role_name": params.get("role") or params.get("principal"),
+                "policy_name": params.get("policy_name") or "fluid-policy",
+                "policy_document": params.get("policy", {}),
+            }
+        )
+
+    def _publish_event_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``publishEvent`` → ``events.put_events`` (or
+        ``sns.publish`` when ``params.transport='sns'``).
+        """
+        params = action.get("params", {})
+        transport = (params.get("transport") or "eventbridge").lower()
+        if transport == "sns":
+            topic = params.get("topic")
+            if not topic:
+                raise ProviderError("publishEvent (sns) requires 'topic' in params")
+            return self._execute_sns_action(
+                {
+                    "op": "sns.publish",
+                    "topic": topic,
+                    "message": params.get("data") or params.get("payload") or {},
+                    "attributes": params.get("attributes", {}),
+                }
+            )
+        return self._execute_events_action(
+            {
+                "op": "events.put_events",
+                "source": params.get("source") or "fluid",
+                "detail_type": params.get("detail_type") or "FluidEvent",
+                "detail": params.get("data") or params.get("payload") or {},
+                "event_bus": params.get("event_bus") or "default",
+            }
+        )
+
+    def _custom_071(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate ``custom`` (v0.7.1 abstract op) into the native
+        operation the author embedded under ``params.op``. The author
+        is responsible for naming a valid native op (e.g.
+        ``glue.ensure_database``); we just forward the params dict.
+        """
+        params = action.get("params", {})
+        native_op = params.get("op")
+        if not native_op:
+            raise ProviderError(
+                "custom requires 'op' field naming the native operation to dispatch"
+            )
+        forwarded = dict(params)
+        forwarded["op"] = native_op
+        return self._dispatch_action(forwarded)
 
     def _execute_s3_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """Execute S3 operations."""
@@ -552,6 +838,8 @@ class AwsProvider(BaseProvider):
             return with_retry(lambda: glue.ensure_table(action), self.logger)
         elif op == "glue.ensure_iceberg_table":
             return with_retry(lambda: glue.ensure_iceberg_table(action), self.logger)
+        elif op == "glue.update_table_schema":
+            return with_retry(lambda: glue.update_table_schema(action), self.logger)
         elif op == "glue.ensure_crawler":
             return with_retry(lambda: glue.ensure_crawler(action), self.logger)
         elif op == "glue.run_crawler":
@@ -579,6 +867,10 @@ class AwsProvider(BaseProvider):
             return athena.create_view(action)
         elif op == "athena.create_iceberg_table":
             return athena.create_iceberg_table(action)
+        else:
+            raise ProviderError(f"Unknown Athena operation: {op}")
+
+    def _execute_redshift_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """Execute Redshift operations."""
         from .actions import redshift
 
@@ -622,6 +914,13 @@ class AwsProvider(BaseProvider):
             return events.ensure_schedule(action)
         elif op == "events.put_target":
             return events.put_target(action)
+        elif op == "events.put_rule":
+            # Alias for the schedule path used by ``scheduleTask`` —
+            # the abstract handler emits ``events.put_rule`` and the
+            # ``ensure_rule`` boto call is the same shape.
+            return events.ensure_rule(action)
+        elif op == "events.put_events":
+            return events.put_events(action)
         else:
             raise ProviderError(f"Unknown EventBridge operation: {op}")
 
@@ -661,6 +960,10 @@ class AwsProvider(BaseProvider):
             return iam.ensure_role(action)
         elif op == "iam.attach_policy":
             return iam.attach_policy(action)
+        elif op == "iam.detach_policy":
+            return iam.detach_policy(action)
+        elif op == "iam.put_role_policy":
+            return iam.put_role_policy(action)
         elif op == "iam.ensure_policy":
             return iam.ensure_policy(action)
         elif op == "iam.bind_s3_bucket":
@@ -706,7 +1009,10 @@ class AwsProvider(BaseProvider):
             return with_retry(lambda: sns.ensure_topic(action), self.logger)
         elif op == "sns.ensure_subscription":
             return sns.ensure_subscription(action)
-        elif op == "sns.publish_message":
+        elif op == "sns.publish_message" or op == "sns.publish":
+            # ``publishEvent`` translation emits ``sns.publish``; the
+            # native handler is named ``publish_message``. Accept both
+            # so the abstract path doesn't silently no-op.
             return sns.publish_message(action)
         else:
             raise ProviderError(f"Unknown SNS operation: {op}")

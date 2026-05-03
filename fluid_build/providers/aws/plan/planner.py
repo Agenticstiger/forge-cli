@@ -26,6 +26,8 @@ import re
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
+from fluid_build.providers._planner_base import BasePlanner
+
 from ..util.logging import format_event
 from ..util.names import normalize_database_name
 
@@ -47,27 +49,131 @@ def _resolve_env_templates(value: str) -> str:
     return re.sub(r"\{\{\s*env\.(\S+?)\s*\}\}", _replacer, value)
 
 
+class AwsPlanner(BasePlanner):
+    """AWS-specific planner — wires the 6-phase scaffold to the
+    Glue / S3 / Athena / Redshift phase functions below.
+
+    Pre-flight S3 prefix-copy snapshots are emitted from
+    :meth:`plan_replace_snapshots` (BasePlanner phase 3) for any
+    ``s3_file`` / ``glue_table`` expose. Restore semantics live in
+    :class:`fluid_build.providers.aws.AwsProvider.cleanup_backups`.
+    """
+
+    _logger_name = "fluid.providers.aws.planner"
+
+    def __init__(
+        self,
+        *,
+        account_id: str,
+        region: str,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        super().__init__(logger=logger)
+        self.account_id = account_id
+        self.region = region
+
+    def plan_infrastructure(self, contract):
+        return _plan_infrastructure(contract, self.account_id, self.region, self.logger)
+
+    def plan_iam(self, contract):
+        return _plan_iam_policies(contract, self.account_id, self.logger)
+
+    def plan_replace_snapshots(self, contract):
+        """Phase 3 — emit one ``aws.s3.copy_prefix`` action per
+        ``s3_file`` / ``glue_table`` expose for rollback.
+
+        Reads ``binding.location.{bucket, prefix}`` directly. The
+        emitted action carries a ``rollback_snapshot`` blob the
+        rollback writer picks up and persists to
+        ``.fluid/rollback-state.json``.
+        """
+        import time
+
+        actions: List[Dict[str, Any]] = []
+        ts = int(time.time())
+        for expose in contract.get("exposes", []) or []:
+            if not isinstance(expose, dict):
+                continue
+            binding = expose.get("binding") or {}
+            fmt = (binding.get("format") or "").lower()
+            if fmt not in ("s3_file", "glue_table"):
+                continue
+            location = binding.get("location") or {}
+            bucket = location.get("bucket")
+            prefix = location.get("prefix") or location.get("path")
+            if not (bucket and prefix):
+                continue
+            tail = prefix.rstrip("/").split("/")[-1]
+            backup_prefix = f"BACKUP_{tail}_{ts}"
+            actions.append(
+                {
+                    "id": f"snapshot_{expose.get('exposeId')}",
+                    "op": "aws.s3.copy_prefix",
+                    "phase": "snapshot",
+                    "src_bucket": bucket,
+                    "src_prefix": prefix.rstrip("/") + "/",
+                    "dst_bucket": bucket,
+                    "dst_prefix": f"{backup_prefix}/",
+                    "allow_failure": True,
+                    "rollback_snapshot": {
+                        "backup_name": backup_prefix,
+                        "product_id": contract.get("id"),
+                        "expose_id": expose.get("exposeId"),
+                        "location": {
+                            "database": bucket,
+                            "schema": "/".join(prefix.rstrip("/").split("/")[:-1]) or "/",
+                            "table": tail,
+                            "backup_table": backup_prefix,
+                        },
+                    },
+                }
+            )
+        return actions
+
+    def plan_expose(self, contract, *, is_destructive):
+        # AWS planner doesn't gate ensure-table on destructive mode
+        # (S3 prefix-copy backups handle restore separately).
+        return _plan_exposures(contract, self.account_id, self.region, self.logger)
+
+    def plan_build(self, contract, *, is_destructive):
+        # AWS build emitter doesn't differentiate destructive yet.
+        return _plan_build_transformations(contract, self.account_id, self.region, self.logger)
+
+    def plan_schedule(self, contract):
+        return _plan_scheduling(contract, self.account_id, self.region, self.logger)
+
+
 def plan_actions(
     contract: Mapping[str, Any],
     account_id: str,
     region: str,
     logger: Optional[logging.Logger] = None,
+    *,
+    mode: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Generate AWS actions from FLUID contract.
 
-    Analyzes contract and produces ordered list of actions to:
-    1. Create necessary S3 buckets and Glue databases
-    2. Set up IAM roles and policies
-    3. Deploy transformation logic (dbt/Lambda)
-    4. Configure scheduling (EventBridge)
-    5. Expose data products (Glue tables, Athena views, Redshift tables)
+    Back-compat shim — constructs an :class:`AwsPlanner` and calls
+    :meth:`AwsPlanner.plan`. The 6-phase ordering lives in
+    :class:`fluid_build.providers._planner_base.BasePlanner` so all
+    cloud providers stay in lockstep.
+
+    Phase order (set by ``BasePlanner.plan``):
+    1. Infrastructure — S3 buckets, Glue databases.
+    2. IAM — roles, policies.
+    3. Replace snapshots — currently a no-op here (S3 prefix-copy
+       backups are emitted in ``aws.py::AWSProvider.plan``).
+    4. Expose — Glue tables, Athena views, Redshift tables.
+    5. Build — dbt / Lambda / Glue jobs.
+    6. Schedule — EventBridge / Step Functions.
 
     Args:
         contract: FLUID contract specification
         account_id: AWS account ID
         region: AWS region
         logger: Optional logger instance
+        mode: apply-time mode (forwarded to :meth:`BasePlanner.plan`)
 
     Returns:
         List of ordered actions to execute
@@ -75,45 +181,20 @@ def plan_actions(
     if logger is None:
         logger = logging.getLogger(__name__)
 
-    actions = []
-
-    # Validate contract structure
     contract_id = contract.get("id")
     if not contract_id:
         raise ValueError("Contract must have an 'id' field")
 
     logger.debug(format_event("planning_started", contract_id=contract_id))
 
-    # Phase 1: Infrastructure setup (S3 buckets, Glue databases)
-    infrastructure_actions = _plan_infrastructure(contract, account_id, region, logger)
-    actions.extend(infrastructure_actions)
-
-    # Phase 2: IAM roles and policies
-    iam_actions = _plan_iam_policies(contract, account_id, logger)
-    actions.extend(iam_actions)
-
-    # Phase 3: Build transformations (dbt, Lambda, Glue jobs)
-    build_actions = _plan_build_transformations(contract, account_id, region, logger)
-    actions.extend(build_actions)
-
-    # Phase 4: Expose data products
-    expose_actions = _plan_exposures(contract, account_id, region, logger)
-    actions.extend(expose_actions)
-
-    # Phase 5: Scheduling and orchestration (EventBridge, Step Functions)
-    schedule_actions = _plan_scheduling(contract, account_id, region, logger)
-    actions.extend(schedule_actions)
+    planner = AwsPlanner(account_id=account_id, region=region, logger=logger)
+    actions = planner.plan(contract, mode=mode)
 
     logger.info(
         format_event(
             "planning_completed",
             contract_id=contract_id,
             total_actions=len(actions),
-            infrastructure_actions=len(infrastructure_actions),
-            iam_actions=len(iam_actions),
-            build_actions=len(build_actions),
-            expose_actions=len(expose_actions),
-            schedule_actions=len(schedule_actions),
         )
     )
 
@@ -580,6 +661,8 @@ def _get_resource_tags(contract: Mapping[str, Any]) -> Dict[str, str]:
 
     if metadata.get("layer"):
         tags["fluid:layer"] = metadata["layer"]
+    if metadata.get("productType"):
+        tags["fluid:product-type"] = metadata["productType"]
 
     owner = metadata.get("owner") or {}
     if isinstance(owner, dict) and owner.get("team"):

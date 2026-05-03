@@ -66,6 +66,8 @@ def extract_snowflake_tags(contract: Dict[str, Any], exposure: Dict[str, Any]) -
     metadata = contract.get("metadata", {})
     if metadata.get("layer"):
         tags["FLUID_LAYER"] = sanitize_tag_value(metadata["layer"])
+    if metadata.get("productType"):
+        tags["FLUID_PRODUCT_TYPE"] = sanitize_tag_value(metadata["productType"])
     if metadata.get("domain"):
         tags["FLUID_DOMAIN"] = sanitize_tag_value(metadata.get("domain", ""))
     if metadata.get("owner", {}).get("team"):

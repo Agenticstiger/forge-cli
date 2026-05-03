@@ -498,8 +498,8 @@ class OdcsProvider(BaseProvider):
         ODCS v3.1.0 requires schema to be an array of SchemaObjects (logicalType: "object")
         with properties arrays containing the actual fields.
 
-        Supports both FLUID 0.5.7 and 0.7.1:
-        - 0.5.7: exposes.schema.fields (object with fields array)
+        Supports both FLUID 0.7.x and 0.7.1:
+        - exposes.schema.fields (object with fields array)
         - 0.7.1: exposes.contract.schema (array of fields)
         """
         odcs_schema = []
@@ -523,7 +523,7 @@ class OdcsProvider(BaseProvider):
                 if isinstance(schema, list):
                     contract_schema = schema
 
-            # Fall back to 0.5.7 format: schema.fields (object)
+            # Fall back to schema.fields (object)
             if not contract_schema:
                 schema_obj = expose.get("schema")
                 if isinstance(schema_obj, dict):
@@ -985,14 +985,14 @@ class OdcsProvider(BaseProvider):
             location = binding.get("location")
             fmt = binding.get("format")
 
-        # Fall back to 0.5.7 format: direct provider field
+        # Fall back to direct provider field
         if not provider:
             provider = expose.get("provider")
 
         if not provider:
             return None
 
-        # Use exposeId (0.7.1) or id (0.5.7)
+        # Use exposeId (0.7.1) or id (v0.7.x)
         expose_id = expose.get("exposeId") or expose.get("id", "default")
 
         server_type = self._map_provider_to_server_type(provider)
@@ -1004,7 +1004,7 @@ class OdcsProvider(BaseProvider):
 
         # Location/connection details - ensure it's a dict
         if not isinstance(location, dict):
-            # Fall back to direct location (0.5.7)
+            # Fall back to direct location (v0.7.x)
             location = expose.get("location")
 
         if isinstance(location, dict) and location:
@@ -1030,7 +1030,7 @@ class OdcsProvider(BaseProvider):
             self.logger.warning(f"Skipping non-dict expect: {type(expect)}")
             return None
 
-        # Try binding.platform (0.7.1) or direct provider (0.5.7)
+        # Try binding.platform (0.7.1) or direct provider (v0.7.x)
         binding = expect.get("binding")
         provider = None
         location = None

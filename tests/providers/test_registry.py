@@ -175,32 +175,17 @@ class TestEntryPointDiscovery:
 
 
 # ---------------------------------------------------------------------------
-# Deprecated base.py re-exports
+# providers.base public surface
 # ---------------------------------------------------------------------------
 
 
-class TestBaseReExports:
-    def test_register_provider_warns_deprecation(self):
-        from fluid_build.providers.base import BaseProvider
-
-        class TestProv(BaseProvider):
-            name = "test_dep"
-
-            def plan(self, contract):
-                return []
-
-            def apply(self, actions):
-                pass
-
-        from fluid_build.providers.base import register_provider
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            register_provider("test_dep", TestProv)
-            assert any("deprecated" in str(x.message).lower() for x in w)
-
+class TestBaseImports:
     def test_base_imports_still_work(self):
-        """Ensure existing import paths don't break."""
+        """The canonical type re-exports stay on ``providers.base``;
+        the deprecated registry-functions (``register_provider``,
+        ``list_providers``, ``get_provider``, ``PROVIDERS``,
+        ``DISCOVERY_ERRORS``) were removed — import them from
+        ``fluid_build.providers`` directly."""
         from fluid_build.providers.base import (
             ApplyResult,
             BaseProvider,
