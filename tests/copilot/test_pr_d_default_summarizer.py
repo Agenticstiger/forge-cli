@@ -24,14 +24,15 @@ Pins the contract:
   fallback.
 * The agent loop's ``_compact_message_history`` accepts the
   summarizer when called with one.
+
+Migration note: the summarizer now routes through ``litellm.completion``
+(one provider-agnostic call) instead of building per-provider HTTP
+requests by hand. Tests mock ``litellm.completion`` directly.
 """
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
-import httpx
-import pytest
+from unittest.mock import MagicMock, patch
 
 from fluid_build.cli.forge_copilot_default_summarizer import (
     build_default_summarizer,
@@ -74,42 +75,38 @@ class TestBuildDefaultSummarizer:
     def test_summarizer_invokes_provider_request_path(self) -> None:
         captured = {}
 
-        def fake_post(url, headers=None, json=None, timeout=None):
-            captured["url"] = url
-            captured["payload"] = json
-            captured["timeout"] = timeout
-            return _FakeResponse(
-                200,
-                {"content": [{"type": "text", "text": "compressed summary."}]},
-            )
+        def fake_completion(**kwargs):
+            captured["kwargs"] = kwargs
+            return {"choices": [{"message": {"content": "compressed summary."}}]}
 
-        with patch("httpx.post", side_effect=fake_post):
+        fake_litellm = MagicMock()
+        fake_litellm.completion = MagicMock(side_effect=fake_completion)
+        with patch.dict("sys.modules", {"litellm": fake_litellm}):
             s = build_default_summarizer(_config())
             out = s("[some big blob]")
         assert out == "compressed summary."
-        # Provider's build_request was used → URL is non-empty + payload
-        # has the user prompt.
-        assert captured["url"]
-        assert captured["timeout"] == 30
+        # litellm receives a normalised payload — model name has the
+        # ``<provider>/<model>`` prefix and the user blob is the second
+        # message.
+        kw = captured["kwargs"]
+        assert "/" in kw["model"]  # litellm prefix shape
+        assert kw["timeout"] == 30
+        assert kw["messages"][1]["content"] == "[some big blob]"
 
     def test_http_error_degrades_to_marker(self) -> None:
-        def fake_post(url, headers=None, json=None, timeout=None):
-            request = httpx.Request("POST", url)
-            response = httpx.Response(500, request=request, content=b"upstream error")
-            raise httpx.HTTPStatusError("500", request=request, response=response)
-
-        with patch("httpx.post", side_effect=fake_post):
+        fake_litellm = MagicMock()
+        fake_litellm.completion = MagicMock(side_effect=RuntimeError("HTTP 500"))
+        with patch.dict("sys.modules", {"litellm": fake_litellm}):
             s = build_default_summarizer(_config())
             out = s("x" * 1500)
         assert "[summarization failed" in out
         assert "1500 chars" in out
 
     def test_runtime_error_during_extract_text_degrades(self) -> None:
-        # Provider returns 200 but extract_text raises (unexpected JSON).
-        def fake_post(url, headers=None, json=None, timeout=None):
-            return _FakeResponse(200, {"unexpected": "shape"})
-
-        with patch("httpx.post", side_effect=fake_post):
+        # Provider returns 200 but the response shape is unexpected.
+        fake_litellm = MagicMock()
+        fake_litellm.completion = MagicMock(return_value={"unexpected": "shape"})
+        with patch.dict("sys.modules", {"litellm": fake_litellm}):
             s = build_default_summarizer(_config())
             out = s("y" * 200)
         assert "[summarization failed" in out
@@ -118,18 +115,20 @@ class TestBuildDefaultSummarizer:
         # Internal trim point is 60_000 chars.
         captured = {}
 
-        def fake_post(url, headers=None, json=None, timeout=None):
-            captured["payload"] = json
-            return _FakeResponse(200, {"content": [{"type": "text", "text": "ok"}]})
+        def fake_completion(**kwargs):
+            captured["kwargs"] = kwargs
+            return {"choices": [{"message": {"content": "ok"}}]}
 
-        with patch("httpx.post", side_effect=fake_post):
+        fake_litellm = MagicMock()
+        fake_litellm.completion = MagicMock(side_effect=fake_completion)
+        with patch.dict("sys.modules", {"litellm": fake_litellm}):
             s = build_default_summarizer(_config())
             blob = "x" * 100_000
             s(blob)
         # The user prompt that landed in the payload is the trimmed blob.
-        # Anthropic build_request → ``messages[0].content`` is the user prompt.
-        msgs = captured["payload"]["messages"]
-        sent_user = msgs[0]["content"]
+        # litellm normalises every provider to OpenAI shape so it's
+        # always ``messages[1].content`` (system, then user).
+        sent_user = captured["kwargs"]["messages"][1]["content"]
         assert isinstance(sent_user, str)
         assert len(sent_user) <= 60_000
 

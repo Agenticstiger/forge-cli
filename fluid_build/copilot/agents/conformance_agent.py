@@ -161,8 +161,14 @@ class ConformanceAgent:
     def __init__(
         self,
         *,
-        fluid_version: str = "0.7.2",
+        fluid_version: Optional[str] = None,
     ) -> None:
+        # Default tracks the latest bundled schema; pass an explicit version
+        # to pin (e.g. for backward-compat regression tests).
+        if fluid_version is None:
+            from fluid_build.schema_manager import FluidSchemaManager
+
+            fluid_version = FluidSchemaManager.latest_bundled_version()
         self.fluid_version = fluid_version
         self._fluid_validator = FluidContractValidator(version=fluid_version)
 

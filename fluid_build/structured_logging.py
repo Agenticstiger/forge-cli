@@ -246,19 +246,30 @@ class LogContext:
 
 
 def log_operation_start(logger: logging.Logger, operation: str, **kwargs):
-    """Log the start of an operation with context"""
-    logger.info(f"Starting {operation}", extra={"operation": operation, "phase": "start", **kwargs})
+    """Log the start of an operation with context.
+
+    Emitted at DEBUG so observability breadcrumbs (``Starting <op>``)
+    don't bleed into user-facing CLI output. Operators who want the
+    breadcrumbs surface them with ``--debug`` / ``FLUID_LOG_LEVEL=DEBUG``
+    or by routing to a ``--log-file`` JSON sink. Phase 1.PR1 of the
+    UX hardening pass — the ``info`` level here was creating a
+    "Starting validate_contract" preface on every CLI call, which
+    operators hate.
+    """
+    logger.debug(
+        f"Starting {operation}", extra={"operation": operation, "phase": "start", **kwargs}
+    )
 
 
 def log_operation_success(
     logger: logging.Logger, operation: str, duration: Optional[float] = None, **kwargs
 ):
-    """Log successful completion of an operation"""
+    """Log successful completion of an operation (DEBUG; see start)."""
     msg = f"Completed {operation}"
     if duration is not None:
         msg += f" in {duration:.2f}s"
 
-    logger.info(
+    logger.debug(
         msg, extra={"operation": operation, "phase": "success", "duration": duration, **kwargs}
     )
 
@@ -270,12 +281,21 @@ def log_operation_failure(
     duration: Optional[float] = None,
     **kwargs,
 ):
-    """Log failed operation with error details"""
+    """Log failed operation with error details.
+
+    The user-facing ``CLIError``/``FluidUserError`` handlers already
+    print a clean, typed message. This logger entry is for the
+    structured log file / observability sink — emitted at DEBUG with
+    ``exc_info=False`` so a ``--log-file`` collector still gets the
+    error context, but interactive users don't see a duplicated
+    Python traceback (the original UX cut: ``Failed validate_contract``
+    + a stack trace BEFORE the typed ``❌`` line).
+    """
     msg = f"Failed {operation}"
     if duration is not None:
         msg += f" after {duration:.2f}s"
 
-    logger.error(
+    logger.debug(
         msg,
         extra={
             "operation": operation,
@@ -285,7 +305,11 @@ def log_operation_failure(
             "duration": duration,
             **kwargs,
         },
-        exc_info=True,
+        # exc_info=False: the CLIError handler in cli/__init__.py
+        # already renders the user-facing error. Re-emitting the
+        # traceback here just creates noise. Set ``--debug`` to get
+        # the full traceback when you actually want it.
+        exc_info=False,
     )
 
 
@@ -293,9 +317,12 @@ def log_metric(
     logger: logging.Logger, metric_name: str, value: float, unit: Optional[str] = None, **tags
 ):
     """
-    Log a metric value.
+    Log a metric value (DEBUG-level — observability sink, not user output).
 
-    Useful for performance monitoring and observability.
+    Useful for performance monitoring and observability. Emitted at
+    DEBUG so the ``Metric: validation_duration=0.005seconds`` breadcrumbs
+    don't bleed onto the user's terminal. Surface them via ``--debug``
+    or a ``--log-file`` JSON sink.
 
     Args:
         logger: Logger instance
@@ -304,7 +331,7 @@ def log_metric(
         unit: Optional unit (seconds, bytes, count, etc.)
         **tags: Additional tags for the metric
     """
-    logger.info(
+    logger.debug(
         f"Metric: {metric_name}={value}{unit or ''}",
         extra={"metric": metric_name, "value": value, "unit": unit, **tags},
     )

@@ -82,7 +82,7 @@ class CatalogPermissionError(CatalogError):
 
     The adapter MUST surface the exact privilege missing. Example
     suggestion: "Snowflake role 'ANALYST' lacks USAGE on schema
-    'BIZ_LAB.SEEDED'. Run: GRANT USAGE ON SCHEMA BIZ_LAB.SEEDED TO
+    'DEMO_DB.SEEDED'. Run: GRANT USAGE ON SCHEMA DEMO_DB.SEEDED TO
     ROLE ANALYST;"
 
     The fail-closed contract: never silently skip tables the user
