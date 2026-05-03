@@ -748,503 +748,17 @@ class GraphBuilder:
 # --------------------------- Legacy DOT Builders (for backward compatibility) --------------------------- #
 
 
-def _build_contract_dot(
-    contract: Mapping[str, Any],
-    *,
-    theme: str,
-    rankdir: str,
-    title: Optional[str],
-    legend: bool,
-    collapse_consumes: bool,
-    collapse_exposes: bool,
-    plan: Optional[Mapping[str, Any]],
-) -> str:
-    t = THEMES.get(theme, THEMES["dark"])
-
-    c_id = contract.get("id", "product")
-    c_name = contract.get("name") or c_id
-    meta = contract.get("metadata") or {}
-    domain = contract.get("domain", "Unknown")
-    layer = meta.get("layer", "N/A")
-
-    consumes: Sequence[Mapping[str, Any]] = contract.get("consumes") or []
-    exposes: Sequence[Mapping[str, Any]] = contract.get("exposes") or []
-
-    # Nodes
-    product_node = _safe_id(f"product_{c_id}")
-    consume_nodes: List[Tuple[str, str]] = []  # (node_id, label)
-    expose_nodes: List[Tuple[str, str]] = []
-
-    if collapse_consumes and consumes:
-        consume_nodes.append(("consumes_agg", "Consumes…"))
-    else:
-        for c in consumes:
-            rid = str(c.get("ref") or c.get("id") or "source")
-            nid = _safe_id(f"consume_{rid}")
-            lbl_top = c.get("id") or "source"
-            lbl_bot = rid
-            consume_nodes.append((nid, f"{lbl_top}\\n{lbl_bot}"))
-
-    if collapse_exposes and exposes:
-        expose_nodes.append(("exposes_agg", "Exposes…"))
-    else:
-        for e in exposes:
-            eid = str(e.get("id") or "expose")
-            et = str(e.get("type") or "")
-            loc = e.get("location") or {}
-            fmt = loc.get("format") or ""
-            nid = _safe_id(f"expose_{eid}")
-            lbl_top = eid
-            lbl_bot = f"{et or 'artifact'} {f'[{fmt}]' if fmt else ''}".strip()
-            expose_nodes.append((nid, f"{lbl_top}\\n{lbl_bot}"))
-
-    # Plan nodes (optional)
-    plan_nodes: List[Tuple[str, str]] = []
-    plan_edges: List[Tuple[str, str]] = []
-    if plan and isinstance(plan.get("actions"), list) and plan["actions"]:
-        # Chain actions A->B->C, then link product to first action and last action to exposes
-        prev = None
-        for i, a in enumerate(plan["actions"]):
-            op = str(a.get("op", "action"))
-            nid = _safe_id(f"action_{i}_{op}")
-            label = op
-            if "dataset" in a and "table" in a:
-                label = f"{op}\\n{a['dataset']}.{a['table']}"
-            elif "name" in a:
-                label = f"{op}\\n{a['name']}"
-            elif "dst" in a:
-                label = f"{op}\\n{a['dst']}"
-            plan_nodes.append((nid, label))
-            if prev:
-                plan_edges.append((prev, nid))
-            prev = nid
-
-    # Build DOT
-    lines: List[str] = []
-    lines.append("digraph G {")
-    lines.append(
-        f'  graph [bgcolor="{t["bg"]}", color="{t["grid"]}", fontname="{t["font"]}", labeljust="l"];'
-    )
-    lines.append(f'  node [fontname="{t["font"]}", color="{t["fg"]}", fontcolor="{t["fg"]}"];')
-    lines.append(f'  edge [color="{t["edge"]}", arrowsize=0.8];')
-    lines.append(f"  rankdir={rankdir};")
-
-    # Title
-    graph_title = title or f"{c_name}  •  Domain: {domain}  •  Layer: {layer}"
-    lines.append('  labelloc="t";')
-    lines.append(f'  label="{_escape_label(graph_title)}";')
-
-    # Clusters: Domain/Layer around Product; Consumes; Exposes; Plan
-    # Product cluster
-    lines.append("  subgraph cluster_product {")
-    lines.append('    label="Data Product";')
-    lines.append(f'    color="{t["cluster_border"]}";')
-    lines.append('    style="rounded,filled";')
-    lines.append(f'    fillcolor="{t["cluster_fill"]}";')
-    lines.append(
-        f'    {product_node} [shape=box, style="rounded,filled", fillcolor="{t["product_fill"]}", '
-        f'color="{t["product_border"]}", penwidth=2, label="{_escape_label(c_name)}\\n({_escape_label(c_id)})"];'
-    )
-    # Domain & Layer “tags”
-    tag_domain = _safe_id(f"tag_domain_{domain}")
-    tag_layer = _safe_id(f"tag_layer_{layer}")
-    lines.append(
-        f'    {tag_domain} [shape=note, style="filled", fontsize=10, fillcolor="{t["expose_fill"]}", '
-        f'color="{t["expose_border"]}", label="Domain: {_escape_label(domain)}"];'
-    )
-    lines.append(
-        f'    {tag_layer} [shape=note, style="filled", fontsize=10, fillcolor="{t["expose_fill"]}", '
-        f'color="{t["expose_border"]}", label="Layer: {_escape_label(layer)}"];'
-    )
-    lines.append(f"    {tag_domain} -> {product_node} [style=dotted, arrowhead=none];")
-    lines.append(f"    {tag_layer} -> {product_node} [style=dotted, arrowhead=none];")
-    lines.append("  }")
-
-    # Consumes cluster
-    if consume_nodes:
-        lines.append("  subgraph cluster_consumes {")
-        lines.append('    label="Consumes";')
-        lines.append(f'    color="{t["cluster_border"]}";')
-        lines.append('    style="rounded,filled";')
-        lines.append(f'    fillcolor="{t["cluster_fill"]}";')
-        for nid, lbl in consume_nodes:
-            lines.append(
-                f'    {nid} [shape=folder, style="filled", fillcolor="{t["consume_fill"]}", '
-                f'color="{t["consume_border"]}", label="{_escape_label(lbl)}"];'
-            )
-            lines.append(f"    {nid} -> {product_node};")
-        lines.append("  }")
-
-    # Plan cluster (optional)
-    if plan_nodes:
-        lines.append("  subgraph cluster_plan {")
-        lines.append('    label="Build Plan";')
-        lines.append(f'    color="{t["cluster_border"]}";')
-        lines.append('    style="rounded,filled";')
-        lines.append(f'    fillcolor="{t["cluster_fill"]}";')
-        first_action_id = None
-        last_action_id = None
-        for i, (nid, lbl) in enumerate(plan_nodes):
-            lines.append(
-                f'    {nid} [shape=diamond, style="filled", fillcolor="{t["action_fill"]}", '
-                f'color="{t["action_border"]}", label="{_escape_label(lbl)}"];'
-            )
-            if i == 0:
-                first_action_id = nid
-            last_action_id = nid
-        for a, b in plan_edges:
-            lines.append(f"    {a} -> {b} [style=solid, arrowhead=normal];")
-        # Link product -> first action if present
-        if first_action_id:
-            lines.append(f"  {product_node} -> {first_action_id} [style=dashed];")
-        lines.append("  }")
-
-    # Exposes cluster
-    if expose_nodes:
-        lines.append("  subgraph cluster_exposes {")
-        lines.append('    label="Exposes";')
-        lines.append(f'    color="{t["cluster_border"]}";')
-        lines.append('    style="rounded,filled";')
-        lines.append(f'    fillcolor="{t["cluster_fill"]}";')
-        for nid, lbl in expose_nodes:
-            lines.append(
-                f'    {nid} [shape=component, style="filled", fillcolor="{t["expose_fill"]}", '
-                f'color="{t["expose_border"]}", label="{_escape_label(lbl)}"];'
-            )
-            # Link last action -> expose if plan exists, else product -> expose
-            if plan_nodes:
-                last_action_id = plan_nodes[-1][0]
-                lines.append(f"    {last_action_id} -> {nid};")
-            else:
-                lines.append(f"    {product_node} -> {nid};")
-        lines.append("  }")
-
-    # Legend (optional)
-    if legend:
-        lines.append("  subgraph cluster_legend {")
-        lines.append('    label="Legend";')
-        lines.append(f'    color="{t["legend_border"]}";')
-        lines.append('    style="rounded,filled";')
-        lines.append(f'    fillcolor="{t["legend_fill"]}";')
-        lines.append(
-            f'    key_product [shape=box, style="rounded,filled", fillcolor="{t["product_fill"]}", '
-            f'color="{t["product_border"]}", label="Data Product"];'
-        )
-        lines.append(
-            f'    key_consume [shape=folder, style="filled", fillcolor="{t["consume_fill"]}", '
-            f'color="{t["consume_border"]}", label="Consumed Source"];'
-        )
-        lines.append(
-            f'    key_action [shape=diamond, style="filled", fillcolor="{t["action_fill"]}", '
-            f'color="{t["action_border"]}", label="Plan Action"];'
-        )
-        lines.append(
-            f'    key_expose [shape=component, style="filled", fillcolor="{t["expose_fill"]}", '
-            f'color="{t["expose_border"]}", label="Exposed Artifact"];'
-        )
-        lines.append("  }")
-
-    lines.append("}")
-    return "\n".join(lines)
-
-
-def _write_output(
-    dot: str,
-    config: GraphConfig,
-    metrics: GraphMetrics,
-    logger: logging.Logger,
-) -> None:
-    """Enhanced output writer with security hardening and better error handling."""
-    secure_logger = ProductionLogger(logger)
-
-    try:
-        out_path = _prepare_output_directory(config.output_path, config.force_overwrite)
-
-        # Track input metrics
-        metrics.dot_size = len(dot.encode("utf-8"))
-
-        # If DOT requested or Graphviz not available, write DOT
-        graphviz_available, graphviz_version = _check_graphviz_installation()
-
-        if config.format == "dot" or not graphviz_available:
-            if config.format != "dot" and not graphviz_available:
-                warn(
-                    logger,
-                    "graphviz_not_available_writing_dot",
-                    out=str(out_path.with_suffix(".dot")),
-                )
-                out_path = out_path.with_suffix(".dot")
-
-            # Secure file write
-            from .security import write_file_secure
-
-            write_file_secure(out_path, dot, "DOT graph file")
-            metrics.output_size = _get_file_size(out_path)
-
-            if not config.quiet:
-                info(
-                    logger,
-                    "viz_graph_output_written",
-                    out=str(out_path),
-                    fmt="dot",
-                    size_bytes=metrics.output_size,
-                )
-
-            if config.open_when_done:
-                _shell_open(out_path, logger)
-            return
-
-        # Render using Graphviz with security safeguards
-        fmt_map = {"svg": "svg", "png": "png", "html": "svg"}
-        gv_fmt = fmt_map.get(config.format, "svg")
-
-        # Validate format to prevent injection
-        if not gv_fmt.isalnum():
-            raise ValueError(f"Invalid Graphviz format: {gv_fmt}")
-
-        # Use secure temporary file for DOT input
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".dot", delete=False, encoding="utf-8"
-        ) as tmp_dot:
-            tmp_dot.write(dot)
-            tmp_dot_path = tmp_dot.name
-
-        try:
-            result_file = out_path if config.format != "html" else out_path.with_suffix(".svg")
-
-            # Build Graphviz command with input validation
-            cmd = ["dot", f"-T{gv_fmt}", tmp_dot_path, "-o", str(result_file)]
-
-            # Validate and sanitize custom Graphviz args
-            if config.graphviz_args:
-                sanitized_args = []
-                for arg in config.graphviz_args:
-                    # Allow only safe Graphviz options
-                    if (
-                        arg.startswith("-")
-                        and len(arg) > 1
-                        and arg[1:].replace("=", "").replace(":", "").isalnum()
-                    ):
-                        sanitized_args.append(arg)
-                    else:
-                        secure_logger.log_safe(
-                            "warning", f"Skipping potentially unsafe Graphviz argument: {arg}"
-                        )
-
-                if sanitized_args:
-                    # Insert custom args before the -o option
-                    cmd = cmd[:-2] + sanitized_args + cmd[-2:]
-
-            subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=Path.cwd(),
-                env={**os.environ, "PATH": os.environ.get("PATH", "")},
-            )
-
-            if config.format == "html":
-                # Wrap SVG into HTML with secure file operations
-                from .security import read_file_secure, write_file_secure
-
-                svg_content = read_file_secure(result_file, "generated SVG")
-                html_content = _create_html_wrapper(svg_content, config, metrics)
-                write_file_secure(out_path, html_content, "HTML wrapper")
-                result_file.unlink(missing_ok=True)
-
-            metrics.output_size = _get_file_size(out_path)
-
-            if not config.quiet:
-                info(
-                    logger,
-                    "viz_graph_output_written",
-                    out=str(out_path),
-                    fmt=config.format,
-                    size_bytes=metrics.output_size,
-                    graphviz_version=graphviz_version,
-                )
-
-            if config.open_when_done:
-                _shell_open(out_path, logger)
-
-        except subprocess.TimeoutExpired:
-            error(logger, "graphviz_timeout", timeout_seconds=30)
-            raise CLIError(1, "graphviz_timeout", {"timeout": 30})
-        except subprocess.CalledProcessError as e:
-            secure_logger.log_safe(
-                "error", "Graphviz render failed", stderr=e.stderr, returncode=e.returncode
-            )
-            # Fallback: write DOT file
-            from .security import write_file_secure
-
-            dot_path = out_path.with_suffix(".dot")
-            write_file_secure(dot_path, dot, "fallback DOT file")
-            warn(logger, "falling_back_to_dot_output", out=str(dot_path))
-            if config.open_when_done:
-                _shell_open(dot_path, logger)
-        finally:
-            # Clean up temporary file securely
-            try:
-                temp_path = Path(tmp_dot_path)
-                if temp_path.exists():
-                    temp_path.unlink()
-            except Exception:
-                pass
-
-    except Exception as e:
-        secure_logger.log_safe(
-            "error", "Output write failed", error=str(e), output_path=config.output_path
-        )
-        raise CLIError(1, "output_write_failed", {"error": str(e), "path": config.output_path})
-
-
-def _create_html_wrapper(svg_content: str, config: GraphConfig, metrics: GraphMetrics) -> str:
-    """Create an enhanced HTML wrapper for SVG content."""
-    metadata_info = ""
-    if config.show_metadata:
-        # Handle potential None values in metrics
-        total_time = metrics.total_time or 0
-        _load_time = metrics.load_time or 0  # noqa: F841
-        _render_time = metrics.render_time or 0  # noqa: F841
-
-        metadata_info = f"""
-        <div class="metadata">
-            <h2>Generation Info</h2>
-            <div class="meta-grid">
-                <div class="meta-item">
-                    <span class="meta-label">Total Time:</span>
-                    <span class="meta-value">{total_time:.2f}s</span>
-                </div>
-                <div class="meta-item">
-                    <span class="meta-label">Nodes:</span>
-                    <span class="meta-value">{metrics.node_count}</span>
-                </div>
-                <div class="meta-item">
-                    <span class="meta-label">Edges:</span>
-                    <span class="meta-value">{metrics.edge_count}</span>
-                </div>
-                <div class="meta-item">
-                    <span class="meta-label">Clusters:</span>
-                    <span class="meta-value">{metrics.cluster_count}</span>
-                </div>
-                <div class="meta-item">
-                    <span class="meta-label">Theme:</span>
-                    <span class="meta-value">{config.theme}</span>
-                </div>
-                <div class="meta-item">
-                    <span class="meta-label">Layout:</span>
-                    <span class="meta-value">{config.rankdir}</span>
-                </div>
-            </div>
-        </div>
-        """
-
-    theme_bg = _get_theme_value(config.theme, "bg", None)
-    theme_fg = _get_theme_value(config.theme, "fg", None)
-
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FLUID Data Product Graph</title>
-    <style>
-        body {{ 
-            margin: 0; 
-            padding: 0;
-            background: {theme_bg}; 
-            color: {theme_fg}; 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
-            line-height: 1.5;
-        }}
-        .container {{ 
-            padding: 20px; 
-            max-width: 100%;
-            overflow-x: auto;
-        }}
-        .header {{
-            margin-bottom: 20px;
-            padding: 20px;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 12px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }}
-        .header h1 {{ 
-            margin: 0 0 8px 0; 
-            font-size: 24px; 
-            font-weight: 600;
-        }}
-        .header .subtitle {{ 
-            color: rgba(255, 255, 255, 0.7); 
-            font-size: 14px; 
-        }}
-        .graph-container {{
-            background: white;
-            border-radius: 12px;
-            padding: 20px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-            overflow: auto;
-        }}
-        .metadata {{
-            margin-top: 20px;
-            padding: 16px;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 8px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }}
-        .metadata h2 {{
-            margin: 0 0 12px 0;
-            font-size: 16px;
-            font-weight: 600;
-        }}
-        .meta-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 8px;
-        }}
-        .meta-item {{
-            display: flex;
-            justify-content: space-between;
-            padding: 4px 0;
-        }}
-        .meta-label {{
-            font-weight: 500;
-            opacity: 0.8;
-        }}
-        .meta-value {{
-            font-family: 'SF Mono', 'Monaco', 'Courier New', monospace;
-            font-size: 13px;
-        }}
-        svg {{ 
-            width: 100%; 
-            height: auto; 
-            max-width: none;
-        }}
-        @media (max-width: 768px) {{
-            .container {{ padding: 12px; }}
-            .header {{ padding: 16px; }}
-            .graph-container {{ padding: 12px; }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>FLUID Data Product Graph</h1>
-            <div class="subtitle">Generated by fluid viz-graph • {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}</div>
-        </div>
-        <div class="graph-container">
-            {svg_content}
-        </div>
-        {metadata_info}
-    </div>
-</body>
-</html>"""
-
-
-# --------------------------- Enhanced CLI Registration & Runner --------------------------- #
+# ── Renderer imports ─────────────────────────────────────────────
+# The DOT / output / HTML renderers were physically extracted into
+# the ``viz_renderers/`` sibling package so the per-format logic
+# lives in dedicated modules. Re-imported here at top level so
+# existing test patches that target
+# ``fluid_build.cli.viz_graph._build_contract_dot`` (etc.) still
+# resolve — the symbol is bound on this module's namespace via the
+# import, even though the body lives elsewhere.
+from fluid_build.cli.viz_renderers.dot import _build_contract_dot  # noqa: E402,F401
+from fluid_build.cli.viz_renderers.html import _create_html_wrapper  # noqa: E402,F401
+from fluid_build.cli.viz_renderers.output import _write_output  # noqa: E402,F401
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -1281,7 +795,15 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
     # Input/Output arguments
     input_group = p.add_argument_group("Input/Output")
-    input_group.add_argument("contract", help="Path to contract.fluid.yaml file")
+    input_group.add_argument(
+        "contract",
+        nargs="?",
+        help=(
+            "Path to a single contract.fluid.yaml file. Omit when "
+            "using ``--mesh`` to render the cross-product DAG of every "
+            "contract under cwd."
+        ),
+    )
     input_group.add_argument("--env", help="Environment overlay for contract (e.g., dev, prod)")
     input_group.add_argument("--plan", help="Optional plan.json file to show build actions")
     input_group.add_argument(
@@ -1291,14 +813,49 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         default="runtime/graph/contract.svg",
         help="Output file path (default: runtime/graph/contract.svg)",
     )
+    # Mesh mode — workspace-wide cross-product DAG.
+    #
+    # Single-contract mode (the default) renders the internal DAG of
+    # ONE data product (sources → transforms → exposes). Mesh mode
+    # walks ``**/*.fluid.yaml`` under cwd and renders the inter-product
+    # DAG built from each contract's ``consumes[]`` references — i.e.
+    # which SDPs feed which ADPs feed which CDPs across the workspace.
+    # This is the view operators need for impact analysis ("if I change
+    # SDP X, what breaks?") and onboarding diagrams ("here's the shape
+    # of our mesh"). Plan item 2.3 originally proposed a separate
+    # ``fluid mesh graph`` subcommand; folding it into ``viz-graph``
+    # via this flag keeps the CLI surface narrow.
+    input_group.add_argument(
+        "--mesh",
+        action="store_true",
+        help=(
+            "Mesh mode: walk ``**/*.fluid.yaml`` under cwd and render "
+            "the cross-product DAG (SDP→ADP→CDP) instead of a single "
+            "contract's internal DAG. The ``contract`` positional is "
+            "ignored when ``--mesh`` is set."
+        ),
+    )
+    input_group.add_argument(
+        "--mesh-root",
+        default=".",
+        help=("Root directory for mesh-mode walk (default: cwd). Ignored " "without ``--mesh``."),
+    )
 
     # Format and appearance
     format_group = p.add_argument_group("Format & Appearance")
     format_group.add_argument(
         "--format",
-        choices=["dot", "svg", "png", "html"],
+        # ``mermaid`` is mesh-only — single-contract mode keeps the
+        # original Graphviz-rooted choices. Mesh mode adds ``mermaid``
+        # for inline GitHub / GitLab diagrams and ``json`` for tooling
+        # that wants structured graph data.
+        choices=["dot", "svg", "png", "html", "mermaid", "json"],
         default="svg",
-        help="Output format (default: svg)",
+        help=(
+            "Output format. ``svg`` / ``png`` / ``html`` need Graphviz; "
+            "``dot`` / ``mermaid`` / ``json`` are pure-text. "
+            "``mermaid`` and ``json`` only make sense with ``--mesh``."
+        ),
     )
     format_group.add_argument(
         "--theme", choices=list(THEMES.keys()), default="dark", help="Color theme (default: dark)"
@@ -1374,8 +931,40 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
-    """Enhanced main handler for viz-graph command."""
+    """Enhanced main handler for viz-graph command.
+
+    Two modes:
+
+    * **Single-contract** (default) — renders the internal DAG of one
+      contract.fluid.yaml. Backward-compatible with every prior call
+      site.
+    * **Mesh** (``--mesh``) — walks the workspace and renders the
+      cross-product SDP→ADP→CDP DAG built from each contract's
+      ``consumes[]`` references. ``--format mermaid`` / ``--format json``
+      are most useful here.
+    """
     time.time()
+
+    # Mesh mode short-circuits the single-contract path entirely. The
+    # ``contract`` positional is ignored (and may be None thanks to
+    # ``nargs="?"``).
+    if getattr(args, "mesh", False):
+        return _run_mesh_mode(args, logger)
+
+    # Single-contract mode requires the positional argument that mesh
+    # mode makes optional. Surface a clear error early.
+    if not getattr(args, "contract", None):
+        error(logger, "viz_graph_no_contract")
+        raise CLIError(
+            2,
+            "viz_graph_no_contract",
+            {
+                "hint": (
+                    "Pass a contract path, or use ``--mesh`` to render "
+                    "the workspace-wide cross-product DAG."
+                )
+            },
+        )
 
     try:
         # Create configuration from args
@@ -1489,6 +1078,304 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
             error(logger, "debug_traceback", traceback=traceback.format_exc())
         raise CLIError(1, "unexpected_error", {"error": str(e)})
+
+
+def _run_mesh_mode(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """Render the workspace-wide cross-product DAG.
+
+    Walks ``args.mesh_root`` (default cwd) for ``contract.fluid.yaml``
+    files via :func:`workspace_config.discover_workspace_products`,
+    builds the inter-product dependency graph from each contract's
+    ``consumes[]`` block (``productId`` → consumer's ``id``), and
+    renders to one of {dot, mermaid, json, svg, png, html}.
+
+    Output formats:
+
+    * ``dot`` — Graphviz source (text). Pipe into ``dot`` for SVG/PNG.
+    * ``mermaid`` — Mermaid ``graph TD`` block, ready for inline
+      paste into a GitHub / GitLab Markdown comment.
+    * ``json`` — structured ``{"nodes": [...], "edges": [...]}`` for
+      tooling that wants graph data, not pixels.
+    * ``svg`` / ``png`` / ``html`` — render the dot through Graphviz
+      (same renderer the single-contract mode uses); requires
+      ``dot`` on PATH.
+
+    Per-contract metadata used:
+
+    * ``id`` — node identifier + label.
+    * ``metadata.layer`` / ``metadata.productType`` — node colour.
+      Bronze/SDP, Silver/ADP, Gold/CDP each get a distinct fill.
+    * ``consumes[].productId`` — incoming edges.
+
+    Edges to consumed products that aren't present in the workspace
+    (federated upstreams, missing contracts, etc.) get rendered as
+    dashed-grey ``external`` nodes so the operator sees the gap.
+    """
+    from pathlib import Path as _Path
+
+    import yaml as _yaml
+
+    from .workspace_config import discover_workspace_products
+
+    root = _Path(getattr(args, "mesh_root", ".") or ".").resolve()
+    products = discover_workspace_products(root)
+    if not products:
+        error(logger, "viz_graph_mesh_empty", root=str(root))
+        raise CLIError(
+            2,
+            "viz_graph_mesh_empty",
+            {
+                "root": str(root),
+                "hint": (
+                    "No ``contract.fluid.yaml`` files found under the "
+                    "workspace root. Initialise a workspace via "
+                    "``fluid init`` or set ``--mesh-root`` to the "
+                    "right path."
+                ),
+            },
+        )
+
+    # ----- Build the in-memory graph -----
+    # node_id  -> {"id", "label", "layer", "productType", "external"}
+    # edges    -> [(upstream_id, downstream_id, expose_id)]
+    nodes: Dict[str, Dict[str, Any]] = {}
+    edges: List[Tuple[str, str, str]] = []
+    for prod in products:
+        try:
+            contract = _yaml.safe_load(prod.contract_path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:  # noqa: BLE001 — broken YAML shouldn't kill the walk
+            warn(
+                logger,
+                "viz_graph_mesh_skip_unparseable",
+                path=str(prod.contract_path),
+                error=str(exc),
+            )
+            continue
+        cid = str(contract.get("id") or prod.name)
+        meta = contract.get("metadata") or {}
+        nodes[cid] = {
+            "id": cid,
+            "label": str(contract.get("name") or cid),
+            "layer": meta.get("layer"),
+            "productType": meta.get("productType"),
+            "external": False,
+            "path": str(prod.contract_path),
+        }
+        for c in contract.get("consumes") or []:
+            upstream_id = str(c.get("productId") or "")
+            if not upstream_id:
+                continue
+            expose_id = str(c.get("exposeId") or "")
+            edges.append((upstream_id, cid, expose_id))
+
+    # Materialise external upstreams (referenced in consumes[] but
+    # absent from the workspace). These are typical for federated
+    # meshes where SDPs live in another repo.
+    referenced = {u for u, _d, _e in edges}
+    for upstream_id in referenced - set(nodes.keys()):
+        nodes[upstream_id] = {
+            "id": upstream_id,
+            "label": upstream_id,
+            "layer": None,
+            "productType": None,
+            "external": True,
+            "path": None,
+        }
+
+    fmt = getattr(args, "format", "svg")
+    out_path = getattr(args, "output_path", "runtime/graph/mesh.svg")
+
+    # ----- Render -----
+    if fmt == "json":
+        body = json.dumps(
+            {
+                "nodes": list(nodes.values()),
+                "edges": [{"from": u, "to": d, "exposeId": e or None} for u, d, e in edges],
+                "root": str(root),
+            },
+            indent=2,
+        )
+        _emit_mesh_text(body, out_path, logger, default_ext=".json")
+        return 0
+
+    if fmt == "mermaid":
+        body = _build_mesh_mermaid(nodes, edges)
+        _emit_mesh_text(body, out_path, logger, default_ext=".md")
+        return 0
+
+    # dot / svg / png / html — build dot source first, then route
+    # through the existing single-contract pipeline for the rendered
+    # variants.
+    dot = _build_mesh_dot(nodes, edges, getattr(args, "rankdir", "LR"))
+    if fmt == "dot":
+        _emit_mesh_text(dot, out_path, logger, default_ext=".dot")
+        return 0
+
+    # svg / png / html — write dot to a temp file and shell out to
+    # graphviz. We can re-use _write_output's machinery, but it
+    # expects a GraphConfig — easier here to call dot directly.
+    out_file = _Path(out_path)
+    if out_file.suffix == "":
+        out_file = out_file.with_suffix("." + fmt)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    if fmt in ("svg", "png"):
+        available, _ver = _check_graphviz_installation()
+        if not available:
+            warn(
+                logger,
+                "graphviz_not_available_writing_dot",
+                fallback=str(out_file.with_suffix(".dot")),
+            )
+            out_file = out_file.with_suffix(".dot")
+            out_file.write_text(dot, encoding="utf-8")
+            return 0
+        with tempfile.NamedTemporaryFile("w", suffix=".dot", delete=False) as fh:
+            fh.write(dot)
+            tmp_path = fh.name
+        try:
+            subprocess.run(
+                ["dot", f"-T{fmt}", tmp_path, "-o", str(out_file)],
+                check=True,
+            )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    else:  # html — just wrap the SVG in a minimal page
+        # Render SVG first into a tmp, then template-wrap.
+        with tempfile.NamedTemporaryFile("w", suffix=".dot", delete=False) as fh:
+            fh.write(dot)
+            tmp_path = fh.name
+        try:
+            svg_bytes = subprocess.check_output(["dot", "-Tsvg", tmp_path])
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        out_file.write_text(
+            (
+                "<!doctype html>\n<html><head><meta charset='utf-8'>"
+                "<title>FLUID mesh graph</title></head><body>"
+                + svg_bytes.decode("utf-8")
+                + "</body></html>"
+            ),
+            encoding="utf-8",
+        )
+    info(
+        logger, "viz_graph_mesh_complete", output=str(out_file), nodes=len(nodes), edges=len(edges)
+    )
+    return 0
+
+
+def _build_mesh_dot(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: List[Tuple[str, str, str]],
+    rankdir: str = "LR",
+) -> str:
+    """Render the mesh as Graphviz DOT source.
+
+    Layer / productType drives the fill color so the SDP/ADP/CDP
+    progression is visible at a glance:
+
+    * Bronze / SDP → ``#cd7f32`` (bronze).
+    * Silver / ADP → ``#c0c0c0`` (silver).
+    * Gold   / CDP → ``#ffd700`` (gold).
+    * external (referenced but not in workspace) → grey, dashed.
+    * unknown → light blue.
+    """
+    fill_map = {
+        ("bronze", "sdp"): "#cd7f32",
+        ("silver", "adp"): "#c0c0c0",
+        ("gold", "cdp"): "#ffd700",
+    }
+
+    def _fill(node: Dict[str, Any]) -> str:
+        if node.get("external"):
+            return "#dddddd"
+        layer = (node.get("layer") or "").lower()
+        ptype = (node.get("productType") or "").lower()
+        for (lo_layer, lo_type), color in fill_map.items():
+            if layer == lo_layer or ptype == lo_type:
+                return color
+        return "#cfe8ff"
+
+    safe_id = lambda raw: '"' + raw.replace('"', "'") + '"'  # noqa: E731
+    lines: List[str] = [
+        "digraph fluid_mesh {",
+        f"  rankdir={rankdir};",
+        '  node [shape=box, style="rounded,filled", fontname="Helvetica"];',
+        '  edge [fontname="Helvetica", fontsize=10];',
+    ]
+    for node in nodes.values():
+        attrs = [
+            f'label="{node["label"]}\\n{node["id"]}"',
+            f'fillcolor="{_fill(node)}"',
+        ]
+        if node.get("external"):
+            attrs.append('style="rounded,filled,dashed"')
+            attrs.append('color="#888888"')
+        lines.append(f"  {safe_id(node['id'])} [{', '.join(attrs)}];")
+    for upstream, downstream, expose in edges:
+        edge_attrs = ""
+        if expose:
+            edge_attrs = f' [label="{expose}"]'
+        lines.append(f"  {safe_id(upstream)} -> {safe_id(downstream)}{edge_attrs};")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def _build_mesh_mermaid(
+    nodes: Dict[str, Dict[str, Any]],
+    edges: List[Tuple[str, str, str]],
+) -> str:
+    """Render the mesh as a Mermaid ``graph TD`` block.
+
+    Mermaid identifiers must be alphanumeric — we use a stable hash
+    of the productId so two products with the same display label
+    don't collide.
+    """
+    import hashlib
+
+    def _mid(raw: str) -> str:
+        h = hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:10]
+        return f"n{h}"
+
+    lines: List[str] = ["graph TD"]
+    for node in nodes.values():
+        nid = _mid(node["id"])
+        label = node["label"].replace('"', "'")
+        layer_or_type = (node.get("productType") or node.get("layer") or "").upper()
+        suffix = f" [{layer_or_type}]" if layer_or_type else ""
+        ext = " :::external" if node.get("external") else ""
+        lines.append(f'  {nid}["{label}{suffix}"]{ext}')
+    for upstream, downstream, expose in edges:
+        u, d = _mid(upstream), _mid(downstream)
+        if expose:
+            lines.append(f"  {u} -- {expose} --> {d}")
+        else:
+            lines.append(f"  {u} --> {d}")
+    lines.append("  classDef external fill:#dddddd,stroke-dasharray: 5 5;")
+    return "\n".join(lines) + "\n"
+
+
+def _emit_mesh_text(
+    body: str, out_path: str, logger: logging.Logger, default_ext: str = ""
+) -> None:
+    """Write a text-format mesh render (dot / mermaid / json) to disk
+    or stdout (when ``out_path`` is ``-``)."""
+    if out_path in ("", "-", "/dev/stdout"):
+        # Use plain print so the body can be piped — info() emits
+        # structured logs which would corrupt the output.
+        print(body, end="" if body.endswith("\n") else "\n")  # noqa: T201
+        return
+    p = Path(out_path)
+    if p.suffix == "" and default_ext:
+        p = p.with_suffix(default_ext)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body, encoding="utf-8")
+    info(logger, "viz_graph_mesh_written", output=str(p))
 
 
 def _run_provider_actions_viz(args: argparse.Namespace, logger: logging.Logger) -> int:
