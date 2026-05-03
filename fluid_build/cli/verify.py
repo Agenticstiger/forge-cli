@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional
 
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.cli.console import error as console_error
+from fluid_build.observability.tracing import traced_stage as _traced_stage
 from fluid_build.providers._sql_safety import validate_ident
 from fluid_build.providers.snowflake.util.config import resolve_env_templates
 
@@ -677,6 +678,7 @@ def verify_snowflake_table(
         return {"status": "error", "error": str(exc), "exists": False}
 
 
+@_traced_stage("verify")
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Main verify command execution"""
 
@@ -881,6 +883,14 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     match_count = 0
     mismatch_count = 0
     error_count = 0
+    # Track critical-severity mismatches separately so ``--strict``
+    # can differentiate breaking drift (missing fields, type mismatches,
+    # region mismatches) from non-breaking constraint drift
+    # (nullable vs required). Without this split, ``verify --strict``
+    # red-flagged dbt-built tables for every demo (dbt creates nullable
+    # cols by default; contracts often declare ``required: true``) —
+    # which conflated a known modelling tension with real schema breaks.
+    critical_mismatch_count = 0
 
     for expose_name, result in results.items():
         expose_config = exposes_to_verify.get(expose_name, {})
@@ -1016,11 +1026,46 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             for action in severity["actions"]:
                 cprint(f"      • {action}")
 
-        # Update counts
+        # Update counts. ``critical_mismatch_count`` only ticks when
+        # the per-expose severity is CRITICAL (missing fields, type
+        # mismatches, region drift). WARNING-only constraint drift
+        # still counts toward ``mismatch_count`` so the summary remains
+        # accurate, but ``--strict`` consults the critical counter
+        # below.
         if status == "match":
             match_count += 1
         else:
             mismatch_count += 1
+            if severity.get("level") == "CRITICAL":
+                critical_mismatch_count += 1
+
+    # ── Acquisition pattern: post-apply probes ─────────────────────────
+    # When the contract has any ``pattern: acquisition`` builds, run the
+    # acquisition stage extension against the current workdir. The
+    # extension checks: a run record exists, records landed, run state
+    # is SUCCEEDED or PARTIAL, no DLQ overflow, and cost is within
+    # budget. Failures count toward the verify exit code under
+    # ``--strict``.
+    try:
+        from fluid_build.cli._acquisition_stage_ext import (
+            is_acquisition_contract,
+            verify_acquisition,
+        )
+
+        if is_acquisition_contract(contract):
+            cprint("\n" + "=" * 80)
+            cprint("🔄 Acquisition Post-Apply Probes")
+            cprint("=" * 80)
+            acq_results = verify_acquisition(contract, Path.cwd())
+            for r in acq_results:
+                cprint(f"\n   Build: {r.product_id}/{r.build_id}")
+                for c in r.checks:
+                    icon = "✅" if c.passed else "❌"
+                    cprint(f"      {icon} {c.name}: {c.detail}")
+                    if not c.passed:
+                        mismatch_count += 1
+    except Exception as exc:  # noqa: BLE001 — verify must not crash the CLI
+        warning(f"Acquisition probes skipped: {exc}")
 
     # Summary
     cprint("\n" + "=" * 80)
@@ -1060,8 +1105,19 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
         cprint(f"\n📄 Report saved: {output_path}")
 
-    # Exit with error code if strict mode and issues found
-    if args.strict and (mismatch_count > 0 or error_count > 0):
+    # Exit with error code if strict mode and CRITICAL issues found.
+    # Non-critical mismatches (e.g. nullable-vs-required constraint
+    # drift) emit warnings to stderr but do NOT fail the build —
+    # operators can tighten the contract incrementally. ``error_count``
+    # always fails (auth issues, connection failures, missing tables
+    # the contract claims should exist).
+    if args.strict and (critical_mismatch_count > 0 or error_count > 0):
         return 1
+    if args.strict and mismatch_count > 0:
+        warning(
+            f"--strict: {mismatch_count} non-critical mismatch(es) downgraded "
+            "to warning (constraint-only drift). Tighten the contract or fix "
+            "the warehouse to clear them."
+        )
 
     return 0

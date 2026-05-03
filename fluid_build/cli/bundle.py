@@ -69,7 +69,15 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("contract", help="Path to the root FLUID contract file")
+    p.add_argument(
+        "contract",
+        nargs="?",
+        default=None,
+        help=(
+            "Path to the root FLUID contract file. When omitted, "
+            "auto-finds ``contract.fluid.yaml`` in the current directory."
+        ),
+    )
     p.add_argument(
         "--out",
         "-o",
@@ -190,6 +198,23 @@ def _has_refs(obj: Any) -> bool:
 
 @traced_stage("bundle")
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
+    # UX hardening pass — accept the bare ``fluid bundle`` invocation
+    # when CWD has a ``contract.fluid.yaml``. Mirrors ``fluid validate``'s
+    # ergonomics so the same workflow works across commands.
+    from fluid_build.cli._common import CLIError, auto_find_contract
+
+    if not auto_find_contract(args):
+        raise CLIError(
+            1,
+            "contract_required",
+            {
+                "message": (
+                    "No contract path supplied and no ``contract.fluid.yaml`` "
+                    "found in the current directory."
+                )
+            },
+        )
+
     contract_path = args.contract
     out = args.out
     env = args.env

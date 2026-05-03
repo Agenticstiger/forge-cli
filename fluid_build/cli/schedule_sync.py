@@ -1240,6 +1240,47 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
 
     results = dispatcher(dags_dir, args)
 
+    # ── Acquisition pattern: emit per-orchestrator artifacts ────────────
+    # When the contract carries a Bronze ``pattern: acquisition`` build,
+    # we ALSO emit deterministic Airflow/Dagster/Prefect/cron artifacts
+    # into ``.fluid/artifacts/<contract-id>/schedule/`` via the
+    # acquisition stage extension. These are validated, sandbox-safe
+    # files; they do not replace the dispatcher above (which talks to
+    # the scheduler API), but they make the schedule visible as code
+    # for review + version control.
+    try:
+        from fluid_build.cli._acquisition_stage_ext import (
+            is_acquisition_contract,
+            schedule_sync_acquisition,
+        )
+        from fluid_build.loader import load_contract_with_overlay
+
+        for cp in getattr(args, "contracts", []) or []:
+            try:
+                contract = load_contract_with_overlay(str(cp), getattr(args, "env", None), logger)
+            except Exception:
+                continue
+            if not is_acquisition_contract(contract):
+                continue
+            picked = (
+                [args.scheduler]
+                if args.scheduler
+                in (
+                    "airflow",
+                    "dagster",
+                    "prefect",
+                )
+                else ["airflow", "cron"]
+            )
+            artifacts = schedule_sync_acquisition(contract, Path.cwd(), orchestrators=picked)
+            for a in artifacts:
+                cprint(
+                    f"[schedule-sync] acquisition emitted " f"{a.orchestrator} → {a.artifact_path}",
+                    markup=False,
+                )
+    except Exception as exc:  # noqa: BLE001 — schedule-sync must not crash on this
+        logger.warning(f"acquisition schedule emission skipped: {exc}")
+
     # Aggregate exit code: any non-zero → overall failure.
     overall_exit = 0
     for r in results:

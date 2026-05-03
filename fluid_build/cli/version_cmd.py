@@ -47,7 +47,7 @@ except ImportError:
     RICH_AVAILABLE = False
 
 COMMAND = "version"
-FALLBACK_SPEC_VERSION = "0.5.7"
+FALLBACK_SPEC_VERSION = "0.7.3"
 
 
 def register(subparsers: argparse._SubParsersAction):
@@ -187,7 +187,7 @@ def _detect_providers() -> Dict[str, str]:
             providers["gcp"] = "not installed"
 
         try:
-            from fluid_build.providers.aws import AWSProvider
+            from fluid_build.providers.aws import AwsProvider  # noqa: F401
 
             providers["aws"] = "available"
         except ImportError:
@@ -237,7 +237,7 @@ API: {cli_info["api_version"]}
 
         feature_names = {
             "core_validation": "Core Validation",
-            "legacy_057": "FLUID 0.5.7 Support",
+            "legacy_057": "FLUID 0.7.x Support",
             "0.7.1_support": "FLUID 0.7.1+ Support",
             "provider_actions": "Provider Actions",
             "sovereignty": "Sovereignty Constraints",

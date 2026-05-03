@@ -475,6 +475,9 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
             pl.add_argument("--out", required=True)
             pl.set_defaults(func=cmd_plan_run)
 
+    # ship (UX hardening — validate → bundle → plan → apply macro)
+    _try_register(sp, "ship", "ship")
+
     # apply (enhanced → fallback)
     if is_command_enabled("apply"):
         try:
@@ -534,6 +537,15 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     _try_register(sp, "datamesh_manager", "datamesh-manager", method="add_parser")
     _try_register(sp, "ai_setup", "ai")
     _try_register(sp, "forge", "forge")
+    _try_register(sp, "contract", "contract")
+    # Day-2 ops surface for source-aligned acquisition contracts.
+    # `fluid runs {status,logs,diff}` for run-record introspection;
+    # `fluid retention sweep` for state-root cleanup. Kept under their own
+    # umbrellas so the existing top-level `status` / `doctor` / `auth`
+    # commands aren't shadowed.
+    _try_register(sp, "runs", "runs")
+    _try_register(sp, "retention", "retention")
+    _try_register(sp, "secrets", "secrets")
     _try_register(sp, "market", "market")
     # ``fluid policy {check,compile,apply}`` — unified umbrella that
     # groups the three policy verbs under one subcommand. The legacy
@@ -558,13 +570,11 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     # pipeline landed. Users running ``fluid compile`` now get the standard
     # argparse "invalid choice" error, which is the desired signal.
     _try_register(sp, "split", "split")
-    _try_register(sp, "preview", "preview")  # deprecated — use plan --html
     _try_register(sp, "diff", "diff")
-    _try_register(sp, "context", "config")  # renamed: context → config
-    # Hidden backward-compat alias: ``fluid context`` still works
-    _try_register(sp, "context", "context", method="register_context_alias")
+    _try_register(sp, "context", "config")  # canonical: ``fluid config``
     _try_register(sp, "product_add", "product-add")
     _try_register(sp, "pipeline_generator", "generate-pipeline")
     # copilot removed — AI is built into forge
     _try_register(sp, "ide", "ide")
     _try_register(sp, "workspace", "workspace")
+    _try_register(sp, "stats", "stats")

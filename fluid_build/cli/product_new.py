@@ -34,12 +34,16 @@ def register(subparsers: argparse._SubParsersAction):
 
 
 SAMPLE = {
-    "fluidVersion": "0.5.7",
+    "fluidVersion": "0.7.3",
     "kind": "DataProduct",
     "id": "gold.customer360_v1",
     "name": "Customer 360",
     "domain": "Customer",
-    "metadata": {"layer": "Gold", "owner": {"team": "Data", "email": "owner@example.com"}},
+    "metadata": {
+        "layer": "Gold",
+        "productType": "CDP",
+        "owner": {"team": "Data", "email": "owner@example.com"},
+    },
     "consumes": [],
     "builds": [
         {
