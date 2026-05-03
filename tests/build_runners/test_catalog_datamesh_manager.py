@@ -154,9 +154,8 @@ class TestPublishAcquisitionToDmm:
     def test_publish_acquisition_dispatches_to_dmm(self, tmp_path: Path):
         # The user's flow: contract has ``catalog.register: [datamesh_manager]``,
         # publish_acquisition picks it up, our registrar publishes.
-        from fluid_build.cli._acquisition_stage_ext import publish_acquisition
-
         from fluid_build.build_runners import _catalog as orch
+        from fluid_build.cli._acquisition_stage_ext import publish_acquisition
 
         respx.put(
             "https://api.datamesh-manager.com/api/data-products/bronze.crm.salesforce_accounts"
@@ -174,9 +173,8 @@ class TestPublishAcquisitionToDmm:
 
     @respx.mock
     def test_publish_acquisition_dmm_5xx_surfaces_failure(self, tmp_path: Path):
-        from fluid_build.cli._acquisition_stage_ext import publish_acquisition
-
         from fluid_build.build_runners import _catalog as orch
+        from fluid_build.cli._acquisition_stage_ext import publish_acquisition
 
         respx.put(
             "https://api.datamesh-manager.com/api/data-products/bronze.crm.salesforce_accounts"
