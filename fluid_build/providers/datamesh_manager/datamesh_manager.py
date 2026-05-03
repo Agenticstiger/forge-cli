@@ -662,7 +662,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
     # behaviour change. Tests that patched
     # ``DataMeshManagerProvider._is_odps_spec`` etc. still work
     # because the binding is on the class.
-    from ._odps_helpers import (
+    from ._odps_helpers import (  # noqa: I001
         ensure_odps_output_port_display_names as _ensure_odps_output_port_display_names_impl,
         is_odps_payload as _is_odps_payload_impl,
         is_odps_spec as _is_odps_spec_impl,
@@ -717,7 +717,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
     # ``_ensure_odps_input_port_contract_ids``,
     # ``_ensure_odps_input_port_source_system_custom_property``) — ~290 LOC
     # combined — moved to ``_odps_helpers.py``.
-    from ._odps_helpers import (
+    from ._odps_helpers import (  # noqa: I001
         ensure_odps_input_port_contract_ids as _ensure_odps_input_port_contract_ids_impl,
         ensure_odps_input_port_source_system_custom_property as _ensure_odps_input_port_source_system_custom_property_impl,
         remove_odps_product_consume_input_ports as _remove_odps_product_consume_input_ports_impl,
@@ -830,7 +830,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
     # ``_payload_builders.py``. Bound here as staticmethods so
     # existing call sites (``self._build_server_object(...)``) keep
     # resolving.
-    from ._payload_builders import (
+    from ._payload_builders import (  # noqa: I001
         _build_server_object as _build_server_object_impl,
         _extract_custom as _extract_custom_impl,
         _extract_links as _extract_links_impl,
@@ -897,7 +897,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
     # thin wrappers that pass ``self._derive_team_id`` /
     # ``self._extract_provider`` as callables, preserving the
     # public method shape (``provider._build_data_contract_odcs(...)``).
-    from ._contract_builders import (
+    from ._contract_builders import (  # noqa: I001
         _build_data_contract_dcs as _build_data_contract_dcs_impl,
         _build_data_contract_odcs as _build_data_contract_odcs_impl,
         _odcs_logical_type as _odcs_logical_type_impl,
