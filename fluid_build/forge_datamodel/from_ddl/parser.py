@@ -111,7 +111,16 @@ class DDLParser:
                     nullable = True
                     primary_key = False
                     for constraint in constraints:
-                        constraint_kind = type(constraint.this).__name__ if constraint.this else ""
+                        # sqlglot's ``ColumnConstraint`` exposes the
+                        # constraint type in ``.kind`` (newer versions);
+                        # older versions stored it on ``.this``. Read
+                        # both so the parser is version-agnostic.
+                        kind_node = (
+                            constraint.args.get("kind")
+                            or getattr(constraint, "kind", None)
+                            or getattr(constraint, "this", None)
+                        )
+                        constraint_kind = type(kind_node).__name__ if kind_node is not None else ""
                         if constraint_kind == "NotNullColumnConstraint":
                             nullable = False
                         if constraint_kind == "PrimaryKeyColumnConstraint":

@@ -33,12 +33,13 @@ from fluid_build.cli import apply as apply_module
 
 def test_apply_run_hydrates_dotenv_before_branch_dispatch(tmp_path: Path) -> None:
     # Build a minimal argparse.Namespace that apply.run will short-circuit on.
-    # The --build path delegates to build_runners.run_builds_from_args; we stub
-    # that so we can assert hydrate_dotenv fired *before* the delegation happens.
+    # ``--mode amend-and-build`` delegates to build_runners.run_builds_from_args;
+    # we stub that so we can assert hydrate_dotenv fired *before* delegation.
     args = argparse.Namespace(
         contract=str(tmp_path / "contract.fluid.yaml"),
         env=None,
         dry_run=True,
+        mode="amend-and-build",
         build_id="some_build",
     )
     (tmp_path / "contract.fluid.yaml").write_text("fluidVersion: '0.7.2'\nkind: DataProduct\n")
@@ -71,6 +72,7 @@ def test_apply_run_passes_env_overlay_to_hydrate(tmp_path: Path) -> None:
         contract=str(tmp_path / "contract.fluid.yaml"),
         env="prod",
         dry_run=True,
+        mode="amend-and-build",
         build_id="some_build",
     )
     (tmp_path / "contract.fluid.yaml").write_text("fluidVersion: '0.7.2'\nkind: DataProduct\n")

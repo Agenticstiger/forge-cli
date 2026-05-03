@@ -358,7 +358,14 @@ def validate_odps_bitol(path: str, content: bytes) -> List[ValidationIssue]:
 
 
 def validate_dag_python(path: str, content: bytes) -> List[ValidationIssue]:
-    """``python -m py_compile`` on a DAG file; any SyntaxError flagged with line."""
+    """``python -m py_compile`` on a DAG file; any SyntaxError flagged with line.
+
+    Uses :data:`sys.executable` rather than a hard-coded ``"python"`` so
+    the test runs portably on systems where only ``python3`` is on
+    ``$PATH`` (modern macOS / Debian 12+ / venvs that don't shim the
+    unsuffixed name).
+    """
+    import sys
     import tempfile
 
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as fh:
@@ -367,7 +374,7 @@ def validate_dag_python(path: str, content: bytes) -> List[ValidationIssue]:
 
     try:
         result = subprocess.run(
-            ["python", "-m", "py_compile", tmp_path],
+            [sys.executable, "-m", "py_compile", tmp_path],
             capture_output=True,
             text=True,
             timeout=30,
