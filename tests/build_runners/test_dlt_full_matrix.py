@@ -22,8 +22,16 @@ from typing import Any, Dict
 
 import pytest
 
-from fluid_build.api.runner import RunnerCapability
-from fluid_build.build_runners.dlt.runner import (
+# Skip the whole file when the optional ``dlt`` extra isn't installed.
+# CI's base ``[dev,local]`` install does NOT pull dlt; that's intentional —
+# dlt is a heavy dep ridden along its own ``[dlt]`` extra (PR-13's pyproject
+# aggregations land that). Until then, this file's tests would 8x-fail on
+# every Python version. Module-level importorskip is the canonical pattern
+# (mirrors how Pandas / SciPy / etc. gate their tests).
+pytest.importorskip("dlt")
+
+from fluid_build.api.runner import RunnerCapability  # noqa: E402
+from fluid_build.build_runners.dlt.runner import (  # noqa: E402
     DltRunner,
     _map_mode_to_write_disposition,
     execute_dlt_build,
