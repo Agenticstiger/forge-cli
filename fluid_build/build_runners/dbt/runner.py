@@ -37,6 +37,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -117,13 +118,42 @@ def resolve_dbt_project_path(contract_path: Path, build: Dict[str, Any]) -> Opti
 
 
 def _resolve_dbt_executable() -> Optional[str]:
+    """Resolve a usable ``dbt`` binary.
+
+    Search order:
+      1. ``$DBT_EXECUTABLE`` if it points at an absolute / relative path.
+      2. ``shutil.which($DBT_EXECUTABLE or "dbt")`` — relies on PATH.
+      3. ``Path(sys.executable).parent / "dbt"`` — the venv-sibling
+         fallback. When users run ``.venv/bin/python -m fluid_build.cli``
+         without activating the venv, ``shutil.which`` doesn't see
+         ``.venv/bin/dbt`` because the venv's bin dir isn't on PATH.
+         The dbt binary IS sitting next to the python interpreter
+         that's executing right now, so we look there before giving up.
+
+    Hardening on the venv-sibling fallback:
+
+    * ``is_file()`` rejects directory matches (a ``dbt`` directory next
+      to ``python`` would otherwise be returned as a string and explode
+      at ``subprocess.run`` time with EACCES instead of a clean error).
+    * ``os.access(..., os.X_OK)`` rejects non-executable matches (e.g.
+      a stale ``dbt.dist-info/`` artifact). An attacker who can write
+      to the venv's ``bin/`` is past the trust boundary, but defending
+      against accidental misuse keeps the failure mode loud and early.
+    """
     configured = os.getenv("DBT_EXECUTABLE", "dbt")
     if os.path.sep in configured or configured.startswith((".", "~")):
         candidate = Path(configured).expanduser()
         if candidate.exists():
             return str(candidate)
         return None
-    return shutil.which(configured)
+    found = shutil.which(configured)
+    if found:
+        return found
+    # Venv-sibling fallback: works when running via ``.venv/bin/python``.
+    sibling = Path(sys.executable).parent / configured
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling)
+    return None
 
 
 def _configured_dbt_command_prefix() -> Optional[List[str]]:
@@ -279,8 +309,18 @@ def build_dbt_command(
     *,
     profiles_dir: Optional[Path] = None,
     project_config: Optional[Dict[str, Any]] = None,
+    apply_mode: Optional[str] = None,
 ) -> List[str]:
-    """Build the dbt CLI command for a dbt-based build."""
+    """Build the dbt CLI command for a dbt-based build.
+
+    The optional ``apply_mode`` carries the ``fluid apply --mode``
+    value. When destructive (``replace`` / ``replace-and-build``) the
+    command appends ``--full-refresh`` so dbt's incremental models
+    rebuild from scratch instead of doing the standard merge/append.
+    Non-incremental materialisations (``table`` / ``view``) ignore the
+    flag — they always rebuild fresh — so the flag is safe to add
+    unconditionally for destructive modes.
+    """
     props = build.get("properties") or {}
     project_config = project_config or _load_dbt_project_config(project_dir)
     dbt_args = ["build", "--project-dir", str(project_dir)]
@@ -308,6 +348,14 @@ def build_dbt_command(
     dbt_vars = props.get("vars")
     if dbt_vars:
         dbt_args += ["--vars", json.dumps(_resolve_env_placeholders(dbt_vars))]
+
+    # Destructive apply modes (``replace`` / ``replace-and-build``)
+    # force dbt to fully rebuild incremental models. ``--full-refresh``
+    # is a no-op for ``table`` / ``view`` materializations (they
+    # always rebuild) so this is safe to add unconditionally for
+    # destructive modes.
+    if apply_mode and apply_mode.lower() in ("replace", "replace-and-build"):
+        dbt_args.append("--full-refresh")
 
     configured_prefix = _configured_dbt_command_prefix()
     if configured_prefix:
@@ -383,8 +431,15 @@ def execute_dbt_build(
     no_output: bool = False,
     fail_fast: bool = False,
     force_run: bool = False,
+    apply_mode: Optional[str] = None,
 ) -> int:
-    """Execute a dbt-based build."""
+    """Execute a dbt-based build.
+
+    The optional ``apply_mode`` carries the ``fluid apply --mode``
+    value through to ``build_dbt_command`` so destructive modes append
+    ``--full-refresh`` to the dbt invocation (forcing incremental
+    models to rebuild from scratch).
+    """
     build_id = build.get("id", "unknown")
     execution = build.get("execution", {})
     trigger = execution.get("trigger", {})
@@ -407,6 +462,7 @@ def execute_dbt_build(
             project_dir,
             profiles_dir=profiles_dir,
             project_config=project_config,
+            apply_mode=apply_mode,
         )
     except (RuntimeError, OSError, yaml.YAMLError) as exc:
         if temp_profiles_dir:
