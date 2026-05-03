@@ -74,7 +74,7 @@ class ProviderActionParser:
         Returns:
             List of normalized ProviderAction objects
         """
-        fluid_version = contract.get("fluidVersion", "0.5.7")
+        fluid_version = contract.get("fluidVersion", "0.7.3")
 
         # Check for explicit provider actions (0.7.0+)
         if "providerActions" in contract:
@@ -172,21 +172,31 @@ class ProviderActionParser:
                     )
                 )
 
-        # Infer from builds (schedule tasks)
+        # Infer from builds (schedule tasks). Pass through the build's
+        # SQL + outputs + properties so the provider's ``scheduleTask``
+        # handler can run the SQL inline for ``engine: sql`` builds
+        # (Snowflake / BigQuery / etc.).
         for i, build in enumerate(contract.get("builds", [])):
-            build_id = build.get("buildId", f"build_{i}")
+            build_id = build.get("buildId") or build.get("id") or f"build_{i}"
             engine = build.get("engine", "dbt")
+            build_props = build.get("properties") or {}
 
             actions.append(
                 ProviderAction(
                     action_id=f"schedule_{build_id}",
                     action_type=ActionType.SCHEDULE_TASK,
-                    provider="local",  # Builds are typically local
+                    provider="local",
                     params={
                         "buildId": build_id,
                         "engine": engine,
                         "script": build.get("script"),
                         "schedule": build.get("schedule"),
+                        # Inline-execution data: SQL builds need the
+                        # SQL string, outputs reference the target
+                        # expose, properties carry per-engine knobs.
+                        "sql": build.get("sql") or build_props.get("sql"),
+                        "outputs": build.get("outputs") or [],
+                        "pattern": build.get("pattern"),
                     },
                     description=f"Schedule build task {build_id}",
                 )
@@ -220,6 +230,8 @@ class ProviderActionParser:
         metadata = contract.get("metadata", {})
         if metadata.get("layer"):
             labels["fluid_layer"] = sanitize_label_value(metadata["layer"])
+        if metadata.get("productType"):
+            labels["fluid_product_type"] = sanitize_label_value(metadata["productType"])
         if metadata.get("domain"):
             labels["fluid_domain"] = sanitize_label_value(metadata.get("domain", ""))
         if metadata.get("owner", {}).get("team"):

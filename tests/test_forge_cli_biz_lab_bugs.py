@@ -445,6 +445,137 @@ class TestDmmPublishDefaultsToOdps:
 # ---------------------------------------------------------------------------
 
 
+class TestFederationEndpointSchemeAllowList:
+    """``federation/upstreams.yaml::workspaces[].endpoint`` is
+    PR-reviewable; passing it verbatim to ``git clone <url> <dir>``
+    let an attacker smuggle git CLI options like
+    ``--upload-pack=<cmd>`` at clone time. The fix validates the
+    URL scheme + ``-`` prefix at manifest-load time; the subprocess
+    argv ALSO passes ``--`` before the positional URL as belt-and-
+    suspenders. Both lines of defence are pinned here."""
+
+    def test_endpoint_with_dash_prefix_rejected(self):
+        """Endpoints starting with ``-`` are the argument-injection
+        attack shape (``--upload-pack=...``, ``--config=...``).
+        Rejected at construction time with ``ValueError``."""
+        from fluid_build.forge.federation import FederatedWorkspace
+
+        with pytest.raises(ValueError, match="must not start with '-'"):
+            FederatedWorkspace.from_dict(
+                {
+                    "id": "evil",
+                    "kind": "git_registry",
+                    "endpoint": "--upload-pack=touch /tmp/pwn",
+                }
+            )
+
+    def test_endpoint_without_scheme_rejected(self):
+        """A bare ``host:port/path`` without an explicit scheme is
+        rejected so ambiguous SCP-style values can't slip through."""
+        from fluid_build.forge.federation import FederatedWorkspace
+
+        with pytest.raises(ValueError, match="explicit URL scheme"):
+            FederatedWorkspace.from_dict(
+                {
+                    "id": "no-scheme",
+                    "kind": "git_registry",
+                    "endpoint": "github.com/foo/bar.git",
+                }
+            )
+
+    def test_endpoint_with_disallowed_scheme_rejected(self):
+        """The ``ext::sh -c`` historical git transport is the most
+        notorious smuggling vector. We accept only well-known
+        clone-time schemes."""
+        from fluid_build.forge.federation import FederatedWorkspace
+
+        with pytest.raises(ValueError, match="not allowed"):
+            FederatedWorkspace.from_dict(
+                {
+                    "id": "ext-attack",
+                    "kind": "git_registry",
+                    "endpoint": "ext://sh -c touch /tmp/pwn",
+                }
+            )
+
+    def test_endpoint_with_https_accepted(self):
+        from fluid_build.forge.federation import FederatedWorkspace
+
+        ws = FederatedWorkspace.from_dict(
+            {
+                "id": "ok",
+                "kind": "git_registry",
+                "endpoint": "https://github.com/org/repo.git",
+            }
+        )
+        assert ws.endpoint == "https://github.com/org/repo.git"
+
+    def test_endpoint_with_ssh_accepted(self):
+        from fluid_build.forge.federation import FederatedWorkspace
+
+        ws = FederatedWorkspace.from_dict(
+            {
+                "id": "ok-ssh",
+                "kind": "git_registry",
+                "endpoint": "ssh://git@github.com/org/repo.git",
+            }
+        )
+        assert ws.endpoint == "ssh://git@github.com/org/repo.git"
+
+    def test_load_manifest_skips_invalid_workspaces_keeps_valid_ones(self, tmp_path):
+        """A single tampered workspace entry must not disable
+        federation for legitimate workspaces declared alongside it."""
+        import textwrap
+
+        from fluid_build.forge.federation import load_federation_manifest
+
+        manifest_path = tmp_path / "federation" / "upstreams.yaml"
+        manifest_path.parent.mkdir(parents=True)
+        manifest_path.write_text(
+            textwrap.dedent("""\
+                workspaces:
+                  - id: evil
+                    kind: git_registry
+                    endpoint: "--upload-pack=touch /tmp/pwn"
+                  - id: ok
+                    kind: git_registry
+                    endpoint: "https://github.com/org/repo.git"
+                """),
+            encoding="utf-8",
+        )
+
+        manifest = load_federation_manifest(tmp_path)
+
+        ids = {ws.id for ws in manifest.workspaces}
+        assert "evil" not in ids, "tampered workspace must be skipped"
+        assert "ok" in ids, "legitimate workspace must still load"
+
+    def test_git_clone_argv_passes_dash_dash_before_url(self):
+        """Belt-and-suspenders: even with the scheme allow-list,
+        every ``git clone`` invocation must pass ``--`` before the
+        positional URL so a future code path forgetting the
+        validation can't reintroduce the bug."""
+        import inspect
+
+        from fluid_build.forge import federation
+
+        src = inspect.getsource(federation._git_clone_or_pull_via_shellout)
+        # The ``"--"`` separator must appear inside the argv list,
+        # specifically between ``"--depth", "1"`` and ``auth_url``.
+        # We assert a structural pattern rather than parsing the
+        # argv literally.
+        assert '"--"' in src or "'--'" in src, (
+            "_git_clone_or_pull_via_shellout argv must include '--' "
+            "before the positional URL (defence-in-depth against "
+            "argument injection)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bug #6: Snowflake / Redshift rollback cleanup DDL skipped validate_ident.
+# ---------------------------------------------------------------------------
+
+
 class TestSnowflakeRollbackCleanupValidatesIdentifiers:
     """Identifiers read from ``.fluid/rollback-state.json`` must
     route through ``validate_ident`` before being interpolated into

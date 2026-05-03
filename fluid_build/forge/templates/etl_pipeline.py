@@ -74,103 +74,28 @@ class ETLPipelineTemplate(ProjectTemplate):
         }
 
     def generate_contract(self, context: GenerationContext) -> Dict[str, Any]:
-        project_config = context.project_config
-        project_name = project_config.get("name", "etl-pipeline")
-        description = project_config.get("description", "ETL pipeline data product")
-        domain = project_config.get("domain", "integration")
-        owner = project_config.get("owner", "data-team")
-        provider = project_config.get("provider", "gcp")
+        """Generate a v0.7.3-canonical contract via the shared builder.
 
-        return {
-            "fluidVersion": project_config.get("fluid_version", "0.5.7"),
-            "kind": "DataProduct",
-            "id": f"{project_name.replace('-', '_')}_etl_pipeline",
-            "name": f"{project_name} ETL Pipeline",
-            "description": description,
-            "domain": domain,
-            "metadata": {
-                "layer": "Silver",
-                "owner": {"team": owner, "email": f"{owner}@company.com"},
-                "status": "Development",
-                "tags": ["etl", "pipeline", "data-integration", "batch"],
-                "created": context.creation_time,
-                "template": "etl_pipeline",
-                "forge_version": context.forge_version,
-            },
-            "consumes": [
-                {
-                    "id": "source_system",
-                    "ref": "urn:fluid:source_system:v1",
-                    "description": "Source system data for ETL processing",
-                }
-            ],
-            "builds": [  # Changed from 'build' to 'builds' array
-                {
-                    "transformation": {
-                        "pattern": "hybrid-reference",
-                        "engine": "dbt",
-                        "properties": {
-                            "model_path": "transforms/",
-                            "staging_models": "staging/",
-                            "mart_models": "marts/",
-                        },
-                    },
-                    "execution": {
-                        "trigger": {"type": "schedule", "cron": "0 2 * * *"},
-                        "runtime": {
-                            "platform": provider,
-                            "resources": {"cpu": "4", "memory": "8GB"},
-                        },
-                    },
-                }
-            ],  # Close builds array
-            "exposes": [
-                {
-                    "exposeId": "data_warehouse",  # Changed from 'id'
-                    "kind": "table",  # Changed from 'type'
-                    "description": "Processed data warehouse tables",
-                    "binding": {  # Changed from 'location'
-                        "format": "table",
-                        "dataset": "warehouse",  # Flattened from properties
-                        "table": "fact_orders",
-                    },
-                    "schema": [
-                        {
-                            "name": "order_id",
-                            "type": "string",
-                            "description": "Unique order identifier",
-                            "nullable": False,
-                        },
-                        {
-                            "name": "customer_id",
-                            "type": "string",
-                            "description": "Customer identifier",
-                            "nullable": False,
-                        },
-                        {
-                            "name": "order_amount",
-                            "type": "decimal",
-                            "description": "Total order amount",
-                            "nullable": False,
-                        },
-                        {
-                            "name": "order_date",
-                            "type": "date",
-                            "description": "Date when order was placed",
-                            "nullable": False,
-                        },
-                    ],
-                    "quality": [
-                        {
-                            "name": "primary_key_check",
-                            "rule": "order_id IS NOT NULL AND customer_id IS NOT NULL",
-                            "onFailure": {"action": "reject_row"},
-                        }
-                    ],
-                }
-            ],
-            "slo": {"freshnessMinutes": 180, "availabilityPct": 99.5},
-        }
+        Per-template specifics (product type, build pattern, engine,
+        default columns) live in :class:`TemplateSpec` below;
+        :func:`build_contract` populates the canonical fluidVersion,
+        layer↔productType pair, owner, exposes[].binding, builds[],
+        and consumes[] structure so every template stays in lockstep
+        with schema changes.
+        """
+        from ._v073_builder import TemplateSpec, build_contract
+
+        spec = TemplateSpec(
+            template_name="etl_pipeline",
+            product_type="ADP",
+            pattern="embedded-logic",
+            engine="python",
+            properties={"model": "etl_pipeline.main"},
+            expose_id="processed_records",
+            binding_format="parquet",
+            description_suffix="Multi-stage ETL pipeline with quality gates",
+        )
+        return build_contract(spec=spec, project_config=context.project_config)
 
     def validate_configuration(self, config: Dict[str, Any]) -> ValidationResult:
         errors = []
