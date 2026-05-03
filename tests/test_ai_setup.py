@@ -946,24 +946,31 @@ class TestGeminiIsDefaultProvider:
         )
 
     def test_prompt_for_api_key_lists_gemini_first_with_default_one(self):
-        """The picker source-of-truth: gemini_free is index 0 of the
-        choices list, so ``default=1`` selects it."""
+        """The picker source-of-truth: ``gemini`` is index 0 of the
+        choices list, so ``default=1`` selects it. Gemini's free-tier
+        sub-flow is now a follow-up prompt after the user picks
+        ``gemini``, which keeps the top-level picker shorter and lists
+        every provider via litellm."""
         import fluid_build.cli.ai_setup as mod
 
         src = Path(mod.__file__).read_text()
-        # Locate the choices list passed to ask_numbered_choice.
-        marker = '"How do you want to connect?"'
-        assert marker in src, "ask_numbered_choice prompt copy changed; update test"
+        # Locate the base_choices list — first row is the picker default.
+        marker = "base_choices: List[Tuple[str, str]]"
+        assert marker in src, "base_choices definition moved; update test"
         idx = src.index(marker)
         snippet = src[idx : idx + 1200]
         first_choice_pos = snippet.index('("')
-        # The first tuple inside the list must be the gemini-free path.
-        assert snippet[first_choice_pos : first_choice_pos + 80].startswith('("gemini_free"'), (
+        # The first tuple in base_choices must be the gemini row.
+        assert snippet[first_choice_pos : first_choice_pos + 60].startswith('("gemini"'), (
             "AI-setup picker first option regressed away from "
-            "Google Gemini (free) — card 69da8d7e fix lost"
+            "Google Gemini — card 69da8d7e fix lost. Gemini must "
+            "be the default pick because it's the cheapest path to "
+            "world-class authoring (free tier covers most users)."
         )
         # And the default must point at index 1 (1-based) i.e. that first row.
-        assert "default=1" in snippet, "ask_numbered_choice default= regressed"
+        connect_idx = src.index('"How do you want to connect?"')
+        connect_snippet = src[connect_idx : connect_idx + 400]
+        assert "default=1" in connect_snippet, "ask_numbered_choice default= regressed"
 
     def test_resolve_llm_config_falls_back_to_gemini_when_unconfigured(self, monkeypatch):
         """With no flags, no FLUID_LLM_PROVIDER, no inferable provider env,

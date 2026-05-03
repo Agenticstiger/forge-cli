@@ -42,7 +42,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import httpx
@@ -134,234 +134,72 @@ _CONFIG_DIR = Path.home() / ".fluid"
 _CONFIG_FILE = _CONFIG_DIR / "ai_config.json"
 
 
-def _allow_plaintext_ai_secrets() -> bool:
-    """Return True when the operator explicitly opts into plaintext key persistence."""
-    return os.environ.get(_PLAINTEXT_AI_SECRETS_ENV, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _save_ai_config(
-    provider: str,
-    model: str,
-    *,
-    api_key: Optional[str] = None,
-    endpoint: Optional[str] = None,
-    ollama_host: Optional[str] = None,
-) -> bool:
-    """Save non-sensitive AI config to ``~/.fluid/ai_config.json``.
-
-    Provider and model choices live in the JSON file. API keys are
-    persisted to the OS keyring whenever possible. Plaintext key
-    fallback is intentionally opt-in via ``FLUID_ALLOW_PLAINTEXT_AI_SECRETS=1``
-    so automated and agent-facing workflows don't quietly leave live
-    provider tokens on disk.
-    """
-    import json
-    import stat
-
-    try:
-        _CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-        data: dict = {"provider": provider, "model": model}
-        if api_key:
-            saved_to_keyring = _save_key_to_keyring(provider, api_key)
-            if saved_to_keyring:
-                LOG.debug("Saved API key to keyring; not writing it to %s", _CONFIG_FILE)
-            elif _allow_plaintext_ai_secrets():
-                data["api_key"] = api_key
-                LOG.warning("Plaintext local AI credential fallback is enabled.")
-            else:
-                LOG.debug("Keyring unavailable; sensitive AI value was not persisted.")
-        if endpoint:
-            data["endpoint"] = endpoint
-        if ollama_host:
-            data["ollama_host"] = ollama_host
-        _CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        # Owner-only read/write — protect the API key
-        _CONFIG_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
-        LOG.debug("Saved AI config to %s (mode 600)", _CONFIG_FILE)
-        return True
-    except OSError as exc:
-        LOG.debug("Could not save AI config: %s", exc)
-        return False
-
-
-def _load_ai_config() -> Optional[dict]:
-    """Load saved AI preferences.  Returns None if no config exists.
-
-    Lookup order (Sprint #7 wiring):
-
-    1. ``~/.fluid/config.yaml`` ``llm:`` section (unified path —
-       new operators land here on first ``fluid ai setup`` call).
-    2. ``~/.fluid/ai_config.json`` (legacy v1.5 file — pre-existing
-       installs continue to work without re-migrating).
-    3. ``None`` — no config saved yet.
-    """
-    import json
-
-    # 1. Unified config — new operators.
-    try:
-        from fluid_build.copilot.unified_config import load_unified_config
-
-        cfg = load_unified_config()
-        if cfg is not None and cfg.llm and cfg.llm.provider:
-            data: dict = {"provider": cfg.llm.provider}
-            if cfg.llm.model:
-                data["model"] = cfg.llm.model
-            if cfg.llm.tiered:
-                data["tiered"] = cfg.llm.tiered
-            return data
-    except Exception as exc:  # pragma: no cover — defensive
-        LOG.debug("Could not load unified AI config: %s", exc)
-
-    # 2. Legacy ``~/.fluid/ai_config.json`` — pre-existing installs.
-    try:
-        if not _CONFIG_FILE.exists():
-            return None
-        data = json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and data.get("provider"):
-            return data
-        return None
-    except (OSError, json.JSONDecodeError, ValueError):
-        return None
-
-
-def _clear_ai_config() -> None:
-    """Delete the saved AI config file."""
-    try:
-        if _CONFIG_FILE.exists():
-            _CONFIG_FILE.unlink()
-            LOG.debug("Deleted AI config at %s", _CONFIG_FILE)
-    except OSError as exc:
-        LOG.debug("Could not delete AI config: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Keyring helpers
-# ---------------------------------------------------------------------------
-
-
-def _save_key_to_keyring(provider: str, api_key: str) -> bool:
-    """Persist *api_key* in the OS keyring.  Returns True on success."""
-    try:
-        from fluid_build.credentials.keyring_store import KeyringCredentialStore
-
-        KeyringCredentialStore.set_credential(f"{_KEYRING_PREFIX}.{provider}", api_key)
-        LOG.debug("Saved API key to keyring for provider=%s", provider)
-        return True
-    except ImportError as exc:
-        LOG.debug("Keyring library not available: %s", exc)
-        return False
-    except OSError as exc:
-        LOG.debug("Could not save API key to keyring for %s: %s", provider, exc)
-        return False
-    except Exception as exc:  # noqa: BLE001 — keyring backends can raise anything
-        LOG.debug("Unexpected keyring error for %s: %s", provider, exc)
-        return False
-
-
-def _load_key_from_keyring(provider: str) -> Optional[str]:
-    """Load a previously saved API key from the OS keyring."""
-    try:
-        from fluid_build.credentials.keyring_store import KeyringCredentialStore
-
-        return KeyringCredentialStore.get_credential(f"{_KEYRING_PREFIX}.{provider}")
-    except (ImportError, OSError) as exc:
-        LOG.debug("Could not load key from keyring for %s: %s", provider, exc)
-        return None
-    except Exception as exc:  # noqa: BLE001 — keyring backends can raise anything
-        LOG.debug("Unexpected keyring error loading key for %s: %s", provider, exc)
-        return None
-
-
-def _clear_key_from_keyring(provider: str) -> bool:
-    try:
-        from fluid_build.credentials.keyring_store import KeyringCredentialStore
-
-        KeyringCredentialStore.delete_credential(f"{_KEYRING_PREFIX}.{provider}")
-        return True
-    except (ImportError, OSError) as exc:
-        LOG.debug("Could not clear keyring for %s: %s", provider, exc)
-        return False
-    except Exception as exc:  # noqa: BLE001
-        LOG.debug("Unexpected keyring error clearing %s: %s", provider, exc)
-        return False
-
-
-def _query_ollama_models(host: str) -> list:
-    """Return a list of model names available on the local Ollama instance.
-
-    Returns an empty list if Ollama is unreachable or has no models.
-    """
-    try:
-        import httpx
-    except ImportError:
-        LOG.debug("httpx not installed — cannot query Ollama models")
-        return []
-
-    try:
-        resp = httpx.get(f"{host.rstrip('/')}/api/tags", timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        return [m["name"] for m in data.get("models", []) if m.get("name")]
-    except httpx.ConnectError:
-        LOG.debug("Ollama is not running at %s", host)
-        return []
-    except Exception:  # noqa: BLE001
-        LOG.debug("Could not query Ollama models at %s", host, exc_info=True)
-        return []
+# Storage helpers (config + keyring) — physically extracted to
+# ``cli/_ai_setup_storage.py``. ~155 LOC of pure I/O lifted without
+# behavior change. Re-exported here under the same names so test
+# patches on ``fluid_build.cli.ai_setup.<helper>`` flow through to
+# the moved functions via the module-attribute-access indirection.
+# Ollama poll/query helpers — extracted; see
+# ``cli/_ai_setup_ollama.py`` for the implementation.
+from fluid_build.cli._ai_setup_ollama import (  # noqa: E402,F401
+    _poll_for_ollama,
+    _query_ollama_models,
+)
+from fluid_build.cli._ai_setup_storage import (  # noqa: E402,F401
+    _allow_plaintext_ai_secrets,
+    _clear_ai_config,
+    _clear_key_from_keyring,
+    _load_ai_config,
+    _load_key_from_keyring,
+    _save_ai_config,
+    _save_key_to_keyring,
+)
 
 
 def _validate_api_key(provider: Any, api_key: str) -> Optional[str]:
-    """Make a lightweight API call to validate the key works.
+    """Lightweight API call to verify the key works.
 
-    Returns ``None`` on success or an error message string on failure.
-    Uses provider-specific minimal requests (e.g. list-models endpoint).
+    One litellm completion validates every provider — there's no
+    per-provider httpx logic anymore. litellm is a core dep so the
+    import always resolves.
+
+    Returns ``None`` on success or a short human-readable error message.
     """
+    import litellm  # core dep
+
+    from fluid_build.cli.forge_copilot_llm_litellm import (
+        _LITELLM_PREFIX_BY_PROVIDER,
+    )
+
+    prefix = _LITELLM_PREFIX_BY_PROVIDER.get(provider.name.lower(), provider.name.lower())
+    model = (
+        provider.default_model
+        if "/" in (provider.default_model or "")
+        else f"{prefix}/{provider.default_model}"
+    )
     try:
-        import httpx
-
-        env = dict(os.environ)
-        # Build a minimal request — ask the model to return a short response
-        config = LlmConfig(
-            provider=provider.name,
-            model=provider.default_model,
-            endpoint=provider.default_endpoint(provider.default_model, env),
+        litellm.completion(
+            model=model,
+            messages=[{"role": "user", "content": "Say ok"}],
             api_key=api_key,
-            timeout_seconds=15,
+            max_tokens=4,
+            timeout=15,
+            num_retries=0,
         )
-        headers, payload = provider.build_request(
-            config,
-            system_prompt="Respond with exactly: ok",
-            user_prompt="Say ok",
-        )
-        # Reduce token budget for validation
-        if "max_tokens" in payload:
-            payload["max_tokens"] = 10
-
-        with httpx.Client(timeout=config.timeout_seconds) as client:
-            resp = client.post(config.endpoint, headers=headers, json=payload)
-            resp.raise_for_status()
-
-        return None  # Success
-    except httpx.HTTPStatusError as exc:
-        status = exc.response.status_code
-        if status == 401:
+        return None
+    except Exception as exc:  # noqa: BLE001 — translate to friendly text
+        msg = str(exc).lower()
+        if "401" in msg or "invalid" in msg or "auth" in msg:
             return "Invalid or expired API key"
-        if status == 403:
+        if "403" in msg or "permission" in msg:
             return "API key does not have sufficient permissions"
-        if status == 429:
-            return "Rate limited -- key is valid but quota exceeded"
-        return f"API returned {status}"
-    except httpx.ConnectError:
-        return "Could not connect to API endpoint"
-    except httpx.TimeoutException:
-        return "API request timed out (15s)"
-    except Exception as exc:  # noqa: BLE001
-        return f"Unexpected error: {exc}"
+        if "429" in msg or "rate" in msg or "quota" in msg:
+            return "Rate limited — key is valid but quota exceeded"
+        if "timeout" in msg:
+            return "API request timed out (15s)"
+        if "connect" in msg or "dns" in msg or "resolv" in msg:
+            return "Could not connect to API endpoint"
+        return f"validation failed: {exc}"
 
 
 def set_session_env(provider: str, api_key: str) -> None:
@@ -382,43 +220,68 @@ def set_session_env(provider: str, api_key: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _prompt_for_api_key(console: Any) -> Optional[LlmConfig]:
-    """Walk the user through picking an AI provider via numbered menu.
+_SIGNUP_URLS = {
+    "gemini": "https://aistudio.google.com/apikey",
+    "openai": "https://platform.openai.com/api-keys",
+    "anthropic": "https://console.anthropic.com/settings/keys",
+}
 
-    Returns a resolved ``LlmConfig`` or ``None`` if the user cancels.
+
+def _pick_provider(console: Any) -> Optional[str]:
+    """Pick an LLM provider.
+
+    LiteLLM runs invisibly under the hood for every option (it's the
+    default backend when installed). The user just picks a provider —
+    they never see "litellm" as a choice. Adding a new provider
+    becomes one row in this list because litellm already speaks them
+    all (Groq, Bedrock, Azure, Vertex, Mistral, Cohere, …).
+
+    Providers in the picker are surfaced based on what litellm
+    supports + what's most likely useful to the user. The list expands
+    as litellm's catalog grows.
+
+    Returns the canonical provider key, or ``None`` if the user skipped.
     """
-    if not console or not RICH_AVAILABLE:
-        LOG.debug("Cannot prompt for API key: no Rich console available")
-        return None
-
     from fluid_build.cli.forge_ui import ask_numbered_choice
 
-    console.print(
-        Panel(
-            (
-                "Forge uses AI to generate your data product.\n\n"
-                "[dim]Not sure your environment is ready? Run [bold]fluid doctor[/bold] "
-                "first\nto check Python version, credentials, and local providers.[/dim]\n\n"
-                "Got an API key? Pick your provider below.\n"
-                "Don't have one? No worries -- pick [bold]Google Gemini[/bold] to kick\n"
-                "the tyres for [bold]free[/bold] (no credit card, 30 seconds to sign up)."
-            ),
-            title="AI Setup",
-            border_style="blue",
-        )
-    )
+    # Detect litellm availability once so we can offer the broader
+    # list when present, and fall back to the native four when it
+    # isn't installed.
+    try:
+        import litellm  # noqa: F401
+
+        litellm_available = True
+    except ImportError:
+        litellm_available = False
+
+    base_choices: List[Tuple[str, str]] = [
+        ("gemini", "Google Gemini  (free tier available)"),
+        ("openai", "OpenAI (ChatGPT)"),
+        ("anthropic", "Anthropic (Claude)"),
+    ]
+    extended_choices: List[Tuple[str, str]] = [
+        ("groq", "Groq  (fast inference, Llama / Mixtral)"),
+        ("bedrock", "AWS Bedrock  (Claude / Llama / Titan via AWS)"),
+        ("azure", "Azure OpenAI  (enterprise OpenAI deployments)"),
+        ("vertex_ai", "Google Vertex AI  (Gemini via GCP)"),
+        ("mistral", "Mistral AI"),
+        ("cohere", "Cohere"),
+    ]
+    tail_choices: List[Tuple[str, str]] = [
+        ("ollama", "Ollama  (run AI locally — free, no internet)"),
+        ("browser", "Browser sign-in (OAuth — preview)"),
+        ("skip", "Skip for now — I'll set this up later"),
+    ]
+
+    choices = list(base_choices)
+    if litellm_available:
+        choices += extended_choices
+    choices += tail_choices
 
     provider_choice = ask_numbered_choice(
         console,
         "How do you want to connect?",
-        [
-            ("gemini_free", "Google Gemini (free!) -- get a key in 30 seconds"),
-            ("gemini", "Google Gemini -- I have an API key"),
-            ("openai", "OpenAI (ChatGPT) -- I have an API key"),
-            ("anthropic", "Anthropic (Claude) -- I have an API key"),
-            ("ollama", "Ollama -- run AI locally on my machine (free, no internet)"),
-            ("skip", "Skip for now -- I'll set this up later"),
-        ],
+        choices,
         default=1,
     )
 
@@ -428,177 +291,347 @@ def _prompt_for_api_key(console: Any) -> Optional[LlmConfig]:
         LOG.debug("User skipped AI setup (sticky for this session)")
         return None
 
-    # --- Ollama path ---
+    # Gemini sub-flow: free or BYO-key. Both end up with provider='gemini'.
+    if provider_choice == "gemini":
+        sub = ask_numbered_choice(
+            console,
+            "Gemini setup:",
+            [
+                ("byo", "I have a Gemini API key"),
+                ("free", "I need a key — 30-second free signup"),
+            ],
+            default=1,
+        )
+        if sub == "free":
+            console.print(
+                "\n[bold]Get your free Gemini key:[/bold]\n"
+                "  1. Open [bold cyan]https://aistudio.google.com/apikey[/bold cyan]\n"
+                "  2. Sign in with your Google account\n"
+                "  3. Click [bold]Create API Key[/bold]\n"
+                "  4. Paste it below.\n"
+            )
+        return "gemini"
+
+    return provider_choice
+
+
+def _pick_tier(console: Any) -> str:
+    """Phase 0.5 #9 — tier picker FIRST, before key validation.
+
+    The user picks fast / balanced / cheap up-front so they understand
+    the cost trade-off BEFORE pasting a key. Default ``balanced`` —
+    cheapest option compatible with every provider.
+    """
+    from fluid_build.cli.forge_ui import ask_numbered_choice
+
+    return ask_numbered_choice(
+        console,
+        "Which model tier?",
+        [
+            ("flagship", "Flagship — most capable (highest cost)"),
+            ("balanced", "Balanced — recommended (cheaper, faster)"),
+            ("fast", "Fast / cheap — for quick iteration"),
+        ],
+        default=2,  # balanced is the world-class default
+    )
+
+
+def _classify_key_shape(raw: str) -> str:
+    """Phase 0.5 #12 — shape-detect on bad keys.
+
+    Returns one of ``openai``, ``anthropic``, ``gemini``, or ``unknown``.
+    Lightweight regex match on the key prefix; never validates against
+    the provider — that's what ``_validate_api_key`` is for.
+    """
+    return detect_provider_from_api_key(raw) or "unknown"
+
+
+def _rescue_after_attempts(console: Any) -> Optional[str]:
+    """Phase 0.5 #11 — 3-attempt rescue dialog.
+
+    Instead of dead-ending with "run fluid ai setup later", offer a
+    way back into the flow:
+
+    * switch provider — re-enter the picker
+    * Ollama — bypass the cloud entirely
+    * skip — abort gracefully (the existing path)
+
+    Returns the new provider choice (``"switch"``, ``"ollama"``, or
+    ``None`` for skip).
+    """
+    from fluid_build.cli._ai_setup_prompt import render as render_ai_panel
+    from fluid_build.cli.forge_ui import ask_numbered_choice
+
+    render_ai_panel(reason="rescue", console=console)
+    rescue = ask_numbered_choice(
+        console,
+        "Pick a path forward:",
+        [
+            ("switch", "Try a different provider"),
+            ("ollama", "Switch to Ollama (run AI locally, free)"),
+            ("skip", "Skip AI for now (I'll use --blank or come back later)"),
+        ],
+        default=1,
+    )
+    if rescue == "skip":
+        return None
+    return rescue
+
+
+def _prompt_for_api_key(console: Any) -> Optional[LlmConfig]:
+    """Walk the user through picking an AI provider via numbered menu.
+
+    Phase 0.5 fixes (#6, #7, #9, #11, #12, #15, #18) all land here:
+
+    * Unified panel via ``_ai_setup_prompt.render`` (#6)
+    * Single Gemini entry with sub-flow (#7)
+    * Tier picker FIRST (#9)
+    * 3-attempt rescue dialog (#11)
+    * Shape-detect on bad keys BEFORE retry (#12)
+    * Doctor hint promoted (#15)
+    * Browser OAuth scaffold (#18)
+
+    Returns a resolved ``LlmConfig`` or ``None`` if the user cancels.
+    """
+    if not console or not RICH_AVAILABLE:
+        LOG.debug("Cannot prompt for API key: no Rich console available")
+        return None
+
+    from fluid_build.cli._ai_setup_prompt import render as render_ai_panel
+
+    render_ai_panel(reason="missing", console=console, show_doctor_hint=True)
+
+    return _prompt_for_api_key_loop(console, allow_browser=True)
+
+
+def _prompt_for_api_key_loop(console: Any, *, allow_browser: bool = True) -> Optional[LlmConfig]:
+    """Inner loop — picker + tier + key + validation + rescue.
+
+    Split from :func:`_prompt_for_api_key` so the rescue path can
+    re-enter without re-rendering the unified top panel.
+    """
+    provider_choice = _pick_provider(console)
+    if provider_choice is None:
+        return None
+
     if provider_choice == "ollama":
         return _setup_ollama(console)
 
-    # --- Free Gemini path: show signup URL then ask for key ---
-    if provider_choice == "gemini_free":
-        provider_choice = "gemini"
-        console.print(
-            "\n[bold]Here's how to get your free Gemini key:[/bold]\n"
-            "  1. Go to [bold cyan]https://aistudio.google.com/apikey[/bold cyan]\n"
-            "  2. Sign in with your Google account\n"
-            "  3. Click [bold]Create API Key[/bold]\n"
-            "  4. Copy the key and paste it below\n"
-        )
+    if provider_choice == "browser":
+        if not allow_browser:
+            return None
+        return _setup_browser_oauth(console)
 
-    # --- Cloud provider path: ask for API key with retry ---
-    max_attempts = 3
+    # Phase 0.5 #9 — tier picker FIRST so the user understands trade-offs.
+    tier = _pick_tier(console)
+
+    return _collect_and_validate_api_key(console, provider_choice=provider_choice, tier=tier)
+
+
+def _collect_and_validate_api_key(
+    console: Any,
+    *,
+    provider_choice: str,
+    tier: str,
+    max_attempts: int = 3,
+) -> Optional[LlmConfig]:
+    """Ask for the API key, validate, retry up to ``max_attempts``,
+    rescue on exhaustion. Returns a resolved :class:`LlmConfig` or
+    ``None`` when the user gives up.
+    """
+    label = PROVIDER_DISPLAY_NAMES.get(provider_choice, provider_choice)
+    signup_url = _SIGNUP_URLS.get(provider_choice, "")
+    last_error: Optional[str] = None
+
     for attempt in range(1, max_attempts + 1):
-        if provider_choice:
-            label = PROVIDER_DISPLAY_NAMES.get(provider_choice, provider_choice)
-            signup_url = {
-                "gemini": "https://aistudio.google.com/apikey",
-                "openai": "https://platform.openai.com/api-keys",
-                "anthropic": "https://console.anthropic.com/settings/keys",
-            }.get(provider_choice, "")
-            if attempt > 1 or provider_choice != "gemini":
-                url_hint = (
-                    f"\n[dim]Get your key at: [bold cyan]{signup_url}[/bold cyan][/dim]"
-                    if signup_url
-                    else ""
-                )
-                console.print(f"\n[bold]{label}[/bold] selected.{url_hint}")
+        url_hint = (
+            f"\n[dim]Get your key at: [bold cyan]{signup_url}[/bold cyan][/dim]"
+            if signup_url
+            else ""
+        )
+        if attempt == 1:
+            console.print(f"\n[bold]{label}[/bold] selected.{url_hint}")
         console.print("[dim]Paste your API key (input is hidden).[/dim]")
 
         raw = Prompt.ask("[bold]API key[/bold]", password=True)
-        raw = raw.strip()
+        raw = (raw or "").strip()
         if not raw:
-            console.print("[yellow]No key entered. You can run 'fluid ai setup' anytime.[/yellow]")
+            console.print("[yellow]No key entered.[/yellow]")
             return None
 
-        # Auto-detect provider from key format — warn if mismatch
-        detected = detect_provider_from_api_key(raw)
-        if detected and detected != provider_choice:
-            actual_label = PROVIDER_DISPLAY_NAMES.get(detected, detected)
-            console.print(f"[yellow]That looks like a key for {actual_label}.[/yellow]")
+        # Phase 0.5 #12 — shape-detect BEFORE validation when format is
+        # obviously wrong for the chosen provider. Saves the user a
+        # round-trip to the API and a confusing 401 error.
+        shape = _classify_key_shape(raw)
+        if shape != "unknown" and shape != provider_choice:
+            actual_label = PROVIDER_DISPLAY_NAMES.get(shape, shape)
+            console.print(
+                f"[yellow]That key looks like a {actual_label} key, "
+                f"but you picked {label}.[/yellow]"
+            )
             use_detected = Confirm.ask(f"Use {actual_label} instead?", default=True)
             if use_detected:
-                provider_choice = detected
+                provider_choice = shape
+                label = actual_label
+                signup_url = _SIGNUP_URLS.get(provider_choice, "")
+        elif shape == "unknown":
+            console.print(
+                "[dim]Could not match key format to any known provider — "
+                "trying validation anyway.[/dim]"
+            )
 
         provider = BUILTIN_LLM_PROVIDERS.get(provider_choice)
         if not provider:
-            console.print(f"[red]Unknown provider: {provider_choice}[/red]")
-            return None
+            # Litellm-only provider (groq, bedrock, azure, vertex_ai,
+            # mistral, cohere, ...). Synthesise a LiteLLMProvider so
+            # the validation + persistence path doesn't need a
+            # legacy class for every provider litellm speaks.
+            try:
+                from fluid_build.cli.forge_copilot_llm_litellm import (
+                    get_litellm_provider,
+                )
 
-        # Validate the key by making a lightweight API call
+                provider = get_litellm_provider(provider_choice)
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("litellm_provider_unavailable: %s", exc)
+                console.print(f"[red]Unknown provider: {provider_choice}[/red]")
+                return None
+
         console.print("[dim]Verifying API key...[/dim]")
         error = _validate_api_key(provider, raw)
         if error:
+            last_error = error
             remaining = max_attempts - attempt
             if remaining > 0:
                 console.print(
                     f"[red]Key validation failed: {error}[/red]\n"
-                    f"[dim]You have {remaining} attempt(s) remaining.[/dim]"
+                    f"[dim]{remaining} attempt(s) left. "
+                    "[bold]Tip:[/bold] run [bold cyan]fluid doctor[/bold cyan] "
+                    "if you suspect an environment issue.[/dim]"
                 )
                 continue
-            else:
-                console.print(
-                    f"[red]Key validation failed: {error}[/red]\n"
-                    "[yellow]Run 'fluid ai setup' when you have a valid key.[/yellow]"
-                )
-                return None
 
-        # Key is valid — save and return
-        console.print(f"[green]Verified! Connected to {label}.[/green]")
+            # Phase 0.5 #11 — 3-attempt rescue.
+            console.print(f"[red]Last error: {error}[/red]")
+            rescue = _rescue_after_attempts(console)
+            if rescue == "switch":
+                # Re-enter the picker — but skip browser to avoid loop.
+                return _prompt_for_api_key_loop(console, allow_browser=False)
+            if rescue == "ollama":
+                return _setup_ollama(console)
+            return None  # skip
 
-        saved = _save_key_to_keyring(provider_choice, raw)
-        if saved:
-            console.print("[green]Saved to system keychain (you won't be asked again).[/green]")
-            api_key_for_config = None
-        elif _allow_plaintext_ai_secrets():
-            console.print(
-                f"[yellow]System keychain unavailable; saved key to {_CONFIG_FILE} "
-                "because FLUID_ALLOW_PLAINTEXT_AI_SECRETS is enabled.[/yellow]"
-            )
-            api_key_for_config = raw
-        else:
-            console.print(
-                "[yellow]System keychain unavailable; provider/model will be saved, "
-                "but the API key will only be used for this process. Export the "
-                "provider API key env var, install a keyring backend, or set "
-                "FLUID_ALLOW_PLAINTEXT_AI_SECRETS=1 to opt into local plaintext "
-                "persistence.[/yellow]"
-            )
-            api_key_for_config = None
-
-        set_session_env(provider_choice, raw)
-
-        # Model tier choice: flagship (most capable) vs balanced.
-        # The catalog drives the actual model names so this code
-        # never hardcodes a model string.
-        from fluid_build.cli.forge_copilot_llm_providers import get_catalog_tier_model
-
-        tier = ask_numbered_choice(
+        return _persist_and_return(
             console,
-            "Which model tier?",
-            [
-                ("flagship", "Most capable (recommended)"),
-                ("balanced", "Most balanced (faster, lower cost)"),
-            ],
-            default=1,
-        )
-        model = get_catalog_tier_model(provider_choice, tier) or provider.default_model
-
-        _save_ai_config(provider_choice, model, api_key=api_key_for_config)
-
-        env = dict(os.environ)
-        LOG.info("AI setup: configured provider=%s model=%s tier=%s", provider_choice, model, tier)
-        return LlmConfig(
-            provider=provider_choice,
-            model=model,
-            endpoint=provider.default_endpoint(model, env),
-            api_key=raw,
+            provider_choice=provider_choice,
+            provider=provider,
+            label=label,
+            tier=tier,
+            raw_key=raw,
         )
 
-    return None  # Shouldn't reach here, but satisfy type checker
+    # Defensive — should not be reached because the loop above either
+    # returns or exhausts via the rescue branch.
+    LOG.debug("api_key_loop_exhausted_silently last_error=%s", last_error)
+    return None
 
 
-def _setup_ollama(console: Any) -> Optional[LlmConfig]:
-    """Handle the Ollama setup path with model discovery."""
-    from fluid_build.cli.forge_ui import ask_numbered_choice
+def _persist_and_return(
+    console: Any,
+    *,
+    provider_choice: str,
+    provider: Any,
+    label: str,
+    tier: str,
+    raw_key: str,
+) -> LlmConfig:
+    """Save key + config, set session env, return :class:`LlmConfig`."""
+    from fluid_build.cli.forge_copilot_llm_providers import get_catalog_tier_model
 
-    provider = BUILTIN_LLM_PROVIDERS["ollama"]
-    host = _sanitize_ollama_host(os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
-    os.environ["OLLAMA_HOST"] = host
-
-    available_models = _query_ollama_models(host)
-    if not available_models:
+    console.print(f"[green]Verified! Connected to {label}.[/green]")
+    saved = _save_key_to_keyring(provider_choice, raw_key)
+    if saved:
+        console.print("[green]Saved to system keychain (you won't be asked again).[/green]")
+        api_key_for_config: Optional[str] = None
+    elif _allow_plaintext_ai_secrets():
         console.print(
-            "[yellow]Could not reach Ollama or no models are installed.[/yellow]\n\n"
-            "To get started with Ollama:\n"
-            "  1. Install from [bold cyan]https://ollama.com[/bold cyan]\n"
-            "  2. Run: [bold]ollama pull llama3.1[/bold]\n"
-            "  3. Then try [bold]fluid forge[/bold] again"
+            f"[yellow]System keychain unavailable; saved key to {_CONFIG_FILE} "
+            "because FLUID_ALLOW_PLAINTEXT_AI_SECRETS is enabled.[/yellow]"
         )
-        return None
-
-    if len(available_models) == 1:
-        model = available_models[0]
-        console.print(f"[green]Using Ollama model:[/green] {model}")
+        api_key_for_config = raw_key
     else:
-        model = ask_numbered_choice(
-            console,
-            "Which local model should Forge use?",
-            [(m, m) for m in available_models],
-            default=1,
+        console.print(
+            "[yellow]System keychain unavailable; provider/model will be saved, "
+            "but the API key will only be used for this process. Export the "
+            "provider API key env var, install a keyring backend, or set "
+            "FLUID_ALLOW_PLAINTEXT_AI_SECRETS=1 to opt into local plaintext "
+            "persistence.[/yellow]"
         )
+        api_key_for_config = None
 
+    set_session_env(provider_choice, raw_key)
+    model = get_catalog_tier_model(provider_choice, tier) or provider.default_model
+    _save_ai_config(provider_choice, model, api_key=api_key_for_config)
     env = dict(os.environ)
-    LOG.info("AI setup: selected ollama model=%s", model)
-    _save_ai_config("ollama", model, ollama_host=host)
+    LOG.info("AI setup: configured provider=%s model=%s tier=%s", provider_choice, model, tier)
     return LlmConfig(
-        provider="ollama",
+        provider=provider_choice,
         model=model,
         endpoint=provider.default_endpoint(model, env),
-        api_key=None,
+        api_key=raw_key,
     )
 
 
-# ---------------------------------------------------------------------------
-# Public entry points
-# ---------------------------------------------------------------------------
+def _setup_browser_oauth(console: Any) -> Optional[LlmConfig]:
+    """Phase 0.5 #18 — browser OAuth flow (preview).
+
+    Today this is a scaffold: it confirms intent + falls through to
+    the keyring-stored credential check for whichever provider the
+    user picks. A full OAuth implementation will land per-provider in
+    follow-up work; this surface keeps the option visible and the
+    fallback safe.
+    """
+    from fluid_build.cli.forge_ui import ask_numbered_choice
+
+    console.print(
+        "\n[bold]Browser sign-in[/bold] is a preview — only a small set of "
+        "providers expose first-class OAuth today."
+    )
+    provider = ask_numbered_choice(
+        console,
+        "Which provider?",
+        [
+            ("openai", "OpenAI"),
+            ("anthropic", "Anthropic"),
+            ("gemini", "Google"),
+            ("back", "Back to the picker"),
+        ],
+        default=1,
+    )
+    if provider == "back":
+        return _prompt_for_api_key_loop(console, allow_browser=False)
+
+    try:
+        from fluid_build.cli.ai_setup_browser import open_oauth_flow
+
+        return open_oauth_flow(console, provider=provider)
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("browser_oauth_failed: %s", exc)
+        console.print(
+            "[yellow]Browser OAuth isn't fully wired for that provider yet.[/yellow]\n"
+            "[dim]Falling back to API-key entry.[/dim]"
+        )
+        tier = _pick_tier(console)
+        return _collect_and_validate_api_key(console, provider_choice=provider, tier=tier)
+
+
+# Ollama setup helpers — physically extracted to
+# ``cli/_ai_setup_ollama.py``. Re-exported via the
+# module-attribute-access indirection pattern.
+from fluid_build.cli._ai_setup_ollama import (  # noqa: E402,F401
+    _make_ollama_config,
+    _setup_ollama,
+)
 
 
 def run_ai_setup_interactive(console: Any) -> Optional[LlmConfig]:
@@ -641,24 +674,6 @@ def run_ai_setup_interactive(console: Any) -> Optional[LlmConfig]:
             )
         )
     return config
-
-
-def _make_ollama_config(*, model: Optional[str] = None) -> LlmConfig:
-    """Build a fully-formed ``LlmConfig`` for local Ollama.
-
-    Reads ``os.environ`` once and defaults the model to the provider's
-    built-in default when *model* is ``None`` or empty.  Callers that need
-    ``OLLAMA_HOST`` respected should set it on ``os.environ`` before calling.
-    """
-    provider = BUILTIN_LLM_PROVIDERS["ollama"]
-    env = dict(os.environ)
-    resolved_model = model or provider.default_model
-    return LlmConfig(
-        provider="ollama",
-        model=resolved_model,
-        endpoint=provider.default_endpoint(resolved_model, env),
-        api_key=None,
-    )
 
 
 def _make_cloud_config(
@@ -792,8 +807,6 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
 
 def show_ai_status(console: Any) -> None:
     """Display current AI configuration status.  Used by ``fluid doctor``."""
-    # Also check config file for extra info
-    saved = _load_ai_config()
     readiness = check_llm_readiness()
 
     if not console or not RICH_AVAILABLE:
@@ -904,502 +917,28 @@ def show_ai_models(
     )
 
 
-def _coerce_ai_test_timeout(raw: Any) -> int:
-    if raw in (None, ""):
-        return _AI_TEST_DEFAULT_TIMEOUT_SECONDS
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return _AI_TEST_DEFAULT_TIMEOUT_SECONDS
-    return max(1, min(3600, value))
-
-
-def _normalize_ai_test_provider(value: Any) -> str:
-    provider = str(value or "").strip().lower().replace("-", "_")
-    return "anthropic" if provider == "claude" else provider
-
-
-def _safe_ai_test_display(value: Any, *, limit: int = _AI_TEST_DISPLAY_LIMIT) -> str:
-    text = str(value or "")
-    clean = "".join(ch if ch.isprintable() and ch != "\x1b" else "?" for ch in text)
-    if len(clean) > limit:
-        return clean[: limit - 1] + "…"
-    return clean
-
-
-def _http_error_name(exc: httpx.HTTPError) -> str:
-    return exc.__class__.__name__
-
-
-def _validate_ai_test_endpoint(provider_name: str, endpoint: str) -> Optional[str]:
-    parsed = urlsplit(str(endpoint or ""))
-    if parsed.username or parsed.password:
-        return "AI test endpoint URLs must not embed credentials."
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return "AI test endpoint must be an absolute HTTP(S) URL."
-    host = (parsed.hostname or "").lower()
-    if provider_name == "ollama":
-        if parsed.scheme != "http" or host not in {"localhost", "127.0.0.1", "::1"}:
-            return "Ollama AI test endpoints must stay on localhost."
-        return None
-    if parsed.scheme != "https":
-        return "Cloud AI test endpoints must use HTTPS to avoid sending API keys over plaintext."
-    return None
-
-
-def _resolve_cloud_api_key(provider: str, saved: Optional[dict] = None) -> Optional[str]:
-    if os.environ.get("FLUID_LLM_API_KEY"):
-        return os.environ["FLUID_LLM_API_KEY"]
-    if provider == "gemini":
-        for env_var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-            if os.environ.get(env_var):
-                return os.environ[env_var]
-    env_var = PROVIDER_ENV_VARS.get(provider)
-    if env_var and os.environ.get(env_var):
-        return os.environ[env_var]
-    if saved and saved.get("api_key"):
-        return str(saved["api_key"])
-    key = _load_key_from_keyring(provider)
-    if key:
-        return key
-    try:
-        from fluid_build.cli.forge_copilot_llm_providers import _resolve_api_key
-
-        return _resolve_api_key(provider, {})
-    except Exception:  # noqa: BLE001 - best-effort compatibility with the Forge keyring namespace
-        LOG.debug("Could not read Forge LLM keyring namespace for provider=%s", provider)
-        return None
-
-
-def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[str]]:
-    provider_override = _normalize_ai_test_provider(getattr(args, "llm_provider", None))
-    model_override = getattr(args, "llm_model", None) or os.environ.get("FLUID_LLM_MODEL")
-    endpoint_override = getattr(args, "llm_endpoint", None) or os.environ.get("FLUID_LLM_ENDPOINT")
-    timeout = _coerce_ai_test_timeout(
-        getattr(args, "llm_timeout_seconds", None) or os.environ.get("FLUID_LLM_TIMEOUT_SECONDS")
-    )
-    saved = _load_ai_config() or {}
-
-    def _build_for_provider(
-        pname: str, *, allow_saved: bool = True
-    ) -> tuple[Optional[LlmConfig], Optional[str]]:
-        provider = BUILTIN_LLM_PROVIDERS.get(pname)
-        if not provider:
-            return None, f"Unsupported AI provider '{pname}'."
-        saved_for_provider = saved if allow_saved and saved.get("provider") == pname else {}
-        model = model_override or saved_for_provider.get("model") or provider.default_model
-        if pname == "ollama":
-            host = saved_for_provider.get("ollama_host")
-            if host and not os.environ.get("OLLAMA_HOST"):
-                os.environ["OLLAMA_HOST"] = _sanitize_ollama_host(str(host))
-            endpoint = endpoint_override or provider.default_endpoint(model, dict(os.environ))
-            endpoint_error = _validate_ai_test_endpoint(pname, endpoint)
-            if endpoint_error:
-                return None, endpoint_error
-            return (
-                LlmConfig(
-                    provider=pname,
-                    model=model,
-                    endpoint=endpoint,
-                    api_key=None,
-                    timeout_seconds=timeout,
-                ),
-                None,
-            )
-        api_key = _resolve_cloud_api_key(pname, saved_for_provider)
-        if not api_key:
-            return None, f"No API key found for {PROVIDER_DISPLAY_NAMES.get(pname, pname)}."
-        endpoint = endpoint_override or saved_for_provider.get("endpoint")
-        config = _make_cloud_config(pname, api_key, model=model, endpoint=endpoint)
-        endpoint_error = _validate_ai_test_endpoint(pname, config.endpoint)
-        if endpoint_error:
-            return None, endpoint_error
-        return (
-            config,
-            None,
-        )
-
-    if provider_override:
-        config, error = _build_for_provider(provider_override)
-        if config:
-            config.timeout_seconds = timeout
-        return config, error
-
-    if saved.get("provider"):
-        config, error = _build_for_provider(str(saved["provider"]))
-        if config:
-            config.timeout_seconds = timeout
-            return config, None
-        LOG.debug("Saved AI config was not test-ready: %s", error)
-
-    for pname, env_var in PROVIDER_ENV_VARS.items():
-        if os.environ.get(env_var) or (pname == "gemini" and os.environ.get("GEMINI_API_KEY")):
-            config, error = _build_for_provider(pname, allow_saved=False)
-            if config:
-                config.timeout_seconds = timeout
-            return config, error
-
-    if os.environ.get("OLLAMA_HOST") or detect_ollama_available(os.environ):
-        config, error = _build_for_provider("ollama", allow_saved=False)
-        if config:
-            config.timeout_seconds = timeout
-        return config, error
-
-    return None, "No AI provider configured. Run 'fluid ai setup' or set a provider API key."
-
-
-def _cap_ai_test_token_budget(config: LlmConfig, payload: dict) -> None:
-    provider_name = config.provider
-    if provider_name in {"openai", "ollama"}:
-        payload["max_tokens"] = _AI_TEST_DEFAULT_OUTPUT_TOKENS
-        return
-    if provider_name == "anthropic":
-        payload["max_tokens"] = min(
-            int(payload.get("max_tokens") or _AI_TEST_DEFAULT_OUTPUT_TOKENS),
-            _AI_TEST_DEFAULT_OUTPUT_TOKENS,
-        )
-        return
-    if provider_name == "gemini":
-        generation_config = payload.setdefault("generationConfig", {})
-        if not isinstance(generation_config, dict):
-            return
-        generation_config["maxOutputTokens"] = _AI_TEST_GEMINI_OUTPUT_TOKENS
-
-
-def _ai_test_token_budget_label(config: LlmConfig) -> str:
-    if config.provider == "gemini":
-        return f"{_AI_TEST_GEMINI_OUTPUT_TOKENS} tokens"
-    return f"{_AI_TEST_DEFAULT_OUTPUT_TOKENS} tokens"
-
-
-def _with_freeform_ai_test_payload(provider: Any, config: LlmConfig) -> tuple[dict, dict]:
-    old_value = os.environ.get("FLUID_LLM_STRUCTURED_OUTPUTS")
-    had_value = "FLUID_LLM_STRUCTURED_OUTPUTS" in os.environ
-    os.environ["FLUID_LLM_STRUCTURED_OUTPUTS"] = "0"
-    try:
-        headers, payload = provider.build_request(
-            config, _AI_TEST_SYSTEM_PROMPT, _AI_TEST_USER_PROMPT
-        )
-    finally:
-        if had_value:
-            os.environ["FLUID_LLM_STRUCTURED_OUTPUTS"] = old_value or ""
-        else:
-            os.environ.pop("FLUID_LLM_STRUCTURED_OUTPUTS", None)
-    payload = dict(payload)
-    _cap_ai_test_token_budget(config, payload)
-    return headers, payload
-
-
-def _check_ai_test_model_availability(
-    provider: Any, config: LlmConfig
-) -> tuple[str, Optional[list[str]]]:
-    try:
-        available = provider.list_available_models(config.api_key, dict(os.environ))
-    except httpx.HTTPStatusError as exc:
-        raise CopilotGenerationError(
-            "ai_test_model_preflight_failed",
-            f"Could not list {config.provider} models ({exc.response.status_code}).",
-            suggestions=[
-                "Check the provider API key and account permissions",
-                "Try again after confirming network access to the provider",
-            ],
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise CopilotGenerationError(
-            "ai_test_model_preflight_failed",
-            f"Could not list {config.provider} models ({_http_error_name(exc)}).",
-            suggestions=[
-                "Check network connectivity",
-                "For Ollama, start the local Ollama server",
-            ],
-        ) from exc
-    if available is None:
-        return "unavailable", None
-    if config.model not in available:
-        available_preview = ", ".join(_safe_ai_test_display(model) for model in available[:5])
-        raise CopilotGenerationError(
-            "ai_test_model_unavailable",
-            f"Configured {config.provider} model "
-            f"'{_safe_ai_test_display(config.model)}' was not returned by the provider.",
-            suggestions=[
-                f"Available models include: {available_preview or '(none)'}",
-                "Run `fluid ai models` to inspect bundled defaults",
-                "Re-run `fluid ai setup` or pass `fluid ai test --model <model>`",
-            ],
-        )
-    return "available", available
-
-
-def _run_ai_smoke_call(provider: Any, config: LlmConfig) -> tuple[str, dict, int]:
-    """Issue the diagnostic call. Returns (text, usage, latency_ms)."""
-    headers, payload = _with_freeform_ai_test_payload(provider, config)
-    started = time.perf_counter()
-    try:
-        with httpx.Client(timeout=config.timeout_seconds) as client:
-            response = client.post(config.endpoint, headers=headers, json=payload)
-            response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise CopilotGenerationError(
-            "ai_test_request_failed",
-            f"AI test request failed ({exc.response.status_code}) for {config.provider}.",
-            suggestions=[
-                "Check the selected model and endpoint",
-                "Verify the API key has access to the configured model",
-            ],
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise CopilotGenerationError(
-            "ai_test_network_error",
-            f"AI test network error for {config.provider} ({_http_error_name(exc)}).",
-            suggestions=[
-                "Check network connectivity",
-                "For Ollama, start the local Ollama server",
-            ],
-        ) from exc
-    latency_ms = int((time.perf_counter() - started) * 1000)
-
-    try:
-        response_json = response.json()
-    except ValueError as exc:
-        raise CopilotGenerationError(
-            "ai_test_response_invalid",
-            f"AI test response from {config.provider} could not be parsed as JSON.",
-            suggestions=["Try a different model or re-run `fluid ai setup`."],
-        ) from exc
-    try:
-        text = provider.extract_text(response_json).strip()
-        usage = provider.extract_usage(response_json)
-    except Exception as exc:  # noqa: BLE001 — provider adapters raise heterogeneous errors
-        raise CopilotGenerationError(
-            "ai_test_response_invalid",
-            f"AI test response from {config.provider} did not match the expected schema.",
-            suggestions=["Try a different model or re-run `fluid ai setup`."],
-        ) from exc
-    if "FLUID_OK" not in text:
-        raise CopilotGenerationError(
-            "ai_test_unexpected_response",
-            f"AI test response from {config.provider} was not the expected diagnostic token.",
-            suggestions=["Try again, or choose a different model with `fluid ai setup`."],
-        )
-    return "FLUID_OK", usage, latency_ms
-
-
-# Map (error_code, http_status) → exit code. Status is None when there's no HTTP response.
-_AI_TEST_AUTH_STATUSES = frozenset({401, 403, 407})
-
-
-def _classify_ai_test_error(error_code: str, status_code: Optional[int]) -> int:
-    """Return the parseable exit code for a CopilotGenerationError.
-
-    0 OK / 2 config / 3 auth / 4 resource / 5 network. See AGENTS.md for the contract.
-    """
-    if error_code in {"ai_test_request_failed", "ai_test_model_preflight_failed"}:
-        if status_code is None:
-            return _AI_TEST_EXIT_NETWORK
-        if status_code in _AI_TEST_AUTH_STATUSES:
-            return _AI_TEST_EXIT_AUTH
-        if status_code == 429 or status_code >= 500:
-            return _AI_TEST_EXIT_NETWORK
-        return _AI_TEST_EXIT_RESOURCE
-    if error_code == "ai_test_network_error":
-        return _AI_TEST_EXIT_NETWORK
-    return _AI_TEST_EXIT_RESOURCE
-
-
-def _http_status_from_cause(exc: CopilotGenerationError) -> Optional[int]:
-    cause = exc.__cause__
-    if isinstance(cause, httpx.HTTPStatusError):
-        return cause.response.status_code
-    return None
-
-
-def _new_ai_test_report(
-    *,
-    ok: bool,
-    provider: Optional[str],
-    model: Optional[str],
-    endpoint: Optional[str],
-    availability: Optional[str],
-    live_call: Optional[str],
-    usage: Optional[dict],
-    output_cap: Optional[str],
-    latency_ms: Optional[int],
-    error_code: Optional[str] = None,
-    error_message: Optional[str] = None,
-    error_suggestions: Optional[list] = None,
-    exit_code: int = _AI_TEST_EXIT_OK,
-) -> dict:
-    """Build the stable JSON-output schema. Bumps `_AI_TEST_REPORT_VERSION` on changes."""
-    return {
-        "schema_version": _AI_TEST_REPORT_VERSION,
-        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "ok": ok,
-        "exit_code": exit_code,
-        "provider": provider,
-        "model": _safe_ai_test_display(model) if model else None,
-        "endpoint": _safe_ai_test_display(endpoint) if endpoint else None,
-        "model_availability": availability,
-        "live_call": live_call,
-        "usage": usage,
-        "output_cap": output_cap,
-        "latency_ms": latency_ms,
-        "error": (
-            {
-                "code": error_code,
-                "message": error_message,
-                "suggestions": error_suggestions or [],
-            }
-            if error_code
-            else None
-        ),
-    }
-
-
-def run_ai_test(console: Any, args: Any) -> tuple[int, dict]:
-    """Run a configured-provider connectivity test.
-
-    Returns ``(exit_code, report)`` where ``exit_code`` is one of
-    ``_AI_TEST_EXIT_OK / _CONFIG / _AUTH / _RESOURCE / _NETWORK`` and
-    ``report`` is the JSON-output schema dict (see ``_new_ai_test_report``).
-    """
-    as_json = bool(getattr(args, "json", False))
-    config, config_error = _resolve_ai_test_config(args)
-    if not config:
-        message = config_error or "AI provider is not configured."
-        report = _new_ai_test_report(
-            ok=False,
-            provider=None,
-            model=None,
-            endpoint=None,
-            availability=None,
-            live_call=None,
-            usage=None,
-            output_cap=None,
-            latency_ms=None,
-            error_code="ai_test_no_provider",
-            error_message=message,
-            error_suggestions=["Run `fluid ai setup` to configure a provider."],
-            exit_code=_AI_TEST_EXIT_CONFIG,
-        )
-        if as_json:
-            sys.stdout.write(_json.dumps(report, indent=2) + "\n")
-        elif console and RICH_AVAILABLE:
-            console.print(
-                Panel(
-                    f"[yellow]{message}[/yellow]\n\n"
-                    "Run [bold cyan]fluid ai setup[/bold cyan] to configure a provider.",
-                    title="AI Provider Test",
-                    border_style="yellow",
-                )
-            )
-        else:
-            from fluid_build.cli.console import cprint
-
-            cprint(f"AI Provider Test: {message}")
-        return _AI_TEST_EXIT_CONFIG, report
-
-    provider = BUILTIN_LLM_PROVIDERS[config.provider]
-    label = PROVIDER_DISPLAY_NAMES.get(config.provider, config.provider)
-    endpoint = config.redacted_endpoint
-    output_cap = _ai_test_token_budget_label(config)
-    try:
-        availability, available_models = _check_ai_test_model_availability(provider, config)
-        text, usage, latency_ms = _run_ai_smoke_call(provider, config)
-    except CopilotGenerationError as exc:
-        exit_code = _classify_ai_test_error(exc.event, _http_status_from_cause(exc))
-        report = _new_ai_test_report(
-            ok=False,
-            provider=config.provider,
-            model=config.model,
-            endpoint=endpoint,
-            availability=None,
-            live_call=None,
-            usage=None,
-            output_cap=output_cap,
-            latency_ms=None,
-            error_code=exc.event,
-            error_message=exc.message,
-            error_suggestions=list(exc.suggestions or []),
-            exit_code=exit_code,
-        )
-        if as_json:
-            sys.stdout.write(_json.dumps(report, indent=2) + "\n")
-        elif console and RICH_AVAILABLE:
-            suggestions = "\n".join(f"- {s}" for s in exc.suggestions)
-            body = f"[red]{exc.message}[/red]"
-            if suggestions:
-                body += f"\n\n[dim]{suggestions}[/dim]"
-            console.print(Panel(body, title="AI Provider Test Failed", border_style="red"))
-        else:
-            from fluid_build.cli.console import cprint
-
-            cprint(f"AI Provider Test Failed: {exc.message}")
-        return exit_code, report
-
-    report = _new_ai_test_report(
-        ok=True,
-        provider=config.provider,
-        model=config.model,
-        endpoint=endpoint,
-        availability=availability,
-        live_call=text,
-        usage={
-            "input_tokens": int(usage.get("input_tokens", 0) or 0),
-            "output_tokens": int(usage.get("output_tokens", 0) or 0),
-            "total_tokens": int(usage.get("total_tokens", 0) or 0),
-        },
-        output_cap=output_cap,
-        latency_ms=latency_ms,
-        exit_code=_AI_TEST_EXIT_OK,
-    )
-
-    if as_json:
-        sys.stdout.write(_json.dumps(report, indent=2) + "\n")
-        return _AI_TEST_EXIT_OK, report
-
-    usage_text = (
-        f"{report['usage']['input_tokens']} input / "
-        f"{report['usage']['output_tokens']} output / "
-        f"{report['usage']['total_tokens']} total"
-    )
-    latency_text = f"{latency_ms} ms"
-    if console and RICH_AVAILABLE:
-        table = Table(title="AI Provider Test", border_style="green")
-        table.add_column("Check", style="cyan")
-        table.add_column("Result", style="green")
-        table.add_row("Provider", label)
-        table.add_row("Model", _safe_ai_test_display(config.model))
-        table.add_row("Endpoint", _safe_ai_test_display(endpoint))
-        table.add_row(
-            "Model availability",
-            (
-                "available"
-                if availability == "available"
-                else "not supported by this provider adapter"
-            ),
-        )
-        table.add_row("Live call", text)
-        table.add_row("Latency", latency_text)
-        table.add_row("Token usage", usage_text)
-        table.add_row("Output cap", output_cap)
-        if available_models:
-            table.caption = f"Provider returned {len(available_models)} available model(s)."
-        console.print(table)
-    else:
-        from fluid_build.cli.console import cprint
-
-        cprint(f"AI Provider Test: ready ({label}, {_safe_ai_test_display(config.model)})")
-        cprint(f"  Endpoint: {_safe_ai_test_display(endpoint)}")
-        cprint(f"  Model availability: {availability}")
-        cprint(f"  Live call: {text}")
-        cprint(f"  Latency: {latency_text}")
-        cprint(f"  Token usage: {usage_text}; output cap: {output_cap}")
-    return _AI_TEST_EXIT_OK, report
-
-
-# ---------------------------------------------------------------------------
-# CLI registration -- ``fluid ai setup``
-# ---------------------------------------------------------------------------
+# AI-test plumbing — physically extracted to ``cli/_ai_setup_test.py``.
+# ~500 LOC of config resolution, endpoint validation, token caps,
+# model preflight, smoke call, error classification, JSON report
+# emission. Re-exported here so existing call sites (``run_ai_test``)
+# and test patches keep resolving.
+from fluid_build.cli._ai_setup_test import (  # noqa: E402,F401
+    _ai_test_token_budget_label,
+    _cap_ai_test_token_budget,
+    _check_ai_test_model_availability,
+    _classify_ai_test_error,
+    _coerce_ai_test_timeout,
+    _http_error_name,
+    _http_status_from_cause,
+    _new_ai_test_report,
+    _normalize_ai_test_provider,
+    _resolve_ai_test_config,
+    _run_ai_smoke_call,
+    _safe_ai_test_display,
+    _validate_ai_test_endpoint,
+    _with_freeform_ai_test_payload,
+    run_ai_test,
+)
 
 
 def register(subparsers) -> None:
