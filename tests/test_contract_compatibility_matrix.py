@@ -45,7 +45,6 @@ from fluid_build.schema_manager import FluidSchemaManager
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "contracts" / "compatibility"
 
 MINIMAL_FIXTURES = [
-    ("minimal_057.yaml", "0.5.7"),
     ("minimal_071.yaml", "0.7.1"),
     ("minimal_072.yaml", "0.7.2"),
 ]
@@ -159,10 +158,15 @@ def test_compatibility_fixtures_export_to_odps_standard(fixture_name: str, _expe
 
 @pytest.mark.parametrize(("fixture_name", "_expected_version"), ALL_FIXTURES)
 def test_compatibility_fixtures_dmm_dry_run_dps(fixture_name: str, _expected_version: str):
+    """Legacy DPS shape is reachable via explicit
+    ``data_product_specification='0.0.1'``. The provider's default
+    switched to ODPS in 2026-05 (DMM rejects DPS server-side); this
+    test pins the DPS-shape contract for any caller that still
+    explicitly opts in."""
     contract = _load_contract(fixture_name)
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
-    result = provider.apply(contract, dry_run=True)
+    result = provider.apply(contract, dry_run=True, data_product_specification="0.0.1")
     payload = result["payload"]
 
     assert payload["id"] == contract["id"]

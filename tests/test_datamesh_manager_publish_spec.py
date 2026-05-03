@@ -148,10 +148,50 @@ def _sample_odps_consumes_with_source_system_contract():
     return contract
 
 
-def test_apply_dry_run_defaults_to_dps_spec():
+def test_apply_dry_run_defaults_to_odps_spec():
+    """The default ``dataProductSpecification`` is ``odps`` (ODPS-only).
+
+    Pre-2026-05 the default was DPS ``0.0.1`` but Entropy / Data Mesh
+    Manager has migrated to ODPS-only on the server side and rejects
+    DPS payloads with HTTP 400. Catalog-provider path
+    (``fluid publish --target datamesh-manager``) auto-falls-back to
+    ODPS via ``_should_retry_with_odps``; the direct CLI path
+    (``fluid datamesh-manager publish``) used to fail by default.
+    Switching the default here brings both surfaces into line.
+    """
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
     result = provider.apply(_sample_contract(), dry_run=True)
+
+    payload = result["payload"]
+    # ODPS payload shape: ``apiVersion: v1.0.0`` + ``kind: DataProduct``,
+    # no top-level ``dataProductSpecification`` field, no ``info`` block.
+    assert payload["apiVersion"] == "v1.0.0"
+    assert payload["kind"] == "DataProduct"
+    assert "info" not in payload
+
+
+def test_apply_dry_run_uses_dps_spec_when_explicitly_requested():
+    """Legacy DPS path is still reachable via explicit
+    ``data_product_specification='0.0.1'`` for any out-of-tree caller
+    that still authors against the older spec."""
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+
+    result = provider.apply(
+        _sample_contract(),
+        dry_run=True,
+        data_product_specification="0.0.1",
+    )
+
+    assert result["payload"]["dataProductSpecification"] == "0.0.1"
+
+
+def test_apply_dry_run_uses_dps_spec_when_provider_hint_is_dps():
+    """``provider_hint='dps'`` is the symmetric inverse of the existing
+    ``provider_hint='odps'`` form — selects the legacy DPS shape."""
+    provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
+
+    result = provider.apply(_sample_contract(), dry_run=True, provider_hint="dps")
 
     assert result["payload"]["dataProductSpecification"] == "0.0.1"
 
@@ -181,9 +221,17 @@ def test_apply_dry_run_allows_explicit_spec_override():
 
 
 def test_apply_dry_run_keeps_per_expose_data_contract_ids_for_dps():
+    """Per-expose ``dataContractId`` is set on output ports under the
+    legacy DPS shape — exercised here via explicit
+    ``provider_hint='dps'`` since the default is now ODPS."""
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
-    result = provider.apply(_sample_contract_with_exposes(), dry_run=True, publish_contract=True)
+    result = provider.apply(
+        _sample_contract_with_exposes(),
+        dry_run=True,
+        publish_contract=True,
+        provider_hint="dps",
+    )
 
     output_ports = result["payload"].get("outputPorts", [])
     data_contract_ids = [port.get("dataContractId") for port in output_ports]

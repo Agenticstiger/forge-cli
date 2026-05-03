@@ -1178,7 +1178,12 @@ class TestDataProductSpecConformance:
         assert port["sourceSystemId"] == "bss-crm"
 
     def test_archetype_inferred_from_layer(self):
-        """When metadata.archetype is absent, infer from layer."""
+        """When metadata.archetype is absent, infer from layer.
+
+        Canonical Data Mesh mapping (corrected by the DMM provider
+        extraction in c641664):
+        Bronze→source-aligned, Silver→aggregate, Gold→consumer-aligned.
+        """
         contract = {
             "kind": "DataProduct",
             "id": "test-infer",
@@ -1187,7 +1192,7 @@ class TestDataProductSpecConformance:
             "exposes": [],
         }
         dp = self._make_provider()._to_data_product(contract)
-        assert dp["info"].get("archetype") == "aggregate"
+        assert dp["info"].get("archetype") == "consumer-aligned"
 
 
 # ---------------------------------------------------------------------------
