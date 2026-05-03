@@ -17,11 +17,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from fluid_build.build_runners._acquisition_common import generate_run_id
-from fluid_build.build_runners._cost import InMemoryCostTracker
-from fluid_build.build_runners._lineage import NullLineageEmitter
-from fluid_build.build_runners._state import FileStateStore
-from fluid_build.build_runners.duckdb.runner import DuckdbRunner
 
 from fluid_build.api.conformance.fixtures.minimal import minimal_acquisition_contract
 from fluid_build.api.conformance.runner import RunnerConformance
@@ -29,6 +24,11 @@ from fluid_build.api.cost import ChargebackTag
 from fluid_build.api.hooks import HookChain
 from fluid_build.api.runner import RunContext
 from fluid_build.api.source import SinkSpec, SourceSpec
+from fluid_build.build_runners._acquisition_common import generate_run_id
+from fluid_build.build_runners._cost import InMemoryCostTracker
+from fluid_build.build_runners._lineage import NullLineageEmitter
+from fluid_build.build_runners._state import FileStateStore
+from fluid_build.build_runners.duckdb.runner import DuckdbRunner
 
 
 @pytest.fixture

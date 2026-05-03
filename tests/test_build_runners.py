@@ -416,6 +416,87 @@ class TestBuildDbtCommand:
         assert json.loads(cmd[vars_index + 1]) == {"database": "TELCO_LAB"}
 
 
+class TestResolveDbtExecutable:
+    """Pin the dbt-resolver search order, including the venv-sibling
+    hardening from the SDP/ADP/CDP real-world test pass.
+
+    The fallback `Path(sys.executable).parent / configured` exists so
+    `.venv/bin/python -m fluid_build.cli apply` can find `.venv/bin/dbt`
+    without venv activation. Hardening: it must reject directories and
+    non-executable matches so a stale ``dbt.dist-info/`` artefact or
+    accidental directory next to ``python`` doesn't get returned as a
+    string and explode at ``subprocess.run`` time.
+    """
+
+    def test_path_with_separator_short_circuits_existence_check(self, tmp_path, monkeypatch):
+        binary = tmp_path / "dbt"
+        binary.write_text("#!/bin/sh\necho dbt\n")
+        binary.chmod(0o755)
+        monkeypatch.setenv("DBT_EXECUTABLE", str(binary))
+
+        from fluid_build.build_runners.dbt.runner import _resolve_dbt_executable
+
+        assert _resolve_dbt_executable() == str(binary)
+
+    def test_venv_sibling_fallback_finds_executable_next_to_python(self, tmp_path, monkeypatch):
+        # Simulate ``sys.executable`` pointing at a fake venv ``python``.
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_python = fake_bin / "python"
+        fake_python.write_text("#!/bin/sh\n")
+        fake_python.chmod(0o755)
+        fake_dbt = fake_bin / "dbt"
+        fake_dbt.write_text("#!/bin/sh\necho dbt\n")
+        fake_dbt.chmod(0o755)
+
+        monkeypatch.delenv("DBT_EXECUTABLE", raising=False)
+        # Hide PATH so ``shutil.which`` falls through to the sibling check.
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr("sys.executable", str(fake_python))
+
+        from fluid_build.build_runners.dbt.runner import _resolve_dbt_executable
+
+        assert _resolve_dbt_executable() == str(fake_dbt)
+
+    def test_venv_sibling_rejects_directory_named_dbt(self, tmp_path, monkeypatch):
+        """Hardening: a *directory* named ``dbt`` next to ``python``
+        used to be returned as a string and explode at subprocess.run
+        time. The is_file() gate catches it cleanly."""
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "python").write_text("#!/bin/sh\n")
+        (fake_bin / "python").chmod(0o755)
+        # Create a *directory* called ``dbt`` — this is the exploit shape.
+        (fake_bin / "dbt").mkdir()
+
+        monkeypatch.delenv("DBT_EXECUTABLE", raising=False)
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr("sys.executable", str(fake_bin / "python"))
+
+        from fluid_build.build_runners.dbt.runner import _resolve_dbt_executable
+
+        assert _resolve_dbt_executable() is None
+
+    def test_venv_sibling_rejects_non_executable_match(self, tmp_path, monkeypatch):
+        """Hardening: a non-executable file (chmod 0644) shouldn't be
+        returned as a runnable dbt path."""
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "python").write_text("#!/bin/sh\n")
+        (fake_bin / "python").chmod(0o755)
+        non_exec = fake_bin / "dbt"
+        non_exec.write_text("not actually executable\n")
+        non_exec.chmod(0o644)  # readable but not +x
+
+        monkeypatch.delenv("DBT_EXECUTABLE", raising=False)
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr("sys.executable", str(fake_bin / "python"))
+
+        from fluid_build.build_runners.dbt.runner import _resolve_dbt_executable
+
+        assert _resolve_dbt_executable() is None
+
+
 class TestGeneratedDbtProfile:
     def test_runtime_resources_resolve_env_templates(self, monkeypatch):
         monkeypatch.setenv("SNOWFLAKE_DATABASE", "TELCO_LAB")

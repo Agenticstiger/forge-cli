@@ -1,0 +1,27 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+"""Airbyte acquisition runner.
+
+Engine name: ``airbyte``. Lane: 350+ Airbyte connectors. Capabilities:
+``full_refresh``, ``incremental_append``, ``incremental_dedup``, ``cdc``,
+``schema_discovery``.
+
+Two execution modes:
+- **REST mode**: drives an Airbyte OSS / Cloud server via REST. Set
+  ``properties.airbyte.deployment.mode = bring-your-own`` and
+  ``deployment.server_url``.
+- **Embedded mode (PyAirbyte)**: runs connectors in-process. Set
+  ``deployment.mode = embedded``. Optional dependency ``airbyte`` package.
+"""
+
+from __future__ import annotations
+
+from .runner import AirbyteRunner, execute_airbyte_build
+
+__all__ = ["AirbyteRunner", "execute_airbyte_build"]
