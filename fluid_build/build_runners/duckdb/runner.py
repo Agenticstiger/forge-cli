@@ -1274,7 +1274,13 @@ def execute_duckdb_build(
             # no HookChain entry needed.
             continue
         else:
-            LOG.debug("unknown_preLand_hook: %s", hook_id)
+            # Don't interpolate `hook_id` — CodeQL's taint analysis traces
+            # any contract-derived value as potentially-sensitive (the
+            # contract dict also carries connection.{s3,gcs,azure} secrets).
+            # The hook id is contract-validated upstream; dropping the
+            # interpolation keeps the debug trail useful without the
+            # taint-flow false positive.
+            LOG.debug("unknown_preLand_hook (skipped — see contract.preLand)")
 
     ctx = RunContext(
         run_id=generate_run_id(),
