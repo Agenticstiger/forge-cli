@@ -18,7 +18,7 @@ This test only runs when ``GEMINI_API_KEY`` is set in the environment —
 CI runners without the key skip it automatically so the default suite
 stays green on keyless machines.
 
-What it covers (the Snowflake biz-lab demo path):
+What it covers (telco-domain demo path):
 
 * Structured outputs flip is live for Gemini — a real call returns
   Pydantic-valid JSON (H4).

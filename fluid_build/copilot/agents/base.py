@@ -289,7 +289,21 @@ class BaseStageAgent:
         Wrapped in :func:`retry_with_backoff` — three attempts with
         exponential backoff, matching the cherry-pick retry envelope
         shared with the rest of the staged flow.
+
+        Phase 3.9: a per-agent voice fragment from
+        ``agent_specs/_defaults/agent_voice/<stage>.yaml`` is
+        auto-prepended to the supplied ``system_prompt`` so each
+        stage's role ("you are the FLUID LogicalAgent …") lives in
+        yaml next to the other prompt defaults instead of being
+        baked into the agent class. No-op when the stage has no
+        voice file (additive wiring; partial installs don't crash).
         """
+        from fluid_build.cli.forge_copilot_prompts import agent_voice
+
+        voice = agent_voice(self.stage)
+        if voice and not system_prompt.startswith(voice):
+            system_prompt = voice + "\n" + system_prompt
+
         retry_if: Optional[Callable[[Exception], bool]] = None
         if not retry_schema_errors:
 
@@ -363,7 +377,10 @@ class BaseStageAgent:
         # compact the message history before re-attempting. Disable
         # via ``capability_matrix["disable_token_preflight"]: True``
         # for users who want to risk the API call.
-        from fluid_build.copilot.agents.token_budget import check_prompt_fits
+        from fluid_build.copilot.agents.token_budget import (
+            check_prompt_fits,
+            count_tokens,
+        )
 
         check_prompt_fits(
             system_prompt=system_prompt,
@@ -373,8 +390,55 @@ class BaseStageAgent:
             capability_matrix=session.capability_matrix or {},
         )
 
+        # Phase 3.6 — per-agent cost-budget ceiling.
+        # Before the LLM call fires, project the running total + this
+        # call's estimated cost. If it would exceed
+        # ``FLUID_COST_LIMIT_USD`` (or ``behavior.cost_limit_usd_per_run``
+        # in unified config), raise ``CostLimitExceeded`` BEFORE the
+        # spend happens. The post-hoc ``check_cost_ceiling()`` (after
+        # ``record_call``) is still kept as the safety net — it catches
+        # the case where the prediction was too low.
+        #
+        # Disable per-agent for users on cheap models who don't want
+        # the overhead via ``capability_matrix["disable_cost_preflight"]: True``.
+        cap = session.capability_matrix or {}
+        if not cap.get("disable_cost_preflight"):
+            from fluid_build.copilot.cost import (
+                CostLimitExceeded,
+                predict_call_cost,
+            )
+
+            est_input = count_tokens(
+                system_prompt + "\n" + user_prompt,
+                provider=provider.name,
+                model=config.model,
+            )
+            # Output estimate: use the model's configured ``max_tokens``
+            # when available (worst-case spend), otherwise fall back to
+            # a sane default. Conservative-by-default — we'd rather
+            # over-estimate and fail fast than under-estimate and let
+            # the runaway through.
+            est_output = int(getattr(config, "max_tokens", 0) or 4096)
+            would_exceed, projected, limit_usd = predict_call_cost(
+                provider=provider.name,
+                model=config.model,
+                input_tokens=est_input,
+                output_tokens=est_output,
+            )
+            if would_exceed:
+                raise CostLimitExceeded(
+                    running_usd=projected,
+                    limit_usd=float(limit_usd or 0.0),
+                )
+
         headers, payload = provider.build_request(config, system_prompt, user_prompt)
         self._inject_provider_schema(provider.name, payload, output_schema)
+        # Carry only the structured-output directive through to litellm
+        # (the rest of ``payload`` is rebuilt by ``invoke_blocking``;
+        # only the schema needs to survive the round-trip).
+        extra_payload = {
+            k: payload[k] for k in ("response_format", "tools", "tool_choice") if k in payload
+        } or None
         # Wrap the network + parse path in a lightweight "thinking" status
         # panel so users can see which agent is active without staring at a
         # silent prompt. The panel self-disables on non-TTY, ``FLUID_QUIET``,
@@ -419,63 +483,48 @@ class BaseStageAgent:
             model=config.model,
         ):
             try:
+                # Every provider routes through litellm now. Use the
+                # public ``call_llm`` / ``call_llm_streaming`` API
+                # instead of reaching into provider internals (which
+                # used to do per-provider httpx; that's deleted).
+                from fluid_build.cli.forge_copilot_llm_providers import (
+                    call_llm,
+                    call_llm_streaming,
+                    consume_streaming_usage,
+                )
+
                 if streaming_enabled:
                     from fluid_build.copilot.streaming import (
                         NullStreamHandler,
                         StreamingCall,
                     )
 
-                    stream_url, stream_headers, stream_payload = provider.build_streaming_request(
-                        config,
-                        system_prompt,
-                        user_prompt,
-                    )
-                    self._inject_provider_schema(provider.name, stream_payload, output_schema)
-                    with httpx.stream(
-                        "POST",
-                        stream_url,
-                        headers=stream_headers,
-                        json=stream_payload,
-                        timeout=config.timeout_seconds,
-                    ) as response:
-                        response.raise_for_status()
-                        handler = cm.get("stream_handler") or NullStreamHandler()
-                        with StreamingCall(
-                            provider.iter_stream_chunks(response),
-                            handler,
-                        ) as call:
-                            for _chunk in call:
-                                pass
-                        raw = call.full_text
-                    # Pull usage from the thread-local stash that each
-                    # provider's ``iter_stream_chunks`` populates from
-                    # the SSE usage events. Closes the streaming
-                    # ``record_missing_usage`` gap — cost summaries
-                    # now report accurate token counts for streamed
-                    # calls instead of silently under-reporting.
-                    from fluid_build.cli.forge_copilot_llm_providers import (
-                        consume_streaming_usage,
-                    )
-
+                    handler = cm.get("stream_handler") or NullStreamHandler()
+                    with StreamingCall(
+                        call_llm_streaming(
+                            provider,
+                            config,
+                            system_prompt,
+                            user_prompt,
+                            extra_payload=extra_payload,
+                        ),
+                        handler,
+                    ) as call:
+                        for _chunk in call:
+                            pass
+                    raw = call.full_text
                     streamed_usage = consume_streaming_usage()
-                    # The stash returns a canonical
-                    # ``{input_tokens, output_tokens, total_tokens, ...}``
-                    # dict, which matches what each provider's
-                    # ``extract_usage`` produces on the blocking
-                    # path. Pass it through unchanged to skip
-                    # the provider-specific re-extraction below.
                     raw_response = streamed_usage if streamed_usage else {}
                     parsed = safe_json_parse(raw)
                 else:
-                    response = httpx.post(
-                        config.endpoint,
-                        headers=headers,
-                        json=payload,
-                        timeout=config.timeout_seconds,
+                    raw = call_llm(
+                        provider,
+                        config,
+                        system_prompt,
+                        user_prompt,
+                        extra_payload=extra_payload,
                     )
-                    response.raise_for_status()
-                    raw_response = response.json()
-                    raw = provider.extract_text(raw_response)
+                    raw_response = {}
                     parsed = safe_json_parse(raw)
             except (httpx.HTTPError, httpx.HTTPStatusError) as exc:
                 raise classify_provider_error(exc, provider=provider.name) from exc
@@ -555,26 +604,43 @@ class BaseStageAgent:
         payload: Dict[str, Any],
         output_schema: Type[StageOutputT],
     ) -> None:
-        if provider_name in {"openai", "azure-openai"}:
-            payload["response_format"] = output_schema.to_openai_json_schema()
+        """Set the structured-output directive on the litellm payload.
+
+        Different providers have different limits on what
+        ``response_format`` shapes they accept. We handle the
+        provider-specific edge cases here so the agent layer can stay
+        provider-agnostic upstream.
+
+        * **OpenAI / Anthropic / Azure / Bedrock** — accept the full
+          OpenAI-style ``response_format: {type: json_schema, ...}``;
+          honour every field including enums and length bounds.
+        * **Gemini** — its ``responseSchema`` engine has a "too many
+          constraint states" cap and rejects deep enums + bounded
+          numbers. The safe default is to ask for a JSON-mime response
+          and skip the schema; opt-in to the schema with the legacy
+          ``FLUID_GEMINI_RESPONSE_SCHEMA=1`` debug env var when the
+          schema is small enough.
+        * **Ollama / others** — fall through to OpenAI-shape; litellm
+          translates per-provider.
+        """
+        provider = (provider_name or "").lower()
+        try:
+            schema = output_schema.to_openai_json_schema()
+        except Exception:  # noqa: BLE001 — never block on schema generation
             return
-        if provider_name in {"anthropic", "claude"}:
-            tool = output_schema.to_anthropic_tool()
-            payload["tools"] = [tool]
-            payload["tool_choice"] = {"type": "tool", "name": tool["name"]}
+
+        if provider in ("gemini", "google", "vertex_ai", "vertex"):
+            # Gemini has tight constraints on response_format
+            # complexity. Default to no schema, just JSON-mime — the
+            # validator + repair loop catches mis-shaped output later.
+            if os.environ.get("FLUID_GEMINI_RESPONSE_SCHEMA") == "1":
+                # Operator opted in (probably testing); send the schema
+                # and accept the risk of a 400 from Gemini.
+                payload["response_format"] = schema
+            else:
+                payload["response_format"] = {"type": "json_object"}
             return
-        if provider_name == "gemini":
-            generation_config = payload.setdefault("generationConfig", {})
-            generation_config["responseMimeType"] = "application/json"
-            # LogicalDraft is too large for Gemini's responseSchema state
-            # budget, especially on 2.5 Pro. Keep JSON mode by default and
-            # leave schema forcing behind an explicit debug opt-in.
-            if os.environ.get("FLUID_GEMINI_RESPONSE_SCHEMA", "").strip().lower() in {
-                "1",
-                "true",
-                "yes",
-            }:
-                generation_config.update(output_schema.to_gemini_config())
-            return
-        if provider_name == "ollama":
-            payload["response_format"] = {"type": "json_object"}
+
+        # Default OpenAI-style for every other provider; litellm
+        # normalises this to the provider's native field names.
+        payload["response_format"] = schema

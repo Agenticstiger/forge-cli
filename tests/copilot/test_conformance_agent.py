@@ -469,9 +469,15 @@ class TestNoLlmCalls:
     def test_constructed_without_session(self):
         """The agent has zero LLM dependencies — no session, no
         provider, no API key. Constructible in any environment
-        including air-gapped CI."""
+        including air-gapped CI.
+
+        ``fluid_version`` defaults to ``FluidSchemaManager.latest_bundled_version()``
+        so the agent automatically tracks new schema releases.
+        """
+        from fluid_build.schema_manager import FluidSchemaManager
+
         agent = ConformanceAgent()
-        assert agent.fluid_version == "0.7.2"
+        assert agent.fluid_version == FluidSchemaManager.latest_bundled_version()
 
     def test_run_works_offline(self, monkeypatch):
         """Sanity check — running the agent does NOT touch the

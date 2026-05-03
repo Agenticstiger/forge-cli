@@ -137,27 +137,44 @@ class TestGetLogger:
 
 
 class TestConvenienceFunctions:
+    """UX hardening pass — these convenience helpers were moved from
+    ``logger.info`` / ``logger.error`` to ``logger.debug`` so the
+    breadcrumbs (``Starting <op>``, ``Completed <op>``, ``Metric: ...``)
+    don't bleed onto user-facing CLI terminals on every command. The
+    structured event still flows to a ``--log-file`` sink + surfaces
+    with ``--debug`` / ``FLUID_LOG_LEVEL=DEBUG``.
+
+    These tests pin the new posture so a future change can't silently
+    flip them back to INFO and resurrect the noise cut.
+    """
+
     def test_log_operation_start(self):
         mock_logger = logging.getLogger("test.op")
-        with patch.object(mock_logger, "info") as mock_info:
+        with patch.object(mock_logger, "debug") as mock_debug:
             log_operation_start(mock_logger, "build")
-        mock_info.assert_called_once()
-        assert "build" in mock_info.call_args[0][0]
+        mock_debug.assert_called_once()
+        assert "build" in mock_debug.call_args[0][0]
 
     def test_log_operation_success_with_duration(self):
         mock_logger = logging.getLogger("test.op2")
-        with patch.object(mock_logger, "info") as mock_info:
+        with patch.object(mock_logger, "debug") as mock_debug:
             log_operation_success(mock_logger, "deploy", duration=1.5)
-        assert "1.50s" in mock_info.call_args[0][0]
+        assert "1.50s" in mock_debug.call_args[0][0]
 
     def test_log_operation_failure(self):
+        """The user-facing CLIError handler prints a clean ``❌``
+        message; the structured-log entry is for the observability
+        sink only and emits at DEBUG with exc_info=False so it
+        doesn't dump a Python traceback before the typed error."""
         mock_logger = logging.getLogger("test.op3")
-        with patch.object(mock_logger, "error") as mock_error:
+        with patch.object(mock_logger, "debug") as mock_debug:
             log_operation_failure(mock_logger, "validate", ValueError("fail"), duration=0.3)
-        assert "validate" in mock_error.call_args[0][0]
+        assert "validate" in mock_debug.call_args[0][0]
+        # exc_info=False contract: no traceback in the log entry.
+        assert mock_debug.call_args.kwargs.get("exc_info") is False
 
     def test_log_metric(self):
         mock_logger = logging.getLogger("test.metric")
-        with patch.object(mock_logger, "info") as mock_info:
+        with patch.object(mock_logger, "debug") as mock_debug:
             log_metric(mock_logger, "latency", 42.0, unit="ms", host="a")
-        mock_info.assert_called_once()
+        mock_debug.assert_called_once()

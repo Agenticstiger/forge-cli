@@ -132,6 +132,33 @@ class TestRunCostTracker:
 # ---------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _force_embedded_price_table(monkeypatch, request):
+    """Pin the embedded ``MODEL_PRICES_USD`` table for cost tests.
+
+    `_price_for` now consults litellm's catalog before the embedded
+    table (matching the "rely on litellm" architecture). The pricing
+    tests in this file pin specific dollar amounts that came from the
+    embedded table — mocking litellm out forces the fallthrough so
+    the assertions stay deterministic regardless of litellm's
+    upstream pricing changes.
+
+    Only fires for the ``TestPricing`` and ``TestPriceOverride``
+    classes; the rest of the file doesn't read prices.
+    """
+    target_classes = {"TestPricing", "TestPriceOverride"}
+    cls = request.cls.__name__ if request.cls else ""
+    if cls not in target_classes:
+        return
+    import sys
+
+    fake_litellm = type(sys)("_test_fake_litellm")
+    fake_litellm.cost_per_token = lambda **_kw: (_ for _ in ()).throw(
+        RuntimeError("litellm disabled for embedded-fallback test")
+    )
+    monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
+
+
 class TestPricing:
     def setup_method(self):
         reset_run_tracker()
