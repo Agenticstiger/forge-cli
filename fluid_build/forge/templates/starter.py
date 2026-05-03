@@ -26,7 +26,7 @@ Features:
 - Test framework setup
 - Git repository initialization
 
-This template follows FLUID 0.5.7 specification and provides a solid
+This template follows FLUID 0.7.x specification and provides a solid
 foundation that can be extended as projects mature.
 """
 
@@ -85,88 +85,28 @@ class StarterTemplate(ProjectTemplate):
         }
 
     def generate_contract(self, context: GenerationContext) -> Dict[str, Any]:
-        """Generate FLUID 0.5.7 compliant contract"""
-        project_config = context.project_config
+        """Generate a v0.7.3-canonical contract via the shared builder.
 
-        # Extract configuration values
-        project_name = project_config.get("name", "starter-product")
-        description = project_config.get("description", "A starter data product")
-        domain = project_config.get("domain", "analytics")
-        owner = project_config.get("owner", "data-team")
-        provider = project_config.get("provider", "local")
+        Per-template specifics (product type, build pattern, engine,
+        default columns) live in :class:`TemplateSpec` below;
+        :func:`build_contract` populates the canonical fluidVersion,
+        layer↔productType pair, owner, exposes[].binding, builds[],
+        and consumes[] structure so every template stays in lockstep
+        with schema changes.
+        """
+        from ._v073_builder import TemplateSpec, build_contract
 
-        # Generate contract using the configured FLUID schema version
-        contract = {
-            "fluidVersion": project_config.get("fluid_version", "0.5.7"),
-            "kind": "DataProduct",
-            "id": project_name.replace("-", "_").replace(" ", "_"),
-            "name": project_name,
-            "description": description,
-            "domain": domain,
-            "metadata": {
-                "layer": "Bronze",
-                "owner": {"team": owner, "email": f"{owner}@company.com"},
-            },
-            "consumes": [
-                {
-                    "productId": "sample_data_product",
-                    "exposeId": "sample_data",
-                    "purpose": "Sample input data for getting started",
-                }
-            ],
-            "builds": [
-                {
-                    "id": "main_build",
-                    "description": "Main data processing pipeline",
-                    "pattern": "embedded-logic",
-                    "engine": "sql",
-                    "properties": {
-                        "sql": "SELECT * FROM sample_data WHERE created_at >= CURRENT_DATE - INTERVAL 1 DAY",
-                        "language": "sql",
-                    },
-                    "execution": {
-                        "trigger": {"type": "schedule", "cron": "0 6 * * *"},
-                        "runtime": {
-                            "platform": provider,
-                            "resources": {"cpu": "1", "memory": "2GB"},
-                        },
-                    },
-                }
-            ],
-            "exposes": [
-                {
-                    "exposeId": "clean_data",
-                    "kind": "table",
-                    "binding": {
-                        "platform": provider,
-                        "format": "parquet",
-                        "location": {"path": "data/processed/clean_data.parquet"},
-                    },
-                    "contract": {
-                        "schema": [
-                            {"name": "id", "type": "string", "required": True},
-                            {"name": "value", "type": "string", "required": False},
-                            {"name": "created_at", "type": "timestamp", "required": True},
-                        ],
-                        "dq": {
-                            "rules": [
-                                {
-                                    "id": "id_not_null",
-                                    "type": "completeness",
-                                    "selector": "id",
-                                    "threshold": 1.0,
-                                    "operator": ">=",
-                                    "severity": "error",
-                                }
-                            ]
-                        },
-                    },
-                    "qos": {"availability": "99.0%", "freshnessSLO": "PT24H"},
-                }
-            ],
-        }
-
-        return contract
+        spec = TemplateSpec(
+            template_name="starter",
+            product_type="SDP",
+            pattern="embedded-logic",
+            engine="sql",
+            properties={"sql": "SELECT 1 AS id, CURRENT_TIMESTAMP AS created_at"},
+            expose_id="starter_table",
+            binding_format="csv",
+            description_suffix="Minimal starter contract",
+        )
+        return build_contract(spec=spec, project_config=context.project_config)
 
     def validate_configuration(self, config: Dict[str, Any]) -> ValidationResult:
         """Validate starter template configuration"""

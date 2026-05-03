@@ -43,7 +43,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, success, warning
+from fluid_build.observability.tracing import traced_stage as _traced_stage
 
 # Rich imports for enhanced output
 try:
@@ -103,78 +104,28 @@ def register(subparsers: argparse._SubParsersAction):
     p = subparsers.add_parser(
         COMMAND,
         help="Apply a plan or contract against providers with full orchestration",
-        epilog="""
-🌊 FLUID Apply - The Heart of Data Product Orchestration
-
-The apply command is the core orchestration engine that transforms your declarative 
-FLUID contract into a fully deployed, governed, and discoverable data product.
-
-Examples:
-  # Apply a contract
-  fluid apply contract.fluid.yaml --env prod
-  
-  # Apply with custom configuration
-  fluid apply contract.fluid.yaml \\
-    --env staging \\
-    --rollback-strategy immediate \\
-    --parallel-phases \\
-    --timeout 120
-  
-  # Dry run to see what would happen
-  fluid apply contract.fluid.yaml --dry-run --verbose
-  
-  # Apply from a pre-generated plan
-  fluid apply runtime/execution_plan.json --yes
-  
-  # Apply with custom monitoring
-  fluid apply contract.fluid.yaml \\
-    --report detailed_report.html \\
-    --metrics-export prometheus \\
-    --notify slack:data-team
-
-Advanced Examples:
-  # Production deployment with full safety
-  fluid apply prod-contract.fluid.yaml \\
-    --env production \\
-    --rollback-strategy immediate \\
-    --require-approval \\
-    --backup-state \\
-    --validate-dependencies
-  
-  # Parallel execution for faster deployments
-  fluid apply large-pipeline.fluid.yaml \\
-    --parallel-phases \\
-    --max-workers 8 \\
-    --timeout 180
-  
-  # Development with enhanced debugging
-  fluid apply dev-contract.fluid.yaml \\
-    --env dev \\
-    --verbose \\
-    --debug \\
-    --keep-temp-files \\
-    --rollback-strategy none
-
-What Apply Does:
-1. 🔍 Validates contract and dependencies
-2. 🏗️  Provisions infrastructure (Terraform, Cloud resources)
-3. 📊 Sets up data ingestion (Airbyte, custom connectors)
-4. 🔄 Executes transformations (dbt, Spark, SQL)
-5. ✅ Runs quality gates (Great Expectations, custom tests)
-6. 🛡️  Applies governance (Ranger, Atlas, privacy controls)
-7. 📈 Configures monitoring (Datadog, Grafana, alerts)
-8. 📚 Registers in discovery (catalogs, service registry)
-9. 📝 Generates reports and notifications
-
-The apply command coordinates multiple providers in the correct dependency order,
-handles rollbacks on failure, provides real-time progress tracking, and ensures
-your data product is production-ready with full observability.
-        """,
+        # 3 examples + doc link. Long-form flag reference lives in the
+        # docs page.
+        epilog=(
+            "  fluid apply                                    # CWD contract\n"
+            "  fluid apply contract.fluid.yaml --env prod --yes\n"
+            "  fluid apply contract.fluid.yaml --dry-run --verbose\n\n"
+            "Docs: https://github.com/open-data-protocol/fluid/blob/main/docs/apply.md"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     # Core arguments
-    p.add_argument("contract", help="Path to contract.fluid.yaml or execution plan JSON file")
+    p.add_argument(
+        "contract",
+        nargs="?",
+        default=None,
+        help=(
+            "Path to contract.fluid.yaml or execution plan JSON file. "
+            "When omitted, auto-finds ``contract.fluid.yaml`` in the "
+            "current directory."
+        ),
+    )
     p.add_argument("--env", help="Environment overlay (dev, staging, prod, etc.)")
 
     # --- Mode matrix (11-stage pipeline stage 7) ---
@@ -187,18 +138,11 @@ your data product is production-ready with full observability.
     mode_group.add_argument(
         "--mode",
         choices=_MODE_CHOICES,
-        default=None,  # resolved by resolve_mode_with_build_alias; None = amend
+        default=None,  # resolved by parse_mode; None = amend
         help=(
-            "What DDL/DML to run against the target. "
-            "dry-run (render only; no warehouse calls). "
-            "create-only (fail if target exists; otherwise CREATE IF NOT EXISTS). "
-            "amend (default — ALTER ADD COLUMN IF NOT EXISTS; views CREATE OR REPLACE; "
-            "data preserved). "
-            "amend-and-build (amend + dbt run; transforms refreshed). "
-            "replace (auto-snapshot then DROP+RECREATE; requires --allow-data-loss "
-            "in non-dev or when target has rows). "
-            "replace-and-build (replace + dbt run --full-refresh). "
-            "See plan Part 1 for the full matrix."
+            "DDL/DML strategy: dry-run | create-only | amend (default) | "
+            "amend-and-build | replace | replace-and-build. See docs/apply.md "
+            "for the full matrix."
         ),
     )
     mode_group.add_argument(
@@ -206,11 +150,8 @@ your data product is production-ready with full observability.
         action="store_true",
         default=False,
         help=(
-            "Required for --mode replace / --mode replace-and-build when the "
-            "environment is not ``dev`` OR the target has rows. Explicit "
-            "operator opt-in that can't be accidentally typed. The pre-replace "
-            "table is snapshotted to ``<target>__backup_<ts>`` so "
-            "``fluid rollback`` can restore it."
+            "Required for replace modes when env != dev or target has rows. "
+            "Pre-replace snapshot enables ``fluid rollback``."
         ),
     )
     mode_group.add_argument(
@@ -218,28 +159,18 @@ your data product is production-ready with full observability.
         action="store_true",
         default=False,
         help=(
-            "Skip the ``planDigest`` + ``bundleDigest`` verification that "
-            "normally runs before any DDL (emergency-hotfix escape hatch). "
-            "Use only when a legitimate plan.json exists but the original "
-            "bundle is unreachable (mid-incident recovery, out-of-band "
-            "DR runbook). Logged prominently so audit trails show the "
-            "operator waived the binding."
+            "Skip plan/bundle digest verification (DR escape hatch). "
+            "Logged at WARNING for audit."
         ),
     )
 
     # Execution control
     execution_group = p.add_argument_group("Execution Control")
-    execution_group.add_argument(
-        "--yes", action="store_true", help="Skip confirmation prompt and proceed automatically"
-    )
+    execution_group.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
     execution_group.add_argument(
         "--dry-run",
         action="store_true",
-        help=(
-            "Show what would be executed without making changes. Equivalent to "
-            "--mode dry-run but retained as an orthogonal flag for back-compat "
-            "with existing CI scripts."
-        ),
+        help="Render plan without applying (alias for --mode dry-run)",
     )
     execution_group.add_argument(
         "--timeout", type=int, default=120, help="Global timeout in minutes (default: 120)"
@@ -314,15 +245,14 @@ your data product is production-ready with full observability.
     # Build execution (absorbed from 'fluid execute')
     build_group = p.add_argument_group("Build Execution")
     build_group.add_argument(
-        "--build",
         "--build-id",
         dest="build_id",
         help=(
-            "Execute a specific build job by ID (from contract builds section). "
-            "DEPRECATED in 11-stage pipeline: use --mode amend-and-build (or "
-            "--mode replace-and-build) instead. When --build is set WITHOUT "
-            "--mode, the apply auto-upgrades to --mode amend-and-build with a "
-            "deprecation warning. Alias kept for one release."
+            "Filter build execution to a specific build job by ID "
+            "(from the contract's ``builds[]``). Combine with "
+            "``--mode amend-and-build`` (additive) or "
+            "``--mode replace-and-build`` (destructive). When unset "
+            "and the mode requires builds, every build runs."
         ),
     )
     build_group.add_argument(
@@ -361,7 +291,14 @@ your data product is production-ready with full observability.
     p.set_defaults(cmd=COMMAND, func=run)
 
 
-def _actions_from_source(src: str, env: str | None, provider, logger: logging.Logger):
+def _actions_from_source(
+    src: str,
+    env: str | None,
+    provider,
+    logger: logging.Logger,
+    *,
+    mode: Optional[str] = None,
+):
     """
     Extract actions from source (supports 0.7.1 provider actions).
 
@@ -371,10 +308,47 @@ def _actions_from_source(src: str, env: str | None, provider, logger: logging.Lo
 
     For other providers or when no planner is available, fall back to the 0.7.1
     ProviderActionParser which infers high-level actions (provisionDataset, etc.).
+
+    The optional ``mode`` argument is forwarded to provider planners that
+    accept it so destructive modes (``replace`` / ``replace-and-build``)
+    can emit CREATE OR REPLACE + a pre-flight CLONE snapshot. Providers
+    that don't accept ``mode`` (older signatures) fall back to the
+    mode-less call.
     """
     if src.endswith(".json"):
-        # Load pre-generated execution plan
+        # Load pre-generated execution plan.
         data = read_json(src)
+        # When the plan embeds the contract AND a destructive mode is
+        # in play, re-translate via the provider's native planner so
+        # the actions are CTAS-shaped + carry the pre-flight CLONE.
+        # Without this, the abstract ``provisionDataset`` / ``scheduleTask``
+        # actions baked into plan.json would dispatch via the abstract
+        # handler which only emits ``INSERT INTO`` regardless of mode.
+        embedded_contract = data.get("contract") if isinstance(data.get("contract"), dict) else None
+        is_destructive = (mode or "").lower() in ("replace", "replace-and-build")
+        if (
+            embedded_contract
+            and is_destructive
+            and hasattr(provider, "plan")
+            and callable(getattr(provider, "plan", None))
+        ):
+            try:
+                native_actions = provider.plan(embedded_contract, mode=mode)
+            except TypeError:
+                native_actions = None
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "plan_retranslation_failed: falling back to recorded " "actions (%s)",
+                    exc,
+                )
+                native_actions = None
+            if native_actions:
+                logger.info(
+                    "plan_retranslated_for_mode mode=%s actions=%d",
+                    mode,
+                    len(native_actions),
+                )
+                return native_actions
         return data.get("actions", [])
 
     # Load contract
@@ -384,7 +358,12 @@ def _actions_from_source(src: str, env: str | None, provider, logger: logging.Lo
     # actions (s3.*, glue.*, athena.*) that the provider's apply() can dispatch.
     if hasattr(provider, "plan") and callable(getattr(provider, "plan", None)):
         try:
-            actions = provider.plan(contract)
+            try:
+                actions = provider.plan(contract, mode=mode)
+            except TypeError:
+                # Provider's plan() doesn't accept ``mode``; fall back so
+                # older providers still work.
+                actions = provider.plan(contract)
             if actions:
                 logger.info(f"Provider planner generated {len(actions)} actions")
                 return actions
@@ -467,6 +446,7 @@ def _verify_plan_digests(plan_data: Dict[str, Any], args, logger: logging.Logger
         )
 
 
+@_traced_stage("apply")
 def run(args, logger: logging.Logger) -> int:
     """
     Main execution function for the apply command
@@ -474,8 +454,33 @@ def run(args, logger: logging.Logger) -> int:
     This is the heart of the FLUID platform - the orchestration engine that
     transforms declarative contracts into deployed data products.
     """
+    # Bare ``fluid apply`` auto-finds ``contract.fluid.yaml`` in CWD.
+    from fluid_build.cli._common import auto_find_contract
+
+    if not auto_find_contract(args):
+        from fluid_build.cli._common import CLIError as _CE
+
+        raise _CE(
+            1,
+            "contract_required",
+            {
+                "message": (
+                    "No contract path supplied and no ``contract.fluid.yaml`` "
+                    "found in the current directory."
+                )
+            },
+        )
+
     start_time = time.time()
     execution_id = f"fluid_apply_{int(time.time())}_{os.getpid()}"
+
+    # Cross-CLI run-id correlation — read or create the workspace's
+    # shared id so OTel spans emitted here group with the upstream
+    # bundle / plan stages and the downstream verify / publish stages.
+    # See ``observability/run_id.py`` for the resolution order.
+    from fluid_build.observability.run_id import get_or_create_run_id
+
+    run_id = get_or_create_run_id()
 
     # Mirror verify/publish: hydrate os.environ from project dotenv +
     # FLUID_SECRETS_FILE before anything that reads SNOWFLAKE_*, DMM_*, etc.
@@ -483,48 +488,46 @@ def run(args, logger: logging.Logger) -> int:
     # the dbt subprocess launched there reads os.environ for its profile.
     hydrate_dotenv(Path.cwd(), environment=getattr(args, "env", None))
 
-    # --- Resolve --mode + --build back-compat (11-stage pipeline stage 7) ---
-    # ``--build X`` without ``--mode`` auto-upgrades to ``--mode amend-and-build``
-    # with a deprecation warning. ``--build`` combined with a non-build-augmented
-    # mode raises a clear error.
+    # --- Resolve apply mode (11-stage pipeline stage 7) ---
+    # ``--mode`` is canonical (amend / amend-and-build / replace /
+    # replace-and-build / dry-run / create-only). Default is ``amend``.
     from fluid_build.forge.core.apply_modes import (
         ApplyMode,
         check_data_loss_gate,
         is_dry_run,
         needs_build,
-        resolve_mode_with_build_alias,
+        parse_mode,
     )
 
-    build_id = getattr(args, "build_id", None)
     try:
-        resolved_mode, resolved_build_id = resolve_mode_with_build_alias(
-            getattr(args, "mode", None),
-            build_id if isinstance(build_id, str) else None,
-        )
+        resolved_mode = parse_mode(getattr(args, "mode", None))
     except ValueError as exc:
         raise CLIError(1, "apply_mode_invalid", {"error": str(exc)})
 
-    # Deprecation warning when the legacy --build flag kicked the upgrade.
-    if (
-        resolved_build_id
-        and getattr(args, "mode", None) is None
-        and resolved_mode is ApplyMode.AMEND_AND_BUILD
-    ):
-        logger.warning(
-            "--build is deprecated; use --mode amend-and-build instead. "
-            "This invocation has been auto-upgraded. --build will be removed "
-            "in the next release."
-        )
+    resolved_build_id = getattr(args, "build_id", None)
 
-    # --dry-run flag is still honored for back-compat; --mode dry-run is the
-    # canonical form. Normalize the two so the downstream code sees one signal.
+    # ``--dry-run`` flag still supported as a CLI ergonomic alias for
+    # ``--mode dry-run``; the canonical form is the mode value. Normalize
+    # the two so the downstream code sees one signal.
+    #
+    # Stomp the resolved value back onto ``args.dry_run`` so the rest of
+    # the apply path (which checks ``args.dry_run`` at the gate sites)
+    # honours ``--mode dry-run`` too. Without this, ``--mode dry-run``
+    # was passing through the dry-run gate and reaching the provider's
+    # apply() — for the Snowflake provider that meant attempting to
+    # connect with credentials it didn't have.
     effective_dry_run = bool(getattr(args, "dry_run", False)) or is_dry_run(resolved_mode)
+    args.dry_run = effective_dry_run
 
-    # Log operation start — include resolved mode so observability surfaces it.
+    # Log operation start — include resolved mode + run_id so
+    # observability surfaces both. ``run_id`` correlates this apply
+    # stage's spans with the upstream bundle / plan stages and the
+    # downstream verify / publish stages.
     log_operation_start(
         logger,
         "apply_contract",
         execution_id=execution_id,
+        run_id=run_id,
         source=args.contract,
         env=args.env,
         dry_run=effective_dry_run,
@@ -533,13 +536,21 @@ def run(args, logger: logging.Logger) -> int:
 
     try:
         # --- Build execution mode (absorbed from legacy 'fluid execute') ---
-        # ``--mode amend-and-build`` / ``--mode replace-and-build`` + an
-        # explicit ``--build <id>`` delegate to build_runners. Legacy --build
-        # calls land here too (post-resolve mode is amend-and-build).
+        # ``--mode amend-and-build`` / ``--mode replace-and-build`` delegate
+        # to build_runners. Three paths in:
+        #   1. Legacy ``--build <id>`` (auto-upgrades to amend-and-build).
+        #   2. ``--mode amend-and-build --build <id>`` (explicit pair).
+        #   3. ``--mode amend-and-build`` alone — the runner runs every
+        #      build in the contract. Previously this branch required
+        #      ``resolved_build_id`` to be set, which made bare
+        #      ``--mode amend-and-build`` a silent no-op when the user
+        #      forgot ``--build``. Now we delegate unconditionally for
+        #      build-augmented modes; ``run_builds_from_args`` handles
+        #      the "no filter → run all builds" case cleanly.
         # force_run=True mirrors the historical ``_from_apply=True`` semantic.
-        if resolved_build_id and needs_build(resolved_mode):
-            # Ensure the build engine sees the resolved build_id even if the
-            # caller only passed --mode (no --build). Safe-no-op when already set.
+        if needs_build(resolved_mode):
+            # Forward the resolved build_id (may be None — that's fine,
+            # the runner iterates all builds when unfiltered).
             args.build_id = resolved_build_id
             from fluid_build.build_runners import run_builds_from_args
 
@@ -559,6 +570,40 @@ def run(args, logger: logging.Logger) -> int:
             # ``fluid apply <bundle.tgz> --plan plan.json`` (Phase 7 wiring).
             # ``--no-verify-digest`` waives the gate for emergency hotfixes.
             _verify_plan_digests(plan_data, args, logger)
+
+            # --- Plan/apply mode-mismatch gate ---
+            # ``fluid plan x.yaml --output p.json`` records the mode it
+            # was generated for (None = mode-unaware). When the operator
+            # then runs ``fluid apply p.json --mode X``, the recorded
+            # mode must match (or be unrecorded for the additive
+            # default). Otherwise we'd silently run an additive apply
+            # against a plan generated for replace, or vice-versa.
+            recorded_mode = plan_data.get("mode")
+            requested_mode_value = resolved_mode.value if resolved_mode is not None else None
+            # Normalize: treat ``amend`` and ``None`` as compatible
+            # (default; mode-unaware plans applied with default mode).
+            _amend_aliases = {None, "amend"}
+            requested_norm = (
+                None if requested_mode_value in _amend_aliases else requested_mode_value
+            )
+            recorded_norm = None if recorded_mode in _amend_aliases else recorded_mode
+            if requested_norm != recorded_norm:
+                raise CLIError(
+                    1,
+                    "apply_plan_mode_mismatch",
+                    {
+                        "plan_mode": recorded_mode,
+                        "requested_mode": requested_mode_value,
+                        "hint": (
+                            "the plan was generated for "
+                            f"mode={recorded_mode!r} but apply requested "
+                            f"mode={requested_mode_value!r}. Re-run "
+                            f"``fluid plan <contract> --mode {requested_mode_value}`` "
+                            "to produce a mode-aware plan, or change "
+                            "``--mode`` on apply to match."
+                        ),
+                    },
+                )
 
             contract = plan_data.get("contract", {})
 
@@ -642,6 +687,58 @@ def run(args, logger: logging.Logger) -> int:
                 raise error from exc
             contract.update(override_config)
 
+        # --- Cross-mesh federation digest gate (stage-7 apply gate) ---
+        # When ``consumes[]`` declares an ``upstreamWorkspace``, the
+        # federation validator fetches the live upstream digest and
+        # compares against the pinned ``upstreamDigest``. Drift produces
+        # a typed ``FederatedConsumeViolation`` per drifted row and we
+        # abort apply before any DDL — same loud-failure posture as the
+        # plan-binding gate. ``--no-verify-digest`` is the DR escape
+        # hatch (logged at WARNING).
+        if not getattr(args, "no_verify_digest", False):
+            try:
+                from fluid_build.forge.federation import validate_federated_consumes
+
+                fed_violations = validate_federated_consumes(contract, workspace_root=Path.cwd())
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.debug(
+                    "federation_validate_skipped: err=%s — manifest absent or "
+                    "unreachable; treating as no-op",
+                    exc,
+                )
+                fed_violations = []
+            if fed_violations:
+                # Build a stable, machine-parseable error payload that
+                # mirrors PlanBindingError's contract so CI templates can
+                # match both gates with one regex.
+                first = fed_violations[0]
+                raise CLIError(
+                    1,
+                    "apply_consumes_drift",
+                    {
+                        "kind": "upstream-mismatch",
+                        "violations": [
+                            {
+                                "consume_index": v.consume_index,
+                                "upstream_workspace_id": v.upstream_workspace_id,
+                                "upstream_product_id": v.upstream_product_id,
+                                "expected_digest": v.expected_digest,
+                                "actual_digest": v.actual_digest,
+                                "reason": v.reason,
+                            }
+                            for v in fed_violations
+                        ],
+                        "first_violation": first.reason,
+                    },
+                )
+        else:
+            logger.warning(
+                "--no-verify-digest: federation digest gate was SKIPPED. "
+                "Federated consumes[] entries with drifted upstreams will "
+                "apply against stale data. Make sure this is recorded in "
+                "the change log."
+            )
+
         # --- Data-loss safety gate (11-stage pipeline stage 7) ---
         # Destructive modes (``replace*``) require ``--allow-data-loss`` in any
         # env where FLUID_ENV != dev OR the target has rows. This runs BEFORE
@@ -720,8 +817,17 @@ def run(args, logger: logging.Logger) -> int:
             logger.info(f"Detected provider: {provider_name}, project: {project}")
             provider = build_provider(provider_name, project, region, logger)
 
-            # Get actions from contract
-            actions = _actions_from_source(args.contract, args.env, provider, logger)
+            # Get actions from contract — pass the resolved apply mode so
+            # destructive modes (replace / replace-and-build) trigger
+            # CREATE OR REPLACE TABLE + pre-flight CLONE snapshot in
+            # the provider's planner.
+            actions = _actions_from_source(
+                args.contract,
+                args.env,
+                provider,
+                logger,
+                mode=resolved_mode.value if resolved_mode is not None else None,
+            )
 
             if not actions:
                 logger.warning("No actions to execute")
@@ -816,10 +922,59 @@ def run(args, logger: logging.Logger) -> int:
             # Check for success (local provider uses 'failed' field, others use 'status')
             success = result.get("failed", 1) == 0 or result.get("status") == "success"
 
+            # Rollback-state writer: when the plan contained
+            # ``rollback_snapshot`` markers (emitted for destructive
+            # modes by per-provider planners) AND the apply succeeded,
+            # append the snapshot metadata to ``.fluid/rollback-state.json``
+            # so ``fluid rollback`` can find them. Best-effort: a
+            # writer failure does not abort the apply.
+            if success:
+                try:
+                    from fluid_build.cli._rollback_writer import (
+                        write_snapshots_for_apply,
+                    )
+
+                    write_snapshots_for_apply(
+                        actions,
+                        contract=contract,
+                        env=getattr(args, "env", None),
+                        provider=getattr(provider, "name", None) or provider_name or "unknown",
+                        workspace_root=Path.cwd(),
+                        logger=logger,
+                        results=(
+                            result.get("results")
+                            if isinstance(result.get("results"), list)
+                            else None
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("rollback_state_writer_skipped: %s", exc, exc_info=True)
+
+            # Three outcomes — success_with_outputs (green), success_no_outputs
+            # (yellow warning, render the misconfigured-contract case),
+            # failure (red).
+            output_count = 0
+            if isinstance(result.get("results"), list):
+                output_count = sum(
+                    len(r.get("written", [])) for r in result["results"] if r.get("status") == "ok"
+                )
+            # ``no_outputs`` fires only when ``applied == 0 AND
+            # output_count == 0`` so two legitimate "0 local files"
+            # cases stay green:
+            #   * Cloud applies (snowflake / bigquery / aws) where
+            #     materialisation is in the cloud catalog.
+            #   * Acquisition builds where the engine runner wrote
+            #     parquet under its own path (apply.py doesn't see those
+            #     writes via ``result["results"]``).
+            applied_count = (
+                int(result.get("applied", 0)) if isinstance(result.get("applied"), int) else 0
+            )
+            no_outputs = success and output_count == 0 and applied_count == 0
+
             # Show results
             if RICH_AVAILABLE:
                 console = Console()
-                if success:
+                if success and not no_outputs:
                     # Success panel
                     console.print("\n[green]✅ Data product deployed successfully[/green]")
 
@@ -834,29 +989,31 @@ def run(args, logger: logging.Logger) -> int:
                     total_time = time.time() - start_time
                     summary_table.add_row("Duration", f"{total_time:.2f}s")
 
-                    if "results" in result:
-                        # Count output files
-                        output_count = sum(
-                            len(r.get("written", []))
-                            for r in result["results"]
-                            if r.get("status") == "ok"
-                        )
-                        if output_count > 0:
-                            summary_table.add_row("Files Generated", str(output_count))
+                    if output_count > 0:
+                        summary_table.add_row("Files Generated", str(output_count))
 
                     console.print(summary_table)
 
                     # Show output files
                     if "results" in result:
-                        files_shown = 0
                         for r in result["results"]:
                             if r.get("status") == "ok" and "written" in r:
                                 for path in r["written"]:
                                     console.print(f"  📁 [cyan]{path}[/cyan]")
-                                    files_shown += 1
-
-                        if files_shown == 0:
-                            console.print("  [dim]No output files generated[/dim]")
+                elif no_outputs:
+                    # Honest "ran but did nothing useful" panel.
+                    console.print(
+                        "\n[yellow]⚠️  Apply ran but produced no output files." "[/yellow]"
+                    )
+                    if "applied" in result:
+                        console.print(f"  [dim]Actions applied: {result['applied']}[/dim]")
+                    console.print(
+                        "  [dim]This usually means the contract uses an "
+                        "engine the active provider doesn't yet materialise "
+                        "(e.g. dlt acquisition on the local provider). "
+                        "Try a different provider with `--provider <name>` "
+                        "or fix the contract's engine choice.[/dim]"
+                    )
                 else:
                     error_msg = result.get("error", "Unknown error")
                     console.print(f"\n[red]❌ Deployment failed: {error_msg}[/red]")
@@ -870,16 +1027,25 @@ def run(args, logger: logging.Logger) -> int:
                                     f"  {i+1}. [red]✗[/red] {r.get('op', 'unknown')}: {r.get('error', 'no details')}"
                                 )
             else:
-                if success:
+                if success and not no_outputs:
                     logger.info("✅ Data product deployed successfully")
                     if "applied" in result:
                         logger.info(f"Applied {result['applied']} action(s)")
+                elif no_outputs:
+                    logger.warning("⚠️  Apply ran but produced no output files.")
+                    if "applied" in result:
+                        logger.info(f"Actions applied: {result['applied']}")
                 else:
                     error_msg = result.get("error", "Unknown error")
                     logger.error(f"❌ Deployment failed: {error_msg}")
 
             total_time = time.time() - start_time
-            logger.info(f"✅ Execution completed in {total_time:.2f}s")
+            # Drop the always-green "Execution completed" footer when the
+            # run had no output — a hidden retort that contradicted the
+            # warning panel above. Surface the duration via the summary
+            # table only.
+            if success and not no_outputs:
+                logger.info(f"✅ Execution completed in {total_time:.2f}s")
 
             # Log metrics and completion
             log_metric(logger, "apply_duration", total_time, unit="seconds")
@@ -1010,8 +1176,10 @@ def run(args, logger: logging.Logger) -> int:
             _display_dry_run_summary(plan, console, logger)
             return 0
 
-        # Execute the plan
-        logger.info("🚀 Starting data product deployment orchestration")
+        # Execute the plan. The user-facing "🚀 Executing actions..."
+        # message lands later via the progress UI; this breadcrumb is
+        # for the structured log only (DEBUG).
+        logger.debug("Starting data product deployment orchestration")
 
         if asyncio.get_event_loop().is_running():
             # If we're already in an async context, create a new loop
@@ -1092,6 +1260,13 @@ def run(args, logger: logging.Logger) -> int:
         logger.warning("⚠️ Execution interrupted by user")
         return 130
     except Exception as e:
+        # Let typed user errors bubble straight to main() for the rich
+        # five-field Panel render — wrapping them in CLIError loses the
+        # structured shape the catalog provides.
+        from fluid_build.cli._errors import FluidUserError as _FUE
+
+        if isinstance(e, _FUE):
+            raise
         logger.error(f"💥 Unexpected error during execution: {e}")
         if args.debug:
             import traceback
@@ -1100,244 +1275,19 @@ def run(args, logger: logging.Logger) -> int:
         raise CLIError(1, "apply_execution_failed", {"error": str(e)})
 
 
-def _display_execution_plan(plan: ExecutionPlan, console, logger: logging.Logger):
-    """Display execution plan summary"""
-    total_actions = sum(len(phase.actions) for phase in plan.phases)
-
-    if console and RICH_AVAILABLE:
-        table = Table(title="📋 Execution Plan Summary")
-        table.add_column("Phase", style="cyan")
-        table.add_column("Actions", justify="right", style="magenta")
-        table.add_column("Parallel", justify="center", style="green")
-        table.add_column("Strategy", style="yellow")
-
-        for phase in plan.phases:
-            table.add_row(
-                phase.phase.value.title(),
-                str(len(phase.actions)),
-                "✅" if phase.parallel_execution else "❌",
-                phase.rollback_strategy.value,
-            )
-
-        console.print(table)
-        console.print(f"\n📊 Total Actions: {total_actions}")
-        console.print(f"⏱️  Estimated Duration: {plan.global_timeout_minutes} minutes")
-    else:
-        logger.info(f"📋 Execution Plan: {len(plan.phases)} phases, {total_actions} total actions")
-
-
-def _confirm_execution(plan: ExecutionPlan, console) -> bool:
-    """Get user confirmation for execution"""
-    total_actions = sum(len(phase.actions) for phase in plan.phases)
-
-    if console and RICH_AVAILABLE:
-        console.print(
-            f"\n⚠️  This will execute {total_actions} actions across {len(plan.phases)} phases."
-        )
-        console.print("Some operations may be irreversible. Continue? [y/N] ", end="")
-    else:
-        cprint(f"This will execute {total_actions} actions. Continue? [y/N] ", end="", flush=True)
-
-    answer = (input() or "n").strip().lower()
-    return answer in ("y", "yes")
-
-
-def _display_dry_run_summary(plan: ExecutionPlan, console, logger: logging.Logger):
-    """Display dry run summary"""
-    if console and RICH_AVAILABLE:
-        console.print("\n🔍 Dry Run Summary:", style="bold blue")
-        for phase in plan.phases:
-            console.print(f"\n📂 {phase.phase.value.title()}:", style="bold")
-            for action in phase.actions:
-                console.print(f"  • {action.description} ({action.provider})", style="dim")
-    else:
-        logger.info("Dry run summary:")
-        for phase in plan.phases:
-            logger.info(f"Phase: {phase.phase.value}")
-            for action in phase.actions:
-                logger.info(f"  - {action.description}")
-
-
-def _generate_final_report(
-    execution_result: Dict[str, Any], args, context: ExecutionContext, logger: logging.Logger
-):
-    """Generate comprehensive final report"""
-    try:
-        report_path = Path(args.report)
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if args.report_format == "html":
-            _generate_html_report(execution_result, report_path, context)
-        elif args.report_format == "json":
-            _generate_json_report(execution_result, report_path, context)
-        elif args.report_format == "markdown":
-            _generate_markdown_report(execution_result, report_path, context)
-
-        logger.info(f"📄 Execution report generated: {report_path}")
-    except Exception as e:
-        logger.warning(f"Failed to generate report: {e}")
-
-
-def _generate_html_report(
-    execution_result: Dict[str, Any], report_path: Path, context: ExecutionContext
-):
-    """Generate HTML execution report"""
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>FLUID Apply Execution Report</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 40px; }}
-            .header {{ background: #1f2937; color: white; padding: 20px; border-radius: 8px; }}
-            .metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }}
-            .metric {{ background: #f8fafc; padding: 15px; border-radius: 8px; border-left: 4px solid #3b82f6; }}
-            .phase {{ margin: 20px 0; padding: 15px; border-radius: 8px; }}
-            .success {{ background-color: #ecfdf5; border-left: 4px solid #10b981; }}
-            .failed {{ background-color: #fef2f2; border-left: 4px solid #ef4444; }}
-        </style>
-    </head>
-    <body>
-        <div class="header">
-            <h1>🌊 FLUID Apply Execution Report</h1>
-            <p>Execution ID: {context.execution_id}</p>
-            <p>Status: {'✅ Success' if execution_result.get('success') else '❌ Failed'}</p>
-        </div>
-        
-        <div class="metrics">
-            <div class="metric">
-                <h3>Total Actions</h3>
-                <p>{execution_result.get('metrics', {}).get('total_actions', 0)}</p>
-            </div>
-            <div class="metric">
-                <h3>Successful</h3>
-                <p>{execution_result.get('metrics', {}).get('successful_actions', 0)}</p>
-            </div>
-            <div class="metric">
-                <h3>Failed</h3>
-                <p>{execution_result.get('metrics', {}).get('failed_actions', 0)}</p>
-            </div>
-            <div class="metric">
-                <h3>Duration</h3>
-                <p>{execution_result.get('metrics', {}).get('total_duration_seconds', 0):.2f}s</p>
-            </div>
-        </div>
-        
-        <h2>Phase Details</h2>
-    """
-
-    for phase in execution_result.get("phases", []):
-        status_class = "success" if phase.get("status") == "success" else "failed"
-        html_content += f"""
-        <div class="phase {status_class}">
-            <h3>{phase.get('phase', 'Unknown').title()}</h3>
-            <p>Status: {phase.get('status', 'unknown')}</p>
-            <p>Actions: {phase.get('action_count', 0)}</p>
-            <p>Duration: {phase.get('duration', 0):.2f}s</p>
-        </div>
-        """
-
-    html_content += """
-    </body>
-    </html>
-    """
-
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
-
-
-def _generate_json_report(
-    execution_result: Dict[str, Any], report_path: Path, context: ExecutionContext
-):
-    """Generate JSON execution report"""
-    report_data = {
-        "execution_id": context.execution_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "contract_path": context.plan.contract_path,
-        "environment": context.plan.environment,
-        "result": execution_result,
-    }
-
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(report_data, f, indent=2)
-
-
-def _generate_markdown_report(
-    execution_result: Dict[str, Any], report_path: Path, context: ExecutionContext
-):
-    """Generate Markdown execution report"""
-    status_icon = "✅" if execution_result.get("success") else "❌"
-
-    markdown_content = f"""# 🌊 FLUID Apply Execution Report
-
-## Summary
-- **Execution ID**: {context.execution_id}
-- **Status**: {status_icon} {'Success' if execution_result.get('success') else 'Failed'}
-- **Contract**: {context.plan.contract_path}
-- **Environment**: {context.plan.environment or 'default'}
-- **Duration**: {execution_result.get('metrics', {}).get('total_duration_seconds', 0):.2f} seconds
-
-## Metrics
-| Metric | Value |
-|--------|-------|
-| Total Actions | {execution_result.get('metrics', {}).get('total_actions', 0)} |
-| Successful | {execution_result.get('metrics', {}).get('successful_actions', 0)} |
-| Failed | {execution_result.get('metrics', {}).get('failed_actions', 0)} |
-| Skipped | {execution_result.get('metrics', {}).get('skipped_actions', 0)} |
-
-## Phase Details
-"""
-
-    for phase in execution_result.get("phases", []):
-        phase_icon = "✅" if phase.get("status") == "success" else "❌"
-        markdown_content += f"""
-### {phase_icon} {phase.get('phase', 'Unknown').title()}
-- **Status**: {phase.get('status', 'unknown')}
-- **Actions**: {phase.get('action_count', 0)}
-- **Duration**: {phase.get('duration', 0):.2f}s
-"""
-
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(markdown_content)
-
-
-def _send_notifications(
-    execution_result: Dict[str, Any], notify_config: str, logger: logging.Logger
-):
-    """Send execution notifications"""
-    try:
-        # Parse notification configuration
-        # Format: "slack:channel" or "email:user@domain.com"
-        notify_type, notify_target = notify_config.split(":", 1)
-
-        status = "✅ Success" if execution_result.get("success") else "❌ Failed"
-        f"FLUID Apply {status} - {execution_result.get('execution_id')}"
-
-        if notify_type == "slack":
-            # Would integrate with Slack API
-            logger.info(f"Notification sent to Slack: {notify_target}")
-        elif notify_type == "email":
-            # Would integrate with email service
-            logger.info(f"Notification sent to email: {notify_target}")
-
-    except Exception as e:
-        logger.warning(f"Failed to send notification: {e}")
-
-
-def _export_metrics(execution_result: Dict[str, Any], metrics_system: str, logger: logging.Logger):
-    """Export metrics to monitoring system"""
-    try:
-        execution_result.get("metrics", {})
-
-        if metrics_system == "prometheus":
-            # Would export to Prometheus
-            logger.info("Metrics exported to Prometheus")
-        elif metrics_system == "datadog":
-            # Would export to Datadog
-            logger.info("Metrics exported to Datadog")
-        elif metrics_system == "cloudwatch":
-            # Would export to CloudWatch
-            logger.info("Metrics exported to CloudWatch")
-
-    except Exception as e:
-        logger.warning(f"Failed to export metrics: {e}")
+# Plan-display + report-generation helpers — physically extracted to
+# ``cli/_apply_reports.py``. ~240 LOC of post-execution renderers
+# lifted without behaviour change. Re-exported here so existing test
+# patches on ``fluid_build.cli.apply.<helper>`` flow through to the
+# moved functions via the module-attribute-access indirection.
+from fluid_build.cli._apply_reports import (  # noqa: E402,F401
+    _confirm_execution,
+    _display_dry_run_summary,
+    _display_execution_plan,
+    _export_metrics,
+    _generate_final_report,
+    _generate_html_report,
+    _generate_json_report,
+    _generate_markdown_report,
+    _send_notifications,
+)

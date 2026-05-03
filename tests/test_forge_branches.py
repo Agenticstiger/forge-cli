@@ -896,22 +896,13 @@ class TestMemoryManagement:
         mock_store_cls.return_value.delete.assert_called_once()
 
 
-class TestGetEnhancedTemplates:
-    def test_returns_dict(self):
-        from fluid_build.cli.forge import get_enhanced_templates
+class TestLegacyBootstrapperRemoved:
+    def test_create_legacy_bootstrapper_is_gone(self):
+        """``create_legacy_bootstrapper`` was deleted along with the
+        non-existent ``forge_legacy`` module it tried to import. The
+        public surface is :func:`run_ai_copilot_mode` etc. directly
+        on :mod:`fluid_build.cli.forge_modes`; there is no legacy
+        bootstrapper."""
+        import fluid_build.cli.forge as forge_mod
 
-        templates = get_enhanced_templates()
-        assert isinstance(templates, dict)
-
-
-class TestCreateLegacyBootstrapper:
-    def test_returns_object(self):
-        from fluid_build.cli.forge import create_legacy_bootstrapper
-
-        try:
-            result = create_legacy_bootstrapper(target_dir="/tmp/test")
-        except (ImportError, ModuleNotFoundError):
-            pytest.skip("forge_legacy not available")
-
-        assert result is not None
-        assert callable(getattr(result, "run", None)) or hasattr(result, "target_dir")
+        assert not hasattr(forge_mod, "create_legacy_bootstrapper")
