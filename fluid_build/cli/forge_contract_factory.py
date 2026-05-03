@@ -86,6 +86,7 @@ def build_minimal_contract(
         "tags": tags or [],
         "metadata": {
             "layer": "Bronze",
+            "productType": "SDP",
             "owner": owner_metadata,
         },
         "builds": [build_doc],
@@ -170,9 +171,11 @@ def create_and_validate_contract(
 
     On failure, prints an ``ActionableError`` panel via
     :func:`fluid_build.cli.errors.print_actionable_error` so the user
-    sees a ``Fix:`` line in addition to the symptom.  The function
-    still returns ``None`` (not raises) for backward compatibility
-    with existing callers that check the return value.
+    sees a ``Fix:`` line in addition to the symptom. The function
+    returns ``None`` (rather than raising) so callers can branch on
+    write-result without a try/except — every consumer of this
+    function is a contract-emit pipeline that needs to short-circuit
+    cleanly when validation fails post-write.
     """
     target_dir.mkdir(parents=True, exist_ok=True)
     contract_path = target_dir / CONTRACT_FILENAME

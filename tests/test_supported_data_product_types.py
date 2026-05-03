@@ -38,11 +38,11 @@ import textwrap
 from pathlib import Path
 
 import pytest
+
 from fluid_build.cli._world_class_interview import (
     InterviewSignals,
     _question_data_product_type,
 )
-
 from fluid_build.cli.forge_agent_specs import (
     AgentSpecError,
     load_agent_spec_from_path,

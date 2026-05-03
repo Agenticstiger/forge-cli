@@ -89,6 +89,18 @@ def next_milestone(today: Optional[date] = None) -> Optional[RoadmapMilestone]:
 
 
 def banner_enabled(surface: str, *, quiet: bool = False) -> bool:
+    """Show the roadmap-teaser banner only when the operator opts in.
+
+    UX hardening pass — the banner used to display by default on
+    every ``fluid forge data-model`` invocation, which interactive
+    users found noisy ("v1.2 (Semantic Reuse) lands by May 07, 2026
+    — see fluid roadmap"). Default is now off; opt-in via
+    ``FLUID_BANNER=1`` for users who like seeing the roadmap teaser
+    and milestone callout. The other gates (``--quiet``,
+    ``FLUID_QUIET``, ``FLUID_NONINTERACTIVE``) keep working so a
+    legacy script that disables the banner doesn't see new
+    behaviour.
+    """
     if quiet:
         return False
     if surface not in _BANNER_SURFACES:
@@ -96,6 +108,10 @@ def banner_enabled(surface: str, *, quiet: bool = False) -> bool:
     if os.environ.get("FLUID_QUIET") == "1":
         return False
     if os.environ.get("FLUID_NONINTERACTIVE") == "1":
+        return False
+    # Opt-in toggle. ``FLUID_BANNER=1`` (or any truthy "1/true/yes/on")
+    # surfaces the banner; default off keeps daily CLI usage uncluttered.
+    if os.environ.get("FLUID_BANNER", "").strip().lower() not in {"1", "true", "yes", "on"}:
         return False
     return _today() < _EXPIRES_ON
 
