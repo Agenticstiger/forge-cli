@@ -633,6 +633,124 @@ def ensure_routine(action: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
+def update_table_schema(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Update an existing BigQuery table's schema in place.
+
+    The ``registerSchema`` (v0.7.1 abstract op) handler routes here.
+    Behaviour mirrors the schema-update branch of :func:`ensure_table`
+    but only the schema is touched: location, partitioning, labels are
+    preserved.
+
+    Action keys:
+        project, dataset, table (str): table identity.
+        schema (list | dict): ODCS schema block or column list.
+        location (str): for policy-tag taxonomy lookup.
+        contract (dict, optional): full contract for masking pass.
+
+    Idempotent: returns ``status="ok", changed=False`` when the
+    BigQuery schema already matches the desired one. Non-additive
+    changes are rejected (matches ``ensure_table`` policy).
+    """
+    start_time = time.time()
+
+    try:
+        from google.cloud import bigquery
+    except ImportError:
+        return {
+            "status": "error",
+            "error": (
+                "google-cloud-bigquery library not available. "
+                "Install with: pip install google-cloud-bigquery"
+            ),
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    project = action.get("project")
+    dataset = action.get("dataset")
+    table = action.get("table")
+    schema = action.get("schema")
+    location = action.get("location") or "US"
+
+    if not all([project, dataset, table]):
+        return {
+            "status": "error",
+            "error": "'project', 'dataset', and 'table' are required",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+    if not schema:
+        return {
+            "status": "error",
+            "error": "'schema' is required",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    try:
+        client = bigquery.Client(project=project)
+        normalized_dataset = normalize_dataset_name(dataset)
+        normalized_table = normalize_table_name(table)
+        table_id = f"{project}.{normalized_dataset}.{normalized_table}"
+
+        try:
+            existing_table = client.get_table(table_id)
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": (
+                    f"Table {table_id} not found. registerSchema requires "
+                    f"the table to exist; run provisionDataset first. ({e})"
+                ),
+                "duration_ms": duration_ms(start_time),
+                "changed": False,
+            }
+
+        # Coerce schema → BQ shape (reuses the existing converter).
+        taxonomy_uris: Dict[str, Any] = {}
+        if project and location:
+            taxonomy_uris = _ensure_policy_tags(project, location, schema)
+        bq_schema = _convert_schema_to_bq(schema, project, location, taxonomy_uris)
+
+        if not _is_schema_different(existing_table.schema, bq_schema):
+            return {
+                "status": "ok",
+                "table_id": table_id,
+                "message": "Schema already up-to-date",
+                "duration_ms": duration_ms(start_time),
+                "changed": False,
+            }
+
+        if not _is_additive_schema_change(existing_table.schema, bq_schema):
+            return {
+                "status": "error",
+                "error": (
+                    "Non-additive schema changes not allowed. Use contract"
+                    "-tests to validate breaking changes."
+                ),
+                "duration_ms": duration_ms(start_time),
+                "changed": False,
+            }
+
+        existing_table.schema = bq_schema
+        client.update_table(existing_table, ["schema"])
+        return {
+            "status": "changed",
+            "table_id": table_id,
+            "columns_count": len(bq_schema),
+            "message": "Schema updated",
+            "duration_ms": duration_ms(start_time),
+            "changed": True,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+
 def execute_sql(action: Dict[str, Any]) -> Dict[str, Any]:
     """
     Execute SQL statement against BigQuery.
@@ -742,7 +860,7 @@ def _convert_schema_to_bq(
     """
     Convert FLUID schema to BigQuery SchemaField objects.
 
-    Enhanced in v0.5.7 to support:
+    Supports (v0.7.x):
     - Default values from column labels
     - Policy tags from column labels (with full Data Catalog URIs if available)
     - Constraint hints in descriptions
@@ -773,10 +891,10 @@ def _convert_schema_to_bq(
         description = field.get("description", "")
         labels = field.get("labels", {})
 
-        # Extract default value from labels (v0.5.7 feature)
+        # Extract default value from labels (v0.7.x feature)
         default_value = labels.get("default")
 
-        # Extract policy tags from labels (v0.5.7 feature) - ENHANCED WITH FULL IMPLEMENTATION
+        # Extract policy tags from labels (v0.7.x feature) - ENHANCED WITH FULL IMPLEMENTATION
         policy_tags = None
         if "policyTag" in labels and "taxonomy" in labels:
             policy_tag_name = labels["policyTag"]
@@ -807,7 +925,7 @@ def _convert_schema_to_bq(
                 # If PolicyTagList not available or fails, continue without it
                 pass
 
-        # Enhance description with constraint hints (v0.5.7 feature)
+        # Enhance description with constraint hints (v0.7.x feature)
         semantic_type = field.get("semanticType", "")
         constraint = labels.get("constraint", "")
 

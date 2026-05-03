@@ -205,13 +205,11 @@ def _validate_fluid_contract(contract: dict, validation_mode: str, logger: loggi
     """Validate an already-loaded FLUID contract on the publish path.
 
     **Validation target is the contract's own declared ``fluidVersion``**,
-    not a hardcoded master version. A contract with ``fluidVersion: 0.5.7``
-    is validated against ``fluid-schema-0.5.7.json``, a 0.7.1 contract
-    against 0.7.1, a 0.7.2 contract against 0.7.2, and so on — whichever
-    bundled schema matches. This is the backward-compatibility guarantee:
-    upgrading the CLI never invalidates a contract that was valid against
-    its own declared version. The CLI acts as coordinator for the whole
-    FLUID version range, not just the latest.
+    within the 0.7.x line. A 0.7.1 contract validates against
+    ``fluid-schema-0.7.1.json``, a 0.7.2 contract against 0.7.2, a 0.7.3
+    contract against 0.7.3 — whichever bundled schema matches. Pre-0.7
+    contracts (0.4.0, 0.5.x) are no longer supported; operators on
+    those should run a one-time migration to 0.7.3.
 
     Delegates to :func:`fluid_build.cli.validate.run_on_contract_dict`, the
     public one-call wrapper around the native ``fluid validate`` flow, and
@@ -342,13 +340,8 @@ def _print_publish_result(result):
         lines = [f"[green]✅ Published:[/green] [bold]{product_id}[/bold]"]
         if url:
             lines.append(f"[dim]View at:[/dim] {url}")
-        # Legacy single contract (kept for backward compatibility)
-        dc = result.get("data_contract")
-        if dc:
-            lines.append(f"[green]📄 Contract:[/green] {dc.get('contract_id', '?')}")
-            if dc.get("url"):
-                lines.append(f"[dim]View at:[/dim] {dc['url']}")
-        # Per-expose ODCS contracts
+        # Per-expose ODCS contracts (one per expose; the legacy
+        # single-contract ``data_contract`` field has been deleted).
         for odcs in result.get("odcs_contracts", []):
             status_icon = "✅" if odcs.get("success") else "❌"
             lines.append(f"[green]{status_icon} ODCS:[/green] {odcs.get('contract_id', '?')}")
@@ -366,11 +359,6 @@ def _print_publish_result(result):
         success(f"Published data product: {product_id}")
         if url:
             cprint(f"   View at: {url}")
-        dc = result.get("data_contract")
-        if dc:
-            cprint(f"📄 Published data contract: {dc.get('contract_id', '?')}")
-            if dc.get("url"):
-                cprint(f"   View at: {dc['url']}")
         for odcs in result.get("odcs_contracts", []):
             icon = "✅" if odcs.get("success") else "❌"
             cprint(f"{icon} ODCS contract: {odcs.get('contract_id', '?')}")
@@ -404,18 +392,26 @@ def _cmd_list(args, logger=None):
             table.add_column("Status")
             table.add_column("Team")
             for p in products:
-                info = p.get("info", {})
+                # DMM / Entropy Data API v1 returns fields at the top
+                # level of each product (``id``, ``name``, ``status``,
+                # ``team.name``). The legacy v0 shape nested them under
+                # ``info`` and used ``teamId``. Read both so the CLI
+                # works against either deployment.
+                info = p.get("info") or {}
+                team_obj = p.get("team") if isinstance(p.get("team"), dict) else {}
                 table.add_row(
-                    info.get("id", "?"),
-                    info.get("name", "?"),
-                    info.get("status", "?"),
-                    p.get("teamId", "?"),
+                    p.get("id") or info.get("id") or "?",
+                    p.get("name") or info.get("name") or "?",
+                    p.get("status") or info.get("status") or "?",
+                    team_obj.get("name") or p.get("teamId") or "?",
                 )
             console.print(table)
         else:
             for p in products:
-                info = p.get("info", {})
-                cprint(f"  {info.get('id', '?'):30s}  {info.get('name', '?')}")
+                info = p.get("info") or {}
+                pid = p.get("id") or info.get("id") or "?"
+                pname = p.get("name") or info.get("name") or "?"
+                cprint(f"  {pid:30s}  {pname}")
         return 0
 
     except ProviderError as exc:

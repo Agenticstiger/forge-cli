@@ -265,6 +265,187 @@ def ensure_table(action: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
+def update_table_schema(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Update an existing Glue table's column schema in place.
+
+    Use case: ``registerSchema`` (v0.7.1 abstract op) — the table
+    already exists (created by an earlier ``ensure_table`` /
+    ``provisionDataset`` call); we only need to refresh the column
+    list / types so a downstream contract change propagates without
+    re-creating the catalog entry.
+
+    Action keys:
+        database (str): Glue database name.
+        table (str): Glue table name.
+        schema (list[dict] | dict): Column definitions. Either an ODCS
+            ``schema`` block (single dict with ``properties``) or a
+            list of ``{name, type, ...}`` columns.
+
+    Idempotent: if the existing schema already matches the supplied
+    one (column-name + type match), returns ``status="ok",
+    changed=False``.
+    """
+    start_time = time.time()
+
+    try:
+        import boto3
+        from botocore.exceptions import ClientError
+    except ImportError:
+        return {
+            "status": "error",
+            "error": "boto3 not available",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    database = action.get("database")
+    table = action.get("table")
+    schema_input = action.get("schema") or action.get("columns") or []
+
+    if not database or not table:
+        return {
+            "status": "error",
+            "error": "'database' and 'table' required",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    columns = _coerce_schema_to_glue_columns(schema_input)
+    if not columns:
+        return {
+            "status": "error",
+            "error": "'schema' produced no columns — check ODCS shape",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    try:
+        glue = boto3.client("glue")
+        normalized_table = normalize_table_name(table)
+
+        try:
+            response = glue.get_table(DatabaseName=database, Name=normalized_table)
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code == "EntityNotFoundException":
+                return {
+                    "status": "error",
+                    "error": (
+                        f"Table {database}.{normalized_table} not found. "
+                        "registerSchema requires the table to exist; run "
+                        "provisionDataset first."
+                    ),
+                    "duration_ms": duration_ms(start_time),
+                    "changed": False,
+                }
+            raise
+
+        existing = response["Table"]
+        existing_cols = existing.get("StorageDescriptor", {}).get("Columns", [])
+        if _columns_equal(existing_cols, columns):
+            return {
+                "status": "ok",
+                "database": database,
+                "table": normalized_table,
+                "columns_count": len(columns),
+                "message": "Schema already up-to-date",
+                "duration_ms": duration_ms(start_time),
+                "changed": False,
+            }
+
+        # Build a minimal TableInput that preserves existing storage
+        # config but swaps in the new column list.
+        sd = dict(existing.get("StorageDescriptor", {}) or {})
+        sd["Columns"] = columns
+        table_input = {
+            "Name": normalized_table,
+            "StorageDescriptor": sd,
+            "TableType": existing.get("TableType", "EXTERNAL_TABLE"),
+        }
+        if existing.get("Description"):
+            table_input["Description"] = existing["Description"]
+        if existing.get("Parameters"):
+            table_input["Parameters"] = existing["Parameters"]
+        if existing.get("PartitionKeys"):
+            table_input["PartitionKeys"] = existing["PartitionKeys"]
+
+        glue.update_table(DatabaseName=database, TableInput=table_input)
+
+        return {
+            "status": "changed",
+            "database": database,
+            "table": normalized_table,
+            "columns_count": len(columns),
+            "message": "Schema updated",
+            "duration_ms": duration_ms(start_time),
+            "changed": True,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+
+def _coerce_schema_to_glue_columns(schema_input: Any) -> List[Dict[str, str]]:
+    """Coerce contract schema (ODCS ``schema`` block OR a column list)
+    into the Glue column shape ``[{Name, Type, Comment?}, ...]``.
+
+    Handles three input shapes commonly fed by translation layers:
+
+    1. List of Glue-shape dicts (already correct) — returned verbatim.
+    2. List of ODCS-shape dicts ``{name, logicalType|physicalType, ...}``.
+    3. ODCS ``schema`` dict ``{properties: {col: {logicalType: ...}}}``.
+    """
+    if isinstance(schema_input, dict) and "properties" in schema_input:
+        out: List[Dict[str, str]] = []
+        for name, defn in (schema_input.get("properties") or {}).items():
+            if not isinstance(defn, dict):
+                continue
+            t = defn.get("physicalType") or defn.get("logicalType") or defn.get("type") or "string"
+            row: Dict[str, str] = {"Name": str(name), "Type": str(t).lower()}
+            if defn.get("description"):
+                row["Comment"] = str(defn["description"])
+            out.append(row)
+        return out
+
+    if isinstance(schema_input, list):
+        out = []
+        for col in schema_input:
+            if not isinstance(col, dict):
+                continue
+            if "Name" in col and "Type" in col:
+                # Already Glue-shaped.
+                out.append(
+                    {
+                        "Name": str(col["Name"]),
+                        "Type": str(col["Type"]).lower(),
+                        **({"Comment": str(col["Comment"])} if col.get("Comment") else {}),
+                    }
+                )
+            else:
+                name = col.get("name") or col.get("Name")
+                t = (
+                    col.get("physicalType")
+                    or col.get("logicalType")
+                    or col.get("type")
+                    or col.get("Type")
+                    or "string"
+                )
+                if not name:
+                    continue
+                row = {"Name": str(name), "Type": str(t).lower()}
+                desc = col.get("description") or col.get("Comment")
+                if desc:
+                    row["Comment"] = str(desc)
+                out.append(row)
+        return out
+
+    return []
+
+
 def ensure_crawler(action: Dict[str, Any]) -> Dict[str, Any]:
     """Configure Glue crawler."""
     start_time = time.time()

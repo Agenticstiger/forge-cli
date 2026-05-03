@@ -321,16 +321,6 @@ class TestPrintPublishResult:
         joined = "\n".join(str(l) for l in lines)
         assert "https://view.me" in joined
 
-    def test_data_contract_section_printed(self):
-        result = {
-            "product_id": "p1",
-            "url": "",
-            "data_contract": {"contract_id": "dc-1", "url": "https://dc.view"},
-        }
-        lines = self._run_without_rich(result)
-        joined = "\n".join(str(l) for l in lines)
-        assert "dc-1" in joined
-
     def test_odcs_contracts_printed(self):
         result = {
             "product_id": "p1",

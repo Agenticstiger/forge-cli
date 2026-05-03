@@ -334,7 +334,7 @@ class OdpsStandardProvider(BaseProvider):
                — stable identifier for the contract's upstream source)
             3. Canonical ``name`` (last-resort stable identifier)
 
-        Uses :func:`consumes_to_canonical_ports` for 0.4.0/0.5.7/0.7.x
+        Uses :func:`consumes_to_canonical_ports` for v0.7.x
         compatibility.
         """
         canonical_ports = consumes_to_canonical_ports(

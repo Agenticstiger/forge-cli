@@ -471,3 +471,261 @@ def _map_permission_to_pubsub_role(permission: str) -> Optional[str]:
         "owner": "roles/pubsub.admin",
     }
     return permission_map.get(permission.lower())
+
+
+# ── v0.7.1 abstract→native bridges ─────────────────────────────────────
+
+
+def grant_role(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Grant an IAM role to a member at the specified resource scope.
+
+    The ``grantAccess`` (v0.7.1 abstract op) handler routes here. We
+    dispatch to the right scope-specific binder based on the
+    ``resource`` shape:
+
+    * ``project`` (or no resource) → project-level binding via
+      Resource Manager.
+    * ``dataset`` → ``bind_bq_dataset``.
+    * ``table`` → ``bind_bq_table``.
+    * ``bucket`` → ``bind_gcs_bucket``.
+    * ``topic``  → ``bind_pubsub_topic``.
+
+    Action keys:
+        role (str): e.g. ``"roles/bigquery.dataViewer"``.
+        member (str): e.g. ``"user:foo@example.com"``,
+            ``"serviceAccount:..."``.
+        project (str): GCP project id (required for project-scope).
+        resource (dict): ``{"kind": "dataset|table|bucket|topic|project",
+                          "name": "...",
+                          "dataset": "..." (for table)}``.
+    """
+    start_time = time.time()
+    role = action.get("role")
+    member = action.get("member")
+    project = action.get("project")
+    resource = action.get("resource") or {}
+
+    if not role or not member:
+        return {
+            "status": "error",
+            "error": "'role' and 'member' are required",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    kind = (resource.get("kind") or "project").lower()
+
+    if kind == "dataset":
+        return bind_bq_dataset(
+            {
+                "project": project,
+                "dataset": resource.get("name") or resource.get("dataset"),
+                "bindings": [{"role": role, "members": [member]}],
+            }
+        )
+    if kind == "table":
+        return bind_bq_table(
+            {
+                "project": project,
+                "dataset": resource.get("dataset"),
+                "table": resource.get("name") or resource.get("table"),
+                "bindings": [{"role": role, "members": [member]}],
+            }
+        )
+    if kind == "bucket":
+        return bind_gcs_bucket(
+            {
+                "bucket": resource.get("name") or resource.get("bucket"),
+                "bindings": [{"role": role, "members": [member]}],
+            }
+        )
+    if kind == "topic":
+        return bind_pubsub_topic(
+            {
+                "project": project,
+                "topic": resource.get("name") or resource.get("topic"),
+                "bindings": [{"role": role, "members": [member]}],
+            }
+        )
+
+    # Project-scope binding via Resource Manager.
+    return _bind_project_role(project, role, member, start_time, attach=True)
+
+
+def revoke_role(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Revoke an IAM role from a member at the specified resource scope.
+
+    Same routing as :func:`grant_role` but with the inverse semantics —
+    the binder strips the member from the existing role binding and
+    writes the policy back. ``NoSuchEntity``-equivalent (member not in
+    binding) is treated as idempotent success.
+    """
+    start_time = time.time()
+    role = action.get("role")
+    member = action.get("member")
+    project = action.get("project")
+    resource = action.get("resource") or {}
+
+    if not role or not member:
+        return {
+            "status": "error",
+            "error": "'role' and 'member' are required",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    return _bind_project_role(project, role, member, start_time, attach=False)
+
+
+def set_policy(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace the IAM policy at a project scope with the supplied
+    policy document.
+
+    Action keys:
+        project (str): GCP project id.
+        policy (dict): IAM policy document — ``{"bindings": [...]}``.
+
+    This is the ``updatePolicy`` (v0.7.1 abstract op) target. Use
+    sparingly: it overwrites the entire project policy. The binder
+    sets the policy via the Resource Manager v3 API.
+    """
+    start_time = time.time()
+    project = action.get("project")
+    policy = action.get("policy") or {}
+    if not project:
+        return {
+            "status": "error",
+            "error": "'project' is required",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+    if not policy.get("bindings"):
+        return {
+            "status": "error",
+            "error": "'policy.bindings' is required",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    try:
+        from google.cloud import resourcemanager_v3
+        from google.iam.v1 import iam_policy_pb2, policy_pb2
+    except ImportError:
+        return {
+            "status": "error",
+            "error": (
+                "google-cloud-resource-manager not installed. "
+                "Install with: pip install google-cloud-resource-manager"
+            ),
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    try:
+        client = resourcemanager_v3.ProjectsClient()
+        resource_name = f"projects/{project}"
+        new_policy = policy_pb2.Policy()
+        for b in policy["bindings"]:
+            binding = new_policy.bindings.add()
+            binding.role = b["role"]
+            binding.members.extend(b.get("members", []))
+        request = iam_policy_pb2.SetIamPolicyRequest(resource=resource_name, policy=new_policy)
+        client.set_iam_policy(request=request)
+        return {
+            "status": "changed",
+            "project": project,
+            "bindings": len(policy["bindings"]),
+            "duration_ms": duration_ms(start_time),
+            "changed": True,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+
+def _bind_project_role(
+    project: Optional[str],
+    role: str,
+    member: str,
+    start_time: float,
+    *,
+    attach: bool,
+) -> Dict[str, Any]:
+    """Add or remove a single (role, member) pair from a project-scope
+    IAM policy. Used by :func:`grant_role` (attach=True) and
+    :func:`revoke_role` (attach=False).
+    """
+    if not project:
+        return {
+            "status": "error",
+            "error": "'project' is required for project-scope IAM binding",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+    try:
+        from google.cloud import resourcemanager_v3
+        from google.iam.v1 import iam_policy_pb2
+    except ImportError:
+        return {
+            "status": "error",
+            "error": (
+                "google-cloud-resource-manager not installed. "
+                "Install with: pip install google-cloud-resource-manager"
+            ),
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    try:
+        client = resourcemanager_v3.ProjectsClient()
+        resource_name = f"projects/{project}"
+        get_req = iam_policy_pb2.GetIamPolicyRequest(resource=resource_name)
+        existing = client.get_iam_policy(request=get_req)
+
+        target_binding = None
+        for b in existing.bindings:
+            if b.role == role:
+                target_binding = b
+                break
+
+        changed = False
+        if attach:
+            if target_binding is None:
+                target_binding = existing.bindings.add()
+                target_binding.role = role
+            if member not in target_binding.members:
+                target_binding.members.append(member)
+                changed = True
+        else:
+            if target_binding is not None and member in target_binding.members:
+                target_binding.members.remove(member)
+                changed = True
+
+        if changed:
+            set_req = iam_policy_pb2.SetIamPolicyRequest(resource=resource_name, policy=existing)
+            client.set_iam_policy(request=set_req)
+
+        return {
+            "status": "changed" if changed else "ok",
+            "project": project,
+            "role": role,
+            "member": member,
+            "message": (
+                "Role granted"
+                if attach and changed
+                else "Role revoked" if not attach and changed else "No-op (already in target state)"
+            ),
+            "duration_ms": duration_ms(start_time),
+            "changed": changed,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
