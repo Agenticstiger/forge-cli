@@ -23,6 +23,45 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
+def auto_find_contract(args: Any) -> bool:
+    """Auto-find ``contract.fluid.yaml`` in CWD when ``args.contract`` is empty.
+
+    UX hardening pass — every command that takes a positional ``contract``
+    should accept the bare ``fluid <verb>`` invocation when CWD has a
+    single contract. ``validate`` already does this; this helper makes
+    the same behaviour available to ``bundle`` / ``plan`` / ``apply``
+    / ``policy-apply`` / ``publish`` so the user doesn't have to type
+    ``contract.fluid.yaml`` four times for one workflow.
+
+    Mutates ``args.contract`` in place when a CWD contract is found.
+    Returns ``True`` if it filled the slot, ``False`` if there was no
+    contract to find (caller raises the canonical "contract required"
+    error). Idempotent: a non-empty ``args.contract`` is left alone.
+
+    SECURITY (S-014): rejects symlinks. ``Path.is_file()`` follows
+    symlinks by default, so a malicious actor with write access to
+    CWD could plant a symlink ``contract.fluid.yaml`` pointing at an
+    out-of-tree file (``/etc/passwd``, ``../../../sensitive.yaml``)
+    and have a subsequent ``fluid <verb>`` operate on that target.
+    The auto-find path explicitly skips symlinks; the operator can
+    still pass an explicit symlinked path via the positional arg if
+    they really want one — that's an intentional choice, not an
+    auto-resolution.
+    """
+    if getattr(args, "contract", None):
+        return True
+    cwd_contract = Path.cwd() / "contract.fluid.yaml"
+    # Reject symlinks to prevent TOCTOU symlink-swap attacks on the
+    # auto-find path. Operators who need symlinked contracts pass an
+    # explicit path on the command line.
+    if cwd_contract.is_symlink():
+        return False
+    if cwd_contract.is_file():
+        args.contract = str(cwd_contract)
+        return True
+    return False
+
+
 def redact_secrets(text: str) -> str:
     """Best-effort redaction of common secret patterns in text."""
     redacted = re.sub(r"(Bearer\s+)[^\s]+", r"\1***", text, flags=re.I)
@@ -71,6 +110,99 @@ def load_contract_with_overlay(
 
     # Auto-bundle: if the contract contains $ref pointers, silently resolve them
     contract = _auto_bundle_if_needed(contract, path, logger)
+    # Normalize common alias values to their canonical form before any
+    # downstream code (validator, planner, runner) reads them. Without
+    # this, contracts using human-friendly aliases like ``sink.format=kafka``
+    # or ``source.mode=incremental`` were rejected by the strict
+    # JSON-schema enum check, forcing trial-and-error to discover the
+    # canonical names.
+    contract = _normalize_contract_aliases(contract)
+    return contract
+
+
+# Alias → canonical mapping table, applied at contract-load time.
+# Add entries here whenever a human-friendly synonym diverges from the
+# schema-enforced enum value. Keep the canonical name as the schema's
+# enum entry; treat the alias as a soft-rewrite at load time.
+_FIELD_ALIASES = {
+    # source.mode
+    ("builds", "properties", "source", "mode"): {
+        "incremental": "incremental_append",
+        "append": "incremental_append",
+        "dedup": "incremental_dedup",
+        "merge": "incremental_merge",
+    },
+    # source.kind
+    ("builds", "properties", "source", "kind"): {
+        "postgresql": "postgres",
+        "mariadb": "mariadb",  # canonical for v0.7.3 multi-engine support
+        "pg": "postgres",
+    },
+    # builds[].properties.sink.format
+    ("builds", "properties", "sink", "format"): {
+        "kafka": "iceberg",  # streaming sink → iceberg surrogate; the
+        # canonical streaming-sink shape is ``binding.format=kafka_topic``
+        # on the expose, not the build's sink.format
+    },
+    # exposes[].binding.format
+    ("exposes", "binding", "format"): {
+        "kafka": "kafka_topic",
+        "kafka-topic": "kafka_topic",
+        "snowflake-table": "snowflake_table",
+        "bigquery-table": "bigquery_table",
+        "redshift-table": "redshift_table",
+    },
+}
+
+
+def _normalize_contract_aliases(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Rewrite common alias values to their canonical form.
+
+    The ``_FIELD_ALIASES`` table maps tuple-of-keys → {alias: canonical}.
+    Walks the contract and rewrites any matching value found at the
+    described path. Safe-by-default: unknown values pass through
+    unchanged so the schema-validator still catches typos that aren't
+    in the alias map.
+    """
+    if not isinstance(contract, dict):
+        return contract
+
+    def _rewrite_in_list(items, key_path: tuple, mapping: dict) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            _rewrite_at_path(item, key_path, mapping)
+
+    def _rewrite_at_path(node: Dict[str, Any], path: tuple, mapping: dict) -> None:
+        if not path:
+            return
+        head, *rest = path
+        if head not in node:
+            return
+        if not rest:
+            current = node.get(head)
+            if isinstance(current, str) and current in mapping:
+                node[head] = mapping[current]
+            return
+        sub = node[head]
+        if isinstance(sub, list):
+            _rewrite_in_list(sub, tuple(rest), mapping)
+        elif isinstance(sub, dict):
+            _rewrite_at_path(sub, tuple(rest), mapping)
+
+    for path_tuple, mapping in _FIELD_ALIASES.items():
+        head = path_tuple[0]
+        rest = path_tuple[1:]
+        if head not in contract:
+            continue
+        sub = contract.get(head)
+        if isinstance(sub, list):
+            _rewrite_in_list(sub, rest, mapping)
+        elif isinstance(sub, dict):
+            _rewrite_at_path(sub, rest, mapping)
+
     return contract
 
 

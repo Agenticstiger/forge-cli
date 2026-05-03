@@ -16,7 +16,7 @@
 FLUID Policy Check Command
 
 Validates contracts against schema-driven policy declarations.
-Enforces governance rules defined in the FLUID 0.5.7 schema.
+Enforces governance rules defined in the FLUID 0.7.x schema.
 """
 
 from __future__ import annotations

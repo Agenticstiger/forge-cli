@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from fluid_build.cli.console import cprint
+from fluid_build.observability.tracing import traced_stage as _traced_stage
 
 try:
     from rich.console import Console
@@ -567,6 +568,38 @@ async def run_async(args, logger: logging.Logger) -> int:
             cprint(f"  Success Rate: {metrics['success_rate']}%")
             cprint(f"  Total Failures: {metrics['total_failures']}")
 
+    # ── Acquisition pattern: catalog auto-registration ─────────────────
+    # Bronze contracts with ``properties.catalog.register`` push their
+    # exposes through the acquisition catalog dispatcher in addition to
+    # the standard publish flow above. Failures don't block publish
+    # exit code — they're surfaced via the warning channel because
+    # catalog auto-registration is observability, not correctness.
+    try:
+        from fluid_build.cli._acquisition_stage_ext import (
+            is_acquisition_contract,
+            publish_acquisition,
+        )
+
+        for cp in contract_paths:
+            try:
+                from fluid_build.loader import load_contract_with_overlay
+
+                contract = load_contract_with_overlay(str(cp), getattr(args, "env", None), logger)
+            except Exception:
+                continue
+            if not is_acquisition_contract(contract):
+                continue
+            acq_results = publish_acquisition(contract, Path.cwd())
+            for r in acq_results:
+                icon = "✅" if r.succeeded else "⚠️"
+                cprint(
+                    f"  {icon} acquisition publish "
+                    f"{r.product_id}/{r.expose_id} → {r.target}"
+                    + (f"  [{r.error}]" if r.error else "")
+                )
+    except Exception as exc:  # noqa: BLE001 — publish must not crash the CLI
+        logger.warning(f"Acquisition catalog dispatch skipped: {exc}")
+
     # Determine exit code
     success_count = sum(1 for r in results if r.success)
     if success_count == 0:
@@ -577,6 +610,7 @@ async def run_async(args, logger: logging.Logger) -> int:
         return 0  # All success
 
 
+@_traced_stage("publish")
 def run(args, logger: logging.Logger) -> int:
     """Main entry point for publish command"""
     try:

@@ -290,8 +290,11 @@ class TestPipelineTemplateCommands:
         assert "verify" in cmds
         assert "--strict" in cmds["verify"]
         assert "${CONTRACT:-contract.fluid.yaml}" in cmds["verify"]
-        # Writes a JSON report — CI artifact uploads need a deterministic path.
-        assert "--report" in cmds["verify"]
+        # Writes a JSON report — CI artifact uploads need a deterministic
+        # path. ``fluid verify`` accepts ``--out`` (NOT ``--report`` —
+        # that's apply's flag); the prior assertion pinned a runtime bug.
+        assert "--out" in cmds["verify"]
+        assert "verify-report.json" in cmds["verify"]
 
     def test_publish_catalog_uses_target_flag(self):
         cmds = self._cmds()

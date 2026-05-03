@@ -37,6 +37,7 @@ from pathlib import Path
 
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.console import cprint
+from fluid_build.observability.tracing import traced_stage as _traced_stage
 
 COMMAND = "validate-artifacts"
 
@@ -130,6 +131,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(cmd=COMMAND, func=run)
 
 
+@_traced_stage("validate_artifacts")
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     from fluid_build.forge.core.artifact_validators import validate_artifacts
 

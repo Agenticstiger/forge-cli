@@ -841,6 +841,16 @@ def _serve_stdio(*, policy: McpPolicy, logger: logging.Logger) -> int:
         except json.JSONDecodeError:
             continue
         method = request.get("method")
+        # MCP notifications carry no ``id`` and expect NO response.
+        # Per spec, the most important is ``notifications/initialized``
+        # which the client sends after ``initialize``. Returning an
+        # error response here breaks well-behaved clients (Claude
+        # Desktop, Cursor, the @modelcontextprotocol SDK).
+        is_notification = "id" not in request
+        if is_notification:
+            # We don't yet act on any notifications, but accept and
+            # silently consume them so the protocol handshake completes.
+            continue
         response: Dict[str, Any] = {"jsonrpc": "2.0", "id": request.get("id")}
         try:
             if method == "initialize":
@@ -1310,7 +1320,7 @@ def _scope_from_args(arguments: Dict[str, Any]) -> Any:
 
     Accepts the JSON shape::
 
-        {"scope": {"database": "BIZ_LAB", "schema": "SEEDED", "tables": [...]}}
+        {"scope": {"database": "DEMO_DB", "schema": "SEEDED", "tables": [...]}}
 
     or a flat shape with the scope fields at the top level. Both
     are tolerated to keep the LLM-facing schema forgiving.
