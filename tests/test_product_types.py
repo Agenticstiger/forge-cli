@@ -332,12 +332,6 @@ def test_scaffold_files_dlt_path_emits_source_module():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="Requires fluid-schema-0.7.3.json bundled in fluid_build/schemas/. "
-    "That schema file lands in a follow-up PR (default-version flip) which also "
-    "updates the ~15 tests that pin v0.7.2 as latest_bundled_version. Re-enable "
-    "this test in that PR."
-)
 @pytest.mark.parametrize("product_type", ["SDP", "ADP", "CDP"])
 def test_shape_contract_passes_schema_validator(product_type):
     """Every shape_contract output MUST validate cleanly under the

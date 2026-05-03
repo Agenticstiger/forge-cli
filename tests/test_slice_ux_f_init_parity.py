@@ -118,13 +118,24 @@ class TestBlankModeParity:
 
     def test_contract_is_v072_shape(self, tmp_path: Path, monkeypatch):
         """Top-level domain / description / tags, metadata.layer=Bronze,
-        SQL build pattern=embedded-logic — the new scaffold shape."""
+        SQL build pattern=embedded-logic — the new scaffold shape.
+
+        ``fluidVersion`` tracks the latest bundled schema; older 0.7.x
+        floats remain accepted for templates that haven't been refreshed.
+        """
         monkeypatch.chdir(tmp_path)
         args = _build_args(name="test-blank", blank=True)
         blank_mode(args, logging.getLogger("test"))
 
+        from fluid_build.schema_manager import FluidSchemaManager
+
         doc = yaml.safe_load((tmp_path / "test-blank" / "contract.fluid.yaml").read_text())
-        assert doc["fluidVersion"] in {"0.7.2", 0.7}
+        assert doc["fluidVersion"] in {
+            FluidSchemaManager.latest_bundled_version(),
+            "0.7.2",
+            "0.7.1",
+            0.7,
+        }
         assert doc.get("domain") == "analytics"
         assert doc["metadata"]["layer"] == "Bronze"
         assert doc["metadata"]["owner"] == {"team": "data-team"}

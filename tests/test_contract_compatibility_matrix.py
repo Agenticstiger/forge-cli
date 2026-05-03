@@ -47,6 +47,7 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures" / "contracts" / "compatibility"
 MINIMAL_FIXTURES = [
     ("minimal_071.yaml", "0.7.1"),
     ("minimal_072.yaml", "0.7.2"),
+    ("minimal_073.yaml", "0.7.3"),
 ]
 
 LINEAGE_FIXTURES = [
