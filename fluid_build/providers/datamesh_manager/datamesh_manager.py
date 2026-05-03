@@ -668,10 +668,13 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         is_odps_spec as _is_odps_spec_impl,
         normalize_fluid_for_odps_standard as _normalize_fluid_for_odps_standard_impl,
     )
+
     _normalize_fluid_for_odps_standard = staticmethod(_normalize_fluid_for_odps_standard_impl)
     _is_odps_spec = staticmethod(_is_odps_spec_impl)
     _is_odps_payload = staticmethod(_is_odps_payload_impl)
-    _ensure_odps_output_port_display_names = staticmethod(_ensure_odps_output_port_display_names_impl)
+    _ensure_odps_output_port_display_names = staticmethod(
+        _ensure_odps_output_port_display_names_impl
+    )
 
     def _resolve_data_product_specification(
         self,
@@ -722,9 +725,14 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         ensure_odps_input_port_source_system_custom_property as _ensure_odps_input_port_source_system_custom_property_impl,
         remove_odps_product_consume_input_ports as _remove_odps_product_consume_input_ports_impl,
     )
-    _remove_odps_product_consume_input_ports = staticmethod(_remove_odps_product_consume_input_ports_impl)
+
+    _remove_odps_product_consume_input_ports = staticmethod(
+        _remove_odps_product_consume_input_ports_impl
+    )
     _ensure_odps_input_port_contract_ids = staticmethod(_ensure_odps_input_port_contract_ids_impl)
-    _ensure_odps_input_port_source_system_custom_property = staticmethod(_ensure_odps_input_port_source_system_custom_property_impl)
+    _ensure_odps_input_port_source_system_custom_property = staticmethod(
+        _ensure_odps_input_port_source_system_custom_property_impl
+    )
 
     # ---- port mapping -----------------------------------------------------
 
@@ -837,6 +845,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         _extract_provider as _extract_provider_impl,
         _resolve_location as _resolve_location_impl,
     )
+
     _build_server_object = staticmethod(_build_server_object_impl)
     _extract_provider = staticmethod(_extract_provider_impl)
     _resolve_location = staticmethod(_resolve_location_impl)
@@ -902,6 +911,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         _build_data_contract_odcs as _build_data_contract_odcs_impl,
         _odcs_logical_type as _odcs_logical_type_impl,
     )
+
     # Bind the impls as staticmethods so they don't get passed
     # ``self`` when called via ``self._build_data_contract_*_impl(...)``.
     _odcs_logical_type = staticmethod(_odcs_logical_type_impl)
@@ -931,7 +941,6 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             derive_team_id_fn=self._derive_team_id,
             extract_provider_fn=self._extract_provider,
         )
-
 
     @staticmethod
     def _build_team_payload(fluid: Mapping[str, Any], team_id: str) -> Dict[str, Any]:

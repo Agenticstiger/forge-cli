@@ -186,9 +186,7 @@ class TestSnowflakeProvisionDatasetActionIdResolution:
         provider._execute_database_action = MagicMock(
             return_value={"status": "ok", "changed": False}
         )
-        provider._execute_schema_action = MagicMock(
-            return_value={"status": "ok", "changed": False}
-        )
+        provider._execute_schema_action = MagicMock(return_value={"status": "ok", "changed": False})
 
         def _exec_table(sub):
             capture["columns"] = sub.get("columns")
@@ -197,9 +195,7 @@ class TestSnowflakeProvisionDatasetActionIdResolution:
 
         provider._execute_table_action = MagicMock(side_effect=_exec_table)
         provider._aggregate_sub_status = lambda subs: "ok"
-        provider._binding_location = (
-            lambda action: action["params"]["binding"]["location"]
-        )
+        provider._binding_location = lambda action: action["params"]["binding"]["location"]
         return provider
 
     @pytest.fixture
@@ -411,19 +407,21 @@ class TestVerifyStrictCriticalOnly:
 
         src = inspect.getsource(verify.run)
         assert "critical_mismatch_count" in src, (
-            "verify.run() must track critical_mismatch_count for "
-            "selective --strict failure."
+            "verify.run() must track critical_mismatch_count for " "selective --strict failure."
         )
         # The exit gate must consult critical_mismatch_count, not
         # mismatch_count.
         gate_lines = [
-            line.strip() for line in src.splitlines()
+            line.strip()
+            for line in src.splitlines()
             if "args.strict" in line and "return 1" in line
         ]
         # First check after our edit: gate references critical only.
-        assert any("critical_mismatch_count" in line for line in src.splitlines() if "args.strict" in line and "critical_mismatch_count" in line), (
-            "args.strict must check critical_mismatch_count specifically."
-        )
+        assert any(
+            "critical_mismatch_count" in line
+            for line in src.splitlines()
+            if "args.strict" in line and "critical_mismatch_count" in line
+        ), "args.strict must check critical_mismatch_count specifically."
 
 
 # ---------------------------------------------------------------------------
@@ -445,9 +443,7 @@ class TestDmmPublishDefaultsToOdps:
     def _make_provider(self):
         from fluid_build.providers.datamesh_manager import DataMeshManagerProvider
 
-        return DataMeshManagerProvider(
-            api_key="dummy", api_url="https://api.entropy-data.com"
-        )
+        return DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
     def _sample_contract(self) -> Dict[str, Any]:
         return {
@@ -507,9 +503,7 @@ class TestDmmPublishDefaultsToOdps:
         existing ``provider_hint='odps'`` form."""
         provider = self._make_provider()
 
-        result = provider.apply(
-            self._sample_contract(), dry_run=True, provider_hint="dps"
-        )
+        result = provider.apply(self._sample_contract(), dry_run=True, provider_hint="dps")
 
         assert result["payload"]["dataProductSpecification"] == "0.0.1"
 
