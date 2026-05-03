@@ -136,7 +136,12 @@ def _apply_object_store_secret(con: Any, ctx: RunContext) -> None:
                 continue
             con.execute(stmt)
         except Exception as exc:  # noqa: BLE001
-            LOG.warning("DuckDB CREATE SECRET (%s) failed: %s", scheme, exc)
+            # CodeQL py/clear-text-logging-sensitive-data: DuckDB error
+            # messages typically echo the failing statement, which would
+            # include the cleartext secret embedded in CREATE SECRET. Log
+            # only the scheme + exception class so operators can debug
+            # without the secret leaving the process.
+            LOG.warning("DuckDB CREATE SECRET (%s) failed: %s", scheme, type(exc).__name__)
 
 
 # ── Reader dispatch ──────────────────────────────────────────────────────
@@ -404,7 +409,9 @@ class DuckdbRunner:
                 con.execute(f"INSTALL {ext}")
                 con.execute(f"LOAD {ext}")
             except Exception as exc:  # noqa: BLE001
-                LOG.warning("DuckDB extension load failed (%s): %s", ext, exc)
+                # Don't include `exc` directly — DuckDB error messages can
+                # echo statement text containing DSN-embedded credentials.
+                LOG.warning("DuckDB extension load failed (%s): %s", ext, type(exc).__name__)
         _apply_object_store_secret(con, ctx)
         self._attach_external_databases(con, ctx)
 
@@ -557,7 +564,13 @@ def _run_post_land_hooks(
             try:
                 result = ctx.hook_chain.run(records, ctx={"classifications": {}})
             except Exception as exc:  # noqa: BLE001
-                LOG.debug("hook_chain_run_failed stream=%s err=%s", stream_name, exc)
+                # Don't pass `exc` directly — userland hook errors can wrap
+                # DuckDB exceptions whose messages may echo DSN-embedded creds.
+                LOG.debug(
+                    "hook_chain_run_failed stream=%s err=%s",
+                    stream_name,
+                    type(exc).__name__,
+                )
                 continue
             classifications = result.classifications if hasattr(result, "classifications") else {}
             pii_cols = sorted(col for col, tags in (classifications or {}).items() if tags)
@@ -981,7 +994,13 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                         bad_rows = con.execute(bad_sel).fetchall()
                         bad_cols = [d[0] for d in con.description]
                     except Exception as exc:  # noqa: BLE001
-                        LOG.warning("duckdb.dlq.fetch_failed stream=%s err=%s", stream, exc)
+                        # Avoid logging `exc` content — DuckDB error messages
+                        # can echo SQL containing DSN-embedded credentials.
+                        LOG.warning(
+                            "duckdb.dlq.fetch_failed stream=%s err=%s",
+                            stream,
+                            type(exc).__name__,
+                        )
                         bad_rows = []
                         bad_cols = []
                     if bad_rows:
@@ -1028,7 +1047,15 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                         on_error,
                     )
             except Exception as exc:  # noqa: BLE001
-                LOG.error("duckdb.run.failed stream=%s err=%s", stream, exc, exc_info=True)
+                # The COPY SQL embeds DSN strings (postgres_scan dsn=…),
+                # which DuckDB echoes in its error messages. Don't pass
+                # `exc` directly and don't dump the full traceback via
+                # exc_info — both can carry password/key data.
+                LOG.error(
+                    "duckdb.run.failed stream=%s err=%s",
+                    stream,
+                    type(exc).__name__,
+                )
                 failures += 1
                 stream_results.append(
                     StreamResult(
@@ -1060,7 +1087,9 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
         try:
             pii_findings = _run_post_land_hooks(ctx, stream_results, sink_format)
         except Exception as exc:  # noqa: BLE001
-            LOG.warning("post_land_hook_failed: %s", exc, exc_info=True)
+            # Hook errors may wrap DuckDB exceptions whose messages can
+            # echo DSN/secret content. Defensive: log only the class.
+            LOG.warning("post_land_hook_failed: %s", type(exc).__name__)
 
     # Post-land late-arrival enforcement — when the contract declares
     # ``WatermarkSpec.allowed_lateness``, split rows older than
@@ -1075,7 +1104,9 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 ctx, stream_results, sink_format
             )
         except Exception as exc:  # noqa: BLE001
-            LOG.warning("late_arrival_split_failed: %s", exc, exc_info=True)
+            # Defensive: late-arrival split runs DuckDB SQL which may carry
+            # DSN content; don't include exc body or full traceback.
+            LOG.warning("late_arrival_split_failed: %s", type(exc).__name__)
 
     # ``onError: fail`` mode — when ANY bad rows landed in the DLQ,
     # promote the run to FAILED so the run record reflects the issue.
@@ -1224,7 +1255,10 @@ def execute_duckdb_build(
 
                 hooks.append(DlpScanHook())
             except Exception as exc:  # noqa: BLE001
-                LOG.debug("dlp_scan_hook_init_failed: %s", exc)
+                # Defensive: never log raw exception text from runner code
+                # paths that could be entered with DSN/secret carriers in
+                # scope. Class name is enough for debug-level diagnostics.
+                LOG.debug("dlp_scan_hook_init_failed: %s", type(exc).__name__)
         elif hook_id in ("tokenize_pii", "tokenize"):
             try:
                 from fluid_build.build_runners.hooks.tokenize_pii import (
@@ -1233,7 +1267,7 @@ def execute_duckdb_build(
 
                 hooks.append(TokenizePiiHook())
             except Exception as exc:  # noqa: BLE001
-                LOG.debug("tokenize_pii_hook_init_failed: %s", exc)
+                LOG.debug("tokenize_pii_hook_init_failed: %s", type(exc).__name__)
         elif hook_id == "quality_gate":
             # quality_gate is handled via the per-row gate evaluation
             # inside ``_execute`` (see ``_build_quality_predicates``);
