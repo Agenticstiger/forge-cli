@@ -12,26 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""AWS provider package — comprehensive AWS data-platform support.
+
+Surfaces:
+* :class:`AwsProvider` — plan / apply / restore_ddl / cleanup_backups
+  for S3 / Glue / Athena / Lambda / EventBridge / Redshift.
+* :class:`RedshiftProvider` — owns Redshift's rollback DDL (DROP +
+  CTAS) which is incompatible with the rest of AWS's S3 prefix-copy
+  semantics; registered under the ``"redshift"`` provider name.
+
+The legacy ``aws.py::AWSProvider`` (1601 LOC, registered as
+``LegacyAWSProvider``) was deleted — its rollback methods migrated
+into :class:`AwsProvider` and its ``plan`` method was redundant with
+the planner module's 6-phase scaffold.
 """
-AWS Provider for FLUID Build - Enterprise Cloud Data Platform Integration.
 
-Now includes comprehensive implementation with:
-- S3, Glue, Athena, Redshift support
-- Event-driven orchestration (EventBridge, Lambda, Step Functions)
-- IAM integration and security
-- Complete planning and execution engine
-"""
-
-# Import old provider for backward compatibility
-try:
-    from .aws import AWSProvider as LegacyAWSProvider
-except ImportError:
-    LegacyAWSProvider = None
-
-# Import new comprehensive provider
 from .provider import AwsProvider
+from .redshift_provider import RedshiftProvider
 
-# Import types if available
 try:
     from .types import (
         AWSProviderOptions,
@@ -45,16 +43,17 @@ try:
 except ImportError:
     _types_available = False
 
-# Register the new provider
 from fluid_build.providers import register_provider
 
 register_provider("aws", AwsProvider)
+# Redshift dispatches by its own name so the rollback writer can route
+# DROP+CTAS DDL emission to a class with the right semantics.
+register_provider("redshift", RedshiftProvider)
 
-# Export
 if _types_available:
     __all__ = [
         "AwsProvider",
-        "LegacyAWSProvider",
+        "RedshiftProvider",
         "AWSProviderOptions",
         "ServiceConfig",
         "SecurityConfig",
@@ -62,4 +61,4 @@ if _types_available:
         "CostOptimizationConfig",
     ]
 else:
-    __all__ = ["AwsProvider", "LegacyAWSProvider"]
+    __all__ = ["AwsProvider", "RedshiftProvider"]

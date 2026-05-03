@@ -143,6 +143,80 @@ def ensure_schedule(action: Dict[str, Any]) -> Dict[str, Any]:
     return ensure_rule(action)
 
 
+def put_events(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Send a single event onto the EventBridge bus.
+
+    Action keys:
+        source (str): Event source label (e.g. ``"fluid"``).
+        detail_type (str): Event type label (e.g. ``"FluidEvent"``).
+        detail (dict | str): Event payload — JSON-serialisable dict or
+            already-serialised string.
+        event_bus (str): Target bus name (default ``"default"``).
+        region (str): AWS region (default ``"us-east-1"``).
+
+    Returns:
+        Standard FLUID action result dict. ``failed_entry_count`` from
+        EventBridge surfaces in ``meta`` so callers can detect partial
+        send failures even when the API call returned 200.
+    """
+    start_time = time.time()
+    try:
+        import boto3
+    except ImportError:
+        return {
+            "status": "error",
+            "error": "boto3 library not available. Install with: pip install boto3",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    source = action.get("source") or "fluid"
+    detail_type = action.get("detail_type") or "FluidEvent"
+    detail = action.get("detail") or action.get("data") or {}
+    event_bus = action.get("event_bus") or "default"
+    region = action.get("region") or "us-east-1"
+
+    if isinstance(detail, dict):
+        import json as _json
+
+        detail_str = _json.dumps(detail)
+    else:
+        detail_str = str(detail)
+
+    try:
+        events = boto3.client("events", region_name=region)
+        resp = events.put_events(
+            Entries=[
+                {
+                    "Source": source,
+                    "DetailType": detail_type,
+                    "Detail": detail_str,
+                    "EventBusName": event_bus,
+                }
+            ]
+        )
+        failed = resp.get("FailedEntryCount", 0)
+        return {
+            "status": "changed" if failed == 0 else "partial",
+            "event_bus": event_bus,
+            "source": source,
+            "detail_type": detail_type,
+            "duration_ms": duration_ms(start_time),
+            "changed": failed == 0,
+            "meta": {
+                "failed_entry_count": failed,
+                "entries": resp.get("Entries", []),
+            },
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+
 def put_target(action: Dict[str, Any]) -> Dict[str, Any]:
     """Add target to EventBridge rule."""
     start_time = time.time()

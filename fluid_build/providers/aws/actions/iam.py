@@ -411,6 +411,104 @@ def bind_glue_database(action: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def detach_policy(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Detach a managed policy from an IAM role.
+
+    Action keys:
+        role_name (str): Target IAM role.
+        policy_arn (str): ARN of the managed policy to detach.
+
+    Idempotent: returns ``status="ok", changed=False`` if the policy is
+    already detached (NoSuchEntity from AWS).
+    """
+    start_time = time.time()
+
+    try:
+        import boto3
+        from botocore.exceptions import ClientError
+    except ImportError:
+        return _boto_missing(start_time)
+
+    role_name = action.get("role_name")
+    policy_arn = action.get("policy_arn")
+    if not role_name or not policy_arn:
+        return _error("'role_name' and 'policy_arn' are required", start_time)
+
+    iam = boto3.client("iam")
+
+    try:
+        iam.detach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
+        return {
+            "status": "changed",
+            "role_name": role_name,
+            "policy_arn": policy_arn,
+            "message": "Policy detached",
+            "duration_ms": duration_ms(start_time),
+            "changed": True,
+        }
+    except ClientError as e:
+        # ``NoSuchEntity`` = already detached → idempotent success.
+        if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+            return {
+                "status": "ok",
+                "role_name": role_name,
+                "policy_arn": policy_arn,
+                "message": "Policy already detached",
+                "duration_ms": duration_ms(start_time),
+                "changed": False,
+            }
+        return _error(str(e), start_time)
+    except Exception as e:
+        return _error(str(e), start_time)
+
+
+def put_role_policy(action: Dict[str, Any]) -> Dict[str, Any]:
+    """Put an inline policy on an IAM role.
+
+    Action keys:
+        role_name (str): Target IAM role.
+        policy_name (str): Name of the inline policy.
+        policy_document (dict): IAM policy JSON document.
+
+    Inline policies live attached to the role; ``put_role_policy``
+    creates or replaces the named policy on each call.
+    """
+    start_time = time.time()
+
+    try:
+        import boto3
+    except ImportError:
+        return _boto_missing(start_time)
+
+    role_name = action.get("role_name")
+    policy_name = action.get("policy_name")
+    policy_doc = action.get("policy_document")
+    if not role_name or not policy_name or not policy_doc:
+        return _error(
+            "'role_name', 'policy_name', and 'policy_document' are required",
+            start_time,
+        )
+
+    iam = boto3.client("iam")
+
+    try:
+        iam.put_role_policy(
+            RoleName=role_name,
+            PolicyName=policy_name,
+            PolicyDocument=json.dumps(policy_doc),
+        )
+        return {
+            "status": "changed",
+            "role_name": role_name,
+            "policy_name": policy_name,
+            "message": "Inline policy updated",
+            "duration_ms": duration_ms(start_time),
+            "changed": True,
+        }
+    except Exception as e:
+        return _error(str(e), start_time)
+
+
 # ── helpers ──────────────────────────────────────────────────────────────
 
 

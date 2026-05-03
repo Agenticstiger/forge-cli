@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import json
 import logging
-import warnings
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Type
@@ -211,11 +210,60 @@ except ImportError:
             return ProviderMetadata(name=cls.name)
 
         @abstractmethod
-        def plan(self, contract: Mapping[str, Any]) -> List[Dict[str, Any]]: ...
+        def plan(
+            self,
+            contract: Mapping[str, Any],
+            *,
+            mode: Optional[str] = None,
+        ) -> List[Dict[str, Any]]:
+            """Generate ordered actions from a contract.
+
+            ``mode`` is the apply-time mode (``amend`` / ``amend-and-build`` /
+            ``replace`` / ``replace-and-build`` / ``dry-run`` / ``create-only``).
+            Destructive modes typically emit pre-flight backup snapshots
+            and CREATE OR REPLACE-shaped writes; additive modes emit
+            INSERT INTO. Providers that don't differentiate may ignore
+            ``mode``.
+            """
+            ...
+
         @abstractmethod
         def apply(self, actions: Iterable[Mapping[str, Any]]) -> ApplyResult: ...
+
         def render(self, src, *, out=None, fmt=None) -> Dict[str, Any]:
             raise ProviderError(f"{self.name}: render() not supported")
+
+        # ── Rollback surface (provider-level, not engine-level) ──────
+        # Each provider owns its restore semantics. Callers (the
+        # rollback writer + the rollback CLI) ask the provider for the
+        # DDL list and the cleanup recipe; they don't switch on
+        # provider names.
+
+        def restore_ddl(self, snapshot: Mapping[str, Any]) -> List[str]:
+            """Return the DDL to restore ``snapshot``'s data into the
+            original target.
+
+            ``snapshot`` carries ``backup_name``, ``location.{database,
+            schema, table, backup_table}``. Returns a list of SQL
+            statements the rollback executor will run in order.
+            Returns an empty list when the provider doesn't support
+            rollback — the rollback CLI surfaces that as a typed
+            ``rollback_provider_unsupported`` error.
+
+            Default implementation: empty list. Each provider that
+            participates in destructive rollback overrides.
+            """
+            return []
+
+        def cleanup_backups(self, snapshots: List[Mapping[str, Any]]) -> None:
+            """Delete the backup tables / files referenced by
+            ``snapshots`` (called when those snapshots have aged out
+            of ``.fluid/rollback-state.json``).
+
+            Default implementation: no-op. Providers that emit
+            rollback snapshots override to release storage.
+            """
+            return None
 
         def require(self, cond, msg):
             if not cond:
@@ -320,128 +368,12 @@ def _utc_now_iso() -> str:
 
 
 # -----------------------------------------------------------------------------
-# Backward-compatible re-exports from the canonical registry
+# Public surface — types only. The provider registry
+# (``register_provider`` / ``list_providers`` / ``get_provider`` /
+# ``PROVIDERS`` / ``DISCOVERY_ERRORS``) lives in
+# ``fluid_build.providers.__init__``; the deprecated re-exports that
+# used to live here have been deleted.
 # -----------------------------------------------------------------------------
-# The canonical registry lives in fluid_build.providers.__init__.
-# These thin wrappers preserve import paths that existing code may rely on,
-# but all state is delegated to __init__.py.
-
-
-def _canonical_registry():
-    """Lazy import to avoid circular deps."""
-    import fluid_build.providers as _reg
-
-    return _reg
-
-
-def register_provider(
-    name: str, cls: Type[BaseProvider], logger: Optional[logging.Logger] = None
-) -> None:
-    """**Deprecated** — use ``from fluid_build.providers import register_provider`` instead.
-
-    Thin wrapper that delegates to the canonical registry in
-    ``fluid_build.providers.__init__``.
-    """
-    warnings.warn(
-        "Importing register_provider from fluid_build.providers.base is deprecated. "
-        "Use: from fluid_build.providers import register_provider",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    _canonical_registry().register_provider(name, cls, logger=logger, source="base_compat")
-
-
-def list_providers(
-    logger: Optional[logging.Logger] = None, *, lazy_discover: bool = True
-) -> List[str]:
-    """**Deprecated** — use ``from fluid_build.providers import list_providers`` instead."""
-    warnings.warn(
-        "Importing list_providers from fluid_build.providers.base is deprecated. "
-        "Use: from fluid_build.providers import list_providers",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    reg = _canonical_registry()
-    if lazy_discover:
-        reg.discover_providers(logger)
-    return reg.list_providers()
-
-
-def get_provider(
-    name: str, logger: Optional[logging.Logger] = None, *, lazy_discover: bool = True
-) -> Type[BaseProvider]:
-    """**Deprecated** — use ``from fluid_build.providers import get_provider`` instead."""
-    warnings.warn(
-        "Importing get_provider from fluid_build.providers.base is deprecated. "
-        "Use: from fluid_build.providers import get_provider",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    reg = _canonical_registry()
-    if lazy_discover:
-        reg.discover_providers(logger)
-    return reg.get_provider(name)
-
-
-# Proxy objects that delegate to the canonical registry so legacy imports
-# (``from fluid_build.providers.base import PROVIDERS``) still work.
-
-
-class _RegistryProxy(dict):
-    """Dict proxy that reads from the canonical registry on every access."""
-
-    def _reg(self):
-        return _canonical_registry().PROVIDERS
-
-    def __getitem__(self, key):
-        return self._reg()[key]
-
-    def __contains__(self, key):
-        return key in self._reg()
-
-    def __iter__(self):
-        return iter(self._reg())
-
-    def __len__(self):
-        return len(self._reg())
-
-    def get(self, key, default=None):
-        return self._reg().get(key, default)
-
-    def keys(self):
-        return self._reg().keys()
-
-    def values(self):
-        return self._reg().values()
-
-    def items(self):
-        return self._reg().items()
-
-    def __repr__(self):
-        return repr(self._reg())
-
-
-class _ErrorsProxy(list):
-    """List proxy that reads from the canonical registry on every access."""
-
-    def _errs(self):
-        return _canonical_registry().DISCOVERY_ERRORS
-
-    def __getitem__(self, idx):
-        return self._errs()[idx]
-
-    def __iter__(self):
-        return iter(self._errs())
-
-    def __len__(self):
-        return len(self._errs())
-
-    def __repr__(self):
-        return repr(self._errs())
-
-
-PROVIDERS: Dict[str, Type[BaseProvider]] = _RegistryProxy()  # type: ignore[assignment]
-DISCOVERY_ERRORS: List[Dict[str, str]] = _ErrorsProxy()  # type: ignore[assignment]
 
 
 __all__ = [
@@ -455,10 +387,4 @@ __all__ = [
     "SDK_VERSION",
     "_HAS_SDK",
     "_utc_now_iso",
-    # Deprecated re-exports (will be removed in a future release)
-    "register_provider",
-    "list_providers",
-    "get_provider",
-    "PROVIDERS",
-    "DISCOVERY_ERRORS",
 ]

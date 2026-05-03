@@ -150,7 +150,112 @@ class SnowflakeProviderEnhanced(BaseProvider):
             "auth": True,
         }
 
-    def plan(self, contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    def restore_ddl(self, snapshot: Mapping[str, Any]) -> List[str]:
+        """Snowflake restore via zero-copy CLONE.
+
+        ``CREATE OR REPLACE TABLE <orig> CLONE <backup>`` is atomic
+        and metadata-only — no storage cost beyond the CLONE pointer.
+
+        Security: identifiers come from ``.fluid/rollback-state.json``
+        which is documented as PR-reviewable / attacker-authorable —
+        every component is routed through ``validate_ident`` before
+        being interpolated into the DDL string. The pattern mirrors
+        ``cli/rollback.py::_restore_snowflake``. A single tampered
+        record yields ``[]`` rather than poisoning the caller; this
+        keeps legitimate snapshots restorable when one stale entry is
+        malformed.
+        """
+        from fluid_build.providers._sql_safety import validate_ident
+
+        location = snapshot.get("location") or {}
+        db = location.get("database")
+        sch = location.get("schema")
+        tbl = location.get("table")
+        backup = location.get("backup_table") or snapshot.get("backup_name")
+        if not (db and sch and tbl and backup):
+            return []
+        try:
+            db_v = validate_ident(str(db))
+            sch_v = validate_ident(str(sch))
+            tbl_v = validate_ident(str(tbl))
+            backup_v = validate_ident(str(backup))
+        except ValueError as exc:
+            self.warn_kv(
+                event="backup_restore_invalid_identifier",
+                error=str(exc),
+                database=db,
+                schema=sch,
+                table=tbl,
+                backup=backup,
+            )
+            return []
+        return [
+            f"CREATE OR REPLACE TABLE {db_v}.{sch_v}.{tbl_v} " f"CLONE {db_v}.{sch_v}.{backup_v}"
+        ]
+
+    def cleanup_backups(self, snapshots: List[Mapping[str, Any]]) -> None:
+        """Drop Snowflake backup tables for snapshots aged out of state.
+
+        Best-effort: per-table failures log a warning and continue.
+        ``DROP TABLE IF EXISTS`` is idempotent so repeat runs are safe.
+
+        Security: identifiers come from ``.fluid/rollback-state.json``
+        which is documented as PR-reviewable / attacker-authorable —
+        every component is routed through ``validate_ident`` before
+        being interpolated into the DDL string (mirrors the same
+        defence applied at ``cli/rollback.py::_restore_snowflake``).
+        Records with invalid identifiers are skipped + logged so a
+        single tampered entry doesn't poison the whole cleanup pass.
+        """
+        from fluid_build.providers._sql_safety import validate_ident
+
+        if not snapshots:
+            return
+        for snap in snapshots:
+            loc = snap.get("location") or {}
+            db = loc.get("database")
+            sch = loc.get("schema")
+            backup = loc.get("backup_table") or snap.get("backup_name")
+            if not (db and sch and backup):
+                continue
+            try:
+                db_v = validate_ident(str(db))
+                sch_v = validate_ident(str(sch))
+                backup_v = validate_ident(str(backup))
+            except ValueError as exc:
+                self.warn_kv(
+                    event="backup_cleanup_invalid_identifier",
+                    error=str(exc),
+                    database=db,
+                    schema=sch,
+                    backup=backup,
+                )
+                continue
+            stmt = f"DROP TABLE IF EXISTS {db_v}.{sch_v}.{backup_v}"
+            try:
+                self._execute_sql_action(
+                    {
+                        "op": "sf.sql.execute",
+                        "id": f"cleanup_{backup_v}",
+                        "sql": stmt,
+                        "account": self.account,
+                        "database": db_v,
+                        "schema": sch_v,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.warn_kv(
+                    event="backup_cleanup_drop_failed",
+                    table=f"{db_v}.{sch_v}.{backup_v}",
+                    error=str(exc),
+                )
+
+    def plan(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        mode: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Generate Snowflake actions from FLUID contract.
 
@@ -160,18 +265,35 @@ class SnowflakeProviderEnhanced(BaseProvider):
         - Streams and tasks
         - Stored procedures and UDFs
         - RBAC grants
+
+        The optional ``mode`` carries the apply-time mode and triggers
+        destructive semantics (``CREATE OR REPLACE TABLE AS SELECT``
+        for SQL builds, plus a pre-flight CLONE snapshot for rollback)
+        when set to ``replace`` / ``replace-and-build``.
         """
         self.debug_kv(
-            event="plan_started", contract_id=contract.get("id"), contract_name=contract.get("name")
+            event="plan_started",
+            contract_id=contract.get("id"),
+            contract_name=contract.get("name"),
+            mode=mode,
         )
 
         try:
             actions = plan_actions(
-                contract, self.account, self.warehouse, self.database, self.schema, self.logger
+                contract,
+                self.account,
+                self.warehouse,
+                self.database,
+                self.schema,
+                self.logger,
+                mode=mode,
             )
 
             self.info_kv(
-                event="plan_completed", contract_id=contract.get("id"), actions_count=len(actions)
+                event="plan_completed",
+                contract_id=contract.get("id"),
+                actions_count=len(actions),
+                mode=mode,
             )
 
             return actions
@@ -205,7 +327,7 @@ class SnowflakeProviderEnhanced(BaseProvider):
                 # Redact action before logging (removes 'op' from spread to avoid duplicate)
                 redacted_action = redact_dict(action)
                 redacted_action.pop("op", None)  # Remove op to avoid duplicate with explicit op=op
-                redacted_action.pop("id", None)  # Remove id to avoid duplicate (0.5.7)
+                redacted_action.pop("id", None)  # Remove id to avoid duplicate (v0.7.x)
                 redacted_action.pop(
                     "action_id", None
                 )  # Remove action_id to avoid duplicate (0.7.1)
@@ -232,6 +354,27 @@ class SnowflakeProviderEnhanced(BaseProvider):
                 )
 
             except Exception as e:
+                # ``allow_failure`` actions (pre-flight CLONE snapshots
+                # for replace mode) record a warning + continue. Any
+                # other exception aborts the plan as a hard failure.
+                if action.get("allow_failure"):
+                    soft_result = {
+                        "action_id": action_id,
+                        "index": i,
+                        "status": "skipped",
+                        "op": op,
+                        "reason": str(e),
+                        "changed": False,
+                        "soft_failure": True,
+                    }
+                    results.append(soft_result)
+                    self.warn_kv(
+                        event="action_soft_failed",
+                        action_id=action_id,
+                        op=op,
+                        reason=str(e),
+                    )
+                    continue
                 failed += 1
                 error_result = {
                     "action_id": action_id,
@@ -297,21 +440,16 @@ class SnowflakeProviderEnhanced(BaseProvider):
         1. **0.7.1 abstract ops** (``provisionDataset``, ``grantAccess``,
            ``revokeAccess``, ``scheduleTask``, ``registerSchema``,
            ``createView``, ``updatePolicy``, ``publishEvent``,
-           ``custom``). These are the provider-agnostic op names that
-           ``fluid plan`` emits into ``plan.json`` when the contract is
-           fluidVersion >= 0.7.1. Each is translated into one or more
-           synthetic sub-actions with ``sf.*`` ops and re-dispatched.
-           Status is aggregated via :meth:`_aggregate_sub_status`.
+           ``custom``). The provider-agnostic op names ``fluid plan``
+           emits when the contract is fluidVersion >= 0.7.1. Each is
+           translated into one or more synthetic sub-actions with
+           ``sf.*`` ops and re-dispatched. Status is aggregated via
+           :meth:`_aggregate_sub_status`.
 
         2. **Native ``sf.*`` ops** (``sf.database.ensure``,
-           ``sf.schema.ensure``, etc.). These are the low-level routes
-           used by the native planner directly, and as the target of
+           ``sf.schema.ensure``, etc.). The low-level routes used by
+           the native planner directly, and as the target of
            abstract-op translation above.
-
-        Phase 6F: previously only mode 2 was implemented; abstract ops
-        fell through to the ``unknown_action_op`` branch and returned
-        silent no-ops while apply reported SUCCESS. This dispatcher now
-        handles both.
         """
         op = action.get("op")
 
@@ -334,36 +472,42 @@ class SnowflakeProviderEnhanced(BaseProvider):
             return abstract_handlers[op](action)
 
         # ── 2. Native sf.* prefix dispatch ───────────────────────────
-        if op.startswith("sf.database."):
-            return self._execute_database_action(action)
-        elif op.startswith("sf.schema."):
-            return self._execute_schema_action(action)
-        elif op.startswith("sf.table."):
-            return self._execute_table_action(action)
-        elif op.startswith("sf.view."):
-            return self._execute_view_action(action)
-        elif op.startswith("sf.stream."):
-            return self._execute_stream_action(action)
-        elif op.startswith("sf.task."):
-            return self._execute_task_action(action)
-        elif op.startswith("sf.procedure."):
-            return self._execute_procedure_action(action)
-        elif op.startswith("sf.udf."):
-            return self._execute_udf_action(action)
-        elif op.startswith("sf.grant."):
-            return self._execute_grant_action(action)
-        elif op.startswith("sf.share."):
-            return self._execute_share_action(action)
-        elif op.startswith("sf.sql."):
-            return self._execute_sql_action(action)
-        else:
-            self.warn_kv(event="unknown_action_op", op=op, action_id=action.get("id"))
-            return {
-                "status": "skipped",
-                "op": op,
-                "reason": f"Unknown operation: {op}",
-                "changed": False,
-            }
+        # Lookup table replaces the 12-way ``elif op.startswith(...)``
+        # chain. Adding a new sf.<service>. prefix is one entry here +
+        # the handler implementation. ``next(...)`` picks the longest
+        # matching prefix so ``sf.database.ensure`` doesn't accidentally
+        # route through a generic ``sf.`` fallback if one were added.
+        prefix_handlers = {
+            "sf.database.": self._execute_database_action,
+            "sf.schema.": self._execute_schema_action,
+            "sf.table.": self._execute_table_action,
+            "sf.view.": self._execute_view_action,
+            "sf.stream.": self._execute_stream_action,
+            "sf.task.": self._execute_task_action,
+            "sf.procedure.": self._execute_procedure_action,
+            "sf.udf.": self._execute_udf_action,
+            "sf.grant.": self._execute_grant_action,
+            "sf.share.": self._execute_share_action,
+            "sf.sql.": self._execute_sql_action,
+        }
+        handler = next(
+            (
+                h
+                for prefix, h in sorted(prefix_handlers.items(), key=lambda x: -len(x[0]))
+                if op.startswith(prefix)
+            ),
+            None,
+        )
+        if handler is not None:
+            return handler(action)
+
+        self.warn_kv(event="unknown_action_op", op=op, action_id=action.get("id"))
+        return {
+            "status": "skipped",
+            "op": op,
+            "reason": f"Unknown operation: {op}",
+            "changed": False,
+        }
 
     # -------------------------------------------------------------------------
     # 0.7.1 abstract-op handlers (Phase 6F)
@@ -428,10 +572,44 @@ class SnowflakeProviderEnhanced(BaseProvider):
         the table step is skipped and only the db + schema are ensured.
         The dbt runner then creates the table during stage-7's
         ``amend-and-build`` mode.
+
+        Side effect: registers the binding in
+        ``self._provisioned_bindings`` keyed by exposeId so a downstream
+        ``scheduleTask`` action with ``params.outputs == [exposeId]``
+        can look up the target ``database/schema/table`` for INSERT
+        wrapping.
         """
         loc = self._binding_location(action)
-        action_id = action.get("id")
+        # The plan stage emits actions with an ``action_id`` key (see
+        # ``cli/plan.py::_plan_with_provider_actions`` — uses
+        # ``"action_id": action.action_id``). Older code paths set
+        # ``id`` instead, so check both. **Critical**: when this falls
+        # back to None, the per-expose column-resolution fallback
+        # below silently grabs the FIRST expose's schema — which leaks
+        # cross-expose columns onto sibling tables (e.g. adds 7 cols
+        # from ``subscriber360_core`` onto the
+        # ``subscriber_health_scorecard`` table on every apply, even
+        # though apply reports ``applied: 0``).
+        action_id = action.get("action_id") or action.get("id")
         sub_results: List[Dict[str, Any]] = []
+        # Stash the binding so a follow-on scheduleTask can resolve
+        # the target without re-reading the contract.
+        params = action.get("params") or {}
+        binding = params.get("binding") if isinstance(params, dict) else None
+        if isinstance(binding, dict):
+            cache = getattr(self, "_provisioned_bindings", None)
+            if cache is None:
+                cache = {}
+                self._provisioned_bindings = cache
+            # Heuristic key: the action_id is shaped like
+            # ``provision_<exposeId>`` — strip the prefix to recover
+            # the expose name. Falls back to the action_id itself.
+            expose_id = (
+                action_id[len("provision_") :]
+                if action_id and action_id.startswith("provision_")
+                else action_id or ""
+            )
+            cache[expose_id] = binding
 
         account = loc.get("account")
         database = loc.get("database")
@@ -494,6 +672,41 @@ class SnowflakeProviderEnhanced(BaseProvider):
             params = action.get("params") or {}
             table_spec = params.get("table") or params.get("tableSpec") or {}
             columns = table_spec.get("columns") or params.get("columns")
+            # Also accept columns nested under
+            # ``params.contract.exposes[].contract.schema`` — the shape
+            # the high-level planner emits when the contract author
+            # declared the schema on the expose. SQL builds that don't
+            # use dbt rely on this path so the table is materialised
+            # before the INSERT INTO runs.
+            if not columns and isinstance(params.get("contract"), dict):
+                # Recover the expose id we're provisioning by stripping
+                # the ``provision_`` prefix from the action id, OR by
+                # reading the explicit ``params.exposeId`` the legacy
+                # planner emits at ``forge/core/provider_actions.py``
+                # line 144. Without one of these we **refuse** to
+                # guess — silently picking the first expose's schema
+                # was the regression that leaked columns from
+                # subscriber360_core onto subscriber_health_scorecard
+                # in the biz-lab A1 demo.
+                target_id = None
+                if action_id and action_id.startswith("provision_"):
+                    target_id = action_id[len("provision_") :]
+                if not target_id:
+                    target_id = params.get("exposeId")
+                if target_id:
+                    for ex in params["contract"].get("exposes") or []:
+                        if not isinstance(ex, dict):
+                            continue
+                        if ex.get("exposeId") == target_id or ex.get("id") == target_id:
+                            contract_block = ex.get("contract") or {}
+                            cols = contract_block.get("schema") or []
+                            if cols:
+                                columns = cols
+                                break
+                # When target_id can't be recovered, ``columns`` stays
+                # empty and the table-create branch below records a
+                # ``status: skipped`` sub-result with reason. That is
+                # the safe failure mode — no cross-expose column leak.
             if columns:
                 sub_tb = {
                     "op": "sf.table.ensure",
@@ -686,15 +899,73 @@ class SnowflakeProviderEnhanced(BaseProvider):
         }
 
     def _handle_abstract_schedule_task(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """scheduleTask → Path-B handled by SchedulePlanner; Path-A uses
-        stage-11 fluid schedule-sync. Return skipped-with-reason so apply
-        reports an explicit no-op rather than silently succeed."""
+        """scheduleTask handler.
+
+        Two execution paths:
+
+        * **Inline SQL execution** — when the build's
+          ``engine == "sql"`` AND ``params.sql`` is present, the
+          handler runs the SQL synchronously as part of apply. When
+          ``params.outputs`` references a snowflake_table expose,
+          the SQL is wrapped with ``INSERT INTO <db>.<schema>.<table>``
+          so the rows land in the target.
+        * **Deferred orchestration** — Path-A engines (airflow / prefect /
+          dagster) are pushed by stage-11 ``fluid schedule-sync``;
+          Path-B engines (snowflake_tasks / eventbridge) emit native
+          schedule DDL via SchedulePlanner. Returns
+          ``skipped-with-reason`` so apply doesn't silently no-op.
+        """
         params = action.get("params") or {}
         engine = params.get("engine") or params.get("orchestration", {}).get("engine") or "unknown"
+        action_id = action.get("id")
+
+        sql_text = params.get("sql")
+        # Inline-execute path: ``engine: sql`` builds with a SQL string.
+        if engine == "sql" and sql_text:
+            wrapped = self._wrap_inline_sql_for_outputs(
+                sql_text=sql_text,
+                outputs=params.get("outputs") or [],
+                action=action,
+            )
+            # Resolve the target db/schema for this sub-action — required
+            # by ``sf.sql.execute`` (the action handler reads
+            # ``action["account"]`` and KeyErrors with ``'account'`` if
+            # absent). Pull from the cached binding registered by
+            # ``_handle_abstract_provision_dataset`` first, fall back
+            # to the provider's session defaults.
+            target_binding = (
+                self._find_target_binding_for_outputs(
+                    outputs=params.get("outputs") or [], action=action
+                )
+                or {}
+            )
+            location = target_binding.get("location") or {}
+            from .util.config import resolve_env_templates as _resolve
+
+            sub_db = _resolve(location.get("database")) or self.database
+            sub_sch = _resolve(location.get("schema")) or self.schema
+            sub = {
+                "op": "sf.sql.execute",
+                "id": f"{action_id}.run" if action_id else None,
+                "sql": wrapped,
+                "account": self.account,
+                "database": sub_db,
+                "schema": sub_sch,
+                "comment": f"inline schedule_task build {params.get('buildId') or ''}",
+            }
+            sub_result = self._execute_sql_action(sub)
+            return {
+                "status": sub_result.get("status", "success"),
+                "op": "scheduleTask",
+                "action_id": action_id,
+                "sub_results": [sub_result],
+                "changed": sub_result.get("changed", False),
+            }
+
         return {
             "status": "skipped",
             "op": "scheduleTask",
-            "action_id": action.get("id"),
+            "action_id": action_id,
             "reason": (
                 f"schedule task deferred (engine={engine}). Path-B engines "
                 "(snowflake_tasks, eventbridge) land schedule actions in "
@@ -704,6 +975,93 @@ class SnowflakeProviderEnhanced(BaseProvider):
             ),
             "changed": False,
         }
+
+    def _wrap_inline_sql_for_outputs(
+        self,
+        *,
+        sql_text: str,
+        outputs: List[str],
+        action: Dict[str, Any],
+    ) -> str:
+        """Wrap a build's SQL with ``INSERT INTO <target>`` when its
+        ``outputs[]`` references a snowflake_table expose.
+
+        Mirrors the wrap logic in ``planner._wrap_sql_for_target`` but
+        runs against the live action so the abstract-op dispatcher can
+        compose the right SQL even when the planner emitted a bare
+        ``scheduleTask`` action.
+
+        No-op (returns SQL unchanged) when:
+
+        * No ``outputs`` declared.
+        * The expose isn't snowflake_table.
+        * The SQL already starts with INSERT/CREATE/MERGE/UPDATE/etc.
+          — author declared their own sink.
+        """
+        from fluid_build.providers._sql_safety import validate_ident
+
+        if not outputs:
+            return sql_text
+        # Find the matching expose in the action's contract context.
+        # The high-level planner stamps ``params.binding`` on the
+        # paired ``provisionDataset`` action with the same ``buildId``;
+        # we look there for the target binding when available, else
+        # fall back to the contract's exposes[] by ``exposeId``.
+        params = action.get("params") or {}
+        target_binding = self._find_target_binding_for_outputs(outputs=outputs, action=action)
+        if not target_binding:
+            return sql_text
+        if (target_binding.get("format") or "").lower() not in (
+            "snowflake_table",
+            "snowflake-table",
+        ):
+            return sql_text
+        location = target_binding.get("location") or {}
+        from fluid_build.providers.snowflake.util.config import (
+            resolve_env_templates as _resolve,
+        )
+
+        db = _resolve(location.get("database"))
+        sch = _resolve(location.get("schema"))
+        tbl = _resolve(location.get("table")) or outputs[0]
+        if not (db and sch and tbl):
+            return sql_text
+        upper_head = sql_text.lstrip().upper()[:32]
+        for kw in ("INSERT", "CREATE", "MERGE", "UPDATE", "DELETE", "COPY", "TRUNCATE"):
+            if upper_head.startswith(kw):
+                return sql_text
+        body = sql_text.rstrip().rstrip(";")
+        return (
+            f"INSERT INTO {validate_ident(str(db))}."
+            f"{validate_ident(str(sch))}.{validate_ident(str(tbl))}\n{body}"
+        )
+
+    def _find_target_binding_for_outputs(
+        self, *, outputs: List[str], action: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Find the binding for the action's ``outputs[0]``.
+
+        The plan.json passed to apply doesn't carry the full contract,
+        so we have to look in two places:
+
+        1. The matching ``provisionDataset`` action that ran earlier
+           in the plan (it has ``params.binding``). The provider keeps
+           a per-run cache of provisioned bindings keyed by exposeId.
+        2. ``params.binding`` on this action itself (if the planner
+           stamped it directly — newer plans).
+
+        Returns the binding dict or ``None`` when nothing matches.
+        """
+        if not outputs:
+            return None
+        target_id = outputs[0]
+        # Direct: action carries the binding (newer plans).
+        params = action.get("params") or {}
+        if isinstance(params.get("binding"), dict):
+            return params["binding"]
+        # Cache: provisionDataset registers per-exposeId.
+        cache = getattr(self, "_provisioned_bindings", None) or {}
+        return cache.get(target_id)
 
     def _handle_abstract_update_policy(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """updatePolicy — deferred.

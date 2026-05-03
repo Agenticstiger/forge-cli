@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any, Dict, Mapping, Optional
 
 _SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_EXPR_CHARS = re.compile(r"^[A-Za-z0-9_\s().,<>=!'+\-*/%|&\":\[\]]+$")
@@ -38,6 +39,63 @@ def quote_string_literal(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"Invalid SQL string literal: {value!r}")
     return "'" + value.replace("'", "''") + "'"
+
+
+def libpq_escape(value: Any) -> str:
+    """Escape one libpq-style DSN value (postgres + mysql + sqlite extension).
+
+    Strings with whitespace or single quotes are wrapped in single
+    quotes with internal quotes / backslashes doubled (libpq syntax).
+    Plain alphanumerics pass through unchanged. The result is then
+    wrapped in :func:`quote_string_literal` at the SQL boundary, so
+    two layers of quoting compose correctly: libpq sees one level,
+    SQL sees the other. Callers MUST still wrap the full DSN with
+    :func:`quote_string_literal` at the SQL boundary.
+
+    Used by:
+
+    * The duckdb acquisition runner when building ``postgres_scan(...)``
+      DSNs and ``ATTACH '<dsn>' ... TYPE mysql`` strings.
+    * The discoverer modules (``cli/discover/postgres.py``,
+      ``cli/discover/mysql.py``).
+    """
+    s = str(value).replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{s}'" if (" " in s or "'" in s) else s
+
+
+def build_libpq_dsn(
+    connection: Mapping[str, Any],
+    *,
+    database_key: str = "dbname",
+) -> str:
+    """Construct a libpq-style DSN ``key=value`` whitespace-separated string.
+
+    The postgres path uses ``database_key="dbname"`` (libpq convention);
+    the mysql path uses ``database_key="database"`` (duckdb mysql
+    extension expects this key). Both engines share the same escape +
+    field-emission logic; only the database key name differs.
+
+    Empty / missing fields are omitted (no ``user=`` for an empty
+    user). The returned DSN is SQL-literal-safe once the caller wraps
+    it with :func:`quote_string_literal`. ``port`` is validated as
+    numeric and raises ``ValueError`` at build time when non-digit;
+    other values route through :func:`libpq_escape`.
+    """
+    parts = []
+    if connection.get("host"):
+        parts.append(f"host={libpq_escape(connection['host'])}")
+    if connection.get("port") not in (None, ""):
+        port_str = str(connection["port"])
+        if not port_str.isdigit():
+            raise ValueError(f"connection.port must be numeric, got {port_str!r}")
+        parts.append(f"port={port_str}")
+    if connection.get("user"):
+        parts.append(f"user={libpq_escape(connection['user'])}")
+    if connection.get("password"):
+        parts.append(f"password={libpq_escape(connection['password'])}")
+    if connection.get("database"):
+        parts.append(f"{database_key}={libpq_escape(connection['database'])}")
+    return " ".join(parts)
 
 
 def validate_sql_expression_allowlist(expr: str) -> str:

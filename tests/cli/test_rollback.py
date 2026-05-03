@@ -60,7 +60,16 @@ def _snap(
     timestamp="2026-04-23T10:00:00Z",
     provider="snowflake",
     database="TELCO_LAB",
+    table="SUBSCRIBER360",
 ):
+    """Build a canonical rollback snapshot row.
+
+    Carries ``ddl[]`` directly — the rollback writer always records the
+    table-level CLONE statement at write time so the rollback CLI can
+    replay it without re-resolving the provider's restore semantics.
+    A snapshot without ``ddl`` is malformed and raises
+    ``rollback_snowflake_missing_ddl`` on restore.
+    """
     return {
         "timestamp": timestamp,
         "env": env,
@@ -68,7 +77,15 @@ def _snap(
         "backup_name": backup_name,
         "provider": provider,
         "mode": "replace",
-        "location": {"database": database, "schema": "PUBLIC"},
+        "location": {
+            "database": database,
+            "schema": "PUBLIC",
+            "table": table,
+            "backup_table": backup_name,
+        },
+        "ddl": [
+            f"CREATE OR REPLACE TABLE {database}.PUBLIC.{table} CLONE {database}.PUBLIC.{backup_name}"
+        ],
     }
 
 
@@ -250,12 +267,13 @@ class TestSelectSnapshot:
 class TestRestoreSnowflake:
     def test_dry_run_returns_ddl_without_execution(self):
         """Dry-run must NOT import the Snowflake provider (no network,
-        no connector). It just returns the planned DDL."""
+        no connector). It just returns the planned DDL — taken from
+        the snapshot's ``ddl[]`` field (table-level CLONE shape)."""
         snap = _snap()
         with patch("fluid_build.providers.snowflake.SnowflakeProvider") as mock_provider:
             result = rollback._restore_snowflake(snap, dry_run=True)
         assert result["status"] == "dry_run"
-        assert "CREATE OR REPLACE DATABASE" in result["ddl"]
+        assert "CREATE OR REPLACE TABLE" in result["ddl"]
         assert "TELCO_LAB" in result["ddl"]
         assert snap["backup_name"] in result["ddl"]
         mock_provider.assert_not_called()
@@ -268,14 +286,30 @@ class TestRestoreSnowflake:
         with pytest.raises(CLIError, match="rollback_snowflake_missing_database"):
             rollback._restore_snowflake(snap, dry_run=False)
 
+    def test_missing_ddl_array_raises(self):
+        """A snapshot without ``ddl[]`` is malformed (or written by a
+        pre-T3 build). Reject loudly rather than emitting a
+        database-level CLONE that could overwrite unrelated tables."""
+        snap = _snap()
+        snap.pop("ddl")
+        with pytest.raises(CLIError, match="rollback_snowflake_missing_ddl"):
+            rollback._restore_snowflake(snap, dry_run=False)
+
     def test_live_restore_invokes_provider(self):
         """Non-dry-run path constructs a SnowflakeProvider and runs
         the CLONE DDL through it. We mock the provider to avoid a
-        real connection."""
+        real connection.
+
+        Implementation note: ``rollback.py`` now calls the provider's
+        ``_execute_sql_action`` (the enhanced provider's stable
+        sql-action handler), not the older ``execute_sql`` shortcut,
+        so each statement gets the same dispatch path live applies use.
+        """
         snap = _snap()
         mock_provider_cls = MagicMock()
         mock_instance = MagicMock()
-        mock_instance.execute_sql.return_value = {"status": "ok"}
+        mock_instance.account = "test_account"
+        mock_instance._execute_sql_action.return_value = {"status": "ok"}
         mock_provider_cls.return_value = mock_instance
         with patch(
             "fluid_build.providers.snowflake.SnowflakeProvider",
@@ -286,6 +320,9 @@ class TestRestoreSnowflake:
         assert result["provider_result"] == {"status": "ok"}
         # Provider was constructed with the target database.
         mock_provider_cls.assert_called_once_with(database="TELCO_LAB")
+        # Per-statement dispatch — the loop runs ``_execute_sql_action``
+        # at least once.
+        assert mock_instance._execute_sql_action.call_count >= 1
 
 
 class TestRestoreSnowflakeSqlInjection:

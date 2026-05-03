@@ -579,7 +579,7 @@ class TestCmdPublishBackwardCompatibleValidation:
 
     These tests exercise the real publish path (loader → validator →
     provider dry-run) on the three FLUID versions that ship a usable
-    lineage/minimal contract fixture: 0.5.7, 0.7.1, 0.7.2.
+    lineage/minimal contract fixture: 0.7.1, 0.7.2, 0.7.3.
     """
 
     _FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "contracts" / "compatibility"
@@ -587,9 +587,9 @@ class TestCmdPublishBackwardCompatibleValidation:
     @pytest.mark.parametrize(
         "fixture_name,expected_version",
         [
-            ("minimal_057.yaml", "0.5.7"),
             ("minimal_071.yaml", "0.7.1"),
             ("minimal_072.yaml", "0.7.2"),
+            ("minimal_073.yaml", "0.7.3"),
             ("lineage_071.yaml", "0.7.1"),
             ("lineage_072.yaml", "0.7.2"),
         ],
@@ -648,9 +648,9 @@ class TestCmdPublishBackwardCompatibleValidation:
         latest = FluidSchemaManager.latest_bundled_version()
 
         for fixture_name, expected in [
-            ("minimal_057.yaml", "0.5.7"),
             ("minimal_071.yaml", "0.7.1"),
             ("minimal_072.yaml", "0.7.2"),
+            ("minimal_073.yaml", "0.7.3"),
         ]:
             with (self._FIXTURES_DIR / fixture_name).open() as f:
                 contract = yaml.safe_load(f)
@@ -1178,21 +1178,48 @@ class TestDataProductSpecConformance:
         assert port["sourceSystemId"] == "bss-crm"
 
     def test_archetype_inferred_from_layer(self):
-        """When metadata.archetype is absent, infer from layer.
+        """When metadata.archetype is absent, infer from the canonical
+        layer ↔ archetype mapping (Bronze=source-aligned, Silver=aggregate,
+        Gold=consumer-aligned)."""
+        cases = [
+            ("Bronze", "source-aligned"),
+            ("Silver", "aggregate"),
+            ("Gold", "consumer-aligned"),
+        ]
+        for layer, expected in cases:
+            contract = {
+                "kind": "DataProduct",
+                "id": f"test-infer-{layer.lower()}",
+                "name": f"Test-{layer}",
+                "metadata": {"layer": layer, "owner": {"team": "t"}},
+                "exposes": [],
+            }
+            dp = self._make_provider()._to_data_product(contract)
+            assert dp["info"].get("archetype") == expected, (
+                f"{layer} layer should map to {expected!r}, " f"got {dp['info'].get('archetype')!r}"
+            )
 
-        Canonical Data Mesh mapping (corrected by the DMM provider
-        extraction in c641664):
-        Bronze→source-aligned, Silver→aggregate, Gold→consumer-aligned.
-        """
-        contract = {
-            "kind": "DataProduct",
-            "id": "test-infer",
-            "name": "Test",
-            "metadata": {"layer": "Gold", "owner": {"team": "t"}},
-            "exposes": [],
-        }
-        dp = self._make_provider()._to_data_product(contract)
-        assert dp["info"].get("archetype") == "consumer-aligned"
+    def test_archetype_inferred_from_product_type(self):
+        """metadata.productType drives archetype directly when present
+        (Source-Aligned, Aggregated, Consumption-Aligned)."""
+        cases = [
+            ("SDP", "source-aligned"),
+            ("ADP", "aggregate"),
+            ("CDP", "consumer-aligned"),
+        ]
+        for product_type, expected in cases:
+            contract = {
+                "kind": "DataProduct",
+                "id": f"test-pt-{product_type.lower()}",
+                "name": f"Test-{product_type}",
+                "metadata": {"productType": product_type, "owner": {"team": "t"}},
+                "exposes": [],
+            }
+            dp = self._make_provider()._to_data_product(contract)
+            assert dp["info"].get("archetype") == expected, (
+                f"{product_type} should map to {expected!r}, "
+                f"got {dp['info'].get('archetype')!r}"
+            )
 
 
 # ---------------------------------------------------------------------------

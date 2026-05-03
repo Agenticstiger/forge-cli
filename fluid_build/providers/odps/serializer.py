@@ -36,33 +36,36 @@ def _owner_from_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _interfaces_from_fluid(contract: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-    """Extract interfaces supporting both 0.4.0 and 0.5.7 field names."""
+    """Extract interfaces from a v0.7.x contract.
+
+    Reads canonical fields only — ``consumes[].productId``,
+    ``exposes[].exposeId`` / ``kind`` / ``binding.location``. Pre-0.7
+    field names (``ref``, ``id``, ``type``, top-level ``location``)
+    are no longer accepted.
+    """
     inputs: List[Dict[str, Any]] = []
     for c in contract.get("consumes") or []:
-        # Support both 0.5.7 (productId) and 0.4.0 (ref)
-        ref = c.get("productId") or c.get("ref")
+        ref = c.get("productId")
         inputs.append(
             {
-                "id": c.get("id") or c.get("alias") or "input",
+                "id": c.get("exposeId") or "input",
                 "ref": ref,
-                "description": c.get("description"),
+                "description": c.get("description") or c.get("purpose"),
                 "type": "reference",
                 "x-fluid": {
-                    k: v for k, v in c.items() if k not in {"id", "ref", "productId", "description"}
+                    k: v
+                    for k, v in c.items()
+                    if k not in {"exposeId", "productId", "description", "purpose"}
                 },
             }
         )
 
     outputs: List[Dict[str, Any]] = []
     for e in contract.get("exposes") or []:
-        # Support both 0.5.7 (exposeId, kind, binding) and 0.4.0 (id, type, location)
-        expose_id = e.get("exposeId") or e.get("id") or "output"
-        expose_type = e.get("kind") or e.get("type") or "dataset"
-        location = (
-            e.get("binding", {}).get("location")
-            if isinstance(e.get("binding"), dict)
-            else e.get("location")
-        )
+        expose_id = e.get("exposeId") or "output"
+        expose_type = e.get("kind") or "dataset"
+        binding = e.get("binding") if isinstance(e.get("binding"), dict) else {}
+        location = binding.get("location") if isinstance(binding, dict) else None
 
         outputs.append(
             {
@@ -93,14 +96,13 @@ def _policies_from_fluid(contract: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_from_fluid(contract: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract build information supporting both 0.4.0 and 0.5.7 formats."""
-    # Support both 0.5.7 (builds array) and 0.4.0 (build object)
-    builds = contract.get("builds", [])
-    if builds and len(builds) > 0:
-        b = builds[0]
-    else:
-        b = contract.get("build") or {}
+    """Extract the primary build from a v0.7.x ``builds[]`` array.
 
+    Pre-0.7 contracts that used a single-object ``build`` field are no
+    longer supported.
+    """
+    builds = contract.get("builds") or []
+    b = builds[0] if builds else {}
     t = b.get("transformation", {}) if isinstance(b, dict) else {}
     return {
         "pattern": t.get("pattern"),
@@ -111,12 +113,13 @@ def _build_from_fluid(contract: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def fluid_to_odps_document(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a FLUID v0.7.x contract to a minimal ODPS document.
+
+    Emits the ODPS core surface (``info`` / ``product`` / ``interfaces``
+    / ``policies`` / ``slo``) and preserves full fidelity under
+    ``x-fluid`` for round-tripping.
     """
-    Convert a FLUID v0.4.0 contract to a minimal ODPS document.
-    - ODPS core: info, product, interfaces, policies, slo
-    - Preserve full fidelity under x-fluid
-    """
-    fluid_version = contract.get("fluidVersion") or contract.get("version") or "0.4.0"
+    fluid_version = contract.get("fluidVersion") or "0.7.3"
     metadata = contract.get("metadata", {}) or {}
     owner = _owner_from_metadata(metadata)
     product_id = contract.get("id", "unknown_product")
