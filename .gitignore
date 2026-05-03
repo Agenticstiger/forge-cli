@@ -28,13 +28,14 @@ MANIFEST
 
 # Virtual Environments
 .env
-.venv
+.venv*
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
 fluid-env/
+.ruff_cache/
 
 # IDE and Editor Files
 .vscode/
@@ -111,6 +112,11 @@ CLI_IMPROVEMENTS.md
 ENHANCED_*.md
 FLUID_*_ENHANCEMENT*.md
 
+# Claude Code session-local artifacts (lock files, scratch — may contain
+# OAuth tokens / live API keys via the agent runtime). Never commit.
+.claude/
+.aiexclude
+
 # Generated and Archive Directories
 legacy_tests_backup/
 scripts_archive/
@@ -180,3 +186,4 @@ runtime/
 #   .fluid/skills.yaml      — industry reference pack (team-shared)
 #   .fluid/ci-state.json    — records inputs that produced committed CI files
 # --- end fluid-cli -------------------------------------------------------
+.verify-logs/
