@@ -35,8 +35,9 @@ from fluid_build.forge_datamodel.emit.fluid_contract import build_contract_from_
 from fluid_build.forge_datamodel.emit.validator import FluidContractValidator
 
 
-@pytest.mark.skip(
-    reason="emitter behavior shift with v0.7.3 default; lands in PR-3 (build_runners + matching emitter update)"
+@pytest.mark.xfail(
+    strict=False,
+    reason="emitter behavior shift with v0.7.3 default; lands in PR-3 (build_runners + matching emitter update)",
 )
 def test_second_time_grain_is_normalized_before_contract_validation():
     logical = LogicalDraft(

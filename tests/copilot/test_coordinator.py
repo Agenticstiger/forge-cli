@@ -46,8 +46,9 @@ from fluid_build.forge_datamodel.emit.validator import FluidContractValidator
 from fluid_build.forge_datamodel.from_ddl.parser import DDLParser
 
 
-@pytest.mark.skip(
-    reason="emitter defaults to fluidVersion 0.7.3 \u2014 needs PR-3+ for build_runners + matching emitter update"
+@pytest.mark.xfail(
+    strict=False,
+    reason="emitter defaults to fluidVersion 0.7.3 \u2014 needs PR-3+ for build_runners + matching emitter update",
 )
 def test_coordinator_from_intent_produces_valid_contract():
     session = StageSession(store=NullBackend())
@@ -147,8 +148,9 @@ def test_from_tables_infers_links_from_uppercase_snowflake_keys():
     assert join_key.column2 == "PARTY_ID"
 
 
-@pytest.mark.skip(
-    reason="emitter defaults to fluidVersion 0.7.3 \u2014 needs PR-3+ for build_runners + matching emitter update"
+@pytest.mark.xfail(
+    strict=False,
+    reason="emitter defaults to fluidVersion 0.7.3 \u2014 needs PR-3+ for build_runners + matching emitter update",
 )
 def test_from_tables_combines_repeated_relationships_into_one_link():
     session = StageSession(store=NullBackend())

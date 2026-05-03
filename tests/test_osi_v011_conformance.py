@@ -344,8 +344,9 @@ class TestSemanticCompleteness:
             pytest.param(_make_dv2_logical, id="data_vault_2"),
         ],
     )
-    @pytest.mark.skip(
-        reason="needs build_runners + acquisition pattern \u2014 lands in PR-3 (runners) or later"
+    @pytest.mark.xfail(
+        strict=False,
+        reason="needs build_runners + acquisition pattern \u2014 lands in PR-3 (runners) or later",
     )
     def test_physical_ir_backfills_sparse_osi_semantics(self, logical_factory) -> None:
         logical = logical_factory()
@@ -405,8 +406,9 @@ class TestEmittedContractValidates:
             pytest.param(_make_dv2_logical, id="data_vault_2"),
         ],
     )
-    @pytest.mark.skip(
-        reason="needs build_runners + acquisition pattern \u2014 lands in PR-3 (runners) or later"
+    @pytest.mark.xfail(
+        strict=False,
+        reason="needs build_runners + acquisition pattern \u2014 lands in PR-3 (runners) or later",
     )
     def test_emitted_contract_passes_fluid_validator(self, logical_factory) -> None:
         """The OSI block we emit can't break Fluid contract validation —

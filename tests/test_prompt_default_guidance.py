@@ -236,8 +236,9 @@ class TestAuxiliaryPromptComposition:
 class TestSystemPromptSnapshot:
     """The composed system prompt must match the checked-in baseline byte-for-byte."""
 
-    @pytest.mark.skip(
-        reason="needs build_runners + acquisition pattern \u2014 lands in PR-3 (runners) or later"
+    @pytest.mark.xfail(
+        strict=False,
+        reason="needs build_runners + acquisition pattern \u2014 lands in PR-3 (runners) or later",
     )
     def test_prompt_matches_baseline(self):
         from fluid_build.cli.forge_copilot_runtime import (
