@@ -98,6 +98,8 @@ class TestCheckFluidFeatures:
         assert "FLUID Schema Manager" in names
 
     def test_schema_manager_check_is_available(self):
+        """The schema-manager doctor check enumerates the bundled
+        v0.7.x schemas. Pre-0.7 schemas (0.4.0, 0.5.x) were dropped."""
         from fluid_build.cli.doctor import _check_fluid_features
 
         all_ok, checks = _check_fluid_features()
@@ -106,7 +108,8 @@ class TestCheckFluidFeatures:
         assert all_ok is True
         assert schema_check["ok"] is True
         assert schema_check["status"] == "✅ Available"
-        assert "0.5.7" in schema_check["details"]
+        # The details string lists the bundled v0.7.x schemas.
+        assert "0.7.3" in schema_check["details"]
 
 
 class TestRun:
@@ -119,6 +122,7 @@ class TestRun:
         args = MagicMock()
         args.features_only = True
         args.verbose = False
+        args.scope = None  # default to legacy doctor flow (no scoped checks)
         logger = MagicMock()
 
         result = run(args, logger)
@@ -134,6 +138,7 @@ class TestRun:
         args = MagicMock()
         args.features_only = True
         args.verbose = False
+        args.scope = None  # default to legacy doctor flow (no scoped checks)
         logger = MagicMock()
 
         result = run(args, logger)
@@ -169,6 +174,7 @@ class TestRun:
         args.features_only = False
         args.verbose = False
         args.extended = False
+        args.scope = None  # default to legacy doctor flow (no scoped checks)
         args.out_dir = "/tmp/diag"
         logger = MagicMock()
 
@@ -204,6 +210,7 @@ class TestRun:
         args.features_only = False
         args.verbose = False
         args.extended = False
+        args.scope = None  # default to legacy doctor flow (no scoped checks)
         args.out_dir = "/tmp/diag"
         logger = MagicMock()
 
@@ -238,6 +245,7 @@ class TestRun:
         args.features_only = False
         args.verbose = False
         args.extended = True
+        args.scope = None  # default to legacy doctor flow
         args.out_dir = "/tmp/diag"
 
         with pytest.raises(CLIError) as exc:
