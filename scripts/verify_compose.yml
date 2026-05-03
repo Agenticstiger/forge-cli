@@ -1,0 +1,101 @@
+# Engine-matrix verification compose. Boots the minimum infra needed to
+# exercise each acquisition runner (duckdb, dlt, meltano, airbyte,
+# kafka-connect, debezium) end-to-end.
+#
+# Up:    docker compose -f scripts/verify_compose.yml up -d
+# Down:  docker compose -f scripts/verify_compose.yml down -v
+#
+# Networks: a single `verify` network. Inside the verify-runner container we
+# reach services by their service name (e.g. `postgres:5432`).
+name: forge-verify
+
+networks:
+  verify:
+    driver: bridge
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: forge-verify-pg
+    environment:
+      POSTGRES_USER: forge
+      POSTGRES_PASSWORD: forge
+      POSTGRES_DB: forge
+    # Required by Debezium: enable logical replication.
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
+    networks: [verify]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "forge", "-d", "forge"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  mysql:
+    image: mysql:8.0
+    container_name: forge-verify-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: forge
+      MYSQL_DATABASE: forge
+      MYSQL_USER: forge
+      MYSQL_PASSWORD: forge
+    networks: [verify]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uforge", "-pforge"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # Single-node Kafka in KRaft mode — no Zookeeper container needed.
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: forge-verify-kafka
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
+    networks: [verify]
+
+  # Kafka Connect with the Debezium Postgres connector pre-baked.
+  connect:
+    image: quay.io/debezium/connect:2.7
+    container_name: forge-verify-connect
+    depends_on:
+      kafka:
+        condition: service_started
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: forge-verify-connect
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+    networks: [verify]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/ >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Tiny mock that imitates the Airbyte API surface the runner exercises
+  # (workspace probe, source/destination create, connection create+sync).
+  # Real Airbyte OSS is an 8-container deploy; the runner's contract with
+  # its server is REST so a mock is sufficient for correctness verification.
+  airbyte-mock:
+    image: forge-verify
+    container_name: forge-verify-airbyte-mock
+    entrypoint: ["python", "/repo/scripts/airbyte_mock.py"]
+    networks: [verify]
+    volumes:
+      - ./..:/repo
+    working_dir: /repo

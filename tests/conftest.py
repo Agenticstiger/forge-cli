@@ -156,3 +156,36 @@ def _disable_copilot_self_eval(monkeypatch):
     ``call_llm`` with exact side-effect counts.
     """
     monkeypatch.setenv("FLUID_COPILOT_SELF_EVAL", "0")
+
+
+# ── Source-aligned acquisition test infrastructure (Slice A) ────────────
+#
+# Re-export the shared fixtures from tests/_infrastructure/ so individual
+# test files can pull them by name without an explicit import. Lazy import
+# guarded against missing optional dependencies (testcontainers, respx).
+
+try:  # pragma: no cover — exercised at collection time
+    from tests._infrastructure.respx_fixtures import (  # noqa: F401
+        airbyte_mock,
+        datahub_mock,
+        glue_mock,
+        kafka_connect_mock,
+        marquez_mock,
+        openmetadata_mock,
+        snowflake_horizon_mock,
+        unity_mock,
+    )
+except ImportError:
+    pass
+
+try:  # pragma: no cover
+    from tests._infrastructure.testcontainers_fixtures import (  # noqa: F401
+        minio_container,
+        mongodb_container,
+        mysql_container,
+        postgres_container,
+        redpanda_container,
+        seeded_postgres,
+    )
+except ImportError:
+    pass

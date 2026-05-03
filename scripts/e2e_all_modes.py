@@ -38,7 +38,7 @@ Phases (gates in parens):
                                    canonical scenarios through the real
                                    ModelerAgent LLM path and checks
                                    naming-convention compliance.
-    5. Live Snowflake biz-lab   — gate: SNOWFLAKE_*  env vars. Exercises
+    5. Live Snowflake demo-lab   — gate: SNOWFLAKE_*  env vars. Exercises
                                    dump-ddl → from-ddl → generate
                                    speed-transformation → dbt parse.
     6. Full stack (requires 4+5)— intent → data-model → speed-transformation
@@ -118,7 +118,7 @@ class PhaseResult:
     phase_data: Dict[str, Any] = field(default_factory=dict)
 
 
-# Regexes (shared with gemini_biz_lab_scenarios.py).
+# Regexes (shared with gemini_demo_db_scenarios.py).
 HUB_NAME = re.compile(r"^hub_[a-z][a-z0-9_]*$")
 SAT_NAME = re.compile(r"^sat_[a-z][a-z0-9_]*$")
 LNK_NAME = re.compile(r"^lnk_[a-z][a-z0-9_]*$")
@@ -1412,9 +1412,9 @@ def _phase4_gemini(workspace: Path) -> PhaseResult:
     # can easily approach 15 min in the worst case. 1200s gives headroom while
     # still catching true hangs. The runner flushes a partial report after
     # each scenario so even a timeout preserves completed work.
-    report_path = workspace / ".fluid" / "gemini_biz_lab_report.json"
+    report_path = workspace / ".fluid" / "gemini_demo_db_report.json"
     proc = _run_external_safe(
-        [sys.executable, "scripts/gemini_biz_lab_scenarios.py"],
+        [sys.executable, "scripts/gemini_demo_db_scenarios.py"],
         cwd=str(workspace),
         env={**os.environ, **env},
         timeout=1200,
@@ -1434,7 +1434,7 @@ def _phase4_gemini(workspace: Path) -> PhaseResult:
         current_report,
         "Gemini scenario runner writes a fresh report",
         phase="gemini",
-        detail_on_fail="Expected .fluid/gemini_biz_lab_report.json from the current run.",
+        detail_on_fail="Expected .fluid/gemini_demo_db_report.json from the current run.",
     )
     if current_report:
         try:
@@ -1511,7 +1511,7 @@ def _phase4_gemini(workspace: Path) -> PhaseResult:
 
 
 # ---------------------------------------------------------------------------
-# Phase 5 — live Snowflake biz-lab (gate: SNOWFLAKE_* env)
+# Phase 5 — live Snowflake demo-lab (gate: SNOWFLAKE_* env)
 # ---------------------------------------------------------------------------
 
 
@@ -1527,10 +1527,10 @@ def _phase5_snowflake(workspace: Path) -> PhaseResult:
         return result
 
     database = (
-        os.environ.get("FLUID_BIZ_LAB_DB") or os.environ.get("SNOWFLAKE_DATABASE") or "BIZ_LAB"
+        os.environ.get("FLUID_DEMO_DB_DB") or os.environ.get("SNOWFLAKE_DATABASE") or "DEMO_DB"
     )
     schema = (
-        os.environ.get("FLUID_BIZ_LAB_SCHEMA")
+        os.environ.get("FLUID_DEMO_DB_SCHEMA")
         or os.environ.get("SNOWFLAKE_STAGE_SCHEMA")
         or os.environ.get("SNOWFLAKE_SCHEMA")
         or "SEEDED"

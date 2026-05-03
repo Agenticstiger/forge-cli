@@ -40,6 +40,12 @@ dependencies = [
   "jinja2>=3.1",
   "httpx>=0.27",  # For FluidCommandCenter catalog provider
   "requests>=2.32.5",  # For Data Mesh Manager catalog publishing and shared HTTP helpers
+  # LiteLLM is the canonical LLM backend (was an opt-in extra). It
+  # replaces ~1,300 lines of per-provider wire-format code with one
+  # unified API across openai / anthropic / gemini / bedrock / azure /
+  # vertex / groq / mistral / cohere / ollama / etc., plus built-in
+  # cost tracking, retries, streaming, and tool-use normalisation.
+  "litellm>=1.50",
   "python-dotenv>=1.0",  # .env file credential loading in fluid_build.credentials.dotenv_store
   "cryptography>=42.0",  # Fernet-encrypted credential store in fluid_build.credentials.encrypted_store
   # OS keyring is now a hard dependency (Issue 5).  Catalog source
@@ -125,6 +131,12 @@ vector = [
 postgres = [
   "psycopg[binary]>=3.1",
 ]
+
+# LiteLLM is now a core dependency (above), not an extra. The
+# ``[litellm]`` alias is kept empty for back-compat with anyone who
+# scripted ``pip install fluid-build[litellm]`` during the opt-in
+# preview window.
+litellm = []
 
 # V1.5 metadata-source catalog adapters.
 #
@@ -354,6 +366,7 @@ markers = [
     "datamesh: Tests for DataMesh Manager provider",
     "policy: Tests for policy validators",
     "runtime: Tests for runtime generators",
+    "live_llm: Tests that hit a live LLM provider (Anthropic / OpenAI / Gemini); gated on a real API key",
 ]
 
 [tool.coverage.run]

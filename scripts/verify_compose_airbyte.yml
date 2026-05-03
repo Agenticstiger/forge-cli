@@ -1,0 +1,49 @@
+# Real Airbyte OSS overlay via k3s-in-Docker.
+#
+# Airbyte 1.x is k8s-first (`abctl install` uses Kind under the hood).
+# We run a single-node k3s server in a sibling container, install the
+# airbyte/airbyte Helm chart into it, then expose airbyte-server's
+# /api/v1 via a NodePort so the verify runner inside the same Docker
+# network can hit it at ``http://k3s:30080``.
+#
+# Up:
+#   docker compose -f scripts/verify_compose.yml -f scripts/verify_compose_airbyte.yml up -d k3s
+#   ./scripts/install_airbyte_on_k3s.sh        # blocks until /api/v1/health = 200
+#
+# Down:
+#   docker compose -f scripts/verify_compose.yml -f scripts/verify_compose_airbyte.yml down -v
+#
+# Resources: ~3GB RAM, ~10–15 minutes warmup the first time (image pulls
+# + airbyte boot). Subsequent runs reuse the volume.
+
+services:
+  k3s:
+    image: rancher/k3s:v1.30.4-k3s1
+    container_name: forge-verify-k3s
+    privileged: true
+    command:
+      - server
+      - --disable=traefik
+      - --disable=metrics-server
+      - --disable=servicelb
+      - --tls-san=k3s
+      - --node-name=k3s
+    environment:
+      K3S_KUBECONFIG_OUTPUT: /output/kubeconfig.yaml
+      K3S_KUBECONFIG_MODE: "666"
+    networks: [verify]
+    volumes:
+      - k3s-server:/var/lib/rancher/k3s
+      - ./../.verify-logs/k3s:/output
+      - /tmp
+    tmpfs:
+      - /run
+      - /var/run
+    healthcheck:
+      test: ["CMD-SHELL", "kubectl get nodes 2>/dev/null | grep -q ' Ready '"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+volumes:
+  k3s-server:
