@@ -16,7 +16,7 @@
 FLUID Build - Blueprint Marketplace Commands
 
 Commands for interacting with the FLUID Blueprint Marketplace API.
-Marketplace blueprints are Jinja2 templates that generate FLUID 0.5.7 contracts.
+Marketplace blueprints are Jinja2 templates that generate FLUID 0.7.x contracts.
 
 Usage:
     fluid market --blueprints --search analytics
