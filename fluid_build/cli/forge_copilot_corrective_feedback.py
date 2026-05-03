@@ -49,6 +49,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 __all__ = [
     "build_corrective_messages",
+    "build_schema_validation_message",
+    "build_join_key_repair_message",
     "diagnose_tool_failure",
     "TOOL_ERROR_GUIDANCE",
 ]
@@ -196,3 +198,166 @@ def build_corrective_messages(
             }
         )
     return messages
+
+
+def build_schema_validation_message(errors: Sequence[str]) -> Dict[str, str]:
+    """Phase 3 — self-healing schema validation as a corrective message.
+
+    Same shape as the tool-error feedback so the agent loop's existing
+    plumbing handles it. Use after a contract emit fails schema
+    validation: append the result of this function to the message
+    history and the next agent turn re-emits with the violations
+    listed by JSON path.
+
+    Returns a single ``user``-role message; the LLM treats it the
+    same as a tool-call error.
+    """
+    if not errors:
+        return {"role": "user", "content": ""}
+    bullets = "\n".join(f"  - {e}" for e in errors[:30])
+    return {
+        "role": "user",
+        "content": (
+            "The contract you produced has schema validation errors:\n"
+            f"{bullets}\n\n"
+            "Please re-emit the contract with these issues fixed. "
+            "Read the existing seed_contract for the expected shape and "
+            "match every field name + value enumeration exactly. "
+            "Do NOT change unrelated parts of the contract."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase-3 #14 — Join-key composition self-healing
+#
+# When an ADP / CDP composes upstream products via ``consumes[]`` and
+# the join key the LLM picked doesn't exist in the upstream's schema,
+# generic schema-validation feedback isn't enough — the LLM has no
+# signal about which *alternative* keys are available. This builder
+# emits a structured "alternative keys: A, B, C" prompt that tells
+# the LLM exactly what columns are present in the upstream + what the
+# canonical primary key is, so the next repair turn can pick a real
+# key instead of guessing again.
+# ---------------------------------------------------------------------------
+
+
+def build_join_key_repair_message(
+    *,
+    upstream_product_id: str,
+    requested_key: str,
+    available_columns: Sequence[str],
+    primary_key_columns: Sequence[str] = (),
+    foreign_key_candidates: Sequence[str] = (),
+) -> Dict[str, str]:
+    """Build a targeted corrective message for a join-key mismatch.
+
+    Used by the composition pipeline (``forge_datamodel.from_data_products``)
+    when an emitted contract references an upstream column that doesn't
+    exist in the upstream's schema. The message includes:
+
+    * The upstream product id + the bad key the LLM picked.
+    * The full list of columns the upstream actually exposes.
+    * The upstream's primary key columns (the canonical join target).
+    * A short list of likely-foreign-key candidates (columns ending in
+      ``_id``, columns matching the requested key by edit distance).
+
+    Returns a single ``user``-role message ready to append to the
+    repair conversation. Same shape as
+    :func:`build_schema_validation_message` so the existing repair
+    loop in :mod:`forge_copilot_runtime` plumbs it identically.
+
+    Args:
+        upstream_product_id: ``productId`` from ``consumes[].productId``.
+        requested_key: The bad column name the LLM picked.
+        available_columns: Every column the upstream's schema declares.
+        primary_key_columns: The upstream's PK columns (subset of
+            ``available_columns``); empty if the upstream has no PK.
+        foreign_key_candidates: Optional pre-ranked list of likely
+            replacement keys. When empty, callers can populate via
+            ``_rank_join_key_candidates`` below.
+    """
+    if not requested_key:
+        return {"role": "user", "content": ""}
+
+    cols_preview = ", ".join(sorted(available_columns)[:30]) or "(none — upstream schema is empty)"
+    pk_str = ", ".join(primary_key_columns) if primary_key_columns else "(none declared)"
+    fk_hint = (
+        ", ".join(foreign_key_candidates[:5]) if foreign_key_candidates else "(no obvious matches)"
+    )
+
+    return {
+        "role": "user",
+        "content": (
+            f"Join-key mismatch on consumes[productId={upstream_product_id!r}]: "
+            f"you used join key {requested_key!r}, but that column does not "
+            f"exist in the upstream product's schema.\n\n"
+            f"Available upstream columns: {cols_preview}\n"
+            f"Upstream primary key:       {pk_str}\n"
+            f"Likely replacement keys:    {fk_hint}\n\n"
+            f"Re-emit the contract with one of the actual columns above as "
+            f"the join key. Prefer the upstream primary key when the join "
+            f"is one-to-one with the upstream entity; pick a *_id-suffixed "
+            f"column when the join is a foreign-key reference. Do NOT "
+            f"invent a new column name."
+        ),
+    }
+
+
+def _rank_join_key_candidates(
+    requested_key: str,
+    available_columns: Sequence[str],
+    primary_key_columns: Sequence[str] = (),
+) -> List[str]:
+    """Heuristic ranker for likely join-key replacements.
+
+    Used by :func:`build_join_key_repair_message` callers to pre-fill
+    the ``foreign_key_candidates`` list. Ranks columns by:
+
+    1. Exact match minus case (``CustomerID`` vs ``customer_id``).
+    2. Same lowercased stem (``customer_id`` vs ``customer_pk``).
+    3. PK columns (always included near the top).
+    4. ``*_id``-suffixed columns (foreign-key idiom).
+    5. Edit-distance proximity to the requested key (last-resort).
+
+    Returns a deduplicated list, longest-relevance-first, capped at 8.
+    """
+    if not (requested_key and available_columns):
+        return list(primary_key_columns)[:8]
+
+    requested_lower = requested_key.lower().replace("-", "_")
+    requested_stem = requested_lower.rstrip("_id").rstrip("_pk")
+
+    scored: List[Tuple[float, str]] = []
+    for col in available_columns:
+        col_lower = col.lower()
+        col_stem = col_lower.rstrip("_id").rstrip("_pk")
+        score = 0.0
+        if col_lower == requested_lower:
+            score += 100.0  # exact-case-insensitive match
+        if col_stem == requested_stem and col_stem:
+            score += 50.0  # same logical stem, different suffix
+        if col in primary_key_columns:
+            score += 30.0
+        if col_lower.endswith("_id") or col_lower.endswith("_pk"):
+            score += 10.0
+        if requested_stem and requested_stem in col_lower:
+            score += 5.0
+        if col_lower in requested_lower:
+            score += 5.0
+        if score > 0:
+            scored.append((score, col))
+
+    scored.sort(reverse=True, key=lambda x: (x[0], x[1]))
+    seen = set()
+    ranked: List[str] = []
+    # PKs always anchor the list when present.
+    for col in primary_key_columns:
+        if col not in seen:
+            ranked.append(col)
+            seen.add(col)
+    for _, col in scored:
+        if col not in seen:
+            ranked.append(col)
+            seen.add(col)
+    return ranked[:8]

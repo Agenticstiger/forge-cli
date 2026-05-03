@@ -68,109 +68,29 @@ class StreamingTemplate(ProjectTemplate):
         }
 
     def generate_contract(self, context: GenerationContext) -> Dict[str, Any]:
-        project_config = context.project_config
-        project_name = project_config.get("name", "streaming-pipeline")
-        description = project_config.get("description", "Streaming data product")
-        domain = project_config.get("domain", "streaming")
-        owner = project_config.get("owner", "platform-team")
-        provider = project_config.get("provider", "gcp")
+        """Generate a v0.7.3-canonical contract via the shared builder.
 
-        return {
-            "fluidVersion": project_config.get("fluid_version", "0.5.7"),
-            "kind": "DataProduct",
-            "id": f"{project_name.replace('-', '_')}_streaming",
-            "name": f"{project_name} Streaming",
-            "description": description,
-            "domain": domain,
-            "metadata": {
-                "layer": "Bronze",
-                "owner": {"team": owner, "email": f"{owner}@company.com"},
-                "status": "Development",
-                "tags": ["streaming", "real-time", "events", "analytics"],
-                "created": context.creation_time,
-                "template": "streaming",
-                "forge_version": context.forge_version,
-            },
-            "consumes": [
-                {
-                    "id": "event_stream",
-                    "ref": "urn:fluid:events:v1",
-                    "description": "Real-time event stream for processing",
-                }
-            ],
-            "builds": [  # Changed from 'build' to 'builds' array
-                {
-                    "transformation": {
-                        "pattern": "streaming",
-                        "engine": "beam",
-                        "properties": {
-                            "pipeline": "src/streaming/event_processor.py",
-                            "windowing": {"type": "tumbling", "size": "5m"},
-                            "processing_guarantee": "exactly_once",
-                        },
-                    },
-                    "execution": {
-                        "trigger": {"type": "continuous", "mode": "streaming"},
-                        "runtime": {
-                            "platform": provider,
-                            "resources": {"cpu": "2", "memory": "4GB", "parallelism": 4},
-                        },
-                    },
-                }
-            ],  # Close builds array
-            "exposes": [
-                {
-                    "exposeId": "real_time_metrics",  # Changed from 'id'
-                    "kind": "stream",  # Changed from 'type'
-                    "description": "Real-time aggregated metrics stream",
-                    "binding": {  # Changed from 'location'
-                        "format": "stream",
-                        "topic": "metrics-output",  # Flattened from properties
-                        "sink": "monitoring_dashboard",
-                    },
-                    "schema": [
-                        {
-                            "name": "event_id",
-                            "type": "string",
-                            "description": "Unique event identifier",
-                            "nullable": False,
-                        },
-                        {
-                            "name": "metric_value",
-                            "type": "float",
-                            "description": "Aggregated metric value",
-                            "nullable": False,
-                        },
-                        {
-                            "name": "window_start",
-                            "type": "timestamp",
-                            "description": "Window start timestamp",
-                            "nullable": False,
-                        },
-                        {
-                            "name": "window_end",
-                            "type": "timestamp",
-                            "description": "Window end timestamp",
-                            "nullable": False,
-                        },
-                    ],
-                    "quality": [
-                        {
-                            "name": "event_ordering",
-                            "rule": "window_start <= window_end",
-                            "onFailure": {"action": "reject_event"},
-                        }
-                    ],
-                }
-            ],
-            "slo": {"freshnessMinutes": 1, "availabilityPct": 99.9},
-            "streaming_config": {
-                "window_size": "5m",
-                "processing_guarantee": "exactly_once",
-                "checkpoint_interval": "30s",
-                "parallelism": 4,
-            },
-        }
+        Per-template specifics (product type, build pattern, engine,
+        default columns) live in :class:`TemplateSpec` below;
+        :func:`build_contract` populates the canonical fluidVersion,
+        layer↔productType pair, owner, exposes[].binding, builds[],
+        and consumes[] structure so every template stays in lockstep
+        with schema changes.
+        """
+        from ._v073_builder import TemplateSpec, build_contract
+
+        spec = TemplateSpec(
+            template_name="streaming",
+            product_type="SDP",
+            pattern="acquisition",
+            engine="kafka-connect",
+            properties={"connector": "kafka-source"},
+            expose_id="streaming_events",
+            expose_kind="topic",
+            binding_format="kafka_topic",
+            description_suffix="Real-time streaming data product",
+        )
+        return build_contract(spec=spec, project_config=context.project_config)
 
     def validate_configuration(self, config: Dict[str, Any]) -> ValidationResult:
         errors = []

@@ -48,8 +48,6 @@ __all__ = [
     "call_llm",
     "call_llm_streaming",
     "streaming_is_enabled",
-    "detect_provider_from_api_key",
-    "check_llm_readiness",
     "live_provider_models",
 ]
 
@@ -58,7 +56,6 @@ import logging
 import os
 import re
 import threading
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,11 +64,16 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional
 import httpx
 
 from fluid_build.cli._common import CLIError
-from fluid_build.cli.forge_copilot_response_schema import (
-    anthropic_tool_definition,
-    ollama_supports_structured_output,
-    openai_response_format,
-)
+
+# Per-provider response_format helpers (``openai_response_format``,
+# ``gemini_response_schema_config``, ``anthropic_tool_definition``,
+# ``ollama_supports_structured_output``) used to be imported here for
+# the deleted per-provider classes. They're now superseded by litellm's
+# unified ``response_format={"type": "json_schema", ...}`` directive
+# which normalises to whatever the underlying provider needs. The
+# ``forge_copilot_response_schema`` module retains only the canonical
+# ``FORGE_RESPONSE_SCHEMA`` constant + the strict-mode hardening
+# helper for OpenAI's strict json_schema mode.
 
 LOG = logging.getLogger("fluid.cli.forge_copilot.llm")
 
@@ -151,10 +153,12 @@ def _structured_outputs_enabled() -> bool:
 # Determinism controls
 # ---------------------------------------------------------------------------
 
-# Constant seed for OpenAI-compatible providers.  Combined with
-# temperature 0 this makes sampling fully deterministic for a given
-# prompt (modulo model-version changes on the provider side).
-_OPENAI_SEED: int = 42
+# The legacy ``_OPENAI_SEED = 42`` constant was deleted with the
+# native ``OpenAIProvider.build_request`` it served. Determinism is
+# now requested via ``litellm.completion(temperature=0)`` plus
+# ``seed=42`` when the underlying provider supports it; litellm passes
+# ``seed`` through to OpenAI / Bedrock and silently ignores it
+# elsewhere, which is exactly the behaviour we used to hand-roll.
 
 
 def _get_temperature() -> float:
@@ -489,814 +493,6 @@ class ToolCall:
     arguments: Dict[str, Any]
 
 
-class OpenAIProvider(LlmProvider):
-    name = "openai"
-    default_model = "gpt-4o-mini"
-
-    def default_endpoint(self, model: str, env: Mapping[str, str]) -> str:
-        base = env.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-        if base != "https://api.openai.com/v1":
-            LOG.warning(
-                "OPENAI_BASE_URL is set to a non-default value (%s). "
-                "Your API key will be sent to this host.",
-                base,
-            )
-        return base + "/chat/completions"
-
-    def list_available_models(
-        self, api_key: Optional[str], env: Mapping[str, str]
-    ) -> Optional[List[str]]:
-        if not api_key:
-            return None
-        base = env.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-        response = httpx.get(
-            f"{base}/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        models = payload.get("data") or []
-        return [str(item.get("id")) for item in models if isinstance(item, dict) and item.get("id")]
-
-    def build_request(
-        self, config: LlmConfig, system_prompt: str, user_prompt: str
-    ) -> tuple[Dict[str, str], Dict[str, Any]]:
-        headers = {"Content-Type": "application/json"}
-        if config.api_key:
-            headers["Authorization"] = f"Bearer {config.api_key}"
-        payload: Dict[str, Any] = {
-            "model": config.model,
-            "temperature": _get_temperature(),
-            "seed": _OPENAI_SEED,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        # Slice UX-I: provider-native structured outputs.  For
-        # gpt-4o-mini / gpt-4o-2024-08-06+ this is strict
-        # ``json_schema`` mode which literally cannot return
-        # anything else; for older models it falls back to the
-        # weaker ``json_object`` mode.  Either path eliminates the
-        # "LLM returned markdown fences" repair retries.
-        if _structured_outputs_enabled():
-            payload["response_format"] = openai_response_format(config.model)
-        return headers, payload
-
-    def extract_text(self, response_json: Dict[str, Any]) -> str:
-        return response_json["choices"][0]["message"]["content"]
-
-    def extract_usage(self, response_json: Dict[str, Any]) -> Dict[str, int]:
-        usage = response_json.get("usage") or {}
-        inp = usage.get("prompt_tokens", 0)
-        out = usage.get("completion_tokens", 0)
-        return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
-
-    def extract_prompt_cache(self, response_json: Dict[str, Any]) -> Dict[str, Any]:
-        usage = response_json.get("usage") or {}
-        details = usage.get("prompt_token_details") or usage.get("prompt_tokens_details") or {}
-        return _prompt_cache_metrics(
-            details.get("cached_tokens", 0),
-            usage.get("prompt_tokens", 0),
-        )
-
-    def build_streaming_request(
-        self, config: LlmConfig, system_prompt: str, user_prompt: str
-    ) -> tuple[str, Dict[str, str], Dict[str, Any]]:
-        headers, payload = self.build_request(config, system_prompt, user_prompt)
-        payload = dict(payload)
-        payload["stream"] = True
-        payload["stream_options"] = {"include_usage": True}
-        return config.endpoint, headers, payload
-
-    def iter_stream_chunks(self, response: httpx.Response) -> Iterator[str]:
-        """Parse an OpenAI Chat Completions SSE stream.
-
-        Each SSE event is of the form::
-
-            data: {"choices":[{"delta":{"content":"..."}}], ...}
-            data: [DONE]
-
-        The concatenation of every yielded chunk equals the
-        ``choices[0].message.content`` value that
-        :meth:`extract_text` returns on the blocking path.
-        """
-        for raw_line in response.iter_lines():
-            if not raw_line:
-                continue
-            line = raw_line if isinstance(raw_line, str) else raw_line.decode("utf-8", "replace")
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if not data or data == "[DONE]":
-                if data == "[DONE]":
-                    return
-                continue
-            try:
-                event = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            _record_prompt_cache_from_response(self, event)
-            # OpenAI streams a terminal chunk with the full request
-            # usage when ``stream_options.include_usage`` is set
-            # (we set it in ``build_streaming_request``). Capture it
-            # so the staged-agent layer's cost tracker stops calling
-            # ``record_missing_usage`` on every streamed call.
-            usage_block = event.get("usage")
-            if isinstance(usage_block, dict):
-                _record_streaming_usage(
-                    input_tokens=usage_block.get("prompt_tokens", 0) or 0,
-                    output_tokens=usage_block.get("completion_tokens", 0) or 0,
-                )
-            choices = event.get("choices") or []
-            if not choices:
-                continue
-            delta = choices[0].get("delta") or {}
-            content = delta.get("content")
-            if content:
-                yield content
-
-    # -- Tool use (slice UX-K) ------------------------------------------
-
-    def build_tool_request(
-        self,
-        config: LlmConfig,
-        system_prompt: str,
-        messages: List[Dict[str, Any]],
-        tools: List[Dict[str, Any]],
-    ) -> tuple[str, Dict[str, str], Dict[str, Any]]:
-        headers: Dict[str, str] = {"Content-Type": "application/json"}
-        if config.api_key:
-            headers["Authorization"] = f"Bearer {config.api_key}"
-        openai_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "parameters": t.get("input_schema", {}),
-                },
-            }
-            for t in tools
-        ]
-        payload: Dict[str, Any] = {
-            "model": config.model,
-            "temperature": _get_temperature(),
-            "seed": _OPENAI_SEED,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                *messages,
-            ],
-            "tools": openai_tools,
-        }
-        return config.endpoint, headers, payload
-
-    def extract_tool_calls(self, response_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-        choices = response_json.get("choices") or []
-        if not choices:
-            return []
-        msg = choices[0].get("message") or {}
-        raw_calls = msg.get("tool_calls") or []
-        result = []
-        for tc in raw_calls:
-            fn = tc.get("function") or {}
-            try:
-                args = json.loads(fn.get("arguments", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                args = {}
-            result.append(
-                {
-                    "id": tc.get("id", ""),
-                    "name": fn.get("name", ""),
-                    "arguments": args,
-                }
-            )
-        return result
-
-    def build_tool_result_messages(
-        self, tool_calls: List[Dict[str, Any]], results: List[Any]
-    ) -> List[Dict[str, Any]]:
-        # OpenAI expects: assistant message with tool_calls, then one
-        # tool-role message per call result.
-        assistant_msg: Dict[str, Any] = {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": json.dumps(tc["arguments"]),
-                    },
-                }
-                for tc in tool_calls
-            ],
-        }
-        tool_msgs = [
-            {
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": json.dumps(result, default=str),
-            }
-            for tc, result in zip(tool_calls, results, strict=True)
-        ]
-        return [assistant_msg] + tool_msgs
-
-
-class OllamaProvider(OpenAIProvider):
-    name = "ollama"
-    default_model = "llama3.1"
-
-    def default_endpoint(self, model: str, env: Mapping[str, str]) -> str:
-        host = env.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-        return host + "/v1/chat/completions"
-
-    def list_available_models(
-        self, api_key: Optional[str], env: Mapping[str, str]
-    ) -> Optional[List[str]]:
-        response = httpx.get(f"{_ollama_host(env)}/api/tags", timeout=2.0)
-        response.raise_for_status()
-        result: List[str] = []
-        for item in response.json().get("models") or []:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or "")
-            if not name:
-                continue
-            result.append(name)
-            if name.endswith(":latest"):
-                result.append(name.removesuffix(":latest"))
-        return result
-
-    def build_request(
-        self, config: LlmConfig, system_prompt: str, user_prompt: str
-    ) -> tuple[Dict[str, str], Dict[str, Any]]:
-        headers, payload = super().build_request(config, system_prompt, user_prompt)
-        headers.pop("Authorization", None)
-        # Slice UX-I: Ollama's chat-compat endpoint does not accept
-        # OpenAI's ``response_format: json_schema`` directive.  For
-        # known-good local models fall back to the OpenAI-compat
-        # ``{"type": "json_object"}`` (supported by recent Ollama
-        # builds via ``format: "json"``); for unknown models drop
-        # the directive entirely and rely on the in-prompt JSON
-        # nudge.
-        if _structured_outputs_enabled():
-            payload.pop("response_format", None)
-            if ollama_supports_structured_output(config.model):
-                payload["response_format"] = {"type": "json_object"}
-        else:
-            payload.pop("response_format", None)
-        return headers, payload
-
-
-class AnthropicProvider(LlmProvider):
-    name = "anthropic"
-    default_model = "claude-sonnet-4-6"
-
-    def default_endpoint(self, model: str, env: Mapping[str, str]) -> str:
-        return "https://api.anthropic.com/v1/messages"
-
-    def list_available_models(
-        self, api_key: Optional[str], env: Mapping[str, str]
-    ) -> Optional[List[str]]:
-        if not api_key:
-            return None
-        response = httpx.get(
-            "https://api.anthropic.com/v1/models",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        models = payload.get("data") or []
-        return [str(item.get("id")) for item in models if isinstance(item, dict) and item.get("id")]
-
-    def choose_available_model(
-        self, requested_model: str, available_models: List[str]
-    ) -> Optional[str]:
-        if requested_model in available_models:
-            return requested_model
-        requested = requested_model.lower()
-        for family in ("sonnet", "opus", "haiku"):
-            if family not in requested:
-                continue
-            for model in available_models:
-                if family in model.lower():
-                    return model
-        return available_models[0] if available_models else None
-
-    def build_request(
-        self, config: LlmConfig, system_prompt: str, user_prompt: str
-    ) -> tuple[Dict[str, str], Dict[str, Any]]:
-        headers = {
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-        }
-        if config.api_key:
-            headers["x-api-key"] = config.api_key
-        # Slice UX-I: the ``system`` field is a blocks array with a
-        # ``cache_control: ephemeral`` hint.  Anthropic marks this
-        # prefix as a 5-minute cache candidate; subsequent requests
-        # with the byte-identical prefix read cached tokens at ~10%
-        # of the normal input cost and ~50-80% faster TTFT.
-        # ``build_system_prompt`` is memoized upstream so the prefix
-        # is stable across retries and non-interactive reruns.
-        # Pin sampling temperature explicitly for the Anthropic API.
-        # Without this, the request would inherit the provider-side
-        # default (typically 1.0 on Claude), which makes structured
-        # contract generation non-deterministic — a regression
-        # against the determinism-ladder contract we advertise via
-        # ``--deterministic`` and ``FLUID_LLM_TEMPERATURE``. The
-        # Anthropic API does not yet expose a public ``seed``
-        # parameter, so OpenAI-style seeding is omitted; the
-        # ``--deterministic`` flag's audit-trail metadata records
-        # this provider gap so users know byte-stability is
-        # OpenAI-only today.
-        #
-        # NOTE — Newer Claude models (opus-4-7+, the o-series-style
-        # reasoning models) DEPRECATED the ``temperature`` parameter.
-        # Sending it returns ``400 invalid_request_error: 'temperature'
-        # is deprecated for this model.``  We detect the deprecated
-        # set and skip the field for those models. The catalog tier
-        # ``deep`` points at ``claude-opus-4-7`` so this gate is
-        # exactly what makes ``--tiered`` work end-to-end.
-        payload: Dict[str, Any] = {
-            "model": config.model,
-            "max_tokens": 8192,
-            "system": [
-                {
-                    "type": "text",
-                    "text": system_prompt,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            "messages": [{"role": "user", "content": user_prompt}],
-        }
-        if not _model_deprecates_temperature(config.model):
-            payload["temperature"] = _get_temperature()
-        # Slice UX-I: force the model to emit its response via a
-        # single ``emit_forge_contract`` tool call.  The tool's
-        # ``input_schema`` is the response envelope JSON Schema, so
-        # the model cannot return anything outside the shape the
-        # validator expects.  ``extract_text`` below will unwrap the
-        # tool_use block and return the JSON-encoded ``input``.
-        if _structured_outputs_enabled():
-            payload["tools"] = [anthropic_tool_definition()]
-            payload["tool_choice"] = {
-                "type": "tool",
-                "name": "emit_forge_contract",
-            }
-        return headers, payload
-
-    def extract_text(self, response_json: Dict[str, Any]) -> str:
-        content = response_json.get("content") or []
-        # Slice UX-I: support both legacy ``text`` blocks and
-        # ``tool_use`` blocks emitted by structured-output forced
-        # tool calls (``emit_forge_contract``).  When a tool_use
-        # block is present, return its JSON-encoded input so the
-        # downstream ``extract_json_object`` parser can consume it
-        # without any natural-language unwrapping.
-        for part in content:
-            if part.get("type") == "tool_use":
-                tool_input = part.get("input") or {}
-                return json.dumps(tool_input)
-        for part in content:
-            if part.get("type") == "text":
-                return part.get("text", "")
-        raise KeyError("Anthropic response did not contain a text or tool_use block")
-
-    def extract_usage(self, response_json: Dict[str, Any]) -> Dict[str, int]:
-        usage = response_json.get("usage") or {}
-        inp = usage.get("input_tokens", 0)
-        out = usage.get("output_tokens", 0)
-        return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
-
-    def extract_prompt_cache(self, response_json: Dict[str, Any]) -> Dict[str, Any]:
-        usage = response_json.get("usage") or {}
-        read = usage.get("cache_read_input_tokens", 0)
-        created = usage.get("cache_creation_input_tokens", 0)
-        uncached = usage.get("input_tokens", 0)
-        return _prompt_cache_metrics(read, uncached + created + read)
-
-    def iter_stream_chunks(self, response: httpx.Response) -> Iterator[str]:
-        """Parse an Anthropic Messages API SSE stream.
-
-        Anthropic ships events in this shape::
-
-            event: content_block_start
-            data: {"type":"content_block_start","content_block":{"type":"text","text":""}}
-
-            event: content_block_delta
-            data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
-
-        When the generation path is using the forced
-        ``emit_forge_contract`` tool (slice UX-I structured outputs),
-        the deltas carry ``input_json_delta`` with ``partial_json``
-        fragments that concatenate into the tool's JSON input.  This
-        parser handles both — the concatenation of every yielded
-        chunk matches what :meth:`extract_text` returns on the
-        blocking path (a JSON string for the tool_use path, plain
-        text for the legacy text path).
-        """
-        for raw_line in response.iter_lines():
-            if not raw_line:
-                continue
-            line = raw_line if isinstance(raw_line, str) else raw_line.decode("utf-8", "replace")
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if not data:
-                continue
-            try:
-                event = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            usage_source = event.get("message") if isinstance(event.get("message"), dict) else event
-            _record_prompt_cache_from_response(self, usage_source)
-            # Anthropic streams usage in two places: the initial
-            # ``message_start`` event carries the input-token count
-            # (and any cache_read/cache_creation hits), and a final
-            # ``message_delta`` event carries the cumulative output
-            # tokens. We accumulate both so that by the time the
-            # iterator drains, the thread-local stash has the
-            # complete usage record for this call.
-            usage_block = (
-                (usage_source or {}).get("usage") if isinstance(usage_source, dict) else None
-            )
-            if isinstance(usage_block, dict):
-                prior = getattr(_streaming_usage_state, "usage", None) or {}
-                _record_streaming_usage(
-                    input_tokens=usage_block.get("input_tokens") or prior.get("input_tokens", 0),
-                    output_tokens=usage_block.get("output_tokens") or prior.get("output_tokens", 0),
-                    cache_read_tokens=usage_block.get("cache_read_input_tokens")
-                    or prior.get("cache_read_tokens", 0),
-                    cache_write_tokens=usage_block.get("cache_creation_input_tokens")
-                    or prior.get("cache_write_tokens", 0),
-                )
-            event_type = event.get("type")
-            if event_type == "content_block_delta":
-                delta = event.get("delta") or {}
-                delta_type = delta.get("type")
-                if delta_type == "text_delta":
-                    text = delta.get("text")
-                    if text:
-                        yield text
-                elif delta_type == "input_json_delta":
-                    partial = delta.get("partial_json")
-                    if partial:
-                        yield partial
-            elif event_type == "message_stop":
-                return
-
-    # -- Tool use (slice UX-K) ------------------------------------------
-
-    def build_tool_request(
-        self,
-        config: LlmConfig,
-        system_prompt: str,
-        messages: List[Dict[str, Any]],
-        tools: List[Dict[str, Any]],
-    ) -> tuple[str, Dict[str, str], Dict[str, Any]]:
-        headers: Dict[str, str] = {
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-        }
-        if config.api_key:
-            headers["x-api-key"] = config.api_key
-        anthropic_tools = [
-            {
-                "name": t["name"],
-                "description": t.get("description", ""),
-                "input_schema": t.get("input_schema", {"type": "object", "properties": {}}),
-            }
-            for t in tools
-        ]
-        payload: Dict[str, Any] = {
-            "model": config.model,
-            "max_tokens": 8192,
-            "system": [
-                {
-                    "type": "text",
-                    "text": system_prompt,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            "messages": list(messages),
-            "tools": anthropic_tools,
-        }
-        return config.endpoint, headers, payload
-
-    def extract_tool_calls(self, response_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-        content = response_json.get("content") or []
-        result = []
-        for block in content:
-            if block.get("type") == "tool_use":
-                result.append(
-                    {
-                        "id": block.get("id", ""),
-                        "name": block.get("name", ""),
-                        "arguments": block.get("input") or {},
-                    }
-                )
-        return result
-
-    def build_tool_result_messages(
-        self, tool_calls: List[Dict[str, Any]], results: List[Any]
-    ) -> List[Dict[str, Any]]:
-        # Anthropic expects: assistant message with the raw content
-        # blocks (text + tool_use), then a user message with
-        # tool_result blocks.
-        # We reconstruct a simplified assistant message from the calls.
-        assistant_content = [
-            {
-                "type": "tool_use",
-                "id": tc["id"],
-                "name": tc["name"],
-                "input": tc["arguments"],
-            }
-            for tc in tool_calls
-        ]
-        user_content = [
-            {
-                "type": "tool_result",
-                "tool_use_id": tc["id"],
-                "content": json.dumps(result, default=str),
-            }
-            for tc, result in zip(tool_calls, results, strict=True)
-        ]
-        return [
-            {"role": "assistant", "content": assistant_content},
-            {"role": "user", "content": user_content},
-        ]
-
-
-class GeminiProvider(LlmProvider):
-    name = "gemini"
-    default_model = "gemini-2.5-flash"
-
-    def default_endpoint(self, model: str, env: Mapping[str, str]) -> str:
-        safe_model = _sanitize_model_for_url(model)
-        return (
-            f"https://generativelanguage.googleapis.com/v1beta/models/{safe_model}:generateContent"
-        )
-
-    def list_available_models(
-        self, api_key: Optional[str], env: Mapping[str, str]
-    ) -> Optional[List[str]]:
-        if not api_key:
-            return None
-        response = httpx.get(
-            "https://generativelanguage.googleapis.com/v1beta/models",
-            headers={"x-goog-api-key": api_key},
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        result: List[str] = []
-        for item in payload.get("models") or []:
-            if not isinstance(item, dict):
-                continue
-            methods = item.get("supportedGenerationMethods") or []
-            if methods and "generateContent" not in methods:
-                continue
-            name = str(item.get("name") or "")
-            if name.startswith("models/"):
-                name = name.removeprefix("models/")
-            if name:
-                result.append(name)
-        return result
-
-    def build_request(
-        self, config: LlmConfig, system_prompt: str, user_prompt: str
-    ) -> tuple[Dict[str, str], Dict[str, Any]]:
-        headers = {"Content-Type": "application/json"}
-        if config.api_key:
-            headers["x-goog-api-key"] = config.api_key
-        generation_config: Dict[str, Any] = {"temperature": _get_temperature()}
-        # Slice UX-I note: Gemini's responseSchema doesn't handle
-        # deeply nested free-form objects (like the ``contract``
-        # field which is itself a full FLUID contract with 10+
-        # nested levels).  Gemini strips ``additionalProperties``
-        # during schema processing, which means nested free-form
-        # objects become ``{"type": "object", "properties": {}}``
-        # — interpreted as "empty object, no fields allowed".
-        # The natural-language JSON nudge in the system prompt is
-        # sufficient for Gemini; structured outputs are left to
-        # OpenAI (json_schema) and Anthropic (tool_use) where the
-        # nested free-form handling works correctly.
-        #
-        # If Gemini improves nested schema support in the future,
-        # uncomment the block below:
-        # if _structured_outputs_enabled():
-        #     generation_config.update(gemini_response_schema_config())
-        payload = {
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-            "generationConfig": generation_config,
-        }
-        return headers, payload
-
-    def extract_text(self, response_json: Dict[str, Any]) -> str:
-        candidates = response_json.get("candidates") or []
-        for candidate in candidates:
-            content = candidate.get("content") or {}
-            for part in content.get("parts") or []:
-                text = part.get("text")
-                if text:
-                    return text
-        raise KeyError("Gemini response did not contain any text")
-
-    def extract_usage(self, response_json: Dict[str, Any]) -> Dict[str, int]:
-        usage = response_json.get("usageMetadata") or {}
-        inp = usage.get("promptTokenCount", 0)
-        out = usage.get("candidatesTokenCount", 0)
-        total = usage.get("totalTokenCount", inp + out)
-        return {"input_tokens": inp, "output_tokens": out, "total_tokens": total}
-
-    def extract_prompt_cache(self, response_json: Dict[str, Any]) -> Dict[str, Any]:
-        usage = response_json.get("usageMetadata") or {}
-        return _prompt_cache_metrics(
-            usage.get("cachedContentTokenCount", 0),
-            usage.get("promptTokenCount", 0),
-        )
-
-    # -- Streaming (slice UX-I) --------------------------------------------
-
-    def _streaming_url(self, config: LlmConfig) -> str:
-        """Rewrite the Gemini generate-content URL for SSE streaming.
-
-        Gemini exposes streaming via ``:streamGenerateContent?alt=sse``
-        rather than ``:generateContent``.  We patch the URL in place
-        so ``build_streaming_request`` can reuse the existing blocking
-        payload without caring about endpoint resolution.
-        """
-        endpoint = config.endpoint or ""
-        if ":generateContent" in endpoint:
-            endpoint = endpoint.replace(":generateContent", ":streamGenerateContent")
-        if "alt=sse" not in endpoint:
-            sep = "&" if "?" in endpoint else "?"
-            endpoint = f"{endpoint}{sep}alt=sse"
-        return endpoint
-
-    def build_streaming_request(
-        self, config: LlmConfig, system_prompt: str, user_prompt: str
-    ) -> tuple[str, Dict[str, str], Dict[str, Any]]:
-        headers, payload = self.build_request(config, system_prompt, user_prompt)
-        return self._streaming_url(config), headers, payload
-
-    def iter_stream_chunks(self, response: httpx.Response) -> Iterator[str]:
-        """Parse a Gemini ``streamGenerateContent?alt=sse`` response.
-
-        Each SSE event carries a partial Gemini response with one or
-        more text parts under ``candidates[0].content.parts``.  We
-        yield every non-empty text fragment in order; the
-        concatenation matches :meth:`extract_text` on the blocking
-        path.
-        """
-        for raw_line in response.iter_lines():
-            if not raw_line:
-                continue
-            line = raw_line if isinstance(raw_line, str) else raw_line.decode("utf-8", "replace")
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if not data:
-                continue
-            try:
-                event = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            _record_prompt_cache_from_response(self, event)
-            # Gemini ships its terminal usage block in ``usageMetadata``
-            # on the last SSE event of the stream. Capture so the
-            # staged-agent layer's cost tracker stops calling
-            # ``record_missing_usage`` on every Gemini streaming run.
-            usage_md = event.get("usageMetadata")
-            if isinstance(usage_md, dict):
-                _record_streaming_usage(
-                    input_tokens=usage_md.get("promptTokenCount", 0) or 0,
-                    output_tokens=usage_md.get("candidatesTokenCount", 0) or 0,
-                    cache_read_tokens=usage_md.get("cachedContentTokenCount", 0) or 0,
-                )
-            for candidate in event.get("candidates") or []:
-                content = candidate.get("content") or {}
-                for part in content.get("parts") or []:
-                    text = part.get("text")
-                    if text:
-                        yield text
-
-    # -- Tool use (slice UX-K) ------------------------------------------
-
-    def build_tool_request(
-        self,
-        config: LlmConfig,
-        system_prompt: str,
-        messages: List[Dict[str, Any]],
-        tools: List[Dict[str, Any]],
-    ) -> tuple[str, Dict[str, str], Dict[str, Any]]:
-        headers: Dict[str, str] = {"Content-Type": "application/json"}
-        if config.api_key:
-            headers["x-goog-api-key"] = config.api_key
-        from fluid_build.cli.forge_copilot_response_schema import _strip_for_gemini
-
-        gemini_tools = [
-            {
-                "functionDeclarations": [
-                    {
-                        "name": t["name"],
-                        "description": t.get("description", ""),
-                        "parameters": _strip_for_gemini(
-                            t.get("input_schema", {"type": "object", "properties": {}})
-                        ),
-                    }
-                    for t in tools
-                ]
-            }
-        ]
-        # Convert chat messages to Gemini's contents format
-        contents = []
-        for msg in messages:
-            role = "user" if msg.get("role") == "user" else "model"
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                contents.append({"role": role, "parts": [{"text": content}]})
-            elif isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") == "text":
-                            parts.append({"text": block.get("text", "")})
-                        elif "functionCall" in block:
-                            parts.append(block)
-                        elif "functionResponse" in block:
-                            parts.append(block)
-                if parts:
-                    contents.append({"role": role, "parts": parts})
-        payload: Dict[str, Any] = {
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": contents,
-            "tools": gemini_tools,
-            "generationConfig": {"temperature": _get_temperature()},
-        }
-        return config.endpoint, headers, payload
-
-    def extract_tool_calls(self, response_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-        candidates = response_json.get("candidates") or []
-        result = []
-        for candidate in candidates:
-            content = candidate.get("content") or {}
-            for part in content.get("parts") or []:
-                fc = part.get("functionCall")
-                if fc:
-                    result.append(
-                        {
-                            "id": fc.get("name", ""),
-                            "name": fc.get("name", ""),
-                            "arguments": fc.get("args") or {},
-                        }
-                    )
-        return result
-
-    def build_tool_result_messages(
-        self, tool_calls: List[Dict[str, Any]], results: List[Any]
-    ) -> List[Dict[str, Any]]:
-        # Gemini: model turn with functionCall parts, then user turn
-        # with functionResponse parts
-        model_parts = [
-            {"functionCall": {"name": tc["name"], "args": tc["arguments"]}} for tc in tool_calls
-        ]
-        user_parts = [
-            {
-                "functionResponse": {
-                    "name": tc["name"],
-                    "response": {"result": result},
-                }
-            }
-            for tc, result in zip(tool_calls, results, strict=True)
-        ]
-        return [
-            {"role": "model", "content": model_parts},
-            {"role": "user", "content": user_parts},
-        ]
-
-
-# ---------------------------------------------------------------------------
-# Registry
-# ---------------------------------------------------------------------------
-
-BUILTIN_LLM_PROVIDERS: Dict[str, LlmProvider] = {
-    "openai": OpenAIProvider(),
-    "anthropic": AnthropicProvider(),
-    "claude": AnthropicProvider(),
-    "gemini": GeminiProvider(),
-    "ollama": OllamaProvider(),
-}
-
-
 def _sync_provider_defaults_from_catalog() -> None:
     """Override provider class ``default_model`` attrs with catalog defaults.
 
@@ -1335,19 +531,21 @@ def normalize_llm_provider_name(value: Any) -> str:
 
 
 def get_llm_provider(name: str) -> LlmProvider:
-    """Resolve a provider adapter by name."""
+    """Resolve a provider adapter by name.
+
+    Every provider in fluid is a :class:`LiteLLMProvider` shim — the
+    native per-provider httpx classes were deleted in favour of
+    litellm's unified backend. ``name`` is canonicalised (``"claude"``
+    → ``"anthropic"``) and dispatched through
+    :func:`get_litellm_provider`.
+
+    ``litellm`` is a hard dependency of fluid (declared in
+    ``pyproject.toml``); the import never fails in a working install.
+    """
     normalized = (name or "").strip().lower()
-    provider = BUILTIN_LLM_PROVIDERS.get(normalized)
-    if not provider:
-        raise CopilotGenerationError(
-            "copilot_invalid_llm_provider",
-            f"Unsupported LLM provider '{name}'.",
-            suggestions=[
-                "Choose one of: openai, anthropic, gemini, ollama",
-                "Use --llm-provider or FLUID_LLM_PROVIDER to select a provider",
-            ],
-        )
-    return provider
+    from fluid_build.cli.forge_copilot_llm_litellm import get_litellm_provider
+
+    return get_litellm_provider(normalize_llm_provider_name(normalized))
 
 
 # ---------------------------------------------------------------------------
@@ -1579,28 +777,25 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
 
 
 def _default_routing_model(provider_name: str, strong_model: str) -> Optional[str]:
-    """Return the catalog's routing model for *provider_name*.
+    """Re-export shim for the extracted helper.
 
-    Reads the ``routing`` field from the catalog (v2 schema) instead
-    of a hardcoded mapping.  Returns ``None`` when no cheaper
-    alternative is available or when the routing model would be the
-    same as the strong model (no point routing to self).
+    Catalog logic now lives in :mod:`fluid_build.cli._llm_model_catalog`.
+    Tests that ``patch("fluid_build.cli.forge_copilot_llm_providers._default_routing_model", ...)``
+    still work because the patched name remains in this module's namespace.
     """
-    catalog = _load_model_catalog()
-    entry = catalog.get("providers", {}).get(provider_name, {})
-    routing = entry.get("routing")
-    if routing and routing != strong_model:
-        return routing
-    return None
+    from fluid_build.cli._llm_model_catalog import _default_routing_model as _impl
+
+    return _impl(provider_name, strong_model)
 
 
 # ---------------------------------------------------------------------------
 # LLM Call with Retry
 # ---------------------------------------------------------------------------
 
-_TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
-_LLM_MAX_RETRIES = 2
-_LLM_RETRY_BASE_SECONDS = 2.0
+# Retry / transient-error handling lives in :class:`LiteLLMProvider`,
+# which configures ``num_retries=2`` and lets litellm own the
+# exponential backoff. No module-level retry constants here — every
+# tunable goes through the provider config.
 
 # Cumulative token usage across all LLM calls in this process.
 # Not thread-safe by design — LLM calls are sequential in the current
@@ -1697,71 +892,32 @@ def call_llm(
     config: LlmConfig,
     system_prompt: str,
     user_prompt: str,
+    *,
+    extra_payload: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Call the configured provider and return free-form response text."""
-    headers, payload = provider.build_request(config, system_prompt, user_prompt)
+    """Call the configured provider and return free-form response text.
 
-    _LLM_REQUEST_SUGGESTIONS = [
-        "Check the selected model and endpoint are correct",
-        "Verify the API key environment variable is set",
-        "Use --llm-endpoint only when you need to override the provider default",
-    ]
+    Every provider in fluid is a :class:`LiteLLMProvider` shim — the
+    native per-provider httpx classes were deleted in favour of
+    litellm's unified backend. We delegate straight to the provider's
+    ``invoke_blocking`` method which owns retries, error translation,
+    cost capture, and prompt-cache normalisation.
 
-    for attempt in range(_LLM_MAX_RETRIES + 1):
+    ``extra_payload`` is the structured-output / JSON-schema
+    response_format directive the agent layer injects. Plumbing it
+    through here keeps the litellm path honest about the schema
+    constraint the caller cares about.
+    """
+    if extra_payload:
+        # Forward only when the provider supports the kwarg — older
+        # base-class subclasses ignore it; LiteLLMProvider honours it.
         try:
-            with httpx.Client(timeout=config.timeout_seconds) as client:
-                response = client.post(config.endpoint, headers=headers, json=payload)
-                response.raise_for_status()
-            break
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in _TRANSIENT_STATUS_CODES and attempt < _LLM_MAX_RETRIES:
-                delay = _LLM_RETRY_BASE_SECONDS * (2**attempt)
-                LOG.info(
-                    "LLM request returned %s, retrying in %.1fs", exc.response.status_code, delay
-                )
-                time.sleep(delay)
-                continue
-            status = exc.response.status_code
-            suggestions = list(_LLM_REQUEST_SUGGESTIONS)
-            if status == 404 and config.provider == "ollama":
-                suggestions.insert(
-                    0,
-                    f"Model '{config.model}' may not be installed. "
-                    f"Run: ollama pull {config.model}",
-                )
-            elif status == 401:
-                suggestions.insert(0, "API key may be invalid or expired. Run: fluid ai setup")
-            raise CopilotGenerationError(
-                "copilot_llm_request_failed",
-                f"LLM request failed ({status}) for {config.provider} model '{config.model}'.",
-                suggestions=suggestions,
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise CopilotGenerationError(
-                "copilot_llm_network_error",
-                f"LLM network error for provider {config.provider}: {exc}",
-                suggestions=_LLM_REQUEST_SUGGESTIONS,
-            ) from exc
-
-    try:
-        resp_json = response.json()
-        usage = provider.extract_usage(resp_json)
-        _cumulative_usage["input_tokens"] += usage.get("input_tokens", 0)
-        _cumulative_usage["output_tokens"] += usage.get("output_tokens", 0)
-        _cumulative_usage["total_tokens"] += usage.get("total_tokens", 0)
-        _record_prompt_cache_from_response(provider, resp_json)
-        return provider.extract_text(resp_json)
-    except CopilotGenerationError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise CopilotGenerationError(
-            "copilot_llm_response_invalid",
-            f"LLM response from {config.provider} could not be parsed.",
-            suggestions=[
-                "Verify the selected model supports JSON-friendly instruction following",
-                "Try a different --llm-model or --llm-provider",
-            ],
-        ) from exc
+            return provider.invoke_blocking(  # type: ignore[call-arg]
+                config, system_prompt, user_prompt, extra_payload=extra_payload
+            )
+        except TypeError:
+            pass
+    return provider.invoke_blocking(config, system_prompt, user_prompt)
 
 
 def call_llm_streaming(
@@ -1769,223 +925,64 @@ def call_llm_streaming(
     config: LlmConfig,
     system_prompt: str,
     user_prompt: str,
+    *,
+    extra_payload: Optional[Dict[str, Any]] = None,
 ) -> Iterator[str]:
-    """Slice UX-I: stream text deltas from the configured provider.
+    """Stream text deltas from the configured provider.
 
-    This is a generator that yields text chunks as they arrive via
-    SSE.  Callers typically accumulate into a buffer::
+    Yields text chunks as they arrive. Callers accumulate the chunks::
 
         chunks = []
         for chunk in call_llm_streaming(provider, config, sys, usr):
             chunks.append(chunk)
-            # optional: update a live progress view
         raw_text = "".join(chunks)
 
-    The concatenated buffer is byte-identical to what
-    :func:`call_llm` would have returned for the same request.  Every
-    downstream parser (``extract_json_object``, the retry loop,
-    validation) works unchanged.
+    Concatenated output matches what :func:`call_llm` would have
+    returned for the same request. After the iterator drains, the
+    process-wide cumulative usage tracker reflects the streamed
+    tokens (litellm's ``stream_options.include_usage=True`` carries
+    final usage on the terminal chunk).
 
-    Errors are translated to :class:`CopilotGenerationError` with the
-    same suggestions as the blocking path.  HTTP transient failures
-    are NOT retried here — callers that need retries should fall back
-    to :func:`call_llm` or wrap the generator in their own loop.
-    Retrying a partial SSE stream would require re-parsing chunks
-    delivered before the failure, which is not worth the complexity
-    when the blocking path already has a solid retry story.
+    ``extra_payload`` carries structured-output / JSON-schema
+    response_format directives — same purpose as in :func:`call_llm`.
     """
-    url, headers, payload = provider.build_streaming_request(config, system_prompt, user_prompt)
-    suggestions = [
-        "Check the selected model and endpoint are correct",
-        "Verify the API key environment variable is set",
-        "Set FLUID_LLM_STREAMING=0 to fall back to the blocking path",
-    ]
-    try:
-        with httpx.Client(timeout=config.timeout_seconds) as client:
-            with client.stream("POST", url, headers=headers, json=payload) as response:
-                try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    # Drain the error body so the message is populated.
-                    try:
-                        response.read()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    status = exc.response.status_code
-                    raise CopilotGenerationError(
-                        "copilot_llm_request_failed",
-                        f"LLM streaming request failed ({status}) "
-                        f"for {config.provider} model '{config.model}'.",
-                        suggestions=suggestions,
-                    ) from exc
-                yielded_any = False
-                for chunk in provider.iter_stream_chunks(response):
-                    if chunk:
-                        yielded_any = True
-                        yield chunk
-                if not yielded_any:
-                    raise CopilotGenerationError(
-                        "copilot_llm_stream_empty",
-                        f"LLM streaming response from {config.provider} was empty.",
-                        suggestions=suggestions,
-                    )
-    except httpx.HTTPError as exc:
-        raise CopilotGenerationError(
-            "copilot_llm_network_error",
-            f"LLM streaming network error for provider {config.provider}: {exc}",
-            suggestions=suggestions,
-        ) from exc
+    if extra_payload:
+        try:
+            yield from provider.invoke_streaming(  # type: ignore[call-arg]
+                config, system_prompt, user_prompt, extra_payload=extra_payload
+            )
+            return
+        except TypeError:
+            pass
+    yield from provider.invoke_streaming(config, system_prompt, user_prompt)
 
 
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
-_SAFE_MODEL_RE = re.compile(r"^[a-zA-Z0-9._:/-]+$")
+# ``_sanitize_model_for_url`` was deleted alongside the per-provider
+# wire-format classes — model names no longer interpolate into URL
+# paths because litellm owns endpoint construction. The regex constant
+# is gone too.
 
 
-def _sanitize_model_for_url(model: str) -> str:
-    """Reject model names that could cause path traversal in URL interpolation."""
-    if not model or not _SAFE_MODEL_RE.match(model) or ".." in model:
-        raise CopilotGenerationError(
-            "copilot_invalid_model_name",
-            f"Model name contains unsafe characters: {model!r}",
-            suggestions=["Use a model name like 'gemini-2.5-flash' or 'gpt-4o'"],
-        )
-    return model
-
-
-def _infer_provider_from_explicit_keys(env: Mapping[str, str]) -> Optional[str]:
-    """Return the provider when the operator supplied exactly one explicit
-    API-key env var.
-
-    Explicit keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY,
-    GOOGLE_API_KEY, OLLAMA_HOST) are deliberate per-run signals, so
-    they should beat the saved ``~/.fluid/ai_config.json`` provider.
-    Crucially, this helper does NOT auto-detect ambient Ollama on
-    ``localhost:11434`` — a stray ``ollama serve`` running in the
-    background must never override an explicit saved provider; that
-    discovery happens later in :func:`_infer_provider_from_ambient`,
-    which only fires once every other resolution step has failed.
-    """
-
-    detected = []
-    if env.get("OPENAI_API_KEY"):
-        detected.append("openai")
-    if env.get("ANTHROPIC_API_KEY"):
-        detected.append("anthropic")
-    if env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY"):
-        detected.append("gemini")
-    if env.get("OLLAMA_HOST"):
-        detected.append("ollama")
-    if len(detected) == 1:
-        return detected[0]
-    return None
-
-
-def _infer_provider_from_ambient(env: Mapping[str, str]) -> Optional[str]:
-    """Last-resort detection: Ollama already running on localhost.
-
-    Only call this AFTER the saved config and the keyring have been
-    consulted — ambient services must not override an explicit
-    operator choice.  See :func:`check_llm_readiness` for the full
-    resolution ladder.
-    """
-
-    if detect_ollama_available(env):
-        return "ollama"
-    return None
-
-
-# Backwards-compatible alias for callers outside this module that
-# imported ``_infer_provider_from_env``.  The new code paths inside
-# :func:`check_llm_readiness` use the split functions above so the
-# saved config gets a chance to win over ambient Ollama.
-def _infer_provider_from_env(env: Mapping[str, str]) -> Optional[str]:
-    explicit = _infer_provider_from_explicit_keys(env)
-    if explicit:
-        return explicit
-    keyring_match = _infer_provider_from_keyring()
-    if keyring_match:
-        return keyring_match
-    return _infer_provider_from_ambient(env)
-
-
-def _infer_provider_from_keyring() -> Optional[str]:
-    """Return the provider name if exactly one has a saved keyring key."""
-    detected = []
-    for name in ("openai", "anthropic", "gemini"):
-        if _get_api_key_from_keyring(name):
-            detected.append(name)
-    if len(detected) == 1:
-        return detected[0]
-    return None
-
-
-def _resolve_api_key(provider: str, env: Mapping[str, str]) -> Optional[str]:
-    if env.get("FLUID_LLM_API_KEY"):
-        return env["FLUID_LLM_API_KEY"]
-    env_var = PROVIDER_ENV_VARS.get(provider)
-    if env_var:
-        key = env.get(env_var)
-        if key:
-            return key
-    # Gemini accepts either the Forge-centric alias or Google's native env var.
-    if provider == "gemini":
-        key = env.get("GEMINI_API_KEY")
-        if key:
-            return key
-        key = env.get("GOOGLE_API_KEY")
-        if key:
-            return key
-    # Fallback: check the OS keyring for a saved key.
-    return _get_api_key_from_keyring(provider)
-
-
-# ---------------------------------------------------------------------------
-# Keyring helpers
-# ---------------------------------------------------------------------------
-
-_LLM_KEYRING_PREFIX = "llm"
-
-
-def _keyring_key(provider: str) -> str:
-    return f"{_LLM_KEYRING_PREFIX}.{provider}.api_key"
-
-
-def _get_api_key_from_keyring(provider: str) -> Optional[str]:
-    """Retrieve a saved LLM API key from the OS keyring."""
-    try:
-        from fluid_build.credentials.keyring_store import KeyringCredentialStore
-
-        return KeyringCredentialStore.get_credential(_keyring_key(provider))
-    except Exception:  # noqa: BLE001
-        LOG.debug("Keyring read failed for %s", _keyring_key(provider))
-        return None
-
-
-def save_api_key_to_keyring(provider: str, api_key: str) -> bool:
-    """Persist an LLM API key in the OS keyring for future runs."""
-    try:
-        from fluid_build.credentials.keyring_store import KeyringCredentialStore
-
-        KeyringCredentialStore.set_credential(_keyring_key(provider), api_key)
-        return True
-    except Exception:  # noqa: BLE001
-        LOG.debug("Keyring write failed for %s", _keyring_key(provider))
-        return False
-
-
-def clear_api_key_from_keyring(provider: str) -> bool:
-    """Remove a saved LLM API key from the OS keyring."""
-    try:
-        from fluid_build.credentials.keyring_store import KeyringCredentialStore
-
-        KeyringCredentialStore.delete_credential(_keyring_key(provider))
-        return True
-    except Exception:  # noqa: BLE001
-        LOG.debug("Keyring delete failed for %s", _keyring_key(provider))
-        return False
+# Provider-inference + keyring helpers (~133 LOC) physically
+# extracted to ``cli/_llm_provider_resolve.py``. Re-exported here
+# under the same names so existing call sites and test patches keep
+# resolving.
+from fluid_build.cli._llm_provider_resolve import (  # noqa: E402,F401
+    _LLM_KEYRING_PREFIX,
+    _get_api_key_from_keyring,
+    _infer_provider_from_ambient,
+    _infer_provider_from_env,
+    _infer_provider_from_explicit_keys,
+    _infer_provider_from_keyring,
+    _keyring_key,
+    _resolve_api_key,
+    clear_api_key_from_keyring,
+    save_api_key_to_keyring,
+)
 
 
 def reset_llm_caches() -> None:
@@ -2174,122 +1171,34 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
 _model_catalog_cache: Optional[Dict[str, Any]] = None
 
 
-def _load_model_catalog() -> Dict[str, Any]:
-    """Load the model catalog with a two-tier resolution.
-
-    1. ``~/.fluid/llm_models.json`` (user override — checked first)
-    2. ``fluid_build/cli/llm_models.json`` (bundled baseline)
-
-    The user override lets users add models or change defaults
-    between CLI releases without touching installed packages.
-    Cached per-process after the first successful load.
-    """
-    global _model_catalog_cache  # noqa: PLW0603
-    if _model_catalog_cache is not None:
-        return _model_catalog_cache
-
-    # Tier 1: user override
-    user_catalog = Path.home() / ".fluid" / "llm_models.json"
-    if user_catalog.is_file():
-        try:
-            data = json.loads(user_catalog.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and data.get("providers"):
-                _model_catalog_cache = data
-                LOG.debug("Loaded user model catalog from %s", user_catalog)
-                return _model_catalog_cache
-        except Exception as exc:  # noqa: BLE001
-            LOG.debug("User catalog at %s unreadable: %s", user_catalog, exc)
-
-    # Tier 2: bundled baseline
-    bundled_path = Path(__file__).with_name("llm_models.json")
-    try:
-        _model_catalog_cache = json.loads(bundled_path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        LOG.warning("Could not load model catalog %s: %s", bundled_path, exc)
-        _model_catalog_cache = {}
-    return _model_catalog_cache
+# Model-catalog query helpers — physically extracted to
+# ``cli/_llm_model_catalog.py``. ~220 LOC of pure JSON-walk lifted
+# without behavior change. Re-exported here under the same names so
+# test patches on
+# ``fluid_build.cli.forge_copilot_llm_providers.<helper>`` flow
+# through to the moved functions via the module-attribute-access
+# indirection pattern.
+from fluid_build.cli._llm_model_catalog import (  # noqa: E402,F401
+    _load_model_catalog,
+    _model_has_capability,
+    get_catalog_default,
+    get_catalog_routing_model,
+    get_catalog_tier_model,
+    get_catalog_tier_models,
+    has_distinct_tier_models,
+    model_supports_structured_output,
+    model_supports_tool_use,
+    resolve_model_name,
+)
 
 
-def get_catalog_default(provider: str) -> Optional[str]:
-    """Return the catalog's default model for *provider*."""
-    catalog = _load_model_catalog()
-    entry = catalog.get("providers", {}).get(provider)
-    if entry:
-        return entry.get("default") or entry.get("flagship")
-    return None
-
-
-def get_catalog_routing_model(provider_name: str, strong_model: str = "") -> Optional[str]:
-    """Return the catalog routing model when it differs from *strong_model*."""
-    return _default_routing_model(provider_name, strong_model or "")
-
-
-def get_catalog_tier_model(provider_name: str, tier: str = "flagship") -> Optional[str]:
-    """Return the model for a given tier with v1/v2 compatibility mapping."""
-    catalog = _load_model_catalog()
-    tier_entry = catalog.get("tiers", {}).get(provider_name, {})
-    if tier in tier_entry:
-        return tier_entry.get(tier)
-    entry = catalog.get("providers", {}).get(provider_name, {})
-    legacy_tier = {
-        "deep": "flagship",
-        "balanced": "balanced",
-        "fast": "routing",
-    }.get(tier, tier)
-    return (
-        entry.get(legacy_tier) or entry.get(tier) or entry.get("flagship") or entry.get("default")
-    )
-
-
-def get_catalog_tier_models(provider_name: str) -> Dict[str, str]:
-    """Return non-empty configured tier models for *provider_name*.
-
-    The result is intentionally small and explicit: only ``deep``,
-    ``balanced``, and ``fast`` are returned, and provider-schema fallback
-    is applied for older catalog shapes. This gives command help,
-    preflight, receipts, and stage agents one shared view of the model
-    tiers instead of each caller re-walking ``llm_models.json``.
-    """
-    result: Dict[str, str] = {}
-    for tier in ("deep", "balanced", "fast"):
-        model = get_catalog_tier_model(provider_name, tier)
-        if isinstance(model, str) and model.strip():
-            result[tier] = model.strip()
-    return result
-
-
-def has_distinct_tier_models(provider_name: str) -> bool:
-    """Return ``True`` iff the provider's tier map exposes ≥2 distinct models.
-
-    The plan promises that ``--tiered`` (or
-    ``copilot.tiered: true`` in ``ai_config.json``) silently
-    collapses to single-model with a one-line warning when the
-    selected provider has no distinct tiers — so we never crash, and
-    we never bill the deep tier for a stage that can't actually
-    benefit. Today ``llm_models.json`` ships Ollama with
-    ``deep == balanced == llama3.1`` (only ``fast`` differs). When a
-    future config or a user override flattens all three tiers to a
-    single model, the helper reports ``False`` and the caller
-    downgrades to single-model mode without surfacing a misleading
-    "deep" indicator on every stage banner.
-
-    Pure read against the catalog — no I/O on the hot path beyond the
-    cached ``_load_model_catalog`` call ``get_catalog_tier_model``
-    already uses.
-    """
-    catalog = _load_model_catalog()
-    tier_entry = catalog.get("tiers", {}).get(provider_name, {})
-    distinct = {value for value in tier_entry.values() if isinstance(value, str) and value.strip()}
-    return len(distinct) >= 2
-
-
-def build_llm_run_plan(config: LlmConfig, *, tiered: bool = False) -> Dict[str, Any]:
+def build_llm_run_plan(config: "LlmConfig", *, tiered: bool = False) -> Dict[str, Any]:
     """Build the user-facing plan for an AI forge run.
 
-    The plan is deliberately honest: deterministic stages are marked
-    deterministic even when a provider has a balanced tier configured.
-    That prevents the UX from implying "balanced executes" for dbt SQL,
-    which is generated deterministically from the logical sidecar.
+    Stays in the host module because it consumes :class:`LlmConfig`
+    (defined here) — extracting it would require a forward reference
+    or a circular import. The catalog query is delegated to
+    :func:`get_catalog_tier_models` (now in ``_llm_model_catalog``).
     """
     tier_models = config.tier_models or (get_catalog_tier_models(config.provider) if tiered else {})
     logical_model = tier_models.get("deep") if tiered else None
@@ -2345,53 +1254,6 @@ def build_llm_run_plan(config: LlmConfig, *, tiered: bool = False) -> Dict[str, 
             },
         ],
     }
-
-
-def model_supports_structured_output(provider_name: str, model: str) -> bool:
-    """Check the catalog for structured_output capability on *model*.
-
-    Returns ``False`` for unknown models — the caller should fall
-    back to the prompt-level JSON nudge.
-    """
-    return _model_has_capability(provider_name, model, "structured_output")
-
-
-def model_supports_tool_use(provider_name: str, model: str) -> bool:
-    """Check the catalog for tool_use capability on *model*."""
-    return _model_has_capability(provider_name, model, "tool_use")
-
-
-def _model_has_capability(provider_name: str, model: str, capability: str) -> bool:
-    """Generic capability check against the catalog."""
-    catalog = _load_model_catalog()
-    models = catalog.get("providers", {}).get(provider_name, {}).get("models") or []
-    lower = (model or "").lower()
-    for m in models:
-        if lower == m["id"].lower() or lower in [a.lower() for a in (m.get("aliases") or [])]:
-            return bool(m.get("capabilities", {}).get(capability, False))
-    return False
-
-
-def resolve_model_name(provider: str, user_input: str) -> str:
-    """Resolve a potentially fuzzy model name to its canonical id.
-
-    Checks the bundled catalog for exact id matches and aliases.
-    Returns *user_input* unchanged if no match is found (the API will
-    decide whether it is valid).
-    """
-    text = (user_input or "").strip()
-    if not text:
-        return text
-    catalog = _load_model_catalog()
-    models = catalog.get("providers", {}).get(provider, {}).get("models") or []
-    lower = text.lower()
-    for entry in models:
-        if lower == entry["id"].lower():
-            return entry["id"]
-        for alias in entry.get("aliases") or []:
-            if lower == alias.lower():
-                return entry["id"]
-    return text
 
 
 # ---------------------------------------------------------------------------
@@ -2474,5 +1336,169 @@ def resolve_ollama_model(env: Mapping[str, str]) -> str:
 # ---------------------------------------------------------------------------
 # Module init: sync provider defaults from catalog (must run AFTER all
 # functions and the model catalog section are defined above).
+# (Moved below ``BUILTIN_LLM_PROVIDERS`` so the sync sees the actual
+# instance attrs.)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Provider shims (litellm-backed)
+# ---------------------------------------------------------------------------
+#
+# What used to be ~1,300 lines of per-provider wire-format code is now
+# four thin subclasses that delegate every method to LiteLLMProvider.
+# litellm normalises every supported providers payload + response shape
+# to the OpenAI shape so the per-provider `build_request` / `extract_text`
+# / `extract_usage` / `extract_prompt_cache` / `extract_tool_calls` /
+# `iter_stream_chunks` overrides are all gone.
+#
+# These shim classes exist so legacy import paths
+# (`OpenAIProvider`, `AnthropicProvider`, ...) keep resolving — the
+# code that *used* them already calls the abstract `LlmProvider` API,
+# so swapping in a litellm-backed subclass is invisible at the call
+# site.
+#
+# Adding a new provider becomes one row in `BUILTIN_LLM_PROVIDERS`
+# below: litellm already speaks every major provider so the per-class
+# wire format wrapping is no longer required.
+
+
+def _make_litellm_shim(provider_name: str, default_model: str):
+    """Build a LiteLLMProvider-backed subclass with a fixed provider name.
+
+    Returns a class so legacy code that does ``OpenAIProvider()``
+    keeps working unchanged. We avoid a top-level
+    ``from forge_copilot_llm_litellm import LiteLLMProvider`` because
+    that module imports from this one — the circular import would
+    deadlock at module load time when callers do
+    ``from forge_copilot_llm_litellm import LiteLLMProvider`` first.
+
+    Instead we resolve ``LiteLLMProvider`` lazily on first
+    *instantiation* of the shim class. By that point both modules
+    are fully loaded.
+    """
+    _shim_class: list = [None]  # closed-over cache
+
+    def _resolve_shim_class():
+        if _shim_class[0] is not None:
+            return _shim_class[0]
+        from fluid_build.cli.forge_copilot_llm_litellm import LiteLLMProvider
+
+        class _Shim(LiteLLMProvider):
+            def __init__(self):
+                super().__init__(provider_name, default_model=default_model)
+
+        _Shim.__name__ = provider_name.title() + "Provider"
+        _Shim.__qualname__ = _Shim.__name__
+        _shim_class[0] = _Shim
+        return _Shim
+
+    class _LazyShim:
+        """Public stand-in: instantiating it builds the real class
+        on first call and forwards through. ``isinstance`` checks
+        against ``LiteLLMProvider`` post-construction will work
+        because the constructed object IS a ``LiteLLMProvider``
+        subclass."""
+
+        def __new__(cls, *args, **kwargs):
+            real_cls = _resolve_shim_class()
+            return real_cls(*args, **kwargs)
+
+    _LazyShim.__name__ = provider_name.title() + "Provider"
+    _LazyShim.__qualname__ = _LazyShim.__name__
+    return _LazyShim
+
+
+# Keep the historical class names available for any caller that
+# imported them. New code should not reference these directly — use
+# `get_llm_provider(name)` instead. Defaults pulled from the central
+# model registry so a single edit to ``copilot/models.py`` propagates
+# here.
+from fluid_build.copilot.models import default_model_for as _default_model
+
+OpenAIProvider = _make_litellm_shim(
+    "openai", _default_model("openai", "default", fallback="gpt-4.1-mini")
+)
+AnthropicProvider = _make_litellm_shim(
+    "anthropic",
+    _default_model("anthropic", "fast", fallback="claude-haiku-4-5"),
+)
+GeminiProvider = _make_litellm_shim(
+    "gemini", _default_model("gemini", "default", fallback="gemini-2.5-flash")
+)
+
+
+class OllamaProvider(
+    _make_litellm_shim("ollama", _default_model("ollama", "default", fallback="gemma3:4b"))
+):
+    """Local Ollama — same shim shape, kept as its own class so call
+    sites that special-case Ollama (zero cost, host detection, etc.)
+    still find a stable subclass."""
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+
+class _LazyBuiltinProviders(dict):
+    """Lazy registry for built-in LLM providers.
+
+    Instantiating ``OpenAIProvider`` etc. requires
+    :class:`LiteLLMProvider` from ``forge_copilot_llm_litellm``, which
+    in turn imports from this module. Eager instantiation at module
+    load time deadlocks the circular import. We defer per-key
+    construction to the first ``__getitem__`` / ``get`` call.
+
+    The dict-subclass shape preserves the public contract:
+    ``BUILTIN_LLM_PROVIDERS["openai"]`` works,
+    ``"openai" in BUILTIN_LLM_PROVIDERS`` works, ``.values()`` returns
+    instantiated providers (it forces resolution of every key).
+    """
+
+    _factories: Dict[str, Any] = {
+        "openai": lambda: OpenAIProvider(),
+        "anthropic": lambda: AnthropicProvider(),
+        "claude": lambda: AnthropicProvider(),
+        "gemini": lambda: GeminiProvider(),
+        "ollama": lambda: OllamaProvider(),
+    }
+
+    def __init__(self):
+        super().__init__()
+
+    def __contains__(self, key) -> bool:  # type: ignore[override]
+        return key in self._factories or super().__contains__(key)
+
+    def __getitem__(self, key):
+        if not super().__contains__(key):
+            factory = self._factories.get(key)
+            if factory is None:
+                raise KeyError(key)
+            super().__setitem__(key, factory())
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def keys(self):  # type: ignore[override]
+        # Union of cached + lazy keys.
+        return list(set(self._factories.keys()) | set(super().keys()))
+
+    def values(self):  # type: ignore[override]
+        return [self[k] for k in self.keys()]
+
+    def items(self):  # type: ignore[override]
+        return [(k, self[k]) for k in self.keys()]
+
+
+BUILTIN_LLM_PROVIDERS: Dict[str, LlmProvider] = _LazyBuiltinProviders()
+
+
+# Sync defaults from the catalog now that BUILTIN_LLM_PROVIDERS exists.
+# The shim ``__init__`` writes its hardcoded fallback ``default_model``;
+# this runs immediately after to override it with the catalog flagship,
+# keeping the catalog file as the single source of truth.
 _sync_provider_defaults_from_catalog()

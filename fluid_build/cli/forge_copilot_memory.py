@@ -44,8 +44,11 @@ from fluid_build.util.contract import get_builds
 
 LOG = logging.getLogger("fluid.cli.forge_copilot_memory")
 
-#: Re-exported for backward compatibility.  New callers should import
-#: ``PRODUCT_MEMORY_FILENAME`` from :mod:`fluid_build.cli.artifact_paths`.
+#: Public alias for ``PRODUCT_MEMORY_FILENAME`` — kept under the
+#: shorter name because every per-product call site here uses
+#: ``MEMORY_FILENAME`` and the rename would touch ~30 read-only refs
+#: in this module without changing semantics. Single source of truth
+#: still lives in :mod:`fluid_build.cli.artifact_paths`.
 MEMORY_FILENAME = PRODUCT_MEMORY_FILENAME
 MEMORY_SCHEMA_VERSION = 1
 MAX_MEMORY_LIST_VALUES = 8

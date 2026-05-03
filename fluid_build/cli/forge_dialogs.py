@@ -290,15 +290,33 @@ def ask_friendly_text(
     required: bool,
     default: Optional[str] = None,
 ) -> Optional[str]:
-    """Ask a free-text question with one gentle retry for required fields."""
-    answer = _read_free_text(console, prompt, default=default)
-    if answer:
-        return answer
+    """Ask a free-text question with one gentle retry for required fields.
+
+    Phase 0.5 #19 — slash commands like ``:ai-setup`` are detected
+    BEFORE the answer is treated as content. The user can re-enter
+    AI setup, toggle ``--show-work``, or abort gracefully without
+    leaving the interview. After a slash command runs, the prompt
+    repeats so the user can answer the original question.
+    """
+    from fluid_build.cli._interview_slash_commands import maybe_handle_slash_command
+
+    # Up to 5 successive slash commands, then resume the prompt.
+    for _ in range(5):
+        answer = _read_free_text(console, prompt, default=default)
+        if answer and maybe_handle_slash_command(answer, console=console):
+            continue
+        if answer:
+            return answer
+        break
+
     if not required:
         return None
     if console:
         console.print("[dim]A short answer is enough here. A phrase works fine.[/dim]")
     retry = _read_free_text(console, prompt, default=default)
+    if retry and maybe_handle_slash_command(retry, console=console):
+        # Slash command on the retry — give one more chance.
+        retry = _read_free_text(console, prompt, default=default)
     return retry or None
 
 
