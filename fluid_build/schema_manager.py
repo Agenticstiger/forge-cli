@@ -61,6 +61,14 @@ def _schema_version_sort_key(version: str) -> tuple[int, int, int]:
 
 
 def _discover_bundled_versions() -> List[str]:
+    """Enumerate bundled schemas under :mod:`fluid_build.schemas`.
+
+    Scans ``fluid-schema-X.Y.Z.json`` files. Only the 0.7.x line is
+    bundled; pre-0.7 schemas (0.4.0, 0.5.7) were dropped because the
+    feature accessors no longer support those shapes — operators on
+    older contracts must run ``fluid contract migrate-product-type``
+    (or upgrade the contract by hand) before this CLI can act on it.
+    """
     schemas_dir = Path(__file__).parent / "schemas"
     versions = set()
 
@@ -71,7 +79,11 @@ def _discover_bundled_versions() -> List[str]:
                 versions.add(match.group(1))
 
     if not versions:
-        versions.update(["0.4.0", "0.5.7", "0.7.1", "0.7.2"])
+        # Defensive fallback — the bundled directory normally has the
+        # full 0.7.x set. If it's missing entirely (broken install,
+        # zip-app stripped), seed with the canonical line so the
+        # version registry doesn't blow up at import time.
+        versions.update(["0.7.1", "0.7.2", "0.7.3"])
 
     return sorted(versions, key=_schema_version_sort_key)
 
@@ -104,7 +116,7 @@ class SchemaVersion:
                 context={"version": version_str, "expected_format": "X.Y.Z"},
                 suggestions=[
                     "Version must follow semantic versioning: major.minor.patch",
-                    "Examples: 0.4.0, 0.5.7, 1.0.0",
+                    "Examples: 0.7.3, 0.7.2, 1.0.0",
                     "Prerelease versions: 1.0.0-alpha, 1.0.0-beta.1",
                 ],
             )
@@ -147,14 +159,14 @@ class SchemaVersion:
 
 @dataclass
 class VersionConstraint:
-    """Represents version constraints like >=0.4.0, ~0.5.0, etc."""
+    """Represents version constraints like ``>=0.7.0``, ``~0.7.1``, etc."""
 
     operator: str
     version: SchemaVersion
 
     @classmethod
     def parse(cls, constraint_str: str) -> VersionConstraint:
-        """Parse constraint string like '>=0.4.0' or '~0.5.0'."""
+        """Parse constraint string like ``>=0.7.0`` or ``~0.7.1``."""
         constraint_str = constraint_str.strip()
 
         # Extract operator and version
@@ -346,10 +358,14 @@ class FluidSchemaManager:
 
     @classmethod
     def latest_bundled_version(cls) -> str:
-        """Return the newest bundled FLUID schema version."""
+        """Return the newest bundled FLUID schema version.
+
+        Defaults to ``0.7.3`` when no bundled schemas are discovered
+        (e.g. a stripped install). Pre-0.7 versions are not supported.
+        """
         if cls.BUNDLED_VERSIONS:
             return cls.BUNDLED_VERSIONS[-1]
-        return "0.7.2"
+        return "0.7.3"
 
     def __init__(
         self,
@@ -392,12 +408,16 @@ class FluidSchemaManager:
             except (json.JSONDecodeError, OSError) as e:
                 self.logger.warning(f"Failed to load bundled schema {schema_file}: {e}")
 
-        # Fallback: ensure we have at least 0.5.7 with minimal schema
-        if "0.5.7" not in self._bundled_schemas:
-            self._bundled_schemas["0.5.7"] = {
+        # Defensive: when the bundled directory was stripped during
+        # install, seed a minimal v0.7.3 placeholder so the validator
+        # short-circuit doesn't blow up. The shape is intentionally
+        # permissive — operators with real contracts will still get
+        # the bundled schema in any sane install.
+        if "0.7.3" not in self._bundled_schemas:
+            self._bundled_schemas["0.7.3"] = {
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "description": "FLUID v0.5.7 Contract Schema (minimal fallback)",
+                "description": "FLUID v0.7.3 Contract Schema (minimal fallback)",
             }
 
     def detect_version(self, contract: Dict[str, Any]) -> Optional[SchemaVersion]:
@@ -498,7 +518,7 @@ class FluidSchemaManager:
         Find the best compatible version for a constraint.
 
         Args:
-            constraint: Version constraint like '>=0.4.0'
+            constraint: Version constraint like ``>=0.7.0``
             available_versions: List of available versions to check
 
         Returns:
@@ -620,7 +640,25 @@ class FluidSchemaManager:
                 error_msg = f"{path_str}: {error.message}"
                 result.add_error(error_msg)
 
-            return len(errors) == 0
+            # Equivalence axiom: cross-validate metadata.layer ↔ metadata.productType
+            # via the canonical registry in fluid_build.forge.product_types.
+            # JSON Schema can't express the Bronze↔SDP / Silver↔ADP / Gold↔CDP
+            # mapping; the registry call also fills the missing twin so every
+            # consumer downstream sees the canonical pair.
+            from fluid_build.forge.product_types import (
+                ProductTypeError,
+                normalize_metadata_in_place,
+            )
+
+            metadata = (contract or {}).get("metadata") or {}
+            try:
+                normalize_metadata_in_place(metadata)
+            except ProductTypeError as exc:
+                result.add_error(f"metadata.productType: {exc}")
+
+            # is_valid is True only when no JSON Schema errors AND no
+            # productType cross-check error was added by the block above.
+            return not result.errors
 
         except Exception as e:
             result.add_error(f"JSON Schema validation error: {str(e)}")

@@ -24,7 +24,6 @@ _NAME_PATTERN = re.compile(r"^.{1,256}$")
 _VERSION_PATTERN = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
 _EMAIL_PATTERN = re.compile(r"^[^@]+@[^@]+\.[^@]+$")
 
-_LAYERS = {"Bronze", "Silver", "Gold", "Platinum"}
 _PATTERNS = {"declarative", "hybrid-reference", "embedded-logic", "logical-mapping"}
 
 
@@ -142,10 +141,28 @@ def _check_metadata(md: Any, errors: List[str]) -> None:
     _assert(_is_obj(md), "metadata must be object", errors)
     if not _is_obj(md):
         return
-    layer = _req(md, "layer", errors, "metadata")
+    # Equivalence axiom: ``metadata.productType`` (SDP/ADP/CDP) and
+    # ``metadata.layer`` (Bronze/Silver/Gold/Platinum) are twin fields.
+    # ``normalize_metadata_in_place`` enforces the canonical mapping,
+    # rejects invalid values, and fills the missing twin so every
+    # consumer downstream sees the canonical pair.
+    from fluid_build.forge.product_types import ProductTypeError, normalize_metadata_in_place
+
+    layer = md.get("layer")
+    product_type = md.get("productType")
     owner = _req(md, "owner", errors, "metadata")
-    if layer is not None:
-        _assert(layer in _LAYERS, f"metadata.layer must be one of {sorted(_LAYERS)}", errors)
+    if layer is None and product_type is None:
+        _assert(
+            False,
+            "metadata requires either 'layer' (Bronze/Silver/Gold/Platinum) "
+            "or 'productType' (SDP/ADP/CDP)",
+            errors,
+        )
+    else:
+        try:
+            normalize_metadata_in_place(md)
+        except ProductTypeError as exc:
+            errors.append(f"metadata: {exc}")
     if owner is not None:
         if _is_str(owner):
             _check_email(owner, "metadata.owner", errors)
@@ -181,7 +198,7 @@ def _check_build(build: Any, errors: List[str]) -> None:
     if props is not None:
         _assert(_is_obj(props), "build.transformation.properties must be object", errors)
 
-    # Conditional validation (the v0.4.0 if/then semantics)
+    # Conditional validation — pattern-specific required-key checks.
     if _is_str(pattern) and _is_obj(props):
         if pattern == "hybrid-reference":
             model = _req(props, "model", errors, "build.transformation.properties")
@@ -226,8 +243,10 @@ def _check_build(build: Any, errors: List[str]) -> None:
 
 # --------- Public API used by CLI ---------
 def validate_contract(contract: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    """
-    Validate a FLUID v0.4.0 contract.
+    """Validate a FLUID 0.7.x contract.
+
+    Pre-0.7 contracts (0.4.0, 0.5.x) are no longer supported — operators
+    on those should run a one-time migration and re-emit at 0.7.3.
 
     Returns:
         (ok, error_string_or_none)
