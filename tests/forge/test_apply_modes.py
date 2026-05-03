@@ -34,7 +34,7 @@ from fluid_build.forge.core.apply_modes import (
     is_destructive,
     is_dry_run,
     needs_build,
-    resolve_mode_with_build_alias,
+    parse_mode,
 )
 
 # ---------------------------------------------------------------------------
@@ -254,48 +254,27 @@ class TestDataLossGate:
 # ---------------------------------------------------------------------------
 
 
-class TestResolveModeWithBuildAlias:
-    def test_neither_flag_yields_default(self):
-        mode, build = resolve_mode_with_build_alias(None, None)
-        assert mode is ApplyMode.default()
-        assert build is None
+class TestParseMode:
+    """``parse_mode`` is the canonical mode parser. The legacy
+    ``resolve_mode_with_build_alias`` (which auto-upgraded ``--build X``
+    to ``--mode amend-and-build``) was deleted along with the ``--build``
+    flag's deprecation path."""
+
+    def test_none_yields_default(self):
+        assert parse_mode(None) is ApplyMode.default()
 
     def test_explicit_mode_passes_through(self):
         for value in CANONICAL_CHOICES:
-            mode, build = resolve_mode_with_build_alias(value, None)
-            assert mode.value == value
-            assert build is None
-
-    def test_legacy_build_upgrades_to_amend_and_build(self):
-        """The deprecation alias: ``--build X`` with no ``--mode`` becomes
-        ``--mode amend-and-build --build X``. Keeps existing CI scripts
-        working during the one-release deprecation window."""
-        mode, build = resolve_mode_with_build_alias(None, "my-build")
-        assert mode is ApplyMode.AMEND_AND_BUILD
-        assert build == "my-build"
-
-    def test_explicit_build_mode_plus_build_id_passes_through(self):
-        """``--mode amend-and-build --build X`` is fully valid (both flags
-        set together, but consistently). No warning, no upgrade."""
-        mode, build = resolve_mode_with_build_alias("amend-and-build", "my-build")
-        assert mode is ApplyMode.AMEND_AND_BUILD
-        assert build == "my-build"
-
-        mode, build = resolve_mode_with_build_alias("replace-and-build", "my-build")
-        assert mode is ApplyMode.REPLACE_AND_BUILD
-        assert build == "my-build"
-
-    def test_non_build_mode_plus_build_id_raises(self):
-        """``--mode amend --build X`` is ambiguous: user wanted a build but
-        picked a non-build mode. Force a clear error rather than silently
-        dropping --build."""
-        for non_build in ["dry-run", "create-only", "amend", "replace"]:
-            with pytest.raises(ValueError, match="only valid with build-augmented"):
-                resolve_mode_with_build_alias(non_build, "my-build")
+            assert parse_mode(value).value == value
 
     def test_unknown_mode_raises(self):
         with pytest.raises(ValueError, match="unknown --mode"):
-            resolve_mode_with_build_alias("invalid-mode", None)
+            parse_mode("invalid-mode")
+
+    def test_non_string_input_returns_default(self):
+        """Defensive: argparse always sends strings, but a test passing
+        a MagicMock should not blow up — return the default instead."""
+        assert parse_mode(object()) is ApplyMode.default()
 
 
 # ---------------------------------------------------------------------------

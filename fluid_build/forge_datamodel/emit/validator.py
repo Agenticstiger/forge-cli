@@ -45,9 +45,13 @@ _DRIFT_SIMILARITY_THRESHOLD = 0.72
 class FluidContractValidator:
     """Validate logical drafts and emitted contracts against current specs."""
 
-    def __init__(self, *, version: str = "0.7.2") -> None:
-        self.version = version
+    def __init__(self, *, version: Optional[str] = None) -> None:
+        # Default to the latest bundled schema so the validator tracks releases
+        # automatically. Callers can pin to a specific version when emitting
+        # for a frozen target. Per-contract validation honors the contract's
+        # own ``fluidVersion`` first (see ``validate``) — this is the fallback.
         self.schema_manager = FluidSchemaManager()
+        self.version = version or self.schema_manager.latest_bundled_version()
 
     def validate(
         self,
@@ -119,9 +123,15 @@ class FluidContractValidator:
 
         if contract is not None:
             contract_for_schema = _strip_contract_provenance(contract)
+            # Honor the contract's own ``fluidVersion`` when present so a
+            # contract emitted at one schema version validates against that
+            # version, not whichever default the validator was initialized
+            # with. Falls back to ``self.version`` (the configured / latest)
+            # for contracts that omit the field.
+            target_version = contract.get("fluidVersion") or self.version
             validation = self.schema_manager.validate_contract(
                 contract_for_schema,
-                schema_version=self.version,
+                schema_version=target_version,
                 offline_only=True,
             )
             for err in validation.errors:

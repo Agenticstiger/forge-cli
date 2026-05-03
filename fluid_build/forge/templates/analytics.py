@@ -105,205 +105,33 @@ class AnalyticsTemplate(ProjectTemplate):
         }
 
     def generate_contract(self, context: GenerationContext) -> Dict[str, Any]:
-        """Generate FLUID 0.5.7 compliant analytics contract"""
-        project_config = context.project_config
+        """Generate a v0.7.3-canonical contract via the shared builder.
 
-        # Extract configuration values
-        project_name = project_config.get("name", "analytics-product")
-        description = project_config.get(
-            "description", "Analytics data product for business intelligence"
+        Per-template specifics (product type, build pattern, engine,
+        default columns) live in :class:`TemplateSpec` below;
+        :func:`build_contract` populates the canonical fluidVersion,
+        layer↔productType pair, owner, exposes[].binding, builds[],
+        and consumes[] structure so every template stays in lockstep
+        with schema changes.
+        """
+        from ._v073_builder import TemplateSpec, build_contract
+
+        spec = TemplateSpec(
+            template_name="analytics",
+            product_type="ADP",
+            pattern="hybrid-reference",
+            engine="dbt",
+            properties={"model": "analytics_model"},
+            expose_id="analytics_facts",
+            binding_format="csv",
+            description_suffix="Star-schema analytics with metrics layer",
+            columns=[
+                {"name": "customer_id", "type": "string", "required": True},
+                {"name": "metric_value", "type": "decimal", "required": True},
+                {"name": "as_of", "type": "timestamp", "required": True},
+            ],
         )
-        domain = project_config.get("domain", "analytics")
-        owner = project_config.get("owner", "analytics-team")
-        provider = project_config.get("provider", "gcp")
-
-        contract = {
-            "fluidVersion": project_config.get("fluid_version", "0.5.7"),
-            "kind": "DataProduct",
-            "id": f"{project_name.replace('-', '_')}_analytics",
-            "name": f"{project_name} Analytics",
-            "description": description,
-            "domain": domain,
-            "metadata": {
-                "layer": "Silver",
-                "owner": {"team": owner, "email": f"{owner}@company.com"},
-                "status": "Development",
-                "tags": ["analytics", "reporting", "bi", "dashboard"],
-                "created": context.creation_time,
-                "template": "analytics",
-                "forge_version": context.forge_version,
-                "dbt_version": "1.6.0",
-                "analytics_patterns": ["dimensional_modeling", "star_schema", "metrics_layer"],
-            },
-            "consumes": [
-                {
-                    "id": "source_systems",
-                    "ref": "urn:fluid:source_systems:v1",
-                    "description": "Raw data from operational systems for analytics processing",
-                },
-                {
-                    "id": "customer_data",
-                    "ref": "urn:fluid:customers:v1",
-                    "description": "Customer master data and attributes",
-                },
-                {
-                    "id": "transaction_data",
-                    "ref": "urn:fluid:transactions:v1",
-                    "description": "Transaction and event data",
-                },
-            ],
-            "builds": [  # Changed from 'build' to 'builds' array
-                {
-                    "transformation": {
-                        "pattern": "hybrid-reference",
-                        "engine": "dbt",
-                        "properties": {
-                            "models_path": "dbt/models/",
-                            "staging_models": "staging/",
-                            "mart_models": "marts/",
-                            "vars": {
-                                "source_schema": "raw",
-                                "staging_schema": "staging",
-                                "mart_schema": "marts",
-                            },
-                            "materializations": {
-                                "staging": "view",
-                                "intermediate": "ephemeral",
-                                "marts": "table",
-                            },
-                        },
-                    },
-                    "execution": {
-                        "trigger": {"type": "schedule", "cron": "0 2 * * *"},
-                        "runtime": {
-                            "platform": provider,
-                            "resources": {"cpu": "4", "memory": "8GB"},
-                        },
-                        "retries": {"count": 3, "delaySeconds": 300, "backoff": "exponential"},
-                    },
-                }
-            ],  # Close builds array
-            "exposes": [
-                {
-                    "exposeId": "customer_analytics_mart",  # Changed from 'id'
-                    "kind": "table",  # Changed from 'type'
-                    "description": "Customer analytics and segmentation data mart",
-                    "binding": {  # Changed from 'location'
-                        "format": "table",
-                        "dataset": "marts",  # Flattened from properties
-                        "table": "customer_analytics",
-                    },
-                    "schema": [
-                        {
-                            "name": "customer_id",
-                            "type": "string",
-                            "description": "Unique customer identifier",
-                            "nullable": False,
-                        },
-                        {
-                            "name": "customer_segment",
-                            "type": "string",
-                            "description": "Customer segment classification",
-                            "nullable": True,
-                        },
-                        {
-                            "name": "lifetime_value",
-                            "type": "decimal",
-                            "description": "Customer lifetime value",
-                            "nullable": True,
-                        },
-                        {
-                            "name": "acquisition_date",
-                            "type": "date",
-                            "description": "Customer acquisition date",
-                            "nullable": False,
-                        },
-                        {
-                            "name": "last_activity_date",
-                            "type": "date",
-                            "description": "Last customer activity date",
-                            "nullable": True,
-                        },
-                        {
-                            "name": "calculated_at",
-                            "type": "timestamp",
-                            "description": "Analytics calculation timestamp",
-                            "nullable": False,
-                        },
-                    ],
-                    "quality": [
-                        {
-                            "name": "customer_uniqueness",
-                            "rule": 'customer_id IS NOT NULL AND customer_id != ""',
-                            "onFailure": {"action": "reject_row"},
-                        },
-                        {
-                            "name": "data_freshness",
-                            "rule": "calculated_at >= CURRENT_TIMESTAMP - INTERVAL 2 DAY",
-                            "onFailure": {"action": "alert"},
-                        },
-                        {
-                            "name": "ltv_reasonableness",
-                            "rule": "lifetime_value >= 0 OR lifetime_value IS NULL",
-                            "onFailure": {"action": "flag_for_review"},
-                        },
-                    ],
-                },
-                {
-                    "id": "revenue_metrics",
-                    "type": "table",
-                    "description": "Revenue and financial metrics data mart",
-                    "location": {
-                        "format": "table",
-                        "properties": {"dataset": "marts", "table": "revenue_metrics"},
-                    },
-                    "schema": [
-                        {
-                            "name": "date",
-                            "type": "date",
-                            "description": "Metric date",
-                            "nullable": False,
-                        },
-                        {
-                            "name": "revenue",
-                            "type": "decimal",
-                            "description": "Daily revenue",
-                            "nullable": False,
-                        },
-                        {
-                            "name": "orders",
-                            "type": "integer",
-                            "description": "Number of orders",
-                            "nullable": False,
-                        },
-                        {
-                            "name": "customers",
-                            "type": "integer",
-                            "description": "Number of unique customers",
-                            "nullable": False,
-                        },
-                    ],
-                    "quality": [
-                        {
-                            "name": "revenue_positive",
-                            "rule": "revenue >= 0",
-                            "onFailure": {"action": "reject_row"},
-                        }
-                    ],
-                },
-            ],
-            "slo": {"freshnessMinutes": 120, "availabilityPct": 99.5},  # 2 hours
-            "analytics": {
-                "modeling_approach": "dimensional",
-                "grain": "daily",
-                "historical_data": "2_years",
-                "refresh_frequency": "daily",
-                "bi_tools": ["looker", "tableau"],
-                "metrics_layer": True,
-            },
-        }
-
-        return contract
+        return build_contract(spec=spec, project_config=context.project_config)
 
     def validate_configuration(self, config: Dict[str, Any]) -> ValidationResult:
         """Validate analytics template configuration"""

@@ -184,65 +184,26 @@ def check_data_loss_gate(
 
 
 # ---------------------------------------------------------------------------
-# --build deprecation alias
+# Mode parsing
 # ---------------------------------------------------------------------------
 
 
-def resolve_mode_with_build_alias(
-    mode_arg: Optional[str],
-    build_id: Optional[str],
-) -> tuple[ApplyMode, Optional[str]]:
-    """Coerce the user's ``--mode`` + ``--build`` inputs into a canonical
-    ``(ApplyMode, build_id_or_None)`` pair.
+def parse_mode(mode_arg: Optional[str]) -> ApplyMode:
+    """Parse a user-supplied ``--mode`` value into a canonical :class:`ApplyMode`.
 
-    Rules:
-
-    * Neither flag set → default ``ApplyMode.AMEND``.
-    * ``--mode X`` set, no ``--build`` → ``(X, None)``.
-    * No ``--mode``, ``--build Y`` set → legacy invocation. Auto-upgrade to
-      ``amend-and-build`` and log a deprecation warning. Keep ``build_id=Y``
-      so the build engine still picks the right job.
-    * BOTH ``--mode`` and ``--build`` set — only valid when ``--mode`` is
-      a build-augmented variant (amend-and-build or replace-and-build).
-      Otherwise raise ``ValueError`` (CLI converts to user-facing error).
-
-    Defensive input handling: ``mode_arg`` and ``build_id`` are normalized
-    to ``None`` when not strings. This is the gate that lets tests pass a
-    ``MagicMock`` for ``args`` without explicitly stubbing these attributes —
-    Mock's auto-attribute creation would otherwise trigger the unknown-mode
-    error path. Real argparse always sends strings or None.
-
-    The ``ValueError`` carries a specific message so ``apply.py`` can map
-    it to a CLIError with a stable ``event`` field.
+    Returns the default mode (``amend``) when ``mode_arg`` is ``None``
+    or not a string (defensive — argparse always sends strings, but
+    test harnesses passing MagicMock should not fall through to
+    ``ApplyMode("MagicMock")``).
     """
-    # Normalize non-string inputs (MagicMock, missing attrs) to None so the
-    # downstream logic doesn't have to special-case them.
     if not isinstance(mode_arg, str):
-        mode_arg = None
-    if not isinstance(build_id, str):
-        build_id = None
-
-    if mode_arg is None:
-        if build_id:
-            # Legacy path — caller will emit the deprecation log.
-            return ApplyMode.AMEND_AND_BUILD, build_id
-        return ApplyMode.default(), None
-
+        return ApplyMode.default()
     try:
-        mode = ApplyMode(mode_arg)
+        return ApplyMode(mode_arg)
     except ValueError:
         raise ValueError(
             f"unknown --mode value: {mode_arg!r}. " f"Valid: {', '.join(CANONICAL_CHOICES)}"
         ) from None
-
-    if build_id and not needs_build(mode):
-        raise ValueError(
-            f"--build is only valid with build-augmented modes "
-            f"(amend-and-build, replace-and-build); got --mode {mode.value}. "
-            f"Either drop --build or use --mode amend-and-build."
-        )
-
-    return mode, build_id
 
 
 __all__ = [
@@ -256,5 +217,5 @@ __all__ = [
     "is_destructive",
     "is_dry_run",
     "needs_build",
-    "resolve_mode_with_build_alias",
+    "parse_mode",
 ]
