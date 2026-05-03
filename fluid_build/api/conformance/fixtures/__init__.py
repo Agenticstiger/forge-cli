@@ -1,0 +1,12 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+"""Fixture configurations for the conformance suite. Each fixture is a
+contract dictionary that exercises a specific code path. Subclasses of
+``RunnerConformance`` can pick a fixture to validate against.
+"""

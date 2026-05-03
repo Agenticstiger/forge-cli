@@ -80,8 +80,7 @@ def _bootstrap_options() -> ProviderOptions:
 
 
 def _write_contract(path: Path) -> None:
-    path.write_text(
-        """
+    path.write_text("""
 fluidVersion: "0.7.1"
 kind: "DataProduct"
 id: "silver.community.live_snowflake_happy_path_v1"
@@ -139,9 +138,7 @@ exposes:
           type: "STRING"
         - name: "CREATED_AT"
           type: "TIMESTAMP"
-""".strip()
-        + "\n"
-    )
+""".strip() + "\n")
 
 
 def _run_cli(

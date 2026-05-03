@@ -308,9 +308,12 @@ def compile_contract(
     if not resolve_refs:
         return contract
 
-    log.info("compile_start", extra={"path": str(p)})
+    # DEBUG-level so the breadcrumbs don't bleed into user-facing CLI
+    # output. Surface them via ``--debug`` / ``FLUID_LOG_LEVEL=DEBUG``
+    # or a structured ``--log-file`` JSON sink.
+    log.debug("compile_start", extra={"path": str(p)})
     compiled = _resolve_refs(contract, p.parent)
-    log.info("compile_done", extra={"path": str(p)})
+    log.debug("compile_done", extra={"path": str(p)})
     return compiled
 
 
