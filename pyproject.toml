@@ -181,6 +181,7 @@ dev = [
   "pytest-cov>=4.1",
   "pytest-asyncio>=0.23",        # For async test support
   "pytest-randomly>=3.15",       # Randomize test order to catch hidden deps
+  "respx>=0.21",                 # HTTPX request mocking — used by acquisition test matrix
   "mypy>=1.10",
   "ruff>=0.5",
   "types-PyYAML>=6.0.12",
