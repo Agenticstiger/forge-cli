@@ -43,11 +43,8 @@ call per long agent loop.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Callable, Optional
-
-import httpx
 
 from fluid_build.cli.forge_copilot_llm_providers import (
     BUILTIN_LLM_PROVIDERS,
@@ -124,23 +121,37 @@ def build_default_summarizer(
         if len(blob) > 60_000:
             blob = blob[-60_000:]
         try:
-            headers, payload = provider.build_request(
-                routing_config, _SUMMARIZER_SYSTEM_PROMPT, blob
+            # Route through litellm directly — same one-line completion
+            # for every provider. Replaces ~30 lines of per-provider
+            # request building, header formatting, and httpx posting
+            # that the legacy path used to do.
+            import litellm  # core dep
+
+            from fluid_build.cli.forge_copilot_llm_litellm import (
+                _LITELLM_PREFIX_BY_PROVIDER,
             )
-            payload = dict(payload)
-            payload.pop("response_format", None)  # plain text, not json_schema
-            payload.pop("tools", None)
-            payload.pop("tool_choice", None)
-            if config.provider in {"anthropic", "claude"}:
-                payload["max_tokens"] = max_summary_tokens
-            response = httpx.post(
-                routing_config.endpoint,
-                headers=headers,
-                json=payload,
+
+            prefix = _LITELLM_PREFIX_BY_PROVIDER.get(
+                routing_config.provider.lower(), routing_config.provider.lower()
+            )
+            model = (
+                routing_config.model
+                if "/" in (routing_config.model or "")
+                else f"{prefix}/{routing_config.model}"
+            )
+            resp = litellm.completion(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _SUMMARIZER_SYSTEM_PROMPT},
+                    {"role": "user", "content": blob},
+                ],
+                api_key=routing_config.api_key,
+                max_tokens=max_summary_tokens,
+                temperature=0.0,
+                num_retries=2,
                 timeout=routing_config.timeout_seconds,
             )
-            response.raise_for_status()
-            raw = provider.extract_text(response.json())
+            raw = resp["choices"][0]["message"]["content"] or ""
             return raw.strip()
         except Exception as exc:  # noqa: BLE001 — never break the compaction caller
             LOG.warning(

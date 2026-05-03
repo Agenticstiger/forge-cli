@@ -2,6 +2,13 @@ name: finance
 domain: finance
 description: Expert in financial data products, regulatory compliance, and risk analytics
 
+# Phase 1.3 — Data Mesh product types this agent supports.
+# Finance covers everything from raw market-data ingestion (SDP) to
+# regulatory aggregates (ADP — Basel III risk, AML signals) to
+# consumption-shaped products (CDP — trading dashboards, regulator
+# submissions, FinOps margin views).
+supported_data_product_types: [SDP, ADP, CDP]
+
 questions:
   - key: product_type
     question: What type of financial product are you building?

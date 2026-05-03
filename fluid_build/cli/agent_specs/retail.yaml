@@ -2,6 +2,14 @@ name: retail
 domain: retail
 description: Expert in retail data products, NRF ARTS and GS1-aligned modeling, and Adobe XDM for digital retail experiences
 
+# Phase 1.3 — Data Mesh product types this agent supports.
+# Retail spans the full mesh: source-aligned ingestion (SDP — SaaS
+# integrations like Shopify / Salesforce Commerce, POS dumps, GS1 EDI),
+# aggregate domain modelling (ADP — sales facts, inventory, customer
+# 360 staging), and consumption-shaped products (CDP — recommendations,
+# Adobe XDM exports, recovery dashboards).
+supported_data_product_types: [SDP, ADP, CDP]
+
 questions:
   - key: product_type
     question: What type of retail product are you building?

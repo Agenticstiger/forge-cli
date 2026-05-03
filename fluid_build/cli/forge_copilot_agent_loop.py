@@ -138,7 +138,7 @@ def _build_agent_system_prompt() -> str:
         "You are FLUID Forge Copilot, running in agent mode.\n"
         "Use the available tools to understand the user's workspace, choose "
         "the right template and provider, build a contract, and validate it.\n\n"
-        "PLANNING: Before calling any tools, state a intent plan (2-4 sentences):\n"
+        "PLANNING: Before calling any tools, state an intent plan (2-4 sentences):\n"
         "- What you already know from the user's context\n"
         "- What information is missing and needs discovery\n"
         "- Which tools you will call and in what order\n"
@@ -181,6 +181,8 @@ def run_copilot_agent_loop(
     console: Any = None,
     perf_stats: Optional[Dict[str, Any]] = None,
     workspace_root: Optional[Path] = None,
+    preview_panel: Any = None,
+    show_work: bool = False,
 ) -> Dict[str, Any]:
     """Run the multi-turn agent loop and return the final result dict.
 
@@ -197,6 +199,17 @@ def run_copilot_agent_loop(
     when callers haven't plumbed it through — the CLI entry points
     should pass this explicitly from the user's ``--workspace`` or
     current directory.
+
+    ``preview_panel`` (Phase 0.4, invariant **I1**): when supplied, every
+    iteration appends a transcript event (tools called, response text,
+    iteration index) and persists the artifact stack under
+    ``.fluid/agents/<run-id>/``. A Ctrl-C anywhere in the loop leaves
+    a recoverable record on disk — the next ``fluid forge --refine``
+    can pick up where this run left off.
+
+    ``show_work`` (Phase 0.4): when True, stream the agent's reasoning
+    and tool-call decisions to the console as they happen. Independent
+    of ``preview_panel`` — they can be combined or used separately.
     """
     provider_adapter = get_llm_provider(llm_config.provider)
     tools = get_tool_definitions()
@@ -224,8 +237,83 @@ def run_copilot_agent_loop(
     ]
 
     total_tool_calls = 0
+
+    def _record_iteration(
+        *,
+        iteration_idx: int,
+        kind: str,
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        text: str = "",
+    ) -> None:
+        """Persist one agent loop event to the preview panel (I1).
+
+        Called from inside the loop after every meaningful step so a
+        Ctrl-C doesn't lose the trace. Best-effort — failures are
+        logged at debug, never raised.
+        """
+        if preview_panel is None:
+            return
+        try:
+            preview_panel.append_transcript(
+                {
+                    "kind": kind,
+                    "iteration": iteration_idx + 1,
+                    "tool_calls": [
+                        {"name": tc.get("name"), "input": tc.get("input")}
+                        for tc in (tool_calls or [])
+                    ],
+                    "text_excerpt": (text or "")[:1024],
+                }
+            )
+            if text:
+                preview_panel.append_reasoning(text)
+            for tc in tool_calls or []:
+                if tc.get("name"):
+                    preview_panel.add_tool_call(str(tc["name"]))
+            preview_panel.persist_artifacts()
+        except Exception as exc:  # noqa: BLE001 — never crash the loop on telemetry
+            LOG.debug("preview_panel_record_failed: %s", exc)
+
     for iteration in range(max_iterations):
         LOG.debug("Agent loop iteration %d/%d", iteration + 1, max_iterations)
+
+        # Phase 0.5 / Gap #3 — honour ``:override`` from the interview
+        # slash-command dispatcher. The interview sets
+        # ``preview_panel.override_action`` (when supplied); we stop
+        # the loop cleanly so the runtime can react instead of
+        # running to the iteration cap.
+        override = (
+            getattr(preview_panel, "override_action", None) if preview_panel is not None else None
+        )
+        if override and override != "cancel":
+            LOG.info("Agent loop honouring override: %s", override)
+            if console:
+                try:
+                    console.print(
+                        f"[yellow]Override received: {override} — "
+                        "exporting current state and exiting the agent loop.[/yellow]"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                preview_panel.append_transcript(
+                    {
+                        "kind": "override",
+                        "iteration": iteration + 1,
+                        "action": override,
+                    }
+                )
+                preview_panel.persist_artifacts()
+            except Exception:  # noqa: BLE001
+                pass
+            raise CopilotGenerationError(
+                "copilot_agent_loop_overridden",
+                f"Agent loop stopped by user override: {override}.",
+                suggestions=[
+                    "Re-run forge with the desired engine via --transform-engine",
+                    "Use --refine to iterate on the partial contract under .fluid/agents/",
+                ],
+            )
 
         # Compact old messages to stay within context window limits.
         if iteration >= _COMPACT_AFTER:
@@ -257,6 +345,12 @@ def run_copilot_agent_loop(
                     pass
             # No tool calls — the model is emitting its final response.
             text = provider_adapter.extract_text_from_tool_response(response_json)
+            _record_iteration(iteration_idx=iteration, kind="final_response", text=text)
+            if show_work and console and text:
+                try:
+                    console.print(f"[dim]  {text[:200]}{'…' if len(text) > 200 else ''}[/dim]")
+                except Exception:  # noqa: BLE001
+                    pass
             if text:
                 try:
                     from fluid_build.cli.forge_copilot_runtime import extract_json_object
@@ -297,6 +391,25 @@ def run_copilot_agent_loop(
         if console:
             try:
                 console.print(f"  [bold cyan]Round {iteration + 1}[/bold cyan]  {tool_list}")
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Phase 0.4 (I1): record the planned tool call set BEFORE
+        # dispatch so a Ctrl-C mid-tool leaves the intent on disk.
+        _record_iteration(
+            iteration_idx=iteration, kind="tool_calls_dispatched", tool_calls=tool_calls
+        )
+        if show_work and console:
+            try:
+                for tc in tool_calls:
+                    name = tc.get("name", "?")
+                    inp = tc.get("input") or {}
+                    inp_summary = (
+                        ", ".join(f"{k}={v!r}" for k, v in list(inp.items())[:3])
+                        if isinstance(inp, dict)
+                        else ""
+                    )
+                    console.print(f"[dim]  → {name}({inp_summary})[/dim]")
             except Exception:  # noqa: BLE001
                 pass
 

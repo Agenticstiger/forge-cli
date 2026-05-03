@@ -77,6 +77,53 @@ def _load_default_guidance() -> Mapping[str, str]:
 
 _DEFAULT_GUIDANCE: Mapping[str, str] = _load_default_guidance()
 
+
+def _load_agent_voices() -> Mapping[str, str]:
+    """Load per-agent voice fragments under ``_defaults/agent_voice/``.
+
+    Phase 3.9 — splits the single shared system-prompt voice into one
+    yaml file per agent so each stage's role identity ("you are the
+    FLUID LogicalAgent — a senior data modeller …") lives next to the
+    other prompt fragments. Loaded once at module import; missing /
+    malformed files fall back to empty strings so the wiring is
+    additive and a partial install can't crash the CLI.
+
+    Keys are agent stage names (``logical``, ``builder``,
+    ``transformation``, ``readme``, ``validator``, ``critic``,
+    ``contract_forge``). Callers compose these on top of their
+    existing system prompt via :func:`agent_voice` below.
+    """
+    voices: dict[str, str] = {}
+    voice_dir = _DEFAULTS_DIR / "agent_voice"
+    if not voice_dir.is_dir():
+        return voices
+    for path in sorted(voice_dir.glob("*.yaml")):
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(raw, Mapping):
+            continue
+        text = raw.get("system_prompt")
+        if isinstance(text, str):
+            voices[path.stem] = text.rstrip() + "\n"
+    return voices
+
+
+_AGENT_VOICES: Mapping[str, str] = _load_agent_voices()
+
+
+def agent_voice(stage: str) -> str:
+    """Return the per-agent voice fragment for ``stage`` (or "" if none).
+
+    Phase 3.9 public surface. Agents that want their per-stage voice
+    auto-prepended to the system prompt call this and concatenate
+    the result. Empty string when the stage doesn't have a voice
+    file — keeps callers from crashing on unrecognised stage names.
+    """
+    return _AGENT_VOICES.get((stage or "").strip().lower(), "")
+
+
 _AUXILIARY_PROMPT_NAMES = frozenset({"clarification", "evaluation"})
 # ``MappingProxyType`` makes the auxiliary prompt map actually immutable post-import,
 # matching the ``Mapping[str, str]`` annotation rather than a mutable ``dict`` that
@@ -217,30 +264,107 @@ def build_system_prompt(
         "Only include 'sovereignty' when the user specifies jurisdiction, compliance, or data residency requirements.\n"
         "DO NOT add 'quality', 'governance', 'owner', or any other top-level key.\n\n"
         "metadata must be an object with: owner (object with team and email) and layer.\n\n"
-        "Each build must have: id, pattern (one of: 'embedded-logic', 'hybrid-reference', 'multi-stage'), "
+        "Each build must have: id, pattern (one of: 'embedded-logic', 'hybrid-reference', "
+        "'multi-stage', 'acquisition'), "
         "engine (one of: " + engines + "), properties, execution.\n"
         "The 'engine' value MUST be exactly one of the short names above. "
         "Do NOT invent provider-suffixed variants like 'dbt-snowflake', 'dbt-bigquery', 'dbt-athena', "
         "'dbt-redshift', 'dataform', or 'glue' — those are NOT valid. "
         "For Snowflake/BigQuery/Athena dbt projects, use engine='dbt' and declare the target platform "
         "via binding.platform on each expose.\n"
+        # --- Engine ↔ productType mapping (Data Mesh axiom) ---
+        # Strong nudge: SDPs ingest, ADP/CDP transform. The wrong engine
+        # for a given productType produces a contract that's syntactically
+        # valid but architecturally incoherent — e.g. a dbt-engine SDP
+        # implies the SDP IS a dbt model, which contradicts SDP's role
+        # as the raw, source-aligned product. Picking the right engine
+        # up-front saves a refine round-trip.
+        "ENGINE × productType MAPPING (pick the engine that matches the role):\n"
+        "- SDP (source-aligned, Bronze): role = INGESTION. Prefer ingestion engines:\n"
+        "  * 'duckdb' for filesystem / JDBC sources (CSV / Parquet / Postgres / MySQL / SQLite, zero infra)\n"
+        "  * 'dlt' for Python-native incremental loads (REST APIs, GitHub, Stripe, custom auth flows)\n"
+        "  * 'airbyte' for 350+ pre-built SaaS connectors (Salesforce / Hubspot / Stripe / GitHub)\n"
+        "  * 'meltano' for Singer-tap ecosystem (600+ taps, when you want config-driven Singer)\n"
+        "  * 'kafka-connect' for streaming source connectors\n"
+        "  * 'debezium' for CDC from operational databases (Postgres / MySQL / Mongo / Oracle)\n"
+        "  * 'python' for fully custom ingestion (rare — usually one of the above fits)\n"
+        "  * 'sql' for SDP only when the source IS a SQL warehouse and you're snapshotting a query\n"
+        "  AVOID 'dbt' for SDP — dbt is a TRANSFORM engine; using it for SDP implies the SDP IS a dbt model,\n"
+        "  which contradicts SDP's source-aligned role.\n"
+        "- ADP (aggregate, Silver): role = TRANSFORM. Prefer 'dbt' (most common), 'sql', or 'python'.\n"
+        "  AVOID ingestion engines (duckdb/dlt/airbyte/meltano/kafka-connect/debezium) for ADP.\n"
+        "- CDP (consumer-aligned, Gold): role = TRANSFORM + SHAPE FOR SERVING. Prefer 'dbt' or 'sql'.\n"
+        "  AVOID ingestion engines for CDP.\n"
+        "When the user's data_sources mention an external system (REST API, OAuth, SaaS, files in S3/GCS,\n"
+        "a Postgres database that's not the warehouse) AND productType='SDP', you are almost certainly\n"
+        "supposed to pick 'dlt', 'duckdb', or 'airbyte' — NOT 'dbt'.\n"
         "BUILD PROPERTIES SHAPE (strict — additionalProperties is false per pattern):\n"
         "- pattern='hybrid-reference' (the common dbt case): properties = {model (required, string), "
         "vars? (object), materializations? (object, keys->{table|view|incremental|ephemeral}), "
         "tags?, labels?}. DO NOT add 'profile', 'projectDir', 'target', 'schema', 'database', or any "
         "other key to properties — those are resolved at apply time from the provider config, not "
         "declared in the contract.\n"
-        "- pattern='embedded-logic' (engine='sql' or 'python'): properties = {sql (required, string), "
+        "- pattern='embedded-logic' (engine='sql' for inline SQL): properties = {sql (required, string), "
         "language? (one of: sql, flink_sql, pyspark, scala, python, r), parameters? (object), "
-        "tags?, labels?}.\n"
+        "tags?, labels?}. ``sql`` is required even when language=python — pass the Python code in "
+        "``sql`` and set ``language: python``.\n"
         "- pattern='multi-stage': properties = {stages (array of objects with name, pattern, "
         "properties, dependsOn)}.\n"
-        "For engine='sql', properties must contain 'sql' with a SQL string.\n"
-        "For engine='python', the build must have 'repository' and properties.model.\n"
+        "- pattern='acquisition' (NEW in 0.7.3, REQUIRED for engines duckdb/dlt/airbyte/meltano/"
+        "kafka-connect/debezium): properties = {\n"
+        "    source (REQUIRED object, additionalProperties=false; allowed keys: "
+        "kind, connection?, mode, cursor_field?, watermark?, streams?, reader?),\n"
+        "    sink? (object, additionalProperties=false; allowed keys: format, catalog?, "
+        "partitionBy?),\n"
+        "    delivery? (object: trigger/scheduler/replay/ordering/slo),\n"
+        "    schemaEvolution? (object),\n"
+        "    preLand? (array, allowed values: 'dlp_scan'|'tokenize_pii'|'quality_gate'|"
+        "'emit_lineage_input'),\n"
+        "    quality?, cost?, catalog?, concurrency?, lineage?,\n"
+        "    duckdb? (engine-specific config: extensions[]),\n"
+        "    dlt? ({source_module, pipeline_name}),\n"
+        "    airbyte? ({connector_image, version, normalization, ...}),\n"
+        "    meltano? ({tap, project_dir, deployment}),\n"
+        "    'kafka-connect'? (engine-specific),\n"
+        "    debezium? (engine-specific)\n"
+        "  }.\n"
+        "  source.kind is engine-specific: filesystem/postgres/mysql/sqlite/http/salesforce/stripe/"
+        "github/kafka — pick the value the engine documents. source.mode MUST be one of: "
+        "'full_refresh', 'incremental_append', 'incremental_dedup', 'incremental_merge', 'cdc', "
+        "'streaming'. sink.format MUST be one of: 'iceberg', 'delta', 'parquet', 'csv', 'json', "
+        "'snowflake_table', 'bigquery_table', 'redshift_table', 'duckdb_table'. "
+        "DO NOT add 'format'/'schema'/'datasets' under source — those go elsewhere "
+        "(sink.format, expose.contract.schema, source.streams). DO NOT add 'datasetRef' or "
+        "'writeMode' under sink — those are not part of the schema. NEVER inline credentials — "
+        "use ${ENV_VAR} placeholders or connection.secretRef.\n"
+        "For engine='sql', use pattern='embedded-logic' and properties must contain 'sql' with "
+        "a SQL string.\n"
+        "For engine='python', ALWAYS use pattern='hybrid-reference'. Required fields: "
+        "build.repository (git URL or local path string) AND properties.model (dotted module "
+        "path like 'src.weather:fetch'). DO NOT use pattern='embedded-logic' for python — the "
+        "validator rejects python builds without repository+model. Use this shape:\n"
+        "    builds:\n"
+        "    - id: <build_id>\n"
+        "      pattern: hybrid-reference\n"
+        "      engine: python\n"
+        "      repository: <git url or local path>\n"
+        "      properties:\n"
+        "        model: <module>:<entrypoint>\n"
+        "      execution: {trigger: {...}, runtime: {platform, resources}}\n"
+        "For engines duckdb/dlt/airbyte/meltano/kafka-connect/debezium, ALWAYS use "
+        "pattern='acquisition' and the acquisition properties shape above. Do NOT use "
+        "embedded-logic/hybrid-reference/multi-stage for those engines — schema validation will "
+        "reject the contract.\n"
         "execution must have trigger (object with type and iterations) and runtime (object with platform and resources).\n"
-        "trigger.type must be one of: 'cron' (time-based, e.g. daily at 2am), 'event' (data-arrival or webhook), "
-        "'manual' (on-demand), or 'streaming' (continuous). trigger.iterations is usually 1 for batch, -1 for streaming.\n"
-        "If the user asked for scheduling, set trigger.type='cron' and a sensible schedule in trigger.schedule (cron syntax).\n"
+        "trigger.type MUST be EXACTLY one of: 'schedule' (time-based, e.g. daily at 2am — set "
+        "trigger.schedule to a cron string like '0 2 * * *'), 'event' (data-arrival or webhook — "
+        "set trigger.event), 'manual' (on-demand), 'dependency' (run when an upstream completes), "
+        "'dataset' (run when a dataset arrives — set trigger.datasets), 'schedule_and_dataset' "
+        "(both gates required), 'timetable' (custom timetable). trigger.iterations is usually 1 "
+        "for batch, -1 for streaming. DO NOT use 'cron' or 'streaming' as trigger.type — those "
+        "are NOT in the schema enum and will fail validation.\n"
+        "If the user asked for scheduling, set trigger.type='schedule' and a sensible cron in "
+        "trigger.schedule (cron syntax like '0 2 * * *').\n"
         "DO NOT add 'consumes' or 'produces' inside a build object.\n\n"
         "Each consume must have: productId (string) and exposeId (string). No other keys.\n\n"
         "Each expose must have: exposeId (string), kind (string), binding (object with platform, format, location), "

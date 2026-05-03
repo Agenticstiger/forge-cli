@@ -2,6 +2,13 @@ name: healthcare
 domain: healthcare
 description: Expert in healthcare data products, HL7 FHIR interoperability, OMOP CDM analytics, and HIPAA compliance
 
+# Phase 1.3 — Data Mesh product types this agent supports.
+# Healthcare's mesh maps cleanly: SDP for FHIR-bundle ingestion and
+# raw EHR feeds; ADP for OMOP CDM aggregates and patient-360 staging;
+# CDP for population-health analytics, regulator-bound exports, and
+# clinical decision support models.
+supported_data_product_types: [SDP, ADP, CDP]
+
 questions:
   - key: product_type
     question: What type of healthcare product are you building?

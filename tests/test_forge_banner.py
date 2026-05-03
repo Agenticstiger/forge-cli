@@ -92,10 +92,12 @@ def test_banner_disabled_for_unknown_surface():
 
 
 def test_banner_enabled_for_each_known_surface(monkeypatch):
-    """All five surfaces must opt in by default — flipping the
-    allow-list silently would drop the banner everywhere."""
+    """All five surfaces must surface the banner when the operator
+    opts in via ``FLUID_BANNER=1``. (UX hardening pass — the default
+    is off so the roadmap teaser doesn't fire on every CLI call.)"""
     monkeypatch.delenv("FLUID_QUIET", raising=False)
     monkeypatch.delenv("FLUID_NONINTERACTIVE", raising=False)
+    monkeypatch.setenv("FLUID_BANNER", "1")  # explicit opt-in
     monkeypatch.setenv("FLUID_BANNER_TODAY", "2026-04-25")
     for surface in (
         "forge_data_model",
@@ -107,6 +109,28 @@ def test_banner_enabled_for_each_known_surface(monkeypatch):
         assert banner_enabled(surface) is True, f"banner suppressed for {surface}"
 
 
+def test_banner_disabled_by_default_without_opt_in(monkeypatch):
+    """UX hardening pass — the banner used to show by default on
+    every ``fluid forge data-model`` invocation, which interactive
+    users found noisy. The default is now off; opt-in via
+    ``FLUID_BANNER=1``. Pin this so a future change can't silently
+    flip the default back."""
+    monkeypatch.delenv("FLUID_QUIET", raising=False)
+    monkeypatch.delenv("FLUID_NONINTERACTIVE", raising=False)
+    monkeypatch.delenv("FLUID_BANNER", raising=False)
+    monkeypatch.setenv("FLUID_BANNER_TODAY", "2026-04-25")
+    for surface in (
+        "forge_data_model",
+        "speed_transformation",
+        "init_copilot",
+        "ai_setup",
+        "version",
+    ):
+        assert (
+            banner_enabled(surface) is False
+        ), f"banner shown without FLUID_BANNER=1 for {surface}"
+
+
 # ----------------------------------------------------------------------
 # Auto-expiry — hard kill-switch one week after the v1.1 target date
 # ----------------------------------------------------------------------
@@ -115,6 +139,7 @@ def test_banner_enabled_for_each_known_surface(monkeypatch):
 def test_banner_active_one_day_before_expiry(monkeypatch):
     monkeypatch.delenv("FLUID_QUIET", raising=False)
     monkeypatch.delenv("FLUID_NONINTERACTIVE", raising=False)
+    monkeypatch.setenv("FLUID_BANNER", "1")  # explicit opt-in (UX hardening)
     monkeypatch.setenv("FLUID_BANNER_TODAY", "2026-05-06")
     assert banner_enabled("forge_data_model") is True
 
@@ -188,12 +213,14 @@ def test_print_v2_banner_silent_on_quiet_kwarg(monkeypatch, capsys):
 
 
 def test_print_v2_banner_emits_when_active(monkeypatch, capsys):
-    """Positive control: when nothing is suppressing, the banner DOES
-    print and includes the next-milestone version + roadmap pointer.
-    Ensures the prior negative-control tests aren't trivially passing
-    because the printer is broken."""
+    """Positive control: when the operator opts in via ``FLUID_BANNER=1``
+    AND nothing else is suppressing, the banner DOES print and
+    includes the next-milestone version + roadmap pointer. Ensures
+    the prior negative-control tests aren't trivially passing because
+    the printer is broken."""
     monkeypatch.delenv("FLUID_QUIET", raising=False)
     monkeypatch.delenv("FLUID_NONINTERACTIVE", raising=False)
+    monkeypatch.setenv("FLUID_BANNER", "1")  # opt-in (UX hardening)
     monkeypatch.setenv("FLUID_BANNER_TODAY", "2026-04-25")
     print_v2_banner("forge_data_model")
     captured = capsys.readouterr()

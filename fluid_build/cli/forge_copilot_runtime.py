@@ -30,7 +30,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional
 
 from fluid_build.cli._common import redact_secrets, resolve_provider_from_contract
 
@@ -731,6 +731,23 @@ def generate_copilot_artifacts(
             logger=logger,
             context=context,
         )
+        # Self-healing (Phase 3 / Gap #2 wiring): run the JSON-schema
+        # validator on the LLM's contract output so repair attempts get
+        # ALL schema violations, not just the ones validate_generated_result
+        # flags. Schema errors get prepended to validation_errors so the
+        # corrective-feedback loop sees them — and the next-attempt
+        # prompt carries the prescriptive
+        # ``build_schema_validation_message`` body that asks the LLM to
+        # match field names + enums exactly.
+        try:
+            from fluid_build.schema_manager import FluidSchemaManager
+
+            schema_result = FluidSchemaManager().validate_contract(normalized.get("contract") or {})
+            if not schema_result.is_valid:
+                schema_errors = [f"Schema validation: {e}" for e in (schema_result.errors or [])]
+                validation_errors = schema_errors + list(validation_errors)
+        except Exception as exc:  # noqa: BLE001 — never block on validator failure
+            logger.debug("self_healing_schema_validate_failed: %s", exc)
         report.validation_errors = validation_errors
         report.validation_warnings = validation_warnings
 
@@ -783,6 +800,33 @@ def generate_copilot_artifacts(
                 ai_run_plan=ai_run_plan,
             )
 
+        # Self-healing: build a prescriptive repair message when ANY
+        # schema-validation error fired this attempt. The message tells
+        # the LLM exactly which JSON paths failed and asks for a re-emit
+        # with the existing seed_contract shape preserved.
+        schema_only_errors = [e for e in validation_errors if e.startswith("Schema validation:")]
+        try:
+            from fluid_build.cli.forge_copilot_corrective_feedback import (
+                build_schema_validation_message,
+            )
+
+            if schema_only_errors:
+                schema_msg = build_schema_validation_message(schema_only_errors)
+                if schema_msg.get("content"):
+                    if logger:
+                        logger.info(
+                            "self_healing_repair: attempt %d/%d, %d schema error(s)",
+                            attempt_index,
+                            max_attempts,
+                            len(schema_only_errors),
+                        )
+                    previous_errors = build_structured_repair_feedback(validation_errors) + [
+                        schema_msg["content"]
+                    ]
+                    previous_payload = payload
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
         previous_errors = build_structured_repair_feedback(validation_errors)
         previous_payload = payload
 
@@ -823,17 +867,6 @@ def _generate_staged_copilot_artifacts(
     try:
         from fluid_build.copilot.agents.base import StageSession
         from fluid_build.copilot.agents.coordinator import StageCoordinator
-        from fluid_build.copilot.schemas.intent import (
-            BusinessContext,
-            BusinessIntent,
-            Consumption,
-            DataProduct,
-            DataSource,
-            Dimensions,
-            Grain,
-            Metric,
-            ModelingPreferences,
-        )
         from fluid_build.copilot.store.factory import resolve_store
         from fluid_build.forge_datamodel.from_ddl.parser import TableDefinition
     except Exception as exc:  # noqa: BLE001
@@ -1189,159 +1222,12 @@ def _transform_plan_to_files(transform_plan: Any, *, technique: str) -> Dict[str
     return files
 
 
-def suggest_scaffold(
-    context: Mapping[str, Any],
-    discovery_report: DiscoveryReport,
-    capability_matrix: Mapping[str, Any],
-    *,
-    project_memory: Optional[CopilotMemorySnapshot] = None,
-) -> tuple[str, str]:
-    """Heuristically choose valid scaffold defaults used only as LLM guidance."""
-    decision = _build_scaffold_decision(
-        context,
-        discovery_report,
-        capability_matrix,
-        project_memory=project_memory,
-    )
-    return decision.template, decision.provider
-
-
-def _build_scaffold_decision(
-    context: Mapping[str, Any],
-    discovery_report: DiscoveryReport,
-    capability_matrix: Mapping[str, Any],
-    *,
-    project_memory: Optional[CopilotMemorySnapshot] = None,
-) -> ScaffoldDecisionReport:
-    """Build explainable scaffold guidance before LLM generation."""
-    text = " ".join(
-        [
-            str(context.get("project_goal", "")),
-            str(context.get("use_case", "")),
-            str(context.get("use_case_other", "")),
-            str(context.get("data_sources", "")),
-            " ".join(discovery_report.provider_hints),
-        ]
-    ).lower()
-
-    available_providers = set(capability_matrix.get("providers") or [])
-    fallback_provider = (
-        "local"
-        if "local" in available_providers
-        else (
-            sorted(available_providers)[0] if available_providers else COPILOT_BUILTIN_PROVIDERS[0]
-        )
-    )
-
-    # --- Provider selection ---
-    explicit_provider = normalize_provider_name(context.get("provider") or "")
-    if explicit_provider in available_providers:
-        provider = explicit_provider
-        provider_source = "explicit_context"
-        provider_reason = (
-            f"Using explicit provider hint '{explicit_provider}' from the current run."
-        )
-    elif discovery_report.provider_hints:
-        provider = provider_source = provider_reason = ""
-        for hint in discovery_report.provider_hints:
-            candidate = normalize_provider_name(hint)
-            if candidate in available_providers:
-                provider = candidate
-                provider_source = "current_discovery"
-                provider_reason = (
-                    f"Using current discovery provider hint '{candidate}' from local assets."
-                )
-                break
-    elif "snowflake" in text:
-        provider, provider_source = "snowflake", "heuristic_context"
-        provider_reason = "Using the current run context because it references Snowflake."
-    elif any(t in text for t in ("aws", "s3", "redshift", "athena", "glue")):
-        provider, provider_source = "aws", "heuristic_context"
-        provider_reason = (
-            "Using the current run context because it references AWS-oriented sources."
-        )
-    elif any(t in text for t in ("gcp", "bigquery", "dataform", "composer")):
-        provider, provider_source = "gcp", "heuristic_context"
-        provider_reason = (
-            "Using the current run context because it references GCP-oriented sources."
-        )
-    else:
-        provider = provider_source = provider_reason = ""
-
-    if not provider and project_memory:
-        preferred = normalize_provider_name(project_memory.preferred_provider)
-        if preferred in available_providers:
-            provider, provider_source = preferred, "project_memory"
-            provider_reason = f"Reusing saved project memory provider '{preferred}' because the current run was ambiguous."
-        else:
-            for hint in project_memory.provider_hints:
-                candidate = normalize_provider_name(hint)
-                if candidate in available_providers:
-                    provider, provider_source = candidate, "project_memory"
-                    provider_reason = f"Using saved project memory provider hint '{candidate}' because no stronger current signal was available."
-                    break
-    if not provider:
-        provider, provider_source = fallback_provider, "default"
-        provider_reason = f"Falling back to the safe default provider '{provider}'."
-
-    # --- Template selection ---
-    templates = set((capability_matrix.get("templates") or {}).keys())
-    explicit_template = context.get("template") or context.get("recommended_template")
-    template = normalize_template_name(explicit_template) if explicit_template else ""
-
-    if template in templates:
-        template_source = "explicit_context"
-        template_reason = f"Using explicit template hint '{template}' from the current run."
-    elif any(t in text for t in ("ml", "machine learning", "feature store", "model")):
-        template, template_source = "ml_pipeline", "heuristic_context"
-        template_reason = (
-            "Using the current run context because it looks like a machine-learning pipeline."
-        )
-    elif any(t in text for t in ("stream", "kafka", "real-time", "realtime")):
-        template, template_source = "streaming", "heuristic_context"
-        template_reason = (
-            "Using the current run context because it looks like a streaming workload."
-        )
-    elif any(
-        t in text
-        for t in (
-            "etl",
-            "ingest",
-            "cdc",
-            "multi-source",
-            "sync",
-            "data_platform",
-            "data platform",
-            "data lake",
-            "lakehouse",
-        )
-    ):
-        template, template_source = "etl_pipeline", "heuristic_context"
-        template_reason = (
-            "Using the current run context because it looks like an ingestion or ETL workload."
-        )
-    elif any(t in text for t in ("analytics", "report", "dashboard", "bi", "metric")):
-        template, template_source = "analytics", "heuristic_context"
-        template_reason = (
-            "Using the current run context because it looks like an analytics project."
-        )
-    elif project_memory and normalize_template_name(project_memory.preferred_template) in templates:
-        template = normalize_template_name(project_memory.preferred_template)
-        template_source = "project_memory"
-        template_reason = f"Reusing saved project memory template '{template}' because the current run was ambiguous."
-    else:
-        template, template_source = "starter", "default"
-        template_reason = "Falling back to the safe default template 'starter'."
-
-    if template not in templates:
-        template, template_source = "starter", "default"
-        template_reason = "Falling back to the safe default template 'starter'."
-
-    return ScaffoldDecisionReport(
-        template=template,
-        provider=provider,
-        template_source=template_source,
-        provider_source=provider_source,
-        template_reason=template_reason,
-        provider_reason=provider_reason,
-    )
+# ``suggest_scaffold`` + ``_build_scaffold_decision`` +
+# ``validate_and_repair`` — physically extracted to
+# ``cli/_forge_copilot_runtime_repair.py`` (~360 LOC). Re-exported
+# here so existing import sites keep resolving without breakage.
+from fluid_build.cli._forge_copilot_runtime_repair import (  # noqa: E402,F401
+    _build_scaffold_decision,
+    suggest_scaffold,
+    validate_and_repair,
+)

@@ -232,7 +232,10 @@ class TestResolveLlmConfig:
 
         assert config.provider == "ollama"
         assert config.api_key is None
-        assert config.endpoint == "http://localhost:11434/v1/chat/completions"
+        # litellm owns auth/endpoint resolution; we emit a sentinel
+        # ``litellm://ollama/<model>`` so telemetry can identify the
+        # routed call without leaking the daemon URL into the config.
+        assert config.endpoint.startswith("litellm://ollama/")
 
     def test_llm_timeout_seconds_can_be_configured_from_env(self):
         args = SimpleNamespace(llm_provider="ollama", llm_model=None, llm_endpoint=None)
@@ -254,21 +257,20 @@ class TestResolveLlmConfig:
             llm_endpoint=None,
             require_llm=True,
         )
-        response = MagicMock()
-        response.json.return_value = {
-            "data": [
-                {"id": "claude-sonnet-4-6"},
-                {"id": "claude-haiku-4-5-20251001"},
-            ]
-        }
-        response.raise_for_status = MagicMock()
-
+        # litellm path: stub the provider's live model list directly. The
+        # legacy native code path used to hit ``httpx.get`` against the
+        # provider's /models endpoint; litellm reads its static catalog
+        # via ``models_by_provider`` so we patch the adapter method.
+        live_models = ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"]
         with (
             patch(
                 "fluid_build.cli.forge_copilot_llm_providers.get_catalog_default",
                 return_value="claude-sonnet-4-5-20250514",
             ),
-            patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response),
+            patch(
+                "fluid_build.cli.forge_copilot_llm_litellm.LiteLLMProvider.list_available_models",
+                return_value=live_models,
+            ),
         ):
             config = resolve_llm_config(
                 args,
@@ -286,11 +288,10 @@ class TestResolveLlmConfig:
             llm_endpoint=None,
             require_llm=True,
         )
-        response = MagicMock()
-        response.json.return_value = {"data": [{"id": "claude-sonnet-4-6"}]}
-        response.raise_for_status = MagicMock()
-
-        with patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response):
+        with patch(
+            "fluid_build.cli.forge_copilot_llm_litellm.LiteLLMProvider.list_available_models",
+            return_value=["claude-sonnet-4-6"],
+        ):
             with pytest.raises(CopilotGenerationError, match="copilot_llm_model_unavailable"):
                 resolve_llm_config(args, environ={"ANTHROPIC_API_KEY": "sk-ant-test"})
 
@@ -301,11 +302,10 @@ class TestResolveLlmConfig:
             llm_endpoint=None,
             require_llm=True,
         )
-        response = MagicMock()
-        response.json.return_value = {"data": [{"id": "gpt-4o-mini"}]}
-        response.raise_for_status = MagicMock()
-
-        with patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response):
+        with patch(
+            "fluid_build.cli.forge_copilot_llm_litellm.LiteLLMProvider.list_available_models",
+            return_value=["gpt-4o-mini"],
+        ):
             with pytest.raises(CopilotGenerationError, match="copilot_llm_model_unavailable"):
                 resolve_llm_config(args, environ={"OPENAI_API_KEY": "sk-test"})
 
@@ -319,15 +319,6 @@ class TestResolveLlmConfig:
             require_llm=False,
             tiered=True,
         )
-        response = MagicMock()
-        response.json.return_value = {
-            "data": [
-                {"id": "gpt-4.1"},
-                {"id": "gpt-4.1-mini"},
-                {"id": "gpt-4.1-nano"},
-            ]
-        }
-        response.raise_for_status = MagicMock()
         tier_models = {
             "deep": "gpt-4.1",
             "balanced": "gpt-missing-balanced",
@@ -335,7 +326,10 @@ class TestResolveLlmConfig:
         }
 
         with (
-            patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response),
+            patch(
+                "fluid_build.cli.forge_copilot_llm_litellm.LiteLLMProvider.list_available_models",
+                return_value=["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano"],
+            ),
             patch(
                 "fluid_build.cli.forge_copilot_llm_providers.get_catalog_tier_models",
                 return_value=tier_models,
@@ -370,22 +364,13 @@ class TestResolveLlmConfig:
         assert stages["contract_forge"]["mode"] == "deterministic"
 
     def test_gemini_live_model_list_strips_prefix_and_filters_generation_models(self):
-        response = MagicMock()
-        response.json.return_value = {
-            "models": [
-                {
-                    "name": "models/gemini-2.5-flash",
-                    "supportedGenerationMethods": ["generateContent"],
-                },
-                {
-                    "name": "models/gemini-embedding-exp",
-                    "supportedGenerationMethods": ["embedContent"],
-                },
-            ]
-        }
-        response.raise_for_status = MagicMock()
-
-        with patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response):
+        # litellm path: ``live_provider_models`` defers to the LiteLLMProvider
+        # adapter, which reads litellm's static ``models_by_provider`` map
+        # (already filtered to generation-capable models, prefixes stripped).
+        with patch(
+            "fluid_build.cli.forge_copilot_llm_litellm.LiteLLMProvider.list_available_models",
+            return_value=["gemini-2.5-flash"],
+        ):
             assert live_provider_models("gemini", environ={"GEMINI_API_KEY": "gemini-test"}) == [
                 "gemini-2.5-flash"
             ]
@@ -397,16 +382,17 @@ class TestResolveLlmConfig:
             llm_endpoint=None,
             require_llm=True,
         )
-        response = MagicMock()
-        response.json.return_value = {"models": [{"name": "gemma4:latest"}]}
-        response.raise_for_status = MagicMock()
-
-        with patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response):
+        # The adapter hits the local daemon's /api/tags for ollama; we
+        # stub the resolved list directly so the test runs offline.
+        with patch(
+            "fluid_build.cli.forge_copilot_llm_litellm.LiteLLMProvider.list_available_models",
+            return_value=["gemma4:latest"],
+        ):
             config = resolve_llm_config(args, environ={"OLLAMA_HOST": "http://localhost:11434"})
 
         assert config.provider == "ollama"
         assert config.model == "gemma4:latest"
-        assert config.endpoint == "http://localhost:11434/v1/chat/completions"
+        assert config.endpoint.startswith("litellm://ollama/")
 
     def test_required_llm_preflight_rejects_unavailable_ollama_model(self):
         args = SimpleNamespace(
@@ -415,11 +401,10 @@ class TestResolveLlmConfig:
             llm_endpoint=None,
             require_llm=True,
         )
-        response = MagicMock()
-        response.json.return_value = {"models": [{"name": "gemma4:latest"}]}
-        response.raise_for_status = MagicMock()
-
-        with patch("fluid_build.cli.forge_copilot_llm_providers.httpx.get", return_value=response):
+        with patch(
+            "fluid_build.cli.forge_copilot_llm_litellm.LiteLLMProvider.list_available_models",
+            return_value=["gemma4:latest"],
+        ):
             with pytest.raises(CopilotGenerationError, match="copilot_llm_model_unavailable"):
                 resolve_llm_config(args, environ={"OLLAMA_HOST": "http://localhost:11434"})
 
@@ -448,7 +433,8 @@ class TestCheckLlmReadiness:
         assert readiness.ready is True
         assert readiness.provider == "ollama"
         assert readiness.auth_available is True
-        assert readiness.endpoint == "http://localhost:11434/v1/chat/completions"
+        # litellm-routed sentinel — see test_ollama_uses_default_endpoint_without_api_key.
+        assert readiness.endpoint.startswith("litellm://ollama/")
 
     def test_redacts_endpoint_in_readiness_output(self):
         readiness = check_llm_readiness(
@@ -492,51 +478,49 @@ class TestEndpointRedaction:
 
 class TestProviderAdapters:
     @pytest.mark.parametrize(
-        ("provider", "config", "expected_header", "expected_payload_key"),
+        ("provider", "config", "expected_litellm_model"),
         [
             (
                 OpenAIProvider(),
-                LlmConfig(
-                    "openai", "gpt-4o-mini", "https://api.openai.com/v1/chat/completions", "key"
-                ),
-                "Authorization",
-                "messages",
+                LlmConfig("openai", "gpt-4o-mini", "litellm://openai/gpt-4o-mini", "key"),
+                "openai/gpt-4o-mini",
             ),
             (
                 AnthropicProvider(),
                 LlmConfig(
                     "anthropic",
                     "claude-3-5-sonnet-latest",
-                    "https://api.anthropic.com/v1/messages",
+                    "litellm://anthropic/claude-3-5-sonnet-latest",
                     "key",
                 ),
-                "x-api-key",
-                "messages",
+                "anthropic/claude-3-5-sonnet-latest",
             ),
             (
                 GeminiProvider(),
-                LlmConfig("gemini", "gemini-1.5-pro", "https://example.test/generate", "key"),
-                "x-goog-api-key",
-                "contents",
+                LlmConfig("gemini", "gemini-1.5-pro", "litellm://gemini/gemini-1.5-pro", "key"),
+                "gemini/gemini-1.5-pro",
             ),
             (
                 OllamaProvider(),
-                LlmConfig("ollama", "llama3.1", "http://localhost:11434/v1/chat/completions", None),
-                None,
-                "messages",
+                LlmConfig("ollama", "llama3.1", "litellm://ollama/llama3.1", None),
+                "ollama/llama3.1",
             ),
         ],
     )
-    def test_builtin_provider_build_request_shapes(
-        self, provider, config, expected_header, expected_payload_key
-    ):
+    def test_builtin_provider_build_request_shapes(self, provider, config, expected_litellm_model):
+        """Provider shims now route through litellm — assert the
+        normalised payload shape (OpenAI ``messages``) and the
+        ``<provider>/<model>`` litellm prefix."""
         headers, payload = provider.build_request(config, "system prompt", "user prompt")
 
-        if expected_header:
-            assert expected_header in headers
-        else:
-            assert "Authorization" not in headers
-        assert expected_payload_key in payload
+        # litellm owns auth, so headers come back empty. The actual
+        # request shape lives in ``payload`` keyed by ``model`` /
+        # ``messages`` for every provider (litellm's normalised shape).
+        assert headers == {}
+        assert payload["model"] == expected_litellm_model
+        assert "messages" in payload
+        assert payload["messages"][0]["role"] == "system"
+        assert payload["messages"][1]["role"] == "user"
 
 
 class TestRuntimeHelpers:
@@ -558,34 +542,37 @@ class TestRuntimeHelpers:
         assert sanitized == {"docs/notes.md": "# Notes\n"}
 
     def test_call_llm_wraps_http_errors(self):
-        class FailingClient:
-            def __init__(self, *args, **kwargs):
-                pass
+        """Provider faults route through litellm now. The wrapper still
+        translates them to typed ``CopilotGenerationError`` so callers
+        see a stable event tag rather than a bare provider exception."""
+        # Patch litellm.completion to fail; LiteLLMProvider.invoke_blocking
+        # catches the exception and re-raises as CopilotGenerationError
+        # with event ``copilot_litellm_request_failed``.
+        import fluid_build.cli.forge_copilot_llm_litellm as litellm_mod
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def post(self, *args, **kwargs):
-                raise httpx.HTTPError("boom")
-
-        with patch("fluid_build.cli.forge_copilot_llm_providers.httpx.Client", FailingClient):
+        fake_litellm = MagicMock()
+        fake_litellm.completion = MagicMock(side_effect=RuntimeError("boom"))
+        with patch.object(litellm_mod, "_get_litellm", return_value=fake_litellm):
             with pytest.raises(CopilotGenerationError) as exc_info:
                 call_llm(
                     OpenAIProvider(),
                     LlmConfig(
                         "openai",
                         "gpt-4o-mini",
-                        "https://api.openai.com/v1/chat/completions",
+                        "litellm://openai/gpt-4o-mini",
                         "key",
                     ),
                     "system",
                     "user",
                 )
 
-        assert exc_info.value.event in ("copilot_llm_request_failed", "copilot_llm_network_error")
+        # Stable taxonomy: the litellm path raises a typed event so CI
+        # log parsers and metrics keep the same shape.
+        assert exc_info.value.event in (
+            "copilot_litellm_request_failed",
+            "copilot_llm_request_failed",
+            "copilot_llm_network_error",
+        )
 
     def test_scaffold_decision_uses_use_case_other_for_other_context(self):
         decision = _build_scaffold_decision(
