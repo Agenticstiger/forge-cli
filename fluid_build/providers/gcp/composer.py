@@ -26,7 +26,7 @@ with DAG(dag_id='{dag_id}', schedule='{cron}', start_date=datetime(2024,1,1), ca
 
 
 def scaffold_dag(contract: dict, out_dir: str, project: str, region: str):
-    # Support both 0.5.7 (builds array) and 0.4.0 (build object)
+    # Support both v0.7.x builds array
     from fluid_build.util.contract import get_primary_build
 
     build = get_primary_build(contract) or {}

@@ -21,7 +21,6 @@ import pytest
 
 from fluid_build.cli.verify import assess_drift_severity
 from fluid_build.providers.snowflake.util.config import (
-    _get_connection_params_legacy,
     resolve_account_and_warehouse,
 )
 
@@ -102,69 +101,9 @@ class TestResolveAccountAndWarehouse:
                     resolve_account_and_warehouse()
 
 
-class TestGetConnectionParamsLegacy:
-    def test_basic_with_password(self):
-        with patch.dict(os.environ, {"SNOWFLAKE_USER": "user1"}, clear=True):
-            params = _get_connection_params_legacy("acc", "wh", password="secret")
-            assert params["account"] == "acc"
-            assert params["warehouse"] == "wh"
-            assert params["user"] == "user1"
-            assert params["password"] == "secret"
-
-    def test_explicit_user(self):
-        params = _get_connection_params_legacy("acc", "wh", user="explicit_user", password="p")
-        assert params["user"] == "explicit_user"
-
-    def test_env_password(self):
-        with patch.dict(
-            os.environ, {"SNOWFLAKE_USER": "u", "SNOWFLAKE_PASSWORD": "envpw"}, clear=True
-        ):
-            params = _get_connection_params_legacy("acc", "wh")
-            assert params["password"] == "envpw"
-
-    def test_no_user_raises(self):
-        with patch.dict(os.environ, {}, clear=True):
-            with pytest.raises(ValueError, match="Snowflake user not specified"):
-                _get_connection_params_legacy("acc", "wh")
-
-    def test_database_and_schema(self):
-        params = _get_connection_params_legacy(
-            "acc", "wh", database="db", schema="sch", user="u", password="p"
-        )
-        assert params["database"] == "db"
-        assert params["schema"] == "sch"
-
-    def test_token_auth(self):
-        with patch.dict(os.environ, {"SNOWFLAKE_USER": "u"}, clear=True):
-            params = _get_connection_params_legacy("acc", "wh", token="tok123")
-            assert params["token"] == "tok123"
-
-    def test_authenticator_kwarg(self):
-        with patch.dict(os.environ, {"SNOWFLAKE_USER": "u"}, clear=True):
-            params = _get_connection_params_legacy("acc", "wh", authenticator="externalbrowser")
-            assert params["authenticator"] == "externalbrowser"
-
-    def test_env_authenticator(self):
-        with patch.dict(
-            os.environ, {"SNOWFLAKE_USER": "u", "SNOWFLAKE_AUTHENTICATOR": "okta"}, clear=True
-        ):
-            params = _get_connection_params_legacy("acc", "wh")
-            assert params["authenticator"] == "okta"
-
-    def test_default_externalbrowser(self):
-        with patch.dict(os.environ, {"SNOWFLAKE_USER": "u"}, clear=True):
-            params = _get_connection_params_legacy("acc", "wh")
-            assert params["authenticator"] == "externalbrowser"
-
-    def test_optional_params(self):
-        with patch.dict(os.environ, {"SNOWFLAKE_USER": "u"}, clear=True):
-            params = _get_connection_params_legacy(
-                "acc", "wh", role="ADMIN", application="myapp", password="p"
-            )
-            assert params["role"] == "ADMIN"
-            assert params["application"] == "myapp"
-
-    def test_private_key_auth(self):
-        with patch.dict(os.environ, {"SNOWFLAKE_USER": "u"}, clear=True):
-            params = _get_connection_params_legacy("acc", "wh", private_key="key_data")
-            assert params["private_key"] == "key_data"
+# ``TestGetConnectionParamsLegacy`` was deleted along with its target —
+# the ``_get_connection_params_legacy`` function (a 60-LOC env-var-only
+# fallback that was never invoked at runtime). Every caller flows
+# through ``get_connection_params`` which delegates to the unified
+# credential resolver (``credentials/resolver.py``) and is covered by
+# ``tests/test_credential_resolver*`` + ``tests/providers/test_snowflake_*``.

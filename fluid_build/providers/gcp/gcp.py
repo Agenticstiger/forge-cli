@@ -95,6 +95,8 @@ class GcpProvider(BaseProvider):
         metadata = contract.get("metadata", {})
         if "layer" in metadata:
             labels["fluid_layer"] = metadata["layer"].lower()
+        if "productType" in metadata:
+            labels["fluid_product_type"] = metadata["productType"].lower()
 
         owner = metadata.get("owner", {})
         if "team" in owner:
@@ -180,7 +182,7 @@ class GcpProvider(BaseProvider):
 
         # Process exposes (output tables)
         for expo in contract.get("exposes", []):
-            # Support both 0.5.7 (binding) and legacy (location) formats
+            # Read v0.7.x ``binding`` (canonical)
             binding = expo.get("binding", {})
             loc = binding.get("location", {})
             fmt = binding.get("format")
@@ -245,7 +247,7 @@ class GcpProvider(BaseProvider):
                     res = self._provision_dataset(a)
                 elif op == "scheduleTask":
                     res = self._schedule_task(a)
-                # Legacy 0.5.7 operations
+                # v0.7.x operations
                 elif op == "ensure_dataset":
                     res = self._ensure_dataset(a)
                 elif op == "ensure_table":
