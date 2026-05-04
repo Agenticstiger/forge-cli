@@ -128,7 +128,8 @@ class EncryptedCredentialStore:
         # Support both old format (bare string) and new format (dict with metadata)
         value = entry["value"] if isinstance(entry, dict) else entry
         if value:
-            logger.debug(f"Retrieved encrypted credential: {key}")
+            # Constant-only log: ``value`` (the credential) is in scope.
+            logger.debug("Retrieved encrypted credential")
         return value
 
     def get_credential_metadata(self, key: str) -> Optional[Dict[str, Any]]:

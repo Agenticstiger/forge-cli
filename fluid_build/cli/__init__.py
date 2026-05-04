@@ -28,6 +28,7 @@ from fluid_build.cli.forge_banner import compact_next_line
 from fluid_build.observability import install_secret_redacting_filter
 
 from ._common import CLIError
+from ._errors import FluidUserError as _FluidUserError
 from .bootstrap import register_core_commands  # your aggregator that wires subcommands
 from .core import CLIContext, FluidCLIError
 from .help_formatter import RICH_AVAILABLE as HELP_RICH_AVAILABLE
@@ -185,6 +186,20 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
         metavar="COMMAND",
     )
     register_core_commands(sp)  # pulls in validate/plan/apply/... from commands/*
+
+    # UX hardening — wire shell tab completion via argcomplete when
+    # available. Soft-import: a missing argcomplete dep silently
+    # disables completion rather than failing the whole CLI. Users
+    # opt in by running ``eval "$(register-python-argcomplete fluid)"``
+    # in their shell rc per the README. Zero overhead when not in
+    # completion mode.
+    try:
+        import argcomplete
+
+        argcomplete.autocomplete(p)
+    except ImportError:
+        pass
+
     return p
 
 
@@ -320,6 +335,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                 },
             )
             return e.exit_code
+
+        except _FluidUserError as e:
+            # Typed-error catalog ([cli/_errors.py](fluid_build/cli/_errors.py)).
+            # Prefer JSON when callers pipe to tooling (--json on the
+            # active subcommand); otherwise render the rich five-field
+            # panel to stderr. Exit code 1 = user error per the catalog
+            # contract (0/1/2/3/4 in CHANGELOG).
+            if getattr(args, "json", False):
+                sys.stdout.write(e.as_json() + "\n")
+            else:
+                sys.stderr.write(e.render(color=not getattr(args, "no_color", False)))
+            cli.logger.log_safe(
+                "error",
+                "CLI typed user error",
+                extra={
+                    "cmd": getattr(args, "cmd", None),
+                    "code": e.code,
+                    "what": e.what,
+                },
+            )
+            return 1
 
         except CLIError as e:
             # Handle lightweight CLI errors from command modules
@@ -510,6 +546,16 @@ def _setup_enhanced_logging(
             LOG.warning(f"Failed to setup file logging: {e}")
 
     install_secret_redacting_filter(root_logger)
+
+    # UX hardening — silence noisy third-party loggers by default.
+    # ``httpx`` emits an INFO-level "HTTP Request: GET ... 200 OK" on
+    # every request, which bleeds onto user terminals during forge /
+    # apply / etc. Operators who want the breadcrumbs surface them
+    # via ``--debug`` / ``FLUID_LOG_LEVEL=DEBUG``. ``litellm`` emits
+    # a similar "LiteLLM completion()" INFO line per call.
+    if numeric > logging.DEBUG:
+        for noisy in ("httpx", "httpcore", "litellm", "LiteLLM", "openai", "anthropic"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # Return production logger wrapper
     return ProductionLogger(LOG)

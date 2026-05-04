@@ -130,70 +130,75 @@ class BaseCredentialResolver(ABC):
         # Check cache first
         cache_key = f"{self.provider}.{key}"
         if cache_key in self._cache:
-            logger.debug(f"Credential '{key}' retrieved from cache")
+            # Constant-only log: ``cached_value`` is in scope.
+            logger.debug("Credential retrieved from cache")
             return self._cache[cache_key]
 
         # Try each source in priority order
         value = None
 
         # 1. CLI argument (highest priority)
+        # CodeQL py/clear-text-logging-sensitive-data: ``value`` is in
+        # scope at every LOG site below. Don't interpolate ``key`` —
+        # log only the resolution source so operators can trace the
+        # ladder without leaking credential identifiers / values.
         if cli_value is not None:
             value = cli_value
-            logger.debug(f"Credential '{key}' from CLI argument")
+            logger.debug("Credential resolved from: CLI argument")
 
         # 2. Environment variable
         if value is None:
             value = self._get_from_env(key)
             if value:
-                logger.debug(f"Credential '{key}' from environment variable")
+                logger.debug("Credential resolved from: environment variable")
 
         # 3. .env file
         if value is None:
             value = self._get_from_dotenv(key)
             if value:
-                logger.debug(f"Credential '{key}' from .env file")
+                logger.debug("Credential resolved from: .env file")
 
         # 4. OS Keyring
         if value is None:
             value = self._get_from_keyring(key)
             if value:
-                logger.debug(f"Credential '{key}' from OS keyring")
+                logger.debug("Credential resolved from: OS keyring")
 
         # 5. Encrypted file
         if value is None:
             value = self._get_from_encrypted_file(key)
             if value:
-                logger.debug(f"Credential '{key}' from encrypted file")
+                logger.debug("Credential resolved from: encrypted file")
 
         # 6. Config file
         if value is None:
             value = self._get_from_config(key)
             if value:
-                logger.debug(f"Credential '{key}' from config file")
+                logger.debug("Credential resolved from: config file")
 
         # 7. Vault
         if value is None:
             value = self._get_from_vault(key)
             if value:
-                logger.debug(f"Credential '{key}' from Vault")
+                logger.debug("Credential resolved from: Vault")
 
         # 8. Secret Manager
         if value is None:
             value = self._get_from_secret_manager(key)
             if value:
-                logger.debug(f"Credential '{key}' from secret manager")
+                logger.debug("Credential resolved from: secret manager")
 
         # 9. Provider-specific default
         if value is None:
             value = self._get_provider_default(key, **kwargs)
             if value:
-                logger.debug(f"Credential '{key}' from provider default")
+                logger.debug("Credential resolved from: provider default")
 
         # 10. Interactive prompt (lowest priority)
         if value is None and self.config.allow_prompt and required:
             value = self._get_from_prompt(key)
             if value:
-                logger.debug(f"Credential '{key}' from interactive prompt")
+                logger.debug("Credential resolved from: interactive prompt")
 
         # Handle not found
         if value is None and required:

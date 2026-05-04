@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
+from ..observability.tracing import traced_stage as _traced_stage
 from ._common import (
     CLIError,
     build_provider,
@@ -50,6 +51,7 @@ def register(subparsers: argparse._SubParsersAction):
     p.set_defaults(cmd=COMMAND, func=run)
 
 
+@_traced_stage("diff")
 def run(args, logger: logging.Logger) -> int:
     try:
         # Load contract and generate desired state

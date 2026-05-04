@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-FLUID Plan Command - Unified Version
+"""FLUID Plan Command (v0.7.x).
 
-Supports both FLUID 0.5.7 and 0.7.1+ contracts with automatic version detection.
-Uses ProviderActionParser for 0.7.1+ (with dependency resolution) and legacy
-provider.plan() for 0.5.7.
+Reads a v0.7.x contract and produces an execution plan via the
+:class:`ProviderActionParser` (provider actions with dependency
+resolution). Pre-0.7 contracts (0.4.0, 0.5.x) are no longer supported.
 """
 
 from __future__ import annotations
@@ -37,6 +36,7 @@ from fluid_build.cli.console import cprint, warning
 # carries ``bundleDigest`` (pins input bundle) + ``planDigest`` (catches
 # plan-file tampering). ``fluid apply`` re-verifies both before any DDL.
 from ..forge.core.plan_digest import inject_digests, is_bundle_path
+from ..observability.tracing import traced_stage as _traced_stage
 from ._common import (
     CLIError,
     build_provider,
@@ -134,22 +134,20 @@ def write_json_idempotent(path: str, obj: Any) -> None:
 
 
 def register(subparsers: argparse._SubParsersAction):
-    """Register unified plan command supporting both 0.5.7 and 0.7.1+"""
+    """Register the plan command (v0.7.x)."""
     p = subparsers.add_parser(
         COMMAND,
         help="Generate execution plan from FLUID contract",
         description="""
-Generate an execution plan from a FLUID data product contract.
+Generate an execution plan from a FLUID v0.7.x data product contract.
 
-UNIFIED SUPPORT for FLUID 0.5.7 and 0.7.1+:
-• Automatically detects contract version
-• 0.7.1+: Uses ProviderActionParser with dependency resolution
-• 0.5.7: Uses legacy provider.plan() method
-• Gracefully handles both explicit and inferred actions
+Uses :class:`ProviderActionParser` with dependency resolution to walk
+``builds[]`` / ``exposes[]`` and emit ordered actions per provider.
+Pre-0.7 contracts (0.4.0, 0.5.x) are no longer supported.
 
 The plan shows the sequence of operations needed to build and deploy
-the data product, including infrastructure provisioning, data transformations,
-access grants, and orchestration tasks.
+the data product, including infrastructure provisioning, data
+transformations, access grants, and orchestration tasks.
         """.strip(),
         epilog="""Examples:
   # Plan a contract (generates execution plan)
@@ -168,8 +166,29 @@ access grants, and orchestration tasks.
   fluid plan contract.fluid.yaml --verbose""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("contract", help="path to contract.fluid.yaml file")
+    p.add_argument(
+        "contract",
+        nargs="?",
+        default=None,
+        help=(
+            "Path to the contract.fluid.yaml file. When omitted, "
+            "auto-finds it in the current directory."
+        ),
+    )
     p.add_argument("--env", help="environment overlay (dev, staging, prod)")
+    p.add_argument(
+        "--mode",
+        default=None,
+        help=(
+            "Apply mode the plan is being generated FOR. Stamped into "
+            "plan.json so a subsequent ``fluid apply plan.json --mode X`` "
+            "can detect a mismatch and refuse rather than running an "
+            "additive apply when the operator asked for replace. "
+            "Choices: amend (default) | amend-and-build | replace | "
+            "replace-and-build | dry-run | create-only. When unset, the "
+            "plan is generated mode-less and apply must use the same."
+        ),
+    )
     p.add_argument(
         "--out",
         "--output",
@@ -212,16 +231,33 @@ access grants, and orchestration tasks.
     p.set_defaults(cmd=COMMAND, func=run)
 
 
+@_traced_stage("plan")
 def run(args, logger: logging.Logger) -> int:
     """
-    Main entry point with automatic version detection and routing.
-
-    Supports both FLUID 0.7.1+ (provider actions) and 0.5.7 (legacy) contracts.
+    Main entry point — accepts a v0.7.x contract path or pre-built
+    ``plan.json``, dispatches to ``ProviderActionParser`` for the
+    canonical action graph, and writes the merged plan + binding
+    digest to ``runtime/plan.json``.
     """
     try:
+        # UX hardening — accept bare ``fluid plan`` when CWD has a contract.
+        from fluid_build.cli._common import auto_find_contract
+
+        if not auto_find_contract(args):
+            raise CLIError(
+                1,
+                "contract_required",
+                {
+                    "message": (
+                        "No contract path supplied and no ``contract.fluid.yaml`` "
+                        "found in the current directory."
+                    )
+                },
+            )
+
         # Load contract with environment overlay
         contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
-        fluid_version = contract.get("fluidVersion", "0.5.7")
+        fluid_version = contract.get("fluidVersion", "0.7.3")
 
         info(
             logger,
@@ -509,7 +545,7 @@ def _should_use_provider_actions(contract: Dict[str, Any], logger: logging.Logge
         return True
 
     # Check version and parser availability
-    version = contract.get("fluidVersion", "0.5.7")
+    version = contract.get("fluidVersion", "0.7.3")
     if _parse_semver(version) >= (0, 7, 0) and PROVIDER_ACTIONS_AVAILABLE:
         return True
 
@@ -519,12 +555,11 @@ def _should_use_provider_actions(contract: Dict[str, Any], logger: logging.Logge
 def _plan_with_provider_actions(
     contract: Dict[str, Any], args, logger: logging.Logger
 ) -> Dict[str, Any]:
-    """
-    Generate plan using FLUID 0.7.1+ ProviderActionParser.
+    """Generate plan using the v0.7.x ``ProviderActionParser``.
 
     Handles both:
-    - Explicit providerActions array (0.7.1+)
-    - Inferred actions from exposes/builds (0.5.7 compatibility)
+    - Explicit ``providerActions[]`` arrays (when present)
+    - Inferred actions from ``exposes[]`` / ``builds[]`` (the common path)
 
     Returns plan dict with actions, dependencies, and execution order.
     """
@@ -532,7 +567,7 @@ def _plan_with_provider_actions(
         raise CLIError(
             1,
             "provider_actions_not_available",
-            context={"message": "ProviderActionParser not available. Install 0.7.1 dependencies."},
+            context={"message": "ProviderActionParser not available. Install 0.7.x dependencies."},
         )
 
     parser = ProviderActionParser(logger)
@@ -620,6 +655,12 @@ def _plan_with_provider_actions(
     return {
         "format_version": contract.get("fluidVersion", _default_fluid_version()),
         "generated_at": time.time(),
+        # ``mode`` records the apply mode the operator generated this
+        # plan FOR (None = mode-unaware plan). ``fluid apply plan.json
+        # --mode X`` uses this to detect a mismatch and refuse rather
+        # than silently running an additive apply when the operator
+        # asked for replace.
+        "mode": getattr(args, "mode", None),
         # Embed full contract so stage-7 apply can resolve provider,
         # binding, exposes, builds without re-reading the source file.
         # ``contract_metadata`` preserved for identity-only consumers.
@@ -640,11 +681,16 @@ def _plan_with_provider_actions(
 
 
 def _plan_legacy(contract: Dict[str, Any], args, logger: logging.Logger) -> Dict[str, Any]:
-    """
-    Generate plan using legacy provider.plan() method (0.5.7).
+    """Generate plan via the provider's ``plan()`` method directly.
 
-    Falls back to provider-specific planning for older contracts.
-    Provider is resolved from: --provider flag > contract binding.platform > FLUID_PROVIDER env.
+    Used for v0.7.x contracts whose providers haven't migrated to
+    ``providerActions[]`` yet (Snowflake / GCP / AWS still emit their
+    plans through this path). The function name is preserved for
+    git-blame continuity but the "legacy" framing is gone — this is
+    the standard plan path for class-based providers.
+
+    Provider is resolved from: --provider flag > contract
+    binding.platform > FLUID_PROVIDER env.
     """
     provider_flag = getattr(args, "provider", None)
     project_flag = getattr(args, "project", None)
@@ -689,14 +735,14 @@ def _plan_legacy(contract: Dict[str, Any], args, logger: logging.Logger) -> Dict
     actions = run_post_plan(provider, actions, logger)
 
     return {
-        "format_version": "0.5.7",
+        "format_version": "0.7.3",
         "generated_at": time.time(),
         # Embed full contract (see rationale in _plan_with_provider_actions).
         "contract": contract,
         "contract_metadata": {
             "id": contract.get("id"),
             "name": contract.get("name") or contract.get("metadata", {}).get("name") or "Unknown",
-            "version": contract.get("fluidVersion", "0.5.7"),
+            "version": contract.get("fluidVersion", "0.7.3"),
         },
         "actions": actions,
         "total_actions": len(actions),

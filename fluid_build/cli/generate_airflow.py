@@ -48,7 +48,7 @@ def register(subparsers: argparse._SubParsersAction):
         implements the orchestration workflow defined in providerActions.
         
         Supports both explicit provider actions (0.7.0+) and inferred actions
-        from legacy 0.5.7 contracts.
+        from v0.7.x contracts.
         
         If the contract has an 'orchestration' section, delegates to 
         'fluid export --engine airflow' for richer multi-engine support.

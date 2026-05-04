@@ -375,9 +375,19 @@ def print_forge_help() -> None:
             ("--target-dir, -d DIR", "Target directory for project creation"),
             ("--provider, -p NAME", "Infrastructure provider"),
             ("--domain NAME", "Domain hint (finance, healthcare, retail, telco)"),
+            (
+                "--data-product-type CODE",
+                "Data Mesh type (SDP/ADP/CDP) or layer (Bronze/Silver/Gold)",
+            ),
+            (
+                "--transform-engine NAME",
+                "Override transformation engine (dbt/sql/spark/dataform/...)",
+            ),
             ("--blank", "Empty contract without AI (no LLM needed)"),
             ("--dry-run", "Preview without creating files"),
             ("--non-interactive", "Use defaults without prompting"),
+            ("--yes, -y", "Skip the pre-write preview prompt (panel still renders)"),
+            ("--show-work", "Stream agent reasoning + tool calls live"),
             ("--context VALUE", "Additional AI context (JSON string or file path)"),
         ],
     )

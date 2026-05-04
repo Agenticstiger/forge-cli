@@ -92,9 +92,10 @@ class SecretManager:
             ConfigurationError: If required secret is missing
             AuthenticationError: If authentication with secret provider fails
         """
-        # Check cache first
+        # Check cache first. CodeQL py/clear-text-logging-sensitive-data:
+        # the cached value is in scope; don't interpolate ``secret_name``.
         if secret_name in self._cache:
-            logger.debug(f"Secret '{secret_name}' retrieved from cache")
+            logger.debug("Secret retrieved from cache")
             return self._cache[secret_name]
 
         # Retrieve from source
@@ -111,10 +112,10 @@ class SecretManager:
                 ],
             )
 
-        # Cache if found
+        # Cache if found. ``value`` is in scope; log only the action.
         if value is not None:
             self._cache[secret_name] = value
-            logger.debug(f"Secret '{secret_name}' cached")
+            logger.debug("Secret cached")
 
         return value
 
@@ -188,11 +189,14 @@ class SecretManager:
 
                 return base64.b64decode(response["SecretBinary"]).decode("utf-8")
         except ClientError as e:
+            # CodeQL py/clear-text-logging-sensitive-data: don't
+            # interpolate ``secret_name`` (the surrounding ``response``
+            # frame and any nearby ``value`` are in scope).
             if e.response["Error"]["Code"] == "ResourceNotFoundException":
-                logger.warning(f"Secret not found in AWS: {secret_name}")
+                logger.warning("Secret not found in AWS")
                 return None
             else:
-                logger.error(f"Failed to retrieve secret from AWS: {e}")
+                logger.error("Failed to retrieve secret from AWS: %s", type(e).__name__)
                 raise AuthenticationError(
                     f"Failed to access AWS Secrets Manager: {e}", original_error=e
                 )

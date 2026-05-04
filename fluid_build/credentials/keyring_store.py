@@ -90,10 +90,12 @@ class KeyringCredentialStore:
         try:
             value = keyring.get_password(KeyringCredentialStore.SERVICE_NAME, key)
             if value:
-                logger.debug(f"Retrieved credential from keyring: {key}")
+                # Constant-only log: ``value`` (the credential) is in scope.
+                logger.debug("Retrieved credential from keyring")
             return value
-        except KeyringError as e:
-            logger.debug(f"Failed to retrieve credential from keyring: {e}")
+        except KeyringError:
+            # Don't include exception text — backend errors can echo creds.
+            logger.debug("Failed to retrieve credential from keyring")
             return None
 
     @staticmethod
