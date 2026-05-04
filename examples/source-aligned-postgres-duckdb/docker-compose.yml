@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fluid-source-aligned-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: fluid_demo
+      POSTGRES_USER: fluid
+      POSTGRES_PASSWORD: fluid_pw
+    ports:
+      - "${PGPORT:-5432}:5432"
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fluid -d fluid_demo"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

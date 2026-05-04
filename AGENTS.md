@@ -158,6 +158,7 @@ make demo           # validate → plan → apply on example contract
 - **Adding a template**: Create `fluid_build/templates/<name>.j2` or add to `fluid_build/forge/templates/`
 - **Adding a policy rule**: Extend validators in `fluid_build/policy/`
 - **Modifying the contract schema**: Update `fluid_build/schemas/` and bump `fluidVersion`. Never hardcode the new version as a literal — `SchemaManager.latest_bundled_version()` scans the schemas directory and returns the newest, so fallbacks track future bumps automatically.
+- **Data-product type vocabulary** (v0.7.3+): contracts can use medallion (`metadata.layer ∈ {Bronze, Silver, Gold, Platinum}`) or Data Mesh (`metadata.productType ∈ {SDP, ADP, CDP}`) — they're equivalent. Canonical mapping: **Bronze↔SDP** (Source-Aligned Data Product), **Silver↔ADP** (Aggregated), **Gold↔CDP** (Consumption-Aligned). Either-or-both is accepted; when both are set the validator enforces consistency. Cross-check is duplicated inline at three call sites (`fluid_build/schema.py::_check_metadata`, `fluid_build/schema_manager.py::_validate_with_jsonschema`, `fluid_build/cli/contract_validation.py::_validate_metadata`) — keep them in lockstep when changing the mapping. Provider tag/label propagation in `providers/{aws,gcp,snowflake}` and `forge/core/provider_actions.py` emits both as separate cloud labels (`fluid_layer` + `fluid_product_type`).
 - **Adding a new apply mode**: extend `fluid_build/forge/core/apply_modes.py::ApplyMode` enum + `CANONICAL_CHOICES` list + predicates (`is_destructive`, `needs_build`, etc.) + `check_data_loss_gate` if the mode is destructive. The mode must map to a provider-native DDL flavor in `providers/<provider>/actions/*.py`.
 - **Changing what `fluid plan` emits**: `plan.json` must carry both `planDigest` and `bundleDigest` (re-run `inject_digests` after any mutation to the dict). Actions must carry BOTH `op` and `action_type` fields — apply.py's provider dispatcher reads `op`, display/viz reads `action_type`. Dropping either silently breaks the pipeline.
 - **Generating a new CI system template**: extend `fluid_build/forge/core/pipeline_templates.py`. The 11-stage sequence + the `--install-mode {pypi,dev-source}` semantics must be preserved across systems. Jenkins is the reference implementation; GitHub Actions / GitLab / Azure / Bitbucket / CircleCI / Tekton port from it.
@@ -279,13 +280,29 @@ The `AgentPolicyValidator` in `fluid_build/policy/agent_policy.py` checks for:
 
 ## For AI-Assisted Project Creation (Forge)
 
-FLUID Forge includes AI-powered project creation via specialized domain agents:
+FLUID Forge includes AI-powered project creation via a 5-mode picker:
 
 ```bash
-fluid forge                          # Interactive — picks the best agent
-fluid forge --mode template          # Template-guided creation
-fluid forge --mode copilot           # AI copilot assistance
-fluid forge --mode blueprint         # Enterprise blueprint deployment
+fluid forge                          # 5-mode picker: AI / Compose / Refine / Template / Blank
+fluid forge --blank                  # No-AI scaffold
+fluid forge --template starter       # Template (alias --scaffold)
+fluid forge --refine contract.yaml   # Iterate on existing contract (1 question)
+fluid forge --from-product <id>      # Compose ADP/CDP from existing products
+fluid forge --data-product-type ADP  # Set Data Mesh productType (or Silver alias)
+fluid forge --yes                    # Skip the [Y/n] prompt; cost still shown
+fluid forge --show-work              # Stream agent reasoning + tool calls
+```
+
+The interview is **mode-aware**: compose runs ~3 questions seeded from upstream schemas, refine asks "what to change?", standard mode runs the world-class bootstrap (detect-first inferences, examples in every prompt, productType-first, `:auto` escape, schema-coverage gate). Slash commands inside the interview: `:ai-setup`, `:override`, `:show-work`, `:doctor`, `:help`, `:quit`.
+
+Cost is visible before it's spent: every run renders `.fluid/agents/<run-id>/{cost.json,reasoning.md,transcript.json}` and `.fluid/forge-receipt.json`. Aggregate across runs via `fluid stats --by provider|type|engine`.
+
+Opt into the **LiteLLM unified backend** for one API across OpenAI / Anthropic / Gemini / Bedrock / Azure / Vertex / Groq / Cohere / Mistral / Ollama:
+
+```bash
+pip install "fluid-build[litellm]"
+export FLUID_LLM_BACKEND=litellm
+fluid forge --llm-provider gemini --llm-model gemini-2.5-flash
 ```
 
 ### Domain Agents
@@ -377,6 +394,139 @@ For MCP (Model Context Protocol) tool servers, these JSON outputs can be piped d
 - Policy compliance reports with violation severity
 
 ---
+
+## Cross-stage run-id, ADP replay, late-arrival, federation (2026-05-02)
+
+These four orthogonal hardening bands landed in one push; the
+machinery is described in detail in `CLAUDE.md` under "Recent
+architectural changes worth knowing (2026-05-02, world-class hardening)".
+
+### Run-id correlation
+
+Every `fluid <stage>` decorated with `@traced_stage(...)` auto-stamps
+`fluid.run_id` on its OTel root span via
+`observability/run_id.py::get_or_create_run_id()`. Resolution order:
+
+1. `$FLUID_RUN_ID` env var (operator override / CI injection).
+2. `.fluid/run-id.txt` (persisted between stages).
+3. Newly generated 12-char hex id (first stage of a run).
+
+All 11 CLI stages now wear the decorator: `bundle, plan, apply,
+verify, publish, schedule_sync, validate, diff, generate_artifacts,
+validate_artifacts, policy_apply`. Operators query by
+`fluid.run_id="..."` to reconstruct a multi-stage run.
+
+### ADP auto-replay (replay marker schema)
+
+`build_runners/_state.py::FileStateStore.set_cursor` detects rewinds,
+walks `consumes[]` to find downstream products, writes a JSON marker
+at `.fluid/<downstream-product-id>/runtime/replay-pending.json`:
+
+```json
+{
+  "upstream_product_id": "bronze.crm.customers",
+  "upstream_build_id": "main_build",
+  "upstream_stream": "default",
+  "old_cursor_value": "2026-04-30T00:00:00Z",
+  "new_cursor_value": "2026-04-15T00:00:00Z",
+  "detected_at": "2026-05-02T12:30:00Z",
+  "reason": "upstream cursor rewound from <old> to <new>"
+}
+```
+
+`fluid status` surfaces the dirty list via `list_dirty_products()`.
+`clear_dirty_marker()` runs on `fluid apply --replay` completion.
+Single chokepoint integration: every cursor-writing runner
+(Kafka-Connect / Debezium / DLT / duckdb / Meltano) benefits without
+per-runner wiring.
+
+### Streaming late-arrival (connector config keys + SQL splitter)
+
+`build_runners/_late_arrival.extract_late_arrival_policy` reads
+`WatermarkSpec.allowed_lateness` (ISO-8601 duration) and surfaces as
+connector config under stable keys:
+
+| Connector config key | Type | Meaning |
+|---|---|---|
+| `fluid.late_arrival.enabled` | string | `"true"` / `"false"` |
+| `fluid.late_arrival.allowed_lateness_seconds` | string | budget in seconds |
+| `fluid.late_arrival.side_output_table` | string | `<target>__late_events` |
+
+Wired into `kafka_connect/runner.py` and `debezium/runner.py` (declarative;
+SMT / sink-side enforcer reads these keys).
+
+For Python-side runners (duckdb / DLT) where there's no Kafka SMT,
+`split_late_events_in_duckdb()` does the actual SQL split:
+``rows where event_time < max(event_time) - budget`` move to
+``<basename>__late_events.<ext>`` and are deleted from the main file.
+Wired into `duckdb/runner.py::_enforce_late_arrival_split`.
+
+### Cross-mesh federation
+
+`forge/federation.py` ships three live-fetch backends called from
+`fetch_federated_digest`:
+
+* `_fetch_digest_via_http` — GET `<endpoint>/<product>/<version>/digest`
+  returning `sha256:...`.
+* `_fetch_digest_via_catalog` — REST GET returning JSON
+  `{"digest": "..."}`.
+* `_fetch_digest_via_git` — gitpython primary (in-process clone +
+  pull); shell-out fallback when gitpython unavailable. Caches
+  cloned repos under `~/.cache/fluid/federation-git/<workspace_id>`.
+
+Manifest at `federation/upstreams.yaml`:
+
+```yaml
+workspaces:
+  - id: telco-billing
+    kind: git_registry           # | catalog | http_registry
+    endpoint: https://github.com/acme/telco-billing-mesh
+    auth:
+      mode: github_token         # | basic | oidc | bearer | none
+      secret_ref: GITHUB_TOKEN   # env var name; resolved at fetch time
+```
+
+`validate_federated_consumes` is wired into `cli/apply.py` as a
+stage-7 gate. Drift produces `CLIError(event="apply_consumes_drift",
+context={"kind": "upstream-mismatch", "violations": [...]})`. The
+`--no-verify-digest` flag is the DR escape hatch and logs at
+WARNING level so audit trails catch the override.
+
+### Phase 2.6 — `from-source --source postgres|mysql|sqlite`
+
+`fluid forge data-model from-source --source postgres --uri
+postgresql://...` now uses the duckdb-extension scanner via
+`cli/discover/_jdbc_introspect.py::introspect_jdbc()`. Supported
+shapes:
+
+* `postgresql://user:pass@host:5432/db`
+* `postgres://user:pass@host:5432/db` (alias)
+* `mysql://user:pass@host:3306/db`
+* `sqlite:///path/to/db.sqlite`
+
+The dispatcher in `cli/forge_data_model.py::run_from_source_command`
+branches on `args.source ∈ {postgres, postgresql, mysql, sqlite}` to
+the JDBC path; everything else goes through the existing catalog
+adapter resolver chain.
+
+### File LOC reductions in flight
+
+Top files >1500 LOC are being extracted to natural seams using the
+**module-attribute-access indirection pattern** (`_module = original;
+... _module._fn(...)`) so test patches on the original module flow
+through to the extracted helper. Reductions this session:
+
+* `cli/market.py` — 2614 → 2493 (-121 LOC) via `cli/_market_render.py`
+  (format_table_output + format_detailed_output + format_json_output).
+* Prior sessions: forge_modes (-1204), auth (-1409), modeler_agent
+  (-654), interview (-936), viz_graph (-486), init (-238).
+
+Files still over 1500 LOC (slated for follow-up): `datamesh_manager.py`
+(2595), `forge_modes.py` (2459), `init.py` (1920), `ai_setup.py`
+(1888), `forge_data_model.py` (1825 — gained ~120 from Phase 2.6),
+`forge_copilot_llm_providers.py` (1687), `forge_copilot_tools.py`
+(1614), `forge_copilot_runtime.py` (1590), `apply.py` (~1580 with
+the federation gate), `coordinator.py` (1522).
 
 ## Links
 

@@ -335,7 +335,8 @@ name: Customer 360
 domain: analytics
 
 metadata:
-  layer: Gold
+  layer: Gold              # medallion vocabulary
+  productType: CDP         # Data Mesh vocabulary (NEW in v0.7.3) — Bronze↔SDP, Silver↔ADP, Gold↔CDP
   owner:
     team: data-platform
     email: platform@example.com
