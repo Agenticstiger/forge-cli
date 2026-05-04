@@ -1,0 +1,102 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+"""Handler for ``fluid import {meltano,airbyte,dlt,singer} <source>``.
+
+Dispatches to the matching importer in
+:mod:`fluid_build.cli.import_workflow`, writes the resulting contract YAML
+to disk, and prints the translation report so the user knows exactly what
+mapped 1:1, what got defaulted, and what's unsupported.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Optional
+
+import yaml
+
+from fluid_build.cli._errors import SchemaValidationError
+from fluid_build.cli.console import cprint
+from fluid_build.cli.import_workflow import get_importer
+
+
+def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Optional[str]) -> int:
+    if not source:
+        raise SchemaValidationError(
+            what=f"`fluid import {tool}` requires a positional source argument",
+            why=(
+                f"The {tool} importer needs to know what to convert "
+                f"(project dir / workspace id / pipeline name / tap config)."
+            ),
+            fix=(
+                f"`fluid import {tool} <project-dir | workspace-id | "
+                f"pipeline-name | tap-config.json>`"
+            ),
+            doc="https://forge.fluid.dev/ref/import",
+            extras={"tool": tool},
+        )
+
+    importer = get_importer(tool)
+    if importer is None:
+        raise SchemaValidationError(
+            what=f"unknown importer tool: {tool}",
+            why=f"`{tool}` is not in the registered importer set.",
+            fix="Use one of: meltano | airbyte | dlt | singer.",
+            doc="https://forge.fluid.dev/ref/import",
+            extras={"tool": tool, "supported": ["meltano", "airbyte", "dlt", "singer"]},
+        )
+
+    cprint(f"📥 Importing {tool} configuration from {source}…")
+    try:
+        contract, report = importer.import_to_contract(source)
+    except Exception as exc:  # noqa: BLE001
+        raise SchemaValidationError(
+            what=f"{tool} import failed for {source}",
+            why=str(exc),
+            fix=(
+                "Check the source path/identifier and that the foreign tool's "
+                "config is well-formed."
+            ),
+            doc=f"https://forge.fluid.dev/ref/import#{tool}",
+            extras={"tool": tool, "source": source},
+        ) from exc
+
+    out_path = Path(getattr(args, "out_path", None) or _default_out_path(contract))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+
+    cprint(f"✓ Wrote {out_path}")
+    _print_report(report)
+    cprint("\nNext: `fluid validate {0}` and review the contract before applying.".format(out_path))
+    return 0
+
+
+def _default_out_path(contract: dict) -> str:
+    cid = (contract.get("id") or "imported").replace("/", "_")
+    return f"contract.{cid}.fluid.yaml"
+
+
+def _print_report(report) -> None:
+    if report.mapped_one_to_one:
+        cprint(f"\n  Mapped 1:1 ({len(report.mapped_one_to_one)}):")
+        for x in report.mapped_one_to_one:
+            cprint(f"    • {x}")
+    if report.required_defaults:
+        cprint(f"\n  Used defaults ({len(report.required_defaults)}):")
+        for x in report.required_defaults:
+            cprint(f"    • {x}")
+    if report.unsupported:
+        cprint(f"\n  Unsupported (must be re-authored, {len(report.unsupported)}):")
+        for x in report.unsupported:
+            cprint(f"    ⚠ {x}")
+    if report.notes:
+        cprint("\n  Notes:")
+        for x in report.notes:
+            cprint(f"    – {x}")
