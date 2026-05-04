@@ -537,8 +537,24 @@ def test_copilot_scenario_explicit_input_beats_discovery_and_memory(tmp_path: Pa
     agent = _make_agent()
 
     with patch("fluid_build.cli.forge.resolve_llm_config", return_value=_mock_llm_config()):
-        with patch(
-            "fluid_build.cli.forge.build_capability_matrix", return_value=_capability_matrix()
+        # Disable streaming + short-circuit the schema validator and
+        # self-evaluation routing call so the test stays focused on
+        # scaffold-decision sourcing rather than the full agent loop.
+        from fluid_build.schema_manager import ValidationResult
+
+        with (
+            patch(
+                "fluid_build.cli.forge.build_capability_matrix", return_value=_capability_matrix()
+            ),
+            patch.dict("os.environ", {"FLUID_LLM_STREAMING": "0"}, clear=False),
+            patch(
+                "fluid_build.schema_manager.FluidSchemaManager.validate_contract",
+                return_value=ValidationResult(is_valid=True, errors=[], warnings=[]),
+            ),
+            patch(
+                "fluid_build.cli.forge_copilot_runtime._self_evaluate_contract",
+                return_value=None,
+            ),
         ):
             with patch(
                 "fluid_build.cli.forge_copilot_runtime.validate_generated_result",

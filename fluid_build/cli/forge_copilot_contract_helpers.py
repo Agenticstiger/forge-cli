@@ -83,18 +83,41 @@ TEMPLATE_ALIASES = {
 }
 
 KNOWN_BUILD_ENGINES = {
+    # Transformation engines (ADP / CDP role).
     "sql",
     "python",
     "dbt",
     "spark",
     "custom",
+    # Ingestion engines (SDP role) — must be advertised so the AI
+    # path can pick the right engine for source-aligned products.
+    # The build_runners directory ships dispatchers for each.
+    "duckdb",
+    "dlt",
+    "airbyte",
+    "meltano",
+    "kafka-connect",
+    "debezium",
 }
 
 PROVIDER_ENGINE_COMPATIBILITY = {
-    "local": {"sql", "python", "dbt"},
-    "gcp": {"sql", "python", "dbt"},
-    "aws": {"sql", "python", "dbt"},
-    "snowflake": {"sql", "python", "dbt"},
+    # Local: every engine works (zero-infra ingestion + local dbt).
+    "local": {
+        "sql",
+        "python",
+        "dbt",
+        "duckdb",
+        "dlt",
+        "airbyte",
+        "meltano",
+        "kafka-connect",
+        "debezium",
+    },
+    # Cloud platforms: transformation engines + ingestion engines that
+    # have first-class support there.
+    "gcp": {"sql", "python", "dbt", "dlt", "airbyte", "meltano", "kafka-connect"},
+    "aws": {"sql", "python", "dbt", "dlt", "airbyte", "meltano", "kafka-connect", "debezium"},
+    "snowflake": {"sql", "python", "dbt", "dlt", "airbyte", "meltano"},
 }
 
 _AMBIGUITY_ERROR_KEYWORDS = (
@@ -569,6 +592,53 @@ def _default_binding(provider_name: str, expose_name: str) -> Dict[str, Any]:
     }
 
 
+def _seed_contract_override(context: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Refine-mode seed: when ``context['seed_contract_override']`` is
+    populated (set by ``_run_refine_interview``), the seed IS the
+    existing contract — the LLM's job is to apply the user's change
+    request to it, not author a new one."""
+    override = context.get("seed_contract_override")
+    if isinstance(override, dict) and override.get("kind") == "DataProduct":
+        return dict(override)
+    return None
+
+
+def _seed_metadata(context: Mapping[str, Any], owner_team: str) -> Dict[str, Any]:
+    """Build the metadata block for the seed contract.
+
+    Honors ``--data-product-type`` (Phase 1) by reading the canonical
+    pair from the registry — when the user said ``--data-product-type
+    ADP`` the seed lands as ``layer: Silver`` + ``productType: ADP``.
+    Defaults to Bronze/SDP when no type is specified.
+    """
+    from fluid_build.forge.product_types import (
+        get_product_type,
+    )
+
+    requested = (
+        context.get("data_product_type") or context.get("productType") or context.get("layer")
+    )
+    pt = get_product_type(str(requested)) if requested else None
+    if pt is not None:
+        layer = pt.layer
+        product_type = pt.code
+    elif requested in {"Platinum"}:
+        # Platinum has no productType analogue — leave it absent.
+        layer = "Platinum"
+        product_type = None
+    else:
+        layer = "Bronze"
+        product_type = "SDP"
+
+    metadata: Dict[str, Any] = {
+        "layer": layer,
+        "owner": {"team": owner_team, "email": "data-team@example.com"},
+    }
+    if product_type:
+        metadata["productType"] = product_type
+    return metadata
+
+
 def build_seed_contract(
     *,
     context: Mapping[str, Any],
@@ -578,7 +648,16 @@ def build_seed_contract(
     project_memory: Optional[CopilotMemorySnapshot],
     map_inferred_type_fn: Callable[[str], str],
 ) -> Dict[str, Any]:
-    """Create a minimal valid 0.7.2 contract used as guidance for the LLM."""
+    """Create a minimal valid 0.7.2 contract used as guidance for the LLM.
+
+    Phase 0.4 / refine-mode short-circuit: when the interview loaded an
+    existing contract via ``--refine``, ``_seed_contract_override``
+    returns it verbatim so the LLM modifies the actual user contract
+    instead of inventing a new one.
+    """
+    override = _seed_contract_override(context)
+    if override is not None:
+        return override
     interview_summary = _normalize_interview_summary(context)
     project_name = sanitize_name(context.get("project_goal") or "copilot-data-product")
     expose_name = f"{project_name}_output"
@@ -600,23 +679,64 @@ def build_seed_contract(
     build_engine = str(interview_summary.get("build_engine") or "sql").strip().lower()
     if build_engine not in KNOWN_BUILD_ENGINES:
         build_engine = "sql"
-    build = {
-        "id": "main_build",
-        "pattern": "embedded-logic",
-        "engine": "python" if build_engine == "python" else "sql",
-        "execution": {
-            "trigger": {"type": "manual", "iterations": 1},
-            "runtime": {
-                "platform": provider_name,
-                "resources": {"cpu": "1", "memory": "2Gi"},
+
+    # Phase 1: when the user explicitly chose an SDP product type, the
+    # seed should demonstrate the ``acquisition`` pattern (which the
+    # LLM otherwise tries to fake with ``embedded-logic`` + python
+    # scripts that fail validation). Building from the canonical
+    # registry keeps every authoring path byte-equivalent (I2).
+    requested_pt = (
+        context.get("data_product_type") or context.get("productType") or context.get("layer")
+    )
+    _is_sdp_seed = False
+    if requested_pt:
+        from fluid_build.forge.product_types import get_product_type as _resolve_pt
+
+        _resolved = _resolve_pt(str(requested_pt))
+        _is_sdp_seed = _resolved is not None and _resolved.code == "SDP"
+
+    if _is_sdp_seed:
+        # Acquisition pattern: source.kind + source.mode are required
+        # by acquisitionSource. Trigger type is ``schedule`` (not
+        # ``scheduled``); cron expression goes alongside.
+        first_source = ""
+        sources = context.get("data_sources") or []
+        if isinstance(sources, list) and sources:
+            first_source = str(sources[0])
+        source_block: Dict[str, Any] = {"kind": "filesystem", "mode": "full_refresh"}
+        if first_source:
+            source_block["connection"] = {"uri": first_source}
+        build = {
+            "id": "main_acquisition",
+            "pattern": "acquisition",
+            "engine": "duckdb",
+            "properties": {"source": source_block},
+            "execution": {
+                "trigger": {"type": "schedule", "cron": "0 6 * * *"},
+                "runtime": {
+                    "platform": provider_name,
+                    "resources": {"cpu": "1", "memory": "2Gi"},
+                },
             },
-        },
-    }
-    if build["engine"] == "python":
-        build["repository"] = "src/main.py"
-        build["properties"] = {"model": "src.main:build"}
+        }
     else:
-        build["properties"] = {"sql": "SELECT 1 AS id"}
+        build = {
+            "id": "main_build",
+            "pattern": "embedded-logic",
+            "engine": "python" if build_engine == "python" else "sql",
+            "execution": {
+                "trigger": {"type": "manual"},
+                "runtime": {
+                    "platform": provider_name,
+                    "resources": {"cpu": "1", "memory": "2Gi"},
+                },
+            },
+        }
+        if build["engine"] == "python":
+            build["repository"] = "src/main.py"
+            build["properties"] = {"model": "src.main:build"}
+        else:
+            build["properties"] = {"sql": "SELECT 1 AS id"}
 
     description = context.get("project_goal") or "AI-generated FLUID data product"
     domain = (
@@ -634,7 +754,11 @@ def build_seed_contract(
         or context.get("team_size")
         or "data-team"
     )
-    consumes = interview_summary.get("consumes") or []
+    # Compose-mode: ``_run_compose_interview`` pre-fills consumes[] on
+    # the context with rows shaped as ``{productId, exposeId}`` (the
+    # v0.7.3 schema shape). Prefer that over the legacy interview
+    # summary which carried a free-form list.
+    consumes = context.get("consumes") or interview_summary.get("consumes") or []
     if not isinstance(consumes, list):
         consumes = []
 
@@ -670,10 +794,7 @@ def build_seed_contract(
         "name": project_name.replace("-", " ").title(),
         "description": description,
         "domain": domain,
-        "metadata": {
-            "layer": "Bronze",
-            "owner": {"team": owner_team, "email": "data-team@example.com"},
-        },
+        "metadata": _seed_metadata(context, owner_team),
         "consumes": consumes,
         "builds": [build],
         "exposes": [expose],
@@ -752,6 +873,36 @@ def _build_default_readme(
     return "\n".join(lines)
 
 
+def _harmonise_agent_policy_inplace(contract: Dict[str, Any]) -> None:
+    """Resolve the ``canReason=false but reasoning in allowedUseCases`` contradiction.
+
+    LLMs occasionally emit policy blocks where ``canReason=false`` (set
+    by the seed for confidential/restricted data) coexists with
+    ``allowedUseCases: [reasoning, ...]``. The validator surfaces this
+    as a warning, but a contract that ships with the contradiction
+    embedded is genuinely incoherent. Strip ``reasoning`` from
+    ``allowedUseCases`` whenever ``canReason=false`` so the contract
+    self-validates without operator intervention.
+    """
+    exposes = contract.get("exposes") or []
+    if not isinstance(exposes, list):
+        return
+    for expose in exposes:
+        if not isinstance(expose, dict):
+            continue
+        policy = expose.get("policy")
+        if not isinstance(policy, dict):
+            continue
+        agent_policy = policy.get("agentPolicy")
+        if not isinstance(agent_policy, dict):
+            continue
+        # Only act when both fields are explicitly present + contradictory.
+        if agent_policy.get("canReason") is False:
+            allowed = agent_policy.get("allowedUseCases")
+            if isinstance(allowed, list) and "reasoning" in allowed:
+                agent_policy["allowedUseCases"] = [u for u in allowed if u != "reasoning"]
+
+
 def normalize_generation_payload(
     payload: Mapping[str, Any],
     *,
@@ -770,6 +921,11 @@ def normalize_generation_payload(
             contract = yaml.safe_load(contract_yaml)
     if not isinstance(contract, dict):
         raise ValueError("The LLM response did not include a valid contract object.")
+
+    # Auto-resolve the canReason ↔ allowedUseCases:[reasoning] contradiction
+    # before any downstream validator sees it. Cheap, deterministic, and
+    # honest about the seed's intent (canReason=false means no reasoning).
+    _harmonise_agent_policy_inplace(contract)
 
     readme_markdown = payload.get("readme_markdown")
     if not isinstance(readme_markdown, str) or not readme_markdown.strip():

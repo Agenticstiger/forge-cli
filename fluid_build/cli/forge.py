@@ -266,6 +266,25 @@ def register(subparsers: argparse._SubParsersAction):
     )
     parser.add_argument("--target-dir", "-d", help="Target directory for project creation")
     parser.add_argument("--provider", "-p", help="Infrastructure provider to use")
+    parser.add_argument(
+        "--data-product-type",
+        dest="data_product_type",
+        help=(
+            "Data Mesh productType (SDP/ADP/CDP) or medallion layer "
+            "(Bronze/Silver/Gold) — accepted interchangeably via the "
+            "canonical mapping (Bronze↔SDP, Silver↔ADP, Gold↔CDP). "
+            "When omitted the copilot infers from the project goal."
+        ),
+    )
+    parser.add_argument(
+        "--transform-engine",
+        dest="transform_engine",
+        help=(
+            "Override the transformation engine (dbt / sql / spark / dataform / "
+            "dataflow / glue) for ADP / CDP products. SDP products pick the "
+            "right acquisition engine via the capability catalog."
+        ),
+    )
     try:
         from fluid_build.cli.forge_agents import get_all_domain_names
 
@@ -343,6 +362,90 @@ def register(subparsers: argparse._SubParsersAction):
         help=(
             "Force the heuristic-only forge path; never call any LLM. "
             "Equivalent to `--blank` for the full no-AI experience."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help=(
+            "Skip the pre-write preview confirmation prompt. The cost + file "
+            "list is still rendered (invariant: cost is visible before it's "
+            "spent), only the [Y/n] prompt is bypassed."
+        ),
+    )
+    parser.add_argument(
+        "--show-work",
+        action="store_true",
+        help=(
+            "Stream the agent's reasoning and tool calls live as they happen. "
+            "Reasoning + transcript also persist to "
+            ".fluid/agents/<run-id>/{reasoning.md,transcript.json}."
+        ),
+    )
+    parser.add_argument(
+        "--refine",
+        nargs="?",
+        const="contract.fluid.yaml",
+        default=None,
+        metavar="CONTRACT_PATH",
+        help=(
+            "Iterate on an existing contract. Reads the contract + the latest "
+            ".fluid/agents/<run-id>/ artifacts and asks the LLM what to change. "
+            "Defaults to ./contract.fluid.yaml when no path is given."
+        ),
+    )
+    parser.add_argument(
+        "--from-product",
+        action="append",
+        dest="from_product",
+        default=[],
+        metavar="ID_OR_PATH",
+        help=(
+            "Compose this product from an existing upstream product. "
+            "Accepts a contract id (e.g. silver.commerce.orders_v1) or a "
+            "path to a contract.fluid.yaml. Repeatable; each --from-product "
+            "becomes one row in consumes[]."
+        ),
+    )
+    parser.add_argument(
+        "--from-product-list",
+        dest="from_product_list",
+        metavar="FILE",
+        help=(
+            "Read upstream product ids/paths from a file (one per line). "
+            "Combines additively with --from-product."
+        ),
+    )
+    parser.add_argument(
+        "--from-workspace",
+        dest="from_workspace",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Search this additional workspace path for upstream contracts. "
+            "Repeatable; useful when upstream products live in a sibling repo."
+        ),
+    )
+    parser.add_argument(
+        "--also-emit",
+        dest="also_emit",
+        default=None,
+        metavar="FORMATS",
+        help=(
+            "After writing the FLUID contract, also emit additional standards "
+            "(comma-separated: odcs, opds, odps). Defaults to 'odcs' for CDP "
+            "products and empty otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help=(
+            "Use the browser-based AI setup flow when picking a provider. "
+            "Opens the provider's API-key dashboard in your browser; the "
+            "key still pastes back into the terminal (preview)."
         ),
     )
 
@@ -437,15 +540,21 @@ def register(subparsers: argparse._SubParsersAction):
     # ForgeEngine + opinionated templates.
     parser.add_argument(
         "--scaffold",
+        "--template",
+        dest="scaffold",
         metavar="TEMPLATE",
         default=None,
         help=(
             "Opt into the full ForgeEngine scaffold using one of the built-in "
             "templates (e.g. 'etl_pipeline', 'analytics', 'ml_pipeline', "
-            "'streaming', 'starter'). Default: minimal — only contract.fluid.yaml "
-            "and .fluid/forge-receipt.json are written."
+            "'streaming', 'starter'). ``--template`` is an alias retained "
+            "for parity with ``fluid init --template``. Default: minimal — "
+            "only contract.fluid.yaml and .fluid/forge-receipt.json are written."
         ),
     )
+    # Mirror the parsed value to ``args.template`` so the mode-picker
+    # template branch (which reads ``args.template``) sees it too.
+    # argparse aliases only set the dest, not extra attributes.
 
     # --- Agent loop opt-in (slice UX-K) ---
     parser.add_argument(
@@ -517,6 +626,40 @@ def handle_memory_management(args, logger: logging.Logger) -> int:
 # ---------------------------------------------------------------------------
 # Blank mode — scaffold empty contract, no AI
 # ---------------------------------------------------------------------------
+
+
+def _pick_template_subchoice(console: Any) -> Optional[str]:
+    """Sub-picker shown when the user chose ``template`` in the mode menu
+    but didn't pre-select one with ``--template``.
+
+    Lists the templates registered with ``forge.core.registry`` so a new
+    template auto-appears here without code edits.
+    """
+    try:
+        from fluid_build.cli.forge_ui import ask_numbered_choice
+        from fluid_build.forge.core.registry import template_registry
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("template_subpicker_unavailable: %s", exc)
+        return "starter"
+
+    try:
+        names = sorted(template_registry.list_available())
+    except Exception:  # noqa: BLE001
+        names = ["starter", "analytics", "etl_pipeline", "streaming", "ml_pipeline"]
+    if not names:
+        return "starter"
+
+    choices = [(name, name.replace("_", " ").title()) for name in names]
+    choices.append(("cancel", "Cancel — back to forge"))
+    pick = ask_numbered_choice(
+        console,
+        "Which template?",
+        choices,
+        default=1,
+    )
+    if pick == "cancel":
+        return None
+    return pick
 
 
 def _run_blank_mode(args: Any, logger: logging.Logger) -> int:
@@ -678,6 +821,55 @@ def run(args, logger: logging.Logger) -> int:
         if get_cli_arg(args, "no_llm", False) or get_cli_arg(args, "deterministic", False):
             args.blank = True
 
+        # --- Mode picker (Phase 0.2) ---
+        # When the user runs bare ``fluid forge`` with no mode flag and
+        # stdin is a TTY, surface the menu of authoring paths instead
+        # of dropping straight into AI mode. Pre-highlights the most
+        # likely choice from the welcome scan (existing contract →
+        # refine; existing products → from_product; otherwise → AI).
+        _picker_ran = False
+        _picked_mode = "ai"
+        try:
+            from fluid_build.cli._forge_mode_picker import pick_mode, should_show_picker
+
+            if should_show_picker(args):
+                _picked_mode = pick_mode(args, console=console)
+                _picker_ran = True
+                LOG.debug("Forge: mode picker selected %s", _picked_mode)
+                # Print a sticky confirmation so the user always sees
+                # which path the run is taking — even when downstream
+                # panels (welcome / Ollama detection) push the picker
+                # off-screen on short terminals.
+                if console:
+                    try:
+                        _label_map = {
+                            "ai": "🧠 AI Copilot",
+                            "blank": "🧱 Blank scaffold",
+                            "refine": "✏️  Refine existing contract",
+                            "from_product": "🔗 Compose from existing products",
+                            "template": "📋 Template-based",
+                        }
+                        console.print(
+                            f"\n[bold green]→[/bold green] [bold]{_label_map.get(_picked_mode, _picked_mode)}[/bold] mode\n"
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                # ``from_product`` mode picker — gather upstream picks
+                # interactively so the AI mode below can use them.
+                if _picked_mode == "from_product":
+                    try:
+                        from fluid_build.cli._forge_from_product_picker import (
+                            pick_upstream_products,
+                        )
+
+                        picks = pick_upstream_products(console=console)
+                        if picks:
+                            args.from_product = list(picks)
+                    except Exception:  # noqa: BLE001 — picker is best-effort
+                        LOG.debug("from_product_picker_failed", exc_info=True)
+        except Exception:  # noqa: BLE001 — never let the picker break forge
+            LOG.debug("mode_picker_failed", exc_info=True)
+
         # --- Determine effective mode ---
         is_blank = get_cli_arg(args, "blank", False)
         flow = "blank" if is_blank else "copilot"
@@ -696,9 +888,56 @@ def run(args, logger: logging.Logger) -> int:
                 _print_forge_next_steps(console, args, scan_root)
             return result
 
+        # Template mode: route to the dedicated handler, no AI required.
+        # Triggered by the picker's "template" choice OR by
+        # ``--template``/``--scaffold`` on the command line. argparse
+        # stores both flags in ``args.scaffold``; ``run_template_mode``
+        # reads ``args.template``, so we mirror across them.
+        _scaffold_value = getattr(args, "scaffold", None) or getattr(args, "template", None)
+        # Only treat as explicit when the value is a real string —
+        # tests sometimes pass MagicMock placeholders that are truthy
+        # but not actual template names.
+        _template_explicit = isinstance(_scaffold_value, str) and bool(_scaffold_value)
+        if _template_explicit:
+            args.template = _scaffold_value
+            args.scaffold = _scaffold_value
+
+        if (_picker_ran and _picked_mode == "template") or _template_explicit:
+            LOG.debug(
+                "Forge: template mode (picker=%s, explicit=%s)", _picker_ran, _template_explicit
+            )
+            # Default template when the user hasn't set one explicitly.
+            if not getattr(args, "template", None):
+                tpl = _pick_template_subchoice(console)
+                if tpl is None:
+                    return 0
+                args.template = tpl
+                args.scaffold = tpl
+            from fluid_build.cli.forge_modes import (
+                run_template_mode as _run_template,
+            )
+
+            result = _run_template(
+                args,
+                logger,
+                get_target_directory_fn=get_target_directory,
+            )
+            if result == 0:
+                _write_forge_receipt(
+                    flow="template",
+                    args=args,
+                    before_snapshot=before_snapshot,
+                    scan_root=scan_root,
+                    logger=logger,
+                )
+                _print_forge_next_steps(console, args, scan_root)
+            return result
+
         # --- Default: AI Copilot with inline LLM setup ---
         LOG.debug("Forge: copilot mode")
-        if console and not get_cli_arg(args, "non_interactive", False):
+        # Skip the redundant FLUID-Forge welcome panel when the
+        # mode picker already showed; the picker IS the welcome.
+        if console and not get_cli_arg(args, "non_interactive", False) and not _picker_ran:
             print_welcome_panel(console)
 
         # Check LLM readiness; load saved config or offer inline setup
@@ -846,13 +1085,6 @@ def load_context(
     )
 
 
-def create_legacy_bootstrapper(target_dir: Optional[str] = None, **kwargs):
-    """Create a legacy bootstrapper for backward compatibility."""
-    from .forge_legacy import ForgeBootstrapper
-
-    return ForgeBootstrapper(target_dir, **kwargs)
-
-
 def _write_forge_receipt(
     *,
     flow: str,
@@ -996,28 +1228,6 @@ def _format_forge_command(args, flow: str) -> str:
     return " ".join(parts)
 
 
-def get_enhanced_templates():
-    """Get enhanced templates for backward compatibility."""
-    from ..forge.core.registry import template_registry
-
-    legacy_templates = {}
-    for template_name in template_registry.list_available():
-        template = template_registry.get(template_name)
-        if template:
-            metadata = template.get_metadata()
-            legacy_templates[template_name] = {
-                "name": metadata.name,
-                "description": metadata.description,
-                "complexity": metadata.complexity.value,
-                "provider_support": metadata.provider_support,
-                "use_cases": metadata.use_cases,
-                "technologies": metadata.technologies,
-                "estimated_time": metadata.estimated_time,
-                "tags": metadata.tags,
-            }
-    return legacy_templates
-
-
 __all__ = [
     "AIAgent",
     "AI_AGENTS",
@@ -1028,9 +1238,7 @@ __all__ = [
     "ForgeMode",
     "InvalidProjectNameError",
     "ProjectGenerationError",
-    "create_legacy_bootstrapper",
     "get_cli_arg",
-    "get_enhanced_templates",
     "get_target_directory",
     "handle_memory_management",
     "load_context",

@@ -50,8 +50,10 @@ from fluid_build.cli.artifact_paths import (
 
 LOG = logging.getLogger("fluid.cli.workspace_config")
 
-#: Re-exported from :mod:`fluid_build.cli.artifact_paths` for backward compat.
-#: New callers should import from ``artifact_paths`` directly.
+#: Canonical workspace-config filename. Defined in
+#: :mod:`fluid_build.cli.artifact_paths` (single source of truth) and
+#: re-exported here as the public symbol every workspace consumer
+#: imports — see ``cli/init.py``, ``cli/forge.py``, etc.
 WORKSPACE_FILENAME = WORKSPACE_CONFIG_FILENAME
 DEFAULT_PRODUCTS_DIR = "."
 
@@ -86,6 +88,11 @@ class WorkspaceDefaults:
     provider: str = ""
     industry: str = ""
     products_dir: str = DEFAULT_PRODUCTS_DIR
+    # Phase 0.2 — workspace specialization. When set, future ``fluid forge``
+    # runs default to this productType and reject conflicting
+    # ``--data-product-type`` flags. Use ``fluid init --workspace-lock SDP|
+    # ADP|CDP`` to opt in.
+    data_product_type_lock: str = ""
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -155,6 +162,7 @@ def load_workspace_config(root: Optional[Path] = None) -> WorkspaceDefaults:
         owner_email=str(owner.get("email") or ""),
         provider=str(ws.get("provider") or ""),
         products_dir=str(ws.get("products_dir") or DEFAULT_PRODUCTS_DIR),
+        data_product_type_lock=str(ws.get("data_product_type_lock") or ""),
         raw=raw,
     )
 
@@ -168,6 +176,7 @@ def save_workspace_config(
     owner_email: str = "",
     provider: str = "",
     products_dir: str = DEFAULT_PRODUCTS_DIR,
+    data_product_type_lock: str = "",
     command: str = "fluid init",
 ) -> Path:
     """Write a ``fluid.workspace.yaml`` file to *root*.
@@ -206,6 +215,8 @@ def save_workspace_config(
         ws["provider"] = provider
     if products_dir != DEFAULT_PRODUCTS_DIR:
         ws["products_dir"] = products_dir
+    if data_product_type_lock:
+        ws["data_product_type_lock"] = data_product_type_lock
 
     payload = {"workspace": ws}
     body = dump_yaml_with_envelope(

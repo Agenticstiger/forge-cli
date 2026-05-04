@@ -239,69 +239,11 @@ class TestExtractUsage:
         )
         assert metrics == {"read_tokens": 50, "total_tokens": 200, "hit_rate": 0.25}
 
-    def test_anthropic_usage(self):
-        from fluid_build.cli.forge_copilot_llm_providers import AnthropicProvider
-
-        provider = AnthropicProvider()
-        usage = provider.extract_usage(
-            {
-                "content": [{"type": "text", "text": "hi"}],
-                "usage": {"input_tokens": 200, "output_tokens": 80},
-            }
-        )
-        assert usage == {"input_tokens": 200, "output_tokens": 80, "total_tokens": 280}
-
-    def test_anthropic_prompt_cache_usage(self):
-        from fluid_build.cli.forge_copilot_llm_providers import AnthropicProvider
-
-        provider = AnthropicProvider()
-        metrics = provider.extract_prompt_cache(
-            {
-                "usage": {
-                    "input_tokens": 80,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 20,
-                }
-            }
-        )
-        assert metrics == {"read_tokens": 20, "total_tokens": 100, "hit_rate": 0.2}
-
-    def test_gemini_usage(self):
-        from fluid_build.cli.forge_copilot_llm_providers import GeminiProvider
-
-        provider = GeminiProvider()
-        usage = provider.extract_usage(
-            {
-                "candidates": [{"content": {"parts": [{"text": "hi"}]}}],
-                "usageMetadata": {
-                    "promptTokenCount": 300,
-                    "candidatesTokenCount": 120,
-                    "totalTokenCount": 420,
-                },
-            }
-        )
-        assert usage == {"input_tokens": 300, "output_tokens": 120, "total_tokens": 420}
-
-    def test_gemini_prompt_cache_usage(self):
-        from fluid_build.cli.forge_copilot_llm_providers import GeminiProvider
-
-        provider = GeminiProvider()
-        metrics = provider.extract_prompt_cache(
-            {
-                "usageMetadata": {
-                    "promptTokenCount": 100,
-                    "cachedContentTokenCount": 25,
-                }
-            }
-        )
-        assert metrics == {"read_tokens": 25, "total_tokens": 100, "hit_rate": 0.25}
-
-    def test_gemini_missing_usage(self):
-        from fluid_build.cli.forge_copilot_llm_providers import GeminiProvider
-
-        provider = GeminiProvider()
-        usage = provider.extract_usage({"candidates": []})
-        assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    # Anthropic / Gemini native-shape extract_usage tests deleted —
+    # litellm normalises every provider's response to the OpenAI shape
+    # before our extract_* methods see it. Wire-shape pinning per
+    # provider lives in litellm's own test suite; our LiteLLMProvider's
+    # OpenAI-shape extraction is covered in test_litellm_backend.py.
 
     def test_ollama_inherits_openai(self):
         from fluid_build.cli.forge_copilot_llm_providers import OllamaProvider

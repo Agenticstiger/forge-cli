@@ -88,95 +88,28 @@ _REDACTED_COLUMN = "<redacted-suspicious-text>"
 TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 
-def _register(
-    name: str,
-    description: str,
-    input_schema: Dict[str, Any],
-    impl: Callable[..., Any],
-) -> None:
-    """Back-compat shim — kept for any third-party code that imports it.
-
-    New tools should use ``@forge_tool`` instead.
-    """
-    TOOL_REGISTRY[name] = {
-        "name": name,
-        "description": description,
-        "input_schema": input_schema,
-        "impl": impl,
-    }
-
-
 # ---- Args models ----------------------------------------------------------
 
 
-class DiscoverWorkspaceArgs(BaseModel):
-    """Args for the ``discover_workspace`` tool.
-
-    The ``workspace_path`` field is retained for wire compatibility but
-    is intentionally ignored by the impl — the effective scope is the
-    caller-provided ``workspace_root`` (SECURITY_REVIEW S-004). Keeping
-    it in the schema means existing LLM agents that pass the field
-    don't get a validation error.
-    """
-
-    workspace_path: str = Field(
-        default=".",
-        description=(
-            "Ignored — retained for schema compatibility. The "
-            "workspace root is fixed by the invoking CLI."
-        ),
-    )
-
-
-class ReadSampleSchemaArgs(BaseModel):
-    path: str = Field(
-        description="Absolute or relative path to the sample file.",
-    )
-
-
-class ListTemplatesArgs(BaseModel):
-    use_case: str = Field(
-        default="",
-        description="Optional use-case hint (analytics, etl_pipeline, streaming, ml_pipeline).",
-    )
-    domain: str = Field(
-        default="",
-        description="Optional domain hint (finance, healthcare, retail, telco).",
-    )
-
-
-class ProposeContractArgs(BaseModel):
-    context: Dict[str, Any] = Field(
-        description="User context with project_goal, data_sources, use_case, etc.",
-    )
-    template: str = Field(
-        default="starter",
-        description="Template id from the capability matrix (e.g. 'starter', 'analytics').",
-    )
-    provider: str = Field(
-        default="local",
-        description="Provider id (e.g. 'local', 'gcp', 'aws', 'snowflake').",
-    )
-
-    # Permit nested free-form objects in ``context`` — the field is an
-    # arbitrary user-provided dict and the LLM should not be limited to
-    # a fixed schema for it.
-    model_config = {"extra": "allow"}
-
-
-class ValidateContractArgs(BaseModel):
-    contract: Dict[str, Any] = Field(
-        description="The FLUID contract to validate.",
-    )
-
-    model_config = {"extra": "allow"}
-
-
-class ListSchedulersArgs(BaseModel):
-    """No arguments — pass ``{}``."""
-
-    model_config = {"extra": "ignore"}
-
+# Tool args (Pydantic schemas) — physically extracted to
+# ``cli/_forge_copilot_tool_args.py``. Re-exported here so the
+# ``@forge_tool(args_schema=...)`` decorations below keep
+# resolving at module-load time.
+from fluid_build.cli._forge_copilot_tool_args import (  # noqa: E402,F401
+    CheckPiiClassificationArgs,
+    DiscoverWorkspaceArgs,
+    DiscoverWorkspaceContractsArgs,
+    EstimateCostArgs,
+    GenerateDltSourceArgs,
+    ListSchedulersArgs,
+    ListTemplatesArgs,
+    ProposeContractArgs,
+    ReadLogicalModelArgs,
+    ReadSampleSchemaArgs,
+    ReadUpstreamSchemaArgs,
+    SearchSemanticMemoryArgs,
+    ValidateContractArgs,
+)
 
 # ---- discover_workspace ---------------------------------------------------
 
@@ -583,6 +516,758 @@ def _dispatch_list_schedulers(
         return _cached_schedulers
     except ImportError:
         return {"schedulers": [], "trigger_types": _TRIGGER_TYPES}
+
+
+# ---- discover_workspace_contracts (Phase 2 catalog-aware picker) ---------
+
+
+@forge_tool(
+    name="discover_workspace_contracts",
+    description=(
+        "Walk the workspace for existing contract.fluid.yaml files and "
+        "return a structured catalog the LLM can use to build "
+        "consumes[] for ADP / CDP composition. Each entry carries "
+        "{id, productType, layer, exposes[], path}. Filter via "
+        "allowed_upstream_types so only valid composition candidates "
+        "surface (e.g. ADP can consume SDP+ADP, not CDP)."
+    ),
+    args_schema=DiscoverWorkspaceContractsArgs,
+    workspace_root_aware=True,
+)
+def _dispatch_discover_workspace_contracts(
+    args: DiscoverWorkspaceContractsArgs,
+    *,
+    workspace_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Walk the workspace for contracts and return picker-ready records.
+
+    SECURITY_REVIEW S-003/S-004: confined to ``workspace_root`` via
+    ``rglob`` from a resolved path; no user-controlled paths.
+    """
+    import yaml as _yaml
+
+    from fluid_build.forge.product_types import (
+        LAYER_TO_PRODUCT_TYPE,
+        get_product_type,
+    )
+
+    effective_root = (workspace_root or Path.cwd()).resolve()
+    allowed = {pt.upper() for pt in (args.allowed_upstream_types or [])}
+    cap = max(1, min(int(args.max_results or 50), 200))
+
+    products: List[Dict[str, Any]] = []
+    for contract_path in sorted(effective_root.rglob("contract.fluid.yaml")):
+        # Confine: resolved path must stay under root.
+        try:
+            contract_path.resolve().relative_to(effective_root)
+        except ValueError:
+            continue
+        try:
+            doc = _yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001 — skip unreadable
+            continue
+        meta = doc.get("metadata") or {}
+        product_type = meta.get("productType")
+        layer = meta.get("layer")
+        if not product_type and layer:
+            product_type = LAYER_TO_PRODUCT_TYPE.get(layer)
+        normalized = get_product_type(product_type) if product_type else None
+        product_type_code = normalized.code if normalized else (product_type or "")
+
+        if allowed and product_type_code.upper() not in allowed:
+            continue
+
+        exposes_summary: List[Dict[str, Any]] = []
+        for ex in doc.get("exposes") or []:
+            if not isinstance(ex, dict):
+                continue
+            exposes_summary.append(
+                {
+                    "exposeId": ex.get("exposeId") or ex.get("id"),
+                    "kind": ex.get("kind") or ex.get("type"),
+                    "schema_columns": [
+                        col.get("name")
+                        for col in (ex.get("contract") or {}).get("schema", []) or []
+                        if isinstance(col, dict)
+                    ][:12],
+                }
+            )
+
+        products.append(
+            {
+                "id": doc.get("id"),
+                "name": doc.get("name"),
+                "productType": product_type_code,
+                "layer": layer or "",
+                "domain": doc.get("domain"),
+                "path": str(contract_path.relative_to(effective_root)),
+                "exposes": exposes_summary,
+            }
+        )
+        if len(products) >= cap:
+            break
+
+    return {"products": products, "total": len(products)}
+
+
+# ---- read_upstream_schema (Phase 3.1 — composition richness) -------------
+
+
+@forge_tool(
+    name="read_upstream_schema",
+    description=(
+        "Return the full schema (columns, types, required flags, "
+        "descriptions, classifications) of a specific upstream product's "
+        "exposes. Use this AFTER discover_workspace_contracts when the "
+        "agent needs to author a join, projection, or aggregation "
+        "against a known upstream. Confined to the workspace_root."
+    ),
+    args_schema=ReadUpstreamSchemaArgs,
+    workspace_root_aware=True,
+)
+def _dispatch_read_upstream_schema(
+    args: ReadUpstreamSchemaArgs,
+    *,
+    workspace_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Look up an upstream contract by product id and return its schemas.
+
+    SECURITY_REVIEW: `rglob` from a resolved workspace root + per-path
+    `.relative_to` confinement — no user-controlled paths escape the
+    workspace.
+    """
+    import yaml as _yaml
+
+    effective_root = (workspace_root or Path.cwd()).resolve()
+    target_id = (args.product_id or "").strip()
+    if not target_id:
+        return {"error": "InvalidProductId", "message": "product_id is required"}
+
+    for contract_path in effective_root.rglob("contract.fluid.yaml"):
+        try:
+            contract_path.resolve().relative_to(effective_root)
+        except ValueError:
+            continue
+        try:
+            doc = _yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001 — skip unreadable
+            continue
+        if doc.get("id") != target_id:
+            continue
+
+        # Found the contract — project the exposes the caller asked for.
+        all_exposes = doc.get("exposes") or []
+        if not isinstance(all_exposes, list):
+            return {
+                "error": "MalformedContract",
+                "message": f"{target_id}: exposes is not a list",
+            }
+
+        scoped: List[Dict[str, Any]] = []
+        for ex in all_exposes:
+            if not isinstance(ex, dict):
+                continue
+            eid = ex.get("exposeId") or ex.get("id")
+            if args.expose_id and eid != args.expose_id:
+                continue
+            schema_block = (ex.get("contract") or {}).get("schema") or []
+            cols: List[Dict[str, Any]] = []
+            for col in schema_block:
+                if not isinstance(col, dict):
+                    continue
+                row: Dict[str, Any] = {
+                    "name": col.get("name", ""),
+                    "type": col.get("type", ""),
+                    "required": bool(col.get("required", False)),
+                }
+                if col.get("description"):
+                    row["description"] = col["description"]
+                if args.include_classifications and col.get("classification"):
+                    row["classification"] = col["classification"]
+                cols.append(row)
+            scoped.append(
+                {
+                    "exposeId": eid,
+                    "kind": ex.get("kind") or ex.get("type"),
+                    "binding": ex.get("binding") or {},
+                    "schema": cols,
+                }
+            )
+
+        if args.expose_id and not scoped:
+            return {
+                "error": "ExposeNotFound",
+                "message": (
+                    f"{target_id} has no expose named {args.expose_id!r}. "
+                    f"Available: "
+                    + ", ".join(
+                        ex.get("exposeId") or ex.get("id", "")
+                        for ex in all_exposes
+                        if isinstance(ex, dict)
+                    )
+                ),
+            }
+
+        meta = doc.get("metadata") or {}
+        return {
+            "id": target_id,
+            "name": doc.get("name"),
+            "domain": doc.get("domain"),
+            "productType": meta.get("productType"),
+            "layer": meta.get("layer"),
+            "exposes": scoped,
+        }
+
+    return {
+        "error": "ProductNotFound",
+        "message": (
+            f"No contract.fluid.yaml under {effective_root} declares "
+            f"id={target_id!r}. Use discover_workspace_contracts to "
+            "list known products."
+        ),
+    }
+
+
+# ---- read_logical_model (Phase 3.5 — toolkit parity with MCP) -----------
+
+
+@forge_tool(
+    name="read_logical_model",
+    description=(
+        "Read a logical-model sidecar (.model.json) — the OSI / "
+        "DV2 / Dimensional skeleton emitted next to a forged contract. "
+        "Composition agents call this when they need entity / "
+        "relationship structure to drive a join. Confined to the "
+        "workspace root; absolute paths and parent-directory escapes "
+        "are rejected."
+    ),
+    args_schema=ReadLogicalModelArgs,
+    workspace_root_aware=True,
+)
+def _dispatch_read_logical_model(
+    args: ReadLogicalModelArgs,
+    *,
+    workspace_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Read a `.model.json` sidecar with workspace-confined path
+    resolution. Mirrors the MCP server's implementation so MCP
+    clients (Cursor / Claude Desktop) and in-process FORGE agents
+    see the same data.
+    """
+    import json
+
+    raw_path = (args.path or "").strip()
+    if not raw_path:
+        return {"error": "InvalidPath", "message": "path is required"}
+
+    effective_root = (workspace_root or Path.cwd()).resolve()
+    candidate = Path(raw_path)
+    if candidate.is_absolute():
+        return {
+            "error": "InvalidPath",
+            "message": "absolute paths are not allowed; use a path relative to workspace_root",
+        }
+
+    target = (effective_root / candidate).resolve()
+    try:
+        target.relative_to(effective_root)
+    except ValueError:
+        return {
+            "error": "PathEscape",
+            "message": f"path {raw_path!r} resolves outside workspace_root",
+        }
+
+    if not target.exists():
+        return {
+            "error": "FileNotFound",
+            "message": f"no logical sidecar at {raw_path}",
+        }
+    if not target.is_file():
+        return {
+            "error": "NotAFile",
+            "message": f"{raw_path} is not a regular file",
+        }
+
+    try:
+        body = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {
+            "error": "ReadFailed",
+            "message": f"could not read {raw_path}: {exc}",
+        }
+
+    try:
+        model = json.loads(body)
+    except json.JSONDecodeError as exc:
+        return {
+            "error": "InvalidJSON",
+            "message": f"{raw_path} is not valid JSON: {exc}",
+        }
+
+    return {
+        "path": str(target.relative_to(effective_root)),
+        "model": model,
+    }
+
+
+# ---- search_semantic_memory (Phase 3.4 — cross-session learning) ---------
+
+
+@forge_tool(
+    name="search_semantic_memory",
+    description=(
+        "Search the semantic memory namespace for prior forged products "
+        "similar to the current draft. Use when an entity or "
+        "relationship feels familiar — there may be a past forge "
+        "session that can be a starting point. Returns "
+        "{matches: [{key, value, score}]}. Empty when memory is "
+        "disabled (FLUID_COPILOT_SEMANTIC_MEMORY unset) or the query "
+        "doesn't match anything."
+    ),
+    args_schema=SearchSemanticMemoryArgs,
+    workspace_root_aware=True,
+)
+def _dispatch_search_semantic_memory(
+    args: SearchSemanticMemoryArgs,
+    *,
+    workspace_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Resolve the semantic store + run a hybrid search.
+
+    Reuses the same store-resolution path the agentic loop uses, so
+    the FORGE-side tool sees the same data the staged ModelerAgent
+    sees. Failure modes are surfaced as empty match lists with a
+    reason — never raise — so a missing store doesn't crash the run.
+    """
+    import os
+
+    query = (args.query or "").strip()
+    limit = max(1, min(int(args.limit or 3), 10))
+    if not query:
+        return {"error": "InvalidArgs", "message": "query is required"}
+
+    if not os.environ.get("FLUID_COPILOT_SEMANTIC_MEMORY"):
+        return {
+            "matches": [],
+            "reason": "semantic memory is disabled (set FLUID_COPILOT_SEMANTIC_MEMORY=1)",
+        }
+
+    try:
+        from fluid_build.copilot.store.factory import resolve_store
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "matches": [],
+            "reason": f"store factory unavailable: {exc.__class__.__name__}",
+        }
+
+    try:
+        store = resolve_store(workspace_root=workspace_root)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "matches": [],
+            "reason": f"store resolve failed: {exc.__class__.__name__}: {exc}",
+        }
+
+    try:
+        records = store.search("memory/semantic", query, mode="hybrid", limit=limit) or []
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "matches": [],
+            "reason": f"store search failed: {exc.__class__.__name__}: {exc}",
+        }
+
+    matches: List[Dict[str, Any]] = []
+    for r in records:
+        matches.append(
+            {
+                "key": getattr(r, "key", None),
+                "value": getattr(r, "value", None),
+                "score": getattr(r, "score", None),
+            }
+        )
+    return {"matches": matches, "query": query}
+
+
+# ---- estimate_cost (Phase 3.3 — pre-flight LLM cost preview) -------------
+
+
+@forge_tool(
+    name="estimate_cost",
+    description=(
+        "Estimate the USD cost of a planned LLM call given "
+        "(provider, model, input_tokens, output_tokens). Returns "
+        "{usd, model, would_exceed_budget, remaining_budget_usd, source}. "
+        "Composition agents call this before firing a large prompt to "
+        "decide whether to compact, downshift, or abort against the "
+        "FLUID_COST_LIMIT_USD ceiling."
+    ),
+    args_schema=EstimateCostArgs,
+    workspace_root_aware=False,
+)
+def _dispatch_estimate_cost(args: EstimateCostArgs) -> Dict[str, Any]:
+    """Project the USD cost of one LLM call + check the run budget.
+
+    Reuses ``cost._price_for`` (litellm-aware, override-aware) so the
+    estimate matches what ``RunCostTracker`` will record after the
+    actual call. The ``source`` field tells the caller whether the
+    quote came from the override file, the embedded ``MODEL_PRICES_USD``
+    table, or litellm's catalog — useful when a price seems
+    surprising.
+    """
+    from fluid_build.copilot.cost import (
+        MODEL_PRICES_USD,
+        _load_price_overrides,
+        _price_for,
+        _resolve_cost_limit_usd,
+    )
+
+    provider = (args.provider or "").strip().lower()
+    model = (args.model or "").strip()
+    input_tokens = max(0, int(args.input_tokens or 0))
+    output_tokens = max(0, int(args.output_tokens or 0))
+
+    if not provider or not model:
+        return {
+            "error": "InvalidArgs",
+            "message": "provider and model are required",
+        }
+
+    usd = _price_for(provider, model, input_tokens, output_tokens)
+    if usd is None:
+        # Price unknown — surface honestly so the caller can decide.
+        usd = 0.0
+        source = "unknown"
+    elif provider == "ollama":
+        source = "ollama_zero"
+    elif _load_price_overrides().get(model) is not None:
+        source = "user_override"
+    elif model in MODEL_PRICES_USD:
+        source = "embedded_table"
+    else:
+        source = "litellm_catalog"
+
+    # Cost ceiling: ``_resolve_cost_limit_usd`` checks the env var
+    # first then any saved config — same precedence the run-level
+    # tracker uses.
+    limit = _resolve_cost_limit_usd()
+    would_exceed = bool(limit is not None and usd > limit)
+    remaining = (limit - usd) if limit is not None else None
+
+    return {
+        "provider": provider,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "usd": float(usd),
+        "source": source,
+        "limit_usd": limit,
+        "would_exceed_budget": would_exceed,
+        "remaining_budget_usd": remaining,
+    }
+
+
+# ---- check_pii_classification (Phase 3.2 — PII propagation) --------------
+#
+# Sensitivity ladder used to compare classifications across the upstream
+# chain. ``restricted`` and ``pci`` are the strictest; ``public`` the
+# loosest. When walking ``consumes[]`` we keep the highest tag seen so a
+# downstream contract that drops the tag (or relabels it as 'internal')
+# is caught at composition time.
+_CLASSIFICATION_SEVERITY: Dict[str, int] = {
+    "public": 1,
+    "internal": 2,
+    "confidential": 3,
+    "pii": 4,
+    "phi": 5,
+    "pci": 6,
+    "restricted": 7,
+}
+
+
+def _classification_max(a: str, b: str) -> str:
+    """Return whichever of ``a`` / ``b`` has higher sensitivity."""
+    sa = _CLASSIFICATION_SEVERITY.get((a or "").lower(), 0)
+    sb = _CLASSIFICATION_SEVERITY.get((b or "").lower(), 0)
+    return a if sa >= sb else b
+
+
+def _column_classifications_in_contract(
+    contract: Dict[str, Any], expose_id: Optional[str], column_name: str
+) -> List[str]:
+    """Return every ``classification`` value seen for ``column_name``
+    across one expose (when ``expose_id`` is set) or all of them."""
+    out: List[str] = []
+    for ex in contract.get("exposes") or []:
+        if not isinstance(ex, dict):
+            continue
+        eid = ex.get("exposeId") or ex.get("id")
+        if expose_id and eid != expose_id:
+            continue
+        for col in (ex.get("contract") or {}).get("schema") or []:
+            if not isinstance(col, dict):
+                continue
+            if col.get("name") == column_name:
+                tag = col.get("classification")
+                if tag:
+                    out.append(str(tag))
+    return out
+
+
+@forge_tool(
+    name="check_pii_classification",
+    description=(
+        "Look up the classification (pii / phi / pci / confidential / "
+        "restricted / internal / public) of a specific column on a "
+        "product. When walk_upstreams=true (default), follows the "
+        "consumes[] chain and returns the highest sensitivity tag any "
+        "upstream copy of the column carries — composition agents use "
+        "this to ensure PII tags propagate end-to-end without silent "
+        "downgrade."
+    ),
+    args_schema=CheckPiiClassificationArgs,
+    workspace_root_aware=True,
+)
+def _dispatch_check_pii_classification(
+    args: CheckPiiClassificationArgs,
+    *,
+    workspace_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Resolve a column's classification, walking upstream chains.
+
+    SECURITY_REVIEW: same workspace confinement as
+    ``read_upstream_schema``; no external I/O.
+    """
+    import yaml as _yaml
+
+    effective_root = (workspace_root or Path.cwd()).resolve()
+    target_id = (args.product_id or "").strip()
+    column = (args.column_name or "").strip()
+    if not target_id or not column:
+        return {
+            "error": "InvalidArgs",
+            "message": "product_id and column_name are required",
+        }
+
+    # Index every contract by id once — cheap walk; the recursive
+    # upstream lookup below would re-walk for every consumes[] entry
+    # otherwise.
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for path in effective_root.rglob("contract.fluid.yaml"):
+        try:
+            path.resolve().relative_to(effective_root)
+        except ValueError:
+            continue
+        try:
+            doc = _yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001
+            continue
+        cid = doc.get("id")
+        if cid:
+            by_id[str(cid)] = doc
+
+    target = by_id.get(target_id)
+    if target is None:
+        return {
+            "error": "ProductNotFound",
+            "message": f"No contract under {effective_root} declares id={target_id!r}",
+        }
+
+    # Direct hits on the target product.
+    direct = _column_classifications_in_contract(target, args.expose_id, column)
+
+    # Walk upstreams via consumes[] — each entry is {productId, exposeId}
+    # so we have a strong identity to look up.
+    inherited: List[Dict[str, str]] = []
+    visited: set = {target_id}
+    if args.walk_upstreams:
+        frontier: List[Dict[str, Any]] = list(target.get("consumes") or [])
+        while frontier:
+            ref = frontier.pop()
+            if not isinstance(ref, dict):
+                continue
+            uid = str(ref.get("productId") or "").strip()
+            uexpose = ref.get("exposeId")
+            if not uid or uid in visited:
+                continue
+            visited.add(uid)
+            upstream = by_id.get(uid)
+            if upstream is None:
+                # Best-effort — the picker would normally have caught
+                # missing upstreams, but be lenient here so the tool is
+                # still useful in partial workspaces.
+                continue
+            for tag in _column_classifications_in_contract(upstream, uexpose, column):
+                inherited.append(
+                    {
+                        "product_id": uid,
+                        "expose_id": uexpose or "",
+                        "classification": tag,
+                    }
+                )
+            for grand in upstream.get("consumes") or []:
+                frontier.append(grand)
+
+    # Pick the highest-sensitivity classification across direct +
+    # inherited tags.
+    all_tags = list(direct) + [r["classification"] for r in inherited]
+    if not all_tags:
+        effective = ""
+    else:
+        effective = ""
+        for tag in all_tags:
+            effective = _classification_max(effective, tag)
+
+    return {
+        "product_id": target_id,
+        "column_name": column,
+        "expose_id": args.expose_id,
+        "direct_classifications": direct,
+        "inherited_classifications": inherited,
+        "effective_classification": effective,
+    }
+
+
+# ---- generate_dlt_source (Phase 2 LLM-native SDP source) -----------------
+
+
+@forge_tool(
+    name="generate_dlt_source",
+    description=(
+        "Generate a Python module under sources/<name>.py that uses the "
+        "dlt framework to acquire data from an external API. Returns "
+        "the module path (relative to the workspace root) plus a "
+        "preview of the file body. The corresponding contract build "
+        "block must reference the module via "
+        "builds[].properties.source.connection.module."
+    ),
+    args_schema=GenerateDltSourceArgs,
+    workspace_root_aware=True,
+)
+def _dispatch_generate_dlt_source(
+    args: GenerateDltSourceArgs,
+    *,
+    workspace_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Generate a dlt-framework Python source module for an SDP product.
+
+    SECURITY_REVIEW: file is written under
+    ``<workspace_root>/sources/<name>.py`` after sanitising ``name``
+    to alphanumeric/underscore. The auth secret is referenced via env
+    var (``<NAME>_TOKEN``); no inline secret material is written.
+    """
+    import re
+
+    safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", (args.name or "").strip()).lower()
+    if not safe_name:
+        return {"error": "InvalidName", "message": "name must be alphanumeric"}
+    # A name that's only underscores (e.g. all chars stripped by the
+    # sanitiser) is also invalid — the resulting module + function
+    # would have no human-readable identity. Reject loudly.
+    if safe_name.strip("_") == "":
+        return {
+            "error": "InvalidName",
+            "message": (
+                "name must contain at least one alphanumeric character "
+                f"(got {args.name!r}, sanitised to {safe_name!r})"
+            ),
+        }
+    if not (args.api_url.startswith("http://") or args.api_url.startswith("https://")):
+        return {"error": "InvalidApiUrl", "message": "api_url must be http(s)://"}
+
+    effective_root = (workspace_root or Path.cwd()).resolve()
+    rel_path = f"sources/{safe_name}.py"
+    target = (effective_root / rel_path).resolve()
+    try:
+        target.relative_to(effective_root)
+    except ValueError:
+        return {"error": "PathEscape", "message": "computed path escapes workspace"}
+
+    auth_kind = (args.auth_kind or "bearer").strip().lower()
+    if auth_kind not in {"bearer", "basic", "api_key", "none"}:
+        auth_kind = "bearer"
+
+    token_env = f"{safe_name.upper()}_TOKEN"
+    body = _render_dlt_source(
+        name=safe_name,
+        api_url=args.api_url,
+        description=args.description or f"dlt source for {safe_name}",
+        auth_kind=auth_kind,
+        token_env=token_env,
+    )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+    preview = body if len(body) < 1500 else body[:1500] + "\n# … truncated for prompt …"
+    return {
+        "module_path": rel_path,
+        "function_name": f"{safe_name}_source",
+        "auth_env_var": token_env,
+        "preview": preview,
+    }
+
+
+def _render_dlt_source(
+    *,
+    name: str,
+    api_url: str,
+    description: str,
+    auth_kind: str,
+    token_env: str,
+) -> str:
+    """Render a minimal dlt source body. Keep it copy-pastable + valid."""
+    auth_block = ""
+    if auth_kind == "bearer":
+        auth_block = (
+            "    headers = {}\n"
+            f"    token = os.environ.get('{token_env}')\n"
+            "    if token:\n"
+            "        headers['Authorization'] = f'Bearer {token}'\n"
+        )
+    elif auth_kind == "api_key":
+        auth_block = (
+            "    headers = {}\n"
+            f"    token = os.environ.get('{token_env}')\n"
+            "    if token:\n"
+            "        headers['X-API-Key'] = token\n"
+        )
+    elif auth_kind == "basic":
+        auth_block = (
+            "    import base64\n"
+            f"    creds = os.environ.get('{token_env}', '')\n"
+            "    headers = {}\n"
+            "    if creds:\n"
+            "        headers['Authorization'] = 'Basic ' + base64.b64encode(creds.encode()).decode()\n"
+        )
+    else:
+        auth_block = "    headers = {}\n"
+
+    return (
+        f'"""dlt source for {name}.\n\n{description}\n\nAuth: {auth_kind} '
+        f'(env var ``{token_env}``).\n"""\n'
+        "from __future__ import annotations\n\n"
+        "import os\n\n"
+        "import dlt\n"
+        "import httpx\n\n\n"
+        "@dlt.source\n"
+        f"def {name}_source(api_url: str = '{api_url}'):\n"
+        f'    """Yield records from {api_url}."""\n'
+        f"{auth_block}"
+        "\n"
+        "    @dlt.resource(write_disposition='replace')\n"
+        f"    def {name}():\n"
+        "        with httpx.Client(headers=headers, timeout=30) as client:\n"
+        "            resp = client.get(api_url)\n"
+        "            resp.raise_for_status()\n"
+        "            payload = resp.json()\n"
+        "            if isinstance(payload, list):\n"
+        "                yield from payload\n"
+        "            elif isinstance(payload, dict) and 'data' in payload:\n"
+        "                yield from payload['data']\n"
+        "            else:\n"
+        "                yield payload\n"
+        "\n"
+        f"    return {name}\n"
+    )
 
 
 def get_tool_definitions() -> List[Dict[str, Any]]:

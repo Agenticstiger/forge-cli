@@ -101,6 +101,44 @@ def get_all_domain_names() -> List[str]:
     return sorted(names)
 
 
+def get_supported_data_product_types(agent_name: str = "") -> List[str]:
+    """Return the canonical product-type codes (SDP/ADP/CDP) an agent supports.
+
+    Used by the interview to filter the data-product-type picker so a
+    domain agent that opted out of a type (e.g. a streaming-CDC agent
+    that only emits SDPs) doesn't surface "ADP / CDP" as choices.
+
+    Resolution order:
+      * Empty / unknown agent name → return ALL canonical type codes.
+      * Built-in agent (finance / healthcare / retail / telco) →
+        load the spec, return its ``supported_data_product_types``.
+        Empty list in the spec means "no filter" (all types).
+      * User agent (workspace or global ``~/.fluid/agents``) → same
+        resolution path via ``load_user_or_builtin_spec``.
+      * Anything goes wrong → fail open with all types so an interview
+        is never blocked by a typo in a domain spec.
+    """
+    # Lazy import — keeps the cold start of forge_agents fast for
+    # callers that don't filter (the common case).
+    from fluid_build.forge.product_types import PRODUCT_TYPES
+
+    all_types = [pt.code for pt in PRODUCT_TYPES]
+
+    name = (agent_name or "").strip().lower()
+    if not name:
+        return list(all_types)
+
+    try:
+        from fluid_build.cli.forge_agent_specs import load_user_or_builtin_spec
+
+        spec = load_user_or_builtin_spec(name)
+    except Exception:  # noqa: BLE001 — fail open
+        return list(all_types)
+
+    supported = list(getattr(spec, "supported_data_product_types", []) or [])
+    return supported if supported else list(all_types)
+
+
 def list_agents() -> List[Dict[str, str]]:
     """List all available domain agents (built-in + user-defined)."""
     agents = []
@@ -145,6 +183,7 @@ __all__ = [
     "DOMAIN_AGENTS",
     "get_agent",
     "get_all_domain_names",
+    "get_supported_data_product_types",
     "list_agents",
     "_raw_answer",
     "_resolve_context_choice",

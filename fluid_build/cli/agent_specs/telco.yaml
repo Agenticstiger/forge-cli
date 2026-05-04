@@ -2,6 +2,14 @@ name: telco
 domain: telco
 description: Expert in telecom data products, TM Forum SID-aligned modeling, and secure OSS/BSS analytics
 
+# Phase 1.3 — Data Mesh product types this agent supports.
+# Telco mesh: SDP for OSS/BSS ingestion (CDR streams via Debezium /
+# kafka-connect, charging records, trouble tickets); ADP for SID
+# aggregates (subscriber lifecycle, churn signals, network KPIs);
+# CDP for analytics surfaces (regulator reports, partner-share
+# dashboards, ML scoring inputs).
+supported_data_product_types: [SDP, ADP, CDP]
+
 questions:
   - key: product_type
     question: What type of telecom product are you building?

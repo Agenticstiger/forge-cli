@@ -50,6 +50,13 @@ class AgentSpec:
     next_step_tips: List[str] = field(default_factory=list)
     conditional_next_step_tips: List[Dict[str, Any]] = field(default_factory=list)
     keywords: List[str] = field(default_factory=list)
+    # Phase 1.3: Data Mesh product types (SDP / ADP / CDP) this agent
+    # is willing to support. Empty / missing means "all three" (the
+    # interview shows the full picker). Specs can narrow to a subset
+    # when the domain only makes sense for some types — e.g. a
+    # streaming-CDC agent might list only ["SDP"]. Validated against
+    # the canonical PRODUCT_TYPES registry on load.
+    supported_data_product_types: List[str] = field(default_factory=list)
 
 
 def _require_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
@@ -240,6 +247,15 @@ def load_agent_spec_from_path(spec_path: Path) -> AgentSpec:
         if str(kw or "").strip()
     ]
 
+    # Phase 1.3: parse + validate ``supported_data_product_types``.
+    # Each entry must resolve through ``PRODUCT_TYPES`` so a typo in the
+    # YAML fails loudly at load time instead of silently filtering the
+    # picker to nothing. Empty / missing means "all types" (the
+    # picker is unfiltered for that domain).
+    supported_types = _normalize_supported_data_product_types(
+        payload.get("supported_data_product_types"), spec_name=spec_name
+    )
+
     return AgentSpec(
         name=name,
         domain=domain,
@@ -257,7 +273,48 @@ def load_agent_spec_from_path(spec_path: Path) -> AgentSpec:
             payload.get("conditional_next_step_tips"), spec_name=spec_name
         ),
         keywords=keywords,
+        supported_data_product_types=supported_types,
     )
+
+
+def _normalize_supported_data_product_types(raw: Any, *, spec_name: str) -> List[str]:
+    """Validate the optional ``supported_data_product_types`` field.
+
+    Returns the canonical codes (SDP / ADP / CDP) so callers don't have
+    to re-resolve aliases. Empty list (the default) signals "no filter"
+    — the picker shows every type. Raises ``AgentSpecError`` on any
+    unknown entry so a typo in the spec fails loudly.
+    """
+    if raw is None or raw == []:
+        return []
+    if not isinstance(raw, list):
+        raise AgentSpecError(
+            f"{spec_name}: supported_data_product_types must be a list of "
+            "type codes (SDP / ADP / CDP) or aliases (Bronze / Silver / Gold)."
+        )
+
+    # Lazy-import the registry — keeps the agent-spec loader fast for
+    # the hot path that doesn't touch the field, and avoids any risk
+    # of an import cycle as the product_types module grows.
+    from fluid_build.forge.product_types import get_product_type
+
+    canonical: List[str] = []
+    seen: set = set()
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise AgentSpecError(
+                f"{spec_name}: supported_data_product_types entries must be " "non-empty strings."
+            )
+        pt = get_product_type(item)
+        if pt is None:
+            raise AgentSpecError(
+                f"{spec_name}: '{item}' is not a known data product type. "
+                "Allowed: SDP / ADP / CDP (or Bronze / Silver / Gold)."
+            )
+        if pt.code not in seen:
+            canonical.append(pt.code)
+            seen.add(pt.code)
+    return canonical
 
 
 @lru_cache(maxsize=None)
