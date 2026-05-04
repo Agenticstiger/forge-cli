@@ -62,9 +62,14 @@ class KeyringCredentialStore:
 
         try:
             keyring.set_password(KeyringCredentialStore.SERVICE_NAME, key, value)
-            logger.debug(f"Stored credential in keyring: {key}")
-        except KeyringError as e:
-            logger.error(f"Failed to store credential in keyring: {e}")
+            # Don't interpolate ``key`` — ``value`` (the credential) is
+            # in scope at this LOG site (CodeQL py/clear-text-logging-
+            # sensitive-data).
+            logger.debug("Stored credential in keyring")
+        except KeyringError:
+            # Don't pass ``e`` — keyring backend errors can echo the
+            # credential value in the exception message.
+            logger.error("Failed to store credential in keyring")
             raise
 
     @staticmethod
