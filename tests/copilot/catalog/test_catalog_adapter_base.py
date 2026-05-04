@@ -118,8 +118,8 @@ class TestCatalogAdapterABC:
         ``suggestions`` so every catalog produces consistent UX."""
         err = CatalogAdapter._permission_error(
             "Snowflake denied a metadata read",
-            privilege="USAGE on schema BIZ_LAB.SEEDED",
-            grant_sql="GRANT USAGE ON SCHEMA BIZ_LAB.SEEDED TO ROLE ANALYST;",
+            privilege="USAGE on schema DEMO_DB.SEEDED",
+            grant_sql="GRANT USAGE ON SCHEMA DEMO_DB.SEEDED TO ROLE ANALYST;",
         )
         assert isinstance(err, CatalogPermissionError)
         assert err.suggestions

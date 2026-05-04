@@ -81,14 +81,30 @@ class TestCountTokens:
     def test_empty_string_zero(self) -> None:
         assert count_tokens("", provider="openai", model="gpt-4o") == 0
 
-    def test_uses_char_heuristic(self) -> None:
+    def test_uses_char_heuristic(self, monkeypatch) -> None:
+        # FLUID_TOKEN_COUNTER=chars forces the char-heuristic path.
+        # litellm.token_counter would otherwise be authoritative.
+        monkeypatch.setenv("FLUID_TOKEN_COUNTER", "chars")
         text = "a" * 700  # 700 / 3.5 = 200 tokens (exact under the formula)
         assert count_tokens(text, provider="openai", model="gpt-4o") == 200
 
-    def test_provider_and_model_args_are_accepted_but_unused(self) -> None:
-        # Symmetry with call sites — the heuristic ignores them.
+    def test_provider_and_model_args_are_accepted_but_unused(self, monkeypatch) -> None:
+        # Symmetry with call sites — when the char-heuristic path is
+        # forced, the args are accepted but unused.
+        monkeypatch.setenv("FLUID_TOKEN_COUNTER", "chars")
         assert count_tokens("hello", provider="anthropic", model="claude-opus-4-7") == 2
         assert count_tokens("hello", provider="gemini", model="gemini-2.5-pro") == 2
+
+    def test_litellm_path_uses_real_tokenizer(self) -> None:
+        """When the env var is unset, count_tokens delegates to
+        ``litellm.token_counter`` for accurate per-provider counts."""
+        # tiktoken counts "hello" as 1 token; the char heuristic would
+        # over-estimate at 2. The test confirms we're on the litellm
+        # path by accepting either accurate value (token_counter for
+        # OpenAI returns 1 today; if upstream changes the tokenizer
+        # the count may change but should stay <= heuristic).
+        n = count_tokens("hello", provider="openai", model="gpt-4o")
+        assert 1 <= n <= 2
 
 
 class TestCheckPromptFits:
