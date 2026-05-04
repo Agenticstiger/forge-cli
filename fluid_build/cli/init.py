@@ -195,6 +195,17 @@ def register(subparsers: argparse._SubParsersAction):
         action="store_true",
         help="List available templates and exit",
     )
+    # Source-aligned acquisition: introspect a live source URI and emit a
+    # deterministic Bronze contract per discovered stream. Mutually
+    # exclusive with the other modes — discovery owns the whole project.
+    mode_group.add_argument(
+        "--discover",
+        metavar="URI",
+        help=(
+            "🔍 Introspect a source (postgres://, mysql://, file://, s3://) "
+            "and emit a Bronze acquisition contract per discovered stream"
+        ),
+    )
 
     # Provider selection
     p.add_argument(
@@ -202,6 +213,26 @@ def register(subparsers: argparse._SubParsersAction):
         choices=["local", "gcp", "snowflake", "aws", "azure"],
         default="local",
         help="Infrastructure provider (default: local = DuckDB, no cloud needed)",
+    )
+
+    # Data Mesh productType ↔ medallion layer (Phase 1)
+    p.add_argument(
+        "--data-product-type",
+        dest="data_product_type",
+        help=(
+            "Data Mesh productType (SDP/ADP/CDP) or medallion layer "
+            "(Bronze/Silver/Gold) for the first product. Carried "
+            "through to the init→forge handoff."
+        ),
+    )
+    p.add_argument(
+        "--workspace-lock",
+        dest="workspace_lock",
+        choices=["SDP", "ADP", "CDP"],
+        help=(
+            "Lock this workspace to a single productType. Future forge "
+            "runs default to this type and reject conflicting --data-product-type."
+        ),
     )
 
     # Use case / persona (advanced — hidden from default --help)
@@ -231,6 +262,15 @@ def register(subparsers: argparse._SubParsersAction):
         "-q",
         action="store_true",
         help="Suppress the next-steps panel and other post-success hints",
+    )
+    p.add_argument(
+        "--show-work",
+        action="store_true",
+        help=(
+            "Stream the agent's reasoning and tool calls live during the "
+            "init→forge handoff. Reasoning + transcript also persist to "
+            ".fluid/agents/<run-id>/."
+        ),
     )
     p.add_argument(
         "--agent",
@@ -263,6 +303,16 @@ def run(args, logger: logging.Logger) -> int:
         # Handle --list-templates early — no workspace, no mode detection.
         if getattr(args, "list_templates", False):
             return _print_templates_list()
+
+        # ── --discover <uri> ─────────────────────────────────────────────
+        # Source introspection mode: connect to the URI, enumerate streams,
+        # emit one acquisition contract per stream. Owns the whole project
+        # (mutually exclusive with --template / --quickstart / --blank).
+        discover_uri = getattr(args, "discover", None)
+        if discover_uri:
+            from fluid_build.cli._init_discover_handler import run_discover
+
+            return run_discover(args, logger, uri=discover_uri)
 
         # Handle --agent: scaffold a custom domain agent spec.
         agent_name = getattr(args, "agent", None)
@@ -359,6 +409,13 @@ def run(args, logger: logging.Logger) -> int:
             cprint("\n⚠️  Operation cancelled by user")
         return 130
     except Exception as e:
+        # Typed user errors carry rich five-field rendering — let them
+        # bubble to the top-level main() handler so the user gets the
+        # Panel + structured exit, not a flat "Init failed: …" line.
+        from fluid_build.cli._errors import FluidUserError as _FUE
+
+        if isinstance(e, _FUE):
+            raise
         error(logger, "init_failed", error=str(e))
         if RICH_AVAILABLE:
             console.print(f"[red]❌ Init failed: {e}[/red]")
@@ -472,7 +529,8 @@ def _offer_first_forge(args, logger: logging.Logger) -> None:
                 )
 
         cprint("")
-        # Build minimal args for forge
+        # Build args for forge — carry through every flag the init user
+        # already passed so we don't ask twice (invariant **I3**).
         import argparse as _argparse
 
         from .forge import run as forge_run
@@ -480,24 +538,42 @@ def _offer_first_forge(args, logger: logging.Logger) -> None:
         forge_args = _argparse.Namespace(
             target_dir=getattr(args, "target_dir", None) or getattr(args, "name", "."),
             provider=getattr(args, "provider", None),
-            domain=None,
+            domain=getattr(args, "domain", None),
             blank=False,
             dry_run=False,
-            non_interactive=False,
-            context=None,
-            llm_provider=None,
-            llm_model=None,
-            llm_endpoint=None,
+            non_interactive=bool(getattr(args, "non_interactive", False)),
+            context=getattr(args, "context", None),
+            # LLM flags — carry through so the user picks provider/model
+            # ONCE (in init or via env var) and forge inherits the choice.
+            llm_provider=getattr(args, "llm_provider", None),
+            llm_model=getattr(args, "llm_model", None),
+            llm_endpoint=getattr(args, "llm_endpoint", None),
+            llm_routing_model=getattr(args, "llm_routing_model", None),
+            llm_routing_endpoint=getattr(args, "llm_routing_endpoint", None),
+            tiered=bool(getattr(args, "tiered", False)),
+            require_llm=bool(getattr(args, "require_llm", False)),
+            # Discovery — init already scanned; let forge re-use the result.
             discover=True,
             no_discover=False,
-            discovery_path=None,
+            discovery_path=getattr(args, "discovery_path", None),
+            # Memory / output
             memory=True,
             no_memory=False,
             save_memory=True,
             show_memory=False,
             reset_memory=False,
-            quiet=False,
-            verbose=False,
+            quiet=getattr(args, "quiet", False),
+            verbose=getattr(args, "verbose", False),
+            # Pre-write preview UX (Phase 0): plumbed through so the
+            # init handoff respects --yes / --show-work.
+            yes=bool(getattr(args, "yes", False)),
+            show_work=bool(getattr(args, "show_work", False)),
+            no_llm=bool(getattr(args, "no_llm", False)),
+            no_cache=bool(getattr(args, "no_cache", False)),
+            deterministic=bool(getattr(args, "deterministic", False)),
+            # Phase 1 — type-aware authoring
+            data_product_type=getattr(args, "data_product_type", None),
+            transform_engine=None,
         )
         forge_run(forge_args, logger)
     except (KeyboardInterrupt, EOFError):
@@ -624,6 +700,7 @@ def _ensure_workspace(args, logger: logging.Logger) -> None:
         cwd,
         name=ws_name,
         provider=provider,
+        data_product_type_lock=getattr(args, "workspace_lock", "") or "",
     )
 
     # Slice 9: drop a .gitignore template alongside the workspace config
@@ -885,936 +962,50 @@ def detect_mode(args, logger: logging.Logger) -> Optional[str]:
     return _resolve_menu_choice(_ask_creation_mode())
 
 
-def _print_welcome_panel() -> None:
-    """Show the compact welcome panel for first-time users."""
-    if not RICH_AVAILABLE:
-        return
-    console.print(
-        Panel(
-            "[bold]FLUID[/bold] turns a YAML contract into a deployed, governed data "
-            "product —\nlike [cyan]terraform plan/apply[/cyan], but for tables, views, "
-            "and files.\n\n"
-            "[dim]Tip: in a hurry? [bold]fluid init my-project --quickstart[/bold] "
-            "ships a working\ncustomer-360 example in ~30 seconds with zero "
-            "questions.[/dim]\n\n"
-            "Let's set up your first project.\n\n"
-            "[dim]Advanced: [bold]fluid init --help[/bold] for cloud providers "
-            "(gcp/snowflake/aws).\n"
-            "Migrating from dbt/Terraform? See [bold]fluid import[/bold].[/dim]",
-            title="Welcome to FLUID",
-            border_style="blue",
-        )
-    )
-    console.print()
-
-
-def _list_filesystem_templates() -> List[str]:
-    """Return the list of template names that ``copy_template`` can
-    actually find on disk.
-
-    The registry (``simple_forge.list_templates``) returns logical
-    template names (``starter``, ``analytics``, ``etl_pipeline``…)
-    that do NOT correspond 1:1 to filesystem directories under
-    ``fluid_build/templates/``.  If the interactive menu offers those
-    logical names, ``copy_template`` crashes with "Template 'starter'
-    not found".  This helper walks the filesystem directly so the
-    picker only ever offers names that exist.
-    """
-    templates_dir = Path(__file__).parent.parent / "templates"
-    try:
-        return sorted(
-            p.name
-            for p in templates_dir.iterdir()
-            if p.is_dir() and not p.name.startswith(".") and p.name != "__pycache__"
-        )
-    except (OSError, FileNotFoundError):
-        return []
-
-
-def _ask_template_name() -> Optional[str]:
-    """Prompt the user to pick a template when 'Start from a template' is chosen.
-
-    Lists the filesystem templates under ``fluid_build/templates/``
-    (the ones ``copy_template`` can actually copy) and prompts for a
-    choice.  Defaults to ``customer-360`` when it exists, otherwise to
-    the first alphabetically.  Falls back to the default when Rich is
-    unavailable or the prompt is cancelled — the caller never receives
-    ``None`` so ``template_mode`` cannot crash on an empty
-    ``args.template``.
-    """
-    default_name = "customer-360"
-
-    names = _list_filesystem_templates()
-    if not names:
-        # No templates on disk — absolute fallback so at least the
-        # default path is wired.  template_mode will still fail
-        # cleanly if the default isn't present, but the caller won't
-        # see the Path/None TypeError.
-        return default_name
-
-    if default_name not in names:
-        # Default is missing from disk — pick the first alphabetical
-        # template as the fallback default so the picker stays usable.
-        default_name = names[0]
-
-    if not RICH_AVAILABLE:
-        return default_name
-
-    console.print()
-    console.print("[dim]Available templates:[/dim]")
-    for i, name in enumerate(names, 1):
-        marker = " [dim](default)[/dim]" if name == default_name else ""
-        console.print(f"  [bold]{i}.[/bold] {name}{marker}")
-    console.print()
-
-    valid_indices = [str(i) for i in range(1, len(names) + 1)]
-    default_index = str(names.index(default_name) + 1)
-    try:
-        choice = Prompt.ask("Choose template", choices=valid_indices, default=default_index)
-    except Exception:  # noqa: BLE001 — never crash the init flow over a prompt
-        return default_name
-
-    try:
-        return names[int(choice) - 1]
-    except (ValueError, IndexError):
-        return default_name
-
-
-def _ask_industry(workspace_root: Path) -> Optional[str]:
-    """Present the industry picker and generate ``.fluid/skills.yaml``.
-
-    Returns the selected industry key (e.g. ``"telco"``) or ``None`` if
-    Rich is unavailable.
-    """
-    from .industry_skills import generate_skills_file, list_industries
-
-    industries = list_industries()
-
-    if not RICH_AVAILABLE:
-        # Non-interactive: skip industry picker, generate tools-only skills.
-        generate_skills_file(None, workspace_root)
-        return None
-
-    console.print("[dim]What industry is this project for?[/dim]\n")
-    for i, ind in enumerate(industries, 1):
-        desc = f"  [dim]({ind['description']})[/dim]" if ind["description"] else ""
-        console.print(f"  [bold]{i}.[/bold] {ind['label']}{desc}")
-    console.print()
-
-    valid = [str(i) for i in range(1, len(industries) + 1)]
-    choice = Prompt.ask("Choose", choices=valid, default=str(len(industries)))
-    selected = industries[int(choice) - 1]
-
-    industry_key = selected["key"]
-    out_path = generate_skills_file(industry_key, workspace_root)
-
-    if industry_key == "other":
-        console.print(
-            '\n[yellow]No industry-specific skills shipped for "Other".[/yellow]\n'
-            "[dim]Agents will work without domain-specific guidance.\n"
-            "You can add industry skills later with:[/dim] "
-            "[cyan]fluid skills update[/cyan]\n"
-        )
-    else:
-        console.print(
-            Panel(
-                f"[bold]Generated .fluid/skills.yaml for {selected['label']}[/bold]\n\n"
-                "This file contains industry-specific knowledge that\n"
-                "all FLUID agents will use:\n"
-                f"  [dim]Industry:[/dim]    {selected['label']}\n"
-                f"  [dim]File:[/dim]        {out_path.relative_to(workspace_root)}\n\n"
-                "Keep this file in version control — your whole\n"
-                "team will benefit from shared project context.",
-                border_style="green",
-            )
-        )
-
-    return industry_key
-
-
-def _ask_creation_mode() -> str:
-    """Present the creation menu and return the selected mode."""
-    if not RICH_AVAILABLE:
-        return "quickstart"  # non-Rich fallback
-
-    console.print(
-        Panel(
-            "A [bold]workspace[/bold] is a home for your data products.\n"
-            "Each product gets its own folder and contract.\n"
-            "You can add more products later with [cyan]fluid forge[/cyan].",
-            title="New Project",
-            border_style="blue",
-        )
-    )
-    console.print("[dim]How would you like to create your first data product?[/dim]\n")
-    console.print(
-        "  [bold]1.[/bold] Quickstart                 [dim](customer-360 example, zero questions, ~30s) ← fastest[/dim]"
-    )
-    console.print(
-        "  [bold]2.[/bold] Let AI design it           [dim](recommended — just answer questions)[/dim]"
-    )
-    console.print(
-        "  [bold]3.[/bold] Start from a template     [dim](pre-built, customize later)[/dim]"
-    )
-    console.print(
-        "  [bold]4.[/bold] Empty contract             [dim](for experienced users)[/dim]\n"
-    )
-
-    choice = Prompt.ask(
-        "Choose",
-        choices=["1", "2", "3", "4"],
-        default="2",
-    )
-    return {"1": "quickstart", "2": "ai", "3": "template", "4": "blank"}.get(choice, "ai")
-
-
-def _print_workspace_products(existing: List, ws_name: str) -> None:
-    """Print the workspace product listing (shared by redirect paths)."""
-    console.print(
-        f"[dim]Workspace: [bold]{ws_name}[/bold] ({len(existing)} existing product"
-        f"{'s' if len(existing) != 1 else ''})[/dim]"
-    )
-    for product in existing[:10]:
-        meta = []
-        if product.expose_count:
-            meta.append(f"{product.expose_count} expose{'s' if product.expose_count != 1 else ''}")
-        if product.provider:
-            meta.append(f"provider: {product.provider}")
-        suffix = f"  ({', '.join(meta)})" if meta else ""
-        console.print(f"[dim]  • [bold]{product.name}[/bold]{suffix}[/dim]")
-        console.print(f"[dim]    {product.path}[/dim]")
-    console.print()
-
-
-def _redirect_existing_workspace(
-    existing: List,
-    ws_root: Path,
-    is_first_time: bool = False,
-) -> Optional[str]:
-    """Show existing products and redirect the user.
-
-    When *is_first_time* is ``True`` the user has never run FLUID on this
-    machine (no ``~/.fluid``), so we show a short welcome explaining what FLUID
-    is before the redirect.
-    """
-    if not RICH_AVAILABLE:
-        cprint(f"This is already a FLUID workspace with {len(existing)} product(s).")
-        for product in existing[:10]:
-            cprint(f"  • {product.name}  ({product.path})")
-        cprint("Use 'fluid forge' to add another product.")
-        if is_first_time:
-            _mark_first_run_complete()
-        return None
-
-    ws_config = load_workspace_config(ws_root)
-    name = ws_config.name or ws_root.name
-
-    # New colleague who cloned the repo — explain what FLUID is first.
-    if is_first_time:
-        _print_welcome_panel()
-        _print_workspace_products(existing, name)
-        console.print("This workspace is already set up. To add a product:")
-        console.print("  [cyan]fluid forge[/cyan]\n")
-        console.print("To work with existing products:")
-        console.print("  [cyan]fluid validate[/cyan]       [dim]← check all contracts[/dim]")
-        console.print("  [cyan]fluid plan[/cyan]           [dim]← generate execution plan[/dim]")
-        console.print("  [cyan]fluid doctor[/cyan]         [dim]← check your environment[/dim]")
-        _mark_first_run_complete()
-        return None
-
-    # Returning user — short redirect.
-    _print_workspace_products(existing, name)
-    console.print("To add another product:  [cyan]fluid forge[/cyan]")
-    return None
-
-
+# Interactive UI helpers (welcome panel, template/industry/mode pickers,
+# workspace redirect) — physically extracted to
+# ``cli/_init_interactive_helpers.py``. ~241 LOC of pure UI code lifted
+# without behavior change. Re-exported here under the same names so
+# existing test patches on ``fluid_build.cli.init.<helper>`` flow
+# through to the moved functions via the module-attribute-access
+# indirection pattern documented in CLAUDE.md.
 # ============================================================================
 # DAG GENERATION HELPERS
 # ============================================================================
-
-
-def should_generate_dag(contract: dict, template: str = None) -> bool:
-    """
-    Determine if DAG should be auto-generated for this project.
-
-    Auto-generate DAGs when:
-    1. Contract has explicit orchestration config
-    2. Template is orchestration-focused (customer-360, sales-analytics, ml-features, data-quality)
-    3. Project has multiple provider actions (complex pipeline)
-    """
-    # Check for explicit orchestration config
-    if "orchestration" in contract:
-        return True
-
-    # Check for orchestration-focused templates
-    orchestrated_templates = ["customer-360", "sales-analytics", "ml-features", "data-quality"]
-    if template and template in orchestrated_templates:
-        return True
-
-    # Check for complex pipelines (multiple actions)
-    binding = contract.get("binding", {})
-    provider_actions = binding.get("providerActions", [])
-    if len(provider_actions) > 1:
-        return True
-
-    return False
-
-
-def generate_dag_for_project(
-    project_dir: Path, contract: dict, logger, console, template: str = None
-) -> bool:
-    """
-    Generate Airflow DAG using existing generate-airflow command.
-
-    Creates dags/ folder with:
-    - DAG Python file (contract_name_dag.py)
-    - README.md with usage instructions
-    """
-    try:
-        import subprocess
-
-        # Get contract details
-        contract_name = contract.get("name", "my_product")
-        orchestration = contract.get("orchestration", {})
-
-        # Prepare DAG parameters — sanitize to prevent injection
-        schedule = orchestration.get("schedule", "@daily")
-        dag_id = contract_name.replace("-", "_").replace(" ", "_")
-        # Strict identifier validation: only alphanumeric + underscore
-        dag_id = re.sub(r"[^a-zA-Z0-9_]", "", dag_id) or "fluid_dag"
-        # Validate schedule is a plausible cron/preset string
-        if not re.match(r"^[@a-zA-Z0-9_ */,-]+$", schedule):
-            schedule = "@daily"
-
-        # Call generate-airflow command
-        dag_dir = project_dir / "dags"
-        dag_dir.mkdir(exist_ok=True)
-
-        # Build command
-        cmd = [
-            "fluid",
-            "generate-airflow",
-            str(project_dir / "contract.fluid.yaml"),
-            "--output-dir",
-            str(dag_dir),
-            "--dag-id",
-            dag_id,
-            "--schedule",
-            schedule,
-        ]
-
-        if RICH_AVAILABLE:
-            console.print("\n[cyan]📅 Generating Airflow DAG...[/cyan]")
-
-        # Execute command
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(project_dir))
-
-        if result.returncode != 0:
-            # generate-airflow may not exist yet - create DAG manually
-            logger.warning("generate-airflow command not available, creating basic DAG template")
-            create_basic_dag(project_dir, contract, logger)
-
-        # Create README
-        dag_filename = f"{dag_id}_dag.py"
-        create_dags_readme(dag_dir, dag_id, schedule, dag_filename)
-
-        if RICH_AVAILABLE:
-            console.print(f"[green]✅ DAG created: dags/{dag_filename}[/green]")
-
-        return True
-
-    except Exception as e:
-        logger.warning(f"Failed to generate DAG: {e}")
-        return False
-
-
-def create_basic_dag(project_dir: Path, contract: dict, logger):
-    """Create a basic DAG template if generate-airflow is not available."""
-
-    import re as _re
-
-    contract_name = contract.get("name", "my_product")
-    orchestration = contract.get("orchestration", {})
-    # Sanitize values to prevent code injection in generated Python.
-    dag_id = _re.sub(r"[^a-zA-Z0-9_]", "_", contract_name)[:128]
-    schedule = _re.sub(r"[^a-zA-Z0-9@*/, _-]", "", orchestration.get("schedule", "@daily"))[:64]
-    contract_name = _re.sub(r"[^a-zA-Z0-9 _.-]", "_", contract_name)[:128]
-
-    dag_content = f'''"""
-Airflow DAG for FLUID contract: {contract_name}
-Auto-generated by fluid init
-"""
-
-from datetime import datetime, timedelta
-from airflow import DAG
-from airflow.operators.bash import BashOperator
-
-default_args = {{
-    'owner': 'fluid',
-    'depends_on_past': False,
-    'start_date': datetime(2024, 1, 1),
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': {orchestration.get("retries", 3)},
-    'retry_delay': timedelta(minutes={orchestration.get("retry_delay", "5m").replace("m", "")}),
-}}
-
-with DAG(
-    dag_id='{dag_id}',
-    default_args=default_args,
-    description='FLUID data product: {contract_name}',
-    schedule_interval='{schedule}',
-    catchup=False,
-    tags=['fluid', 'data-product'],
-) as dag:
-
-    # Validate contract
-    validate = BashOperator(
-        task_id='validate_contract',
-        bash_command='cd {project_dir.absolute()} && fluid validate contract.fluid.yaml',
-    )
-
-    # Plan execution
-    plan = BashOperator(
-        task_id='plan_execution',
-        bash_command='cd {project_dir.absolute()} && fluid plan contract.fluid.yaml',
-    )
-
-    # Apply changes
-    apply = BashOperator(
-        task_id='apply_contract',
-        bash_command='cd {project_dir.absolute()} && fluid apply contract.fluid.yaml --auto-approve',
-    )
-
-    validate >> plan >> apply
-'''
-
-    dag_dir = project_dir / "dags"
-    dag_dir.mkdir(exist_ok=True)
-    dag_file = dag_dir / f"{dag_id}_dag.py"
-
-    with open(dag_file, "w") as f:
-        f.write(dag_content)
-
-    logger.info(f"Created basic DAG template: {dag_file}")
-
-
-def create_dags_readme(dag_dir: Path, dag_id: str, schedule: str, dag_filename: str):
-    """Create README in dags/ folder with usage instructions."""
-
-    readme_content = f"""# Airflow DAG Configuration
-
-This folder contains the Airflow DAG for your FLUID data product.
-
-## Generated DAG
-
-- **DAG ID**: `{dag_id}`
-- **Schedule**: `{schedule}`
-- **File**: `{dag_filename}`
-
-## Usage
-
-### Local Development
-
-Run the DAG locally using Airflow:
-
-```bash
-# Start Airflow (from project root)
-docker-compose --profile airflow up -d
-
-# Access Airflow UI
-open http://localhost:8080
-
-# Default credentials
-# Username: admin
-# Password: admin
-```
-
-### Manual Execution
-
-Run the FLUID pipeline manually:
-
-```bash
-# Validate contract
-fluid validate contract.fluid.yaml
-
-# Plan execution
-fluid plan contract.fluid.yaml
-
-# Apply changes
-fluid apply contract.fluid.yaml --auto-approve
-```
-
-### CI/CD Integration
-
-This DAG can be deployed to:
-- Cloud Composer (GCP)
-- MWAA (AWS)
-- Astronomer
-- Self-hosted Airflow
-
-See `.jenkins/` folder for CI/CD pipeline configuration.
-
-## Customization
-
-To customize the DAG:
-
-1. Edit `{dag_filename}`
-2. Add custom operators or sensors
-3. Configure alerting and notifications
-4. Update schedule interval as needed
-
-## Next Steps
-
-- **Add data quality checks**: Use Great Expectations or Soda
-- **Set up alerting**: Configure email/Slack notifications
-- **Add lineage tracking**: Enable OpenLineage integration
-- **Monitor performance**: Use Airflow metrics
-
-For more information, see: https://fluid.dev/docs/orchestration
-"""
-
-    readme_path = dag_dir / "README.md"
-    with open(readme_path, "w") as f:
-        f.write(readme_content)
-
-
-# ============================================================================
-# MODE HANDLERS
-# ============================================================================
-
-
-def demo_mode(args, logger: logging.Logger) -> int:
-    """Scaffold and run a working customer-360 example.
-
-    This is the handler for ``fluid demo``. It scaffolds customer-360
-    template files, initializes a local DuckDB database, optionally
-    generates an Airflow DAG, and executes the pipeline end-to-end.
-
-    Note: ``fluid init --quickstart`` does NOT route here — it is
-    rewritten in ``detect_mode`` to ``--template customer-360 --yes``
-    and dispatches through ``template_mode`` (scaffold only, no run).
-    """
-
-    project_name = slugify_identifier(args.name, fallback="my-first-product")
-    template = "customer-360"  # Default template
-
-    if RICH_AVAILABLE:
-        console.print(
-            Panel(
-                f"🚀 Creating [bold cyan]{project_name}[/bold cyan] with customer analytics...\n\n"
-                f"This will create a working data product with sample data.\n"
-                f"No cloud account needed - runs locally with DuckDB.",
-                title="Quickstart Mode",
-                border_style="cyan",
-            )
-        )
-    else:
-        cprint(f"🚀 Creating {project_name} with customer analytics...")
-
-    project_dir = Path(project_name)
-
-    # Guard against symlink attacks.
-    if project_dir.is_symlink():
-        if RICH_AVAILABLE:
-            console.print(f"[red]❌ '{project_name}' is a symlink — refusing to write[/red]")
-        else:
-            console_error(f"'{project_name}' is a symlink — refusing to write")
-        return 1
-
-    # Check if directory already exists
-    if project_dir.exists() and any(project_dir.iterdir()):
-        if RICH_AVAILABLE:
-            console.print(
-                f"[red]❌ Directory '{project_name}' already exists and is not empty[/red]"
-            )
-        else:
-            console_error(f"Directory '{project_name}' already exists")
-        return 1
-
-    if args.dry_run:
-        if RICH_AVAILABLE:
-            console.print("[yellow]🔍 Dry run - would create:[/yellow]")
-            console.print(f"  📁 {project_name}/")
-            console.print(f"  📄 {project_name}/contract.fluid.yaml")
-            console.print(f"  📊 {project_name}/data/customers.csv")
-            console.print(f"  📊 {project_name}/data/orders.csv")
-            console.print(f"  💾 {project_name}/.fluid/db.duckdb")
-        return 0
-
-    try:
-        # Create project directory
-        project_dir.mkdir(parents=True, exist_ok=True)
-
-        # Copy template files
-        success = copy_template(project_dir, template, logger)
-        if not success:
-            return 1
-
-        # Copy sample data
-        copy_sample_data(project_dir, template, logger)
-
-        # Initialize local database
-        init_local_db(project_dir, args.provider, logger)
-
-        # Generate DAG if contract has orchestration config
-        has_dag = False
-        if not getattr(args, "no_dag", False):
-            try:
-                import yaml
-
-                contract_path = project_dir / "contract.fluid.yaml"
-                if contract_path.exists():
-                    with open(contract_path) as f:
-                        contract = yaml.safe_load(f)
-
-                    if should_generate_dag(contract, template):
-                        has_dag = generate_dag_for_project(
-                            project_dir,
-                            contract,
-                            logger,
-                            console if RICH_AVAILABLE else None,
-                            template,
-                        )
-            except Exception as e:
-                logger.warning(f"Failed to generate DAG: {e}")
-
-        # Run pipeline if not --no-run
-        if not args.no_run and args.provider == "local":
-            run_local_pipeline(project_dir, logger)
-
-        # NOTE: CI/CD scaffolding intentionally removed from this path.
-        # Users who want Jenkinsfile / GitHub Actions / GitLab CI / Cloud
-        # Build configs should run `fluid scaffold-ci` explicitly — init
-        # should produce predictable artifacts, not interactively prompt
-        # for cloud-platform-specific files.
-
-        # Show next steps
-        show_success_message(project_dir, args.provider, logger, has_dag=has_dag)
-
-        return 0
-
-    except Exception as e:
-        error(logger, "demo_failed", error=str(e))
-        if RICH_AVAILABLE:
-            console.print(f"[red]❌ Demo failed: {e}[/red]")
-        return 1
-
-
-def blank_mode(args, logger: logging.Logger) -> int:
-    """Empty project skeleton.
-
-    Slice UX-F rewrite: goes directly through
-    :func:`fluid_build.cli.forge_contract_factory.build_minimal_contract`
-    + :func:`fluid_build.cli.forge_contract_factory.write_contract` so
-    the output shape matches what ``fluid forge --blank`` produces —
-    v0.7.2 YAML contract with ``metadata.provenance`` envelope
-    alongside the workspace config, the ``.gitignore`` template, and
-    the init receipt.
-
-    The previous implementation delegated to ``product_new.run``, which
-    emitted a legacy v0.5.7 JSON contract under ``bronze_<name>/``.
-    That left three different scaffolding paths with three different
-    contract formats (blank / forge-blank / template).  This slice
-    unifies them.
-    """
-    from fluid_build.cli.artifact_envelope import dump_json_with_envelope
-    from fluid_build.cli.artifact_paths import product_forge_receipt_path
-    from fluid_build.cli.artifact_receipts import ReceiptBuilder
-    from fluid_build.cli.forge_contract_factory import (
-        build_minimal_contract,
-        create_and_validate_contract,
-    )
-
-    project_name = slugify_identifier(args.name, fallback="my-project")
-    project_dir = Path(project_name)
-
-    if RICH_AVAILABLE:
-        console.print(
-            Panel(
-                f"🔧 Creating minimal project: [bold]{project_name}[/bold]\n\n"
-                f"Empty skeleton with no assumptions.",
-                title="Blank Mode",
-                border_style="white",
-            )
-        )
-    else:
-        cprint(f"🔧 Creating minimal project: {project_name}")
-
-    # Guard against symlink attacks.
-    if project_dir.is_symlink():
-        if RICH_AVAILABLE:
-            console.print(f"[red]❌ '{project_name}' is a symlink — refusing to write[/red]")
-        return 1
-
-    if project_dir.exists() and any(project_dir.iterdir()):
-        if RICH_AVAILABLE:
-            console.print(
-                f"[red]❌ Directory '{project_name}' already exists and is not empty[/red]"
-            )
-        else:
-            console_error(f"Directory '{project_name}' already exists and is not empty")
-        return 1
-
-    if getattr(args, "dry_run", False):
-        preview_lines = [
-            f"  📁 {project_name}/",
-            f"  📄 {project_name}/contract.fluid.yaml",
-            f"  📄 {project_name}/.fluid/forge-receipt.json",
-        ]
-        if RICH_AVAILABLE:
-            console.print("[yellow]🔍 Dry run - would create:[/yellow]")
-            for line in preview_lines:
-                console.print(line)
-        else:
-            cprint("Dry run - would create:")
-            for line in preview_lines:
-                cprint(line)
-        return 0
-
-    # Derive a contract id from the workspace name — mirrors what
-    # ``fluid forge --blank`` does when no --context is supplied.
-    product_slug = slugify_identifier(project_name, fallback="my-data-product")
-
-    contract = build_minimal_contract(
-        product_id=product_slug,
-        name=project_name,
-    )
-
-    result_path = create_and_validate_contract(
-        contract,
-        project_dir,
-        logger,
-        console=console if RICH_AVAILABLE else None,
-    )
-    if result_path is None:
-        return 1
-
-    # Write a forge-receipt.json inside the product so `fluid status`,
-    # drift detection, and any downstream tooling see the same shape
-    # `fluid forge --blank` produces.
-    try:
-        from fluid_build import __version__ as tool_version
-    except Exception:  # pragma: no cover — defensive
-        tool_version = ""
-
-    builder = ReceiptBuilder(flow="blank", dry_run=False)
-    # Record the contract write with a sha256 for drift-awareness.
-    import hashlib
-
-    try:
-        sha = hashlib.sha256(result_path.read_bytes()).hexdigest()
-        size = result_path.stat().st_size
-    except OSError:
-        sha, size = None, 0
-    builder.record_entry(
-        path=Path("contract.fluid.yaml"),
-        action="create",
-        sha256=sha,
-        size=size,
-    )
-    builder.set_inputs(
-        blank=True,
-        flow="init-blank",
-        provider=getattr(args, "provider", None),
-        name=project_name,
-    )
-
-    try:
-        receipt_path = product_forge_receipt_path(project_dir)
-        receipt_path.parent.mkdir(parents=True, exist_ok=True)
-        receipt_bytes = dump_json_with_envelope(
-            builder.build_document().to_payload(),
-            kind="ForgeReceipt",
-            command=f"fluid init {project_name} --blank",
-            tool_version=str(tool_version),
-        )
-        receipt_path.write_text(receipt_bytes, encoding="utf-8")
-        logger.debug("blank_mode_receipt_written", extra={"path": str(receipt_path)})
-    except Exception as exc:  # noqa: BLE001 — receipt is best-effort
-        logger.debug("blank_mode_receipt_write_failed", extra={"error": str(exc)})
-
-    if RICH_AVAILABLE:
-        console.print(f"\n✅ Created [cyan]{project_name}/contract.fluid.yaml[/cyan]")
-        console.print(f"[dim]Next:[/dim] [cyan]cd {project_name} && fluid validate[/cyan]")
-    else:
-        cprint(f"Created {project_name}/contract.fluid.yaml")
-
-    return 0
-
-
-def template_mode(args, logger: logging.Logger) -> int:
-    """Create from specific template"""
-
-    template_name = args.template
-    if not template_name:
-        # Defensive: template_mode should never be reached with an empty
-        # ``args.template``.  The interactive menu path runs
-        # ``_ask_template_name`` before dispatching, and every CLI flag
-        # path requires a value.  This guard catches direct callers and
-        # prints an actionable error instead of crashing inside
-        # ``copy_template`` with a cryptic Path/None TypeError.
-        if RICH_AVAILABLE:
-            console.print(
-                "[red]❌ No template name provided.[/red]\n"
-                "[dim]Pass [bold]--template NAME[/bold] or pick one from "
-                "[bold]fluid init --list-templates[/bold].[/dim]"
-            )
-        else:
-            console_error("No template name provided. Pass --template NAME.")
-        return 1
-
-    project_name = slugify_identifier(args.name or template_name, fallback="my-project")
-    project_dir = Path(project_name)
-
-    if RICH_AVAILABLE:
-        console.print(
-            Panel(
-                f"📦 Creating from template: [bold]{template_name}[/bold]\n"
-                f"Project: [bold]{project_name}[/bold]",
-                title="Template Mode",
-                border_style="blue",
-            )
-        )
-    else:
-        cprint(f"📦 Creating from template: {template_name}")
-
-    success = copy_template(project_dir, template_name, logger)
-    if not success:
-        return 1
-
-    # Slice UX-F: after the template files have landed, rewrite the
-    # product's contract.fluid.yaml through ``write_contract`` so it
-    # carries the ``metadata.provenance`` envelope (slice 4) and
-    # record a forge receipt under ``.fluid/forge-receipt.json`` so
-    # the product looks the same as one produced by ``fluid forge``.
-    _finalise_template_product(
-        template_name=template_name,
-        project_name=project_name,
-        project_dir=project_dir,
-        logger=logger,
-    )
-
-    if RICH_AVAILABLE:
-        console.print(f"\n✅ Created project from {template_name} template")
-
-    return 0
-
-
-def _finalise_template_product(
-    *,
-    template_name: str,
-    project_name: str,
-    project_dir: Path,
-    logger: logging.Logger,
-) -> None:
-    """Post-copy hook: inject provenance envelope + write forge receipt.
-
-    Runs after ``copy_template`` / ``create_from_template`` lands the
-    template files.  Best-effort: never raises.  When the template
-    doesn't include a ``contract.fluid.yaml``, the provenance step is
-    silently skipped.
-    """
-    import hashlib
-
-    from fluid_build.cli.artifact_envelope import build_envelope, dump_json_with_envelope
-    from fluid_build.cli.artifact_paths import product_forge_receipt_path
-    from fluid_build.cli.artifact_receipts import ReceiptBuilder
-
-    try:
-        import yaml
-    except ImportError:  # pragma: no cover — yaml is a hard dep
-        return
-
-    contract_path = project_dir / "contract.fluid.yaml"
-    if not contract_path.is_file():
-        return  # some templates don't ship a contract; nothing to stamp.
-
-    try:
-        from fluid_build import __version__ as tool_version
-    except Exception:  # pragma: no cover — defensive
-        tool_version = ""
-
-    # Load the template's contract and inject metadata.provenance.
-    try:
-        doc = yaml.safe_load(contract_path.read_text(encoding="utf-8")) or {}
-        if not isinstance(doc, dict):
-            return
-
-        metadata = doc.get("metadata")
-        if not isinstance(metadata, dict):
-            metadata = {}
-        metadata = dict(metadata)
-        metadata["provenance"] = build_envelope(
-            kind="ContractMetadata",
-            command=f"fluid init {project_name} --template {template_name}",
-            tool_version=str(tool_version),
-        )
-        doc["metadata"] = metadata
-
-        contract_path.write_text(
-            "# FLUID Data Product Contract\n"
-            "# Docs: https://fluid-build.dev/docs/contracts\n"
-            + yaml.dump(doc, default_flow_style=False, sort_keys=False, allow_unicode=True),
-            encoding="utf-8",
-        )
-    except Exception as exc:  # noqa: BLE001 — provenance is best-effort
-        logger.debug("template_provenance_inject_failed", extra={"error": str(exc)})
-
-    # Write the forge-receipt.json inside the product.
-    try:
-        builder = ReceiptBuilder(flow="template", dry_run=False)
-        try:
-            sha = hashlib.sha256(contract_path.read_bytes()).hexdigest()
-            size = contract_path.stat().st_size
-        except OSError:
-            sha, size = None, 0
-        builder.record_entry(
-            path=Path("contract.fluid.yaml"),
-            action="create",
-            sha256=sha,
-            size=size,
-        )
-        builder.set_inputs(
-            template=template_name,
-            name=project_name,
-        )
-        receipt_path = product_forge_receipt_path(project_dir)
-        receipt_path.parent.mkdir(parents=True, exist_ok=True)
-        receipt_path.write_text(
-            dump_json_with_envelope(
-                builder.build_document().to_payload(),
-                kind="ForgeReceipt",
-                command=f"fluid init {project_name} --template {template_name}",
-                tool_version=str(tool_version),
-            ),
-            encoding="utf-8",
-        )
-        logger.debug("template_receipt_written", extra={"path": str(receipt_path)})
-    except Exception as exc:  # noqa: BLE001 — receipt is best-effort
-        logger.debug("template_receipt_write_failed", extra={"error": str(exc)})
-
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-
-#: Filename suffixes that should NEVER be copied from a template source.
-#: ``*.old`` files are template-author scratch artifacts (backup copies of
-#: old contract shapes), not something the user should see inherit into
-#: their new project.
-_TEMPLATE_IGNORE_SUFFIXES = (".old", ".bak", ".tmp", ".swp")
-_TEMPLATE_IGNORE_NAMES = {"__pycache__", ".DS_Store"}
-
-
-def _should_copy_template_entry(entry: Path) -> bool:
-    """Return True if *entry* should be copied into a new project dir."""
-    if entry.name in _TEMPLATE_IGNORE_NAMES:
-        return False
-    if any(entry.name.endswith(suffix) for suffix in _TEMPLATE_IGNORE_SUFFIXES):
-        return False
-    return True
+# ── DAG-generation helpers (extracted) ────────────────────────────
+# The Airflow DAG emission utilities live in the
+# ``_init_dag_helpers`` sibling module. Re-imported at module top
+# so test patches on ``fluid_build.cli.init.<helper>`` still
+# resolve via this module's namespace.
+from fluid_build.cli._init_dag_helpers import (  # noqa: E402,F401
+    create_basic_dag,
+    create_dags_readme,
+    generate_dag_for_project,
+    should_generate_dag,
+)
+from fluid_build.cli._init_interactive_helpers import (  # noqa: E402,F401
+    _ask_creation_mode,
+    _ask_industry,
+    _ask_template_name,
+    _list_filesystem_templates,
+    _print_welcome_panel,
+    _print_workspace_products,
+    _redirect_existing_workspace,
+)
+
+# Mode handlers (demo / blank / template) — physically extracted to
+# ``cli/_init_modes.py``. ~480 LOC of mode-handler logic lifted with
+# the module-attribute-access indirection so test patches on
+# ``fluid_build.cli.init.<helper>`` flow through to the moved
+# functions.
+from fluid_build.cli._init_modes import (  # noqa: E402,F401
+    _bridge_init_template_to_forge,
+    _finalise_template_product,
+    _should_copy_template_entry,
+    blank_mode,
+    demo_mode,
+    template_mode,
+)
 
 
 def copy_template(project_dir: Path, template_name: str, logger: logging.Logger) -> bool:
@@ -1825,11 +1016,31 @@ def copy_template(project_dir: Path, template_name: str, logger: logging.Logger)
     templates_dir = cli_dir.parent / "templates" / template_name
 
     if not templates_dir.exists():
+        # Bridge to the forge.core.registry — when a name isn't a
+        # directory-template, fall back to a code-template (starter,
+        # analytics, etl_pipeline, streaming, ml_pipeline). This unifies
+        # ``fluid init --template X`` with ``fluid forge --template X``
+        # so the user picks a single name and it works in both flows.
+        try:
+            if _bridge_init_template_to_forge(project_dir, template_name, logger):
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("init_template_forge_bridge_failed: %s", exc)
+
+        # Show every option (directory templates + forge code templates).
+        try:
+            from fluid_build.forge.core.registry import template_registry as _tr
+
+            forge_names = sorted(_tr.list_available())
+        except Exception:  # noqa: BLE001
+            forge_names = []
         if RICH_AVAILABLE:
             console.print(f"[yellow]⚠️  Template '{template_name}' not found[/yellow]")
             console.print(f"Looking in: {templates_dir}")
             console.print("\nAvailable templates:")
             console.print("  - customer-360 (customer analytics)")
+            for name in forge_names:
+                console.print(f"  - {name} (code template)")
         else:
             warning(f"Template '{template_name}' not found")
         return False

@@ -59,263 +59,12 @@ COMMAND = "data-model"
 _SAFE_ARTIFACT_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-def register_forge_subcommand(subparsers: argparse._SubParsersAction) -> None:
-    """Register ``fluid forge data-model``."""
-    parser = subparsers.add_parser(
-        COMMAND,
-        help="Forge a reviewable data model contract and logical sidecar",
-    )
-    # ``required=False`` so a bare ``fluid forge data-model`` doesn't blow up
-    # with the bare-bones argparse "the following arguments are required:
-    # data_model_action" error.  ``run_data_model_command`` catches the
-    # ``data_model_action is None`` case and renders a Rich-friendly panel
-    # listing the subcommands instead.
-    data_model_sub = parser.add_subparsers(dest="data_model_action", required=False)
-
-    from_ddl = data_model_sub.add_parser("from-ddl", help="Forge a data model from DDL")
-    _add_common_generation_args(from_ddl)
-    from_ddl.add_argument("--ddl", nargs="+", required=True, help="One or more DDL files")
-    from_ddl.add_argument(
-        "--source-type",
-        choices=["snowflake", "bigquery", "postgres", "postgresql", "oracle", "mysql"],
-        help="Source SQL dialect hint",
-    )
-    from_ddl.set_defaults(data_model_func=run_from_ddl_command)
-
-    from_intent = data_model_sub.add_parser(
-        "from-intent",
-        help="Forge a data model from a business intent file",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=(
-            "Forge a reviewable data model contract from a YAML/JSON business "
-            "intent file.\n\n"
-            "An intent file describes the data product you want: identity, "
-            "grain, dimensions, metrics, source hints, rules, and modeling "
-            "preferences."
-        ),
-        epilog=(
-            "Required minimum:\n"
-            "  data_product.name\n"
-            "  data_product.domain\n"
-            "  plus at least one grain, dimension, metric, or data source\n\n"
-            "Useful fields:\n"
-            "  business_context, metrics, grain, dimensions, data_sources,\n"
-            "  business_rules, modeling\n\n"
-            "Minimal example:\n"
-            "  data_product:\n"
-            "    name: customer_orders\n"
-            "    domain: retail\n"
-            "  grain:\n"
-            "    entity: order_line\n"
-            "    time_dimension: order_date\n"
-            "  dimensions:\n"
-            "    entities: [customer, product]\n\n"
-            "Examples:\n"
-            "  fluid forge data-model from-intent --example\n"
-            "  fluid forge data-model from-intent --example retail\n"
-            "  fluid forge data-model from-intent --schema\n"
-            "  fluid forge data-model from-intent --validate intent.yaml\n"
-            "  fluid forge data-model from-intent intent.yaml -o contract.fluid.yaml\n"
-        ),
-    )
-    _add_common_generation_args(from_intent, output_required=False)
-    from_intent.add_argument(
-        "intent_file",
-        nargs="?",
-        metavar="intent-file",
-        help="Path to a YAML or JSON business intent file",
-    )
-    from_intent.add_argument(
-        "--example",
-        nargs="?",
-        const="minimal",
-        choices=["minimal", "retail", "telco", "finance"],
-        help="Print a YAML intent example (minimal, retail, telco, or finance) and exit",
-    )
-    from_intent.add_argument(
-        "--schema",
-        action="store_true",
-        help="Print the BusinessIntent JSON Schema and exit",
-    )
-    from_intent.add_argument(
-        "--validate",
-        dest="validate_intent",
-        metavar="intent-file",
-        help="Validate an intent file without writing artifacts",
-    )
-    from_intent.set_defaults(data_model_func=run_from_intent_command)
-
-    # V1.5 — forge from a configured metadata-source catalog.
-    # User-facing vocabulary uses "source" / "metadata source" to
-    # disambiguate from forge-cli's existing publish-target catalog
-    # role (``fluid publish --target dmm`` etc.). See ``docs/MIGRATION.md``
-    # for the full UX-vocabulary table.
-    from_source = data_model_sub.add_parser(
-        "from-source",
-        help=(
-            "Forge a data model from a configured metadata source "
-            "(snowflake / unity / bigquery / dataplex / glue / "
-            "datahub / datamesh_manager)."
-        ),
-    )
-    _add_common_generation_args(from_source)
-    from_source.add_argument(
-        "--source",
-        required=True,
-        choices=[
-            "snowflake",
-            "unity",
-            "bigquery",
-            "dataplex",
-            "glue",
-            "datahub",
-            "datamesh_manager",
-        ],
-        help=(
-            "Which metadata-source catalog to read from. Configure the "
-            "credentials with `fluid ai setup --source <catalog> --name <credential-id>` first "
-            "(or set the matching env vars; see docs/PROVIDERS.md)."
-        ),
-    )
-    from_source.add_argument(
-        "--credential-id",
-        default=None,
-        help=(
-            "Saved credential name to use (created via "
-            "`fluid ai setup --source <catalog> --name <credential-id>`). When omitted, the resolver "
-            "falls through to env vars and (with --allow-metadata-service) "
-            "to cloud workload-identity."
-        ),
-    )
-    from_source.add_argument(
-        "--database",
-        default=None,
-        help=(
-            "Database / project to enumerate (Snowflake DATABASE, BigQuery "
-            "PROJECT, Glue DATABASE, etc.). Required for most catalogs."
-        ),
-    )
-    from_source.add_argument(
-        "--schema",
-        dest="schema_name",
-        default=None,
-        help=(
-            "Schema / dataset / domain to enumerate. Required for Snowflake "
-            "/ Unity / BigQuery / Dataplex; optional for Glue / DataHub / DMM."
-        ),
-    )
-    from_source.add_argument(
-        "--catalog",
-        default=None,
-        help=(
-            "Unity catalog name OR Dataplex entry-group name. Ignored "
-            "for catalogs that don't have a separate catalog-level scope."
-        ),
-    )
-    from_source.add_argument(
-        "--tables",
-        nargs="+",
-        default=None,
-        help=(
-            "Optional list of table names to enumerate. When omitted, "
-            "every table under the (database, schema) is fetched."
-        ),
-    )
-    from_source.add_argument(
-        "--name",
-        default=None,
-        help=(
-            "Output model name (used for the sidecar filename and the "
-            "contract's id / name fields). Defaults to the schema / "
-            "dataset name."
-        ),
-    )
-    from_source.add_argument(
-        "--allow-metadata-service",
-        action="store_true",
-        help=(
-            "Permit the credential resolver to use cloud workload-identity "
-            "(GCE / GKE / Cloud Run / Lambda metadata service / IAM "
-            "instance profile). Off by default — opt in for hosted CI / "
-            "production runs (see docs/PROVIDERS.md for the security model)."
-        ),
-    )
-    from_source.set_defaults(data_model_func=run_from_source_command)
-
-    validate = data_model_sub.add_parser(
-        "validate", help="Validate a forged data model contract or sidecar"
-    )
-    _add_quiet_arg(validate)
-    validate.add_argument("path", help="Path to a contract.fluid.yaml or *.model.json file")
-    validate.set_defaults(data_model_func=run_validate_command)
-
-    diff = data_model_sub.add_parser("diff", help="Diff two forged logical sidecars")
-    _add_quiet_arg(diff)
-    diff.add_argument("old", help="Path to the older *.model.json file")
-    diff.add_argument("new", help="Path to the newer *.model.json file")
-    diff.set_defaults(data_model_func=run_diff_command)
-
-    # Item 6 — capture operator edits and record them to
-    # memory/semantic so the next forge biases toward operator
-    # preferences. Closes the continuous-learning loop end-to-end.
-    learn = data_model_sub.add_parser(
-        "learn",
-        help=(
-            "Capture operator edits between an original forged "
-            "contract and a hand-edited version; record the diff "
-            "to memory/semantic so the next forge starts closer "
-            "to operator preferences."
-        ),
-    )
-    _add_quiet_arg(learn)
-    learn.add_argument(
-        "--original",
-        required=True,
-        help="Path to the originally-forged contract.fluid.yaml.",
-    )
-    learn.add_argument(
-        "--edited",
-        required=True,
-        help="Path to the operator-edited contract.fluid.yaml.",
-    )
-    learn.add_argument(
-        "--name",
-        default=None,
-        help=(
-            "Optional contract name for the memory key. Defaults "
-            "to the original contract filename stem."
-        ),
-    )
-    learn.set_defaults(data_model_func=run_learn_command)
-
-    dump_ddl = data_model_sub.add_parser(
-        "dump-ddl",
-        help="Dump DDL from a Snowflake database.schema to a .sql file",
-    )
-    _add_quiet_arg(dump_ddl)
-    dump_ddl.add_argument("--database", required=True, help="Snowflake database (e.g. BIZ_LAB)")
-    dump_ddl.add_argument("--schema", required=True, help="Snowflake schema (e.g. SEEDED)")
-    dump_ddl.add_argument("--output", "-o", required=True, help="Path to the .sql file to write")
-    dump_ddl.add_argument(
-        "--tables",
-        nargs="+",
-        default=None,
-        help=(
-            "Optional list of table names to dump. When omitted, the whole "
-            "schema is dumped via GET_DDL('SCHEMA', ...)."
-        ),
-    )
-    dump_ddl.add_argument(
-        "--role",
-        default=None,
-        help="Snowflake role override (defaults to env SNOWFLAKE_ROLE)",
-    )
-    dump_ddl.add_argument(
-        "--warehouse",
-        default=None,
-        help="Snowflake warehouse override (defaults to env SNOWFLAKE_WAREHOUSE)",
-    )
-    dump_ddl.set_defaults(data_model_func=run_dump_ddl_command)
+# Argparse subparser registration — physically extracted to
+# ``cli/_forge_data_model_register.py`` (~280 LOC). Re-exported so
+# ``register(subparsers)`` glue keeps working.
+from fluid_build.cli._forge_data_model_register import (  # noqa: E402,F401
+    register_forge_subcommand,
+)
 
 
 def _add_quiet_arg(parser: argparse.ArgumentParser) -> None:
@@ -688,7 +437,8 @@ def _print_copilot_generation_error(exc: CopilotGenerationError) -> None:
 
 
 def run_from_source_command(args: Any, logger: logging.Logger) -> int:
-    """V1.5 — forge from a configured metadata-source catalog.
+    """V1.5 — forge from a configured metadata-source catalog OR a
+    JDBC-introspectable database.
 
     The CLI surface mirrors ``run_from_intent_command`` /
     ``run_from_ddl_command`` so the staged-pipeline output (the
@@ -696,16 +446,28 @@ def run_from_source_command(args: Any, logger: logging.Logger) -> int:
     OSI sidecar / DDL emit / dimensional variants) lands the same
     way regardless of how the user fed input in.
 
-    The catalog adapter is built via the credential resolver chain
-    (per-call inline → keyring → ~/.fluid/sources.yaml → env vars
-    → metadata-service-when-allowed → fail-closed). Same guarantees
-    as the MCP ``forge_from_source`` tool — no credentials ever leak
-    into the audit trail or memory namespaces.
+    Branches:
+
+    * ``--source <catalog>`` (snowflake, unity, bigquery, dataplex,
+      glue, datahub, datamesh_manager) — the credential-resolver-built
+      catalog adapter. Same guarantees as the MCP ``forge_from_source``
+      tool — no credentials ever leak into the audit trail.
+    * ``--source <jdbc>`` (postgres, postgresql, mysql, sqlite) —
+      a duckdb-extension-based introspection path. Reads ``--uri``,
+      attaches the source via ``INSTALL <ext>; LOAD <ext>; ATTACH``,
+      enumerates tables + types, returns the same staged-pipeline
+      output. No credential resolver: the URI carries everything.
 
     Internally calls ``run_from_catalog`` from
     ``forge_datamodel.from_catalog.pipeline`` so the MCP tool and
     the CLI subcommand share one staged-pipeline path.
     """
+    # JDBC sources — branch out early to a duckdb-attach helper. The
+    # rest of the function below handles catalog sources.
+    jdbc_sources = {"postgres", "postgresql", "mysql", "sqlite"}
+    if args.source in jdbc_sources:
+        return _run_from_jdbc_source(args, logger)
+
     # Lazy imports keep ``fluid forge --help`` cold-start fast: the
     # catalog SDKs only load when this command actually runs.
     from fluid_build.copilot.catalog.credentials import CredentialResolver
@@ -832,6 +594,16 @@ def run_from_source_command(args: Any, logger: logging.Logger) -> int:
         ),
         industry_pack=session.industry_pack,
     )
+
+
+# JDBC-source path (postgres / mysql / sqlite via duckdb-extension
+# scanner) — physically extracted to ``cli/_forge_data_model_jdbc.py``.
+# Re-exported here so the dispatcher in ``run_from_source_command``
+# keeps resolving the bare names.
+from fluid_build.cli._forge_data_model_jdbc import (  # noqa: E402,F401
+    _map_jdbc_type_to_logical,
+    _run_from_jdbc_source,
+)
 
 
 def _build_catalog_adapter(

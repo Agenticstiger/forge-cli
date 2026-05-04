@@ -88,16 +88,49 @@ def _safe_yaml_load(path: Path, max_bytes: int = _YAML_MAX_BYTES) -> Any:
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
-    """Register the ``fluid import`` command."""
+    """Register the ``fluid import`` command.
+
+    Two-mode positional contract:
+      - ``fluid import meltano|airbyte|dlt|singer <source>`` — convert a
+        foreign tool config (Meltano project / Airbyte workspace / dlt
+        pipeline / Singer tap config) into FLUID contracts via
+        :mod:`fluid_build.cli.import_workflow`.
+      - ``fluid import [--dir <path>]`` — legacy directory scan for
+        dbt / Terraform / SQL projects.
+    """
     parser = subparsers.add_parser(
         COMMAND,
-        help="📥 Import an existing dbt / Terraform / SQL project into FLUID",
+        help="📥 Import an existing project into FLUID (dbt/Terraform/SQL or Meltano/Airbyte/dlt/Singer)",
         description=(
-            "Scan a directory for a dbt, Terraform, or SQL project and generate "
-            "FLUID contracts from the discovered models. This is the migration "
-            "path from legacy tools to FLUID — use it once, then work with the "
-            "generated contracts going forward."
+            "Two modes:\n"
+            "  fluid import meltano <project-dir>       — convert meltano.yml\n"
+            "  fluid import airbyte <workspace-id>      — convert an Airbyte workspace\n"
+            "  fluid import dlt <pipeline-name>         — convert a dlt pipeline\n"
+            "  fluid import singer <tap-config.json>    — convert a Singer tap+target\n"
+            "  fluid import [--dir <path>]              — legacy dbt/Terraform/SQL scan"
         ),
+    )
+    # Optional first positional: tool name. When present, dispatches to the
+    # foreign-config importer; when absent, falls through to the legacy
+    # directory scanner.
+    parser.add_argument(
+        "tool",
+        nargs="?",
+        choices=["meltano", "airbyte", "dlt", "singer"],
+        default=None,
+        help="Foreign tool to import from (omit for legacy dbt/Terraform/SQL scan)",
+    )
+    parser.add_argument(
+        "source",
+        nargs="?",
+        default=None,
+        help="Project dir / workspace id / pipeline name / tap config (required for tool-mode)",
+    )
+    parser.add_argument(
+        "--out",
+        dest="out_path",
+        default=None,
+        help="Output contract path (default: contract.<id>.fluid.yaml in cwd)",
     )
     parser.add_argument(
         "--provider",
@@ -110,7 +143,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "-C",
         dest="target_dir",
         default=None,
-        help="Directory to scan (default: current directory)",
+        help="Directory to scan in legacy mode (default: current directory)",
     )
     parser.add_argument(
         "--yes",
@@ -467,11 +500,21 @@ def _safe_contract_filename(raw_name: str, index: int) -> str:
 def run(args: Any, logger: logging.Logger) -> int:
     """Entry point for ``fluid import``.
 
-    Scans the target directory for a recognizable project, displays what
-    was found, asks for confirmation, then generates FLUID contracts into
-    the scanned directory.  CI/CD scaffolding is intentionally NOT part of
-    this flow — run ``fluid scaffold-ci`` separately if you want it.
+    If ``args.tool`` is set, dispatches to a foreign-tool importer
+    (``meltano|airbyte|dlt|singer``). Otherwise scans the target directory
+    for a recognizable dbt / Terraform / SQL project — the legacy flow.
     """
+    tool = getattr(args, "tool", None)
+    if tool:
+        from fluid_build.cli._import_workflow_handler import run_import_from_tool
+
+        return run_import_from_tool(args, logger, tool=tool, source=getattr(args, "source", None))
+    legacy_run = _run_legacy
+    return legacy_run(args, logger)
+
+
+def _run_legacy(args: Any, logger: logging.Logger) -> int:
+    """Legacy directory-scan import (dbt / Terraform / SQL)."""
     # Resolve the directory to scan — default is cwd.  We temporarily
     # chdir into it so any legacy helpers that still read ``Path.cwd()``
     # see the expected working directory, and we restore the original
