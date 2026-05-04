@@ -33,6 +33,7 @@ from pathlib import Path
 
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.console import cprint
+from fluid_build.observability.tracing import traced_stage as _traced_stage
 
 
 def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
@@ -97,6 +98,7 @@ def _run_from_generate(args: argparse.Namespace, logger: logging.Logger) -> int:
     return run(args, logger)
 
 
+@_traced_stage("generate_artifacts")
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     from fluid_build.forge.core.artifact_fanout import FanoutError, run_fanout
 

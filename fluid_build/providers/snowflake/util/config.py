@@ -265,8 +265,11 @@ def _resolve_with_adapter(
             source = "explicit_or_contract" if _is_present(cli_value) else "credential_resolver"
             return value, source
         return None, None
-    except Exception as exc:
-        logger.debug("Snowflake credential adapter unavailable for %s: %s", key, exc)
+    except Exception:
+        # Constant-only log: ``cli_value`` (the credential) is in scope
+        # via the closure. Don't include ``key`` or ``exc`` — keyring
+        # adapter errors can echo credential values.
+        logger.debug("Snowflake credential adapter unavailable")
         return None, None
 
 

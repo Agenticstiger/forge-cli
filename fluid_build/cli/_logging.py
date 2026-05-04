@@ -51,10 +51,28 @@ def _event(level: str, name: str, payload: Dict[str, Any]) -> str:
 
 
 def info(logger: logging.Logger, message: str, **payload: Any) -> None:
-    logger.info(_event("INFO", message, payload))
+    """Emit a structured INFO event to the log sink.
+
+    Routed at DEBUG level for the human-facing console handler so the
+    ``{"time":"...","message":"plan_success",...}`` JSON line stops
+    bleeding onto user terminals next to the user-facing
+    ``cprint("✅ Plan saved to: ...")`` line. Operators can surface
+    these structured events with ``--debug`` / ``FLUID_LOG_LEVEL=DEBUG``
+    or by adding a ``--log-file`` JSON sink.
+
+    UX hardening pass — the legacy ``logger.info`` emission was the
+    single biggest source of "what is this JSON line on my terminal?"
+    feedback from users.
+    """
+    logger.debug(_event("INFO", message, payload))
 
 
 def warn(logger: logging.Logger, message: str, **payload: Any) -> None:
+    """Emit a structured WARNING event — stays at WARNING level.
+
+    Warnings are user-relevant ("we didn't break, but you should know
+    about this") so they continue to surface on the console handler.
+    """
     logger.warning(_event("WARNING", message, payload))
 
 

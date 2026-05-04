@@ -185,7 +185,7 @@ def _export_odcs(contract_path: str, env, out: str, logger: logging.Logger) -> i
             "id": c.get("id"),
             "info": {
                 "title": c.get("name"),
-                "version": c.get("fluidVersion", "0.5.7"),
+                "version": c.get("fluidVersion", "0.7.3"),
                 "owner": c.get("metadata", {}).get("owner", {}),
             },
         }

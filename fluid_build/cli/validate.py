@@ -24,6 +24,7 @@ from typing import Any, Mapping, Optional, Tuple
 
 from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
+from fluid_build.observability.tracing import traced_stage as _traced_stage
 
 from ..policy.agent_policy import validate_agent_policy
 from ..policy.sovereignty import validate_sovereignty
@@ -64,7 +65,7 @@ Examples:
   fluid validate contract.fluid.yaml --verbose --show-schema
 
   # Validate against specific schema version
-  fluid validate contract.fluid.yaml --schema-version 0.5.7
+  fluid validate contract.fluid.yaml --schema-version 0.7.3
 
   # Strict validation (warnings as errors)
   fluid validate contract.fluid.yaml --strict
@@ -81,9 +82,9 @@ Examples:
     # Version control
     p.add_argument(
         "--schema-version",
-        help="Specific schema version to validate against (e.g., '0.4.0', '0.5.0')",
+        help="Specific schema version to validate against (e.g., '0.7.3').",
     )
-    p.add_argument("--min-version", help="Minimum acceptable schema version (e.g., '>=0.4.0')")
+    p.add_argument("--min-version", help="Minimum acceptable schema version (e.g., '>=0.7.0').")
     p.add_argument("--max-version", help="Maximum acceptable schema version (e.g., '<0.6.0')")
 
     # Validation options
@@ -158,10 +159,22 @@ Examples:
             "collect-all so one bad file doesn't hide issues in others."
         ),
     )
+    p.add_argument(
+        "--probe",
+        action="store_true",
+        default=False,
+        help=(
+            "NEW in v0.7.3: Extend validation with live external probes for "
+            "acquisition contracts (secret resolution, source connectivity, "
+            "image-signature presence, source schema fingerprint vs baseline). "
+            "Off by default; pure schema validation otherwise."
+        ),
+    )
 
     p.set_defaults(cmd=COMMAND, func=run)
 
 
+@_traced_stage("validate")
 def run(args, logger: logging.Logger) -> int:
     """Enhanced validation command with comprehensive schema management."""
     start_time = time.time()
@@ -190,16 +203,22 @@ def run(args, logger: logging.Logger) -> int:
         if args.list_versions:
             return _handle_list_versions(schema_manager, args, logger)
 
-        # Handle case where no contract is provided — try workspace discovery.
+        # Handle case where no contract is provided — try workspace discovery
+        # first (multi-product workspace), then fall back to a single
+        # ``contract.fluid.yaml`` in CWD (the common single-product case).
         if not args.contract:
             workspace_result = _try_workspace_validate(args, schema_manager, logger)
             if workspace_result is not None:
                 return workspace_result
-            raise CLIError(
-                1,
-                "contract_required",
-                {"message": "Contract file is required unless using --list-versions"},
-            )
+            # ``_try_workspace_validate`` sets ``args.contract`` when it
+            # finds a single contract in CWD; re-check here so the user
+            # doesn't have to type ``contract.fluid.yaml`` every time.
+            if not args.contract:
+                raise CLIError(
+                    1,
+                    "contract_required",
+                    {"message": "Contract file is required unless using --list-versions"},
+                )
 
         # Validate contract file existence
         contract_path = Path(args.contract)
@@ -420,7 +439,7 @@ def _find_latest_compatible_version(args, schema_manager: FluidSchemaManager) ->
     if versions:
         return versions[-1]
 
-    return SchemaVersion.parse("0.5.7")
+    return SchemaVersion.parse("0.7.3")
 
 
 def _find_previous_compatible_version(
@@ -473,6 +492,52 @@ def _validate_contract_for_version(
 
         if not agent_policy_valid:
             validation_result.is_valid = False
+
+    # Composition rules — fire on every consume[]. Resolves each
+    # upstream's productType by walking the workspace and rejects
+    # SDP-with-upstreams plus any other axiom violation. Hard errors
+    # only when both target_type AND upstream_type are known and the
+    # rule is violated. "Upstream productType unresolved" is logged
+    # under --verbose only — operators legitimately consume across
+    # workspaces / catalogs that aren't on the local filesystem, so
+    # promoting that case to a warning would trip ``--strict`` in CI
+    # for every 0.7.x reference-only contract.
+    #
+    # Gate by major.minor (0.7.x). The rule's output enum
+    # (SDP/ADP/CDP) was formalised on ``metadata.productType`` in
+    # v0.7.3, but the rule itself works on every 0.7.x contract via
+    # the ``metadata.layer`` fallback in ``product_types.py``. Future
+    # schema majors must opt in here explicitly so we don't silently
+    # apply the rule to contract surfaces that don't model it.
+    contract_fluid_version = str(contract.get("fluidVersion", "")).strip()
+    if contract_fluid_version.startswith("0.7."):
+        try:
+            from pathlib import Path as _Path
+
+            from fluid_build.forge.product_types import (
+                validate_composition_for_contract,
+            )
+
+            contract_path = getattr(args, "contract", None)
+            composition_violations = validate_composition_for_contract(
+                contract,
+                contract_path=_Path(contract_path) if contract_path else None,
+            )
+            any_hard = False
+            for v in composition_violations:
+                is_unknown = v.upstream_type is None
+                msg = f"composition rule: {v.reason} (upstream={v.upstream_id!r})"
+                if is_unknown:
+                    if args.verbose:
+                        info(logger, msg)
+                else:
+                    validation_result.add_error(msg)
+                    any_hard = True
+            if any_hard:
+                validation_result.is_valid = False
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"Composition rule check skipped: {exc}")
 
     return validation_result
 
@@ -692,13 +757,13 @@ def run_on_contract_dict(
     """Validate an already-loaded FLUID contract and emit the native output.
 
     **The schema version is auto-detected from the contract's own
-    ``fluidVersion`` field.** A 0.5.7 contract is validated against the
-    bundled 0.5.7 schema, a 0.7.1 contract against 0.7.1, a 0.7.2 contract
-    against 0.7.2, and so on. Callers that want to force a specific
-    validation target should construct a ``FluidSchemaManager`` and call
-    ``validate_contract(contract, schema_version=...)`` directly — but the
-    default here is backward-compatible auto-detection, which is what
-    ``fluid dmm publish`` and every other CLI embedding needs.
+    ``fluidVersion`` field.** A 0.7.1 contract validates against the
+    bundled 0.7.1 schema, a 0.7.2 contract against 0.7.2, a 0.7.3
+    contract against 0.7.3 — whichever bundled v0.7.x schema matches.
+    Callers that want to force a specific validation target should
+    construct a ``FluidSchemaManager`` and call
+    ``validate_contract(contract, schema_version=...)`` directly.
+    Pre-0.7 contracts (0.4.0, 0.5.x) are no longer supported.
 
     This is the one-call convenience wrapper for embedding schema validation
     into other CLI commands (publish, apply, …). It:

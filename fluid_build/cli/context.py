@@ -43,22 +43,6 @@ def register(subparsers: argparse._SubParsersAction):
     p.set_defaults(cmd=COMMAND, func=run)
 
 
-def register_context_alias(subparsers: argparse._SubParsersAction):
-    """Register hidden 'context' alias for backward compatibility."""
-    import argparse as _argparse
-
-    p = subparsers.add_parser("context", help=_argparse.SUPPRESS)
-    # Same friendly-fallback pattern as the canonical ``fluid config``
-    # registration above.
-    sp = p.add_subparsers(dest="verb", required=False)
-    sp.add_parser("list", help="Show current context")
-    g = sp.add_parser("set", help="Set a key")
-    g.add_argument("key", choices=["provider", "project", "region"], help="Key")
-    g.add_argument("value", help="Value")
-    sp.add_parser("get", help="Get a key").add_argument("key")
-    p.set_defaults(cmd="context", func=run)
-
-
 def _read():
     try:
         with open(CTX_PATH, encoding="utf-8") as f:

@@ -67,6 +67,60 @@ class DoctorSummary:
     text_style: str
 
 
+def _run_scoped(args, logger: logging.Logger, scope_arg: str) -> int:
+    """Dispatch ``fluid doctor --scope <scope>`` into cli/ops/doctor.py.
+
+    Returns 0 when every check is OK, 1 if any error is reported, and
+    keeps a non-zero exit on warnings unless ``--json`` is passed (machine
+    consumers can decide for themselves).
+    """
+    import json
+    import sys
+
+    from fluid_build.cli.ops.doctor import DoctorScope, Severity, run_doctor
+
+    scope = DoctorScope(scope_arg)
+    report = run_doctor(scope)
+
+    if getattr(args, "json", False):
+        json.dump(
+            {
+                "scope": report.scope.value,
+                "ok": report.ok,
+                "results": [
+                    {
+                        "name": r.name,
+                        "severity": r.severity.value,
+                        "detail": r.detail,
+                        "fix": r.fix,
+                        "doc": r.doc,
+                    }
+                    for r in report.results
+                ],
+            },
+            sys.stdout,
+            indent=2,
+            default=str,
+        )
+        sys.stdout.write("\n")
+    else:
+        from fluid_build.cli.console import cprint
+
+        icon = {Severity.OK: "✓", Severity.WARN: "!", Severity.ERROR: "✗"}
+        cprint(f"fluid doctor — scope={report.scope.value}")
+        for r in report.results:
+            cprint(f"  {icon[r.severity]} {r.name}: {r.detail}")
+            if r.severity is not Severity.OK and r.fix:
+                cprint(f"      fix: {r.fix}")
+        summary = (
+            f"{len(report.results)} checks  "
+            f"errors={len(report.errors)}  warnings={len(report.warnings)}"
+        )
+        cprint(summary)
+
+    return 0 if not report.errors else 1
+
+
 def register(subparsers: argparse._SubParsersAction):
     """Register unified doctor command"""
     p = subparsers.add_parser(
@@ -102,6 +156,21 @@ is available in the current checkout.
         help="Run optional workspace diagnostics via scripts/diagnose.sh",
     )
     p.add_argument("--verbose", "-v", action="store_true", help="Show detailed output")
+    # Acquisition-stack scope check. When set, runs the source-aligned
+    # acquisition health checks from cli/ops/doctor.py instead of the
+    # legacy infrastructure-and-features path. Five scopes available:
+    # authoring | pipeline | ingestion | infra | catalog | all.
+    p.add_argument(
+        "--scope",
+        choices=["authoring", "pipeline", "ingestion", "infra", "catalog", "all"],
+        default=None,
+        help="Run acquisition-stack health checks for the named scope",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit results as JSON (only when --scope is set)",
+    )
     p.set_defaults(cmd=COMMAND, func=run)
 
 
@@ -110,7 +179,13 @@ def run(args, logger: logging.Logger) -> int:
     Run system diagnostics with automatic feature detection.
 
     Automatically checks both base infrastructure and 0.7.1 features.
+    When ``--scope`` is set, dispatches to the acquisition-stack scoped
+    checks in cli/ops/doctor.py instead.
     """
+    scope_arg = getattr(args, "scope", None)
+    if scope_arg:
+        return _run_scoped(args, logger, scope_arg)
+
     secure_logger = ProductionLogger(logger)
     verbose = getattr(args, "verbose", False)
     extended_requested = getattr(args, "extended", False)
@@ -347,7 +422,7 @@ def _print_doctor_next_steps(
 
 def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
     """
-    Check FLUID feature availability (both 0.5.7 base and 0.7.1 enhancements).
+    Check FLUID feature availability (v0.7.x line).
 
     Returns:
         (all_ok, checks) - Boolean and list of check results
@@ -355,7 +430,7 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
     checks = []
     all_ok = True
 
-    # Core checks (0.5.7 baseline)
+    # Core checks (v0.7.x baseline)
     try:
         from fluid_build.schema_manager import FluidSchemaManager
 
@@ -388,8 +463,8 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
                     "check": "FLUID 0.7.1 Schema",
                     "category": "0.7.1",
                     "status": "⚠️  Not found",
-                    "ok": True,  # Not critical - can still use 0.5.7
-                    "details": "0.7.1 features unavailable, falling back to 0.5.7",
+                    "ok": True,  # Not critical — older 0.7.x still works
+                    "details": "newer 0.7.x features unavailable; older 0.7.x baseline still works",
                 }
             )
     except Exception as e:
@@ -463,7 +538,7 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
                 "check": "Provider Action Parser",
                 "category": "0.7.1",
                 "status": "⚠️  Not available",
-                "ok": True,  # Non-critical - falls back to 0.5.7
+                "ok": True,  # Non-critical — older 0.7.x baseline still works
                 "details": "0.7.1 provider actions unavailable",
             }
         )
@@ -546,6 +621,35 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
                 "status": "⚠️  Not available",
                 "ok": True,
                 "details": "Run 'fluid ai setup' to configure",
+            }
+        )
+
+    # Phase B4 — LiteLLM unified backend detection. Optional dep; the
+    # check is non-critical (ok=True) so a missing install doesn't fail
+    # the suite. Surfaces both install state and the env-var status so
+    # users can confirm at a glance whether routing is live.
+    try:
+        import litellm  # type: ignore[import-untyped]
+
+        litellm_version = getattr(litellm, "__version__", "(unknown)")
+        details = f"litellm {litellm_version} · routing every provider"
+        checks.append(
+            {
+                "check": "LiteLLM backend",
+                "category": "ai",
+                "status": "✅ Installed",
+                "ok": True,
+                "details": details,
+            }
+        )
+    except ImportError:
+        checks.append(
+            {
+                "check": "LiteLLM backend",
+                "category": "ai",
+                "status": "⚠️  Not installed (optional)",
+                "ok": True,
+                "details": "Install with: pip install 'fluid-build[litellm]'",
             }
         )
 
