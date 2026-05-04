@@ -123,6 +123,10 @@ class _ModelUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     calls: int = 0
+    # Phase A3: when the caller passed ``usd_override`` (litellm's
+    # accurate per-call cost), accumulate it here. ``None`` means
+    # "no override seen yet — fall back to MODEL_PRICES_USD".
+    usd_override: Optional[float] = None
 
 
 @dataclass
@@ -232,6 +236,39 @@ class AgentCostRow:
     calls: int
 
 
+@dataclass
+class ProductCostRow:
+    """One row in the per-product breakdown.
+
+    ``product_id`` matches the ``contract.id`` of the product being
+    forged or composed. When the caller doesn't supply a product_id
+    (forge runs that haven't yet resolved one), the row is keyed by
+    the empty string and rendered as the "unattributed" bucket.
+
+    Used by the per-product cost ceiling (``FLUID_COST_LIMIT_USD_PER_PRODUCT``)
+    so a multi-product invocation (e.g. ``--from-product-list``) can
+    fail loud as soon as ANY single product crosses the budget,
+    without waiting for the run total to do so.
+    """
+
+    product_id: str
+    input_tokens: int
+    output_tokens: int
+    calls: int
+    usd: Optional[float]
+
+
+@dataclass
+class _ProductUsage:
+    """Internal per-product accumulator (writer-side state)."""
+
+    product_id: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    calls: int = 0
+    usd_override: Optional[float] = None
+
+
 class RunCostTracker:
     """Process-wide accumulator for staged forge LLM usage.
 
@@ -245,9 +282,16 @@ class RunCostTracker:
         self._lock = threading.Lock()
         self._counters: Dict[Tuple[str, str], _ModelUsage] = {}
         self._per_agent: Dict[Tuple[str, str], _AgentUsage] = {}
+        self._per_product: Dict[str, _ProductUsage] = {}
         self._missing_usage_calls: int = 0
         self._variant_lint: Dict[str, int] = {}
         self._catalog_fetch_ms: Dict[str, int] = {}
+        # Stack of active product_ids for nested forge runs (e.g. an
+        # ADP composition pulling from an SDP). The top of the stack
+        # is the "current" product whose budget gate applies; the
+        # cost-attribution path reads it without callers having to
+        # pass product_id on every record_call.
+        self._product_stack: List[str] = []
 
     def record_call(
         self,
@@ -258,6 +302,8 @@ class RunCostTracker:
         output_tokens: int,
         stage: str = "",
         agent_class: str = "",
+        usd_override: Optional[float] = None,
+        product_id: str = "",
     ) -> None:
         """Add one provider call's tokens to the running counters.
 
@@ -272,6 +318,15 @@ class RunCostTracker:
         working unchanged (we can't make the kwargs required
         without a deprecation cycle); they also signal "unattributed"
         in the per-agent breakdown.
+
+        ``usd_override`` (Phase A3): when supplied (typically from
+        ``litellm.completion_cost``), the tracker accumulates the
+        litellm-derived USD directly instead of computing from the
+        embedded ``MODEL_PRICES_USD`` table. This keeps cost reporting
+        accurate for models the table doesn't know (Bedrock, Vertex,
+        Groq, …) without forcing every native provider call to supply
+        one. Backward-compatible: every existing caller passes ``None``
+        by omission.
         """
         in_tok = int(input_tokens or 0)
         out_tok = int(output_tokens or 0)
@@ -284,6 +339,11 @@ class RunCostTracker:
             entry.input_tokens += in_tok
             entry.output_tokens += out_tok
             entry.calls += 1
+            if usd_override is not None:
+                try:
+                    entry.usd_override = (entry.usd_override or 0.0) + float(usd_override)
+                except (TypeError, ValueError):
+                    pass
             # Ollama is legitimately $0 even with full token counts,
             # so a 0/0 call there is not "missing usage" — it's the
             # local-compute baseline. Only flag paid providers.
@@ -302,6 +362,28 @@ class RunCostTracker:
             agent_entry.input_tokens += in_tok
             agent_entry.output_tokens += out_tok
             agent_entry.calls += 1
+            # Per-product attribution — credit the call to the
+            # current product on the product stack (set via
+            # ``push_product`` at forge entry, popped at exit) or
+            # the explicit ``product_id`` kwarg if supplied. Empty
+            # string → unattributed bucket.
+            effective_product_id = product_id or (
+                self._product_stack[-1] if self._product_stack else ""
+            )
+            product_entry = self._per_product.get(effective_product_id)
+            if product_entry is None:
+                product_entry = _ProductUsage(product_id=effective_product_id)
+                self._per_product[effective_product_id] = product_entry
+            product_entry.input_tokens += in_tok
+            product_entry.output_tokens += out_tok
+            product_entry.calls += 1
+            if usd_override is not None:
+                try:
+                    product_entry.usd_override = (product_entry.usd_override or 0.0) + float(
+                        usd_override
+                    )
+                except (TypeError, ValueError):
+                    pass
         # Emit the event AFTER mutating internal state so a
         # subscriber that calls ``breakdown()`` from the handler
         # sees the updated numbers.
@@ -415,9 +497,61 @@ class RunCostTracker:
         with self._lock:
             self._counters.clear()
             self._per_agent.clear()
+            self._per_product.clear()
+            self._product_stack.clear()
             self._missing_usage_calls = 0
             self._variant_lint.clear()
             self._catalog_fetch_ms.clear()
+
+    # ── Per-product attribution surface ──────────────────────────────
+
+    def push_product(self, product_id: str) -> None:
+        """Push ``product_id`` as the current attribution scope.
+
+        Subsequent ``record_call`` invocations (without an explicit
+        ``product_id`` kwarg) credit cost to this product. The stack
+        supports nested forge runs (e.g. an ADP composition that
+        pulls from an SDP); ``pop_product`` reverts to the previous
+        scope.
+        """
+        if not product_id:
+            return
+        with self._lock:
+            self._product_stack.append(product_id)
+
+    def pop_product(self) -> Optional[str]:
+        """Pop the most-recently pushed product_id. Returns the popped
+        id, or ``None`` if the stack was empty (defensive: a missing
+        ``push_product`` shouldn't crash the run).
+        """
+        with self._lock:
+            if not self._product_stack:
+                return None
+            return self._product_stack.pop()
+
+    def current_product(self) -> Optional[str]:
+        """Peek the top of the product stack without popping."""
+        with self._lock:
+            return self._product_stack[-1] if self._product_stack else None
+
+    def per_product_usd(self, product_id: str) -> Optional[float]:
+        """Return the running USD cost attributed to ``product_id``.
+
+        Returns ``None`` when the product has rows with unknown price
+        (so callers can distinguish "$0" from "unknown spend so far").
+        """
+        with self._lock:
+            entry = self._per_product.get(product_id)
+        if entry is None:
+            return 0.0
+        if entry.usd_override is not None:
+            return round(float(entry.usd_override), 6)
+        # Fallback: re-derive USD from counters by walking model rows.
+        # Conservative — when we can't recover a per-model split for
+        # this product (we don't track that today), return None so the
+        # ceiling check fails-open rather than over- or under-billing.
+        # The ``usd_override`` path covers the common case (litellm).
+        return None
 
     def breakdown(self) -> CostBreakdown:
         """Materialise the current state as a :class:`CostBreakdown`."""
@@ -434,7 +568,16 @@ class RunCostTracker:
         out_total = 0
         calls_total = 0
         for entry in entries:
-            usd = _price_for(entry.provider, entry.model, entry.input_tokens, entry.output_tokens)
+            # Phase A3: prefer litellm's ``usd_override`` when present —
+            # it's an authoritative per-call price catalog kept in sync
+            # with provider pricing. Falls through to the embedded
+            # ``MODEL_PRICES_USD`` table for the legacy native path.
+            if entry.usd_override is not None:
+                usd: Optional[float] = round(float(entry.usd_override), 6)
+            else:
+                usd = _price_for(
+                    entry.provider, entry.model, entry.input_tokens, entry.output_tokens
+                )
             if usd is None:
                 any_unknown = True
                 if entry.model not in unknown:
@@ -600,7 +743,7 @@ class CostLimitExceeded(RuntimeError):
 
 
 def _resolve_cost_limit_usd() -> Optional[float]:
-    """Read the cost ceiling from env or unified config.
+    """Read the per-RUN cost ceiling from env or unified config.
 
     Precedence:
 
@@ -635,18 +778,71 @@ def _resolve_cost_limit_usd() -> Optional[float]:
     return None
 
 
+def _resolve_cost_limit_usd_per_product() -> Optional[float]:
+    """Read the per-PRODUCT cost ceiling from env or unified config.
+
+    Distinct from the per-run ceiling: when an invocation forges
+    multiple products in sequence (``--from-product-list``,
+    workspace-wide build), this caps the spend per individual
+    product. The per-run ceiling still caps the aggregate.
+
+    Precedence:
+
+    1. ``$FLUID_COST_LIMIT_USD_PER_PRODUCT`` (operator override).
+    2. ``UnifiedConfig.behavior.cost_limit_usd_per_product``.
+    3. ``None`` — no per-product ceiling (per-run still applies).
+
+    Best-effort fallback to ``None`` on config-read errors.
+    """
+    env_value = os.environ.get("FLUID_COST_LIMIT_USD_PER_PRODUCT")
+    if env_value:
+        try:
+            limit = float(env_value)
+            return limit if limit > 0 else None
+        except (TypeError, ValueError):
+            return None
+    try:
+        from fluid_build.copilot.unified_config import load_unified_config
+
+        cfg = load_unified_config()
+        if cfg is not None:
+            behavior = getattr(cfg, "behavior", None)
+            if behavior is not None:
+                limit = getattr(behavior, "cost_limit_usd_per_product", None)
+                if limit is not None and float(limit) > 0:
+                    return float(limit)
+    except Exception:  # pragma: no cover — defensive
+        pass
+    return None
+
+
 def check_cost_ceiling() -> None:
-    """Inspect the run tracker's running total; raise
-    :class:`CostLimitExceeded` if it exceeds the configured limit.
+    """Inspect the run tracker's running totals; raise
+    :class:`CostLimitExceeded` if either the per-run or the
+    per-product ceiling has been exceeded.
 
     Called by ``BaseStageAgent._call_once`` AFTER each
-    ``record_call`` so the limit is checked at every LLM-cost
+    ``record_call`` so both ceilings are checked at every LLM-cost
     increment. A raised exception immediately aborts the forge —
     by design: an operator who set a $5 ceiling wants the run to
     stop, not the run to continue burning past the limit.
 
-    No-op when no ceiling is configured (the common case).
+    Order: per-product ceiling fires first when a product is on
+    the stack and its running spend exceeds the per-product cap;
+    per-run ceiling fires after when the aggregate exceeds the
+    per-run cap. No-op when neither ceiling is configured (the
+    common case).
     """
+    # Per-product check (fires first when applicable).
+    per_product_limit = _resolve_cost_limit_usd_per_product()
+    if per_product_limit is not None:
+        current = _RUN_TRACKER.current_product()
+        if current:
+            running = _RUN_TRACKER.per_product_usd(current)
+            if running is not None and running > per_product_limit:
+                raise CostLimitExceeded(running_usd=running, limit_usd=per_product_limit)
+
+    # Per-run check (the aggregate cap).
     limit = _resolve_cost_limit_usd()
     if limit is None:
         return
@@ -661,6 +857,47 @@ def check_cost_ceiling() -> None:
         raise CostLimitExceeded(running_usd=running, limit_usd=limit)
 
 
+def predict_call_cost(
+    *,
+    provider: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> Tuple[bool, float, Optional[float]]:
+    """Phase 3.6 — pre-flight per-agent cost-budget check.
+
+    Projects what ``RunCostTracker`` will look like after one more
+    call of size ``(input_tokens, output_tokens)`` against
+    ``(provider, model)`` and tells the caller whether the projection
+    would exceed the configured ceiling.
+
+    Returns ``(would_exceed, projected_total_usd, limit_usd)``:
+
+    * ``would_exceed`` — True only when a limit is configured AND the
+      projected total exceeds it.
+    * ``projected_total_usd`` — running total + estimated call cost.
+    * ``limit_usd`` — the configured ceiling, or ``None`` when no
+      ceiling is set (in which case ``would_exceed`` is always False).
+
+    Used by ``BaseStageAgent._call_once`` BEFORE the LLM call fires
+    so a runaway agent that would push past the ceiling is aborted
+    cleanly, not after the spend has already happened.
+    """
+    limit = _resolve_cost_limit_usd()
+    breakdown = _RUN_TRACKER.breakdown()
+    running = breakdown.total_usd or 0.0
+    # If we can't price the planned call, honour the post-hoc
+    # check_cost_ceiling() path: don't pre-flight-block on unknown
+    # cost.
+    estimated = _price_for(provider, model, int(input_tokens), int(output_tokens))
+    if estimated is None:
+        estimated = 0.0
+    projected = float(running) + float(estimated)
+    if limit is None:
+        return False, projected, None
+    return projected > limit, projected, limit
+
+
 # ---------------------------------------------------------------------
 # Price lookup
 # ---------------------------------------------------------------------
@@ -669,16 +906,25 @@ def check_cost_ceiling() -> None:
 def _price_for(provider: str, model: str, input_tokens: int, output_tokens: int) -> Optional[float]:
     """Look up the USD cost for one (provider, model, tokens) triple.
 
-    Provider-name match first (catches Ollama where every model is
-    ``$0``); then exact model id; returns ``None`` when neither
-    matches so the caller can surface a "price unknown" indicator.
+    Lookup order (most specific wins):
 
-    Lookup order for per-model prices (most specific wins):
-
-    1. Per-org / per-user override at ``~/.fluid/prices.json`` —
+    1. Provider name match — Ollama is locally served, always $0.
+    2. Per-org / per-user override at ``~/.fluid/prices.json`` —
        lets enterprise customers patch in their negotiated rates
        (or local volume discounts) without forking forge-cli.
-    2. Embedded :data:`MODEL_PRICES_USD` table.
+    3. ``litellm.cost_per_token`` — **the canonical price source.**
+       litellm carries an actively-maintained pricing catalog covering
+       every supported provider / model and tracks upstream price
+       changes. Calling forge-cli should always reflect the latest
+       upstream pricing without us shipping a release.
+    4. Embedded :data:`MODEL_PRICES_USD` table — **offline fallback
+       only.** Used when litellm isn't installed or doesn't know the
+       model. New models should NOT be added here unless litellm has
+       a documented catalog gap.
+
+    Returns ``None`` when none of the sources can price the triple
+    so the caller can surface a "price unknown" indicator instead of
+    silently fabricating $0.
 
     The override file is re-read from disk on every call so a price
     correction takes effect on the next forge run, no restart
@@ -686,11 +932,42 @@ def _price_for(provider: str, model: str, input_tokens: int, output_tokens: int)
     """
     if provider.lower() == "ollama":
         return 0.0
-    pricing = _load_price_overrides().get(model) or MODEL_PRICES_USD.get(model)
-    if pricing is None:
-        return None
-    in_price, out_price = pricing
-    return (input_tokens * in_price + output_tokens * out_price) / 1_000_000
+
+    # 1. Operator overrides win — enterprise rates / volume discounts.
+    overrides = _load_price_overrides().get(model)
+    if overrides is not None:
+        in_price, out_price = overrides
+        return (input_tokens * in_price + output_tokens * out_price) / 1_000_000
+
+    # 2. litellm catalog — canonical, kept current upstream.
+    try:
+        import litellm  # type: ignore[import-untyped]
+
+        for candidate in (model, f"{provider.lower()}/{model}"):
+            try:
+                in_cost, out_cost = litellm.cost_per_token(
+                    model=candidate,
+                    prompt_tokens=int(input_tokens or 0),
+                    completion_tokens=int(output_tokens or 0),
+                )
+                total = float(in_cost or 0.0) + float(out_cost or 0.0)
+                # Accept zero-cost only when there really were zero
+                # tokens — otherwise treat it as a catalog miss and
+                # fall through to the next candidate / source.
+                if total > 0 or (not input_tokens and not output_tokens):
+                    return total
+            except Exception:  # noqa: BLE001
+                continue
+    except ImportError:
+        pass
+
+    # 3. Embedded fallback — offline runs / litellm catalog misses.
+    pricing = MODEL_PRICES_USD.get(model)
+    if pricing is not None:
+        in_price, out_price = pricing
+        return (input_tokens * in_price + output_tokens * out_price) / 1_000_000
+
+    return None
 
 
 # ---------------------------------------------------------------------
