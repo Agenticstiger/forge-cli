@@ -114,7 +114,7 @@ class ClaimProvenance:
     """Where a single claim in the output came from.
 
     ``kind`` says what category of source. ``ref`` is a free-form
-    locator the source uses (e.g. ``"snowflake://BIZ_LAB.SEEDED.ORDERS#owner_team_tag"``
+    locator the source uses (e.g. ``"snowflake://DEMO_DB.SEEDED.ORDERS#owner_team_tag"``
     for catalog signal, or ``"intent.yaml:metadata.domain"`` for intent
     fields). ``snippet`` is the actual source text — kept short
     (200 chars) so the audit trail doesn't bloat.

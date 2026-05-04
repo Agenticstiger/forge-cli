@@ -16,7 +16,7 @@
 FLUID Schema-Driven Policy Engine
 
 Policy engine that derives all governance rules directly from FLUID contract schema declarations.
-No external policy files needed - everything is declared in the contract following the FLUID 0.5.7 schema.
+No external policy files needed - everything is declared in the contract following the FLUID 0.7.x schema.
 
 Enforces:
 - Sensitivity & Privacy policies (PII, PHI, encryption, masking)
@@ -144,7 +144,7 @@ class SchemaBasedPolicyEngine:
     Policy engine that enforces governance rules declared in FLUID contracts.
 
     All policies are derived from the contract schema - no external configuration needed.
-    Follows FLUID 0.5.7 schema specification.
+    Follows FLUID 0.7.x schema specification.
     """
 
     # Sensitive data types that require protection

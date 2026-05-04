@@ -403,26 +403,44 @@ class TestCoordinatorRepair:
         assert result.physical.transform_plan.additional_files["iter"] == "2"
 
     # -------------------------------------------------------------------
-    # Logical failure: out of physical-repair scope → NO re-run.
+    # Logical failure: routes to _maybe_repair_logical (Phase 3.7).
     # -------------------------------------------------------------------
-    def test_logical_failure_is_not_repaired(self, stub_pipeline, monkeypatch) -> None:
-        """The ``osi`` prefix is diagnosed as the logical stage. v1.0
-        physical-scope repair deliberately excludes logical — the
-        coordinator surfaces the failing report to the caller as-is."""
+    def test_logical_failure_routes_to_logical_repair_loop(
+        self, stub_pipeline, monkeypatch
+    ) -> None:
+        """Phase 3.7 — logical-scope failures (``osi`` prefix and
+        friends) now route to ``_maybe_repair_logical`` instead of
+        being silently dropped.
+
+        Physical agents (builder / readme / transformation) still
+        run exactly once each — the repair loop targets the logical
+        stage, not the physicals. The validator runs once for the
+        original assessment plus one per repair attempt
+        (``_MAX_REPAIR_ATTEMPTS=1``) so the bounded count is 2.
+        """
+        from fluid_build.copilot.agents.coordinator import _MAX_REPAIR_ATTEMPTS
+
         monkeypatch.delenv("FLUID_COPILOT_PARALLEL_PHYSICAL", raising=False)
-        stub_pipeline["reports"].append(_failing_report("osi"))
+        # Push reports for: original validation + N repair-loop validations.
+        stub_pipeline["reports"].extend([_failing_report("osi")] * (1 + _MAX_REPAIR_ATTEMPTS))
 
         session = _session()
         coordinator = StageCoordinator()
         result = coordinator.from_intent(
             session, intent=_build_intent(), technique="dimensional", include_physical=True
         )
-        # Every physical agent ran exactly once — no repair attempted.
+        # Physical agents still run exactly once each — repair targeted
+        # the logical stage, not the physicals.
         assert stub_pipeline["builder"].calls == 1
         assert stub_pipeline["readme"].calls == 1
         assert stub_pipeline["transformation"].calls == 1
-        assert stub_pipeline["validator"].calls == 1
-        # Caller sees the original failing report.
+        # Validator: 1 original + N repair-loop attempts.
+        assert stub_pipeline["validator"].calls == 1 + _MAX_REPAIR_ATTEMPTS
+        # The MVP repair path doesn't actually re-run the LogicalAgent
+        # in v1.0 (no generic ``run()`` exists yet) so the final
+        # validation still flags the original logical-scope failure;
+        # the operator gets the failing report PLUS scratchpad
+        # feedback they can act on.
         assert result.physical.validation.passes_schema is False
         assert result.physical.validation.issues[0].field == "osi"
 

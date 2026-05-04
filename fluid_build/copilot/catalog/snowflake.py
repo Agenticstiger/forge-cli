@@ -498,7 +498,7 @@ class SnowflakeCatalogAdapter(CatalogAdapter):
             raise CatalogConfigError(
                 message=f"Snowflake FQN must be DATABASE.SCHEMA.TABLE; got {fqn!r}",
                 suggestions=[
-                    "Provide all three parts: BIZ_LAB.SEEDED.ORDERS.",
+                    "Provide all three parts: DEMO_DB.SEEDED.ORDERS.",
                 ],
             )
         return parts[0], parts[1], parts[2]

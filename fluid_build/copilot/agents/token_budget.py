@@ -39,6 +39,7 @@ infrequently and the catalog is overrideable per-call via
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, Optional
 
 from fluid_build.copilot.agents.errors import ContextOverflowError
@@ -135,10 +136,13 @@ DEFAULT_OUTPUT_RESERVATION = 4_096
 def get_context_window(model: str) -> int:
     """Return the known context window for ``model``.
 
-    Looks up by exact match first, then by longest matching prefix.
-    Falls back to ``DEFAULT_CONTEXT_WINDOWS["_default"]`` (32K) — small
-    enough to refuse runaway prompts on unknown models, large enough
-    that legitimate stage prompts fit.
+    Embedded ``DEFAULT_CONTEXT_WINDOWS`` is canonical; we prefer
+    longer-prefix matches before delegating to litellm's
+    ``model_cost`` catalog (whose ``max_input_tokens`` is the same
+    figure but only populated for the providers it knows). litellm's
+    plain ``get_max_tokens`` is the wrong API here — it returns the
+    *output* limit, not the input context window. Last-resort fallback
+    is the 32K conservative default.
     """
     if model in DEFAULT_CONTEXT_WINDOWS:
         return DEFAULT_CONTEXT_WINDOWS[model]
@@ -152,6 +156,20 @@ def get_context_window(model: str) -> int:
     for prefix in candidates:
         if model.startswith(prefix):
             return DEFAULT_CONTEXT_WINDOWS[prefix]
+    # Fall back to litellm's static catalog when our table doesn't
+    # know the model. Use ``model_cost[*]["max_input_tokens"]`` (the
+    # context window) — NOT ``get_max_tokens()`` which is the output
+    # cap.
+    try:
+        import litellm  # core dep
+
+        cost = getattr(litellm, "model_cost", None) or {}
+        entry = cost.get(model) or cost.get(f"openai/{model}")
+        max_input = entry.get("max_input_tokens") if isinstance(entry, dict) else None
+        if max_input and int(max_input) > 0:
+            return int(max_input)
+    except Exception:  # noqa: BLE001 — fall back to default
+        pass
     return DEFAULT_CONTEXT_WINDOWS["_default"]
 
 
@@ -173,20 +191,34 @@ def estimate_tokens(text: str) -> int:
 
 
 def count_tokens(text: str, *, provider: str = "", model: str = "") -> int:
-    """Count tokens in ``text`` using the char-based heuristic.
+    """Count tokens in ``text``.
 
-    Pure-Python, no external tokenizers. Provider/model arguments are
-    accepted for symmetry with the call sites but currently unused —
-    every supported provider uses a different tokenizer and shipping
-    each one (Rust-extension tiktoken for OpenAI, custom for Anthropic,
-    SentencePiece for Gemini) would bloat the CLI. The heuristic
-    over-estimates by ~10-20% which matches the desired fail-fast bias.
+    Uses ``litellm.token_counter`` for accurate, provider-specific
+    counts (tiktoken for OpenAI, Anthropic's tokenizer for Claude,
+    SentencePiece for Gemini). Falls back to a char-based heuristic
+    when litellm doesn't recognise the model — same fail-fast bias
+    as before so a too-big prompt still raises before the API call.
 
-    ``FLUID_TOKEN_COUNTER=chars`` is the only supported value today and
-    is honored implicitly (it's already the only path).
+    ``FLUID_TOKEN_COUNTER=chars`` forces the legacy heuristic path
+    (useful when test fixtures need stable counts).
     """
     if not text:
         return 0
+    if os.environ.get("FLUID_TOKEN_COUNTER", "").strip().lower() == "chars":
+        return estimate_tokens(text)
+    if provider and model:
+        try:
+            import litellm  # core dep
+
+            from fluid_build.cli.forge_copilot_llm_litellm import (
+                _LITELLM_PREFIX_BY_PROVIDER,
+            )
+
+            prefix = _LITELLM_PREFIX_BY_PROVIDER.get(provider.lower(), provider.lower())
+            qualified = model if "/" in (model or "") else f"{prefix}/{model}"
+            return int(litellm.token_counter(model=qualified, text=text))
+        except Exception:  # noqa: BLE001 — heuristic fallback
+            pass
     return estimate_tokens(text)
 
 

@@ -37,7 +37,6 @@ import contextvars
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from fluid_build.cli.forge_copilot_llm_providers import get_catalog_tier_model
@@ -52,7 +51,6 @@ from fluid_build.copilot.schemas.intent import BusinessIntent
 from fluid_build.copilot.schemas.stage_outputs import (
     LogicalDraft,
     PhysicalDraft,
-    ValidationReport,
 )
 from fluid_build.copilot.store.semantic_writer import write_semantic_record
 from fluid_build.forge_datamodel.from_ddl.parser import TableDefinition
@@ -60,119 +58,36 @@ from fluid_build.forge_datamodel.logical_canonicalizer import canonicalize_logic
 from fluid_build.observability.tracing import traced_span
 
 _log = logging.getLogger(__name__)
-
-# Env-var escape hatch: set to ``0`` / ``false`` / ``no`` to force the
-# physical stages to run sequentially (same order as v1.0). Default is
-# parallel — the wall-clock win is the whole point of M1.
-_PARALLEL_ENV_VAR = "FLUID_COPILOT_PARALLEL_PHYSICAL"
-_DISABLE_TOKENS = frozenset({"0", "false", "no", "off"})
-
-
-def _parallel_physical_enabled() -> bool:
-    raw = os.environ.get(_PARALLEL_ENV_VAR)
-    if raw is None:
-        return True
-    return raw.strip().lower() not in _DISABLE_TOKENS
-
-
-# ---------------------------------------------------------------------------
-# M3 — Targeted repair routing
-#
-# When the validator rejects a draft, the plan calls for retrying ONLY
-# the stage that produced the bad output, not the whole pipeline. The
-# routing is data-driven: ``ValidationFinding.field`` names the slice
-# of the output that's wrong, and the physical-scope slices map back
-# to the stage that wrote them. Logical-scope failures (``osi``,
-# ``dv2``, ``dimensional``) belong to ``LogicalAgent`` — but that stage
-# runs above ``_run_physical_stages`` in the flow, so we can *diagnose*
-# them here (useful for telemetry) and a v1.4+ pipeline-level repair
-# will act on them once LogicalAgent learns a "revise with feedback"
-# entry point. For v1.0 we repair builder and transformation; anything
-# else is surfaced to the caller as-is.
-#
-# Hard cap: one repair attempt per invocation. The re-run uses
-# ``session.no_cache=True`` so the LLM isn't served the same bad
-# output from the cache — at temperature 0 the second call still
-# usually matches the first, but even a small deviation can flip a
-# borderline schema error. More attempts would mostly burn budget.
-# ---------------------------------------------------------------------------
-
-_MAX_REPAIR_ATTEMPTS = 1
-
-# Physical-scope stages we can re-run locally from _run_physical_stages.
-# Logical and readme failures are in-scope for diagnosis (as an
-# observability signal) but out of scope for *automated* repair in
-# v1.0 — see the module-level comment above.
-_PHYSICAL_REPAIR_STAGES = frozenset({"builder", "transformation"})
+# StageCoordinator helpers — physically extracted to
+# ``copilot/agents/_coordinator_helpers.py``. Pure functions /
+# constants that don't depend on coordinator state. Re-exported
+# under their original ``_``-prefixed names so existing call sites
+# (``self._diagnose_failing_stage(...)`` etc.) keep resolving.
+from fluid_build.copilot.agents._coordinator_helpers import (  # noqa: F401
+    LOGICAL_REPAIR_STAGES as _LOGICAL_REPAIR_STAGES,
+)
+from fluid_build.copilot.agents._coordinator_helpers import (  # noqa: F401
+    MAX_REPAIR_ATTEMPTS as _MAX_REPAIR_ATTEMPTS,
+)
+from fluid_build.copilot.agents._coordinator_helpers import (  # noqa: F401
+    PHYSICAL_REPAIR_STAGES as _PHYSICAL_REPAIR_STAGES,
+)
+from fluid_build.copilot.agents._coordinator_helpers import (  # noqa: E402,F401
+    CoordinatorResult,
+)
+from fluid_build.copilot.agents._coordinator_helpers import (  # noqa: F401
+    diagnose_failing_stage as _diagnose_failing_stage,
+)
+from fluid_build.copilot.agents._coordinator_helpers import (  # noqa: F401
+    new_run_id as _new_run_id,
+)
+from fluid_build.copilot.agents._coordinator_helpers import (  # noqa: F401
+    parallel_physical_enabled as _parallel_physical_enabled,
+)
+from fluid_build.copilot.agents._coordinator_repair import _RepairLoopMixin
 
 
-def _diagnose_failing_stage(report: ValidationReport) -> Optional[str]:
-    """Map a failed validator report back to the stage responsible.
-
-    Returns one of ``"logical"`` / ``"builder"`` / ``"transformation"``
-    / ``"readme"`` when the error's ``field`` (or message) clearly
-    implicates that stage; returns ``None`` when the signal is too
-    noisy to route (we prefer "don't repair" over "repair the wrong
-    stage"). Pure function — no session, no I/O, trivially testable.
-
-    Field prefixes are matched case-sensitively because
-    :class:`ValidationFinding` field values come from first-party code
-    in :mod:`fluid_build.forge_datamodel.emit.validator`, which emits
-    a small fixed vocabulary. Messages are scanned as a secondary
-    signal only when ``field`` is absent.
-    """
-    if report.passes_schema:
-        return None
-
-    # First pass: structured ``field`` hints win, because the validator
-    # module chooses these deliberately.
-    for finding in report.issues:
-        if finding.severity != "error":
-            continue
-        field = (finding.field or "").strip()
-        if not field:
-            continue
-        # Logical-scope symbols: the LLM's draft itself is malformed.
-        if field == "osi" or field.startswith("osi."):
-            return "logical"
-        if field == "dv2" or field.startswith("dv2."):
-            return "logical"
-        if field == "dimensional" or field.startswith("dimensional."):
-            return "logical"
-        # Contract-scope symbols: the builder assembles contract/exposes.
-        if field == "exposes" or field.startswith("exposes"):
-            return "builder"
-        # Transform-scope symbols the validator may add in future versions.
-        if field.startswith("transform_plan") or field.startswith("builds"):
-            return "transformation"
-        if field.startswith("readme"):
-            return "readme"
-
-    # Second pass: fall back to message scanning for validators that
-    # didn't populate ``field`` (e.g., raw ``schema_manager`` errors
-    # lifted into findings without a field tag).
-    for finding in report.issues:
-        if finding.severity != "error":
-            continue
-        msg = (finding.message or "").lower()
-        if "transform" in msg or "build sql" in msg or "builds[" in msg:
-            return "transformation"
-        if "exposes" in msg or "contract" in msg:
-            return "builder"
-        if "osi" in msg or "semantic model" in msg:
-            return "logical"
-
-    return None
-
-
-@dataclass
-class CoordinatorResult:
-    logical: LogicalDraft
-    contract: dict
-    physical: Optional[PhysicalDraft] = None
-
-
-class StageCoordinator:
+class StageCoordinator(_RepairLoopMixin):
     """Coordinate staged data-model and physical planning flows."""
 
     def __init__(self) -> None:
@@ -217,67 +132,94 @@ class StageCoordinator:
         engine: str = "dbt",
         include_physical: bool = False,
     ) -> CoordinatorResult:
-        # Each sub-stage opens a nested OTEL span; no-op when OTEL is
-        # disabled (the CLI's ``traced_stage`` opens the parent span).
-        with traced_span(
-            "fluid.copilot.coordinator.from_tables",
-            {
-                "fluid.copilot.entry": "tables",
-                "fluid.copilot.technique": technique,
-                "fluid.copilot.engine": engine,
-                "fluid.copilot.table_count": len(tables),
-                "fluid.copilot.include_physical": include_physical,
-            },
-        ):
-            with traced_span("fluid.copilot.logical", {"fluid.copilot.agent": "logical"}):
-                logical_budget = self._stage_budget(session, stage="logical")
-                logical = self._run_logical_with_cooperation(
-                    session,
-                    agent_invoke=lambda: self.logical_agent.from_tables(
-                        session,
-                        name=name,
-                        tables=list(tables),
-                        technique=technique,
-                        source_type=source_type,
-                    ),
-                )
-                self._check_stage_budget(logical_budget)
-            logical = canonicalize_logical_draft(logical)
-            self._record_agent_event(session, stage="logical", agent=self.logical_agent)
-            self._run_logical_critic(session, logical=logical)
-            self._stamp_annotation_summary(session)
-            with traced_span(
-                "fluid.copilot.contract_forge",
-                {"fluid.copilot.agent": "contract_forge"},
+        # Phase 3.8 — outermost ``fluid.copilot.staged.invocation`` span
+        # ties every nested span (coordinator, logical, builder, ...)
+        # under one run_id so observability dashboards can group the
+        # full staged-forge lifecycle. No-op when OTEL is disabled.
+        run_id = getattr(session, "run_id", "") or _new_run_id()
+        # Per-product cost attribution — push the project name onto
+        # the cost tracker's product stack so every LLM call inside
+        # the run credits the right product. Pops in the ``finally``
+        # below so a mid-run exception still releases the slot.
+        from fluid_build.copilot.cost import get_run_tracker
+
+        _cost_tracker = get_run_tracker()
+        _cost_tracker.push_product(name)
+        try:
+            with (
+                traced_span(
+                    "fluid.copilot.staged.invocation",
+                    {
+                        "fluid.copilot.run_id": run_id,
+                        "fluid.copilot.entry": "tables",
+                        "fluid.copilot.technique": technique,
+                        "fluid.copilot.engine": engine,
+                        "fluid.copilot.include_physical": include_physical,
+                        "fluid.copilot.product_id": name,
+                    },
+                ),
+                traced_span(
+                    "fluid.copilot.coordinator.from_tables",
+                    {
+                        "fluid.copilot.entry": "tables",
+                        "fluid.copilot.technique": technique,
+                        "fluid.copilot.engine": engine,
+                        "fluid.copilot.table_count": len(tables),
+                        "fluid.copilot.include_physical": include_physical,
+                    },
+                ),
             ):
-                contract = self.contract_forge_agent.forge_contract(
-                    session, logical=logical, engine=engine
+                with traced_span("fluid.copilot.logical", {"fluid.copilot.agent": "logical"}):
+                    logical_budget = self._stage_budget(session, stage="logical")
+                    logical = self._run_logical_with_cooperation(
+                        session,
+                        agent_invoke=lambda: self.logical_agent.from_tables(
+                            session,
+                            name=name,
+                            tables=list(tables),
+                            technique=technique,
+                            source_type=source_type,
+                        ),
+                    )
+                    self._check_stage_budget(logical_budget)
+                logical = canonicalize_logical_draft(logical)
+                self._record_agent_event(session, stage="logical", agent=self.logical_agent)
+                self._run_logical_critic(session, logical=logical)
+                self._stamp_annotation_summary(session)
+                with traced_span(
+                    "fluid.copilot.contract_forge",
+                    {"fluid.copilot.agent": "contract_forge"},
+                ):
+                    contract = self.contract_forge_agent.forge_contract(
+                        session, logical=logical, engine=engine
+                    )
+                self._record_agent_event(
+                    session,
+                    stage="contract_forge",
+                    agent=self.contract_forge_agent,
                 )
-            self._record_agent_event(
-                session,
-                stage="contract_forge",
-                agent=self.contract_forge_agent,
-            )
-            physical = None
-            if include_physical:
-                physical = self._run_physical_stages(
-                    session, logical=logical, contract=contract, engine=engine
+                physical = None
+                if include_physical:
+                    physical = self._run_physical_stages(
+                        session, logical=logical, contract=contract, engine=engine
+                    )
+                # D7 — auto-write memory/semantic on successful forge (opt-in).
+                # Gated by FLUID_COPILOT_SEMANTIC_MEMORY; swallows errors so
+                # a broken store never poisons a successful forge result.
+                write_semantic_record(session.store, logical, source_type="tables")
+                # A2 — episodic memory writer. Records a "forge.success"
+                # event so future runs can resume / branch on prior
+                # outcomes. Best-effort: a store error MUST NOT poison
+                # a successful forge result.
+                self._record_forge_episode(
+                    session,
+                    outcome="success",
+                    source_type="tables",
+                    logical=logical,
                 )
-            # D7 — auto-write memory/semantic on successful forge (opt-in).
-            # Gated by FLUID_COPILOT_SEMANTIC_MEMORY; swallows errors so
-            # a broken store never poisons a successful forge result.
-            write_semantic_record(session.store, logical, source_type="tables")
-            # A2 — episodic memory writer. Records a "forge.success"
-            # event so future runs can resume / branch on prior
-            # outcomes. Best-effort: a store error MUST NOT poison
-            # a successful forge result.
-            self._record_forge_episode(
-                session,
-                outcome="success",
-                source_type="tables",
-                logical=logical,
-            )
-            return CoordinatorResult(logical=logical, contract=contract, physical=physical)
+                return CoordinatorResult(logical=logical, contract=contract, physical=physical)
+        finally:
+            _cost_tracker.pop_product()
 
     def from_intent(
         self,
@@ -288,59 +230,90 @@ class StageCoordinator:
         engine: str = "dbt",
         include_physical: bool = False,
     ) -> CoordinatorResult:
-        with traced_span(
-            "fluid.copilot.coordinator.from_intent",
-            {
-                "fluid.copilot.entry": "intent",
-                "fluid.copilot.technique": technique,
-                "fluid.copilot.engine": engine,
-                "fluid.copilot.include_physical": include_physical,
-            },
-        ):
-            with traced_span("fluid.copilot.logical", {"fluid.copilot.agent": "logical"}):
-                logical_budget = self._stage_budget(session, stage="logical")
-                logical = self._run_logical_with_cooperation(
-                    session,
-                    agent_invoke=lambda: self.logical_agent.from_intent(
-                        session,
-                        intent=intent,
-                        technique=technique,
-                    ),
-                )
-                self._check_stage_budget(logical_budget)
-            logical = canonicalize_logical_draft(logical)
-            self._record_agent_event(session, stage="logical", agent=self.logical_agent)
-            self._run_logical_critic(session, logical=logical)
-            self._stamp_annotation_summary(session)
-            with traced_span(
-                "fluid.copilot.contract_forge",
-                {"fluid.copilot.agent": "contract_forge"},
+        # Phase 3.8 — outermost ``fluid.copilot.staged.invocation`` span.
+        run_id = getattr(session, "run_id", "") or _new_run_id()
+        # Per-product cost attribution — derive product_id from the
+        # business intent (the entity name in the intent IS the
+        # product). Pops in the matching ``finally`` so a mid-run
+        # exception releases the slot.
+        from fluid_build.copilot.cost import get_run_tracker
+
+        _cost_tracker = get_run_tracker()
+        product_id = (
+            getattr(getattr(intent, "grain", None), "entity", None)
+            or getattr(intent, "name", None)
+            or "intent_product"
+        )
+        _cost_tracker.push_product(str(product_id))
+        try:
+            with (
+                traced_span(
+                    "fluid.copilot.staged.invocation",
+                    {
+                        "fluid.copilot.run_id": run_id,
+                        "fluid.copilot.entry": "intent",
+                        "fluid.copilot.technique": technique,
+                        "fluid.copilot.engine": engine,
+                        "fluid.copilot.include_physical": include_physical,
+                        "fluid.copilot.product_id": str(product_id),
+                    },
+                ),
+                traced_span(
+                    "fluid.copilot.coordinator.from_intent",
+                    {
+                        "fluid.copilot.entry": "intent",
+                        "fluid.copilot.technique": technique,
+                        "fluid.copilot.engine": engine,
+                        "fluid.copilot.include_physical": include_physical,
+                    },
+                ),
             ):
-                contract = self.contract_forge_agent.forge_contract(
-                    session, logical=logical, engine=engine
+                with traced_span("fluid.copilot.logical", {"fluid.copilot.agent": "logical"}):
+                    logical_budget = self._stage_budget(session, stage="logical")
+                    logical = self._run_logical_with_cooperation(
+                        session,
+                        agent_invoke=lambda: self.logical_agent.from_intent(
+                            session,
+                            intent=intent,
+                            technique=technique,
+                        ),
+                    )
+                    self._check_stage_budget(logical_budget)
+                logical = canonicalize_logical_draft(logical)
+                self._record_agent_event(session, stage="logical", agent=self.logical_agent)
+                self._run_logical_critic(session, logical=logical)
+                self._stamp_annotation_summary(session)
+                with traced_span(
+                    "fluid.copilot.contract_forge",
+                    {"fluid.copilot.agent": "contract_forge"},
+                ):
+                    contract = self.contract_forge_agent.forge_contract(
+                        session, logical=logical, engine=engine
+                    )
+                self._record_agent_event(
+                    session,
+                    stage="contract_forge",
+                    agent=self.contract_forge_agent,
                 )
-            self._record_agent_event(
-                session,
-                stage="contract_forge",
-                agent=self.contract_forge_agent,
-            )
-            physical = None
-            if include_physical:
-                physical = self._run_physical_stages(
-                    session, logical=logical, contract=contract, engine=engine
+                physical = None
+                if include_physical:
+                    physical = self._run_physical_stages(
+                        session, logical=logical, contract=contract, engine=engine
+                    )
+                # D7 — auto-write memory/semantic on successful forge (opt-in).
+                # See module-level comment in ``store.semantic_writer`` for
+                # the privacy / predictability rationale behind the opt-in.
+                write_semantic_record(session.store, logical, source_type="intent")
+                # A2 — episodic memory writer.
+                self._record_forge_episode(
+                    session,
+                    outcome="success",
+                    source_type="intent",
+                    logical=logical,
                 )
-            # D7 — auto-write memory/semantic on successful forge (opt-in).
-            # See module-level comment in ``store.semantic_writer`` for
-            # the privacy / predictability rationale behind the opt-in.
-            write_semantic_record(session.store, logical, source_type="intent")
-            # A2 — episodic memory writer.
-            self._record_forge_episode(
-                session,
-                outcome="success",
-                source_type="intent",
-                logical=logical,
-            )
-            return CoordinatorResult(logical=logical, contract=contract, physical=physical)
+                return CoordinatorResult(logical=logical, contract=contract, physical=physical)
+        finally:
+            _cost_tracker.pop_product()
 
     def from_catalog(
         self,
@@ -376,64 +349,88 @@ class StageCoordinator:
         of the catalog subpackage (catalog imports are lazy at the
         CLI / MCP-tool layer).
         """
-        with traced_span(
-            "fluid.copilot.coordinator.from_catalog",
-            {
-                "fluid.copilot.entry": "catalog",
-                "fluid.copilot.technique": technique,
-                "fluid.copilot.engine": engine,
-                "fluid.copilot.catalog_name": getattr(adapter, "name", "unknown"),
-                "fluid.copilot.include_physical": include_physical,
-            },
-        ):
-            with traced_span("fluid.copilot.logical", {"fluid.copilot.agent": "logical"}):
-                logical_budget = self._stage_budget(session, stage="logical")
-                logical = self._run_logical_with_cooperation(
-                    session,
-                    agent_invoke=lambda: self.logical_agent.from_catalog(
-                        session,
-                        name=name,
-                        adapter=adapter,
-                        scope=scope,
-                        technique=technique,
-                    ),
-                )
-                self._check_stage_budget(logical_budget)
-            logical = canonicalize_logical_draft(logical)
-            self._record_agent_event(session, stage="logical", agent=self.logical_agent)
-            self._run_logical_critic(session, logical=logical)
-            self._stamp_annotation_summary(session)
-            with traced_span(
-                "fluid.copilot.contract_forge",
-                {"fluid.copilot.agent": "contract_forge"},
+        # Phase 3.8 — outermost ``fluid.copilot.staged.invocation`` span.
+        run_id = getattr(session, "run_id", "") or _new_run_id()
+        # Per-product cost attribution — the catalog scope's name is
+        # the product being forged.
+        from fluid_build.copilot.cost import get_run_tracker
+
+        _cost_tracker = get_run_tracker()
+        _cost_tracker.push_product(name)
+        try:
+            with (
+                traced_span(
+                    "fluid.copilot.staged.invocation",
+                    {
+                        "fluid.copilot.run_id": run_id,
+                        "fluid.copilot.entry": "catalog",
+                        "fluid.copilot.technique": technique,
+                        "fluid.copilot.engine": engine,
+                        "fluid.copilot.include_physical": include_physical,
+                        "fluid.copilot.product_id": name,
+                    },
+                ),
+                traced_span(
+                    "fluid.copilot.coordinator.from_catalog",
+                    {
+                        "fluid.copilot.entry": "catalog",
+                        "fluid.copilot.technique": technique,
+                        "fluid.copilot.engine": engine,
+                        "fluid.copilot.catalog_name": getattr(adapter, "name", "unknown"),
+                        "fluid.copilot.include_physical": include_physical,
+                    },
+                ),
             ):
-                contract = self.contract_forge_agent.forge_contract(
-                    session, logical=logical, engine=engine
+                with traced_span("fluid.copilot.logical", {"fluid.copilot.agent": "logical"}):
+                    logical_budget = self._stage_budget(session, stage="logical")
+                    logical = self._run_logical_with_cooperation(
+                        session,
+                        agent_invoke=lambda: self.logical_agent.from_catalog(
+                            session,
+                            name=name,
+                            adapter=adapter,
+                            scope=scope,
+                            technique=technique,
+                        ),
+                    )
+                    self._check_stage_budget(logical_budget)
+                logical = canonicalize_logical_draft(logical)
+                self._record_agent_event(session, stage="logical", agent=self.logical_agent)
+                self._run_logical_critic(session, logical=logical)
+                self._stamp_annotation_summary(session)
+                with traced_span(
+                    "fluid.copilot.contract_forge",
+                    {"fluid.copilot.agent": "contract_forge"},
+                ):
+                    contract = self.contract_forge_agent.forge_contract(
+                        session, logical=logical, engine=engine
+                    )
+                self._record_agent_event(
+                    session,
+                    stage="contract_forge",
+                    agent=self.contract_forge_agent,
                 )
-            self._record_agent_event(
-                session,
-                stage="contract_forge",
-                agent=self.contract_forge_agent,
-            )
-            physical = None
-            if include_physical:
-                physical = self._run_physical_stages(
-                    session, logical=logical, contract=contract, engine=engine
+                physical = None
+                if include_physical:
+                    physical = self._run_physical_stages(
+                        session, logical=logical, contract=contract, engine=engine
+                    )
+                # D7 — auto-write memory/semantic on successful forge (opt-in).
+                write_semantic_record(
+                    session.store,
+                    logical,
+                    source_type=f"catalog:{getattr(adapter, 'name', 'unknown')}",
                 )
-            # D7 — auto-write memory/semantic on successful forge (opt-in).
-            write_semantic_record(
-                session.store,
-                logical,
-                source_type=f"catalog:{getattr(adapter, 'name', 'unknown')}",
-            )
-            # A2 — episodic memory writer.
-            self._record_forge_episode(
-                session,
-                outcome="success",
-                source_type=f"catalog:{getattr(adapter, 'name', 'unknown')}",
-                logical=logical,
-            )
-            return CoordinatorResult(logical=logical, contract=contract, physical=physical)
+                # A2 — episodic memory writer.
+                self._record_forge_episode(
+                    session,
+                    outcome="success",
+                    source_type=f"catalog:{getattr(adapter, 'name', 'unknown')}",
+                    logical=logical,
+                )
+                return CoordinatorResult(logical=logical, contract=contract, physical=physical)
+        finally:
+            _cost_tracker.pop_product()
 
     def _run_physical_stages(
         self,
@@ -1080,198 +1077,3 @@ class StageCoordinator:
     # ------------------------------------------------------------------
     # M3 — Targeted repair helpers
     # ------------------------------------------------------------------
-
-    def _maybe_repair_physical(
-        self,
-        session: StageSession,
-        *,
-        physical: PhysicalDraft,
-        logical: LogicalDraft,
-        contract: dict,
-        engine: str,
-    ) -> None:
-        """Re-run the single physical stage that produced a failing draft.
-
-        The validator has already populated ``physical.validation``;
-        this method decides whether a targeted re-run is warranted and,
-        if so, mutates ``physical`` in place. It never raises: repair
-        is strictly additive — a clean draft is left untouched, and a
-        draft that still fails after repair keeps its original
-        ``validation`` replaced by the new (hopefully improved) one so
-        callers see the latest signal.
-
-        Bounded by :data:`_MAX_REPAIR_ATTEMPTS` (one extra attempt); the
-        caller can still inspect ``physical.validation.passes_schema``
-        if it wants to short-circuit further work on a still-failing
-        draft.
-        """
-        report = physical.validation
-        if report is None or report.passes_schema:
-            return
-
-        stage = _diagnose_failing_stage(report)
-        if stage is None:
-            _log.info("fluid.copilot.repair.skip: validator failed but no stage could be diagnosed")
-            return
-        if stage not in _PHYSICAL_REPAIR_STAGES:
-            # Logical / readme failures are observability-only for v1.0
-            # — see the module-level M3 comment for rationale.
-            _log.info(
-                "fluid.copilot.repair.skip: diagnosed stage %r is not in physical repair scope",
-                stage,
-            )
-            return
-
-        # Missing #4 — structured feedback loops. Convert the
-        # validator's findings into a ``StageFeedback`` addressed
-        # to the failing stage, then write to the session
-        # scratchpad. The re-run path reads
-        # ``scratchpad.feedback_for_stage(stage)`` and biases the
-        # agent's prompt accordingly. Without this, retries see
-        # the original prompt + a tail-appended findings list and
-        # have to figure out the contract themselves.
-        try:
-            self._emit_validator_feedback(session, stage=stage, report=report)
-        except Exception:  # pragma: no cover — defensive
-            pass
-
-        attempts = 0
-        while attempts < _MAX_REPAIR_ATTEMPTS and not physical.validation.passes_schema:
-            attempts += 1
-            with traced_span(
-                "fluid.copilot.repair",
-                {
-                    "fluid.copilot.repair": True,
-                    "fluid.copilot.repair.stage": stage,
-                    "fluid.copilot.repair.attempt": attempts,
-                },
-            ):
-                self._rerun_physical_stage(
-                    session,
-                    stage=stage,
-                    physical=physical,
-                    logical=logical,
-                    contract=contract,
-                    engine=engine,
-                )
-                # Re-validate the repaired draft so the caller sees the
-                # fresh pass/fail signal; we intentionally *replace*
-                # ``physical.validation`` rather than append, because
-                # the original report's findings may no longer apply
-                # to the repaired artefact.
-                physical.validation = self.validator_agent.run(
-                    logical=logical,
-                    contract=contract,
-                    industry_pack=session.industry_pack,
-                )
-                _log.info(
-                    "fluid.copilot.repair.done: stage=%s passes_schema=%s score=%s",
-                    stage,
-                    physical.validation.passes_schema,
-                    physical.validation.score,
-                )
-
-    def _emit_validator_feedback(
-        self,
-        session: StageSession,
-        *,
-        stage: str,
-        report: ValidationReport,
-    ) -> None:
-        """Write a structured ``StageFeedback`` for the failing stage.
-
-        The feedback's ``summary`` is a one-line human-readable
-        message; ``structured`` carries the validator's findings as
-        a list of dicts so the consuming agent can branch on
-        ``severity`` / ``field`` without re-parsing free text.
-
-        Empty / clean reports produce no feedback (the loop won't
-        invoke this method anyway, but defensive).
-        """
-        from fluid_build.copilot.scratchpad import StageFeedback
-
-        findings_payload = [
-            {
-                "message": getattr(f, "message", ""),
-                "severity": getattr(f, "severity", "warning"),
-                "field": getattr(f, "field", "") or "",
-            }
-            for f in (getattr(report, "issues", None) or [])
-        ]
-        if not findings_payload:
-            return
-
-        error_count = sum(1 for f in findings_payload if f.get("severity") == "error")
-        warning_count = sum(1 for f in findings_payload if f.get("severity") == "warning")
-        summary = (
-            f"Validator found {error_count} error(s) and {warning_count} "
-            f"warning(s) in stage {stage!r}. Bias the next attempt to "
-            f"address the listed findings."
-        )
-
-        feedback = StageFeedback(
-            source_stage="validator",
-            target_stage=stage,
-            summary=summary,
-            structured={
-                "score": getattr(report, "score", None),
-                "passes_schema": getattr(report, "passes_schema", False),
-                "findings": findings_payload,
-            },
-        )
-        session.get_scratchpad().add_feedback(feedback)
-
-    def _rerun_physical_stage(
-        self,
-        session: StageSession,
-        *,
-        stage: str,
-        physical: PhysicalDraft,
-        logical: LogicalDraft,
-        contract: dict,
-        engine: str,
-    ) -> None:
-        """Re-run exactly one physical-stage agent, bypassing the cache.
-
-        ``session.no_cache`` is flipped on for the duration of the
-        re-run so the LLM is genuinely re-prompted rather than served
-        the same bad response from the shared cache. The flip is
-        restored in a ``finally`` block so a downstream exception can
-        never leak the bypass into unrelated work on the same session.
-        """
-        prior_no_cache = getattr(session, "no_cache", False)
-        try:
-            session.no_cache = True
-            if stage == "builder":
-                # Preserve readme + transform_plan from the original
-                # fanout: the builder's job is to synthesise the
-                # contract-facing ``PhysicalDraft`` shell; readme and
-                # transform_plan are orthogonal artefacts the parallel
-                # pipeline already produced correctly.
-                preserved_readme = physical.readme
-                preserved_transform = physical.transform_plan
-                with traced_span("fluid.copilot.builder", {"fluid.copilot.agent": "builder"}):
-                    repaired = self.builder.build_physical(
-                        session, logical=logical, contract=contract, engine=engine
-                    )
-                repaired.readme = preserved_readme
-                repaired.transform_plan = preserved_transform
-                # Mutate the caller's ``physical`` in place by copying
-                # the repaired object's fields onto it — the caller
-                # already holds a reference and downstream code may
-                # too, so swapping the object would desync them.
-                for field_name in repaired.model_fields:
-                    setattr(physical, field_name, getattr(repaired, field_name))
-            elif stage == "transformation":
-                with traced_span(
-                    "fluid.copilot.transformation",
-                    {"fluid.copilot.agent": "transformation"},
-                ):
-                    physical.transform_plan = self.transformation_agent.run(logical, engine=engine)
-            else:  # pragma: no cover — defensive guard; caller filtered
-                _log.warning(
-                    "fluid.copilot.repair.unknown_stage: %r — no-op",
-                    stage,
-                )
-        finally:
-            session.no_cache = prior_no_cache

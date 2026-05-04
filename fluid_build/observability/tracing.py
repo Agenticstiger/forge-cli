@@ -224,6 +224,21 @@ def traced_stage(stage_name: str) -> Callable[[Callable[..., int]], Callable[...
             if ns is not None:
                 attrs.update(_args_to_attrs(ns))
 
+            # Cross-stage correlation. Resolves $FLUID_RUN_ID env var,
+            # then ``.fluid/run-id.txt``, then generates+persists a new
+            # id. Once stamped here, every nested ``traced_span`` and
+            # downstream stage shares the same id — operators query
+            # ``fluid.run_id="..."`` to reconstruct a multi-stage run.
+            try:
+                from fluid_build.observability.run_id import get_or_create_run_id
+
+                attrs["fluid.run_id"] = get_or_create_run_id()
+            except Exception:  # pragma: no cover — defensive
+                # Tracing must never break the CLI. If run_id resolution
+                # fails (read-only fs, permission, etc.), continue
+                # without the attribute.
+                pass
+
             with tracer.start_as_current_span(f"fluid.{stage_name}") as span:
                 for k, v in attrs.items():
                     span.set_attribute(k, v)
