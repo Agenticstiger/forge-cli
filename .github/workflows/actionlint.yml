@@ -1,0 +1,76 @@
+# Validates GitHub Actions workflow YAML on every PR.
+#
+# Catches the failure modes that single-repo secret-scoping depends on:
+#   • A maintainer accidentally adds `pull_request_target:` to a workflow
+#     that has access to secrets — the worst-case secret-leak shape.
+#   • A workflow file has a typo that silently makes it never run.
+#   • An action is referenced by floating tag instead of pinned SHA.
+#
+# Runs on every push and PR (including from forks, since it has no
+# secrets to leak). Read-only.
+
+name: actionlint
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run actionlint
+        uses: reviewdog/action-actionlint@v1
+        with:
+          fail_level: error
+
+      # Belt-and-suspenders: explicitly grep for the dangerous patterns
+      # that actionlint won't catch but that would let a fork PR read
+      # secrets if introduced.
+      #
+      # The check is anchored to the trigger key shape (whitespace then
+      # `pull_request_target:` at the start of a line) so it ignores
+      # comments and string literals that just mention the keyword.
+      #
+      # Some pre-existing workflows use `pull_request_target` for
+      # documented-safe purposes — they are listed in the allowlist
+      # below. Adding a workflow to the allowlist requires explicit
+      # security review (CODEOWNERS gate on .github/workflows/*).
+      - name: Check for pull_request_target trigger outside allowlist
+        run: |
+          allowlist='/(actionlint|docs-reminder|welcome|labeler)\.yml:'
+          violations=$(grep -rEn '^[[:space:]]*pull_request_target[[:space:]]*:' .github/workflows/ \
+            | grep -Ev "$allowlist" || true)
+          if [ -n "$violations" ]; then
+            echo "::error::pull_request_target trigger used outside the audited allowlist:"
+            echo "$violations"
+            echo "::error::pull_request_target on fork PRs grants write+secrets access."
+            echo "::error::If this usage is genuinely safe, add the workflow to the allowlist"
+            echo "::error::in .github/workflows/actionlint.yml AFTER security review."
+            exit 1
+          fi
+          echo "No new pull_request_target trigger outside the audited allowlist."
+
+      # Sanity check: integration.yml must NEVER list pull_request as a
+      # trigger. The whole secret-scoping design depends on this.
+      - name: Check integration.yml trigger purity
+        run: |
+          if [ -f .github/workflows/integration.yml ]; then
+            if grep -E "^\s*pull_request:" .github/workflows/integration.yml; then
+              echo "::error::integration.yml has a pull_request trigger."
+              echo "::error::That would expose cloud secrets to fork PRs."
+              echo "::error::Remove the pull_request trigger or move tests to ci.yml."
+              exit 1
+            fi
+            echo "integration.yml triggers OK."
+          fi

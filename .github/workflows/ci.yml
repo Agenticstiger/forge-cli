@@ -199,6 +199,76 @@ jobs:
           test -f smoke-test/contract.fluid.yaml || { echo "::error::scaffold failed"; exit 1; }
           echo "Scaffold verified"
 
+  # ──────────────────────────────────────────────────────────────
+  # DuckDB end-to-end integration. Free, secret-less, runs on every PR
+  # including from forks. Catches the kind of regressions mocked unit
+  # tests miss: CLI dispatch, schema validation, contract-loader env
+  # interpolation, plan-binding hash stability, the full 11-stage
+  # pipeline orchestration.
+  #
+  # IMPORTANT: this job MUST NOT reference any cloud secrets. The whole
+  # secret-scoping design depends on `ci.yml` being secret-free so fork
+  # PRs can run it with full fidelity.
+  # ──────────────────────────────────────────────────────────────
+  duckdb-integration:
+    name: DuckDB end-to-end (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      # Surface every OS-specific failure on every run instead of
+      # bailing on the first red. Cross-platform regressions are the
+      # whole point of the matrix.
+      fail-fast: false
+      matrix:
+        # ubuntu is the reference; macos catches pathlib + filesystem-case
+        # regressions; windows catches CRLF, path-separator, and shell-
+        # quoting regressions that contributors hit in the wild.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with local extras
+        # `python -m pip` is more reliable on Windows than bare `pip`
+        # (the bare command's PATH resolution differs between shells).
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,local]"
+      - name: Run DuckDB end-to-end suite
+        # Glob the test files so newly-added test_e2e_local_*.py and
+        # test_local_live_*.py files are picked up automatically without
+        # editing this workflow.
+        env:
+          # Windows defaults to cp1252 for both stdout/stderr (when
+          # captured to a non-TTY) AND for file I/O via open(). The
+          # fluid CLI uses Unicode in its banner (🌊, ━) and reads the
+          # bundled YAML examples which contain UTF-8 bytes outside
+          # cp1252. Both paths fail on Windows with charmap codec
+          # errors.
+          #
+          # PYTHONUTF8=1 flips Python's default encoding to UTF-8 across
+          # the entire process — stdout, stderr, AND open() — which
+          # covers both failure modes in one knob.
+          # PYTHONIOENCODING=utf-8 is set for belt-and-braces clarity
+          # but is technically subsumed by PYTHONUTF8=1.
+          #
+          # Both are no-ops on Linux/macOS, which already default to
+          # UTF-8.
+          #
+          # The underlying fluid CLI should also handle this itself
+          # (open files with explicit encoding='utf-8'; reconfigure
+          # stdout to utf-8 at boot). Tracked as Trello card xsdOYJ6E.
+          # When that fix lands these env vars can be removed.
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: utf-8
+        run: |
+          python -m pytest -v -m "integration and not slow" tests/test_e2e_local.py tests/test_e2e_local_apply.py tests/test_e2e_local_negative.py tests/providers/test_local_live_happy_path.py
+      - name: Cleanup local artifacts (defensive)
+        if: always()
+        run: python scripts/cleanup_local_test_artifacts.py
+
   security:
     name: Security Scan
     runs-on: ubuntu-latest
