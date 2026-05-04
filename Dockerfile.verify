@@ -1,0 +1,51 @@
+# Verification image — Python 3.12, repo mounted at /repo, editable install.
+# NOT for production. Used by the gap-verification harness.
+#
+# Build:  docker build -f Dockerfile.verify -t forge-verify .
+# Run:    docker run --rm -v "$PWD:/repo" -w /repo forge-verify <cmd...>
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /repo
+
+# Pre-install runtime deps so the editable install is fast.
+# We copy only pyproject.toml + README so deps are cached across edits.
+COPY pyproject.toml README.md ./
+RUN python -m pip install --upgrade pip setuptools wheel \
+ && python -m pip install \
+      "click>=8.1" "pyyaml>=6.0" "jsonschema>=4.22" "rich>=13.7" \
+      "pydantic>=2.7" "typing-extensions>=4.8" "jinja2>=3.1" \
+      "httpx>=0.27" "requests>=2.32.5" "python-dotenv>=1.0" \
+      "cryptography>=42.0" "keyring>=24.0" \
+      "duckdb>=1.0" "pandas>=2.2" "psycopg[binary]>=3.1" \
+      pytest pytest-cov
+
+# dlt for in-process Python ingestion verification. The runner imports
+# from dlt.sources.sql_database, which only ships under the sql_database
+# extra (pulls in sqlalchemy + the configured dialect).
+RUN python -m pip install \
+      "dlt[postgres,duckdb,sql_database]>=0.5" \
+      pyarrow "sqlalchemy>=2.0"
+
+# Singer tap-postgres binary for the meltano runner's "embedded Singer"
+# default mode (the runner spawns the tap via subprocess and routes
+# RECORD messages through its built-in target). Kept in its own venv so
+# the tap's older dep pins don't poison the fluid env.
+RUN python -m venv /opt/singer-venv \
+ && /opt/singer-venv/bin/pip install --no-cache-dir "meltanolabs-tap-postgres>=0.5" \
+ && ln -s /opt/singer-venv/bin/tap-postgres /usr/local/bin/tap-postgres
+
+# Editable install happens at runtime against the bind-mounted /repo,
+# so iteration is "edit on host → re-run" with no rebuild.
+ENV PYTHONPATH=/repo
+
+ENTRYPOINT ["python", "-m", "fluid_build.cli"]
+CMD ["--help"]

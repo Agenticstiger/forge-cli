@@ -14,7 +14,7 @@
 
 """Multi-scenario smoke runner for the forge data-model pipeline on Gemini.
 
-Goal: before a live biz-lab demo, exercise the ``forge data-model
+Goal: before a live demo-lab demo, exercise the ``forge data-model
 from-intent`` pipeline against real Gemini across the four
 industry × technique combos that ship with seed skeletons:
 
@@ -34,7 +34,7 @@ For each scenario the runner captures:
 
 Usage::
 
-    GEMINI_API_KEY=... python scripts/gemini_biz_lab_scenarios.py
+    GEMINI_API_KEY=... python scripts/gemini_demo_db_scenarios.py
 
 The runner is standalone (no pytest); it prints a markdown summary
 table at the end so the results can be pasted directly into a demo
@@ -327,7 +327,7 @@ def _run_scenario(s: Scenario, api_key: str, workspace: Path) -> ScenarioResult:
 def _print_report(results: List[ScenarioResult]) -> None:
     print()
     print("=" * 78)
-    print("Forge data-model · Gemini biz-lab scenarios · report")
+    print("Forge data-model · Gemini demo-lab scenarios · report")
     print("=" * 78)
     header = "| Industry | Technique | OK | Latency | Counts | Naming | SCD | Schema | Warns |"
     sep = "|---|---|---|---|---|---|---|---|---|"
@@ -401,7 +401,7 @@ def main() -> int:
     workspace = Path.cwd()
     scenarios = _scenarios()
     results: List[ScenarioResult] = []
-    out_path = Path(".fluid") / "gemini_biz_lab_report.json"
+    out_path = Path(".fluid") / "gemini_demo_db_report.json"
 
     for s in scenarios:
         print(f"→ running {s.industry} × {s.technique} …", flush=True)

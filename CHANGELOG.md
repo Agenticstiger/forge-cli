@@ -9,8 +9,159 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Data-product type vocabulary** (`metadata.productType`). v0.7.3
+  introduces a Data Mesh-aligned classification that runs alongside the
+  existing medallion `metadata.layer` field. Both vocabularies are
+  first-class and accepted side-by-side; existing contracts using only
+  `Bronze`/`Silver`/`Gold` validate unchanged. Canonical mapping:
+
+  | medallion (`metadata.layer`) | Data Mesh (`metadata.productType`) | expansion                          |
+  |------------------------------|------------------------------------|------------------------------------|
+  | `Bronze`                     | `SDP`                              | Source-Aligned Data Product        |
+  | `Silver`                     | `ADP`                              | Aggregated Data Product            |
+  | `Gold`                       | `CDP`                              | Consumption-Aligned Data Product   |
+  | `Platinum`                   | (no analogue)                      | —                                  |
+
+  When a contract sets both fields they MUST agree; the validator emits a
+  clear error otherwise. The discover emitter (`fluid init --discover`)
+  populates both fields automatically. Helpers in
+  `fluid_build.forge_datamodel.product_type` (`infer_product_type`,
+  `infer_layer`, `validate_layer_product_type_consistency`) let
+  downstream tooling normalize between the two vocabularies.
+
+- **FLUID schema v0.7.3 — Source-Aligned Data Products.** First-class
+  support for source-aligned (Bronze / SDP) data products that ingest
+  external systems into the mesh.
+  - New `acquisition` build pattern with full `$defs/acquisitionPattern`
+    sub-schema (`source`, `sink`, `delivery`, `schemaEvolution`, `quality`,
+    `cost`, `catalog`, `concurrency`, `imageSignature`, `deployment`).
+  - **All six ingestion engines GA**: `duckdb`, `airbyte`, `meltano`, `dlt`,
+    `kafka-connect`, `debezium` — every engine has a working runner, full
+    test matrix (sources × sinks × modes × failure modes × capabilities ×
+    deployment modes), and conforms to the public Runner Protocol via the
+    conformance suite.
+  - Three deployment modes (`embedded`, `bring-your-own`, `managed`) with
+    three managed back-ends (`docker`, `kubernetes`, `terraform`).
+  - Capability-based negotiation between contract and runner
+    (`capabilities` array on builds; `RunnerCapability` enum on the public
+    API).
+  - Schema evolution semantics (`schemaPolicy`) with concrete per-policy +
+    per-change decision matrix.
+  - Delivery guarantees (`at_most_once | at_least_once | exactly_once`) +
+    DLQ semantics (`dlq.maxRecordsBeforeAbort`, `dlq.alertOn`).
+  - Cosign image-signature verification + SLSA provenance fields.
+  - Top-level `retention` block (`runState`, `runLogs`, `lineage`, `dlq`).
+  - Sovereignty extension: `dataResidency.region`,
+    `dataResidency.prohibitTransferTo`.
+  - `metadata.classification` enum + `metadata.experimental` array
+    (feature gate).
+  - All schema additions are additive and backward-compatible with v0.7.2;
+    existing 0.7.x contracts validate unchanged.
+
+- **`fluid_build.api` v1.0 — public extension contract.** Stable surface
+  third-party runners and providers target. SemVer-governed via
+  `__api_version__ = "1.0"` with a 2-minor-version deprecation window.
+  Conformance suite available at
+  `fluid_build.api.conformance.RunnerConformance`.
+
+- **Common acquisition runtime** under `fluid_build/build_runners/` —
+  `_state` (FileStateStore + single-flight lock), `_dlq`, `_retry`,
+  `_idempotency`, `_schema_evolution`, `_fingerprint`, `_anomaly`
+  (EWMA/IQR/exact), `_signature` (Cosign), `_cost` (budget gate),
+  `_catalog` (registrar dispatch), `_lineage` (Null/Buffered/HTTP OL
+  emitters), `_retention` (sweeper), and four pre-land hooks
+  (`dlp_scan`, `tokenize_pii`, `quality_gate`, `emit_lineage_input`).
+
+- **Six ingestion runners** under `fluid_build/build_runners/<engine>/`:
+  - `duckdb` — zero-infra file/JDBC ingestion (CSV/Parquet/JSON/Postgres/MySQL/SQLite/HTTP).
+  - `dlt` — Python-native sources, including custom `@dlt.source` modules + verified sources (filesystem, sql_database).
+  - `meltano` — Singer protocol over subprocess; one runner unlocks 600+ Singer taps.
+  - `airbyte` — REST mode against Airbyte OSS / Cloud + Cosign image signature verification (5-path verification matrix: signed/unsigned/wrong-key/SLSA-required-missing/SLSA-required-present).
+  - `kafka-connect` — full connector lifecycle (create/get/update/delete/status) against a Kafka Connect cluster; JDBC + S3 + Salesforce + MongoDB sources; JDBC + S3 + Snowflake + Iceberg + BigQuery sinks.
+  - `debezium` — CDC for Postgres / MySQL / MongoDB / SQL Server / Oracle; both Kafka Connect mode (preferred) and Debezium Server (embedded) mode; all 5 snapshot modes (`initial`, `schema_only`, `never`, `when_needed`, `always`).
+
+- **Infrastructure layer** (`fluid_build/infra/`): three managed-mode artifact
+  generators (Docker Compose, Helm with Flux-style HelmRelease CRs, OpenTofu
+  modules). Pinned upstream Helm chart references; ExternalSecret + NetworkPolicy
+  emission; sovereignty propagation into values overlays; deterministic bundle
+  digests. **Hyperscaler-agnostic by construction** — no `boto3`, `google.cloud`,
+  or `azure` imports anywhere in the layer (test-asserted).
+
+- **Five catalog registrars** (`fluid_build/build_runners/catalog_registrars/`):
+  DataHub (GMS REST), OpenMetadata, Databricks Unity Catalog, AWS Glue Catalog
+  (HTTP — no boto3 dependency), Snowflake Horizon. Classifications propagate as
+  glossary terms / PII tags / table parameters / column tags depending on target.
+
+- **Authoring workflows**:
+  - `fluid init --discover <uri>` — introspect Postgres / MySQL / filesystem
+    sources and emit deterministic Bronze contracts.
+  - `fluid import meltano <project>` / `fluid import airbyte <workspace>` /
+    `fluid import dlt <pipeline>` / `fluid import singer <tap-cfg>` — convert
+    foreign configs to FLUID contracts. Secrets are auto-redacted to `${ENV_VAR}`
+    placeholders.
+
+- **Day-2 operations** (`fluid_build/cli/ops/`). Run-record introspection
+  is grouped under a `fluid runs` umbrella so the new commands don't
+  collide with the existing top-level `fluid status / doctor / auth`
+  which serve different (workspace-overview / system-diagnostic / cloud-
+  auth) purposes.
+  - `fluid runs status <product-id>` — last-N runs, freshness,
+    error-rate-24h, last state, per-stream record counts.
+  - `fluid runs logs <product-id> --component build|infra|server|worker|dlq`
+    — component-scoped log fetch with `--grep` and JSON parsing.
+  - `fluid runs diff <product-id> --build <id> --run-a <a> --run-b <b>`
+    — schema and row-count delta between two runs.
+  - `fluid retention sweep` — periodic cleanup with structured summary.
+  - `fluid doctor --scope authoring|pipeline|ingestion|infra|catalog|all`
+    — extends the existing `fluid doctor` with the acquisition-stack
+    health report covering schema version, dispatcher integrity, runner
+    module imports, optional extras, infra binaries, registrar imports.
+  - `fluid secrets login|verify|rotate <secretRef>` — pipeline credential
+    ops with keychain backend and probe-before-rotate semantics. Lives
+    under its own `secrets` umbrella so it doesn't collide with the
+    legacy cloud-provider `fluid auth`.
+
+- **Typed CLI error catalog** (`fluid_build/cli/_errors.py`) — every
+  user-facing error renders the five-field shape (`what / where / why /
+  fix / doc`). 14 typed classes covering schema validation, capability
+  mismatch, secret resolution, sovereignty, connectivity, partial failure,
+  DLQ overflow, schema drift, budget, lock contention, replay staleness,
+  missing extras, infra drift, residency, supply chain.
+
+- **`fluid validate --probe`** flag for live external probes (off by
+  default; pure schema validation otherwise).
+
+- **End-to-end example** `examples/source-aligned-postgres-duckdb/` with
+  `docker-compose.yml`, `seed.sql`, `Makefile`, `verify.py`. `make all`
+  brings up Postgres, runs `fluid validate → apply`, and asserts row count
+  + schema in the output Parquet. Verified end-to-end on Postgres 16.
+
+- **Test infrastructure**:
+  - Testcontainers fixtures for Postgres / MySQL / MongoDB.
+  - respx mock servers for Airbyte / Kafka Connect / DataHub / OpenMetadata /
+    Unity / Glue / Snowflake Horizon / Marquez.
+  - Cosign mock with 5 signature scenarios (signed/unsigned/wrong-key/SLSA missing/SLSA present).
+  - Synthetic Singer tap (`tap-fluid-fake`) for protocol-level tests.
+  - Hypothesis property tests for state machine, locks, and schema evolution.
+
+- **UX acceptance bar**:
+  - Error-catalog completeness (15 typed error classes, all with `for_*`
+    factories and five-field shape).
+  - Engine uniformity: every runner declares the same Protocol surface,
+    returns the same exit-code shape, and emits the same run-record JSON.
+  - Performance budgets: validate < 3s, fingerprint < 500ms for 100 calls,
+    schema evolution < 500ms for 100 resolves, doctor (all scopes) < 3s.
+  - JSON output stability: error catalog snapshot, contract emitter snapshot.
+  - Exit-code contract: 0 success, 1 user error, 2 partial, 3 transient, 4 internal.
+
 ### Changed
 
+- `FluidContractValidator.__init__` and `ConformanceAgent.__init__` now
+  default `fluid_version` to `FluidSchemaManager.latest_bundled_version()`
+  (was hardcoded `"0.7.2"`). `FluidContractValidator.validate` honors the
+  contract's own `fluidVersion` when present, so contracts emitted at one
+  version validate against that version regardless of the validator's
+  default.
 - Dropped Python 3.9 support, raised the package baseline to Python 3.10,
   and expanded CI/package classifiers through Python 3.14.
 

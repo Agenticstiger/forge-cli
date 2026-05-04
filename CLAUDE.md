@@ -59,6 +59,24 @@ A six-PR security-hardening series landed (PRs #28–#33) resolving the 14 findi
 - Typed tool errors (`{"error": <ExcName>, "message": "…see server logs"}`) — exception text no longer round-trips into the LLM context.
 - Expanded redactor coverage for JWTs, Stripe, GitHub, and bare `key[:=]value` assignments.
 
+## Recent architectural changes worth knowing (2026-04-30)
+
+The `feat/source-aligned-acquisition` branch lands SDP/ADP/CDP as a Data
+Mesh-aligned classification that runs alongside the medallion
+`metadata.layer`. **Bronze↔SDP, Silver↔ADP, Gold↔CDP** — either-or-both
+is accepted; when both are set the validator enforces consistency.
+Cross-check is duplicated inline at three sites (no helper module — the
+user explicitly rejected one): `schema.py::_check_metadata`,
+`schema_manager.py::_validate_with_jsonschema`, and
+`cli/contract_validation.py::_validate_metadata`. If the mapping ever
+changes, update all three in lockstep, plus the discover emitter at
+`cli/discover/emitter.py`. Templates / importers / fixtures all populate
+both fields; provider tag emitters (AWS / GCP / Snowflake / forge)
+propagate both into cloud labels as `fluid_layer` + `fluid_product_type`
+(distinct keys, same canonical value). The marketplace surfaces both as
+facets and accepts `fluid market --product-type SDP|ADP|CDP` alongside
+`--layer`. Test pinning lives in `tests/test_product_type_mapping.py`.
+
 ## Recent architectural changes worth knowing (2026-04-23)
 
 The `feat/cli-pipeline-and-publish-hardening` branch (15 commits) landed the **11-stage pipeline** and its supporting surface. AGENTS.md has the canonical lifecycle doc; the Claude-Code-specific operational notes are:
@@ -73,6 +91,169 @@ The `feat/cli-pipeline-and-publish-hardening` branch (15 commits) landed the **1
 - **The Jenkins template is the reference 11-stage implementation.** `forge/core/pipeline_templates.py::JenkinsTemplate.generate()` ships the full parameterized template. The other 6 CI systems (GitHub Actions, GitLab, Azure DevOps, Bitbucket, CircleCI, Tekton) are scheduled for Phase 7-rest to port from it.
 - **Smoke scripts live in `scripts/`.** `scripts/smoke_phase_6b.py` validates plan-binding + data-loss-gate against a real .venv.fluid-dev venv. `scripts/smoke_a1.py` validates the A1 variant with the new `--mode` / `--target` flags. Both auto-discover env from the launchpad; both are safe (every apply runs `--dry-run`).
 - **Known gap — `unknown_action_op` (Phase 6F, deferred).** The Snowflake provider's dispatcher doesn't yet recognize the 0.7.1 high-level abstract ops (`provisionDataset`, `scheduleTask`). Stage 7 apply logs `{"event": "unknown_action_op", ...}` and no-ops instead of emitting native DDL. Pipeline reports SUCCESS but accomplishes nothing. Fix involves a translator layer in `providers/snowflake/` that maps abstract → native ops. Pre-existing, not a regression.
+
+## Recent architectural changes worth knowing (2026-04-30, world-class forge UX)
+
+A multi-phase push landed comprehensive UX + architecture upgrades on `feat/source-aligned-acquisition`. Key surfaces and where they live:
+
+- **Mode picker (`fluid forge`).** Bare invocation surfaces a 5-mode menu (AI / Compose / Refine / Template / Blank) instead of dropping into AI. Lives at `cli/_forge_mode_picker.py`. Skipped via `FLUID_FORGE_NO_PICKER=1`. Picker default is highlighted by the welcome scan; user always sees the menu.
+- **Welcome scan.** Detect-first parallel scan runs in <50ms before any prompt — workspace state, AI configured, CLIs installed, sample data, cloud creds, return-user state. Lives at `cli/_welcome_scan.py`. `~/.fluid/usage.json` carries `forge_count`.
+- **Mode-aware interviews.** `forge_copilot_interview.py::run_adaptive_copilot_interview` short-circuits to `_run_compose_interview` (3 questions max for `--from-product`) or `_run_refine_interview` (1 question for `--refine`) when the runtime resolved upstreams or loaded an existing contract. Standard mode runs the world-class bootstrap (below).
+- **World-class bootstrap.** New default fresh-product interview at `cli/_world_class_interview.py`. Inferences first (`InterviewSignals`), examples in every prompt, productType-first, `:auto` escape, schema-coverage gate. Toggle via `FLUID_INTERVIEW_LEGACY=1` to revert to the legacy bootstrap.
+- **Slash commands inside the interview.** `cli/_interview_slash_commands.py` — `:ai-setup`, `:override`, `:show-work`, `:doctor`, `:help`, `:quit`. Wrapped into `forge_dialogs.ask_friendly_text` so every prompt accepts them.
+- **Pre-write preview panel.** `cli/_preview_panel.py` — renders cost + file list + run-id BEFORE the writes; persists `.fluid/agents/<run-id>/{cost.json,reasoning.md,transcript.json}` so Ctrl-C at the prompt loses nothing. `--yes` skips the prompt but the panel still renders. Receipts are richened via `forge_modes.py::_populate_richer_receipt`.
+- **Streaming contract preview.** `cli/_streaming_contract_preview.py` re-shapes the seed contract after every interview answer so the user sees it grow. Toggle off with `FLUID_FORGE_NO_STREAMING_PREVIEW=1`.
+- **Composition pipeline.** `forge_datamodel/from_data_products/pipeline.py` resolves upstream products, validates composition rules (SDP rejects upstreams; ADP/CDP accept SDP+ADP), pre-fills `consumes[]`. Wired via `--from-product <ID|path>` (repeatable) and `--from-product-list <file>`.
+- **`fluid forge --refine`** loads an existing contract, asks "what to change?", feeds the existing contract verbatim to the LLM as the seed (via `_seed_contract_override`).
+- **Self-healing repair loop.** `forge_copilot_runtime.py` runs the JSON-schema validator on every emitted contract and prepends path-specific errors to the next attempt's repair feedback. Function: `forge_copilot_corrective_feedback.build_schema_validation_message`.
+- **`fluid stats`.** Aggregates `.fluid/agents/*/cost.json` across runs. `--by provider/type/engine`, `--since <spec>`, `--json`.
+- **Forge templates emit v0.7.3 directly.** Each of `forge/templates/{starter,analytics,etl_pipeline,ml_pipeline,streaming}.py` now uses the shared spec-driven builder at `forge/templates/_v073_builder.py`. The legacy v0.5-vintage methods are preserved as `_legacy_generate_contract_unused` for reference. The runtime coercion layer at `forge_modes.py::_coerce_template_contract_to_v073` is now a no-op for v0.7.3 contracts (fast-path) and remains as a safety net for any legacy out-of-tree template.
+- **LiteLLM unified backend.** `cli/forge_copilot_llm_litellm.py` ships an opt-in `LiteLLMProvider` that subclasses `LlmProvider` and routes every provider through one API. Enable via `FLUID_LLM_BACKEND=litellm` + `pip install 'fluid-build[litellm]'`. `RunCostTracker.record_call` now accepts `usd_override` (used by litellm to feed accurate per-call cost into the cost summary). Dispatched in `forge_copilot_llm_providers.py::get_llm_provider` + short-circuits in `call_llm` and `call_llm_streaming`.
+- **UX telemetry.** `cli/_ux_telemetry.py` captures `time_to_first_panel_ms`, `questions_asked`, `inferences_used`, `picker_choice`, `mode`, `preview_accepted`, `schema_repair_attempts`. Emitted onto the `forge.invocation` OTel span when an exporter is configured.
+- **Mode dispatch fix.** Picking `template` now routes to `forge_modes.run_template_mode` (no AI). Picking `blank` goes to `_run_blank_mode`. Picking `refine`/`from_product` flows through the AI runtime with the right context flags. The `--template` flag is an argparse alias of `--scaffold`.
+- **Datamesh-manager Silver↔Gold archetype swap fix.** `providers/datamesh_manager/datamesh_manager.py` had `Silver→consumer-aligned` and `Gold→aggregate` reversed. Now correctly reads `metadata.productType` first and falls back to the canonical layer mapping (Bronze→source-aligned / Silver→aggregate / Gold→consumer-aligned).
+
+Test files pinning the above: `tests/test_forge_mode_picker.py`, `tests/test_welcome_scan.py`, `tests/test_world_class_interview.py`, `tests/test_interview_modes.py`, `tests/test_preview_panel.py`, `tests/test_interruptible_authoring.py`, `tests/test_phase2_tools.py`, `tests/test_from_data_products.py`, `tests/test_stats.py`, `tests/test_self_healing_repair.py`, `tests/test_litellm_backend.py`, `tests/test_ux_telemetry.py`, `tests/test_init_forge_scenarios_e2e.py` (the matrix that runs `fluid validate` on every produced contract).
+
+Key env vars introduced or honoured by the new path:
+
+| env var | what it does |
+|---|---|
+| `FLUID_LLM_BACKEND=litellm` | route every LLM call through litellm |
+| `FLUID_LITELLM_MODEL_PREFIX=<x>` | override the litellm model-name prefix for niche providers |
+| `FLUID_INTERVIEW_LEGACY=1` | revert to the legacy bootstrap interview |
+| `FLUID_FORGE_NO_PICKER=1` | suppress the mode picker (CI / scripts) |
+| `FLUID_FORGE_NO_PREVIEW=1` | suppress the pre-write preview panel + prompt |
+| `FLUID_FORGE_NO_WELCOME=1` | suppress the welcome scan render |
+| `FLUID_FORGE_NO_STREAMING_PREVIEW=1` | suppress the live contract growth panel |
+| `FLUID_FORGE_PICKER_ALWAYS=1` | force the picker even for return users |
+| `FLUID_COST_LIMIT_USD_PER_RUN=<n>` | per-run cost cap shown in the progress prefix |
+| `FLUID_INTERVIEW_LEGACY=1` | use the legacy bootstrap (fallback) |
+
+## Recent architectural changes worth knowing (2026-05-02, world-class hardening)
+
+A multi-pass close-the-gaps push landed across providers, observability, and
+streaming runners. Headline items:
+
+- **AWS + GCP abstract op handlers route to real native ops.** The 9
+  v0.7.1 abstract ops (`provisionDataset`, `scheduleTask`, `registerSchema`,
+  `createView`, `grantAccess`, `revokeAccess`, `updatePolicy`, `publishEvent`,
+  `custom`) translate via per-provider helpers in
+  `providers/{aws,gcp}/provider.py`. Previously some translations called
+  native ops the dispatcher didn't recognise — silent no-op apply. Fixed:
+  - AWS adds `glue.update_table_schema`, `iam.detach_policy`,
+    `iam.put_role_policy`, `events.put_events`. The dispatcher also
+    accepts `events.put_rule` (alias for `ensure_rule`) and `sns.publish`
+    (alias for `publish_message`).
+  - GCP adds `bq.update_table_schema`, `iam.grant_role`, `iam.revoke_role`,
+    `iam.set_policy`. Dispatcher accepts `ps.publish` (alias for
+    `publish_message`) and `bq.execute_sql`.
+  - Pin file: `tests/providers/test_abstract_op_dispatch.py` — every
+    abstract handler must route to a recognised native op.
+  - **Critical bug fix in passing**: `aws/provider.py` had a malformed
+    method body — Athena dispatcher fell through into orphaned Redshift
+    code with no proper method header. Now `_execute_redshift_action`
+    is a real method.
+
+- **Cross-CLI run-id correlation auto-stamps.** `traced_stage` decorator
+  (`observability/tracing.py`) now resolves
+  `fluid_build.observability.run_id.get_or_create_run_id()` and stamps
+  `fluid.run_id` onto every CLI stage's root span. Every stage decorated
+  with `@traced_stage(...)` auto-correlates without per-stage wiring.
+  `cli/{plan,verify,publish,apply,bundle,schedule_sync}.py` carry the
+  decorator; pin file `tests/observability/test_run_id_decorator_integration.py`
+  asserts each one is decorated.
+
+- **ADP auto-replay on upstream reprocess.** `build_runners/_state.py`
+  `FileStateStore.set_cursor` now reads the previous cursor before
+  writing the new one and routes through `build_runners._replay`:
+  - `detect_cursor_rewind` — true when new < old.
+  - `mark_downstream_dirty` — walks the workspace for products whose
+    `consumes[]` references the rewound product, writes a JSON marker
+    at `.fluid/<product>/runtime/replay-pending.json`.
+  - `list_dirty_products` / `clear_dirty_marker` — lifecycle helpers.
+  - Pin file: `tests/build_runners/test_replay_state_integration.py`.
+  Single chokepoint integration: every runner that calls `set_cursor`
+  benefits without per-runner wiring (Kafka-Connect, Debezium, DLT,
+  duckdb, Meltano).
+
+- **Streaming late-arrival policy surfaces as connector config.**
+  `build_runners/_late_arrival.extract_late_arrival_policy(ctx.source,
+  target_table=...)` reads `WatermarkSpec.allowed_lateness` and returns
+  connector-config keys under `fluid.late_arrival.*`:
+  - `fluid.late_arrival.enabled` ("true" / "false")
+  - `fluid.late_arrival.allowed_lateness_seconds` (str)
+  - `fluid.late_arrival.side_output_table` (`<target>__late_events`)
+  Wired into `kafka_connect/runner.py` and `debezium/runner.py`. The
+  side-output table name is canonical (no per-runner naming surprises).
+  Pin file: `tests/build_runners/test_late_arrival_runner_integration.py`.
+
+- **Cross-mesh federation backends ship.** `forge/federation.py` ships
+  three live-fetch backends called from `fetch_federated_digest`:
+  - `_fetch_digest_via_http` — plain HTTP GET against
+    `<endpoint>/<product>/<version>/digest` returning `sha256:...`.
+  - `_fetch_digest_via_catalog` — REST GET returning JSON
+    `{"digest": "..."}`.
+  - `_fetch_digest_via_git` — clones repo into
+    `~/.cache/fluid/federation-git/<workspace_id>`, reads
+    `<product_id>/contract.fluid.yaml`, recomputes via
+    `compute_contract_digest`. Falls back to shell-out git when
+    gitpython missing. Auth via env-var `secret_ref` (e.g.
+    `GITHUB_TOKEN`) injected into HTTPS clone URL.
+  - Pin file: `tests/forge/test_federation_backends.py`.
+  - Manifest schema: `federation/upstreams.yaml` with workspaces
+    `[{id, kind: git_registry|catalog|http_registry, endpoint,
+      auth: {mode, secret_ref}}]`.
+
+- **Per-product cost ceiling.** `copilot/cost.py::RunCostTracker`
+  now maintains a per-product LIFO stack via `push_product` /
+  `pop_product` / `current_product` / `per_product_usd`.
+  `FLUID_COST_LIMIT_USD_PER_PRODUCT` enforces a per-product cap (in
+  addition to the existing per-run `FLUID_COST_LIMIT_USD`). The agent
+  coordinator pushes/pops on each entry point (`from_tables`,
+  `from_intent`, `from_catalog`). Pin file:
+  `tests/copilot/test_cost_ceiling_per_product.py`.
+
+- **Join-key self-healing.** `cli/forge_copilot_corrective_feedback.py`
+  adds `build_join_key_repair_message()` that detects "join key X not
+  in upstream Y" errors specifically and routes to the LLM with a
+  ranked list of plausible alternative keys (via
+  `_rank_join_key_candidates`). Pin file:
+  `tests/test_join_key_self_healing.py`.
+
+- **Physical extractions reduced top-LOC files.**
+  - `cli/_init_dag_helpers.py` (DAG generation, ~250 LOC) extracted
+    from `cli/init.py`.
+  - `cli/_interview_ask_helpers.py` (slot prompt helpers) extracted
+    from `cli/forge_copilot_interview.py`.
+  - `cli/_template_mode.py` extracted from `cli/forge_modes.py`.
+  - `cli/_auth_provider_impls.py` extracted from `cli/auth.py`.
+  - `cli/viz_renderers/{dot,output,html}.py` extracted from
+    `cli/viz_graph.py`.
+  - `copilot/agents/_modeler_helpers.py` extracted from
+    `copilot/agents/modeler_agent.py`.
+  All extractions use the **module-attribute-access indirection pattern**
+  (`_module = original_module; ... _module._fn(...)`) so test patches
+  on the original module flow through to the extracted helper. Apply
+  this pattern when extracting from a hot file with many test-time
+  patches.
+
+Test files pinning the above (this session):
+`tests/providers/test_abstract_op_dispatch.py`,
+`tests/observability/test_run_id_decorator_integration.py`,
+`tests/build_runners/test_replay_state_integration.py`,
+`tests/build_runners/test_late_arrival_runner_integration.py`,
+`tests/forge/test_federation_backends.py`,
+`tests/copilot/test_cost_ceiling_per_product.py`,
+`tests/test_join_key_self_healing.py`,
+`tests/observability/test_run_id.py`.
+
+Key env vars added this session:
+
+| env var | what it does |
+|---|---|
+| `FLUID_RUN_ID` | override or pre-seed cross-stage run-id |
+| `FLUID_COST_LIMIT_USD_PER_PRODUCT` | per-product cost ceiling (separate from the existing per-run cap) |
 
 ## Working style
 

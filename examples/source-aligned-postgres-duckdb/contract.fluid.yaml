@@ -1,0 +1,81 @@
+fluidVersion: "0.7.3"
+kind: DataProduct
+id: bronze.crm_orders
+name: CRM Orders Bronze
+description: |
+  Source-aligned Bronze data product. Acquires raw orders from a Postgres
+  source via DuckDB's postgres_scan and lands them as Parquet for downstream
+  Silver/Gold consumption.
+domain: sales
+
+metadata:
+  # Both vocabularies (medallion + Data Mesh) are first-class in v0.7.3.
+  # Bronze and SDP (Source-Aligned Data Product) are equivalent — either
+  # alone is sufficient. They're shown here together to demonstrate that
+  # tools and humans can read whichever they prefer. The validator
+  # rejects Bronze+ADP / Bronze+CDP / Silver+SDP etc. as inconsistent.
+  layer: Bronze
+  productType: SDP
+  owner:
+    team: data-platform
+    email: data-platform@co.example
+  classification: confidential
+  experimental: [acquisition]
+
+retention:
+  runState: P30D
+  runLogs: P90D
+  lineage: P365D
+  dlq: P180D
+
+builds:
+  - id: ingest_orders
+    description: Full-refresh copy of public.orders from Postgres.
+    pattern: acquisition
+    engine: duckdb
+    capabilities:
+      - full_refresh
+      - schema_discovery
+    properties:
+      source:
+        kind: postgres
+        connection:
+          host: "{{ env.PGHOST }}"
+          port: "{{ env.PGPORT }}"
+          database: "{{ env.PGDATABASE }}"
+          user: "{{ env.PGUSER }}"
+          password: "{{ env.PGPASSWORD }}"
+        mode: full_refresh
+        streams:
+          - public.orders
+      sink:
+        format: parquet
+      preLand:
+        - dlp_scan
+        - quality_gate
+      quality:
+        gates:
+          - rule: not_null
+            columns: [id]
+            severity: error
+        onError: route_to_dlq
+      lineage:
+        emit: true
+    execution:
+      trigger:
+        type: schedule
+        schedule: "0 */4 * * *"
+    outputs:
+      - orders_raw
+
+exposes:
+  - exposeId: orders_raw
+    kind: table
+    binding:
+      platform: local
+      format: parquet
+      location:
+        path: ./out/orders.parquet
+    contract:
+      schema: []
+      schemaPolicy: discover_and_freeze
