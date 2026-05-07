@@ -8,15 +8,53 @@
 
 **The declarative control plane for data engineering in the Agentic Era.**
 
+<a href="https://github.com/Agenticstiger/forge-cli/stargazers"><img src="https://img.shields.io/github/stars/Agenticstiger/forge-cli?style=social" alt="GitHub stars"></a>
+<a href="https://github.com/Agenticstiger/forge-cli/network/members"><img src="https://img.shields.io/github/forks/Agenticstiger/forge-cli?style=social" alt="GitHub forks"></a>
+
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/Agenticstiger/forge-cli/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/data-product-forge.svg)](https://pypi.org/project/data-product-forge/)
+[![Downloads](https://img.shields.io/pypi/dm/data-product-forge.svg)](https://pypi.org/project/data-product-forge/)
 [![CI](https://github.com/Agenticstiger/forge-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/Agenticstiger/forge-cli/actions/workflows/ci.yml)
+[![Last commit](https://img.shields.io/github/last-commit/Agenticstiger/forge-cli)](https://github.com/Agenticstiger/forge-cli/commits/main)
+[![Open issues](https://img.shields.io/github/issues/Agenticstiger/forge-cli)](https://github.com/Agenticstiger/forge-cli/issues)
+[![Open PRs](https://img.shields.io/github/issues-pr/Agenticstiger/forge-cli)](https://github.com/Agenticstiger/forge-cli/pulls)
 
 [Documentation](https://agenticstiger.github.io/forge_docs/) · [Getting Started](https://agenticstiger.github.io/forge_docs/getting-started/) · [FLUID Specification](https://open-data-protocol.github.io/fluid/) · [The Book](https://a.co/d/04zTi7aQ) · [Community](https://github.com/Agenticstiger/forge-cli/discussions)
 
+<br>
+
+<img src="https://raw.githubusercontent.com/Agenticstiger/forge_docs/main/docs/.vuepress/public/demos/local-quickstart.svg" alt="FLUID Forge — install through deploy in 30 seconds" width="800">
+
+<sub><i>Install through deploy in 30 seconds, against the local DuckDB provider. Click through to <a href="https://agenticstiger.github.io/forge_docs/demos/">the demos library</a> for 8 more casts (GCP, AWS, Snowflake, agentPolicy, AI copilot…).</i></sub>
+
 </div>
 
+
+---
+
+## Why FLUID Forge?
+
+<table>
+<tr>
+<td width="25%" align="center">
+<strong>1 file. 4 clouds. 0 rewrites.</strong><br>
+<sub>One contract.fluid.yaml. Swap <code>binding.platform</code> and ship.</sub>
+</td>
+<td width="25%" align="center">
+<strong>Validate → deploy in 30s.</strong><br>
+<sub>Local DuckDB out of the box. No cloud account, no credit card.</sub>
+</td>
+<td width="25%" align="center">
+<strong>Compiles to native IAM.</strong><br>
+<sub>policy-compile emits real BigQuery/Snowflake/AWS bindings.</sub>
+</td>
+<td width="25%" align="center">
+<strong>Agentic governance, declarative.</strong><br>
+<sub>agentPolicy gates which LLMs can read which fields.</sub>
+</td>
+</tr>
+</table>
 
 ---
 
