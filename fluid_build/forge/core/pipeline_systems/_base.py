@@ -453,6 +453,24 @@ class BasePipelineTemplate:
         )
         return render_pip_install_command(bootstrap)
 
+    def _install_command(self, config: "PipelineConfig") -> str:
+        """Combined ``pip install`` for forge-cli + per-engine extras.
+
+        Returns ``"pip install --quiet data-product-forge"`` when the
+        contract has no engine declared OR the registry has no extras;
+        otherwise returns ``"pip install --quiet data-product-forge && <engine pip install>"``.
+
+        Used by every CI emitter as the install step body so adding a
+        new engine to ``_engine_specs.py`` reaches every CI system
+        automatically (the alternative — an ``Install engine extras``
+        step BEFORE the FLUID install step — fails because some emitters
+        run pip install across many isolated jobs).
+        """
+        engine_pip = self._engine_pip_install_command(config)
+        if engine_pip:
+            return f"pip install --quiet data-product-forge && {engine_pip}"
+        return "pip install --quiet data-product-forge"
+
     def _engine_runtime_env_vars(self, config: "PipelineConfig") -> Dict[str, str]:
         """Per-engine env vars (e.g. AIRBYTE_PROJECT_DIR for engine='airbyte').
 
@@ -970,6 +988,11 @@ class BasePipelineTemplate:
         the pipeline rather than silently moving to the next step.
         """
         mode = getattr(config, "install_mode", "pypi") or "pypi"
+        # Per-engine pip extras (e.g. ``airbyte>=0.20,<1`` for engine='airbyte').
+        # Appended to the install body so the 11-stage path picks up
+        # engine deps the same way the BASIC paths do via _install_command().
+        engine_pip = self._engine_pip_install_command(config)
+        engine_install = f"\n{engine_pip}" if engine_pip else ""
         if mode == "dev-source":
             return (
                 "set -eu\n"
@@ -981,7 +1004,7 @@ class BasePipelineTemplate:
                 'export PYTHONPATH="/forge-cli-src:${PYTHONPATH:-}"\n'
                 'python -c "import fluid_build" || (echo \'FATAL: '
                 "fluid_build import failed; check /forge-cli-src' >&2 && exit 3)\n"
-                "fluid --version"
+                "fluid --version" + engine_install
             )
         # pypi mode — TestPyPI overrides + optional --pre
         return (
@@ -1000,7 +1023,7 @@ class BasePipelineTemplate:
             "fi\n"
             'SPEC="${FLUID_PACKAGE_SPEC:-data-product-forge}"\n'
             'sh -c "python -m pip install $INDEX_FLAGS $PRE_FLAG $SPEC"\n'
-            "fluid --version"
+            "fluid --version" + engine_install
         )
 
     def _stage_toggle_defaults(self, config: "PipelineConfig") -> Dict[str, bool]:

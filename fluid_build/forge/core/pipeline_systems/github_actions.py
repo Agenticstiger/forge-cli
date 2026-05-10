@@ -294,6 +294,8 @@ class GitHubActionsTemplate(BasePipelineTemplate):
 
         commands = self._get_fluid_commands()
         env_vars = self._get_common_environment_vars()
+        env_vars.update(self._engine_runtime_env_vars(config))
+        _install_cmd = self._install_command(config)
 
         workflow = {
             "name": "FLUID DataOps Pipeline - Standard",
@@ -317,7 +319,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         },
                         {
                             "name": "Install Dependencies",
-                            "run": "pip install --quiet data-product-forge",
+                            "run": _install_cmd,
                         },
                         {"name": "FLUID Doctor", "run": commands["doctor"]},
                         {"name": "Validate", "run": commands["validate"]},
@@ -342,7 +344,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         },
                         {
                             "name": "Install Dependencies",
-                            "run": "pip install --quiet data-product-forge",
+                            "run": _install_cmd,
                         },
                         {
                             "name": "Generate Transformations",
@@ -376,7 +378,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         },
                         {
                             "name": "Install Dependencies",
-                            "run": "pip install --quiet data-product-forge",
+                            "run": _install_cmd,
                         },
                         {"name": "Generate Plan", "run": commands["plan"]},
                         {
@@ -400,7 +402,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         },
                         {
                             "name": "Install Dependencies",
-                            "run": "pip install --quiet data-product-forge",
+                            "run": _install_cmd,
                         },
                         {
                             "name": "Run Tests",
@@ -434,7 +436,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     "uses": _pin_action("actions/setup-python@v5"),
                     "with": {"python-version": "3.10"},
                 },
-                {"name": "Install Dependencies", "run": "pip install --quiet data-product-forge"},
+                {"name": "Install Dependencies", "run": _install_cmd},
                 *self._get_oidc_steps(config.oidc_provider),
                 {
                     "name": "Generate Transformations",
@@ -519,7 +521,13 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                 "already wired when --oidc-provider is set."
             ),
         )
-        files = {".github/workflows/fluid-standard.yml": banner + yaml.dump(workflow, indent=2)}
+        runtime_notes = self._engine_runtime_notes(config, indent="# ")
+        notes_block = ("\n" + runtime_notes + "\n") if runtime_notes else ""
+        files = {
+            ".github/workflows/fluid-standard.yml": banner
+            + notes_block
+            + yaml.dump(workflow, indent=2)
+        }
         files[".env.ci.example"] = self._generate_env_ci_example(config.oidc_provider)
         return files
 
