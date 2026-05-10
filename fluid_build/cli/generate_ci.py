@@ -426,6 +426,7 @@ def run(args, logger: logging.Logger) -> int:
         # the generator can produce pip-extras for. Useful when authoring
         # a new contract and wondering what's supported.
         if getattr(args, "list_engines", False):
+            from fluid_build.cli.console import cprint
             from fluid_build.forge.core.pipeline_systems._engine_specs import (
                 _DBT_PLATFORM_ADAPTERS,
                 _DLT_SINK_EXTRAS,
@@ -434,8 +435,6 @@ def run(args, logger: logging.Logger) -> int:
                 _MELTANO_SOURCE_PACKAGES,
                 resolve_engine_bootstrap,
             )
-
-            from fluid_build.cli.console import cprint
 
             cprint("Engines recognised by ``fluid generate ci`` bootstrap:", markup=False)
             cprint("", markup=False)

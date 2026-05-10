@@ -399,9 +399,19 @@ def resolve_engine_runtime(engine: Optional[str]) -> EngineRuntime:
     e = engine.strip().lower()
 
     if e == "airbyte":
+        # The two ``/tmp/...`` strings below trip bandit B108
+        # (hardcoded_tmp_directory) but they are env-var VALUES emitted
+        # into generated CI files for PyAirbyte's connector executor,
+        # not paths used by Python's tempfile module. The /tmp prefix
+        # is REQUIRED because PyAirbyte's docker executor mounts the
+        # host's tempfile.gettempdir() into the spawned source-connector
+        # container at /airbyte/tmp; the path must exist symmetrically
+        # on host + runner for DinD to work (operator bind-mounts
+        # /tmp/airbyte host->runner). The B108 warning does not apply
+        # to declarative env-var emission.
         return EngineRuntime(
             env_vars={
-                "AIRBYTE_PROJECT_DIR": "/tmp/airbyte",
+                "AIRBYTE_PROJECT_DIR": "/tmp/airbyte",  # nosec B108
                 # PyAirbyte's docker executor uses tempfile.gettempdir() (default
                 # ``/tmp``) as the host source for the ``/airbyte/tmp`` bind in
                 # the spawned connector container. When the FLUID runner is
@@ -414,7 +424,7 @@ def resolve_engine_runtime(engine: Optional[str]) -> EngineRuntime:
                 # this, the spawned connector hits ``NoSuchFileException:
                 # /airbyte/tmp/tmpXXX.json`` because the host's ``/tmp`` is
                 # empty (the temp file lives in the runner container's ``/tmp``).
-                "AIRBYTE_TEMP_DIR": "/tmp/airbyte/tmp",
+                "AIRBYTE_TEMP_DIR": "/tmp/airbyte/tmp",  # nosec B108
             },
             needs_docker_socket=True,
             notes=[
