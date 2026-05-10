@@ -650,7 +650,7 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
     ),
     "context": (
         "Deprecated: use 'fluid config' instead. Get or set defaults.",
-        ("  fluid config list\n" "  fluid config set provider gcp"),
+        ("  fluid config list\n  fluid config set provider gcp"),
     ),
     "auth": (
         "Manage authentication credentials for cloud providers (GCP, AWS, Azure, Snowflake, Databricks).",

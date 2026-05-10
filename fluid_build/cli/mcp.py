@@ -607,7 +607,7 @@ def check_tool_permission(
         target = Path(str(raw)).expanduser().resolve()
         if not _path_is_allowed(target, policy.readable_paths):
             raise PermissionError(
-                f"Tool {tool!r} cannot read from {target} " f"(outside --readable-paths allowlist)"
+                f"Tool {tool!r} cannot read from {target} (outside --readable-paths allowlist)"
             )
 
     if cap.mutates_files:
@@ -618,8 +618,7 @@ def check_tool_permission(
             target = Path(str(raw)).expanduser().resolve()
             if not _path_is_writable(target, policy.writable_paths):
                 raise PermissionError(
-                    f"Tool {tool!r} cannot write to {target} "
-                    f"(outside --writable-paths allowlist)"
+                    f"Tool {tool!r} cannot write to {target} (outside --writable-paths allowlist)"
                 )
 
     for ns in cap.writes_namespaces:
@@ -1303,9 +1302,7 @@ def _build_source_adapter(
         )
     if source not in _SOURCE_ADAPTERS:
         supported = ", ".join(sorted(_SOURCE_ADAPTERS))
-        raise RuntimeError(
-            f"Unknown source-catalog adapter: {source!r}. " f"Supported: {supported}."
-        )
+        raise RuntimeError(f"Unknown source-catalog adapter: {source!r}. Supported: {supported}.")
     resolver = CredentialResolver(
         allow_metadata_service=bool(arguments.get("allow_metadata_service", False))
     )

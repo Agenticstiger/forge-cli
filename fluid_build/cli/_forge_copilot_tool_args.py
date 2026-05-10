@@ -151,7 +151,7 @@ class ReadUpstreamSchemaArgs(BaseModel):
     expose_id: Optional[str] = Field(
         default=None,
         description=(
-            "Specific expose to read. When omitted, returns every expose " "the product publishes."
+            "Specific expose to read. When omitted, returns every expose the product publishes."
         ),
     )
     include_classifications: bool = Field(

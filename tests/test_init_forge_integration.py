@@ -444,7 +444,6 @@ class TestInitForgeHandover:
             patch("fluid_build.cli.init.get_target_directory", create=True),
             patch("fluid_build.cli.init.load_context", create=True),
         ):
-
             # Mock workspace config
             mock_ws_config.return_value = SimpleNamespace(
                 name="test-ws",

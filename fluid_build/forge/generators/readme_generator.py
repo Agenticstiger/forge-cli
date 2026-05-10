@@ -53,7 +53,7 @@ This is a FLUID data product created using the **{template_name}** template.
 - **Domain**: {domain}
 - **Owner**: {owner}
 - **Created**: {context.creation_time}
-- **FLUID Version**: {context.project_config.get('fluid_version', '0.5.7')}
+- **FLUID Version**: {context.project_config.get("fluid_version", "0.5.7")}
 
 ## Quick Start
 

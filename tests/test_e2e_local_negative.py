@@ -91,17 +91,12 @@ class TestFluidValidateRejectsMalformedContracts:
     def test_unsupported_schema_version_exits_nonzero(self, tmp_path: Path) -> None:
         contract = tmp_path / "contract.fluid.yaml"
         contract.write_text(
-            'fluidVersion: "9.99.99"\n'
-            'kind: "DataProduct"\n'
-            'id: "x.y"\n'
-            'name: "x"\n'
-            'domain: "x"\n'
+            'fluidVersion: "9.99.99"\nkind: "DataProduct"\nid: "x.y"\nname: "x"\ndomain: "x"\n'
         )
         result = _fluid("validate", str(contract), cwd=tmp_path)
-        assert result.returncode != 0, (
-            f"validate accepted unsupported fluidVersion; "
-            f"output: {result.stdout}{result.stderr}"
-        )
+        assert (
+            result.returncode != 0
+        ), f"validate accepted unsupported fluidVersion; output: {result.stdout}{result.stderr}"
 
 
 class TestFluidApplyRejectsBadInputs:

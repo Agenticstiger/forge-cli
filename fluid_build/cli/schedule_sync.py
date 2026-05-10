@@ -1275,7 +1275,7 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
             artifacts = schedule_sync_acquisition(contract, Path.cwd(), orchestrators=picked)
             for a in artifacts:
                 cprint(
-                    f"[schedule-sync] acquisition emitted " f"{a.orchestrator} → {a.artifact_path}",
+                    f"[schedule-sync] acquisition emitted {a.orchestrator} → {a.artifact_path}",
                     markup=False,
                 )
     except Exception as exc:  # noqa: BLE001 — schedule-sync must not crash on this
@@ -1314,12 +1314,12 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
 
     if overall_exit == 0:
         cprint(
-            f"[schedule-sync] ✔ {args.scheduler} sync complete " f"({len(results)} subprocess(es))",
+            f"[schedule-sync] ✔ {args.scheduler} sync complete ({len(results)} subprocess(es))",
             markup=False,
         )
     else:
         cprint(
-            f"[schedule-sync] ✘ {args.scheduler} sync failed " f"(see logs for argv + stderr tail)",
+            f"[schedule-sync] ✘ {args.scheduler} sync failed (see logs for argv + stderr tail)",
             markup=False,
         )
 

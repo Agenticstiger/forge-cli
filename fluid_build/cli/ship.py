@@ -86,7 +86,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "-y",
         "--yes",
         action="store_true",
-        help=("Skip apply's interactive confirmation. Required for " "non-interactive / CI usage."),
+        help=("Skip apply's interactive confirmation. Required for non-interactive / CI usage."),
     )
     p.add_argument(
         "--skip-bundle",
@@ -119,8 +119,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             "contract_required",
             {
                 "message": (
-                    "No contract path supplied and no contract.fluid.yaml "
-                    "in the current directory."
+                    "No contract path supplied and no contract.fluid.yaml in the current directory."
                 )
             },
         )

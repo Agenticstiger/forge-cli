@@ -66,7 +66,12 @@ def test_load_milestones_reads_packaged_roadmap():
 def test_compact_next_line_mentions_roadmap():
     line = compact_next_line()
     assert "fluid roadmap" in line
-    assert "v1.2" in line
+    # The next-future milestone shifts as milestones ship — assert on
+    # the version-prefix shape instead of a specific version, so the
+    # test stays green when next_milestone() rolls forward.
+    import re
+
+    assert re.search(r"\bv\d+\.\d+\b", line), f"expected v<X>.<Y> in {line!r}"
 
 
 def test_next_milestone_returns_first_future_milestone():

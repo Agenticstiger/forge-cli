@@ -263,8 +263,8 @@ class TestSystemPromptSnapshot:
                     pytest.fail(
                         f"system prompt drift at byte {i}. "
                         f"context before diff: {context_before!r}; "
-                        f"expected: {expected[i:i+40]!r}; "
-                        f"got: {actual[i:i+40]!r}. "
+                        f"expected: {expected[i : i + 40]!r}; "
+                        f"got: {actual[i : i + 40]!r}. "
                         f"If the change is intentional, regenerate the baseline "
                         f"per the instructions at the top of "
                         f"tests/test_prompt_default_guidance.py."
@@ -273,5 +273,5 @@ class TestSystemPromptSnapshot:
             pytest.fail(
                 f"system prompt length mismatch: expected {len(expected)} bytes, "
                 f"got {len(actual)} bytes. "
-                f"Extra tail: {(actual[len(expected):] or expected[len(actual):])[:200]!r}"
+                f"Extra tail: {(actual[len(expected) :] or expected[len(actual) :])[:200]!r}"
             )

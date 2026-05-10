@@ -181,7 +181,7 @@ def mark_downstream_dirty(
     """
     detected_at = _utc_now_iso()
     if not reason:
-        reason = f"upstream cursor rewound from {old_cursor_value!r} to " f"{new_cursor_value!r}"
+        reason = f"upstream cursor rewound from {old_cursor_value!r} to {new_cursor_value!r}"
     marked: List[str] = []
     for match in find_downstream_products(workspace_root, upstream_product_id):
         product_id = match["product_id"]

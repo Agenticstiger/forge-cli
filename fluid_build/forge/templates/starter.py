@@ -348,10 +348,10 @@ solid foundation for building data products with best practices and modern tooli
 
 ## Overview
 
-- **Domain**: {context.project_config.get('domain', 'analytics')}
+- **Domain**: {context.project_config.get("domain", "analytics")}
 - **Owner**: {owner}
 - **Provider**: {provider}
-- **FLUID Version**: {context.project_config.get('fluid_version', '0.5.7')}
+- **FLUID Version**: {context.project_config.get("fluid_version", "0.5.7")}
 - **Created**: {context.creation_time}
 
 ## Getting Started

@@ -200,7 +200,7 @@ _REGISTRY: List[_SettingSpec] = [
     # ── rollback ──────────────────────────────────────────────────────
     _SettingSpec(
         key="FLUID_ROLLBACK_KEEP_LAST_N",
-        description="Per-product retention cap on .fluid/rollback-state.json. " "Default 20.",
+        description="Per-product retention cap on .fluid/rollback-state.json. Default 20.",
         default=20,
         cast=lambda v: _to_int(v, default=20),
         category="rollback",
@@ -208,7 +208,7 @@ _REGISTRY: List[_SettingSpec] = [
     # ── runtime / paths ───────────────────────────────────────────────
     _SettingSpec(
         key="FLUID_WORKSPACE_ROOT",
-        description="Override the workspace root (where .fluid/ lives). " "Defaults to CWD.",
+        description="Override the workspace root (where .fluid/ lives). Defaults to CWD.",
         default=None,
         category="runtime",
     ),

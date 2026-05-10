@@ -158,8 +158,7 @@ class _PublishFlowMixin:
             seen.add(access_id)
 
             purpose = canonical.get("description") or (
-                f"{consumer_product_id} consumes "
-                f"{provider_product_id}.{provider_output_port_id}."
+                f"{consumer_product_id} consumes {provider_product_id}.{provider_output_port_id}."
             )
 
             tags = ["fluid", "lineage"]

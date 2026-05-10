@@ -264,7 +264,7 @@ def _gemini_config() -> LlmConfig | None:
         provider="gemini",
         model=model,
         endpoint=(
-            f"https://generativelanguage.googleapis.com/v1beta/models/" f"{model}:generateContent"
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         ),
         api_key=key,
         timeout_seconds=60,

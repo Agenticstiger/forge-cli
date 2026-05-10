@@ -298,7 +298,7 @@ def _generate_create_database_sql(params: Dict[str, Any]) -> str:
     comment = params.get("comment", "")
     transient = params.get("transient", False)
 
-    sql = f"CREATE {'TRANSIENT ' if transient else ''}DATABASE IF NOT EXISTS \"{database}\""
+    sql = f'CREATE {"TRANSIENT " if transient else ""}DATABASE IF NOT EXISTS "{database}"'
 
     if comment:
         sql += f" COMMENT = '{comment}'"
@@ -315,7 +315,7 @@ def _generate_create_schema_sql(params: Dict[str, Any]) -> str:
     comment = params.get("comment", "")
     transient = params.get("transient", False)
 
-    sql = f"CREATE {'TRANSIENT ' if transient else ''}SCHEMA IF NOT EXISTS \"{database}\".\"{schema}\""
+    sql = f'CREATE {"TRANSIENT " if transient else ""}SCHEMA IF NOT EXISTS "{database}"."{schema}"'
 
     if comment:
         sql += f" COMMENT = '{comment}'"

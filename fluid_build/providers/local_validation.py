@@ -100,7 +100,7 @@ class LocalValidationProvider(ValidationProvider):
                 self._duckdb = duckdb
             except ImportError:
                 raise RuntimeError(
-                    "duckdb is required for local validation. " "Install with: pip install duckdb"
+                    "duckdb is required for local validation. Install with: pip install duckdb"
                 )
         return self._duckdb
 

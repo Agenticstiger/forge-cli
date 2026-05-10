@@ -45,6 +45,7 @@ from fluid_build.providers._sql_safety import (
 
 from ..util.config import resolve_env_templates as _resolve_env_templates
 from ..util.metadata import extract_snowflake_tags
+from ..util.types import map_fluid_type_to_snowflake
 
 _SAFE_POLICY_SIGNATURE = re.compile(
     r"^\(\s*[A-Za-z_][A-Za-z0-9_]*\s+[A-Za-z_][A-Za-z0-9_(),\s]*\)"
@@ -494,8 +495,7 @@ def _emit_named_masking_policy_actions(
             "account": account,
             "database": database,
             "sql": (
-                f"CREATE OR REPLACE MASKING POLICY {safe_name} "
-                f"AS {safe_signature} -> {safe_body}"
+                f"CREATE OR REPLACE MASKING POLICY {safe_name} AS {safe_signature} -> {safe_body}"
             ),
             "comment": policy.get("comment") or f"Masking policy {safe_name}",
         }
@@ -523,7 +523,7 @@ def _emit_row_access_application_actions(
     except ValueError as exc:
         if logger is not None:
             logger.warning(
-                "snowflake_row_access_application_skipped " "table=%r policy=%r error=%s",
+                "snowflake_row_access_application_skipped table=%r policy=%r error=%s",
                 table,
                 policy_name,
                 exc,
@@ -569,7 +569,7 @@ def _emit_masking_application_actions(
     except ValueError as exc:
         if logger is not None:
             logger.warning(
-                "snowflake_masking_application_skipped " "table=%r column=%r policy=%r error=%s",
+                "snowflake_masking_application_skipped table=%r column=%r policy=%r error=%s",
                 table,
                 column,
                 policy_name,
@@ -1008,7 +1008,7 @@ def _plan_expose(
             columns = []
             for field in fields:
                 col_name = field.get("name")
-                col_type = _map_fluid_type_to_snowflake(field.get("type", "string"))
+                col_type = map_fluid_type_to_snowflake(field.get("type", "string"))
                 nullable = field.get("nullable", not field.get("required", False))
                 description = field.get("description")
 
@@ -1147,67 +1147,3 @@ def _plan_schedule(
                 )
 
     return actions
-
-
-def _map_fluid_type_to_snowflake(fluid_type: str) -> str:
-    """
-    Map FLUID type to Snowflake data type.
-
-    FLUID Types → Snowflake Types:
-    - string → VARCHAR
-    - integer → NUMBER(38,0)
-    - long → NUMBER(38,0)
-    - float → FLOAT
-    - double → DOUBLE
-    - decimal → NUMBER(38,10)
-    - boolean → BOOLEAN
-    - date → DATE
-    - timestamp → TIMESTAMP_NTZ
-    - binary → BINARY
-    - array → ARRAY
-    - object → OBJECT
-    """
-    raw_type = (fluid_type or "string").strip()
-    lower_type = raw_type.lower()
-    parameterized_prefixes = {
-        "decimal",
-        "numeric",
-        "number",
-        "varchar",
-        "char",
-        "character",
-        "binary",
-        "varbinary",
-    }
-    base_type = lower_type.split("(", 1)[0].strip()
-    if "(" in lower_type and base_type in parameterized_prefixes:
-        return raw_type.upper()
-
-    type_map = {
-        "string": "VARCHAR",
-        "integer": "NUMBER(38,0)",
-        "int": "NUMBER(38,0)",
-        "long": "NUMBER(38,0)",
-        "bigint": "NUMBER(38,0)",
-        "float": "FLOAT",
-        "double": "DOUBLE",
-        "decimal": "NUMBER(38,10)",
-        "numeric": "NUMBER(38,10)",
-        "boolean": "BOOLEAN",
-        "bool": "BOOLEAN",
-        "date": "DATE",
-        "timestamp": "TIMESTAMP_NTZ",
-        "datetime": "TIMESTAMP_NTZ",
-        "timestamp_ntz": "TIMESTAMP_NTZ",
-        "timestamp_tz": "TIMESTAMP_TZ",
-        "timestamp_ltz": "TIMESTAMP_LTZ",
-        "time": "TIME",
-        "binary": "BINARY",
-        "array": "ARRAY",
-        "object": "OBJECT",
-        "variant": "VARIANT",
-        "geography": "GEOGRAPHY",
-        "geometry": "GEOMETRY",
-    }
-
-    return type_map.get(lower_type, "VARCHAR")

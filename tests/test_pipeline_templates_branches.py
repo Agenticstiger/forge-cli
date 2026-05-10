@@ -131,7 +131,10 @@ class TestPipelineConfig:
         )
         assert cfg.verify_strict_default is True
         assert cfg.publish_stage_default is False
-        assert cfg.publish_include_env is True
+        # publish_include_env default is False because `fluid publish`
+        # does not accept `--env`; emitting it would make Stage 10 die
+        # with `unrecognized arguments: --env dev`.
+        assert cfg.publish_include_env is False
 
 
 # ── BasePipelineTemplate tests ──────────────────────────────────────
@@ -503,7 +506,7 @@ class TestJenkinsTemplateHardening:
         # Stage 3 is always PRESENT in the template (toggleable) —
         # what changes between reference-only and normal is the DEFAULT
         # value of RUN_STAGE_3_GENERATE_ARTIFACTS.
-        assert "stage('3 · generate artifacts')" in content
+        assert "stage('3 - generate artifacts')" in content
         # Default generates_artifacts=True → param default true.
         assert "name: 'RUN_STAGE_3_GENERATE_ARTIFACTS', defaultValue: true" in content
 
@@ -511,12 +514,12 @@ class TestJenkinsTemplateHardening:
         content = self._jenkinsfile(generates_artifacts=False)
         # Stage 3 is still declared (parameterized), but the default
         # flips to false so a zero-click build skips it.
-        assert "stage('3 · generate artifacts')" in content
+        assert "stage('3 - generate artifacts')" in content
         assert "name: 'RUN_STAGE_3_GENERATE_ARTIFACTS', defaultValue: false" in content
         # Adjacent stages must still be present — we're defaulting a
         # stage off, not breaking the template.
-        assert "stage('2 · validate')" in content
-        assert "stage('6 · plan')" in content
+        assert "stage('2 - validate')" in content
+        assert "stage('6 - plan')" in content
 
     # Regression 3: empty-archive/result tolerance --------------------
 
@@ -557,11 +560,29 @@ class TestJenkinsTemplateHardening:
 
     def test_publish_stage_can_omit_env_flag(self):
         content = self._jenkinsfile(publish_include_env=False)
-        stage_10 = content[content.index("stage('10 · publish')") :]
-        stage_10 = stage_10[: stage_10.index("stage('11 · schedule sync')")]
+        stage_10 = content[content.index("stage('10 - publish')") :]
+        stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
         assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS}' in stage_10
         assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS} \\' not in stage_10
         assert '--env "${FLUID_ENV:-dev}"' not in stage_10
+
+    def test_publish_stage_default_omits_env_flag(self):
+        # Default (no publish_include_env passed) MUST omit --env on
+        # `fluid publish`, because the CLI doesn't accept --env. When
+        # the default emitted --env, every Stage 10 build that ran
+        # publish died with `unrecognized arguments: --env dev`.
+        content = self._jenkinsfile()
+        stage_10 = content[content.index("stage('10 - publish')") :]
+        stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
+        assert '--env "${FLUID_ENV:-dev}"' not in stage_10
+
+    def test_publish_stage_can_opt_in_to_env_flag(self):
+        # Operators who wrap `fluid publish` with a custom CLI alias
+        # that accepts --env can opt in via publish_include_env=True.
+        content = self._jenkinsfile(publish_include_env=True)
+        stage_10 = content[content.index("stage('10 - publish')") :]
+        stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
+        assert '--env "${FLUID_ENV:-dev}"' in stage_10
 
     def test_doctor_not_extended(self):
         """``fluid doctor --extended`` requires scripts/diagnose.sh which
@@ -587,7 +608,7 @@ class TestJenkinsTemplateHardening:
     def test_install_mode_default_is_pypi(self):
         content = self._jenkinsfile()
         # Unambiguous marker in stage name — operator sees it in UI.
-        assert "stage('Setup [install-mode: pypi]')" in content
+        assert "stage('0 — Bootstrap FLUID [pypi]')" in content
         # pypi mode's pip install sees FLUID_PACKAGE_SPEC with default.
         assert '"${FLUID_PACKAGE_SPEC:-data-product-forge}"' in content
         # dev-source branch must NOT appear in pypi mode — clean separation.
@@ -602,7 +623,7 @@ class TestJenkinsTemplateHardening:
     def test_install_mode_dev_source(self):
         content = self._jenkinsfile(install_mode="dev-source")
         # Unambiguous marker in stage name.
-        assert "stage('Setup [install-mode: dev-source]')" in content
+        assert "stage('0 — Bootstrap FLUID [dev-source]')" in content
         # Fail-loud check is required — no silent fallback to PyPI.
         assert "install-mode=dev-source but /forge-cli-src" in content
         assert "exit 2" in content
@@ -751,7 +772,7 @@ class TestJenkinsTemplateStage11ScheduleSync:
         pipeline stage defaults to "hard-fail on absent optional input".
         """
         content = self._jenkinsfile()
-        sh_body = self._extract_stage_sh_body(content, "11 · schedule sync")
+        sh_body = self._extract_stage_sh_body(content, "11 - schedule sync")
         # The gate condition: missing dir OR empty dir. Mirror the
         # stage 8 pattern of ``if [ ... ]; then ...; else ...; fi``
         # but with ``exit 0`` + explanatory echo so the skip is
@@ -782,7 +803,7 @@ class TestJenkinsTemplateStage11ScheduleSync:
         content = self._jenkinsfile()
         # Locate the stage-11 sh block and assert it has no ${params.*} inside.
         # We slice from the stage label to the next `stage(` boundary or post.
-        marker = "stage('11 · schedule sync')"
+        marker = "stage('11 - schedule sync')"
         assert marker in content
         start = content.index(marker)
         # Find the next stage boundary or the start of the post{} block.
@@ -839,7 +860,7 @@ class TestJenkinsTemplateStage11ScheduleSync:
         and the sh body uses POSIX ``set --`` with individually-quoted
         ``$VAR`` expansions. This test is the regression guard."""
         content = self._jenkinsfile()
-        sh_body = self._extract_stage_sh_body(content, "7 · apply")
+        sh_body = self._extract_stage_sh_body(content, "7 - apply")
         # Pattern fingerprints that should NOT appear:
         assert "${APPLY_BUILD_FLAG}" not in sh_body
         assert "${APPLY_LOSS_FLAG}" not in sh_body
@@ -862,7 +883,7 @@ class TestJenkinsTemplateStage11ScheduleSync:
         Groovy interpolation (safe inside env assignments) and shell
         interpretation (safe because we quote every $VAR expansion)."""
         content = self._jenkinsfile()
-        marker = "stage('7 · apply')"
+        marker = "stage('7 - apply')"
         assert marker in content
         tail = content[content.index(marker) :]
         # Isolate the stage-7 environment{} block via brace-depth
@@ -1254,9 +1275,9 @@ class TestElevenStagePortsAllSystems:
             "fluid schedule-sync ",
         ]
         missing = [v for v in verbs if v not in content]
-        assert not missing, (
-            f"{name} emit is missing stage(s): {missing!r}. " f"Output files: {list(out.keys())}"
-        )
+        assert (
+            not missing
+        ), f"{name} emit is missing stage(s): {missing!r}. Output files: {list(out.keys())}"
 
     @pytest.mark.parametrize("name,cls,provider,fname", SYSTEMS)
     def test_filename_matches_system_convention(self, name, cls, provider, fname):

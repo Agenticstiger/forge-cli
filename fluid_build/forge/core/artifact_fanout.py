@@ -155,7 +155,7 @@ def _safe_tar_members(tar: tarfile.TarFile, dest: Path):
         target = (dest / member.name).resolve()
         if not str(target).startswith(str(dest_resolved) + os.sep) and target != dest_resolved:
             raise FanoutError(
-                f"bundle tar entry resolves outside destination: " f"{member.name!r} → {target}",
+                f"bundle tar entry resolves outside destination: {member.name!r} → {target}",
                 key=None,
             )
         yield member
@@ -272,7 +272,7 @@ def parse_emit_set(
     unknown = [k for k in requested if k not in EMIT_KEYS]
     if unknown:
         raise FanoutError(
-            f"unknown --emit keys: {sorted(unknown)}. " f"Valid: {sorted(EMIT_KEYS)}",
+            f"unknown --emit keys: {sorted(unknown)}. Valid: {sorted(EMIT_KEYS)}",
             key=unknown[0],
         )
 

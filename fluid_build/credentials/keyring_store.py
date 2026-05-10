@@ -56,8 +56,7 @@ class KeyringCredentialStore:
         """
         if not KEYRING_AVAILABLE:
             raise ImportError(
-                "keyring library required for OS keyring support. "
-                "Install with: pip install keyring"
+                "keyring library required for OS keyring support. Install with: pip install keyring"
             )
 
         try:
@@ -108,8 +107,7 @@ class KeyringCredentialStore:
         """
         if not KEYRING_AVAILABLE:
             raise ImportError(
-                "keyring library required for OS keyring support. "
-                "Install with: pip install keyring"
+                "keyring library required for OS keyring support. Install with: pip install keyring"
             )
 
         try:

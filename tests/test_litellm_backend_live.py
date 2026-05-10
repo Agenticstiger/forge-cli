@@ -63,7 +63,7 @@ def _opt_in_required() -> None:
 
 def _skip_if_missing(env_var: str, hint: str) -> None:
     if not os.environ.get(env_var):
-        pytest.skip(f"Skipping live LLM test: ``${env_var}`` is not set. " f"{hint}")
+        pytest.skip(f"Skipping live LLM test: ``${env_var}`` is not set. {hint}")
 
 
 @pytest.mark.parametrize(

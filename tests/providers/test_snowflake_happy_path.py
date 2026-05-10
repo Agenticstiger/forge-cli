@@ -660,8 +660,7 @@ def test_plan_actions_emits_named_masking_policy_and_application():
                         "name": "hash_email",
                         "signature": "(val VARCHAR) RETURNS VARCHAR",
                         "body": (
-                            "CASE WHEN CURRENT_ROLE() IN ('ADMIN') "
-                            "THEN val ELSE SHA2(val, 256) END"
+                            "CASE WHEN CURRENT_ROLE() IN ('ADMIN') THEN val ELSE SHA2(val, 256) END"
                         ),
                     }
                 ]

@@ -231,7 +231,7 @@ def _resolve_refs(
         _BLOCKED_PREFIXES = ("/etc/", "/var/", "/usr/", "/proc/", "/sys/", "/dev/")
         if any(_ref_str.startswith(p) for p in _BLOCKED_PREFIXES):
             raise RefResolutionError(
-                f"$ref resolves to a blocked system path: {ref_value} " f"(resolved to {ref_path})"
+                f"$ref resolves to a blocked system path: {ref_value} (resolved to {ref_path})"
             )
 
         # Circular detection keyed on absolute path + pointer.
@@ -244,9 +244,7 @@ def _resolve_refs(
         _seen.add(ref_key)
 
         if not ref_path.exists():
-            raise RefResolutionError(
-                f"$ref target not found: {ref_value} " f"(resolved to {ref_path})"
-            )
+            raise RefResolutionError(f"$ref target not found: {ref_value} (resolved to {ref_path})")
 
         try:
             resolved = _parse_file(ref_path)

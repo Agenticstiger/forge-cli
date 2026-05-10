@@ -174,7 +174,7 @@ def _serialize(contract: Dict[str, Any], fmt: str) -> str:
         return json.dumps(contract, indent=2, default=str) + "\n"
     if yaml is None:
         raise RuntimeError(
-            "YAML output requires PyYAML. Install with: pip install pyyaml\n" "Or use --format json"
+            "YAML output requires PyYAML. Install with: pip install pyyaml\nOr use --format json"
         )
     return yaml.dump(
         contract,
@@ -357,7 +357,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             # Keyless mode emits sig + cert; keyed mode emits sig only.
             if sig_result.get("key_mode") == "keyed":
                 sys.stderr.write(
-                    f"✅ Bundle signed (keyed mode)\n" f"   signature: {sig_result['sig_path']}\n"
+                    f"✅ Bundle signed (keyed mode)\n   signature: {sig_result['sig_path']}\n"
                 )
             else:
                 sys.stderr.write(
@@ -396,8 +396,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 sys.stderr.write(f"❌ Attestation write failed: {e}\n")
                 return 1
             sys.stderr.write(
-                f"✅ Attestation written (SLSA Provenance v1)\n"
-                f"   intoto: {attest_result['path']}\n"
+                f"✅ Attestation written (SLSA Provenance v1)\n   intoto: {attest_result['path']}\n"
             )
         return 0
 

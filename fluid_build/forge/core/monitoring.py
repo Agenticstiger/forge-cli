@@ -762,7 +762,7 @@ class MonitoringSystem:
 <body>
     <div class="header">
         <h1>FLUID Forge Monitoring Dashboard</h1>
-        <p>Project: {self.project_name} | Last Updated: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
+        <p>Project: {self.project_name} | Last Updated: {time.strftime("%Y-%m-%d %H:%M:%S")}</p>
     </div>
     
     <div class="section">
@@ -796,7 +796,7 @@ class MonitoringSystem:
                 <div class="alert {alert.severity.value}">
                     <strong>{alert.name}</strong> [{alert.severity.value.upper()}]<br>
                     {alert.message}<br>
-                    <small>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(alert.timestamp))}</small>
+                    <small>{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(alert.timestamp))}</small>
                 </div>
                 """
         else:

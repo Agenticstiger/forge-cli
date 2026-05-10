@@ -44,7 +44,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Mapping, Optional
 
-from fluid_build.util.contract import consumes_to_canonical_ports
+from fluid_build.util.contract import consumes_to_canonical_ports, kind_to_dmm_type
 
 LOG = logging.getLogger("fluid.providers.datamesh_manager.odps")
 
@@ -244,7 +244,7 @@ def ensure_odps_input_port_contract_ids(
         if existing == reference and promoted != existing:
             port["contractId"] = promoted
             LOG.debug(
-                "Promoted input port %s contractId %r -> %r " "(product-level -> expose-level)",
+                "Promoted input port %s contractId %r -> %r (product-level -> expose-level)",
                 port_id,
                 existing,
                 promoted,
@@ -301,6 +301,65 @@ def ensure_odps_input_port_source_system_custom_property(
         port["customProperties"] = props
 
 
+def promote_input_port_native_source_system_fields(
+    odps_payload: Dict[str, Any],
+) -> None:
+    """Lift ODPS ``customProperties[sourceSystem|sourceKind]`` into native
+    DMM fields on each input port (``sourceSystemId``, ``type``).
+
+    Why this is an overlay rather than baked into the standalone artifact:
+    the ODPS-Bitol v1.0.0 ``InputPort`` schema is closed
+    (``additionalProperties: false``) — only ``name, version, contractId,
+    tags, customProperties, authoritativeDefinitions`` are permitted.
+    ``sourceSystemId`` and ``type`` would fail the spec's JSON-schema
+    validator if emitted by the standalone exporter.
+
+    DMM (Entropy Data CE), however, ACCEPTS those native fields on
+    InputPort and uses them to render lineage edges in the UI. So:
+
+      * The standalone ``*.odps-bitol.yaml`` artifact stays spec-clean
+        with source-system info in ``customProperties[]`` only.
+      * The DMM POST payload runs through this overlay, which copies the
+        ``sourceSystem`` / ``sourceKind`` custom property values into the
+        native fields. DMM's UI then renders the lineage edge to the
+        registered SourceSystem entity.
+
+    The customProperties stay in place after promotion — they're the
+    canonical source of truth, and DMM tolerates duplication. Idempotent
+    (won't overwrite an explicit ``sourceSystemId`` set by the author).
+    """
+    input_ports = odps_payload.get("inputPorts")
+    if not isinstance(input_ports, list):
+        return
+    promoted_count = 0
+    for port in input_ports:
+        if not isinstance(port, dict):
+            continue
+        custom_props = port.get("customProperties") or []
+        if not isinstance(custom_props, list):
+            continue
+        for prop in custom_props:
+            if not isinstance(prop, Mapping):
+                continue
+            name = prop.get("property")
+            value = prop.get("value")
+            if name == "sourceSystem" and value and not port.get("sourceSystemId"):
+                port["sourceSystemId"] = str(value)
+                promoted_count += 1
+            elif name == "sourceKind" and value and not port.get("type"):
+                # Use DMM's TitleCase enum (Postgres / Kafka / Snowflake / …)
+                # so the lineage UI renders the correct connector icon —
+                # raw lowercase kinds fall back to "API" in DMM's renderer.
+                port["type"] = kind_to_dmm_type(str(value)) or str(value)
+    if promoted_count > 0:
+        LOG.debug(
+            "Promoted source-system fields on %d input port(s) for DMM payload "
+            "(DMM ODPS-Bitol payloads strip unknown native fields; lineage "
+            "still flows via customProperties[sourceSystem])",
+            promoted_count,
+        )
+
+
 __all__ = [
     "ensure_odps_input_port_contract_ids",
     "ensure_odps_input_port_source_system_custom_property",
@@ -308,5 +367,6 @@ __all__ = [
     "is_odps_payload",
     "is_odps_spec",
     "normalize_fluid_for_odps_standard",
+    "promote_input_port_native_source_system_fields",
     "remove_odps_product_consume_input_ports",
 ]

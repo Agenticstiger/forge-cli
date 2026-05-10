@@ -245,9 +245,7 @@ def validate_manifest_dir(
                 file=str(manifest_path),
                 validator="manifest",
                 severity="error",
-                message=(
-                    f"merkle root mismatch: expected {expected_merkle}, " f"got {actual_merkle}"
-                ),
+                message=(f"merkle root mismatch: expected {expected_merkle}, got {actual_merkle}"),
                 code="MANIFEST-MERKLE-MISMATCH",
             )
         )
@@ -275,7 +273,7 @@ def _validate_against_schema(
                 file=artifact_path,
                 validator=validator_name,
                 severity="info",
-                message=("schema not vendored; skipped. " "Expected at one of the schemas/ paths."),
+                message=("schema not vendored; skipped. Expected at one of the schemas/ paths."),
                 code=f"{code_prefix}-SCHEMA-MISSING",
             )
         ]
@@ -620,8 +618,7 @@ def validate_opa_conftest(
                 validator="opa-conftest",
                 severity="error",
                 message=(
-                    f"conftest exit {result.returncode}: "
-                    f"{(result.stderr or result.stdout).strip()}"
+                    f"conftest exit {result.returncode}: {(result.stderr or result.stdout).strip()}"
                 ),
                 code="OPA-FAIL",
             )

@@ -200,7 +200,7 @@ class SnowflakeCatalogAdapter(CatalogAdapter):
                 suggestions=[
                     "Verify SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / "
                     "SNOWFLAKE_PASSWORD env vars are set.",
-                    "If using SSO, ensure a fresh ID-token via " "`fluid verify snowflake`.",
+                    "If using SSO, ensure a fresh ID-token via `fluid verify snowflake`.",
                     "If the account is behind a corporate proxy, set "
                     "HTTPS_PROXY before invoking the catalog tool.",
                 ],

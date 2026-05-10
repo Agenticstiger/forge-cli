@@ -46,7 +46,7 @@ class CircuitBreakerOpenError(Exception):
         self.service = service
         self.timeout_remaining = timeout_remaining
         super().__init__(
-            f"Circuit breaker is OPEN for {service}. " f"Retry in {timeout_remaining:.1f}s"
+            f"Circuit breaker is OPEN for {service}. Retry in {timeout_remaining:.1f}s"
         )
 
 

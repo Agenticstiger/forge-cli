@@ -84,7 +84,6 @@ class CommandCenterConnector(BaseCatalogConnector):
     async def _search_data_products_impl(self, filters: SearchFilters) -> List[DataProductMetadata]:
         """Search Command Center's data product catalog"""
         try:
-
             # Build query parameters
             params = {}
 
@@ -179,7 +178,6 @@ class CommandCenterConnector(BaseCatalogConnector):
     async def _get_catalog_stats_impl(self) -> Dict[str, Any]:
         """Get Command Center catalog statistics"""
         try:
-
             stats_url = f"{self.base_url}/stats"
 
             async with self.session.get(stats_url) as response:

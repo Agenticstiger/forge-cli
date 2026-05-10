@@ -181,25 +181,25 @@ def _generate_html_report(
         <div class="header">
             <h1>🌊 FLUID Apply Execution Report</h1>
             <p>Execution ID: {context.execution_id}</p>
-            <p>Status: {'✅ Success' if execution_result.get('success') else '❌ Failed'}</p>
+            <p>Status: {"✅ Success" if execution_result.get("success") else "❌ Failed"}</p>
         </div>
         
         <div class="metrics">
             <div class="metric">
                 <h3>Total Actions</h3>
-                <p>{execution_result.get('metrics', {}).get('total_actions', 0)}</p>
+                <p>{execution_result.get("metrics", {}).get("total_actions", 0)}</p>
             </div>
             <div class="metric">
                 <h3>Successful</h3>
-                <p>{execution_result.get('metrics', {}).get('successful_actions', 0)}</p>
+                <p>{execution_result.get("metrics", {}).get("successful_actions", 0)}</p>
             </div>
             <div class="metric">
                 <h3>Failed</h3>
-                <p>{execution_result.get('metrics', {}).get('failed_actions', 0)}</p>
+                <p>{execution_result.get("metrics", {}).get("failed_actions", 0)}</p>
             </div>
             <div class="metric">
                 <h3>Duration</h3>
-                <p>{execution_result.get('metrics', {}).get('total_duration_seconds', 0):.2f}s</p>
+                <p>{execution_result.get("metrics", {}).get("total_duration_seconds", 0):.2f}s</p>
             </div>
         </div>
         
@@ -210,10 +210,10 @@ def _generate_html_report(
         status_class = "success" if phase.get("status") == "success" else "failed"
         html_content += f"""
         <div class="phase {status_class}">
-            <h3>{phase.get('phase', 'Unknown').title()}</h3>
-            <p>Status: {phase.get('status', 'unknown')}</p>
-            <p>Actions: {phase.get('action_count', 0)}</p>
-            <p>Duration: {phase.get('duration', 0):.2f}s</p>
+            <h3>{phase.get("phase", "Unknown").title()}</h3>
+            <p>Status: {phase.get("status", "unknown")}</p>
+            <p>Actions: {phase.get("action_count", 0)}</p>
+            <p>Duration: {phase.get("duration", 0):.2f}s</p>
         </div>
         """
 
@@ -252,18 +252,18 @@ def _generate_markdown_report(
 
 ## Summary
 - **Execution ID**: {context.execution_id}
-- **Status**: {status_icon} {'Success' if execution_result.get('success') else 'Failed'}
+- **Status**: {status_icon} {"Success" if execution_result.get("success") else "Failed"}
 - **Contract**: {context.plan.contract_path}
-- **Environment**: {context.plan.environment or 'default'}
-- **Duration**: {execution_result.get('metrics', {}).get('total_duration_seconds', 0):.2f} seconds
+- **Environment**: {context.plan.environment or "default"}
+- **Duration**: {execution_result.get("metrics", {}).get("total_duration_seconds", 0):.2f} seconds
 
 ## Metrics
 | Metric | Value |
 |--------|-------|
-| Total Actions | {execution_result.get('metrics', {}).get('total_actions', 0)} |
-| Successful | {execution_result.get('metrics', {}).get('successful_actions', 0)} |
-| Failed | {execution_result.get('metrics', {}).get('failed_actions', 0)} |
-| Skipped | {execution_result.get('metrics', {}).get('skipped_actions', 0)} |
+| Total Actions | {execution_result.get("metrics", {}).get("total_actions", 0)} |
+| Successful | {execution_result.get("metrics", {}).get("successful_actions", 0)} |
+| Failed | {execution_result.get("metrics", {}).get("failed_actions", 0)} |
+| Skipped | {execution_result.get("metrics", {}).get("skipped_actions", 0)} |
 
 ## Phase Details
 """
@@ -271,10 +271,10 @@ def _generate_markdown_report(
     for phase in execution_result.get("phases", []):
         phase_icon = "✅" if phase.get("status") == "success" else "❌"
         markdown_content += f"""
-### {phase_icon} {phase.get('phase', 'Unknown').title()}
-- **Status**: {phase.get('status', 'unknown')}
-- **Actions**: {phase.get('action_count', 0)}
-- **Duration**: {phase.get('duration', 0):.2f}s
+### {phase_icon} {phase.get("phase", "Unknown").title()}
+- **Status**: {phase.get("status", "unknown")}
+- **Actions**: {phase.get("action_count", 0)}
+- **Duration**: {phase.get("duration", 0):.2f}s
 """
 
     with open(report_path, "w", encoding="utf-8") as f:

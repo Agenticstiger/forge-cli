@@ -92,6 +92,15 @@ def _make_sql_database_source(connection: Dict[str, Any], streams: List[str]) ->
     extra is missing we surface the typed catalog's ``MissingExtraError``
     so the user gets a five-field Panel pointing at the precise install
     command, instead of dlt's raw ``MissingDependencyException`` text.
+
+    Container-runtime loopback override fires here so dlt's
+    SQLAlchemy URL is built with ``host.docker.internal`` (or whatever
+    ``FLUID_RUNNER_HOST_OVERRIDE`` is set to) when the contract author
+    wrote ``host: localhost`` and FLUID is running inside a container
+    whose localhost differs from the operator's. Mutates the input
+    dict in place — same pattern the airbyte / meltano source adapters
+    use. Defensive: it's a no-op when the env var isn't set or the
+    host isn't a loopback address.
     """
     import dlt
 
@@ -108,6 +117,10 @@ def _make_sql_database_source(connection: Dict[str, Any], streams: List[str]) ->
                 "e.g. psycopg or pymysql, if not already installed)"
             ),
         ) from exc
+
+    from .._acquisition_common import apply_loopback_host_override
+
+    apply_loopback_host_override(connection)
 
     # Use SQLAlchemy's URL builder so credentials with URL-special characters
     # (``@``, ``:``, ``/``, ``%``) are safely percent-encoded. Building URLs
@@ -135,7 +148,26 @@ def _make_sql_database_source(connection: Dict[str, Any], streams: List[str]) ->
     # connection string dlt's ``ConnectionStringCredentials`` parses; passing the
     # raw ``URL`` object trips dlt's native-value resolver.
     rendered_dsn = url.render_as_string(hide_password=False)
-    src = sql_database(credentials=rendered_dsn)
+
+    # connection.schema / connection.schemas → dlt sql_database(schema=...).
+    # dlt's sql_database accepts a single schema (Postgres/MySQL/Oracle
+    # convention). When the contract declares multiple schemas we use the
+    # first and warn — multi-schema reads need a per-schema source instance.
+    from .._acquisition_common import extract_source_schemas
+
+    schemas = extract_source_schemas(connection)
+    sql_db_kwargs: Dict[str, Any] = {"credentials": rendered_dsn}
+    if schemas:
+        sql_db_kwargs["schema"] = schemas[0]
+        if len(schemas) > 1:
+            LOG.warning(
+                "dlt.sql_database accepts a single schema; using %r and ignoring "
+                "the rest: %r. Author one acquisition build per schema if you "
+                "need multi-schema ingestion.",
+                schemas[0],
+                schemas[1:],
+            )
+    src = sql_database(**sql_db_kwargs)
     if streams:
         return src.with_resources(*[s.split(".")[-1] for s in streams])
     return src
@@ -208,15 +240,19 @@ class DltRunner:
         return _execute(ctx, self)
 
     def fingerprint(self, ctx: RunContext) -> SchemaFingerprint:
-        # dlt resolves schema during pipeline.run; we surface a placeholder
-        # fingerprint here that reflects only the declared streams. A full
-        # fingerprint requires running the source which is too expensive for
-        # a fingerprint-only call — that's by design for code-as-config.
-        cols = [
-            SchemaColumn(name=s, type="dlt", nullable=True)
-            for s in (ctx.source.streams or [ctx.source.kind])
-        ]
-        return SchemaFingerprint.of(cols, captured_at=utc_now_iso())
+        # dlt resolves the actual source schema inside ``pipeline.run`` —
+        # introspecting it here would require constructing the source AND
+        # making a metadata round-trip to the upstream system. That's too
+        # expensive for fingerprint() (which gets called from the schema-
+        # evolution gate before any side-effecting work). Instead we surface
+        # a placeholder marked ``is_placeholder=True`` so the gate skips the
+        # contract-vs-current comparison; drift gets surfaced at run-time by
+        # dlt's own schema-discovery hooks once the connector is live.
+        return SchemaFingerprint.placeholder(
+            list(ctx.source.streams or [ctx.source.kind]),
+            engine="dlt",
+            captured_at=utc_now_iso(),
+        )
 
 
 def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
@@ -226,9 +262,31 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
     t_start = time.time()
 
     # Schema-evolution gate (shared across all 6 acquisition runners).
-    from .._acquisition_common import enforce_schema_policy_or_raise
+    from .._acquisition_common import (
+        enforce_schema_policy_or_raise,
+        resolve_connection_secrets,
+    )
+    from .._credentials import make_destination
 
     enforce_schema_policy_or_raise(ctx, runner)
+
+    # Bridge FLUID's canonical destination env vars (SNOWFLAKE_*, BIGQUERY_*,
+    # …) to dlt's DESTINATION__<NAME>__CREDENTIALS__* convention via the
+    # introspector in dlt/destinations.py — that walks dlt's OWN spec to
+    # discover the field names rather than hardcoding per-destination
+    # factories. binding.platform is the canonical signal of where data
+    # is being written.
+    expose = (ctx.contract.get("exposes") or [{}])[0]
+    binding = expose.get("binding") or {}
+    dest_platform = binding.get("platform")
+    if dest_platform:
+        make_destination(
+            "dlt",
+            dest_platform,
+            binding=binding,
+            contract=ctx.contract,
+            product_id=ctx.product_id,
+        )
 
     props = ctx.contract.get("builds", [{}])[0].get("properties", {})
     dlt_props = props.get("dlt", {}) or {}
@@ -241,7 +299,10 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
             source_obj = _make_custom_source(custom_module, contract_dir)
         else:
             kind = ctx.source.kind
-            connection = dict(ctx.source.connection.raw)
+            # Resolve secretRef → password (or other credential field) before
+            # the connection dict reaches dlt's source factories. Inline literal
+            # values in the connection always win over secretRef.
+            connection = resolve_connection_secrets(dict(ctx.source.connection.raw))
             if kind == "filesystem":
                 reader_dict = {}
                 if ctx.source.reader is not None:
@@ -267,6 +328,21 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
     dlt_root = contract_dir / ".fluid" / "dlt" / ctx.product_id / ctx.build_id
     dlt_root.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("DLT_DATA_DIR", str(dlt_root))
+
+    # Defensive env-namespace cleanup: dlt's Snowflake destination has a
+    # ``stage_name`` config field which dlt's configspec resolves from
+    # env in this priority: explicit DESTINATION__SNOWFLAKE__STAGE_NAME
+    # → namespaced fallbacks → bare ``STAGE_NAME``. Jenkins Pipeline DSL
+    # automatically exports ``STAGE_NAME=<the stage groovy name>`` inside
+    # any ``stage('foo') { ... }`` block — so a generated Jenkinsfile
+    # stage like ``stage('7 - apply')`` ends up overriding dlt's stage
+    # name to ``7 - apply``, which produces invalid Snowflake SQL like
+    # ``COPY INTO ... FROM @7 - apply/...``. Strip it before invoking
+    # dlt so the destination falls back to its default per-table stage.
+    # Same threat: GitHub Actions exports ``GITHUB_JOB`` / ``GITHUB_ACTION``
+    # which don't currently collide but the principle holds.
+    for _shadowed in ("STAGE_NAME",):
+        os.environ.pop(_shadowed, None)
 
     # Resolve the destination using the expose's binding when available.
     # Both ``dest_name=duckdb`` (writes a .duckdb file) and

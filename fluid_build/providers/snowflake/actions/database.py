@@ -41,10 +41,25 @@ def ensure_database(action: Dict[str, Any], provider) -> Dict[str, Any]:
     provider.debug_kv(event="ensure_database_started", database=database, account=account)
 
     try:
-        # Get connection parameters
+        # Build connection parameters and STRIP ``database`` / ``schema``
+        # before connecting. We are about to CREATE the database, so passing
+        # one to ``connect()`` forces Snowflake's session-init step to
+        # validate it exists first (``Object does not exist, or operation
+        # cannot be performed``) — a chicken-and-egg that prevents
+        # bootstrapping fresh accounts.
+        #
+        # Strip happens AFTER ``get_connection_params`` because the
+        # resolver's env-var fallback chain (SNOWFLAKE_DATABASE / SF_DATABASE)
+        # would otherwise repopulate the field even when we pass
+        # ``database=None`` explicitly. Downstream actions (ensure_schema,
+        # ensure_table) build their own params via their own
+        # get_connection_params calls and DO get the database — they're
+        # called only after this CREATE DATABASE has run.
         params = get_connection_params(
             account=account, warehouse=provider.warehouse, **provider._kwargs
         )
+        params.pop("database", None)
+        params.pop("schema", None)
 
         # Connect and check if database exists
         with SnowflakeConnection(**params) as conn:

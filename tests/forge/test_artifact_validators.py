@@ -372,9 +372,9 @@ class TestVendoredSchemas:
             / "schemas"
             / "odps-bitol-json-schema-v1.0.0.json"
         )
-        assert not bad_path.exists(), (
-            f"ODPS-Bitol schema must not live under fluid_build/schemas/; " f"found at {bad_path}"
-        )
+        assert (
+            not bad_path.exists()
+        ), f"ODPS-Bitol schema must not live under fluid_build/schemas/; found at {bad_path}"
 
     def test_odps_bitol_schema_is_valid_json(self):
         with open(_ODPS_BITOL_SCHEMA_PATH, "r", encoding="utf-8") as fh:

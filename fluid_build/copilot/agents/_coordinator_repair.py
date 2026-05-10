@@ -248,7 +248,7 @@ class _RepairLoopMixin:
                     industry_pack=session.industry_pack,
                 )
                 _log.info(
-                    "fluid.copilot.repair.done: stage=logical " "passes_schema=%s score=%s",
+                    "fluid.copilot.repair.done: stage=logical passes_schema=%s score=%s",
                     physical.validation.passes_schema,
                     physical.validation.score,
                 )

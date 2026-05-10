@@ -255,7 +255,6 @@ class ComponentRegistry(Generic[T], ABC):
                             and issubclass(attr, self.component_type)
                             and attr != self.component_type
                         ):
-
                             component_name = attr_name.lower().replace(
                                 self.component_type.__name__.lower(), ""
                             )

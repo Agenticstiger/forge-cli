@@ -210,7 +210,7 @@ def classify_arrival(
     return ArrivalClassification(
         category="late",
         lateness_seconds=delta,
-        reason=(f"{delta:.3f}s late > {budget_seconds:.0f}s budget; " f"routed to side-output"),
+        reason=(f"{delta:.3f}s late > {budget_seconds:.0f}s budget; routed to side-output"),
     )
 
 

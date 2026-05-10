@@ -170,16 +170,19 @@ class ConfigurationManager:
             # Provider validation
             ValidationRule(
                 "provider_valid",
-                lambda cfg: cfg.get("provider", {}).value
-                in ["local", "gcp", "aws", "azure", "snowflake"],
+                lambda cfg: (
+                    cfg.get("provider", {}).value in ["local", "gcp", "aws", "azure", "snowflake"]
+                ),
                 "Provider must be one of: local, gcp, aws, azure, snowflake",
             ),
             # Cloud provider project requirement
             ValidationRule(
                 "cloud_provider_project",
-                lambda cfg: not (
-                    cfg.get("provider", {}).value in ["gcp", "aws", "azure"]
-                    and not cfg.get("project", {}).value
+                lambda cfg: (
+                    not (
+                        cfg.get("provider", {}).value in ["gcp", "aws", "azure"]
+                        and not cfg.get("project", {}).value
+                    )
                 ),
                 "Cloud providers (gcp, aws, azure) require a project to be specified",
                 environments=[EnvironmentType.STAGING, EnvironmentType.PRODUCTION],
@@ -199,8 +202,9 @@ class ConfigurationManager:
             # Log level validation
             ValidationRule(
                 "log_level_valid",
-                lambda cfg: cfg.get("log_level", {}).value.upper()
-                in ["DEBUG", "INFO", "WARNING", "ERROR"],
+                lambda cfg: (
+                    cfg.get("log_level", {}).value.upper() in ["DEBUG", "INFO", "WARNING", "ERROR"]
+                ),
                 "Log level must be one of: DEBUG, INFO, WARNING, ERROR",
             ),
             # File size limits
@@ -224,9 +228,11 @@ class ConfigurationManager:
             # Production debugging warning
             ValidationRule(
                 "production_debug_warning",
-                lambda cfg: not (
-                    cfg.get("debug", {}).value
-                    and cfg.get("environment") == EnvironmentType.PRODUCTION
+                lambda cfg: (
+                    not (
+                        cfg.get("debug", {}).value
+                        and cfg.get("environment") == EnvironmentType.PRODUCTION
+                    )
                 ),
                 "Debug mode should not be enabled in production",
                 severity="warning",

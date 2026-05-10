@@ -34,7 +34,7 @@ from typing import Any, Dict, Optional
 from fluid_build.cli.console import cprint, success
 from fluid_build.cli.console import error as console_error
 
-from .._path_safety import confine_to_workspace
+from .._path_safety import confine_to_workspace, resolve_workspace_root
 
 LOG = logging.getLogger("fluid.build_runners.python")
 
@@ -51,7 +51,11 @@ def resolve_script_path(contract_path: Path, build: Dict[str, Any]) -> Optional[
     properties = build.get("properties", {})
     model = properties.get("model", "ingest")
     build_id = str(build.get("id", "unknown"))
-    workspace_root = contract_path.parent
+    # Pattern-aware workspace boundary: hybrid-reference / shared-reference
+    # builds widen to the enclosing repo root so they can reach scripts in
+    # sibling directories. Inline (default) builds stay confined to
+    # ``contract.parent``.
+    workspace_root = resolve_workspace_root(contract_path, build)
 
     # Try .py extension first
     script_path = contract_path.parent / repository / f"{model}.py"
@@ -116,7 +120,7 @@ def execute_build(
         failed_runs = 0
 
         for i in range(iterations):
-            cprint(f"🚀 Run {i+1}/{iterations} - {datetime.now().strftime('%H:%M:%S')}")
+            cprint(f"🚀 Run {i + 1}/{iterations} - {datetime.now().strftime('%H:%M:%S')}")
             cprint("-" * 80)
 
             start_time = time.time()
@@ -141,10 +145,10 @@ def execute_build(
 
                 if result.returncode == 0:
                     successful_runs += 1
-                    success(f"Run {i+1} completed successfully ({duration:.2f}s)")
+                    success(f"Run {i + 1} completed successfully ({duration:.2f}s)")
                 else:
                     failed_runs += 1
-                    console_error(f"Run {i+1} failed with exit code {result.returncode}")
+                    console_error(f"Run {i + 1} failed with exit code {result.returncode}")
 
                     if no_output and result.stderr:
                         cprint(f"Error output:\n{result.stderr}")
@@ -155,7 +159,7 @@ def execute_build(
 
             except Exception as e:
                 failed_runs += 1
-                console_error(f"Run {i+1} failed with exception: {e}")
+                console_error(f"Run {i + 1} failed with exception: {e}")
                 if fail_fast:
                     return 1
 

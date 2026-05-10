@@ -486,9 +486,9 @@ class TestCliBundleDefaultFilename:
         assert rc == 0
 
         expected = tmp_path / "customer-360.fluid.bundle.tgz"
-        assert expected.exists(), (
-            f"expected default bundle at {expected}; " f"got {list(tmp_path.iterdir())}"
-        )
+        assert (
+            expected.exists()
+        ), f"expected default bundle at {expected}; got {list(tmp_path.iterdir())}"
 
     def test_default_filename_slugifies_nonfilesafe_ids(self, tmp_path):
         # IDs with spaces / parens / uppercase must slugify into something

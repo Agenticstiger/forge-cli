@@ -2453,6 +2453,22 @@
               "type": "string",
               "pattern": "^[a-z][a-z0-9_+.-]*://.+",
               "description": "Reference to a secret in the configured backend (vault://, aws://, gcp://, azure://, env://)."
+            },
+            "user": {
+              "type": "string",
+              "description": "NEW in v0.7.3: Username/principal for SQL- or REST-style sources. Required by most database drivers (Postgres/MySQL/Oracle/etc.) — without it the underlying client falls back to the OS-user identity and typically fails authentication. Goes alongside ``secretRef`` (or an inline ``password``) for the credential pair."
+            },
+            "schema": {
+              "type": "string",
+              "description": "NEW in v0.7.3: Default schema/namespace within the source database to read from. Maps to engine-specific config: dlt sql_database schema=, Meltano tap-postgres filter_schemas=[], Airbyte source-postgres schemas=[], Debezium schema.include.list, Kafka Connect JDBC schema.pattern. Use ``schemas`` (array) to scope to multiple schemas at once."
+            },
+            "schemas": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true,
+              "description": "NEW in v0.7.3: Multi-schema variant of ``schema``. When both are set, ``schemas`` wins and ``schema`` is treated as a deprecated alias. Engines that don't natively support multi-schema reads will iterate the list."
             }
           }
         },

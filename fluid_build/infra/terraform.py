@@ -136,7 +136,7 @@ def _emit_variables_tf(modules: List[Dict[str, Any]]) -> str:
     for m in modules:
         eng = _safe_id(m["engine"])
         lines.append(f'variable "{eng}_values" {{')
-        lines.append(f"  description = \"Helm values overlay for {m['engine']}\"")
+        lines.append(f'  description = "Helm values overlay for {m["engine"]}"')
         lines.append("  type        = string")
         # Default to the generated values JSON, escaping it so it survives Terraform expansion.
         default_json = json.dumps(m["values"])

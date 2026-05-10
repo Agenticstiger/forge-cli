@@ -366,8 +366,7 @@ def test_build_access_agreements_maps_consumes_to_entropy_lineage_edges():
                 "managedBy": "forge-cli",
                 "source": "fluid.consumes",
                 "providerContractId": (
-                    "bizlab.teleforge.subscriber_usage_daily_lineage_local."
-                    "subscriber_usage_daily"
+                    "bizlab.teleforge.subscriber_usage_daily_lineage_local.subscriber_usage_daily"
                 ),
             },
         },
@@ -863,7 +862,7 @@ def test_publish_odcs_warn_validation_still_puts(monkeypatch):
     monkeypatch.setattr(
         provider,
         "_request",
-        lambda *args, **kwargs: (request_calls.append((args, kwargs)) or _Resp()),
+        lambda *args, **kwargs: request_calls.append((args, kwargs)) or _Resp(),
     )
 
     results = provider._publish_odcs_per_expose(

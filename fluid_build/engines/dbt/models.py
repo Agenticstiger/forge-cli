@@ -172,7 +172,7 @@ def _generate_embedded(
         return {}
 
     model_name = build.get("id", "main")
-    content = f"{_HEADER}" f"{{{{ config(materialized='table') }}}}\n\n" f"{sql.strip()}\n"
+    content = f"{_HEADER}{{{{ config(materialized='table') }}}}\n\n{sql.strip()}\n"
     return {f"models/marts/{model_name}.sql": content}
 
 
@@ -253,9 +253,7 @@ def _generate_from_intent(
         materialization = _layer_materialization(layer)
 
         content = (
-            f"{_HEADER}"
-            f"{{{{ config(materialized='{materialization}') }}}}\n\n"
-            f"{sql.strip()}\n"
+            f"{_HEADER}{{{{ config(materialized='{materialization}') }}}}\n\n{sql.strip()}\n"
             if sql
             else f"{_HEADER}"
             f"{{{{ config(materialized='{materialization}') }}}}\n\n"

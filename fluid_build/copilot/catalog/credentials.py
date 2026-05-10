@@ -780,7 +780,7 @@ class CredentialResolver:
         except Exception as exc:
             raise CatalogConfigError(
                 message=(
-                    f"Stored credentials for source {credential_id!r} " f"failed validation: {exc}"
+                    f"Stored credentials for source {credential_id!r} failed validation: {exc}"
                 ),
                 suggestions=[
                     f"Run: fluid ai setup --source {credential_id} --rotate",

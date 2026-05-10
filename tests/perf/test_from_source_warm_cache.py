@@ -215,7 +215,7 @@ def test_warm_cache_reduces_from_source_latency(perf_session):
     reduction = (cold - warm) / cold if cold else 0.0
     assert reduction >= _TARGET_REDUCTION, (
         f"warm-cache reduction {reduction:.2%} < target {_TARGET_REDUCTION:.0%} "
-        f"(cold {cold*1000:.1f}ms, warm {warm*1000:.1f}ms). The catalog "
+        f"(cold {cold * 1000:.1f}ms, warm {warm * 1000:.1f}ms). The catalog "
         f"forge path's LLM stage must hit the on-disk cache on a re-run "
         f"with identical inputs."
     )

@@ -105,7 +105,7 @@ class TestSinglePassConvergence:
                     CriticFinding(
                         stage="logical",
                         severity="error",
-                        message=("Hub has no business_key_columns; cannot " "load satellites."),
+                        message=("Hub has no business_key_columns; cannot load satellites."),
                         suggestion="Set business_key_columns to ['customer_id']",
                     )
                 ]

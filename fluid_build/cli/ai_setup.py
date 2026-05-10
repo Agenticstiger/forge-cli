@@ -989,8 +989,7 @@ def register(subparsers) -> None:
         "--name",
         default=None,
         help=(
-            "Saved name for the source / LLM config. Defaults to "
-            "'<source>-prod' for source setup."
+            "Saved name for the source / LLM config. Defaults to '<source>-prod' for source setup."
         ),
     )
     setup_parser.add_argument(

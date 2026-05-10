@@ -272,7 +272,7 @@ def test_init_template_validates(tmp_path, template_name):
     assert contract is not None, f"init --template {template_name} did not produce a contract"
     _assert_metadata_canonical(contract)
     ok, output = _validate_contract_passes(contract, tmp_path)
-    assert ok, f"validate failed for init --template {template_name}: " f"{output[-1500:]}"
+    assert ok, f"validate failed for init --template {template_name}: {output[-1500:]}"
 
 
 # ---------------------------------------------------------------------------
@@ -290,9 +290,9 @@ def test_init_quickstart_validates(tmp_path):
         "--quiet",
         cwd=tmp_path,
     )
-    assert proc.returncode == 0, (
-        f"init --quickstart failed:\n" f"stdout={proc.stdout[-1000:]}\nstderr={proc.stderr[-1000:]}"
-    )
+    assert (
+        proc.returncode == 0
+    ), f"init --quickstart failed:\nstdout={proc.stdout[-1000:]}\nstderr={proc.stderr[-1000:]}"
 
     contract = _find_contract(tmp_path)
     assert contract is not None, "init --quickstart did not produce a contract"
@@ -370,9 +370,10 @@ def test_forge_refine_round_trips_a_blank_contract(tmp_path):
     )
     # Refine + --no-llm currently routes through blank (no-LLM fallback)
     # which should not corrupt the on-disk contract.
-    assert proc2.returncode in (0, 1), (
-        "Refine round-trip should either succeed or fail-soft, " f"got rc={proc2.returncode}"
-    )
+    assert proc2.returncode in (
+        0,
+        1,
+    ), f"Refine round-trip should either succeed or fail-soft, got rc={proc2.returncode}"
     # The on-disk contract MUST still be valid no matter what refine did.
     ok2, output2 = _validate_contract_passes(contract, tmp_path)
     assert ok2, (

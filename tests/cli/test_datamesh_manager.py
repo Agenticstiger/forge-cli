@@ -1195,9 +1195,9 @@ class TestDataProductSpecConformance:
                 "exposes": [],
             }
             dp = self._make_provider()._to_data_product(contract)
-            assert dp["info"].get("archetype") == expected, (
-                f"{layer} layer should map to {expected!r}, " f"got {dp['info'].get('archetype')!r}"
-            )
+            assert (
+                dp["info"].get("archetype") == expected
+            ), f"{layer} layer should map to {expected!r}, got {dp['info'].get('archetype')!r}"
 
     def test_archetype_inferred_from_product_type(self):
         """metadata.productType drives archetype directly when present
@@ -1216,10 +1216,9 @@ class TestDataProductSpecConformance:
                 "exposes": [],
             }
             dp = self._make_provider()._to_data_product(contract)
-            assert dp["info"].get("archetype") == expected, (
-                f"{product_type} should map to {expected!r}, "
-                f"got {dp['info'].get('archetype')!r}"
-            )
+            assert (
+                dp["info"].get("archetype") == expected
+            ), f"{product_type} should map to {expected!r}, got {dp['info'].get('archetype')!r}"
 
 
 # ---------------------------------------------------------------------------

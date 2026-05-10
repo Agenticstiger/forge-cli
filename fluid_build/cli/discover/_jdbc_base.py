@@ -102,7 +102,7 @@ class JdbcDiscoverer(Discoverer):
         p = urlparse(uri)
         if p.scheme not in self.config.schemes:
             raise ValueError(
-                f"{type(self).__name__} expects one of " f"{self.config.schemes}, got {p.scheme!r}"
+                f"{type(self).__name__} expects one of {self.config.schemes}, got {p.scheme!r}"
             )
         return {
             "host": p.hostname or "localhost",
@@ -123,8 +123,7 @@ class JdbcDiscoverer(Discoverer):
         try:
             con.execute(f"INSTALL {self.config.extension}; LOAD {self.config.extension};")
             con.execute(
-                f"ATTACH {quote_string_literal(dsn)} AS {alias} "
-                f"(TYPE {self.config.attach_type})"
+                f"ATTACH {quote_string_literal(dsn)} AS {alias} (TYPE {self.config.attach_type})"
             )
 
             filter_fn = self.config.table_filter or _default_table_filter

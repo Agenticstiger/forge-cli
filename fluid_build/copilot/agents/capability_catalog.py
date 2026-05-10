@@ -102,7 +102,7 @@ CAPABILITY_CATALOG: Tuple[ProviderCapabilities, ...] = (
         streaming=True,
         prompt_caching=True,
         extended_thinking=True,
-        notes=("Temperature is deprecated on Opus 4.7 — providers drop it " "automatically.",),
+        notes=("Temperature is deprecated on Opus 4.7 — providers drop it automatically.",),
     ),
     ProviderCapabilities(
         provider="anthropic",
@@ -367,8 +367,7 @@ CAPABILITY_CATALOG: Tuple[ProviderCapabilities, ...] = (
         structured_output=False,
         streaming=True,
         notes=(
-            "Original Gemma (1.x) does not support tool calling. Use gemma3+ "
-            "for the agent loop.",
+            "Original Gemma (1.x) does not support tool calling. Use gemma3+ for the agent loop.",
         ),
     ),
     ProviderCapabilities(

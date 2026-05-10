@@ -106,10 +106,8 @@ class GitLabCITemplate(BasePipelineTemplate):
             rule_expr = (
                 f'$({spec.toggle_param}) == "true"'
                 if False
-                else (
-                    # GitLab uses $VAR (not $(VAR)) in rules:if
-                    f'${spec.toggle_param} == "true"'
-                )
+                # GitLab uses $VAR (not $(VAR)) in rules:if
+                else (f'${spec.toggle_param} == "true"')
             )
             job: Dict[str, Any] = {
                 "stage": f"stage-{spec.num}",
@@ -119,7 +117,7 @@ class GitLabCITemplate(BasePipelineTemplate):
             }
             # Stage 11 also gates on non-blank SCHEDULER.
             if spec.num == 11:
-                job["rules"] = [{"if": (f'${spec.toggle_param} == "true" ' '&& $SCHEDULER != ""')}]
+                job["rules"] = [{"if": (f'${spec.toggle_param} == "true" && $SCHEDULER != ""')}]
             jobs[f"stage-{spec.num}-{spec.slug.replace('_', '-')}"] = job
 
         pipeline: Dict[str, Any] = {
@@ -143,6 +141,10 @@ class GitLabCITemplate(BasePipelineTemplate):
 
         commands = self._get_fluid_commands()
         env_vars = self._get_common_environment_vars()
+        # Engine specs registry — merge per-engine env vars (e.g.
+        # AIRBYTE_PROJECT_DIR for engine='airbyte') so they reach every
+        # job via GitLab CI's top-level ``variables:`` block.
+        env_vars.update(self._engine_runtime_env_vars(config))
 
         if config.complexity == PipelineComplexity.BASIC:
             pipeline = self._generate_basic_gitlab_pipeline(config, commands, env_vars)
@@ -150,6 +152,14 @@ class GitLabCITemplate(BasePipelineTemplate):
             pipeline = self._generate_standard_gitlab_pipeline(config, commands, env_vars)
         else:
             pipeline = self._generate_advanced_gitlab_pipeline(config, commands, env_vars)
+
+        # Splice the per-engine pip-install command into ``before_script``
+        # so every job picks up the engine extras (dlt[snowflake], airbyte,
+        # meltanolabs-tap-postgres, etc.). Pulled from the same registry
+        # as Jenkins; consistent across CI systems.
+        engine_pip = self._engine_pip_install_command(config)
+        if engine_pip and "before_script" in pipeline:
+            pipeline["before_script"] = list(pipeline["before_script"]) + [engine_pip]
 
         banner = self._credential_banner(
             comment_prefix="# ",
@@ -160,7 +170,9 @@ class GitLabCITemplate(BasePipelineTemplate):
                 "protected branches."
             ),
         )
-        return {".gitlab-ci.yml": banner + yaml.dump(pipeline, indent=2)}
+        runtime_notes = self._engine_runtime_notes(config, indent="# ")
+        notes_block = ("\n" + runtime_notes + "\n") if runtime_notes else ""
+        return {".gitlab-ci.yml": banner + notes_block + yaml.dump(pipeline, indent=2)}
 
     def _generate_basic_gitlab_pipeline(self, config, commands, env_vars):
         """Generate basic GitLab CI pipeline"""

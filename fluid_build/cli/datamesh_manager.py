@@ -88,8 +88,7 @@ def add_parser(subparsers):
     pub.add_argument(
         "--data-product-spec",
         help=(
-            "Override dataProductSpecification value sent to Entropy Data "
-            "(e.g. 'odps' or '0.0.1')."
+            "Override dataProductSpecification value sent to Entropy Data (e.g. 'odps' or '0.0.1')."
         ),
     )
     pub.add_argument(

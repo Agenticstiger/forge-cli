@@ -146,18 +146,18 @@ def format_detailed_output(
 • Layer: {product.layer.value}
 • Status: {product.status.value}
 • Version: {product.version}
-• Quality Score: {product.quality_score if product.quality_score else 'N/A'}
+• Quality Score: {product.quality_score if product.quality_score else "N/A"}
 
 [bold blue]Timestamps:[/bold blue]
-• Created: {product.created_at.strftime('%Y-%m-%d %H:%M:%S UTC')}
-• Updated: {product.updated_at.strftime('%Y-%m-%d %H:%M:%S UTC')}
+• Created: {product.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")}
+• Updated: {product.updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")}
 
-[bold magenta]Tags:[/bold magenta] {', '.join(product.tags) if product.tags else 'None'}
+[bold magenta]Tags:[/bold magenta] {", ".join(product.tags) if product.tags else "None"}
 
 [bold yellow]Resources:[/bold yellow]
-• Schema: {product.schema_url or 'Not available'}
-• Documentation: {product.documentation_url or 'Not available'}
-• API Endpoint: {product.api_endpoint or 'Not available'}
+• Schema: {product.schema_url or "Not available"}
+• Documentation: {product.documentation_url or "Not available"}
+• API Endpoint: {product.api_endpoint or "Not available"}
 
 [bold dim]Source:[/bold dim] {product.catalog_source} ({product.catalog_type})
         """

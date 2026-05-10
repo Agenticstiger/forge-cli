@@ -254,8 +254,7 @@ def setup_source(
     if source not in _AUTH_METHODS:
         _emit(
             console,
-            f"Unknown source catalog: {source!r}. "
-            f"Supported: {', '.join(sorted(_AUTH_METHODS))}.",
+            f"Unknown source catalog: {source!r}. Supported: {', '.join(sorted(_AUTH_METHODS))}.",
             kind="error",
         )
         return 1
@@ -399,7 +398,7 @@ def show_source_status(console: Any = None) -> int:
         )
     _emit(
         console,
-        "Use any of these names with --credential-id on " "`fluid forge data-model from-source`.",
+        "Use any of these names with --credential-id on `fluid forge data-model from-source`.",
         kind="info",
     )
     return 0

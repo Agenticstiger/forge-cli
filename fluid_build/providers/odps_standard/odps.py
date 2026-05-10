@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderError
 from fluid_build.util.contract import (
+    builds_to_canonical_input_ports,
     consumes_to_canonical_ports,
     get_owner,
 )
@@ -314,7 +315,8 @@ class OdpsStandardProvider(BaseProvider):
         return team if team else None
 
     def _extract_input_ports(self, fluid: Mapping[str, Any]) -> List[Dict[str, Any]]:
-        """Map FLUID ``consumes[]`` to ODPS-Bitol v1.0.0 input ports.
+        """Map FLUID ``consumes[]`` AND ``builds[].properties.source`` to
+        ODPS-Bitol v1.0.0 input ports.
 
         ODPS-Bitol v1.0.0 ``InputPort`` (``additionalProperties: false``) permits
         only: ``name, version, contractId, tags, customProperties,
@@ -326,7 +328,10 @@ class OdpsStandardProvider(BaseProvider):
           are NOT permitted on ``InputPort`` under v1.0.0. Stripped. If the
           host repo uses them downstream (e.g. for DMM provider overlay),
           that extension should happen after this provider returns — not
-          be baked into the v1.0.0 artifact.
+          be baked into the v1.0.0 artifact. The DMM publish path
+          (``_promote_input_port_native_source_system_fields``) lifts the
+          ``customProperties[sourceSystem]`` value into native
+          ``sourceSystemId / type / location`` for the wire payload only.
         * ``contractId`` is REQUIRED. We synthesize when the FLUID consume
           didn't carry one explicitly, in order of preference:
             1. Canonical ``contract_id`` field (FLUID's explicit field)
@@ -334,27 +339,75 @@ class OdpsStandardProvider(BaseProvider):
                — stable identifier for the contract's upstream source)
             3. Canonical ``name`` (last-resort stable identifier)
 
-        Uses :func:`consumes_to_canonical_ports` for v0.7.x
-        compatibility.
+        For SDPs (Source-Aligned Data Products with no ``consumes[]``
+        but a ``builds[].properties.source`` block), we ALSO emit one
+        InputPort per source stream via
+        :func:`builds_to_canonical_input_ports`. Each such port carries:
+
+          - ``customProperties[sourceSystem]`` = derived source-system id
+            (kind-database slug) — picked up by the DMM provider to
+            establish lineage to a registered SourceSystem entity.
+          - ``customProperties[sourceKind]`` = the source kind
+            (postgres / mysql / mssql / kafka / s3 / ...).
+          - ``contractId`` = synthetic ``<kind>://<database>/<stream>``
+            (mirrors OpenLineage namespace+name convention since no
+            upstream FLUID contract exists).
         """
-        canonical_ports = consumes_to_canonical_ports(
+        consumes_ports = consumes_to_canonical_ports(
+            fluid,
+            default_version=self.default_port_version,
+            logger=self.logger,
+        )
+        build_ports = builds_to_canonical_input_ports(
             fluid,
             default_version=self.default_port_version,
             logger=self.logger,
         )
 
         input_ports: List[Dict[str, Any]] = []
-        for canonical in canonical_ports:
-            # Synthesize contractId via fallback chain so the emitted port
-            # always carries the v1.0.0-required field.
+        # Track names to avoid emitting duplicate InputPorts when an
+        # author wires both a consumes[] entry AND an acquisition build
+        # for the same upstream (rare but legal).
+        seen_names: set = set()
+
+        for canonical in consumes_ports:
+            name = canonical["name"]
+            if name in seen_names:
+                continue
+            seen_names.add(name)
             contract_id = (
                 canonical.get("contract_id") or canonical.get("reference") or canonical.get("name")
             )
             port: Dict[str, Any] = {
-                "name": canonical["name"],
+                "name": name,
                 "version": canonical["version"],
-                "contractId": str(contract_id) if contract_id else canonical["name"],
+                "contractId": str(contract_id) if contract_id else name,
             }
+            input_ports.append(port)
+
+        for canonical in build_ports:
+            name = canonical["name"]
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            port = {
+                "name": name,
+                "version": canonical["version"],
+                "contractId": str(canonical["contract_id"]),
+            }
+            # Pre-seed source-system custom properties so they survive into
+            # the standalone ODPS-Bitol artifact (which never gets the
+            # DMM-only overlay). The DMM provider's overlay treats these
+            # as the canonical source for native field promotion.
+            custom_props = []
+            sys_id = canonical.get("source_system_id")
+            if sys_id:
+                custom_props.append({"property": "sourceSystem", "value": sys_id})
+            kind = canonical.get("kind")
+            if kind:
+                custom_props.append({"property": "sourceKind", "value": kind})
+            if custom_props:
+                port["customProperties"] = custom_props
             input_ports.append(port)
 
         return input_ports

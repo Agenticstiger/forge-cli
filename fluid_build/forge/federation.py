@@ -644,7 +644,7 @@ def _git_clone_or_pull_via_gitpython(
         from git import GitCommandError, Repo
     except ImportError:
         LOG.debug(
-            "federation_git_gitpython_unavailable: workspace=%s — falling " "back to shell-out",
+            "federation_git_gitpython_unavailable: workspace=%s — falling back to shell-out",
             workspace_id,
         )
         return None
@@ -915,7 +915,7 @@ def validate_federated_consumes(
                     upstream_product_id=str(product_id or "?"),
                     expected_digest=str(expected),
                     actual_digest="",
-                    reason=(f"Federation fetcher for kind={ws.kind!r} not " f"yet wired ({exc})."),
+                    reason=(f"Federation fetcher for kind={ws.kind!r} not yet wired ({exc})."),
                 )
             )
             continue

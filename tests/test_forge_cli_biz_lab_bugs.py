@@ -627,7 +627,7 @@ class TestSnowflakeRollbackCleanupValidatesIdentifiers:
         )
 
         assert result == [
-            "CREATE OR REPLACE TABLE PROD.PUBLIC.ORDERS " "CLONE PROD.PUBLIC.BACKUP_ORDERS_20260503"
+            "CREATE OR REPLACE TABLE PROD.PUBLIC.ORDERS CLONE PROD.PUBLIC.BACKUP_ORDERS_20260503"
         ]
 
     def test_cleanup_backups_skips_tampered_records(self):

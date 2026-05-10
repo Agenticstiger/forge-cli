@@ -220,9 +220,9 @@ Version: {cli_info["version"]}
 API: {cli_info["api_version"]}
 
 [bold cyan]Supported Specifications:[/bold cyan]
-• FLUID {', '.join(spec_info['supported'])}
-• Default: {spec_info['default']}
-• Latest: {spec_info['latest']}"""
+• FLUID {", ".join(spec_info["supported"])}
+• Default: {spec_info["default"]}
+• Latest: {spec_info["latest"]}"""
 
         console.print(Panel(version_text, title="📦 Version Information", border_style="cyan"))
         next_line = compact_next_line()

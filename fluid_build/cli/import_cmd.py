@@ -81,7 +81,7 @@ def _safe_yaml_load(path: Path, max_bytes: int = _YAML_MAX_BYTES) -> Any:
         raise ValueError(f"Cannot stat {path}: {exc}") from exc
     if size > max_bytes:
         raise ValueError(
-            f"Refusing to parse {path.name}: " f"{size:,} bytes exceeds {max_bytes:,}-byte cap"
+            f"Refusing to parse {path.name}: {size:,} bytes exceeds {max_bytes:,}-byte cap"
         )
     with open(path) as f:
         return yaml.safe_load(f)

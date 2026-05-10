@@ -39,7 +39,9 @@ from fluid_build.api.runner import (
 from fluid_build.api.schema import SchemaColumn, SchemaFingerprint
 
 from .._acquisition_common import (
+    extract_source_schemas,
     generate_run_id,
+    resolve_connection_secrets,
     utc_now_iso,
     write_run_record_and_finalize,
 )
@@ -166,11 +168,17 @@ class KafkaConnectRunner:
         return _execute(ctx, self)
 
     def fingerprint(self, ctx: RunContext) -> SchemaFingerprint:
-        cols = [
-            SchemaColumn(name=s, type="kafka-connect", nullable=True)
-            for s in (ctx.source.streams or [ctx.source.kind])
-        ]
-        return SchemaFingerprint.of(cols, captured_at=utc_now_iso())
+        # Kafka Connect connectors emit schema info via the schema registry
+        # (Avro/JSON-Schema) at run time; introspecting at fingerprint() time
+        # would require deploying the connector + querying the registry.
+        # Surface a placeholder marked ``is_placeholder=True`` so the schema-
+        # evolution gate skips comparison — the Connect REST API + schema
+        # registry handle real drift after deploy.
+        return SchemaFingerprint.placeholder(
+            list(ctx.source.streams or [ctx.source.kind]),
+            engine="kafka-connect",
+            captured_at=utc_now_iso(),
+        )
 
 
 def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
@@ -350,6 +358,8 @@ def _debezium_config(
     Postgres we also default ``plugin.name=pgoutput``. Per-source-stream
     filtering uses ``table.include.list`` (Postgres / MySQL / SQL Server).
     """
+    # Resolve secretRef → password before any connection.get("password") read.
+    connection = resolve_connection_secrets(dict(connection))
     host = connection.get("host", "localhost")
     port = connection.get("port") or {"postgres": 5432, "mysql": 3306}.get(kind, 5432)
     db = connection.get("database", "")
@@ -375,6 +385,12 @@ def _debezium_config(
 def _jdbc_config(connection: Dict[str, Any], kind: str) -> Dict[str, Any]:
     """Translate a connection dict into Kafka Connect JDBC config keys."""
     if kind in ("jdbc", "postgres", "mysql", "sqlserver", "oracle"):
+        # Resolve secretRef → password ONLY when we're about to consume it.
+        # Non-JDBC kinds (s3, gcs, http, …) fall through to the passthrough
+        # branch below and don't need credential resolution; eagerly resolving
+        # there would force the secret backend to be available even when the
+        # secret isn't used.
+        connection = resolve_connection_secrets(dict(connection))
         host = connection.get("host", "localhost")
         port = connection.get("port", "")
         db = connection.get("database", "")
@@ -387,11 +403,20 @@ def _jdbc_config(connection: Dict[str, Any], kind: str) -> Dict[str, Any]:
             "oracle": "oracle",
         }.get(kind, "postgresql")
         url = f"jdbc:{protocol}://{host}{':' + str(port) if port else ''}/{db}"
-        return {
+        cfg = {
             "connection.url": url,
             "connection.user": user,
             "connection.password": password,
         }
+        # connection.schema / connection.schemas → Confluent JDBC source
+        # ``schema.pattern`` (regex). Single-schema only; multi-schema needs
+        # one connector per schema.
+        schemas = extract_source_schemas(connection)
+        if schemas:
+            cfg["schema.pattern"] = schemas[0]
+        return cfg
+    # Passthrough for non-JDBC kinds: strip secretRef so a downstream client
+    # never sees a stray field. The original strip preserved here intentionally.
     return {k: v for k, v in connection.items() if k != "secretRef"}
 
 

@@ -875,7 +875,7 @@ def _run_compose_interview(state: "CopilotInterviewState", console: Any) -> None
 
         type_answer = ask_friendly_text(
             console,
-            "Type? ADP (Silver, joined/cleaned) or CDP (Gold, consumption mart). " "[default: ADP]",
+            "Type? ADP (Silver, joined/cleaned) or CDP (Gold, consumption mart). [default: ADP]",
             required=False,
         )
         type_answer = (type_answer or "ADP").strip()

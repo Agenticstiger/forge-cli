@@ -145,7 +145,7 @@ def test_federation_gate_bypassed_with_no_verify_digest(monkeypatch, tmp_path, s
     try:
         with patch("fluid_build.forge.federation.validate_federated_consumes") as mock_validate:
             mock_validate.side_effect = AssertionError(
-                "validate_federated_consumes should be skipped under " "--no-verify-digest"
+                "validate_federated_consumes should be skipped under --no-verify-digest"
             )
             try:
                 apply_mod.run(sample_args, test_logger)

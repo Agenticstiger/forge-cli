@@ -212,7 +212,7 @@ def _create_project_agent_loop(
         if console:
             try:
                 console.print(
-                    "[cyan]Running in agent-loop mode[/cyan] " "[dim](multi-turn tool use)[/dim]\n"
+                    "[cyan]Running in agent-loop mode[/cyan] [dim](multi-turn tool use)[/dim]\n"
                 )
             except Exception:  # noqa: BLE001
                 pass

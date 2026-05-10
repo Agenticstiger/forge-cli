@@ -99,10 +99,13 @@ def build_default_summarizer(
         # compaction layer's caller still gets a usable string. This
         # keeps the world-class branch's pluggable contract intact even
         # when the user picked an unknown provider.
-        return lambda blob: blob[:2000] + (
-            f"\n[truncated — {len(blob)} chars total — unknown provider for summarizer]"
-            if len(blob) > 2000
-            else ""
+        return lambda blob: (
+            blob[:2000]
+            + (
+                f"\n[truncated — {len(blob)} chars total — unknown provider for summarizer]"
+                if len(blob) > 2000
+                else ""
+            )
         )
 
     routing_config = LlmConfig(

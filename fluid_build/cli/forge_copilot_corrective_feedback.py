@@ -96,7 +96,7 @@ TOOL_ERROR_GUIDANCE: Dict[str, str] = {
         "first to enumerate available files, then pass one of those."
     ),
     "PermissionError": (
-        "The path is not readable. Check the workspace permissions " "or pick a different file."
+        "The path is not readable. Check the workspace permissions or pick a different file."
     ),
     "JSONDecodeError": (
         "Your arguments were not valid JSON. Tool argument blocks "
@@ -192,8 +192,7 @@ def build_corrective_messages(
             {
                 "role": "user",
                 "content": (
-                    f"Tool ``{tool_name}`` failed with error class "
-                    f"``{error_class}``. {guidance}"
+                    f"Tool ``{tool_name}`` failed with error class ``{error_class}``. {guidance}"
                 ),
             }
         )

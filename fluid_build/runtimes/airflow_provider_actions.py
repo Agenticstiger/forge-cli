@@ -144,7 +144,7 @@ dag = DAG(
     schedule_interval="{schedule}",
     start_date=days_ago(1),
     catchup=False,
-    tags=["fluid", "data-product", "{contract.get('kind', 'DataProduct').lower()}", "{domain}"],
+    tags=["fluid", "data-product", "{contract.get("kind", "DataProduct").lower()}", "{domain}"],
     default_args=default_args
 )'''
 

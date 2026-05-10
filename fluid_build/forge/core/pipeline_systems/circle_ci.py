@@ -188,6 +188,17 @@ class CircleCITemplate(BasePipelineTemplate):
         """Generate CircleCI pipeline"""
 
         commands = self._get_fluid_commands()
+        # Engine specs registry — splice per-engine pip extras into the
+        # install step so every CircleCI job picks them up. Each job is
+        # isolated (no shared state across CircleCI jobs), so the install
+        # has to repeat per-job, hence the shared ``_install_cmd``.
+        engine_pip = self._engine_pip_install_command(config)
+        _install_cmd = (
+            f"pip install --quiet data-product-forge && {engine_pip}"
+            if engine_pip
+            else "pip install --quiet data-product-forge"
+        )
+        engine_env = self._engine_runtime_env_vars(config)
 
         pipeline = {
             "version": 2.1,
@@ -202,7 +213,7 @@ class CircleCITemplate(BasePipelineTemplate):
                     "executor": "python-executor",
                     "steps": [
                         "checkout",
-                        {"run": "pip install --quiet data-product-forge"},
+                        {"run": _install_cmd},
                         {"run": {"name": "FLUID Doctor", "command": commands["doctor"]}},
                         {"run": {"name": "Validate", "command": commands["validate"]}},
                     ],
@@ -211,7 +222,7 @@ class CircleCITemplate(BasePipelineTemplate):
                     "executor": "python-executor",
                     "steps": [
                         "checkout",
-                        {"run": "pip install --quiet data-product-forge"},
+                        {"run": _install_cmd},
                         {"run": {"name": "Generate Plan", "command": commands["plan"]}},
                         {"persist_to_workspace": {"root": ".", "paths": ["plan.json"]}},
                     ],
@@ -220,7 +231,7 @@ class CircleCITemplate(BasePipelineTemplate):
                     "executor": "python-executor",
                     "steps": [
                         "checkout",
-                        {"run": "pip install --quiet data-product-forge"},
+                        {"run": _install_cmd},
                         {"run": {"name": "Run Tests", "command": commands["test"]}},
                         {"store_test_results": {"path": "test-results"}},
                     ],
@@ -242,7 +253,7 @@ class CircleCITemplate(BasePipelineTemplate):
                 "steps": [
                     "checkout",
                     {"attach_workspace": {"at": "."}},
-                    {"run": "pip install --quiet data-product-forge"},
+                    {"run": _install_cmd},
                     {
                         "run": {
                             "name": f"Deploy to {env}",
@@ -281,7 +292,7 @@ class CircleCITemplate(BasePipelineTemplate):
                 "executor": "python-executor",
                 "steps": [
                     "checkout",
-                    {"run": "pip install --quiet data-product-forge"},
+                    {"run": _install_cmd},
                     {
                         "run": {
                             "name": audit["name"],
@@ -295,6 +306,13 @@ class CircleCITemplate(BasePipelineTemplate):
                 {"security-audit": {"requires": ["validate"]}}
             )
 
+        # Inject per-engine env vars at the top of the pipeline (CircleCI
+        # supports a top-level ``environment:`` only inside jobs/executors;
+        # we inject into the python-executor so every job inherits).
+        if engine_env:
+            executor_env = pipeline["executors"]["python-executor"].setdefault("environment", {})
+            executor_env.update(engine_env)
+
         banner = self._credential_banner(
             comment_prefix="# ",
             ci_system_name="CircleCI",
@@ -304,4 +322,6 @@ class CircleCITemplate(BasePipelineTemplate):
                 "Both auto-inject as env for every step."
             ),
         )
-        return {".circleci/config.yml": banner + yaml.dump(pipeline, indent=2)}
+        runtime_notes = self._engine_runtime_notes(config, indent="# ")
+        notes_block = ("\n" + runtime_notes + "\n") if runtime_notes else ""
+        return {".circleci/config.yml": banner + notes_block + yaml.dump(pipeline, indent=2)}

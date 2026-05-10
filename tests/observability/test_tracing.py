@@ -279,7 +279,7 @@ class TestSpanEmission:
         @tracing.traced_stage("apply")
         def fn(args):
             raise RuntimeError(
-                "connection failed: Bearer " "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.leak"
+                "connection failed: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.leak"
             )
 
         with pytest.raises(RuntimeError):

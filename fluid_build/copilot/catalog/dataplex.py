@@ -227,12 +227,14 @@ class DataplexCatalogAdapter(CatalogAdapter):
         # land in catalog_specific for the modeler to inspect.
         aspects = dict(getattr(entry, "aspects", {}) or {})
         quality_score = safe_metadata_call(
-            lambda: float(
-                aspects.get("dataplex.googleapis.com/data-quality/score", {})
-                .get("data", {})
-                .get("score", 0.0)
-            )
-            or None,
+            lambda: (
+                float(
+                    aspects.get("dataplex.googleapis.com/data-quality/score", {})
+                    .get("data", {})
+                    .get("score", 0.0)
+                )
+                or None
+            ),
             fallback=None,
             description="dataplex quality-score extraction",
             log_target=fqn,
@@ -267,9 +269,7 @@ class DataplexCatalogAdapter(CatalogAdapter):
         upstream: List[LineageRef] = []
         downstream: List[LineageRef] = []
         try:
-            parent = (
-                f"projects/{self._credentials.project}/" f"locations/{self._credentials.location}"
-            )
+            parent = f"projects/{self._credentials.project}/locations/{self._credentials.location}"
             up = lineage_client.search_links(
                 parent=parent,
                 target={"fully_qualified_name": fqn},
@@ -303,7 +303,7 @@ class DataplexCatalogAdapter(CatalogAdapter):
         project/location."""
         clients = self._clients()
         glossary = clients["glossary"]
-        parent = f"projects/{self._credentials.project}/" f"locations/{self._credentials.location}"
+        parent = f"projects/{self._credentials.project}/locations/{self._credentials.location}"
         try:
             terms_list = list(glossary.list_glossary_terms(parent=parent))
         except Exception as exc:

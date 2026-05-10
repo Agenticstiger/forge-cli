@@ -183,7 +183,7 @@ class TestGitBackend:
 
     def test_happy_path_uses_compute_contract_digest(self):
         ws = self._ws()
-        contract_text = "fluidVersion: 0.7.3\nid: external.orders\n" "exposes:\n  - id: orders\n"
+        contract_text = "fluidVersion: 0.7.3\nid: external.orders\nexposes:\n  - id: orders\n"
         with patch(
             "fluid_build.forge.federation._git_read_contract",
             return_value=contract_text,
@@ -256,9 +256,9 @@ class TestGitBackend:
         ):
             result = _fetch_digest_via_git(ws, "ext.x", "1")
 
-        assert mock_gp.called and mock_sh.called, (
-            "Both gitpython AND shell-out must be exercised when " "gitpython is unavailable"
-        )
+        assert (
+            mock_gp.called and mock_sh.called
+        ), "Both gitpython AND shell-out must be exercised when gitpython is unavailable"
         assert result is not None and result.startswith("sha256:")
 
     def test_gitpython_real_failure_aborts_no_shellout(self, tmp_path: Path, monkeypatch):

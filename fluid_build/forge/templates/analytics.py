@@ -226,12 +226,12 @@ class AnalyticsTemplate(ProjectTemplate):
 
         # dbt_project.yml
         project_name = context.project_config.get("name", "analytics-product")
-        dbt_project_config = f"""name: '{project_name.replace('-', '_')}'
+        dbt_project_config = f"""name: '{project_name.replace("-", "_")}'
 version: '1.0.0'
 config-version: 2
 
 # This setting configures which "profile" dbt uses for this project.
-profile: '{project_name.replace('-', '_')}'
+profile: '{project_name.replace("-", "_")}'
 
 # These configurations specify where dbt should look for different types of files.
 model-paths: ["models"]
@@ -248,7 +248,7 @@ clean-targets:         # directories to be removed by `dbt clean`
 
 # Model configurations
 models:
-  {project_name.replace('-', '_')}:
+  {project_name.replace("-", "_")}:
     # Applies to all files under models/.../
     staging:
       +materialized: view
@@ -298,7 +298,7 @@ vars:
         provider = context.project_config.get("provider", "gcp")
         if provider in ["gcp", "bigquery"]:
             profiles_config = f"""# dbt profiles for {project_name}
-{project_name.replace('-', '_')}:
+{project_name.replace("-", "_")}:
   target: dev
   outputs:
     dev:
@@ -323,7 +323,7 @@ vars:
 """
         elif provider == "snowflake":
             profiles_config = f"""# dbt profiles for {project_name}
-{project_name.replace('-', '_')}:
+{project_name.replace("-", "_")}:
   target: dev
   outputs:
     dev:
@@ -351,7 +351,7 @@ vars:
         else:
             # Default/local configuration
             profiles_config = f"""# dbt profiles for {project_name}
-{project_name.replace('-', '_')}:
+{project_name.replace("-", "_")}:
   target: dev
   outputs:
     dev:

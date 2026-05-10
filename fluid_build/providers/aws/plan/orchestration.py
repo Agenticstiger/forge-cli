@@ -235,7 +235,7 @@ class OrchestrationPlanner:
 
         if len(action_parts) < 3:
             raise OrchestrationError(
-                f"Invalid action format: '{action_str}'. " f"Expected 'aws.service.operation'"
+                f"Invalid action format: '{action_str}'. Expected 'aws.service.operation'"
             )
 
         provider = action_parts[0]

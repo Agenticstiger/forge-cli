@@ -79,7 +79,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     migrate_p.add_argument(
         "--write",
         action="store_true",
-        help=("Rewrite contract files in place (default: dry-run / report " "what would change)."),
+        help=("Rewrite contract files in place (default: dry-run / report what would change)."),
     )
     migrate_p.add_argument(
         "--check",

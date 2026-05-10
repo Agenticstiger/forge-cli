@@ -180,9 +180,9 @@ def test_non_https_api_url_returns_typed_error(tmp_path):
 def test_auth_kind_emits_correct_header(tmp_path, auth_kind, expected_header_marker):
     _result, written = _generate(tmp_path, name=f"src_{auth_kind}", auth_kind=auth_kind)
     body = written.read_text(encoding="utf-8")
-    assert expected_header_marker in body, (
-        f"auth_kind={auth_kind!r} body missing {expected_header_marker!r}: " f"{body[:300]}"
-    )
+    assert (
+        expected_header_marker in body
+    ), f"auth_kind={auth_kind!r} body missing {expected_header_marker!r}: {body[:300]}"
 
 
 def test_auth_kind_none_omits_authorization_header(tmp_path):

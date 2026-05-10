@@ -148,8 +148,7 @@ class CapabilityMismatchError(FluidUserError):
         return cls(
             what=f"runner `{runner_name}` does not support capability {missing}",
             why=(
-                f"build asks for capabilities={sorted(asked)}; "
-                f"runner declares {sorted(declared)}."
+                f"build asks for capabilities={sorted(asked)}; runner declares {sorted(declared)}."
             ),
             fix=(
                 suggestion

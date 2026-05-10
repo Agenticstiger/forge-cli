@@ -147,8 +147,7 @@ def validate_and_quote_identifier(
         raise CatalogConfigError(
             message=f"Invalid {kind} identifier: {value!r}",
             suggestions=[
-                f"{kind} names must match {rule.pattern} "
-                "(no dots, spaces, or special characters).",
+                f"{kind} names must match {rule.pattern} (no dots, spaces, or special characters).",
             ],
         )
     return f"{quote_char}{value}{quote_char}"

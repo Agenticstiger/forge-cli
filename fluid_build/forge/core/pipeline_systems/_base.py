@@ -150,6 +150,31 @@ class PipelineConfig:
     # mode; teams that need multi-env Jenkinsfiles use two generated
     # files instead of one multi-branch file.
     install_mode: str = "pypi"
+    # FLUID acquisition / transformation engine declared in the contract's
+    # ``builds[0].engine`` field. Drives the per-engine pip-install plan
+    # in the generated pipeline's bootstrap stage. Common values:
+    # ``dlt``, ``airbyte``, ``meltano``, ``debezium``, ``kafka_connect``,
+    # ``duckdb``, ``dbt``. ``None`` skips engine-side bootstrap (caller
+    # is expected to provide the runtime).
+    engine: Optional[str] = None
+    # Source kind (``builds[0].properties.source.kind``) — picks the
+    # right per-source pip extras (e.g. dlt[sql_database] for postgres
+    # source, meltanolabs-tap-postgres for meltano + postgres). ``None``
+    # means engine has no source-kind dependency (PyAirbyte, dbt).
+    source_kind: Optional[str] = None
+    # Sink platform (``binding.platform`` of the first expose) — picks
+    # the right per-sink pip extras (e.g. dlt[snowflake], dbt-snowflake,
+    # meltanolabs-target-snowflake). ``None`` means no sink known yet.
+    sink_platform: Optional[str] = None
+    # Container-runtime loopback override env var, propagated into the
+    # generated pipeline's environment block. When the FLUID process
+    # runs inside a container (CI runner, Jenkins agent), ``localhost``
+    # in the contract's source.connection.host points at the container,
+    # not the operator's machine. Setting this to ``host.docker.internal``
+    # (Docker Desktop) / the bridge IP (Linux) / etc. is what the FLUID
+    # acquisition runner's ``apply_loopback_host_override`` reads. Empty
+    # string = don't emit the env var (operator handles externally).
+    runner_host_override: str = ""
     # Opt-in fallback catalog target baked into the Jenkins Stage 10
     # publish shell as ``${PUBLISH_TARGETS:-<value>}``. Left ``None`` by
     # default, which preserves the original ``${PUBLISH_TARGETS}`` (no
@@ -170,9 +195,15 @@ class PipelineConfig:
     # ``--env`` flag to ``fluid publish``. These exist so scenario-specific
     # launchpads can ask ``fluid generate ci`` to emit the intended default
     # behavior directly instead of patching the generated Jenkinsfile text.
+    #
+    # ``publish_include_env`` defaults to False because ``fluid publish``
+    # does NOT accept ``--env``; including it makes Stage 10 die with
+    # ``unrecognized arguments: --env dev``. Operators who add ``--env``
+    # support to ``fluid publish`` (or wrap it via a custom CLI alias) can
+    # opt in via ``--publish-include-env`` at generate time.
     verify_strict_default: bool = True
     publish_stage_default: bool = False
-    publish_include_env: bool = True
+    publish_include_env: bool = False
 
     def __post_init__(self):
         if self.environments is None:
@@ -390,6 +421,82 @@ class BasePipelineTemplate:
             "PYTHONPATH": ".",
             "PIP_CACHE_DIR": ".pip-cache",
         }
+
+    # ── EngineRuntime registry integration (used by ALL CI emitters) ──
+    #
+    # The three helpers below pull the per-engine bootstrap + runtime
+    # facts from ``_engine_specs`` so each subclass (github_actions,
+    # gitlab_ci, circle_ci, azure_devops, bitbucket, tekton, jenkins)
+    # can consume them in its native dialect without re-implementing
+    # the engine→pip / engine→env-var dispatch logic. Adding a new
+    # engine means one entry in ``_engine_specs.py`` and EVERY CI
+    # emitter picks it up automatically.
+
+    def _engine_pip_install_command(self, config: "PipelineConfig") -> str:
+        """One-line ``pip install <engine extras>`` command, or "" if none.
+
+        Returns the empty string when the contract has no engine declared
+        OR the registry has no extras for the (engine, source, sink)
+        combo. Caller can splice the result into a shell step body and
+        skip the step cleanly when empty.
+        """
+        # Lazy import to avoid a startup-time cycle.
+        from ._engine_specs import (
+            render_pip_install_command,
+            resolve_engine_bootstrap,
+        )
+
+        bootstrap = resolve_engine_bootstrap(
+            getattr(config, "engine", None),
+            source_kind=getattr(config, "source_kind", None),
+            sink_platform=getattr(config, "sink_platform", None),
+        )
+        return render_pip_install_command(bootstrap)
+
+    def _install_command(self, config: "PipelineConfig") -> str:
+        """Combined ``pip install`` for forge-cli + per-engine extras.
+
+        Returns ``"pip install --quiet data-product-forge"`` when the
+        contract has no engine declared OR the registry has no extras;
+        otherwise returns ``"pip install --quiet data-product-forge && <engine pip install>"``.
+
+        Used by every CI emitter as the install step body so adding a
+        new engine to ``_engine_specs.py`` reaches every CI system
+        automatically (the alternative — an ``Install engine extras``
+        step BEFORE the FLUID install step — fails because some emitters
+        run pip install across many isolated jobs).
+        """
+        engine_pip = self._engine_pip_install_command(config)
+        if engine_pip:
+            return f"pip install --quiet data-product-forge && {engine_pip}"
+        return "pip install --quiet data-product-forge"
+
+    def _engine_runtime_env_vars(self, config: "PipelineConfig") -> Dict[str, str]:
+        """Per-engine env vars (e.g. AIRBYTE_PROJECT_DIR for engine='airbyte').
+
+        Returns ``{}`` when the engine has no exec-time env-var needs
+        (dlt, meltano, dbt, duckdb) so callers can skip cleanly.
+        """
+        from ._engine_specs import render_runner_env_vars
+
+        return render_runner_env_vars(
+            runner_host_override=getattr(config, "runner_host_override", "") or "",
+            engine=getattr(config, "engine", None),
+        )
+
+    def _engine_runtime_notes(self, config: "PipelineConfig", *, indent: str = "# ") -> str:
+        """Operator-facing runtime notes (REQUIRES: …) as comment lines.
+
+        Default ``indent='# '`` matches YAML / HCL / shell conventions
+        used by every CI system except Jenkins (which overrides with
+        ``// ``). Returns ``""`` for engines with no runtime needs.
+        """
+        from ._engine_specs import render_runtime_notes
+
+        return render_runtime_notes(
+            getattr(config, "engine", None),
+            indent=indent,
+        )
 
     def _security_audit_block(self, complexity: "PipelineComplexity") -> Dict[str, Any]:
         """Return a CI-system-agnostic security + compliance audit payload.
@@ -643,7 +750,7 @@ class BasePipelineTemplate:
                 display="validate",
                 toggle_param="RUN_STAGE_2_VALIDATE",
                 default_run=True,
-                command=('fluid validate "${CONTRACT:-contract.fluid.yaml}" ' "--strict"),
+                command=('fluid validate "${CONTRACT:-contract.fluid.yaml}" --strict'),
             ),
             StageSpec(
                 num=3,
@@ -881,6 +988,11 @@ class BasePipelineTemplate:
         the pipeline rather than silently moving to the next step.
         """
         mode = getattr(config, "install_mode", "pypi") or "pypi"
+        # Per-engine pip extras (e.g. ``airbyte>=0.20,<1`` for engine='airbyte').
+        # Appended to the install body so the 11-stage path picks up
+        # engine deps the same way the BASIC paths do via _install_command().
+        engine_pip = self._engine_pip_install_command(config)
+        engine_install = f"\n{engine_pip}" if engine_pip else ""
         if mode == "dev-source":
             return (
                 "set -eu\n"
@@ -892,7 +1004,7 @@ class BasePipelineTemplate:
                 'export PYTHONPATH="/forge-cli-src:${PYTHONPATH:-}"\n'
                 'python -c "import fluid_build" || (echo \'FATAL: '
                 "fluid_build import failed; check /forge-cli-src' >&2 && exit 3)\n"
-                "fluid --version"
+                "fluid --version" + engine_install
             )
         # pypi mode — TestPyPI overrides + optional --pre
         return (
@@ -911,7 +1023,7 @@ class BasePipelineTemplate:
             "fi\n"
             'SPEC="${FLUID_PACKAGE_SPEC:-data-product-forge}"\n'
             'sh -c "python -m pip install $INDEX_FLAGS $PRE_FLAG $SPEC"\n'
-            "fluid --version"
+            "fluid --version" + engine_install
         )
 
     def _stage_toggle_defaults(self, config: "PipelineConfig") -> Dict[str, bool]:

@@ -548,7 +548,7 @@ def _record_logical_plan_from_tables(
         plan = StagePlan(
             stage="logical",
             summary=(
-                f"Forge {len(tables)} input table(s) into a " f"{technique} model named {name!r}."
+                f"Forge {len(tables)} input table(s) into a {technique} model named {name!r}."
             ),
             steps=steps,
             inputs_used=[t.name for t in tables],

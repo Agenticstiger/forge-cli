@@ -41,7 +41,9 @@ from fluid_build.api.runner import (
 from fluid_build.api.schema import SchemaColumn, SchemaFingerprint
 
 from .._acquisition_common import (
+    extract_source_schemas,
     generate_run_id,
+    resolve_connection_secrets,
     utc_now_iso,
     write_run_record_and_finalize,
 )
@@ -109,6 +111,9 @@ def build_connector_config(
     passed verbatim under the ``database.*`` namespace.
     """
     connector_class = resolve_debezium_class(kind)
+    # Resolve secretRef → password (or other credential field) before any
+    # ``connection.get("password")`` lookup. Inline literal values still win.
+    connection = resolve_connection_secrets(dict(connection))
     cfg: Dict[str, Any] = {
         "connector.class": connector_class,
         "database.server.name": server_name,
@@ -149,7 +154,7 @@ def build_connector_config(
             {
                 "mongodb.connection.string": connection.get(
                     "connection_string",
-                    f"mongodb://{connection.get('host','localhost')}:{connection.get('port',27017)}",
+                    f"mongodb://{connection.get('host', 'localhost')}:{connection.get('port', 27017)}",
                 ),
                 "mongodb.user": connection.get("user", ""),
                 "mongodb.password": connection.get("password", ""),
@@ -182,6 +187,17 @@ def build_connector_config(
 
     if streams:
         cfg["table.include.list"] = ",".join(streams)
+    # connection.schema / connection.schemas → Debezium ``schema.include.list``
+    # (Postgres + SQL Server use schemas; MySQL uses databases natively so we
+    # write to ``database.include.list`` instead). Comma-separated list of
+    # regex patterns per Debezium docs.
+    schemas = extract_source_schemas(connection)
+    if schemas:
+        if "postgres" in kind or "sqlserver" in kind:
+            cfg.setdefault("schema.include.list", ",".join(schemas))
+        elif "mysql" in kind:
+            cfg.setdefault("database.include.list", ",".join(schemas))
+        # mongo / oracle: no equivalent concept — skip silently.
     if extra:
         cfg.update(extra)
     return cfg
@@ -214,11 +230,16 @@ class DebeziumRunner:
         return _execute(ctx, self)
 
     def fingerprint(self, ctx: RunContext) -> SchemaFingerprint:
-        cols = [
-            SchemaColumn(name=s, type="debezium", nullable=True)
-            for s in (ctx.source.streams or [ctx.source.kind])
-        ]
-        return SchemaFingerprint.of(cols, captured_at=utc_now_iso())
+        # Debezium reads the actual source schema inside the connector
+        # process; introspecting at fingerprint() time would require booting
+        # a connector. Surface a placeholder marked ``is_placeholder=True``
+        # so the schema-evolution gate skips comparison; CDC-side drift is
+        # surfaced by Debezium's own schema-history topic at run-time.
+        return SchemaFingerprint.placeholder(
+            list(ctx.source.streams or [ctx.source.kind]),
+            engine="debezium",
+            captured_at=utc_now_iso(),
+        )
 
 
 def _execute(ctx: RunContext, runner: DebeziumRunner) -> RunResult:

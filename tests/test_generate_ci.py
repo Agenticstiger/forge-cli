@@ -90,8 +90,8 @@ _GENERATE_CI_EXPECTATIONS = (
         "jenkins",
         "Jenkinsfile",
         # 11-stage parameterized template — names are prefixed with stage
-        # number ("2 · validate", "6 · plan") per the perfect-pipeline design.
-        ("pipeline {", "stage('2 · validate')", "stage('6 · plan')", "parameters {", "fluid"),
+        # number ("2 - validate", "6 - plan") per the perfect-pipeline design.
+        ("pipeline {", "stage('2 - validate')", "stage('6 - plan')", "parameters {", "fluid"),
     ),
     (
         "azure",
@@ -220,14 +220,14 @@ class TestGenerateCIJenkins:
         written = (tmp_path / "Jenkinsfile").read_text()
         # Post-11-stage-rewrite, the Jenkins template emits a
         # parameterized declarative pipeline with every stage named
-        # ``<n> · <stage-name>``. Assert structural markers rather than
+        # ``<n> -<stage-name>``. Assert structural markers rather than
         # byte equality so prose tweaks don't break the suite.
         assert "pipeline {" in written
-        assert "stage('2 · validate')" in written
+        assert "stage('2 - validate')" in written
         assert "fluid" in written
         assert "parameters {" in written
         # Default install mode is pypi — stable PyPI.
-        assert "stage('Setup [install-mode: pypi]')" in written
+        assert "stage('0 — Bootstrap FLUID [pypi]')" in written
 
     def test_install_mode_dev_source_flag(self, tmp_path, monkeypatch):
         """``--install-mode dev-source`` emits the bind-mount install
@@ -237,7 +237,7 @@ class TestGenerateCIJenkins:
         rc = generate_ci_run(_make_args(install_mode="dev-source"), _logger)
         assert rc == 0
         written = (tmp_path / "Jenkinsfile").read_text()
-        assert "stage('Setup [install-mode: dev-source]')" in written
+        assert "stage('0 — Bootstrap FLUID [dev-source]')" in written
         assert "/forge-cli-src" in written
         # Fail-loud ERROR message must be present in the generated Setup.
         assert "install-mode=dev-source but /forge-cli-src" in written
@@ -313,8 +313,8 @@ class TestGenerateCIJenkins:
         content = (tmp_path / "Jenkinsfile").read_text()
         assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS}' in content
         assert 'fluid publish "${CONTRACT:-contract.fluid.yaml}" ${TARGET_FLAGS} \\' not in content
-        stage_10 = content[content.index("stage('10 · publish')") :]
-        stage_10 = stage_10[: stage_10.index("stage('11 · schedule sync')")]
+        stage_10 = content[content.index("stage('10 - publish')") :]
+        stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
         assert '--env "${FLUID_ENV:-dev}"' not in stage_10
 
 
@@ -409,23 +409,23 @@ class TestJenkinsPipelineTemplateGenerator:
     def test_output_contains_all_11_stages(self, generator):
         """11-stage template must emit all 11 named stages in order.
         Setup stage's name includes the install-mode marker —
-        ``stage('Setup [install-mode: pypi]')`` by default, or
-        ``stage('Setup [install-mode: dev-source]')`` when generated
+        ``stage('0 — Bootstrap FLUID [pypi]')`` by default, or
+        ``stage('0 — Bootstrap FLUID [dev-source]')`` when generated
         with ``--install-mode dev-source``."""
         content = self._generate(generator)["Jenkinsfile"]
         expected = [
-            "stage('Setup [install-mode: pypi]')",
-            "stage('1 · bundle')",
-            "stage('2 · validate')",
-            "stage('3 · generate artifacts')",
-            "stage('4 · validate artifacts')",
-            "stage('5 · diff (drift gate)')",
-            "stage('6 · plan')",
-            "stage('7 · apply')",
-            "stage('8 · policy apply')",
-            "stage('9 · verify')",
-            "stage('10 · publish')",
-            "stage('11 · schedule sync')",
+            "stage('0 — Bootstrap FLUID [pypi]')",
+            "stage('1 - bundle')",
+            "stage('2 - validate')",
+            "stage('3 - generate artifacts')",
+            "stage('4 - validate artifacts')",
+            "stage('5 - diff (drift gate)')",
+            "stage('6 - plan')",
+            "stage('7 - apply')",
+            "stage('8 - policy apply')",
+            "stage('9 - verify')",
+            "stage('10 - publish')",
+            "stage('11 - schedule sync')",
         ]
         for s in expected:
             assert s in content, f"missing stage: {s}"
@@ -514,9 +514,9 @@ class TestJenkinsPipelineTemplateGenerator:
         content = self._generate(generator)["Jenkinsfile"]
         # The BUNDLE_FORMAT choice parameter was removed — the pipeline now
         # hardcodes tgz.
-        assert "name: 'BUNDLE_FORMAT'" not in content, (
-            "BUNDLE_FORMAT should no longer be a pipeline parameter; " "Stages 4/6/7 require tgz."
-        )
+        assert (
+            "name: 'BUNDLE_FORMAT'" not in content
+        ), "BUNDLE_FORMAT should no longer be a pipeline parameter; Stages 4/6/7 require tgz."
         # The obsolete, invalid choice must not reappear.
         assert "'yaml-single-file'" not in content, (
             "'yaml-single-file' is not a valid `fluid bundle --format` choice "
@@ -738,29 +738,29 @@ class TestJenkinsSimulatedRun:
 
     def test_11_stages_present(self, pipeline):
         """Replaces the old per-env deploy stages. The 11-stage design
-        has a single parameterized ``7 · apply`` stage controlled by
+        has a single parameterized ``7 - apply`` stage controlled by
         FLUID_ENV + APPLY_MODE params, not N environment-named stages.
         Every structural stage (1-11) must be present."""
         stage_names = [s.name for s in pipeline.stages]
         for marker in [
-            "1 · bundle",
-            "2 · validate",
-            "3 · generate artifacts",
-            "4 · validate artifacts",
-            "5 · diff",
-            "6 · plan",
-            "7 · apply",
-            "8 · policy apply",
-            "9 · verify",
-            "10 · publish",
-            "11 · schedule sync",
+            "1 - bundle",
+            "2 - validate",
+            "3 - generate artifacts",
+            "4 - validate artifacts",
+            "5 - diff",
+            "6 - plan",
+            "7 - apply",
+            "8 - policy apply",
+            "9 - verify",
+            "10 - publish",
+            "11 - schedule sync",
         ]:
             assert any(
                 marker in n for n in stage_names
             ), f"stage containing {marker!r} missing from {stage_names}"
 
     def test_publish_stage_present(self, pipeline):
-        """Stage 10 is named ``10 · publish`` in the parameterized
+        """Stage 10 is named ``10 - publish`` in the parameterized
         template — matches the HTML design's naming scheme."""
         stage_names = [s.name for s in pipeline.stages]
         assert any("publish" in n.lower() for n in stage_names)
@@ -1043,7 +1043,7 @@ class TestContractIsReferenceOnly:
 
         p = self._write(
             tmp_path,
-            "builds:\n" "  - just a string\n" "  - id: foo\n" "    pattern: reference\n",
+            "builds:\n  - just a string\n  - id: foo\n    pattern: reference\n",
         )
         # Must not raise on the bare-string entry; must still detect the
         # dict entry's reference pattern.

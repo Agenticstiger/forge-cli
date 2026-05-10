@@ -104,7 +104,7 @@ def test_existing_example_validates_against_declared_version(
         # 0.7.1 / 0.7.2 schemas are unchanged on disk, so any failure here
         # was already broken before this branch landed.
         pytest.skip(
-            f"Pre-existing schema mismatch (not a v0.7.3 regression): " f"errors={result.errors}"
+            f"Pre-existing schema mismatch (not a v0.7.3 regression): errors={result.errors}"
         )
 
     # If we got here the contract validates today — which is exactly what

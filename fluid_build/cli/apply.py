@@ -159,8 +159,7 @@ def register(subparsers: argparse._SubParsersAction):
         action="store_true",
         default=False,
         help=(
-            "Skip plan/bundle digest verification (DR escape hatch). "
-            "Logged at WARNING for audit."
+            "Skip plan/bundle digest verification (DR escape hatch). Logged at WARNING for audit."
         ),
     )
 
@@ -338,7 +337,7 @@ def _actions_from_source(
                 native_actions = None
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "plan_retranslation_failed: falling back to recorded " "actions (%s)",
+                    "plan_retranslation_failed: falling back to recorded actions (%s)",
                     exc,
                 )
                 native_actions = None
@@ -385,7 +384,7 @@ def _actions_from_source(
 
             latest_version = SchemaManager.latest_bundled_version()
             logger.info(
-                f"Parsed {len(provider_actions)} provider actions " f"(schema {latest_version})"
+                f"Parsed {len(provider_actions)} provider actions (schema {latest_version})"
             )
             return [
                 {
@@ -1002,9 +1001,7 @@ def run(args, logger: logging.Logger) -> int:
                                     console.print(f"  📁 [cyan]{path}[/cyan]")
                 elif no_outputs:
                     # Honest "ran but did nothing useful" panel.
-                    console.print(
-                        "\n[yellow]⚠️  Apply ran but produced no output files." "[/yellow]"
-                    )
+                    console.print("\n[yellow]⚠️  Apply ran but produced no output files.[/yellow]")
                     if "applied" in result:
                         console.print(f"  [dim]Actions applied: {result['applied']}[/dim]")
                     console.print(
@@ -1024,7 +1021,7 @@ def run(args, logger: logging.Logger) -> int:
                         for i, r in enumerate(result["results"]):
                             if r.get("status") == "error":
                                 console.print(
-                                    f"  {i+1}. [red]✗[/red] {r.get('op', 'unknown')}: {r.get('error', 'no details')}"
+                                    f"  {i + 1}. [red]✗[/red] {r.get('op', 'unknown')}: {r.get('error', 'no details')}"
                                 )
             else:
                 if success and not no_outputs:
@@ -1079,7 +1076,7 @@ def run(args, logger: logging.Logger) -> int:
         <h1>FLUID Apply Report</h1>
         <p>Contract: {contract_name}</p>
         <p>Execution ID: {execution_id}</p>
-        <p>Status: {'Success' if success else 'Failed'}</p>
+        <p>Status: {"Success" if success else "Failed"}</p>
     </div>
     <div class="metrics">
         <div class="metric"><h3>Actions Applied</h3><p>{applied_count}</p></div>

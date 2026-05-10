@@ -50,6 +50,14 @@ def ensure_schema(action: Dict[str, Any], provider) -> Dict[str, Any]:
         params = get_connection_params(
             account=account, warehouse=provider.warehouse, database=database, **provider._kwargs
         )
+        # Strip ``schema`` from session params: we are about to CREATE the
+        # schema and Snowflake's session-init validates that any default
+        # schema set at connect time exists. If the resolver pulled a
+        # SNOWFLAKE_SCHEMA env-var fallback that doesn't exist yet, connect()
+        # would fail with "Object does not exist". Same chicken-and-egg as
+        # ensure_database; downstream actions (ensure_table, etc.) build
+        # their own params and DO get the schema after this CREATE has run.
+        params.pop("schema", None)
 
         with SnowflakeConnection(**params) as conn:
             # Check existence

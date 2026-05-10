@@ -113,7 +113,7 @@ class GcpProvider(BaseProvider):
         if not (db and sch and tbl and backup):
             return []
         return [
-            f"CREATE OR REPLACE TABLE `{db}.{sch}.{tbl}` AS " f"SELECT * FROM `{db}.{sch}.{backup}`"
+            f"CREATE OR REPLACE TABLE `{db}.{sch}.{tbl}` AS SELECT * FROM `{db}.{sch}.{backup}`"
         ]
 
     def cleanup_backups(self, snapshots: List[Mapping[str, Any]]) -> None:

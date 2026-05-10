@@ -24,6 +24,6 @@ def to_dot(plan: list) -> str:
         label = f"{a['op']}\\n{a['resource_type']}\\n{a['resource_id']}"
         lines.append(f'  {nid} [label="{label}"];')
         if i > 0:
-            lines.append(f"  n{i-1} -> {nid};")
+            lines.append(f"  n{i - 1} -> {nid};")
     lines.append("}")
     return "\n".join(lines)

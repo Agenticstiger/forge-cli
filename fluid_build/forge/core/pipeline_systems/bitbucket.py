@@ -149,6 +149,16 @@ class BitbucketTemplate(BasePipelineTemplate):
         """Generate Bitbucket pipeline"""
 
         commands = self._get_fluid_commands()
+        # Engine specs registry — per-engine pip extras, env vars,
+        # runtime notes. Each Bitbucket step is isolated so pip install
+        # repeats; ``_install_cmd`` keeps that consistent.
+        engine_pip = self._engine_pip_install_command(config)
+        _install_cmd = (
+            f"pip install --quiet data-product-forge && {engine_pip}"
+            if engine_pip
+            else "pip install --quiet data-product-forge"
+        )
+        engine_env = self._engine_runtime_env_vars(config)
 
         pipeline = {
             "image": "python:3.12-slim",
@@ -158,7 +168,7 @@ class BitbucketTemplate(BasePipelineTemplate):
                         "step": {
                             "name": "Validate",
                             "script": [
-                                "pip install --quiet data-product-forge",
+                                _install_cmd,
                                 commands["doctor"],
                                 commands["validate"],
                             ],
@@ -219,7 +229,7 @@ class BitbucketTemplate(BasePipelineTemplate):
                 "step": {
                     "name": audit["name"],
                     "script": [
-                        "pip install --quiet data-product-forge",
+                        _install_cmd,
                         audit_comment,
                         audit["body"],
                     ],
@@ -256,4 +266,21 @@ class BitbucketTemplate(BasePipelineTemplate):
                 "auto-injected as env vars for every step."
             ),
         )
-        return {"bitbucket-pipelines.yml": banner + yaml.dump(pipeline, indent=2)}
+        # Bitbucket Pipelines doesn't have a top-level env block; per-step
+        # env can be set via `step: { env: { K: V } }`. We emit the engine
+        # env vars as a comment for now since the lab's pre-2/3 contracts
+        # use Jenkins, and a Bitbucket-side first-class wiring is a
+        # follow-up. Operators copy these into per-step `env:` as needed.
+        engine_env_comment = ""
+        if engine_env:
+            engine_env_comment = "\n# Engine env vars (copy into per-step `env:`):\n" + "".join(
+                f"#   {k}: '{v}'\n" for k, v in engine_env.items()
+            )
+        runtime_notes = self._engine_runtime_notes(config, indent="# ")
+        notes_block = ("\n" + runtime_notes + "\n") if runtime_notes else ""
+        return {
+            "bitbucket-pipelines.yml": banner
+            + notes_block
+            + engine_env_comment
+            + yaml.dump(pipeline, indent=2)
+        }

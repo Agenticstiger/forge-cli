@@ -39,13 +39,24 @@ from fluid_build.api.schema import SchemaColumn, SchemaFingerprint
 from fluid_build.api.security import ImageSignatureVerifier
 
 from .._acquisition_common import (
+    adapt_source_config,
+    extract_source_schemas,
     generate_run_id,
+    resolve_connection_secrets,
+    resolve_secret_ref,
     utc_now_iso,
     write_run_record_and_finalize,
 )
 from .._fingerprint import fingerprint_from_columns
 
 LOG = logging.getLogger("fluid.acquire.airbyte")
+
+
+# Per-connector source adapters live in ``fluid_build.build_runners.airbyte.sources``
+# and register themselves with the shared ``_acquisition_common`` registry at
+# import time (the engine's ``__init__.py`` imports the module for that side
+# effect). The runner just calls ``adapt_source_config("airbyte", kind, conn)``
+# without knowing about specific connector quirks.
 
 
 # ── REST client ─────────────────────────────────────────────────────────
@@ -204,11 +215,17 @@ class AirbyteRunner:
         return _execute(ctx, self)
 
     def fingerprint(self, ctx: RunContext) -> SchemaFingerprint:
-        cols = [
-            SchemaColumn(name=s, type="airbyte", nullable=True)
-            for s in (ctx.source.streams or [ctx.source.kind])
-        ]
-        return SchemaFingerprint.of(cols, captured_at=utc_now_iso())
+        # Airbyte resolves stream schemas inside ``source.discover`` /
+        # ``source.read`` — introspecting at fingerprint() time would mean
+        # spinning up a source connector container. Surface a placeholder
+        # marked ``is_placeholder=True`` so the schema-evolution gate skips
+        # the contract-vs-current comparison; Airbyte's own catalog stream
+        # surfaces real schema drift at sync time.
+        return SchemaFingerprint.placeholder(
+            list(ctx.source.streams or [ctx.source.kind]),
+            engine="airbyte",
+            captured_at=utc_now_iso(),
+        )
 
 
 def _execute(ctx: RunContext, runner: AirbyteRunner) -> RunResult:
@@ -277,7 +294,19 @@ def _execute_rest_mode(
     if not server_url:
         return _failed(ctx, started_at, t_start, "airbyte REST mode requires deployment.server_url")
     auth = deployment.get("auth", {}) or {}
-    api_token = auth.get("token") or auth.get("secretRef")  # secretRef resolved upstream
+    # auth.token wins; if absent, resolve auth.secretRef via the central
+    # secret backends (env://, vault://, aws://, gcp://, azure://, file://).
+    api_token = auth.get("token")
+    if not api_token and auth.get("secretRef"):
+        try:
+            api_token = resolve_secret_ref(auth["secretRef"])
+        except (ValueError, NotImplementedError) as exc:
+            return _failed(
+                ctx,
+                started_at,
+                t_start,
+                f"airbyte deployment.auth.secretRef did not resolve: {exc}",
+            )
 
     workspace_id = airbyte_props.get("workspace_id", "default-workspace")
     expose = (ctx.contract.get("exposes") or [{}])[0]
@@ -292,11 +321,25 @@ def _execute_rest_mode(
         # the legacy path will 400 on Airbyte 1.x but is kept so older
         # contracts surface a clear error rather than a silent miss.
         source_definition_id = airbyte_props.get("source_definition_id") or image_ref
+        # Resolve secretRef → password (or other credential field) before
+        # POSTing to Airbyte. Inline literal values still win.
+        connection_config = resolve_connection_secrets(dict(ctx.source.connection.raw))
+        # connection.schema / connection.schemas → Airbyte source-postgres
+        # (and similar) accept ``schemas`` (list). Pop the generic FLUID
+        # fields so unrecognised-setting validators don't fire.
+        schemas = extract_source_schemas(connection_config)
+        connection_config.pop("schema", None)
+        connection_config.pop("schemas", None)
+        if schemas:
+            connection_config.setdefault("schemas", schemas)
+        # Adapt FLUID generic connection → Airbyte source-X spec
+        # (renames, type coercions, connector-required defaults).
+        connection_config = adapt_source_config("airbyte", ctx.source.kind, connection_config)
         source_body = {
             "workspaceId": workspace_id,
             "name": f"forge-{ctx.product_id}",
             "sourceDefinitionId": source_definition_id,
-            "connectionConfiguration": dict(ctx.source.connection.raw),
+            "connectionConfiguration": connection_config,
         }
         source = client.create_source(source_body)
         source_id = source["sourceId"]
@@ -517,17 +560,69 @@ def _execute_embedded_mode(
         )
 
     try:
+        # Resolve secretRef → password before passing to PyAirbyte.
+        embedded_config = resolve_connection_secrets(dict(ctx.source.connection.raw))
+        # Same schema-list translation as the REST mode above.
+        embedded_schemas = extract_source_schemas(embedded_config)
+        embedded_config.pop("schema", None)
+        embedded_config.pop("schemas", None)
+        if embedded_schemas:
+            embedded_config.setdefault("schemas", embedded_schemas)
+        # Adapt FLUID generic connection → Airbyte source-X spec
+        # (renames, type coercions, connector-required defaults).
+        embedded_config = adapt_source_config("airbyte", ctx.source.kind, embedded_config)
         source = ab.get_source(
             f"source-{ctx.source.kind}",
-            config=dict(ctx.source.connection.raw),
+            config=embedded_config,
         )
         if ctx.source.streams:
             source.select_streams(list(ctx.source.streams))
         else:
             source.select_all_streams()
 
-        cache = ab.new_local_cache(cache_name=f"forge_{ctx.product_id.replace('.', '_')}")
-        result = source.read(cache=cache)
+        # Pick a PyAirbyte cache via the introspector in airbyte/destinations.py
+        # (one ~40-line introspector that walks ``<X>Cache.__init__`` signature
+        # — no per-destination factories). Credentials are resolved through the
+        # pydantic-settings layer in _credentials.py. Falls back to local
+        # DuckDB cache + warning when no cache class matches the platform.
+        from .._credentials import make_destination
+
+        binding = (ctx.contract.get("exposes") or [{}])[0].get("binding") or {}
+        platform = binding.get("platform", "local")
+        cache = make_destination(
+            "airbyte",
+            platform,
+            binding=binding,
+            contract=ctx.contract,
+            product_id=ctx.product_id,
+        )
+        if cache is None:
+            LOG.warning(
+                "airbyte: no destination factory registered for platform=%r; "
+                "falling back to local DuckDB cache (data lands in "
+                "~/.cache/airbyte/, NOT the contract's declared destination). "
+                "Register a factory in airbyte/destinations.py to wire it.",
+                platform,
+            )
+            safe_id = ctx.product_id.replace(".", "_").replace("-", "_")
+            cache = ab.new_local_cache(cache_name=f"forge_{safe_id}")
+        # Honour the contract's acquisition mode (per FLUID 0.7.3
+        # ``properties.source.mode``). PyAirbyte defaults to incremental
+        # which trips on relational sources that don't have a cursor field
+        # configured (postgres source falls into ``getCursorBasedSyncStatus``
+        # and emits ``column "null" does not exist``). Forcing the read
+        # mode to match the contract is the right thing.
+        mode = (
+            ctx.source.mode.value if hasattr(ctx.source.mode, "value") else str(ctx.source.mode)
+        ).lower()
+        force_full_refresh = mode == "full_refresh"
+        try:
+            result = source.read(cache=cache, force_full_refresh=force_full_refresh)
+        except TypeError:
+            # Older PyAirbyte versions don't expose force_full_refresh.
+            # Fall back to the default; the contract author can configure
+            # cursor_field if they hit this path.
+            result = source.read(cache=cache)
         records_total = (
             sum(len(stream) for stream in result.streams.values())
             if hasattr(result, "streams")

@@ -39,6 +39,7 @@ from .util.auth import get_auth_report
 from .util.config import resolve_snowflake_settings
 from .util.logging import redact_dict
 from .util.retry import with_retry
+from .util.types import map_fluid_type_to_snowflake
 
 
 class SnowflakeProviderEnhanced(BaseProvider):
@@ -189,9 +190,7 @@ class SnowflakeProviderEnhanced(BaseProvider):
                 backup=backup,
             )
             return []
-        return [
-            f"CREATE OR REPLACE TABLE {db_v}.{sch_v}.{tbl_v} " f"CLONE {db_v}.{sch_v}.{backup_v}"
-        ]
+        return [f"CREATE OR REPLACE TABLE {db_v}.{sch_v}.{tbl_v} CLONE {db_v}.{sch_v}.{backup_v}"]
 
     def cleanup_backups(self, snapshots: List[Mapping[str, Any]]) -> None:
         """Drop Snowflake backup tables for snapshots aged out of state.
@@ -701,7 +700,39 @@ class SnowflakeProviderEnhanced(BaseProvider):
                             contract_block = ex.get("contract") or {}
                             cols = contract_block.get("schema") or []
                             if cols:
-                                columns = cols
+                                # Contract-shape → action-shape translation.
+                                # Two normalisations matter:
+                                #
+                                # 1. ``required: true`` (FLUID-schema convention) →
+                                #    ``nullable: false`` (action-handler convention).
+                                #    Without this, contract NOT NULL guarantees
+                                #    silently degrade to nullable Snowflake columns.
+                                # 2. FLUID type → Snowflake type via
+                                #    ``map_fluid_type_to_snowflake``. Without this,
+                                #    ``type: NUMBER`` falls through to VARCHAR
+                                #    instead of becoming NUMBER(38,0).
+                                # ``nullable`` wins if explicitly set so a
+                                # contract author can still override.
+                                columns = [
+                                    {
+                                        "name": c.get("name"),
+                                        "type": map_fluid_type_to_snowflake(
+                                            c.get("type", "string")
+                                        ),
+                                        "nullable": c.get(
+                                            "nullable",
+                                            not c.get("required", False),
+                                        ),
+                                        **(
+                                            {"comment": c["description"]}
+                                            if c.get("description")
+                                            else {}
+                                        ),
+                                        **({"labels": c["labels"]} if c.get("labels") else {}),
+                                    }
+                                    for c in cols
+                                    if isinstance(c, dict) and c.get("name")
+                                ]
                                 break
                 # When target_id can't be recovered, ``columns`` stays
                 # empty and the table-create branch below records a

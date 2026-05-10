@@ -582,7 +582,6 @@ class ProjectValidator:
                                 and "example" not in line_lower
                                 and "placeholder" not in line_lower
                             ):
-
                                 self.issues.append(
                                     ValidationIssue(
                                         level=ValidationLevel.WARNING,
@@ -607,9 +606,9 @@ def validate_project(project_path: str) -> ValidationResult:
 def print_validation_report(result: ValidationResult, project_path: str):
     """Print a formatted validation report"""
 
-    cprint(f"\n{'='*60}")
+    cprint(f"\n{'=' * 60}")
     cprint(f"VALIDATION REPORT: {project_path}")
-    cprint(f"{'='*60}")
+    cprint(f"{'=' * 60}")
 
     if result.success:
         success("VALIDATION PASSED")

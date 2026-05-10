@@ -142,9 +142,9 @@ def test_picker_surfaces_extended_providers_when_litellm_installed(console):
     keys = captured[0]
     # litellm is installed in the dev venv → the extended set MUST appear
     for extended in ("groq", "bedrock", "azure", "vertex_ai"):
-        assert extended in keys, (
-            f"litellm-enabled provider {extended} missing from picker " f"(only see: {keys})"
-        )
+        assert (
+            extended in keys
+        ), f"litellm-enabled provider {extended} missing from picker (only see: {keys})"
 
 
 # ---------------------------------------------------------------------------

@@ -202,7 +202,7 @@ def parse_mode(mode_arg: Optional[str]) -> ApplyMode:
         return ApplyMode(mode_arg)
     except ValueError:
         raise ValueError(
-            f"unknown --mode value: {mode_arg!r}. " f"Valid: {', '.join(CANONICAL_CHOICES)}"
+            f"unknown --mode value: {mode_arg!r}. Valid: {', '.join(CANONICAL_CHOICES)}"
         ) from None
 
 

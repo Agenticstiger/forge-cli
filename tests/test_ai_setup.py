@@ -999,7 +999,7 @@ class TestGeminiIsDefaultProvider:
 
         with (
             patch(
-                "fluid_build.cli.forge_copilot_llm_providers." "_infer_provider_from_keyring",
+                "fluid_build.cli.forge_copilot_llm_providers._infer_provider_from_keyring",
                 return_value=None,
             ),
             patch(

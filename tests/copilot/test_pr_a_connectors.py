@@ -308,9 +308,9 @@ class TestOllamaCatalogCoverage:
         self, model: str, expected_prefix: str, expected_tool_use: bool
     ) -> None:
         caps = assess_capabilities("ollama", model)
-        assert caps.model_prefix == expected_prefix, (
-            f"expected prefix {expected_prefix!r} for {model!r}, " f"got {caps.model_prefix!r}"
-        )
+        assert (
+            caps.model_prefix == expected_prefix
+        ), f"expected prefix {expected_prefix!r} for {model!r}, got {caps.model_prefix!r}"
         assert caps.tool_use is expected_tool_use
         # Every catalogued Ollama entry should advertise streaming.
         assert caps.streaming is True
@@ -337,6 +337,6 @@ class TestOllamaCatalogCoverage:
         # The Ollama prefix lookup should produce the model-design
         # window, not the conservative 32K fallback.
         window = get_context_window(model)
-        assert window >= minimum_window, (
-            f"{model} resolved to {window:,}-token window; " f"expected at least {minimum_window:,}"
-        )
+        assert (
+            window >= minimum_window
+        ), f"{model} resolved to {window:,}-token window; expected at least {minimum_window:,}"

@@ -280,10 +280,10 @@ class ForgeEngine:
 [dim]Creating production-ready FLUID data products with best practices[/dim]
 
 [bold cyan]📊 System Status:[/bold cyan]
-• Templates: {status['templates']['count']} available
-• Providers: {status['providers']['count']} available  
-• Extensions: {status['extensions']['count']} loaded
-• Generators: {status['generators']['count']} available
+• Templates: {status["templates"]["count"]} available
+• Providers: {status["providers"]["count"]} available  
+• Extensions: {status["extensions"]["count"]} loaded
+• Generators: {status["generators"]["count"]} available
 
 [bold green]System ready ⚡[/bold green]
         """
@@ -754,7 +754,6 @@ class ForgeEngine:
                 TextColumn("[progress.description]{task.description}"),
                 transient=True,
             ) as progress:
-
                 # Generate folder structure
                 progress.add_task("Creating folder structure...", total=None)
                 structure = template.generate_structure(self.generation_context)
@@ -1075,11 +1074,11 @@ class ForgeEngine:
 
 [bold cyan]📊 Session Summary:[/bold cyan]
 • Duration: {duration.total_seconds():.1f} seconds
-• Steps completed: {len(self.session_stats['steps_completed'])}
-• Project: {self.project_config.get('name', 'Unknown')}
-• Template: {self.project_config.get('template', 'Unknown')}
-• Provider: {self.project_config.get('provider', 'Unknown')}
-• Location: {self.project_config.get('target_dir', 'Unknown')}
+• Steps completed: {len(self.session_stats["steps_completed"])}
+• Project: {self.project_config.get("name", "Unknown")}
+• Template: {self.project_config.get("template", "Unknown")}
+• Provider: {self.project_config.get("provider", "Unknown")}
+• Location: {self.project_config.get("target_dir", "Unknown")}
 
 [bold green]🚀 Your data product is ready for development![/bold green]
         """
