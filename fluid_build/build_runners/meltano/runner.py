@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,7 +51,9 @@ from fluid_build.api.state import Cursor
 from fluid_build.providers._sql_safety import validate_ident
 
 from .._acquisition_common import (
+    extract_source_schemas,
     generate_run_id,
+    resolve_connection_secrets,
     utc_now_iso,
     write_run_record_and_finalize,
 )
@@ -105,10 +108,26 @@ def collect_singer_output(
 
 
 _TAP_NAME_RE = re.compile(r"^tap-[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
+_TARGET_NAME_RE = re.compile(r"^target-[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
 
 
 def _resolve_tap_binary(tap_name: str, *, project_dir: Optional[Path] = None) -> Optional[str]:
-    """Locate a Singer tap binary on PATH (preferred) or in the project venv.
+    """Locate a Singer tap binary on PATH, in the active Python's venv, or
+    in the Meltano project venv.
+
+    Search order (each step short-circuits on first hit):
+
+    1. ``shutil.which(name)`` — operator pinned the binary on PATH
+       (preferred for production / containerised use).
+    2. ``Path(sys.executable).parent / name`` — sibling of the running
+       Python interpreter. Catches the common dev-time pattern of
+       ``pip install meltanolabs-tap-postgres`` into the same venv that
+       hosts forge-cli, where ``shutil.which`` won't find the binary
+       because the venv isn't activated when ``fluid`` is invoked
+       directly via its bin path.
+    3. ``project_dir/.meltano/extractors/<name>/venv/bin/<name>`` —
+       Meltano-style per-extractor isolated venv (legacy / production
+       Meltano-managed install).
 
     The tap name is validated against ``_TAP_NAME_RE`` (lowercase + alnum +
     ``._-`` only, must start with ``tap-`` and start/end alnum) so a
@@ -125,6 +144,20 @@ def _resolve_tap_binary(tap_name: str, *, project_dir: Optional[Path] = None) ->
     on_path = shutil.which(candidate)
     if on_path:
         return on_path
+    # Sibling-of-Python lookup: catches the common dev-time install pattern
+    # of putting Singer taps into the same venv as forge-cli, where the
+    # venv isn't on PATH because ``fluid`` is invoked via its absolute bin
+    # path (no activation).
+    #
+    # Use ``sys.prefix`` not ``Path(sys.executable).resolve().parent`` —
+    # ``.resolve()`` follows the venv's python symlink back to the system
+    # interpreter (e.g. /opt/homebrew/.../python), escaping the venv. Each
+    # venv sets ``sys.prefix`` to its own root directory, regardless of
+    # interpreter symlinks.
+    venv_bin = Path(sys.prefix) / "bin"
+    sibling_candidate = venv_bin / candidate
+    if sibling_candidate.exists():
+        return str(sibling_candidate)
     if project_dir is not None:
         extractors_root = (project_dir / ".meltano" / "extractors").resolve()
         candidate_path = (extractors_root / candidate / "venv" / "bin" / candidate).resolve()
@@ -251,22 +284,57 @@ def discover_tap_catalog(
     return None
 
 
+def _stream_matches_request(stream_name: str, requested: set) -> bool:
+    """Return True if the catalog ``stream_name`` matches any requested name.
+
+    Singer taps name streams differently:
+
+    - **bare table**: ``usage_event`` (some legacy taps)
+    - **schema-prefixed (dash)**: ``telco-usage_event`` (tap-postgres,
+      tap-mysql — they join schema + table with ``-``)
+    - **schema-prefixed (dot)**: ``telco.usage_event`` (some custom taps)
+    - **database-prefixed**: ``mydb-telco-usage_event``
+
+    We accept any of these so the contract author can write the natural
+    table name and not have to know which separator the tap chose. Order:
+
+    1. exact match on ``stream`` or ``tap_stream_id``
+    2. dot ↔ dash swaps (``telco.usage_event`` ↔ ``telco-usage_event``)
+    3. **suffix match** after splitting on ``-`` or ``.`` — catches
+       ``telco-usage_event`` matching request ``usage_event``
+    """
+    if stream_name in requested:
+        return True
+    if stream_name.replace(".", "-") in requested:
+        return True
+    if stream_name.replace("-", ".") in requested:
+        return True
+    # Suffix match: split on either separator and check if the last
+    # segment is requested (e.g. "telco-usage_event" -> "usage_event").
+    for sep in ("-", "."):
+        if sep in stream_name:
+            tail = stream_name.rsplit(sep, 1)[-1]
+            if tail in requested:
+                return True
+    return False
+
+
 def _select_streams_in_catalog(catalog: Dict[str, Any], streams: List[str]) -> Dict[str, Any]:
     """Mark the requested streams as ``selected: true`` in catalog metadata.
 
     Singer + Singer-SDK both honour the ``selected`` metadata flag on the
     root metadata entry of each stream. Without it the tap emits SCHEMA
-    messages but no RECORDs. Stream matching is by exact ``stream`` name
-    or by ``tap_stream_id`` so contracts using either form still work.
+    messages but no RECORDs. Stream matching is via
+    :func:`_stream_matches_request` (exact, dot↔dash, and suffix match) so
+    a contract requesting ``usage_event`` matches a tap-postgres catalog
+    entry called ``telco-usage_event``.
     """
     if not streams:
         return catalog
     wanted = set(streams)
     for s in catalog.get("streams") or []:
-        sname = s.get("stream") or s.get("tap_stream_id")
-        if sname not in wanted and (
-            sname.replace(".", "-") not in wanted and sname.replace("-", ".") not in wanted
-        ):
+        sname = s.get("stream") or s.get("tap_stream_id") or ""
+        if not _stream_matches_request(sname, wanted):
             continue
         md_list = s.get("metadata") or []
         seen_root = False
@@ -279,6 +347,122 @@ def _select_streams_in_catalog(catalog: Dict[str, Any], streams: List[str]) -> D
             md_list.append({"breadcrumb": [], "metadata": {"selected": True}})
         s["metadata"] = md_list
     return catalog
+
+
+# ── Singer target invocation (out-of-process, stdin Singer pipe) ────────
+
+
+def _resolve_target_binary(
+    target_name: str, *, project_dir: Optional[Path] = None
+) -> Optional[str]:
+    """Locate a Singer target binary using the same precedence as taps.
+
+    1. ``shutil.which`` (PATH, preferred for production).
+    2. ``Path(sys.prefix) / "bin"`` — sibling of the running Python (catches
+       ``pip install meltanolabs-target-snowflake`` into the same venv).
+    3. ``project_dir/.meltano/loaders/<name>/venv/bin/<name>`` — Meltano
+       per-loader venv (mirrors the tap-side ``extractors`` layout).
+
+    Validation parallels ``_resolve_tap_binary``: the name must match
+    ``_TARGET_NAME_RE`` so a malicious ``target-../../etc/passwd`` can't
+    construct a path-escape.
+    """
+    candidate = target_name if target_name.startswith("target-") else f"target-{target_name}"
+    if not _TARGET_NAME_RE.match(candidate):
+        LOG.warning("singer.invalid_target_name name=%r", target_name)
+        return None
+    on_path = shutil.which(candidate)
+    if on_path:
+        return on_path
+    venv_bin = Path(sys.prefix) / "bin"
+    sibling_candidate = venv_bin / candidate
+    if sibling_candidate.exists():
+        return str(sibling_candidate)
+    if project_dir is not None:
+        loaders_root = (project_dir / ".meltano" / "loaders").resolve()
+        candidate_path = (loaders_root / candidate / "venv" / "bin" / candidate).resolve()
+        try:
+            candidate_path.relative_to(loaders_root)
+        except ValueError:
+            LOG.warning(
+                "singer.target_path_escape candidate=%s root=%s",
+                candidate_path,
+                loaders_root,
+            )
+            return None
+        if candidate_path.exists():
+            return str(candidate_path)
+    return None
+
+
+def invoke_target(
+    binary: str,
+    *,
+    config: Dict[str, Any],
+    schemas: Dict[str, Dict[str, Any]],
+    records: Dict[str, List[Dict[str, Any]]],
+    state: Optional[Dict[str, Any]] = None,
+    workdir: Path,
+    timeout_seconds: int = 600,
+) -> Dict[str, Any]:
+    """Pipe Singer messages into ``<binary> --config <conf>`` over stdin.
+
+    Replays the captured ``schemas`` (one SCHEMA per stream) followed by
+    all ``records`` for that stream as RECORD messages, then a final STATE
+    message. The target reads from stdin, writes to its destination, and
+    exits.
+
+    This is the canonical Singer pattern (stdin/stdout JSONL pipe). We
+    reuse the in-memory tap result rather than re-piping tap → target
+    directly so the FLUID hook chain (PII tokenization, DLQ, quality
+    gates) can mutate / drop records before they land in the warehouse.
+
+    Returns ``{"exit_code": int, "stderr": str}``. Caller checks exit
+    code and surfaces stderr to the operator.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    config_path = (workdir / "target_config.json").resolve()
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    cmd = [binary, "--config", str(config_path)]
+
+    LOG.info("singer.target.invoke binary=%s cwd=%s", binary, workdir)
+    # Pre-render the Singer message stream once; Popen.communicate(input=...)
+    # handles the write+wait+drain in one call so we don't have to manage
+    # the stdin pipe manually (avoids the "I/O operation on closed file"
+    # race when the target exits early during config validation).
+    lines: List[str] = []
+    for stream, schema_msg in schemas.items():
+        lines.append(json.dumps(schema_msg))
+        for record in records.get(stream, []):
+            lines.append(
+                json.dumps({"type": "RECORD", "stream": stream, "record": record})
+            )
+    if state is not None:
+        lines.append(json.dumps({"type": "STATE", "value": state}))
+    singer_input = "\n".join(lines) + ("\n" if lines else "")
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(workdir.resolve()),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _stdout, stderr = proc.communicate(input=singer_input, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _stdout, stderr = proc.communicate()
+        return {"exit_code": -1, "stderr": f"target timeout after {timeout_seconds}s\n{stderr}"}
+
+    # Persist stderr to disk so an operator can re-read after the run
+    # without re-piping. Mirrors the tap-side ``tap_discover_stderr.log``
+    # convention so support paths look the same for both halves.
+    if stderr:
+        (workdir / "target_stderr.log").write_text(stderr, encoding="utf-8")
+
+    return {"exit_code": proc.returncode, "stderr": stderr}
 
 
 # ── Built-in target: Parquet / DuckDB ───────────────────────────────────
@@ -379,11 +563,16 @@ class MeltanoRunner:
         return _execute(ctx, self)
 
     def fingerprint(self, ctx: RunContext) -> SchemaFingerprint:
-        cols = [
-            SchemaColumn(name=s, type="singer", nullable=True)
-            for s in ctx.source.streams or [ctx.source.kind]
-        ]
-        return SchemaFingerprint.of(cols, captured_at=utc_now_iso())
+        # Singer taps emit their own SCHEMA messages mid-stream;
+        # introspecting at fingerprint() time would require running the tap.
+        # Surface a placeholder marked ``is_placeholder=True`` so the schema-
+        # evolution gate skips comparison — actual drift is surfaced at run-
+        # time by the tap's SCHEMA messages and meltano's catalog diff.
+        return SchemaFingerprint.placeholder(
+            list(ctx.source.streams or [ctx.source.kind]),
+            engine="singer",
+            captured_at=utc_now_iso(),
+        )
 
 
 def _execute(ctx: RunContext, runner: MeltanoRunner) -> RunResult:
@@ -405,8 +594,25 @@ def _execute(ctx: RunContext, runner: MeltanoRunner) -> RunResult:
     if binary is None:
         return _failed(ctx, started_at, t_start, f"Singer tap binary not found: {tap}")
 
-    # Build tap config from the source connection block.
-    tap_config = dict(ctx.source.connection.raw)
+    # Build tap config from the source connection block. Resolve secretRef →
+    # password (or other credential field) before the dict reaches the Singer
+    # tap. Inline literal values still win.
+    # Then run the per-source-kind adapter (registered in meltano/sources.py)
+    # to coerce FLUID-canonical fields into the shape the specific tap
+    # expects — e.g. tap-postgres requires ``port: integer`` but FLUID's
+    # ``{{ env.X }}`` template substitution always yields strings.
+    from .._acquisition_common import adapt_source_config
+
+    tap_config = resolve_connection_secrets(dict(ctx.source.connection.raw))
+    tap_config = adapt_source_config("meltano", ctx.source.kind, tap_config)
+    # connection.schema / connection.schemas → Singer convention
+    # ``filter_schemas`` (a list). Pop the generic FLUID fields so the tap
+    # doesn't see them as unrecognised settings.
+    schemas = extract_source_schemas(tap_config)
+    tap_config.pop("schema", None)
+    tap_config.pop("schemas", None)
+    if schemas:
+        tap_config.setdefault("filter_schemas", schemas)
     if ctx.source.streams:
         # Many taps accept ``selected_streams``; harmless for ones that don't.
         tap_config["selected_streams"] = list(ctx.source.streams)
@@ -515,23 +721,93 @@ def _execute(ctx: RunContext, runner: MeltanoRunner) -> RunResult:
     except Exception as exc:  # noqa: BLE001 — hook chain is best-effort
         LOG.warning("meltano hook chain failed: %s", exc)
 
-    # Determine destination DuckDB path.
+    # ── Destination dispatch ────────────────────────────────────────────
+    # Two paths based on the contract's binding:
+    #  1. ``platform: snowflake`` (or any registered meltano destination
+    #     introspector) → invoke target-<platform> via Singer stdin pipe.
+    #  2. anything else → fall back to the built-in DuckDB writer (matches
+    #     the historical default; useful for local dev / tests).
     expose = (ctx.contract.get("exposes") or [{}])[0]
-    binding_loc = (expose.get("binding") or {}).get("location") or {}
-    duckdb_path_str = binding_loc.get("path") or str(workdir / "out.duckdb")
-    duckdb_path = Path(duckdb_path_str)
-    if not duckdb_path.is_absolute():
-        duckdb_path = Path(ctx.workdir) / duckdb_path
-    if duckdb_path.suffix and duckdb_path.suffix != ".duckdb":
-        duckdb_path = duckdb_path.with_suffix(".duckdb")
+    binding = expose.get("binding") or {}
+    binding_loc = binding.get("location") or {}
+    sink_platform = (binding.get("platform") or "").lower()
+    sink_format = (binding.get("format") or "").lower()
     dataset = meltano_props.get("dataset_name") or "bronze"
 
-    try:
-        counts = write_records_to_duckdb(
-            result["records"], duckdb_path=duckdb_path, dataset=dataset
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _failed(ctx, started_at, t_start, f"target write failed: {exc}")
+    use_singer_target = (
+        sink_platform in ("snowflake", "bigquery", "redshift", "postgres")
+        or sink_format.startswith(tuple(["snowflake_", "bigquery_", "redshift_", "postgres_"]))
+    )
+
+    if use_singer_target:
+        # Resolve target binary (operator may pin via properties.meltano.target,
+        # otherwise default to ``target-<platform>``).
+        target_name = meltano_props.get("target") or f"target-{sink_platform}"
+        target_binary = _resolve_target_binary(target_name, project_dir=project_dir)
+        if target_binary is None:
+            return _failed(
+                ctx,
+                started_at,
+                t_start,
+                f"Singer target binary not found: {target_name}",
+            )
+
+        # Build the target config via the FLUID-canonical credentials layer.
+        # Side-effect import: the meltano destinations module registers the
+        # introspector with the unified registry.
+        from . import destinations  # noqa: F401  (registration side-effect)
+        from .._credentials import make_destination
+
+        target_config = make_destination(
+            "meltano",
+            sink_platform,
+            binding=binding,
+            contract=ctx.contract,
+            product_id=ctx.product_id,
+        ) or {}
+        # Merge any contract-author-specified extra config (rare; lets a
+        # contract pin ``add_record_metadata: true`` etc. without forcing
+        # an env var).
+        for k, v in (meltano_props.get("target_config") or {}).items():
+            target_config.setdefault(k, v)
+
+        try:
+            tgt_result = invoke_target(
+                target_binary,
+                config=target_config,
+                schemas=result["schemas"],
+                records=result["records"],
+                state=result["state"],
+                workdir=workdir,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _failed(ctx, started_at, t_start, f"target invocation failed: {exc}")
+
+        if tgt_result["exit_code"] != 0:
+            return _failed(
+                ctx,
+                started_at,
+                t_start,
+                f"target exited {tgt_result['exit_code']}: {tgt_result['stderr'][:500]}",
+            )
+
+        counts = {stream: len(rows) for stream, rows in result["records"].items()}
+        destination_label = sink_platform
+    else:
+        # DuckDB fallback path (historical default).
+        duckdb_path_str = binding_loc.get("path") or str(workdir / "out.duckdb")
+        duckdb_path = Path(duckdb_path_str)
+        if not duckdb_path.is_absolute():
+            duckdb_path = Path(ctx.workdir) / duckdb_path
+        if duckdb_path.suffix and duckdb_path.suffix != ".duckdb":
+            duckdb_path = duckdb_path.with_suffix(".duckdb")
+        try:
+            counts = write_records_to_duckdb(
+                result["records"], duckdb_path=duckdb_path, dataset=dataset
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _failed(ctx, started_at, t_start, f"duckdb write failed: {exc}")
+        destination_label = "duckdb"
 
     # Persist new state.
     if result["state"]:
@@ -567,7 +843,7 @@ def _execute(ctx: RunContext, runner: MeltanoRunner) -> RunResult:
             "duration_seconds": time.time() - t_start,
             "tap": tap,
             "dataset_name": dataset,
-            "destination": "duckdb",
+            "destination": destination_label,
         },
     )
 

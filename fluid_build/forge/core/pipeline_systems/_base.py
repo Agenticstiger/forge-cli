@@ -150,6 +150,31 @@ class PipelineConfig:
     # mode; teams that need multi-env Jenkinsfiles use two generated
     # files instead of one multi-branch file.
     install_mode: str = "pypi"
+    # FLUID acquisition / transformation engine declared in the contract's
+    # ``builds[0].engine`` field. Drives the per-engine pip-install plan
+    # in the generated pipeline's bootstrap stage. Common values:
+    # ``dlt``, ``airbyte``, ``meltano``, ``debezium``, ``kafka_connect``,
+    # ``duckdb``, ``dbt``. ``None`` skips engine-side bootstrap (caller
+    # is expected to provide the runtime).
+    engine: Optional[str] = None
+    # Source kind (``builds[0].properties.source.kind``) — picks the
+    # right per-source pip extras (e.g. dlt[sql_database] for postgres
+    # source, meltanolabs-tap-postgres for meltano + postgres). ``None``
+    # means engine has no source-kind dependency (PyAirbyte, dbt).
+    source_kind: Optional[str] = None
+    # Sink platform (``binding.platform`` of the first expose) — picks
+    # the right per-sink pip extras (e.g. dlt[snowflake], dbt-snowflake,
+    # meltanolabs-target-snowflake). ``None`` means no sink known yet.
+    sink_platform: Optional[str] = None
+    # Container-runtime loopback override env var, propagated into the
+    # generated pipeline's environment block. When the FLUID process
+    # runs inside a container (CI runner, Jenkins agent), ``localhost``
+    # in the contract's source.connection.host points at the container,
+    # not the operator's machine. Setting this to ``host.docker.internal``
+    # (Docker Desktop) / the bridge IP (Linux) / etc. is what the FLUID
+    # acquisition runner's ``apply_loopback_host_override`` reads. Empty
+    # string = don't emit the env var (operator handles externally).
+    runner_host_override: str = ""
     # Opt-in fallback catalog target baked into the Jenkins Stage 10
     # publish shell as ``${PUBLISH_TARGETS:-<value>}``. Left ``None`` by
     # default, which preserves the original ``${PUBLISH_TARGETS}`` (no
@@ -170,9 +195,15 @@ class PipelineConfig:
     # ``--env`` flag to ``fluid publish``. These exist so scenario-specific
     # launchpads can ask ``fluid generate ci`` to emit the intended default
     # behavior directly instead of patching the generated Jenkinsfile text.
+    #
+    # ``publish_include_env`` defaults to False because ``fluid publish``
+    # does NOT accept ``--env``; including it makes Stage 10 die with
+    # ``unrecognized arguments: --env dev``. Operators who add ``--env``
+    # support to ``fluid publish`` (or wrap it via a custom CLI alias) can
+    # opt in via ``--publish-include-env`` at generate time.
     verify_strict_default: bool = True
     publish_stage_default: bool = False
-    publish_include_env: bool = True
+    publish_include_env: bool = False
 
     def __post_init__(self):
         if self.environments is None:

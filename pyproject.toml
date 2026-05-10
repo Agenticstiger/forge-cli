@@ -56,6 +56,12 @@ dependencies = [
   # wizard but resolution fails because keyring isn't installed"
   # first-time UX trap.
   "keyring>=24.0",
+  # Layered settings (init args > env > .env > secrets-dir > defaults) for
+  # the acquisition runner credential layer. Subsumes hand-rolled
+  # setdefault_env precedence + per-platform alias machinery.
+  # Borrowed-not-built per /borrow-before-build (skill receipts in commit msg):
+  #   docs:  https://docs.pydantic.dev/latest/concepts/pydantic_settings/
+  "pydantic-settings>=2.0",
   # Optional UX nicety on Windows; no-op elsewhere
   "colorama>=0.4.6; platform_system == 'Windows'",
 ]

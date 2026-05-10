@@ -49,6 +49,11 @@ from ._base import (
     StageSpec,
     _pin_action,
 )
+from ._engine_specs import (
+    render_bootstrap_shell_section,
+    render_runner_env_vars,
+    render_runtime_notes,
+)
 
 
 class JenkinsTemplate(BasePipelineTemplate):
@@ -230,6 +235,66 @@ EOM
         else:
             pythonpath_value = "."
 
+        # ── Engine-aware bootstrap (uses the shared registry) ─────────────
+        # Pulls per-engine pip extras from
+        # ``fluid_build.forge.core.pipeline_systems._engine_specs`` so this
+        # template stays small and the same engine-resolution logic is
+        # reused across every CI emitter (github_actions, gitlab_ci,
+        # tekton, …). Empty string when the contract has no engine
+        # declared (engine-agnostic Jenkinsfile, no extras installed).
+        engine_bootstrap_sh = render_bootstrap_shell_section(
+            engine=getattr(config, "engine", None),
+            source_kind=getattr(config, "source_kind", None),
+            sink_platform=getattr(config, "sink_platform", None),
+            indent="                      ",  # matches sh ''' ''' nesting
+        )
+        # Wrap in a single ``sh '''...'''`` step so it runs as ONE shell
+        # invocation (preserves env across pip lines, fails loud on first
+        # error). When the registry returns nothing we emit no extra
+        # shell step — the Setup stage stays clean.
+        if engine_bootstrap_sh:
+            engine_bootstrap_step = (
+                "                sh '''set -e\n"
+                f"{engine_bootstrap_sh}\n"
+                "                '''"
+            )
+        else:
+            engine_bootstrap_step = ""
+
+        # Container-runtime env vars (e.g. FLUID_RUNNER_HOST_OVERRIDE).
+        # Same pattern: shared registry → CI-emitter-agnostic dict →
+        # Jenkins ``environment {}`` block. Empty dict → no extra lines.
+        runner_env_lines = []
+        for key, value in render_runner_env_vars(
+            runner_host_override=getattr(config, "runner_host_override", "") or "",
+            engine=getattr(config, "engine", None),
+        ).items():
+            # Jenkins env-block syntax: ``KEY = 'value'`` (single-quoted
+            # so values with literal $ aren't expanded).
+            runner_env_lines.append(f"        {key} = '{value}'")
+        runner_env_block = "\n".join(runner_env_lines)
+        if runner_env_block:
+            runner_env_block = "\n" + runner_env_block + "\n"
+
+        # Per-engine runtime notes (docker socket, external services, ...).
+        # Sourced from the same registry as engine_bootstrap_step + runner
+        # env vars; rendered as Jenkinsfile ``//`` comments above the
+        # ``environment {}`` block so operators see the requirements
+        # before they hit a runtime error. Empty when the engine has no
+        # special runtime needs (dlt / meltano / dbt / duckdb).
+        runtime_notes_text = render_runtime_notes(
+            engine=getattr(config, "engine", None),
+            indent="    // ",  # 4-sp indent matches `pipeline {` inner blocks
+        )
+        if runtime_notes_text:
+            runtime_notes_block = (
+                "\n    // ── Engine runtime requirements (from the shared "
+                "engine_specs registry) ──\n"
+                f"{runtime_notes_text}\n"
+            )
+        else:
+            runtime_notes_block = ""
+
         # Install-mode-specific Jenkins parameters. pypi mode exposes
         # pip-install overrides (package spec, index URLs, prerelease
         # toggle) so operators can swap TestPyPI in without editing
@@ -371,13 +436,11 @@ pipeline {{
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20'))
     }}
-{parameters_block}
-
+{parameters_block}{runtime_notes_block}
     environment {{
         FLUID_LOG_LEVEL = 'INFO'
         FLUID_CONFIG_PATH = './fluid_config'
-        PYTHONPATH = '{pythonpath_value}'
-
+        PYTHONPATH = '{pythonpath_value}'{runner_env_block}
         // ── Provider credential bindings (pick ONE pattern) ──────
         // See the top-of-file banner for the full env-var list per
         // provider.
@@ -404,9 +467,10 @@ pipeline {{
     }}
 
     stages {{
-        stage('Setup [install-mode: {install_mode}]') {{
+        stage('0 — Bootstrap FLUID [{install_mode}]') {{
             steps {{
 {setup_install_sh}
+{engine_bootstrap_step}
                 sh '''{CD}fluid --version'''
             }}
         }}
@@ -416,7 +480,7 @@ pipeline {{
         // Deterministic .tgz + MANIFEST.json (SHA-256 merkle root).
         // Root of trust for every downstream stage.
         // ═════════════════════════════════════════════════════════════
-        stage('1 · bundle') {{
+        stage('1 - bundle') {{
             when {{ expression {{ return params.RUN_STAGE_1_BUNDLE }} }}
             steps {{
                 sh '''{CD}mkdir -p runtime
@@ -430,7 +494,7 @@ pipeline {{
         // Extension-routed: schema + sqlglot (SQL) + openapi-spec-validator.
         // Fail early, fail loud.
         // ═════════════════════════════════════════════════════════════
-        stage('2 · validate') {{
+        stage('2 - validate') {{
             when {{ expression {{ return params.RUN_STAGE_2_VALIDATE }} }}
             environment {{
                 VALIDATE_STRICT_FLAG = "${{params.VALIDATE_STRICT ? '--strict' : ''}}"
@@ -447,7 +511,7 @@ pipeline {{
         // ODCS + ODPS-Bitol + schedule + policy fanout. dbt excluded.
         // Auto-skipped for hybrid-reference contracts.
         // ═════════════════════════════════════════════════════════════
-        stage('3 · generate artifacts') {{
+        stage('3 - generate artifacts') {{
             when {{ expression {{ return params.RUN_STAGE_3_GENERATE_ARTIFACTS }} }}
             steps {{
                 sh '''{CD}fluid generate artifacts "${{CONTRACT:-contract.fluid.yaml}}" \\
@@ -462,7 +526,7 @@ pipeline {{
         // Re-verifies MANIFEST SHA-256 + per-format schema validators.
         // Defence-in-depth against in-flight CI tampering.
         // ═════════════════════════════════════════════════════════════
-        stage('4 · validate artifacts') {{
+        stage('4 - validate artifacts') {{
             // Self-gate: stage 4 re-verifies the output of stage 3
             // (generate artifacts). When stage 3 was skipped — either
             // because the contract is reference-only (RUN_STAGE_3_*
@@ -495,7 +559,7 @@ pipeline {{
         // Live warehouse vs contract. --exit-on-drift forces a human
         // decision before plan proceeds against a drifted baseline.
         // ═════════════════════════════════════════════════════════════
-        stage('5 · diff (drift gate)') {{
+        stage('5 - diff (drift gate)') {{
             when {{ expression {{ return params.RUN_STAGE_5_DIFF }} }}
             // SECURITY: argument-smuggling defence (match stages 7, 9, 11).
             environment {{
@@ -520,7 +584,7 @@ pipeline {{
         // DDL operations + plan.json with bundleDigest + planDigest.
         // Terraform-style "apply consumes exact plan" binding.
         // ═════════════════════════════════════════════════════════════
-        stage('6 · plan') {{
+        stage('6 - plan') {{
             when {{ expression {{ return params.RUN_STAGE_6_PLAN }} }}
             // Pass APPLY_MODE through to plan so plan.json's recorded
             // ``mode`` matches what Stage 7 will request. The
@@ -547,7 +611,7 @@ pipeline {{
         // Six-mode DDL matrix. Destructive modes (replace*) require
         // ALLOW_DATA_LOSS when FLUID_ENV != dev or target has rows.
         // ═════════════════════════════════════════════════════════════
-        stage('7 · apply') {{
+        stage('7 - apply') {{
             when {{ expression {{ return params.RUN_STAGE_7_APPLY }} }}
             // SECURITY: user-supplied params routed through plain
             // environment-block assignments as raw env vars — NOT
@@ -590,7 +654,7 @@ pipeline {{
         // objects surfaces as policy failure, not masked build error).
         // Self-gated on dist/artifacts/policy/bindings.json existence.
         // ═════════════════════════════════════════════════════════════
-        stage('8 · policy apply') {{
+        stage('8 - policy apply') {{
             when {{ expression {{ return params.RUN_STAGE_8_POLICY_APPLY }} }}
             steps {{
                 // ``fluid policy-apply`` does NOT accept a --report
@@ -615,7 +679,7 @@ pipeline {{
         // Post-apply reconciliation. Catches silent DDL coercions
         // (TIMESTAMP_NTZ → LTZ, Redshift length truncations, etc.).
         // ═════════════════════════════════════════════════════════════
-        stage('9 · verify') {{
+        stage('9 - verify') {{
             when {{ expression {{ return params.RUN_STAGE_9_VERIFY }} }}
             // SECURITY: same argument-smuggling defence as stage 7 —
             // route VERIFY_STRICT through a plain env var and compose
@@ -646,7 +710,7 @@ pipeline {{
         // Multi-target catalog publisher. Push to CC / DMM / DataHub /
         // Collibra / Alation / marketplace / blob storage.
         // ═════════════════════════════════════════════════════════════
-        stage('10 · publish') {{
+        stage('10 - publish') {{
             when {{ expression {{ return params.RUN_STAGE_10_PUBLISH }} }}
             steps {{
                 // PUBLISH_TARGETS is a space-separated string; shell
@@ -674,7 +738,7 @@ pipeline {{
         // Path B (EventBridge / MWAA / Snowflake Tasks) is applied in
         // Stage 7 via SchedulePlanner.
         // ═════════════════════════════════════════════════════════════
-        stage('11 · schedule sync') {{
+        stage('11 - schedule sync') {{
             when {{
                 expression {{ return params.RUN_STAGE_11_SCHEDULE_SYNC && params.SCHEDULER?.trim() }}
             }}

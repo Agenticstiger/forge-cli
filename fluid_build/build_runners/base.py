@@ -28,6 +28,7 @@ alongside; ``cli/apply.py`` calls :func:`run_builds_from_args` directly.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -206,6 +207,23 @@ def _execute_acquisition_build(
         )
         return 1
 
+    # Resolve ``{{ env.X }}`` placeholders across the ENTIRE build + contract
+    # before the runner sees them. Some runners do their own per-slice
+    # resolution (e.g. dlt source_dict at runner.py:480) — those calls are
+    # left in place as a defence-in-depth fallback for runners invoked
+    # outside this dispatcher. Doing it once HERE guarantees every runner
+    # gets resolved values for every nested field (source.connection.*,
+    # properties.<engine>.*, sink.*, delivery.*, schemaEvolution.*, …) so
+    # operators don't need to memorise which fields support templating.
+    #
+    # Secrets policy: this is the runtime path; values stay in process
+    # memory and never get serialised to a remote catalog, so we resolve
+    # everything (including secret-shaped vars). Catalog-export paths use
+    # ``cli/_common.py::resolve_contract_env_templates`` instead, which
+    # leaves sensitive placeholders literal.
+    build = _resolve_env_placeholders(build)
+    contract = _resolve_env_placeholders(contract)
+
     module_path, function_name = entry
     import importlib
 
@@ -249,16 +267,94 @@ def run_builds_from_args(
     if not contract_path.exists():
         raise CLIError(1, "contract_not_found", {"path": str(contract_path)})
 
-    # Load contract using shared infrastructure (overlays now work!)
-    LOG.info(f"Loading contract: {contract_path}")
-    try:
-        contract = load_contract_with_overlay(
-            str(contract_path), getattr(args, "env", None), logger
-        )
-    except CLIError:
-        raise
-    except Exception as e:
-        raise CLIError(1, "contract_load_failed", {"path": str(contract_path), "error": str(e)})
+    # Two input shapes are supported:
+    #   1. ``<contract>.yaml`` — load via the standard FLUID loader
+    #      (handles overlays, $ref bundling, alias normalization).
+    #   2. ``<plan>.json`` — the build runner is being invoked from
+    #      ``fluid apply <plan>.json --mode amend-and-build``. The plan
+    #      embeds the FULL FLUID contract under ``plan["contract"]``
+    #      (with ``builds[]`` intact) so we extract it directly. Without
+    #      this branch the legacy "load contract from path" path would
+    #      treat plan.json as a contract, find no ``builds`` key, and
+    #      log "No builds defined in contract" — leaving acquisition /
+    #      hybrid-reference dbt builds as silent no-ops on the canonical
+    #      stage-7 path the lab Taskfile uses.
+    if str(contract_path).endswith(".json"):
+        LOG.info(f"Loading contract from execution plan: {contract_path}")
+        try:
+            plan_data = json.loads(contract_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CLIError(
+                1, "contract_load_failed", {"path": str(contract_path), "error": str(exc)}
+            )
+        contract = plan_data.get("contract") or {}
+        if not contract:
+            raise CLIError(
+                1,
+                "plan_missing_contract",
+                {
+                    "path": str(contract_path),
+                    "hint": (
+                        "plan.json has no embedded ``contract`` key. "
+                        "Re-run ``fluid plan <contract>.yaml --out <plan>.json`` "
+                        "with a current forge-cli; older plan generators omit it."
+                    ),
+                },
+            )
+        # Re-anchor ``contract_path`` at the original source file so build
+        # runners can resolve contract-relative paths (e.g.
+        # ``repository: ../../reference-assets/dbt_dv2_subscriber360``).
+        # Without this, ``contract_path.parent`` below would point at
+        # ``runtime/`` (where plan.json lives) and dbt project lookups
+        # would resolve wrong. The source path is recorded by ``fluid
+        # plan`` in ``contract_metadata.source_path``.
+        source_path_str = (plan_data.get("contract_metadata") or {}).get("source_path")
+        if source_path_str:
+            source_path = Path(source_path_str)
+            if source_path.exists():
+                LOG.info(f"Anchoring builds at source contract dir: {source_path.parent}")
+                contract_path = source_path
+            else:
+                LOG.warning(
+                    "plan source_path %s no longer exists; anchoring at plan dir %s "
+                    "(relative paths in builds may not resolve)",
+                    source_path,
+                    contract_path.parent,
+                )
+        else:
+            LOG.warning(
+                "plan.json has no contract_metadata.source_path; anchoring at plan "
+                "dir %s. Relative paths in builds (e.g. dbt repository) may not "
+                "resolve. Re-run ``fluid plan`` with a current forge-cli to embed "
+                "the source path.",
+                contract_path.parent,
+            )
+        # Mirror the YAML loader's env-template + alias normalization that
+        # ``load_contract_with_overlay`` would have done. Plan-embedded
+        # contracts are still authored with ``{{ env.X }}`` placeholders;
+        # the build runner needs them resolved before passing to engine
+        # SDKs (dlt destination spec, dbt vars, target-snowflake config).
+        # Apply the same secret-aware resolver the publish path uses so we
+        # don't accidentally exfiltrate secret-named placeholders.
+        try:
+            from fluid_build.cli._common import resolve_contract_env_templates
+
+            contract = resolve_contract_env_templates(contract)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            LOG.debug("env template resolution failed (non-fatal): %s", exc)
+    else:
+        # Standard YAML contract path.
+        LOG.info(f"Loading contract: {contract_path}")
+        try:
+            contract = load_contract_with_overlay(
+                str(contract_path), getattr(args, "env", None), logger
+            )
+        except CLIError:
+            raise
+        except Exception as e:
+            raise CLIError(
+                1, "contract_load_failed", {"path": str(contract_path), "error": str(e)}
+            )
 
     builds = contract.get("builds", [])
 

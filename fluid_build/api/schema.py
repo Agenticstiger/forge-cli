@@ -40,6 +40,14 @@ class SchemaFingerprint:
     digest: str
     columns: List[SchemaColumn] = field(default_factory=list)
     captured_at: Optional[str] = None  # ISO-8601
+    # Marks a fingerprint that the runner could not compute from real source
+    # schema (e.g. dlt resolves columns inside ``pipeline.run`` and emits
+    # stream names only at fingerprint() time). The shared schema-evolution
+    # gate must SKIP comparison for placeholder fingerprints — otherwise
+    # stream names get treated as real columns and every contract column
+    # shows up as ``removed→fail``. See
+    # ``fluid_build.build_runners._acquisition_common.enforce_schema_policy_or_raise``.
+    is_placeholder: bool = False
 
     @classmethod
     def of(
@@ -51,6 +59,37 @@ class SchemaFingerprint:
         )
         h = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode("utf-8")).hexdigest()
         return cls(digest=f"sha256:{h}", columns=list(columns), captured_at=captured_at)
+
+    @classmethod
+    def placeholder(
+        cls,
+        streams: List[str],
+        *,
+        engine: str,
+        captured_at: Optional[str] = None,
+    ) -> "SchemaFingerprint":
+        """Return a placeholder fingerprint for runners that can't introspect
+        the source schema cheaply (dlt, debezium, airbyte, meltano,
+        kafka_connect — anything code-as-config). The columns slot still
+        carries the stream names tagged with the engine, so observability
+        tooling keeps per-stream visibility — but ``is_placeholder=True``
+        tells the schema-evolution gate to skip the contract-vs-current
+        comparison rather than misreading stream names as real columns.
+
+        For runners that DO introspect (e.g. duckdb), use
+        :meth:`SchemaFingerprint.of`.
+        """
+        cols = [SchemaColumn(name=s, type=engine, nullable=True) for s in streams]
+        # Reuse `of()` for the digest so the value is still deterministic
+        # over the placeholder content (useful for change detection between
+        # placeholder snapshots, e.g. when ``streams[]`` changes).
+        fp = cls.of(cols, captured_at=captured_at)
+        return cls(
+            digest=fp.digest,
+            columns=fp.columns,
+            captured_at=fp.captured_at,
+            is_placeholder=True,
+        )
 
 
 class EvolutionAction(str, Enum):

@@ -51,6 +51,7 @@ from fluid_build.cli.console import error as console_error
 from .._path_safety import confine_to_workspace
 from ..base import SENSITIVE_ENV_KEY_RE, _resolve_env_placeholders
 from .profiles import (
+    _list_profile_targets,
     _load_dbt_project_config,
     _resolve_dbt_profile_name,
     _resolve_dbt_target_name,
@@ -101,15 +102,22 @@ def resolve_dbt_project_path(contract_path: Path, build: Dict[str, Any]) -> Opti
     """Resolve the dbt project root for a build, confined to the contract's workspace.
 
     Returns ``None`` if no ``dbt_project.yml`` is found, or if the resolved
-    path escapes the contract's parent directory (path-traversal guard).
+    path escapes the workspace boundary (path-traversal guard). The
+    workspace boundary is pattern-aware via :func:`resolve_workspace_root`:
+    inline builds (default) confine to ``contract.parent``; hybrid-reference
+    builds widen to the nearest enclosing repo root so they can reach
+    shared dbt projects in sibling directories.
     """
     repository = build.get("repository", "./")
     build_id = str(build.get("id", "unknown"))
     project_dir = (contract_path.parent / repository).resolve()
     if (project_dir / "dbt_project.yml").exists():
+        from .._path_safety import resolve_workspace_root
+
+        workspace_root = resolve_workspace_root(contract_path, build)
         return confine_to_workspace(
             project_dir,
-            contract_path.parent,
+            workspace_root,
             build_id=build_id,
             kind="dbt",
             logger=LOG,
@@ -332,9 +340,36 @@ def build_dbt_command(
     if profile_name:
         dbt_args += ["--profile", str(profile_name)]
 
-    target_name = props.get("target") or os.getenv("DBT_TARGET")
-    if target_name:
-        dbt_args += ["--target", str(target_name)]
+    # Target selection: contract override > DBT_TARGET env > profile default.
+    # We DON'T blindly forward DBT_TARGET because operator labs commonly set
+    # ``DBT_TARGET=snowflake`` in their .env, but ``fluid generate`` emits
+    # dbt projects with the conventional ``target: dev`` profile. Forwarding
+    # ``--target snowflake`` against a dev-only profile makes dbt fail with
+    # ``does not have a target named 'snowflake'``. Resolve the profile
+    # targets up-front and only pass ``--target`` when the requested name
+    # actually exists; otherwise let dbt use the profile's default and emit
+    # a debug log so the operator knows which one was picked.
+    requested_target = props.get("target") or os.getenv("DBT_TARGET")
+    if requested_target:
+        available = _list_profile_targets(profiles_dir, profile_name)
+        if available is None or str(requested_target) in available:
+            dbt_args += ["--target", str(requested_target)]
+        else:
+            LOG.warning(
+                "dbt.target.fallback requested=%r unavailable; using profile "
+                "default. Available targets: %s. Set ``properties.target`` on "
+                "the build OR rename the profile target to '%s' to suppress.",
+                requested_target,
+                sorted(available) if available else "<unknown>",
+                requested_target,
+            )
+            # dbt also reads DBT_TARGET from the environment automatically.
+            # Without this strip, the dbt subprocess would still see the
+            # operator's ``DBT_TARGET=snowflake`` and re-introduce the same
+            # "no such target" failure we just dodged. Mutating os.environ
+            # for the rest of this CLI process is intentional — every dbt
+            # subprocess we spawn from here on should respect the fallback.
+            os.environ.pop("DBT_TARGET", None)
 
     selectors = _normalize_selectors(props.get("select") or props.get("models"))
     if not selectors:

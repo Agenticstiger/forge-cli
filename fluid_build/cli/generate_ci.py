@@ -208,8 +208,40 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         help=(
             "Whether the generated Jenkins Stage 10 command includes "
             '``--env \\"${FLUID_ENV:-dev}\\"`` on ``fluid publish``. '
-            "When omitted, Jenkinsfiles preserve the current default of true. "
+            "Default is FALSE because ``fluid publish`` does not accept "
+            "``--env``; including it makes Stage 10 die with "
+            "``unrecognized arguments: --env dev``. Pass "
+            "``--publish-include-env`` to opt in (operators who wrap "
+            "``fluid publish`` with a custom CLI that does accept --env). "
             "Only the Jenkins template consumes this today."
+        ),
+    )
+    p.add_argument(
+        "--runner-host-override",
+        default="",
+        metavar="HOST",
+        help=(
+            "Container-runtime loopback host override. Set to "
+            "``host.docker.internal`` (Docker Desktop), the bridge IP "
+            "(Linux Docker), ``host.containers.internal`` (Podman), or "
+            "a Service name (Kubernetes) when the contract uses "
+            "``host: localhost`` and the FLUID process runs inside a "
+            "container that can't reach the operator's machine via "
+            "localhost. Emitted as ``FLUID_RUNNER_HOST_OVERRIDE`` in "
+            "the generated pipeline's environment block — the FLUID "
+            "acquisition runner reads it via apply_loopback_host_override."
+        ),
+    )
+    p.add_argument(
+        "--list-engines",
+        action="store_true",
+        help=(
+            "Print the supported acquisition / transformation engines + "
+            "their per-source / per-sink pip-install plans, then exit. "
+            "Useful when authoring a new contract — see what engine names "
+            "the generator recognises and which source kinds / sink "
+            "platforms have first-class pip-extras support. Adding new "
+            "entries lives in fluid_build/forge/core/pipeline_systems/_engine_specs.py."
         ),
     )
     p.set_defaults(generate_sub="ci", func=_run_from_generate)
@@ -314,6 +346,49 @@ def _contract_is_reference_only(contract_path: str) -> bool:
     return False
 
 
+def _extract_engine_context(contract_path: str) -> dict:
+    """Read ``engine`` / ``source.kind`` / first ``binding.platform`` from contract.
+
+    Returns a dict with ``engine``, ``source_kind``, ``sink_platform`` keys
+    (any may be ``None``). The CI generator passes these into PipelineConfig
+    so the per-engine pip-install plan in the bootstrap stage matches what
+    the apply stage will actually invoke. Read errors return an empty dict
+    (caller falls back to engine-agnostic bootstrap).
+    """
+    try:
+        import yaml
+
+        with open(contract_path) as fh:
+            contract = yaml.safe_load(fh) or {}
+    except (FileNotFoundError, OSError, ImportError, Exception):
+        return {}
+
+    builds = contract.get("builds") or []
+    engine = None
+    source_kind = None
+    if isinstance(builds, list) and builds:
+        first = builds[0] if isinstance(builds[0], dict) else {}
+        engine = first.get("engine")
+        properties = first.get("properties") or {}
+        source = properties.get("source") or {}
+        if isinstance(source, dict):
+            source_kind = source.get("kind")
+
+    sink_platform = None
+    exposes = contract.get("exposes") or []
+    if isinstance(exposes, list) and exposes:
+        first_expose = exposes[0] if isinstance(exposes[0], dict) else {}
+        binding = first_expose.get("binding") or {}
+        if isinstance(binding, dict):
+            sink_platform = binding.get("platform")
+
+    return {
+        "engine": engine,
+        "source_kind": source_kind,
+        "sink_platform": sink_platform,
+    }
+
+
 def _git_prefix() -> Optional[str]:
     """Return the current directory's path relative to the git repo root.
 
@@ -345,6 +420,66 @@ def run(args, logger: logging.Logger) -> int:
             PipelineProvider,
             PipelineTemplateGenerator,
         )
+
+        # ``--list-engines`` is a discovery short-circuit. Walks the
+        # shared registry and prints what engine / source / sink combos
+        # the generator can produce pip-extras for. Useful when authoring
+        # a new contract and wondering what's supported.
+        if getattr(args, "list_engines", False):
+            from fluid_build.forge.core.pipeline_systems._engine_specs import (
+                _DBT_PLATFORM_ADAPTERS,
+                _DLT_SINK_EXTRAS,
+                _DLT_SOURCE_EXTRAS,
+                _MELTANO_SINK_PACKAGES,
+                _MELTANO_SOURCE_PACKAGES,
+                resolve_engine_bootstrap,
+            )
+
+            from fluid_build.cli.console import cprint
+
+            cprint("Engines recognised by ``fluid generate ci`` bootstrap:", markup=False)
+            cprint("", markup=False)
+            for engine in ("dlt", "airbyte", "meltano", "dbt", "duckdb", "debezium", "kafka_connect"):
+                cprint(f"  {engine}:", markup=False)
+                if engine == "dlt":
+                    cprint(
+                        f"    sources:  {', '.join(sorted(_DLT_SOURCE_EXTRAS))}",
+                        markup=False,
+                    )
+                    cprint(
+                        f"    sinks:    {', '.join(sorted(_DLT_SINK_EXTRAS))}",
+                        markup=False,
+                    )
+                elif engine == "meltano":
+                    cprint(
+                        f"    sources:  {', '.join(sorted(_MELTANO_SOURCE_PACKAGES))}",
+                        markup=False,
+                    )
+                    cprint(
+                        f"    sinks:    {', '.join(sorted(_MELTANO_SINK_PACKAGES))}",
+                        markup=False,
+                    )
+                elif engine == "dbt":
+                    cprint(
+                        f"    sinks:    {', '.join(sorted(_DBT_PLATFORM_ADAPTERS))}",
+                        markup=False,
+                    )
+                # Sample resolution for the most common combo.
+                sample = resolve_engine_bootstrap(
+                    engine,
+                    source_kind="postgres" if engine in ("dlt", "meltano") else None,
+                    sink_platform="snowflake",
+                )
+                cprint(
+                    f"    example pip: {' '.join(sample.packages) if sample.packages else '(none — JVM or runtime-only)'}",
+                    markup=False,
+                )
+                cprint("", markup=False)
+            cprint(
+                "Add new entries in fluid_build/forge/core/pipeline_systems/_engine_specs.py",
+                markup=False,
+            )
+            return 0
 
         system = getattr(args, "system", "gitlab")
         canonical = _SYSTEM_ALIASES.get(system, system)
@@ -385,6 +520,20 @@ def run(args, logger: logging.Logger) -> int:
         verify_strict_default_arg = getattr(args, "verify_strict_default", None)
         publish_stage_default_arg = getattr(args, "publish_stage_default", None)
         publish_include_env_arg = getattr(args, "publish_include_env", None)
+
+        # Engine context drives the bootstrap stage's per-engine pip
+        # install. Parsing failures degrade gracefully — the bootstrap
+        # falls back to "no engine extras" and the operator sets
+        # FLUID_EXTRA_PIP_SPECS at build time.
+        engine_context = _extract_engine_context(contract_path)
+
+        # Operator can override the runner-host loopback target via CLI
+        # flag. Default empty = don't emit the env var (fine for prod
+        # CI runners where source.connection.host points at a real
+        # hostname). Lab-style demos using ``host: localhost`` set this
+        # to ``host.docker.internal`` (Docker Desktop) or the bridge IP.
+        runner_host_override = getattr(args, "runner_host_override", "") or ""
+
         config = PipelineConfig(
             provider=provider,
             complexity=complexity,
@@ -392,6 +541,10 @@ def run(args, logger: logging.Logger) -> int:
             generates_artifacts=generates_artifacts,
             install_mode=install_mode,
             default_publish_target=default_publish_target,
+            engine=engine_context.get("engine"),
+            source_kind=engine_context.get("source_kind"),
+            sink_platform=engine_context.get("sink_platform"),
+            runner_host_override=runner_host_override,
             verify_strict_default=(
                 True if verify_strict_default_arg is None else bool(verify_strict_default_arg)
             ),
@@ -399,7 +552,7 @@ def run(args, logger: logging.Logger) -> int:
                 False if publish_stage_default_arg is None else bool(publish_stage_default_arg)
             ),
             publish_include_env=(
-                True if publish_include_env_arg is None else bool(publish_include_env_arg)
+                False if publish_include_env_arg is None else bool(publish_include_env_arg)
             ),
         )
         files = PipelineTemplateGenerator().generate_pipeline(config)

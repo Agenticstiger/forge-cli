@@ -34,7 +34,7 @@ from typing import Any, Dict, Optional
 from fluid_build.cli.console import cprint, success
 from fluid_build.cli.console import error as console_error
 
-from .._path_safety import confine_to_workspace
+from .._path_safety import confine_to_workspace, resolve_workspace_root
 
 LOG = logging.getLogger("fluid.build_runners.python")
 
@@ -51,7 +51,11 @@ def resolve_script_path(contract_path: Path, build: Dict[str, Any]) -> Optional[
     properties = build.get("properties", {})
     model = properties.get("model", "ingest")
     build_id = str(build.get("id", "unknown"))
-    workspace_root = contract_path.parent
+    # Pattern-aware workspace boundary: hybrid-reference / shared-reference
+    # builds widen to the enclosing repo root so they can reach scripts in
+    # sibling directories. Inline (default) builds stay confined to
+    # ``contract.parent``.
+    workspace_root = resolve_workspace_root(contract_path, build)
 
     # Try .py extension first
     script_path = contract_path.parent / repository / f"{model}.py"

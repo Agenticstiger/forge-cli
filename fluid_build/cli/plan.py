@@ -600,6 +600,16 @@ def _plan_with_provider_actions(
                 or contract.get("metadata", {}).get("name")
                 or "Unknown",
                 "version": contract.get("fluidVersion", _default_fluid_version()),
+                # Absolute path of the source contract file. Used by the
+                # build runner (run_builds_from_args) to anchor relative
+                # paths like ``repository: ../../reference-assets/...``
+                # when invoked via ``fluid apply <plan>.json --mode
+                # amend-and-build``. Without this, the runner would anchor
+                # against runtime/plan.json's parent dir and resolve
+                # relatives wrong.
+                "source_path": str(Path(args.contract).resolve())
+                if getattr(args, "contract", None)
+                else None,
             },
             "actions": [],
             "total_actions": 0,
@@ -669,6 +679,10 @@ def _plan_with_provider_actions(
             "id": contract.get("id"),
             "name": contract.get("name") or contract.get("metadata", {}).get("name") or "Unknown",
             "version": contract.get("fluidVersion", _default_fluid_version()),
+            # See ``source_path`` rationale at the actions=[] branch above.
+            "source_path": str(Path(args.contract).resolve())
+            if getattr(args, "contract", None)
+            else None,
         },
         "actions": plan_actions,
         "total_actions": len(plan_actions),
@@ -743,6 +757,10 @@ def _plan_legacy(contract: Dict[str, Any], args, logger: logging.Logger) -> Dict
             "id": contract.get("id"),
             "name": contract.get("name") or contract.get("metadata", {}).get("name") or "Unknown",
             "version": contract.get("fluidVersion", "0.7.3"),
+            # See ``source_path`` rationale in _plan_with_provider_actions.
+            "source_path": str(Path(args.contract).resolve())
+            if getattr(args, "contract", None)
+            else None,
         },
         "actions": actions,
         "total_actions": len(actions),

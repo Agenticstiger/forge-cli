@@ -59,6 +59,45 @@ def _resolve_dbt_target_name(props: Dict[str, Any]) -> str:
     return str(props.get("target") or os.getenv("DBT_TARGET") or "dev")
 
 
+def _list_profile_targets(
+    profiles_dir: Optional[Path], profile_name: Optional[str]
+) -> Optional[set]:
+    """Return the set of target names defined under ``profile_name`` in the
+    ``profiles.yml`` at ``profiles_dir``.
+
+    Returns ``None`` (not an empty set) when we can't determine the targets
+    — e.g. profiles_dir is None, profiles.yml doesn't exist, or the file
+    doesn't have the expected ``<profile>: outputs: { ... }`` shape.
+    Callers treat ``None`` as "don't second-guess the operator's
+    requested target" — pass ``--target`` through unchanged.
+
+    Used by the runner to detect operator-set ``DBT_TARGET=snowflake``
+    against an AI-generated dbt project whose profile only declares
+    ``dev``, and gracefully fall back to the profile's default target
+    rather than failing with ``does not have a target named 'snowflake'``.
+    """
+    if profiles_dir is None or not profile_name:
+        return None
+    profiles_path = Path(profiles_dir) / "profiles.yml"
+    if not profiles_path.exists():
+        return None
+    try:
+        with profiles_path.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        LOG.debug("could not read profiles.yml at %s: %s", profiles_path, exc)
+        return None
+    if not isinstance(data, dict):
+        return None
+    profile_block = data.get(profile_name)
+    if not isinstance(profile_block, dict):
+        return None
+    outputs = profile_block.get("outputs")
+    if not isinstance(outputs, dict):
+        return None
+    return set(outputs.keys())
+
+
 def _build_generated_dbt_profile(
     build: Dict[str, Any], project_config: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:

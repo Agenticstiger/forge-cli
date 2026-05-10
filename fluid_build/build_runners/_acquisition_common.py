@@ -30,7 +30,7 @@ import re
 import secrets
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Strips ANSI CSI sequences and ASCII control chars from error strings
 # before they reach the user's terminal. Compiled once at import.
@@ -76,6 +76,341 @@ def get_acquisition_build_props(build: Dict[str, Any]) -> Dict[str, Any]:
 
 def is_acquisition_build(build: Dict[str, Any]) -> bool:
     return build.get("pattern") == "acquisition"
+
+
+def setdefault_env(key: str, value: Optional[str]) -> bool:
+    """Set ``os.environ[key] = value`` IFF the env var is currently unset AND
+    the value is non-empty. Returns ``True`` if a value was actually set.
+
+    Used by destination-credential bridges to translate FLUID's canonical
+    env-var naming to engine-specific naming WITHOUT clobbering operator
+    overrides — anything the operator explicitly exported wins.
+    """
+    if not value:
+        return False
+    if os.environ.get(key):
+        return False
+    os.environ[key] = value
+    return True
+
+
+# Destination credential dispatch lives in ``_credentials.py`` (per-engine
+# introspectors + pydantic-settings credential layer). The runners import
+# ``make_destination`` from there. The deprecated ``_DESTINATION_FACTORIES``
+# / ``register_destination`` / ``bridge_destination_env`` machinery that
+# used to live here was removed in favour of that single, OSS-delegating
+# layer — see ``_credentials.py`` for the rationale and OSS receipts.
+
+
+# Registry: (engine, source_kind) → adapter that translates the FLUID generic
+# connection dict (post secretRef resolution) into whatever shape the engine's
+# source connector expects.
+#
+# Why per (engine, kind)? Each (engine, kind) pair has its own quirks. The
+# Airbyte ``source-postgres`` connector wants ``username``; ``source-mysql``
+# wants ``username`` too but with different ssl_mode defaults; Meltano's
+# ``tap-postgres`` is fine with FLUID's generic ``user``; dlt's
+# ``sql_database`` accepts both. Putting the per-connector translation in
+# one place per (engine, kind) keeps engine runners thin and lets us add
+# new connectors without touching runner code.
+#
+# Adapters live in ``fluid_build.build_runners.<engine>.sources`` (or
+# similar) and register themselves at import time via
+# ``register_source_adapter``. Each engine's ``__init__.py`` should
+# ``import . sources`` to fire registration when the package loads.
+_SOURCE_ADAPTERS: Dict[Tuple[str, str], Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
+
+
+def register_source_adapter(
+    engine: str, kind: str
+) -> Callable[[Callable[[Dict[str, Any]], Dict[str, Any]]], Callable[[Dict[str, Any]], Dict[str, Any]]]:
+    """Decorator that registers a source-config adapter for (engine, kind).
+
+    The adapter receives a copy of the FLUID-shaped connection dict (after
+    secretRef resolution and schema extraction) and returns the engine-
+    specific shape with field renames, type coercions, and connector-
+    required defaults applied.
+
+    Example
+    -------
+    >>> @register_source_adapter("airbyte", "postgres")
+    ... def _airbyte_postgres(connection):
+    ...     out = dict(connection)
+    ...     if "user" in out and "username" not in out:
+    ...         out["username"] = out.pop("user")
+    ...     if "port" in out:
+    ...         try: out["port"] = int(out["port"])
+    ...         except (TypeError, ValueError): pass
+    ...     out.setdefault("ssl_mode", {"mode": "disable"})
+    ...     return out
+    """
+    def _wrap(
+        fn: Callable[[Dict[str, Any]], Dict[str, Any]],
+    ) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+        _SOURCE_ADAPTERS[(engine, kind)] = fn
+        return fn
+
+    return _wrap
+
+
+def adapt_source_config(
+    engine: str, kind: str, connection: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Apply the registered (engine, kind) source adapter, if any.
+
+    Returns the connection dict unchanged (shallow copy) when no adapter is
+    registered — non-fatal so engines can grow their adapter coverage
+    incrementally without breaking the unadapted long tail.
+    """
+    adapter = _SOURCE_ADAPTERS.get((engine, kind))
+    return adapter(dict(connection)) if adapter else dict(connection)
+
+
+def _is_loopback_host(host: Any) -> bool:
+    """Return True for any address that resolves to the local loopback.
+
+    Accepts:
+    - The canonical hostname ``localhost`` (case-insensitive). We don't
+      probe the OS resolver because that would couple the helper to whatever
+      ``/etc/hosts`` the operator's machine happens to have configured —
+      ``localhost`` is the one universally-understood loopback name.
+    - Any address in the IPv4 loopback range ``127.0.0.0/8`` (so
+      ``127.0.0.2``, ``127.1.2.3`` etc. are caught, not just ``127.0.0.1``).
+    - The IPv6 loopback ``::1``.
+
+    Anything else (real hostnames, public IPs, link-local addresses) is
+    treated as non-loopback and left untouched by callers.
+    """
+    if not isinstance(host, str) or not host.strip():
+        return False
+    h = host.strip().lower()
+    if h == "localhost":
+        return True
+    # Strip ``[`` / ``]`` for bracketed IPv6 forms like ``[::1]``.
+    candidate = h.lstrip("[").rstrip("]")
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False
+
+
+def apply_loopback_host_override(connection: Dict[str, Any]) -> None:
+    """In-place: substitute loopback host with operator-provided override.
+
+    Some engines (notably Airbyte's PyAirbyte mode, which runs each source
+    connector as a Docker container) reach the host through a different
+    address than what the operator's shell uses. The contract author writes
+    ``host: localhost`` (correct from the contract's perspective — the data
+    is on the operator's machine); the runner needs to translate that to
+    whatever the engine's container runtime uses to reach the host.
+
+    Container-runtime variants:
+
+    - Docker Desktop (macOS/Windows): ``host.docker.internal``
+    - Linux Docker (recent): ``host.docker.internal`` (when launched with
+      ``--add-host=host.docker.internal:host-gateway``) OR the bridge IP.
+    - Podman: ``host.containers.internal``
+    - Kubernetes: a pod-internal Service name or the host's pod-network IP.
+
+    Rather than hard-code one of these (which biases the runner to one
+    runtime), runners call this helper which consults an operator-
+    controlled env var. Two are accepted, in precedence order:
+
+    1. ``FLUID_RUNNER_HOST_OVERRIDE`` — FLUID-canonical name (wins when set).
+    2. ``TESTCONTAINERS_HOST_OVERRIDE`` — testcontainers-python ecosystem
+       convention (https://github.com/testcontainers/testcontainers-python).
+       Operators who already use testcontainers for integration tests get
+       PyAirbyte/Debezium reachability with zero extra config.
+
+    When set and the connection's host is a loopback address (any form —
+    ``localhost``, 127.0.0.0/8, ``::1`` — see :func:`_is_loopback_host`),
+    the override replaces the host. No env var, OR non-loopback host → no-op.
+
+    This is intentionally NOT engine-specific: every engine that runs in a
+    container faces the same problem, and the operator's network topology
+    answers it once for all of them.
+    """
+    override = os.environ.get("FLUID_RUNNER_HOST_OVERRIDE") or os.environ.get(
+        "TESTCONTAINERS_HOST_OVERRIDE"
+    )
+    if not override:
+        return
+    if _is_loopback_host(connection.get("host")):
+        connection["host"] = override
+
+
+def extract_source_schemas(connection: Dict[str, Any]) -> List[str]:
+    """Return the list of source schemas/namespaces declared on a connection.
+
+    The 0.7.3 acquisitionSource.connection schema documents two equivalent
+    fields: ``schema`` (single, convenience) and ``schemas`` (list,
+    canonical). When both are set, ``schemas`` wins. When neither is set,
+    returns an empty list — runners interpret that as "engine default"
+    (typically ``public`` for Postgres, ``dbo`` for SQL Server, etc.).
+
+    Each acquisition runner translates this generic contract concept into
+    its engine-specific config key:
+
+    - dlt sql_database         → ``sql_database(schema=schemas[0])`` (single)
+    - Meltano tap-postgres     → ``filter_schemas: schemas`` (list)
+    - Airbyte source-postgres  → ``schemas: schemas`` (list)
+    - Debezium postgres        → ``schema.include.list = ",".join(schemas)``
+    - Kafka Connect JDBC src   → ``schema.pattern = schemas[0]`` (regex, single)
+
+    Centralising the read here keeps the contract syntax consistent across
+    engines and lets us evolve the schema (e.g. adding ``exclude_schemas``)
+    in one place.
+    """
+    if connection.get("schemas"):
+        return [str(s) for s in connection["schemas"]]
+    if connection.get("schema"):
+        return [str(connection["schema"])]
+    return []
+
+
+# secretRef URI scheme → fluid_build.secrets.SecretSource attribute name.
+# Adding a new backend = one entry here + the corresponding SecretSource
+# value already exists in fluid_build/secrets.py.
+_SECRET_REF_BACKENDS: Dict[str, str] = {
+    "vault": "HASHICORP_VAULT",
+    "aws": "AWS_SECRETS_MANAGER",
+    "gcp": "GCP_SECRET_MANAGER",
+    "azure": "AZURE_KEY_VAULT",
+    "file": "LOCAL_FILE",
+}
+
+
+def resolve_secret_ref(secret_ref: str) -> str:
+    """Resolve a single ``secretRef`` URI to its literal value.
+
+    secretRef syntax (per FLUID 0.7.3 schema): ``<scheme>://<identifier>``.
+
+    Schemes
+    -------
+    - ``env://VAR_NAME`` — read ``os.environ[VAR_NAME]``. Short-circuits to
+      ``os.environ`` to avoid spinning up a ``SecretManager`` for the
+      hot-path local-dev case.
+    - ``vault://path``    → HashiCorp Vault    via ``SecretManager``
+    - ``aws://name``      → AWS Secrets Manager via ``SecretManager``
+    - ``gcp://name``      → GCP Secret Manager  via ``SecretManager``
+    - ``azure://name``    → Azure Key Vault     via ``SecretManager``
+    - ``file://path``     → local encrypted file via ``SecretManager``
+
+    The cloud / vault schemes delegate to ``fluid_build.secrets.SecretManager``,
+    which already implements the backend-specific clients. Adding a new scheme
+    is a one-entry change in ``_SECRET_REF_BACKENDS`` (assuming the matching
+    ``SecretSource`` already exists in ``fluid_build/secrets.py``).
+
+    Args:
+        secret_ref: URI of the form ``<scheme>://<identifier>``.
+
+    Returns:
+        The resolved literal secret string.
+
+    Raises:
+        ValueError: ``secret_ref`` is malformed, references an unset env var,
+            or uses an unsupported scheme.
+    """
+    if "://" not in secret_ref:
+        raise ValueError(
+            f"secretRef must be of the form '<scheme>://<identifier>': {secret_ref!r}"
+        )
+    scheme, _, ident = secret_ref.partition("://")
+    scheme = scheme.strip().lower()
+    ident = ident.strip()
+    if not scheme or not ident:
+        raise ValueError(
+            f"secretRef must be of the form '<scheme>://<identifier>': {secret_ref!r}"
+        )
+
+    # Hot path: env:// short-circuit to os.environ.
+    if scheme == "env":
+        value = os.environ.get(ident)
+        if value is None:
+            raise ValueError(
+                f"secretRef env://{ident}: environment variable not set"
+            )
+        return value
+
+    # Cloud / vault path: delegate to the existing SecretManager registry.
+    backend = _SECRET_REF_BACKENDS.get(scheme)
+    if backend is None:
+        supported = ["env"] + sorted(_SECRET_REF_BACKENDS)
+        raise ValueError(
+            f"secretRef scheme {scheme!r} is not supported. "
+            f"Supported schemes: {supported}"
+        )
+
+    # Lazy import — the SecretManager pulls in optional cloud SDKs that we
+    # don't want to load on every acquisition runner import.
+    from fluid_build.secrets import SecretConfig, SecretManager, SecretSource
+
+    source = getattr(SecretSource, backend)
+    manager = SecretManager(SecretConfig(source=source))
+    value = manager.get_secret(ident, required=True)
+    if value is None:
+        raise ValueError(f"secretRef {secret_ref}: backend returned no value")
+    return value
+
+
+def resolve_connection_secrets(
+    connection: Dict[str, Any], *, target_field: str = "password"
+) -> Dict[str, Any]:
+    """Resolve a connection block's ``secretRef`` into a literal credential field.
+
+    Convenience wrapper over :func:`resolve_secret_ref` for the common case
+    where a SQL- or REST-style connection block has a single ``secretRef``
+    that should be placed into a named credential field. Most acquisition
+    runners (dlt sql_database, meltano tap-postgres, airbyte source-postgres,
+    debezium connectors, …) want the secret as the ``password`` field of the
+    underlying client — that's the default.
+
+    Behaviour
+    ---------
+    1. Returns a NEW dict; never mutates the input.
+    2. No ``secretRef`` → returns a shallow copy unchanged.
+    3. ``secretRef`` is resolved via :func:`resolve_secret_ref`. Any scheme
+       supported there works here.
+    4. The resolved value is placed in ``connection[target_field]`` IFF that
+       field is empty. An inline literal always wins over the secretRef.
+    5. ``secretRef`` is removed from the returned dict so downstream client
+       SDKs don't see a stray field.
+
+    Args:
+        connection: The raw ``properties.source.connection`` dict (the
+            ``ConnectionSpec.raw`` view).
+        target_field: Field to populate with the resolved secret. Most
+            SQL-flavoured connections want ``"password"`` (the default).
+            HTTP / REST sources that authenticate with a token can pass
+            ``target_field="token"``; OAuth2 flows can pass
+            ``target_field="access_token"``. The choice belongs to the
+            runner because the secretRef schema is engine-agnostic.
+
+    Returns:
+        A new connection dict with the secret resolved into ``target_field``
+        and ``secretRef`` removed.
+
+    Example
+    -------
+    >>> os.environ["PG_PASSWORD"] = "s3cret"
+    >>> resolve_connection_secrets({
+    ...     "host": "db.example.com",
+    ...     "port": 5432,
+    ...     "user": "alice",
+    ...     "secretRef": "env://PG_PASSWORD",
+    ... })
+    {'host': 'db.example.com', 'port': 5432, 'user': 'alice', 'password': 's3cret'}
+    """
+    out = dict(connection)
+    secret_ref = out.pop("secretRef", None)
+    if not secret_ref:
+        return out
+    value = resolve_secret_ref(secret_ref)
+    if not out.get(target_field):
+        out[target_field] = value
+    return out
 
 
 def _default_succeeded_states() -> Tuple:
@@ -244,6 +579,17 @@ def enforce_schema_policy_or_raise(ctx: Any, runner: Any) -> None:
         # Skip the check rather than blocking the run.
         return
     if not current:
+        return
+    # Code-as-config runners (dlt, debezium, airbyte, meltano, kafka_connect)
+    # surface stream names as placeholder columns because computing the real
+    # schema requires running the source. Comparing those stream-name columns
+    # against the contract's real columns produces spurious added/removed
+    # decisions. The runner declares a placeholder by setting
+    # SchemaFingerprint.is_placeholder=True (or using
+    # SchemaFingerprint.placeholder(...)). Skip the gate in that case — drift
+    # gets detected at run-time by the engine itself once it actually reads
+    # the source.
+    if getattr(current_fp, "is_placeholder", False):
         return
 
     plan = resolve_decisions(

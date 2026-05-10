@@ -44,7 +44,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from fluid_build.providers.base import BaseProvider, ProviderError
-from fluid_build.util.contract import consumes_to_canonical_ports
+from fluid_build.util.contract import (
+    builds_to_canonical_input_ports,
+    consumes_to_canonical_ports,
+    kind_to_dmm_type,
+)
 
 if TYPE_CHECKING:
     import requests as requests_typing
@@ -527,6 +531,12 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 fluid,
                 default_from_reference=use_source_system_fallback,
             )
+            # Overlay: lift sourceSystem / sourceKind customProperties into
+            # native DMM inputPort fields (sourceSystemId / type). Only
+            # applied to the wire payload; the standalone .odps-bitol.yaml
+            # artifact stays spec-clean (the v1.0.0 InputPort schema is
+            # closed, so native fields would fail JSON-schema validation).
+            self._promote_input_port_native_source_system_fields(dp)
         else:
             dp["teamId"] = tid
 
@@ -723,6 +733,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
     from ._odps_helpers import (  # noqa: I001
         ensure_odps_input_port_contract_ids as _ensure_odps_input_port_contract_ids_impl,
         ensure_odps_input_port_source_system_custom_property as _ensure_odps_input_port_source_system_custom_property_impl,
+        promote_input_port_native_source_system_fields as _promote_input_port_native_source_system_fields_impl,
         remove_odps_product_consume_input_ports as _remove_odps_product_consume_input_ports_impl,
     )
 
@@ -732,6 +743,9 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
     _ensure_odps_input_port_contract_ids = staticmethod(_ensure_odps_input_port_contract_ids_impl)
     _ensure_odps_input_port_source_system_custom_property = staticmethod(
         _ensure_odps_input_port_source_system_custom_property_impl
+    )
+    _promote_input_port_native_source_system_fields = staticmethod(
+        _promote_input_port_native_source_system_fields_impl
     )
 
     # ---- port mapping -----------------------------------------------------
@@ -1034,40 +1048,118 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
     ) -> None:
         """Upsert SourceSystem entities referenced by ODPS input ports.
 
-        Only explicitly authored ``sourceSystem`` fields become SourceSystem
-        entities. Compatibility mode may still add a ``sourceSystem`` custom
-        property from an upstream product reference to satisfy local CE
-        validation, but creating SourceSystem rows for those product IDs causes
-        duplicate graph nodes next to the real Access lineage edges.
+        Two contributing surfaces:
+
+        1. ``consumes[].sourceSystem`` (legacy / explicit). Only explicitly
+           authored fields become SourceSystem entities — compat mode may
+           still inject a ``sourceSystem`` customProperty from an upstream
+           product reference to satisfy local CE validation, but creating
+           SourceSystem rows for those product IDs causes duplicate graph
+           nodes next to the real Access lineage edges.
+        2. ``builds[].properties.source`` (Source-Aligned Data Products).
+           Each acquisition build's source declares its kind + connection;
+           we register one SourceSystem per ``<kind>-<database>`` slug and
+           attach the redacted connection metadata as the SourceSystem's
+           ``custom`` block. Without this branch, SDPs published to DMM
+           appear free-floating with no upstream lineage (gap #2).
+
+        Both branches share a single ``seen`` set so the same source
+        system isn't upserted twice when a contract author lists the same
+        upstream in both blocks.
         """
-        canonical_ports = consumes_to_canonical_ports(fluid, logger=LOG)
+        consumes_ports = consumes_to_canonical_ports(fluid, logger=LOG)
+        build_ports = builds_to_canonical_input_ports(fluid, logger=LOG)
         seen: set = set()
-        for canonical in canonical_ports:
+
+        for canonical in consumes_ports:
             sys_id = canonical.get("source_system_id")
             if not sys_id or sys_id in seen:
                 continue
             seen.add(sys_id)
+            self._upsert_source_system(
+                sys_id=str(sys_id),
+                team_id=team_id,
+                kind=canonical.get("kind"),
+                redacted_connection=None,
+                tags=None,
+            )
 
-            try:
-                resp = self._session().get(
-                    f"{self.api_url}/api/sourcesystems/{sys_id}",
-                    headers=self._headers(),
-                    timeout=_TIMEOUT,
-                )
-                if resp.status_code == 200:
-                    self._log.debug("SourceSystem already exists: %s", sys_id)
-                    continue
-            except Exception:
-                pass  # proceed to create
+        for canonical in build_ports:
+            sys_id = canonical.get("source_system_id")
+            if not sys_id or sys_id in seen:
+                continue
+            seen.add(sys_id)
+            kind = canonical.get("kind")
+            self._upsert_source_system(
+                sys_id=str(sys_id),
+                team_id=team_id,
+                kind=kind,
+                redacted_connection=canonical.get("source_connection") or None,
+                tags=["acquisition", str(kind)] if kind else ["acquisition"],
+            )
 
-            body = {"id": str(sys_id), "name": str(sys_id), "owner": team_id}
-            try:
-                put_resp = self._request("PUT", f"/api/sourcesystems/{sys_id}", json_body=body)
-                self._log.info(
-                    "Created/updated source system %s (%s)", sys_id, put_resp.status_code
-                )
-            except ProviderError as exc:
-                self._log.warning("Could not create source system %s: %s", sys_id, exc)
+    def _upsert_source_system(
+        self,
+        *,
+        sys_id: str,
+        team_id: str,
+        kind: Optional[str] = None,
+        redacted_connection: Optional[Mapping[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+    ) -> None:
+        """PUT a SourceSystem entity to DMM (full upsert — replace
+        semantics).
+
+        Always PUTs (no GET-then-skip) so newly-added fields like ``type``
+        and ``custom`` propagate when the contract evolves. PUT in DMM's
+        REST API is idempotent — repeating the same body is safe and
+        cheap.
+
+        DMM's SourceSystem schema (per docs.datamesh-manager.com and the
+        published gitops example) accepts: ``id, name, owner, type,
+        tags, links, custom``. We populate ``type`` from ``kind``
+        (postgres / mysql / kafka / s3 / ...) via ``kind_to_dmm_type`` so
+        the DMM UI renders the right connector icon, and ``custom`` from
+        the ALREADY-REDACTED connection block (host/port/database/schema
+        only — no secrets ever).
+        """
+        body: Dict[str, Any] = {
+            "id": sys_id,
+            "name": sys_id,
+            "owner": team_id,
+        }
+        if tags:
+            body["tags"] = list(tags)
+        # ``custom`` is the DMM-native carrier for descriptive metadata
+        # (DMM SourceSystem schema has no top-level ``type``; sent values
+        # are silently stripped — verified against /openapi.yaml). DMM's
+        # lineage UI reads ``custom.type`` to render the connector label
+        # on edges — without it, edges default to "API" regardless of the
+        # actual source kind. We populate three keys:
+        #   - ``type``: TitleCase enum (Postgres, Kafka, ...) for the UI
+        #   - ``kind``: lowercase FLUID-canonical (postgres, kafka, ...)
+        #   - host/port/database/schema/...: redacted connection details
+        # Order matters less than completeness — DMM picks whichever it
+        # recognises. NEVER credentials; the caller passed
+        # ``redacted_connection`` through ``redact_source_connection``.
+        custom: Dict[str, Any] = {}
+        dmm_type = kind_to_dmm_type(kind)
+        if dmm_type:
+            custom["type"] = dmm_type
+        if kind:
+            custom["kind"] = str(kind)
+        if redacted_connection:
+            for k, v in redacted_connection.items():
+                custom[k] = str(v)
+        if custom:
+            body["custom"] = custom
+        try:
+            put_resp = self._request("PUT", f"/api/sourcesystems/{sys_id}", json_body=body)
+            self._log.info(
+                "Created/updated source system %s (%s)", sys_id, put_resp.status_code
+            )
+        except ProviderError as exc:
+            self._log.warning("Could not create source system %s: %s", sys_id, exc)
 
     # ---- id helpers -------------------------------------------------------
 

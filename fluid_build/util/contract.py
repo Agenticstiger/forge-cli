@@ -362,6 +362,280 @@ def consumes_to_canonical_ports(
     return canonical
 
 
+# ── Source-system canonicalization (Source-Aligned Data Products) ──────────
+#
+# SDPs (pre-* contracts) carry their upstream system info under
+# ``builds[].properties.source`` rather than ``consumes[]``. The helpers
+# below mirror ``consumes_to_canonical_ports`` so providers can treat
+# both shapes uniformly when emitting input ports / registering
+# SourceSystem entities.
+#
+# Per /borrow-before-build receipts:
+#   - DMM (Entropy Data CE) has a first-class SourceSystem entity with a
+#     PUT /api/sourcesystems/{id} endpoint and an InputPort.sourceSystemId
+#     linkage field — confirmed against the published gitops example
+#     (https://github.com/datamesh-manager/example-gitops-repository).
+#   - ODPS-Bitol v1.0.0 InputPort is closed (additionalProperties:false)
+#     with no sourceSystemId — so the standalone artifact uses
+#     ``customProperties[{property: sourceSystem}]`` and the DMM-publish
+#     overlay (in datamesh_manager/_odps_helpers.py) lifts it to the
+#     native field for the wire payload.
+#   - Connection-config field naming follows ODCS v3 ``servers[]``
+#     conventions (host/port/database/schema/account/project/dataset)
+#     which our FLUID 0.7.3 source.connection block already uses, so
+#     pass-through is the right call.
+
+# Connection fields safe to publish to the catalog. Anything else
+# (passwords, secrets, tokens, even the username — DMM is a metadata
+# catalog, not a credential store) is dropped.
+_SAFE_CONNECTION_KEYS: frozenset = frozenset(
+    {
+        "host",
+        "port",
+        "database",
+        "schema",
+        "schemas",
+        "account",         # snowflake / azure
+        "project",         # bigquery / gcp
+        "project_id",
+        "dataset",         # bigquery
+        "warehouse",       # snowflake
+        "role",            # snowflake (read-only role is OK to disclose)
+        "region",          # cloud locality
+        "endpoint",        # rest / s3
+        "url",
+        "topic",           # kafka
+        "topics",
+        "bootstrap_servers",
+    }
+)
+
+# Values that look like secrets even when the key is allowlisted (defence
+# in depth — catches operators who put a token into ``host`` by accident).
+_SECRET_VALUE_RE = re.compile(
+    r"(?i)(password|secret|token|key|credential|bearer)"
+)
+
+
+# FLUID source ``kind`` (lowercase, snake_case per FLUID schema) →
+# DMM SourceSystem / InputPort ``type`` (TitleCase per DMM enum).
+# DMM defaults un-mapped values to "API" in the lineage UI, which is
+# misleading for non-HTTP sources (Postgres database shows as "API").
+# Add new entries here as we onboard more source kinds.
+_KIND_TO_DMM_TYPE: Dict[str, str] = {
+    "postgres": "Postgres",
+    "postgresql": "Postgres",
+    "mysql": "MySQL",
+    "mariadb": "MariaDB",
+    "mssql": "SQL Server",
+    "sqlserver": "SQL Server",
+    "oracle": "Oracle",
+    "snowflake": "Snowflake",
+    "bigquery": "BigQuery",
+    "redshift": "Redshift",
+    "databricks": "Databricks",
+    "duckdb": "DuckDB",
+    "clickhouse": "ClickHouse",
+    "kafka": "Kafka",
+    "kinesis": "Kinesis",
+    "pubsub": "Pub/Sub",
+    "s3": "S3",
+    "gcs": "GCS",
+    "azure-blob": "Azure Blob",
+    "azure_blob": "Azure Blob",
+    "rest": "API",
+    "api": "API",
+    "graphql": "GraphQL",
+    "salesforce": "Salesforce",
+    "stripe": "Stripe",
+    "shopify": "Shopify",
+    "github": "GitHub",
+    "file": "File",
+}
+
+
+def kind_to_dmm_type(kind: Optional[str]) -> Optional[str]:
+    """Translate FLUID source ``kind`` → DMM TitleCase ``type`` enum.
+
+    DMM's lineage UI renders the SourceSystem / InputPort ``type`` field
+    as the connector icon. Unknown values default to "API", which
+    mis-renders Postgres / Snowflake / file sources as HTTP APIs in the
+    graph. Mapping to DMM's documented TitleCase enum (e.g. ``Postgres``,
+    ``Snowflake``, ``BigQuery``, ``Kafka``) restores the correct icon.
+
+    Returns ``None`` for ``None`` input, the mapped TitleCase string for
+    known kinds, and the raw input (with first letter capitalised) for
+    unknown kinds — preserves operator intent rather than silently
+    erasing it. Add unknown kinds to ``_KIND_TO_DMM_TYPE`` when DMM
+    starts rendering them with a dedicated icon.
+    """
+    if not kind:
+        return None
+    normalized = str(kind).strip().lower()
+    if not normalized:
+        return None
+    return _KIND_TO_DMM_TYPE.get(normalized) or normalized.capitalize()
+
+
+def redact_source_connection(connection: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return a metadata-safe copy of a FLUID source ``connection`` dict.
+
+    Whitelist-keeps fields in ``_SAFE_CONNECTION_KEYS`` and rejects values
+    whose KEY OR string value matches a secret-y pattern. Used when
+    publishing source-system info to a metadata catalog (DMM, OpenMetadata,
+    DataHub, …) — none of those should hold credentials.
+
+    FLUID's ``{{ env.X }}`` placeholders are passed through verbatim;
+    we never resolve them client-side. The catalog records "host comes
+    from env var X" as the connection metadata, not the resolved value.
+    """
+    safe: Dict[str, Any] = {}
+    for key, value in connection.items():
+        if key not in _SAFE_CONNECTION_KEYS:
+            continue
+        if isinstance(value, str) and _SECRET_VALUE_RE.search(value):
+            continue
+        safe[key] = value
+    return safe
+
+
+def _source_system_id_for_build(source: Mapping[str, Any]) -> Optional[str]:
+    """Derive a stable SourceSystem id from a ``builds[].properties.source``.
+
+    Convention: ``<kind>-<database>`` (slug-sanitised). Two SDPs ingesting
+    from the same Postgres database collapse to ONE SourceSystem entity,
+    which matches the operator mental model (one Postgres = one source
+    system) and avoids per-stream proliferation in the DMM UI.
+
+    Falls back to the raw ``kind`` when database is absent (REST APIs,
+    file sources, etc.). Returns ``None`` when even ``kind`` is missing
+    (caller can then skip the entry rather than emit a junk id).
+    """
+    kind = (source.get("kind") or "").strip().lower()
+    if not kind:
+        return None
+    conn = source.get("connection") or {}
+    db = conn.get("database") or conn.get("project") or conn.get("dataset")
+    parts = [kind, str(db).strip()] if db else [kind]
+    return _slugify_core("-".join(p for p in parts if p)) or kind
+
+
+def builds_to_canonical_input_ports(
+    contract: Mapping[str, Any],
+    *,
+    default_version: str = "1",
+    logger: Optional[logging.Logger] = None,
+) -> List[Dict[str, Any]]:
+    """Normalize ``builds[].properties.source`` into canonical input ports.
+
+    Returns one canonical port per ``streams[]`` entry on each acquisition
+    build's source. The shape matches :func:`consumes_to_canonical_ports`
+    so downstream code (ODPS exporter, DMM source-system upserter) can
+    UNION the two lists and treat them uniformly.
+
+    For SDPs (which is the only contract shape that has acquisition builds
+    today), this is the only path that produces input ports — the
+    ``consumes[]`` block is empty.
+
+    Per-port shape additions over the consumes-derived port:
+      * ``source_system_id`` is always populated (derived from
+        ``<kind>-<database>``, slugified). This is the linkage to the
+        SourceSystem entity the DMM provider will upsert.
+      * ``kind`` is the source kind (postgres / mysql / mssql / ...).
+      * ``source_connection`` is a metadata-safe copy of the connection
+        dict (via :func:`redact_source_connection`) — used by the DMM
+        provider to populate SourceSystem ``custom`` fields.
+      * ``contract_id`` is synthesized as
+        ``<kind>://<database>/<stream>`` (mirrors OpenLineage namespace+
+        name convention) so the ODPS-Bitol-required field is populated
+        even though no upstream FLUID contract exists.
+
+    Malformed entries are skipped with a warning rather than raising,
+    matching the consumes-side semantics.
+    """
+    canonical: List[Dict[str, Any]] = []
+    raw_builds = contract.get("builds", [])
+    if not isinstance(raw_builds, list):
+        return canonical
+
+    for build_index, build in enumerate(raw_builds):
+        if not isinstance(build, Mapping):
+            continue
+        properties = build.get("properties") or {}
+        source = properties.get("source")
+        if not isinstance(source, Mapping):
+            continue
+
+        source_system_id = _source_system_id_for_build(source)
+        if not source_system_id:
+            if logger is not None:
+                logger.warning(
+                    "Skipping builds[%d].properties.source: missing 'kind' "
+                    "(can't derive source system id, keys=%s)",
+                    build_index,
+                    sorted(source.keys()),
+                )
+            continue
+
+        kind = (source.get("kind") or "").strip().lower()
+        connection = source.get("connection") or {}
+        if not isinstance(connection, Mapping):
+            connection = {}
+        safe_connection = redact_source_connection(connection)
+        database = (
+            connection.get("database")
+            or connection.get("project")
+            or connection.get("dataset")
+            or "default"
+        )
+
+        streams = source.get("streams") or []
+        if not isinstance(streams, list) or not streams:
+            # Source declared without explicit streams — emit one port
+            # representing the whole source (e.g. "this SDP ingests
+            # everything from the postgres telco_source DB"). The port id
+            # falls back to the source-system id.
+            streams = [source_system_id]
+
+        for stream in streams:
+            stream_str = str(stream).strip()
+            if not stream_str:
+                continue
+            # OpenLineage-style synthetic contract id: kind://database/stream.
+            # Stable, human-readable, doesn't pretend to be an upstream
+            # ODCS contract, satisfies ODPS-Bitol's required ``contractId``.
+            synth_contract_id = f"{kind}://{database}/{stream_str}"
+
+            canonical.append(
+                {
+                    "id": stream_str,
+                    "name": stream_str,
+                    "description": (
+                        f"{stream_str} from {kind} source "
+                        f"{database} (SDP source-aligned input)"
+                    ),
+                    "version": default_version,
+                    "reference": None,
+                    # 0.7.2 canonical fields — none authored on a build.
+                    "version_constraint": None,
+                    "qos_expectations": None,
+                    "required_policies": None,
+                    "tags": None,
+                    "labels": None,
+                    # Identity / lineage fields.
+                    "contract_id": synth_contract_id,
+                    "required": True,
+                    "source_system_id": source_system_id,
+                    "kind": kind,
+                    "constraints": None,
+                    # Build-derived extras for DMM source-system upsert.
+                    "source_connection": safe_connection,
+                }
+            )
+
+    return canonical
+
+
 # Slug sanitization ---------------------------------------------------------
 
 _SLUG_NON_ALNUM = re.compile(r"[^a-z0-9]+")

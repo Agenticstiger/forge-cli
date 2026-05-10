@@ -16,5 +16,17 @@ Engine name: ``meltano``. Lane: 600+ Singer taps. Capabilities:
 from __future__ import annotations
 
 from .runner import MeltanoRunner, execute_meltano_build
+# Side-effect imports:
+# - ``sources``: registers per-source-kind adapters (postgres / mysql /
+#   mssql) with the shared registry in _acquisition_common.py. Each
+#   adapter coerces FLUID-canonical connection fields into the shape the
+#   corresponding Singer tap expects (e.g. port str→int for tap-postgres).
+# - ``destinations``: registers the meltano engine introspector with the
+#   unified registry in _credentials.py. The introspector builds the
+#   target-snowflake / target-bigquery / target-redshift config dict from
+#   FLUID-resolved credentials + binding location.
+# Don't remove either import — the registry only sees what's been imported.
+from . import sources  # noqa: F401  (registration side-effect)
+from . import destinations  # noqa: F401  (registration side-effect)
 
 __all__ = ["MeltanoRunner", "execute_meltano_build"]

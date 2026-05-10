@@ -16,5 +16,11 @@ packages. Capabilities: ``full_refresh``, ``incremental_append``,
 from __future__ import annotations
 
 from .runner import DltRunner, execute_dlt_build
+# Side-effect import: registers the dlt engine introspector with the unified
+# registry in _credentials.py. The introspector walks dlt's OWN destination
+# spec to discover credential field names — no per-destination factories.
+# Runner dispatches via make_destination("dlt", binding.platform, ...).
+# Don't remove.
+from . import destinations  # noqa: F401  (registration side-effect)
 
 __all__ = ["DltRunner", "execute_dlt_build"]
