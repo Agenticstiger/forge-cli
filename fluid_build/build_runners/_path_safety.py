@@ -42,7 +42,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-
 # Repo-root marker files / dirs (in priority order). The first one found
 # walking up from the contract becomes the workspace root for shared-asset
 # patterns. ``.git`` is the universal one; the rest catch monorepos and

@@ -34,7 +34,6 @@ from __future__ import annotations
 
 from typing import Dict, FrozenSet
 
-
 # Bare type names that take optional ``(precision, scale)`` parameters; for
 # these, an explicit ``(...)`` suffix is preserved verbatim and uppercased
 # (e.g. ``decimal(18,4)`` → ``DECIMAL(18,4)``).

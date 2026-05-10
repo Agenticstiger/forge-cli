@@ -22,10 +22,12 @@ Two execution modes:
 
 from __future__ import annotations
 
-from .runner import AirbyteRunner, execute_airbyte_build
 # Side-effect imports — both register their factories with the runner's
 # dispatch tables at package-load time. Don't remove.
-from . import sources  # noqa: F401  per-source-kind config adapters
-from . import destinations  # noqa: F401  per-platform PyAirbyte cache factories
+from . import (
+    destinations,  # noqa: F401  per-platform PyAirbyte cache factories
+    sources,  # noqa: F401  per-source-kind config adapters
+)
+from .runner import AirbyteRunner, execute_airbyte_build
 
 __all__ = ["AirbyteRunner", "execute_airbyte_build"]

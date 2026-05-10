@@ -755,8 +755,8 @@ def _execute(ctx: RunContext, runner: MeltanoRunner) -> RunResult:
         # Build the target config via the FLUID-canonical credentials layer.
         # Side-effect import: the meltano destinations module registers the
         # introspector with the unified registry.
-        from . import destinations  # noqa: F401  (registration side-effect)
         from .._credentials import make_destination
+        from . import destinations  # noqa: F401  (registration side-effect)
 
         target_config = make_destination(
             "meltano",

@@ -27,10 +27,6 @@ from fluid_build.build_runners._acquisition_common import (
     setdefault_env,
     utc_now_iso,
 )
-from fluid_build.build_runners._credentials import (
-    make_destination,
-    register_engine_introspector,
-)
 from fluid_build.build_runners._anomaly import (
     EwmaState,
     ewma_update,
@@ -42,6 +38,10 @@ from fluid_build.build_runners._cost import (
     InMemoryCostTracker,
     gate_or_raise,
     parse_bytes,
+)
+from fluid_build.build_runners._credentials import (
+    make_destination,
+    register_engine_introspector,
 )
 from fluid_build.build_runners._dlq import DLQConfig, DLQOverflowError, DLQWriter
 from fluid_build.build_runners._fingerprint import fingerprint_from_columns
