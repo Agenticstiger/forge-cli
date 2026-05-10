@@ -487,12 +487,12 @@ def test_every_emitter_consumes_engine_runtime_for_airbyte(system_name):
     content = "\n".join(files.values())
 
     assert "airbyte" in content.lower(), f"{system_name} did not include the airbyte pip extra"
-    assert "AIRBYTE_TEMP_DIR" in content, (
-        f"{system_name} did not surface AIRBYTE_TEMP_DIR (DinD config-mount fix)"
-    )
-    assert "/var/run/docker.sock" in content, (
-        f"{system_name} did not surface the docker.sock REQUIRES note"
-    )
+    assert (
+        "AIRBYTE_TEMP_DIR" in content
+    ), f"{system_name} did not surface AIRBYTE_TEMP_DIR (DinD config-mount fix)"
+    assert (
+        "/var/run/docker.sock" in content
+    ), f"{system_name} did not surface the docker.sock REQUIRES note"
 
 
 @pytest.mark.parametrize(
@@ -552,13 +552,13 @@ def test_every_emitter_skips_runtime_block_for_pure_python_engines(system_name):
     content = "\n".join(files.values())
     # dlt has no runtime requirements — assert no airbyte env-var
     # pollution and no docker.sock note.
-    assert "AIRBYTE_TEMP_DIR" not in content, (
-        f"{system_name} leaked AIRBYTE_TEMP_DIR for engine='dlt'"
-    )
-    assert "AIRBYTE_PROJECT_DIR" not in content, (
-        f"{system_name} leaked AIRBYTE_PROJECT_DIR for engine='dlt'"
-    )
+    assert (
+        "AIRBYTE_TEMP_DIR" not in content
+    ), f"{system_name} leaked AIRBYTE_TEMP_DIR for engine='dlt'"
+    assert (
+        "AIRBYTE_PROJECT_DIR" not in content
+    ), f"{system_name} leaked AIRBYTE_PROJECT_DIR for engine='dlt'"
     # But the dlt pip extras MUST be present so the engine actually works.
-    assert "dlt[" in content or "dlt>" in content, (
-        f"{system_name} did not include the dlt pip extras"
-    )
+    assert (
+        "dlt[" in content or "dlt>" in content
+    ), f"{system_name} did not include the dlt pip extras"

@@ -331,9 +331,9 @@ class TestOSIPropagation:
         for semantics in _all_semantics_blocks(contract):
             entities = semantics.get("entities", [])
             foreign_entities = [e for e in entities if e.get("type") == "foreign"]
-            assert any(e.get("name") == "customers" for e in foreign_entities), (
-                "OSI relationship target must surface as a foreign entity"
-            )
+            assert any(
+                e.get("name") == "customers" for e in foreign_entities
+            ), "OSI relationship target must surface as a foreign entity"
 
 
 class TestSemanticCompleteness:

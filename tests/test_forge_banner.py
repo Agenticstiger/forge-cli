@@ -131,9 +131,9 @@ def test_banner_disabled_by_default_without_opt_in(monkeypatch):
         "ai_setup",
         "version",
     ):
-        assert banner_enabled(surface) is False, (
-            f"banner shown without FLUID_BANNER=1 for {surface}"
-        )
+        assert (
+            banner_enabled(surface) is False
+        ), f"banner shown without FLUID_BANNER=1 for {surface}"
 
 
 # ----------------------------------------------------------------------

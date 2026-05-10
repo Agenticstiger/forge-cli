@@ -132,9 +132,9 @@ class TestStarViolations:
             variant="star",
         )
         findings = lint_dimensional_variant(model)
-        assert any("exactly one fact" in f.message.lower() for f in findings), (
-            "two-fact star must warn about the fact count"
-        )
+        assert any(
+            "exactly one fact" in f.message.lower() for f in findings
+        ), "two-fact star must warn about the fact count"
 
     def test_star_with_no_dims_warns(self):
         model = DimensionalModel(
@@ -178,9 +178,9 @@ class TestGalaxyViolations:
             variant="galaxy",
         )
         findings = lint_dimensional_variant(model)
-        assert any("≥ 2 fact tables" in f.message for f in findings), (
-            "single-fact galaxy must warn about the fact count"
-        )
+        assert any(
+            "≥ 2 fact tables" in f.message for f in findings
+        ), "single-fact galaxy must warn about the fact count"
 
     def test_galaxy_without_conformed_dims_warns(self):
         model = DimensionalModel(

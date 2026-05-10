@@ -350,6 +350,6 @@ def test_shape_contract_passes_schema_validator(product_type):
     contract = shape_contract(answer)
     sm = FluidSchemaManager()
     result = sm.validate_contract(contract)
-    assert result.is_valid, (
-        f"{product_type} contract failed schema validation: {', '.join(result.errors)}"
-    )
+    assert (
+        result.is_valid
+    ), f"{product_type} contract failed schema validation: {', '.join(result.errors)}"

@@ -107,9 +107,7 @@ def _minimal_contract(engine: str) -> Dict[str, Any]:
                     (
                         "cdc"
                         if engine == "debezium"
-                        else "streaming"
-                        if engine == "kafka-connect"
-                        else "full_refresh"
+                        else "streaming" if engine == "kafka-connect" else "full_refresh"
                     )
                 ],
                 "properties": {

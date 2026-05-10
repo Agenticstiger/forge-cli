@@ -752,7 +752,9 @@ def register(subparsers: argparse._SubParsersAction):
     init_parser.add_argument("--owner", help="Workspace owner")
 
     # Show workspace info
-    _info_parser = workspace_subparsers.add_parser("info", help="Show workspace information")  # noqa: F841
+    _info_parser = workspace_subparsers.add_parser(
+        "info", help="Show workspace information"
+    )  # noqa: F841
 
     # Team management
     team_parser = workspace_subparsers.add_parser("team", help="Manage team members")

@@ -86,12 +86,12 @@ def test_redact_dsn_strips_secret_and_leaves_marker(
     expected_marker: str,
 ) -> None:
     redacted = _redact_dsn(dsn)
-    assert banned_substring not in redacted, (
-        f"redacted DSN still contains the secret substring {banned_substring!r}: {redacted!r}"
-    )
-    assert expected_marker in redacted, (
-        f"redacted DSN missing the expected marker {expected_marker!r}: {redacted!r}"
-    )
+    assert (
+        banned_substring not in redacted
+    ), f"redacted DSN still contains the secret substring {banned_substring!r}: {redacted!r}"
+    assert (
+        expected_marker in redacted
+    ), f"redacted DSN missing the expected marker {expected_marker!r}: {redacted!r}"
 
 
 def test_redact_dsn_passes_through_dsn_without_credentials() -> None:

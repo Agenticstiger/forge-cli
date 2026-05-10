@@ -149,9 +149,9 @@ def test_forge_blank_every_product_type_validates(
     if data_product_type:
         cli_args.extend(["--data-product-type", data_product_type])
     proc = _fluid(*cli_args, cwd=tmp_path)
-    assert proc.returncode == 0, (
-        f"forge --blank failed:\nstdout={proc.stdout}\nstderr={proc.stderr}"
-    )
+    assert (
+        proc.returncode == 0
+    ), f"forge --blank failed:\nstdout={proc.stdout}\nstderr={proc.stderr}"
 
     contract = _find_contract(tmp_path)
     assert contract is not None, "fluid forge --blank did not produce a contract.fluid.yaml"
@@ -231,9 +231,9 @@ def test_init_blank_every_product_type_validates(tmp_path, data_product_type):
     if data_product_type:
         cli_args.extend(["--data-product-type", data_product_type])
     proc = _fluid(*cli_args, cwd=tmp_path)
-    assert proc.returncode == 0, (
-        f"init --blank failed:\nstdout={proc.stdout[-1000:]}\nstderr={proc.stderr[-1000:]}"
-    )
+    assert (
+        proc.returncode == 0
+    ), f"init --blank failed:\nstdout={proc.stdout[-1000:]}\nstderr={proc.stderr[-1000:]}"
 
     contract = _find_contract(tmp_path)
     if contract is None:
@@ -246,9 +246,9 @@ def test_init_blank_every_product_type_validates(tmp_path, data_product_type):
 
     _assert_metadata_canonical(contract)
     ok, output = _validate_contract_passes(contract, tmp_path)
-    assert ok, (
-        f"validate failed for init --blank --data-product-type={data_product_type}: {output[-1500:]}"
-    )
+    assert (
+        ok
+    ), f"validate failed for init --blank --data-product-type={data_product_type}: {output[-1500:]}"
 
 
 @pytest.mark.parametrize("template_name", _list_templates())
@@ -290,9 +290,9 @@ def test_init_quickstart_validates(tmp_path):
         "--quiet",
         cwd=tmp_path,
     )
-    assert proc.returncode == 0, (
-        f"init --quickstart failed:\nstdout={proc.stdout[-1000:]}\nstderr={proc.stderr[-1000:]}"
-    )
+    assert (
+        proc.returncode == 0
+    ), f"init --quickstart failed:\nstdout={proc.stdout[-1000:]}\nstderr={proc.stderr[-1000:]}"
 
     contract = _find_contract(tmp_path)
     assert contract is not None, "init --quickstart did not produce a contract"
@@ -370,9 +370,10 @@ def test_forge_refine_round_trips_a_blank_contract(tmp_path):
     )
     # Refine + --no-llm currently routes through blank (no-LLM fallback)
     # which should not corrupt the on-disk contract.
-    assert proc2.returncode in (0, 1), (
-        f"Refine round-trip should either succeed or fail-soft, got rc={proc2.returncode}"
-    )
+    assert proc2.returncode in (
+        0,
+        1,
+    ), f"Refine round-trip should either succeed or fail-soft, got rc={proc2.returncode}"
     # The on-disk contract MUST still be valid no matter what refine did.
     ok2, output2 = _validate_contract_passes(contract, tmp_path)
     assert ok2, (

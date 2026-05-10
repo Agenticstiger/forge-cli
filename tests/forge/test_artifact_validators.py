@@ -104,9 +104,9 @@ class TestValidateManifestDir:
         # Tamper
         (tmp_path / "odcs/a.yaml").write_bytes(b"modified")
         issues = validate_manifest_dir(tmp_path)
-        assert any(i.code == "MANIFEST-SHA-MISMATCH" for i in issues), (
-            f"expected SHA mismatch; got {[i.code for i in issues]}"
-        )
+        assert any(
+            i.code == "MANIFEST-SHA-MISMATCH" for i in issues
+        ), f"expected SHA mismatch; got {[i.code for i in issues]}"
 
     def test_missing_declared_file(self, tmp_path):
         _write_manifest(tmp_path, {"odcs/a.yaml": b"x"})
@@ -363,18 +363,18 @@ class TestVendoredSchemas:
     def test_odps_bitol_schema_exists_in_provider_dir(self):
         """Must be under providers/odps_standard/ — NOT fluid_build/schemas/
         (that namespace is reserved for FLUID contract schemas)."""
-        assert _ODPS_BITOL_SCHEMA_PATH.exists(), (
-            f"vendored ODPS-Bitol schema missing at {_ODPS_BITOL_SCHEMA_PATH}"
-        )
+        assert (
+            _ODPS_BITOL_SCHEMA_PATH.exists()
+        ), f"vendored ODPS-Bitol schema missing at {_ODPS_BITOL_SCHEMA_PATH}"
         # Schemas/ namespace must NOT house third-party schemas.
         bad_path = (
             _ODPS_BITOL_SCHEMA_PATH.parent.parent.parent
             / "schemas"
             / "odps-bitol-json-schema-v1.0.0.json"
         )
-        assert not bad_path.exists(), (
-            f"ODPS-Bitol schema must not live under fluid_build/schemas/; found at {bad_path}"
-        )
+        assert (
+            not bad_path.exists()
+        ), f"ODPS-Bitol schema must not live under fluid_build/schemas/; found at {bad_path}"
 
     def test_odps_bitol_schema_is_valid_json(self):
         with open(_ODPS_BITOL_SCHEMA_PATH, "r", encoding="utf-8") as fh:

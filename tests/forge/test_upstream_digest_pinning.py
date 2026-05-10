@@ -373,9 +373,9 @@ class TestApplyNoVerifyDigestEscapeHatch:
                 except Exception:
                     pass
 
-        assert validator_called["count"] == 0, (
-            "validate_federated_consumes was called despite --no-verify-digest"
-        )
+        assert (
+            validator_called["count"] == 0
+        ), "validate_federated_consumes was called despite --no-verify-digest"
         # WARNING line must mention the skip so audit log parsers see it.
         warning_messages = [r.getMessage() for r in caplog.records]
         assert any(

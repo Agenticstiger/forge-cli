@@ -350,9 +350,9 @@ class TestCoordinatorRepair:
         )
         assert result.physical is not None
         assert result.physical.validation.passes_schema is True
-        assert stub_pipeline["builder"].calls == 2, (
-            "builder must be re-run exactly once after exposes-scope failure"
-        )
+        assert (
+            stub_pipeline["builder"].calls == 2
+        ), "builder must be re-run exactly once after exposes-scope failure"
         # Readme + transformation are NOT re-run — they weren't blamed.
         assert stub_pipeline["readme"].calls == 1
         assert stub_pipeline["transformation"].calls == 1

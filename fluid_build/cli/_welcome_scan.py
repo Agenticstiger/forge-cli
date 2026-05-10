@@ -158,9 +158,7 @@ def _probe_ai_credentials() -> Dict[str, Any]:
                 else (
                     "anthropic"
                     if "ANTHROPIC" in var or "CLAUDE" in var
-                    else "gemini"
-                    if "GEMINI" in var or "GOOGLE" in var
-                    else ""
+                    else "gemini" if "GEMINI" in var or "GOOGLE" in var else ""
                 )
             )
             return {"ai_configured": True, "ai_provider_hint": hint}

@@ -97,9 +97,7 @@ def format_table_output(
             quality_color = (
                 "green"
                 if product.quality_score and product.quality_score >= 0.9
-                else "yellow"
-                if product.quality_score and product.quality_score >= 0.7
-                else "red"
+                else "yellow" if product.quality_score and product.quality_score >= 0.7 else "red"
             )
 
             table.add_row(

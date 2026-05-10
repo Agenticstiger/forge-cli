@@ -591,9 +591,9 @@ def test_apply_dry_run_odps_product_consume_with_explicit_contract_id_is_access_
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
     contract = _sample_odps_consumes_contract()
-    contract["consumes"][0]["contractId"] = (
-        "bizlab.teleforge.subscriber_usage_daily_lineage_local.custom_view"
-    )
+    contract["consumes"][0][
+        "contractId"
+    ] = "bizlab.teleforge.subscriber_usage_daily_lineage_local.custom_view"
 
     result = provider.apply(contract, dry_run=True, provider_hint="odps")
 

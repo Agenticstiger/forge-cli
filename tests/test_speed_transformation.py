@@ -503,9 +503,9 @@ class TestEngineThreading:
         # Engine still emits infrastructure; it must NOT emit model-level
         # schema.yml files that would collide with the LLM's own.
         schema_yml_files = [p for p in files if "schema.yml" in p]
-        assert schema_yml_files == [], (
-            f"engine must skip schema.yml when technique is set; got {schema_yml_files}"
-        )
+        assert (
+            schema_yml_files == []
+        ), f"engine must skip schema.yml when technique is set; got {schema_yml_files}"
         # Infrastructure must still be there.
         assert "dbt_project.yml" in files
         assert "profiles.yml" in files

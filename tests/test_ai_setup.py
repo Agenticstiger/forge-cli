@@ -821,9 +821,9 @@ class TestModelCatalogIntegrity:
             entry = catalog["providers"][name]
             flagship = entry["flagship"]
             model_ids = [m["id"] for m in entry.get("models", [])]
-            assert flagship in model_ids, (
-                f"{name} flagship '{flagship}' not in models list {model_ids}"
-            )
+            assert (
+                flagship in model_ids
+            ), f"{name} flagship '{flagship}' not in models list {model_ids}"
 
     def test_class_defaults_match_catalog_flagship(self):
         """After _sync_provider_defaults_from_catalog runs, every
@@ -851,9 +851,9 @@ class TestModelCatalogIntegrity:
                 caps = m.get("capabilities", {})
                 for key in ("structured_output", "tool_use", "streaming"):
                     if key in caps:
-                        assert isinstance(caps[key], bool), (
-                            f"{name}/{m['id']}.capabilities.{key} is not bool"
-                        )
+                        assert isinstance(
+                            caps[key], bool
+                        ), f"{name}/{m['id']}.capabilities.{key} is not bool"
 
     def test_model_supports_structured_output_reads_catalog(self):
         from fluid_build.cli.forge_copilot_llm_providers import (

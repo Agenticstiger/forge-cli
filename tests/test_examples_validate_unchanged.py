@@ -113,9 +113,9 @@ def test_existing_example_validates_against_declared_version(
 
 
 def test_examples_directory_not_empty() -> None:
-    assert len(CONTRACTS) > 0, (
-        f"No contracts found under {EXAMPLES_DIR}; backward-compat coverage is empty"
-    )
+    assert (
+        len(CONTRACTS) > 0
+    ), f"No contracts found under {EXAMPLES_DIR}; backward-compat coverage is empty"
 
 
 def test_pre_existing_failures_documented() -> None:

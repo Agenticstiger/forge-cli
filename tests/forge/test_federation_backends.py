@@ -256,9 +256,9 @@ class TestGitBackend:
         ):
             result = _fetch_digest_via_git(ws, "ext.x", "1")
 
-        assert mock_gp.called and mock_sh.called, (
-            "Both gitpython AND shell-out must be exercised when gitpython is unavailable"
-        )
+        assert (
+            mock_gp.called and mock_sh.called
+        ), "Both gitpython AND shell-out must be exercised when gitpython is unavailable"
         assert result is not None and result.startswith("sha256:")
 
     def test_gitpython_real_failure_aborts_no_shellout(self, tmp_path: Path, monkeypatch):
@@ -283,9 +283,9 @@ class TestGitBackend:
         ):
             result = _fetch_digest_via_git(ws, "ext.x", "1")
 
-        assert mock_gp.called and not mock_sh.called, (
-            "gitpython failure must NOT trigger shell-out fallback"
-        )
+        assert (
+            mock_gp.called and not mock_sh.called
+        ), "gitpython failure must NOT trigger shell-out fallback"
         assert result is None
 
 

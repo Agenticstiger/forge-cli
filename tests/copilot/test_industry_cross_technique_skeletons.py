@@ -76,9 +76,9 @@ def test_cross_technique_skeleton_file_exists(relative_path: str) -> None:
     paths the compiler looks them up by. File-not-found would degrade
     the compiler to an empty pack — silently worse accuracy on every
     off-default-combo forge."""
-    assert (_SKELETONS_DIR / relative_path).exists(), (
-        f"missing cross-technique skeleton: {relative_path}"
-    )
+    assert (
+        _SKELETONS_DIR / relative_path
+    ).exists(), f"missing cross-technique skeleton: {relative_path}"
 
 
 # ---------------------------------------------------------------------------
@@ -131,12 +131,12 @@ def test_finance_one_big_table_attaches_as_dimensional_model() -> None:
     skel = pack.seed_dimensional_skeleton
     # OBT invariant: exactly one fact table, zero conformed dimensions.
     assert len(skel.facts) == 1, f"OBT must have exactly one wide fact, got {len(skel.facts)}"
-    assert skel.conformed_dimensions == [], (
-        f"OBT has no conformed dims; got {skel.conformed_dimensions}"
-    )
-    assert skel.dimensions == [], (
-        f"OBT inlines attributes into the fact; got dims {skel.dimensions}"
-    )
+    assert (
+        skel.conformed_dimensions == []
+    ), f"OBT has no conformed dims; got {skel.conformed_dimensions}"
+    assert (
+        skel.dimensions == []
+    ), f"OBT inlines attributes into the fact; got dims {skel.dimensions}"
     # ISO 20022 fingerprint — ``message_id`` / ``end_to_end_id`` /
     # ``instruction_id`` are the payment-message identifiers that
     # appear across pain.*, pacs.* and camt.* message types.

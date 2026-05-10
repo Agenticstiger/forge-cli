@@ -198,9 +198,9 @@ class TestArgsDryRunNormalisation:
                 pass
 
         # The fix sets args.dry_run = True after mode resolution.
-        assert args.dry_run is True, (
-            f"args.dry_run should be True after --mode dry-run normalisation, got {args.dry_run!r}"
-        )
+        assert (
+            args.dry_run is True
+        ), f"args.dry_run should be True after --mode dry-run normalisation, got {args.dry_run!r}"
 
 
 # ---------------------------------------------------------------------------

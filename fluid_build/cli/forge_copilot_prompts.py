@@ -407,7 +407,7 @@ def build_system_prompt(
         f"Allowed providers: {providers}.\n"
         "Only use build engines from the provided capability matrix.\n\n"
         # --- Upstream-driven transformation SQL ---
-         + _DEFAULT_GUIDANCE.get("upstream_sql", "") + "\n"
+        + _DEFAULT_GUIDANCE.get("upstream_sql", "") + "\n"
         # --- Engine-owned files: do NOT recreate ---
         "ENGINE-OWNED FILES (do NOT write these to additional_files):\n"
         "- dbt_project/models/sources.yml — emitted by the engine. NEVER include a "
@@ -421,7 +421,7 @@ def build_system_prompt(
         "`additional_files['dbt_project/models/schema.yml']` listing every staging + "
         "mart model you authored, with per-column tests.\n\n"
         # --- Modeling-technique mandate ---
-         + _DEFAULT_GUIDANCE.get("technique_mandate", "") + "\n"
+        + _DEFAULT_GUIDANCE.get("technique_mandate", "") + "\n"
     )
 
 

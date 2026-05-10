@@ -208,9 +208,9 @@ def test_table_driven_composition_matrix(target, upstream):
     assert target_pt is not None
 
     expected_violation = upstream not in target_pt.allowed_upstream_types
-    assert bool(out) is expected_violation, (
-        f"target={target} upstream={upstream}: expected violation={expected_violation}, got {out}"
-    )
+    assert (
+        bool(out) is expected_violation
+    ), f"target={target} upstream={upstream}: expected violation={expected_violation}, got {out}"
 
 
 # ---------------------------------------------------------------------------

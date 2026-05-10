@@ -181,9 +181,9 @@ def test_provider_render_emits_input_port_contract_id_when_explicit():
     # detail. Pin that contractId is non-empty and matches a known source.
     cid_1 = result["inputPorts"][1]["contractId"]
     assert cid_1, "contractId must be synthesized when FLUID consume omits it"
-    assert "test.upstream.b" in cid_1 or "upstream_b" in cid_1, (
-        f"synthesized contractId should reflect the upstream source; got {cid_1!r}"
-    )
+    assert (
+        "test.upstream.b" in cid_1 or "upstream_b" in cid_1
+    ), f"synthesized contractId should reflect the upstream source; got {cid_1!r}"
     # ``required`` is NOT permitted on v1.0.0 InputPort — stripped.
     assert "required" not in result["inputPorts"][0]
     assert "required" not in result["inputPorts"][1]

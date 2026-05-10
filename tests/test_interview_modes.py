@@ -153,9 +153,9 @@ def test_compose_interview_asks_at_most_three_questions():
     assert len(asked) <= 3, f"compose asked {len(asked)} questions: {asked}"
     joined = "\n".join(asked).lower()
     for forbidden in ("data source", "ddl", "sample", "industry", "use case"):
-        assert forbidden not in joined, (
-            f"compose interview asked a generic question that the system already knows: {forbidden!r}"
-        )
+        assert (
+            forbidden not in joined
+        ), f"compose interview asked a generic question that the system already knows: {forbidden!r}"
 
 
 def test_compose_interview_prefills_consumes_from_upstreams():
@@ -329,9 +329,9 @@ def test_run_adaptive_copilot_interview_short_circuits_on_compose():
             project_memory=None,
         )
 
-    assert bootstrap_called["count"] == 0, (
-        "compose mode must short-circuit the standard bootstrap interview"
-    )
+    assert (
+        bootstrap_called["count"] == 0
+    ), "compose mode must short-circuit the standard bootstrap interview"
 
 
 def test_run_adaptive_copilot_interview_short_circuits_on_refine(tmp_path):
@@ -355,9 +355,9 @@ def test_run_adaptive_copilot_interview_short_circuits_on_refine(tmp_path):
             project_memory=None,
         )
 
-    assert bootstrap_called["count"] == 0, (
-        "refine mode must short-circuit the standard bootstrap interview"
-    )
+    assert (
+        bootstrap_called["count"] == 0
+    ), "refine mode must short-circuit the standard bootstrap interview"
 
 
 @pytest.mark.xfail(

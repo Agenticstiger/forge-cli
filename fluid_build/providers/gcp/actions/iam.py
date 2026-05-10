@@ -717,9 +717,7 @@ def _bind_project_role(
             "message": (
                 "Role granted"
                 if attach and changed
-                else "Role revoked"
-                if not attach and changed
-                else "No-op (already in target state)"
+                else "Role revoked" if not attach and changed else "No-op (already in target state)"
             ),
             "duration_ms": duration_ms(start_time),
             "changed": changed,

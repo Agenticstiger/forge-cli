@@ -346,9 +346,9 @@ class TestCapabilityNegotiationPerEngine:
         module = importlib.import_module(module_path)
         runner = getattr(module, class_name)()
         cap_enum = RunnerCapability(capability_runner_cant_satisfy)
-        assert cap_enum not in runner.declared_capabilities, (
-            f"{engine} unexpectedly declares {capability_runner_cant_satisfy}"
-        )
+        assert (
+            cap_enum not in runner.declared_capabilities
+        ), f"{engine} unexpectedly declares {capability_runner_cant_satisfy}"
 
 
 # ── Stage 8: existence of every entry-point ──────────────────────────

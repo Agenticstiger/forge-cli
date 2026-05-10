@@ -108,12 +108,12 @@ class TestEnsureDatabaseBootstrap:
             )
 
         # Critical: neither was passed to connect(). This is THE fix.
-        assert "database" not in factory.captured, (
-            f"connect() received database={factory.captured.get('database')!r}; chicken-and-egg risk"
-        )
-        assert "schema" not in factory.captured, (
-            f"connect() received schema={factory.captured.get('schema')!r}; chicken-and-egg risk"
-        )
+        assert (
+            "database" not in factory.captured
+        ), f"connect() received database={factory.captured.get('database')!r}; chicken-and-egg risk"
+        assert (
+            "schema" not in factory.captured
+        ), f"connect() received schema={factory.captured.get('schema')!r}; chicken-and-egg risk"
 
         # Sanity: the SHOW + CREATE actually ran.
         assert any("SHOW DATABASES" in s for s in factory.executed_sql)
@@ -182,9 +182,9 @@ class TestEnsureSchemaBootstrap:
         # database SHOULD be present (it exists, we want USE DATABASE).
         assert factory.captured.get("database") == "EXISTING_DB"
         # schema MUST NOT be present.
-        assert "schema" not in factory.captured, (
-            f"connect() received schema={factory.captured.get('schema')!r}; chicken-and-egg risk"
-        )
+        assert (
+            "schema" not in factory.captured
+        ), f"connect() received schema={factory.captured.get('schema')!r}; chicken-and-egg risk"
 
         assert any("SHOW SCHEMAS" in s for s in factory.executed_sql)
         assert any("CREATE" in s and "SCHEMA" in s for s in factory.executed_sql)

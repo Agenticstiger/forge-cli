@@ -137,9 +137,9 @@ class TestToolRegistryShape:
                 assert cap.mutates_files is True
                 assert "output_path" in cap.file_path_args
             else:
-                assert cap.mutates_files is False, (
-                    f"{name} should be read-only — got mutates_files=True"
-                )
+                assert (
+                    cap.mutates_files is False
+                ), f"{name} should be read-only — got mutates_files=True"
 
     def test_forge_from_source_writes_history_and_audit(self):
         """The write tool's writes_namespaces must include both
@@ -157,9 +157,9 @@ class TestToolRegistryShape:
             ):
                 continue
             cap = TOOL_CAPABILITIES[name]
-            assert "credential_id" in cap.description, (
-                f"{name} description missing 'credential_id': {cap.description}"
-            )
+            assert (
+                "credential_id" in cap.description
+            ), f"{name} description missing 'credential_id': {cap.description}"
 
     def test_every_tool_advertises_input_schema(self):
         """Gap 5 — populated ``input_schema`` lets MCP clients (Claude
@@ -197,12 +197,12 @@ class TestToolRegistryShape:
             cap = TOOL_CAPABILITIES[name]
             schema = cap.input_schema
             assert schema is not None, f"{name} missing input_schema"
-            assert "credentials" in schema.get("required", []), (
-                f"{name} schema must REQUIRE credentials"
-            )
-            assert "credentials" in schema.get("properties", {}), (
-                f"{name} schema must declare credentials property"
-            )
+            assert "credentials" in schema.get(
+                "required", []
+            ), f"{name} schema must REQUIRE credentials"
+            assert "credentials" in schema.get(
+                "properties", {}
+            ), f"{name} schema must declare credentials property"
 
     def test_forge_from_source_schema_has_technique_enum(self):
         """``forge_from_source.technique`` must be a closed enum so

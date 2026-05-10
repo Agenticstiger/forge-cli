@@ -153,9 +153,9 @@ class TestLocalProviderEndToEnd:
             str(plan_out),
             cwd=workspace,
         )
-        assert result.returncode == 0, (
-            f"plan exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+        assert (
+            result.returncode == 0
+        ), f"plan exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
         assert plan_out.exists(), "plan should produce an output file"
 
     def test_validate_smoke_contract(self, hello_world_contract: Path, workspace: Path) -> None:
@@ -164,9 +164,9 @@ class TestLocalProviderEndToEnd:
             str(hello_world_contract),
             cwd=workspace,
         )
-        assert result.returncode == 0, (
-            f"validate exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+        assert (
+            result.returncode == 0
+        ), f"validate exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
 
 
 class TestLocalProviderDeterminism:

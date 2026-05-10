@@ -118,9 +118,9 @@ class TestMainHelpNoStaleFlags:
         text = _capture_main_help()
         for line in text.splitlines():
             if line.strip().startswith("forge"):
-                assert "copilot" in line.lower() or "AI" in line, (
-                    "Expected copilot/AI mention in forge help line"
-                )
+                assert (
+                    "copilot" in line.lower() or "AI" in line
+                ), "Expected copilot/AI mention in forge help line"
                 break
 
 

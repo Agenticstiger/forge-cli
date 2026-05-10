@@ -198,9 +198,9 @@ class TestPlannerTopologicalSort:
         # execute_sql must come before materialize
         sql_idx = ops.index("execute_sql")
         mat_idx = ops.index("materialize")
-        assert sql_idx < mat_idx, (
-            f"execute_sql({sql_idx}) should come before materialize({mat_idx})"
-        )
+        assert (
+            sql_idx < mat_idx
+        ), f"execute_sql({sql_idx}) should come before materialize({mat_idx})"
 
     def test_csv_input_ordering(self):
         """CSV input: load_data → execute_sql → materialize."""
@@ -240,12 +240,12 @@ class TestPlannerTopologicalSort:
         actions = plan_actions(contract, "test", "local")
         ops = [a["op"] for a in actions]
 
-        assert ops.index("load_data") < ops.index("execute_sql"), (
-            "load_data should come before execute_sql"
-        )
-        assert ops.index("execute_sql") < ops.index("materialize"), (
-            "execute_sql should come before materialize"
-        )
+        assert ops.index("load_data") < ops.index(
+            "execute_sql"
+        ), "load_data should come before execute_sql"
+        assert ops.index("execute_sql") < ops.index(
+            "materialize"
+        ), "execute_sql should come before materialize"
 
     def test_build_input_generates_load_data(self):
         """Build inputs with file paths should generate load_data actions."""

@@ -142,9 +142,9 @@ def test_self_healing_runs_schema_validator_in_repair_loop():
 
     # The 2nd attempt's prompt MUST mention the schema errors that the
     # 1st attempt's output produced. That's the whole point of wiring.
-    assert len(captured_user_prompts) >= 2, (
-        f"Expected >= 2 attempts, got {len(captured_user_prompts)}"
-    )
+    assert (
+        len(captured_user_prompts) >= 2
+    ), f"Expected >= 2 attempts, got {len(captured_user_prompts)}"
     second_attempt_prompt = captured_user_prompts[1]
     # The schema validator flags missing 'builds' and 'exposes' (required).
     assert (

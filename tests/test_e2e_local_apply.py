@@ -110,17 +110,17 @@ class TestFluidApplyMaterializesData:
             "--yes",
             cwd=hello_world_workspace,
         )
-        assert result.returncode == 0, (
-            f"apply exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+        assert (
+            result.returncode == 0
+        ), f"apply exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
 
         # The hello-world contract binds its 'hello_output' expose to
         # runtime/out/hello-world-v1.csv. If the materialisation step
         # silently skipped, this file is missing.
         output_csv = hello_world_workspace / "runtime" / "out" / "hello-world-v1.csv"
-        assert output_csv.exists(), (
-            f"apply claimed success but did not produce {output_csv}\nstdout: {result.stdout}"
-        )
+        assert (
+            output_csv.exists()
+        ), f"apply claimed success but did not produce {output_csv}\nstdout: {result.stdout}"
         assert output_csv.stat().st_size > 0, f"{output_csv} exists but is empty"
 
     def test_apply_output_has_expected_schema_and_rows(self, hello_world_workspace: Path) -> None:
@@ -163,9 +163,9 @@ class TestFluidApplyMaterializesData:
         # The literal value is hardcoded in the contract's SQL and is
         # the most readable signal that the SQL ran end-to-end.
         message_idx = column_names.index("message")
-        assert rows[0][message_idx] == "Hello, FLUID!", (
-            f"expected 'Hello, FLUID!'; got {rows[0][message_idx]!r}"
-        )
+        assert (
+            rows[0][message_idx] == "Hello, FLUID!"
+        ), f"expected 'Hello, FLUID!'; got {rows[0][message_idx]!r}"
 
 
 class TestFluidApplyIdempotency:
@@ -187,9 +187,9 @@ class TestFluidApplyIdempotency:
                 "--yes",
                 cwd=hello_world_workspace,
             )
-            assert result.returncode == 0, (
-                f"apply run {run + 1} exited {result.returncode}\nstderr: {result.stderr}"
-            )
+            assert (
+                result.returncode == 0
+            ), f"apply run {run + 1} exited {result.returncode}\nstderr: {result.stderr}"
 
     def test_two_apply_runs_produce_consistent_row_count(self, hello_world_workspace: Path) -> None:
         """Two apply runs must leave the output with the same row count.

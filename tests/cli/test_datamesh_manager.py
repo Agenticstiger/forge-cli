@@ -112,9 +112,9 @@ class TestCmdSignatures:
         fn = getattr(dmm_mod, fn_name)
         sig = inspect.signature(fn)
         params = list(sig.parameters.keys())
-        assert len(params) >= 2, (
-            f"{fn_name} must accept at least 2 params (args, logger), got {params}"
-        )
+        assert (
+            len(params) >= 2
+        ), f"{fn_name} must accept at least 2 params (args, logger), got {params}"
         assert params[0] == "args"
         assert params[1] == "logger"
 
@@ -135,9 +135,9 @@ class TestCmdSignatures:
         fn = getattr(dmm_mod, fn_name)
         sig = inspect.signature(fn)
         logger_param = sig.parameters["logger"]
-        assert logger_param.default is not inspect.Parameter.empty, (
-            f"{fn_name}: logger param must have a default value"
-        )
+        assert (
+            logger_param.default is not inspect.Parameter.empty
+        ), f"{fn_name}: logger param must have a default value"
 
 
 # ---------------------------------------------------------------------------
@@ -1195,9 +1195,9 @@ class TestDataProductSpecConformance:
                 "exposes": [],
             }
             dp = self._make_provider()._to_data_product(contract)
-            assert dp["info"].get("archetype") == expected, (
-                f"{layer} layer should map to {expected!r}, got {dp['info'].get('archetype')!r}"
-            )
+            assert (
+                dp["info"].get("archetype") == expected
+            ), f"{layer} layer should map to {expected!r}, got {dp['info'].get('archetype')!r}"
 
     def test_archetype_inferred_from_product_type(self):
         """metadata.productType drives archetype directly when present
@@ -1216,9 +1216,9 @@ class TestDataProductSpecConformance:
                 "exposes": [],
             }
             dp = self._make_provider()._to_data_product(contract)
-            assert dp["info"].get("archetype") == expected, (
-                f"{product_type} should map to {expected!r}, got {dp['info'].get('archetype')!r}"
-            )
+            assert (
+                dp["info"].get("archetype") == expected
+            ), f"{product_type} should map to {expected!r}, got {dp['info'].get('archetype')!r}"
 
 
 # ---------------------------------------------------------------------------
