@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-05-10
+
+Beta release of the v0.7.3 acquisition-pattern engine runners and the
+EngineRuntime registry across all CI emitters. Schema is GA; the
+package is staged through a beta tag (`v0.8.2b1` → TestPyPI) so
+downstream pipelines can validate the EngineRuntime wiring before
+graduating to a stable `v0.8.2` on PyPI.
+
 ### Added
 
 - **Data-product type vocabulary** (`metadata.productType`). v0.7.3
