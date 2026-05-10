@@ -306,7 +306,7 @@ def _generate_aws_task(task: Dict[str, Any], config: Dict[str, Any]) -> str:
     task_id='{task_id}',
     job_name='{job_name}',
     region_name='{region}',
-    script_args={params.get('script_args', {})!r},
+    script_args={params.get("script_args", {})!r},
     dag=dag,
 )"""
         elif service == "s3":

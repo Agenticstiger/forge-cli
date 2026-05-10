@@ -534,8 +534,7 @@ def validate_composition(
                     upstream_type=_utype,
                     target_type=target.code,
                     reason=(
-                        f"{target.code} ({target.description}) does not accept "
-                        "upstream products."
+                        f"{target.code} ({target.description}) does not accept upstream products."
                     ),
                 )
             )

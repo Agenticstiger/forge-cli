@@ -151,9 +151,9 @@ def test_gemini_from_intent_produces_valid_dv2_model(tmp_path: Path) -> None:
 
     # DV2 naming convention — enforced by the skeleton-lint validator.
     for hub in hubs:
-        assert hub.hub_table_name.startswith(
-            "hub_"
-        ), f"Hub table name violates DV2 naming: {hub.hub_table_name!r}"
+        assert hub.hub_table_name.startswith("hub_"), (
+            f"Hub table name violates DV2 naming: {hub.hub_table_name!r}"
+        )
 
     # At least one satellite is expected for any non-trivial DV2 model;
     # change_tracking defaults to "type2" in the Pydantic schema, so
@@ -163,15 +163,15 @@ def test_gemini_from_intent_produces_valid_dv2_model(tmp_path: Path) -> None:
     assert len(sats) >= 1, "Gemini produced zero satellites — expected at least one"
     for sat in sats:
         assert sat.change_tracking in {"type1", "type2", "append_only"}
-        assert sat.satellite_table_name.startswith(
-            "sat_"
-        ), f"Satellite table name violates DV2 naming: {sat.satellite_table_name!r}"
+        assert sat.satellite_table_name.startswith("sat_"), (
+            f"Satellite table name violates DV2 naming: {sat.satellite_table_name!r}"
+        )
 
     # Validation report — with a real LLM we tolerate warnings but not
     # a schema failure; the validator is allowed to flag drift (H3).
-    assert (
-        result.validation.passes_schema
-    ), f"Emitted contract failed Fluid 0.7.2 schema: {result.validation.issues}"
+    assert result.validation.passes_schema, (
+        f"Emitted contract failed Fluid 0.7.2 schema: {result.validation.issues}"
+    )
 
     # S2 coverage helper agrees with the pipeline — the pack has a
     # skeleton, so coverage must be non-None and its render must carry

@@ -151,9 +151,9 @@ def test_traced_stage_run_id_persists_across_stages(monkeypatch, tmp_path: Path)
     stage_plan(_NS())
 
     assert len(seen_run_ids) == 2
-    assert (
-        seen_run_ids[0] == seen_run_ids[1]
-    ), "Bundle and plan must share the same run_id via the persisted file"
+    assert seen_run_ids[0] == seen_run_ids[1], (
+        "Bundle and plan must share the same run_id via the persisted file"
+    )
 
 
 @pytest.mark.parametrize(

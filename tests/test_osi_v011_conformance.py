@@ -331,9 +331,9 @@ class TestOSIPropagation:
         for semantics in _all_semantics_blocks(contract):
             entities = semantics.get("entities", [])
             foreign_entities = [e for e in entities if e.get("type") == "foreign"]
-            assert any(
-                e.get("name") == "customers" for e in foreign_entities
-            ), "OSI relationship target must surface as a foreign entity"
+            assert any(e.get("name") == "customers" for e in foreign_entities), (
+                "OSI relationship target must surface as a foreign entity"
+            )
 
 
 class TestSemanticCompleteness:
@@ -421,9 +421,7 @@ class TestEmittedContractValidates:
         # ``ValidationReport``; zero error-severity issues == clean.
         report = FluidContractValidator().validate(contract=contract)
         errors = [i for i in report.issues if i.severity == "error"]
-        assert not errors, (
-            f"emitted contract failed Fluid validator: " f"{[i.message for i in errors]}"
-        )
+        assert not errors, f"emitted contract failed Fluid validator: {[i.message for i in errors]}"
         # Schema-validation also passes.
         assert report.passes_schema is True, f"contract failed schema validation: {report.issues}"
 

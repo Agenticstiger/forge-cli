@@ -395,16 +395,16 @@ _SAFE_CONNECTION_KEYS: frozenset = frozenset(
         "database",
         "schema",
         "schemas",
-        "account",         # snowflake / azure
-        "project",         # bigquery / gcp
+        "account",  # snowflake / azure
+        "project",  # bigquery / gcp
         "project_id",
-        "dataset",         # bigquery
-        "warehouse",       # snowflake
-        "role",            # snowflake (read-only role is OK to disclose)
-        "region",          # cloud locality
-        "endpoint",        # rest / s3
+        "dataset",  # bigquery
+        "warehouse",  # snowflake
+        "role",  # snowflake (read-only role is OK to disclose)
+        "region",  # cloud locality
+        "endpoint",  # rest / s3
         "url",
-        "topic",           # kafka
+        "topic",  # kafka
         "topics",
         "bootstrap_servers",
     }
@@ -412,9 +412,7 @@ _SAFE_CONNECTION_KEYS: frozenset = frozenset(
 
 # Values that look like secrets even when the key is allowlisted (defence
 # in depth — catches operators who put a token into ``host`` by accident).
-_SECRET_VALUE_RE = re.compile(
-    r"(?i)(password|secret|token|key|credential|bearer)"
-)
+_SECRET_VALUE_RE = re.compile(r"(?i)(password|secret|token|key|credential|bearer)")
 
 
 # FLUID source ``kind`` (lowercase, snake_case per FLUID schema) →
@@ -611,8 +609,7 @@ def builds_to_canonical_input_ports(
                     "id": stream_str,
                     "name": stream_str,
                     "description": (
-                        f"{stream_str} from {kind} source "
-                        f"{database} (SDP source-aligned input)"
+                        f"{stream_str} from {kind} source {database} (SDP source-aligned input)"
                     ),
                     "version": default_version,
                     "reference": None,

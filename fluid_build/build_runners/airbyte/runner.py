@@ -302,7 +302,9 @@ def _execute_rest_mode(
             api_token = resolve_secret_ref(auth["secretRef"])
         except (ValueError, NotImplementedError) as exc:
             return _failed(
-                ctx, started_at, t_start,
+                ctx,
+                started_at,
+                t_start,
                 f"airbyte deployment.auth.secretRef did not resolve: {exc}",
             )
 
@@ -321,9 +323,7 @@ def _execute_rest_mode(
         source_definition_id = airbyte_props.get("source_definition_id") or image_ref
         # Resolve secretRef → password (or other credential field) before
         # POSTing to Airbyte. Inline literal values still win.
-        connection_config = resolve_connection_secrets(
-            dict(ctx.source.connection.raw)
-        )
+        connection_config = resolve_connection_secrets(dict(ctx.source.connection.raw))
         # connection.schema / connection.schemas → Airbyte source-postgres
         # (and similar) accept ``schemas`` (list). Pop the generic FLUID
         # fields so unrecognised-setting validators don't fire.
@@ -334,9 +334,7 @@ def _execute_rest_mode(
             connection_config.setdefault("schemas", schemas)
         # Adapt FLUID generic connection → Airbyte source-X spec
         # (renames, type coercions, connector-required defaults).
-        connection_config = adapt_source_config(
-            "airbyte", ctx.source.kind,connection_config
-        )
+        connection_config = adapt_source_config("airbyte", ctx.source.kind, connection_config)
         source_body = {
             "workspaceId": workspace_id,
             "name": f"forge-{ctx.product_id}",
@@ -563,9 +561,7 @@ def _execute_embedded_mode(
 
     try:
         # Resolve secretRef → password before passing to PyAirbyte.
-        embedded_config = resolve_connection_secrets(
-            dict(ctx.source.connection.raw)
-        )
+        embedded_config = resolve_connection_secrets(dict(ctx.source.connection.raw))
         # Same schema-list translation as the REST mode above.
         embedded_schemas = extract_source_schemas(embedded_config)
         embedded_config.pop("schema", None)
@@ -574,9 +570,7 @@ def _execute_embedded_mode(
             embedded_config.setdefault("schemas", embedded_schemas)
         # Adapt FLUID generic connection → Airbyte source-X spec
         # (renames, type coercions, connector-required defaults).
-        embedded_config = adapt_source_config(
-            "airbyte", ctx.source.kind,embedded_config
-        )
+        embedded_config = adapt_source_config("airbyte", ctx.source.kind, embedded_config)
         source = ab.get_source(
             f"source-{ctx.source.kind}",
             config=embedded_config,
@@ -596,7 +590,8 @@ def _execute_embedded_mode(
         binding = (ctx.contract.get("exposes") or [{}])[0].get("binding") or {}
         platform = binding.get("platform", "local")
         cache = make_destination(
-            "airbyte", platform,
+            "airbyte",
+            platform,
             binding=binding,
             contract=ctx.contract,
             product_id=ctx.product_id,
@@ -617,7 +612,9 @@ def _execute_embedded_mode(
         # configured (postgres source falls into ``getCursorBasedSyncStatus``
         # and emits ``column "null" does not exist``). Forcing the read
         # mode to match the contract is the right thing.
-        mode = (ctx.source.mode.value if hasattr(ctx.source.mode, "value") else str(ctx.source.mode)).lower()
+        mode = (
+            ctx.source.mode.value if hasattr(ctx.source.mode, "value") else str(ctx.source.mode)
+        ).lower()
         force_full_refresh = mode == "full_refresh"
         try:
             result = source.read(cache=cache, force_full_refresh=force_full_refresh)

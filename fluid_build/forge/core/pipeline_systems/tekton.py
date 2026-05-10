@@ -203,6 +203,13 @@ class TektonTemplate(BasePipelineTemplate):
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate Tekton pipeline.
 
+        Engine specs registry: per-engine pip extras + env vars are
+        merged into every Task's install script and `spec.steps[].env`
+        block via the registry helpers. The basic 3-task shape below
+        consumes ``_install_cmd`` and ``engine_env``; the 11-stage
+        shape (``_generate_eleven_stage``) is similarly registry-aware
+        through ``BasePipelineTemplate._engine_pip_install_command``.
+
         Routes STANDARD / ADVANCED / ENTERPRISE complexity to the
         canonical 11-stage shape (matches Jenkins / GitLab / GitHub
         Actions parity). BASIC complexity keeps the legacy 3-task
@@ -237,8 +244,7 @@ class TektonTemplate(BasePipelineTemplate):
                         "name": "fluid-security-audit",
                         "annotations": {
                             "description": (
-                                "Security and Compliance Audit — SAST, policy, "
-                                "vulnerability scan."
+                                "Security and Compliance Audit — SAST, policy, vulnerability scan."
                             )
                         },
                     },
@@ -273,6 +279,15 @@ class TektonTemplate(BasePipelineTemplate):
             return files
 
         commands = self._get_fluid_commands()
+        # Engine specs registry — per-engine pip extras + env vars
+        # spliced into each Tekton Task's install script + step env.
+        engine_pip = self._engine_pip_install_command(config)
+        _install_cmd = (
+            f"pip install --quiet data-product-forge && {engine_pip}"
+            if engine_pip
+            else "pip install --quiet data-product-forge"
+        )
+        engine_env = self._engine_runtime_env_vars(config)
 
         # Tekton pipeline definition
         pipeline = {
@@ -330,8 +345,9 @@ class TektonTemplate(BasePipelineTemplate):
                         "name": "validate",
                         "image": "python:3.12-slim",
                         "workingDir": "$(workspaces.source.path)",
+                        "env": [{"name": k, "value": v} for k, v in engine_env.items()],
                         "script": f"""#!/bin/bash
-pip install --quiet data-product-forge
+{_install_cmd}
 {commands["doctor"]}
 {commands["validate"]}
 """,
@@ -352,9 +368,11 @@ pip install --quiet data-product-forge
                 "same namespace as the PipelineRun."
             ),
         )
+        runtime_notes = self._engine_runtime_notes(config, indent="# ")
+        notes_block = ("\n" + runtime_notes + "\n") if runtime_notes else ""
         files = {
-            "tekton/pipeline.yaml": banner + yaml.dump(pipeline, indent=2),
-            "tekton/tasks.yaml": banner + yaml.dump_all(task_definitions, indent=2),
+            "tekton/pipeline.yaml": banner + notes_block + yaml.dump(pipeline, indent=2),
+            "tekton/tasks.yaml": banner + notes_block + yaml.dump_all(task_definitions, indent=2),
         }
 
         return files

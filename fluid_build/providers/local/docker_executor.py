@@ -129,7 +129,10 @@ class DockerExecutor:
             # Execute
             self.logger.info(f"Running Python script in Docker: {image}")
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300  # 5 minute timeout
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5 minute timeout
             )
 
             return {
@@ -216,7 +219,10 @@ except Exception as e:
 
         self.logger.info(f"Running dbt command: {dbt_command}")
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600  # 10 minute timeout
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,  # 10 minute timeout
         )
 
         return {

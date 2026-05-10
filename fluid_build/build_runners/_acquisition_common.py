@@ -123,7 +123,9 @@ _SOURCE_ADAPTERS: Dict[Tuple[str, str], Callable[[Dict[str, Any]], Dict[str, Any
 
 def register_source_adapter(
     engine: str, kind: str
-) -> Callable[[Callable[[Dict[str, Any]], Dict[str, Any]]], Callable[[Dict[str, Any]], Dict[str, Any]]]:
+) -> Callable[
+    [Callable[[Dict[str, Any]], Dict[str, Any]]], Callable[[Dict[str, Any]], Dict[str, Any]]
+]:
     """Decorator that registers a source-config adapter for (engine, kind).
 
     The adapter receives a copy of the FLUID-shaped connection dict (after
@@ -144,6 +146,7 @@ def register_source_adapter(
     ...     out.setdefault("ssl_mode", {"mode": "disable"})
     ...     return out
     """
+
     def _wrap(
         fn: Callable[[Dict[str, Any]], Dict[str, Any]],
     ) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
@@ -153,9 +156,7 @@ def register_source_adapter(
     return _wrap
 
 
-def adapt_source_config(
-    engine: str, kind: str, connection: Dict[str, Any]
-) -> Dict[str, Any]:
+def adapt_source_config(engine: str, kind: str, connection: Dict[str, Any]) -> Dict[str, Any]:
     """Apply the registered (engine, kind) source adapter, if any.
 
     Returns the connection dict unchanged (shallow copy) when no adapter is
@@ -314,24 +315,18 @@ def resolve_secret_ref(secret_ref: str) -> str:
             or uses an unsupported scheme.
     """
     if "://" not in secret_ref:
-        raise ValueError(
-            f"secretRef must be of the form '<scheme>://<identifier>': {secret_ref!r}"
-        )
+        raise ValueError(f"secretRef must be of the form '<scheme>://<identifier>': {secret_ref!r}")
     scheme, _, ident = secret_ref.partition("://")
     scheme = scheme.strip().lower()
     ident = ident.strip()
     if not scheme or not ident:
-        raise ValueError(
-            f"secretRef must be of the form '<scheme>://<identifier>': {secret_ref!r}"
-        )
+        raise ValueError(f"secretRef must be of the form '<scheme>://<identifier>': {secret_ref!r}")
 
     # Hot path: env:// short-circuit to os.environ.
     if scheme == "env":
         value = os.environ.get(ident)
         if value is None:
-            raise ValueError(
-                f"secretRef env://{ident}: environment variable not set"
-            )
+            raise ValueError(f"secretRef env://{ident}: environment variable not set")
         return value
 
     # Cloud / vault path: delegate to the existing SecretManager registry.
@@ -339,8 +334,7 @@ def resolve_secret_ref(secret_ref: str) -> str:
     if backend is None:
         supported = ["env"] + sorted(_SECRET_REF_BACKENDS)
         raise ValueError(
-            f"secretRef scheme {scheme!r} is not supported. "
-            f"Supported schemes: {supported}"
+            f"secretRef scheme {scheme!r} is not supported. Supported schemes: {supported}"
         )
 
     # Lazy import — the SecretManager pulls in optional cloud SDKs that we

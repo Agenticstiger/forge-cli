@@ -359,7 +359,7 @@ class ValidationResultHistory:
                 return {
                     "drift_detected": True,
                     "type": "new_issues",
-                    "message": f'New issue categories detected: {", ".join(new_categories)}',
+                    "message": f"New issue categories detected: {', '.join(new_categories)}",
                     "new_categories": list(new_categories),
                 }
 

@@ -63,7 +63,7 @@ def _opt_in_required() -> None:
 
 def _skip_if_missing(env_var: str, hint: str) -> None:
     if not os.environ.get(env_var):
-        pytest.skip(f"Skipping live LLM test: ``${env_var}`` is not set. " f"{hint}")
+        pytest.skip(f"Skipping live LLM test: ``${env_var}`` is not set. {hint}")
 
 
 @pytest.mark.parametrize(
@@ -124,9 +124,9 @@ def test_litellm_completion_round_trips_live(provider: str, model: str, env_var:
     # exclusively tool-calls. For this single-turn no-tools prompt we
     # expect text content; ``None`` indicates a real auth / model
     # config regression worth surfacing.
-    assert (
-        isinstance(text, str) and len(text.strip()) > 0
-    ), f"{provider}: empty completion text (response={response!r})"
+    assert isinstance(text, str) and len(text.strip()) > 0, (
+        f"{provider}: empty completion text (response={response!r})"
+    )
 
     # Cost tracking. ``completion_cost`` may raise NotFoundError on a
     # model litellm doesn't have a price for — surface as test failure
@@ -197,6 +197,6 @@ def test_litellm_provider_adapter_round_trips_live():
             .choices[0]
             .message.content
         )
-    assert (
-        isinstance(text, str) and len(text.strip()) > 0
-    ), f"adapter ({provider}): empty completion"
+    assert isinstance(text, str) and len(text.strip()) > 0, (
+        f"adapter ({provider}): empty completion"
+    )

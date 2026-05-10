@@ -263,7 +263,6 @@ class BaseCatalogConnector:
             self.last_health_check is None
             or now - self.last_health_check > self.health_check_interval
         ):
-
             if not await self._health_check():
                 self.logger.warning(
                     f"Health check failed for {self.catalog_type}, attempting reconnection"

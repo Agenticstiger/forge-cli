@@ -53,7 +53,7 @@ def _generate_embedded(
     build_id = build.get("id", "main")
     contract_id = contract.get("id", "unknown")
 
-    header = f"{_HEADER}" f"-- Contract: {contract_id}\n" f"-- Build: {build_id}\n\n"
+    header = f"{_HEADER}-- Contract: {contract_id}\n-- Build: {build_id}\n\n"
 
     if sql:
         return {f"{build_id}.sql": header + sql.strip() + "\n"}
@@ -80,9 +80,7 @@ def _generate_multi_stage(
         depends_on = stage.get("dependsOn", [])
 
         header = (
-            f"{_HEADER}"
-            f"-- Contract: {contract_id}\n"
-            f"-- Stage: {name} ({idx + 1}/{len(stages)})\n"
+            f"{_HEADER}-- Contract: {contract_id}\n-- Stage: {name} ({idx + 1}/{len(stages)})\n"
         )
         if depends_on:
             header += f"-- Depends on: {', '.join(depends_on)}\n"
@@ -114,7 +112,7 @@ def _generate_from_intent(
         sql = stage.get("sql", "")
         depends_on = stage.get("depends_on", [])
 
-        header = f"{_HEADER}" f"-- Contract: {contract_id}\n" f"-- Stage: {name}\n"
+        header = f"{_HEADER}-- Contract: {contract_id}\n-- Stage: {name}\n"
         if depends_on:
             header += f"-- Depends on: {', '.join(depends_on)}\n"
         header += "\n"

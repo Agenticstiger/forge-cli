@@ -252,7 +252,7 @@ def visualize_provider_actions_html(actions: List[Dict], dependencies: Dict[str,
                 <div class="stat-label">Total Actions</div>
             </div>
             <div class="stat-item">
-                <div class="stat-value">{len(set(a.get('provider', 'unknown') for a in actions))}</div>
+                <div class="stat-value">{len(set(a.get("provider", "unknown") for a in actions))}</div>
                 <div class="stat-label">Providers</div>
             </div>
             <div class="stat-item">
@@ -260,14 +260,14 @@ def visualize_provider_actions_html(actions: List[Dict], dependencies: Dict[str,
                 <div class="stat-label">Dependencies</div>
             </div>
             <div class="stat-item">
-                <div class="stat-value">{len(set(a.get('action_type', 'unknown') for a in actions))}</div>
+                <div class="stat-value">{len(set(a.get("action_type", "unknown") for a in actions))}</div>
                 <div class="stat-label">Action Types</div>
             </div>
         </div>
         
         <div class="action-list">
             <h2>Actions (Execution Order)</h2>
-            {''.join(_render_action_item(a, dependencies) for a in actions)}
+            {"".join(_render_action_item(a, dependencies) for a in actions)}
         </div>
         
         <div class="graph-container">

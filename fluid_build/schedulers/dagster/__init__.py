@@ -349,7 +349,7 @@ def _generate_job(
     return f'''# Job definition
 @job(
     resource_defs={{{resource_defs}}},
-    tags={{"fluid": "auto-generated", "contract_id": "{contract_id}", "provider": "{provider or 'generic'}"}},
+    tags={{"fluid": "auto-generated", "contract_id": "{contract_id}", "provider": "{provider or "generic"}"}},
 )
 def {job_name}():
     """{contract_id} pipeline."""

@@ -212,9 +212,9 @@ class TestKindHelmManifestRender:
             # Non-fatal: helm lint of a values-only dir often warns about
             # missing Chart.yaml. We accept warnings (returncode 0) but
             # NOT actual errors. Errors print as ``Error:``.
-            assert (
-                "Error:" not in r.stdout + r.stderr
-            ), f"helm lint hard-error: {r.stdout}\n{r.stderr}"
+            assert "Error:" not in r.stdout + r.stderr, (
+                f"helm lint hard-error: {r.stdout}\n{r.stderr}"
+            )
 
         # kubectl dry-run apply against the kind cluster — confirms the
         # YAMLs are admitted by the live API server. We only validate

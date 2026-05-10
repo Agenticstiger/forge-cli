@@ -32,7 +32,7 @@ def scaffold_dag(contract: dict, out_dir: str, project: str, region: str):
     build = get_primary_build(contract) or {}
     cron = build.get("execution", {}).get("trigger", {}).get("cron", "0 2 * * *")
     dag_id = contract.get("id", "fluid_product").replace(".", "_")
-    bash_cmd = f"python -m fluid_build.cli apply {contract.get('id','contract.fluid.yaml')} --provider gcp --project {project} --region {region}"
+    bash_cmd = f"python -m fluid_build.cli apply {contract.get('id', 'contract.fluid.yaml')} --provider gcp --project {project} --region {region}"
     code = DAG_TEMPLATE.format(dag_id=dag_id, cron=cron, bash_cmd=bash_cmd)
     p = pathlib.Path(out_dir) / f"{dag_id}.py"
     p.parent.mkdir(parents=True, exist_ok=True)

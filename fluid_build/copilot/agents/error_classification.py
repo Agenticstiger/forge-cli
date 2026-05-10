@@ -154,8 +154,7 @@ def classify_provider_error(
             )
         if status == 400 and _looks_like_context_overflow(body):
             return ContextOverflowError(
-                f"Prompt exceeds context window for provider {provider or 'unknown'}: "
-                f"{body[:200]}",
+                f"Prompt exceeds context window for provider {provider or 'unknown'}: {body[:200]}",
                 provider=provider,
                 status_code=status,
             )

@@ -322,7 +322,7 @@ class TestResolveRefsDepthLimit:
             if i == _MAX_REF_DEPTH + 1:
                 _write_yaml(tmp_path / f"file_{i}.yaml", {"leaf": "end"})
             else:
-                _write_yaml(tmp_path / f"file_{i}.yaml", {"next": {"$ref": f"./file_{i+1}.yaml"}})
+                _write_yaml(tmp_path / f"file_{i}.yaml", {"next": {"$ref": f"./file_{i + 1}.yaml"}})
 
         tree = {"start": {"$ref": "./file_0.yaml"}}
         with pytest.raises(RefResolutionError, match="depth exceeded"):

@@ -189,12 +189,22 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
         """Generate Azure DevOps pipeline"""
 
         commands = self._get_fluid_commands()
+        # Engine specs registry — per-engine pip extras + env vars,
+        # consumed by every Azure DevOps job's install + variable blocks.
+        engine_pip = self._engine_pip_install_command(config)
+        _install_cmd = (
+            f"pip install --quiet data-product-forge && {engine_pip}"
+            if engine_pip
+            else "pip install --quiet data-product-forge"
+        )
+        variables = self._get_common_environment_vars()
+        variables.update(self._engine_runtime_env_vars(config))
 
         pipeline = {
             "trigger": {"branches": {"include": ["main", "develop"]}},
             "pr": {"branches": {"include": ["main", "develop"]}},
             "pool": {"vmImage": "ubuntu-latest"},
-            "variables": self._get_common_environment_vars(),
+            "variables": variables,
             "stages": [],
         }
 
@@ -209,7 +219,7 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                     "steps": [
                         {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.12"}},
                         {
-                            "script": "pip install --quiet data-product-forge",
+                            "script": _install_cmd,
                             "displayName": "Install dependencies",
                         },
                         {"script": commands["doctor"], "displayName": "FLUID Doctor Check"},
@@ -235,7 +245,7 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                     "steps": [
                         {"task": "UsePythonVersion@0", "inputs": {"versionSpec": "3.12"}},
                         {
-                            "script": "pip install --quiet data-product-forge",
+                            "script": _install_cmd,
                             "displayName": "Install dependencies",
                         },
                         {"script": commands["test"], "displayName": "Run tests"},
@@ -435,4 +445,6 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                 "pipeline and map secret vars into step env via `env: FOO: $(FOO)`."
             ),
         )
-        return {"azure-pipelines.yml": banner + yaml.dump(pipeline, indent=2)}
+        runtime_notes = self._engine_runtime_notes(config, indent="# ")
+        notes_block = ("\n" + runtime_notes + "\n") if runtime_notes else ""
+        return {"azure-pipelines.yml": banner + notes_block + yaml.dump(pipeline, indent=2)}

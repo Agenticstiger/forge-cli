@@ -150,7 +150,7 @@ def minio_bucket_with_csv(minio_container: Dict[str, Any]) -> Dict[str, Any]:
         minio_container["secret_key"],
         bucket,
     )
-    csv_body = b"id,customer,amount\n" b"1,Alice,100.50\n" b"2,Bob,250.00\n" b"3,Carol,42.00\n"
+    csv_body = b"id,customer,amount\n1,Alice,100.50\n2,Bob,250.00\n3,Carol,42.00\n"
     _put_object_via_mc(shim, bucket, "orders.csv", csv_body)
     return {**minio_container, "bucket": bucket, "csv_key": "orders.csv"}
 

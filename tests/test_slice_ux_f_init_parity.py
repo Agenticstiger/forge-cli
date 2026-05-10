@@ -322,9 +322,9 @@ class TestTemplateModeParity:
 
         doc = yaml.safe_load(contract_path.read_text())
         assert isinstance(doc.get("metadata"), dict)
-        assert (
-            "provenance" in doc["metadata"]
-        ), "slice UX-F must inject metadata.provenance into template contracts"
+        assert "provenance" in doc["metadata"], (
+            "slice UX-F must inject metadata.provenance into template contracts"
+        )
         prov = doc["metadata"]["provenance"]
         assert prov["schema_version"] == 1
         assert prov["kind"] == "ContractMetadata"

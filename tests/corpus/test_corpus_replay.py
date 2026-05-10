@@ -56,7 +56,7 @@ def test_corpus_fixture(fixture_path: Path) -> None:
 
 def test_corpus_directory_exists():
     assert CORPUS_DIR.is_dir(), (
-        f"Expected corpus directory at {CORPUS_DIR}; v1.6 replay " "tooling requires it to exist."
+        f"Expected corpus directory at {CORPUS_DIR}; v1.6 replay tooling requires it to exist."
     )
 
 

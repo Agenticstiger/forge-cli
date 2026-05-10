@@ -838,7 +838,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     input_group.add_argument(
         "--mesh-root",
         default=".",
-        help=("Root directory for mesh-mode walk (default: cwd). Ignored " "without ``--mesh``."),
+        help=("Root directory for mesh-mode walk (default: cwd). Ignored without ``--mesh``."),
     )
 
     # Format and appearance

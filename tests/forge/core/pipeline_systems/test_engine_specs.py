@@ -55,7 +55,9 @@ class TestResolveEngineBootstrap:
         assert b.packages == ["dlt>=1.0"]
 
     def test_dlt_unknown_source_falls_back(self):
-        b = resolve_engine_bootstrap("dlt", source_kind="totally_unknown", sink_platform="snowflake")
+        b = resolve_engine_bootstrap(
+            "dlt", source_kind="totally_unknown", sink_platform="snowflake"
+        )
         # Should still produce a valid spec with just the sink extra.
         assert any(p.startswith("dlt[snowflake]") for p in b.packages)
 
@@ -76,7 +78,9 @@ class TestResolveEngineBootstrap:
         assert "meltanolabs-target-snowflake>=0.18" in b.packages
 
     def test_meltano_unknown_source_emits_note(self):
-        b = resolve_engine_bootstrap("meltano", source_kind="totally_unknown", sink_platform="snowflake")
+        b = resolve_engine_bootstrap(
+            "meltano", source_kind="totally_unknown", sink_platform="snowflake"
+        )
         assert any("totally_unknown" in n for n in b.notes)
         # Sink package should still be present.
         assert "meltanolabs-target-snowflake>=0.18" in b.packages
@@ -208,10 +212,7 @@ class TestRenderRunnerEnvVars:
     def test_arbitrary_host_value(self):
         # The helper doesn't validate the host — operators may set it
         # to bridge IPs, K8s service names, etc.
-        assert (
-            render_runner_env_vars("10.42.0.1").get("FLUID_RUNNER_HOST_OVERRIDE")
-            == "10.42.0.1"
-        )
+        assert render_runner_env_vars("10.42.0.1").get("FLUID_RUNNER_HOST_OVERRIDE") == "10.42.0.1"
 
     def test_airbyte_engine_injects_project_dir(self):
         # Engine-declared env vars come from the runtime registry.
@@ -229,9 +230,7 @@ class TestRenderRunnerEnvVars:
         assert env.get("AIRBYTE_TEMP_DIR") == "/tmp/airbyte/tmp"
 
     def test_airbyte_engine_combined_with_host_override(self):
-        env = render_runner_env_vars(
-            "host.docker.internal", engine="airbyte"
-        )
+        env = render_runner_env_vars("host.docker.internal", engine="airbyte")
         assert env == {
             "AIRBYTE_PROJECT_DIR": "/tmp/airbyte",
             "AIRBYTE_TEMP_DIR": "/tmp/airbyte/tmp",
@@ -255,9 +254,7 @@ class TestRenderRunnerEnvVars:
         # If a future engine ever sets FLUID_RUNNER_HOST_OVERRIDE in
         # its runtime spec, the operator's CLI flag should still win
         # (operator intent > engine default).
-        env = render_runner_env_vars(
-            "operator-host", engine="airbyte"
-        )
+        env = render_runner_env_vars("operator-host", engine="airbyte")
         assert env["FLUID_RUNNER_HOST_OVERRIDE"] == "operator-host"
 
 
@@ -285,6 +282,7 @@ class TestResolveEngineRuntime:
         # has to grow to match — flag it via this test.
         rt = resolve_engine_runtime("airbyte")
         from pathlib import PurePosixPath
+
         proj = PurePosixPath(rt.env_vars["AIRBYTE_PROJECT_DIR"])
         tmp = PurePosixPath(rt.env_vars["AIRBYTE_TEMP_DIR"])
         assert tmp.is_relative_to(proj), (
@@ -371,9 +369,7 @@ class TestRenderRuntimeNotes:
             assert line.startswith("# ")
 
     def test_external_services_can_be_suppressed(self):
-        s = render_runtime_notes(
-            "kafka_connect", include_external_services=False
-        )
+        s = render_runtime_notes("kafka_connect", include_external_services=False)
         assert "REQUIRES SERVICE" not in s
         # Notes still present even when service line is suppressed.
         assert "JVM" in s
@@ -417,3 +413,152 @@ def test_common_combos_produce_non_empty_install(engine, source, sink):
     assert b.packages, f"{engine}/{source}/{sink} produced no packages"
     pip_line = render_pip_install_command(b)
     assert pip_line.startswith("pip install"), pip_line
+
+
+# ── EngineRuntime registry consumed by ALL CI emitters ─────────────────
+
+
+@pytest.mark.parametrize(
+    "system_name",
+    ["github_actions", "gitlab_ci", "circle_ci", "azure_devops", "bitbucket", "tekton"],
+)
+def test_every_emitter_consumes_engine_runtime_for_airbyte(system_name):
+    """Every CI emitter (not just Jenkins) must surface engine='airbyte'
+    runtime requirements in its generated output:
+    - the AIRBYTE_TEMP_DIR env var (DinD config-mount fix)
+    - the per-engine pip extras (``airbyte>=0.20,<1``)
+    - the runtime notes mentioning ``/var/run/docker.sock``
+
+    Locks in the registry-driven design: adding a new engine to
+    ``_engine_specs.py`` automatically reaches every CI emitter.
+    """
+    from fluid_build.forge.core.pipeline_systems._base import (
+        PipelineComplexity,
+        PipelineConfig,
+        PipelineProvider,
+    )
+
+    # Lazy-import each emitter module to avoid pulling all six at module
+    # import time (each pulls yaml + pin_action machinery).
+    emitters = {
+        "github_actions": (
+            "fluid_build.forge.core.pipeline_systems.github_actions",
+            "GitHubActionsTemplate",
+        ),
+        "gitlab_ci": (
+            "fluid_build.forge.core.pipeline_systems.gitlab_ci",
+            "GitLabCITemplate",
+        ),
+        "circle_ci": (
+            "fluid_build.forge.core.pipeline_systems.circle_ci",
+            "CircleCITemplate",
+        ),
+        "azure_devops": (
+            "fluid_build.forge.core.pipeline_systems.azure_devops",
+            "AzureDevOpsTemplate",
+        ),
+        "bitbucket": (
+            "fluid_build.forge.core.pipeline_systems.bitbucket",
+            "BitbucketTemplate",
+        ),
+        "tekton": (
+            "fluid_build.forge.core.pipeline_systems.tekton",
+            "TektonTemplate",
+        ),
+    }
+    import importlib
+
+    module_path, class_name = emitters[system_name]
+    module = importlib.import_module(module_path)
+    template = getattr(module, class_name)()
+
+    cfg = PipelineConfig(
+        provider=PipelineProvider.GITHUB_ACTIONS,
+        complexity=PipelineComplexity.BASIC,
+        engine="airbyte",
+        source_kind="postgres",
+        sink_platform="snowflake",
+        runner_host_override="host.docker.internal",
+    )
+    files = template.generate(cfg)
+    # Concat all generated files so we can assert across whichever file
+    # the emitter chose to embed each piece in (Tekton splits into
+    # tasks.yaml + pipeline.yaml; others use a single file).
+    content = "\n".join(files.values())
+
+    assert "airbyte" in content.lower(), f"{system_name} did not include the airbyte pip extra"
+    assert "AIRBYTE_TEMP_DIR" in content, (
+        f"{system_name} did not surface AIRBYTE_TEMP_DIR (DinD config-mount fix)"
+    )
+    assert "/var/run/docker.sock" in content, (
+        f"{system_name} did not surface the docker.sock REQUIRES note"
+    )
+
+
+@pytest.mark.parametrize(
+    "system_name",
+    ["github_actions", "gitlab_ci", "circle_ci", "azure_devops", "bitbucket", "tekton"],
+)
+def test_every_emitter_skips_runtime_block_for_pure_python_engines(system_name):
+    """Engines without runtime requirements (dlt, meltano, dbt, duckdb)
+    must NOT pollute the generated output with empty REQUIRES blocks
+    or stray AIRBYTE env vars."""
+    import importlib
+
+    from fluid_build.forge.core.pipeline_systems._base import (
+        PipelineComplexity,
+        PipelineConfig,
+        PipelineProvider,
+    )
+
+    emitters = {
+        "github_actions": (
+            "fluid_build.forge.core.pipeline_systems.github_actions",
+            "GitHubActionsTemplate",
+        ),
+        "gitlab_ci": (
+            "fluid_build.forge.core.pipeline_systems.gitlab_ci",
+            "GitLabCITemplate",
+        ),
+        "circle_ci": (
+            "fluid_build.forge.core.pipeline_systems.circle_ci",
+            "CircleCITemplate",
+        ),
+        "azure_devops": (
+            "fluid_build.forge.core.pipeline_systems.azure_devops",
+            "AzureDevOpsTemplate",
+        ),
+        "bitbucket": (
+            "fluid_build.forge.core.pipeline_systems.bitbucket",
+            "BitbucketTemplate",
+        ),
+        "tekton": (
+            "fluid_build.forge.core.pipeline_systems.tekton",
+            "TektonTemplate",
+        ),
+    }
+    module_path, class_name = emitters[system_name]
+    module = importlib.import_module(module_path)
+    template = getattr(module, class_name)()
+
+    cfg = PipelineConfig(
+        provider=PipelineProvider.GITHUB_ACTIONS,
+        complexity=PipelineComplexity.BASIC,
+        engine="dlt",
+        source_kind="postgres",
+        sink_platform="snowflake",
+    )
+    files = template.generate(cfg)
+    content = "\n".join(files.values())
+    # dlt has no runtime requirements — assert no airbyte env-var
+    # pollution and no docker.sock note.
+    assert "AIRBYTE_TEMP_DIR" not in content, (
+        f"{system_name} leaked AIRBYTE_TEMP_DIR for engine='dlt'"
+    )
+    assert "AIRBYTE_PROJECT_DIR" not in content, (
+        f"{system_name} leaked AIRBYTE_PROJECT_DIR for engine='dlt'"
+    )
+    # But the dlt pip extras MUST be present so the engine actually works.
+    assert "dlt[" in content or "dlt>" in content, (
+        f"{system_name} did not include the dlt pip extras"
+    )

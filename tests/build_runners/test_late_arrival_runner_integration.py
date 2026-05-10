@@ -131,9 +131,9 @@ class TestKafkaConnectRunnerWiring:
         src = kc_runner.__file__
         with open(src) as f:
             text = f.read()
-        assert (
-            "extract_late_arrival_policy" in text
-        ), "kafka_connect runner must call extract_late_arrival_policy"
+        assert "extract_late_arrival_policy" in text, (
+            "kafka_connect runner must call extract_late_arrival_policy"
+        )
         assert "fluid.late_arrival" in text or "late_arrival_policy" in text
 
 
@@ -144,9 +144,9 @@ class TestDebeziumRunnerWiring:
         src = dbz_runner.__file__
         with open(src) as f:
             text = f.read()
-        assert (
-            "extract_late_arrival_policy" in text
-        ), "debezium runner must call extract_late_arrival_policy"
+        assert "extract_late_arrival_policy" in text, (
+            "debezium runner must call extract_late_arrival_policy"
+        )
         assert "late_arrival_policy" in text
 
 

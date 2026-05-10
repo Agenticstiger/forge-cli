@@ -438,7 +438,15 @@ def run(args, logger: logging.Logger) -> int:
 
             cprint("Engines recognised by ``fluid generate ci`` bootstrap:", markup=False)
             cprint("", markup=False)
-            for engine in ("dlt", "airbyte", "meltano", "dbt", "duckdb", "debezium", "kafka_connect"):
+            for engine in (
+                "dlt",
+                "airbyte",
+                "meltano",
+                "dbt",
+                "duckdb",
+                "debezium",
+                "kafka_connect",
+            ):
                 cprint(f"  {engine}:", markup=False)
                 if engine == "dlt":
                     cprint(

@@ -154,7 +154,7 @@ class TestLocalProviderEndToEnd:
             cwd=workspace,
         )
         assert result.returncode == 0, (
-            f"plan exited {result.returncode}\n" f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            f"plan exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
         )
         assert plan_out.exists(), "plan should produce an output file"
 
@@ -165,8 +165,7 @@ class TestLocalProviderEndToEnd:
             cwd=workspace,
         )
         assert result.returncode == 0, (
-            f"validate exited {result.returncode}\n"
-            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            f"validate exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
         )
 
 

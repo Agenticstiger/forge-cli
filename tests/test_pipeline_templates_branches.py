@@ -464,9 +464,9 @@ class TestJenkinsTemplateHardening:
     def test_no_workdir_produces_no_cd_wrapper(self):
         content = self._jenkinsfile()
         # Without workdir, commands should not have a `cd "..." &&` prefix.
-        assert (
-            'cd "' not in content
-        ), "Jenkinsfile should not contain cd wrappers when workdir is unset"
+        assert 'cd "' not in content, (
+            "Jenkinsfile should not contain cd wrappers when workdir is unset"
+        )
 
     def test_workdir_wraps_every_fluid_command(self):
         content = self._jenkinsfile(workdir="examples/demo")
@@ -530,9 +530,9 @@ class TestJenkinsTemplateHardening:
         archive_lines = [line for line in content.splitlines() if "archiveArtifacts" in line]
         assert archive_lines, "expected at least one archiveArtifacts line"
         for line in archive_lines:
-            assert (
-                "allowEmptyArchive: true" in line
-            ), f"archiveArtifacts without allowEmptyArchive breaks reference-only builds: {line}"
+            assert "allowEmptyArchive: true" in line, (
+                f"archiveArtifacts without allowEmptyArchive breaks reference-only builds: {line}"
+            )
 
     # Other hardening fixes --------------------------------------------
 
@@ -1276,7 +1276,7 @@ class TestElevenStagePortsAllSystems:
         ]
         missing = [v for v in verbs if v not in content]
         assert not missing, (
-            f"{name} emit is missing stage(s): {missing!r}. " f"Output files: {list(out.keys())}"
+            f"{name} emit is missing stage(s): {missing!r}. Output files: {list(out.keys())}"
         )
 
     @pytest.mark.parametrize("name,cls,provider,fname", SYSTEMS)
@@ -1306,9 +1306,9 @@ class TestElevenStagePortsAllSystems:
             # Case-insensitive + underscore-or-hyphen tolerant: Tekton
             # converts RUN_STAGE_1_BUNDLE → run-stage-1-bundle.
             toggles = [f"RUN_STAGE_{n}_", f"run_stage_{n}_", f"run-stage-{n}-"]
-            assert any(
-                t in content for t in toggles
-            ), f"{name} emit is missing stage-{n} toggle (tried {toggles!r})"
+            assert any(t in content for t in toggles), (
+                f"{name} emit is missing stage-{n} toggle (tried {toggles!r})"
+            )
 
     # -----------------------------------------------------------------
     # 3. Install setup — every emit carries the install-mode body
@@ -1362,9 +1362,9 @@ class TestElevenStagePortsAllSystems:
             "SCHEDULER",
             "scheduler",
         ]
-        assert any(
-            r in content for r in scheduler_refs
-        ), f"{name}: SCHEDULER param not referenced anywhere in emit"
+        assert any(r in content for r in scheduler_refs), (
+            f"{name}: SCHEDULER param not referenced anywhere in emit"
+        )
 
     # -----------------------------------------------------------------
     # 6. Parameters come from the shared list (no drift between systems)
@@ -1391,9 +1391,9 @@ class TestElevenStagePortsAllSystems:
             "SCHEDULER_DESTINATION",
         ]:
             variants = [param, param.lower(), param.lower().replace("_", "-")]
-            assert any(
-                v in content for v in variants
-            ), f"{name}: parameter {param!r} (or case variants) not declared"
+            assert any(v in content for v in variants), (
+                f"{name}: parameter {param!r} (or case variants) not declared"
+            )
 
     # -----------------------------------------------------------------
     # 7. Reference-only contracts skip stage 3 (generate artifacts)

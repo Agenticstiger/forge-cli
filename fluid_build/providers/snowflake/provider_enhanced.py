@@ -190,9 +190,7 @@ class SnowflakeProviderEnhanced(BaseProvider):
                 backup=backup,
             )
             return []
-        return [
-            f"CREATE OR REPLACE TABLE {db_v}.{sch_v}.{tbl_v} " f"CLONE {db_v}.{sch_v}.{backup_v}"
-        ]
+        return [f"CREATE OR REPLACE TABLE {db_v}.{sch_v}.{tbl_v} CLONE {db_v}.{sch_v}.{backup_v}"]
 
     def cleanup_backups(self, snapshots: List[Mapping[str, Any]]) -> None:
         """Drop Snowflake backup tables for snapshots aged out of state.
@@ -730,11 +728,7 @@ class SnowflakeProviderEnhanced(BaseProvider):
                                             if c.get("description")
                                             else {}
                                         ),
-                                        **(
-                                            {"labels": c["labels"]}
-                                            if c.get("labels")
-                                            else {}
-                                        ),
+                                        **({"labels": c["labels"]} if c.get("labels") else {}),
                                     }
                                     for c in cols
                                     if isinstance(c, dict) and c.get("name")

@@ -154,7 +154,7 @@ def build_connector_config(
             {
                 "mongodb.connection.string": connection.get(
                     "connection_string",
-                    f"mongodb://{connection.get('host','localhost')}:{connection.get('port',27017)}",
+                    f"mongodb://{connection.get('host', 'localhost')}:{connection.get('port', 27017)}",
                 ),
                 "mongodb.user": connection.get("user", ""),
                 "mongodb.password": connection.get("password", ""),

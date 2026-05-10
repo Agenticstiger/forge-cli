@@ -156,9 +156,9 @@ def test_prior_similar_models_injected_when_semantic_memory_populated(tmp_path) 
 
     assert len(captured) == 1
     payload = json.loads(captured[0]["user_prompt"])
-    assert (
-        "prior_similar_models" in payload
-    ), "ModelerAgent must inject prior_similar_models when memory/semantic is non-empty"
+    assert "prior_similar_models" in payload, (
+        "ModelerAgent must inject prior_similar_models when memory/semantic is non-empty"
+    )
     hits = payload["prior_similar_models"]
     # At least one hit, no more than the documented cap of 3.
     assert 1 <= len(hits) <= ModelerAgent._SEMANTIC_RETRIEVAL_LIMIT
@@ -188,9 +188,9 @@ def test_retail_intent_ranks_retail_prior_first(tmp_path) -> None:
     agent._llm_from_intent(session, intent=_simple_intent(), technique="dimensional")
 
     hits = json.loads(captured[0]["user_prompt"])["prior_similar_models"]
-    assert (
-        hits[0]["key"] == "prior_retail_loyalty"
-    ), f"expected retail prior ranked first for a retail intent; got {hits[0]['key']}"
+    assert hits[0]["key"] == "prior_retail_loyalty", (
+        f"expected retail prior ranked first for a retail intent; got {hits[0]['key']}"
+    )
 
 
 # ---------------------------------------------------------------------------

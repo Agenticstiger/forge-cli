@@ -281,7 +281,7 @@ class ResourceValidator:
             # Validate individual action
             errors = self.validate_action(action)
             for error in errors:
-                all_errors.append(f"Action {i+1}: {error}")
+                all_errors.append(f"Action {i + 1}: {error}")
 
             # Count resources
             op = action.get("op", "")

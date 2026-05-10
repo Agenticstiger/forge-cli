@@ -422,6 +422,64 @@ class BasePipelineTemplate:
             "PIP_CACHE_DIR": ".pip-cache",
         }
 
+    # ── EngineRuntime registry integration (used by ALL CI emitters) ──
+    #
+    # The three helpers below pull the per-engine bootstrap + runtime
+    # facts from ``_engine_specs`` so each subclass (github_actions,
+    # gitlab_ci, circle_ci, azure_devops, bitbucket, tekton, jenkins)
+    # can consume them in its native dialect without re-implementing
+    # the engine→pip / engine→env-var dispatch logic. Adding a new
+    # engine means one entry in ``_engine_specs.py`` and EVERY CI
+    # emitter picks it up automatically.
+
+    def _engine_pip_install_command(self, config: "PipelineConfig") -> str:
+        """One-line ``pip install <engine extras>`` command, or "" if none.
+
+        Returns the empty string when the contract has no engine declared
+        OR the registry has no extras for the (engine, source, sink)
+        combo. Caller can splice the result into a shell step body and
+        skip the step cleanly when empty.
+        """
+        # Lazy import to avoid a startup-time cycle.
+        from ._engine_specs import (
+            render_pip_install_command,
+            resolve_engine_bootstrap,
+        )
+
+        bootstrap = resolve_engine_bootstrap(
+            getattr(config, "engine", None),
+            source_kind=getattr(config, "source_kind", None),
+            sink_platform=getattr(config, "sink_platform", None),
+        )
+        return render_pip_install_command(bootstrap)
+
+    def _engine_runtime_env_vars(self, config: "PipelineConfig") -> Dict[str, str]:
+        """Per-engine env vars (e.g. AIRBYTE_PROJECT_DIR for engine='airbyte').
+
+        Returns ``{}`` when the engine has no exec-time env-var needs
+        (dlt, meltano, dbt, duckdb) so callers can skip cleanly.
+        """
+        from ._engine_specs import render_runner_env_vars
+
+        return render_runner_env_vars(
+            runner_host_override=getattr(config, "runner_host_override", "") or "",
+            engine=getattr(config, "engine", None),
+        )
+
+    def _engine_runtime_notes(self, config: "PipelineConfig", *, indent: str = "# ") -> str:
+        """Operator-facing runtime notes (REQUIRES: …) as comment lines.
+
+        Default ``indent='# '`` matches YAML / HCL / shell conventions
+        used by every CI system except Jenkins (which overrides with
+        ``// ``). Returns ``""`` for engines with no runtime needs.
+        """
+        from ._engine_specs import render_runtime_notes
+
+        return render_runtime_notes(
+            getattr(config, "engine", None),
+            indent=indent,
+        )
+
     def _security_audit_block(self, complexity: "PipelineComplexity") -> Dict[str, Any]:
         """Return a CI-system-agnostic security + compliance audit payload.
 
@@ -674,7 +732,7 @@ class BasePipelineTemplate:
                 display="validate",
                 toggle_param="RUN_STAGE_2_VALIDATE",
                 default_run=True,
-                command=('fluid validate "${CONTRACT:-contract.fluid.yaml}" ' "--strict"),
+                command=('fluid validate "${CONTRACT:-contract.fluid.yaml}" --strict'),
             ),
             StageSpec(
                 num=3,

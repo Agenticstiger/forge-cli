@@ -752,9 +752,7 @@ def register(subparsers: argparse._SubParsersAction):
     init_parser.add_argument("--owner", help="Workspace owner")
 
     # Show workspace info
-    _info_parser = workspace_subparsers.add_parser(
-        "info", help="Show workspace information"
-    )  # noqa: F841
+    _info_parser = workspace_subparsers.add_parser("info", help="Show workspace information")  # noqa: F841
 
     # Team management
     team_parser = workspace_subparsers.add_parser("team", help="Manage team members")
@@ -888,16 +886,16 @@ def handle_workspace_info(args, workspace_manager: WorkspaceManager, logger: log
 [bold]Name:[/bold] {config.name}
 [bold]Description:[/bold] {config.description}
 [bold]Owner:[/bold] {config.owner}
-[bold]Created:[/bold] {config.created_at.strftime('%Y-%m-%d %H:%M')}
+[bold]Created:[/bold] {config.created_at.strftime("%Y-%m-%d %H:%M")}
 
 [bold]Team Members:[/bold] {team_count}
 [bold]Contract Versions:[/bold] {versions_count}
 [bold]Open Change Requests:[/bold] {open_changes}
 
 [bold]Settings:[/bold]
-• Auto Backup: {'✅' if config.settings.get('auto_backup') else '❌'}
-• Require Reviews: {'✅' if config.settings.get('require_reviews') else '❌'}
-• Approval Threshold: {config.settings.get('approval_threshold', 1)}
+• Auto Backup: {"✅" if config.settings.get("auto_backup") else "❌"}
+• Require Reviews: {"✅" if config.settings.get("require_reviews") else "❌"}
+• Approval Threshold: {config.settings.get("approval_threshold", 1)}
     """
 
     console.print(Panel(info_text.strip(), title="Workspace Information", border_style="blue"))

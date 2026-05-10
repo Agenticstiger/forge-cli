@@ -181,7 +181,7 @@ def test_auth_kind_emits_correct_header(tmp_path, auth_kind, expected_header_mar
     _result, written = _generate(tmp_path, name=f"src_{auth_kind}", auth_kind=auth_kind)
     body = written.read_text(encoding="utf-8")
     assert expected_header_marker in body, (
-        f"auth_kind={auth_kind!r} body missing {expected_header_marker!r}: " f"{body[:300]}"
+        f"auth_kind={auth_kind!r} body missing {expected_header_marker!r}: {body[:300]}"
     )
 
 

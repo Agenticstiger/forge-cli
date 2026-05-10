@@ -191,8 +191,10 @@ _QUESTIONS: Tuple[Question, ...] = (
         example="daily Stripe pricing snapshots loaded into Snowflake for trading desk",
         required=True,
         when_to_skip=lambda ctx, sig: _has(ctx, "project_goal"),
-        auto_default=lambda _ctx, sig: "AI-generated FLUID data product"
-        + (f" in the {sig.domain} domain" if sig.domain else ""),
+        auto_default=lambda _ctx, sig: (
+            "AI-generated FLUID data product"
+            + (f" in the {sig.domain} domain" if sig.domain else "")
+        ),
     ),
     Question(
         key="data_product_type",
@@ -202,9 +204,9 @@ _QUESTIONS: Tuple[Question, ...] = (
         example="SDP for ingestion · ADP if composing from upstreams",
         when_to_skip=lambda ctx, sig: _has(ctx, "data_product_type") or _has(ctx, "productType"),
         infer=_question_data_product_type,
-        auto_default=lambda _ctx, sig: sig.workspace_lock
-        or sig.suggested_data_product_type
-        or "SDP",
+        auto_default=lambda _ctx, sig: (
+            sig.workspace_lock or sig.suggested_data_product_type or "SDP"
+        ),
     ),
     Question(
         key="domain",
@@ -229,10 +231,10 @@ _QUESTIONS: Tuple[Question, ...] = (
         schema_field="$.builds[].properties.source / $.consumes[]",
         prompt="What data sources? (paste a URI, table name, or 'none' if "
         "they're already in this workspace)",
-        example="https://api.stripe.com/v1/prices · postgres://db/orders · " "data/orders.csv",
-        when_to_skip=lambda ctx, sig: _has(ctx, "data_sources")
-        or sig.existing_products >= 1
-        or bool(sig.sample_files),
+        example="https://api.stripe.com/v1/prices · postgres://db/orders · data/orders.csv",
+        when_to_skip=lambda ctx, sig: (
+            _has(ctx, "data_sources") or sig.existing_products >= 1 or bool(sig.sample_files)
+        ),
         infer=_question_data_sources,
         auto_default=lambda _ctx, sig: (
             ", ".join(sig.sample_files[:2]) if sig.sample_files else "tbd"

@@ -246,7 +246,9 @@ class TestCatalogFreshness:
         provider = (
             "anthropic"
             if model.startswith("claude")
-            else "gemini" if model.startswith("gemini") else "openai"
+            else "gemini"
+            if model.startswith("gemini")
+            else "openai"
         )
         caps = assess_capabilities(provider, model)
         assert caps.model_prefix == expected_prefix
@@ -309,7 +311,7 @@ class TestOllamaCatalogCoverage:
     ) -> None:
         caps = assess_capabilities("ollama", model)
         assert caps.model_prefix == expected_prefix, (
-            f"expected prefix {expected_prefix!r} for {model!r}, " f"got {caps.model_prefix!r}"
+            f"expected prefix {expected_prefix!r} for {model!r}, got {caps.model_prefix!r}"
         )
         assert caps.tool_use is expected_tool_use
         # Every catalogued Ollama entry should advertise streaming.
@@ -338,5 +340,5 @@ class TestOllamaCatalogCoverage:
         # window, not the conservative 32K fallback.
         window = get_context_window(model)
         assert window >= minimum_window, (
-            f"{model} resolved to {window:,}-token window; " f"expected at least {minimum_window:,}"
+            f"{model} resolved to {window:,}-token window; expected at least {minimum_window:,}"
         )

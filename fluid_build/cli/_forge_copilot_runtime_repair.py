@@ -344,7 +344,7 @@ def validate_and_repair(
         # have one matcher.
         raise CopilotGenerationError(
             "validate_and_repair_no_llm",
-            "Contract failed schema validation and no LlmConfig was " "provided for repair.",
+            "Contract failed schema validation and no LlmConfig was provided for repair.",
             suggestions=[
                 "Pass an llm=LlmConfig(...) to validate_and_repair to "
                 "enable the self-healing repair loop.",
@@ -422,7 +422,7 @@ def validate_and_repair(
             attempt_log.append(f"attempt {attempt}/{max_attempts} repaired clean")
             return work, attempt_log
         attempt_log.append(
-            f"attempt {attempt}/{max_attempts} still invalid: " f"{len(errors)} error(s)"
+            f"attempt {attempt}/{max_attempts} still invalid: {len(errors)} error(s)"
         )
         last_errors = errors
 

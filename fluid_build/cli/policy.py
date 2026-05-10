@@ -212,8 +212,7 @@ def _render_policy_guide() -> int:
         SubcommandEntry(
             name="apply",
             description=(
-                "Deploy compiled IAM bindings to the warehouse "
-                "(stage 8 of the 11-stage pipeline)."
+                "Deploy compiled IAM bindings to the warehouse (stage 8 of the 11-stage pipeline)."
             ),
             example="fluid policy apply bindings.json --mode check",
         ),

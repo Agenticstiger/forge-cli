@@ -434,9 +434,7 @@ def invoke_target(
     for stream, schema_msg in schemas.items():
         lines.append(json.dumps(schema_msg))
         for record in records.get(stream, []):
-            lines.append(
-                json.dumps({"type": "RECORD", "stream": stream, "record": record})
-            )
+            lines.append(json.dumps({"type": "RECORD", "stream": stream, "record": record}))
     if state is not None:
         lines.append(json.dumps({"type": "STATE", "value": state}))
     singer_input = "\n".join(lines) + ("\n" if lines else "")
@@ -734,10 +732,12 @@ def _execute(ctx: RunContext, runner: MeltanoRunner) -> RunResult:
     sink_format = (binding.get("format") or "").lower()
     dataset = meltano_props.get("dataset_name") or "bronze"
 
-    use_singer_target = (
-        sink_platform in ("snowflake", "bigquery", "redshift", "postgres")
-        or sink_format.startswith(tuple(["snowflake_", "bigquery_", "redshift_", "postgres_"]))
-    )
+    use_singer_target = sink_platform in (
+        "snowflake",
+        "bigquery",
+        "redshift",
+        "postgres",
+    ) or sink_format.startswith(tuple(["snowflake_", "bigquery_", "redshift_", "postgres_"]))
 
     if use_singer_target:
         # Resolve target binary (operator may pin via properties.meltano.target,
@@ -758,13 +758,16 @@ def _execute(ctx: RunContext, runner: MeltanoRunner) -> RunResult:
         from .._credentials import make_destination
         from . import destinations  # noqa: F401  (registration side-effect)
 
-        target_config = make_destination(
-            "meltano",
-            sink_platform,
-            binding=binding,
-            contract=ctx.contract,
-            product_id=ctx.product_id,
-        ) or {}
+        target_config = (
+            make_destination(
+                "meltano",
+                sink_platform,
+                binding=binding,
+                contract=ctx.contract,
+                product_id=ctx.product_id,
+            )
+            or {}
+        )
         # Merge any contract-author-specified extra config (rare; lets a
         # contract pin ``add_record_metadata: true`` etc. without forcing
         # an env var).

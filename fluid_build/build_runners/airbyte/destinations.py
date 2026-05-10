@@ -146,7 +146,8 @@ def _airbyte_introspect(
                 name
                 for name, param in sig.parameters.items()
                 if name not in ("self", "args", "kwargs")
-                and param.kind not in (
+                and param.kind
+                not in (
                     inspect.Parameter.VAR_POSITIONAL,
                     inspect.Parameter.VAR_KEYWORD,
                 )
@@ -168,8 +169,11 @@ def _airbyte_introspect(
             "PyAirbyte %s construction failed (likely missing required field): %s. "
             "Resolved kwargs were: %s. Check FLUID env vars or "
             "binding.location overrides.",
-            cache_cls_name, exc,
-            {k: ("<<set>>" if "key" in k or "secret" in k or "password" in k else v)
-             for k, v in kwargs.items()},
+            cache_cls_name,
+            exc,
+            {
+                k: ("<<set>>" if "key" in k or "secret" in k or "password" in k else v)
+                for k, v in kwargs.items()
+            },
         )
         return None

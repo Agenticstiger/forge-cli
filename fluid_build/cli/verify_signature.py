@@ -131,7 +131,7 @@ def run(args: argparse.Namespace, _logger: Optional[logging.Logger] = None) -> i
         raise CLIError(
             2,
             "verify_signature_cosign_missing",
-            {"hint": ("install cosign from " "https://docs.sigstore.dev/cosign/installation/")},
+            {"hint": ("install cosign from https://docs.sigstore.dev/cosign/installation/")},
         )
 
     key_ref = getattr(args, "key", None)

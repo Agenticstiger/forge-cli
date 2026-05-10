@@ -228,7 +228,7 @@ def register_provider(
     cname = _normalize_name(name)
     if not _is_valid_name(cname):
         raise ValueError(
-            f"Invalid provider name '{name}'. " "Use lowercase letters, digits or underscore."
+            f"Invalid provider name '{name}'. Use lowercase letters, digits or underscore."
         )
     if cname in _BANNED_NAMES:
         _safe_log(
@@ -292,7 +292,7 @@ def get_provider(name: str) -> Any:
     cname = _normalize_name(name)
     with _LOCK:
         if cname not in PROVIDERS:
-            raise KeyError(f"Unknown provider '{name}'. " f"Available: {sorted(PROVIDERS.keys())}")
+            raise KeyError(f"Unknown provider '{name}'. Available: {sorted(PROVIDERS.keys())}")
         return PROVIDERS[cname]
 
 

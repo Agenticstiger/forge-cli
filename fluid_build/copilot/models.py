@@ -187,7 +187,7 @@ def default_model_for(
     Returns ``fallback`` (default ``None``) when the provider isn't
     in the registry.
     """
-    env_key = f"FLUID_LLM_DEFAULT_MODEL_{provider.upper().replace('-', '_')}_" f"{role.upper()}"
+    env_key = f"FLUID_LLM_DEFAULT_MODEL_{provider.upper().replace('-', '_')}_{role.upper()}"
     override = os.environ.get(env_key)
     if override:
         return override

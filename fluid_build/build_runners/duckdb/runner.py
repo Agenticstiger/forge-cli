@@ -679,8 +679,7 @@ def _enforce_late_arrival_split(
             quoted_main = quote_string_literal(str(main_path_obj))
             quoted_late = quote_string_literal(str(late_path_obj))
             con.execute(
-                f"CREATE OR REPLACE TABLE __la_main AS "
-                f"SELECT * FROM {reader_func}({quoted_main})"
+                f"CREATE OR REPLACE TABLE __la_main AS SELECT * FROM {reader_func}({quoted_main})"
             )
 
             try:
@@ -711,7 +710,7 @@ def _enforce_late_arrival_split(
             con.execute(f"COPY __la_side TO {quoted_late} ({writer_func})")
             results[stream_name] = counts
             LOG.info(
-                "late_arrival_split: stream=%s on_time=%d late=%d " "side_output=%s",
+                "late_arrival_split: stream=%s on_time=%d late=%d side_output=%s",
                 stream_name,
                 counts["on_time"],
                 counts["late"],

@@ -123,7 +123,7 @@ _DLT_SOURCE_EXTRAS: Dict[str, List[str]] = {
     "gcs": ["filesystem"],
     "azure-blob": ["filesystem"],
     "filesystem": ["filesystem"],
-    "rest": [],   # rest_api source ships in dlt core, no extra needed
+    "rest": [],  # rest_api source ships in dlt core, no extra needed
     "api": [],
     "kafka": [],  # dlt has no first-party Kafka source — operator wires custom
 }
@@ -302,9 +302,7 @@ def _resolve_dlt(source_kind: Optional[str], sink_platform: Optional[str]) -> En
     return EngineBootstrap(packages=packages)
 
 
-def _resolve_meltano(
-    source_kind: Optional[str], sink_platform: Optional[str]
-) -> EngineBootstrap:
+def _resolve_meltano(source_kind: Optional[str], sink_platform: Optional[str]) -> EngineBootstrap:
     packages: List[str] = []
     notes: List[str] = []
     if source_kind:
@@ -547,12 +545,8 @@ def render_bootstrap_shell_section(
     lines: List[str] = []
 
     if include_pydantic_settings:
-        lines.append(
-            f"{indent}# forge-cli hard-dep — required by the credential introspector."
-        )
-        lines.append(
-            f'{indent}{pip_executable} install --quiet "pydantic-settings>=2.0,<3"'
-        )
+        lines.append(f"{indent}# forge-cli hard-dep — required by the credential introspector.")
+        lines.append(f'{indent}{pip_executable} install --quiet "pydantic-settings>=2.0,<3"')
 
     if bootstrap.notes:
         for note in bootstrap.notes:

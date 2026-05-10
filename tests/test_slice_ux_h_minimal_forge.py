@@ -356,9 +356,9 @@ class TestScaffoldOptIn:
 
                 run_ai_copilot_mode(args, logger)
 
-        assert (
-            mock_scaffold_data.called
-        ), "_scaffold_data_folder must still run when --scaffold is set"
+        assert mock_scaffold_data.called, (
+            "_scaffold_data_folder must still run when --scaffold is set"
+        )
 
     def test_minimal_path_does_not_run_scaffold_data_folder(self, tmp_path: Path):
         """Mirror test: the minimal (default) path must NOT call
@@ -478,7 +478,7 @@ class TestEnginePipelineShim:
         from fluid_build.forge.core.engine import ForgeEngine
 
         assert hasattr(ForgeEngine, "_generate_pipeline_files_legacy"), (
-            "slice UX-H must preserve the pre-UX-H body under " "_generate_pipeline_files_legacy"
+            "slice UX-H must preserve the pre-UX-H body under _generate_pipeline_files_legacy"
         )
         assert callable(ForgeEngine._generate_pipeline_files_legacy)
 

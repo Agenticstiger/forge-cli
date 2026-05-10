@@ -414,9 +414,9 @@ def test_streaming_preview_skipped_via_env_var(tmp_path, monkeypatch):
     ):
         run_world_class_bootstrap(state=state, console=None, target_dir=tmp_path)
 
-    assert (
-        streaming_render_calls["count"] == 0
-    ), "Streaming preview must respect FLUID_FORGE_NO_STREAMING_PREVIEW"
+    assert streaming_render_calls["count"] == 0, (
+        "Streaming preview must respect FLUID_FORGE_NO_STREAMING_PREVIEW"
+    )
 
 
 def test_world_class_not_invoked_in_compose_mode():

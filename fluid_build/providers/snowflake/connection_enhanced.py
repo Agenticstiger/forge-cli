@@ -461,6 +461,8 @@ class ConnectionPool:
             "status": (
                 "healthy"
                 if health_ratio >= 0.8
-                else "degraded" if health_ratio >= 0.5 else "unhealthy"
+                else "degraded"
+                if health_ratio >= 0.5
+                else "unhealthy"
             ),
         }

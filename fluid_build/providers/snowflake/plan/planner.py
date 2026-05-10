@@ -495,8 +495,7 @@ def _emit_named_masking_policy_actions(
             "account": account,
             "database": database,
             "sql": (
-                f"CREATE OR REPLACE MASKING POLICY {safe_name} "
-                f"AS {safe_signature} -> {safe_body}"
+                f"CREATE OR REPLACE MASKING POLICY {safe_name} AS {safe_signature} -> {safe_body}"
             ),
             "comment": policy.get("comment") or f"Masking policy {safe_name}",
         }
@@ -524,7 +523,7 @@ def _emit_row_access_application_actions(
     except ValueError as exc:
         if logger is not None:
             logger.warning(
-                "snowflake_row_access_application_skipped " "table=%r policy=%r error=%s",
+                "snowflake_row_access_application_skipped table=%r policy=%r error=%s",
                 table,
                 policy_name,
                 exc,
@@ -570,7 +569,7 @@ def _emit_masking_application_actions(
     except ValueError as exc:
         if logger is not None:
             logger.warning(
-                "snowflake_masking_application_skipped " "table=%r column=%r policy=%r error=%s",
+                "snowflake_masking_application_skipped table=%r column=%r policy=%r error=%s",
                 table,
                 column,
                 policy_name,
@@ -1148,5 +1147,3 @@ def _plan_schedule(
                 )
 
     return actions
-
-

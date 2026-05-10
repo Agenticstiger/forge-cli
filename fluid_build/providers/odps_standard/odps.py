@@ -376,9 +376,7 @@ class OdpsStandardProvider(BaseProvider):
                 continue
             seen_names.add(name)
             contract_id = (
-                canonical.get("contract_id")
-                or canonical.get("reference")
-                or canonical.get("name")
+                canonical.get("contract_id") or canonical.get("reference") or canonical.get("name")
             )
             port: Dict[str, Any] = {
                 "name": name,

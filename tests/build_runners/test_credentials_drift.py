@@ -104,7 +104,8 @@ def _pyairbyte_cache_params(platform: str) -> set:
         name
         for name, param in sig.parameters.items()
         if name not in ("self", "args", "kwargs")
-        and param.kind not in (
+        and param.kind
+        not in (
             inspect.Parameter.VAR_POSITIONAL,
             inspect.Parameter.VAR_KEYWORD,
         )
@@ -114,12 +115,8 @@ def _pyairbyte_cache_params(platform: str) -> set:
 # ── dlt drift ───────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    "platform,fluid_name,dlt_name", list(_flatten(_FLUID_TO_DLT_FIELD))
-)
-def test_dlt_alias_target_exists_in_sdk(
-    platform: str, fluid_name: str, dlt_name: str
-):
+@pytest.mark.parametrize("platform,fluid_name,dlt_name", list(_flatten(_FLUID_TO_DLT_FIELD)))
+def test_dlt_alias_target_exists_in_sdk(platform: str, fluid_name: str, dlt_name: str):
     """Every (platform, fluid → dlt) alias must point at a real dlt field.
 
     Silent drift here = production-run "missing credential" errors that

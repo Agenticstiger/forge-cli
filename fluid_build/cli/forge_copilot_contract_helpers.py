@@ -498,9 +498,9 @@ def _build_semantics_from_interview_summary(
     entities = [{"name": entity_name, "type": "primary"}]
     if entity_expr:
         entities[0]["expr"] = entity_expr
-        entities[0][
-            "description"
-        ] = f"Canonical {entity_name} entity mapped from {source_entity_name}."
+        entities[0]["description"] = (
+            f"Canonical {entity_name} entity mapped from {source_entity_name}."
+        )
     measures = []
     metrics = []
     for measure_name in measure_names:

@@ -145,9 +145,9 @@ class TestSafeAttr:
         sample = "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.x"
         masked = tracing._safe_attr(sample)
         assert "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.x" not in masked
-        assert (
-            "REDACTED" in masked or "***" in masked
-        ), f"expected some redaction marker in masked={masked!r}"
+        assert "REDACTED" in masked or "***" in masked, (
+            f"expected some redaction marker in masked={masked!r}"
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -279,7 +279,7 @@ class TestSpanEmission:
         @tracing.traced_stage("apply")
         def fn(args):
             raise RuntimeError(
-                "connection failed: Bearer " "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.leak"
+                "connection failed: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.leak"
             )
 
         with pytest.raises(RuntimeError):

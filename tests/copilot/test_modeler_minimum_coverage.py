@@ -116,9 +116,9 @@ class TestEnsureMinimumCoverage:
     # ------------------------------------------------------------------
     def test_vacuous_dimensional_is_backfilled_from_skeleton(self, tmp_path: Path):
         pack = IndustryPackCompiler().compile("retail", technique="dimensional")
-        assert (
-            pack.seed_dimensional_skeleton is not None
-        ), "retail pack must carry a dimensional skeleton — fixture precondition"
+        assert pack.seed_dimensional_skeleton is not None, (
+            "retail pack must carry a dimensional skeleton — fixture precondition"
+        )
         result = _vacuous_logical("dimensional", name="retail_sales")
         session = _session_with_pack(pack, tmp_path)
 
@@ -138,9 +138,9 @@ class TestEnsureMinimumCoverage:
     # ------------------------------------------------------------------
     def test_vacuous_dv2_is_backfilled_from_skeleton(self, tmp_path: Path):
         pack = IndustryPackCompiler().compile("telecommunications", technique="data_vault_2")
-        assert (
-            pack.seed_dv2_skeleton is not None
-        ), "telco pack must carry a DV2 skeleton — fixture precondition"
+        assert pack.seed_dv2_skeleton is not None, (
+            "telco pack must carry a DV2 skeleton — fixture precondition"
+        )
         result = _vacuous_logical("data_vault_2", name="telco_subs")
         session = _session_with_pack(pack, tmp_path)
 

@@ -251,8 +251,7 @@ def migrate_legacy_to_unified(
     target = target_path or unified_config_path()
     if target.exists() and not overwrite:
         raise FileExistsError(
-            f"{target} already exists. Pass overwrite=True to replace it, "
-            "or delete the file first."
+            f"{target} already exists. Pass overwrite=True to replace it, or delete the file first."
         )
 
     legacy = _legacy_paths()

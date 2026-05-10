@@ -303,7 +303,7 @@ def _normalize_supported_data_product_types(raw: Any, *, spec_name: str) -> List
     for item in raw:
         if not isinstance(item, str) or not item.strip():
             raise AgentSpecError(
-                f"{spec_name}: supported_data_product_types entries must be " "non-empty strings."
+                f"{spec_name}: supported_data_product_types entries must be non-empty strings."
             )
         pt = get_product_type(item)
         if pt is None:

@@ -65,9 +65,9 @@ def discover_and_run_tests() -> Dict[str, Any]:
             print(f"⚠️  Test file not found: {pattern}")
             continue
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Running tests from: {pattern}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # Load and run tests from the specific file
         loader = unittest.TestLoader()
@@ -126,9 +126,9 @@ def run_specific_test_modules() -> Dict[str, Any]:
     ]
 
     for module_name, test_function in test_modules:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Running: {module_name}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         try:
             start_time = time.time()
@@ -160,9 +160,9 @@ def run_specific_test_modules() -> Dict[str, Any]:
 
 def print_summary(results: Dict[str, Any]) -> bool:
     """Print comprehensive test summary."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("FLUID Build CLI Test Suite - Comprehensive Summary")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     total_tests = 0
     total_failures = 0
@@ -211,7 +211,7 @@ def print_summary(results: Dict[str, Any]) -> bool:
 
     # Print module-by-module results
     print(f"\n{'Module Results:':<40} {'Status':<10} {'Details'}")
-    print(f"{'-'*70}")
+    print(f"{'-' * 70}")
 
     for module_name, result in results.items():
         if isinstance(result, dict):
@@ -235,7 +235,7 @@ def print_summary(results: Dict[str, Any]) -> bool:
     # Print failure details if any
     if total_failures > 0 or total_errors > 0:
         print(f"\n{'Failure and Error Details:'}")
-        print(f"{'-'*70}")
+        print(f"{'-' * 70}")
 
         for module_name, result in results.items():
             if isinstance(result, dict) and (
@@ -265,7 +265,7 @@ def print_summary(results: Dict[str, Any]) -> bool:
         successful_modules == len(results) and total_failures == 0 and total_errors == 0
     )
 
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     if overall_success:
         print("🎉 ALL TESTS PASSED! CLI Test Suite Complete")
         print(f"   Total: {total_tests} tests across {len(results)} modules")
@@ -280,7 +280,7 @@ def print_summary(results: Dict[str, Any]) -> bool:
             success_rate = (total_tests - total_failures - total_errors) / total_tests * 100
             print(f"   Success Rate: {success_rate:.1f}%")
 
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     return overall_success
 

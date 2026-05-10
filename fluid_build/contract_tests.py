@@ -122,9 +122,7 @@ def _register_input(con, alias: str, cfg: Dict[str, Any]) -> str:
     paths = _as_list(raw_paths)
     files = _glob_all(paths)
     if not files:
-        raise LocalProviderError(
-            f"No files found for input '{alias}'. " f"Checked patterns: {paths}"
-        )
+        raise LocalProviderError(f"No files found for input '{alias}'. Checked patterns: {paths}")
 
     # Normalize to absolute paths for robust COPY/scan
     files = [str(Path(p).resolve()) for p in files]

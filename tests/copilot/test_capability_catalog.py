@@ -170,10 +170,10 @@ class TestCatalogShape:
         regression so users keep getting the ~90% input-cost discount."""
         for entry in CAPABILITY_CATALOG:
             if entry.provider == "anthropic" and entry.model_prefix.startswith("claude-3-5"):
-                assert (
-                    entry.prompt_caching
-                ), f"Anthropic claude-3-5 entry missing prompt_caching: {entry}"
+                assert entry.prompt_caching, (
+                    f"Anthropic claude-3-5 entry missing prompt_caching: {entry}"
+                )
             if entry.provider == "anthropic" and entry.model_prefix.startswith("claude-opus-4-7"):
-                assert (
-                    entry.prompt_caching
-                ), f"Anthropic claude-opus-4-7 missing prompt_caching: {entry}"
+                assert entry.prompt_caching, (
+                    f"Anthropic claude-opus-4-7 missing prompt_caching: {entry}"
+                )

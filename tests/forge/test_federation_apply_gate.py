@@ -145,7 +145,7 @@ def test_federation_gate_bypassed_with_no_verify_digest(monkeypatch, tmp_path, s
     try:
         with patch("fluid_build.forge.federation.validate_federated_consumes") as mock_validate:
             mock_validate.side_effect = AssertionError(
-                "validate_federated_consumes should be skipped under " "--no-verify-digest"
+                "validate_federated_consumes should be skipped under --no-verify-digest"
             )
             try:
                 apply_mod.run(sample_args, test_logger)
@@ -155,9 +155,9 @@ def test_federation_gate_bypassed_with_no_verify_digest(monkeypatch, tmp_path, s
                 # before any DDL was attempted.
                 pass
 
-            assert (
-                not mock_validate.called
-            ), "--no-verify-digest must skip the federation digest gate"
+            assert not mock_validate.called, (
+                "--no-verify-digest must skip the federation digest gate"
+            )
     finally:
         test_logger.removeHandler(handler)
         test_logger.propagate = prior_propagate
@@ -165,6 +165,6 @@ def test_federation_gate_bypassed_with_no_verify_digest(monkeypatch, tmp_path, s
     warning_messages = [
         record.getMessage() for record in captured if record.levelno >= logging.WARNING
     ]
-    assert any(
-        "federation digest gate was SKIPPED" in m for m in warning_messages
-    ), f"Expected WARNING about skip; got {warning_messages!r}"
+    assert any("federation digest gate was SKIPPED" in m for m in warning_messages), (
+        f"Expected WARNING about skip; got {warning_messages!r}"
+    )

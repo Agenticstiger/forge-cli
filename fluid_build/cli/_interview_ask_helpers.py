@@ -667,7 +667,7 @@ def _ask_data_model_question(
             }
         )
 
-    prompt = "Do you have a data model yet? " "[" + " / ".join(c["value"] for c in choices) + "]"
+    prompt = "Do you have a data model yet? [" + " / ".join(c["value"] for c in choices) + "]"
     match = ask_flexible_choice(
         console,
         prompt=prompt,
@@ -737,7 +737,7 @@ def _ask_data_model_question(
         if len(configured_sources) > 1:
             sub_match = ask_flexible_choice(
                 console,
-                prompt=("Which configured catalog? " f"[{' / '.join(configured_sources)}]"),
+                prompt=(f"Which configured catalog? [{' / '.join(configured_sources)}]"),
                 field_name="data_model_source_name",
                 choices=[{"label": s, "value": s} for s in configured_sources],
                 required=False,

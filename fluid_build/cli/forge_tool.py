@@ -328,8 +328,7 @@ def forge_tool(
     """
     if not (inspect.isclass(args_schema) and issubclass(args_schema, BaseModel)):
         raise TypeError(
-            "forge_tool requires a Pydantic BaseModel subclass as args_schema; "
-            f"got {args_schema!r}"
+            f"forge_tool requires a Pydantic BaseModel subclass as args_schema; got {args_schema!r}"
         )
 
     def decorate(func: Callable[..., Any]) -> ForgeTool:

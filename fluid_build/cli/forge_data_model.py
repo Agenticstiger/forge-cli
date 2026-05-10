@@ -273,7 +273,7 @@ def run_learn_command(args: Any, logger: logging.Logger) -> int:
 
     edits = compute_edits(before=before or {}, after=after or {})
     if not edits:
-        cprint("[yellow]No edits found between the two contracts.[/yellow] " "Nothing recorded.")
+        cprint("[yellow]No edits found between the two contracts.[/yellow] Nothing recorded.")
         return 0
 
     contract_name = args.name or original_path.stem.replace(".fluid", "") or "unnamed"
@@ -635,8 +635,7 @@ def _build_catalog_adapter(
     }
     if source not in dispatch:
         raise RuntimeError(
-            f"Unknown source-catalog adapter: {source!r}. "
-            f"Supported: {', '.join(sorted(dispatch))}."
+            f"Unknown source-catalog adapter: {source!r}. Supported: {', '.join(sorted(dispatch))}."
         )
     module_path, class_name = dispatch[source].split(":", 1)
     module = __import__(module_path, fromlist=[class_name])
@@ -1276,7 +1275,7 @@ def _render_data_model_guide() -> int:
             return SubcommandHint(
                 subcommand="from-intent",
                 rationale=(
-                    f"found intent file ({intent_candidates[0].name}) " "in the current directory."
+                    f"found intent file ({intent_candidates[0].name}) in the current directory."
                 ),
             )
         # DDL files are the next-best signal.
@@ -1293,7 +1292,7 @@ def _render_data_model_guide() -> int:
             return SubcommandHint(
                 subcommand="from-source",
                 rationale=(
-                    "you have a metadata-source catalog configured in " "~/.fluid/sources.yaml."
+                    "you have a metadata-source catalog configured in ~/.fluid/sources.yaml."
                 ),
             )
         return None

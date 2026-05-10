@@ -673,8 +673,8 @@ def handle_plugin_info(args, plugin_manager: PluginManager, logger: logging.Logg
 {plugin.metadata.description}
 
 [bold]FLUID Version:[/bold] {plugin.metadata.fluid_version_min}+
-[bold]Dependencies:[/bold] {', '.join(plugin.metadata.dependencies) if plugin.metadata.dependencies else 'None'}
-[bold]Permissions:[/bold] {', '.join(plugin.metadata.permissions) if plugin.metadata.permissions else 'None'}
+[bold]Dependencies:[/bold] {", ".join(plugin.metadata.dependencies) if plugin.metadata.dependencies else "None"}
+[bold]Permissions:[/bold] {", ".join(plugin.metadata.permissions) if plugin.metadata.permissions else "None"}
     """
 
     if plugin.metadata.homepage:
@@ -741,7 +741,7 @@ def handle_create_plugin(args, plugin_manager: PluginManager, logger: logging.Lo
     # Create README.md
     readme = f"""# {plugin_name}
 
-{metadata['description']}
+{metadata["description"]}
 
 ## Installation
 
@@ -786,7 +786,7 @@ from typing import Dict, Any
 from fluid_build.cli.plugins import CommandPlugin, PluginMetadata, PluginType
 
 
-class {name.title().replace('-', '').replace('_', '')}Plugin(CommandPlugin):
+class {name.title().replace("-", "").replace("_", "")}Plugin(CommandPlugin):
     """Custom command plugin for FLUID"""
     
     def get_metadata(self) -> PluginMetadata:
@@ -844,7 +844,7 @@ from typing import Dict, Any
 from fluid_build.cli.plugins import ProviderPlugin, PluginMetadata, PluginType
 
 
-class {name.title().replace('-', '').replace('_', '')}Provider(ProviderPlugin):
+class {name.title().replace("-", "").replace("_", "")}Provider(ProviderPlugin):
     """Custom provider plugin for FLUID"""
     
     def get_metadata(self) -> PluginMetadata:
@@ -894,7 +894,7 @@ from typing import Dict, Any
 from fluid_build.cli.plugins import PluginInterface, PluginMetadata, PluginType
 
 
-class {name.title().replace('-', '').replace('_', '')}Plugin(PluginInterface):
+class {name.title().replace("-", "").replace("_", "")}Plugin(PluginInterface):
     """Custom {plugin_type.value} plugin for FLUID"""
     
     def get_metadata(self) -> PluginMetadata:

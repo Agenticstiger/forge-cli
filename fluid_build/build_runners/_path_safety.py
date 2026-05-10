@@ -142,8 +142,7 @@ def confine_to_workspace(
     if not is_within:
         if logger is not None:
             logger.warning(
-                "build_runner_path_outside_workspace build_id=%r kind=%r "
-                "path=%r workspace_root=%r",
+                "build_runner_path_outside_workspace build_id=%r kind=%r path=%r workspace_root=%r",
                 build_id,
                 kind,
                 str(candidate),

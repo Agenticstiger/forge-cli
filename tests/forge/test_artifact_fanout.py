@@ -241,9 +241,9 @@ class TestRunFanout:
         expected_prefixes = {"odps-bitol/", "odcs/", "policy/"}
         on_disk = {p.relative_to(out_dir).as_posix() for p in out_dir.rglob("*") if p.is_file()}
         present_prefixes = {f.split("/")[0] + "/" for f in on_disk if "/" in f}
-        assert (
-            expected_prefixes <= present_prefixes
-        ), f"missing expected subdirs; got {sorted(present_prefixes)}"
+        assert expected_prefixes <= present_prefixes, (
+            f"missing expected subdirs; got {sorted(present_prefixes)}"
+        )
 
     def test_determinism_two_runs_byte_identical_per_file(self, bundle_tgz, tmp_path, logger):
         """Same bundle input + same emit set → byte-identical artifact files

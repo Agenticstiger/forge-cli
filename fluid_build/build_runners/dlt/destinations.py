@@ -71,9 +71,7 @@ _FLUID_TO_DLT_FIELD: Dict[str, Dict[str, str]] = {
 }
 
 
-def _value_for_dlt_field(
-    platform: str, dlt_field: str, fluid_credentials: Dict[str, Any]
-) -> Any:
+def _value_for_dlt_field(platform: str, dlt_field: str, fluid_credentials: Dict[str, Any]) -> Any:
     """Return the FLUID-resolved value to plug into a given dlt SDK field.
 
     Looks up the reverse alias (dlt field → FLUID field) — most fields
@@ -107,9 +105,7 @@ def _expand_bigquery_service_account(fluid_credentials: Dict[str, Any]) -> None:
         sa_text = Path(sa_path).expanduser().read_text()
         sa = json.loads(sa_text)
     except (OSError, json.JSONDecodeError) as exc:
-        LOG.debug(
-            "BigQuery SA expansion skipped (will let google.auth handle it): %s", exc
-        )
+        LOG.debug("BigQuery SA expansion skipped (will let google.auth handle it): %s", exc)
         return
     fluid_credentials.setdefault("private_key", sa.get("private_key"))
     fluid_credentials.setdefault("client_email", sa.get("client_email"))
@@ -178,10 +174,7 @@ def _dlt_introspect(
         # Field-name discovery — works for dataclasses (current dlt) and
         # pydantic models (future dlt). Filter out dunder/internal fields.
         if hasattr(cred_class, "__dataclass_fields__"):
-            sdk_fields = [
-                f for f in cred_class.__dataclass_fields__
-                if not f.startswith("_")
-            ]
+            sdk_fields = [f for f in cred_class.__dataclass_fields__ if not f.startswith("_")]
         elif hasattr(cred_class, "model_fields"):
             sdk_fields = [f for f in cred_class.model_fields if not f.startswith("_")]
         elif hasattr(cred_class, "__fields__"):

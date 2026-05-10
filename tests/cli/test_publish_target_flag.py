@@ -234,9 +234,9 @@ class TestTargetResolution:
         assert recorded[0]["catalog_name"] == "legacy-catalog"
         # Deprecation warning surfaced — captured via direct logger spy,
         # order-independent.
-        assert any(
-            "deprecated" in w.lower() for w in warnings
-        ), f"--catalog should log a deprecation warning; saw: {warnings}"
+        assert any("deprecated" in w.lower() for w in warnings), (
+            f"--catalog should log a deprecation warning; saw: {warnings}"
+        )
 
     def test_target_and_catalog_both_publish(self):
         """When BOTH flags are set, both participate (both get published).

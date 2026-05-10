@@ -153,7 +153,7 @@ def _print_templates_list() -> int:
             table.add_row(name, desc)
         console.print(table)
         console.print(
-            "\n[dim]Use one with:[/dim] " "[cyan]fluid init my-project --template <name>[/cyan]\n"
+            "\n[dim]Use one with:[/dim] [cyan]fluid init my-project --template <name>[/cyan]\n"
         )
     else:
         cprint("Available templates:")
@@ -289,7 +289,7 @@ def register(subparsers: argparse._SubParsersAction):
         p.add_argument(
             "--no-dag",
             action="store_true",
-            help=("Don't auto-generate Airflow DAG " "(even if contract has orchestration config)"),
+            help=("Don't auto-generate Airflow DAG (even if contract has orchestration config)"),
         )
     )
 
@@ -485,7 +485,7 @@ def _offer_first_forge(args, logger: logging.Logger) -> None:
         if ai_ready:
             prompt_text = "Ready to create your first data product?"
             prompt_rich = (
-                "\n[bold bright_cyan]Ready to create your first data product?" "[/bold bright_cyan]"
+                "\n[bold bright_cyan]Ready to create your first data product?[/bold bright_cyan]"
             )
         else:
             prompt_text = "Set up AI and create your first data product?"

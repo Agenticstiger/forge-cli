@@ -339,9 +339,9 @@ class TestValidateBundle:
 
         report = validate_bundle(tgz, schema_manager=_PermissiveSchema(), fail_fast=True)
         jinja_issues = [i for i in report.issues if i.code == "SQL-JINJA"]
-        assert (
-            len(jinja_issues) == 1
-        ), f"fail_fast should stop at first error; got {len(jinja_issues)}"
+        assert len(jinja_issues) == 1, (
+            f"fail_fast should stop at first error; got {len(jinja_issues)}"
+        )
         assert "builds_0" in jinja_issues[0].file
 
     def test_dbt_external_project_emits_info(self, tmp_path):

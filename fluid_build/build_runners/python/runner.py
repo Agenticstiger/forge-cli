@@ -120,7 +120,7 @@ def execute_build(
         failed_runs = 0
 
         for i in range(iterations):
-            cprint(f"🚀 Run {i+1}/{iterations} - {datetime.now().strftime('%H:%M:%S')}")
+            cprint(f"🚀 Run {i + 1}/{iterations} - {datetime.now().strftime('%H:%M:%S')}")
             cprint("-" * 80)
 
             start_time = time.time()
@@ -145,10 +145,10 @@ def execute_build(
 
                 if result.returncode == 0:
                     successful_runs += 1
-                    success(f"Run {i+1} completed successfully ({duration:.2f}s)")
+                    success(f"Run {i + 1} completed successfully ({duration:.2f}s)")
                 else:
                     failed_runs += 1
-                    console_error(f"Run {i+1} failed with exit code {result.returncode}")
+                    console_error(f"Run {i + 1} failed with exit code {result.returncode}")
 
                     if no_output and result.stderr:
                         cprint(f"Error output:\n{result.stderr}")
@@ -159,7 +159,7 @@ def execute_build(
 
             except Exception as e:
                 failed_runs += 1
-                console_error(f"Run {i+1} failed with exception: {e}")
+                console_error(f"Run {i + 1} failed with exception: {e}")
                 if fail_fast:
                     return 1
 

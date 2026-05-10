@@ -352,9 +352,7 @@ def run_builds_from_args(
         except CLIError:
             raise
         except Exception as e:
-            raise CLIError(
-                1, "contract_load_failed", {"path": str(contract_path), "error": str(e)}
-            )
+            raise CLIError(1, "contract_load_failed", {"path": str(contract_path), "error": str(e)})
 
     builds = contract.get("builds", [])
 

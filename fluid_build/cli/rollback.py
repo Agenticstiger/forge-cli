@@ -139,8 +139,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "--snapshot",
         default=None,
         help=(
-            "Named snapshot to restore. Default: most recent snapshot "
-            "matching --env + --product."
+            "Named snapshot to restore. Default: most recent snapshot matching --env + --product."
         ),
     )
     p.add_argument(
@@ -384,7 +383,7 @@ def _restore_snowflake(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, 
             2,
             "rollback_snowflake_missing_backup_name",
             {
-                "hint": ("snapshot record is missing backup_name — state file " "is malformed."),
+                "hint": ("snapshot record is missing backup_name — state file is malformed."),
             },
         )
     try:

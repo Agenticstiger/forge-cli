@@ -110,10 +110,7 @@ class TestFilesystemDiscoverer:
 class TestPostgresDiscoverer:
     def test_discovers_seeded_tables(self, seeded_postgres: Dict[str, Any]):
         pg = seeded_postgres
-        uri = (
-            f"postgres://{pg['user']}:{pg['password']}"
-            f"@{pg['host']}:{pg['port']}/{pg['database']}"
-        )
+        uri = f"postgres://{pg['user']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}"
         streams = PostgresDiscoverer().discover(uri)
         names = {s.name for s in streams}
         assert "public.fluid_test_orders" in names
@@ -261,10 +258,7 @@ class TestContractEmitter:
 class TestPostgresDiscoverToContractE2E:
     def test_e2e_validates_against_schema(self, seeded_postgres: Dict[str, Any]):
         pg = seeded_postgres
-        uri = (
-            f"postgres://{pg['user']}:{pg['password']}"
-            f"@{pg['host']}:{pg['port']}/{pg['database']}"
-        )
+        uri = f"postgres://{pg['user']}:{pg['password']}@{pg['host']}:{pg['port']}/{pg['database']}"
         streams = PostgresDiscoverer().discover(uri)
         contract = emit_contract(
             product_id="bronze.discovered_pg",

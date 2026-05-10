@@ -255,9 +255,9 @@ class TestWriteTgzDeterminism:
         b = tmp_path / "b.tgz"
         write_tgz(a, files)
         write_tgz(b, files)
-        assert (
-            a.read_bytes() == b.read_bytes()
-        ), "repeated writes of the same files must produce byte-identical tgz"
+        assert a.read_bytes() == b.read_bytes(), (
+            "repeated writes of the same files must produce byte-identical tgz"
+        )
 
     def test_output_path_does_not_leak_into_gzip_filename_field(self, tmp_path):
         """The #1 non-determinism trap: gzip stamps the source filename into
@@ -439,9 +439,9 @@ class TestBuildBundleTgzEndToEnd:
         assert parsed["digest"].startswith("sha256:")
         # Canonical: keys sorted
         keys_sorted = sorted(parsed.keys())
-        assert (
-            list(parsed.keys()) == keys_sorted
-        ), "MANIFEST.json keys must be sorted for determinism"
+        assert list(parsed.keys()) == keys_sorted, (
+            "MANIFEST.json keys must be sorted for determinism"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +487,7 @@ class TestCliBundleDefaultFilename:
 
         expected = tmp_path / "customer-360.fluid.bundle.tgz"
         assert expected.exists(), (
-            f"expected default bundle at {expected}; " f"got {list(tmp_path.iterdir())}"
+            f"expected default bundle at {expected}; got {list(tmp_path.iterdir())}"
         )
 
     def test_default_filename_slugifies_nonfilesafe_ids(self, tmp_path):

@@ -254,9 +254,7 @@ EOM
         # shell step — the Setup stage stays clean.
         if engine_bootstrap_sh:
             engine_bootstrap_step = (
-                "                sh '''set -e\n"
-                f"{engine_bootstrap_sh}\n"
-                "                '''"
+                f"                sh '''set -e\n{engine_bootstrap_sh}\n                '''"
             )
         else:
             engine_bootstrap_step = ""

@@ -130,9 +130,9 @@ modeling:
     # way the dbt parse gate does — by walking for the ``dbt_project.yml``.
     project_files = list(out_dir.rglob("dbt_project.yml"))
     assert project_files, f"expected exactly one dbt_project.yml under {out_dir}; found none"
-    assert (
-        len(project_files) == 1
-    ), f"expected exactly one dbt_project.yml; found {len(project_files)}"
+    assert len(project_files) == 1, (
+        f"expected exactly one dbt_project.yml; found {len(project_files)}"
+    )
     project_dir = project_files[0].parent
 
     # The generator must have emitted the pieces that make dbt parse

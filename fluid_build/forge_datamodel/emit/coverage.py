@@ -81,8 +81,7 @@ class CoverageSummary:
         if not self.groups:
             return ""
         header = (
-            f"{self.canonical_label or self.industry} canonical-model coverage "
-            f"({self.industry})"
+            f"{self.canonical_label or self.industry} canonical-model coverage ({self.industry})"
         )
         lines = [header]
         for group in self.groups:

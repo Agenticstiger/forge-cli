@@ -281,7 +281,8 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
     dest_platform = binding.get("platform")
     if dest_platform:
         make_destination(
-            "dlt", dest_platform,
+            "dlt",
+            dest_platform,
             binding=binding,
             contract=ctx.contract,
             product_id=ctx.product_id,

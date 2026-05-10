@@ -189,8 +189,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                         loc += f":C{issue.column}"
                     loc += ")"
                 cprint(
-                    f"   [{issue.severity}] {issue.validator}: {issue.file}{loc}: "
-                    f"{issue.message}"
+                    f"   [{issue.severity}] {issue.validator}: {issue.file}{loc}: {issue.message}"
                 )
 
     # Structured report file (atomic write — matches stage-2 pattern).

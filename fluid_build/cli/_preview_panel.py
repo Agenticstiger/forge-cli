@@ -458,9 +458,7 @@ def render(panel: PreviewPanel, *, console: Optional[Any] = None) -> None:
             "[yellow]One or more models are not in the price catalog; the dollar "
             "figure above is an estimate.[/yellow]"
         )
-    out.print(
-        f"[dim]Artifacts:[/dim] {panel.run_dir}/  " "(reasoning.md, transcript.json, cost.json)"
-    )
+    out.print(f"[dim]Artifacts:[/dim] {panel.run_dir}/  (reasoning.md, transcript.json, cost.json)")
     if panel.assumptions:
         out.print("[dim]Assumptions:[/dim]")
         for a in panel.assumptions[:5]:
@@ -480,7 +478,7 @@ def _render_plain(panel: PreviewPanel) -> None:
         print(f"Provider: {provider_line}")
     if panel.cost.unknown_models:
         print("Note: one or more models are not in the price catalog; figure is an estimate.")
-    print(f"Artifacts: {panel.run_dir}/  " "(reasoning.md, transcript.json, cost.json)")
+    print(f"Artifacts: {panel.run_dir}/  (reasoning.md, transcript.json, cost.json)")
     if panel.assumptions:
         print("Assumptions:")
         for a in panel.assumptions[:5]:

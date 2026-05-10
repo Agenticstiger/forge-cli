@@ -110,9 +110,7 @@ def assert_self_eval_median_at_least(
         return
     worst = sorted(results, key=lambda r: r.score)[:3]
     detail = ", ".join(f"{r.intent_id}={r.score}" for r in worst)
-    raise AssertionError(
-        f"self-eval median was {median} (target ≥{target}); " f"worst three: {detail}"
-    )
+    raise AssertionError(f"self-eval median was {median} (target ≥{target}); worst three: {detail}")
 
 
 __all__ = [

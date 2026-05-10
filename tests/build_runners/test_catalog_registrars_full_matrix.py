@@ -251,9 +251,9 @@ class TestGlueRegistrar:
         src = Path(mod.__file__).read_text()
         # Real imports look like `import boto3` or `from boto3.X import ...`.
         for pattern in (r"^\s*import\s+boto3\b", r"^\s*from\s+boto3(\.|\s)"):
-            assert (
-                re.search(pattern, src, flags=re.MULTILINE) is None
-            ), f"boto3 import leaked: {pattern}"
+            assert re.search(pattern, src, flags=re.MULTILINE) is None, (
+                f"boto3 import leaked: {pattern}"
+            )
 
 
 # ── Snowflake Horizon ───────────────────────────────────────────────────

@@ -145,8 +145,7 @@ class MaskingPolicyTemplates:
             or visible_chars > 1000
         ):
             raise ValueError(
-                f"Invalid visible_chars: {visible_chars!r}. "
-                "Must be a non-negative integer <= 1000."
+                f"Invalid visible_chars: {visible_chars!r}. Must be a non-negative integer <= 1000."
             )
         return f"""
             CASE

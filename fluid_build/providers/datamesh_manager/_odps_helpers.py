@@ -244,7 +244,7 @@ def ensure_odps_input_port_contract_ids(
         if existing == reference and promoted != existing:
             port["contractId"] = promoted
             LOG.debug(
-                "Promoted input port %s contractId %r -> %r " "(product-level -> expose-level)",
+                "Promoted input port %s contractId %r -> %r (product-level -> expose-level)",
                 port_id,
                 existing,
                 promoted,

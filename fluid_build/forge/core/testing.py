@@ -395,7 +395,7 @@ class ForgeTestRunner:
 - **Total Templates Tested**: {total_tests}
 - **Passed**: {passed_tests}
 - **Failed**: {total_tests - passed_tests}
-- **Success Rate**: {passed_tests/total_tests*100:.1f}%
+- **Success Rate**: {passed_tests / total_tests * 100:.1f}%
 
 ## Detailed Results
 
@@ -435,8 +435,8 @@ def test_all_templates():
     total = len(results)
     passed = sum(1 for r in results.values() if r.success)
 
-    cprint(f"Total: {total}, Passed: {passed}, Failed: {total-passed}")
-    cprint(f"Success Rate: {passed/total*100:.1f}%")
+    cprint(f"Total: {total}, Passed: {passed}, Failed: {total - passed}")
+    cprint(f"Success Rate: {passed / total * 100:.1f}%")
 
     return results
 

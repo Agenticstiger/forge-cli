@@ -814,13 +814,13 @@ def _display_plan_simple(plan: Dict[str, Any], logger: logging.Logger, output_pa
     name = plan.get("contract", {}).get("name") or "Unknown"
     total = plan["total_actions"]
 
-    cprint(f"\n{'='*60}")
+    cprint(f"\n{'=' * 60}")
     cprint("FLUID Execution Plan")
-    cprint(f"{'='*60}")
+    cprint(f"{'=' * 60}")
     cprint(f"Contract: {name}")
     cprint(f"Version: {version}")
     cprint(f"Total Actions: {total}")
-    cprint(f"{'='*60}\n")
+    cprint(f"{'=' * 60}\n")
 
     if total > 0:
         for action in plan["actions"]:

@@ -85,9 +85,9 @@ class TestApplyMode:
         for mode in [ApplyMode.DRY_RUN, ApplyMode.CREATE_ONLY, ApplyMode.AMEND]:
             assert not is_destructive(mode), f"{mode} flagged destructive"
         for mode in [ApplyMode.AMEND_AND_BUILD]:
-            assert not is_destructive(
-                mode
-            ), f"{mode} flagged destructive; amend-and-build preserves data"
+            assert not is_destructive(mode), (
+                f"{mode} flagged destructive; amend-and-build preserves data"
+            )
         for mode in DESTRUCTIVE_MODES:
             assert is_destructive(mode)
 

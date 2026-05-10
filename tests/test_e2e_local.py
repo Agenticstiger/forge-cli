@@ -145,8 +145,7 @@ class TestFluidValidateLocalContract:
 
         result = _fluid("validate", str(dst_contract), cwd=tmp_path)
         assert result.returncode == 0, (
-            f"validate exited {result.returncode}\n"
-            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            f"validate exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
         )
 
 
@@ -172,7 +171,7 @@ class TestFluidPlanProducesDeterministicArtifact:
             cwd=tmp_path,
         )
         assert result.returncode == 0, (
-            f"plan exited {result.returncode}\n" f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            f"plan exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
         )
         assert plan_out.exists(), "plan should write the output file"
 
@@ -255,12 +254,12 @@ class TestFluidHelpReachesEverySubcommand:
     def test_subcommand_help_succeeds(self, subcommand: str, tmp_path: Path) -> None:
         result = _fluid(subcommand, "--help", cwd=tmp_path)
         assert result.returncode == 0, (
-            f"`fluid {subcommand} --help` exited {result.returncode}\n" f"stderr: {result.stderr}"
+            f"`fluid {subcommand} --help` exited {result.returncode}\nstderr: {result.stderr}"
         )
         # The help output must mention the subcommand name itself.
-        assert (
-            subcommand in result.stdout.lower()
-        ), f"`fluid {subcommand} --help` did not mention '{subcommand}'"
+        assert subcommand in result.stdout.lower(), (
+            f"`fluid {subcommand} --help` did not mention '{subcommand}'"
+        )
 
     def test_top_level_help_lists_core_commands(self, tmp_path: Path) -> None:
         """``fluid --help`` itself must list the headline commands.

@@ -530,7 +530,7 @@ def execute_dbt_build(
 
         try:
             for i in range(iterations):
-                cprint(f"🚀 Run {i+1}/{iterations} - {datetime.now().strftime('%H:%M:%S')}")
+                cprint(f"🚀 Run {i + 1}/{iterations} - {datetime.now().strftime('%H:%M:%S')}")
                 cprint("-" * 80)
 
                 start_time = time.time()
@@ -547,10 +547,10 @@ def execute_dbt_build(
 
                     if result.returncode == 0:
                         successful_runs += 1
-                        success(f"Run {i+1} completed successfully ({duration:.2f}s)")
+                        success(f"Run {i + 1} completed successfully ({duration:.2f}s)")
                     else:
                         failed_runs += 1
-                        console_error(f"Run {i+1} failed with exit code {result.returncode}")
+                        console_error(f"Run {i + 1} failed with exit code {result.returncode}")
 
                         if no_output:
                             if result.stdout:
@@ -564,7 +564,7 @@ def execute_dbt_build(
 
                 except (OSError, subprocess.SubprocessError) as exc:
                     failed_runs += 1
-                    console_error(f"Run {i+1} failed with exception: {exc}")
+                    console_error(f"Run {i + 1} failed with exception: {exc}")
                     if fail_fast:
                         return 1
 

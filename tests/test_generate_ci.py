@@ -345,9 +345,9 @@ class TestGenerateCIStaticSystems:
         assert written.exists(), f"missing {default_path} for system={system}"
         content = written.read_text()
         for token in tokens:
-            assert (
-                token in content
-            ), f"expected token {token!r} missing from generated {default_path}"
+            assert token in content, (
+                f"expected token {token!r} missing from generated {default_path}"
+            )
 
     @pytest.mark.parametrize(
         ("system", "_default_path", "tokens"),
@@ -365,7 +365,9 @@ class TestGenerateCIStaticSystems:
         suffix = (
             "Jenkinsfile"
             if system == "jenkins"
-            else f"{system}.yml" if system != "circleci" else "circleci-config.yml"
+            else f"{system}.yml"
+            if system != "circleci"
+            else "circleci-config.yml"
         )
         custom = tmp_path / "generated" / suffix
         rc = generate_ci_run(_make_args(system=system, out=str(custom)), _logger)
@@ -373,9 +375,9 @@ class TestGenerateCIStaticSystems:
         assert custom.exists()
         content = custom.read_text()
         for token in tokens:
-            assert (
-                token in content
-            ), f"expected token {token!r} missing from custom output for {system}"
+            assert token in content, (
+                f"expected token {token!r} missing from custom output for {system}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -469,9 +471,9 @@ class TestJenkinsPipelineTemplateGenerator:
         """Every stage (1-11) must have a RUN_STAGE_N_* boolean toggle."""
         content = self._generate(generator)["Jenkinsfile"]
         for n in range(1, 12):
-            assert (
-                f"RUN_STAGE_{n}_" in content
-            ), f"RUN_STAGE_{n}_* toggle missing — stage {n} not parameterized"
+            assert f"RUN_STAGE_{n}_" in content, (
+                f"RUN_STAGE_{n}_* toggle missing — stage {n} not parameterized"
+            )
 
     def test_output_contains_allow_data_loss_gate(self, generator):
         """Stage 7 destructive-mode gate must be exposed as a param."""
@@ -515,7 +517,7 @@ class TestJenkinsPipelineTemplateGenerator:
         # The BUNDLE_FORMAT choice parameter was removed — the pipeline now
         # hardcodes tgz.
         assert "name: 'BUNDLE_FORMAT'" not in content, (
-            "BUNDLE_FORMAT should no longer be a pipeline parameter; " "Stages 4/6/7 require tgz."
+            "BUNDLE_FORMAT should no longer be a pipeline parameter; Stages 4/6/7 require tgz."
         )
         # The obsolete, invalid choice must not reappear.
         assert "'yaml-single-file'" not in content, (
@@ -755,9 +757,9 @@ class TestJenkinsSimulatedRun:
             "10 - publish",
             "11 - schedule sync",
         ]:
-            assert any(
-                marker in n for n in stage_names
-            ), f"stage containing {marker!r} missing from {stage_names}"
+            assert any(marker in n for n in stage_names), (
+                f"stage containing {marker!r} missing from {stage_names}"
+            )
 
     def test_publish_stage_present(self, pipeline):
         """Stage 10 is named ``10 - publish`` in the parameterized
@@ -1043,7 +1045,7 @@ class TestContractIsReferenceOnly:
 
         p = self._write(
             tmp_path,
-            "builds:\n" "  - just a string\n" "  - id: foo\n" "    pattern: reference\n",
+            "builds:\n  - just a string\n  - id: foo\n    pattern: reference\n",
         )
         # Must not raise on the bare-string entry; must still detect the
         # dict entry's reference pattern.

@@ -728,7 +728,6 @@ class ConsolidatedTestRunner:
                 TimeElapsedColumn(),
                 console=console,
             ) as progress:
-
                 task = progress.add_task("Initializing...", total=len(test_modules))
 
                 for i, (category, module_path) in enumerate(test_modules.items(), 1):
@@ -1111,7 +1110,7 @@ class ConsolidatedTestRunner:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FLUID Build Test Report - {summary['session_id']}</title>
+    <title>FLUID Build Test Report - {summary["session_id"]}</title>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         
@@ -1397,26 +1396,26 @@ class ConsolidatedTestRunner:
         <div class="header">
             <h1>🌊 FLUID Build Test Report</h1>
             <div class="subtitle">
-                Session {summary['session_id']} • Generated {summary['end_time'][:19].replace('T', ' ')}
+                Session {summary["session_id"]} • Generated {summary["end_time"][:19].replace("T", " ")}
             </div>
         </div>
         
         <div class="content">
             <div class="summary-grid">
                 <div class="summary-card total">
-                    <h3>{summary['total_tests']}</h3>
+                    <h3>{summary["total_tests"]}</h3>
                     <p>Total Categories</p>
                 </div>
                 <div class="summary-card passed">
-                    <h3>{summary['total_passed']}</h3>
+                    <h3>{summary["total_passed"]}</h3>
                     <p>Tests Passed</p>
                 </div>
                 <div class="summary-card failed">
-                    <h3>{summary['total_failed']}</h3>
+                    <h3>{summary["total_failed"]}</h3>
                     <p>Tests Failed</p>
                 </div>
                 <div class="summary-card duration">
-                    <h3>{summary['total_duration']:.1f}s</h3>
+                    <h3>{summary["total_duration"]:.1f}s</h3>
                     <p>Total Duration</p>
                 </div>
             </div>
@@ -1437,16 +1436,16 @@ class ConsolidatedTestRunner:
                         <strong>Working Directory:</strong> {os.getcwd()}
                     </div>
                     <div class="detail-item">
-                        <strong>Start Time:</strong> {summary['start_time'][:19].replace('T', ' ')}
+                        <strong>Start Time:</strong> {summary["start_time"][:19].replace("T", " ")}
                     </div>
                     <div class="detail-item">
-                        <strong>End Time:</strong> {summary['end_time'][:19].replace('T', ' ')}
+                        <strong>End Time:</strong> {summary["end_time"][:19].replace("T", " ")}
                     </div>
                 </div>
             </div>
             
             <div class="success-rate">
-                🎯 Success Rate: {summary['success_rate']:.1f}% • Average Duration: {avg_duration:.1f}s per category
+                🎯 Success Rate: {summary["success_rate"]:.1f}% • Average Duration: {avg_duration:.1f}s per category
             </div>
             
             <div class="test-categories">
@@ -1496,7 +1495,7 @@ class ConsolidatedTestRunner:
                                 <span class="label">Duration</span>
                             </div>
                             <div class="detail-item">
-                                <span class="value" style="color: #0891b2;">{execution_summary.get('success_rate', 0):.1f}%</span>
+                                <span class="value" style="color: #0891b2;">{execution_summary.get("success_rate", 0):.1f}%</span>
                                 <span class="label">Success Rate</span>
                             </div>
                         </div>
@@ -1529,7 +1528,7 @@ class ConsolidatedTestRunner:
                     html_content += f"""
                             <div class="test-item">
                                 <span title="{test_details_info}">{display_name}</span>
-                                <span class="badge {status_badge}">{test.get('status', 'UNKNOWN')}</span>
+                                <span class="badge {status_badge}">{test.get("status", "UNKNOWN")}</span>
                             </div>
 """
                 html_content += "                        </div>\n"
@@ -1561,7 +1560,7 @@ class ConsolidatedTestRunner:
                 html_content += f"""
                         <div class="error-section">
                             <h4>🚨 Error Details</h4>
-                            <div class="error-content">{error_msg[:500]}{'...' if len(error_msg) > 500 else ''}</div>
+                            <div class="error-content">{error_msg[:500]}{"..." if len(error_msg) > 500 else ""}</div>
                         </div>
 """
 
@@ -1578,11 +1577,11 @@ class ConsolidatedTestRunner:
         <div class="footer">
             <p>
                 Generated by FLUID Build Testing Framework • 
-                Session Output: <code>{summary['output_directory']}</code>
+                Session Output: <code>{summary["output_directory"]}</code>
             </p>
             <p style="margin-top: 0.5rem; font-size: 0.8rem;">
-                Report generated on {summary['end_time'][:19].replace('T', ' ')} • 
-                Project: <code>{summary['project_root']}</code>
+                Report generated on {summary["end_time"][:19].replace("T", " ")} • 
+                Project: <code>{summary["project_root"]}</code>
             </p>
         </div>
     </div>
@@ -1682,9 +1681,9 @@ class ConsolidatedTestRunner:
             # Generic coverage for other categories
             coverage.update(
                 {
-                    "Test Execution": f'{result.get("passed", 0)} passed, {result.get("failed", 0)} failed',
-                    "Duration": f'{result.get("duration", 0):.2f} seconds',
-                    "Success Rate": f'{result.get("execution_summary", {}).get("success_rate", 0):.1f}%',
+                    "Test Execution": f"{result.get('passed', 0)} passed, {result.get('failed', 0)} failed",
+                    "Duration": f"{result.get('duration', 0):.2f} seconds",
+                    "Success Rate": f"{result.get('execution_summary', {}).get('success_rate', 0):.1f}%",
                 }
             )
 
@@ -1695,7 +1694,7 @@ class ConsolidatedTestRunner:
             coverage["Test Execution"] = f"{test_count} tests executed ({passed_count} passed)"
 
         if result.get("duration"):
-            coverage["Performance"] = f'Completed in {result["duration"]:.2f}s'
+            coverage["Performance"] = f"Completed in {result['duration']:.2f}s"
 
         return coverage
 

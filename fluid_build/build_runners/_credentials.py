@@ -52,6 +52,7 @@ from typing import Any, Callable, Dict, Optional, Type
 try:
     from pydantic import AliasChoices, Field
     from pydantic_settings import BaseSettings, SettingsConfigDict
+
     _HAS_PYDANTIC_SETTINGS = True
 except ImportError:  # pragma: no cover — defensive; pydantic-settings is a hard dep
     _HAS_PYDANTIC_SETTINGS = False
@@ -75,12 +76,12 @@ if _HAS_PYDANTIC_SETTINGS:
 
     class _Common:
         """Common SettingsConfigDict defaults for every credential class."""
+
         model_config = SettingsConfigDict(
             case_sensitive=False,
             extra="ignore",
             env_file_encoding="utf-8",
         )
-
 
     class SnowflakeCredentials(BaseSettings):
         """FLUID-canonical Snowflake credentials.
@@ -116,7 +117,6 @@ if _HAS_PYDANTIC_SETTINGS:
         private_key_passphrase: Optional[str] = None
         oauth_token: Optional[str] = None
         authenticator: Optional[str] = None
-
 
     class BigQueryCredentials(BaseSettings):
         """FLUID-canonical BigQuery / GCP credentials.
@@ -155,7 +155,6 @@ if _HAS_PYDANTIC_SETTINGS:
             validation_alias=AliasChoices("BIGQUERY_LOCATION", "GCP_LOCATION"),
         )
 
-
     class RedshiftCredentials(BaseSettings):
         """FLUID-canonical Redshift credentials. Env-var convention: ``REDSHIFT_<FIELD>``."""
 
@@ -171,8 +170,7 @@ if _HAS_PYDANTIC_SETTINGS:
         user: Optional[str] = None
         password: Optional[str] = None
         cluster_identifier: Optional[str] = None  # for IAM-based auth
-        iam_role_arn: Optional[str] = None        # for IAM-based auth
-
+        iam_role_arn: Optional[str] = None  # for IAM-based auth
 
     class PostgresCredentials(BaseSettings):
         """FLUID-canonical Postgres credentials. Honours both ``POSTGRES_*``
@@ -184,12 +182,24 @@ if _HAS_PYDANTIC_SETTINGS:
             extra="ignore",
         )
 
-        host: Optional[str] = Field(default=None, validation_alias=AliasChoices("POSTGRES_HOST", "PG_HOST"))
-        port: Optional[int] = Field(default=None, validation_alias=AliasChoices("POSTGRES_PORT", "PG_PORT"))
-        database: Optional[str] = Field(default=None, validation_alias=AliasChoices("POSTGRES_DATABASE", "POSTGRES_DB", "PG_DATABASE", "PG_DB"))
-        user: Optional[str] = Field(default=None, validation_alias=AliasChoices("POSTGRES_USER", "PG_USER"))
-        password: Optional[str] = Field(default=None, validation_alias=AliasChoices("POSTGRES_PASSWORD", "PG_PASSWORD"))
-
+        host: Optional[str] = Field(
+            default=None, validation_alias=AliasChoices("POSTGRES_HOST", "PG_HOST")
+        )
+        port: Optional[int] = Field(
+            default=None, validation_alias=AliasChoices("POSTGRES_PORT", "PG_PORT")
+        )
+        database: Optional[str] = Field(
+            default=None,
+            validation_alias=AliasChoices(
+                "POSTGRES_DATABASE", "POSTGRES_DB", "PG_DATABASE", "PG_DB"
+            ),
+        )
+        user: Optional[str] = Field(
+            default=None, validation_alias=AliasChoices("POSTGRES_USER", "PG_USER")
+        )
+        password: Optional[str] = Field(
+            default=None, validation_alias=AliasChoices("POSTGRES_PASSWORD", "PG_PASSWORD")
+        )
 
     class AwsCredentials(BaseSettings):
         """FLUID-canonical AWS credentials.
@@ -217,7 +227,6 @@ if _HAS_PYDANTIC_SETTINGS:
         role_arn: Optional[str] = None
         profile: Optional[str] = None  # named profile in ~/.aws/credentials
 
-
     class AzureCredentials(BaseSettings):
         """FLUID-canonical Azure credentials.
 
@@ -242,7 +251,6 @@ if _HAS_PYDANTIC_SETTINGS:
         storage_account_name: Optional[str] = None
         storage_account_key: Optional[str] = None
 
-
     # Registry: platform name → credentials class. Adding a new platform =
     # one new class above + one entry here. Engine introspectors that need
     # creds for the platform read from the resolved instance.
@@ -262,9 +270,7 @@ else:
     _CREDENTIAL_CLASSES = {}
 
 
-def get_credentials_for(
-    platform: str, binding: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
+def get_credentials_for(platform: str, binding: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Return resolved credentials for ``platform`` as a flat ``dict``.
 
     Resolution order (highest precedence first):
@@ -331,6 +337,7 @@ def register_engine_introspector(
     ... def _dlt_introspect(*, platform, credentials, binding, contract, product_id):
     ...     ...  # populate DESTINATION__<X>__CREDENTIALS__* env vars
     """
+
     def _wrap(fn: Callable[..., Any]) -> Callable[..., Any]:
         _ENGINE_INTROSPECTORS[engine.lower()] = fn
         return fn

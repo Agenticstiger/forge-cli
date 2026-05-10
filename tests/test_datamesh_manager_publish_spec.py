@@ -366,8 +366,7 @@ def test_build_access_agreements_maps_consumes_to_entropy_lineage_edges():
                 "managedBy": "forge-cli",
                 "source": "fluid.consumes",
                 "providerContractId": (
-                    "bizlab.teleforge.subscriber_usage_daily_lineage_local."
-                    "subscriber_usage_daily"
+                    "bizlab.teleforge.subscriber_usage_daily_lineage_local.subscriber_usage_daily"
                 ),
             },
         },
@@ -592,9 +591,9 @@ def test_apply_dry_run_odps_product_consume_with_explicit_contract_id_is_access_
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
     contract = _sample_odps_consumes_contract()
-    contract["consumes"][0][
-        "contractId"
-    ] = "bizlab.teleforge.subscriber_usage_daily_lineage_local.custom_view"
+    contract["consumes"][0]["contractId"] = (
+        "bizlab.teleforge.subscriber_usage_daily_lineage_local.custom_view"
+    )
 
     result = provider.apply(contract, dry_run=True, provider_hint="odps")
 
@@ -863,7 +862,7 @@ def test_publish_odcs_warn_validation_still_puts(monkeypatch):
     monkeypatch.setattr(
         provider,
         "_request",
-        lambda *args, **kwargs: (request_calls.append((args, kwargs)) or _Resp()),
+        lambda *args, **kwargs: request_calls.append((args, kwargs)) or _Resp(),
     )
 
     results = provider._publish_odcs_per_expose(

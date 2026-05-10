@@ -107,7 +107,7 @@ class ProviderActionExecutor:
                 "message": f"Would execute {action.action_type.value} on {action.provider}",
             }
             results.append(result)
-            self.logger.info(f"  [{i+1}] {action.action_id} ({action.action_type.value})")
+            self.logger.info(f"  [{i + 1}] {action.action_id} ({action.action_type.value})")
 
         return {
             "success": True,
@@ -137,7 +137,7 @@ class ProviderActionExecutor:
         }
 
         for i, action in enumerate(actions):
-            self.logger.info(f"Executing action {i+1}/{len(actions)}: {action.action_id}")
+            self.logger.info(f"Executing action {i + 1}/{len(actions)}: {action.action_id}")
 
             try:
                 result = self._execute_single_action(action, provider_instances)

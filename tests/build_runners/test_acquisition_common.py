@@ -80,9 +80,7 @@ class TestResolveSecretRef:
         monkeypatch.setenv("ACQ_TEST_SECRET", "s3cret-value")
         assert resolve_secret_ref("env://ACQ_TEST_SECRET") == "s3cret-value"
 
-    def test_env_scheme_unset_var_raises_value_error(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_env_scheme_unset_var_raises_value_error(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("ACQ_TEST_MISSING", raising=False)
         with pytest.raises(ValueError, match="environment variable not set"):
             resolve_secret_ref("env://ACQ_TEST_MISSING")
@@ -141,9 +139,7 @@ class TestResolveConnectionSecrets:
         # secretRef MUST be removed so downstream client SDKs don't see it.
         assert "secretRef" not in out
 
-    def test_inline_password_wins_over_secret_ref(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_inline_password_wins_over_secret_ref(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("PG_PASSWORD", "from-env")
         out = resolve_connection_secrets(
             {
@@ -158,9 +154,7 @@ class TestResolveConnectionSecrets:
         # secretRef still gets removed, even when not consumed.
         assert "secretRef" not in out
 
-    def test_target_field_override_for_token_auth(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_target_field_override_for_token_auth(self, monkeypatch: pytest.MonkeyPatch):
         # GitHub / Salesforce / OAuth2-style sources want the secret as a
         # token, not a password. The runner can override the target field.
         monkeypatch.setenv("GH_TOKEN", "ghp_abc123")
@@ -175,9 +169,7 @@ class TestResolveConnectionSecrets:
 
     def test_unsupported_scheme_propagates_value_error(self):
         with pytest.raises(ValueError, match="not supported"):
-            resolve_connection_secrets(
-                {"host": "x", "secretRef": "madeup://identifier"}
-            )
+            resolve_connection_secrets({"host": "x", "secretRef": "madeup://identifier"})
 
     def test_does_not_mutate_input_dict(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("PG_PASSWORD", "x")
@@ -235,9 +227,7 @@ class TestDestinationIntrospector:
             called["n"] += 1
             return None
 
-        make_destination(
-            "__test_engine__", "snowflake", binding={}, contract={}, product_id=""
-        )
+        make_destination("__test_engine__", "snowflake", binding={}, contract={}, product_id="")
         assert called["n"] == 1
 
     def test_dispatch_is_noop_when_no_introspector_registered(self):
@@ -253,6 +243,11 @@ class TestDestinationIntrospector:
     def test_dlt_snowflake_introspector_maps_all_fields_with_bare_account(
         self, monkeypatch: pytest.MonkeyPatch
     ):
+        # The introspector requires the dlt SDK installed (it inspects
+        # ``dlt.destinations.snowflake`` to map FLUID env vars onto dlt's
+        # ``DESTINATION__SNOWFLAKE__CREDENTIALS__*`` schema). CI matrix
+        # rows that don't install dlt skip the test rather than fail.
+        pytest.importorskip("dlt")
         # Force-import dlt's destinations module so the introspector registers.
         import fluid_build.build_runners.dlt  # noqa: F401
 
@@ -273,9 +268,7 @@ class TestDestinationIntrospector:
         monkeypatch.setenv("SNOWFLAKE_WAREHOUSE", "WH1")
         monkeypatch.setenv("SNOWFLAKE_ROLE", "DATA_ENG")
 
-        make_destination(
-            "dlt", "snowflake", binding={}, contract={}, product_id="bronze.test"
-        )
+        make_destination("dlt", "snowflake", binding={}, contract={}, product_id="bronze.test")
 
         import os as _os
 
@@ -284,35 +277,25 @@ class TestDestinationIntrospector:
         # FLUID's `account` aliases to dlt's `host` field; FLUID's `user`
         # aliases to dlt's `username` field — both via the per-platform
         # alias table in dlt/destinations.py.
-        assert (
-            _os.environ["DESTINATION__SNOWFLAKE__CREDENTIALS__HOST"]
-            == "ABC123-XY7890"
-        )
+        assert _os.environ["DESTINATION__SNOWFLAKE__CREDENTIALS__HOST"] == "ABC123-XY7890"
         assert _os.environ["DESTINATION__SNOWFLAKE__CREDENTIALS__USERNAME"] == "alice"
         assert _os.environ["DESTINATION__SNOWFLAKE__CREDENTIALS__PASSWORD"] == "s3cret"
         assert _os.environ["DESTINATION__SNOWFLAKE__CREDENTIALS__DATABASE"] == "PROD_DB"
         assert _os.environ["DESTINATION__SNOWFLAKE__CREDENTIALS__WAREHOUSE"] == "WH1"
         assert _os.environ["DESTINATION__SNOWFLAKE__CREDENTIALS__ROLE"] == "DATA_ENG"
 
-    def test_dlt_snowflake_operator_override_wins(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_dlt_snowflake_operator_override_wins(self, monkeypatch: pytest.MonkeyPatch):
+        pytest.importorskip("dlt")
         import fluid_build.build_runners.dlt  # noqa: F401
 
         monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "from-fluid-env")
-        monkeypatch.setenv(
-            "DESTINATION__SNOWFLAKE__CREDENTIALS__HOST", "operator-set"
-        )
-        make_destination(
-            "dlt", "snowflake", binding={}, contract={}, product_id="bronze.test"
-        )
+        monkeypatch.setenv("DESTINATION__SNOWFLAKE__CREDENTIALS__HOST", "operator-set")
+        make_destination("dlt", "snowflake", binding={}, contract={}, product_id="bronze.test")
         import os as _os
 
         # Operator's explicit DESTINATION__... export wins — introspector
         # uses setdefault semantics, never overwrites.
-        assert (
-            _os.environ["DESTINATION__SNOWFLAKE__CREDENTIALS__HOST"] == "operator-set"
-        )
+        assert _os.environ["DESTINATION__SNOWFLAKE__CREDENTIALS__HOST"] == "operator-set"
 
 
 # ── connection.schema / connection.schemas extraction ──────────────────
@@ -383,9 +366,7 @@ class TestSchemaFingerprintPlaceholder:
     def test_construction_without_is_placeholder_defaults_to_false(self):
         # Backwards compatibility: code that constructs SchemaFingerprint
         # directly (not via factories) gets is_placeholder=False by default.
-        fp = SchemaFingerprint(
-            digest="sha256:fake", columns=[SchemaColumn(name="x", type="t")]
-        )
+        fp = SchemaFingerprint(digest="sha256:fake", columns=[SchemaColumn(name="x", type="t")])
         assert fp.is_placeholder is False
 
 
@@ -437,9 +418,7 @@ class TestEnforceSchemaPolicySkipsPlaceholders:
 
         class PlaceholderRunner:
             def fingerprint(self, ctx):
-                return SchemaFingerprint.placeholder(
-                    ctx.source.streams, engine="dlt"
-                )
+                return SchemaFingerprint.placeholder(ctx.source.streams, engine="dlt")
 
         # Should NOT raise — placeholder bypasses the strict gate.
         enforce_schema_policy_or_raise(
@@ -472,9 +451,7 @@ class TestEnforceSchemaPolicySkipsPlaceholders:
         # Either way the placeholder path above must NOT be the reason for
         # passing. We assert the call doesn't crash.
         try:
-            enforce_schema_policy_or_raise(
-                self._make_ctx(self._baseline_contract()), RealRunner()
-            )
+            enforce_schema_policy_or_raise(self._make_ctx(self._baseline_contract()), RealRunner())
         except Exception:
             # SchemaDriftError or any typed-catalog raise is acceptable —
             # the contract is that real drift is HANDLED, not silently

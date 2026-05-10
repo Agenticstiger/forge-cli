@@ -341,7 +341,7 @@ def create_ai_log_archive(
 ## Summary
 
 - **Category:** {category}
-- **Status:** {'✅ PASSED' if result.wasSuccessful() else '❌ FAILED'}
+- **Status:** {"✅ PASSED" if result.wasSuccessful() else "❌ FAILED"}
 - **Total Tests:** {result.testsRun}
 - **Passed:** {result.testsRun - len(result.failures) - len(result.errors)}
 - **Failed:** {len(result.failures)}

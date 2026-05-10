@@ -253,7 +253,7 @@ class TestWarmCacheLatencyReduction:
                 output_schema=_StubOutput,
             )
             assert mock_post.call_count == 2, (
-                "no_cache=True must skip cache reads/writes — both calls " "must reach httpx.post."
+                "no_cache=True must skip cache reads/writes — both calls must reach httpx.post."
             )
 
     def test_null_backend_session_always_hits_network(self, tmp_path: Path) -> None:

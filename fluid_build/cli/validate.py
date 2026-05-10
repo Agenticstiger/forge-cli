@@ -924,8 +924,7 @@ def _run_bundle_validation(
                         loc += f":C{issue.column}"
                     loc += ")"
                 cprint(
-                    f"   [{issue.severity}] {issue.validator}: {issue.file}{loc}: "
-                    f"{issue.message}"
+                    f"   [{issue.severity}] {issue.validator}: {issue.file}{loc}: {issue.message}"
                 )
 
     # Structured report file — atomic write.

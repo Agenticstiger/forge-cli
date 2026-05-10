@@ -159,32 +159,30 @@ class TestDefaultGuidanceLoaded:
         assert "agent_policy" in _DEFAULT_GUIDANCE
         assert "technique_mandate" in _DEFAULT_GUIDANCE
         assert "upstream_sql" in _DEFAULT_GUIDANCE
-        assert _DEFAULT_GUIDANCE[
-            "sovereignty"
-        ].strip(), "sovereignty guidance must not be empty — check _defaults/sovereignty.yaml"
-        assert _DEFAULT_GUIDANCE[
-            "agent_policy"
-        ].strip(), "agent_policy guidance must not be empty — check _defaults/agent_policy.yaml"
-        assert _DEFAULT_GUIDANCE[
-            "technique_mandate"
-        ].strip(), (
+        assert _DEFAULT_GUIDANCE["sovereignty"].strip(), (
+            "sovereignty guidance must not be empty — check _defaults/sovereignty.yaml"
+        )
+        assert _DEFAULT_GUIDANCE["agent_policy"].strip(), (
+            "agent_policy guidance must not be empty — check _defaults/agent_policy.yaml"
+        )
+        assert _DEFAULT_GUIDANCE["technique_mandate"].strip(), (
             "technique mandate guidance must not be empty — check _defaults/technique_mandate.yaml"
         )
-        assert _DEFAULT_GUIDANCE[
-            "upstream_sql"
-        ].strip(), "upstream SQL guidance must not be empty — check _defaults/upstream_sql.yaml"
+        assert _DEFAULT_GUIDANCE["upstream_sql"].strip(), (
+            "upstream SQL guidance must not be empty — check _defaults/upstream_sql.yaml"
+        )
 
     def test_auxiliary_prompt_map_has_required_keys(self):
         from fluid_build.cli.forge_copilot_prompts import _AUXILIARY_PROMPTS
 
         assert "clarification" in _AUXILIARY_PROMPTS
         assert "evaluation" in _AUXILIARY_PROMPTS
-        assert _AUXILIARY_PROMPTS[
-            "clarification"
-        ].strip(), "clarification prompt must not be empty — check _defaults/clarification.yaml"
-        assert _AUXILIARY_PROMPTS[
-            "evaluation"
-        ].strip(), "evaluation prompt must not be empty — check _defaults/evaluation.yaml"
+        assert _AUXILIARY_PROMPTS["clarification"].strip(), (
+            "clarification prompt must not be empty — check _defaults/clarification.yaml"
+        )
+        assert _AUXILIARY_PROMPTS["evaluation"].strip(), (
+            "evaluation prompt must not be empty — check _defaults/evaluation.yaml"
+        )
 
     def test_auxiliary_prompt_map_is_immutable(self):
         # Defensive immutability: the map is wrapped in MappingProxyType so a
@@ -263,8 +261,8 @@ class TestSystemPromptSnapshot:
                     pytest.fail(
                         f"system prompt drift at byte {i}. "
                         f"context before diff: {context_before!r}; "
-                        f"expected: {expected[i:i+40]!r}; "
-                        f"got: {actual[i:i+40]!r}. "
+                        f"expected: {expected[i : i + 40]!r}; "
+                        f"got: {actual[i : i + 40]!r}. "
                         f"If the change is intentional, regenerate the baseline "
                         f"per the instructions at the top of "
                         f"tests/test_prompt_default_guidance.py."
@@ -273,5 +271,5 @@ class TestSystemPromptSnapshot:
             pytest.fail(
                 f"system prompt length mismatch: expected {len(expected)} bytes, "
                 f"got {len(actual)} bytes. "
-                f"Extra tail: {(actual[len(expected):] or expected[len(actual):])[:200]!r}"
+                f"Extra tail: {(actual[len(expected) :] or expected[len(actual) :])[:200]!r}"
             )

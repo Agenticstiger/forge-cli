@@ -72,8 +72,7 @@ def _meltano_introspect(
     """
     if platform.lower() not in _TARGET_SCHEMA_KEY:
         LOG.debug(
-            "no meltano destination introspector for platform %r; "
-            "runner will fall back to DuckDB",
+            "no meltano destination introspector for platform %r; runner will fall back to DuckDB",
             platform,
         )
         return {}

@@ -86,8 +86,10 @@ def redact_secret_text(text: str) -> str:
     redacted = _STRIPE_KEY_RE.sub(_REDACTED, redacted)
     redacted = _GITHUB_TOKEN_RE.sub(_REDACTED, redacted)
     redacted = _ASSIGNMENT_RE.sub(
-        lambda match: f"{match.group('key')}{match.group('sep')}{match.group('quote')}"
-        f"{_REDACTED}{match.group('quote')}",
+        lambda match: (
+            f"{match.group('key')}{match.group('sep')}{match.group('quote')}"
+            f"{_REDACTED}{match.group('quote')}"
+        ),
         redacted,
     )
     return redacted

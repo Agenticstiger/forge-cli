@@ -252,7 +252,7 @@ data/
         services = []
 
         # Main application service
-        app_service = f"""  {project_name.replace('-', '_')}:
+        app_service = f"""  {project_name.replace("-", "_")}:
     build: .
     ports:
       - "8000:8000"
@@ -273,9 +273,9 @@ data/
                 f"""  postgres:
     image: postgres:13
     environment:
-      POSTGRES_DB: {postgres_config.get('database', project_name)}
-      POSTGRES_USER: {postgres_config.get('user', 'postgres')}
-      POSTGRES_PASSWORD: {postgres_config.get('password', 'password')}
+      POSTGRES_DB: {postgres_config.get("database", project_name)}
+      POSTGRES_USER: {postgres_config.get("user", "postgres")}
+      POSTGRES_PASSWORD: {postgres_config.get("password", "password")}
     ports:
       - "5432:5432"
     volumes:
@@ -376,7 +376,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.black]
 line-length = 88
-target-version = ['py{python_version.replace('.', '')}']
+target-version = ['py{python_version.replace(".", "")}']
 
 [tool.mypy]
 python_version = "{python_version}"

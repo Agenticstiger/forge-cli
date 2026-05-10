@@ -42,9 +42,9 @@ class RunnerConformance:
         assert self.runner.declared_modes <= {"embedded", "bring-your-own", "managed"}
 
     def test_capabilities_non_empty(self) -> None:
-        assert (
-            len(self.runner.declared_capabilities) > 0
-        ), f"Runner {self.runner.name} declares no capabilities — at least one is required."
+        assert len(self.runner.declared_capabilities) > 0, (
+            f"Runner {self.runner.name} declares no capabilities — at least one is required."
+        )
 
     def test_plan_idempotent(self, conformance_ctx: Any) -> None:
         """Calling plan twice must return equivalent results."""

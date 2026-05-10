@@ -1155,9 +1155,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             body["custom"] = custom
         try:
             put_resp = self._request("PUT", f"/api/sourcesystems/{sys_id}", json_body=body)
-            self._log.info(
-                "Created/updated source system %s (%s)", sys_id, put_resp.status_code
-            )
+            self._log.info("Created/updated source system %s (%s)", sys_id, put_resp.status_code)
         except ProviderError as exc:
             self._log.warning("Could not create source system %s: %s", sys_id, exc)
 
@@ -1183,8 +1181,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 # Sanitise: the API needs a valid URL path segment
                 return node.strip().lower().replace(" ", "-").replace("/", "-")
         raise ProviderError(
-            "FLUID contract is missing a product id.  "
-            "Set 'id', 'metadata.id', or 'metadata.name'."
+            "FLUID contract is missing a product id.  Set 'id', 'metadata.id', or 'metadata.name'."
         )
 
     @staticmethod

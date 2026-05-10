@@ -217,10 +217,7 @@ def validate_sql(
 
     if not _sqlglot_available():
         sev: Severity = "error" if strict else "info"
-        msg = (
-            "sqlglot not installed; SQL fragment not validated. "
-            "Install with: pip install sqlglot"
-        )
+        msg = "sqlglot not installed; SQL fragment not validated. Install with: pip install sqlglot"
         return [ValidationIssue(file=path, validator="sqlglot", severity=sev, message=msg)]
 
     import sqlglot  # type: ignore

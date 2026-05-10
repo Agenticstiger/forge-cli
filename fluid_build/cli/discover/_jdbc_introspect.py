@@ -84,8 +84,7 @@ def _normalize_kind(source: str) -> str:
         return "postgres"
     if s not in SUPPORTED_KINDS:
         raise ValueError(
-            f"Unsupported JDBC source: {source!r}. "
-            f"Supported: postgres, postgresql, mysql, sqlite."
+            f"Unsupported JDBC source: {source!r}. Supported: postgres, postgresql, mysql, sqlite."
         )
     return s if s != "postgresql" else "postgres"
 
@@ -137,7 +136,7 @@ def _attach_string_postgres(args: Dict[str, str], alias: str) -> str:
         parts.append(f"user={args['user']}")
     if args.get("password"):
         parts.append(f"password={args['password']}")
-    return f"ATTACH '{ ' '.join(parts) }' AS {alias} (TYPE postgres)"
+    return f"ATTACH '{' '.join(parts)}' AS {alias} (TYPE postgres)"
 
 
 def _attach_string_mysql(args: Dict[str, str], alias: str) -> str:
@@ -150,7 +149,7 @@ def _attach_string_mysql(args: Dict[str, str], alias: str) -> str:
         parts.append(f"user={args['user']}")
     if args.get("password"):
         parts.append(f"password={args['password']}")
-    return f"ATTACH '{ ' '.join(parts) }' AS {alias} (TYPE mysql)"
+    return f"ATTACH '{' '.join(parts)}' AS {alias} (TYPE mysql)"
 
 
 def _attach_string_sqlite(args: Dict[str, str], alias: str) -> str:
@@ -165,7 +164,7 @@ def _validate_alias(alias: str) -> str:
     that wouldn't parse as a bare identifier."""
     if not _IDENT_RE.match(alias):
         raise ValueError(
-            f"Invalid duckdb attach alias: {alias!r}. Must match " f"``[A-Za-z_][A-Za-z0-9_]*``."
+            f"Invalid duckdb attach alias: {alias!r}. Must match ``[A-Za-z_][A-Za-z0-9_]*``."
         )
     return alias
 
@@ -202,7 +201,7 @@ def introspect_jdbc(
         import duckdb
     except ImportError as exc:
         raise ImportError(
-            "duckdb is required for JDBC introspection. " "Install via ``pip install duckdb``."
+            "duckdb is required for JDBC introspection. Install via ``pip install duckdb``."
         ) from exc
 
     kind = _normalize_kind(source)

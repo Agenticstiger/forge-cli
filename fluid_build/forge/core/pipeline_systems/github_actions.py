@@ -209,6 +209,14 @@ class GitHubActionsTemplate(BasePipelineTemplate):
 
         commands = self._get_fluid_commands()
         env_vars = self._get_common_environment_vars()
+        # Engine specs registry — per-engine pip extras + runtime env
+        # vars sourced from ``_engine_specs.py`` so adding a new engine
+        # doesn't require editing this file.
+        env_vars.update(self._engine_runtime_env_vars(config))
+        engine_pip = self._engine_pip_install_command(config)
+        engine_install_step = (
+            [{"name": "Install engine extras", "run": engine_pip}] if engine_pip else []
+        )
 
         workflow = {
             "name": "FLUID DataOps Pipeline",
@@ -230,6 +238,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                             "with": {"python-version": "3.10"},
                         },
                         {"name": "Install FLUID", "run": "pip install --quiet data-product-forge"},
+                        *engine_install_step,
                         *self._get_oidc_steps(config.oidc_provider),
                         {"name": "FLUID Doctor Check", "run": commands["doctor"]},
                         {"name": "Validate Configuration", "run": commands["validate"]},
@@ -270,7 +279,13 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                 "`env: FOO: ${{ secrets.FOO }}`."
             ),
         )
-        files = {".github/workflows/fluid-pipeline.yml": banner + yaml.dump(workflow, indent=2)}
+        runtime_notes = self._engine_runtime_notes(config, indent="# ")
+        notes_block = ("\n" + runtime_notes + "\n") if runtime_notes else ""
+        files = {
+            ".github/workflows/fluid-pipeline.yml": banner
+            + notes_block
+            + yaml.dump(workflow, indent=2)
+        }
         files[".env.ci.example"] = self._generate_env_ci_example(config.oidc_provider)
         return files
 

@@ -55,8 +55,7 @@ SKILLS_NAMESPACE = "skills"
 """Canonical namespace root for compiled-skills records."""
 
 assert SKILLS_NAMESPACE in SKILL_NAMESPACES, (
-    "skills must be registered in SKILL_NAMESPACES — check "
-    "fluid_build/copilot/store/namespaces.py"
+    "skills must be registered in SKILL_NAMESPACES — check fluid_build/copilot/store/namespaces.py"
 )
 
 _WORKSPACE_KEY_LENGTH = 16
