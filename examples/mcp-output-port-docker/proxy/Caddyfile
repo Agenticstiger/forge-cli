@@ -1,0 +1,70 @@
+# Production-shape reverse-proxy template for `fluid mcp output-port
+# serve --transport http`. Pairs Caddy's automatic TLS + mTLS client-cert
+# verification with the gateway's bearer-token check, giving you
+# defence-in-depth: cert + token + agentPolicy.
+#
+# Usage:
+#   1. Issue your CA + a client cert (mkcert / step-ca / your PKI).
+#   2. Trust the CA on each LLM client host (see operator runbook in
+#      the forge-docs repo for cmds).
+#   3. Drop the CA pem at /etc/ssl/forge-mcp/clients-ca.pem.
+#   4. Set FLUID_MCP_AUTH_TOKEN in the gateway environment to a
+#      shared secret you also configure on the trusted clients.
+#   5. caddy run --config Caddyfile (binds :443).
+#
+# Why mTLS + bearer-token + agentPolicy: every layer protects against
+# a different failure. mTLS gives you machine identity, bearer token
+# guards against rogue clients with a leaked cert, agentPolicy
+# enforces the declarative model/use-case gates from the contract.
+# Drop any one and the others are still defending.
+
+{
+    # Use Let's Encrypt for the gateway's public hostname OR swap
+    # for `tls /etc/ssl/forge-mcp/server.pem /etc/ssl/forge-mcp/server.key`
+    # in the site block when you're behind a private CA.
+    auto_https off
+    log {
+        format json
+        level INFO
+    }
+}
+
+mcp.your-domain.example {
+    # 1. Server cert: replace with your private CA-issued pair OR
+    #    let Caddy provision LE certs by removing this line and
+    #    flipping ``auto_https off`` above.
+    tls /etc/ssl/forge-mcp/server.pem /etc/ssl/forge-mcp/server.key {
+        # 2. mTLS: every client connection MUST present a cert
+        #    signed by the trusted CA. Connections without a cert
+        #    are dropped at TLS handshake — never reach the gateway.
+        client_auth {
+            mode require_and_verify
+            trusted_ca_cert_file /etc/ssl/forge-mcp/clients-ca.pem
+        }
+    }
+
+    # 3. Optional belt-and-suspenders: enforce a Forge-CLI bearer
+    #    token at the proxy layer too. The gateway already does
+    #    this when FLUID_MCP_AUTH_TOKEN is set, but doing it here
+    #    fails-fast at the proxy edge so the gateway process never
+    #    sees unauthorised traffic. Token comparison is constant-time
+    #    via Caddy's matcher.
+    @missing_bearer not header Authorization "Bearer your-shared-secret-here"
+    respond @missing_bearer 401 {
+        body `{"error":"unauthorized","message":"missing or invalid bearer token at proxy"}`
+        close
+    }
+
+    # 4. Forward to the gateway. The gateway listens on
+    #    127.0.0.1:8765 by default (`--transport http`); the proxy
+    #    is the only thing that touches it from outside.
+    reverse_proxy 127.0.0.1:8765 {
+        flush_interval -1   # SSE: don't buffer
+        # Forward the client cert subject to the gateway as a header
+        # so the gateway can stamp it onto the audit event for
+        # cryptographic identity attribution beyond what the bearer
+        # token alone gives.
+        header_up X-Client-CN {tls_client_subject}
+        header_up X-Client-Fingerprint {tls_client_fingerprint}
+    }
+}

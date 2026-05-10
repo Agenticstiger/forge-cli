@@ -1,0 +1,73 @@
+fluidVersion: "0.7.3"
+kind: DataProduct
+id: silver.demo.customer_segments_v1
+name: Customer Segments (MCP demo)
+description: |
+  Reference contract for `fluid mcp output-port serve`. Backed by a
+  small DuckDB-loaded CSV so the demo runs without cloud credentials.
+  Drop into Claude Code / Cursor as an MCP server to see describe /
+  sample / query in action.
+domain: demo
+metadata:
+  layer: Silver
+  owner:
+    team: data-platform
+    email: platform@example.com
+  businessContext:
+    domain: Customer
+exposes:
+  - exposeId: customer_segments
+    title: Customer Segments
+    kind: table
+    version: "1.0.0"
+    contract:
+      schema:
+        - name: customer_id
+          type: STRING
+          required: true
+          sensitivity: cleartext
+        - name: segment
+          type: STRING
+          required: true
+          businessName: Customer Segment
+          businessDefinition: enterprise / smb / consumer
+        - name: signup_date
+          type: DATE
+        - name: lifetime_value_usd
+          type: FLOAT64
+          businessName: Lifetime Value (USD)
+    binding:
+      platform: local
+      format: csv
+      location:
+        # Relative to the directory that contains this contract.
+        # `fluid mcp output-port serve` resolves the path against
+        # the contract's parent directory by default.
+        path: ./customers.csv
+        table: customer_segments
+    semantics:
+      name: customer_segments
+      measures:
+        - name: customer_count
+          agg: count_distinct
+          expr: customer_id
+        - name: total_ltv_usd
+          agg: sum
+          expr: lifetime_value_usd
+      dimensions:
+        - name: segment
+          type: categorical
+        - name: signup_date
+          type: time
+      metrics:
+        - name: active_customers
+          type: simple
+          measure: customer_count
+        - name: ltv_total
+          type: simple
+          measure: total_ltv_usd
+    mcp:
+      sampling:
+        maxRows: 50
+      classification:
+        dataClass: internal

@@ -1,0 +1,9 @@
+customer_id,segment,signup_date,lifetime_value_usd
+C-0001,enterprise,2024-01-15,12500.00
+C-0002,smb,2024-02-10,4500.00
+C-0003,consumer,2024-03-05,890.50
+C-0004,enterprise,2024-04-20,18200.75
+C-0005,consumer,2024-05-11,1200.00
+C-0006,smb,2024-06-02,2300.00
+C-0007,enterprise,2024-07-19,28400.00
+C-0008,consumer,2024-08-08,560.25

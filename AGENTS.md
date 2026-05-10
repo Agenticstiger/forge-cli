@@ -106,7 +106,7 @@ forge-cli/
 │   ├── policy/               # Policy compiler, agent policy, sovereignty
 │   ├── blueprints/           # Enterprise blueprint registry
 │   ├── credentials/          # Credential resolution (keyring, dotenv, encrypted)
-│   ├── schemas/              # FLUID JSON Schema versions (0.5.7, 0.7.1, 0.7.2 latest)
+│   ├── schemas/              # FLUID JSON Schema versions (0.7.1, 0.7.2, 0.7.3, 0.7.4 latest)
 │   ├── templates/            # Init templates (hello-world, customer-360, etc.)
 │   └── tools/                # Diagnostic utilities
 ├── tests/                    # Pytest suite — unit, integration, provider-specific
@@ -248,13 +248,37 @@ exposes:
 
 ### How Agents Should Respect Policies
 
+The **Fluid MCP output port** (`fluid mcp output-port serve`, NEW in v0.7.4) reads
+the contract and enforces `allowedModels`/`deniedModels`,
+`allowedUseCases`/`deniedUseCases`, `maxTokensPerRequest`/`maxTokensPerDay`,
+PII/PHI row redaction (via column `sensitivity` markers), and per-tenant
+`policy.rowFilters[]` automatically on every read. When you connect to a
+fluid data product through that gateway, the contract is the policy.
+
+Outside the gateway, the **`fluid_build.output_ports.iam_compiler`** module
+emits Snowflake row-access policies + Postgres `CREATE POLICY` statements that
+honour the same contract — defence-in-depth so a direct warehouse query
+(an analyst with their own Snowflake role) is also gated by the contract.
+
+Defence layers ranked from outer to inner: mTLS proxy (production-only) →
+bearer token (`FLUID_MCP_AUTH_TOKEN`) → agentPolicy.allowedModels →
+allowedUseCases → row-level filters → cloud-IAM compiled policies.
+Drop any one and the others still defend.
+
 1. **Before accessing a data product**, read its `agentPolicy` from the contract
-2. **Check your model identity** against `allowedModels` / `deniedModels`
-3. **Check your use case** against `allowedUseCases` / `deniedUseCases`
+   (or rely on the MCP output port to enforce it for you)
+2. **Declare your model identity** at MCP `initialize` so the gateway can check
+   `allowedModels` / `deniedModels` — gateways fail-closed when identity is missing
+3. **Declare your use case** so the gateway can check `allowedUseCases` /
+   `deniedUseCases`
 4. **Respect token limits** — honour `maxTokensPerRequest` and `maxTokensPerDay`
-5. **Respect storage rules** — if `canStore: false`, do not persist any data beyond the session
-6. **Respect retention** — if `retentionPolicy.requireDeletion: true`, delete data after `maxRetentionDays`
-7. **Log access** if `auditRequired: true`
+   (declarative-only today; runtime enforcement is P2)
+5. **Respect storage rules** — if `canStore: false`, do not persist any data
+   beyond the session (advisory; the gateway surfaces this in `describe`)
+6. **Respect retention** — if `retentionPolicy.requireDeletion: true`, delete
+   data after `maxRetentionDays` (declarative-only)
+7. **Log access** if `auditRequired: true` — the gateway already writes a
+   `data_access` audit event on every decision regardless
 
 ### Validating Agent Policies
 

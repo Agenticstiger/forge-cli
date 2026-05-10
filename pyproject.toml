@@ -62,6 +62,17 @@ dependencies = [
   # Borrowed-not-built per /borrow-before-build (skill receipts in commit msg):
   #   docs:  https://docs.pydantic.dev/latest/concepts/pydantic_settings/
   "pydantic-settings>=2.0",
+  # Anthropic-maintained MCP Python SDK (https://github.com/modelcontextprotocol/python-sdk).
+  # Powers ``fluid mcp output-port serve`` — the consumer-side gateway that
+  # turns a FLUID expose into an agent-consumable MCP endpoint and enforces
+  # ``policy.agentPolicy`` (allowedModels/allowedUseCases) at every read.
+  # Borrowed-not-built per /borrow-before-build: the SDK abstracts JSON-RPC
+  # dispatch, stdio transport, and protocol-version handshakes that we'd
+  # otherwise hand-maintain. Pinned to ``>=1.20`` because the gateway
+  # depends on the lifespan API + ``mcp.shared.memory`` test fixtures
+  # introduced in that line; pinned ``<2.0`` to gate any future major.
+  # Tested against mcp 1.27.x.
+  "mcp>=1.20,<2.0",
   # Optional UX nicety on Windows; no-op elsewhere
   "colorama>=0.4.6; platform_system == 'Windows'",
 ]

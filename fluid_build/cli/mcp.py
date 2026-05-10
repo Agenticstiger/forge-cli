@@ -768,6 +768,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     serve.set_defaults(func=run)
+    # Attach the consumer-side output-port action group under the
+    # same ``fluid mcp`` parent so operators see one MCP surface
+    # with two distinct flavours (authoring vs consumption).
+    from fluid_build.cli.mcp_output_port import attach_to_mcp_subparsers
+
+    attach_to_mcp_subparsers(sp)
 
 
 def run(args, logger: logging.Logger) -> int:
@@ -776,10 +782,17 @@ def run(args, logger: logging.Logger) -> int:
         # Bare ``fluid mcp`` — render the friendly guide instead of
         # exiting non-zero with a generic "subcommand required" error.
         return _render_mcp_guide()
-    if action != "serve":
-        return 1
-    policy = _build_policy_from_args(args)
-    return _serve_stdio(policy=policy, logger=logger)
+    if action == "serve":
+        policy = _build_policy_from_args(args)
+        return _serve_stdio(policy=policy, logger=logger)
+    # ``output-port`` (and any future action) supplies its own
+    # ``func`` via attach_to_mcp_subparsers; argparse calls it
+    # automatically. We only reach this branch when an action
+    # exists but didn't set ``func`` — keep it informative.
+    func = getattr(args, "func", None)
+    if callable(func):
+        return func(args, logger)
+    return 1
 
 
 def _render_mcp_guide() -> int:
