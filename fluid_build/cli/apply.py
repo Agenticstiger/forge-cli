@@ -41,7 +41,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.observability.tracing import traced_stage as _traced_stage
@@ -120,10 +120,20 @@ def _run_apply_hooks(
     to ``errors_list`` to indicate apply-time invariants that have been
     violated (e.g. scaffold bundle digest drift).
 
+    **Trust model.** The hook receives a ``copy.deepcopy`` of the contract,
+    not the live reference, so a buggy or malicious hook cannot mutate the
+    contract the rest of apply will consume. Plugin code is otherwise
+    uncontained (no sandboxing, no timeout, runs in-process); see
+    ``SECURITY.md`` for the full plugin trust statement.
+
     Returns 0 if all hooks passed (or ``force`` was set), non-zero
     otherwise. Plugin exceptions are caught and reported as errors so a
     buggy hook can't crash ``fluid apply`` itself.
     """
+    import copy
+
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
     try:
         import importlib.metadata as _md
 
@@ -132,16 +142,27 @@ def _run_apply_hooks(
         except TypeError:
             eps = _md.entry_points().get("fluid_build.apply_hooks", [])
     except Exception as e:
-        logger.warning("apply hook discovery failed: %s", e)
+        logger.warning("apply hook discovery failed: %s", redact_secret_text(str(e)))
         return 0
 
     errors: List[str] = []
     for ep in eps:
+        # Defense-in-depth: each hook gets its own deep copy. A hook can
+        # observe the contract freely but cannot poison the data structure
+        # the rest of apply or other hooks rely on.
+        hook_contract = copy.deepcopy(contract)
         try:
             hook = ep.load()
-            hook(contract_dir, contract, errors)
+            hook(contract_dir, hook_contract, errors)
         except Exception as e:
-            errors.append(f"apply hook {ep.name!r} raised: {e}")
+            # Pre-redact the exception message — the SecretRedactingFilter
+            # only scrubs args bound to ``password=%s``-style template
+            # tokens, but plugin exception messages are free-form text
+            # that may embed credential-shaped substrings anywhere. We
+            # apply ``redact_secret_text`` directly so the error is safe
+            # both for the log line below and for any reporter consuming
+            # the errors list.
+            errors.append(redact_secret_text(f"apply hook {ep.name!r} raised: {e}"))
 
     if not errors:
         return 0

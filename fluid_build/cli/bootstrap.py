@@ -594,6 +594,9 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     # ────────────────────────────────────────────────────────────────────
     try:
         import importlib.metadata as _md
+
+        from fluid_build.observability.secret_redactor import redact_secret_text
+
         try:
             _eps = _md.entry_points(group="fluid_build.commands")
         except TypeError:
@@ -603,6 +606,18 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
             try:
                 _ep.load()(sp)
             except Exception as _e:
-                LOG.warning("Failed to load CLI plugin %s: %s", _ep.name, _e)
+                # Pre-redact: plugin exception strings can carry credentials
+                # the SecretRedactingFilter won't scrub through the
+                # placeholder template here.
+                LOG.warning(
+                    "Failed to load CLI plugin %s: %s",
+                    _ep.name,
+                    redact_secret_text(str(_e)),
+                )
     except Exception as _e:
-        LOG.warning("CLI plugin discovery failed: %s", _e)
+        try:
+            from fluid_build.observability.secret_redactor import redact_secret_text
+        except Exception:  # pragma: no cover — observability import must always succeed
+            LOG.warning("CLI plugin discovery failed: %s", _e)
+        else:
+            LOG.warning("CLI plugin discovery failed: %s", redact_secret_text(str(_e)))

@@ -684,6 +684,8 @@ def _run_extension_validators(
     extensions = contract.get("extensions") if isinstance(contract, dict) else None
     if not isinstance(extensions, dict):
         return  # no extensions block — nothing to validate
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
     try:
         import importlib.metadata as _md
 
@@ -693,7 +695,7 @@ def _run_extension_validators(
             # Python < 3.10
             eps = _md.entry_points().get("fluid_build.extension_validators", [])
     except Exception as e:
-        logger.warning("Extension validator discovery failed: %s", e)
+        logger.warning("Extension validator discovery failed: %s", redact_secret_text(str(e)))
         return
 
     for ep in eps:
@@ -702,12 +704,16 @@ def _run_extension_validators(
             validator = ep.load()
             validator(extensions, plugin_errors)
         except Exception as e:
+            # Pre-redact plugin exception text: free-form strings can carry
+            # credential-shaped substrings the SecretRedactingFilter won't
+            # scrub through its placeholder-based scanning. See
+            # ``apply.py::_run_apply_hooks`` for the symmetric treatment.
             validation_result.add_error(
-                f"extensions: validator {ep.name!r} raised: {e}"
+                redact_secret_text(f"extensions: validator {ep.name!r} raised: {e}")
             )
             continue
         for msg in plugin_errors:
-            validation_result.add_error(f"extensions.{ep.name}: {msg}")
+            validation_result.add_error(redact_secret_text(f"extensions.{ep.name}: {msg}"))
 
 
 def _output_results(result: ValidationResult, args, logger: logging.Logger) -> int:
