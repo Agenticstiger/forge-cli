@@ -267,11 +267,16 @@ class TestApplyHooks:
             [FakeEntryPoint("digest-check", hook)],
         )
 
-        with caplog.at_level(logging.ERROR):
+        # Explicit logger binding for caplog — without it pytest-randomly's
+        # ordering can run a sibling test that has touched the root logger
+        # filter chain, causing this run's records not to propagate. Binding
+        # to the same logger we hand to `_run_apply_hooks` makes capture
+        # deterministic regardless of test order.
+        with caplog.at_level(logging.ERROR, logger="test"):
             rc = _run_apply_hooks({}, Path("/tmp"), logging.getLogger("test"))
 
         assert rc == 1
-        assert any("digest drift" in record.message for record in caplog.records)
+        assert any("digest drift" in m for m in caplog.messages)
 
     def test_force_overrides_hook_errors(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -288,13 +293,13 @@ class TestApplyHooks:
             [FakeEntryPoint("digest-check", hook)],
         )
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="test"):
             rc = _run_apply_hooks({}, Path("/tmp"), logging.getLogger("test"), force=True)
 
         assert rc == 0
         assert any(
-            "force-pattern-drift" in record.message and record.levelname == "WARNING"
-            for record in caplog.records
+            "force-pattern-drift" in r.getMessage() and r.levelname == "WARNING"
+            for r in caplog.records
         )
 
     def test_hook_exception_is_trapped(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -411,7 +416,7 @@ class TestBootstrapCommands:
         parser = argparse.ArgumentParser()
         sp = parser.add_subparsers()
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="test"):
             self._drive_plugin_loop(
                 sp,
                 logging.getLogger("test"),
@@ -419,8 +424,7 @@ class TestBootstrapCommands:
             )
 
         assert any(
-            "broken-plugin" in record.message and record.levelname == "WARNING"
-            for record in caplog.records
+            "broken-plugin" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records
         )
         # Parser still works for built-ins (the test parser has none, but
         # the point is that no exception escaped).
@@ -436,14 +440,14 @@ class TestBootstrapCommands:
         def crashing_register(_sp: Any) -> None:
             raise RuntimeError("register failed")
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="test"):
             self._drive_plugin_loop(
                 sp, logging.getLogger("test"), [FakeEntryPoint("crashy", crashing_register)]
             )
 
         assert any(
-            "crashy" in record.message and "register failed" in record.message
-            for record in caplog.records
+            "crashy" in r.getMessage() and "register failed" in r.getMessage()
+            for r in caplog.records
         )
 
     def test_bootstrap_code_uses_same_pattern(self) -> None:
