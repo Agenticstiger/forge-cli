@@ -528,6 +528,39 @@ Files still over 1500 LOC (slated for follow-up): `datamesh_manager.py`
 (1614), `forge_copilot_runtime.py` (1590), `apply.py` (~1580 with
 the federation gate), `coordinator.py` (1522).
 
+## Plugin extension points (2026-05-12)
+
+The CLI exposes three Python `entry_points` groups that external packages
+can register against to extend functionality. All three are discovered via
+`importlib.metadata.entry_points()` at runtime; no in-tree plugin manifest
+is required. Failure-trap and pre-redaction behavior is consistent across
+all three (see `SECURITY.md` for the trust model).
+
+| Group | Hook site | Plugin signature | What it does |
+|---|---|---|---|
+| `fluid_build.commands` | `cli/bootstrap.py::register_core_commands` | `register(subparsers: argparse._SubParsersAction) -> None` | Add new `fluid <name>` subcommands. Run once at CLI startup. |
+| `fluid_build.extension_validators` | `cli/validate.py::_run_extension_validators` | `validate(extensions_block: Dict, errors: List[str]) -> None` | Validate sub-keys of `contract.extensions`. Errors fold into `ValidationResult`. |
+| `fluid_build.apply_hooks` | `cli/apply.py::_run_apply_hooks` | `hook(contract_dir: Path, contract: Dict, errors: List[str]) -> None` | Apply-time invariant checks (e.g. scaffold bundle digest drift). |
+
+**Trust boundary.** Plugins are uncontained Python loaded in-process.
+Trust = pip trust. The CLI defends against three failure modes:
+(1) plugin exceptions don't crash the CLI (wrapped in `try/except`);
+(2) plugin exception text and error messages are pre-scrubbed with
+`redact_secret_text` before reaching logs or the errors list; (3) apply
+hooks receive `copy.deepcopy(contract)` so a buggy or malicious hook
+cannot mutate the contract for the rest of apply. Test pinning lives at
+`tests/test_cli_plugin_hooks.py`.
+
+**Override flags.** `fluid apply --force-pattern-drift` downgrades apply
+hook errors to warnings (escape hatch for legitimate drift, e.g. a tag
+moved underneath you in a development scenario). Nothing else silently
+ignores hook output.
+
+The reference plugin for `extension_validators` + `commands` is the
+`data-product-forge-custom-scaffold` package; reading its entry-point
+declarations in its `pyproject.toml` is the canonical "how to write a
+plugin" example.
+
 ## Links
 
 - **Documentation**: [https://agenticstiger.github.io/forge_docs/](https://agenticstiger.github.io/forge_docs/)

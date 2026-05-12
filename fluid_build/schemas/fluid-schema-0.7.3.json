@@ -91,6 +91,11 @@
     }
   ],
   "properties": {
+    "extensions": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Vendor / plugin-namespaced configuration. Each plugin claims a single sub-key (e.g. customScaffold, customCatalog) and validates its own schema there via the fluid_build.extension_validators entry-point."
+    },
     "fluidVersion": {
       "type": "string",
       "pattern": "^\\d+\\.\\d+(\\.\\d+)?$",
