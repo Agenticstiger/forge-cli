@@ -56,6 +56,59 @@ FLUID Forge includes several built-in security measures:
 - **Provider auth isolation** — each provider manages its own authentication boundary
 - **Policy-as-code** — governance rules compile to native cloud IAM before deployment
 
+## Plugin Trust Model
+
+`data-product-forge` discovers external functionality through three Python entry-point groups:
+
+| Entry-point group | Where it hooks | What plugins do |
+|---|---|---|
+| `fluid_build.commands` | `cli/bootstrap.py` | Register additional `fluid <name>` subcommands. |
+| `fluid_build.extension_validators` | `cli/validate.py` | Validate sub-keys of `contract.extensions`. |
+| `fluid_build.apply_hooks` | `cli/apply.py` | Apply-time invariant checks (e.g. scaffold bundle digest drift). |
+
+**Plugins are uncontained Python loaded into the same process as the CLI.**
+Trust in a plugin equals trust in whatever `pip` resolved when the user
+installed it. The CLI does *not* sandbox plugin code, time-limit it, or
+restrict what it can import or do with the host filesystem and network.
+
+### What the CLI does defend against
+
+- **Crash containment.** Each plugin's `load()` and invocation is wrapped
+  in `try/except`. Plugin exceptions are logged at `WARNING` (bootstrap)
+  or folded into the validation/apply error stream — they never crash
+  `fluid` itself.
+- **Contract mutation.** `_run_apply_hooks` passes each hook a
+  `copy.deepcopy()` of the contract, not the live reference, so a buggy
+  or malicious hook cannot corrupt the data structure the rest of apply
+  consumes. Other plugins in the same run see an untouched contract too.
+- **Credential leak in error messages.** Plugin exception text is
+  pre-scrubbed with `redact_secret_text` before it reaches log lines or
+  the `ValidationResult.errors` list. This covers free-form error
+  strings that the placeholder-based `SecretRedactingFilter` cannot
+  catch on its own. Test pinning lives in
+  `tests/test_cli_plugin_hooks.py::TestPluginErrorRedaction`.
+- **Override gate.** `fluid apply --force-pattern-drift` is the only
+  flag that downgrades hook errors to warnings; nothing else silently
+  ignores an apply hook's verdict.
+
+### What the CLI deliberately does NOT defend against
+
+- **Malicious plugins.** A plugin can read environment variables, write
+  arbitrary files, exfiltrate data, or do anything else Python can do.
+  Vet packages before installing them.
+- **Hung plugins.** A plugin that loops infinitely or blocks on the
+  network blocks the CLI. There is no per-hook timeout.
+- **Resource exhaustion.** A plugin can allocate unbounded memory or fork
+  subprocesses; the CLI has no per-plugin resource caps.
+
+### Reporting a plugin vulnerability
+
+If a vulnerability lives in a *third-party* plugin (not in this CLI),
+file the report with that plugin's project. If the issue is in how the
+CLI dispatches to plugins — the hook discovery, exception trapping,
+contract isolation, or redaction logic — file it here via the channel
+above.
+
 ## Contact
 
 For security concerns: **change@agenticstransformation.com**
