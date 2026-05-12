@@ -578,3 +578,31 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     _try_register(sp, "ide", "ide")
     _try_register(sp, "workspace", "workspace")
     _try_register(sp, "stats", "stats")
+
+    # ────────────────────────────────────────────────────────────────────
+    # External CLI plugins — discovered via Python entry-points.
+    #
+    # Any installed package can register an additional ``fluid <name>``
+    # subcommand by declaring an entry-point in its ``pyproject.toml``::
+    #
+    #     [project.entry-points."fluid_build.commands"]
+    #     my-cmd = "my_pkg.cli:register"
+    #
+    # The referenced callable must accept the argparse subparser group and
+    # call ``add_parser`` on it. Failures are logged at WARNING level so a
+    # broken plugin can never break ``fluid`` itself.
+    # ────────────────────────────────────────────────────────────────────
+    try:
+        import importlib.metadata as _md
+        try:
+            _eps = _md.entry_points(group="fluid_build.commands")
+        except TypeError:
+            # Python < 3.10 returned a dict of groups, not a kwarg-filtered iter.
+            _eps = _md.entry_points().get("fluid_build.commands", [])
+        for _ep in _eps:
+            try:
+                _ep.load()(sp)
+            except Exception as _e:
+                LOG.warning("Failed to load CLI plugin %s: %s", _ep.name, _e)
+    except Exception as _e:
+        LOG.warning("CLI plugin discovery failed: %s", _e)

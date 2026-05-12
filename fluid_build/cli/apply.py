@@ -94,6 +94,68 @@ from .orchestration import (
 
 COMMAND = "apply"
 
+
+# ==========================================
+# Plugin apply-time hooks (entry-point group)
+# ==========================================
+
+
+def _run_apply_hooks(
+    contract: Dict[str, Any],
+    contract_dir: Path,
+    logger: logging.Logger,
+    *,
+    force: bool = False,
+) -> int:
+    """Invoke any plugin-registered apply-time hooks.
+
+    External packages can register a hook by declaring an entry-point in
+    their ``pyproject.toml``::
+
+        [project.entry-points."fluid_build.apply_hooks"]
+        my-hook = "my_pkg.hooks:verify_something"
+
+    The referenced callable is invoked as
+    ``hook(contract_dir, contract, errors_list)`` and may append messages
+    to ``errors_list`` to indicate apply-time invariants that have been
+    violated (e.g. scaffold bundle digest drift).
+
+    Returns 0 if all hooks passed (or ``force`` was set), non-zero
+    otherwise. Plugin exceptions are caught and reported as errors so a
+    buggy hook can't crash ``fluid apply`` itself.
+    """
+    try:
+        import importlib.metadata as _md
+
+        try:
+            eps = _md.entry_points(group="fluid_build.apply_hooks")
+        except TypeError:
+            eps = _md.entry_points().get("fluid_build.apply_hooks", [])
+    except Exception as e:
+        logger.warning("apply hook discovery failed: %s", e)
+        return 0
+
+    errors: List[str] = []
+    for ep in eps:
+        try:
+            hook = ep.load()
+            hook(contract_dir, contract, errors)
+        except Exception as e:
+            errors.append(f"apply hook {ep.name!r} raised: {e}")
+
+    if not errors:
+        return 0
+
+    if force:
+        for err in errors:
+            logger.warning("apply hook drift ignored (--force-pattern-drift): %s", err)
+        return 0
+
+    for err in errors:
+        logger.error("apply hook: %s", err)
+    return 1
+
+
 # ==========================================
 # CLI Command Registration & Execution
 # ==========================================
@@ -203,6 +265,15 @@ def register(subparsers: argparse._SubParsersAction):
         "--validate-dependencies",
         action="store_true",
         help="Validate all dependencies before execution",
+    )
+    safety_group.add_argument(
+        "--force-pattern-drift",
+        action="store_true",
+        help=(
+            "Override apply-time plugin hooks that detect drift (e.g. a "
+            "scaffold-bundle digest mismatch). Use with care — drift normally "
+            "means the inputs have changed and a fresh generate is needed."
+        ),
     )
 
     # Reporting and monitoring
@@ -639,6 +710,24 @@ def run(args, logger: logging.Logger) -> int:
             # Load contract
             logger.info(f"Loading FLUID contract: {args.contract}")
             contract = load_contract_with_overlay(args.contract, args.env, logger)
+
+            # Run plugin-registered apply-time hooks (entry-point group
+            # ``fluid_build.apply_hooks``). Plugins can use these to verify
+            # apply-time invariants — e.g. scaffold bundle digest drift,
+            # lockfile freshness. ``--force-pattern-drift`` overrides any
+            # reported drift.
+            _hook_rc = _run_apply_hooks(
+                contract,
+                Path(args.contract).resolve().parent,
+                logger,
+                force=bool(getattr(args, "force_pattern_drift", False)),
+            )
+            if _hook_rc != 0:
+                logger.error(
+                    "apply aborted by an apply-time plugin hook. "
+                    "Pass --force-pattern-drift to override."
+                )
+                return _hook_rc
 
             # Determine if this is a simple local execution (no orchestration engine needed)
             has_complex_config = any(

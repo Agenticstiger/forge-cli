@@ -20,7 +20,7 @@ import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
@@ -261,6 +261,13 @@ def run(args, logger: logging.Logger) -> int:
         # Show schema if requested
         if args.show_schema:
             _show_schema_info(target_version, schema_manager, args, logger)
+
+        # Run plugin-supplied extension validators (entry-point group
+        # ``fluid_build.extension_validators``). Each plugin claims a
+        # sub-key of ``contract.extensions`` and validates its own shape
+        # there. Errors get appended to the validation result as if they
+        # had been emitted by the core schema validator.
+        _run_extension_validators(contract, validation_result, logger)
 
         # Log metrics
         duration = time.time() - start_time
@@ -649,6 +656,58 @@ def _show_schema_info(
             cprint(f"Description: {schema['description']}")
 
         cprint()
+
+
+def _run_extension_validators(
+    contract: Dict[str, Any],
+    validation_result: ValidationResult,
+    logger: logging.Logger,
+) -> None:
+    """Invoke any plugin-registered ``contract.extensions`` validators.
+
+    External packages can register a validator by declaring an
+    entry-point in their ``pyproject.toml``::
+
+        [project.entry-points."fluid_build.extension_validators"]
+        myExtensionKey = "my_pkg.validation:validate"
+
+    The referenced callable is invoked as
+    ``validator(extensions_block, errors_list) -> None`` and may append
+    error strings to ``errors_list``. Each error is folded into the
+    ``ValidationResult`` so the rest of ``fluid validate`` (output
+    formatting, exit code, strict mode) treats it identically to a
+    core schema-validation error.
+
+    Plugin exceptions are caught and reported as a single error so a
+    buggy plugin can't crash ``fluid validate`` itself.
+    """
+    extensions = contract.get("extensions") if isinstance(contract, dict) else None
+    if not isinstance(extensions, dict):
+        return  # no extensions block — nothing to validate
+    try:
+        import importlib.metadata as _md
+
+        try:
+            eps = _md.entry_points(group="fluid_build.extension_validators")
+        except TypeError:
+            # Python < 3.10
+            eps = _md.entry_points().get("fluid_build.extension_validators", [])
+    except Exception as e:
+        logger.warning("Extension validator discovery failed: %s", e)
+        return
+
+    for ep in eps:
+        plugin_errors: List[str] = []
+        try:
+            validator = ep.load()
+            validator(extensions, plugin_errors)
+        except Exception as e:
+            validation_result.add_error(
+                f"extensions: validator {ep.name!r} raised: {e}"
+            )
+            continue
+        for msg in plugin_errors:
+            validation_result.add_error(f"extensions.{ep.name}: {msg}")
 
 
 def _output_results(result: ValidationResult, args, logger: logging.Logger) -> int:
