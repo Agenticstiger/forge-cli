@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import error as console_error
+from fluid_build.observability.secret_redactor import redact_secret_text
 
 # Import shared utilities
 from ._common import build_provider, load_contract_with_overlay
@@ -592,10 +593,13 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     # call ``add_parser`` on it. Failures are logged at WARNING level so a
     # broken plugin can never break ``fluid`` itself.
     # ────────────────────────────────────────────────────────────────────
+    # ``redact_secret_text`` is imported at module top, so both the inner
+    # plugin-load path and the outer discovery-failure path are guaranteed
+    # to scrub plugin-supplied exception text before logging — there is no
+    # code path where a credential-shaped substring from ``str(exception)``
+    # reaches the log handler without going through the redactor.
     try:
         import importlib.metadata as _md
-
-        from fluid_build.observability.secret_redactor import redact_secret_text
 
         try:
             _eps = _md.entry_points(group="fluid_build.commands")
@@ -606,18 +610,10 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
             try:
                 _ep.load()(sp)
             except Exception as _e:
-                # Pre-redact: plugin exception strings can carry credentials
-                # the SecretRedactingFilter won't scrub through the
-                # placeholder template here.
                 LOG.warning(
                     "Failed to load CLI plugin %s: %s",
                     _ep.name,
                     redact_secret_text(str(_e)),
                 )
     except Exception as _e:
-        try:
-            from fluid_build.observability.secret_redactor import redact_secret_text
-        except Exception:  # pragma: no cover — observability import must always succeed
-            LOG.warning("CLI plugin discovery failed: %s", _e)
-        else:
-            LOG.warning("CLI plugin discovery failed: %s", redact_secret_text(str(_e)))
+        LOG.warning("CLI plugin discovery failed: %s", redact_secret_text(str(_e)))
