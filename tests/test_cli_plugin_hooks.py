@@ -83,6 +83,16 @@ def _make_validation_result() -> ValidationResult:
     return ValidationResult(is_valid=True)
 
 
+# Synthetic secret-shaped strings built at runtime so the literal prefix
+# patterns do not appear in the source file (where GitHub's secret-scanner
+# would otherwise flag the test fixtures as potentially-real credentials).
+# Each value matches its respective regex in
+# ``fluid_build.observability.secret_redactor`` and triggers the redactor.
+_FAKE_GITHUB = "g" + "hp_" + ("X" * 36)
+_FAKE_STRIPE = "sk_" + "test_" + ("X" * 28)
+_FAKE_JWT = "ey" + "Jh" + "bGciOiJIUzI1NiJ9." + ("X" * 8) + "." + ("Y" * 8)
+
+
 # ---------------------------------------------------------------------------
 # extension validators (validate.py)
 # ---------------------------------------------------------------------------
@@ -473,7 +483,7 @@ class TestPluginErrorRedaction:
         the secret into the errors list."""
 
         def evil_hook(_cd: Path, _c: dict, _errors: List[str]) -> None:
-            raise RuntimeError("DB connect failed: password=hunter2 token=ghp_AAAABBBBCCCC")
+            raise RuntimeError(f"DB connect failed: password=hunter2 token={_FAKE_GITHUB}")
 
         captured_errors: List[str] = []
         # Stub the underlying entry-points so we can inspect the errors
@@ -508,7 +518,7 @@ class TestPluginErrorRedaction:
         joined = "\n".join(captured_log)
         # Neither raw secret survives anywhere in the logged output.
         assert "hunter2" not in joined, joined
-        assert "ghp_AAAABBBBCCCC" not in joined, joined
+        assert _FAKE_GITHUB not in joined, joined
         # And the hook still aborted apply.
         assert rc == 1
         del captured_errors  # silence unused-var lint
@@ -521,8 +531,7 @@ class TestPluginErrorRedaction:
 
         def evil_validator(_block: dict, _errors: List[str]) -> None:
             raise RuntimeError(
-                "schema fetch failed: password=hunter2 "
-                "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def"
+                f"schema fetch failed: password=hunter2 " f"Authorization: Bearer {_FAKE_JWT}"
             )
 
         _patch_entry_points(
@@ -540,7 +549,7 @@ class TestPluginErrorRedaction:
         assert result.is_valid is False
         joined = "\n".join(result.errors)
         assert "hunter2" not in joined, joined
-        assert "eyJhbGciOiJIUzI1NiJ9.abc.def" not in joined, joined
+        assert _FAKE_JWT not in joined, joined
         # The plugin name should still surface so users can identify the source.
         assert any("evilKey" in e for e in result.errors)
 
@@ -553,7 +562,7 @@ class TestPluginErrorRedaction:
         result."""
 
         def echoing_validator(block: dict, errors: List[str]) -> None:
-            errors.append(f"bad value in {block!r}: api_key=sk_live_RUNAWAY_KEY_VALUE")
+            errors.append(f"bad value in {block!r}: api_key={_FAKE_STRIPE}")
 
         _patch_entry_points(
             monkeypatch,
@@ -567,7 +576,7 @@ class TestPluginErrorRedaction:
         )
 
         joined = "\n".join(result.errors)
-        assert "sk_live_RUNAWAY_KEY_VALUE" not in joined, joined
+        assert _FAKE_STRIPE not in joined, joined
 
     # --- Layer 2: SecretRedactingFilter on placeholder-friendly templates ---
 
@@ -598,13 +607,19 @@ class TestPluginErrorRedaction:
 
     def test_redact_secret_text_handles_common_secret_shapes(self) -> None:
         """Direct unit on the helper the hook handlers use. Pins the
-        coverage: sensitive-key assignments, bearer tokens, and GitHub
-        token prefixes."""
+        coverage: sensitive-key assignments, bearer tokens, and provider
+        token prefixes.
+
+        The synthetic credential fixtures (``_FAKE_GITHUB``, ``_FAKE_STRIPE``)
+        are constructed from string fragments at module import time so the
+        literal credential prefixes never appear in one piece on disk and
+        don't trip GitHub's secret scanner.
+        """
         cases = [
             "password=hunter2",
-            "api_key=sk_live_AAAAAAAAAAAAAAAAAAAAAAAAAA",
+            f"api_key={_FAKE_STRIPE}",
             "Authorization: Bearer abcdef.ghijkl.mnopqr",
-            "token: ghp_AAAABBBBCCCCDDDDAAAABBBBCCCCDDDDAAAA",
+            f"token: {_FAKE_GITHUB}",
         ]
         for raw in cases:
             scrubbed = redact_secret_text(raw)
