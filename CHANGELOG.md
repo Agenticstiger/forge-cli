@@ -7,6 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3rc1] — 2026-05-12
+
+Pre-release candidate of the first stable line after `v0.8.0`. Stacks the
+v0.7.3 acquisition-pattern engine work (graduated from the `v0.8.2b1`
+TestPyPI beta) on top of the new plugin extension points and their
+trust-model hardening. **Published to PyPI as a pre-release** (`pip
+install --pre data-product-forge` or `pip install
+data-product-forge==0.8.3rc1`). The follow-on `v0.8.3` stable tag will
+be cut after a downstream validation window; no functional changes are
+expected between rc1 and stable.
+
+### Added
+
+- **Three plugin extension points** discovered via Python entry-points
+  (`importlib.metadata.entry_points()`):
+  - `fluid_build.commands` — register additional `fluid <name>`
+    subcommands at CLI bootstrap (`cli/bootstrap.py`).
+  - `fluid_build.extension_validators` — validate sub-keys of
+    `contract.extensions` during `fluid validate` (`cli/validate.py`).
+    Errors fold into the `ValidationResult` namespaced under
+    `extensions.<ep-name>`.
+  - `fluid_build.apply_hooks` — apply-time invariant checks (e.g.
+    scaffold bundle digest drift) during `fluid apply` (`cli/apply.py`).
+  All three follow a uniform contract: plugin exceptions are trapped,
+  pre-redacted, and reported as errors — they cannot crash the CLI.
+  Companion packages `data-product-forge-sdk==0.9.0` (Beta) and
+  `data-product-forge-custom-scaffold==0.1.0` (Beta) ship reference
+  ABCs, conformance harnesses, and a custom-scaffold engine that plug
+  in via these hooks.
+
+- **`--force-pattern-drift` flag on `fluid apply`** — override
+  apply-hook drift errors (e.g. when a scaffold bundle digest moved
+  underneath a development scenario). Errors downgrade to WARNINGs;
+  apply proceeds.
+
+- **`contract.extensions` schema field** in `fluid-schema-0.7.3.json`
+  — optional top-level object with `additionalProperties: true`,
+  validated per-sub-key by extension-validator plugins.
+
+### Changed (security)
+
+- **Apply hooks receive `copy.deepcopy(contract)`** rather than the live
+  reference. A buggy or malicious hook cannot mutate the contract the
+  rest of apply or other hooks consume. Pinned by
+  `tests/test_cli_plugin_hooks.py::test_apply_hook_receives_deep_copy_of_contract`.
+
+- **Plugin exception text and plugin-supplied error strings are
+  pre-scrubbed with `redact_secret_text`** before reaching logs or the
+  errors list. The `SecretRedactingFilter` only scrubs args bound to
+  `password=%s`-style template tokens; plugin exceptions are free-form
+  text that can carry credential-shaped substrings anywhere. Applied
+  uniformly across `cli/apply.py`, `cli/validate.py`,
+  `cli/bootstrap.py`. Pinned by `TestPluginErrorRedaction` (5 tests).
+
+- **`bootstrap.py` imports `redact_secret_text` at module top**
+  (was: nested try/except inside the except branch, which could have
+  fallen back to unredacted logging if the import statement failed).
+  Closes a defense-in-depth gap surfaced by the security review.
+
+### Added (docs)
+
+- **SECURITY.md** gains a "Plugin Trust Model" section: tables the
+  three entry-point groups, names the defenses (crash containment,
+  contract deep-copy, pre-redaction, override gate), names the
+  deliberate non-defenses (no sandboxing, no timeout, no resource
+  limits), routes plugin-side vs CLI-side vulnerability reports.
+
+- **AGENTS.md** gains a "Plugin extension points" section documenting
+  the three entry-point groups with hook signatures, failure model,
+  and trust statement — for the AI-coding-agent audience.
+
+### Test coverage
+
+- **`tests/test_cli_plugin_hooks.py`** — 19 new tests across four
+  classes that pin every behavior on the plugin trust surface:
+  extension validators (4), apply hooks (6), bootstrap commands (4),
+  plugin error redaction (5). Uses a `FakeEntryPoint` helper so tests
+  don't need real installed packages.
+
+### Notes
+
+- This release stacks on top of the v0.7.3 acquisition-pattern engine
+  work documented in [0.8.2] below — all six ingestion engines remain
+  GA (`duckdb`, `airbyte`, `meltano`, `dlt`, `kafka-connect`,
+  `debezium`).
+- Companion plugin ecosystem packages on PyPI:
+  - `data-product-forge-sdk` (0.9.0, Beta) — import path `fluid_sdk`,
+    zero runtime dependencies.
+  - `data-product-forge-custom-scaffold` (0.1.0, Beta) — reference
+    `CustomScaffold` engine; Jinja+YAML or Python-plugin bundles.
+
 ## [0.8.2] — 2026-05-10
 
 Beta release of the v0.7.3 acquisition-pattern engine runners and the
