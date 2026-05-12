@@ -107,6 +107,38 @@ _FAKE_STRIPE = "sk_" + "test_" + ("X" * 28)
 _FAKE_JWT = "ey" + "Jh" + "bGciOiJIUzI1NiJ9." + ("X" * 8) + "." + ("Y" * 8)
 
 
+def _isolated_logger_with_capture(name: str) -> tuple[logging.Logger, list[logging.LogRecord]]:
+    """Return a fresh logger + the list its records will be appended to.
+
+    Self-contained substitute for pytest's ``caplog`` fixture. caplog
+    depends on the propagation chain to the root logger, which is fragile
+    when other tests or plugins (SecretRedactingFilter, pytest-cov) mutate
+    handler order under different test orderings. This helper attaches a
+    dedicated handler directly to a named logger and disables propagation,
+    so capture is independent of every other handler in the process.
+
+    The caller passes the logger into the code-under-test; the returned
+    list accumulates LogRecord instances as they're emitted.
+    """
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger(name)
+    # Clear residual state from prior tests using the same name.
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+    for f in list(logger.filters):
+        logger.removeFilter(f)
+    logger.addHandler(_Capture())
+    logger.setLevel(logging.DEBUG)
+    # No propagation — the capture handler is the only sink.
+    logger.propagate = False
+    return logger, records
+
+
 # ---------------------------------------------------------------------------
 # extension validators (validate.py)
 # ---------------------------------------------------------------------------
@@ -252,9 +284,7 @@ class TestApplyHooks:
         rc = _run_apply_hooks({"name": "x"}, Path("/some/dir"), logging.getLogger("test"))
         assert rc == 0
 
-    def test_hook_reports_error_returns_one(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_hook_reports_error_returns_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A hook that appends to ``errors`` causes apply to abort
         (non-zero return)."""
 
@@ -267,15 +297,14 @@ class TestApplyHooks:
             [FakeEntryPoint("digest-check", hook)],
         )
 
-        with caplog.at_level(logging.ERROR):
-            rc = _run_apply_hooks({}, Path("/tmp"), logging.getLogger("test"))
+        # Self-contained capture (no caplog) — see _isolated_logger_with_capture.
+        logger, records = _isolated_logger_with_capture("test.apply-hooks.errors")
+        rc = _run_apply_hooks({}, Path("/tmp"), logger)
 
         assert rc == 1
-        assert any("digest drift" in record.message for record in caplog.records)
+        assert any("digest drift" in r.getMessage() for r in records)
 
-    def test_force_overrides_hook_errors(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_force_overrides_hook_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``force=True`` (the --force-pattern-drift CLI flag) downgrades
         hook errors to WARNING and lets apply continue."""
 
@@ -288,13 +317,12 @@ class TestApplyHooks:
             [FakeEntryPoint("digest-check", hook)],
         )
 
-        with caplog.at_level(logging.WARNING):
-            rc = _run_apply_hooks({}, Path("/tmp"), logging.getLogger("test"), force=True)
+        logger, records = _isolated_logger_with_capture("test.apply-hooks.force")
+        rc = _run_apply_hooks({}, Path("/tmp"), logger, force=True)
 
         assert rc == 0
         assert any(
-            "force-pattern-drift" in record.message and record.levelname == "WARNING"
-            for record in caplog.records
+            "force-pattern-drift" in r.getMessage() and r.levelname == "WARNING" for r in records
         )
 
     def test_hook_exception_is_trapped(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -405,29 +433,24 @@ class TestBootstrapCommands:
         args = parser.parse_args(["my-plugin"])
         assert args.command == "my-plugin"
 
-    def test_plugin_load_failure_logged_not_raised(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_plugin_load_failure_logged_not_raised(self) -> None:
         """A plugin whose ``load()`` itself raises must NOT crash the CLI —
         the failure is logged at WARNING and the CLI continues."""
         parser = argparse.ArgumentParser()
         sp = parser.add_subparsers()
 
-        with caplog.at_level(logging.WARNING):
-            self._drive_plugin_loop(
-                sp,
-                logging.getLogger("test"),
-                [FakeEntryPoint("broken-plugin", ImportError("no such module"))],
-            )
-
-        assert any(
-            "broken-plugin" in record.message and record.levelname == "WARNING"
-            for record in caplog.records
+        logger, records = _isolated_logger_with_capture("test.bootstrap.load-fail")
+        self._drive_plugin_loop(
+            sp,
+            logger,
+            [FakeEntryPoint("broken-plugin", ImportError("no such module"))],
         )
+
+        assert any("broken-plugin" in r.getMessage() and r.levelname == "WARNING" for r in records)
         # Parser still works for built-ins (the test parser has none, but
         # the point is that no exception escaped).
 
-    def test_plugin_register_call_failure_logged_not_raised(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_plugin_register_call_failure_logged_not_raised(self) -> None:
         """A plugin whose ``load()`` succeeds but whose register callable
         raises when called must also be trapped at WARNING."""
         parser = argparse.ArgumentParser()
@@ -436,14 +459,11 @@ class TestBootstrapCommands:
         def crashing_register(_sp: Any) -> None:
             raise RuntimeError("register failed")
 
-        with caplog.at_level(logging.WARNING):
-            self._drive_plugin_loop(
-                sp, logging.getLogger("test"), [FakeEntryPoint("crashy", crashing_register)]
-            )
+        logger, records = _isolated_logger_with_capture("test.bootstrap.register-fail")
+        self._drive_plugin_loop(sp, logger, [FakeEntryPoint("crashy", crashing_register)])
 
         assert any(
-            "crashy" in record.message and "register failed" in record.message
-            for record in caplog.records
+            "crashy" in r.getMessage() and "register failed" in r.getMessage() for r in records
         )
 
     def test_bootstrap_code_uses_same_pattern(self) -> None:
