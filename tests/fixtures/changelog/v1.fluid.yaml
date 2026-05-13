@@ -1,0 +1,71 @@
+fluidVersion: "0.7.3"
+kind: DataProduct
+id: orders-product
+name: Orders Product
+description: Test fixture v1 for changelog comparison
+metadata:
+  owner: data-platform-team
+  domain: commerce
+  layer: Silver
+  productType: ADP
+  tags:
+    - finance
+    - core
+consumes:
+  - ref: upstream.users
+    productId: upstream.users
+exposes:
+  - id: orders
+    type: table
+    primaryKey:
+      - order_id
+    binding:
+      platform: snowflake
+      location:
+        format: TABLE
+        properties:
+          database: ANALYTICS
+          schema: COMMERCE
+          table: ORDERS
+    schema:
+      - name: order_id
+        type: BIGINT
+        nullable: false
+        description: Primary key
+      - name: customer_id
+        type: BIGINT
+        nullable: false
+      - name: amount
+        type: INT
+        nullable: true
+        description: Order total in cents
+      - name: email
+        type: STRING
+        nullable: true
+      - name: status
+        type: STRING
+        nullable: false
+    quality:
+      tests:
+        - name: orders_order_id_not_null
+          column: order_id
+          type: not_null
+          severity: warn
+        - name: orders_amount_positive
+          column: amount
+          type: range
+          min: 0
+          severity: warn
+agentPolicy:
+  allowedModels:
+    - gpt-4
+    - claude-3-opus
+    - gemini-1.5-pro
+  allowedUseCases:
+    - inference
+    - summarization
+sovereignty:
+  allowedRegions:
+    - us-east-1
+    - us-west-2
+    - eu-west-1
