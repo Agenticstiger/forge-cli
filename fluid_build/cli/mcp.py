@@ -1054,10 +1054,27 @@ def _build_fastmcp_app(policy: McpPolicy) -> FastMCP:
 
 
 async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Permission-gate + thread-dispatch for a tool that has no async needs."""
+    """Permission-gate + sync execution for a fast read/write tool.
+
+    NB: deliberately calls ``_call_tool`` SYNCHRONOUSLY (no
+    ``asyncio.to_thread``). The fast tools (file reads, validator runs,
+    catalog enumerations) complete in single-digit milliseconds, so the
+    event-loop block is negligible — and going through a worker thread
+    causes a real race when a client pipelines requests (e.g. the
+    ``tests/test_mcp_protocol_smoke.py`` smoke test sends 3 messages then
+    closes stdin): the SDK can hit stdin-EOF and start shutting down
+    before the worker thread's response makes it to stdout, producing
+    a missing-response failure plus ``ValueError: I/O operation on
+    closed file`` on the worker thread. Sync dispatch guarantees each
+    response is fully flushed before the next request is read.
+
+    The slow tool — ``forge_run`` (in-process forge copilot loop, can
+    take seconds; needs concurrency to service sampling round-trips) —
+    keeps its own explicit ``asyncio.to_thread`` because it MUST run
+    off the loop.
+    """
     check_tool_permission(name, arguments, policy=_policy())
-    return await asyncio.to_thread(
-        _call_tool,
+    return _call_tool(
         name,
         arguments,
         read_only=_policy().read_only,
