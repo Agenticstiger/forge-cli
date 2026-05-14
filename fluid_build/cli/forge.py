@@ -25,7 +25,11 @@ First-time project setup lives in ``fluid init``.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
+import sys
+import time
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -375,6 +379,32 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     parser.add_argument(
+        "--agent",
+        action="store_true",
+        help=(
+            "Headless agent-drivable preset. Bundles --yes + all "
+            "FLUID_FORGE_NO_{PICKER,PREVIEW,WELCOME,STREAMING_PREVIEW}=1 + "
+            "emits JSON-Lines progress events (forge.start, forge.done, "
+            "forge.contract_written, forge.cost) to stdout so the IDE's "
+            "shell tool can parse them. Defaults to --blank when no mode "
+            "flag is provided (avoids dropping into the interactive picker "
+            "the agent cannot navigate). Use this from inside any agentic "
+            "IDE (Kiro, Cursor, Claude Code, Cline)."
+        ),
+    )
+    parser.add_argument(
+        "--emit-plan",
+        dest="emit_plan",
+        action="store_true",
+        help=(
+            "Emit a one-shot `forge.plan` JSONL event with the structured "
+            "checklist of what fields the agent must fill in to complete "
+            "the contract (no LLM call, deterministic). Used after "
+            "`--agent --blank` so the IDE's agent (which is itself an LLM) "
+            "knows exactly what to author. Implies --agent."
+        ),
+    )
+    parser.add_argument(
         "--show-work",
         action="store_true",
         help=(
@@ -691,15 +721,35 @@ def _run_blank_mode(args: Any, logger: logging.Logger) -> int:
     if not result_path:
         return 1
 
-    _scaffold_ci_pipeline(
-        args,
-        target_dir,
-        {},
-        console,
-        ask_dialog_question_fn=ask_dialog_question,
-        get_cli_arg_fn=get_cli_arg,
-        dry_run=False,
-    )
+    # Agent-mode JSONL: blank-mode bypasses ``_write_forge_receipt`` (no LLM
+    # cost to record), so we emit ``forge.contract_written`` directly here
+    # to keep the event stream contract consistent.
+    if bool(get_cli_arg(args, "agent", False)):
+        try:
+            size = result_path.stat().st_size
+        except OSError:
+            size = -1
+        _emit_agent_jsonl(
+            "forge.contract_written",
+            path=str(result_path),
+            action="created",
+            size=size,
+        )
+
+    # In --agent mode we skip the interactive CI-pipeline prompt entirely.
+    # The agent can shell-run ``fluid scaffold-ci --system <name>`` separately
+    # if it wants CI scaffolding. Without this guard, blank-mode under
+    # --agent hits an EOFError trying to read from a closed stdin.
+    if not bool(get_cli_arg(args, "agent", False)):
+        _scaffold_ci_pipeline(
+            args,
+            target_dir,
+            {},
+            console,
+            ask_dialog_question_fn=ask_dialog_question,
+            get_cli_arg_fn=get_cli_arg,
+            dry_run=False,
+        )
 
     _print_next_steps(console, target_dir, result_path)
     return 0
@@ -764,11 +814,263 @@ def _print_next_steps(console: Any, target_dir: Path, contract_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
+# Agent-mode helpers (Phase 2B — `fluid forge --agent`)
+# ---------------------------------------------------------------------------
+#
+# These let the IDE's agent shell-run forge cleanly: a single ``--agent``
+# flag bundles all FLUID_FORGE_NO_* env vars + ``--yes`` + a default-blank
+# fallback so we never drop into the interactive picker. A small JSON-Lines
+# event stream over stdout lets the agent parse progress (start / done /
+# contract_written / cost) without scraping Rich console output.
+#
+# Design choice: events go to stdout AS WHOLE JSON OBJECTS PER LINE so the
+# agent's parser is ``for line in stdout: try: obj = json.loads(line);
+# except: pass``. Rich's banners on stdout don't parse as JSON, so they're
+# harmlessly ignored. No need to mute Rich (which would break user-facing
+# UX outside ``--agent``).
+
+
+def _emit_agent_jsonl(event: str, **kvs: Any) -> None:
+    """Emit one canonical JSON-Lines event to stdout for agent consumption.
+
+    Only used when ``--agent`` is active; callers gate via ``args.agent``.
+    Failures are swallowed so a stdout pipe-closed never poisons the run.
+    """
+    try:
+        payload = {"event": event, "ts": time.time(), **kvs}
+        sys.stdout.write(json.dumps(payload, default=str) + "\n")
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _setup_agent_mode(args: Any) -> None:
+    """Mutate env + args so the run is non-interactive and machine-friendly."""
+    # Suppress all of forge's interactive UI surfaces so the agent never
+    # gets stuck on a prompt it can't answer.
+    for var in (
+        "FLUID_FORGE_NO_PICKER",
+        "FLUID_FORGE_NO_PREVIEW",
+        "FLUID_FORGE_NO_WELCOME",
+        "FLUID_FORGE_NO_STREAMING_PREVIEW",
+    ):
+        os.environ.setdefault(var, "1")
+    args.yes = True
+
+    # If the agent didn't pick a mode, default to --blank: it's the
+    # only mode that succeeds without an LLM round-trip, so it's the
+    # safest fallback when invoked under ``--agent --data-product-type X``
+    # with no other intent. The agent can override by passing
+    # --from-product, --refine, or --template explicitly.
+    no_mode = not any(
+        [
+            bool(getattr(args, "blank", False)),
+            bool(getattr(args, "template", None)),
+            bool(getattr(args, "scaffold", None)),
+            bool(getattr(args, "refine", None)),
+            bool(getattr(args, "from_product", None)),
+            bool(getattr(args, "from_product_list", None)),
+        ]
+    )
+    if no_mode:
+        args.blank = True
+
+
+def _agent_run_id() -> str:
+    """Short, stable run-id for the JSONL event stream (12 hex chars)."""
+    import uuid
+
+    return uuid.uuid4().hex[:12]
+
+
+# ---------------------------------------------------------------------------
+# --emit-plan — deterministic "what to fill in" checklist for the IDE agent
+# ---------------------------------------------------------------------------
+#
+# Architectural note: the IDE's agent already has an LLM (paid for by the
+# IDE's subscription). We don't want forge to ALSO run an LLM — that would
+# need a second API key. Instead, we emit a deterministic checklist of
+# fields the agent must fill in, and let the agent (the LLM in the IDE) do
+# the authoring using its own Edit tools. Pattern 1 from AGENT_IDE.md.
+#
+# The checklist is keyed by productType so SDP / ADP / CDP each get the
+# right next-steps (e.g. SDP has acquisition[], ADP has transformations[],
+# CDP has consumes[] + transformations[] + access[]).
+
+_PLAN_BY_PRODUCT_TYPE: Dict[str, List[Dict[str, Any]]] = {
+    "SDP": [
+        {
+            "step": "Define acquisition[]",
+            "description": "How data is acquired from the source system",
+            "fields": ["acquisition[].source", "acquisition[].mode"],
+            "mcp_tools": ["list_source_adapters", "list_source_tables", "inspect_source_table"],
+        },
+        {
+            "step": "Define models[].entities[]",
+            "description": "Mirror the upstream schema — entity per source table",
+            "fields": [
+                "models[].name",
+                "models[].entities[].name",
+                "models[].entities[].fields[]",
+                "models[].entities[].primaryKey",
+            ],
+            "mcp_tools": ["inspect_source_table", "list_source_lineage"],
+        },
+        {
+            "step": "Add quality[]",
+            "description": "Declarative quality rules (uniqueness, freshness, schema)",
+            "fields": ["quality[].rule", "quality[].entity"],
+            "mcp_tools": ["search_semantic_memory"],
+        },
+    ],
+    "ADP": [
+        {
+            "step": "Define consumes[]",
+            "description": "Upstream SDP/ADP products this aggregate is built from",
+            "fields": ["consumes[].productId", "consumes[].version"],
+            "mcp_tools": ["list_source_lineage", "search_semantic_memory"],
+        },
+        {
+            "step": "Define models[].entities[] for the aggregate",
+            "description": "Aggregate-level entities (joined/grouped)",
+            "fields": ["models[].entities[].name", "models[].entities[].fields[]"],
+            "mcp_tools": ["inspect_source_table", "read_logical_model"],
+        },
+        {
+            "step": "Define transformations[]",
+            "description": "dbt model refs, inline SQL, or external .sql files",
+            "fields": ["transformations[].engine", "transformations[].sql"],
+            "mcp_tools": [],
+        },
+        {
+            "step": "Add quality[]",
+            "description": "Aggregate-level quality rules",
+            "fields": ["quality[].rule", "quality[].entity"],
+            "mcp_tools": [],
+        },
+    ],
+    "CDP": [
+        {
+            "step": "Define consumes[]",
+            "description": "Upstream products feeding this consumer-aligned product",
+            "fields": ["consumes[].productId", "consumes[].version"],
+            "mcp_tools": ["list_source_lineage", "search_semantic_memory"],
+        },
+        {
+            "step": "Define models[].entities[] for the consumer view",
+            "description": "Consumer-facing entities (denormalised, BI-friendly)",
+            "fields": ["models[].entities[].name", "models[].entities[].fields[]"],
+            "mcp_tools": ["read_logical_model"],
+        },
+        {
+            "step": "Define transformations[]",
+            "description": "Joins + denormalisation SQL",
+            "fields": ["transformations[].engine", "transformations[].sql"],
+            "mcp_tools": [],
+        },
+        {
+            "step": "Define access[]",
+            "description": "IAM/GRANT bindings for downstream consumers",
+            "fields": ["access[].principal", "access[].grants[]"],
+            "mcp_tools": [],
+        },
+        {
+            "step": "Add exposes block (optional)",
+            "description": "Agent-policy for downstream AI consumers",
+            "fields": ["exposes.agentPolicy.allowedUseCases", "exposes.semantics"],
+            "mcp_tools": [],
+        },
+    ],
+}
+
+
+def _emit_forge_plan(args: Any, contract_path: Optional[Path]) -> None:
+    """Emit a single ``forge.plan`` JSONL event with the structured checklist
+    for what the IDE's agent should fill in. Deterministic; no LLM call.
+    """
+    dpt_raw = (getattr(args, "data_product_type", None) or "").strip().upper()
+    # Map medallion → DataMesh layer per the canonical mapping in CLAUDE.md.
+    layer_map = {"BRONZE": "SDP", "SILVER": "ADP", "GOLD": "CDP"}
+    dpt = layer_map.get(dpt_raw, dpt_raw)
+    steps = _PLAN_BY_PRODUCT_TYPE.get(dpt, _PLAN_BY_PRODUCT_TYPE["SDP"])
+    _emit_agent_jsonl(
+        "forge.plan",
+        contract_path=str(contract_path) if contract_path else None,
+        data_product_type=dpt or None,
+        next_steps=steps,
+        validation_command=(
+            f"fluid validate {contract_path}" if contract_path else "fluid validate <path>"
+        ),
+        completion_signal=(
+            "After filling in the contract, call MCP `validate_contract` to "
+            "gate-check, then `fluid bundle && fluid plan` for the pipeline."
+        ),
+        note=(
+            "You (the IDE's agent) are the LLM. Fill in these fields using "
+            "your own Edit tool; do NOT shell-run `fluid forge --ai` (that "
+            "would need a second LLM API key)."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 
 def run(args, logger: logging.Logger) -> int:
+    """Agent-mode-aware wrapper around the main forge entry point.
+
+    When ``--agent`` is set, configures the run for headless invocation and
+    emits a JSONL event stream so the IDE's shell tool can parse progress.
+    """
+    # ``--emit-plan`` implies ``--agent`` — the plan event is part of the
+    # JSONL stream contract.
+    if getattr(args, "emit_plan", False) and not getattr(args, "agent", False):
+        args.agent = True
+
+    is_agent = bool(getattr(args, "agent", False))
+    if not is_agent:
+        return _run_main(args, logger)
+
+    _setup_agent_mode(args)
+    run_id = _agent_run_id()
+    mode = (
+        "from-product"
+        if getattr(args, "from_product", None)
+        else (
+            "refine"
+            if getattr(args, "refine", None)
+            else (
+                "template"
+                if getattr(args, "template", None) or getattr(args, "scaffold", None)
+                else ("blank" if getattr(args, "blank", False) else "ai")
+            )
+        )
+    )
+    _emit_agent_jsonl(
+        "forge.start",
+        run_id=run_id,
+        mode=mode,
+        data_product_type=getattr(args, "data_product_type", None),
+        target_dir=str(getattr(args, "target_dir", None) or ""),
+        emit_plan=bool(getattr(args, "emit_plan", False)),
+    )
+    rc = 1
+    try:
+        rc = _run_main(args, logger)
+        # On success, optionally emit the structured plan checklist BEFORE
+        # forge.done so consumers parsing the stream see the plan in order.
+        if rc == 0 and getattr(args, "emit_plan", False):
+            target_dir = getattr(args, "target_dir", None)
+            contract_path = Path(target_dir) / "contract.fluid.yaml" if target_dir else None
+            _emit_forge_plan(args, contract_path)
+        return rc
+    finally:
+        _emit_agent_jsonl("forge.done", run_id=run_id, exit_code=int(rc or 0))
+
+
+def _run_main(args, logger: logging.Logger) -> int:
     """Main entry point for ``fluid forge``."""
     console = Console() if RICH_AVAILABLE else None
     try:
@@ -1124,6 +1426,7 @@ def _write_forge_receipt(
             return
 
         builder = ReceiptBuilder(flow=flow, dry_run=False)
+        is_agent = bool(get_cli_arg(args, "agent", False))
         for entry in changed:
             # Re-anchor the path to the product root so the receipt is
             # self-contained and portable across clones.
@@ -1140,6 +1443,20 @@ def _write_forge_receipt(
                 size=entry.size,
                 reason=entry.reason,
             )
+            # Agent-mode JSONL: one event per changed file. The agent's
+            # caller can highlight new contracts in its UI without
+            # parsing the receipt.
+            if is_agent and entry.action in ("created", "modified"):
+                _emit_agent_jsonl(
+                    (
+                        "forge.contract_written"
+                        if str(entry.path).endswith("contract.fluid.yaml")
+                        else "forge.file_written"
+                    ),
+                    path=str(entry.path),
+                    action=entry.action,
+                    size=entry.size,
+                )
 
         inputs: Dict[str, Any] = {
             "blank": bool(get_cli_arg(args, "blank", False)) or None,

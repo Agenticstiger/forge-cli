@@ -74,7 +74,9 @@ Stage 7 `fluid apply` re-verifies both before any DDL. Mismatch → hard-fail wi
 
 ---
 
-## For AI Coding Agents (Copilot, Cursor, Cline, etc.)
+## For AI Coding Agents (Copilot, Cursor, Cline, Kiro, Claude Code, etc.)
+
+> **Quick start for any agentic IDE.** Run `fluid scaffold-ide --target {kiro|cursor|claude-code|cline|generic}` in your data-product repo. It drops the right steering files, hooks, and MCP server config for your IDE so its agent can drive `fluid` natively. See [AGENT_IDE.md](AGENT_IDE.md) for the full walkthrough.
 
 ### Project Structure
 
