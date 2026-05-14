@@ -144,6 +144,29 @@ Examples:
         help="Skip live data validation (structure-only checks)",
     )
 
+    # --- quality engine ---
+    p.add_argument(
+        "--engine",
+        choices=["native", "soda"],
+        default="native",
+        help=(
+            "Quality-check engine. 'native' (default) runs forge's built-in "
+            "quality gates. 'soda' generates SodaCL from the contract quality "
+            "block and shells out to a locally-installed `soda scan`."
+        ),
+    )
+    p.add_argument(
+        "--datasource",
+        help=(
+            "Soda data-source name (required when --engine soda is set). "
+            "Must match a datasource configured in your Soda configuration.yml."
+        ),
+    )
+    p.add_argument(
+        "--soda-config",
+        help="Path to Soda configuration.yml (defaults to Soda's auto-discovery)",
+    )
+
     # --- output ---
     p.add_argument(
         "--output",
@@ -199,6 +222,12 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     if not contract_path.exists():
         console_error(f"Contract file not found: {contract_path}")
         return 1
+
+    # Soda engine dispatch — generates SodaCL from the contract's quality
+    # block and shells out to the user's installed `soda` binary. Skipped
+    # when --engine native (the default).
+    if getattr(args, "engine", "native") == "soda":
+        return _run_soda_engine(args, contract_path, logger)
 
     # Import ContractValidator lazily to avoid circular deps
     from .contract_validation import ContractValidator
@@ -699,3 +728,204 @@ def _publish_results(
     except Exception as exc:
         console_error(f"Failed to publish test results: {exc}")
         LOG.exception("publish_test_results_error")
+
+
+# ======================================================================
+# Soda engine
+# ======================================================================
+
+
+def _run_soda_engine(
+    args: argparse.Namespace,
+    contract_path: Path,
+    logger: logging.Logger,
+) -> int:
+    """Render SodaCL from the contract and run ``soda scan``.
+
+    Required user inputs:
+        --datasource <name>   Soda datasource configured in their configuration.yml
+        --soda-config <path>  Optional path to that configuration.yml
+
+    The function:
+      1. Loads the contract (with --env overlay if set).
+      2. Renders SodaCL from quality.tests[].
+      3. Writes the SodaCL to a temp file.
+      4. Resolves the `soda` binary (env var → $PATH → fail loud).
+      5. Shells out to `soda scan`.
+      6. Parses results and prints a summary in the requested format.
+
+    Returns 0 on all-pass, 1 on any failed check or runtime error.
+    """
+    import tempfile
+
+    from ..build_runners.soda import (
+        SodaNotInstalled,  # noqa: F401 — used in except
+        resolve_soda_executable,
+        run_soda_scan,
+    )
+    from ..exporters.sodacl import render_sodacl
+    from ._common import load_contract_with_overlay
+
+    datasource = getattr(args, "datasource", None)
+    if not datasource:
+        console_error(
+            "--datasource is required when --engine soda is set. "
+            "Use the name of a datasource defined in your Soda configuration.yml."
+        )
+        return 1
+
+    try:
+        contract = load_contract_with_overlay(
+            str(contract_path), getattr(args, "env", None), logger
+        )
+    except Exception as exc:
+        console_error(f"Failed to load contract: {exc}")
+        return 1
+
+    sodacl_text = render_sodacl(contract)
+    if "# No quality tests" in sodacl_text:
+        warning("Contract has no quality.tests[]; nothing to check via Soda.")
+        return 0
+
+    # Soda needs the YAML on disk — write to a temp file so the scan
+    # invocation is self-contained.
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".sodacl.yml", delete=False, encoding="utf-8"
+    ) as f:
+        f.write(sodacl_text)
+        sodacl_path = f.name
+
+    try:
+        soda_bin = resolve_soda_executable()
+    except Exception as exc:
+        console_error(str(exc))
+        os.unlink(sodacl_path)
+        return 1
+
+    try:
+        result = run_soda_scan(
+            sodacl_path,
+            datasource=datasource,
+            config_path=getattr(args, "soda_config", None),
+            executable=soda_bin,
+        )
+    finally:
+        # Always clean up the temp SodaCL file. The Soda binary has already
+        # consumed it by this point.
+        try:
+            os.unlink(sodacl_path)
+        except OSError:
+            pass
+
+    # Render in the requested format (re-use the existing --output flag).
+    output_format = getattr(args, "output", "text")
+    output_file = getattr(args, "output_file", None)
+
+    if output_format == "json":
+        _emit_soda_json(result, datasource, output_file)
+    elif output_format == "junit":
+        _emit_soda_junit(result, datasource, output_file)
+    else:
+        _emit_soda_text(result, datasource)
+
+    return 0 if result.ok else 1
+
+
+def _emit_soda_json(result, datasource: str, output_file: Optional[str]) -> None:
+    """Write the soda result as the canonical JSON envelope."""
+    data = {
+        "engine": "soda",
+        "datasource": datasource,
+        "return_code": result.return_code,
+        "checks_passed": result.checks_passed,
+        "checks_failed": result.checks_failed,
+        "checks_warned": result.checks_warned,
+        "failed_check_names": result.failed_check_names,
+        "ok": result.ok,
+    }
+    text = json.dumps(data, indent=2)
+    if output_file:
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+        cprint(f"Report saved to: {output_file}")
+    else:
+        sys.stdout.write(text + "\n")
+
+
+def _emit_soda_junit(result, datasource: str, output_file: Optional[str]) -> None:
+    """Write the soda result as JUnit XML for CI/CD systems.
+
+    One ``<testsuite>`` containing one ``<testcase>`` per check.
+    Passed checks emit an empty case; failed checks emit a ``<failure>``
+    with the check expression and any captured stderr (secret-redacted).
+    """
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
+    total = result.checks_passed + result.checks_failed + result.checks_warned
+    ts = ET.Element("testsuite")
+    ts.set("name", f"fluid-test-soda:{datasource}")
+    ts.set("tests", str(total))
+    ts.set("failures", str(result.checks_failed))
+    ts.set("errors", "0")
+    ts.set("skipped", "0")
+
+    # Emit a passed test case for the suite overall when we have no
+    # per-check granularity from Soda's stdout (older Soda versions don't
+    # surface individual passed-check names).
+    if result.checks_passed and not result.failed_check_names:
+        tc = ET.SubElement(ts, "testcase")
+        tc.set("classname", f"soda.{datasource}")
+        tc.set("name", f"{result.checks_passed} check(s) passed")
+
+    for name in result.failed_check_names:
+        tc = ET.SubElement(ts, "testcase")
+        tc.set("classname", f"soda.{datasource}")
+        tc.set("name", name)
+        fail = ET.SubElement(tc, "failure")
+        fail.set("type", "SodaCheckFailure")
+        fail.set("message", name)
+        if result.raw_stderr:
+            fail.text = redact_secret_text(result.raw_stderr.strip()[:2000])
+
+    if not result.ok and not result.failed_check_names:
+        # The runner couldn't pull per-check names but the suite failed —
+        # emit a single failure case so CI dashboards still surface it.
+        tc = ET.SubElement(ts, "testcase")
+        tc.set("classname", f"soda.{datasource}")
+        tc.set("name", "soda scan failed")
+        fail = ET.SubElement(tc, "failure")
+        fail.set("type", "SodaScanFailure")
+        fail.set("message", f"return_code={result.return_code}")
+        if result.raw_stderr:
+            fail.text = redact_secret_text(result.raw_stderr.strip()[:2000])
+
+    if output_file:
+        ET.ElementTree(ts).write(output_file, encoding="unicode", xml_declaration=True)
+        cprint(f"JUnit XML saved to: {output_file}")
+    else:
+        ET.indent(ts)
+        sys.stdout.write('<?xml version="1.0" ?>\n' + ET.tostring(ts, encoding="unicode") + "\n")
+
+
+def _emit_soda_text(result, datasource: str) -> None:
+    """Human-readable terminal output for the soda engine."""
+    icon = "PASS" if result.ok else "FAIL"
+    cprint(f"{icon}  fluid test --engine soda  |  datasource: {datasource}")
+    cprint(
+        f"   passed: {result.checks_passed}, "
+        f"failed: {result.checks_failed}, "
+        f"warned: {result.checks_warned}"
+    )
+    if result.failed_check_names:
+        cprint("   failed checks:")
+        for name in result.failed_check_names:
+            cprint(f"     - {name}")
+    if not result.ok and result.raw_stderr:
+        # Soda's stderr can include credential-bearing connection
+        # strings (DSNs with embedded passwords, BigQuery service-
+        # account JSON). Route through the project-wide redactor
+        # before showing it to the operator.
+        from fluid_build.observability.secret_redactor import redact_secret_text
+
+        redacted = redact_secret_text(result.raw_stderr.strip()[:500])
+        cprint(f"   soda stderr: {redacted}")

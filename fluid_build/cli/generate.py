@@ -79,6 +79,7 @@ Examples:
     from . import (
         generate_artifacts,
         generate_ci,
+        generate_dbt_tests,
         generate_schedule,
         generate_speed_transformation,
         generate_standard,
@@ -89,6 +90,7 @@ Examples:
     generate_ci.register_subcommand(sub)
     generate_standard.register_subcommand(sub)
     generate_artifacts.register_subcommand(sub)
+    generate_dbt_tests.register_subcommand(sub)
 
     # Default handler (backward compat: no subcommand → transformation)
     p.set_defaults(cmd=COMMAND, func=run)
