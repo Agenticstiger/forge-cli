@@ -167,9 +167,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # "1.7" = lower-bound pin from pyproject.toml `mcp>=1.7`
-        # ""    = no version pin -> latest 1.x (this is what users get today)
-        mcp-version: ["1.7", ""]
+        # "1.20" = lower-bound pin from pyproject.toml `mcp>=1.20`
+        #          (see comment there for the FastMCP API features we need:
+        #          deferred-annotation handling, ClientSession
+        #          ``sampling_capabilities`` kwarg, etc.)
+        # ""     = no version pin → latest 1.x (this is what users get today)
+        mcp-version: ["1.20", ""]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6

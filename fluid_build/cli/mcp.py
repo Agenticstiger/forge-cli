@@ -644,6 +644,62 @@ per-artifact snapshot bucket; ``audit`` powers the forensic trail.
 Both are needed for *any* mutating tool to behave responsibly."""
 
 
+# ---------------------------------------------------------------------
+# Public helpers preserved for direct callers / introspection.
+#
+# Before the Phase 3 FastMCP migration these were used by ``_serve_stdio``
+# to advertise tools and to filter the ``tools/list`` advertisement
+# against the active policy. The SDK now owns the transport so the
+# functions are no longer called internally, but tests + downstream
+# tooling still import them for unit-level coverage of the capability
+# registry and the visibility filter. Keep the surface stable.
+# ---------------------------------------------------------------------
+
+
+def _tool_definitions() -> List[Dict[str, Any]]:
+    """Derive the tool-advertisement list from :data:`TOOL_CAPABILITIES`.
+
+    Returns one ``{"name", "description", "inputSchema"}`` dict per tool.
+    Tools with no declared ``input_schema`` fall back to a permissive
+    empty-object schema (accepted by the MCP spec, but unhelpful for
+    editor autocomplete — every shipped tool here has an explicit schema).
+    """
+    out: List[Dict[str, Any]] = []
+    for cap in TOOL_CAPABILITIES.values():
+        entry: Dict[str, Any] = {"name": cap.name, "description": cap.description}
+        entry["inputSchema"] = (
+            cap.input_schema if cap.input_schema is not None else {"type": "object"}
+        )
+        out.append(entry)
+    return out
+
+
+def _filter_visible_tools(tools: List[Dict[str, Any]], policy: "McpPolicy") -> List[Dict[str, Any]]:
+    """Drop tools the active policy hides — denied tools and mutating
+    tools under ``--read-only`` are removed so clients don't advertise
+    options doomed to fail.
+
+    Pre-FastMCP this filtered the ``tools/list`` payload before
+    serialisation; the SDK now prunes via ``FastMCP.remove_tool`` at
+    server-build time, but the function stays callable for unit tests
+    and any in-tree tool that wants to compute the visible set without
+    spinning up a server.
+    """
+    visible: List[Dict[str, Any]] = []
+    for tool in tools:
+        name = tool.get("name")
+        if not isinstance(name, str):
+            continue
+        cap = TOOL_CAPABILITIES.get(name)
+        if cap is None or not policy.is_tool_allowed(name):
+            continue
+        needs_write = cap.mutates_files or bool(cap.writes_namespaces)
+        if policy.read_only and needs_write:
+            continue
+        visible.append(tool)
+    return visible
+
+
 @dataclass(frozen=True)
 class McpPolicy:
     """Access-control policy for an MCP stdio server process.

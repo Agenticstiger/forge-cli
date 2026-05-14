@@ -47,7 +47,6 @@ from mcp.client.stdio import stdio_client
 from mcp.types import (
     CreateMessageRequestParams,
     CreateMessageResult,
-    SamplingCapability,
     TextContent,
 )
 
@@ -133,11 +132,15 @@ def test_forge_run_diag_with_real_llm_via_sampling(tmp_path: Path):
 
     async def _run() -> dict:
         async with stdio_client(_server_params(tmp_path)) as (read, write):
+            # NB: We don't pass ``sampling_capabilities=SamplingCapability()``
+            # explicitly — that kwarg was added in mcp>=1.25-ish. The SDK
+            # advertises sampling capability automatically when a
+            # ``sampling_callback`` is provided, so older floor versions
+            # work without it. The CI ``mcp-sdk-drift`` matrix enforces this.
             async with ClientSession(
                 read,
                 write,
                 sampling_callback=sampling_callback,
-                sampling_capabilities=SamplingCapability(),
             ) as client:
                 await client.initialize()
                 result = await client.call_tool(
