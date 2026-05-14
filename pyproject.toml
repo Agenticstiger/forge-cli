@@ -62,6 +62,17 @@ dependencies = [
   # Borrowed-not-built per /borrow-before-build (skill receipts in commit msg):
   #   docs:  https://docs.pydantic.dev/latest/concepts/pydantic_settings/
   "pydantic-settings>=2.0",
+  # Official Model Context Protocol SDK. Powers `fluid mcp serve --backend sdk`
+  # via FastMCP + ServerSession.create_message (the canonical server-side
+  # sampling primitive). The legacy hand-rolled MCP server in
+  # fluid_build.cli.mcp + fluid_build.cli._mcp_sampling is kept side-by-side
+  # behind --backend legacy (the default) for compatibility; the SDK
+  # backend is the long-term target.
+  # Borrowed-not-built per /borrow-before-build (skill receipts in
+  # AGENT_IDE.md "Related work" section):
+  #   docs:  https://modelcontextprotocol.github.io/python-sdk/
+  #   repo:  https://github.com/modelcontextprotocol/python-sdk
+  "mcp>=1.7",
   # Optional UX nicety on Windows; no-op elsewhere
   "colorama>=0.4.6; platform_system == 'Windows'",
 ]
@@ -374,6 +385,7 @@ markers = [
     "datamesh: Tests for DataMesh Manager provider",
     "policy: Tests for policy validators",
     "runtime: Tests for runtime generators",
+    "live_llm: Tests that call a real LLM (cost ~$0.0001/run; require an API key in env)",
 ]
 
 [tool.coverage.run]

@@ -151,6 +151,50 @@ jobs:
           # blocking signal.
           fail_ci_if_error: false
 
+  # ── MCP SDK version drift ───────────────────────────────────────────────
+  # Catches breaking changes in ``modelcontextprotocol/python-sdk`` at
+  # PR-time instead of at user-install-time. Runs the MCP-touching test
+  # files against the lower-bound pin from pyproject.toml + the latest 1.x
+  # the SDK has released.
+  #
+  # If the SDK ships breaking changes in 2.x, this job will go red and we
+  # can either pin a ceiling in pyproject.toml or do the 2.x port before
+  # users hit it. Either is preferable to "the data team's pip install
+  # picks up an incompatible mcp release tomorrow."
+  mcp-sdk-drift:
+    name: MCP SDK Drift (mcp ${{ matrix.mcp-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # "1.7" = lower-bound pin from pyproject.toml `mcp>=1.7`
+        # ""    = no version pin -> latest 1.x (this is what users get today)
+        mcp-version: ["1.7", ""]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install fluid-build + pinned MCP SDK
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,local]" || pip install -e ".[dev]"
+          if [ -n "${{ matrix.mcp-version }}" ]; then
+            pip install --force-reinstall "mcp==${{ matrix.mcp-version }}"
+          else
+            pip install --upgrade mcp
+          fi
+          pip show mcp | head -3
+      - name: Run MCP-touching tests
+        run: |
+          python -m pytest \
+            tests/cli/test_scaffold_ide.py \
+            tests/cli/test_mcp_sampling_provider.py \
+            tests/cli/test_mcp_forge_run_live.py \
+            tests/cli/test_mcp_sdk_client_e2e.py \
+            -q
+
   build-check:
     name: Build Smoke Test
     runs-on: ubuntu-latest

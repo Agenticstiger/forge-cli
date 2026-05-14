@@ -120,3 +120,80 @@ pulls in any pipeline-stage or steering updates.
 - Full agent guide: [AGENTS.md](AGENTS.md)
 - Architecture / project structure: [AGENTS.md](AGENTS.md)
 - User docs (tutorials, API ref): see the separate `forge-docs` repo.
+
+---
+
+## Related work (intellectual honesty)
+
+forge-cli's agentic-IDE story doesn't exist in a vacuum. The patterns
+below either inspired specific pieces of this design or solve adjacent
+problems — name them up-front so the next maintainer doesn't have to
+re-do the survey.
+
+### MCP server & sampling
+
+- **[modelcontextprotocol/python-sdk](https://github.com/modelcontextprotocol/python-sdk)** —
+  the official Python SDK. **Borrowed-not-built**: forge's MCP server in
+  `fluid_build/cli/mcp.py` runs on `FastMCP`, every tool is registered via
+  `@_mcp_app.tool()`, and `MCPSamplingProvider` calls back through
+  `ctx.session.create_message()` (the canonical server-side sampling
+  primitive). The earlier hand-rolled stdio loop + `SamplingChannel` were
+  removed when the SDK landed — the SDK is the only path forward.
+- **[anyio](https://anyio.readthedocs.io/)** — bridges forge's sync
+  `LlmProvider` interface to the SDK's async `ctx.session.create_message`.
+  We use `anyio.from_thread.run(coro, token=token)` with the token obtained
+  via `anyio.lowlevel.current_token()` — the canonical "call async from a
+  non-event-loop thread" idiom. Mirrors the SDK's own anyio-based internals,
+  cheaper than `asyncio.run_coroutine_threadsafe` to maintain since it works
+  across event-loop impls. Already a transitive dep via the MCP SDK.
+- **[contextvars](https://docs.python.org/3/library/contextvars.html)**
+  (Python stdlib) — request-scoped state for the
+  `(Context, anyio_token)` pair the `forge_run` tool installs. Propagates
+  automatically across the `asyncio.to_thread` boundary that forge runs
+  under (Python ≥3.9 guarantee). Replaces an earlier module-level
+  `threading.Lock`-guarded globals pattern — closes a `/borrow-before-build`
+  miss caught in the second-pass audit.
+- **MCP spec** — protocol version `2025-06-18`. forge's MCP server
+  speaks this version (negotiated automatically by the SDK at
+  `initialize`). Sampling is documented at
+  [modelcontextprotocol.io/specification/.../sampling](https://modelcontextprotocol.io/specification/draft/client/sampling).
+
+### Cross-IDE rules / config
+
+- **[rule-porter](https://forum.cursor.com/t/rule-porter-convert-your-mdc-rules-to-claude-md-agents-md-or-copilot/153197)** —
+  zero-dependency CLI that converts Cursor `.mdc` rules to `CLAUDE.md`,
+  `AGENTS.md`, GitHub Copilot, and Windsurf. The closest analog to
+  `fluid scaffold-ide` (one source, many IDE targets); rule-porter is
+  general-purpose, while our scaffolder is forge-specific (knows the
+  11-stage pipeline, agent voices, and MCP server invocation).
+- **[agent-sh/agentsys](https://github.com/agent-sh/agentsys)** —
+  bigger framework spanning Claude Code, OpenCode, Codex, Cursor, Kiro
+  with plugins, agents, and skills.
+- **[antigravity-awesome-skills](https://github.com/sickn33/antigravity-awesome-skills)** —
+  installable library of skills across Claude Code, Cursor, Codex CLI,
+  Gemini CLI, Kiro, and others.
+
+### CLI output for agents
+
+- **[NDJSON / JSON Lines](https://ndjson.org)** — the convention forge's
+  `--agent` mode follows: one JSON object per line on stdout so the
+  IDE's shell wrapper can parse progress events line-by-line. Same
+  pattern ripgrep's `--json` and [ndjson-cli](https://github.com/mbostock/ndjson-cli)
+  use.
+
+### Deterministic agent completion contracts
+
+- **[DoneSpec](https://pypi.org/project/donespec/)** — JSON-based
+  completion contract for AI coding agents with `must_pass` /
+  `must_not` conditions. Closer in spirit to `fluid forge --agent
+  --emit-plan` than anything else we found; our plan is forge-specific
+  (per-productType field checklists) but the philosophy is the same:
+  agents shouldn't claim done without a deterministic gate.
+
+### AGENTS.md convention
+
+- **[agents.md initiative](https://agents.md)** (cross-IDE) —
+  AGENTS.md is the emerging vendor-neutral substrate that Cursor,
+  Claude Code, Cline, Aider, Continue, Zed, and Kiro all read. forge's
+  `--target generic` writes into this format; our root-level
+  [AGENTS.md](AGENTS.md) is the example.

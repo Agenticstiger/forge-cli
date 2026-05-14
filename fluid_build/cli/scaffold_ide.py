@@ -121,12 +121,28 @@ stages** (anything that mutates a warehouse or emits artifacts).
 
 ## Authoring a new product
 
-Use the mode picker:
+**Always use `--agent` when shell-running `fluid forge` from an IDE.** Bare
+`fluid forge` drops into an interactive mode picker the agent cannot navigate.
+`--agent` bundles `--yes`, suppresses all interactive UI, defaults to `--blank`
+when no other mode is set, and emits JSON-Lines progress events to stdout:
 
 ```bash
-fluid forge                                  # interactive: AI / Compose / Refine / Template / Blank
-fluid forge --from-product <id-or-path>      # build a CDP/ADP from upstream products
-fluid forge --refine                         # iterate on existing contract.fluid.yaml
+# Headless: blank contract, no LLM needed
+fluid forge --agent --blank --data-product-type SDP --target-dir my-product
+
+# Compose from upstream products (LLM needed for inference)
+fluid forge --agent --from-product users --from-product orders --data-product-type CDP
+
+# Iterate on an existing contract
+fluid forge --agent --refine contract.fluid.yaml
+```
+
+JSON-Lines events you can parse from the agent's shell wrapper:
+
+```json
+{"event":"forge.start","run_id":"…","mode":"compose","data_product_type":"CDP","ts":…}
+{"event":"forge.contract_written","path":"my-product/contract.fluid.yaml","action":"created","size":2048}
+{"event":"forge.done","run_id":"…","exit_code":0,"ts":…}
 ```
 
 Every authoring run persists receipts to `.fluid/agents/<run-id>/`:
@@ -183,36 +199,74 @@ has rows. Never bypass without explicit user confirmation.
 _STEERING_PIPELINE_DECISIONS = """\
 # When to call which `fluid` command — decision tree
 
-**User says "I want a new data product"**
-→ `fluid forge` (interactive) or `fluid forge --data-product-type {SDP|ADP|CDP} --yes`.
-→ For composition: `fluid forge --from-product <upstream-id-or-path>` (repeatable).
-→ For iteration on an existing contract: `fluid forge --refine`.
+## Architectural principle: YOU are the LLM. forge is the toolkit.
 
-**User edited `contract.fluid.yaml`**
-→ `fluid validate <contract.fluid.yaml>` first. Fix errors before anything else.
-→ Then `fluid bundle <contract.fluid.yaml> --format tgz` to refresh the digest.
+You (the IDE's agent) already have an LLM — the IDE pays for it. **Do not**
+shell-run `fluid forge --ai` (or any mode that would call an LLM); that would
+need a *second* LLM API key on the user's machine. Instead, **you do the
+authoring** using forge's MCP tools for structured operations and forge's CLI
+for deterministic pipeline stages.
 
-**User asks "what will this change deploy?"**
-→ `fluid plan --out runtime/plan.json --html` and show the HTML.
-→ If `--env != dev`, also run `fluid diff --exit-on-drift --env <env>` first.
+The canonical authoring flow:
 
-**User says "ship it" / "deploy"**
-→ Confirm with the user: which mode? Default `amend`. Destructive ops require
-  explicit `--allow-data-loss`.
-→ `fluid apply runtime/plan.json --mode <mode> --env <env>`.
-→ Then `fluid policy-apply dist/artifacts/policy/bindings.json --mode enforce`.
-→ Then `fluid verify --strict --env <env>`.
-→ Finally `fluid publish --target datamesh-manager` (or whichever catalog).
+1. **Discover** the upstream sources using MCP tools (read-only):
+   - `list_source_adapters` → which catalogs are reachable
+   - `list_source_tables` → tables in a scope
+   - `inspect_source_table` → schema + sample rows
+   - `list_source_lineage` → upstream dependencies
+   - `list_source_glossary` → business terms
+2. **Scaffold** a deterministic blank contract using the CLI (no LLM):
+   - `fluid forge --agent --blank --data-product-type {SDP|ADP|CDP} -d <product-dir>`
+3. **Get a checklist** of what to fill in (no LLM):
+   - `fluid forge --agent --emit-plan -d <product-dir>` → emits one
+     `forge.plan` JSONL event with required fields, examples, suggestions,
+     and the relevant MCP tools for each step
+4. **Author** the contract — *you* edit `contract.fluid.yaml` with your own
+   Edit/Write tools, using your LLM's reasoning. Fill in `models[]`,
+   `transformations[]`, `consumes[]`, `quality[]`. The agent voices and
+   policies forge ships with are loaded into your steering automatically.
+5. **Validate** as you iterate (no LLM):
+   - MCP `validate_contract` (one-shot, structured response), or
+   - shell `fluid validate <contract.fluid.yaml>`
+6. **Pipeline** stages (no LLM, deterministic):
+   - `fluid bundle … --format tgz` → root-of-trust digest
+   - `fluid plan --out runtime/plan.json --html` → bundleDigest + planDigest
+   - `fluid apply --mode <mode> --env <env>` → ALWAYS ask the user before
+     applying outside `dev`. Destructive modes (`replace*`) need
+     `--allow-data-loss` and explicit user consent.
+   - `fluid policy-apply … --mode enforce` → IAM/GRANT
+   - `fluid verify --strict --env <env>` → reconciliation
+   - `fluid publish --target <name>` → catalog (datamesh-manager / datahub)
 
-**Source discovery (catalog work)**
-→ Prefer the MCP tools: `list_source_adapters`, `list_source_tables`,
-  `inspect_source_table`, `list_source_lineage`, `list_source_glossary`,
-  `search_semantic_memory`. They're sandboxed and return structured JSON.
+## What if I want forge's "world-class" copilot (interview, agent voices, repair loop)?
 
-**Logical model edits**
-→ Prefer MCP tools: `read_logical_model`, `update_entity`, `add_relationship`,
-  `regenerate_physical`, `validate_contract`, `diff_models`. Never hand-edit
-  the physical contract — round-trip via the logical sidecar.
+Use the MCP tool **`forge_run`** (when available — its presence depends on
+your IDE's MCP sampling support). It runs `fluid forge`'s full authoring
+loop **inside the MCP subprocess** and routes every LLM call back to your
+IDE via MCP `sampling/createMessage`. You (the IDE) supply the LLM; forge
+supplies the orchestration. No separate API key.
+
+If `forge_run` isn't advertised in `tools/list`, your IDE doesn't yet
+support MCP sampling — stick with the "you author, forge tools assist" flow
+above.
+
+## Quick reference by user intent
+
+| User says | You do |
+|---|---|
+| *"build a new product from X and Y"* | discover via MCP → `--agent --blank` → `--emit-plan` → edit contract → validate → plan → apply |
+| *"refine my existing contract"* | read the contract → MCP `validate_contract` → edit → validate → plan |
+| *"what will this deploy?"* | `fluid plan --out runtime/plan.json --html` → show the HTML diff |
+| *"ship it"* | confirm mode → `fluid apply --mode amend --env dev` → `policy-apply` → `verify` → `publish` |
+| *"discover sources"* | MCP tools only — `list_source_adapters`, `list_source_tables`, `inspect_source_table` |
+| *"edit a logical model"* | MCP tools — `read_logical_model`, `update_entity`, `add_relationship`, `regenerate_physical` |
+
+## Never
+
+- ❌ `fluid forge` (bare) — drops into interactive picker the agent can't navigate
+- ❌ `fluid forge --ai` — needs a second LLM API key the user shouldn't have to manage
+- ❌ Hand-edit `contract.fluid.yaml` without running `validate_contract` after
+- ❌ `apply --mode replace*` without user consent + `--allow-data-loss`
 """
 
 _STEERING_GUARDRAILS = """\

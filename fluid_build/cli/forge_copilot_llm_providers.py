@@ -539,13 +539,170 @@ def get_llm_provider(name: str) -> LlmProvider:
     → ``"anthropic"``) and dispatched through
     :func:`get_litellm_provider`.
 
+    Special case ``"mcp-sampling"`` / ``"mcp_sampling"``: returns the
+    :class:`MCPSamplingProvider` shim which routes LLM calls back to the
+    MCP client (the IDE) via ``sampling/createMessage``. The IDE pays for
+    the LLM; forge never sees an API key. Requires an active sampling
+    channel — typically installed when forge runs inside the ``forge_run``
+    MCP tool.
+
     ``litellm`` is a hard dependency of fluid (declared in
     ``pyproject.toml``); the import never fails in a working install.
     """
     normalized = (name or "").strip().lower()
+    if normalized in ("mcp-sampling", "mcp_sampling"):
+        return MCPSamplingProvider()
     from fluid_build.cli.forge_copilot_llm_litellm import get_litellm_provider
 
     return get_litellm_provider(normalize_llm_provider_name(normalized))
+
+
+class MCPSamplingProvider(LlmProvider):
+    """Route LLM calls through the MCP client's ``sampling/createMessage``.
+
+    Why this exists
+    ---------------
+    Data-team members on Cursor / Kiro / Claude Code shouldn't need a
+    separate LLM API key — their IDE already pays for an LLM. MCP sampling
+    is the canonical spec mechanism: the server (forge) asks the client
+    (IDE) to make the LLM call. Human-in-the-loop is mandatory per spec —
+    the IDE shows the user the prompt before sending and the user approves.
+
+    Implementation
+    --------------
+    Borrowed-not-built on the official
+    `modelcontextprotocol/python-sdk <https://github.com/modelcontextprotocol/python-sdk>`_
+    (which itself is built on `anyio <https://anyio.readthedocs.io>`_).
+    The bridge to the SDK is the ``(ctx, anyio_token)`` pair stored in
+    :class:`contextvars.ContextVar` (Python stdlib, request-scoped state
+    propagates across ``asyncio.to_thread`` automatically since 3.9). The
+    FastMCP ``forge_run`` tool installs them on entry and clears on exit.
+    From a worker thread (forge runs in ``asyncio.to_thread``),
+    :meth:`invoke_blocking` calls :func:`anyio.from_thread.run` —
+    the canonical anyio primitive for "call async code from a
+    non-event-loop thread" — to dispatch ``ctx.session.create_message``
+    back into the SDK's loop. The SDK handles every detail of the
+    spec-compliant wire format, request-id correlation, capability
+    checks, and human-in-the-loop UX.
+
+    How it's invoked
+    ----------------
+    Set ``FLUID_LLM_BACKEND=mcp-sampling`` (or pass ``--llm-provider
+    mcp-sampling``). ``call_llm(provider, ...)`` then routes through this
+    class's :meth:`invoke_blocking`, which reads the active sampling
+    context and raises an actionable :class:`CopilotGenerationError` if
+    forge is running outside an MCP tool-call context.
+
+    Streaming is not supported in v1; callers fall back to blocking.
+    """
+
+    name = "mcp-sampling"
+    default_model = "mcp-sampling"
+
+    def default_endpoint(self, model: str, env: Mapping[str, str]) -> str:
+        # No HTTP endpoint — the transport is stdio JSON-RPC to the MCP client.
+        return "mcp://sampling"
+
+    def build_request(
+        self, config: "LlmConfig", system_prompt: str, user_prompt: str
+    ) -> tuple[Dict[str, str], Dict[str, Any]]:
+        # ``call_llm`` calls ``invoke_blocking`` directly on the provider —
+        # this method is only invoked via the legacy HTTP path which doesn't
+        # apply to MCP sampling. Return inert placeholders so the abstract
+        # contract is satisfied.
+        return ({}, {})
+
+    def extract_text(self, response_json: Dict[str, Any]) -> str:
+        # Same: not used by the MCP sampling path.
+        return str(response_json.get("text", ""))
+
+    def invoke_blocking(
+        self,
+        config: "LlmConfig",
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        # Lazy imports avoid an import cycle: ``mcp.py`` imports the
+        # provider catalog from this module (via LiteLLM), so importing
+        # ``mcp`` at module-load time here would deadlock.
+        import anyio.from_thread
+        from mcp.types import SamplingMessage, TextContent
+
+        from fluid_build.cli.mcp import get_sampling_context
+
+        ctx, anyio_token = get_sampling_context()
+        if ctx is None or anyio_token is None:
+            raise CopilotGenerationError(
+                "mcp_sampling_unavailable",
+                "MCP sampling context not active. forge_run installs it for "
+                "the duration of an MCP tool call; outside that context the "
+                "IDE has no way to receive sampling requests.",
+                suggestions=[
+                    "Invoke forge via the `forge_run` MCP tool from your IDE "
+                    "(installs the sampling context automatically).",
+                    "Or set FLUID_LLM_BACKEND=litellm and an LLM API key "
+                    "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY).",
+                ],
+            )
+
+        max_tokens = int(getattr(config, "max_tokens", 4096) or 4096)
+        temperature = getattr(config, "temperature", None)
+        sampling_kwargs: Dict[str, Any] = {
+            "messages": [
+                SamplingMessage(
+                    role="user",
+                    content=TextContent(type="text", text=user_prompt),
+                )
+            ],
+            "max_tokens": max_tokens,
+            "system_prompt": system_prompt,
+            "include_context": "thisServer",
+        }
+        if temperature is not None:
+            sampling_kwargs["temperature"] = float(temperature)
+
+        # We're on a worker thread (forge runs under ``asyncio.to_thread``).
+        # ``anyio.from_thread.run`` dispatches the coroutine to the SDK's
+        # event loop and blocks this thread until the response arrives.
+        # The ``token`` was captured by the ``forge_run`` tool via
+        # ``anyio.lowlevel.current_token()`` and propagated here through
+        # the ContextVar (auto-propagates across ``asyncio.to_thread``).
+        async def _do_sample() -> Any:
+            return await ctx.session.create_message(**sampling_kwargs)
+
+        try:
+            result = anyio.from_thread.run(_do_sample, token=anyio_token)
+        except Exception as exc:  # noqa: BLE001
+            raise CopilotGenerationError(
+                "mcp_sampling_failed",
+                f"MCP sampling round-trip failed: {exc}",
+                suggestions=[
+                    "Check that your IDE supports the 'sampling' capability.",
+                    "Fall back to FLUID_LLM_BACKEND=litellm + an API key.",
+                ],
+            ) from exc
+
+        # CreateMessageResult.content is either a TextContent or a list.
+        content = result.content
+        if hasattr(content, "text"):
+            return content.text
+        if isinstance(content, list):
+            return "".join(b.text for b in content if hasattr(b, "text"))
+        return ""
+
+    def invoke_streaming(
+        self,
+        config: "LlmConfig",
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> "Iterator[str]":
+        # Streaming via MCP sampling isn't in the spec yet — fall back
+        # to blocking. The caller's loop sees one chunk == full text.
+        yield self.invoke_blocking(config, system_prompt, user_prompt, extra_payload=extra_payload)
 
 
 # ---------------------------------------------------------------------------

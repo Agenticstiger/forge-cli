@@ -39,14 +39,17 @@ can bypass the MCP framing and still get the safety.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
-import sys
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import SamplingMessage, TextContent
 
 from fluid_build.copilot.store.audit_trail import write_audit_event
 from fluid_build.copilot.store.factory import resolve_store
@@ -56,6 +59,53 @@ from fluid_build.forge_datamodel.emit.validator import FluidContractValidator
 
 COMMAND = "mcp"
 MCP_PROTOCOL_VERSION = "2025-06-18"
+
+# ---------------------------------------------------------------------------
+# Sampling-context bridge — request-scoped via contextvars + anyio token
+#
+# When a tool that drives forge's copilot starts, it captures the active SDK
+# ``Context`` and an `anyio` event-loop token (the canonical bridge between
+# a worker thread and the SDK's anyio loop). The values are stored in
+# :class:`contextvars.ContextVar` so they propagate automatically across the
+# ``await asyncio.to_thread(...)`` boundary (Python ≥3.9 guarantees this).
+# :class:`fluid_build.cli.forge_copilot_llm_providers.MCPSamplingProvider`
+# (running in the worker thread) reads them via :func:`get_sampling_context`
+# and dispatches ``ctx.session.create_message`` back into the SDK's loop via
+# :func:`anyio.from_thread.run` — matching the SDK's own anyio-based dialect.
+#
+# Borrowed-not-built per /borrow-before-build:
+#   contextvars — Python stdlib (https://docs.python.org/3/library/contextvars.html);
+#   anyio.from_thread — https://anyio.readthedocs.io/en/stable/threads.html
+# ---------------------------------------------------------------------------
+
+_SAMPLING_CTX: ContextVar[Optional[Context]] = ContextVar("forge_mcp_sampling_ctx", default=None)
+_SAMPLING_TOKEN: ContextVar[Optional[Any]] = ContextVar(
+    "forge_mcp_sampling_anyio_token", default=None
+)
+
+
+def _set_sampling_context(ctx: Optional[Context], anyio_token: Optional[Any]) -> Tuple:
+    """Set the active sampling context. Returns a token tuple for
+    :func:`_reset_sampling_context` to undo (use in a ``try/finally``)."""
+    ctx_token = _SAMPLING_CTX.set(ctx)
+    token_token = _SAMPLING_TOKEN.set(anyio_token)
+    return ctx_token, token_token
+
+
+def _reset_sampling_context(tokens: Tuple) -> None:
+    """Restore the previous sampling context. Symmetric to :func:`_set_sampling_context`."""
+    ctx_token, token_token = tokens
+    _SAMPLING_CTX.reset(ctx_token)
+    _SAMPLING_TOKEN.reset(token_token)
+
+
+def get_sampling_context() -> Tuple[Optional[Context], Optional[Any]]:
+    """Return ``(ctx, anyio_token)`` if a tool with sampling-capable Context
+    is active. Read by
+    :class:`fluid_build.cli.forge_copilot_llm_providers.MCPSamplingProvider`
+    to route LLM calls back through ``ctx.session.create_message`` to the IDE.
+    """
+    return _SAMPLING_CTX.get(), _SAMPLING_TOKEN.get()
 
 
 # ----------------------------------------------------------------------
@@ -525,6 +575,65 @@ TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
             "additionalProperties": False,
         },
     ),
+    "forge_run": ToolCapability(
+        name="forge_run",
+        description=(
+            "Run `fluid forge` inside the MCP subprocess so LLM calls route "
+            "back through the IDE via `sampling/createMessage`. The IDE pays "
+            "for the LLM — no API key on the user's machine.\n\n"
+            "Modes:\n"
+            "  - 'blank': deterministic scaffold, no LLM (always works).\n"
+            "  - 'diag': single sampling round-trip with the given prompt "
+            "(diagnostic; proves the IDE's LLM is reachable).\n"
+            "  - 'ai': full forge copilot loop with sampling-backed LLM "
+            "(requires client to advertise the 'sampling' capability)."
+        ),
+        mutates_files=True,
+        file_path_args=("target_dir",),
+        writes_namespaces=("history", "audit"),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["blank", "diag", "ai"],
+                    "default": "blank",
+                    "description": "Forge run mode (see tool description).",
+                },
+                "target_dir": {
+                    "type": "string",
+                    "description": (
+                        "Workspace-relative directory for the produced "
+                        "contract.fluid.yaml. Must lie under one of the "
+                        "server's --writable-paths roots."
+                    ),
+                },
+                "data_product_type": {
+                    "type": "string",
+                    "enum": ["SDP", "ADP", "CDP", "Bronze", "Silver", "Gold"],
+                    "description": "Data Mesh product type or medallion layer.",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "For mode='diag': the prompt to send to the IDE's LLM. "
+                        "Ignored in other modes."
+                    ),
+                },
+                "from_products": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "For mode='ai': upstream product ids or paths to "
+                        "compose this product from. Repeatable. Ignored "
+                        "in other modes."
+                    ),
+                },
+            },
+            "required": ["mode"],
+            "additionalProperties": False,
+        },
+    ),
 }
 
 
@@ -779,7 +888,13 @@ def run(args, logger: logging.Logger) -> int:
     if action != "serve":
         return 1
     policy = _build_policy_from_args(args)
-    return _serve_stdio(policy=policy, logger=logger)
+    _set_policy(policy)
+    app = _build_fastmcp_app(policy)
+    try:
+        asyncio.run(app.run_stdio_async())
+    except KeyboardInterrupt:
+        return 0
+    return 0
 
 
 def _render_mcp_guide() -> int:
@@ -825,118 +940,459 @@ def _render_mcp_guide() -> int:
 
 
 # ----------------------------------------------------------------------
-# stdio loop
+# Transport — FastMCP server
+#
+# We delegate stdio framing, JSON-RPC routing, tools/list advertisement,
+# initialize handshake, and sampling round-trip to the official
+# ``modelcontextprotocol/python-sdk`` (FastMCP). Each forge tool is registered
+# via ``@_mcp_app.tool()`` and dispatched into a worker thread so blocking
+# code paths (file I/O, the FluidContractValidator, the forge.run() copilot
+# loop) don't stall the asyncio loop the SDK runs on. Tools that need an LLM
+# (``forge_run`` mode='ai', the diagnostic ``forge_run`` mode='diag') call
+# ``ctx.session.create_message`` — the canonical server-side sampling
+# primitive — so the IDE pays for the LLM, not the user.
+#
+# Borrowed-not-built per /borrow-before-build (skill receipts in
+# AGENT_IDE.md "Related work" section).
 # ----------------------------------------------------------------------
 
 
-def _serve_stdio(*, policy: McpPolicy, logger: logging.Logger) -> int:
-    advertised = _filter_visible_tools(_tool_definitions(), policy)
-    for raw in sys.stdin:
-        line = raw.strip()
-        if not line:
+_mcp_app = FastMCP(name="forge-cli-mcp")
+_current_policy: Optional[McpPolicy] = None
+
+
+def _set_policy(policy: McpPolicy) -> None:
+    """Install the active policy for this connection.
+
+    Tools read the policy via :func:`_policy` to gate access. Single-stdio-
+    connection scope, so module-level is safe.
+    """
+    global _current_policy
+    _current_policy = policy
+
+
+def _policy() -> McpPolicy:
+    if _current_policy is None:
+        raise RuntimeError("MCP policy not initialised — call _set_policy first")
+    return _current_policy
+
+
+def _build_fastmcp_app(policy: McpPolicy) -> FastMCP:
+    """Return the FastMCP app, after pruning tools the policy hides.
+
+    Tools that are denied (``--deny-tools``) or that would always be rejected
+    (mutating tools under ``--read-only``) are removed from the SDK's tool
+    registry so they never appear in ``tools/list``.
+    """
+    for name in list(TOOL_CAPABILITIES.keys()):
+        cap = TOOL_CAPABILITIES[name]
+        needs_write = cap.mutates_files or bool(cap.writes_namespaces)
+        denied = not policy.is_tool_allowed(name)
+        read_only_blocked = policy.read_only and needs_write
+        if denied or read_only_blocked:
+            try:
+                _mcp_app.remove_tool(name)
+            except Exception:  # noqa: BLE001
+                pass
+    return _mcp_app
+
+
+async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Permission-gate + thread-dispatch for a tool that has no async needs."""
+    check_tool_permission(name, arguments, policy=_policy())
+    return await asyncio.to_thread(
+        _call_tool,
+        name,
+        arguments,
+        read_only=_policy().read_only,
+        allow_inline_credentials=_policy().allow_inline_credentials,
+    )
+
+
+# ----------------------------------------------------------------------
+# Tool registrations (14 tools — one @_mcp_app.tool() per capability in
+# TOOL_CAPABILITIES). Each is a thin async wrapper that gates on policy and
+# delegates the actual work to :func:`_call_tool` (sync, threaded) or, for
+# ``forge_run``, talks to ``ctx.session.create_message`` directly.
+#
+# Why explicit signatures: FastMCP derives JSON-Schema from the Python
+# function signature. Generic ``**kwargs`` would advertise an empty schema
+# and break editor autocomplete in Claude Code / Cursor / Kiro.
+# ----------------------------------------------------------------------
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["read_logical_model"].description)
+async def read_logical_model(path: str) -> Dict[str, Any]:
+    return await _dispatch_sync_tool("read_logical_model", {"path": path})
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["update_entity"].description)
+async def update_entity(
+    path: str, entity: str, updates: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    return await _dispatch_sync_tool(
+        "update_entity", {"path": path, "entity": entity, "updates": updates or {}}
+    )
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["add_relationship"].description)
+async def add_relationship(path: str, relationship: Dict[str, Any]) -> Dict[str, Any]:
+    return await _dispatch_sync_tool(
+        "add_relationship", {"path": path, "relationship": relationship}
+    )
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["regenerate_physical"].description)
+async def regenerate_physical(
+    path: str, contract_path: Optional[str] = None, engine: str = "dbt"
+) -> Dict[str, Any]:
+    args = {"path": path, "engine": engine}
+    if contract_path:
+        args["contract_path"] = contract_path
+    return await _dispatch_sync_tool("regenerate_physical", args)
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["validate_contract"].description)
+async def validate_contract(
+    logical_path: Optional[str] = None, contract_path: Optional[str] = None
+) -> Dict[str, Any]:
+    args: Dict[str, Any] = {}
+    if logical_path:
+        args["logical_path"] = logical_path
+    if contract_path:
+        args["contract_path"] = contract_path
+    return await _dispatch_sync_tool("validate_contract", args)
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["diff_models"].description)
+async def diff_models(old: str, new: str) -> Dict[str, Any]:
+    return await _dispatch_sync_tool("diff_models", {"old": old, "new": new})
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["search_semantic_memory"].description)
+async def search_semantic_memory(
+    query: str, namespace: Optional[str] = None, limit: Optional[int] = 5
+) -> Dict[str, Any]:
+    args: Dict[str, Any] = {"query": query, "limit": limit or 5}
+    if namespace:
+        args["namespace"] = namespace
+    return await _dispatch_sync_tool("search_semantic_memory", args)
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_adapters"].description)
+async def list_source_adapters() -> Dict[str, Any]:
+    return await _dispatch_sync_tool("list_source_adapters", {})
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_tables"].description)
+async def list_source_tables(
+    source: str,
+    credentials: Dict[str, Any],
+    scope: Dict[str, Any],
+    allow_metadata_service: bool = False,
+) -> Dict[str, Any]:
+    return await _dispatch_sync_tool(
+        "list_source_tables",
+        {
+            "source": source,
+            "credentials": credentials,
+            "scope": scope,
+            "allow_metadata_service": allow_metadata_service,
+        },
+    )
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["inspect_source_table"].description)
+async def inspect_source_table(
+    source: str,
+    credentials: Dict[str, Any],
+    fqn: str,
+    allow_metadata_service: bool = False,
+) -> Dict[str, Any]:
+    return await _dispatch_sync_tool(
+        "inspect_source_table",
+        {
+            "source": source,
+            "credentials": credentials,
+            "fqn": fqn,
+            "allow_metadata_service": allow_metadata_service,
+        },
+    )
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_lineage"].description)
+async def list_source_lineage(
+    source: str,
+    credentials: Dict[str, Any],
+    fqn: str,
+    direction: str = "both",
+    depth: int = 3,
+    allow_metadata_service: bool = False,
+) -> Dict[str, Any]:
+    return await _dispatch_sync_tool(
+        "list_source_lineage",
+        {
+            "source": source,
+            "credentials": credentials,
+            "fqn": fqn,
+            "direction": direction,
+            "depth": depth,
+            "allow_metadata_service": allow_metadata_service,
+        },
+    )
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_glossary"].description)
+async def list_source_glossary(
+    source: str,
+    credentials: Dict[str, Any],
+    query: Optional[str] = None,
+    limit: int = 50,
+    allow_metadata_service: bool = False,
+) -> Dict[str, Any]:
+    args: Dict[str, Any] = {
+        "source": source,
+        "credentials": credentials,
+        "limit": limit,
+        "allow_metadata_service": allow_metadata_service,
+    }
+    if query:
+        args["query"] = query
+    return await _dispatch_sync_tool("list_source_glossary", args)
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["forge_from_source"].description)
+async def forge_from_source(
+    source: str,
+    credentials: Dict[str, Any],
+    scope: Dict[str, Any],
+    output_path: str,
+    name: Optional[str] = None,
+    technique: str = "data_vault_2",
+    engine: str = "dbt",
+    logical_path: Optional[str] = None,
+    allow_metadata_service: bool = False,
+) -> Dict[str, Any]:
+    args: Dict[str, Any] = {
+        "source": source,
+        "credentials": credentials,
+        "scope": scope,
+        "output_path": output_path,
+        "technique": technique,
+        "engine": engine,
+        "allow_metadata_service": allow_metadata_service,
+    }
+    if name:
+        args["name"] = name
+    if logical_path:
+        args["logical_path"] = logical_path
+    return await _dispatch_sync_tool("forge_from_source", args)
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["forge_run"].description)
+async def forge_run(
+    mode: str,
+    target_dir: Optional[str] = None,
+    data_product_type: Optional[str] = None,
+    prompt: Optional[str] = None,
+    from_products: Optional[List[str]] = None,
+    ctx: Context = None,
+) -> Dict[str, Any]:
+    """Run fluid forge inside MCP with sampling-backed LLM.
+
+    See ``TOOL_CAPABILITIES["forge_run"]`` for the mode semantics. Diag mode
+    sends one ``sampling/createMessage`` round-trip via ``ctx.session.create_message``
+    (the canonical SDK primitive); blank/ai modes install the sampling-context
+    bridge so :class:`MCPSamplingProvider` can route LLM calls back to the
+    IDE from inside ``forge.run()``.
+    """
+    # Pass the FULL argument set to the permission gate so the writable-paths
+    # sandbox check actually runs on ``target_dir`` (the tool's only declared
+    # ``file_path_args``). Passing a thin ``{"mode": mode}`` dict here would
+    # cause :func:`check_tool_permission` to silently skip the check
+    # (``arguments.get("target_dir")`` returns ``None`` → ``continue`` in the
+    # gate loop), turning the documented sandbox guarantee into a write-anywhere
+    # primitive. Tracked as security-review finding #1 in the Phase 3 audit.
+    permission_args: Dict[str, Any] = {
+        "mode": mode,
+        "target_dir": target_dir,
+        "data_product_type": data_product_type,
+        "prompt": prompt,
+        "from_products": from_products,
+    }
+    check_tool_permission("forge_run", permission_args, policy=_policy())
+    if _policy().read_only:
+        raise RuntimeError("Server is running in read-only mode")
+
+    mode_norm = (mode or "blank").strip().lower()
+
+    # Mode 'diag' — single sampling round-trip; proves the channel works.
+    if mode_norm == "diag":
+        if ctx is None:
+            raise RuntimeError(
+                "forge_run mode='diag' requires the MCP Context (the IDE must "
+                "advertise the 'sampling' capability at initialize)."
+            )
+        # Pre-check the client advertised sampling capability so we fail
+        # fast with an actionable message instead of hanging in
+        # ``create_message`` waiting for a response the client will never
+        # send. ``check_client_capability`` is the official SDK primitive.
+        from mcp.types import ClientCapabilities, SamplingCapability
+
+        if not ctx.session.check_client_capability(
+            ClientCapabilities(sampling=SamplingCapability())
+        ):
+            raise RuntimeError(
+                "Your MCP client did not advertise the 'sampling' capability "
+                "at initialize, so forge_run mode='diag' / 'ai' cannot work. "
+                "Use mode='blank' (deterministic scaffold, no LLM), or "
+                "shell-run `fluid forge --agent --blank` with "
+                "FLUID_LLM_BACKEND=litellm + an API key as fallback."
+            )
+        prompt_text = prompt or "Say 'hello from the IDE'."
+        try:
+            result = await ctx.session.create_message(
+                messages=[
+                    SamplingMessage(
+                        role="user",
+                        content=TextContent(type="text", text=prompt_text),
+                    )
+                ],
+                max_tokens=256,
+                system_prompt="You are forge's diagnostic helper.",
+                include_context="thisServer",
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "MCP sampling failed — this IDE may not support the "
+                f"'sampling' capability. Underlying error: {exc}. Use "
+                "mode='blank' or set FLUID_LLM_BACKEND=litellm with an API "
+                "key as fallback."
+            ) from exc
+
+        # MCP SDK's CreateMessageResult exposes ``content`` as either a single
+        # TextContent or a list of content blocks depending on client. Handle both.
+        text = ""
+        content = result.content
+        if hasattr(content, "text"):
+            text = content.text
+        elif isinstance(content, list):
+            text = "".join(b.text for b in content if hasattr(b, "text"))
+        return {
+            "mode": "diag",
+            "prompt": prompt_text,
+            "response_text": text,
+            "model": getattr(result, "model", None),
+            "stop_reason": getattr(result, "stopReason", None),
+        }
+
+    # Modes 'blank' and 'ai' — run fluid forge in-process inside a worker
+    # thread so the asyncio loop stays free to service sampling round-trips
+    # (mode='ai' uses MCPSamplingProvider which calls back through the
+    # sampling-context bridge). We capture the anyio event-loop token here
+    # (via ``current_token()`` — the canonical anyio primitive) so the
+    # worker thread can call back into the loop via ``anyio.from_thread.run``.
+    if mode_norm in ("blank", "ai"):
+        if not target_dir:
+            raise RuntimeError("forge_run requires 'target_dir' for mode='blank'/'ai'")
+        from anyio.lowlevel import current_token
+
+        anyio_token = current_token()
+        sampling_tokens = _set_sampling_context(ctx, anyio_token)
+        try:
+            return await asyncio.to_thread(
+                _run_forge_inproc, mode_norm, target_dir, data_product_type, from_products
+            )
+        finally:
+            _reset_sampling_context(sampling_tokens)
+
+    raise RuntimeError(f"unknown forge_run mode: {mode_norm!r}")
+
+
+def _run_forge_inproc(
+    mode: str,
+    target_dir: str,
+    data_product_type: Optional[str],
+    from_products: Optional[List[str]],
+) -> Dict[str, Any]:
+    """Run ``fluid forge`` in-process (sync). Called from ``forge_run`` via
+    ``asyncio.to_thread``. ``MCPSamplingProvider`` (if used) routes back to
+    the IDE's LLM via the sampling-context bridge.
+
+    Critical: ``fluid forge --agent`` writes JSON-Lines progress events to
+    stdout, and stdout IS the MCP wire — the MCP client's JSON-RPC parser
+    rejects anything that isn't a well-formed ``JSONRPCMessage``. We capture
+    forge's stdout for the duration of the run and surface the parsed events
+    in the tool result (so Claude Code / Cursor / Kiro see structured forge
+    progress alongside the standard ``exit_code`` + ``contract_path`` fields)
+    without polluting the MCP wire.
+    """
+    import argparse as _argparse
+    import contextlib
+    import io
+
+    from fluid_build.cli import forge as forge_mod
+
+    # Defense-in-depth: re-validate ``target_dir`` against the active
+    # ``--writable-paths`` policy. The async tool wrapper at ``forge_run``
+    # already gates via ``check_tool_permission`` with the full argument
+    # dict, but a future regression in that wrapper (e.g. forgetting to
+    # plumb a new argument) must NOT silently let an attacker-controlled
+    # path through to ``mkdir(parents=True)`` + ``write_text``. This
+    # second check is the belt-and-braces fail-closed gate.
+    policy = _policy()
+    resolved = Path(str(target_dir)).expanduser().resolve()
+    if not _path_is_writable(resolved, policy.writable_paths):
+        raise PermissionError(
+            f"forge_run: target_dir {resolved} is not within any "
+            f"--writable-paths root ({', '.join(str(p) for p in policy.writable_paths)})"
+        )
+
+    parser = _argparse.ArgumentParser()
+    sp = parser.add_subparsers()
+    forge_mod.register(sp)
+
+    argv = ["forge", "--agent", "-d", str(target_dir)]
+    if data_product_type:
+        argv += ["--data-product-type", str(data_product_type)]
+    if mode == "blank":
+        argv += ["--blank"]
+    elif mode == "ai":
+        for fp in from_products or []:
+            argv += ["--from-product", str(fp)]
+        argv += ["--llm-provider", "mcp-sampling"]
+
+    args = parser.parse_args(argv)
+    forge_logger = logging.getLogger("fluid.mcp.forge_run")
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+        rc = forge_mod.run(args, forge_logger)
+    raw_stdout = captured.getvalue()
+
+    # Forge's --agent mode emits one JSON object per line. Parse them out;
+    # everything else (Rich console banners, etc.) is best-effort discarded
+    # since stdout was redirected to suppress it from the wire.
+    events: List[Dict[str, Any]] = []
+    for line in raw_stdout.splitlines():
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
             continue
         try:
-            request = json.loads(line)
+            obj = json.loads(line)
         except json.JSONDecodeError:
             continue
-        method = request.get("method")
-        # MCP notifications carry no ``id`` and expect NO response.
-        # Per spec, the most important is ``notifications/initialized``
-        # which the client sends after ``initialize``. Returning an
-        # error response here breaks well-behaved clients (Claude
-        # Desktop, Cursor, the @modelcontextprotocol SDK).
-        is_notification = "id" not in request
-        if is_notification:
-            # We don't yet act on any notifications, but accept and
-            # silently consume them so the protocol handshake completes.
-            continue
-        response: Dict[str, Any] = {"jsonrpc": "2.0", "id": request.get("id")}
-        try:
-            if method == "initialize":
-                params = request.get("params") or {}
-                response["result"] = {
-                    "protocolVersion": params.get("protocolVersion") or MCP_PROTOCOL_VERSION,
-                    "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "forge-cli-mcp", "version": "1.0.0"},
-                }
-            elif method == "tools/list":
-                response["result"] = {"tools": advertised}
-            elif method == "tools/call":
-                params = request.get("params") or {}
-                name = params.get("name")
-                arguments = params.get("arguments") or {}
-                check_tool_permission(str(name or ""), arguments, policy=policy)
-                response["result"] = {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(
-                                _call_tool(
-                                    name,
-                                    arguments,
-                                    read_only=policy.read_only,
-                                    allow_inline_credentials=policy.allow_inline_credentials,
-                                ),
-                                indent=2,
-                                default=str,
-                            ),
-                        }
-                    ],
-                    "isError": False,
-                }
-            else:
-                response["error"] = {"code": -32601, "message": f"Unknown method {method}"}
-        except PermissionError as exc:
-            logger.debug("mcp_permission_denied: %s", exc)
-            response["error"] = {"code": -32001, "message": f"Permission denied: {exc}"}
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("mcp_request_failed: %s", exc)
-            response["error"] = {"code": -32000, "message": str(exc)}
-        sys.stdout.write(json.dumps(response) + "\n")
-        sys.stdout.flush()
-    return 0
+        if isinstance(obj, dict) and isinstance(obj.get("event"), str):
+            events.append(obj)
 
-
-def _tool_definitions() -> List[Dict[str, Any]]:
-    """Derive the tools/list advertisement from ``TOOL_CAPABILITIES`` so
-    the registry remains the single source of truth.
-
-    When a tool defines ``input_schema``, it is advertised under
-    ``inputSchema`` (MCP spec key) so clients like Claude Code and
-    Cursor can drive typed autocomplete for the tool's arguments.
-    Tools without a schema fall back to a permissive empty-object
-    advertisement — accepted by the spec, but unhelpful for editor UX.
-    """
-    out: List[Dict[str, Any]] = []
-    for cap in TOOL_CAPABILITIES.values():
-        entry: Dict[str, Any] = {"name": cap.name, "description": cap.description}
-        if cap.input_schema is not None:
-            entry["inputSchema"] = cap.input_schema
-        else:
-            # Empty-object schema is the lowest-friction default — same
-            # semantics as today (any args accepted), but at least
-            # explicit rather than implicit.
-            entry["inputSchema"] = {"type": "object", "properties": {}}
-        out.append(entry)
-    return out
-
-
-def _filter_visible_tools(tools: List[Dict[str, Any]], policy: McpPolicy) -> List[Dict[str, Any]]:
-    """Drop tools that would always be rejected so upstream clients
-    (Claude Code, Cursor) don't advertise options doomed to fail."""
-    visible: List[Dict[str, Any]] = []
-    for tool in tools:
-        name = tool.get("name")
-        if not isinstance(name, str):
-            continue
-        cap = TOOL_CAPABILITIES.get(name)
-        if cap is None or not policy.is_tool_allowed(name):
-            continue
-        needs_write = cap.mutates_files or bool(cap.writes_namespaces)
-        if policy.read_only and needs_write:
-            continue
-        visible.append(tool)
-    return visible
+    contract_path = Path(target_dir) / "contract.fluid.yaml"
+    return {
+        "mode": mode,
+        "exit_code": rc,
+        "target_dir": str(target_dir),
+        "contract_path": str(contract_path),
+        "contract_exists": contract_path.is_file(),
+        "events": events,
+    }
 
 
 def _call_tool(
@@ -1180,6 +1636,11 @@ def _call_tool(
             "sidecar_path": str(sidecar_path) if sidecar_path else None,
             "validation": validation.model_dump(mode="json", by_alias=True),
         }
+
+    # ``forge_run`` is NOT dispatched through ``_call_tool`` — it's a FastMCP
+    # tool with its own async implementation (see ``forge_run`` above) so it
+    # can call ``ctx.session.create_message`` for the sampling round-trip.
+    # Any caller that lands here with name='forge_run' is a bug.
 
     raise RuntimeError(f"Unknown tool {name}")
 
