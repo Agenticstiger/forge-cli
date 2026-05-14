@@ -519,6 +519,7 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     _try_register(sp, "contract_validation", "contract-validation")
     _try_register(sp, "test", "test")
     _try_register(sp, "scaffold_ci", "scaffold-ci")
+    _try_register(sp, "scaffold_ide", "scaffold-ide")
     _try_register(sp, "scaffold_composer", "scaffold-composer")
     _try_register(sp, "generate_airflow", "generate-airflow")
     _try_register(sp, "generate", "generate")
