@@ -118,10 +118,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mcp-output-port-snowflake-e2e` join `mcp-output-port-live-llm`
   on the integration workflow's nightly + workflow-dispatch
   triggers.
-- **Hash-pinned lockfile generator**
-  (`scripts/generate_hashed_lockfile.py`). Walks the existing
-  `requirements.lock.txt`, `pip download`s every pinned wheel,
-  emits a `--require-hashes`-compatible lockfile.
+- **Hash-pinned lockfile recipe** — generated via
+  `uv pip compile pyproject.toml --generate-hashes -o
+  requirements.lock.hashed.txt` (uv is the canonical pip-tools
+  replacement; ~100× faster than the previous custom script). The
+  earlier `scripts/generate_hashed_lockfile.py` placeholder was
+  removed in this release per /borrow-before-build (uv covers the
+  full surface and is dev-time only — no runtime cost).
 - **SBOM generator** (`scripts/generate_sbom.py`). Emits CycloneDX
   1.5 JSON from `pip list` + PyPI metadata. Validated against
   the spec; 191 components on the current venv.

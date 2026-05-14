@@ -22,7 +22,9 @@ Limits (call out, don't paper over):
 - License field comes from PyPI metadata. If a package's classifier
   is ``UNKNOWN``, we record ``NOASSERTION`` per SPDX convention.
 - Component hashes are NOT included in the SBOM today — they live
-  in ``requirements.lock.hashed.txt`` (run ``generate_hashed_lockfile.py``).
+  in ``requirements.lock.hashed.txt``, generated via
+  ``uv pip compile pyproject.toml --generate-hashes -o
+  requirements.lock.hashed.txt``.
 - Vulnerabilities are NOT cross-referenced; pair the SBOM with a
   scanner like ``pip-audit`` for that signal.
 """

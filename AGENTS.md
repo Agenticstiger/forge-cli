@@ -153,6 +153,18 @@ make doctor         # Run system diagnostics
 make demo           # validate → plan → apply on example contract
 ```
 
+Hash-pinned lockfile (supply-chain integrity) — generated with
+[`uv`](https://docs.astral.sh/uv/pip/compile/), the canonical
+pip-tools replacement:
+
+```bash
+uv pip compile pyproject.toml --generate-hashes -o requirements.lock.hashed.txt
+pip install --require-hashes -r requirements.lock.hashed.txt   # CI / containers
+```
+
+Regenerate after every intentional dep bump (pyproject.toml change,
+new extra installed). `uv` is dev-time only — not a runtime dep.
+
 ### When Modifying Code
 
 - **Adding a CLI command**: Create `fluid_build/cli/<command>.py`, register in `fluid_build/cli/__init__.py`
