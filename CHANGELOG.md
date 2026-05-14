@@ -125,6 +125,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   earlier `scripts/generate_hashed_lockfile.py` placeholder was
   removed in this release per /borrow-before-build (uv covers the
   full surface and is dev-time only — no runtime cost).
+
+### Changed (security)
+
+- **SPIFFE SVID validation now routes through the canonical
+  `py-spiffe` library** (`spiffe>=0.2.9`,
+  https://github.com/HewlettPackard/py-spiffe) via
+  `JwtSvid.parse_and_validate` instead of the prior open-coded
+  PyJWT path. Strictness gains: the SPIFFE JWT-SVID spec's required
+  `aud` claim is now enforced (operators set
+  `FLUID_MCP_SPIFFE_AUDIENCE`); the per-spec algorithm allow-list
+  is enforced; the SPIFFE ID structure is validated through the
+  spec-compliant `SpiffeId` parser. The defense-in-depth
+  trust-domain match (reject SVIDs claiming a domain other than
+  the configured one) is preserved on top of py-spiffe. Operators
+  using `FLUID_MCP_AUTH_MODE=spiffe` must now `pip install
+  fluid-build[spiffe]` and configure `FLUID_MCP_SPIFFE_AUDIENCE`;
+  startup `is_enabled()` returns False (gateway warns loud) when
+  audience is missing. Borrowed-not-built per /borrow-before-build
+  retrospective audit.
 - **SBOM generator** (`scripts/generate_sbom.py`). Emits CycloneDX
   1.5 JSON from `pip list` + PyPI metadata. Validated against
   the spec; 191 components on the current venv.

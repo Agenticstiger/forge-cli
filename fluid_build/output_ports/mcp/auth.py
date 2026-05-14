@@ -32,11 +32,15 @@ Three pluggable schemes that the gateway selects via
   Google IAP, Azure AD.
 
 * ``spiffe`` — verify a SPIFFE SVID JWT against a configured trust
-  bundle. Same shape as the jwt mode but the issuer is a SPIFFE
-  authority (``spiffe://<trust-domain>``) and the ``sub`` claim is
-  a SPIFFE ID URI. Pairs with workload-identity systems
-  (SPIRE, Tornjak) so the gateway gets the calling workload's
-  cryptographic identity, not a human-issued bearer token.
+  bundle using the canonical
+  `py-spiffe <https://github.com/HewlettPackard/py-spiffe>`_
+  ``JwtSvid.parse_and_validate`` API. The issuer is a SPIFFE
+  authority (``spiffe://<trust-domain>``); the ``sub`` claim is a
+  SPIFFE ID URI; the ``aud`` claim is required and matched against
+  ``FLUID_MCP_SPIFFE_AUDIENCE``. Pairs with workload-identity
+  systems (SPIRE, Tornjak) so the gateway gets the calling
+  workload's cryptographic identity, not a human-issued bearer
+  token. Requires ``pip install fluid-build[spiffe]``.
 
 mTLS (client-cert-bound identity) is best handled by the reverse
 proxy in front of the gateway — see
@@ -111,6 +115,7 @@ class AuthValidator:
         jwt_claim_mappings: Optional[Mapping[str, str]] = None,
         spiffe_trust_domain: Optional[str] = None,
         spiffe_jwks_url: Optional[str] = None,
+        spiffe_audience: Optional[str] = None,
         jwks_cache_ttl_seconds: float = 600.0,
     ) -> None:
         if mode not in {"shared-token", "jwt", "spiffe", "none"}:
@@ -139,8 +144,10 @@ class AuthValidator:
         )
         self.spiffe_trust_domain = spiffe_trust_domain
         self.spiffe_jwks_url = spiffe_jwks_url
+        self.spiffe_audience = spiffe_audience
         self.jwks_cache_ttl_seconds = jwks_cache_ttl_seconds
         self._jwks_cache: Dict[str, Tuple[float, Any]] = {}
+        self._spiffe_bundle_cache: Dict[str, Tuple[float, Any]] = {}
 
     @classmethod
     def from_env(cls) -> "AuthValidator":
@@ -179,6 +186,7 @@ class AuthValidator:
             kwargs.update(
                 spiffe_trust_domain=os.environ.get("FLUID_MCP_SPIFFE_TRUST_DOMAIN"),
                 spiffe_jwks_url=os.environ.get("FLUID_MCP_SPIFFE_JWKS_URL"),
+                spiffe_audience=os.environ.get("FLUID_MCP_SPIFFE_AUDIENCE"),
             )
         return cls(**kwargs)
 
@@ -201,7 +209,7 @@ class AuthValidator:
         if self.mode == "jwt":
             return bool(self.jwt_issuer and self.jwt_audience and self.jwt_jwks_url)
         if self.mode == "spiffe":
-            return bool(self.spiffe_trust_domain and self.spiffe_jwks_url)
+            return bool(self.spiffe_trust_domain and self.spiffe_jwks_url and self.spiffe_audience)
         return False
 
     def validate(self, headers: Mapping[str, str]) -> AuthDecision:
@@ -220,9 +228,9 @@ class AuthValidator:
         if self.mode == "shared-token":
             return self._validate_shared_token(headers)
         if self.mode == "jwt":
-            return self._validate_jwt(headers, kind="jwt")
+            return self._validate_jwt(headers)
         if self.mode == "spiffe":
-            return self._validate_jwt(headers, kind="spiffe")
+            return self._validate_spiffe(headers)
         return AuthDecision(allowed=False, deny_reason="unknown-auth-mode")
 
     # ------------------------------------------------------------------
@@ -247,18 +255,17 @@ class AuthValidator:
         return AuthDecision(allowed=True, identity_kind="shared-token")
 
     # ------------------------------------------------------------------
-    # JWT / SPIFFE — same wire shape, different issuer expectations
+    # JWT — RFC 7519 bearer against an issuer's JWKS
     # ------------------------------------------------------------------
 
-    def _validate_jwt(self, headers: Mapping[str, str], *, kind: str) -> AuthDecision:
+    def _validate_jwt(self, headers: Mapping[str, str]) -> AuthDecision:
         try:
             import jwt as pyjwt  # type: ignore[import-not-found]
-            from jwt import PyJWKClient
         except ImportError:  # pragma: no cover - PyJWT is a forge-cli dep
             return AuthDecision(
                 allowed=False,
                 deny_reason="pyjwt-not-installed",
-                identity_kind=kind,
+                identity_kind="jwt",
             )
 
         token = _bearer_token(headers)
@@ -266,50 +273,36 @@ class AuthValidator:
             return AuthDecision(
                 allowed=False,
                 deny_reason="missing-bearer-token",
-                identity_kind=kind,
+                identity_kind="jwt",
             )
 
-        jwks_url = self.jwt_jwks_url if kind == "jwt" else self.spiffe_jwks_url
-        if not jwks_url:
+        if not self.jwt_jwks_url:
             return AuthDecision(
                 allowed=False,
                 deny_reason="jwks-url-not-configured",
-                identity_kind=kind,
+                identity_kind="jwt",
             )
 
         try:
             # PyJWKClient handles JWKS fetch + key rotation; we wrap
             # in our own TTL cache to avoid hitting the discovery
             # endpoint on every single request.
-            client = self._cached_jwks_client(jwks_url)
+            client = self._cached_jwks_client(self.jwt_jwks_url)
             signing_key = client.get_signing_key_from_jwt(token).key
-            decode_kwargs: Dict[str, Any] = {
-                "algorithms": list(self.jwt_algorithms),
-                "options": {"require": ["exp", "iat"]},
-            }
-            if kind == "jwt":
-                decode_kwargs["issuer"] = self.jwt_issuer
-                decode_kwargs["audience"] = self.jwt_audience
-            else:  # spiffe
-                # SPIFFE issuer is the trust-domain root; ``sub``
-                # MUST be a SPIFFE ID URI under that domain.
-                decode_kwargs["issuer"] = self.spiffe_trust_domain
-            claims = pyjwt.decode(token, signing_key, **decode_kwargs)
+            claims = pyjwt.decode(
+                token,
+                signing_key,
+                algorithms=list(self.jwt_algorithms),
+                issuer=self.jwt_issuer,
+                audience=self.jwt_audience,
+                options={"require": ["exp", "iat"]},
+            )
         except Exception as exc:  # noqa: BLE001
             return AuthDecision(
                 allowed=False,
                 deny_reason=f"{type(exc).__name__}: {exc}",
-                identity_kind=kind,
+                identity_kind="jwt",
             )
-
-        if kind == "spiffe":
-            sub = claims.get("sub", "")
-            if not sub.startswith(f"{self.spiffe_trust_domain}/"):
-                return AuthDecision(
-                    allowed=False,
-                    deny_reason="spiffe-sub-not-under-trust-domain",
-                    identity_kind=kind,
-                )
 
         # Map configured claims → caller_attributes.
         attrs: Dict[str, Any] = {}
@@ -319,7 +312,7 @@ class AuthValidator:
         # Always carry sub for audit attribution even if the operator
         # didn't map it.
         attrs.setdefault("sub", claims.get("sub"))
-        return AuthDecision(allowed=True, caller_attributes=attrs, identity_kind=kind)
+        return AuthDecision(allowed=True, caller_attributes=attrs, identity_kind="jwt")
 
     def _cached_jwks_client(self, jwks_url: str):
         from jwt import PyJWKClient  # type: ignore[import-not-found]
@@ -331,6 +324,101 @@ class AuthValidator:
         client = PyJWKClient(jwks_url, cache_keys=True, lifespan=int(self.jwks_cache_ttl_seconds))
         self._jwks_cache[jwks_url] = (now, client)
         return client
+
+    # ------------------------------------------------------------------
+    # SPIFFE — JWT-SVID validation via py-spiffe (canonical impl)
+    # ------------------------------------------------------------------
+
+    def _validate_spiffe(self, headers: Mapping[str, str]) -> AuthDecision:
+        try:
+            from spiffe import JwtSvid  # type: ignore[import-not-found]
+        except ImportError:
+            return AuthDecision(
+                allowed=False,
+                deny_reason="spiffe-package-not-installed; install fluid-build[spiffe]",
+                identity_kind="spiffe",
+            )
+
+        token = _bearer_token(headers)
+        if not token:
+            return AuthDecision(
+                allowed=False,
+                deny_reason="missing-bearer-token",
+                identity_kind="spiffe",
+            )
+
+        try:
+            jwt_bundle = self._cached_spiffe_bundle()
+            jwt_svid = JwtSvid.parse_and_validate(
+                token,
+                jwt_bundle,
+                audience={self.spiffe_audience or ""},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return AuthDecision(
+                allowed=False,
+                deny_reason=f"{type(exc).__name__}: {exc}",
+                identity_kind="spiffe",
+            )
+
+        # Defense-in-depth: ``parse_and_validate`` checks signature +
+        # audience but does NOT match the SVID's trust domain against
+        # the bundle's. Reject SVIDs whose ``sub`` claims membership
+        # of a trust domain other than the operator-configured one,
+        # even if the signing key was somehow shared across domains.
+        configured_domain = self.spiffe_trust_domain or ""
+        if not str(jwt_svid.spiffe_id).startswith(f"{configured_domain}/"):
+            return AuthDecision(
+                allowed=False,
+                deny_reason="spiffe-sub-not-under-trust-domain",
+                identity_kind="spiffe",
+            )
+
+        # Map configured claims → caller_attributes. py-spiffe's
+        # JwtSvid only exposes ``spiffe_id`` / ``audience`` / ``expiry``
+        # / ``token`` publicly — there's no public ``claims`` accessor
+        # — so re-decode the token with PyJWT without re-verifying the
+        # signature (parse_and_validate already verified above) to
+        # surface custom claims (model, tenant_id, etc.) into the same
+        # rowFilter placeholder map the JWT mode populates.
+        import jwt as pyjwt  # type: ignore[import-not-found]
+
+        claims = pyjwt.decode(jwt_svid.token, options={"verify_signature": False})
+        attrs: Dict[str, Any] = {}
+        for claim_name, attr_name in self.jwt_claim_mappings.items():
+            if claim_name in claims:
+                attrs[attr_name] = claims[claim_name]
+        # Always carry the SPIFFE ID under ``sub`` for audit
+        # attribution. ``jwt_svid.spiffe_id`` is a parsed SpiffeId;
+        # str() returns the canonical ``spiffe://`` URI.
+        attrs.setdefault("sub", str(jwt_svid.spiffe_id))
+        return AuthDecision(allowed=True, caller_attributes=attrs, identity_kind="spiffe")
+
+    def _cached_spiffe_bundle(self):
+        """TTL-cached py-spiffe ``JwtBundle`` parsed from the
+        configured JWKS endpoint. Mirrors the
+        ``_cached_jwks_client`` pattern so the discovery endpoint
+        isn't hit on every request. Bundle keys are immutable for
+        the cache lifetime; re-fetch on TTL expiry handles SPIRE
+        authority rotation."""
+        import httpx  # forge-cli core dep
+        from spiffe import JwtBundle, TrustDomain  # type: ignore[import-not-found]
+
+        cached = self._spiffe_bundle_cache.get(self.spiffe_jwks_url or "")
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < self.jwks_cache_ttl_seconds:
+            return cached[1]
+        response = httpx.get(self.spiffe_jwks_url or "", timeout=5.0)
+        response.raise_for_status()
+        # ``TrustDomain`` expects the bare authority name, no
+        # ``spiffe://`` prefix — strip if the operator configured the
+        # URI form (both shapes are accepted in env var input).
+        domain_name = self.spiffe_trust_domain or ""
+        if domain_name.startswith("spiffe://"):
+            domain_name = domain_name[len("spiffe://") :]
+        bundle = JwtBundle.parse(TrustDomain(domain_name), response.content)
+        self._spiffe_bundle_cache[self.spiffe_jwks_url or ""] = (now, bundle)
+        return bundle
 
 
 def _bearer_token(headers: Mapping[str, str]) -> Optional[str]:

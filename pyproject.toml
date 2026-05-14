@@ -168,6 +168,25 @@ postgres = [
   "psycopg[binary]>=3.1",
 ]
 
+# SPIFFE/SPIRE workload-identity validation for the MCP output-port
+# gateway (``FLUID_MCP_AUTH_MODE=spiffe``). Provides the canonical
+# JwtSvid + JwtBundle types and ``parse_and_validate`` that
+# enforce SPIFFE JWT-SVID semantics (audience, SPIFFE-ID structure,
+# allowed-algorithm list per the SPIFFE standard) more strictly
+# than open-coded PyJWT could.
+#
+# Borrowed-not-built per /borrow-before-build (retrospective audit
+# 2026-05-14): adopting py-spiffe over the prior 30 LOC custom path
+# trades ~25 MB of transitive deps (grpcio + protobuf, pulled by
+# py-spiffe's Workload API client even when unused) for spec-
+# faithful SVID validation. Optional extra so users not running in
+# SPIFFE mode pay zero cost — only ``mode=spiffe`` triggers the
+# import.
+#   docs:  https://github.com/HewlettPackard/py-spiffe
+spiffe = [
+  "spiffe>=0.2.9",
+]
+
 # LiteLLM is now a core dependency (above), not an extra. The
 # ``[litellm]`` alias is kept empty for back-compat with anyone who
 # scripted ``pip install fluid-build[litellm]`` during the opt-in
