@@ -62,16 +62,35 @@ dependencies = [
   # Borrowed-not-built per /borrow-before-build (skill receipts in commit msg):
   #   docs:  https://docs.pydantic.dev/latest/concepts/pydantic_settings/
   "pydantic-settings>=2.0",
-  # Anthropic-maintained MCP Python SDK (https://github.com/modelcontextprotocol/python-sdk).
-  # Powers ``fluid mcp output-port serve`` — the consumer-side gateway that
-  # turns a FLUID expose into an agent-consumable MCP endpoint and enforces
-  # ``policy.agentPolicy`` (allowedModels/allowedUseCases) at every read.
-  # Borrowed-not-built per /borrow-before-build: the SDK abstracts JSON-RPC
-  # dispatch, stdio transport, and protocol-version handshakes that we'd
-  # otherwise hand-maintain. Pinned to ``>=1.20`` because the gateway
-  # depends on the lifespan API + ``mcp.shared.memory`` test fixtures
-  # introduced in that line; pinned ``<2.0`` to gate any future major.
-  # Tested against mcp 1.27.x.
+  # Official Anthropic-maintained Model Context Protocol Python SDK.
+  # Two consumers in this codebase:
+  #   1. ``fluid mcp serve`` — FastMCP + ServerSession.create_message
+  #      (canonical server-side sampling). Replaced ~450 LOC of
+  #      hand-rolled MCP plumbing in the Phase 3 migration.
+  #   2. ``fluid mcp output-port serve`` — the consumer-side gateway
+  #      that turns a FLUID expose into an agent-consumable MCP
+  #      endpoint and enforces ``policy.agentPolicy``
+  #      (allowedModels/allowedUseCases) at every read.
+  #
+  # Floor pinned at 1.20:
+  #   - 1.7's tools/base.py does ``issubclass(param.annotation, Context)``
+  #     which raises TypeError under ``from __future__ import annotations``
+  #     + ``ctx: Context = None``. Later 1.x releases use
+  #     ``typing.get_type_hints()`` and handle the deferred-annotation +
+  #     Optional shape correctly.
+  #   - 1.15's ``ClientSession.__init__`` doesn't yet accept
+  #     ``sampling_capabilities``; that landed in a later 1.x. Our live
+  #     sampling integration test (test_mcp_live_llm_sampling.py) advertises
+  #     the sampling capability via that kwarg so the floor must include it.
+  #   - The gateway depends on the lifespan API + ``mcp.shared.memory``
+  #     test fixtures introduced in 1.20.
+  #   1.20+ has all of the above. Pinned by the mcp-sdk-drift CI job.
+  # Ceiling ``<2.0`` gates any future major bump (tested against 1.27.x).
+  #
+  # Borrowed-not-built per /borrow-before-build (skill receipts in
+  # AGENT_IDE.md "Related work" section + the gateway commit msg):
+  #   docs:  https://modelcontextprotocol.github.io/python-sdk/
+  #   repo:  https://github.com/modelcontextprotocol/python-sdk
   "mcp>=1.20,<2.0",
   # Optional UX nicety on Windows; no-op elsewhere
   "colorama>=0.4.6; platform_system == 'Windows'",
@@ -385,6 +404,7 @@ markers = [
     "datamesh: Tests for DataMesh Manager provider",
     "policy: Tests for policy validators",
     "runtime: Tests for runtime generators",
+    "live_llm: Tests that call a real LLM (cost ~$0.0001/run; require an API key in env)",
 ]
 
 [tool.coverage.run]

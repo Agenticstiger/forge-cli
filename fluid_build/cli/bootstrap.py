@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import error as console_error
+from fluid_build.observability.secret_redactor import redact_secret_text
 
 # Import shared utilities
 from ._common import build_provider, load_contract_with_overlay
@@ -518,6 +519,7 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     _try_register(sp, "contract_validation", "contract-validation")
     _try_register(sp, "test", "test")
     _try_register(sp, "scaffold_ci", "scaffold-ci")
+    _try_register(sp, "scaffold_ide", "scaffold-ide")
     _try_register(sp, "scaffold_composer", "scaffold-composer")
     _try_register(sp, "generate_airflow", "generate-airflow")
     _try_register(sp, "generate", "generate")
@@ -578,3 +580,41 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     _try_register(sp, "ide", "ide")
     _try_register(sp, "workspace", "workspace")
     _try_register(sp, "stats", "stats")
+
+    # ────────────────────────────────────────────────────────────────────
+    # External CLI plugins — discovered via Python entry-points.
+    #
+    # Any installed package can register an additional ``fluid <name>``
+    # subcommand by declaring an entry-point in its ``pyproject.toml``::
+    #
+    #     [project.entry-points."fluid_build.commands"]
+    #     my-cmd = "my_pkg.cli:register"
+    #
+    # The referenced callable must accept the argparse subparser group and
+    # call ``add_parser`` on it. Failures are logged at WARNING level so a
+    # broken plugin can never break ``fluid`` itself.
+    # ────────────────────────────────────────────────────────────────────
+    # ``redact_secret_text`` is imported at module top, so both the inner
+    # plugin-load path and the outer discovery-failure path are guaranteed
+    # to scrub plugin-supplied exception text before logging — there is no
+    # code path where a credential-shaped substring from ``str(exception)``
+    # reaches the log handler without going through the redactor.
+    try:
+        import importlib.metadata as _md
+
+        try:
+            _eps = _md.entry_points(group="fluid_build.commands")
+        except TypeError:
+            # Python < 3.10 returned a dict of groups, not a kwarg-filtered iter.
+            _eps = _md.entry_points().get("fluid_build.commands", [])
+        for _ep in _eps:
+            try:
+                _ep.load()(sp)
+            except Exception as _e:
+                LOG.warning(
+                    "Failed to load CLI plugin %s: %s",
+                    _ep.name,
+                    redact_secret_text(str(_e)),
+                )
+    except Exception as _e:
+        LOG.warning("CLI plugin discovery failed: %s", redact_secret_text(str(_e)))

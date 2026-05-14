@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
+from ..observability.tracing import traced_span as _traced_span
 from ..observability.tracing import traced_stage as _traced_stage
 from ._common import (
     CLIError,
@@ -38,15 +39,47 @@ COMMAND = "diff"
 def register(subparsers: argparse._SubParsersAction):
     p = subparsers.add_parser(
         COMMAND,
-        help="Compare desired state vs current provider state (drift)",
-        description="Detect configuration drift by comparing the desired state (from contract) with actual provider resources.",
+        help="Compare contract-vs-live (drift) or contract-vs-contract (version)",
+        description=(
+            "Two modes: (1) drift detection — compares the desired state from "
+            "the contract against actual provider resources (default); "
+            "(2) version diff — when --baseline is set, compares the positional "
+            "contract (new) against the baseline contract (old) for breaking-"
+            "change classification. The two modes are mutually exclusive."
+        ),
     )
-    p.add_argument("contract", help="contract.fluid.yaml")
-    p.add_argument("--state", help="previous apply_report.json (optional)")
-    p.add_argument("--env", help="environment overlay (dev, staging, prod)")
-    p.add_argument("--out", default="runtime/diff.json", help="output file for drift report")
+    p.add_argument("contract", help="contract.fluid.yaml (new version when --baseline is set)")
+    p.add_argument("--state", help="previous apply_report.json (drift mode, optional)")
+    p.add_argument("--env", help="environment overlay (dev, staging, prod) — drift mode only")
+    p.add_argument("--out", default="runtime/diff.json", help="output file for the diff report")
     p.add_argument(
         "--exit-on-drift", action="store_true", help="exit with code 1 if drift detected"
+    )
+
+    # Version-diff mode flags. ``--baseline`` toggles the new mode; the other
+    # two are no-ops without it.
+    p.add_argument(
+        "--baseline",
+        metavar="OLD_CONTRACT",
+        help=(
+            "Path to a baseline (old) contract.fluid.yaml. When set, switches "
+            "from drift mode to contract-vs-contract version diff and emits a "
+            "breaking-change classification."
+        ),
+    )
+    p.add_argument(
+        "--fail-on-breaking",
+        action="store_true",
+        help=(
+            "Version-diff mode only: exit with code 1 if any breaking change "
+            "is detected. Use in CI to gate on contract version compatibility."
+        ),
+    )
+    p.add_argument(
+        "--format",
+        choices=["text", "json", "markdown"],
+        default="text",
+        help="Version-diff mode only: stdout rendering format (default: text)",
     )
     p.set_defaults(cmd=COMMAND, func=run)
 
@@ -54,6 +87,14 @@ def register(subparsers: argparse._SubParsersAction):
 @_traced_stage("diff")
 def run(args, logger: logging.Logger) -> int:
     try:
+        # Version-diff mode (contract-vs-contract). When ``--baseline`` is
+        # supplied we bypass provider lookup entirely — the comparison is
+        # pure structural diff between two parsed contracts.
+        baseline_path = getattr(args, "baseline", None)
+        if baseline_path:
+            return _run_version_diff(args, logger)
+
+        # Drift mode (contract-vs-live-warehouse) — the original behaviour.
         # Load contract and generate desired state
         contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
 
@@ -209,3 +250,106 @@ def _extract_resource_ids(actions: List[Dict[str, Any]]) -> Set[str]:
             resources.add(f"action:{op}")
 
     return resources
+
+
+def _run_version_diff(args, logger: logging.Logger) -> int:
+    """Contract-vs-contract version diff branch (``--baseline`` mode).
+
+    Loads two contracts, runs the changelog engine, prints in the requested
+    format, optionally writes a JSON envelope to ``--out``, and returns a
+    non-zero exit code when ``--fail-on-breaking`` is set and any breaking
+    change was detected.
+    """
+    from fluid_build.cli.console import cprint
+
+    from ..api.changelog import compare_contracts, render_markdown, render_text
+
+    if getattr(args, "env", None):
+        # Environment overlays are a drift-mode concept (they shape the
+        # desired state for live comparison). Combining --baseline + --env
+        # would silently pick the overlay applied to "new" but not the
+        # baseline, which is more confusing than helpful. Reject up front.
+        raise CLIError(
+            2,
+            "diff_modes_mutually_exclusive",
+            {
+                "detail": (
+                    "--baseline and --env are mutually exclusive: --baseline "
+                    "selects contract-vs-contract version diff, --env selects "
+                    "contract-vs-live drift. Pick one."
+                ),
+            },
+        )
+    if getattr(args, "state", None):
+        raise CLIError(
+            2,
+            "diff_modes_mutually_exclusive",
+            {
+                "detail": (
+                    "--baseline and --state are mutually exclusive: --state is "
+                    "the prior apply_report.json (drift mode), --baseline is an "
+                    "older contract (version mode)."
+                ),
+            },
+        )
+
+    baseline_path = args.baseline
+    new_path = args.contract
+    info(logger, "version_diff_loading", baseline=baseline_path, new=new_path)
+
+    # Load both contracts the same way as the rest of the CLI does for
+    # consistency (auto-bundle, alias normalization, etc.). ``env=None``
+    # because environment overlays don't apply to a version compare.
+    baseline = load_contract_with_overlay(baseline_path, None, logger)
+    new = load_contract_with_overlay(new_path, None, logger)
+
+    # Open a child span for the version-diff sub-mode so operators can
+    # filter on ``fluid.diff.mode=version`` in OTel exporters. The outer
+    # ``@traced_stage("diff")`` span stays generic; this attribute set
+    # distinguishes the two modes inside it.
+    with _traced_span(
+        "diff.version",
+        attributes={
+            "fluid.diff.mode": "version",
+            "fluid.diff.baseline_path": baseline_path,
+            "fluid.diff.new_path": new_path,
+            "fluid.diff.fail_on_breaking": bool(getattr(args, "fail_on_breaking", False)),
+            "fluid.diff.format": getattr(args, "format", "text") or "text",
+        },
+    ) as span:
+        report = compare_contracts(baseline, new)
+        span.set_attribute("fluid.diff.breaking_count", len(report.breaking))
+        span.set_attribute("fluid.diff.non_breaking_count", len(report.non_breaking))
+        span.set_attribute("fluid.diff.info_count", len(report.info))
+
+    # Render to stdout in the requested format.
+    fmt = getattr(args, "format", "text") or "text"
+    if fmt == "json":
+        # The JSON envelope is also written to --out (below) for CI
+        # artifact collection. Print to stdout here for piping.
+        import json as _json
+
+        cprint(_json.dumps(report.to_dict(), indent=2))
+    elif fmt == "markdown":
+        cprint(render_markdown(report))
+    else:
+        cprint(render_text(report))
+
+    # Always write the structured envelope to --out so CI runners that don't
+    # parse stdout still get a machine-readable artifact.
+    from ._common import write_json
+
+    write_json(args.out, report.to_dict())
+
+    info(
+        logger,
+        "version_diff_done",
+        breaking=len(report.breaking),
+        non_breaking=len(report.non_breaking),
+        info_count=len(report.info),
+        out=args.out,
+    )
+
+    if getattr(args, "fail_on_breaking", False) and report.has_breaking:
+        return 1
+    return 0

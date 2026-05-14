@@ -18,10 +18,30 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
 def test_mcp_stdio_initialize_tools_list_and_call(tmp_path: Path):
+    """Smoke-test the JSON-RPC wire end-to-end.
+
+    NB on the I/O model: this used to use ``subprocess.run(input=...)``
+    which writes all messages then immediately closes stdin. That
+    worked against the legacy hand-rolled ``_serve_stdio`` (sequential
+    sync loop — EOF only after each response was flushed) but is
+    incompatible with the SDK's async architecture. The low-level
+    server dispatches each request as a separate task via
+    ``tg.start_soon`` and explicitly cancels in-flight handlers on
+    stdin EOF (see the SDK's
+    ``mcp/server/lowlevel/server.py::Server.run`` and its
+    inline comment: *"Transport closed: cancel in-flight handlers …
+    when they eventually try to respond they hit a closed write
+    stream"*).
+
+    Switching to ``Popen`` + read-each-response-before-sending-next
+    keeps stdin open until every response has been received, matching
+    the actual MCP transport contract.
+    """
     repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(repo_root)
@@ -46,28 +66,58 @@ def test_mcp_stdio_initialize_tools_list_and_call(tmp_path: Path):
             "params": {"name": "list_source_adapters", "arguments": {}},
         },
     ]
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "fluid_build",
-            "mcp",
-            "serve",
-            "--read-only",
-        ],
-        input="\n".join(json.dumps(message) for message in messages) + "\n",
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "fluid_build", "mcp", "serve", "--read-only"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         cwd=tmp_path,
         env=env,
-        capture_output=True,
         text=True,
-        timeout=30,
     )
 
-    assert proc.returncode == 0, proc.stderr
-    responses = [
-        json.loads(line) for line in proc.stdout.splitlines() if line.strip().startswith("{")
-    ]
-    assert [response["id"] for response in responses] == [1, 2, 3]
+    def _send(msg: dict) -> None:
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps(msg) + "\n")
+        proc.stdin.flush()
+
+    def _read_response_with_id(req_id: int, *, timeout: float = 10.0) -> dict:
+        """Drain stdout until we see a JSON line whose ``id`` matches."""
+        assert proc.stdout is not None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                time.sleep(0.05)
+                continue
+            stripped = line.strip()
+            if not (stripped.startswith("{") and stripped.endswith("}")):
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and obj.get("id") == req_id:
+                return obj
+        raise AssertionError(f"timed out waiting for response with id={req_id}")
+
+    responses: list[dict] = []
+    try:
+        for msg in messages:
+            _send(msg)
+            responses.append(_read_response_with_id(msg["id"]))
+    finally:
+        assert proc.stdin is not None
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    assert proc.returncode == 0, proc.stderr.read() if proc.stderr else ""
+    assert [r["id"] for r in responses] == [1, 2, 3]
     assert responses[0]["result"]["protocolVersion"] == "2025-06-18"
     assert responses[0]["result"]["capabilities"]["tools"]["listChanged"] is False
     assert responses[0]["result"]["serverInfo"]["name"] == "forge-cli-mcp"

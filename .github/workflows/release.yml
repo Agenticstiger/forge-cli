@@ -33,8 +33,11 @@
 #                   ├─ docker            (after TestPyPI verify, regardless
 #                   └─ github-release     of stable/pre)
 #
-# Pre-release tags (containing a/b/rc/dev) stop after verify-testpypi.
-# Stable tags promote to PyPI only if the TestPyPI install smoke passes.
+# All tags (stable and pre-release) promote to PyPI after the TestPyPI
+# install smoke passes. Pre-releases are PEP 440 pre-release versions
+# (a / b / rc / .dev) so `pip install data-product-forge` skips them by
+# default — only `pip install --pre` or an explicit `==X.Y.ZrcN` pin
+# picks them up.
 #
 # Wheel version comes from the git tag via setuptools-scm — no static
 # `version = "..."` literal in pyproject.toml to drift.
@@ -303,7 +306,10 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: [quality-gate, verify-testpypi]
-    if: needs.quality-gate.outputs.is_prerelease == 'false'
+    # All tags promote to PyPI once the TestPyPI install smoke passes.
+    # Pre-releases (rc/b/a/dev) are PEP 440 pre-release versions; PyPI
+    # treats them as such, and `pip install` skips them by default
+    # (only `pip install --pre` or `==X.Y.ZrcN` opts in).
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -329,7 +335,6 @@ jobs:
   verify-pypi:
     name: Verify PyPI Install
     needs: [quality-gate, publish-pypi]
-    if: needs.quality-gate.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v6
@@ -421,10 +426,11 @@ jobs:
             echo
             echo '```bash'
             if [ "$IS_PRE" = "true" ]; then
-              echo "# Pre-release ($PROFILE) — not recommended for production."
-              echo "pip install --index-url https://test.pypi.org/simple/ \\"
-              echo "            --extra-index-url https://pypi.org/simple/ \\"
-              echo "            data-product-forge==$VERSION"
+              echo "# Pre-release ($PROFILE) — installed from PyPI as a PEP 440 pre-release."
+              echo "# 'pip install data-product-forge' skips pre-releases by default."
+              echo "# Use one of:"
+              echo "pip install data-product-forge==$VERSION       # exact pin"
+              echo "pip install --pre data-product-forge            # latest pre-release"
             else
               echo "pip install data-product-forge==$VERSION"
             fi
