@@ -23,12 +23,21 @@ from collections.abc import Mapping
 from typing import Any
 
 _REDACTED = "***REDACTED***"
+# Substring-match list: a mapping/env key is sensitive when any entry is
+# a substring of the lower-cased key name. Keep alphabetically sorted.
 _SENSITIVE_KEY_PARTS = (
     "api_key",
     "apikey",
     "auth_token",
     "authorization",
+    "aws_access_key",
+    "aws_secret_key",
+    "azure_sas_token",
+    "bearer",
     "client_secret",
+    "connection_string",
+    "credential",
+    "jwt",
     "oauth_token",
     "password",
     "passphrase",
@@ -38,6 +47,10 @@ _SENSITIVE_KEY_PARTS = (
     "token",
 )
 _JWT_RE = re.compile(r"\b[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b")
+# Two-segment JWT (header.payload, no signature). Anchored on the ``eyJ``
+# base64url prefix of the JSON ``{"`` header so we don't redact arbitrary
+# dotted identifiers. Complements ``_JWT_RE`` which requires three segments.
+_JWT_TWO_SEGMENT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
 _BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)([^\s,;]+)")
 # SECURITY_REVIEW S-010: provider-specific token shapes. These don't
 # need surrounding assignment syntax — the string itself is distinctive
@@ -45,15 +58,48 @@ _BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)([^\s,;]+)")
 # we don't accidentally strip everything after a prefix match.
 _STRIPE_KEY_RE = re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}")
 _GITHUB_TOKEN_RE = re.compile(r"\bgh[oprsu]_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9_]{20,}")
+# Provider API-key shapes. Regexes follow the standard detect-secrets /
+# gitleaks rule prefixes (OpenAI ``sk-``, Anthropic ``sk-ant-``, AWS
+# ``AKIA``/``ASIA``, GCP ``AIza``, Slack ``xox*``, HuggingFace ``hf_``,
+# Replicate ``r8_``, GitLab ``glpat-``, Vercel ``vc_``). A leak of any of
+# these is a leak regardless of surrounding assignment syntax.
+#
+# Anthropic must run before OpenAI: ``sk-ant-...`` is a strict prefix of
+# the looser OpenAI ``sk-...`` shape, so the more specific pattern goes
+# first to keep the redacted span tight.
+_PROVIDER_KEY_RES = (
+    re.compile(r"\bsk-ant-[A-Za-z0-9-]{30,}"),  # Anthropic
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),  # OpenAI (incl. sk-proj-/sk-svcacct-/sk-admin-)
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),  # AWS access key id
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{35}"),  # GCP API key
+    re.compile(r"\bxox[abprs]-[0-9A-Za-z-]{10,}"),  # Slack
+    re.compile(r"\bhf_[A-Za-z0-9]{30,}"),  # HuggingFace
+    re.compile(r"\br8_[A-Za-z0-9]{30,}"),  # Replicate
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),  # GitLab PAT
+    re.compile(r"\bvc_[A-Za-z0-9]{20,}"),  # Vercel
+)
+# Fernet token — URL-safe base64 starting with the fixed ``gAAAAA`` header
+# emitted by ``cryptography.fernet`` (version byte 0x80 + timestamp).
+_FERNET_TOKEN_RE = re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}")
+# PEM private-key block (RSA / EC / OPENSSH / DSA / bare PKCS#8 ...).
+# ``[^-]*`` (zero-or-more) so the algorithm word is optional and the bare
+# ``-----BEGIN PRIVATE KEY-----`` PKCS#8 header is covered. ``(?s)`` so
+# ``.`` spans newlines — multiline tracebacks must be scrubbed wholesale.
+_PEM_PRIVATE_KEY_RE = re.compile(
+    r"(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----"
+)
+# Quantifiers are upper-bounded ({,N}) so an adversarial log line can't
+# trigger catastrophic backtracking — the key prefix, separator padding
+# and value span are all length-capped.
 _ASSIGNMENT_RE = re.compile(
     r"(?ix)"
-    r"(?P<key>\b(?:[A-Za-z0-9_]*_)?(?:"
+    r"(?P<key>\b(?:[A-Za-z0-9_]{,128}_)?(?:"
     r"api[_-]?key|authorization|aws_secret_access_key|client_secret|"
     r"oauth[_-]?token|password|private[_-]?key(?:_passphrase)?|secret|token"
     r")\b)"
-    r"(?P<sep>\s*[:=]\s*)"
+    r"(?P<sep>\s{,8}[:=]\s{,8})"
     r"(?P<quote>['\"]?)"
-    r"(?P<value>.*?)(?P=quote)"
+    r"(?P<value>.{,256}?)(?P=quote)"
     r"(?=(?:[\s,;}\]]|$))"
 )
 # Matches a single printf-style placeholder. We use this to walk a log message
@@ -79,12 +125,19 @@ def redact_secret_text(text: str) -> str:
         return text
 
     redacted = _BEARER_RE.sub(r"\1" + _REDACTED, text)
+    # PEM blocks first: a multiline key block can itself contain ``.``/``=``
+    # runs that would otherwise be partially mangled by the token regexes.
+    redacted = _PEM_PRIVATE_KEY_RE.sub(_REDACTED, redacted)
     redacted = _JWT_RE.sub(_REDACTED, redacted)
+    redacted = _JWT_TWO_SEGMENT_RE.sub(_REDACTED, redacted)
     # S-010: provider-token shapes run before the assignment regex so
     # ``api_key=sk_live_...`` hits the Stripe pattern in addition to the
     # assignment pattern, which also works.
     redacted = _STRIPE_KEY_RE.sub(_REDACTED, redacted)
     redacted = _GITHUB_TOKEN_RE.sub(_REDACTED, redacted)
+    for provider_re in _PROVIDER_KEY_RES:
+        redacted = provider_re.sub(_REDACTED, redacted)
+    redacted = _FERNET_TOKEN_RE.sub(_REDACTED, redacted)
     redacted = _ASSIGNMENT_RE.sub(
         lambda match: (
             f"{match.group('key')}{match.group('sep')}{match.group('quote')}"
@@ -216,10 +269,17 @@ class SecretRedactingFilter(logging.Filter):
                 record.args = redact_value(record.args)
         elif hasattr(record, "msg"):
             record.msg = redact_value(record.msg)
+        # Exception text is a multiline string — ``redact_secret_text``
+        # applies the ``(?s)`` PEM-block pattern, so a private key embedded
+        # in a traceback is scrubbed across line boundaries. Cover both an
+        # unformatted ``exc_info`` tuple and an already-rendered ``exc_text``
+        # (a prior formatter may have populated one without the other).
         if record.exc_info:
             record.exc_text = redact_secret_text(
                 "".join(traceback.format_exception(*record.exc_info))
             )
+        elif getattr(record, "exc_text", None):
+            record.exc_text = redact_secret_text(record.exc_text)
         if record.stack_info:
             record.stack_info = redact_secret_text(record.stack_info)
         return True

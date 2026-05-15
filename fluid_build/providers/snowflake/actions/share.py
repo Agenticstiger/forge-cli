@@ -17,12 +17,32 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Dict
 
+from ..._sql_safety import quote_string_literal, validate_ident
 from ..connection import SnowflakeConnection
 from ..util.config import get_connection_params
 from ..util.names import quote_identifier
+
+
+def _validate_account_locator(account: str) -> str:
+    """Validate a Snowflake account locator for the ``ADD ACCOUNTS =`` clause.
+
+    The external account in ``ALTER SHARE ... ADD ACCOUNTS = <account>`` is
+    interpolated raw — an unvalidated value is an injection point (BUG-SQL-TYPE
+    sibling). A locator is ``orgname.accountname`` or a legacy
+    hyphen-separated form, so it cannot route through :func:`validate_ident`
+    verbatim. Instead each ``.``/``-`` separated segment is allowlist-validated
+    via :func:`validate_ident`; the original string is returned unchanged when
+    every segment passes. Raises :class:`ValueError` otherwise.
+    """
+    if not isinstance(account, str) or not account.strip():
+        raise ValueError(f"Invalid Snowflake account locator: {account!r}")
+    for segment in re.split(r"[.\-]", account.strip()):
+        validate_ident(segment)
+    return account
 
 
 def ensure_share(action: Dict[str, Any], provider) -> Dict[str, Any]:
@@ -49,15 +69,18 @@ def ensure_share(action: Dict[str, Any], provider) -> Dict[str, Any]:
             # Create share (idempotent)
             create_sql = f"CREATE SHARE IF NOT EXISTS {quote_identifier(share_name)}"
             if comment:
-                escaped_comment = comment.replace("'", "''")
-                create_sql += f" COMMENT = '{escaped_comment}'"
+                create_sql += f" COMMENT = {quote_string_literal(str(comment))}"
 
             conn.execute(create_sql)
 
-            # Grant share to external accounts
+            # Grant share to external accounts. ``external_account`` is
+            # interpolated raw into the ALTER SHARE DDL — route it through the
+            # account-locator allowlist so a contract cannot smuggle DDL
+            # through the ADD ACCOUNTS clause (BUG-SQL-TYPE sibling).
             for external_account in accounts:
+                safe_account = _validate_account_locator(external_account)
                 grant_sql = (
-                    f"ALTER SHARE {quote_identifier(share_name)} ADD ACCOUNTS = {external_account}"
+                    f"ALTER SHARE {quote_identifier(share_name)} ADD ACCOUNTS = {safe_account}"
                 )
                 conn.execute(grant_sql)
 

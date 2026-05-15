@@ -131,7 +131,7 @@ def _setup_ollama(console: Any) -> Optional[Any]:
       start it without restarting the forge run)
     * Switch to a cloud provider via ``--rescue``-style picker
     * Skip AI entirely (returns to top of forge with no LLM)
-    * Print install instructions and quit (the legacy path)
+    * Print install instructions and quit
     """
     from fluid_build.cli.forge_ui import ask_numbered_choice
 

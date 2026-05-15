@@ -15,31 +15,21 @@
 # fluid_build/providers/snowflake/util/__init__.py
 """Snowflake utility modules.
 
-This package shadows the historical ``util.py`` module (Python resolves
-``from .util import X`` to the package, not the sibling file) so the
-three helpers that used to live at module scope — ``backtick``,
-``map_type``, ``create_table_ddl`` — are re-exported here.
-
-Historical context: these helpers were originally imported by the
-legacy ``providers/snowflake/snowflake.py`` ``SnowflakeProvider`` class
-(removed in the Phase 7-rest tech-debt cleanup — the class was dead
-code after ``providers/snowflake/__init__.py`` aliased
-``SnowflakeProviderEnhanced`` as the public ``SnowflakeProvider``).
-The re-exports stay because third-party callers may rely on
-``from fluid_build.providers.snowflake.util import backtick``, and
-the helpers are self-contained + tiny — cheaper to keep than to audit
-downstream users.
-
-The sibling ``util.py`` file (same directory) is kept on disk as a
-pure reference implementation that duplicates the contents of this
-``__init__.py``; Python's import resolution ignores ``util.py`` in
-favor of this package.
+This package historically re-exported three module-scope helpers —
+``map_type`` and ``create_table_ddl`` (plus a now-removed ``backtick``).
+The legacy ``backtick`` quoted identifiers WITHOUT escaping embedded
+double quotes, so it was an injection hazard; identifier quoting now
+routes exclusively through :func:`fluid_build.providers.snowflake.util.names.quote_identifier`,
+which doubles embedded quotes. The redundant sibling ``util.py``
+reference file has been deleted.
 """
 
 from __future__ import annotations
 
+from .names import quote_identifier
+
 # ---------------------------------------------------------------------------
-# Identifier quoting + FLUID → Snowflake type mapping (ex-util.py)
+# FLUID → Snowflake type mapping + DDL rendering
 # ---------------------------------------------------------------------------
 
 _FLUID_TO_SF = {
@@ -68,37 +58,31 @@ def map_type(fluid_type: str) -> str:
     return _FLUID_TO_SF.get(t, t)
 
 
-def backtick(s: str) -> str:
-    """Quote a Snowflake identifier.
-
-    Snowflake prefers double quotes for identifiers (unlike MySQL's
-    backticks). Name kept as ``backtick`` for historical compatibility
-    with the callsites scattered through ``snowflake.py``.
-    """
-    return f'"{s}"'
-
-
 def create_table_ddl(table_spec) -> str:
     """Render a ``CREATE TABLE`` DDL from a TableSpec dataclass.
 
     Used by the legacy-style imperative planner; the 11-stage pipeline's
-    stage-7 apply routes through ``_ensure_table`` instead. Kept for
-    back-compat with tests and any callers that still build DDL strings
-    directly.
+    stage-7 apply routes through ``_ensure_table`` instead. Identifiers
+    are quoted via :func:`names.quote_identifier`, which doubles embedded
+    double quotes (the old ``backtick`` helper did not).
     """
     cols = []
     for c in table_spec.columns:
         coltype = map_type(c.type)
         nulls = "NULL" if c.nullable else "NOT NULL"
-        cols.append(f"{backtick(c.name)} {coltype} {nulls}")
+        cols.append(f"{quote_identifier(c.name)} {coltype} {nulls}")
     columns_sql = ",\n  ".join(cols)
     db, sch, name = (
         table_spec.ident.database,
         table_spec.ident.schema,
         table_spec.ident.name,
     )
-    fq = f"{backtick(db)}.{backtick(sch)}.{backtick(name)}" if db and sch else backtick(name)
+    fq = (
+        f"{quote_identifier(db)}.{quote_identifier(sch)}.{quote_identifier(name)}"
+        if db and sch
+        else quote_identifier(name)
+    )
     return f"CREATE TABLE IF NOT EXISTS {fq} (\n  {columns_sql}\n)"
 
 
-__all__ = ["map_type", "backtick", "create_table_ddl"]
+__all__ = ["map_type", "create_table_ddl"]

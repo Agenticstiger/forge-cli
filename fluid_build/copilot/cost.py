@@ -571,7 +571,7 @@ class RunCostTracker:
             # Phase A3: prefer litellm's ``usd_override`` when present —
             # it's an authoritative per-call price catalog kept in sync
             # with provider pricing. Falls through to the embedded
-            # ``MODEL_PRICES_USD`` table for the legacy native path.
+            # ``MODEL_PRICES_USD`` table for the native provider path.
             if entry.usd_override is not None:
                 usd: Optional[float] = round(float(entry.usd_override), 6)
             else:

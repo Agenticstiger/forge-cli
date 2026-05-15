@@ -441,6 +441,35 @@ def _get_file_size(path: Union[str, Path]) -> Optional[int]:
         return None
 
 
+def _write_dot_tempfile(dot: str) -> str:
+    """Write DOT source to a private temp file and return its path.
+
+    Security: the DOT body can embed contract ids and column names, so
+    the file must not be world-readable while ``dot`` renders it.
+    ``tempfile.NamedTemporaryFile`` yields a predictable ``.dot`` suffix
+    AND leaves the file group/world readable under a default umask. We
+    instead use ``mkstemp`` (unpredictable name) and immediately
+    ``chmod`` the file to ``0o600`` before any content is written.
+
+    The caller owns cleanup (``os.unlink`` in a ``finally`` block).
+    """
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="fluid-viz-", suffix=".dot")
+    try:
+        os.chmod(tmp_path, 0o600)
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            fh.write(dot)
+    except BaseException:
+        # Setup failed — close the descriptor (if still open) and remove
+        # the file so we don't leak it.
+        try:
+            os.close(tmp_fd)
+        except OSError:
+            pass
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
+    return tmp_path
+
+
 # --------------------------- Enhanced DOT Graph Builder --------------------------- #
 
 
@@ -1229,9 +1258,7 @@ def _run_mesh_mode(args: argparse.Namespace, logger: logging.Logger) -> int:
             out_file = out_file.with_suffix(".dot")
             out_file.write_text(dot, encoding="utf-8")
             return 0
-        with tempfile.NamedTemporaryFile("w", suffix=".dot", delete=False) as fh:
-            fh.write(dot)
-            tmp_path = fh.name
+        tmp_path = _write_dot_tempfile(dot)
         try:
             subprocess.run(
                 ["dot", f"-T{fmt}", tmp_path, "-o", str(out_file)],
@@ -1244,9 +1271,7 @@ def _run_mesh_mode(args: argparse.Namespace, logger: logging.Logger) -> int:
                 pass
     else:  # html — just wrap the SVG in a minimal page
         # Render SVG first into a tmp, then template-wrap.
-        with tempfile.NamedTemporaryFile("w", suffix=".dot", delete=False) as fh:
-            fh.write(dot)
-            tmp_path = fh.name
+        tmp_path = _write_dot_tempfile(dot)
         try:
             svg_bytes = subprocess.check_output(["dot", "-Tsvg", tmp_path])
         finally:
@@ -1480,12 +1505,8 @@ def _run_provider_actions_viz(args: argparse.Namespace, logger: logging.Logger) 
                 logger.info(f"DOT file saved to: {dot_path}")
                 return 1
 
-            # Write DOT to temp file
-            import tempfile
-
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".dot", delete=False) as tmp_dot:
-                tmp_dot.write(dot_content)
-                tmp_dot_path = tmp_dot.name
+            # Write DOT to a secure temp file (0o600, unpredictable name).
+            tmp_dot_path = _write_dot_tempfile(dot_content)
 
             try:
                 # Render with Graphviz

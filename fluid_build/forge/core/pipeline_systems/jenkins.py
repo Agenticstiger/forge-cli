@@ -379,7 +379,7 @@ EOM
         booleanParam(name: 'ALLOW_DATA_LOSS', defaultValue: false,
                      description: 'Stage 7: gate waiver for --mode replace* in non-dev or when target has rows.')
         booleanParam(name: 'NO_VERIFY_DIGEST', defaultValue: false,
-                     description: 'Stage 7: DR emergency escape — skip plan-binding verification. Use only when the original bundle is unreachable.')
+                     description: 'Stage 7: DR emergency escape — waives BOTH the plan-binding and federation upstream-digest gates (--no-verify-plan-binding --no-verify-federation). Use only when the original bundle / upstreams are unreachable.')
 
         // ── Stage 8 — policy apply ─────────────────────────────────
         booleanParam(name: 'RUN_STAGE_8_POLICY_APPLY', defaultValue: true,
@@ -619,9 +619,9 @@ pipeline {{
             // then expanded `${{APPLY_BUILD_FLAG}}` UNQUOTED in the sh
             // body, which IFS-word-splits on whitespace. A Jenkins user
             // with Build-With-Parameters permission could set
-            //   APPLY_BUILD_ID="x --allow-data-loss --no-verify-digest"
-            // → the value split into 4 argv tokens → `fluid apply` saw
-            // --allow-data-loss and --no-verify-digest even when the
+            //   APPLY_BUILD_ID="x --allow-data-loss --no-verify-plan-binding"
+            // → the value split into 3 argv tokens → `fluid apply` saw
+            // --allow-data-loss and --no-verify-plan-binding even when the
             // Jenkins booleans ALLOW_DATA_LOSS and NO_VERIFY_DIGEST were
             // false. Auth-gate bypass.
             //
@@ -639,7 +639,7 @@ pipeline {{
                     set -- runtime/plan.json --mode "$APPLY_MODE" --env "${{FLUID_ENV:-dev}}" --yes --report runtime/apply-report.html
                     if [ -n "${{APPLY_BUILD_ID_VAL:-}}" ]; then set -- "$@" --build "$APPLY_BUILD_ID_VAL"; fi
                     if [ "${{ALLOW_DATA_LOSS:-false}}" = "true" ]; then set -- "$@" --allow-data-loss; fi
-                    if [ "${{NO_VERIFY_DIGEST:-false}}" = "true" ]; then set -- "$@" --no-verify-digest; fi
+                    if [ "${{NO_VERIFY_DIGEST:-false}}" = "true" ]; then set -- "$@" --no-verify-plan-binding --no-verify-federation; fi
                     fluid apply "$@"'''
                 archiveArtifacts artifacts: '{P}runtime/apply-report.html', fingerprint: true, allowEmptyArchive: true
             }}

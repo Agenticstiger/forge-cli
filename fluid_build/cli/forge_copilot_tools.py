@@ -120,25 +120,27 @@ from fluid_build.cli._forge_copilot_tool_args import (  # noqa: E402,F401
         "Scan the user's workspace for data files, SQL, dbt projects, "
         "existing contracts, and infer provider hints.  Returns a "
         "metadata-only report (no raw file contents or credentials).  "
-        "Scope is always the caller-provided workspace root; any "
-        "``workspace_path`` argument is ignored for safety."
+        "Takes no arguments — scope is always the caller-provided "
+        "workspace root, fixed by the invoking CLI."
     ),
     args_schema=DiscoverWorkspaceArgs,
     workspace_root_aware=True,
 )
 def _dispatch_discover_workspace(
-    args: DiscoverWorkspaceArgs,  # noqa: ARG001 — schema-only, fields ignored by design
+    args: DiscoverWorkspaceArgs,  # noqa: ARG001 — schema-only, no fields by design
     *,
     workspace_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Scan the workspace and return a metadata-only discovery report.
 
-    SECURITY_REVIEW S-004: the LLM-provided ``workspace_path`` argument
-    is **intentionally ignored**. The effective scope is the
-    ``workspace_root`` plumbed in from the enclosing agent loop (which
-    resolves it from the human-invoked ``--workspace`` or cwd). This
-    prevents the LLM from widening scope to ``/`` or ``~`` by passing
-    a crafted argument.
+    SECURITY_REVIEW S-004 / I8: the tool exposes **no path argument**.
+    The effective scope is the ``workspace_root`` plumbed in from the
+    enclosing agent loop (which resolves it from the human-invoked
+    ``--workspace`` or cwd). This prevents the LLM from widening scope
+    to ``/`` or ``~`` by passing a crafted argument. The former no-op
+    ``workspace_path`` field was removed so the LLM is not shown a
+    parameter the impl discards; ``DiscoverWorkspaceArgs`` keeps
+    ``extra=ignore`` so stale clients still passing it don't error.
     """
     from fluid_build.cli.forge_copilot_discovery import discover_local_context
 
@@ -404,12 +406,26 @@ def _dispatch_forge_data_model(
     if ddl_paths:
         tables = []
         for raw_path in ddl_paths:
-            path = (Path(raw_path) if Path(raw_path).is_absolute() else root / raw_path).resolve()
+            candidate = Path(raw_path)
+            # SECURITY (I3): the LLM controls ddl_paths. Reject absolute
+            # paths outright, skip dotfiles (so the tool can't be steered
+            # at .env / .aws/credentials / id_rsa), and only accept
+            # .sql / .ddl files. The path is then confined to the
+            # workspace and size-capped before it is read.
+            if candidate.is_absolute():
+                continue
+            if any(part.startswith(".") for part in candidate.parts):
+                continue
+            if candidate.suffix.lower() not in (".sql", ".ddl"):
+                continue
+            path = (root / candidate).resolve()
             try:
                 path.relative_to(root)
             except ValueError:
                 continue
-            if not path.exists():
+            if not path.is_file():
+                continue
+            if path.stat().st_size > 50 * 1024 * 1024:
                 continue
             parsed = parse_ddl_text(path.read_text(encoding="utf-8"))
             tables.extend(parsed.tables)
@@ -863,17 +879,22 @@ def _dispatch_search_semantic_memory(
     try:
         store = resolve_store(workspace_root=workspace_root)
     except Exception as exc:  # noqa: BLE001
+        # SECURITY_REVIEW I7: surface only the exception *class* to the
+        # LLM context — raw ``str(exc)`` can embed filesystem paths and
+        # workspace ids. Mirrors the typed-error shape ``dispatch_tool_call``
+        # uses; full detail stays in server logs.
         return {
             "matches": [],
-            "reason": f"store resolve failed: {exc.__class__.__name__}: {exc}",
+            "reason": f"store resolve failed: {exc.__class__.__name__} — see server logs",
         }
 
     try:
         records = store.search("memory/semantic", query, mode="hybrid", limit=limit) or []
     except Exception as exc:  # noqa: BLE001
+        # SECURITY_REVIEW I7: class name only, no raw exception text.
         return {
             "matches": [],
-            "reason": f"store search failed: {exc.__class__.__name__}: {exc}",
+            "reason": f"store search failed: {exc.__class__.__name__} — see server logs",
         }
 
     matches: List[Dict[str, Any]] = []
@@ -1171,8 +1192,24 @@ def _dispatch_generate_dlt_source(
                 f"(got {args.name!r}, sanitised to {safe_name!r})"
             ),
         }
-    if not (args.api_url.startswith("http://") or args.api_url.startswith("https://")):
+    api_url = (args.api_url or "").strip()
+    if not (api_url.startswith("http://") or api_url.startswith("https://")):
         return {"error": "InvalidApiUrl", "message": "api_url must be http(s)://"}
+    # SECURITY: api_url and description are interpolated into a generated
+    # .py file. Reject any api_url character outside the RFC 3986 set so
+    # it cannot break out of the string literal / docstring it lands in —
+    # a crafted value with a quote, newline, or backslash would otherwise
+    # be arbitrary code executed the next time dlt imports the module.
+    if not re.fullmatch(r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", api_url):
+        return {
+            "error": "InvalidApiUrl",
+            "message": "api_url contains characters not permitted in a URL",
+        }
+    # description lands inside a triple-quoted docstring — strip the
+    # characters that could terminate it (`"` sequences, line-continuation
+    # backslash) and bound its length.
+    safe_description = (args.description or "").replace('"', "").replace("\\", "")
+    safe_description = safe_description.strip()[:200] or f"dlt source for {safe_name}"
 
     effective_root = (workspace_root or Path.cwd()).resolve()
     rel_path = f"sources/{safe_name}.py"
@@ -1189,12 +1226,22 @@ def _dispatch_generate_dlt_source(
     token_env = f"{safe_name.upper()}_TOKEN"
     body = _render_dlt_source(
         name=safe_name,
-        api_url=args.api_url,
-        description=args.description or f"dlt source for {safe_name}",
+        api_url=api_url,
+        description=safe_description,
         auth_kind=auth_kind,
         token_env=token_env,
     )
 
+    # SECURITY: refuse to clobber an existing module — an LLM reusing a
+    # name must not silently overwrite a hand-edited source file.
+    if target.exists():
+        return {
+            "error": "FileExists",
+            "message": (
+                f"{rel_path} already exists; refusing to overwrite. "
+                "Remove it first if you intend to regenerate."
+            ),
+        }
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body, encoding="utf-8")
     preview = body if len(body) < 1500 else body[:1500] + "\n# … truncated for prompt …"
@@ -1249,7 +1296,7 @@ def _render_dlt_source(
         "import dlt\n"
         "import httpx\n\n\n"
         "@dlt.source\n"
-        f"def {name}_source(api_url: str = '{api_url}'):\n"
+        f"def {name}_source(api_url: str = {api_url!r}):\n"
         f'    """Yield records from {api_url}."""\n'
         f"{auth_block}"
         "\n"
@@ -1284,17 +1331,19 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
     seen: set[str] = set()
     tool_values: List[Dict[str, Any]] = []
 
-    for t in TOOL_REGISTRY.values():
-        if t["name"] in seen:
-            continue
-        seen.add(t["name"])
-        tool_values.append(t)
-
+    # SECURITY (I5): enumerate the world-class FORGE_TOOL_REGISTRY first
+    # so a stray TOOL_REGISTRY entry cannot shadow a hardened typed tool.
     for forge_tool in FORGE_TOOL_REGISTRY.values():
         if forge_tool.name in seen:
             continue
         seen.add(forge_tool.name)
         tool_values.append(forge_tool.legacy_dict)
+
+    for t in TOOL_REGISTRY.values():
+        if t["name"] in seen:
+            continue
+        seen.add(t["name"])
+        tool_values.append(t)
 
     if _staged_tool_enabled() and _FORGE_DATA_MODEL_TOOL["name"] not in seen:
         tool_values.append(_FORGE_DATA_MODEL_TOOL)
@@ -1322,12 +1371,14 @@ def dispatch_tool_call(
     return an error dict rather than raising so the agent loop can
     continue.
 
-    Resolution order:
+    Resolution order (SECURITY I5 — typed registry wins):
 
-    1. Legacy ``TOOL_REGISTRY`` — hand-written dict entries.
-    2. ``FORGE_TOOL_REGISTRY`` — Pydantic-typed ``@forge_tool``
+    1. ``FORGE_TOOL_REGISTRY`` — Pydantic-typed ``@forge_tool``
        registrations (their ``legacy_dict["impl"]`` adapter handles
-       arg validation + workspace_root injection).
+       arg validation + workspace_root injection). Resolved FIRST so a
+       stray ``TOOL_REGISTRY`` entry cannot shadow a hardened tool.
+    2. Legacy ``TOOL_REGISTRY`` — hand-written dict entries (test-only
+       in practice; empty in production).
     3. The staged ``_FORGE_DATA_MODEL_TOOL`` fallback when enabled.
 
     ``workspace_root`` (SECURITY_REVIEW S-003/S-004) is forwarded to
@@ -1336,19 +1387,20 @@ def dispatch_tool_call(
     (``read_sample_schema``, ``discover_workspace``) read it
     explicitly.
     """
-    tool = TOOL_REGISTRY.get(name)
-    if tool is None:
-        # Bridge to the world-class @forge_tool registry. The
-        # ``legacy_dict`` wrapper validates args via the Pydantic
-        # args_schema and routes through the typed dispatcher
-        # (returns ``{"error": ..., "message": ...}`` on failure
-        # without leaking the original exception text — same security
-        # posture as the legacy path).
-        from fluid_build.cli.forge_tool import FORGE_TOOL_REGISTRY
+    # SECURITY (I5): resolve the world-class @forge_tool registry FIRST so
+    # a stray ``TOOL_REGISTRY`` entry (legacy/test-only) can never silently
+    # shadow a hardened, Pydantic-typed tool of the same name. The
+    # ``legacy_dict`` wrapper validates args via the Pydantic args_schema
+    # and returns ``{"error": ..., "message": ...}`` on failure without
+    # leaking the original exception text.
+    from fluid_build.cli.forge_tool import FORGE_TOOL_REGISTRY
 
-        forge_tool = FORGE_TOOL_REGISTRY.get(name)
-        if forge_tool is not None:
-            tool = forge_tool.legacy_dict
+    tool = None
+    forge_tool = FORGE_TOOL_REGISTRY.get(name)
+    if forge_tool is not None:
+        tool = forge_tool.legacy_dict
+    if tool is None:
+        tool = TOOL_REGISTRY.get(name)
     if tool is None and name == _FORGE_DATA_MODEL_TOOL["name"] and _staged_tool_enabled():
         tool = _FORGE_DATA_MODEL_TOOL
     if not tool:

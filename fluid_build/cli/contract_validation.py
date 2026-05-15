@@ -270,6 +270,11 @@ class ContractValidator:
         # Step 1: Validate contract syntax against schema
         self._validate_contract_schema()
 
+        # Step 1b: Structural type sanity — top-level container fields must
+        # be the right JSON type before the per-field validators iterate
+        # them (otherwise a string ``exposes`` crashes with AttributeError).
+        self._validate_structural_types()
+
         # Step 2: Detect and validate provider
         self._detect_and_validate_provider()
 
@@ -308,6 +313,52 @@ class ContractValidator:
         except Exception as e:
             self.report.add_issue("error", "schema", f"Schema validation failed: {e}", "")
 
+    def _validate_structural_types(self) -> None:
+        """Check top-level container fields are the expected JSON type.
+
+        A contract whose ``exposes`` / ``builds`` / ``consumes`` is a bare
+        string (or any non-list) — or whose ``metadata`` is a non-object —
+        would otherwise crash the per-field validators with an opaque
+        ``AttributeError`` ("'str' object has no attribute 'get'"),
+        surfaced as a useless ``cli_unhandled_exception``. Emit a clear
+        schema error here instead, then the downstream validators skip
+        the malformed field gracefully (see ``_iter_objects``).
+        """
+        array_fields = ("exposes", "builds", "consumes")
+        for fld in array_fields:
+            value = self.contract.get(fld)
+            if value is not None and not isinstance(value, list):
+                self.report.add_issue(
+                    "error",
+                    "schema",
+                    f"'{fld}' must be an array, got {type(value).__name__}",
+                    fld,
+                )
+
+        metadata = self.contract.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            self.report.add_issue(
+                "error",
+                "schema",
+                f"'metadata' must be an object, got {type(metadata).__name__}",
+                "metadata",
+            )
+
+    def _iter_objects(self, field: str) -> List[Dict[str, Any]]:
+        """Return ``contract[field]`` as a list of dict entries, defensively.
+
+        Returns ``[]`` when the field is absent or not a list; skips any
+        non-dict entries. This keeps every ``for x in contract[field]``
+        loop from blowing up on a malformed contract (``exposes`` as a
+        string, ``builds`` as a number, list-of-strings, ...).
+        ``_validate_structural_types`` has already emitted the proper
+        schema error for the malformed shape.
+        """
+        value = self.contract.get(field)
+        if not isinstance(value, list):
+            return []
+        return [entry for entry in value if isinstance(entry, dict)]
+
     def _detect_and_validate_provider(self) -> None:
         """Detect provider from contract and validate configuration."""
         LOG.info("Detecting and validating provider configuration...")
@@ -316,22 +367,29 @@ class ContractValidator:
         detected_provider = None
         detected_project = None
 
-        for expose in self.contract.get("exposes", []):
+        # ``exposes`` / ``builds`` must be arrays of objects. A contract
+        # where ``exposes`` is a bare string would otherwise make
+        # ``for expose in <str>`` iterate characters and ``"c".get(...)``
+        # raise ``AttributeError`` — surfaced as a useless
+        # ``cli_unhandled_exception``. Skip detection on malformed input;
+        # ``_validate_exposes`` emits the proper schema error.
+        for expose in self._iter_objects("exposes"):
             binding = expose.get("binding", {})
-            if "platform" in binding:
+            if isinstance(binding, dict) and "platform" in binding:
                 detected_provider = binding["platform"]
                 location = binding.get("location", {})
-                detected_project = location.get("project") or location.get("properties", {}).get(
-                    "project"
-                )
+                if isinstance(location, dict):
+                    detected_project = location.get("project") or location.get(
+                        "properties", {}
+                    ).get("project")
                 break
 
         # Fallback to builds section
         if not detected_provider:
-            for build in self.contract.get("builds", []):
+            for build in self._iter_objects("builds"):
                 execution = build.get("execution", {})
-                runtime = execution.get("runtime", {})
-                if "platform" in runtime:
+                runtime = execution.get("runtime", {}) if isinstance(execution, dict) else {}
+                if isinstance(runtime, dict) and "platform" in runtime:
                     detected_provider = runtime["platform"]
                     break
 
@@ -451,16 +509,73 @@ class ContractValidator:
         """Validate all exposed data products against actual resources."""
         LOG.info("Validating exposed data products...")
 
-        exposes = self.contract.get("exposes", [])
+        raw_exposes = self.contract.get("exposes")
+        # ``exposes`` as a non-list (string / number / object) is a schema
+        # error already reported by ``_validate_structural_types`` — bail
+        # out here rather than crashing with AttributeError on iteration.
+        if raw_exposes is not None and not isinstance(raw_exposes, list):
+            return
+
+        exposes = self._iter_objects("exposes")
         if not exposes:
             self.report.add_issue(
                 "warning", "metadata", "No data products exposed in contract", "exposes"
             )
             return
 
+        # Duplicate-exposeId guard. Two exposes sharing the same
+        # ``exposeId`` (or ``id`` alias) silently collapse into a single
+        # action at ``fluid plan`` time — straight data loss. The JSON
+        # schema does not enforce array-element uniqueness, so detect it
+        # here and emit a hard error so ``fluid validate`` rejects it.
+        self._check_duplicate_expose_ids(exposes)
+
         for idx, expose in enumerate(exposes):
             self._validate_single_expose(expose, idx)
             self.report.exposes_validated += 1
+
+    def _check_duplicate_expose_ids(self, exposes: List[Dict[str, Any]]) -> None:
+        """Emit an error for any ``exposeId`` (or ``id`` alias) used twice.
+
+        Also covers the top-level ``id`` field: a contract whose top-level
+        ``id`` collides with one of its own expose identifiers is a sign
+        of a copy-paste error and is reported as a warning.
+        """
+        seen: Dict[str, int] = {}
+        for idx, expose in enumerate(exposes):
+            # FLUID DSL accepts both ``exposeId`` and the ``id`` alias.
+            expose_id = expose.get("exposeId") or expose.get("id")
+            if not isinstance(expose_id, str) or not expose_id:
+                continue
+            if expose_id in seen:
+                self.report.add_issue(
+                    "error",
+                    "schema",
+                    (
+                        f"Duplicate exposeId {expose_id!r} — exposes[{seen[expose_id]}] "
+                        f"and exposes[{idx}] share the same identifier. Each "
+                        "exposed data product must have a unique exposeId; "
+                        "duplicates silently collapse into one action at plan "
+                        "time (data loss)."
+                    ),
+                    f"exposes[{idx}].exposeId",
+                )
+            else:
+                seen[expose_id] = idx
+
+        # Cross-check the contract's top-level ``id`` against expose ids.
+        top_id = self.contract.get("id")
+        if isinstance(top_id, str) and top_id and top_id in seen:
+            self.report.add_issue(
+                "warning",
+                "schema",
+                (
+                    f"Top-level contract id {top_id!r} collides with "
+                    f"exposes[{seen[top_id]}].exposeId — likely a copy-paste "
+                    "error."
+                ),
+                "id",
+            )
 
     def _validate_single_expose(self, expose: Dict[str, Any], idx: int) -> None:
         """Validate a single exposed data product."""
@@ -892,7 +1007,13 @@ class ContractValidator:
         """Validate consumed data products (dependencies)."""
         LOG.info("Validating consumed data products...")
 
-        consumes = self.contract.get("consumes", [])
+        raw_consumes = self.contract.get("consumes")
+        # Non-list ``consumes`` is a schema error already reported by
+        # ``_validate_structural_types`` — skip rather than crash.
+        if raw_consumes is not None and not isinstance(raw_consumes, list):
+            return
+
+        consumes = self._iter_objects("consumes")
         if not consumes:
             LOG.debug("No consumed data products declared")
             return
@@ -956,6 +1077,12 @@ class ContractValidator:
         LOG.info("Validating metadata and governance...")
 
         metadata = self.contract.get("metadata", {})
+
+        # A non-object ``metadata`` is a schema error already reported by
+        # ``_validate_structural_types``; bail out rather than crash on
+        # ``metadata.get(...)`` for a string/list value.
+        if metadata is not None and not isinstance(metadata, dict):
+            return
 
         if not metadata:
             self.report.add_issue("warning", "metadata", "No metadata section defined", "metadata")

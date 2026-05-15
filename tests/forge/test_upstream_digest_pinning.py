@@ -28,7 +28,7 @@ Three layers of coverage:
   This mirrors the ``PlanBindingError(kind="bundle-mismatch")`` shape
   so CI templates can match both with one regex.
 
-* **Escape hatch** — ``--no-verify-digest`` bypasses the gate but
+* **Escape hatch** — ``--no-verify-federation`` bypasses the gate but
   must log a WARNING so audit trails record the override.
 
 Sister fixture ``tests/forge/test_federation_apply_gate.py`` covers
@@ -270,7 +270,8 @@ class TestApplyConsumesDriftErrorShape:
         args = SimpleNamespace(
             contract=str(contract_path),
             env="dev",
-            no_verify_digest=False,
+            no_verify_plan_binding=False,
+            no_verify_federation=False,
             mode="amend",
             target=None,
             dry_run=True,
@@ -296,9 +297,16 @@ class TestApplyConsumesDriftErrorShape:
 
         logger = logging.getLogger("fluid.test")
 
-        with patch(
-            "fluid_build.forge.federation.validate_federated_consumes",
-            return_value=[violation],
+        # The contract uses ``upstreamWorkspace`` / ``upstreamDigest``
+        # consume fields not modelled by the bundled schema, so the new
+        # pre-apply schema gate is stubbed — the unit under test is the
+        # federation drift gate, not contract schema validity.
+        with (
+            patch(
+                "fluid_build.forge.federation.validate_federated_consumes",
+                return_value=[violation],
+            ),
+            patch("fluid_build.cli.apply._gate_contract_for_apply"),
         ):
             with pytest.raises(CLIError) as excinfo:
                 apply_cli.run(args, logger)
@@ -312,12 +320,12 @@ class TestApplyConsumesDriftErrorShape:
         assert len(excinfo.value.context.get("violations", [])) == 1
 
 
-class TestApplyNoVerifyDigestEscapeHatch:
-    """``--no-verify-digest`` skips the federation gate but logs at
+class TestApplyNoVerifyFederationEscapeHatch:
+    """``--no-verify-federation`` skips the federation gate but logs at
     WARNING so audit trails record the override."""
 
-    def test_no_verify_digest_skips_gate_and_warns(self, tmp_path: Path, monkeypatch, caplog):
-        """When ``--no-verify-digest`` is set, apply must NOT call the
+    def test_no_verify_federation_skips_gate_and_warns(self, tmp_path: Path, monkeypatch, caplog):
+        """When ``--no-verify-federation`` is set, apply must NOT call the
         federation validator AND must log a WARNING. We assert by
         patching the validator with a sentinel that records calls and
         confirming it stays uncalled even with a drifted contract on
@@ -337,7 +345,8 @@ class TestApplyNoVerifyDigestEscapeHatch:
         args = SimpleNamespace(
             contract=str(contract_path),
             env="dev",
-            no_verify_digest=True,  # <-- escape hatch
+            no_verify_plan_binding=False,
+            no_verify_federation=True,  # <-- escape hatch
             mode="amend",
             target=None,
             dry_run=True,
@@ -361,9 +370,15 @@ class TestApplyNoVerifyDigestEscapeHatch:
             return []
 
         with caplog.at_level(logging.WARNING, logger="fluid.test"):
-            with patch(
-                "fluid_build.forge.federation.validate_federated_consumes",
-                side_effect=_spy,
+            # Stub the pre-apply schema gate — the contract uses consume
+            # fields not modelled by the bundled schema, and this test
+            # exercises the --no-verify-federation skip path.
+            with (
+                patch(
+                    "fluid_build.forge.federation.validate_federated_consumes",
+                    side_effect=_spy,
+                ),
+                patch("fluid_build.cli.apply._gate_contract_for_apply"),
             ):
                 # Apply will fail downstream (no provider configured),
                 # but the federation gate must already be skipped by
@@ -375,11 +390,11 @@ class TestApplyNoVerifyDigestEscapeHatch:
 
         assert (
             validator_called["count"] == 0
-        ), "validate_federated_consumes was called despite --no-verify-digest"
+        ), "validate_federated_consumes was called despite --no-verify-federation"
         # WARNING line must mention the skip so audit log parsers see it.
         warning_messages = [r.getMessage() for r in caplog.records]
         assert any(
-            "no-verify-digest" in m.lower() or "skipped" in m.lower() for m in warning_messages
+            "no-verify-federation" in m.lower() or "skipped" in m.lower() for m in warning_messages
         ), f"no SKIP/WARN log found; got: {warning_messages}"
 
 

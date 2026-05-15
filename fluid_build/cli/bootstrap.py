@@ -114,15 +114,20 @@ def _imp(mod: str, attr: Optional[str] = None) -> Any:
 # Contract IO & Validation
 # -------------------------
 def validate_contract_obj(contract: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    """Validate via fluid_build.schema.validate_contract if present; else a minimal check."""
+    """Validate a contract via the jsonschema-backed FluidSchemaManager.
+
+    Falls back to a minimal required-field check if the schema manager
+    is unavailable for any reason.
+    """
     try:
-        schema_mod = _imp("fluid_build.schema")
-        validate = getattr(schema_mod, "validate_contract", None)
-        if validate:
-            ok, err = validate(contract)  # type: ignore[misc]
-            return bool(ok), err
+        schema_manager = _imp("fluid_build.schema_manager")
+        manager = schema_manager.FluidSchemaManager()
+        result = manager.validate_contract(contract)
+        if result.is_valid:
+            return True, None
+        return False, "\n".join(result.errors) or "contract validation failed"
     except Exception as e:
-        LOG.warning("schema_module_unavailable", extra={"error": str(e)})
+        LOG.warning("schema_manager_unavailable", extra={"error": str(e)})
 
     # Minimal baseline
     required = ["fluidVersion", "kind", "id", "name", "metadata"]

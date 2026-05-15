@@ -21,7 +21,7 @@ helpers:
 * :func:`_save_ai_config` — write provider/model + endpoint to
   ``~/.fluid/ai_config.json`` (mode 600); API key goes to keyring.
 * :func:`_load_ai_config` — read with ``unified_config`` priority,
-  legacy JSON fallback.
+  then the ``ai_config.json`` file.
 * :func:`_clear_ai_config` — delete the JSON file (best-effort).
 * :func:`_save_key_to_keyring`, :func:`_load_key_from_keyring`,
   :func:`_clear_key_from_keyring` — keyring round-trips.
@@ -145,10 +145,9 @@ def _load_ai_config() -> Optional[dict]:
 
     Lookup order:
 
-    1. ``~/.fluid/config.yaml`` ``llm:`` section (unified path — new
-       operators land here on first ``fluid ai setup`` call).
-    2. ``~/.fluid/ai_config.json`` (legacy v1.5 file — pre-existing
-       installs continue to work without re-migrating).
+    1. ``~/.fluid/config.yaml`` ``llm:`` section (unified path).
+    2. ``~/.fluid/ai_config.json`` (the file ``_save_ai_config``
+       writes provider/model/endpoint to).
     3. ``None`` — no config saved yet.
     """
     import json
@@ -168,7 +167,7 @@ def _load_ai_config() -> Optional[dict]:
     except Exception as exc:  # pragma: no cover — defensive
         LOG.debug("Could not load unified AI config: %s", exc)
 
-    # 2. Legacy ``~/.fluid/ai_config.json`` — pre-existing installs.
+    # 2. ``~/.fluid/ai_config.json`` — the file ``_save_ai_config`` writes.
     try:
         cf = _config_file()
         if not cf.exists():

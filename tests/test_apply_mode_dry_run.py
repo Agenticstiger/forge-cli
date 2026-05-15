@@ -62,7 +62,8 @@ def _make_args(contract_path: str, *, mode: str = "dry-run", dry_run_flag: bool 
         verbose=False,
         provider=None,
         no_validate=True,
-        no_verify_digest=True,
+        no_verify_plan_binding=True,
+        no_verify_federation=True,
         yes=True,
         report=None,
         report_format="html",
@@ -72,22 +73,23 @@ def _make_args(contract_path: str, *, mode: str = "dry-run", dry_run_flag: bool 
 
 
 def _write_plan(tmp_path: Path, mode: str = "dry-run") -> Path:
-    """Write a minimal Snowflake plan stamped with the given mode."""
+    """Write a minimal Snowflake plan stamped with the given mode.
+
+    The embedded contract must be schema-valid: ``fluid apply`` now runs a
+    pre-0.7 + JSON-schema gate on the embedded contract before any DDL
+    (the plan-binding ``--no-verify-plan-binding`` waiver does not cover
+    this separate structural gate). Build the contract via
+    ``shape_contract`` so it always tracks the bundled schema.
+    """
+    from fluid_build.forge.product_types import ProductTypeAnswer, shape_contract
+
+    contract = shape_contract(ProductTypeAnswer(product_type="CDP", name="smoke"))
+    contract["id"] = "demo.smoke"
     plan = {
         "fluid_version": "0.7.3",
         "mode": mode,
         "contract_id": "demo.smoke",
-        "contract": {
-            "fluidVersion": "0.7.3",
-            "kind": "DataProduct",
-            "id": "demo.smoke",
-            "exposes": [
-                {
-                    "exposeId": "smoke",
-                    "binding": {"platform": "snowflake"},
-                }
-            ],
-        },
+        "contract": contract,
         "actions": [
             {
                 "id": "action_0",

@@ -62,6 +62,12 @@ _PARALLELIZABLE_TOOLS = frozenset(
 
 # Maximum number of LLM round-trips before we give up.
 MAX_AGENT_ITERATIONS = 12
+# Security: cap the tool-call batch per round. A poisoned or looping LLM
+# response can otherwise request hundreds of parallel tool calls in one
+# round — each result feeds back into the next LLM call, inflating cost,
+# I/O, and workspace scans. With MAX_AGENT_ITERATIONS this bounds the
+# worst case to a small, predictable number of tool invocations.
+MAX_TOOL_CALLS_PER_ITERATION = 8
 
 
 def _int_env(name: str, default: int) -> int:
@@ -333,6 +339,17 @@ def run_copilot_agent_loop(
 
         # Check for tool calls.
         tool_calls = provider_adapter.extract_tool_calls(response_json)
+
+        # Security: bound the tool-call batch. A poisoned/looping LLM
+        # response can otherwise dispatch an unbounded number of parallel
+        # tool calls in a single round.
+        if tool_calls and len(tool_calls) > MAX_TOOL_CALLS_PER_ITERATION:
+            LOG.warning(
+                "LLM requested %d tool calls in one round; truncating to %d",
+                len(tool_calls),
+                MAX_TOOL_CALLS_PER_ITERATION,
+            )
+            tool_calls = tool_calls[:MAX_TOOL_CALLS_PER_ITERATION]
 
         if not tool_calls:
             # Slice UX-L: show the final-response indicator.

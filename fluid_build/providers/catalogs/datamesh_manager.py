@@ -27,6 +27,8 @@ from typing import Any, Dict
 
 import yaml
 
+from fluid_build.util.safe_yaml import load_yaml_safe
+
 from .base import BaseCatalogProvider, CatalogAsset, PublishResult
 
 LOG = logging.getLogger(__name__)
@@ -170,7 +172,7 @@ class DataMeshManagerCatalogProvider(BaseCatalogProvider):
         """Convert a CatalogAsset back to a minimal FLUID dict."""
         if asset.contract_yaml:
             try:
-                parsed = yaml.safe_load(asset.contract_yaml)
+                parsed = load_yaml_safe(asset.contract_yaml)
                 if isinstance(parsed, dict):
                     return parsed
             except Exception:

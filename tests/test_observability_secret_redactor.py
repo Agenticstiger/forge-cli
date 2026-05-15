@@ -244,3 +244,225 @@ class TestProviderTokenShapes:
     def test_non_secret_looking_text_passes_through(self):
         safe = "this is a perfectly safe error message with no secrets"
         assert self._redact(safe) == safe
+
+
+# ---------------------------------------------------------------------------
+# Provider API-key shapes (detect-secrets / gitleaks rule prefixes)
+# ---------------------------------------------------------------------------
+
+
+def _redact_global(text: str) -> str:
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
+    return redact_secret_text(text)
+
+
+# Sample provider secrets. Built from parts at runtime: GitHub secret-
+# scanning push protection flags literal token prefixes in source files,
+# so we keep the realistic prefix out of the file-level bytes while still
+# producing a value the redactor's regex matches. The same list is reused
+# by the cross-layer symmetry test below.
+def _provider_secret_samples() -> dict[str, str]:
+    return {
+        "openai": "sk-" + "A1b2C3d4E5f6G7h8I9j0K1l2",
+        # Modern project-/service-account-scoped OpenAI keys carry hyphens
+        # and underscores in the body — the redactor char class must admit
+        # them. A ``sk-proj-`` key escaped the original ``[A-Za-z0-9]`` class.
+        "openai_project": "sk-proj-" + "A1b2C3-d4E5f6_G7h8I9j0-K1l2M3n4",
+        "openai_svcacct": "sk-svcacct-" + "Xy9_aBc-DeF456ghiJKL012mnoPQR",
+        "anthropic": "sk-ant-" + "api03-" + "x" * 40,
+        "aws_access_key": "AKIA" + "IOSFODNN7EXAMPLE",
+        "aws_temp_key": "ASIA" + "IOSFODNN7EXAMPLE",
+        "gcp_api_key": "AIza" + "Sy" + "C" * 33,
+        "slack_bot": "xox" + "b-" + "1111111111-abcdefghij",
+        "slack_user": "xox" + "p-" + "2222222222abcd",
+        "huggingface": "hf_" + "q" * 35,
+        "replicate": "r8_" + "Z" * 35,
+        "gitlab_pat": "glp" + "at-" + "a" + "k" * 24,
+        "vercel": "vc_" + "9" * 24,
+        "fernet": "gAAAAA" + "B" * 40,
+    }
+
+
+class TestProviderApiKeyShapes:
+    """Each provider API-key shape must be masked anywhere in the stream."""
+
+    @pytest.mark.parametrize("name", sorted(_provider_secret_samples()))
+    def test_provider_key_redacted(self, name: str):
+        secret = _provider_secret_samples()[name]
+        out = _redact_global(f"connecting with {secret} now")
+        assert secret not in out, f"{name} secret leaked through global redactor"
+        assert "***REDACTED***" in out
+
+    def test_anthropic_key_redacted_when_openai_prefix_overlaps(self):
+        # ``sk-ant-`` is a strict prefix of the looser OpenAI ``sk-`` shape;
+        # the full Anthropic token must be gone, not just the ``sk-...`` tail.
+        secret = "sk-ant-" + "api03-" + "z" * 40
+        out = _redact_global(f"anthropic={secret}")
+        assert secret not in out
+        assert "ant-" not in out  # no Anthropic-shaped remnant survives
+
+
+class TestFernetAndPemRedaction:
+    """Fernet tokens and multiline PEM private-key blocks."""
+
+    def test_fernet_token_redacted(self):
+        token = "gAAAAA" + "C" * 60
+        out = _redact_global(f"decrypt token {token}")
+        assert token not in out
+        assert "***REDACTED***" in out
+
+    def test_pem_private_key_block_redacted_inline(self):
+        pem = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEowIBAAKCAQEAsecretkeymaterialhere\n"
+            "abcdefghijklmnopqrstuvwxyz0123456789\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        out = _redact_global(f"loaded key:\n{pem}\ndone")
+        assert "secretkeymaterialhere" not in out
+        assert "MIIEowIBAAKCAQEA" not in out
+        assert "***REDACTED***" in out
+
+    def test_pem_private_key_redacted_in_multiline_exception_text(self):
+        """SECURITY: a PEM block embedded in a traceback must be scrubbed
+        across line boundaries via the ``exc_text`` path of the filter."""
+        stream = StringIO()
+        logger = logging.getLogger("test.secret_redactor.pem_traceback")
+        logger.handlers = []
+        logger.filters = []
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler.addFilter(SecretRedactingFilter())
+        logger.addHandler(handler)
+
+        pem = (
+            "-----BEGIN EC PRIVATE KEY-----\n"
+            "MHcCAQEEILeakedEcKeyMaterialThatMustBeScrubbed\n"
+            "-----END EC PRIVATE KEY-----"
+        )
+        try:
+            raise RuntimeError(f"failed to parse key:\n{pem}")
+        except RuntimeError:
+            logger.exception("key load failed")
+
+        output = stream.getvalue()
+        assert "LeakedEcKeyMaterialThatMustBeScrubbed" not in output
+        assert "MHcCAQEEIL" not in output
+
+
+class TestTwoSegmentJwt:
+    """An ``eyJ``-anchored two-segment (header.payload) JWT — no signature."""
+
+    def test_two_segment_jwt_redacted(self):
+        # header.payload only — would NOT match the 3-segment ``_JWT_RE``.
+        jwt = "eyJ" + "hbGciOiJIUzI1NiJ9" + "." + "eyJ" + "zdWIiOiJ1c2VyMSJ9"
+        out = _redact_global(f"id_token={jwt}")
+        assert jwt not in out
+        assert "***REDACTED***" in out
+
+    def test_three_segment_jwt_still_redacted(self):
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMSJ9.c2lnbmF0dXJlSGVyZQ"
+        out = _redact_global(f"bearer {jwt}")
+        assert jwt not in out
+
+
+class TestSensitiveKeyParts:
+    """Newly added substring-match key parts must mark a mapping key
+    sensitive (``connection_string``, ``bearer``, ``jwt`` etc.)."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "connection_string",
+            "db_connection_string",
+            "bearer",
+            "bearer_token",
+            "jwt",
+            "id_jwt",
+            "credential",
+            "service_credential",
+            "aws_access_key",
+            "aws_access_key_id",
+            "aws_secret_key",
+            "azure_sas_token",
+        ],
+    )
+    def test_new_key_part_marks_key_sensitive(self, key: str):
+        from fluid_build.observability.secret_redactor import (
+            is_sensitive_key_name,
+            redact_value,
+        )
+
+        assert is_sensitive_key_name(key) is True
+        redacted = redact_value({key: "leaked-value-here"})
+        assert redacted[key] == "***REDACTED***"
+
+
+class TestAssignmentRegexBacktrackingBound:
+    """The assignment regex quantifiers are upper-bounded so an adversarial
+    log line cannot trigger catastrophic backtracking."""
+
+    def test_adversarial_assignment_line_completes_quickly(self):
+        import time
+
+        adversarial = "a_" * 300 + "password" + " " * 8000 + ":" + "x" * 8000
+        start = time.perf_counter()
+        _redact_global(adversarial)
+        elapsed = time.perf_counter() - start
+        # Linear-time behaviour finishes in well under a second; a
+        # catastrophic-backtracking regression would hang for minutes.
+        assert elapsed < 1.0, f"assignment redaction took {elapsed:.2f}s"
+
+
+# ---------------------------------------------------------------------------
+# Cross-layer symmetry: the global SecretRedactingFilter and the Snowflake
+# provider-local redact_string MUST cover the same provider-key shapes.
+# This is the contract that keeps the two redaction layers in lock-step
+# (CLAUDE.md: "two parallel redaction layers ... extend both").
+# ---------------------------------------------------------------------------
+
+
+class TestRedactionLayerSymmetry:
+    """Both redaction layers must mask every provider-key shape."""
+
+    @pytest.mark.parametrize("name", sorted(_provider_secret_samples()))
+    def test_both_layers_mask_provider_secret(self, name: str):
+        from fluid_build.providers.snowflake.util.logging import redact_string
+
+        secret = _provider_secret_samples()[name]
+        line = f"observed credential {secret} in payload"
+
+        global_out = _redact_global(line)
+        snowflake_out = redact_string(line)
+
+        assert secret not in global_out, f"{name} leaked through global redactor"
+        assert secret not in snowflake_out, f"{name} leaked through Snowflake redactor"
+
+    def test_both_layers_mask_pem_private_key_block(self):
+        from fluid_build.providers.snowflake.util.logging import redact_string
+
+        pem = (
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmVMUSTBEGONE\n"
+            "-----END OPENSSH PRIVATE KEY-----"
+        )
+        line = f"key:\n{pem}\nend"
+        assert "MUSTBEGONE" not in _redact_global(line)
+        assert "MUSTBEGONE" not in redact_string(line)
+
+    def test_both_layers_preserve_key_name_on_assignment(self):
+        """Both layers redact only the value of ``password=...`` and keep
+        the ``password`` key name (the Snowflake named-group fix)."""
+        from fluid_build.providers.snowflake.util.logging import redact_string
+
+        global_out = _redact_global("password=hunter2")
+        snowflake_out = redact_string("password=hunter2")
+
+        assert "hunter2" not in global_out
+        assert "hunter2" not in snowflake_out
+        # key name survives in both
+        assert global_out.startswith("password=")
+        assert snowflake_out == "password=[REDACTED]"

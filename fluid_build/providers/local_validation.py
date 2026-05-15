@@ -27,6 +27,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from fluid_build.providers._sql_safety import quote_string_literal
 from fluid_build.providers.quality_engine import (
     execute_quality_checks,
     quality_results_to_issues,
@@ -176,8 +177,8 @@ class LocalValidationProvider(ValidationProvider):
                     return None
 
                 # Use parameterised path – DuckDB read functions accept a string literal
-                describe_sql = "DESCRIBE SELECT * FROM {fn}('{p}')".format(
-                    fn=read_fn, p=abs_path.replace("'", "''")
+                describe_sql = "DESCRIBE SELECT * FROM {fn}({p})".format(
+                    fn=read_fn, p=quote_string_literal(abs_path)
                 )
                 rows = conn.execute(describe_sql).fetchall()
 
@@ -194,8 +195,8 @@ class LocalValidationProvider(ValidationProvider):
                     )
 
                 # Row count
-                count_sql = "SELECT COUNT(*) FROM {fn}('{p}')".format(
-                    fn=read_fn, p=abs_path.replace("'", "''")
+                count_sql = "SELECT COUNT(*) FROM {fn}({p})".format(
+                    fn=read_fn, p=quote_string_literal(abs_path)
                 )
                 count_row = conn.execute(count_sql).fetchone()
                 row_count = count_row[0] if count_row else None
@@ -422,7 +423,7 @@ class LocalValidationProvider(ValidationProvider):
                     path="contract.dq.rules",
                 )
             ]
-        table_ref = "{fn}('{p}')".format(fn=read_fn, p=abs_path.replace("'", "''"))
+        table_ref = "{fn}({p})".format(fn=read_fn, p=quote_string_literal(abs_path))
         conn = duckdb.connect(":memory:")
         try:
 

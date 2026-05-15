@@ -21,6 +21,8 @@ for Athena, Glue, and Redshift.
 
 from typing import Any, Dict, List, Optional
 
+from ..._sql_safety import quote_string_literal, validate_ident
+
 
 def generate_athena_ddl(
     database: str,
@@ -46,12 +48,14 @@ def generate_athena_ddl(
     Returns:
         Complete DDL statement
     """
-    # Build column definitions
+    # Build column definitions. Column names route through ``validate_ident``
+    # so a crafted name cannot break out of the backtick quoting; comments
+    # route through the central ``quote_string_literal`` helper.
     col_defs = []
     for col in columns:
-        col_def = f"  `{col['Name']}` {col['Type']}"
+        col_def = f"  `{validate_ident(col['Name'])}` {col['Type']}"
         if col.get("Comment"):
-            col_def += f" COMMENT '{_escape_sql(col['Comment'])}'"
+            col_def += f" COMMENT {quote_string_literal(str(col['Comment']))}"
         col_defs.append(col_def)
 
     ddl = f"CREATE EXTERNAL TABLE IF NOT EXISTS `{database}`.`{table}` (\n"
@@ -71,12 +75,16 @@ def generate_athena_ddl(
     # Add storage format
     ddl += f"\nSTORED AS {_get_stored_as_format(file_format)}"
 
-    # Add location
-    ddl += f"\nLOCATION '{location}'"
+    # Add location — route the S3 path through the central literal-quoting
+    # helper rather than a raw single-quoted interpolation.
+    ddl += f"\nLOCATION {quote_string_literal(str(location))}"
 
-    # Add table properties
+    # Add table properties (key + value both quoted via the central helper)
     if table_properties:
-        props = [f"  '{k}'='{v}'" for k, v in table_properties.items()]
+        props = [
+            f"  {quote_string_literal(str(k))}={quote_string_literal(str(v))}"
+            for k, v in table_properties.items()
+        ]
         ddl += "\nTBLPROPERTIES (\n"
         ddl += ",\n".join(props)
         ddl += "\n)"
@@ -108,10 +116,12 @@ def generate_redshift_ddl(
     Returns:
         Complete DDL statement
     """
-    # Build column definitions
+    # Build column definitions. Redshift column names are interpolated
+    # unquoted, so each must be validated as a SQL identifier to prevent
+    # injection through a crafted column name.
     col_defs = []
     for col in columns:
-        col_def = f"  {col['Name']} {col['Type']}"
+        col_def = f"  {validate_ident(col['Name'])} {col['Type']}"
 
         # Add constraints
         if col.get("NotNull"):
@@ -305,6 +315,19 @@ def schema_to_redshift_columns(schema: List[Dict[str, Any]]) -> List[Dict[str, s
     return columns
 
 
+def _escape_sql(text: str) -> str:
+    """Escape a SQL string literal's body (deprecated thin wrapper).
+
+    All DDL emitters in this module now call ``quote_string_literal``
+    directly, which returns a fully-quoted literal. This helper is kept
+    only as a back-compat shim for out-of-tree callers/tests that expect
+    the *unquoted* doubled-quote form; it delegates to the central
+    ``quote_string_literal`` helper and strips the surrounding quotes,
+    so no hand-rolled escape logic survives here.
+    """
+    return quote_string_literal(str(text))[1:-1]
+
+
 def _get_stored_as_format(file_format: str) -> str:
     """Get STORED AS clause for Athena DDL."""
     format_map = {
@@ -315,11 +338,6 @@ def _get_stored_as_format(file_format: str) -> str:
         "json": "TEXTFILE",
     }
     return format_map.get(file_format.lower(), "PARQUET")
-
-
-def _escape_sql(text: str) -> str:
-    """Escape SQL string literals."""
-    return text.replace("'", "''")
 
 
 def extract_partition_columns(
@@ -388,12 +406,13 @@ def generate_iceberg_athena_ddl(
     iceberg_config = iceberg_config or {}
     table_properties = table_properties or {}
 
-    # Build column definitions
+    # Build column definitions. Column names route through ``validate_ident``;
+    # comments route through the central ``quote_string_literal`` helper.
     col_defs = []
     for col in columns:
-        col_def = f"  `{col['Name']}` {col['Type']}"
+        col_def = f"  `{validate_ident(col['Name'])}` {col['Type']}"
         if col.get("Comment"):
-            col_def += f" COMMENT '{_escape_sql(col['Comment'])}'"
+            col_def += f" COMMENT {quote_string_literal(str(col['Comment']))}"
         col_defs.append(col_def)
 
     ddl = f"CREATE TABLE IF NOT EXISTS `{database}`.`{table}` (\n"
@@ -433,7 +452,9 @@ def generate_iceberg_athena_ddl(
     for key, value in table_properties.items():
         props.setdefault(key, str(value))
 
-    prop_lines = [f"  '{_escape_sql(k)}'='{_escape_sql(v)}'" for k, v in props.items()]
+    prop_lines = [
+        f"  {quote_string_literal(str(k))}={quote_string_literal(str(v))}" for k, v in props.items()
+    ]
     ddl += "\nTBLPROPERTIES (\n"
     ddl += ",\n".join(prop_lines)
     ddl += "\n);"

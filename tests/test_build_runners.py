@@ -53,6 +53,7 @@ from fluid_build.build_runners.dbt.profiles import (
 from fluid_build.build_runners.dbt.runner import (
     _build_containerized_dbt_command,
     _collect_dbt_container_env,
+    _configured_dbt_command_prefix,
     _dbt_command_supports_adapter,
     _render_command_for_log,
     build_dbt_command,
@@ -866,6 +867,124 @@ class TestContainerizedDbtCommand:
 
         assert "example/dbt-snowflake:custom" in cmd
         assert "python:3.12-slim" not in cmd
+
+    def test_adapter_with_shell_metacharacters_is_shell_quoted(self, tmp_path, monkeypatch):
+        """E2 regression: a contract-derived ``adapter`` is interpolated
+        into the ``sh -lc`` bootstrap string as ``pip install dbt-<adapter>``.
+
+        The bootstrap string is executed by a shell, so an ``adapter``
+        carrying ``;`` / backticks / ``$()`` must be ``shlex.quote``d —
+        otherwise a malicious contract could smuggle arbitrary commands
+        into the dbt container. Assert the metacharacters survive only
+        inside a single-quoted token (the ``shlex.quote`` form) and are
+        never left bare in the command string.
+        """
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        # Ensure the bootstrap (sh -lc) path is taken, not a pre-baked image.
+        monkeypatch.delenv("DBT_DOCKER_IMAGE", raising=False)
+        monkeypatch.delenv("DBT_ADAPTER_PACKAGE", raising=False)
+
+        hostile_adapter = "snowflake; rm -rf / #"
+        cmd = _build_containerized_dbt_command(
+            hostile_adapter,
+            ["build", "--project-dir", str(project_dir)],
+            project_dir,
+            None,
+        )
+
+        # The bootstrap path ends with ["...", "sh", "-lc", <script>].
+        assert cmd[-3:-1] == ["sh", "-lc"]
+        script = cmd[-1]
+
+        # The package name reaches the script as ``dbt-<hostile_adapter>``,
+        # and shlex.quote wraps any string with metacharacters in single
+        # quotes. The dangerous payload must be contained inside that
+        # single-quoted token — never appear as an unquoted shell command.
+        import shlex as _shlex
+
+        expected_pkg = f"dbt-{hostile_adapter}"
+        assert _shlex.quote(expected_pkg) in script
+        # A bare (unquoted) ``rm -rf`` would mean shell injection. The only
+        # legitimate occurrence is inside the single-quoted package token.
+        assert "; rm -rf / #" not in script.replace(_shlex.quote(expected_pkg), "")
+
+        # Re-parsing the script with the shell lexer must yield the package
+        # as ONE token — proof the metacharacters did not split it.
+        assert expected_pkg in _shlex.split(script)
+
+    def test_backtick_and_dollar_paren_adapter_is_quoted(self, tmp_path, monkeypatch):
+        """E2: backtick and ``$()`` command-substitution forms are also
+        neutralised by the ``shlex.quote`` on the adapter package."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        monkeypatch.delenv("DBT_DOCKER_IMAGE", raising=False)
+        monkeypatch.delenv("DBT_ADAPTER_PACKAGE", raising=False)
+
+        import shlex as _shlex
+
+        for hostile in ("duckdb`id`", "duckdb$(id)"):
+            cmd = _build_containerized_dbt_command(
+                hostile,
+                ["build", "--project-dir", str(project_dir)],
+                project_dir,
+                None,
+            )
+            script = cmd[-1]
+            expected_pkg = f"dbt-{hostile}"
+            # Single-quoting makes ``$`` and backticks literal to the shell.
+            assert _shlex.quote(expected_pkg) in script
+            assert expected_pkg in _shlex.split(script)
+
+
+class TestConfiguredDbtCommandPrefix:
+    """E1: ``$DBT_EXECUTABLE`` is split into an argv prefix; the program
+    token must be validated before it can be prepended to a subprocess."""
+
+    def test_returns_none_when_unset(self, monkeypatch):
+        monkeypatch.delenv("DBT_EXECUTABLE", raising=False)
+        assert _configured_dbt_command_prefix() is None
+
+    def test_resolves_bare_name_on_path(self, monkeypatch):
+        # A program that resolves via ``shutil.which`` is accepted.
+        monkeypatch.setenv("DBT_EXECUTABLE", "python3 -m dbt")
+        with patch(
+            "fluid_build.build_runners.dbt.runner.shutil.which",
+            return_value="/usr/bin/python3",
+        ):
+            assert _configured_dbt_command_prefix() == ["python3", "-m", "dbt"]
+
+    def test_accepts_existing_absolute_path(self, tmp_path, monkeypatch):
+        fake = tmp_path / "dbt-wrapper"
+        fake.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("DBT_EXECUTABLE", f"{fake} --flag")
+        assert _configured_dbt_command_prefix() == [str(fake), "--flag"]
+
+    def test_rejects_nonexistent_absolute_path(self, tmp_path, monkeypatch, caplog):
+        missing = tmp_path / "does-not-exist-dbt"
+        monkeypatch.setenv("DBT_EXECUTABLE", str(missing))
+        with caplog.at_level(logging.WARNING):
+            assert _configured_dbt_command_prefix() is None
+        assert "does not resolve" in caplog.text
+
+    def test_rejects_garbage_program_not_on_path(self, monkeypatch, caplog):
+        # A hostile / garbage value that resolves to nothing is ignored,
+        # not blindly prepended to ``dbt build ...``.
+        monkeypatch.setenv("DBT_EXECUTABLE", "totally-not-a-real-binary-xyz")
+        with patch(
+            "fluid_build.build_runners.dbt.runner.shutil.which",
+            return_value=None,
+        ):
+            with caplog.at_level(logging.WARNING):
+                assert _configured_dbt_command_prefix() is None
+        assert "does not resolve" in caplog.text
+
+    def test_rejects_unbalanced_quotes(self, monkeypatch, caplog):
+        # Malformed value (shlex.split raises ValueError) → ignored.
+        monkeypatch.setenv("DBT_EXECUTABLE", 'dbt "unclosed')
+        with caplog.at_level(logging.WARNING):
+            assert _configured_dbt_command_prefix() is None
+        assert "not a parseable command" in caplog.text
 
 
 class TestBuildDbtCommandExecutionSelection:

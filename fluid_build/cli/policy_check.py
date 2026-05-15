@@ -62,6 +62,47 @@ logger = logging.getLogger(__name__)
 
 COMMAND = "policy-check"
 
+# Severities that constitute a real check FAILURE. INFO / WARNING are
+# advisories — they lower the score but do not fail the check (unless
+# --strict is in effect, which is handled separately by ``_check_passes``).
+_FAILING_SEVERITIES = (PolicySeverity.CRITICAL, PolicySeverity.ERROR)
+
+
+def _real_failure_count(result: PolicyEnforcementResult) -> int:
+    """Number of genuine FAILURES (CRITICAL / ERROR violations).
+
+    The engine's ``checks_failed`` counter increments once per *violation*
+    of any severity — so an all-advisory run reports ``checks_failed > 0``
+    while every category still reads COMPLIANT/ADVISORY and the verdict is
+    PASSED (B3). The displayed counter must reflect only blocking
+    failures, consistent with ``is_compliant()`` /
+    ``get_blocking_violations()``.
+    """
+    return sum(1 for v in result.violations if getattr(v, "severity", None) in _FAILING_SEVERITIES)
+
+
+def _advisory_count(result: PolicyEnforcementResult) -> int:
+    """Number of advisory (INFO / WARNING) violations — non-blocking."""
+    return sum(
+        1 for v in result.violations if getattr(v, "severity", None) not in _FAILING_SEVERITIES
+    )
+
+
+def _check_passes(result: PolicyEnforcementResult, strict: bool) -> bool:
+    """Whether the policy check passes, accounting for ``--strict``.
+
+    Non-strict: passes when there are no blocking (CRITICAL/ERROR)
+    violations. Strict: passes only when there are *no* violations at all
+    (advisories included). This is the single source of truth the verdict
+    banner, the summary, and the exit code all derive from — so the
+    rendered banner can no longer disagree with the exit code (B4).
+    """
+    if not result.is_compliant():
+        return False
+    if strict and result.violations:
+        return False
+    return True
+
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
     """Populate a pre-created parser with the policy-check argument surface.
@@ -173,20 +214,28 @@ def run(args: argparse.Namespace, logger_instance: logging.Logger) -> int:
             output_json(result, args.output)
         elif args.format == "rich" and RICH_AVAILABLE:
             output_rich(result, contract, args.show_passed, args.strict)
+            # B5: --output is no longer JSON-only. For the rich/text
+            # formats the human-readable report goes to the terminal and
+            # the machine-readable JSON report is written to --output so
+            # `-o report.json` is never silently ignored.
+            if args.output:
+                output_json(result, args.output)
         else:
             output_text(result, contract, args.show_passed, args.strict)
+            if args.output:
+                output_json(result, args.output)
 
-        # Return exit code
+        # Return exit code — derive from the same predicate the verdict
+        # banner uses so the printed verdict and the exit code always agree.
+        if _check_passes(result, args.strict):
+            logger.info("Policy compliance check PASSED")
+            return 0
+
         if not result.is_compliant():
             logger.warning("Policy compliance check FAILED")
-            return 1
-
-        if args.strict and result.violations:
+        else:
             logger.warning("Policy check FAILED (strict mode)")
-            return 1
-
-        logger.info("Policy compliance check PASSED")
-        return 0
+        return 1
 
     except CLIError as e:
         logger.error(f"Policy check error: {e.message}")
@@ -238,13 +287,21 @@ def output_rich(
     header.add_column(style="cyan", justify="right")
     header.add_column(style="white")
 
+    # B3: count only genuine (CRITICAL/ERROR) failures here — advisories
+    # are surfaced separately so the counter no longer contradicts the
+    # COMPLIANT/ADVISORY category badges or the PASSED verdict.
+    failed = _real_failure_count(result)
+    advisories = _advisory_count(result)
+
     header.add_row("🛡️  Contract:", f"[bold]{contract_id}[/bold]")
     header.add_row(
         "📊 Policy Score:",
         f"[{score_color} bold]{score_emoji} {score}/100[/{score_color} bold] [dim]({grade})[/dim]",
     )
     header.add_row("✅ Checks Passed:", f"[green]{result.checks_passed}[/green]")
-    header.add_row("❌ Checks Failed:", f"[red]{result.checks_failed}[/red]")
+    header.add_row("❌ Checks Failed:", f"[red]{failed}[/red]")
+    if advisories:
+        header.add_row("💡 Advisories:", f"[yellow]{advisories}[/yellow]")
 
     console.print()
     console.print(
@@ -396,7 +453,9 @@ def output_rich(
 
     summary_table.add_row("Compliance Score:", score_bar)
     summary_table.add_row("Checks Passed:", f"[green]✓ {result.checks_passed}[/green]")
-    summary_table.add_row("Checks Failed:", f"[red]✗ {result.checks_failed}[/red]")
+    # B3: ``failed`` is the genuine-failure count (CRITICAL/ERROR only),
+    # not the engine's per-violation tally.
+    summary_table.add_row("Checks Failed:", f"[red]✗ {failed}[/red]")
 
     if blocking:
         summary_table.add_row("Blocking Issues:", f"[red bold]🚨 {len(blocking)}[/red bold]")
@@ -415,19 +474,30 @@ def output_rich(
     )
     console.print()
 
-    # Final verdict with style
-    if result.is_compliant():
+    # Final verdict with style.
+    # B4: derive the banner from ``_check_passes`` (which is strict-aware)
+    # so a strict-mode run with only advisories shows a red FAILED banner
+    # instead of a green PASSED box contradicted by an exit code of 1.
+    if _check_passes(result, strict):
         verdict_panel = Panel(
             Align.center(
-                "[bold green]✅ PASSED[/bold green]\n[dim]Contract meets all governance requirements[/dim]"
+                "[bold green]✅ PASSED[/bold green]\n"
+                "[dim]Contract meets all governance requirements[/dim]"
             ),
             border_style="green",
             box=HEAVY,
         )
     else:
-        action_text = f"[red]🚨 {len(blocking)} BLOCKING issue(s) must be resolved[/red]"
-        if strict and result.violations:
-            action_text += "\n[yellow]⚠️  Strict mode: All violations must be fixed[/yellow]"
+        if blocking:
+            action_text = f"[red]🚨 {len(blocking)} BLOCKING issue(s) must be resolved[/red]"
+        elif strict:
+            # No blocking issues, but --strict fails on advisories too.
+            action_text = (
+                f"[yellow]⚠️  Strict mode: {advisories} advisory issue(s) must be "
+                "resolved[/yellow]"
+            )
+        else:  # pragma: no cover — defensive; not reachable via _check_passes
+            action_text = "[red]Policy violations detected[/red]"
 
         verdict_panel = Panel(
             Align.center(f"[bold red]❌ FAILED[/bold red]\n{action_text}"),
@@ -474,17 +544,25 @@ def output_text(
             cprint(f"\n✅ {category_name}")
 
     # Summary
+    # B3: report the genuine-failure count (CRITICAL/ERROR), not the
+    # engine's per-violation tally; advisories are listed separately.
+    failed = _real_failure_count(result)
+    advisories = _advisory_count(result)
     cprint("\n" + "=" * 60)
     cprint(f"Checks Passed: {result.checks_passed}")
-    cprint(f"Checks Failed: {result.checks_failed}")
+    cprint(f"Checks Failed: {failed}")
+    cprint(f"Advisory Issues: {advisories}")
     cprint(f"Total Violations: {len(result.violations)}")
     cprint(f"Blocking Issues: {len(result.get_blocking_violations())}")
     cprint(f"Policy Score: {score}/100\n")
 
-    if result.is_compliant():
+    # B4: strict-aware verdict so the printed verdict agrees with the exit code.
+    if _check_passes(result, strict):
         success("Contract is policy compliant")
-    else:
+    elif not result.is_compliant():
         console_error("Contract has policy violations")
+    else:
+        console_error("Policy check failed (strict mode): advisory issues must be resolved")
 
 
 def output_json(result: PolicyEnforcementResult, output_file: Optional[str] = None) -> None:

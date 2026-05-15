@@ -20,8 +20,9 @@ from __future__ import annotations
 import time
 from typing import Any, Dict
 
+from ..._sql_safety import SqlAllowlistError, parse_and_allowlist_sql
 from ..connection import SnowflakeConnection
-from ..util.config import get_connection_params
+from ..util.config import get_connection_params, resolve_env_templates
 
 
 def execute_sql(action: Dict[str, Any], provider) -> Dict[str, Any]:
@@ -33,16 +34,49 @@ def execute_sql(action: Dict[str, Any], provider) -> Dict[str, Any]:
     - Data loading
     - Configuration changes
     - Advanced features not covered by dedicated actions
+
+    The SQL body is parsed with sqlglot and every statement is checked against
+    the ``custom`` allowlist (:func:`fluid_build.providers._sql_safety.
+    parse_and_allowlist_sql`) before execution. Account/role-level statements
+    (CREATE USER, DROP ROLE, ALTER ACCOUNT, ...) and anything the parser cannot
+    structurally classify are rejected fail-closed.
+
+    ``{{ env.VAR }}`` placeholders in the SQL body, database, and schema are
+    resolved from the environment before validation and execution — matching the
+    behaviour of every other Snowflake action (provisionDataset, scheduleTask,
+    etc.).  Unresolved placeholders (env var absent) are left intact so the
+    warehouse error message identifies the missing variable clearly.
     """
     start_time = time.time()
 
-    sql = action["sql"]
+    sql = resolve_env_templates(action["sql"])
     account = action["account"]
-    database = action.get("database")
-    schema = action.get("schema")
+    database = resolve_env_templates(action.get("database"))
+    schema = resolve_env_templates(action.get("schema"))
     comment = action.get("comment", "Custom SQL execution")
 
     provider.debug_kv(event="execute_sql_started", comment=comment)
+
+    # Statement-kind allowlist gate. Raised as SqlAllowlistError (a ValueError
+    # subclass) before any connection is opened so a rejected payload never
+    # reaches the warehouse.
+    try:
+        statements = parse_and_allowlist_sql(sql, surface="custom")
+    except SqlAllowlistError as e:
+        provider.err_kv(event="execute_sql_rejected", comment=comment, reason=str(e))
+        raise
+
+    # Audit trail: custom SQL is a sensitive capability — record that it ran,
+    # what it structurally was, and how many statements, without echoing the
+    # raw body into logs.
+    provider.info_kv(
+        event="custom_sql_allowed",
+        comment=comment,
+        database=database,
+        schema=schema,
+        statement_count=len(statements),
+        statement_kinds=[type(s).__name__ for s in statements],
+    )
 
     try:
         params = get_connection_params(

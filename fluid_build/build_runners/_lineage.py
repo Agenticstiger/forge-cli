@@ -20,12 +20,17 @@ is configured.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
+from urllib.parse import urlparse
 
 from fluid_build.api.lineage import LineageEmitter, RunEvent
+
+# Reuse the canonical SSRF post-DNS-resolution gate (RFC1918,
+# link-local 169.254.0.0/16 — AWS/GCP metadata — loopback, reserved;
+# fails closed on DNS errors).
+from ._alerter import _hostname_is_private
 
 LOG = logging.getLogger("fluid.acquire.lineage")
 
@@ -55,6 +60,16 @@ class BufferedLineageEmitter(LineageEmitter):
 class HttpLineageEmitter(LineageEmitter):
     """POSTs each event to ``endpoint``. Soft-fails: emission errors are logged
     but do NOT abort the run — lineage is observability, not correctness.
+
+    Security: ``endpoint`` is operator-configured but can be sourced
+    from a foreign contract/manifest, so before any POST the endpoint
+    host is run through :func:`_hostname_is_private` — a host that
+    resolves to a private/loopback/link-local/cloud-metadata address is
+    refused (a Bearer-token-bearing POST to ``http://169.254.169.254/``
+    is exactly the SSRF-exfil shape this blocks). The request itself
+    uses :mod:`httpx` with ``follow_redirects=False`` and ``verify=True``
+    so the auth header is never re-sent across a 30x redirect to an
+    internal host.
     """
 
     endpoint: str
@@ -63,21 +78,35 @@ class HttpLineageEmitter(LineageEmitter):
 
     def emit(self, event: RunEvent) -> None:
         try:
-            import urllib.request
+            import httpx
 
-            payload = json.dumps(self._encode(event)).encode("utf-8")
-            req = urllib.request.Request(
-                self.endpoint,
-                data=payload,
-                method="POST",
-                headers={"Content-Type": "application/json"},
-            )
+            host = urlparse(self.endpoint).hostname
+            if not host:
+                LOG.warning("OpenLineage emission skipped: endpoint has no resolvable host")
+                return
+            if _hostname_is_private(host):
+                # Fail-closed SSRF gate: refuse private/metadata targets.
+                LOG.warning(
+                    "OpenLineage emission skipped: endpoint host %r resolves to "
+                    "a private/loopback/link-local/cloud-metadata address — "
+                    "refusing to POST (SSRF guard)",
+                    host,
+                )
+                return
+
+            headers = {"Content-Type": "application/json"}
             if self.api_key:
-                req.add_header("Authorization", f"Bearer {self.api_key}")
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-                resp.read()
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            with httpx.Client(
+                timeout=self.timeout_seconds,
+                follow_redirects=False,
+                verify=True,
+            ) as client:
+                resp = client.post(self.endpoint, json=self._encode(event), headers=headers)
+                resp.raise_for_status()
         except Exception as exc:  # noqa: BLE001
-            LOG.warning("OpenLineage emission failed (non-fatal): %s", exc)
+            # Class-only — httpx error messages can echo the endpoint URL.
+            LOG.warning("OpenLineage emission failed (non-fatal): %s", type(exc).__name__)
 
     def flush(self, timeout_seconds: float = 5.0) -> bool:
         return True

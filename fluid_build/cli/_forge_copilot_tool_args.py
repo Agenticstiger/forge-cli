@@ -36,20 +36,16 @@ from pydantic import BaseModel, Field
 class DiscoverWorkspaceArgs(BaseModel):
     """Args for the ``discover_workspace`` tool.
 
-    The ``workspace_path`` field is retained for wire compatibility but
-    is intentionally ignored by the impl — the effective scope is the
-    caller-provided ``workspace_root`` (SECURITY_REVIEW S-004). Keeping
-    it in the schema means existing LLM agents that pass the field
-    don't get a validation error.
+    The tool takes no arguments — the effective scope is the
+    caller-provided ``workspace_root`` (SECURITY_REVIEW S-004). The
+    former ``workspace_path`` field was a no-op the impl ignored
+    (SECURITY_REVIEW I8); advertising a parameter the impl discards
+    is misleading to the LLM, so it has been removed. ``extra=ignore``
+    means stale clients that still pass ``workspace_path`` (or any
+    other field) are silently absorbed rather than rejected.
     """
 
-    workspace_path: str = Field(
-        default=".",
-        description=(
-            "Ignored — retained for schema compatibility. The "
-            "workspace root is fixed by the invoking CLI."
-        ),
-    )
+    model_config = {"extra": "ignore"}
 
 
 class ReadSampleSchemaArgs(BaseModel):
@@ -82,10 +78,16 @@ class ProposeContractArgs(BaseModel):
         description="Provider id (e.g. 'local', 'gcp', 'aws', 'snowflake').",
     )
 
-    # Permit nested free-form objects in ``context`` — the field is an
-    # arbitrary user-provided dict and the LLM should not be limited to
-    # a fixed schema for it.
-    model_config = {"extra": "allow"}
+    # SECURITY_REVIEW I4: the ``context`` field is already typed as an
+    # arbitrary ``Dict[str, Any]`` so the LLM has all the free-form
+    # nesting it needs *inside* a known field. Top-level ``extra=allow``
+    # let an LLM smuggle unknown sibling fields past the
+    # ``additionalProperties=False`` advertised in the derived JSON
+    # Schema. Nothing in the codebase reads top-level extras off this
+    # model (``_dispatch_propose_contract`` only touches ``context`` /
+    # ``template`` / ``provider``), so ``ignore`` drops them silently
+    # without breaking stale clients.
+    model_config = {"extra": "ignore"}
 
 
 class ValidateContractArgs(BaseModel):
@@ -93,7 +95,11 @@ class ValidateContractArgs(BaseModel):
         description="The FLUID contract to validate.",
     )
 
-    model_config = {"extra": "allow"}
+    # SECURITY_REVIEW I4: ``ignore`` (not ``allow``) — drop unknown
+    # top-level fields so the LLM can't smuggle data past the
+    # advertised ``additionalProperties=False``. The ``contract`` dict
+    # itself stays free-form.
+    model_config = {"extra": "ignore"}
 
 
 class ListSchedulersArgs(BaseModel):

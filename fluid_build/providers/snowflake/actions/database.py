@@ -20,6 +20,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict
 
+from ..._sql_safety import quote_string_literal
 from ..connection import SnowflakeConnection
 from ..util.config import get_connection_params
 from ..util.names import normalize_database_name, quote_identifier
@@ -64,7 +65,7 @@ def ensure_database(action: Dict[str, Any], provider) -> Dict[str, Any]:
         # Connect and check if database exists
         with SnowflakeConnection(**params) as conn:
             # Check existence
-            check_sql = f"SHOW DATABASES LIKE '{database}'"
+            check_sql = f"SHOW DATABASES LIKE {quote_string_literal(database)}"
             result = conn.execute(check_sql)
 
             if result and len(result) > 0:
@@ -84,9 +85,7 @@ def ensure_database(action: Dict[str, Any], provider) -> Dict[str, Any]:
                 f"CREATE {'TRANSIENT ' if transient else ''}DATABASE {quote_identifier(database)}"
             )
             if comment:
-                # Escape single quotes in comment
-                escaped_comment = comment.replace("'", "''")
-                create_sql += f" COMMENT = '{escaped_comment}'"
+                create_sql += f" COMMENT = {quote_string_literal(str(comment))}"
 
             conn.execute(create_sql)
 

@@ -202,6 +202,36 @@ class TestIsBundlePath:
 # ---------------------------------------------------------------------------
 
 
+def _rewrite_bundle(src: Path, dst: Path, *, mutate) -> None:
+    """Copy a tgz bundle, applying ``mutate(name, data) -> data | None`` to
+    each member. Returning ``None`` drops the member. Used to forge
+    corrupt bundles for the J5/J8 negative tests.
+    """
+    import gzip
+    import io
+    import tarfile
+
+    out_buf = io.BytesIO()
+    with tarfile.open(src, "r:gz") as tin, tarfile.open(fileobj=out_buf, mode="w") as tout:
+        for member in tin.getmembers():
+            if not member.isfile():
+                tout.addfile(member)
+                continue
+            fh = tin.extractfile(member)
+            data = fh.read() if fh else b""
+            new_data = mutate(member.name, data)
+            if new_data is None:
+                continue
+            info = tarfile.TarInfo(name=member.name)
+            info.size = len(new_data)
+            info.mode = member.mode
+            tout.addfile(info, io.BytesIO(new_data))
+    gz_buf = io.BytesIO()
+    with gzip.GzipFile(filename="", fileobj=gz_buf, mode="wb", mtime=0) as gz:
+        gz.write(out_buf.getvalue())
+    dst.write_bytes(gz_buf.getvalue())
+
+
 class TestReadBundleDigest:
     """Must match the digest returned by ``build_bundle_tgz``."""
 
@@ -223,6 +253,109 @@ class TestReadBundleDigest:
     def test_missing_bundle_raises(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
             read_bundle_digest(tmp_path / "does-not-exist.tgz")
+
+    def test_missing_manifest_raises_classified_error(self, tmp_path: Path) -> None:
+        """J8: a bundle with no MANIFEST.json must surface as the distinct
+        ``bundle-manifest-missing`` kind — not blurred into the generic
+        contents-mismatch case, so CI log parsers can classify it."""
+        good = _build_bundle(tmp_path / "good")
+        forged = tmp_path / "no-manifest.tgz"
+        # Drop MANIFEST.json entirely.
+        _rewrite_bundle(
+            good,
+            forged,
+            mutate=lambda name, data: None if name == "MANIFEST.json" else data,
+        )
+        with pytest.raises(PlanBindingError) as exc_info:
+            read_bundle_digest(forged)
+        assert exc_info.value.kind == "bundle-manifest-missing"
+
+    def test_tampered_member_raises_classified_invalid_error(self, tmp_path: Path) -> None:
+        """J8: a bundle whose member bytes diverge from MANIFEST.json
+        (but the manifest IS present) surfaces as ``bundle-manifest-invalid``
+        — a different stable tag from the missing-manifest case."""
+        good = _build_bundle(tmp_path / "good")
+        forged = tmp_path / "tampered.tgz"
+        # Mutate a non-manifest payload file so its SHA no longer matches.
+        _rewrite_bundle(
+            good,
+            forged,
+            mutate=lambda name, data: (
+                data + b"\n-- injected" if name != "MANIFEST.json" else data
+            ),
+        )
+        with pytest.raises(PlanBindingError) as exc_info:
+            read_bundle_digest(forged)
+        assert exc_info.value.kind == "bundle-manifest-invalid"
+
+    def test_missing_and_invalid_have_distinct_tags(self, tmp_path: Path) -> None:
+        """J8: the two failure modes must NOT collapse to the same kind —
+        that distinction is the whole point of the finding."""
+        good = _build_bundle(tmp_path / "good")
+        no_manifest = tmp_path / "nm.tgz"
+        tampered = tmp_path / "tm.tgz"
+        _rewrite_bundle(good, no_manifest, mutate=lambda n, d: None if n == "MANIFEST.json" else d)
+        _rewrite_bundle(good, tampered, mutate=lambda n, d: d + b"x" if n != "MANIFEST.json" else d)
+        with pytest.raises(PlanBindingError) as nm_exc:
+            read_bundle_digest(no_manifest)
+        with pytest.raises(PlanBindingError) as tm_exc:
+            read_bundle_digest(tampered)
+        assert nm_exc.value.kind != tm_exc.value.kind
+
+    def test_merkle_recompute_catches_forged_declared_digest(self, tmp_path: Path) -> None:
+        """J5: defence-in-depth. If an attacker rewrites ONLY the declared
+        ``digest`` field in MANIFEST.json (leaving per-file hashes intact
+        so a naive check passes), the locally-recomputed merkle root must
+        catch the divergence.
+
+        ``validate_manifest`` already independently rejects this (its own
+        merkle check), so the recompute is belt-and-braces — but the test
+        pins that ``read_bundle_digest`` never returns a digest it has not
+        itself reproduced from raw bytes."""
+        import json as _json
+
+        good = _build_bundle(tmp_path / "good")
+        forged = tmp_path / "forged-digest.tgz"
+
+        def _forge(name: str, data: bytes):
+            if name != "MANIFEST.json":
+                return data
+            manifest = _json.loads(data.decode("utf-8"))
+            # Rewrite ONLY the top-level merkle root; leave per-file
+            # hashes untouched.
+            manifest["digest"] = "sha256:" + "e" * 64
+            return _json.dumps(manifest).encode("utf-8")
+
+        _rewrite_bundle(good, forged, mutate=_forge)
+        with pytest.raises(PlanBindingError) as exc_info:
+            read_bundle_digest(forged)
+        # Either layer-1 (validate_manifest's own merkle check) or layer-2
+        # (the independent recompute) fires — both are merkle-class
+        # failures and both must hard-fail. The recompute guarantees we
+        # never trust a declared digest we did not reproduce.
+        assert exc_info.value.kind in (
+            "bundle-merkle-mismatch",
+            "bundle-manifest-invalid",
+        )
+
+    def test_returned_digest_equals_independent_recompute(self, tmp_path: Path) -> None:
+        """J5: the value ``read_bundle_digest`` returns is provably the
+        locally-recomputed merkle root — assert it matches a fresh
+        ``build_manifest`` over the same member bytes."""
+        import tarfile
+
+        from fluid_build.forge.core.bundle import build_manifest
+
+        bundle = _build_bundle(tmp_path)
+        returned = read_bundle_digest(bundle)
+
+        with tarfile.open(bundle, "r:gz") as tar:
+            members = {
+                m.name: tar.extractfile(m).read()
+                for m in tar.getmembers()
+                if m.isfile() and m.name != "MANIFEST.json"
+            }
+        assert returned == build_manifest(members)["digest"]
 
 
 # ---------------------------------------------------------------------------
@@ -252,11 +385,13 @@ class TestInjectDigests:
         assert "planDigest" not in plan
 
     def test_rerun_is_stable(self) -> None:
-        """Calling inject_digests twice produces identical output —
-        no oscillation between two ``planDigest`` values."""
+        """A forced re-inject over an already-bound plan produces
+        identical output — no oscillation between two ``planDigest``
+        values. (``force=True`` is required now that a bare re-inject is
+        guarded against silent overwrite — see J7.)"""
         plan = _minimal_plan()
         first = inject_digests(plan, bundle_path=None)
-        second = inject_digests(first, bundle_path=None)
+        second = inject_digests(first, bundle_path=None, force=True)
         assert first == second
 
     def test_plan_digest_stable_when_bundle_digest_mutates(self, tmp_path: Path) -> None:
@@ -302,7 +437,11 @@ class TestInjectDigests:
         # stale even though bundleDigest is masked from hashing — the
         # rest of the plan body is identical so this step is a no-op
         # in isolation, but a real attack would also mutate actions[].
-        plan_tampered = inject_digests(plan_tampered, bundle_path=bundle_b)
+        # ``force=True`` because the plan is already bound and the J7
+        # guard would otherwise (correctly) refuse the silent re-sign;
+        # an attacker re-binding a tampered plan is exactly the forced
+        # overwrite the guard makes explicit.
+        plan_tampered = inject_digests(plan_tampered, bundle_path=bundle_b, force=True)
 
         # Called with the EVIL bundle: digests agree, verify passes.
         # This is the accepted trade-off — bundle-path is trusted input.
@@ -313,16 +452,49 @@ class TestInjectDigests:
             verify_plan_binding(plan_tampered, bundle_path=bundle_a)
         assert exc_info.value.kind == "bundle-mismatch"
 
-    def test_overwrites_existing_digest_fields(self) -> None:
-        """Re-running plan should produce a fresh binding, not merge."""
+    def test_refuses_silent_overwrite_of_existing_digests(self) -> None:
+        """J7: a plan that already carries non-empty digest fields has
+        been bound once. ``inject_digests`` without ``force`` must refuse
+        to re-sign it — silently re-binding could launder a mutated plan
+        body past the stage-7 gate."""
         plan = {
             **_minimal_plan(),
             "bundleDigest": "sha256:" + "0" * 64,
             "planDigest": "sha256:" + "1" * 64,
         }
-        out = inject_digests(plan, bundle_path=None)
+        with pytest.raises(ValueError) as exc_info:
+            inject_digests(plan, bundle_path=None)
+        assert "already carries digest fields" in str(exc_info.value)
+
+    def test_refuses_overwrite_when_only_plan_digest_present(self) -> None:
+        """The guard trips if EITHER digest field is non-empty, not just
+        when both are."""
+        plan = {**_minimal_plan(), "planDigest": "sha256:" + "1" * 64}
+        with pytest.raises(ValueError):
+            inject_digests(plan, bundle_path=None)
+
+    def test_force_allows_deliberate_rebind(self) -> None:
+        """J7: ``force=True`` is the deliberate-rebind escape hatch — used
+        by callers that legitimately mutated the plan body after the first
+        injection (e.g. ``fluid plan`` appending a cost estimate)."""
+        plan = {
+            **_minimal_plan(),
+            "bundleDigest": "sha256:" + "0" * 64,
+            "planDigest": "sha256:" + "1" * 64,
+        }
+        out = inject_digests(plan, bundle_path=None, force=True)
         assert out["bundleDigest"] == ""  # overwritten
         assert out["planDigest"] != "sha256:" + "1" * 64
+        # The forced rebind produces a self-consistent binding.
+        verify_plan_binding(out, bundle_path=None)
+
+    def test_empty_digest_fields_do_not_trip_the_guard(self) -> None:
+        """A plan carrying empty-string digest fields (the raw-yaml shape)
+        is NOT considered already-bound — first injection still works
+        without ``force``."""
+        plan = {**_minimal_plan(), "bundleDigest": "", "planDigest": ""}
+        out = inject_digests(plan, bundle_path=None)
+        assert out["planDigest"].startswith("sha256:")
 
 
 # ---------------------------------------------------------------------------
@@ -349,10 +521,30 @@ class TestVerifyPlanBinding:
         stripped the field to bypass the gate."""
         plan = _minimal_plan()
         plan["bundleDigest"] = ""
+        plan["bindingMode"] = "raw"
         # No planDigest at all.
         with pytest.raises(PlanBindingError) as exc_info:
             verify_plan_binding(plan, bundle_path=None)
         assert exc_info.value.kind == "plan-tamper"
+
+    def test_inject_digests_records_binding_mode(self, tmp_path: Path) -> None:
+        """J6: inject_digests stamps bindingMode (bound vs raw)."""
+        raw = inject_digests(_minimal_plan(), bundle_path=None)
+        assert raw["bindingMode"] == "raw"
+        bound = inject_digests(_minimal_plan(), bundle_path=_build_bundle(tmp_path))
+        assert bound["bindingMode"] == "bound"
+
+    def test_binding_mode_mismatch_catches_stripped_bundle_digest(self, tmp_path: Path) -> None:
+        """J6: blanking bundleDigest to skip the bundle check — bundleDigest
+        is masked from planDigest, so the plan-tamper check alone would NOT
+        catch it — is caught by the bindingMode consistency check."""
+        plan = inject_digests(_minimal_plan(), bundle_path=_build_bundle(tmp_path))
+        assert plan["bindingMode"] == "bound"
+        # Attacker strips bundleDigest to skip the bundle half of the gate.
+        plan["bundleDigest"] = ""
+        with pytest.raises(PlanBindingError) as exc_info:
+            verify_plan_binding(plan, bundle_path=None)
+        assert exc_info.value.kind == "binding-mode-mismatch"
 
     def test_empty_plan_digest_is_tamper(self) -> None:
         """Empty string planDigest is treated the same as missing.
@@ -384,14 +576,26 @@ class TestVerifyPlanBinding:
             verify_plan_binding(plan, bundle_path=bundle_b)
         assert exc_info.value.kind == "bundle-mismatch"
 
-    def test_bundle_path_none_skips_bundle_check(self, tmp_path: Path) -> None:
-        """Emergency hotfix path: plan carries bundleDigest but caller
-        has no bundle in hand. The plan-tamper check still runs."""
+    def test_bundle_path_none_fails_closed_when_digest_present(self, tmp_path: Path) -> None:
+        """Plan carries a bundleDigest but the caller supplies no bundle —
+        the gate now fails closed (``bundle-missing``) instead of silently
+        skipping the bundle half of the binding. That silent skip was the
+        apply-time bypass closed by finding J1."""
         bundle = _build_bundle(tmp_path)
         plan = inject_digests(_minimal_plan(), bundle_path=bundle)
 
-        # Must NOT raise — bundle_path=None legitimately skips the
-        # bundle-mismatch check but still runs the plan-tamper check.
+        with pytest.raises(PlanBindingError) as exc_info:
+            verify_plan_binding(plan, bundle_path=None)
+        assert exc_info.value.kind == "bundle-missing"
+
+    def test_raw_plan_with_no_bundle_digest_skips_bundle_check(self, tmp_path: Path) -> None:
+        """A plan built against a raw .fluid.yaml carries an empty
+        bundleDigest — bundle_path=None is then legitimate; the bundle
+        check is skipped and only the plan-tamper check runs."""
+        plan = inject_digests(_minimal_plan(), bundle_path=None)
+        assert plan["bundleDigest"] == ""
+
+        # Must NOT raise — no bundle was ever bound to this plan.
         verify_plan_binding(plan, bundle_path=None)
 
     def test_plan_binding_error_carries_kind_attribute(self) -> None:

@@ -832,7 +832,7 @@ class StageCoordinator(_RepairLoopMixin):
         can raise via ``capability_matrix["critic_loop_max_attempts"]``.
         """
         cm = session.capability_matrix or {}
-        # Default ON; explicit False opts out for legacy single-pass.
+        # Default ON; explicit False opts out for a single-pass run.
         if cm.get("critic_loop_enabled") is False:
             return agent_invoke()
         # Cost-aware short-circuit: if a configured cost ceiling

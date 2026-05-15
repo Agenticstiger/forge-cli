@@ -236,7 +236,7 @@ def _export_odps_bitol(contract_path: str, env, out: str, logger: logging.Logger
 
         c = load_contract(contract_path)
         provider = OdpsStandardProvider()
-        result = provider.export(c)
+        result = provider.render(c)
 
         os.makedirs(os.path.dirname(out), exist_ok=True)
         import yaml as _yaml

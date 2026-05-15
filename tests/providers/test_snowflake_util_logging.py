@@ -85,9 +85,18 @@ def test_redact_dict_redacts_sensitive_keys_and_scans_string_values() -> None:
     assert "leaked" not in out["nested"]["label"]
 
 
-def test_sensitive_patterns_group_counts_are_either_zero_one_or_two() -> None:
-    # Invariant: the redactor only handles groups in {0, 1, >=2}. A future
-    # 3-group pattern would silently take the 2-group branch and emit a
-    # malformed replacement, so flag that during review.
+def test_sensitive_patterns_group_counts_are_handled_by_redact_string() -> None:
+    # Invariant: every pattern's group shape is one ``redact_string`` knows
+    # how to substitute. The three handled shapes are:
+    #   * 0 or 1 unnamed groups   -> flat ``[REDACTED]``
+    #   * exactly 2 unnamed groups -> ``\1[REDACTED]\2``
+    #   * named ``key``/``sep``/``value`` groups -> ``\g<key>\g<sep>[REDACTED]``
+    # A pattern with 3+ groups that is NOT the named-group shape would
+    # silently take the 2-group branch and emit a malformed replacement,
+    # so flag that during review.
     for pat in SENSITIVE_PATTERNS:
-        assert pat.groups in (0, 1, 2), f"unexpected group count {pat.groups} for {pat.pattern!r}"
+        named_assignment = "key" in pat.groupindex and "value" in pat.groupindex
+        assert pat.groups in (0, 1, 2) or named_assignment, (
+            f"unhandled group shape: {pat.groups} groups, "
+            f"groupindex={dict(pat.groupindex)} for {pat.pattern!r}"
+        )

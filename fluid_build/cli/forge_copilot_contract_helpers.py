@@ -51,6 +51,7 @@ from fluid_build.cli.forge_copilot_taxonomy import (
     normalize_use_case,
 )
 from fluid_build.schema_manager import FluidSchemaManager
+from fluid_build.util.safe_yaml import load_yaml_safe
 
 SAFE_ADDITIONAL_FILE_EXTENSIONS = {
     ".py",
@@ -918,7 +919,7 @@ def normalize_generation_payload(
     if not isinstance(contract, dict):
         contract_yaml = payload.get("contract_yaml")
         if isinstance(contract_yaml, str):
-            contract = yaml.safe_load(contract_yaml)
+            contract = load_yaml_safe(contract_yaml)
     if not isinstance(contract, dict):
         raise ValueError("The LLM response did not include a valid contract object.")
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict
 
+from ..._sql_safety import SqlAllowlistError, parse_and_allowlist_sql, quote_string_literal
 from ..connection import SnowflakeConnection
 from ..util.config import get_connection_params
 from ..util.names import build_qualified_name, normalize_table_name, quote_identifier
@@ -44,6 +45,17 @@ def ensure_task(action: Dict[str, Any], provider) -> Dict[str, Any]:
 
     provider.debug_kv(event="ensure_task_started", database=database, schema=schema, name=name)
 
+    # Allowlist the task body before opening a connection. A Snowflake task
+    # body is a single statement (CALL / INSERT / UPDATE / DELETE / MERGE /
+    # SELECT); multi-statement bodies and DDL are rejected fail-closed.
+    try:
+        parse_and_allowlist_sql(sql, surface="task_body")
+    except SqlAllowlistError as e:
+        provider.err_kv(
+            event="ensure_task_rejected", database=database, schema=schema, name=name, reason=str(e)
+        )
+        raise
+
     try:
         params = get_connection_params(
             account=account,
@@ -61,7 +73,10 @@ def ensure_task(action: Dict[str, Any], provider) -> Dict[str, Any]:
             create_sql += f"  WAREHOUSE = {quote_identifier(warehouse_name)}\n"
 
             if schedule:
-                create_sql += f"  SCHEDULE = '{schedule}'\n"
+                # SCHEDULE is a string literal — route through the central
+                # quoting helper (doubles embedded single quotes) so a crafted
+                # schedule value cannot break out of the literal.
+                create_sql += f"  SCHEDULE = {quote_string_literal(str(schedule))}\n"
 
             if after:
                 # Task dependencies (runs after other tasks)

@@ -118,7 +118,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         nargs="?",
         choices=["meltano", "airbyte", "dlt", "singer"],
         default=None,
-        help="Foreign tool to import from (omit for legacy dbt/Terraform/SQL scan)",
+        help="Foreign tool to import from (omit for a dbt/Terraform/SQL directory scan)",
     )
     parser.add_argument(
         "source",
@@ -502,23 +502,22 @@ def run(args: Any, logger: logging.Logger) -> int:
 
     If ``args.tool`` is set, dispatches to a foreign-tool importer
     (``meltano|airbyte|dlt|singer``). Otherwise scans the target directory
-    for a recognizable dbt / Terraform / SQL project — the legacy flow.
+    for a recognizable dbt / Terraform / SQL project.
     """
     tool = getattr(args, "tool", None)
     if tool:
         from fluid_build.cli._import_workflow_handler import run_import_from_tool
 
         return run_import_from_tool(args, logger, tool=tool, source=getattr(args, "source", None))
-    legacy_run = _run_legacy
-    return legacy_run(args, logger)
+    return _run_directory_scan_import(args, logger)
 
 
-def _run_legacy(args: Any, logger: logging.Logger) -> int:
-    """Legacy directory-scan import (dbt / Terraform / SQL)."""
+def _run_directory_scan_import(args: Any, logger: logging.Logger) -> int:
+    """Directory-scan import (dbt / Terraform / SQL)."""
     # Resolve the directory to scan — default is cwd.  We temporarily
-    # chdir into it so any legacy helpers that still read ``Path.cwd()``
-    # see the expected working directory, and we restore the original
-    # cwd on exit so we don't leak process state to callers.
+    # chdir into it so any helpers that read ``Path.cwd()`` see the
+    # expected working directory, and we restore the original cwd on
+    # exit so we don't leak process state to callers.
     original_cwd = Path.cwd()
     target_dir = getattr(args, "target_dir", None)
     if target_dir:

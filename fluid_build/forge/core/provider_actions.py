@@ -132,8 +132,10 @@ class ProviderActionParser:
             provider = binding.get("platform") or binding.get("provider", "local")
             expose_id = expose.get("exposeId", f"expose_{i}")
 
-            # Extract labels using same logic as planner
-            labels = self._extract_labels(contract, expose)
+            # Extract labels using same logic as planner. Pass the resolved
+            # platform so label-value sanitization is GCP-conditional —
+            # non-GCP targets must keep label values verbatim.
+            labels = self._extract_labels(contract, expose, provider)
 
             actions.append(
                 ProviderAction(
@@ -205,9 +207,53 @@ class ProviderActionParser:
         self.logger.debug(f"Inferred {len(actions)} actions from legacy contract")
         return actions
 
-    def _extract_labels(self, contract: Dict[str, Any], exposure: Dict[str, Any]) -> Dict[str, str]:
-        """Extract labels from contract and exposure (same logic as GCP planner)."""
+    def _extract_labels(
+        self,
+        contract: Dict[str, Any],
+        exposure: Dict[str, Any],
+        provider: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Extract labels from contract and exposure.
+
+        Label *value* sanitization is platform-aware. The GCP/BigQuery label
+        constraint is "lowercase ``[a-z0-9_-]`` only, <= 63 chars" — applying
+        that unconditionally silently mangles label values for every other
+        target (CJK ``用户三百六十度`` collapses to ``_______``, ``NO`` becomes
+        ``no``, ``1.2.3`` becomes ``1_2_3``). Snowflake / AWS / local tags and
+        labels are free-form strings and must round-trip faithfully into
+        ``plan.json``; only GCP/BigQuery exposures get the lossy rewrite.
+
+        Label *keys* are still normalized on every platform: keys feed into
+        action-param dict keys and downstream tooling expects a stable,
+        identifier-shaped key regardless of target.
+
+        Args:
+            contract: full FLUID contract dict.
+            exposure: the single ``exposes[]`` entry being provisioned.
+            provider: resolved target platform (``gcp``/``aws``/``snowflake``/
+                ``local``/...). When ``None`` it is re-derived from the
+                exposure's ``binding`` so the function is safe to call
+                without the caller pre-resolving it.
+        """
         import re
+
+        # Resolve the target platform. The caller in ``_infer_from_legacy``
+        # already computes this from ``binding.platform``; fall back to
+        # re-deriving it here so the helper is self-sufficient.
+        binding = exposure.get("binding", {}) or {}
+        resolved_platform = (
+            provider or binding.get("platform") or binding.get("provider") or "local"
+        )
+        platform_lc = str(resolved_platform).strip().lower()
+        binding_format = str(binding.get("format", "")).strip().lower()
+        # GCP labels: platform ``gcp`` (canonical), the ``bigquery`` alias
+        # used in some provider code paths, or a ``bigquery_table`` binding
+        # format. These are the only targets whose label values are subject
+        # to GCP's ``[a-z0-9_-]`` lowercase constraint.
+        is_gcp_target = platform_lc in ("gcp", "bigquery") or binding_format in (
+            "bigquery_table",
+            "bigquery",
+        )
 
         def sanitize_label_key(key: str) -> str:
             sanitized = re.sub(r"[^a-z0-9_-]", "_", key.lower())
@@ -216,7 +262,15 @@ class ProviderActionParser:
             return sanitized[:63] if sanitized else ""
 
         def sanitize_label_value(value: str) -> str:
-            sanitized = re.sub(r"[^a-z0-9_-]", "_", value.lower())
+            # Non-GCP targets (Snowflake / AWS / local / ...) accept
+            # free-form label/tag values — preserve them verbatim so the
+            # value round-trips faithfully into ``plan.json``. ``str()`` is
+            # an identity for the str inputs this helper receives and only
+            # guards the declared ``Dict[str, str]`` return contract.
+            if not is_gcp_target:
+                return str(value)
+            # GCP/BigQuery: enforce the platform's actual label constraint.
+            sanitized = re.sub(r"[^a-z0-9_-]", "_", str(value).lower())
             return sanitized[:63] if sanitized else ""
 
         labels = {}

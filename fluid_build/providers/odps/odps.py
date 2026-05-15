@@ -124,7 +124,6 @@ class OdpsProvider(BaseProvider):
         self.opds_schema_url = (
             "https://github.com/Open-Data-Product-Initiative/v4.1/blob/main/source/schema/odps.json"
         )
-        self.opds_schema_url_raw = "https://raw.githubusercontent.com/Open-Data-Product-Initiative/v4.1/main/source/schema/odps.json"
 
     @property
     def name(self) -> str:
@@ -926,9 +925,6 @@ class OdpsProvider(BaseProvider):
                     artifact,
                     version=self.opds_version,
                     use_full_schema=True,
-                    schema_url=(
-                        self.opds_schema_url_raw if hasattr(self, "opds_schema_url_raw") else None
-                    ),
                 )
                 return result
             except Exception as e:

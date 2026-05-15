@@ -94,9 +94,155 @@ def _imp(mod: str, attr: str | None = None):
     return getattr(m, attr) if attr else m
 
 
+def _is_bundle_path(path: str) -> bool:
+    """True when *path* looks like a Phase-2 pipeline bundle (.tgz / .tar.gz).
+
+    Mirrors ``forge.core.plan_digest.is_bundle_path`` — duplicated here as a
+    tiny private helper so the bundle-detection branch in
+    :func:`load_contract_with_overlay` doesn't pull the plan_digest /
+    tarfile import graph for the (common) raw-contract case.
+    """
+    lowered = str(path).lower()
+    return lowered.endswith(".tgz") or lowered.endswith(".tar.gz")
+
+
+def _load_contract_from_bundle(path: str, logger: logging.Logger) -> Dict[str, Any]:
+    """Load the resolved contract from inside a ``.tgz`` / ``.tar.gz`` bundle.
+
+    ``fluid bundle`` (pipeline stage 1) emits a gzip tarball whose payload
+    includes ``contract.resolved.{yaml,json}`` plus a tamper-evident
+    ``MANIFEST.json``. ``fluid validate`` already understands this layout
+    (see ``cli/validate.py::_run_bundle_validation`` → ``validate_bundle``);
+    ``plan`` / ``apply`` did not — they handed the ``.tgz`` straight to the
+    text loader, which tried to UTF-8-decode gzip bytes and crashed with
+    ``'utf-8' codec can't decode byte 0x8b``.
+
+    This helper makes the bundle path work by reusing the exact pieces
+    ``validate`` uses:
+
+      1. ``validate_manifest`` — the SHA-256 tamper gate. A bundle that
+         fails here is rejected before any contract bytes are parsed.
+      2. ``contract.resolved.yaml`` (preferred) or ``contract.resolved.json``
+         is read with the bounded reader (decompression-bomb cap) and
+         parsed via ``loader.parse_contract_text`` — same billion-laughs
+         guard as the on-disk path.
+      3. ``unwrap_source_pointers`` resolves any ``{"$source": "sources/…"}``
+         sentinels (inline SQL / OpenAPI that ``fluid bundle`` extracts into
+         ``sources/``) back into real values, so downstream planners see a
+         fully-materialised contract — never a bare sentinel dict.
+
+    The returned contract is exactly what the planner / apply path would
+    have seen had the operator passed the original ``contract.fluid.yaml``,
+    so ``plan`` / ``apply`` can treat ``.tgz`` and raw contracts uniformly.
+    """
+    import tarfile
+
+    from fluid_build.forge.core.bundle import read_tar_member_bounded, validate_manifest
+    from fluid_build.forge.core.validators import unwrap_source_pointers
+
+    bundle_path = Path(path)
+    if not bundle_path.exists():
+        raise CLIError(1, "bundle_not_found", {"path": str(bundle_path)})
+
+    # 1. Tamper gate — identical to stage-2 validate. Any mismatch (missing
+    #    MANIFEST, per-file SHA drift, merkle-root divergence) is surfaced
+    #    as a typed CLIError rather than a raw ValueError so CLI callers
+    #    classify it consistently.
+    try:
+        validate_manifest(bundle_path)
+    except FileNotFoundError as exc:
+        raise CLIError(1, "bundle_not_found", {"path": str(bundle_path), "error": str(exc)})
+    except ValueError as exc:
+        raise CLIError(1, "bundle_manifest_invalid", {"path": str(bundle_path), "error": str(exc)})
+
+    loader = _imp("fluid_build.loader")
+
+    try:
+        with tarfile.open(bundle_path, "r:gz") as tar:
+            names = set(tar.getnames())
+            # Prefer the YAML twin (authoritative for validate); fall back to
+            # the JSON twin for forward-compat with bundles that ship only one.
+            if "contract.resolved.yaml" in names:
+                member_name, suffix = "contract.resolved.yaml", ".yaml"
+            elif "contract.resolved.json" in names:
+                member_name, suffix = "contract.resolved.json", ".json"
+            else:
+                raise CLIError(
+                    1,
+                    "bundle_missing_contract",
+                    {
+                        "path": str(bundle_path),
+                        "message": (
+                            "bundle contains no contract.resolved.yaml or "
+                            "contract.resolved.json — it is not a fluid contract bundle"
+                        ),
+                    },
+                )
+            raw_bytes = read_tar_member_bounded(tar, member_name)
+
+            # Pre-cache + resolve $source members lazily. Inline SQL/OpenAPI
+            # is extracted into sources/ by ``fluid bundle``; the resolved
+            # contract carries {"$source": "sources/…"} pointers in their
+            # place. Resolve them so the planner gets real values.
+            source_cache: Dict[str, bytes] = {}
+
+            def _resolve_source(src_path: str) -> bytes:
+                if src_path not in source_cache:
+                    try:
+                        source_cache[src_path] = read_tar_member_bounded(tar, src_path)
+                    except (KeyError, ValueError) as exc:
+                        raise CLIError(
+                            1,
+                            "bundle_source_missing",
+                            {
+                                "path": str(bundle_path),
+                                "source": src_path,
+                                "error": str(exc),
+                            },
+                        )
+                return source_cache[src_path]
+
+            doc = loader.parse_contract_text(raw_bytes.decode("utf-8"), suffix=suffix)
+            contract = unwrap_source_pointers(doc, _resolve_source)
+    except CLIError:
+        raise
+    except (tarfile.TarError, OSError, ValueError, RuntimeError) as exc:
+        raise CLIError(
+            1,
+            "bundle_load_failed",
+            {"path": str(bundle_path), "error": str(exc)},
+        )
+
+    if not isinstance(contract, dict):
+        raise CLIError(
+            1,
+            "bundle_load_failed",
+            {
+                "path": str(bundle_path),
+                "error": "resolved contract root is not an object/dict",
+            },
+        )
+
+    logger.debug("bundle_contract_loaded: %s (member=%s)", bundle_path, member_name)
+    return contract
+
+
 def load_contract_with_overlay(
     path: str, env: Optional[str], logger: logging.Logger
 ) -> Dict[str, Any]:
+    # Bundle (.tgz / .tar.gz) input — extract the resolved contract from
+    # inside the archive instead of handing gzip bytes to the text loader.
+    # ``fluid bundle`` already resolved every $ref and applied the
+    # environment overlay at stage 1, so the in-bundle contract is final:
+    # ``env`` is intentionally not re-applied here (a bundle is a frozen,
+    # content-addressed artifact — re-overlaying it would break its digest
+    # binding). This unblocks ``fluid plan <bundle>.tgz`` and
+    # ``fluid apply <bundle>.tgz``, and makes plan.py's bundleDigest
+    # injection reachable via the real CLI.
+    if _is_bundle_path(path):
+        contract = _load_contract_from_bundle(path, logger)
+        return _normalize_contract_aliases(contract)
+
     try:
         loader = _imp("fluid_build.loader")
     except Exception as e:
@@ -307,8 +453,9 @@ def build_provider(
     try:
         return prov_cls(project=project, region=region, logger=logger)  # type: ignore
     except TypeError as exc:
-        # Only fall back for genuine signature mismatch (legacy providers that
-        # don't accept keyword-only args).  Don't swallow unrelated TypeErrors.
+        # Only fall back for a genuine signature mismatch (a provider
+        # class that doesn't accept keyword-only args). Don't swallow
+        # unrelated TypeErrors.
         msg = str(exc)
         if "unexpected keyword argument" in msg or "takes" in msg and "positional" in msg:
             logger.debug("build_provider_signature_fallback: %s — using setattr shim", msg)

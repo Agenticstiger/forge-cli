@@ -217,7 +217,6 @@ def cmd_opds_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
             opds_data,
             version=version,
             use_full_schema=use_full_schema,
-            schema_url=version_info.get("schema_url_raw"),
         )
 
         if not result["valid"]:

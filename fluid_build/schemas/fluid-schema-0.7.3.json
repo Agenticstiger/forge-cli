@@ -143,6 +143,40 @@
         "owner"
       ],
       "properties": {
+        "provenance": {
+          "type": "object",
+          "description": "Generation envelope injected by `fluid forge` / `fluid init` — records how, when and by which tool/command the contract was generated. Machine-written (not user-authored); additive metadata that does not affect the data product's semantic contract.",
+          "properties": {
+            "schema_version": {
+              "type": "integer",
+              "description": "Envelope schema version."
+            },
+            "kind": {
+              "type": "string",
+              "description": "Envelope discriminator, e.g. 'ContractMetadata'."
+            },
+            "generated_at": {
+              "type": "string",
+              "format": "date-time",
+              "description": "ISO 8601 UTC timestamp of generation."
+            },
+            "generated_by": {
+              "type": "object",
+              "description": "Tool, version and command that generated the contract.",
+              "properties": {
+                "tool": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "command": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
         "layer": {
           "type": "string",
           "description": "Data layer label (e.g., Bronze/Silver/Gold). Free-form. When set together with `productType`, the two MUST be consistent under the canonical mapping (Bronze↔SDP, Silver↔ADP, Gold↔CDP)."
@@ -220,6 +254,10 @@
               "description": "Value stream this product participates in."
             }
           }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags",
+          "description": "Product-level tags on metadata for discovery and categorization."
         }
       }
     },
@@ -279,6 +317,10 @@
     "accessPolicy": {
       "$ref": "#/$defs/accessPolicy",
       "description": "Root-level access policy for automated IAM binding generation. Defines principals, permissions, and resources for data product access control."
+    },
+    "orchestration": {
+      "$ref": "#/$defs/orchestration",
+      "description": "Top-level orchestration configuration for scheduling and workflow engines."
     },
     "retention": {
       "$ref": "#/$defs/retention",
@@ -351,6 +393,7 @@
         "cleartext",
         "treated",
         "anonymized",
+        "pseudonymized",
         "tokenized",
         "encrypted"
       ],
@@ -502,6 +545,83 @@
         "semantics": {
           "$ref": "#/$defs/semanticModel",
           "description": "NEW in v0.7.2: Semantic model definition mapping physical columns to business concepts. Defines entities, measures, dimensions, and metrics for agent-consumable business logic. Eliminates semantic hallucination by providing machine-readable KPI definitions. Compatible with dbt MetricFlow, Snowflake Semantic Views, and OSI-aligned formats."
+        },
+        "crawler": {
+          "type": "object",
+          "description": "AWS Glue crawler configuration for auto-discovery of schema from S3 paths.",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Glue crawler name."
+            },
+            "role": {
+              "type": "string",
+              "description": "IAM role ARN for the crawler."
+            },
+            "schedule": {
+              "type": "string",
+              "description": "Cron schedule expression (e.g., 'cron(0 6 * * ? *)')."
+            },
+            "classifiers": {
+              "type": "array",
+              "description": "Custom classifier names to apply.",
+              "items": {
+                "type": "string"
+              }
+            },
+            "schemaChangePolicy": {
+              "type": "object",
+              "description": "Policy for schema changes detected by the crawler.",
+              "properties": {
+                "updateBehavior": {
+                  "type": "string",
+                  "enum": ["UPDATE_IN_DATABASE", "LOG"]
+                },
+                "deleteBehavior": {
+                  "type": "string",
+                  "enum": ["LOG", "DELETE_FROM_DATABASE", "DEPRECATE_IN_DATABASE"]
+                }
+              }
+            }
+          }
+        },
+        "iceberg": {
+          "type": "object",
+          "description": "AWS Glue Iceberg table management configuration (snapshots, compaction).",
+          "properties": {
+            "writeFormat": {
+              "type": "string",
+              "enum": ["parquet", "orc", "avro"],
+              "description": "Underlying file format for Iceberg data files."
+            },
+            "snapshotRetention": {
+              "type": "object",
+              "description": "Snapshot retention policy.",
+              "properties": {
+                "maxSnapshotAgeMs": {
+                  "type": "integer",
+                  "description": "Maximum age of snapshots in milliseconds."
+                },
+                "minSnapshotsToKeep": {
+                  "type": "integer",
+                  "description": "Minimum number of snapshots to retain."
+                }
+              }
+            },
+            "compaction": {
+              "type": "object",
+              "description": "Iceberg compaction settings.",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "targetFileSizeMb": {
+                  "type": "integer",
+                  "description": "Target file size in MB after compaction."
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -573,6 +693,29 @@
           "$ref": "#/$defs/dqSpec",
           "description": "Enhanced data quality rules including anomaly detection."
         },
+        "quality": {
+          "type": "array",
+          "description": "Simplified SQL-expression data quality rules (alternate form of dq.rules for inline assertions).",
+          "items": {
+            "type": "object",
+            "required": ["rule", "expression", "severity"],
+            "properties": {
+              "rule": {
+                "type": "string",
+                "description": "Rule identifier."
+              },
+              "expression": {
+                "type": "string",
+                "description": "SQL or boolean expression that must evaluate to true."
+              },
+              "severity": {
+                "type": "string",
+                "enum": ["error", "warning", "info"],
+                "description": "Severity when the rule fails."
+              }
+            }
+          }
+        },
         "tags": {
           "$ref": "#/$defs/tags",
           "description": "Contract-level tags for data quality and governance."
@@ -608,8 +751,97 @@
           "minLength": 1
         },
         "type": {
-          "type": "string",
-          "minLength": 1
+          "description": "Column data type. Accepts a canonical FLUID/SQL type name (case-insensitive) or a parameterized form such as decimal(18,4) or varchar(255). The enum lists the canonical bare types; the pattern additionally permits case variants and parameter suffixes. Intentionally generous — it rejects obvious garbage (e.g. MYSTERY_TYPE) while admitting the cross-dialect superset.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "string",
+                "text",
+                "varchar",
+                "varchar2",
+                "nvarchar",
+                "char",
+                "nchar",
+                "character",
+                "clob",
+                "int",
+                "integer",
+                "int2",
+                "int4",
+                "int8",
+                "int16",
+                "int32",
+                "int64",
+                "tinyint",
+                "smallint",
+                "mediumint",
+                "bigint",
+                "long",
+                "longint",
+                "serial",
+                "bigserial",
+                "float",
+                "float4",
+                "float8",
+                "float32",
+                "float64",
+                "double",
+                "real",
+                "decimal",
+                "dec",
+                "numeric",
+                "number",
+                "bignumeric",
+                "money",
+                "boolean",
+                "bool",
+                "bit",
+                "date",
+                "time",
+                "datetime",
+                "datetime2",
+                "smalldatetime",
+                "timestamp",
+                "timestamptz",
+                "timestamp_tz",
+                "timestamp_ntz",
+                "timestamp_ltz",
+                "timestampntz",
+                "interval",
+                "year",
+                "variant",
+                "object",
+                "array",
+                "struct",
+                "map",
+                "record",
+                "row",
+                "json",
+                "jsonb",
+                "super",
+                "binary",
+                "varbinary",
+                "bytes",
+                "blob",
+                "bytea",
+                "raw",
+                "geography",
+                "geometry",
+                "geom",
+                "point",
+                "uuid",
+                "uniqueidentifier",
+                "guid",
+                "enum",
+                "hll"
+              ]
+            },
+            {
+              "type": "string",
+              "pattern": "(?i)^\\s*(string|text|varchar|varchar2|nvarchar|char|nchar|character|clob|int|integer|int2|int4|int8|int16|int32|int64|tinyint|smallint|mediumint|bigint|long|longint|serial|bigserial|float|float4|float8|float32|float64|double|real|double\\s+precision|decimal|dec|numeric|number|bignumeric|money|boolean|bool|bit|date|time|datetime|datetime2|smalldatetime|timestamp|timestamptz|timestamp_tz|timestamp_ntz|timestamp_ltz|timestampntz|timestamp\\s+with(out)?\\s+time\\s+zone|interval|year|variant|object|array|struct|map|record|row|json|jsonb|super|binary|varbinary|bytes|blob|bytea|raw|geography|geometry|geom|point|uuid|uniqueidentifier|guid|enum|hll)\\s*(\\(\\s*[0-9A-Za-z_,\\s'\\\"-]*\\s*\\))?\\s*$"
+            }
+          ]
         },
         "required": {
           "type": "boolean"
@@ -1113,6 +1345,11 @@
         "labels": {
           "$ref": "#/$defs/labels",
           "description": "Binding configuration labels for automation."
+        },
+        "properties": {
+          "type": "object",
+          "description": "Provider-specific binding properties (e.g., cluster_by, comment for Snowflake).",
+          "additionalProperties": true
         }
       }
     },
@@ -1791,6 +2028,7 @@
                     "insert",
                     "update",
                     "delete",
+                    "create",
                     "admin",
                     "manage"
                   ]
@@ -1931,6 +2169,7 @@
             "sql",
             "python",
             "spark",
+            "glue",
             "custom",
             "duckdb",
             "airbyte",
@@ -1940,7 +2179,7 @@
             "debezium"
           ],
           "default": "dbt",
-          "description": "Build/ingestion engine. Transformation engines: dbt, sql, python, spark, custom. Ingestion engines (acquisition pattern only): duckdb (zero-infra files/JDBC), airbyte (350+ SaaS), meltano (Singer 600+ taps), dlt (Python-native), kafka-connect (streaming), debezium (CDC)."
+          "description": "Build/ingestion engine. Transformation engines: dbt, sql, python, spark, glue, custom. Ingestion engines (acquisition pattern only): duckdb (zero-infra files/JDBC), airbyte (350+ SaaS), meltano (Singer 600+ taps), dlt (Python-native), kafka-connect (streaming), debezium (CDC). AWS Glue: glue (Spark ETL jobs managed by Glue)."
         },
         "capabilities": {
           "type": "array",
@@ -3286,6 +3525,7 @@
     },
     "notification": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "type": {
           "type": "string",

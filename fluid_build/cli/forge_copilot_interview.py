@@ -591,8 +591,7 @@ def run_adaptive_copilot_interview(
 
     # World-class bootstrap (Phase 0.6) — the only interview path.
     # Detect-first, examples in prompts, productType-first, progress
-    # + cost, :auto escape, no redundant generic questions. The
-    # opt-out (``FLUID_INTERVIEW_LEGACY=1``) was deleted as legacy.
+    # + cost, :auto escape, no redundant generic questions.
     if console:
         print_interview_phase(console, phase=1, total=1, label="Detect-first, world-class")
     try:

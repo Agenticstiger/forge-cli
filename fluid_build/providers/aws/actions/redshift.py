@@ -26,7 +26,7 @@ Implements idempotent Redshift operations:
 import time
 from typing import Any, Dict
 
-from ..._sql_safety import validate_ident
+from ..._sql_safety import build_libpq_dsn, validate_ident
 from ..util.ddl import generate_redshift_ddl
 from ..util.logging import duration_ms
 
@@ -63,7 +63,13 @@ class RedshiftConnectionPool:
 
 
 def _get_connection_string(action: Dict[str, Any]) -> str:
-    """Build Redshift connection string from action parameters."""
+    """Build a Redshift (libpq) connection string from action parameters.
+
+    Routes through :func:`fluid_build.providers._sql_safety.build_libpq_dsn`
+    so host/user/password values with whitespace or quotes are escaped per
+    libpq syntax instead of being interpolated raw — a raw f-string DSN
+    let a crafted password inject extra connection keywords.
+    """
     host = action.get("host")
     port = action.get("port", 5439)
     database = action.get("database")
@@ -73,7 +79,16 @@ def _get_connection_string(action: Dict[str, Any]) -> str:
     if not all([host, database, user, password]):
         raise ValueError("Redshift connection requires: host, database, user, password")
 
-    return f"host={host} port={port} dbname={database} user={user} password={password}"
+    return build_libpq_dsn(
+        {
+            "host": host,
+            "port": port,
+            "user": user,
+            "password": password,
+            "database": database,
+        },
+        database_key="dbname",
+    )
 
 
 def ensure_schema(action: Dict[str, Any]) -> Dict[str, Any]:
@@ -360,6 +375,20 @@ def ensure_view(action: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "status": "error",
             "error": "'schema', 'view', and 'sql' are required",
+            "duration_ms": duration_ms(start_time),
+            "changed": False,
+        }
+
+    # SECURITY: ``schema`` and ``view`` flow into a DDL f-string and
+    # cannot be parameterized — validate both as SQL identifiers. The
+    # ``{sql}`` view body is handled by a separate sprint.
+    try:
+        schema = validate_ident(schema)
+        view = validate_ident(view)
+    except ValueError as exc:
+        return {
+            "status": "error",
+            "error": f"Invalid identifier in view definition: {exc}",
             "duration_ms": duration_ms(start_time),
             "changed": False,
         }

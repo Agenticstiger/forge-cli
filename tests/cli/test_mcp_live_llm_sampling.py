@@ -32,6 +32,7 @@ per run (a 20-token gpt-4o-mini completion), so it's safe to leave enabled
 on CI but is gated behind ``@pytest.mark.live_llm`` so it only runs on
 demand or with the right marker.
 """
+
 from __future__ import annotations
 
 import asyncio

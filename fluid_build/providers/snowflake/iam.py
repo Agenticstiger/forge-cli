@@ -18,9 +18,10 @@ from __future__ import annotations
 import logging
 from typing import Dict, List
 
+from .._sql_safety import validate_ident
 from .connection import SnowflakeConnection
 from .types import SnowflakeIdentifier
-from .util import backtick
+from .util.names import quote_identifier
 
 log = logging.getLogger("fluid.provider.snowflake")
 
@@ -36,13 +37,19 @@ def _slugify(s: str) -> str:
 def compile_table_grants(
     principal: str, db: str, schema: str, table: str, perms: List[str]
 ) -> List[str]:
-    # Create or reuse a role, then grant usage + table privileges
+    # Create or reuse a role, then grant usage + table privileges.
+    # ``role`` flows into GRANT/CREATE ROLE DDL f-strings below; DDL
+    # identifiers cannot be parameterized, so ``role`` is run through
+    # ``validate_ident`` at this trust boundary. For an explicit
+    # ``role:`` principal the value is caller-supplied and MUST be
+    # validated; for a derived ``ROLE_<slug>`` it is already
+    # alphanumeric+underscore but re-validating is cheap defense.
     if principal.startswith("role:"):
-        role = principal.split(":", 1)[1].upper()
+        role = validate_ident(principal.split(":", 1)[1].upper())
         create_role = None
     else:
-        role = f"ROLE_{_slugify(principal)}"
-        create_role = f"CREATE ROLE IF NOT EXISTS {backtick(role)};"
+        role = validate_ident(f"ROLE_{_slugify(principal)}")
+        create_role = f"CREATE ROLE IF NOT EXISTS {quote_identifier(role)};"
 
     grants = []
     if create_role:
@@ -55,13 +62,15 @@ def compile_table_grants(
     wants_manage = "manage" in perms
 
     grants += [
-        f"GRANT USAGE ON DATABASE {backtick(db)} TO ROLE {backtick(role)};",
-        f"GRANT USAGE ON SCHEMA {backtick(db)}.{backtick(schema)} TO ROLE {backtick(role)};",
+        f"GRANT USAGE ON DATABASE {quote_identifier(db)} TO ROLE {quote_identifier(role)};",
+        f"GRANT USAGE ON SCHEMA {quote_identifier(db)}.{quote_identifier(schema)} "
+        f"TO ROLE {quote_identifier(role)};",
     ]
 
     if wants_select:
         grants.append(
-            f"GRANT SELECT ON TABLE {backtick(db)}.{backtick(schema)}.{backtick(table)} TO ROLE {backtick(role)};"
+            f"GRANT SELECT ON TABLE {quote_identifier(db)}.{quote_identifier(schema)}."
+            f"{quote_identifier(table)} TO ROLE {quote_identifier(role)};"
         )
 
     if wants_manage:

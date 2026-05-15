@@ -100,8 +100,7 @@ def execute_build(
 
     if trigger_type == "manual" or (trigger_type == "schedule" and force_run):
         iterations = 1 if trigger_type == "schedule" and force_run else trigger.get("iterations", 1)
-        # Support both delaySeconds (schema-friendly) and delay (legacy)
-        delay_from_contract = trigger.get("delaySeconds", trigger.get("delay"))
+        delay_from_contract = trigger.get("delaySeconds")
         if delay_from_contract is not None:
             delay = delay_from_contract
 

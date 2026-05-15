@@ -16,10 +16,10 @@
 # user-facing output flows through console.cprint elsewhere.
 """World-class fresh-product interview (Phase 0.6).
 
-The legacy bootstrap interview asked generic questions ("what data
-sources?", "got sample data?") even when the welcome scan, project
-memory, and CLI flags had already answered them. This module is the
-opinionated replacement:
+This is the single bootstrap-interview path. Rather than asking
+generic questions ("what data sources?", "got sample data?") even
+when the welcome scan, project memory, and CLI flags have already
+answered them, it is detect-first and opinionated:
 
 * **Detect-first**. Reads the welcome scan + project memory + workspace
   config + CLI flags. Inferred fields render as "→ Inferred" lines,

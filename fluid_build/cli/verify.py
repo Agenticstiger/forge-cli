@@ -678,6 +678,129 @@ def verify_snowflake_table(
         return {"status": "error", "error": str(exc), "exists": False}
 
 
+def _verify_local_file(
+    expose_name: str,
+    expose_config: Dict[str, Any],
+    format_type: str,
+) -> Dict[str, Any]:
+    """Verify a local CSV or Parquet output file using DuckDB.
+
+    Bug A4-1 fix: the format dispatch ``else`` branch previously returned an
+    error for every format that is not BigQuery or Snowflake.  This function
+    mirrors the BigQuery/Snowflake approach: confirm the file exists and is
+    readable, report row count and column names, and surface basic checks.
+
+    Returns a result dict compatible with the existing ``results`` loop below
+    (same shape as ``verify_bigquery_table`` and ``verify_snowflake_table``).
+    """
+    # Resolve the file path from binding.location.path or location.path.
+    binding = expose_config.get("binding") or {}
+    loc = binding.get("location") or expose_config.get("location") or {}
+    file_path_str = loc.get("path") or expose_config.get("path") or ""
+
+    if not file_path_str:
+        return {
+            "status": "error",
+            "error": (
+                f"local/csv/parquet expose '{expose_name}' has no location.path declared; "
+                "cannot verify"
+            ),
+            "exists": False,
+        }
+
+    file_path = Path(file_path_str)
+    if not file_path.exists():
+        return {
+            "status": "error",
+            "error": f"Output file not found: {file_path}",
+            "exists": False,
+        }
+
+    if not file_path.is_file():
+        return {
+            "status": "error",
+            "error": f"Path exists but is not a regular file: {file_path}",
+            "exists": True,
+        }
+
+    # Determine actual format from the file extension when the declared
+    # format_type is ambiguous ("local" or "").
+    suffix = file_path.suffix.lower()
+    if suffix in {".parquet", ".pq"} or format_type in {"parquet", "pq"}:
+        actual_fmt = "parquet"
+    else:
+        actual_fmt = "csv"
+
+    # Introspect with DuckDB.
+    try:
+        import duckdb  # type: ignore[import]
+
+        con = duckdb.connect(":memory:")
+        if actual_fmt == "parquet":
+            rel = con.sql(f"SELECT * FROM read_parquet({file_path.as_posix()!r})")
+        else:
+            rel = con.sql(f"SELECT * FROM read_csv_auto({file_path.as_posix()!r})")
+
+        row_count = rel.aggregate("count(*)").fetchone()[0]
+        actual_columns = [col for col in rel.columns]
+        con.close()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": f"DuckDB could not read {file_path}: {exc}",
+            "exists": True,
+        }
+
+    # Compare against the declared schema (best-effort: we report drift but
+    # do not hard-fail the verify run — schema drift detection mirrors what
+    # the BigQuery verifier does for column name / count checks).
+    contract_block = expose_config.get("contract") or {}
+    raw_schema = contract_block.get("schema") or expose_config.get("schema") or []
+    if isinstance(raw_schema, dict):
+        expected_fields = raw_schema.get("fields", [])
+    else:
+        expected_fields = raw_schema
+
+    dimensions: Dict[str, Any] = {}
+
+    # --- Schema Structure dimension ---
+    expected_names = [f["name"] for f in expected_fields if isinstance(f, dict) and "name" in f]
+    if expected_names:
+        actual_set = set(n.lower() for n in actual_columns)
+        missing = [n for n in expected_names if n.lower() not in actual_set]
+        extra = [n for n in actual_columns if n.lower() not in {e.lower() for e in expected_names}]
+        col_count_match = len(actual_columns) == len(expected_names)
+        schema_status = "match" if not missing and not extra else "mismatch"
+        dimensions["schema_structure"] = {
+            "status": schema_status,
+            "expected_count": len(expected_names),
+            "actual_count": len(actual_columns),
+            "missing_fields": missing,
+            "extra_fields": extra,
+            "column_count_match": col_count_match,
+        }
+    else:
+        dimensions["schema_structure"] = {
+            "status": "match",
+            "note": "no expected schema declared; structure not checked",
+            "actual_count": len(actual_columns),
+        }
+
+    overall_status = (
+        "match" if all(d.get("status") == "match" for d in dimensions.values()) else "mismatch"
+    )
+
+    return {
+        "status": overall_status,
+        "exists": True,
+        "format": actual_fmt,
+        "path": str(file_path),
+        "row_count": row_count,
+        "actual_columns": actual_columns,
+        "dimensions": dimensions,
+    }
+
+
 @_traced_stage("verify")
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Main verify command execution"""
@@ -687,10 +810,26 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     cprint("=" * 80)
 
     # Load contract using shared infrastructure (overlays now work!)
-    contract_path = args.contract
+    # F1 / F6: validate the operator-supplied contract path (traversal,
+    # forbidden system paths, symlink) before it reaches the loader.
+    from fluid_build.cli.core import FluidCLIError as _FluidCLIError
+    from fluid_build.cli.security import validate_cli_path
+
+    try:
+        contract_path = str(validate_cli_path(args.contract, mode="read", file_type="contract"))
+    except _FluidCLIError as exc:
+        if exc.event == "file_not_found":
+            raise CLIError(1, "contract_not_found", {"path": args.contract})
+        raise
+    args.contract = contract_path
+
+    # F1: validate the ``--out`` report write target when set.
+    if getattr(args, "out", None):
+        args.out = str(
+            validate_cli_path(args.out, mode="write", must_exist=False, file_type="report")
+        )
+
     cprint(f"Contract: {contract_path}")
-    if not Path(contract_path).exists():
-        raise CLIError(1, "contract_not_found", {"path": contract_path})
     try:
         contract = load_contract_with_overlay(contract_path, getattr(args, "env", None), logger)
     except CLIError:
@@ -873,6 +1012,16 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 oauth_token=snowflake_settings.get("oauth_token"),
             )
             results[expose_name] = result
+        elif format_type in {"csv", "parquet", "pq", "local", ""}:
+            # Bug A4-1: verify local csv/parquet output files using duckdb.
+            # Mirrors what BigQuery/Snowflake branches do: report row count,
+            # column presence, and basic readability without requiring cloud
+            # credentials.
+            results[expose_name] = _verify_local_file(
+                expose_name=expose_name,
+                expose_config=expose_config,
+                format_type=format_type,
+            )
         else:
             results[expose_name] = {
                 "status": "error",
@@ -1056,7 +1205,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             cprint("\n" + "=" * 80)
             cprint("🔄 Acquisition Post-Apply Probes")
             cprint("=" * 80)
-            acq_results = verify_acquisition(contract, Path.cwd())
+            # Bug A4-3: use the contract file's parent directory, not cwd(),
+            # so run-record lookup works when ``fluid verify`` is called with
+            # an absolute contract path from a different working directory.
+            acq_results = verify_acquisition(contract, Path(contract_path).resolve().parent)
             for r in acq_results:
                 cprint(f"\n   Build: {r.product_id}/{r.build_id}")
                 for c in r.checks:

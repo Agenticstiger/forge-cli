@@ -23,9 +23,6 @@ Entry points:
 - :func:`resolve_dbt_project_path` — locate the build's dbt project root.
 - :func:`build_dbt_command` — compose the ``dbt build`` argv.
 - :func:`execute_dbt_build` — run the command with retry/iteration logic.
-
-Private helpers follow the legacy ``cli/execute.py`` shape so the
-test-rewrite is a mechanical module-path update.
 """
 
 from __future__ import annotations
@@ -165,11 +162,52 @@ def _resolve_dbt_executable() -> Optional[str]:
 
 
 def _configured_dbt_command_prefix() -> Optional[List[str]]:
+    """Parse ``$DBT_EXECUTABLE`` into a command prefix, validating the
+    program token before it can be prepended to a subprocess argv.
+
+    ``DBT_EXECUTABLE`` may be a multi-token wrapper (e.g.
+    ``"poetry run dbt"`` or ``"uv run dbt"``), so it is split with
+    ``shlex``. The first token is the program that will actually be
+    ``exec``'d — a hostile or garbage value there would otherwise be
+    prepended to ``dbt build ...`` unchecked. Resolve it the same way
+    :func:`_resolve_dbt_executable` resolves a bare executable:
+
+    - an absolute / relative path must point at an existing file;
+    - a bare name must resolve on ``PATH`` via ``shutil.which``.
+
+    A value that resolves to neither is rejected: we warn-log and return
+    ``None`` so ``build_dbt_command`` falls through to its normal
+    executable discovery instead of trusting an unverifiable override.
+    """
     configured = os.getenv("DBT_EXECUTABLE")
     if not configured:
         return None
-    parts = shlex.split(configured)
-    return parts or None
+    try:
+        parts = shlex.split(configured)
+    except ValueError as exc:
+        # Unbalanced quotes etc. — don't let a malformed value through.
+        LOG.warning("DBT_EXECUTABLE is not a parseable command (%s); ignoring.", exc)
+        return None
+    if not parts:
+        return None
+
+    program = parts[0]
+    if os.path.sep in program or program.startswith((".", "~")):
+        # Explicit path form — must be an existing file.
+        candidate = Path(program).expanduser()
+        resolved = candidate.is_file()
+    else:
+        # Bare name — must resolve on PATH.
+        resolved = shutil.which(program) is not None
+    if not resolved:
+        LOG.warning(
+            "DBT_EXECUTABLE program token %r does not resolve to an "
+            "executable (not on PATH and not an existing file); ignoring "
+            "the override and falling back to normal dbt discovery.",
+            program,
+        )
+        return None
+    return parts
 
 
 def _normalize_selectors(raw: Any) -> List[str]:
@@ -510,7 +548,7 @@ def execute_dbt_build(
 
     if trigger_type == "manual" or (trigger_type == "schedule" and force_run):
         iterations = 1 if trigger_type == "schedule" and force_run else trigger.get("iterations", 1)
-        delay_from_contract = trigger.get("delaySeconds", trigger.get("delay"))
+        delay_from_contract = trigger.get("delaySeconds")
         if delay_from_contract is not None:
             delay = delay_from_contract
 
