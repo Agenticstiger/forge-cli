@@ -15,9 +15,9 @@
 """
 FLUID Contract Field Adapter
 
-Provides utilities for accessing contract fields in a version-agnostic way.
-This allows the codebase to work with schema 0.5.7 while maintaining
-clean abstraction for future schema versions.
+Provides utilities for accessing contract fields. These helpers read
+the fluid-schema-0.7.x contract shape only; pre-0.7 schemas are not
+supported.
 """
 
 import logging
@@ -27,10 +27,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 def get_expose_id(expose: Mapping[str, Any]) -> Optional[str]:
     """
-    Get the expose ID from an expose object.
-
-    Schema 0.5.7+: exposeId
-    Schema 0.4.0: id
+    Get the expose ID from an expose object (schema 0.7.x: ``exposeId``).
 
     Args:
         expose: The expose dictionary
@@ -38,31 +35,26 @@ def get_expose_id(expose: Mapping[str, Any]) -> Optional[str]:
     Returns:
         The expose ID or None
     """
-    return expose.get("exposeId") or expose.get("id")
+    return expose.get("exposeId")
 
 
 def get_expose_kind(expose: Mapping[str, Any]) -> Optional[str]:
     """
-    Get the expose kind/type from an expose object.
-
-    Schema 0.5.7+: kind
-    Schema 0.4.0: type
+    Get the expose kind from an expose object (schema 0.7.x: ``kind``).
 
     Args:
         expose: The expose dictionary
 
     Returns:
-        The expose kind/type or None
+        The expose kind or None
     """
-    return expose.get("kind") or expose.get("type")
+    return expose.get("kind")
 
 
 def get_expose_binding(expose: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Get the expose binding/location from an expose object.
-
-    Schema 0.5.7+: binding (object with provider, location, etc.)
-    Schema 0.4.0: location (string)
+    Get the expose binding from an expose object (schema 0.7.x:
+    ``binding`` — an object with platform, location, etc.).
 
     Args:
         expose: The expose dictionary
@@ -70,24 +62,13 @@ def get_expose_binding(expose: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     Returns:
         The binding object or None
     """
-    binding = expose.get("binding")
-    if binding:
-        return binding
-
-    # Fallback: convert old location string to binding object
-    location = expose.get("location")
-    if location and isinstance(location, str):
-        return {"location": location}
-
-    return None
+    return expose.get("binding")
 
 
 def get_expose_location(expose: Mapping[str, Any]) -> Optional[str]:
     """
-    Get the physical location string from an expose object.
-
-    Schema 0.5.7+: binding.location
-    Schema 0.4.0: location
+    Get the physical location string from an expose object (schema
+    0.7.x: ``binding.location``).
 
     Args:
         expose: The expose dictionary
@@ -99,16 +80,12 @@ def get_expose_location(expose: Mapping[str, Any]) -> Optional[str]:
     if binding and isinstance(binding, dict):
         return binding.get("location")
 
-    # Direct fallback
-    return expose.get("location")
+    return None
 
 
 def get_builds(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """
-    Get the builds array from a contract.
-
-    Schema 0.5.7+: builds (array)
-    Schema 0.4.0: build (single object)
+    Get the builds array from a contract (schema 0.7.x: ``builds``).
 
     Args:
         contract: The contract dictionary
@@ -119,11 +96,6 @@ def get_builds(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     builds = contract.get("builds")
     if builds and isinstance(builds, list):
         return builds
-
-    # Fallback: wrap single build in array
-    build = contract.get("build")
-    if build and isinstance(build, dict):
-        return [build]
 
     return []
 
@@ -144,7 +116,7 @@ def get_primary_build(contract: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
 
 def get_build_engine(build: Mapping[str, Any]) -> Optional[str]:
     """
-    Get the build engine from a build object.
+    Get the build engine from a build object (schema 0.7.x: ``engine``).
 
     Args:
         build: The build dictionary
@@ -152,7 +124,7 @@ def get_build_engine(build: Mapping[str, Any]) -> Optional[str]:
     Returns:
         The engine name (e.g., 'dbt', 'dataform', 'spark')
     """
-    return build.get("engine") or build.get("type")
+    return build.get("engine")
 
 
 def get_contract_version(contract: Mapping[str, Any]) -> Optional[str]:
@@ -163,7 +135,7 @@ def get_contract_version(contract: Mapping[str, Any]) -> Optional[str]:
         contract: The contract dictionary
 
     Returns:
-        The fluidVersion string (e.g., '0.5.7')
+        The fluidVersion string (e.g., '0.7.3')
     """
     return contract.get("fluidVersion")
 
@@ -172,8 +144,8 @@ def get_expose_contract(expose: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Get the contract section from an expose object.
 
-    In FLUID 0.5.7+ (including 0.7.2), ``schema`` and ``dq`` are nested
-    under a ``contract`` key. In 0.4.0, they were at the top level.
+    In fluid-schema-0.7.x, ``schema`` and ``dq`` are nested under a
+    ``contract`` key on each expose.
 
     Args:
         expose: The expose dictionary
@@ -211,26 +183,20 @@ def get_exposes(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
 
 def get_consume_id(consume: Mapping[str, Any]) -> Optional[str]:
-    """Return the consume's local port id.
-
-    Schema 0.5.7+: ``exposeId``. Schema 0.4.0: ``id``.
-    """
-    return consume.get("exposeId") or consume.get("id")
+    """Return the consume's local port id (schema 0.7.x: ``exposeId``)."""
+    return consume.get("exposeId")
 
 
 def get_consume_ref(consume: Mapping[str, Any]) -> Optional[str]:
-    """Return the upstream data-product reference for a consume.
-
-    Schema 0.5.7+: ``productId``. Schema 0.4.0: ``ref``.
-    """
-    return consume.get("productId") or consume.get("ref")
+    """Return the upstream data-product reference for a consume
+    (schema 0.7.x: ``productId``)."""
+    return consume.get("productId")
 
 
 def get_owner(contract: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return the owner block, preferring the canonical ``metadata.owner``
-    location (where FLUID 0.7.2 mandates it — top-level ``owner`` is not in
-    the 0.7.2 top-level whitelist) and falling back to a top-level ``owner``
-    key for legacy or pre-migration contracts.
+    """Return the owner block from ``metadata.owner`` — the canonical
+    location fluid-schema-0.7.x mandates (top-level ``owner`` is not in
+    the 0.7.x top-level whitelist).
 
     Returns an empty mapping when no owner information is present.
     """
@@ -239,10 +205,6 @@ def get_owner(contract: Mapping[str, Any]) -> Mapping[str, Any]:
         meta_owner = meta.get("owner")
         if isinstance(meta_owner, Mapping) and meta_owner:
             return meta_owner
-
-    top = contract.get("owner")
-    if isinstance(top, Mapping) and top:
-        return top
 
     return {}
 
@@ -256,29 +218,29 @@ def consumes_to_canonical_ports(
     """Normalize ``consumes[]`` into a canonical list of input-port dicts.
 
     The canonical shape is a complete read-view over every field the FLUID
-    0.7.2 ``$defs/consumeRef`` schema permits, plus the legacy-extension
-    fields older contracts commonly carry, so providers can forward or drop
-    anything they support without having to re-parse the raw contract::
+    0.7.x ``$defs/consumeRef`` schema permits, plus a few extension
+    fields, so providers can forward or drop anything they support
+    without having to re-parse the raw contract::
 
         {
             # --- always present ---
-            "id": str,                             # exposeId (or legacy `id`)
+            "id": str,                             # exposeId
 
-            # --- 0.7.2 consumeRef canonical fields ---
-            "reference": Optional[str],            # productId (or legacy `ref`)
-            "description": str,                    # purpose (or legacy `description`)
+            # --- 0.7.x consumeRef canonical fields ---
+            "reference": Optional[str],            # productId
+            "description": str,                    # purpose
             "version_constraint": Optional[str],   # semverRange
             "qos_expectations": Optional[Mapping], # freshnessMax / maxStaleness / ...
             "required_policies": Optional[list],
             "tags": Optional[list],
             "labels": Optional[Mapping],
 
-            # --- 0.4.0 / extension fields (kept for backward compat) ---
+            # --- extension fields ---
             "name": str,                           # defaults to id
-            "version": str,                        # stringified legacy `version`, defaults to default_version
+            "version": str,                        # defaults to default_version
             "contract_id": Optional[str],          # explicit only
             "required": Optional[bool],            # explicit only
-            "source_system_id": Optional[str],     # legacy extension only
+            "source_system_id": Optional[str],     # explicit only
             "kind": Optional[str],
             "constraints": Optional[Any],
         }
@@ -292,10 +254,10 @@ def consumes_to_canonical_ports(
         (or an empty string / default) rather than being fabricated with
         synthetic values — so providers can do ``if canonical["tags"]:`` and
         forward the list only when the author actually declared one.
-      * Malformed entries (non-mapping, or missing both ``exposeId`` and
-        ``id``) are skipped with a warning rather than raising. FLUID
-        contracts in the wild often carry partial lineage; providers should
-        degrade gracefully rather than crash on first bad entry.
+      * Malformed entries (non-mapping, or missing ``exposeId``) are
+        skipped with a warning rather than raising. FLUID contracts in
+        the wild often carry partial lineage; providers should degrade
+        gracefully rather than crash on first bad entry.
     """
     canonical: List[Dict[str, Any]] = []
     raw_consumes = contract.get("consumes", [])
@@ -316,7 +278,7 @@ def consumes_to_canonical_ports(
         if not consume_id:
             if logger is not None:
                 logger.warning(
-                    "Skipping consumes[%d]: missing required 'exposeId'/'id' field (keys=%s)",
+                    "Skipping consumes[%d]: missing required 'exposeId' field (keys=%s)",
                     index,
                     sorted(consume.keys()),
                 )
@@ -350,7 +312,7 @@ def consumes_to_canonical_ports(
             ),
             "tags": list(tags) if isinstance(tags, list) and tags else None,
             "labels": dict(labels) if isinstance(labels, Mapping) and labels else None,
-            # Extension / legacy fields — only populated when explicitly set.
+            # Extension fields — only populated when explicitly set.
             "contract_id": consume.get("contractId") or consume.get("contract_id"),
             "required": consume["required"] if "required" in consume else None,
             "source_system_id": str(source_system_id) if source_system_id else None,

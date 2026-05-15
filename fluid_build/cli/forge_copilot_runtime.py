@@ -807,7 +807,9 @@ def generate_copilot_artifacts(
         schema_only_errors = [e for e in validation_errors if e.startswith("Schema validation:")]
         try:
             from fluid_build.cli.forge_copilot_corrective_feedback import (
+                _parse_additional_props_error,
                 build_schema_validation_message,
+                strip_additional_props_from_contract,
             )
 
             if schema_only_errors:
@@ -820,6 +822,98 @@ def generate_copilot_artifacts(
                             max_attempts,
                             len(schema_only_errors),
                         )
+                    # Last-resort: on the final attempt, if EVERY remaining
+                    # schema error is an additionalProperties violation we can
+                    # parse, strip the offending keys programmatically and
+                    # re-validate immediately instead of spending another LLM
+                    # call on a prompt the model has already ignored twice.
+                    # Mixed errors (missing required fields, type mismatches)
+                    # are left to the LLM — stripping alone can't fix those.
+                    if attempt_index == max_attempts:
+                        all_additional_props = all(
+                            _parse_additional_props_error(e) is not None for e in schema_only_errors
+                        )
+                        non_schema_errors = [
+                            e for e in validation_errors if not e.startswith("Schema validation:")
+                        ]
+                        # non_schema_errors may duplicate the schema errors but without the
+                        # "Schema validation: " prefix (validate_generated_result re-runs the
+                        # same checks). Only block stripping when there are genuinely different
+                        # errors (e.g. missing required fields, type mismatches).
+                        non_schema_non_additional_props = [
+                            e for e in non_schema_errors if _parse_additional_props_error(e) is None
+                        ]
+                        if all_additional_props and not non_schema_non_additional_props:
+                            raw_contract = normalized.get("contract") or {}
+                            patched_contract, stripped_log = strip_additional_props_from_contract(
+                                raw_contract, schema_only_errors
+                            )
+                            if stripped_log:
+                                if logger:
+                                    logger.warning(
+                                        "self_healing_strip_keys: last-resort removed %d "
+                                        "additionalProperties key(s): %s",
+                                        len(stripped_log),
+                                        ", ".join(stripped_log),
+                                    )
+                                # Re-validate the stripped contract.
+                                try:
+                                    from fluid_build.schema_manager import FluidSchemaManager
+
+                                    strip_result = FluidSchemaManager().validate_contract(
+                                        patched_contract
+                                    )
+                                    if strip_result.is_valid:
+                                        # Patch the normalized dict and return success.
+                                        normalized = dict(normalized)
+                                        normalized["contract"] = patched_contract
+                                        report.validation_warnings.append(
+                                            f"self_healing_strip: removed {stripped_log}"
+                                        )
+                                        validation_errors = []
+                                        # Fall through to the success return below.
+                                except Exception as strip_exc:  # noqa: BLE001
+                                    if logger:
+                                        logger.debug(
+                                            "self_healing_strip_revalidate_failed: %s", strip_exc
+                                        )
+
+                    if not validation_errors:
+                        # The stripped contract is valid — return it directly.
+                        eval_result = None
+                        provenance = {
+                            "llm_provider": llm_config.provider,
+                            "llm_model": llm_config.model,
+                            "ai_run_plan": ai_run_plan,
+                            "system_prompt_hash": hashlib.sha256(
+                                system_prompt.encode()
+                            ).hexdigest()[:16],
+                            "user_prompt_hash": hashlib.sha256(user_prompt.encode()).hexdigest()[
+                                :16
+                            ],
+                            "discovery_hash": hashlib.sha256(
+                                json.dumps(
+                                    discovery_report.to_prompt_payload(), sort_keys=True
+                                ).encode()
+                            ).hexdigest()[:16],
+                            "attempt": attempt_index,
+                            "self_eval_score": None,
+                            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                            "strip_repair": True,
+                        }
+                        return CopilotGenerationResult(
+                            suggestions=normalized["suggestions"],
+                            contract=normalized["contract"],
+                            readme_markdown=normalized["readme_markdown"],
+                            additional_files=normalized["additional_files"],
+                            discovery_report=discovery_report,
+                            attempt_reports=attempts,
+                            scaffold_decision=scaffold_decision,
+                            project_memory=project_memory,
+                            provenance=provenance,
+                            ai_run_plan=ai_run_plan,
+                        )
+
                     previous_errors = build_structured_repair_feedback(validation_errors) + [
                         schema_msg["content"]
                     ]
@@ -905,7 +999,7 @@ def _generate_staged_copilot_artifacts(
         team_memory=team_memory,
     )
 
-    source = _select_staged_source(context, discovery_report)
+    source = _select_staged_source(context, discovery_report, workspace_root=Path.cwd().resolve())
     coordinator_result = None
     if source["kind"] == "ddl":
         ddl_tables: List[TableDefinition] = source["tables"]
@@ -1062,11 +1156,50 @@ def _normalize_stage_technique(value: Any) -> Optional[str]:
     return None
 
 
+# SECURITY_REVIEW I6: cap on any file read off an LLM-/discovery-derived
+# path — mirrors the 50 MiB ceiling used by ``_dispatch_forge_data_model``
+# (finding I3) so a crafted huge file can't exhaust memory.
+_STAGED_SOURCE_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _confine_to_workspace(path: Path, workspace_root: Path) -> Optional[Path]:
+    """Resolve ``path`` and confine it under ``workspace_root``.
+
+    SECURITY_REVIEW I6: ``_select_staged_source`` consumes CLI- and
+    discovery-derived paths and reads them with ``read_text()``. Without
+    confinement an attacker-influenced ``data_model_paths`` value (or a
+    poisoned discovery record) could steer a read at ``~/.aws/credentials``
+    / ``/etc/passwd`` etc. Returns the resolved path when it lives inside
+    the workspace and is a real, size-bounded file; ``None`` otherwise so
+    the caller skips it.
+    """
+    try:
+        resolved = path.expanduser().resolve()
+        resolved.relative_to(workspace_root)
+    except (ValueError, OSError):
+        return None
+    try:
+        if not resolved.is_file():
+            return None
+        if resolved.stat().st_size > _STAGED_SOURCE_MAX_BYTES:
+            return None
+    except OSError:
+        return None
+    return resolved
+
+
 def _select_staged_source(
     context: Mapping[str, Any],
     discovery_report: DiscoveryReport,
+    *,
+    workspace_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     from fluid_build.forge_datamodel.from_ddl.parser import parse_ddl_text
+
+    # SECURITY_REVIEW I6: every path read below is confined under this
+    # root. Defaults to cwd — the same workspace root the staged
+    # ``StageSession`` uses.
+    root = (workspace_root or Path.cwd()).resolve()
 
     raw_source = str(context.get("data_model_source") or "").strip().lower()
     explicit_paths = context.get("data_model_paths") or context.get("data_model_path") or []
@@ -1075,22 +1208,28 @@ def _select_staged_source(
     explicit_paths = [str(path) for path in explicit_paths]
 
     if raw_source == "intent" and explicit_paths:
-        candidate = Path(explicit_paths[0]).expanduser()
-        if candidate.exists():
+        candidate = _confine_to_workspace(Path(explicit_paths[0]), root)
+        if candidate is not None:
             return {"kind": "intent_file", "path": str(candidate)}
 
     ddl_candidates: List[Path] = []
     if raw_source == "ddl":
-        ddl_candidates.extend(Path(path).expanduser() for path in explicit_paths)
+        for raw_path in explicit_paths:
+            confined = _confine_to_workspace(Path(raw_path), root)
+            if confined is not None:
+                ddl_candidates.append(confined)
     if not ddl_candidates:
         for model in getattr(discovery_report, "user_data_models", []) or []:
-            path = Path(str(model.get("path") or ""))
-            if path.suffix.lower() == ".sql" and path.exists():
-                ddl_candidates.append(path)
+            raw_path = Path(str(model.get("path") or ""))
+            if raw_path.suffix.lower() != ".sql":
+                continue
+            confined = _confine_to_workspace(raw_path, root)
+            if confined is not None:
+                ddl_candidates.append(confined)
         for sql_file in discovery_report.sql_files:
-            path = Path(str(sql_file.get("path") or ""))
-            if path.exists():
-                ddl_candidates.append(path)
+            confined = _confine_to_workspace(Path(str(sql_file.get("path") or "")), root)
+            if confined is not None:
+                ddl_candidates.append(confined)
 
     tables = []
     for path in ddl_candidates:

@@ -87,6 +87,26 @@ def register(subparsers: argparse._SubParsersAction):
 @_traced_stage("diff")
 def run(args, logger: logging.Logger) -> int:
     try:
+        # F1 / F6: validate every operator-supplied path argument
+        # (traversal, forbidden system paths, symlink) before it reaches
+        # ``load_contract_with_overlay`` / ``read_json`` / ``write_json``.
+        # Covers both diff modes: positional ``contract`` (always),
+        # ``--baseline`` (version mode), ``--state`` (drift mode), and
+        # the ``--out`` write target.
+        from fluid_build.cli.security import validate_cli_path
+
+        args.contract = str(validate_cli_path(args.contract, mode="read", file_type="contract"))
+        if getattr(args, "baseline", None):
+            args.baseline = str(
+                validate_cli_path(args.baseline, mode="read", file_type="baseline contract")
+            )
+        if getattr(args, "state", None):
+            args.state = str(validate_cli_path(args.state, mode="read", file_type="state file"))
+        if getattr(args, "out", None):
+            args.out = str(
+                validate_cli_path(args.out, mode="write", must_exist=False, file_type="output")
+            )
+
         # Version-diff mode (contract-vs-contract). When ``--baseline`` is
         # supplied we bypass provider lookup entirely — the comparison is
         # pure structural diff between two parsed contracts.

@@ -24,8 +24,14 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import yaml
+
+# Reuse the canonical SSRF post-DNS-resolution gate (RFC1918,
+# link-local 169.254.0.0/16 — AWS/GCP metadata — loopback, reserved;
+# fails closed on DNS errors) rather than re-deriving a range list.
+from fluid_build.build_runners._alerter import _hostname_is_private
 
 try:
     import requests
@@ -33,6 +39,42 @@ try:
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
+
+# Opt-in allow-list for operators whose Command Center genuinely lives
+# on an internal/private address (the default ``http://localhost:8000``
+# is itself a loopback host, so localhost is permitted unconditionally
+# — see :func:`_command_center_host_allowed`). Comma-separated host
+# suffixes; matched exactly or as a dotted suffix.
+_CC_HOST_ALLOWLIST_ENV = "FLUID_COMMAND_CENTER_HOST_ALLOWLIST"
+# Loopback hosts always permitted: the documented default Command
+# Center URL is ``http://localhost:8000`` (a local dev server). The
+# SSRF concern is a *user/config-supplied* URL bouncing the X-API-Key
+# to a cloud-metadata endpoint — not the operator's own localhost.
+_CC_ALWAYS_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _command_center_host_allowed(url: Optional[str]) -> bool:
+    """Return True when ``url``'s host is safe to probe.
+
+    Loopback (the documented localhost default) and any host on the
+    ``FLUID_COMMAND_CENTER_HOST_ALLOWLIST`` allow-list are permitted;
+    every other host that resolves to a private/link-local/loopback/
+    cloud-metadata address is refused via :func:`_hostname_is_private`.
+    A URL with no host is refused.
+    """
+    if not url:
+        return False
+    host = urlparse(url).hostname
+    if not host:
+        return False
+    if host in _CC_ALWAYS_ALLOWED_HOSTS:
+        return True
+    suffixes = [
+        s.strip() for s in os.environ.get(_CC_HOST_ALLOWLIST_ENV, "").split(",") if s.strip()
+    ]
+    if any(host == s or host.endswith("." + s) for s in suffixes):
+        return True
+    return not _hostname_is_private(host)
 
 
 @dataclass
@@ -157,6 +199,22 @@ class CommandCenterClient:
         """
         if not REQUESTS_AVAILABLE:
             self.logger.warning("requests library not available, skipping Command Center detection")
+            return
+
+        # SSRF gate: the URL is user/config-supplied and we POST an
+        # X-API-Key against it elsewhere. Refuse to probe a host that
+        # resolves to a private/link-local/cloud-metadata address
+        # unless it is loopback (the localhost default) or explicitly
+        # allow-listed. Bail before any request leaves the process.
+        if not _command_center_host_allowed(self.url):
+            self.logger.warning(
+                "Command Center URL host resolves to a private/loopback/"
+                "link-local/cloud-metadata address; skipping detection to "
+                "prevent SSRF. Set %s=<host-suffix> to allow a genuinely "
+                "internal Command Center endpoint.",
+                _CC_HOST_ALLOWLIST_ENV,
+            )
+            self.available = False
             return
 
         try:

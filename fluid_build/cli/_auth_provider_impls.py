@@ -68,6 +68,7 @@ from fluid_build.cli.auth import (  # noqa: E402,F401
     _sanitize_argv,
 )
 from fluid_build.cli.console import cprint, success  # noqa: E402,F401
+from fluid_build.observability.secret_redactor import redact_secret_text  # noqa: E402
 
 try:
     from rich.console import Console
@@ -312,7 +313,7 @@ class GoogleCloudAuthProvider(AuthProvider):
             return AuthResult(
                 provider=self.name,
                 status=AuthStatus.ERROR,
-                error_message=f"Google Cloud authentication failed: {e}",
+                error_message=f"Google Cloud authentication failed: {redact_secret_text(str(e))}",
             )
 
     async def logout(self) -> bool:
@@ -338,7 +339,7 @@ class GoogleCloudAuthProvider(AuthProvider):
             self.logger.info("Google Cloud logout completed")
             return True
         except Exception as e:
-            self.logger.error(f"Google Cloud logout failed: {e}")
+            self.logger.error("Google Cloud logout failed: %s", redact_secret_text(str(e)))
             return False
 
     async def check_auth(self) -> AuthResult:
@@ -605,7 +606,7 @@ class AWSAuthProvider(AuthProvider):
             return AuthResult(
                 provider=self.name,
                 status=AuthStatus.ERROR,
-                error_message=f"AWS authentication failed: {e}",
+                error_message=f"AWS authentication failed: {redact_secret_text(str(e))}",
             )
 
     async def logout(self) -> bool:
@@ -623,7 +624,7 @@ class AWSAuthProvider(AuthProvider):
             self.logger.info("AWS logout completed")
             return True
         except Exception as e:
-            self.logger.error(f"AWS logout failed: {e}")
+            self.logger.error("AWS logout failed: %s", redact_secret_text(str(e)))
             return False
 
     async def check_auth(self) -> AuthResult:
@@ -836,7 +837,9 @@ class SnowflakeAuthProvider(AuthProvider):
                 },
             )
 
-        error_msg = result.stderr.strip() if result.stderr else "Authentication failed"
+        error_msg = (
+            redact_secret_text(result.stderr.strip()) if result.stderr else "Authentication failed"
+        )
         return AuthResult(
             provider=self.name, status=AuthStatus.NOT_AUTHENTICATED, error_message=error_msg
         )
@@ -1066,7 +1069,11 @@ class DatabricksAuthProvider(AuthProvider):
         return AuthResult(
             provider=self.name,
             status=AuthStatus.NOT_AUTHENTICATED,
-            error_message=test.stderr.strip() if test.stderr else "CLI configuration failed",
+            error_message=(
+                redact_secret_text(test.stderr.strip())
+                if test.stderr
+                else "CLI configuration failed"
+            ),
         )
 
     def _prompt_for_credentials(self) -> AuthResult:
@@ -1181,7 +1188,9 @@ class DatabricksAuthProvider(AuthProvider):
                 self.logger.info("Databricks configuration cleared")
             return True
         except Exception as e:
-            self.logger.error(f"Failed to clear Databricks configuration: {e}")
+            self.logger.error(
+                "Failed to clear Databricks configuration: %s", redact_secret_text(str(e))
+            )
             return False
 
     async def check_auth(self) -> AuthResult:

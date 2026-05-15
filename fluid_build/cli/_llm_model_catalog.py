@@ -157,19 +157,29 @@ def get_catalog_routing_model(provider_name: str, strong_model: str = "") -> Opt
 
 
 def get_catalog_tier_model(provider_name: str, tier: str = "flagship") -> Optional[str]:
-    """Return the model for a given tier with v1/v2 compatibility mapping."""
+    """Return the model for a given tier.
+
+    Catalogs with a ``tiers`` section are keyed by ``deep`` / ``balanced``
+    / ``fast``. A user-supplied catalog (``~/.fluid/llm_models.json``)
+    without a ``tiers`` section is keyed by ``flagship`` / ``balanced``
+    / ``routing`` on the provider entry, so the tier name is mapped to
+    that shape as a fallback.
+    """
     catalog = _resolve_load_model_catalog()()
     tier_entry = catalog.get("tiers", {}).get(provider_name, {})
     if tier in tier_entry:
         return tier_entry.get(tier)
     entry = catalog.get("providers", {}).get(provider_name, {})
-    legacy_tier = {
+    provider_keyed_tier = {
         "deep": "flagship",
         "balanced": "balanced",
         "fast": "routing",
     }.get(tier, tier)
     return (
-        entry.get(legacy_tier) or entry.get(tier) or entry.get("flagship") or entry.get("default")
+        entry.get(provider_keyed_tier)
+        or entry.get(tier)
+        or entry.get("flagship")
+        or entry.get("default")
     )
 
 

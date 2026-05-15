@@ -57,6 +57,12 @@ def _make_args(**kwargs):
         "format": "text",
         "list_versions": False,
         "show_schema": False,
+        # Explicit defaults so the Mock() below does not auto-vivify them
+        # as truthy Mock objects — ``validate.run()`` routes ``report``
+        # through ``validate_cli_path`` and a stray Mock would crash it.
+        "report": None,
+        "fail_fast": False,
+        "probe": False,
     }
     defaults.update(kwargs)
     args = Mock()
@@ -394,3 +400,52 @@ class TestRunFunction:
             with patch("fluid_build.cli.validate.cprint"):
                 run(args, logger)
         sm.clear_cache.assert_called_once()
+
+
+class TestPre07VersionGate:
+    """0.7-only gate: ``fluid validate`` must reject pre-0.7 contracts
+    (0.4.x / 0.5.x / 0.6.x) up front with an actionable error rather
+    than letting them fall through to a confusing schema failure."""
+
+    def test_reject_pre_07_contract_helper_raises_for_05(self):
+        from fluid_build.cli._common import CLIError
+        from fluid_build.cli.validate import _reject_pre_07_contract
+
+        with pytest.raises(CLIError) as exc:
+            _reject_pre_07_contract({"fluidVersion": "0.5.7"})
+        assert exc.value.event == "contract_version_unsupported"
+
+    @pytest.mark.parametrize("version", ["0.4.0", "0.5.7", "0.6.2", "0.5", "0.6"])
+    def test_reject_pre_07_contract_helper_rejects_all_old_majors(self, version):
+        from fluid_build.cli._common import CLIError
+        from fluid_build.cli.validate import _reject_pre_07_contract
+
+        with pytest.raises(CLIError):
+            _reject_pre_07_contract({"fluidVersion": version})
+
+    @pytest.mark.parametrize("version", ["0.7.0", "0.7.3", "0.8.0", "1.0.0"])
+    def test_reject_pre_07_contract_helper_allows_07_and_later(self, version):
+        from fluid_build.cli.validate import _reject_pre_07_contract
+
+        # Must NOT raise.
+        _reject_pre_07_contract({"fluidVersion": version})
+
+    def test_reject_pre_07_contract_helper_ignores_missing_version(self):
+        from fluid_build.cli.validate import _reject_pre_07_contract
+
+        # No fluidVersion key — gate is a no-op (version auto-detected later).
+        _reject_pre_07_contract({"id": "x"})
+
+    def test_run_rejects_pre_07_contract(self, tmp_path):
+        """End-to-end: ``run()`` exits non-zero for a 0.5.x contract."""
+        contract_file = tmp_path / "old.fluid.yaml"
+        contract_file.write_text("fluidVersion: '0.5.7'\nid: old\n")
+        args = _make_args(contract=str(contract_file), list_versions=False, quiet=True)
+        with patch("fluid_build.cli.validate.FluidSchemaManager") as MockSM:
+            MockSM.return_value = _make_schema_manager()
+            with patch(
+                "fluid_build.cli.validate.load_contract_with_overlay",
+                return_value={"fluidVersion": "0.5.7", "id": "old"},
+            ):
+                result = run(args, logger)
+        assert result == 1

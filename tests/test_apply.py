@@ -58,6 +58,10 @@ def _make_args(**kwargs):
         "state_file": None,
         "config_override": None,
         "provider_config": None,
+        # Explicit so the Mock() below does not auto-vivify it as a
+        # truthy Mock — ``apply.run()`` routes ``--bundle`` through
+        # ``validate_cli_path`` and a stray Mock would crash it.
+        "bundle": None,
     }
     defaults.update(kwargs)
     args = Mock()
@@ -191,6 +195,21 @@ def _patch_hooks():
 
 
 class TestRunSimpleMode:
+    @pytest.fixture(autouse=True)
+    def _stub_pre_apply_gate(self):
+        """Stub the pre-apply contract gate for this class.
+
+        ``fluid apply`` now runs a pre-0.7 rejection + JSON-schema
+        validation gate on the loaded contract before any DDL (bug fix:
+        an end-of-life / structurally-broken contract used to apply with
+        exit 0). These unit tests feed deliberately minimal fixture dicts
+        to exercise provider dispatch / report generation / mode handling
+        — contract validity is covered by the validate tests and the
+        dedicated gate tests — so the gate is stubbed out here.
+        """
+        with patch("fluid_build.cli.apply._gate_contract_for_apply", new=Mock()):
+            yield
+
     def _minimal_contract(self):
         return {"id": "test-product", "name": "Test Product"}
 

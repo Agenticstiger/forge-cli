@@ -46,9 +46,13 @@ SENSITIVE_PATTERNS = [
     re.compile(r'"refresh_token":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r"Authorization:\s*Bearer\s+[^\s]+", re.IGNORECASE),
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=\-]{8,}", re.IGNORECASE),
-    # Snowflake passwords and connection strings
+    # Snowflake passwords and connection strings.
+    # NOTE: the bare ``password=...`` shape is handled by the named-group
+    # assignment pattern below (it keeps the ``password=`` key prefix); a
+    # separate 0-group ``password=`` pattern here would run first, whole-
+    # match-redact, and destroy the key name — so it is intentionally
+    # absent.
     re.compile(r'"password":\s*"[^"]*"', re.IGNORECASE),
-    re.compile(r"password=[^\s;&]+", re.IGNORECASE),
     # Generic secrets and credentials
     re.compile(r'"secret":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"token":\s*"[^"]*"', re.IGNORECASE),
@@ -57,8 +61,18 @@ SENSITIVE_PATTERNS = [
     re.compile(r'"api[_-]?key":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"client_secret":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"passphrase":\s*"[^"]*"', re.IGNORECASE),
-    # Bare key:value / key=value assignments — both separators
-    re.compile(r"(?i)\b(api[_-]?key|password|secret|token|passphrase)\s*[:=]\s*\S+"),
+    # Bare key:value / key=value assignments — both separators.
+    # Named groups so ``redact_string`` keeps the key name + separator and
+    # redacts only the value (``password=hunter2`` -> ``password=[REDACTED]``)
+    # instead of whole-match-redacting and destroying the key name. Mirrors
+    # the global ``SecretRedactingFilter`` assignment regex, including its
+    # value terminator set (stop at whitespace / ``;`` / ``&`` / ``,``).
+    # Quantifiers are upper-bounded to prevent catastrophic backtracking.
+    re.compile(
+        r"(?i)\b(?P<key>api[_-]?key|password|secret|token|passphrase)"
+        r"(?P<sep>\s{,8}[:=]\s{,8})"
+        r"(?P<value>[^\s;&,]{,256})"
+    ),
     # AWS keys (for external stages)
     re.compile(r'"aws_key_id":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"aws_access_key_id":\s*"[^"]*"', re.IGNORECASE),
@@ -72,11 +86,34 @@ SENSITIVE_PATTERNS = [
     # Third-party / provider token shapes (S-010)
     # JWT (three base64url parts separated by dots)
     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
+    # JWT (two-segment header.payload, no signature)
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
     # Stripe restricted / live / test secret keys
     re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}"),
     # GitHub personal access tokens, OAuth tokens, app installation tokens
     re.compile(r"\bgh[oprsu]_[A-Za-z0-9]{30,}"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    # Provider API-key shapes — standard detect-secrets / gitleaks rule
+    # prefixes. Kept in lock-step with the global ``SecretRedactingFilter``
+    # in observability/secret_redactor.py (the two layers MUST stay
+    # symmetric per CLAUDE.md). Anthropic runs before OpenAI: ``sk-ant-``
+    # is a strict prefix of the looser OpenAI ``sk-`` shape.
+    re.compile(r"\bsk-ant-[A-Za-z0-9-]{30,}"),  # Anthropic
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),  # OpenAI (incl. sk-proj-/sk-svcacct-/sk-admin-)
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),  # AWS access key id
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{35}"),  # GCP API key
+    re.compile(r"\bxox[abprs]-[0-9A-Za-z-]{10,}"),  # Slack
+    re.compile(r"\bhf_[A-Za-z0-9]{30,}"),  # HuggingFace
+    re.compile(r"\br8_[A-Za-z0-9]{30,}"),  # Replicate
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),  # GitLab PAT
+    re.compile(r"\bvc_[A-Za-z0-9]{20,}"),  # Vercel
+    # Fernet token — URL-safe base64 with the fixed ``gAAAAA`` header.
+    re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}"),
+    # PEM private-key block (RSA / EC / OPENSSH / DSA / bare PKCS#8 ...).
+    # ``[^-]*`` so the algorithm word is optional and the bare
+    # ``-----BEGIN PRIVATE KEY-----`` PKCS#8 header is covered. ``(?s)``
+    # so ``.`` spans newlines and the whole multiline block is scrubbed.
+    re.compile(r"(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----"),
 ]
 
 # Keys that should be redacted in dictionaries.
@@ -105,6 +142,7 @@ SENSITIVE_KEYS = {
     "client_secret",
     "client_id",
     "aws_key_id",
+    "aws_access_key",
     "aws_access_key_id",
     "aws_secret_key",
     "aws_secret_access_key",
@@ -141,9 +179,18 @@ def redact_string(text: str) -> str:
     redacted = text
 
     for pattern in SENSITIVE_PATTERNS:
-        # Only the 2-group shape (prefix + suffix) can use \1[REDACTED]\2;
-        # 1-group patterns would trigger `invalid group reference 2` on sub.
-        if pattern.groups >= 2:
+        # Three substitution shapes, dispatched on the pattern's groups:
+        #   * named ``key``/``sep``/``value`` groups -> keep the key name
+        #     and separator, redact only the value (``password=hunter2``
+        #     becomes ``password=[REDACTED]``). Mirrors the global
+        #     ``SecretRedactingFilter`` behaviour.
+        #   * 2 unnamed groups (prefix + suffix) -> ``\1[REDACTED]\2``.
+        #   * everything else -> flat ``[REDACTED]`` (a 1-group pattern
+        #     would raise ``invalid group reference 2`` on the 2-group
+        #     template, so it must fall through here).
+        if "key" in pattern.groupindex and "value" in pattern.groupindex:
+            redacted = pattern.sub(r"\g<key>\g<sep>[REDACTED]", redacted)
+        elif pattern.groups >= 2:
             redacted = pattern.sub(r"\1[REDACTED]\2", redacted)
         else:
             redacted = pattern.sub("[REDACTED]", redacted)

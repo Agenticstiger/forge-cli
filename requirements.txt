@@ -4,8 +4,9 @@ jsonschema>=4.21.1
 rich>=13.7.1
 requests>=2.32.5
 httpx>=0.26.0
+h11>=0.16  # security: CVE-2025-43859 (chunked request smuggling)
 tenacity>=9.1.4
-jinja2>=3.1.4
+jinja2>=3.1.6  # security: CVE-2025-27516 (sandbox escape via |attr)
 graphviz>=0.20.3
 pydot>=4.0.1
 

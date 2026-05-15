@@ -851,8 +851,8 @@ class TestJenkinsTemplateStage11ScheduleSync:
         ``APPLY_BUILD_FLAG = "${params.APPLY_BUILD_ID ? '--build ' + params.APPLY_BUILD_ID : ''}"``
         then expanded ``${APPLY_BUILD_FLAG}`` UNQUOTED inside ``sh '''...'''``.
         A Jenkins user could set
-        ``APPLY_BUILD_ID="x --allow-data-loss --no-verify-digest"`` →
-        the value word-splits into 4 argv tokens → destructive-mode
+        ``APPLY_BUILD_ID="x --allow-data-loss --no-verify-plan-binding"`` →
+        the value word-splits into 3 argv tokens → destructive-mode
         flags leak through regardless of the corresponding Jenkins
         booleans. Auth-gate bypass.
 
@@ -875,6 +875,11 @@ class TestJenkinsTemplateStage11ScheduleSync:
         assert 'if [ -n "${APPLY_BUILD_ID_VAL:-}" ]' in sh_body
         assert 'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]' in sh_body
         assert 'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]' in sh_body
+        # The single NO_VERIFY_DIGEST CI knob now appends BOTH
+        # narrowly-scoped CLI flags (the digest gate is split in two).
+        assert "--no-verify-plan-binding" in sh_body
+        assert "--no-verify-federation" in sh_body
+        assert "--no-verify-digest" not in sh_body
         assert 'fluid apply "$@"' in sh_body
 
     def test_stage_7_routes_params_through_plain_environment_block(self):
@@ -1066,7 +1071,7 @@ class TestStageSpecsHelper:
     def test_stage_7_uses_injection_proof_pattern(self):
         """Stage 7 (apply) assembles argv via POSIX ``set --`` and
         ``if/then/fi`` so operator-supplied flags (mode, allow-data-
-        loss, no-verify-digest, build-id) flow through env vars as
+        loss, no-verify-*, build-id) flow through env vars as
         whole argv tokens. This closes the argument-smuggling surface
         that the Jenkins ``${APPLY_BUILD_FLAG}`` pattern previously
         had (see tech-debt commit D2)."""
@@ -1080,6 +1085,12 @@ class TestStageSpecsHelper:
         assert 'if [ -n "${APPLY_BUILD_ID:-}" ]' in s7.command
         assert 'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]' in s7.command
         assert 'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]' in s7.command
+        # The single NO_VERIFY_DIGEST CI knob appends BOTH narrowly-
+        # scoped CLI flags — the digest gate is split into a
+        # plan-binding gate and a federation upstream-digest gate.
+        assert "--no-verify-plan-binding" in s7.command
+        assert "--no-verify-federation" in s7.command
+        assert "--no-verify-digest" not in s7.command
         # Regression guard: the old concatenation pattern must not
         # reappear. If this ever fails, the helper has drifted back
         # into the argument-smuggling shape.

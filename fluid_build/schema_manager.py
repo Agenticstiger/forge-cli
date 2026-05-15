@@ -71,7 +71,7 @@ def _discover_bundled_versions() -> List[str]:
                 versions.add(match.group(1))
 
     if not versions:
-        versions.update(["0.4.0", "0.5.7", "0.7.1", "0.7.2"])
+        versions.update(["0.7.1", "0.7.2", "0.7.3"])
 
     return sorted(versions, key=_schema_version_sort_key)
 
@@ -104,7 +104,7 @@ class SchemaVersion:
                 context={"version": version_str, "expected_format": "X.Y.Z"},
                 suggestions=[
                     "Version must follow semantic versioning: major.minor.patch",
-                    "Examples: 0.4.0, 0.5.7, 1.0.0",
+                    "Examples: 0.7.1, 0.7.3, 1.0.0",
                     "Prerelease versions: 1.0.0-alpha, 1.0.0-beta.1",
                 ],
             )
@@ -349,7 +349,7 @@ class FluidSchemaManager:
         """Return the newest bundled FLUID schema version."""
         if cls.BUNDLED_VERSIONS:
             return cls.BUNDLED_VERSIONS[-1]
-        return "0.7.2"
+        return "0.7.3"
 
     def __init__(
         self,
@@ -392,12 +392,13 @@ class FluidSchemaManager:
             except (json.JSONDecodeError, OSError) as e:
                 self.logger.warning(f"Failed to load bundled schema {schema_file}: {e}")
 
-        # Fallback: ensure we have at least 0.5.7 with minimal schema
-        if "0.5.7" not in self._bundled_schemas:
-            self._bundled_schemas["0.5.7"] = {
+        # Fallback: ensure we have at least one 0.7.x schema with a
+        # minimal definition if none were loaded from disk.
+        if not self._bundled_schemas:
+            self._bundled_schemas["0.7.3"] = {
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "description": "FLUID v0.5.7 Contract Schema (minimal fallback)",
+                "description": "FLUID v0.7.3 Contract Schema (minimal fallback)",
             }
 
     def detect_version(self, contract: Dict[str, Any]) -> Optional[SchemaVersion]:
@@ -577,8 +578,10 @@ class FluidSchemaManager:
                 # Use JSON Schema validation
                 is_valid = self._validate_with_jsonschema(contract, schema, result)
             else:
-                # Fallback to existing FLUID validator for 0.4.x or when jsonschema unavailable
-                is_valid = self._validate_with_fluid_validator(contract, schema_version, result)
+                # Fallback to a minimal required-field check only when the
+                # jsonschema library is unavailable (jsonschema is a hard
+                # dependency, so this branch is defensive).
+                is_valid = self._validate_basic(contract, schema_version, result)
 
             if not is_valid:
                 result.is_valid = False
@@ -586,8 +589,8 @@ class FluidSchemaManager:
         except Exception as e:
             result.add_error(f"Validation failed with error: {str(e)}")
 
-        # Version compatibility warnings
-        if schema_version.major == 0 and schema_version.minor < 4:
+        # Version compatibility warnings — only 0.7.x is supported.
+        if schema_version.major == 0 and schema_version.minor < 7:
             result.add_warning(f"Schema version {schema_version} is deprecated")
 
         result.validation_time = time.time() - start_time
@@ -626,43 +629,31 @@ class FluidSchemaManager:
             result.add_error(f"JSON Schema validation error: {str(e)}")
             return False
 
-    def _validate_with_fluid_validator(
+    def _validate_basic(
         self, contract: Dict[str, Any], schema_version: SchemaVersion, result: ValidationResult
     ) -> bool:
-        """Validate using existing FLUID validator (fallback)."""
-        if str(schema_version).startswith("0.4") or str(schema_version).startswith("0.5"):
-            # Use JSON schema validator for 0.4.x and 0.5.x
-            try:
-                from fluid_build.schema import validate_contract
+        """Minimal required-field check.
 
-                is_valid, error_msg = validate_contract(contract)
-                if not is_valid and error_msg:
-                    for error in error_msg.split("\n"):
-                        if error.strip():
-                            result.add_error(error.strip())
-                return is_valid
-            except ImportError as e:
-                result.add_error(f"FLUID validator not available: {str(e)}")
-                return False
-        else:
-            # For other versions, basic validation
-            result.add_warning(f"Using basic validation for v{schema_version}")
+        Only reached when the ``jsonschema`` library is unavailable;
+        ``jsonschema`` is a hard dependency, so this is a defensive
+        fallback rather than a supported code path.
+        """
+        result.add_warning(f"Using basic validation for v{schema_version}")
 
-            # Basic validation
-            required_fields = [
-                "fluidVersion",
-                "kind",
-                "id",
-                "name",
-                "domain",
-                "metadata",
-                "exposes",
-            ]
-            for field in required_fields:
-                if field not in contract:
-                    result.add_error(f"Missing required field: {field}")
+        required_fields = [
+            "fluidVersion",
+            "kind",
+            "id",
+            "name",
+            "domain",
+            "metadata",
+            "exposes",
+        ]
+        for field in required_fields:
+            if field not in contract:
+                result.add_error(f"Missing required field: {field}")
 
-            return len(result.errors) == 0
+        return len(result.errors) == 0
 
     def list_available_versions(self, include_remote: bool = False) -> List[str]:
         """List all available schema versions."""

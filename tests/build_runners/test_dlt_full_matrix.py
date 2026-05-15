@@ -245,8 +245,7 @@ class TestDltCustomSource:
         src_dir = tmp_path / "sources"
         src_dir.mkdir(parents=True)
         (src_dir / "my_source.py").write_text(
-            dedent(
-                """
+            dedent("""
                 import dlt
 
                 @dlt.resource
@@ -260,8 +259,7 @@ class TestDltCustomSource:
                 @dlt.source
                 def source():
                     return my_resource
-                """
-            ),
+                """),
             encoding="utf-8",
         )
         out_db = tmp_path / "out" / "data.duckdb"

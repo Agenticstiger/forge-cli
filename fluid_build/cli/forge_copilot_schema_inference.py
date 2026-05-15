@@ -44,6 +44,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 #: overhead on every discovery run.
 MAX_SAMPLE_ROWS = 5
 
+# Security: cap the per-field CSV size. Python's default is platform
+# ``sys.maxsize`` on many builds, so a single 1-row CSV with a multi-GB
+# unquoted field could exhaust memory during the discovery pass long
+# before MAX_SAMPLE_ROWS ever applies. 1 MiB is far above any legitimate
+# column value.
+csv.field_size_limit(1024 * 1024)
+
 
 # ---------------------------------------------------------------------------
 # Schema summary cache (slice UX-G)

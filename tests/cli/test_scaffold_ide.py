@@ -31,6 +31,7 @@ Five shapes verified:
    appear. This is the only test that catches "config looks fine but the
    subprocess never speaks MCP."
 """
+
 from __future__ import annotations
 
 import argparse

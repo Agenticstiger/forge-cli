@@ -27,9 +27,7 @@ from fluid_build.cli.forge_copilot_tools import dispatch_tool_call
 
 
 def _write_contract(target: Path, *, name: str, product_type: str, layer: str):
-    target.write_text(
-        textwrap.dedent(
-            f"""
+    target.write_text(textwrap.dedent(f"""
             fluidVersion: '0.7.3'
             kind: DataProduct
             id: x.y.{name}
@@ -47,9 +45,7 @@ def _write_contract(target: Path, *, name: str, product_type: str, layer: str):
                   schema:
                     - name: id
                       type: integer
-            """
-        ).strip()
-    )
+            """).strip())
 
 
 def test_discover_workspace_contracts_lists_all_when_no_filter(tmp_path: Path):

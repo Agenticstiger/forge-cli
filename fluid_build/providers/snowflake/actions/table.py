@@ -20,6 +20,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List
 
+from ..._sql_safety import quote_string_literal, validate_sql_type
 from ..connection import SnowflakeConnection
 from ..util.config import get_connection_params
 from ..util.names import (
@@ -161,7 +162,20 @@ def ensure_table(action: Dict[str, Any], provider) -> Dict[str, Any]:
 
 
 def alter_table(action: Dict[str, Any], provider) -> Dict[str, Any]:
-    """Alter existing Snowflake table."""
+    """Alter an existing Snowflake table.
+
+    Each entry in ``action["alterations"]`` is a dict whose ``"kind"`` key
+    selects the alteration: ``"add_column"`` / ``"drop_column"`` /
+    ``"rename_column"``. ``"kind"`` is deliberately a distinct key from a
+    column's ``"type"`` — an ``add_column`` alteration carries a real
+    column data type under ``"type"``, e.g.::
+
+        {"kind": "add_column", "name": "amount", "type": "NUMBER(38,0)"}
+
+    (Previously both the alteration kind and the column type were read
+    from ``"type"``, which made the ``add_column`` branch structurally
+    unreachable with a real column type.)
+    """
     start_time = time.time()
 
     database = normalize_database_name(action["database"])
@@ -185,11 +199,15 @@ def alter_table(action: Dict[str, Any], provider) -> Dict[str, Any]:
             qualified_name = build_qualified_name(database, schema, table)
 
             for alteration in alterations:
-                alter_type = alteration.get("type")
+                # The alteration KIND is read from ``"kind"`` — distinct
+                # from a column's ``"type"`` data-type key below.
+                alter_type = alteration.get("kind")
 
                 if alter_type == "add_column":
                     column_name = normalize_column_name(alteration["name"])
-                    column_type = alteration["type"]
+                    # Raw-interpolated into ALTER TABLE ... ADD COLUMN DDL —
+                    # allowlist it (BUG-SQL-TYPE).
+                    column_type = validate_sql_type(alteration["type"])
                     nullable = alteration.get("nullable", True)
 
                     alter_sql = f"ALTER TABLE {qualified_name} ADD COLUMN {quote_identifier(column_name)} {column_type}"
@@ -288,7 +306,10 @@ def _generate_create_table_sql(
 
     for col in columns:
         col_name = quote_identifier(normalize_column_name(col["name"]))
-        col_type = col["type"]
+        # ``col_type`` is interpolated raw into the CREATE TABLE DDL — route it
+        # through the type allowlist so a contract column ``type`` cannot
+        # smuggle DDL (BUG-SQL-TYPE).
+        col_type = validate_sql_type(col["type"])
         nullable = col.get("nullable", True)
         col_comment = col.get("comment")
 
@@ -296,8 +317,7 @@ def _generate_create_table_sql(
         if not nullable:
             col_def += " NOT NULL"
         if col_comment:
-            escaped_comment = col_comment.replace("'", "''")
-            col_def += f" COMMENT '{escaped_comment}'"
+            col_def += f" COMMENT {quote_string_literal(str(col_comment))}"
 
         column_defs.append(col_def)
 
@@ -310,8 +330,7 @@ def _generate_create_table_sql(
         sql += f"\nCLUSTER BY ({', '.join(quoted_keys)})"
 
     if comment:
-        escaped_comment = comment.replace("'", "''")
-        sql += f"\nCOMMENT = '{escaped_comment}'"
+        sql += f"\nCOMMENT = {quote_string_literal(str(comment))}"
 
     return sql
 
@@ -353,7 +372,9 @@ def _apply_schema_evolution(
         if col_name_upper not in existing_columns:
             # Column doesn't exist - add it
             col_name = quote_identifier(col["name"])
-            col_type = col["type"]
+            # Raw-interpolated into ALTER TABLE ... ADD COLUMN DDL —
+            # allowlist it (BUG-SQL-TYPE).
+            col_type = validate_sql_type(col["type"])
             nullable = col.get("nullable", True)
 
             alter_sql = f"ALTER TABLE {qualified_name} ADD COLUMN {col_name} {col_type}"
@@ -387,16 +408,14 @@ def _apply_table_tags(
         try:
             # Sanitize tag name (Snowflake allows alphanumeric + underscore)
             safe_tag_name = quote_identifier(tag_name.upper().replace("-", "_"))
-            safe_tag_value = str(tag_value).replace("'", "''")
+            safe_tag_value = quote_string_literal(str(tag_value))
 
             # Ensure tag exists (idempotent)
             create_tag_sql = f"CREATE TAG IF NOT EXISTS {safe_tag_name}"
             conn.execute(create_tag_sql)
 
             # Apply tag to table
-            set_tag_sql = (
-                f"ALTER TABLE {qualified_name} SET TAG {safe_tag_name} = '{safe_tag_value}'"
-            )
+            set_tag_sql = f"ALTER TABLE {qualified_name} SET TAG {safe_tag_name} = {safe_tag_value}"
             conn.execute(set_tag_sql)
 
             provider.debug_kv(
@@ -463,14 +482,14 @@ def _apply_column_tags(
         for tag_name, tag_value in tag_mappings.items():
             try:
                 safe_tag_name = quote_identifier(tag_name.upper().replace("-", "_"))
-                safe_tag_value = str(tag_value).replace("'", "''")
+                safe_tag_value = quote_string_literal(str(tag_value))
 
                 # Ensure tag exists
                 create_tag_sql = f"CREATE TAG IF NOT EXISTS {safe_tag_name}"
                 conn.execute(create_tag_sql)
 
                 # Apply tag to column
-                alter_sql = f"ALTER TABLE {qualified_name} MODIFY COLUMN {col_name} SET TAG {safe_tag_name} = '{safe_tag_value}'"
+                alter_sql = f"ALTER TABLE {qualified_name} MODIFY COLUMN {col_name} SET TAG {safe_tag_name} = {safe_tag_value}"
                 conn.execute(alter_sql)
 
                 tags_applied += 1

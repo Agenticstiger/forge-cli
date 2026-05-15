@@ -203,9 +203,13 @@ def _resolve_fluid_bin() -> List[str]:
 
 def _run_stage(fluid_bin: List[str], stage: str, argv: List[str], logger: logging.Logger) -> int:
     """Subprocess one stage; return its exit code. Stream output through."""
+    from fluid_build.cli.auth import _sanitize_argv
+
     cmd = fluid_bin + [stage] + argv
     logger.info("─" * 70)
-    logger.info("[ship %s] $ fluid %s %s", stage, stage, " ".join(argv))
+    # Sanitise argv before logging — a stage may carry credential-bearing
+    # flags (``--*-secret`` / ``--*-token``) the operator passed through.
+    logger.info("[ship %s] $ fluid %s %s", stage, stage, " ".join(_sanitize_argv(argv)))
     logger.info("─" * 70)
     try:
         result = subprocess.run(cmd, check=False)

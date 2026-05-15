@@ -21,9 +21,8 @@ LOGGER = logging.getLogger("fluid.util.cron")
 
 
 def get_cron(contract: dict) -> Optional[str]:
-    """Extract cron schedule from contract (supports both 0.4.0 and 0.5.7)."""
+    """Extract the cron schedule from a fluid-schema-0.7.x contract."""
     try:
-        # Use get_primary_build for version compatibility
         build = get_primary_build(contract)
         if build:
             return build.get("execution", {}).get("trigger", {}).get("cron")

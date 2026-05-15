@@ -16,11 +16,32 @@
 
 import argparse
 import asyncio
+import json
 import logging
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# ``apply.run()`` routes the positional ``contract`` arg through
+# ``validate_cli_path`` (path-traversal hardening), which rejects a
+# non-existent path before the mocked loader runs. These tests mock the
+# loader / read_json, so file content is irrelevant — but the path must
+# exist on disk with an accepted extension. Provide real throwaway files.
+_REAL_CONTRACT = tempfile.NamedTemporaryFile(  # noqa: SIM115 — lives for the test session
+    suffix=".fluid.yaml", delete=False, mode="w"
+)
+_REAL_CONTRACT.write("fluidVersion: '0.7.3'\nid: test\n")
+_REAL_CONTRACT.close()
+_REAL_CONTRACT_PATH = _REAL_CONTRACT.name
+
+_REAL_PLAN = tempfile.NamedTemporaryFile(  # noqa: SIM115 — lives for the test session
+    suffix=".json", delete=False, mode="w"
+)
+json.dump({"actions": [], "contract": {"name": "test"}}, _REAL_PLAN)
+_REAL_PLAN.close()
+_REAL_PLAN_PATH = _REAL_PLAN.name
 
 # ---- Orchestration enums and dataclasses ----
 
@@ -309,7 +330,7 @@ class TestActionsFromSource:
 def _make_simple_args(**overrides):
     """Helper to create args namespace for simple mode tests."""
     defaults = dict(
-        contract="contract.yaml",
+        contract=_REAL_CONTRACT_PATH,
         env="dev",
         dry_run=False,
         yes=True,
@@ -324,6 +345,7 @@ def _make_simple_args(**overrides):
         notify=None,
         config_override=None,
         provider_config=None,
+        bundle=None,
         workspace_dir=Path("."),
         state_file=None,
         keep_temp_files=False,
@@ -340,6 +362,15 @@ def _make_simple_args(**overrides):
 
 class TestApplyRunSimple:
     """Tests for simple mode (no complex config keys)."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_pre_apply_gate(self):
+        """Stub the pre-apply contract gate — these unit tests feed
+        deliberately minimal mock contracts to exercise provider
+        detection / dispatch, not contract schema validity (covered by
+        the validate tests + dedicated gate tests)."""
+        with patch("fluid_build.cli.apply._gate_contract_for_apply", new=MagicMock()):
+            yield
 
     @patch("fluid_build.cli.apply.build_provider")
     @patch("fluid_build.cli.apply.load_contract_with_overlay")
@@ -553,6 +584,14 @@ class TestApplyRunSimple:
 class TestApplyRunComplex:
     """Tests for complex orchestration mode."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_pre_apply_gate(self):
+        """Stub the pre-apply contract gate — these unit tests feed
+        minimal mock contracts to exercise the orchestration engine
+        path, not contract schema validity."""
+        with patch("fluid_build.cli.apply._gate_contract_for_apply", new=MagicMock()):
+            yield
+
     @patch("fluid_build.cli.apply.FluidOrchestrationEngine")
     @patch("fluid_build.cli.apply.FluidPlanGenerator")
     @patch("fluid_build.cli.apply.load_contract_with_overlay")
@@ -631,7 +670,7 @@ class TestApplyRunComplex:
         from fluid_build.cli.apply import run
         from fluid_build.forge.core.plan_digest import inject_digests
 
-        args = _make_simple_args(contract="plan.json", dry_run=True)
+        args = _make_simple_args(contract=_REAL_PLAN_PATH, dry_run=True)
         # Post-Phase-6B, plan.json MUST carry planDigest for the stage-7
         # verification gate. Stamp one in so this test exercises the
         # happy path of digest verification alongside the JSON-load branch.

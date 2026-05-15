@@ -17,7 +17,7 @@
 This is the load-bearing test: without it, federated drift would
 silently apply against stale upstreams. The validator was already
 unit-tested; this fixture verifies the call is **wired** into apply
-and that ``--no-verify-digest`` is the documented escape hatch.
+and that ``--no-verify-federation`` is the documented escape hatch.
 
 We don't run a full apply — that needs a provider, plan, a real
 contract, etc. Instead we patch
@@ -51,7 +51,8 @@ def sample_args(tmp_path: Path):
     return SimpleNamespace(
         contract=str(contract_path),
         env="dev",
-        no_verify_digest=False,
+        no_verify_plan_binding=False,
+        no_verify_federation=False,
         mode="amend",
         target=None,
         dry_run=True,
@@ -92,9 +93,17 @@ def test_federation_gate_aborts_on_drift(monkeypatch, tmp_path, sample_args):
 
     from fluid_build.cli import apply as apply_mod
 
-    with patch(
-        "fluid_build.forge.federation.validate_federated_consumes",
-        return_value=[violation],
+    # The federation contract uses ``upstreamWorkspace`` / ``upstreamDigest``
+    # consume fields that the bundled JSON schema does not yet model, so
+    # the new pre-apply schema gate would reject it first. Stub the gate —
+    # the unit under test here is the federation drift gate, not contract
+    # schema validity.
+    with (
+        patch(
+            "fluid_build.forge.federation.validate_federated_consumes",
+            return_value=[violation],
+        ),
+        patch("fluid_build.cli.apply._gate_contract_for_apply"),
     ):
         with pytest.raises(CLIError) as exc_info:
             apply_mod.run(sample_args, logging.getLogger("test"))
@@ -111,8 +120,8 @@ def test_federation_gate_aborts_on_drift(monkeypatch, tmp_path, sample_args):
     assert violations[0]["actual_digest"] == "sha256:LIVE"
 
 
-def test_federation_gate_bypassed_with_no_verify_digest(monkeypatch, tmp_path, sample_args):
-    """``--no-verify-digest`` must skip the federation gate AND log at
+def test_federation_gate_bypassed_with_no_verify_federation(monkeypatch, tmp_path, sample_args):
+    """``--no-verify-federation`` must skip the federation gate AND log at
     WARNING level so audit trails catch the operator override.
 
     We don't use pytest's ``caplog`` fixture here because it interacts
@@ -121,7 +130,7 @@ def test_federation_gate_bypassed_with_no_verify_digest(monkeypatch, tmp_path, s
     into ``apply_mod.run``, so the assertion is self-contained.
     """
     monkeypatch.chdir(tmp_path)
-    sample_args.no_verify_digest = True
+    sample_args.no_verify_federation = True
 
     import logging
 
@@ -143,9 +152,16 @@ def test_federation_gate_bypassed_with_no_verify_digest(monkeypatch, tmp_path, s
     test_logger.propagate = False
 
     try:
-        with patch("fluid_build.forge.federation.validate_federated_consumes") as mock_validate:
+        # Stub the pre-apply schema gate — the federation contract uses
+        # consume fields not modelled by the bundled schema, and this test
+        # exercises the --no-verify-federation skip path, not schema
+        # validity.
+        with (
+            patch("fluid_build.forge.federation.validate_federated_consumes") as mock_validate,
+            patch("fluid_build.cli.apply._gate_contract_for_apply"),
+        ):
             mock_validate.side_effect = AssertionError(
-                "validate_federated_consumes should be skipped under --no-verify-digest"
+                "validate_federated_consumes should be skipped under --no-verify-federation"
             )
             try:
                 apply_mod.run(sample_args, test_logger)
@@ -157,7 +173,7 @@ def test_federation_gate_bypassed_with_no_verify_digest(monkeypatch, tmp_path, s
 
             assert (
                 not mock_validate.called
-            ), "--no-verify-digest must skip the federation digest gate"
+            ), "--no-verify-federation must skip the federation digest gate"
     finally:
         test_logger.removeHandler(handler)
         test_logger.propagate = prior_propagate

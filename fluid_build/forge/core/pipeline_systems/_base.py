@@ -801,11 +801,18 @@ class BasePipelineTemplate:
                 default_run=True,
                 # Stage 7 uses POSIX ``set --`` + if/then/fi so
                 # parameter-controlled flags (mode, allow-data-loss,
-                # no-verify-digest, build-id) stay as individual argv
+                # no-verify-*, build-id) stay as individual argv
                 # tokens regardless of unquoted env-var expansion. This
                 # is the security-hardened pattern from stage 11 applied
                 # here — avoids the ``${APPLY_BUILD_FLAG}`` argument-
                 # smuggling bug fixed in commit D2.
+                #
+                # NO_VERIFY_DIGEST is the single CI-operator knob; when
+                # true it appends BOTH --no-verify-plan-binding and
+                # --no-verify-federation so the one-knob waives the
+                # plan-binding gate and the federation upstream-digest
+                # gate together (the digest gate is split into two
+                # narrowly-scoped flags at the CLI).
                 command=(
                     "set -eu; "
                     'set -- runtime/plan.json --mode "${APPLY_MODE:-amend}" '
@@ -816,7 +823,7 @@ class BasePipelineTemplate:
                     'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]; then '
                     'set -- "$@" --allow-data-loss; fi; '
                     'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]; then '
-                    'set -- "$@" --no-verify-digest; fi; '
+                    'set -- "$@" --no-verify-plan-binding --no-verify-federation; fi; '
                     'fluid apply "$@"'
                 ),
             ),
@@ -1105,7 +1112,9 @@ class BasePipelineTemplate:
                     "NO_VERIFY_DIGEST",
                     "boolean",
                     "false",
-                    "Stage 7: emergency escape from plan-binding verification. Audit log flag.",
+                    "Stage 7: emergency escape — waives BOTH the plan-binding "
+                    "and federation upstream-digest gates "
+                    "(--no-verify-plan-binding --no-verify-federation). Audit log flag.",
                 ),
                 (
                     "PUBLISH_TARGETS",

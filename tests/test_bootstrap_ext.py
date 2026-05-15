@@ -467,11 +467,12 @@ class TestImp:
 
 
 class TestValidateContractObj:
-    def test_valid_contract(self):
+    def test_valid_contract_baseline_fallback(self):
+        """Schema manager unavailable -> minimal required-field check passes."""
         from fluid_build.cli.bootstrap import validate_contract_obj
 
         contract = {
-            "fluidVersion": "0.5.7",
+            "fluidVersion": "0.7.3",
             "kind": "DataContract",
             "id": "test",
             "name": "Test",
@@ -482,28 +483,32 @@ class TestValidateContractObj:
         assert ok is True
         assert err is None
 
-    def test_invalid_contract_missing_field(self):
+    def test_invalid_contract_missing_field_baseline_fallback(self):
         from fluid_build.cli.bootstrap import validate_contract_obj
 
-        contract = {"fluidVersion": "0.5.7"}  # missing required fields
+        contract = {"fluidVersion": "0.7.3"}  # missing required fields
         with patch("fluid_build.cli.bootstrap._imp", side_effect=ImportError("no schema")):
             ok, err = validate_contract_obj(contract)
         assert ok is False
         assert err is not None
 
-    def test_uses_schema_validate_when_available(self):
-        """Lines 117-121: calls validate_contract from schema module."""
+    def test_uses_schema_manager_when_available(self):
+        """Routes validation through the jsonschema-backed FluidSchemaManager."""
         from fluid_build.cli.bootstrap import validate_contract_obj
 
-        mock_schema_mod = MagicMock()
-        mock_schema_mod.validate_contract = MagicMock(return_value=(True, None))
+        mock_result = MagicMock()
+        mock_result.is_valid = True
+        mock_manager = MagicMock()
+        mock_manager.validate_contract = MagicMock(return_value=mock_result)
+        mock_schema_mgr_mod = MagicMock()
+        mock_schema_mgr_mod.FluidSchemaManager = MagicMock(return_value=mock_manager)
 
-        with patch("fluid_build.cli.bootstrap._imp", return_value=mock_schema_mod):
+        with patch("fluid_build.cli.bootstrap._imp", return_value=mock_schema_mgr_mod):
             ok, err = validate_contract_obj({"id": "test"})
         assert ok is True
 
-    def test_schema_module_exception_falls_to_baseline(self):
-        """Lines 122-123: exception from schema falls through to baseline."""
+    def test_schema_manager_exception_falls_to_baseline(self):
+        """Exception from the schema manager falls through to baseline."""
         from fluid_build.cli.bootstrap import validate_contract_obj
 
         with patch("fluid_build.cli.bootstrap._imp", side_effect=Exception("schema broken")):

@@ -34,6 +34,8 @@ from __future__ import annotations
 
 from typing import Dict, FrozenSet
 
+from ..._sql_safety import SqlTypeError, validate_sql_type_param_payload
+
 # Bare type names that take optional ``(precision, scale)`` parameters; for
 # these, an explicit ``(...)`` suffix is preserved verbatim and uppercased
 # (e.g. ``decimal(18,4)`` → ``DECIMAL(18,4)``).
@@ -96,10 +98,31 @@ def map_fluid_type_to_snowflake(fluid_type: str) -> str:
     - ``"decimal(18,4)"`` → ``"DECIMAL(18,4)"`` (parameter passthrough)
     - ``"timestamp_tz"`` → ``"TIMESTAMP_TZ"``
     - unknown type → ``"VARCHAR"`` (safe fallback)
+
+    The parameterised passthrough branch is a SQL-injection boundary: the
+    returned string is interpolated raw into ``CREATE TABLE`` DDL downstream
+    (``actions/table.py``). A malformed ``(...)`` payload — anything beyond
+    ``(N)`` / ``(N,N)`` — is rejected with :class:`SqlTypeError` here rather
+    than passed through verbatim (BUG-SQL-TYPE defense-in-depth).
     """
     raw_type = (fluid_type or "string").strip()
     lower_type = raw_type.lower()
     base_type = lower_type.split("(", 1)[0].strip()
     if "(" in lower_type and base_type in _PARAMETERIZED_PREFIXES:
+        # Passthrough is only safe once the parameter payload is proven to be
+        # ``N`` / ``N,N``. Split the inner text out of the *first* ``(`` … last
+        # ``)`` and allowlist it; a trailing ``; DROP TABLE t`` (or any other
+        # injection) fails the digits-and-comma check and is rejected.
+        open_paren = raw_type.find("(")
+        close_paren = raw_type.rfind(")")
+        if close_paren <= open_paren:
+            raise SqlTypeError(f"Invalid parameterised SQL type: {fluid_type!r}")
+        payload = raw_type[open_paren + 1 : close_paren]
+        suffix = raw_type[close_paren + 1 :]
+        if suffix.strip():
+            # Anything after the closing paren (e.g. ``decimal(18) ; DROP …``)
+            # is not part of a type and must not survive.
+            raise SqlTypeError(f"Invalid parameterised SQL type: {fluid_type!r}")
+        validate_sql_type_param_payload(payload)
         return raw_type.upper()
     return _TYPE_MAP.get(lower_type, "VARCHAR")

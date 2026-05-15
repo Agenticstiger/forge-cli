@@ -215,9 +215,31 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             },
         )
 
+    # F1 / F6: validate the operator-supplied contract path (traversal,
+    # forbidden system paths, symlink) before it reaches the loader /
+    # ``_parse_file``. Covers both the explicit positional arg and an
+    # auto-found CWD contract. A missing file is mapped to exit code 2 to
+    # preserve ``fluid bundle``'s long-standing "file not found → 2"
+    # contract; traversal / forbidden-path rejections still raise.
+    from fluid_build.cli.core import FluidCLIError
+    from fluid_build.cli.security import validate_cli_path
+
+    try:
+        args.contract = str(validate_cli_path(args.contract, mode="read", file_type="contract"))
+    except FluidCLIError as exc:
+        if exc.event == "file_not_found":
+            sys.stderr.write(f"❌ File not found: {args.contract}\n")
+            return 2
+        raise
+
     contract_path = args.contract
     out = args.out
     env = args.env
+
+    # F1: validate the ``--out`` write target (skipped for ``-`` stdout).
+    # ``must_exist=False`` — the bundle file does not exist yet.
+    if out and out != "-":
+        out = str(validate_cli_path(out, mode="write", must_exist=False, file_type="output"))
 
     # When writing to stdout, move ALL log output to stderr so it doesn't
     # corrupt the YAML/JSON output.  Walk every logger that might write to

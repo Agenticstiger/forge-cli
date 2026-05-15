@@ -26,7 +26,12 @@ except Exception:  # pragma: no cover
     yaml = None  # YAML support optional; JSON still works
 
 
-__all__ = ["load_contract", "load_with_overlay", "compile_contract"]
+__all__ = [
+    "load_contract",
+    "load_with_overlay",
+    "compile_contract",
+    "parse_contract_text",
+]
 
 LOG = logging.getLogger("fluid.loader")
 
@@ -38,6 +43,22 @@ def _read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except Exception as e:  # pragma: no cover
         raise RuntimeError(f"Failed to read file {path}: {e}") from e
+
+
+def _safe_yaml_load(text: str) -> Any:
+    """Parse YAML with billion-laughs (anchor-expansion) protection.
+
+    The primary contract-ingestion path MUST cap anchor expansion and
+    input size: ``yaml.safe_load`` blocks code execution but NOT the
+    exponential alias blow-up, so ``fluid validate`` / ``fluid plan``
+    against an untrusted contract would otherwise be a host-OOM DoS.
+    Routed through :func:`fluid_build.util.safe_yaml.load_yaml_safe`.
+    Imported lazily so ``loader.py`` still imports when PyYAML is absent
+    (JSON-only contracts).
+    """
+    from fluid_build.util.safe_yaml import load_yaml_safe
+
+    return load_yaml_safe(text)
 
 
 def _parse_file(path: Path) -> Dict[str, Any]:
@@ -56,7 +77,7 @@ def _parse_file(path: Path) -> Dict[str, Any]:
                     "YAML parsing requires PyYAML. Install with: pip install pyyaml "
                     "or use JSON (.json) contracts."
                 )
-            obj = yaml.safe_load(text)
+            obj = _safe_yaml_load(text)
             if obj is None:
                 return {}
             if not isinstance(obj, dict):
@@ -68,7 +89,7 @@ def _parse_file(path: Path) -> Dict[str, Any]:
         except Exception:
             if yaml is None:
                 raise
-            obj = yaml.safe_load(text)
+            obj = _safe_yaml_load(text)
             if obj is None:
                 return {}
             if not isinstance(obj, dict):
@@ -76,6 +97,55 @@ def _parse_file(path: Path) -> Dict[str, Any]:
             return obj
     except Exception as e:
         raise RuntimeError(f"Failed to parse {path}: {e}") from e
+
+
+def parse_contract_text(text: str, *, suffix: str = ".yaml") -> Dict[str, Any]:
+    """Parse already-read contract text (JSON or YAML) into a dict.
+
+    The on-disk path goes through :func:`_parse_file`, which reads bytes
+    off disk and then dispatches on the file extension. Callers that have
+    already extracted the contract bytes from elsewhere — most notably the
+    ``contract.resolved.{yaml,json}`` member inside a ``.tgz`` bundle,
+    which cannot be UTF-8 decoded as a whole because the archive is gzip
+    binary — need the *same* parsing semantics without the disk read.
+
+    ``suffix`` selects the parser the same way :func:`_parse_file` keys on
+    ``Path.suffix``: ``.json`` → :func:`json.loads`, ``.yaml`` / ``.yml`` →
+    :func:`_safe_yaml_load`. Anything else falls back to "try JSON first,
+    then YAML". YAML is routed through :func:`_safe_yaml_load` so the
+    billion-laughs (anchor-expansion) protection that guards the on-disk
+    path applies identically to bundle-extracted contracts.
+    """
+    suffix = suffix.lower()
+    try:
+        if suffix == ".json":
+            return json.loads(text)
+        if suffix in (".yaml", ".yml"):
+            if yaml is None:
+                raise RuntimeError(
+                    "YAML parsing requires PyYAML. Install with: pip install pyyaml "
+                    "or use JSON (.json) contracts."
+                )
+            obj = _safe_yaml_load(text)
+            if obj is None:
+                return {}
+            if not isinstance(obj, dict):
+                raise ValueError("contract root must be an object/dict")
+            return obj
+        # Fallback: try JSON first, then YAML (if available).
+        try:
+            return json.loads(text)
+        except Exception:
+            if yaml is None:
+                raise
+            obj = _safe_yaml_load(text)
+            if obj is None:
+                return {}
+            if not isinstance(obj, dict):
+                raise ValueError("contract root must be an object/dict")
+            return obj
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse contract text: {e}") from e
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
@@ -221,18 +291,38 @@ def _resolve_refs(
 
         ref_path = (base_dir / file_part).resolve()
 
-        # Security: block absolute $ref paths and known system directories.
-        # Relative refs (including ../sibling/) are allowed for monorepo layouts,
-        # but absolute paths like /etc/passwd are rejected.
+        # Security (F3): block absolute $ref paths and system directories.
+        # Relative refs (including ../sibling/) are allowed for monorepo
+        # layouts, but absolute paths like /etc/passwd are rejected.
         if file_part.startswith("/"):
             raise RefResolutionError(f"$ref must be a relative path, got absolute: {ref_value}")
-        # Block common system directories even via traversal
-        _ref_str = str(ref_path)
-        _BLOCKED_PREFIXES = ("/etc/", "/var/", "/usr/", "/proc/", "/sys/", "/dev/")
-        if any(_ref_str.startswith(p) for p in _BLOCKED_PREFIXES):
+        # Block system directories even when reached via ``../`` traversal.
+        # The previous inline check used a hand-rolled, Linux-only prefix
+        # list — it missed macOS (``/etc`` resolves to ``/private/etc``)
+        # and Windows entirely. Route through the platform-aware
+        # ``SecurePathValidator`` so the deny set matches the rest of the
+        # CLI. Imported lazily to keep ``loader.py``'s import graph free
+        # of the ``cli`` package.
+        try:
+            from fluid_build.cli.core import FluidCLIError
+            from fluid_build.cli.security import SecurePathValidator, get_security_context
+
+            SecurePathValidator(get_security_context())._validate_path_security(ref_path, "read")
+        except FluidCLIError as exc:
             raise RefResolutionError(
-                f"$ref resolves to a blocked system path: {ref_value} (resolved to {ref_path})"
-            )
+                f"$ref resolves to a blocked system path: {ref_value} " f"(resolved to {ref_path})"
+            ) from exc
+        except ImportError:
+            # Defensive fallback — if the cli.security module is somehow
+            # unavailable, keep the legacy prefix block so refs are still
+            # screened rather than silently allowed.
+            _ref_str = str(ref_path)
+            _BLOCKED_PREFIXES = ("/etc/", "/var/", "/usr/", "/proc/", "/sys/", "/dev/")
+            if any(_ref_str.startswith(p) for p in _BLOCKED_PREFIXES):
+                raise RefResolutionError(
+                    f"$ref resolves to a blocked system path: {ref_value} "
+                    f"(resolved to {ref_path})"
+                )
 
         # Circular detection keyed on absolute path + pointer.
         # Use stack-based tracking: add before descending, remove after.

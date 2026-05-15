@@ -26,7 +26,6 @@ import logging
 import os
 import sys
 from dataclasses import asdict
-from typing import Optional
 
 from fluid_build.cli._errors import SecretResolutionError
 from fluid_build.cli.console import cprint
@@ -49,11 +48,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
     lp = sub.add_parser("login", help="Store a secret under <secretRef>")
     lp.add_argument("ref", help="Secret reference (e.g., postgres.prod.password)")
-    lp.add_argument(
-        "--secret",
-        default=None,
-        help="Secret value (read from stdin / prompt when omitted)",
-    )
+    # SECURITY: the secret value is read ONLY from stdin (non-tty) or an
+    # interactive getpass prompt — never from argv. A ``--secret <value>``
+    # flag leaves the secret visible in ``ps`` / ``/proc/<pid>/cmdline`` /
+    # shell history, so it is deliberately not offered.
     lp.add_argument("--expires-at", default=None, help="ISO-8601 expiry timestamp")
     _add_common(lp)
     lp.set_defaults(cmd=COMMAND, func=_do_login)
@@ -65,11 +63,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
     rp = sub.add_parser("rotate", help="Rotate the secret stored at <secretRef>")
     rp.add_argument("ref", help="Secret reference")
-    rp.add_argument(
-        "--new-secret",
-        default=None,
-        help="New secret value (read from stdin / prompt when omitted)",
-    )
+    # SECURITY: replacement secret is stdin/prompt only — see the login
+    # parser above for why a ``--new-secret <value>`` flag is not offered.
     rp.add_argument("--expires-at", default=None, help="ISO-8601 expiry timestamp")
     _add_common(rp)
     rp.set_defaults(cmd=COMMAND, func=_do_rotate)
@@ -90,9 +85,11 @@ def _backend():
     return KeychainBackend()
 
 
-def _read_secret(provided: Optional[str], *, prompt: str) -> str:
-    if provided is not None:
-        return provided
+def _read_secret(*, prompt: str) -> str:
+    """Read a secret value from stdin (non-interactive) or an interactive
+    getpass prompt. Never accepts the value from argv — a CLI flag would
+    leak it via ``ps`` / ``/proc/<pid>/cmdline`` / shell history.
+    """
     if not sys.stdin.isatty():
         return sys.stdin.read().rstrip("\n")
     return getpass.getpass(prompt)
@@ -114,12 +111,12 @@ def _emit(args, result) -> int:
 def _do_login(args, logger: logging.Logger) -> int:
     from fluid_build.cli.ops.auth import login
 
-    secret = _read_secret(getattr(args, "secret", None), prompt=f"Secret for {args.ref}: ")
+    secret = _read_secret(prompt=f"Secret for {args.ref}: ")
     if not secret:
         raise SecretResolutionError.for_ref(
             ref=args.ref,
             reason="No secret value provided (stdin empty / prompt cancelled)",
-            fix="Pipe the secret to stdin or pass --secret <value>.",
+            fix="Pipe the secret to stdin, or run interactively to be prompted.",
         )
     result = login(
         args.ref, obtain_secret=lambda: secret, backend=_backend(), expires_at=args.expires_at
@@ -137,14 +134,12 @@ def _do_verify(args, logger: logging.Logger) -> int:
 def _do_rotate(args, logger: logging.Logger) -> int:
     from fluid_build.cli.ops.auth import rotate
 
-    new_secret = _read_secret(
-        getattr(args, "new_secret", None), prompt=f"New secret for {args.ref}: "
-    )
+    new_secret = _read_secret(prompt=f"New secret for {args.ref}: ")
     if not new_secret:
         raise SecretResolutionError.for_ref(
             ref=args.ref,
             reason="No replacement secret provided (stdin empty / prompt cancelled)",
-            fix="Pipe the new secret to stdin or pass --new-secret <value>.",
+            fix="Pipe the new secret to stdin, or run interactively to be prompted.",
         )
     result = rotate(args.ref, new_secret=new_secret, backend=_backend(), expires_at=args.expires_at)
     return _emit(args, result)

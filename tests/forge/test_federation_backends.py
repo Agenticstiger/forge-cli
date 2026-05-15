@@ -29,14 +29,12 @@ Each test exercises:
 
 from __future__ import annotations
 
-import io
-import json
-import os
 from pathlib import Path
-from typing import Any, Dict
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
+import httpx
 import pytest
+import respx
 
 from fluid_build.forge.federation import (
     FederatedWorkspace,
@@ -46,6 +44,18 @@ from fluid_build.forge.federation import (
     fetch_federated_digest,
     store_cached_digest,
 )
+
+# The federation HTTP/catalog backends were migrated off
+# ``urllib.request.urlopen`` (which followed up to 10 redirects and
+# re-sent auth headers cross-host) to ``httpx`` with
+# ``follow_redirects=False`` + an SSRF host gate. These tests therefore
+# mock ``httpx`` via ``respx`` and stub the ``_hostname_is_private``
+# gate to "public host" so the synthetic test endpoints aren't refused
+# by the fail-closed DNS check. The SSRF gate itself has dedicated
+# coverage in ``test_federation_ssrf.py``.
+
+_PUBLIC = "fluid_build.forge.federation._hostname_is_private"
+
 
 # ──────────────────── HTTP registry backend ────────────────────────────
 
@@ -60,59 +70,63 @@ class TestHttpBackend:
         defaults.update(overrides)
         return FederatedWorkspace(**defaults)
 
+    @respx.mock
     def test_happy_path_returns_digest(self):
         ws = self._ws()
-        fake_resp = MagicMock()
-        fake_resp.read.return_value = b"sha256:abc123\n"
-        fake_resp.__enter__.return_value = fake_resp
-        fake_resp.__exit__.return_value = False
-
-        with patch("urllib.request.urlopen", return_value=fake_resp):
+        respx.get("https://registry.example/api/orders_v1/1/digest").mock(
+            return_value=httpx.Response(200, text="sha256:abc123\n")
+        )
+        with patch(_PUBLIC, return_value=False):
             result = _fetch_digest_via_http(ws, "orders_v1", "1")
         assert result == "sha256:abc123"
 
+    @respx.mock
     def test_bearer_auth_header_built_from_secret_ref(self, monkeypatch):
         ws = self._ws(auth_mode="bearer", auth_secret_ref="REGISTRY_TOKEN")
         monkeypatch.setenv("REGISTRY_TOKEN", "tok-9876")
 
-        captured: Dict[str, Any] = {}
-
-        def fake_urlopen(req, timeout=15):
-            captured["url"] = req.full_url
-            captured["headers"] = dict(req.header_items())
-            resp = MagicMock()
-            resp.read.return_value = b"sha256:def\n"
-            resp.__enter__.return_value = resp
-            resp.__exit__.return_value = False
-            return resp
-
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        route = respx.get("https://registry.example/api/p/1/digest").mock(
+            return_value=httpx.Response(200, text="sha256:def\n")
+        )
+        with patch(_PUBLIC, return_value=False):
             result = _fetch_digest_via_http(ws, "p", "1")
         assert result == "sha256:def"
-        # Header keys are normalised to title-case by urllib.
-        assert captured["headers"].get("Authorization") == "Bearer tok-9876"
+        assert route.calls[0].request.headers.get("Authorization") == "Bearer tok-9876"
 
+    @respx.mock
     def test_http_error_returns_none(self):
-        import urllib.error
-
         ws = self._ws()
-        with patch(
-            "urllib.request.urlopen",
-            side_effect=urllib.error.HTTPError(
-                url="x", code=403, msg="forbidden", hdrs=None, fp=None
-            ),
-        ):
+        respx.get("https://registry.example/api/p/1/digest").mock(
+            return_value=httpx.Response(403, text="forbidden")
+        )
+        with patch(_PUBLIC, return_value=False):
             result = _fetch_digest_via_http(ws, "p", "1")
         assert result is None
 
+    @respx.mock
     def test_unexpected_body_returns_none(self):
         ws = self._ws()
-        fake_resp = MagicMock()
-        fake_resp.read.return_value = b"<html>not a digest</html>"
-        fake_resp.__enter__.return_value = fake_resp
-        fake_resp.__exit__.return_value = False
+        respx.get("https://registry.example/api/p/1/digest").mock(
+            return_value=httpx.Response(200, text="<html>not a digest</html>")
+        )
+        with patch(_PUBLIC, return_value=False):
+            result = _fetch_digest_via_http(ws, "p", "1")
+        assert result is None
 
-        with patch("urllib.request.urlopen", return_value=fake_resp):
+    @respx.mock
+    def test_redirect_is_not_followed_by_default(self):
+        """``follow_redirects=False`` is the SSRF-safe default: a bare
+        30x without an in-bounds Location-chase that resolves a digest
+        yields ``None`` rather than chasing the redirect blindly."""
+        ws = self._ws()
+        respx.get("https://registry.example/api/p/1/digest").mock(
+            return_value=httpx.Response(302, headers={"Location": "https://registry.example/x"})
+        )
+        # The redirect target also 30x-loops so the bounded loop gives up.
+        respx.get("https://registry.example/x").mock(
+            return_value=httpx.Response(302, headers={"Location": "https://registry.example/x"})
+        )
+        with patch(_PUBLIC, return_value=False):
             result = _fetch_digest_via_http(ws, "p", "1")
         assert result is None
 
@@ -130,36 +144,33 @@ class TestCatalogBackend:
         defaults.update(overrides)
         return FederatedWorkspace(**defaults)
 
+    @respx.mock
     def test_happy_path_returns_digest(self):
         ws = self._ws()
-        fake_resp = MagicMock()
-        fake_resp.read.return_value = json.dumps({"digest": "sha256:cat"}).encode()
-        fake_resp.__enter__.return_value = fake_resp
-        fake_resp.__exit__.return_value = False
-
-        with patch("urllib.request.urlopen", return_value=fake_resp):
+        respx.get("https://catalog.example/api/products/orders/versions/1").mock(
+            return_value=httpx.Response(200, json={"digest": "sha256:cat"})
+        )
+        with patch(_PUBLIC, return_value=False):
             result = _fetch_digest_via_catalog(ws, "orders", "1")
         assert result == "sha256:cat"
 
+    @respx.mock
     def test_missing_digest_field_returns_none(self):
         ws = self._ws()
-        fake_resp = MagicMock()
-        fake_resp.read.return_value = json.dumps({"name": "orders"}).encode()
-        fake_resp.__enter__.return_value = fake_resp
-        fake_resp.__exit__.return_value = False
-
-        with patch("urllib.request.urlopen", return_value=fake_resp):
+        respx.get("https://catalog.example/api/products/orders/versions/1").mock(
+            return_value=httpx.Response(200, json={"name": "orders"})
+        )
+        with patch(_PUBLIC, return_value=False):
             result = _fetch_digest_via_catalog(ws, "orders", "1")
         assert result is None
 
+    @respx.mock
     def test_404_returns_none(self):
-        import urllib.error
-
         ws = self._ws()
-        with patch(
-            "urllib.request.urlopen",
-            side_effect=urllib.error.HTTPError(url="x", code=404, msg="nf", hdrs=None, fp=None),
-        ):
+        respx.get("https://catalog.example/api/products/orders/versions/1").mock(
+            return_value=httpx.Response(404, text="nf")
+        )
+        with patch(_PUBLIC, return_value=False):
             result = _fetch_digest_via_catalog(ws, "orders", "1")
         assert result is None
 

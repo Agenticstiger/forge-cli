@@ -324,9 +324,15 @@ class GovernanceValidator:
     def get_table_properties(self) -> Dict[str, Any]:
         """Get table properties (clustering, retention, etc.)"""
         try:
+            # ``self.table`` is already ``validate_ident``-ed, so the only
+            # special character it can contain is ``_`` — a LIKE wildcard.
+            # Escape it with a pinned ``ESCAPE '\\'`` and route the pattern
+            # through ``quote_string_literal`` so the single-quote handling
+            # matches the central SQL-safety helper (no inline ``.replace``).
+            like_pattern = quote_string_literal(self.table.replace("_", "\\_"))
             self.cursor.execute(
-                "SHOW TABLES LIKE '{}' IN {}".format(
-                    self.table.replace("_", "\\_"),
+                "SHOW TABLES LIKE {} ESCAPE '\\\\' IN {}".format(
+                    like_pattern,
                     _qualified_name(self.database, self.schema),
                 )
             )
@@ -730,13 +736,11 @@ class UnifiedGovernanceApplicator:
         safe_tag_value = quote_string_literal(str(tag_value))
         if not self.dry_run:
             try:
-                self.cursor.execute(
-                    f"""
+                self.cursor.execute(f"""
                     ALTER TABLE {full_table}
                     MODIFY COLUMN {safe_column_name}
                     SET TAG {safe_tag_name} = {safe_tag_value}
-                """
-                )
+                """)
             except Exception as e:
                 logger.warning(
                     f"Could not apply tag {safe_tag_name} to column {safe_column_name}: {e}"
@@ -799,13 +803,11 @@ class UnifiedGovernanceApplicator:
         if not self.dry_run:
             try:
                 _, schema, _ = _parse_qualified_name(full_table)
-                self.cursor.execute(
-                    f"""
+                self.cursor.execute(f"""
                     ALTER TABLE {full_table}
                     MODIFY COLUMN {safe_column_name}
                     SET MASKING POLICY {_qualified_name(schema, safe_policy_name)}
-                """
-                )
+                """)
                 cprint(f"   ✅ Applied {safe_policy_name} to {safe_column_name}")
                 self.stats["masking_policies_applied"] += 1
             except Exception as e:

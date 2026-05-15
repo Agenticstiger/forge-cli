@@ -102,9 +102,7 @@ def test_load_upstream_products_canonicalises_layer_only(tmp_path: Path):
     """Contracts with only layer get productType filled in via the registry."""
     p1 = tmp_path / "p" / "contract.fluid.yaml"
     p1.parent.mkdir(parents=True, exist_ok=True)
-    p1.write_text(
-        textwrap.dedent(
-            """
+    p1.write_text(textwrap.dedent("""
             fluidVersion: '0.7.3'
             kind: DataProduct
             id: x.y.orders_v2
@@ -115,9 +113,7 @@ def test_load_upstream_products_canonicalises_layer_only(tmp_path: Path):
               owner:
                 team: data
             exposes: []
-            """
-        ).strip()
-    )
+            """).strip())
     products, _ = load_upstream_products([p1])
     assert products[0].product_type == "ADP"  # Silver → ADP via registry
 

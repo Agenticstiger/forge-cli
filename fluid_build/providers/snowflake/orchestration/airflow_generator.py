@@ -25,6 +25,7 @@ Converts FLUID provider action tasks into Airflow operators:
 
 from typing import Any, Dict, List, Optional
 
+from ..._sql_safety import quote_string_literal
 from ..registry import SnowflakeActionRegistry
 from .common import OrchestrationConfig, OrchestrationEngine, extract_dependencies, sanitize_task_id
 
@@ -190,14 +191,19 @@ def _generate_provider_action_task(
     else:
         sql = f"-- TODO: Generate SQL for {action}"
 
-    # Escape SQL for Python string
-    sql.replace("'", "\\'").replace('"', '\\"')
+    # The SQL body is interpolated into a triple-double-quoted operator
+    # argument in the generated DAG. A literal triple-double-quote run in
+    # the SQL would close that string early and emit broken Python, so
+    # rewrite each run to its backslash-escaped form: a valid in-string
+    # representation Python does not treat as a string terminator. The SQL
+    # is preserved verbatim when the generated DAG executes.
+    sql_clean = sql.replace('"""', '\\"\\"\\"')
 
     return f'''{task_id} = SnowflakeOperator(
     task_id='{task_id}',
     snowflake_conn_id='{config.snowflake_conn_id}',
     sql="""
-{sql}
+{sql_clean}
     """,
     dag=dag,
 )
@@ -285,7 +291,7 @@ def _generate_create_table_sql(params: Dict[str, Any]) -> str:
         sql += f"\nCLUSTER BY ({cols})"
 
     if comment:
-        sql += f"\nCOMMENT = '{comment}'"
+        sql += f"\nCOMMENT = {quote_string_literal(str(comment))}"
 
     sql += ";"
 
@@ -301,7 +307,7 @@ def _generate_create_database_sql(params: Dict[str, Any]) -> str:
     sql = f'CREATE {"TRANSIENT " if transient else ""}DATABASE IF NOT EXISTS "{database}"'
 
     if comment:
-        sql += f" COMMENT = '{comment}'"
+        sql += f" COMMENT = {quote_string_literal(str(comment))}"
 
     sql += ";"
 
@@ -318,7 +324,7 @@ def _generate_create_schema_sql(params: Dict[str, Any]) -> str:
     sql = f'CREATE {"TRANSIENT " if transient else ""}SCHEMA IF NOT EXISTS "{database}"."{schema}"'
 
     if comment:
-        sql += f" COMMENT = '{comment}'"
+        sql += f" COMMENT = {quote_string_literal(str(comment))}"
 
     sql += ";"
 

@@ -35,6 +35,7 @@ requests (id ≥ 1_000_000) and writes synthetic replies; meanwhile the
 main test thread sends the original ``tools/call`` and waits for the
 final ``tools/call`` response.
 """
+
 from __future__ import annotations
 
 import json

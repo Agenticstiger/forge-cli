@@ -46,6 +46,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 import yaml
 
 from fluid_build.forge.core.bundle import SOURCE_SENTINEL, validate_manifest
+from fluid_build.util.safe_yaml import load_yaml_safe
 
 LOG = logging.getLogger("fluid.forge.core.validators")
 
@@ -119,7 +120,7 @@ def unwrap_source_pointers(
         if ext == "sql":
             return raw.decode("utf-8")
         if ext in ("yaml", "yml"):
-            return yaml.safe_load(raw)
+            return load_yaml_safe(raw)
         if ext == "json":
             return json.loads(raw.decode("utf-8"))
         return raw.decode("utf-8")
@@ -281,7 +282,7 @@ def validate_openapi(
         if path.endswith(".json"):
             spec = json.loads(content.decode("utf-8"))
         else:
-            spec = yaml.safe_load(content)
+            spec = load_yaml_safe(content)
     except (yaml.YAMLError, json.JSONDecodeError) as exc:
         return [
             ValidationIssue(
@@ -430,11 +431,22 @@ class BundleValidationReport:
         }
 
 
+# Bundles are untrusted until the MANIFEST SHA-256 gate passes — cap the
+# read so a decompression-bomb member cannot OOM the process first.
+_MAX_TGZ_MEMBER_BYTES = 64 * 1024 * 1024  # 64 MiB
+
+
 def _read_tgz_file(tar: tarfile.TarFile, path: str) -> bytes:
     member = tar.extractfile(path)
     if member is None:
         raise ValueError(f"{path!r} is not a regular file in bundle")
-    return member.read()
+    data = member.read(_MAX_TGZ_MEMBER_BYTES + 1)
+    if len(data) > _MAX_TGZ_MEMBER_BYTES:
+        raise ValueError(
+            f"bundle member {path!r} exceeds the {_MAX_TGZ_MEMBER_BYTES}-byte "
+            "read cap (possible decompression bomb)"
+        )
+    return data
 
 
 def validate_bundle(
@@ -505,7 +517,7 @@ def validate_bundle(
         dialect: Optional[str] = None
         if "contract.resolved.yaml" in declared_files:
             try:
-                raw_doc = yaml.safe_load(_read_tgz_file(tar, "contract.resolved.yaml"))
+                raw_doc = load_yaml_safe(_read_tgz_file(tar, "contract.resolved.yaml"))
                 resolved_contract = unwrap_source_pointers(raw_doc, _resolve)
                 dialect = infer_sqlglot_dialect(resolved_contract)
             except (yaml.YAMLError, ValueError) as exc:

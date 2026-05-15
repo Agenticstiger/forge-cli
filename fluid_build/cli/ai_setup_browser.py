@@ -227,10 +227,12 @@ def _try_localhost_callback_oauth(
         LlmConfig,
     )
 
-    legacy = BUILTIN_LLM_PROVIDERS.get(provider)
-    model = legacy.default_model if legacy is not None else ""
+    provider_entry = BUILTIN_LLM_PROVIDERS.get(provider)
+    model = provider_entry.default_model if provider_entry is not None else ""
     endpoint = (
-        legacy.default_endpoint(model, dict(__import__("os").environ)) if legacy is not None else ""
+        provider_entry.default_endpoint(model, dict(__import__("os").environ))
+        if provider_entry is not None
+        else ""
     )
     return LlmConfig(provider=provider, model=model, endpoint=endpoint, api_key=token)
 

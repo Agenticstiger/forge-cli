@@ -28,10 +28,13 @@ on the same ``ProductTypeAnswer`` produces a byte-identical contract
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
+
+from fluid_build.util.safe_yaml import load_yaml_safe
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -408,6 +411,186 @@ class CompositionViolation:
     reason: str
 
 
+# Directory names that never hold sibling FLUID contracts. Skipping them
+# keeps the workspace scan from descending into version-control internals,
+# dependency caches, and virtualenvs — the trees that make ``rglob`` slow
+# without ever yielding a ``*.fluid.yaml`` worth parsing.
+_SCAN_SKIP_DIRS: FrozenSet[str] = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".tox",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "site-packages",
+        ".idea",
+        ".vscode",
+        "dist",
+        "build",
+        ".eggs",
+    }
+)
+
+# Marker files/dirs that identify a project/workspace root. The ancestor
+# walk stops once it finds one of these — a contract that lives inside a
+# real project never needs to look above the project boundary, and
+# stopping there prevents the scan from escaping into ``/tmp``, ``/var``,
+# or ``/`` when the contract sits in a shallow path.
+_WORKSPACE_BOUNDARY_MARKERS: Tuple[str, ...] = (
+    ".git",
+    ".fluid",
+    "fluid.yaml",
+    "pyproject.toml",
+    ".hg",
+    ".svn",
+)
+
+# Hard cap on ancestor levels — a backstop for the (rare) case where no
+# boundary marker exists anywhere above the contract.
+_MAX_ANCESTOR_LEVELS = 3
+
+
+def _is_workspace_boundary(directory: Path) -> bool:
+    """True if *directory* contains a project-root marker."""
+    for marker in _WORKSPACE_BOUNDARY_MARKERS:
+        try:
+            if (directory / marker).exists():
+                return True
+        except OSError:  # pragma: no cover — defensive (permissions, etc.)
+            continue
+    return False
+
+
+def _resolve_scan_roots(
+    workspace_root: Optional[Path],
+    contract_path: Optional[Path],
+) -> List[Path]:
+    """Resolve the workspace search roots for composition scanning.
+
+    Explicit ``workspace_root`` wins. Otherwise walk up from the
+    contract directory, **stopping at the first workspace boundary**
+    (a dir with ``.git`` / ``.fluid`` / ``pyproject.toml`` / …) so the
+    scan can never escape into ``/tmp`` or ``/``. Falls back to cwd.
+    """
+    if workspace_root is not None:
+        return [Path(workspace_root)]
+    if contract_path is None:
+        return [Path.cwd()]
+
+    base = Path(contract_path).parent
+    roots: List[Path] = [base]
+    # If the contract directory itself is a workspace root, don't walk up
+    # at all — the contract's own directory is the bounded scan root.
+    if _is_workspace_boundary(base):
+        return roots
+    cur = base
+    for _ in range(_MAX_ANCESTOR_LEVELS):
+        parent = cur.parent
+        if parent == cur:  # reached filesystem root
+            break
+        cur = parent
+        roots.append(cur)
+        if _is_workspace_boundary(cur):
+            # This ancestor is the workspace boundary — include it and
+            # stop. Everything above it is out of scope.
+            break
+    return roots
+
+
+def _build_product_type_index(
+    roots: List[Path],
+    self_path: Optional[Path],
+) -> Dict[str, Optional[str]]:
+    """Scan ``roots`` ONCE and index ``{product id: productType code}``.
+
+    Each root is walked a single time and each ``*.fluid.yaml`` file is
+    parsed at most once, regardless of how many ``consumes[]`` entries
+    will be looked up against the result. Dot-dirs, VCS internals, and
+    dependency caches are skipped so the walk stays bounded even when a
+    root sits high in the tree.
+
+    Parsing routes through :func:`load_yaml_safe` for billion-laughs
+    protection. A file that fails to parse simply contributes nothing.
+    """
+    index: Dict[str, Optional[str]] = {}
+    seen_files: set[Path] = set()
+    seen_roots: set[Path] = set()
+
+    for root in roots:
+        try:
+            resolved_root = root.resolve()
+        except OSError:  # pragma: no cover — defensive
+            resolved_root = root
+        if resolved_root in seen_roots:
+            continue
+        seen_roots.add(resolved_root)
+        if not root.exists():
+            continue
+        for candidate in _iter_fluid_yaml(root):
+            try:
+                resolved = candidate.resolve()
+            except OSError:  # pragma: no cover — defensive
+                resolved = candidate
+            if resolved in seen_files:
+                continue
+            seen_files.add(resolved)
+            if self_path is not None and resolved == self_path:
+                continue
+            try:
+                data = load_yaml_safe(candidate.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            pid = data.get("id")
+            if not pid or pid in index:
+                # First-writer-wins keeps the result deterministic and
+                # avoids re-resolving a productType already indexed.
+                continue
+            md = data.get("metadata") or {}
+            raw = md.get("productType") or md.get("layer")
+            if not raw:
+                index[str(pid)] = None
+                continue
+            pt = get_product_type(str(raw))
+            index[str(pid)] = pt.code if pt else None
+    return index
+
+
+def _iter_fluid_yaml(root: Path):
+    """Yield every ``*.fluid.yaml`` under *root*, skipping noise dirs.
+
+    A bounded replacement for ``root.rglob("*.fluid.yaml")``: it prunes
+    ``_SCAN_SKIP_DIRS`` and any other dot-directory so the traversal
+    never descends into VCS internals, virtualenvs, or dependency
+    caches — the trees that make an unbounded ``rglob`` pathological.
+    """
+    stack: List[Path] = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:  # pragma: no cover — unreadable dir
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    name = entry.name
+                    if name in _SCAN_SKIP_DIRS or name.startswith("."):
+                        continue
+                    stack.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False) and entry.name.endswith(".fluid.yaml"):
+                    yield Path(entry.path)
+            except OSError:  # pragma: no cover — defensive
+                continue
+
+
 def validate_composition_for_contract(
     contract: Dict,
     *,
@@ -419,6 +602,14 @@ def validate_composition_for_contract(
     Resolves this contract's ``metadata.productType`` (or the
     equivalent layer mapping) and looks up each upstream's productType
     by walking ``workspace_root`` for matching ``*.fluid.yaml`` files.
+
+    The workspace is scanned **exactly once** per call — every
+    ``*.fluid.yaml`` is parsed at most once and the result is indexed
+    by ``id``, so a contract with N ``consumes[]`` entries does N dict
+    lookups rather than N full-filesystem walks. The ancestor walk that
+    resolves the scan root stops at the first workspace boundary
+    (``.git`` / ``.fluid`` / ``pyproject.toml`` / …) so it can never
+    escape into ``/tmp`` or ``/``.
 
     Returns the list of :class:`CompositionViolation`s — empty when
     every consume is consistent OR when the upstream's productType
@@ -445,67 +636,25 @@ def validate_composition_for_contract(
     if not consumes:
         return []
 
-    # Resolve the workspace search root: explicit > contract dir +
-    # ancestors > cwd.
-    roots: List[Path] = []
-    if workspace_root is not None:
-        roots.append(Path(workspace_root))
-    elif contract_path is not None:
-        base = Path(contract_path).parent
-        roots.append(base)
-        cur = base
-        for _ in range(3):  # bounded ancestor walk
-            cur = cur.parent
-            if cur != cur.parent:
-                roots.append(cur)
-    else:
-        roots.append(Path.cwd())
+    roots = _resolve_scan_roots(workspace_root, contract_path)
+    self_path: Optional[Path] = None
+    if contract_path is not None:
+        try:
+            self_path = Path(contract_path).resolve()
+        except OSError:  # pragma: no cover — defensive
+            self_path = None
+
+    # One scan, one index — reused for every ``consumes[]`` entry below.
+    type_index = _build_product_type_index(roots, self_path)
 
     upstream_types: Dict[str, Optional[str]] = {}
     for c in consumes:
         ref = c.get("productId") or c.get("ref") or c.get("provider")
         if not ref:
             continue
-        upstream_types[str(ref)] = _scan_workspace_for_product_type(str(ref), roots, contract_path)
+        upstream_types[str(ref)] = type_index.get(str(ref))
 
     return validate_composition(target_type=target_pt.code, upstream_types=upstream_types)
-
-
-def _scan_workspace_for_product_type(
-    product_id: str,
-    roots: List[Path],
-    contract_path: Optional[Path],
-) -> Optional[str]:
-    """Walk ``roots`` for a ``*.fluid.yaml`` whose ``id`` equals
-    ``product_id``; return its productType code or ``None``."""
-    try:
-        import yaml
-    except Exception:  # pragma: no cover
-        return None
-
-    self_path = Path(contract_path).resolve() if contract_path else None
-
-    for root in roots:
-        if not root.exists():
-            continue
-        try:
-            for candidate in root.rglob("*.fluid.yaml"):
-                if self_path is not None and candidate.resolve() == self_path:
-                    continue
-                try:
-                    data = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
-                except Exception:
-                    continue
-                if data.get("id") == product_id:
-                    md = data.get("metadata") or {}
-                    raw = md.get("productType") or md.get("layer")
-                    if not raw:
-                        return None
-                    pt = get_product_type(str(raw))
-                    return pt.code if pt else None
-        except Exception:  # pragma: no cover — defensive
-            continue
-    return None
 
 
 def validate_composition(

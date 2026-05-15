@@ -104,7 +104,15 @@ class GcpProvider(BaseProvider):
         ``CREATE OR REPLACE TABLE <orig> AS SELECT * FROM <backup>``
         is atomic. Storage cost applies (the backup is a real copy
         of the data, not a metadata pointer).
+
+        Every component of both fully-qualified names is validated
+        before interpolation: the project component via the GCP
+        project-ID shape check, and the dataset / table components via
+        ``_sql_safety.validate_ident``. Invalid snapshot metadata yields
+        an empty DDL list rather than an unsafe statement.
         """
+        from .plan.planner import _validated_bq_fqn
+
         location = snapshot.get("location") or {}
         db = location.get("database")
         sch = location.get("schema")
@@ -112,9 +120,13 @@ class GcpProvider(BaseProvider):
         backup = location.get("backup_table") or snapshot.get("backup_name")
         if not (db and sch and tbl and backup):
             return []
-        return [
-            f"CREATE OR REPLACE TABLE `{db}.{sch}.{tbl}` AS SELECT * FROM `{db}.{sch}.{backup}`"
-        ]
+        try:
+            orig_fqn = _validated_bq_fqn(db, sch, tbl)
+            backup_fqn = _validated_bq_fqn(db, sch, backup)
+        except ValueError as exc:
+            self.warn_kv(event="restore_ddl_invalid_identifier", error=str(exc))
+            return []
+        return [f"CREATE OR REPLACE TABLE {orig_fqn} AS SELECT * FROM {backup_fqn}"]
 
     def cleanup_backups(self, snapshots: List[Mapping[str, Any]]) -> None:
         """Drop BigQuery backup tables (best-effort)."""

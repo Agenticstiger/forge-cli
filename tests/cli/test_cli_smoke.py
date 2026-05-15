@@ -241,12 +241,16 @@ class TestPlanCommand:
         assert "actions" in plan or "provider" in plan
 
     def test_plan_default_output_path(self, tmp_path, _clean_env, monkeypatch):
-        """Without --out, plan writes to runtime/plan.json relative to cwd."""
+        """Without --out, plan writes plan.json into the current directory.
+
+        Bug A2-3 fix: the default was ``runtime/plan.json``, which clobbered a
+        repo-relative file across runs. It is now ``plan.json`` in the cwd.
+        """
         contract_file = _write_contract(tmp_path, MINIMAL_CONTRACT_071)
         monkeypatch.chdir(tmp_path)
         rc = main(["plan", str(contract_file), "--provider", "local"])
         assert rc == 0
-        default_plan = tmp_path / "runtime" / "plan.json"
+        default_plan = tmp_path / "plan.json"
         assert default_plan.exists()
 
     def test_plan_missing_contract(self, tmp_path, _clean_env):
@@ -302,8 +306,14 @@ class TestPlanCommand:
         rc = main(["plan", str(contract_file), "--out", str(out_file)])
         assert rc == 0
 
-    def test_plan_057_legacy(self, tmp_path, _clean_env):
-        """Plan should handle 0.5.7-style contracts."""
+    def test_plan_057_rejected(self, tmp_path, _clean_env):
+        """``fluid plan`` must reject pre-0.7 (0.5.7) contracts.
+
+        Pre-0.7 schemas are end-of-life; ``plan`` now runs the same
+        pre-0.7 rejection gate ``validate`` runs (it used to happily plan
+        a 0.5.7 contract and emit a signed plan.json with exit 0). The
+        gate fails with a non-zero exit and writes no plan.
+        """
         contract_file = _write_contract(tmp_path, MINIMAL_CONTRACT_057)
         out_file = tmp_path / "plan.json"
         rc = main(
@@ -316,7 +326,9 @@ class TestPlanCommand:
                 "local",
             ]
         )
-        assert rc == 0
+        assert rc != 0, "plan must reject a pre-0.7 contract"
+        # No success plan should be written when the gate rejects.
+        assert not out_file.exists(), "plan.json must not be written for a rejected contract"
 
 
 # =====================================================================

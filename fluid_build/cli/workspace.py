@@ -212,8 +212,7 @@ class WorkspaceManager:
         """Initialize workspace database"""
         with sqlite3.connect(self.db_path) as conn:
             # Workspace configuration
-            conn.execute(
-                """
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS workspace_config (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     name TEXT NOT NULL,
@@ -223,12 +222,10 @@ class WorkspaceManager:
                     settings TEXT,
                     integrations TEXT
                 )
-            """
-            )
+            """)
 
             # Team members
-            conn.execute(
-                """
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS team_members (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -238,12 +235,10 @@ class WorkspaceManager:
                     last_active TEXT,
                     permissions TEXT
                 )
-            """
-            )
+            """)
 
             # Contract versions
-            conn.execute(
-                """
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS contract_versions (
                     id TEXT PRIMARY KEY,
                     contract_path TEXT NOT NULL,
@@ -256,12 +251,10 @@ class WorkspaceManager:
                     reviewers TEXT,
                     approvals TEXT
                 )
-            """
-            )
+            """)
 
             # Change requests
-            conn.execute(
-                """
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS change_requests (
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
@@ -275,12 +268,10 @@ class WorkspaceManager:
                     reviewers TEXT,
                     comments TEXT
                 )
-            """
-            )
+            """)
 
             # Activity log
-            conn.execute(
-                """
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS activity_log (
                     id TEXT PRIMARY KEY,
                     timestamp TEXT NOT NULL,
@@ -290,8 +281,7 @@ class WorkspaceManager:
                     target_id TEXT,
                     details TEXT
                 )
-            """
-            )
+            """)
 
     def _ensure_git_repo(self):
         """Ensure workspace has git repository for version control"""

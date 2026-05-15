@@ -498,6 +498,22 @@ async def run_async(args, logger: logging.Logger) -> int:
         logger.error(f"Contract files not found: {', '.join(str(p) for p in invalid_paths)}")
         return 1
 
+    # F1 / F6: validate every (glob-expanded) contract path through the
+    # platform-aware path validator — traversal, forbidden system paths,
+    # symlink — before ``load_contract`` / ``load_contract_with_overlay``
+    # touches it. Glob *patterns* are expanded above; the concrete paths
+    # they resolve to are screened here.
+    from fluid_build.cli.core import FluidCLIError as _FluidCLIError
+    from fluid_build.cli.security import validate_cli_path
+
+    try:
+        contract_paths = [
+            validate_cli_path(p, mode="read", file_type="contract") for p in contract_paths
+        ]
+    except _FluidCLIError as exc:
+        logger.error(f"Rejected contract path: {exc.message}")
+        return 1
+
     # Resolve the target list from --target (new) + --catalog (deprecated).
     # Format: list of (name, endpoint_override or None). If neither flag is
     # set, default to a single fluid-command-center target — matches the

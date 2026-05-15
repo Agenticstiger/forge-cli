@@ -21,6 +21,7 @@ notification dispatch, and metric export.
 
 import json
 import logging
+import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -29,6 +30,27 @@ import fluid_build.cli.apply as _apply_mod
 from fluid_build.cli.apply import COMMAND, _actions_from_source
 
 LOG = logging.getLogger("test_apply_ext")
+
+
+# ``apply.run()`` routes the positional ``contract`` arg through
+# ``validate_cli_path`` (path-traversal hardening) — which rejects a
+# non-existent path before the mocked loader is reached. These tests mock
+# ``load_contract_with_overlay`` / ``_actions_from_source`` so the file
+# *content* is irrelevant, but the path must exist on disk and have an
+# accepted extension. Provide real throwaway contract + plan files.
+_REAL_CONTRACT = tempfile.NamedTemporaryFile(  # noqa: SIM115 — lives for the test session
+    suffix=".fluid.yaml", delete=False, mode="w"
+)
+_REAL_CONTRACT.write("fluidVersion: '0.7.3'\nid: test\n")
+_REAL_CONTRACT.close()
+REAL_CONTRACT_PATH = _REAL_CONTRACT.name
+
+_REAL_PLAN = tempfile.NamedTemporaryFile(  # noqa: SIM115 — lives for the test session
+    suffix=".json", delete=False, mode="w"
+)
+json.dump({"actions": [], "contract": {"id": "test"}}, _REAL_PLAN)
+_REAL_PLAN.close()
+REAL_PLAN_PATH = _REAL_PLAN.name
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +64,13 @@ class TestRun:
     Basic dry_run, no_actions, config_override, and provider detection are
     tested in test_apply.py. This class covers execute success/failure paths.
     """
+
+    @pytest.fixture(autouse=True)
+    def _stub_pre_apply_gate(self):
+        """Stub the pre-apply contract gate — these unit tests feed minimal
+        mock contracts to exercise provider dispatch, not schema validity."""
+        with patch("fluid_build.cli.apply._gate_contract_for_apply", new=MagicMock()):
+            yield
 
     @patch("fluid_build.cli.apply.RICH_AVAILABLE", False)
     @patch("fluid_build.cli.apply.load_contract_with_overlay")
@@ -76,7 +105,7 @@ class TestRun:
         mock_actions.return_value = [{"op": "ensure_dataset"}]
 
         args = MagicMock()
-        args.contract = "test.yaml"
+        args.contract = REAL_CONTRACT_PATH
         args.env = None
         args.dry_run = False
         args.yes = True
@@ -85,6 +114,14 @@ class TestRun:
         args.rollback_strategy = "phase_complete"
         args.config_override = None
         args.provider_config = None
+        # ``apply.run()`` reads --provider/--project/--region and routes
+        # --bundle through validate_cli_path; auto-vivified MagicMock attrs
+        # would be truthy and break provider detection / crash validation.
+        args.provider = None
+        args.project = None
+        args.region = None
+        args.bundle = None
+        args.state_file = None
         args.verbose = False
         args.debug = False
         args.report = "report.html"
@@ -126,7 +163,7 @@ class TestRun:
         mock_actions.return_value = [{"op": "ensure_dataset"}]
 
         args = MagicMock()
-        args.contract = "test.yaml"
+        args.contract = REAL_CONTRACT_PATH
         args.env = None
         args.dry_run = False
         args.yes = True
@@ -135,6 +172,14 @@ class TestRun:
         args.rollback_strategy = "phase_complete"
         args.config_override = None
         args.provider_config = None
+        # ``apply.run()`` reads --provider/--project/--region and routes
+        # --bundle through validate_cli_path; auto-vivified MagicMock attrs
+        # would be truthy and break provider detection / crash validation.
+        args.provider = None
+        args.project = None
+        args.region = None
+        args.bundle = None
+        args.state_file = None
         args.verbose = False
         args.debug = False
         args.report = "report.html"
@@ -175,7 +220,14 @@ class TestActionsFromSourceJsonPath:
 class TestRunJsonPlanLoading:
     """Lines 295-310: run() loading a .json execution plan."""
 
-    def _make_args(self, contract="plan.json", **kwargs):
+    @pytest.fixture(autouse=True)
+    def _stub_pre_apply_gate(self):
+        """Stub the pre-apply contract gate — the .json plan fixtures
+        embed minimal mock contracts, not schema-valid ones."""
+        with patch("fluid_build.cli.apply._gate_contract_for_apply", new=MagicMock()):
+            yield
+
+    def _make_args(self, contract=REAL_PLAN_PATH, **kwargs):
         from unittest.mock import MagicMock
 
         args = MagicMock()
@@ -188,11 +240,18 @@ class TestRunJsonPlanLoading:
         args.rollback_strategy = "phase_complete"
         args.config_override = None
         args.provider_config = None
+        # ``apply.run()`` reads --provider/--project/--region and routes
+        # --bundle through validate_cli_path; auto-vivified MagicMock attrs
+        # would be truthy and break provider detection / crash validation.
+        args.provider = None
+        args.project = None
+        args.region = None
+        args.bundle = None
+        args.state_file = None
         args.verbose = False
         args.debug = False
         args.report = None
         args.workspace_dir = MagicMock()
-        args.state_file = None
         args.notify = None
         args.metrics_export = "none"
         args.report_format = "html"
@@ -233,9 +292,16 @@ class TestRunJsonPlanLoading:
 class TestRunSimpleModeProviderDetection:
     """Lines 411-498: simple-mode provider/project/region detection from contract."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_pre_apply_gate(self):
+        """Stub the pre-apply contract gate — these tests feed minimal
+        mock contracts to exercise provider detection, not schema validity."""
+        with patch("fluid_build.cli.apply._gate_contract_for_apply", new=MagicMock()):
+            yield
+
     def _make_args(self, **kwargs):
         args = MagicMock()
-        args.contract = "test.yaml"
+        args.contract = REAL_CONTRACT_PATH
         args.env = None
         args.dry_run = kwargs.get("dry_run", True)
         args.yes = True
@@ -244,6 +310,14 @@ class TestRunSimpleModeProviderDetection:
         args.rollback_strategy = "phase_complete"
         args.config_override = None
         args.provider_config = None
+        # ``apply.run()`` reads --provider/--project/--region and routes
+        # --bundle through validate_cli_path; auto-vivified MagicMock attrs
+        # would be truthy and break provider detection / crash validation.
+        args.provider = None
+        args.project = None
+        args.region = None
+        args.bundle = None
+        args.state_file = None
         args.verbose = False
         args.debug = False
         args.report = None
@@ -370,9 +444,16 @@ class TestRunSimpleModeProviderDetection:
 class TestRunSimpleModeDryRunDisplay:
     """Lines 560-610: dry-run table/logging output in simple mode."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_pre_apply_gate(self):
+        """Stub the pre-apply contract gate — these tests feed minimal
+        mock contracts to exercise dry-run display, not schema validity."""
+        with patch("fluid_build.cli.apply._gate_contract_for_apply", new=MagicMock()):
+            yield
+
     def _make_args(self, **kwargs):
         args = MagicMock()
-        args.contract = "test.yaml"
+        args.contract = REAL_CONTRACT_PATH
         args.env = None
         args.dry_run = True
         args.yes = True
@@ -381,6 +462,14 @@ class TestRunSimpleModeDryRunDisplay:
         args.rollback_strategy = "phase_complete"
         args.config_override = None
         args.provider_config = None
+        # ``apply.run()`` reads --provider/--project/--region and routes
+        # --bundle through validate_cli_path; auto-vivified MagicMock attrs
+        # would be truthy and break provider detection / crash validation.
+        args.provider = None
+        args.project = None
+        args.region = None
+        args.bundle = None
+        args.state_file = None
         args.verbose = False
         args.debug = False
         args.report = None
@@ -453,9 +542,16 @@ class TestRunSimpleModeDryRunDisplay:
 class TestRunReportGeneration:
     """Lines 618-677: HTML/JSON report generation in simple mode."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_pre_apply_gate(self):
+        """Stub the pre-apply contract gate — these tests feed minimal
+        mock contracts to exercise report generation, not schema validity."""
+        with patch("fluid_build.cli.apply._gate_contract_for_apply", new=MagicMock()):
+            yield
+
     def _make_args(self, report_format="html", report="runtime/test_report.html"):
         args = MagicMock()
-        args.contract = "test.yaml"
+        args.contract = REAL_CONTRACT_PATH
         args.env = None
         args.dry_run = False
         args.yes = True
@@ -464,6 +560,14 @@ class TestRunReportGeneration:
         args.rollback_strategy = "phase_complete"
         args.config_override = None
         args.provider_config = None
+        # ``apply.run()`` reads --provider/--project/--region and routes
+        # --bundle through validate_cli_path; auto-vivified MagicMock attrs
+        # would be truthy and break provider detection / crash validation.
+        args.provider = None
+        args.project = None
+        args.region = None
+        args.bundle = None
+        args.state_file = None
         args.verbose = False
         args.debug = False
         args.report = report

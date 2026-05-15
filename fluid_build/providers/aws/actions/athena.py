@@ -18,6 +18,7 @@
 import time
 from typing import Any, Dict
 
+from ..._sql_safety import validate_ident
 from ..util.logging import duration_ms
 
 
@@ -313,7 +314,21 @@ def create_view(action: Dict[str, Any]) -> Dict[str, Any]:
             "changed": False,
         }
 
-    sql = f"CREATE OR REPLACE VIEW {database}.{view} AS {query}"
+    # SECURITY: ``database`` and ``view`` flow into a DDL f-string and
+    # cannot be parameterized — validate both as SQL identifiers. The
+    # ``{query}`` body is intentionally left as-is; view-body parsing is
+    # handled by a separate sprint.
+    try:
+        safe_database = validate_ident(database)
+        safe_view = validate_ident(view)
+    except ValueError as exc:
+        return {
+            "status": "error",
+            "error": f"Invalid identifier in view definition: {exc}",
+            "changed": False,
+        }
+
+    sql = f"CREATE OR REPLACE VIEW {safe_database}.{safe_view} AS {query}"
     return execute_query({"sql": sql, **action})
 
 

@@ -75,7 +75,15 @@ def _resolve_from_bindings(data: dict) -> tuple[str, str]:
 @_traced_stage("policy_apply")
 def run(args, logger: logging.Logger) -> int:
     try:
-        with open(args.bindings, encoding="utf-8") as f:
+        # F1 / F6: validate the operator-supplied bindings path
+        # (traversal, forbidden system paths, symlink) before the raw
+        # ``open()`` below.
+        from fluid_build.cli.security import validate_cli_path
+
+        bindings_path = validate_cli_path(args.bindings, mode="read", file_type="policy bindings")
+        args.bindings = str(bindings_path)
+
+        with open(bindings_path, encoding="utf-8") as f:
             data = json.load(f)
 
         # Provider and project come from the bindings file (set by policy-compile

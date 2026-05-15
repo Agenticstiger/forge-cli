@@ -45,25 +45,21 @@ def sqlite_db(tmp_path: Path) -> Path:
     db_path = tmp_path / "fixtures.sqlite"
     con = sqlite3.connect(str(db_path))
     cur = con.cursor()
-    cur.execute(
-        """
+    cur.execute("""
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             email TEXT NOT NULL,
             created_at DATETIME
         )
-        """
-    )
-    cur.execute(
-        """
+        """)
+    cur.execute("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             customer_id INTEGER NOT NULL,
             amount REAL,
             ordered_at DATETIME
         )
-        """
-    )
+        """)
     con.commit()
     con.close()
     return db_path
@@ -133,14 +129,29 @@ class TestRunFromJdbcSource:
 
         contract = _yaml.safe_load(out.read_text())
         assert contract["fluidVersion"] == "0.7.3"
+        # Top-level kind is now required by v0.7.3.
+        assert contract["kind"] == "DataProduct"
         assert contract["id"] == "forged_sqlite"
         assert contract["metadata"]["productType"] == "SDP"
-        exposes = {e["id"]: e for e in contract["exposes"]}
+        # owner is required by v0.7.3 metadata.
+        assert "owner" in contract["metadata"]
+        # exposes[] uses exposeId (not id), plus required kind + binding.
+        exposes = {e["exposeId"]: e for e in contract["exposes"]}
         assert set(exposes) == {"customers", "orders"}
+        for expose in exposes.values():
+            assert expose["kind"] == "table"
+            assert "binding" in expose
+            assert expose["binding"]["platform"] == "local"
 
         customers_schema = exposes["customers"]["contract"]["schema"]
         col_names = [c["name"] for c in customers_schema]
         assert set(col_names) == {"id", "email", "created_at"}
+        # Columns must use "type" (not logicalType / physicalType / nullable).
+        for col in customers_schema:
+            assert "type" in col
+            assert "logicalType" not in col
+            assert "physicalType" not in col
+            assert "nullable" not in col
 
     def test_missing_uri_returns_error_code(self, tmp_path: Path):
         import logging

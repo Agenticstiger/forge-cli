@@ -17,8 +17,11 @@
 import argparse
 import json
 import logging
+import os
+import stat
 import subprocess
 import sys
+import tempfile
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -36,6 +39,7 @@ from fluid_build.cli.viz_graph import (
     _read_plan,
     _shell_open,
     _validate_input_file,
+    _write_dot_tempfile,
     _write_output,
     run,
 )
@@ -505,6 +509,65 @@ class TestReadPlan:
         ):
             result = _read_plan("/nonexistent/plan.json")
         assert result is None
+
+
+# ── _write_dot_tempfile (F8 — private, non-predictable, 0o600 temp file) ──────
+
+
+class TestWriteDotTempfile:
+    """F8: the transient DOT file can carry contract ids / column names.
+    It must be created with an unpredictable name and mode 0o600 so it is
+    not world-readable for the lifetime of the ``dot`` render."""
+
+    def test_writes_content_and_returns_path(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+        path = _write_dot_tempfile("digraph G { secret_column -> x }")
+        try:
+            assert os.path.exists(path)
+            assert "digraph G { secret_column -> x }" in open(path, encoding="utf-8").read()
+        finally:
+            os.unlink(path)
+
+    def test_tempfile_is_not_world_or_group_readable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+        path = _write_dot_tempfile("digraph G {}")
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            # 0o600: owner rw only — no group/other bits set.
+            assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+        finally:
+            os.unlink(path)
+
+    def test_tempfile_name_carries_fluid_viz_prefix(self, tmp_path, monkeypatch):
+        # ``mkstemp`` prefix makes the file identifiable and the random
+        # middle segment makes the full name unpredictable.
+        monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+        path = _write_dot_tempfile("digraph G {}")
+        try:
+            name = os.path.basename(path)
+            assert name.startswith("fluid-viz-")
+            assert name.endswith(".dot")
+        finally:
+            os.unlink(path)
+
+    def test_uses_mkstemp_not_named_temporary_file(self, tmp_path, monkeypatch):
+        # Regression guard: ``NamedTemporaryFile`` leaves a predictable
+        # suffix AND a group/world-readable file under a default umask.
+        # The helper must route through ``mkstemp``.
+        monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+        called = {}
+        real_mkstemp = tempfile.mkstemp
+
+        def _spy(*a, **kw):
+            called["mkstemp"] = True
+            return real_mkstemp(*a, **kw)
+
+        monkeypatch.setattr("tempfile.mkstemp", _spy)
+        path = _write_dot_tempfile("digraph G {}")
+        try:
+            assert called.get("mkstemp") is True
+        finally:
+            os.unlink(path)
 
 
 # ── _write_output ─────────────────────────────────────────────────────────────

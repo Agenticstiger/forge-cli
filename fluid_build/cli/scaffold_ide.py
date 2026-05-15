@@ -18,6 +18,7 @@ target).
 Design: one canonical pack of steering/hooks/MCP content, multiple per-IDE
 adapters that translate paths and frontmatter. Sibling to ``scaffold-ci``.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -193,7 +194,9 @@ has rows. Never bypass without explicit user confirmation.
 
 `fluid apply` verifies BOTH before any DDL. Mismatch → hard-fail
 (`apply_plan_digest_bundle_mismatch` or `apply_plan_digest_plan_tamper`).
-`--no-verify-digest` is a DR escape hatch only; logs at WARNING level.
+`--no-verify-plan-binding` (plan/bundle digest gate) and
+`--no-verify-federation` (federated-consumes upstream-digest gate) are
+DR escape hatches only; both log at WARNING level.
 """
 
 _STEERING_PIPELINE_DECISIONS = """\

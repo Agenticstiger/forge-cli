@@ -37,6 +37,7 @@ from ..structured_logging import (
 )
 from ._common import CLIError, load_contract_with_overlay
 from ._logging import error, info, warn
+from .core import FluidCLIError
 
 COMMAND = "validate"
 
@@ -189,6 +190,16 @@ def run(args, logger: logging.Logger) -> int:
             strict=args.strict,
         )
 
+        # F1: validate the operator-supplied ``--cache-dir`` (a write
+        # target — schema files are written into it) before it reaches
+        # the schema manager.
+        if getattr(args, "cache_dir", None):
+            from fluid_build.cli.security import validate_cli_path
+
+            args.cache_dir = validate_cli_path(
+                args.cache_dir, mode="write", must_exist=False, file_type="cache directory"
+            )
+
         # Initialize schema manager
         schema_manager = FluidSchemaManager(cache_dir=args.cache_dir, logger=logger)
 
@@ -220,10 +231,27 @@ def run(args, logger: logging.Logger) -> int:
                     {"message": "Contract file is required unless using --list-versions"},
                 )
 
-        # Validate contract file existence
-        contract_path = Path(args.contract)
-        if not contract_path.exists():
-            raise CLIError(1, "contract_file_not_found", {"path": str(contract_path)})
+        # Validate contract file existence + path security.
+        # F1 / F6: route the operator-supplied contract path through the
+        # platform-aware validator (traversal, forbidden system paths,
+        # symlink) before it reaches the loader. ``.tgz`` bundles are
+        # accepted — ``validate_cli_path`` widens the extension allowlist
+        # for pipeline bundles.
+        from fluid_build.cli.security import validate_cli_path
+
+        try:
+            contract_path = validate_cli_path(args.contract, mode="read", file_type="contract")
+        except FluidCLIError as exc:
+            if exc.event == "file_not_found":
+                raise CLIError(1, "contract_file_not_found", {"path": str(args.contract)})
+            raise
+        args.contract = str(contract_path)
+
+        # F1: validate the ``--report`` write target when set.
+        if getattr(args, "report", None):
+            args.report = str(
+                validate_cli_path(args.report, mode="write", must_exist=False, file_type="report")
+            )
 
         # ── Bundle (.tgz) validation — 11-stage pipeline stage 2 ─────────
         # Detect a .tgz / .tar.gz input and dispatch to the extension-routed
@@ -238,7 +266,13 @@ def run(args, logger: logging.Logger) -> int:
             contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
         except Exception as e:
             raise CLIError(1, "contract_load_failed", {"error": str(e)})
-        contract = _strip_contract_provenance(contract)
+
+        # 0.7-only gate: pre-0.7 schemas (0.4.x / 0.5.x / 0.6.x) are no
+        # longer supported anywhere in the pipeline. Reject them with an
+        # explicit, actionable error rather than letting the contract
+        # fall through to a confusing schema-not-found / validation
+        # failure deeper in the stack.
+        _reject_pre_07_contract(contract)
 
         # Determine target schema version
         target_version, auto_selected = _determine_target_version(
@@ -315,6 +349,14 @@ def run(args, logger: logging.Logger) -> int:
         elif e.event == "contract_file_not_found":
             if not args.quiet:
                 console_error(f"Contract file not found: {e.context.get('path')}")
+        elif e.event == "contract_version_unsupported":
+            if not args.quiet:
+                console_error(
+                    e.context.get(
+                        "message",
+                        f"Unsupported contract version: {e.context.get('version')}",
+                    )
+                )
         elif e.event == "contract_required":
             if not args.quiet:
                 console_error(f"{e.context.get('message', 'Contract file is required')}")
@@ -396,20 +438,47 @@ def _determine_target_version(
     return default_version, True
 
 
-def _strip_contract_provenance(contract: Mapping[str, Any]) -> dict[str, Any]:
-    """Drop the envelope block under ``metadata.provenance`` before validation.
+# Pre-0.7 FLUID schema majors are end-of-life. The validator (and every
+# downstream stage) only supports 0.7.x and later. Any contract that
+# declares one of these as its ``fluidVersion`` is rejected up front.
+_UNSUPPORTED_FLUID_MAJORS = ("0.4", "0.5", "0.6")
 
-    The on-disk contract keeps its provenance, but the schema validators should
-    treat it as an additive envelope rather than a user-authored metadata field.
+
+def _reject_pre_07_contract(contract: Mapping[str, Any]) -> None:
+    """Reject contracts declaring a pre-0.7 ``fluidVersion``.
+
+    Pre-0.7 support is being removed project-wide. A 0.4 / 0.5 / 0.6
+    contract validated against the bundled 0.7.x schemas produces a
+    cascade of misleading errors; failing fast with a clear upgrade
+    message is far kinder to the operator.
+
+    Raises:
+        CLIError: ``contract_version_unsupported`` when the contract's
+            ``fluidVersion`` starts with ``0.4``, ``0.5``, or ``0.6``.
     """
-    data = dict(contract)
-    metadata = data.get("metadata")
-    if not isinstance(metadata, Mapping) or "provenance" not in metadata:
-        return data
-    clean_metadata = dict(metadata)
-    clean_metadata.pop("provenance", None)
-    data["metadata"] = clean_metadata
-    return data
+    if not isinstance(contract, Mapping):
+        return
+    raw_version = str(contract.get("fluidVersion", "")).strip()
+    if not raw_version:
+        return
+    for major in _UNSUPPORTED_FLUID_MAJORS:
+        # Match ``0.5`` and ``0.5.x`` but not ``0.50`` — anchor on the
+        # major.minor boundary (exact, or followed by a dot / pre-release
+        # marker).
+        if raw_version == major or raw_version.startswith(major + "."):
+            raise CLIError(
+                1,
+                "contract_version_unsupported",
+                {
+                    "version": raw_version,
+                    "message": (
+                        f"FLUID contract schema version {raw_version!r} is no "
+                        "longer supported. Pre-0.7 schemas (0.4.x / 0.5.x / "
+                        "0.6.x) have been removed; upgrade the contract to "
+                        "fluidVersion 0.7.x or later."
+                    ),
+                },
+            )
 
 
 def _available_schema_versions(schema_manager: FluidSchemaManager, args) -> list[SchemaVersion]:
@@ -518,6 +587,33 @@ def _validate_contract_for_version(
     # apply the rule to contract surfaces that don't model it.
     contract_fluid_version = str(contract.get("fluidVersion", "")).strip()
     if contract_fluid_version.startswith("0.7."):
+        # --- Metadata self-consistency (layer ↔ productType) -------------
+        # ``normalize_metadata_in_place`` raises ``ProductTypeError`` when
+        # ``metadata.layer`` and ``metadata.productType`` disagree with the
+        # canonical Bronze↔SDP / Silver↔ADP / Gold↔CDP mapping (or when
+        # either field carries an unknown value / non-string type). Run it
+        # on a COPY so validate never mutates the caller's contract, and
+        # route any violation to the error collector so ``fluid validate``
+        # rejects e.g. ``Silver`` + ``CDP``.
+        try:
+            import copy as _copy
+
+            from fluid_build.forge.product_types import (
+                ProductTypeError,
+                normalize_metadata_in_place,
+            )
+
+            metadata = contract.get("metadata")
+            if isinstance(metadata, dict):
+                try:
+                    normalize_metadata_in_place(_copy.deepcopy(metadata))
+                except ProductTypeError as pte:
+                    validation_result.add_error(f"metadata consistency: {pte}")
+                    validation_result.is_valid = False
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"Metadata consistency check skipped: {exc}")
+
         try:
             from pathlib import Path as _Path
 

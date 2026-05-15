@@ -53,7 +53,7 @@ class TestDetectFeatures:
     def test_core_validation_always_true(self):
         features = _detect_features()
         assert features["core_validation"] is True
-        assert features["legacy_057"] is True
+        assert features["core_07x_support"] is True
 
     def test_returns_dict(self):
         features = _detect_features()
@@ -145,13 +145,13 @@ class TestDisplayVersionInfo:
         base = {
             "cli": {"version": "1.0.0", "api_version": "v1", "build": "production"},
             "spec_versions": {
-                "supported": ["0.5.7", "0.7.1"],
-                "default": "0.7.1",
-                "latest": "0.7.1",
+                "supported": ["0.7.1", "0.7.3"],
+                "default": "0.7.3",
+                "latest": "0.7.3",
             },
             "features": {
                 "core_validation": True,
-                "legacy_057": True,
+                "core_07x_support": True,
                 "provider_actions": False,
                 "0.7.1_support": True,
             },

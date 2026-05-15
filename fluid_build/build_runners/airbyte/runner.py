@@ -40,6 +40,7 @@ from fluid_build.api.security import ImageSignatureVerifier
 
 from .._acquisition_common import (
     adapt_source_config,
+    apply_loopback_host_override,
     extract_source_schemas,
     generate_run_id,
     resolve_connection_secrets,
@@ -315,12 +316,9 @@ def _execute_rest_mode(
     client = AirbyteRestClient(server_url, api_token=api_token)
     try:
         # 1. Create source. Airbyte's REST API needs the
-        # source-definition UUID (NOT the docker image reference).
-        # Prefer ``properties.airbyte.source_definition_id`` from the
-        # contract; fall back to ``image_ref`` only as a legacy hint —
-        # the legacy path will 400 on Airbyte 1.x but is kept so older
-        # contracts surface a clear error rather than a silent miss.
-        source_definition_id = airbyte_props.get("source_definition_id") or image_ref
+        # source-definition UUID (NOT the docker image reference),
+        # read from ``properties.airbyte.source_definition_id``.
+        source_definition_id = airbyte_props.get("source_definition_id")
         # Resolve secretRef → password (or other credential field) before
         # POSTing to Airbyte. Inline literal values still win.
         connection_config = resolve_connection_secrets(dict(ctx.source.connection.raw))
@@ -562,6 +560,13 @@ def _execute_embedded_mode(
     try:
         # Resolve secretRef → password before passing to PyAirbyte.
         embedded_config = resolve_connection_secrets(dict(ctx.source.connection.raw))
+        # Container-runtime loopback override: PyAirbyte embedded mode runs the
+        # source connector as a Docker container, so a contract-declared
+        # loopback host (localhost / 127.0.0.1) must be rewritten to whatever
+        # the container uses to reach the host (FLUID_RUNNER_HOST_OVERRIDE).
+        # Mirrors the DLT runner — see
+        # ``_acquisition_common.apply_loopback_host_override``.
+        apply_loopback_host_override(embedded_config)
         # Same schema-list translation as the REST mode above.
         embedded_schemas = extract_source_schemas(embedded_config)
         embedded_config.pop("schema", None)

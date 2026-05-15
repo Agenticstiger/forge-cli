@@ -20,9 +20,8 @@ This module is the runtime-execution counterpart of
 ``fluid generate speed-transformation`` time). See
 ``fluid_build/engines/__init__.py`` for the generation-side framework.
 
-Migrated from ``fluid_build/cli/execute.py`` as part of the 11-stage
-pipeline split. The deprecated ``fluid execute`` subcommand was removed
-alongside; ``cli/apply.py`` calls :func:`run_builds_from_args` directly.
+``cli/apply.py`` calls :func:`run_builds_from_args` directly under
+``--mode amend-and-build``.
 """
 
 from __future__ import annotations
@@ -84,6 +83,29 @@ def is_dbt_build(build: Dict[str, Any]) -> bool:
     """
     engine = (build.get("engine") or "").strip().lower()
     return engine == "dbt" or engine.startswith("dbt-")
+
+
+def is_embedded_sql_build(build: Dict[str, Any]) -> bool:
+    """Return True for builds with inline SQL (``engine: sql`` or
+    ``pattern: embedded-logic`` + inline ``properties.sql``).
+
+    These builds carry their SQL directly in the contract and are executed
+    by the local provider's DuckDB engine.  They do NOT require an external
+    Python script, so the python-runner's ``resolve_script_path`` lookup
+    is the wrong dispatch — it always returns ``None`` and emits the
+    confusing "Script not found: ingest.py" warning.
+
+    Bug A4-A: ``--mode amend-and-build`` delegated to ``run_builds_from_args``
+    which fell through to the Python-runner branch for embedded-SQL builds.
+    """
+    engine = (build.get("engine") or "").strip().lower()
+    pattern = (build.get("pattern") or "").strip().lower()
+    if engine == "sql":
+        return True
+    if pattern == "embedded-logic":
+        props = build.get("properties") or {}
+        return bool(props.get("sql"))
+    return False
 
 
 # Engines that ship as acquisition runners under build_runners/<engine>/.
@@ -238,6 +260,71 @@ def _execute_acquisition_build(
     )
 
 
+def _execute_embedded_sql_build(
+    build: Dict[str, Any],
+    contract: Dict[str, Any],
+    contract_dir: Path,
+    dry_run: bool = False,
+) -> int:
+    """Execute an embedded-SQL build via the local provider's DuckDB engine.
+
+    Embedded-SQL builds (``engine: sql`` / ``pattern: embedded-logic`` +
+    ``properties.sql``) carry their transformation inline and do not ship a
+    Python driver script.  They are materialised directly by the local
+    provider, not by the python runner.
+
+    Returns 0 on success, 1 on failure.
+    """
+    import time
+
+    build_id = build.get("id", "unknown")
+    cprint(f"\n{'─' * 60}")
+    cprint(f"🔷 Build '{build_id}' (embedded-SQL / local DuckDB)")
+
+    if dry_run:
+        props = build.get("properties") or {}
+        sql_preview = (props.get("sql") or "").strip()[:200]
+        cprint(f"   [DRY RUN] Would execute SQL:\n{sql_preview}")
+        return 0
+
+    try:
+        from fluid_build.providers.local.local import LocalProvider
+
+        provider = LocalProvider(project="local", region="local")
+        # Derive actions from the single build; wrap the build as a
+        # mini-contract so _derive_actions_from_contract can find inputs
+        # and outputs.
+        mini_contract = {
+            "id": contract.get("id", "product"),
+            "builds": [build],
+            "consumes": contract.get("consumes", []),
+            "exposes": contract.get("exposes", []),
+        }
+        actions = provider._derive_actions_from_contract(mini_contract)
+        t0 = time.time()
+        result = provider.apply(actions=actions, plan={"contract": mini_contract})
+        elapsed = round(time.time() - t0, 2)
+
+        applied = result.get("applied", 0)
+        failed = result.get("failed", 0)
+        if failed == 0:
+            cprint(f"   ✅ Completed in {elapsed}s — {applied} action(s) executed")
+            written_files = []
+            for r in result.get("results") or []:
+                if r.get("status") == "ok":
+                    written_files.extend(r.get("written", []))
+            for p in written_files:
+                cprint(f"   📁 {p}")
+            return 0
+        else:
+            cprint(f"   ❌ Failed: {failed} action(s) failed")
+            return 1
+    except Exception as exc:
+        cprint(f"   ❌ Embedded-SQL build '{build_id}' error: {exc}")
+        LOG.exception("embedded_sql_build_error build_id=%s", build_id)
+        return 1
+
+
 def run_builds_from_args(
     args: argparse.Namespace,
     logger: logging.Logger,
@@ -274,7 +361,7 @@ def run_builds_from_args(
     #      ``fluid apply <plan>.json --mode amend-and-build``. The plan
     #      embeds the FULL FLUID contract under ``plan["contract"]``
     #      (with ``builds[]`` intact) so we extract it directly. Without
-    #      this branch the legacy "load contract from path" path would
+    #      this branch the standard "load contract from path" path would
     #      treat plan.json as a contract, find no ``builds`` key, and
     #      log "No builds defined in contract" — leaving acquisition /
     #      hybrid-reference dbt builds as silent no-ops on the canonical
@@ -400,7 +487,20 @@ def run_builds_from_args(
                     break
             continue
 
-        if is_dbt_build(build):
+        if is_embedded_sql_build(build):
+            # Bug A4-A fix: embedded-SQL builds (engine: sql / pattern:
+            # embedded-logic + properties.sql) carry their SQL inline and do
+            # NOT have an external Python script.  They are executed via the
+            # local provider's DuckDB engine, not the python runner.
+            # Previously they fell through to the python-runner branch and
+            # emitted the confusing "Script not found: ingest.py" warning.
+            result = _execute_embedded_sql_build(
+                build,
+                contract,
+                contract_path.parent,
+                dry_run=args.dry_run,
+            )
+        elif is_dbt_build(build):
             project_dir = resolve_dbt_project_path(contract_path, build)
             if not project_dir:
                 repository = build.get("repository", "./")
@@ -432,7 +532,12 @@ def run_builds_from_args(
                 model = properties.get("model", "ingest")
                 expected = contract_path.parent / repository / f"{model}.py"
 
-                cprint(f"\n⚠️  Build '{build_id}' - Script not found: {expected}")
+                cprint(
+                    f"\n⚠️  Build '{build_id}' - Script not found: {expected}\n"
+                    "   Hint: for inline-SQL builds use ``engine: sql`` (or "
+                    "``pattern: embedded-logic`` + ``properties.sql``). "
+                    "For Python builds, create the script at the expected path above."
+                )
                 total_skipped += 1
                 continue
 

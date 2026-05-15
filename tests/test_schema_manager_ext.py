@@ -268,10 +268,10 @@ class TestFindCompatibleVersion:
         assert result.minor == 5
 
 
-# ── FluidSchemaManager._validate_with_fluid_validator ─────────────────
+# ── FluidSchemaManager._validate_basic ───────────────────────────────
 
 
-class TestValidateWithFluidValidator:
+class TestValidateBasic:
     def _make_manager(self, tmp_path):
         return FluidSchemaManager(cache_dir=Path(tmp_path), logger=LOG)
 
@@ -280,7 +280,7 @@ class TestValidateWithFluidValidator:
         v = SchemaVersion.parse("1.0.0")
         r = ValidationResult(is_valid=True)
         contract = {"fluidVersion": "1.0.0"}  # Missing required fields
-        result = m._validate_with_fluid_validator(contract, v, r)
+        result = m._validate_basic(contract, v, r)
         assert result is False
         assert len(r.errors) > 0
 
@@ -297,21 +297,8 @@ class TestValidateWithFluidValidator:
             "metadata": {},
             "exposes": [],
         }
-        result = m._validate_with_fluid_validator(contract, v, r)
+        result = m._validate_basic(contract, v, r)
         assert result is True
-
-    def test_validate_05x_warns_on_import_failure(self, tmp_path):
-        """Exercises the 0.5.x branch when fluid_build.schema import fails."""
-        m = self._make_manager(tmp_path)
-        v = SchemaVersion.parse("0.5.0")
-        r = ValidationResult(is_valid=True)
-        contract = {"fluidVersion": "0.5.0"}
-        # Simulate import failure for fluid_build.schema
-        with patch.dict("sys.modules", {"fluid_build.schema": None}):
-            # ImportError is expected from the None entry in sys.modules
-            result = m._validate_with_fluid_validator(contract, v, r)
-        # Should fail gracefully and return False
-        assert isinstance(result, bool)
 
 
 # ── FluidSchemaManager.validate_contract ─────────────────────────────
@@ -360,7 +347,7 @@ class TestValidateContract:
         # 0.3.0 won't be available, but we can mock get_schema
         mock_schema = {"type": "object"}
         with patch.object(m, "get_schema", return_value=mock_schema):
-            with patch.object(m, "_validate_with_fluid_validator", return_value=True):
+            with patch.object(m, "_validate_basic", return_value=True):
                 r = m.validate_contract(contract)
         assert any("deprecated" in w.lower() for w in r.warnings)
 

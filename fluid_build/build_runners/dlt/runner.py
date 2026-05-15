@@ -321,8 +321,41 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
 
     # Destination: default DuckDB; override via dlt.destination.
     dest_name = dlt_props.get("destination", "duckdb")
-    dataset_name = dlt_props.get("dataset_name") or "fluid_acquire"
-    pipeline_name = dlt_props.get("pipeline_name") or f"fluid_{ctx.product_id.replace('.', '_')}"
+
+    # Resolve {{ env.X }} placeholders in dataset_name / pipeline_name before
+    # passing to dlt.pipeline().  An unresolved placeholder (env var absent)
+    # must be caught here: dlt's identifier normaliser silently mangles it into
+    # a bogus schema name (e.g. ``env_snowflake_stage_schema__``) and writes
+    # data there, causing silent data misdirection.  We use
+    # ``resolve_env_templates`` (leaves the placeholder intact on miss) rather
+    # than the base runner's ``_resolve_env_placeholders`` (replaces with "")
+    # so the error message clearly identifies the missing variable name.
+    from fluid_build.providers.snowflake.util.config import (
+        ENV_TEMPLATE_RE,
+        resolve_env_templates,
+    )
+
+    _raw_dataset = dlt_props.get("dataset_name") or "fluid_acquire"
+    dataset_name = resolve_env_templates(_raw_dataset)
+    if ENV_TEMPLATE_RE.search(dataset_name):
+        # Still contains a {{ env.X }} token → env var was absent.
+        unresolved = ENV_TEMPLATE_RE.findall(dataset_name)
+        raise ValueError(
+            f"dlt runner: dataset_name contains unresolved env-template placeholders "
+            f"({', '.join(unresolved)}). Set the missing environment variable(s) before "
+            f"running the pipeline."
+        )
+
+    _raw_pipeline = dlt_props.get("pipeline_name")
+    pipeline_name_raw = _raw_pipeline or f"fluid_{ctx.product_id.replace('.', '_')}"
+    pipeline_name = resolve_env_templates(pipeline_name_raw)
+    if ENV_TEMPLATE_RE.search(pipeline_name):
+        unresolved = ENV_TEMPLATE_RE.findall(pipeline_name)
+        raise ValueError(
+            f"dlt runner: pipeline_name contains unresolved env-template placeholders "
+            f"({', '.join(unresolved)}). Set the missing environment variable(s) before "
+            f"running the pipeline."
+        )
 
     # Pipeline working dir under .fluid/dlt/<product>/<build>/.
     dlt_root = contract_dir / ".fluid" / "dlt" / ctx.product_id / ctx.build_id

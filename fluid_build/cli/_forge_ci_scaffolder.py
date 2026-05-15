@@ -35,8 +35,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 # Choices + alias map. These are the source of truth — the host
-# module re-exports them under the same names so legacy imports keep
-# resolving.
+# module re-exports them under the same names so existing imports
+# keep resolving.
 
 _CI_PROVIDER_CHOICES = [
     {"label": "GitHub Actions", "value": "github_actions"},
@@ -65,7 +65,12 @@ _CI_PROVIDER_ALIASES = {
 
 
 def normalize_ci_provider(value: Optional[str]) -> Optional[str]:
-    """Map legacy/provider aliases to the CLI-facing CI provider names."""
+    """Map provider-name aliases to the CLI-facing CI provider names.
+
+    Reconciles the ``circleci`` (CLI-facing) vs ``circle_ci``
+    (PipelineProvider enum) spelling so both flow through
+    ``_resolve_ci_choice``.
+    """
     if value is None:
         return None
     return _CI_PROVIDER_ALIASES.get(value, value)

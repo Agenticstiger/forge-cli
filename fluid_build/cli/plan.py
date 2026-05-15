@@ -35,7 +35,7 @@ from fluid_build.cli.console import cprint, warning
 # 11-stage pipeline: stage-6 → stage-7 cryptographic plan-binding. ``plan.json``
 # carries ``bundleDigest`` (pins input bundle) + ``planDigest`` (catches
 # plan-file tampering). ``fluid apply`` re-verifies both before any DDL.
-from ..forge.core.plan_digest import inject_digests, is_bundle_path
+from ..forge.core.plan_digest import coerce_keys_to_str, inject_digests, is_bundle_path
 from ..observability.tracing import traced_stage as _traced_stage
 from ._common import (
     CLIError,
@@ -43,7 +43,7 @@ from ._common import (
     load_contract_with_overlay,
     resolve_provider_from_contract,
 )
-from ._logging import info, warn
+from ._logging import error, info, warn
 
 # Path-B scheduling engines. When ``orchestration.engine`` matches one of
 # these, plan.py invokes the provider-native scheduler planner so the
@@ -112,8 +112,13 @@ def write_json_idempotent(path: str, obj: Any) -> None:
     # Ensure directory exists (like mkdir -p)
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
 
-    # Serialize to string with consistent formatting
-    new_content = json.dumps(obj, indent=2, sort_keys=True)  # sort_keys for determinism
+    # Serialize to string with consistent formatting. Coerce non-str dict
+    # keys to str first: a contract with a YAML magic-word key (on/off/
+    # yes/no) yields a Python bool key, and ``sort_keys=True`` cannot
+    # order a mixed bool/str key set (TypeError). See plan_digest.py.
+    new_content = json.dumps(
+        coerce_keys_to_str(obj), indent=2, sort_keys=True
+    )  # sort_keys for determinism
 
     # Check if file exists and content is identical
     if Path(path).exists():
@@ -193,8 +198,8 @@ transformations, access grants, and orchestration tasks.
         "--out",
         "--output",
         dest="out",
-        default="runtime/plan.json",
-        help="output file for the execution plan (default: runtime/plan.json)",
+        default="plan.json",
+        help="output file for the execution plan (default: plan.json in the current directory)",
     )
     p.add_argument(
         "--verbose",
@@ -224,9 +229,9 @@ transformations, access grants, and orchestration tasks.
         "--html",
         dest="html_output",
         nargs="?",
-        const="runtime/plan.html",
+        const="plan.html",
         default=None,
-        help="generate HTML visualization (default path: runtime/plan.html)",
+        help="generate HTML visualization (default path: plan.html in the current directory)",
     )
     p.set_defaults(cmd=COMMAND, func=run)
 
@@ -237,7 +242,8 @@ def run(args, logger: logging.Logger) -> int:
     Main entry point — accepts a v0.7.x contract path or pre-built
     ``plan.json``, dispatches to ``ProviderActionParser`` for the
     canonical action graph, and writes the merged plan + binding
-    digest to ``runtime/plan.json``.
+    digest to ``plan.json`` in the current directory (or the path
+    given by ``--out``).
     """
     try:
         # UX hardening — accept bare ``fluid plan`` when CWD has a contract.
@@ -255,9 +261,40 @@ def run(args, logger: logging.Logger) -> int:
                 },
             )
 
+        # F1 / F6: validate the operator-supplied contract/plan path
+        # (traversal, forbidden system paths, symlink) before it reaches
+        # the loader. ``.tgz`` bundles and ``.json`` plans are accepted.
+        from fluid_build.cli.security import validate_cli_path
+
+        args.contract = str(validate_cli_path(args.contract, mode="read", file_type="contract"))
+
+        # F1: validate the ``--out`` plan write target.
+        if getattr(args, "out", None):
+            args.out = str(
+                validate_cli_path(args.out, mode="write", must_exist=False, file_type="output")
+            )
+
+        # F1: validate the ``--html`` write target when set.
+        if getattr(args, "html_output", None):
+            args.html_output = str(
+                validate_cli_path(
+                    args.html_output, mode="write", must_exist=False, file_type="HTML report"
+                )
+            )
+
         # Load contract with environment overlay
         contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
         fluid_version = contract.get("fluidVersion", "0.7.3")
+
+        # --- Pre-plan contract gate ---------------------------------------
+        # ``fluid plan`` used to plan ANY contract — including a pre-0.7
+        # end-of-life contract or a structurally-broken one — and emit a
+        # signed ``plan.json`` with exit 0. That let an invalid contract
+        # slip into stage-7 apply. Run the same gates ``fluid validate``
+        # runs (pre-0.7 rejection + JSON-schema validation) BEFORE any
+        # plan generation or write. A failure raises ``CLIError`` →
+        # non-zero exit, no plan.json written.
+        _gate_contract_for_plan_or_apply(contract, logger, command="plan")
 
         info(
             logger,
@@ -357,7 +394,11 @@ def run(args, logger: logging.Logger) -> int:
                     # Re-inject digests — cost_estimate was added AFTER the
                     # first inject, so planDigest no longer covers the plan
                     # body. Recompute to keep the stage-7 tamper gate honest.
-                    plan = inject_digests(plan, bundle_path=bundle_path)
+                    # ``force=True``: the plan is already bound from the
+                    # injection above; this is a deliberate, in-process
+                    # re-bind over a mutation we just made ourselves, so we
+                    # opt past inject_digests' overwrite guard (J7).
+                    plan = inject_digests(plan, bundle_path=bundle_path, force=True)
                     write_json_idempotent(args.out, plan)
                 else:
                     cprint("\nCost estimation: not supported by this provider")
@@ -380,7 +421,7 @@ def run(args, logger: logging.Logger) -> int:
                 render_plan_html(args.out, html_path, logger)
                 cprint(f"HTML report: {html_path}")
             except Exception:
-                warn(logger, "html_render_skipped", message="plan visualizer not available")
+                warn(logger, "plan visualizer not available", event="html_render_skipped")
 
         info(
             logger,
@@ -398,6 +439,77 @@ def run(args, logger: logging.Logger) -> int:
         raise CLIError(1, "planner_failed", context={"error": str(e)})
 
 
+def _gate_contract_for_plan_or_apply(
+    contract: Dict[str, Any], logger: logging.Logger, *, command: str
+) -> None:
+    """Reject pre-0.7 + schema-invalid contracts before plan/apply.
+
+    Two gates, run on the loaded contract dict BEFORE any plan generation
+    or DDL:
+
+    1. **Pre-0.7 rejection.** Shares ``validate.py::_reject_pre_07_contract``
+       so a 0.4.x / 0.5.x / 0.6.x contract is rejected here exactly as
+       ``fluid validate`` rejects it (raises ``CLIError`` with the
+       ``contract_version_unsupported`` event).
+    2. **JSON-schema validation.** Runs ``FluidSchemaManager.validate_contract``
+       (the same validation ``fluid validate`` runs) so a structurally
+       broken contract — missing ``id``, unknown keys, wrong types —
+       never reaches a signed ``plan.json`` or a provider apply with
+       exit 0. A schema-invalid contract raises ``CLIError`` →
+       non-zero exit; no success plan is written.
+
+    Raises:
+        CLIError: ``contract_version_unsupported`` for pre-0.7 contracts,
+            or ``local_plan_validation_failed`` / ``apply_contract_invalid``
+            for schema-invalid contracts.
+    """
+    # Gate 1 — pre-0.7 rejection (shared with ``fluid validate``).
+    from fluid_build.cli.validate import _reject_pre_07_contract
+
+    _reject_pre_07_contract(contract)
+
+    # Gate 2 — JSON-schema validation. Auto-detects the contract's own
+    # ``fluidVersion`` (offline, bundled schemas) — identical to the
+    # ``fluid validate`` default path.
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    try:
+        result = FluidSchemaManager().validate_contract(contract, offline_only=True)
+    except Exception as exc:  # pragma: no cover — defensive
+        raise CLIError(
+            1,
+            "schema_validation_error",
+            context={
+                "command": command,
+                "error": str(exc),
+                "message": (
+                    f"``fluid {command}`` could not schema-validate the "
+                    "contract before proceeding."
+                ),
+            },
+        )
+
+    if not result.is_valid:
+        errors = list(result.errors)
+        for err in errors:
+            error(logger, "contract_schema_error", command=command, detail=err)
+        event = "local_plan_validation_failed" if command == "plan" else "apply_contract_invalid"
+        raise CLIError(
+            1,
+            event,
+            context={
+                "command": command,
+                "error_count": len(errors),
+                "errors": errors,
+                "message": (
+                    f"Contract validation failed with {len(errors)} error(s); "
+                    f"``fluid {command}`` will not proceed on a schema-invalid "
+                    f"contract. Run ``fluid validate`` for the full report."
+                ),
+            },
+        )
+
+
 def _validate_plan_actions(plan: Dict[str, Any], logger: logging.Logger) -> None:
     """Run SDK ``validate_actions()`` over the plan's action list.
 
@@ -409,14 +521,14 @@ def _validate_plan_actions(plan: Dict[str, Any], logger: logging.Logger) -> None
     except ImportError:
         warn(
             logger,
-            "sdk_not_available",
-            message="fluid-provider-sdk not installed — skipping action validation",
+            "fluid-provider-sdk not installed — skipping action validation",
+            event="sdk_not_available",
         )
         return
 
     raw_actions = plan.get("actions") or []
     if not raw_actions:
-        info(logger, "validate_actions_skip", message="No actions to validate")
+        info(logger, "No actions to validate", event="validate_actions_skip")
         return
 
     typed: list = []

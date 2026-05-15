@@ -21,10 +21,9 @@ declares only what's *unique* about it (engine, pattern, columns,
 exposeId); this helper handles every shape detail the v0.7.3 schema
 checks for.
 
-The coercion layer in ``forge_modes._coerce_template_contract_to_v073``
-remains as a safety net for any out-of-tree template, but for the
-five built-ins this builder is the canonical source — the coercion
-layer's job becomes a no-op rather than a fixup.
+This builder is the canonical source of v0.7.3-shaped contracts for
+the five built-in templates — they emit schema-valid output directly,
+with no coercion layer needed.
 """
 
 from __future__ import annotations
@@ -141,7 +140,7 @@ def _normalise_properties(spec: TemplateSpec) -> Dict[str, Any]:
 
     Defends against templates that ship empty / wrong-shape properties
     so the resulting contract round-trips through ``fluid validate``
-    without the runtime coercion layer needing to fire.
+    directly.
     """
     p = dict(spec.properties)
     if spec.pattern == "embedded-logic":

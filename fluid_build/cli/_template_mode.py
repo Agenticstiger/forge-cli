@@ -23,9 +23,8 @@ template path (``_create_project_agent_loop``,
 ``_generate_schedule_artifacts``, ``_scaffold_data_folder``,
 ``_show_existing_products``).
 
-External symbols shared across modes (``_populate_richer_receipt``,
-``_coerce_template_contract_to_v073``) stay on ``forge_modes`` and
-are accessed via the ``_fm`` indirection so test patches that target
+The shared ``_populate_richer_receipt`` helper stays on ``forge_modes``
+and is accessed via the ``_fm`` indirection so test patches that target
 ``fluid_build.cli.forge_modes._populate_richer_receipt`` still
 resolve at call-time.
 
@@ -46,8 +45,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 # ── Project ──
 # ``_fm`` indirection: ``forge_modes`` re-imports the symbols defined
-# here at module top, AND keeps a couple of pre-extraction helpers
-# (``_populate_richer_receipt``, ``_coerce_template_contract_to_v073``)
+# here at module top, AND keeps the ``_populate_richer_receipt`` helper
 # that this module references via ``_fm.<name>`` so test patches that
 # target ``fluid_build.cli.forge_modes.<name>`` resolve at call time.
 from fluid_build.cli import forge_modes as _fm  # noqa: E402
@@ -134,13 +132,9 @@ def run_template_mode(
             return 0
 
         target_dir.mkdir(parents=True, exist_ok=True)
+        # Templates emit fluid-schema-0.7.x contracts directly via the
+        # shared v0.7.3 builder, so no coercion layer is needed.
         contract = template.generate_contract(context)
-        # Coerce v0.5-vintage template output to the v0.7.3 schema —
-        # the legacy templates were authored before consumes/exposes
-        # shape changes and metadata-field tightening. This keeps every
-        # ``fluid forge --template <X>`` output validatable without
-        # rewriting each template's generate_contract().
-        contract = _fm._coerce_template_contract_to_v073(contract)
         import yaml
 
         with open(target_dir / "contract.fluid.yaml", "w") as handle:
@@ -559,7 +553,7 @@ def _create_project_minimal(
         # the cost we already spent. Persist the artifact stack
         # (cost.json / reasoning.md / transcript.json) BEFORE the
         # confirmation prompt so Ctrl-C at the prompt loses nothing.
-        # Set FLUID_FORGE_NO_PREVIEW=1 to bypass for legacy callers.
+        # Set FLUID_FORGE_NO_PREVIEW=1 to bypass (CI / scripts).
         from fluid_build.cli._preview_panel import (
             PreviewPanel,
             capture_cost_snapshot,
@@ -697,7 +691,7 @@ def _create_project_minimal(
 
         ai_receipt_path = _write_ai_work_receipt(generation_result)
 
-        # Persist project memory the same way the legacy path does, so
+        # Persist project memory the same way the AI mode does, so
         # subsequent forge runs in this product have the full history.
         try:
             copilot._maybe_save_project_memory(
