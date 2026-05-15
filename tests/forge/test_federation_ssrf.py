@@ -80,7 +80,10 @@ class TestGuardFederationUrl:
         # entry trumps the IP check.
         with patch("fluid_build.forge.federation._hostname_is_private", return_value=True):
             out = _guard_federation_url("https://registry.internal.corp/api", workspace_id="ws")
-        assert out.startswith("https://registry.internal.corp")
+        # The allow-listed URL is returned verbatim — assert exact equality
+        # (matches test_public_host_passes; a prefix check would be both
+        # weaker and an incomplete-URL-sanitization smell).
+        assert out == "https://registry.internal.corp/api"
 
     def test_allowlist_miss_still_rejects(self, monkeypatch):
         monkeypatch.setenv("FLUID_FEDERATION_HOST_ALLOWLIST", "other.corp")
