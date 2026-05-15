@@ -218,9 +218,7 @@ def main():
                     script.unlink()
                 console.print("[green]✅ Legacy scripts removed[/green]")
         else:
-            response = input(
-                "⚠️ Are you sure you want to permanently delete these scripts? (y/N): "
-            )
+            response = input("⚠️ Are you sure you want to permanently delete these scripts? (y/N): ")
             if response.lower() in ["y", "yes"]:
                 for script in legacy_scripts:
                     script.unlink()
@@ -253,9 +251,7 @@ def main():
     else:
         print("\n✅ Migration Assessment:")
         print("   • New consolidated test structure: ✅ Available")
-        print(
-            f"   • Legacy scripts: {'✅ Handled' if choice in ['1', '2'] else '⚠️ Still present'}"
-        )
+        print(f"   • Legacy scripts: {'✅ Handled' if choice in ['1', '2'] else '⚠️ Still present'}")
         print("   • Admin command integration: ✅ Ready")
 
         print("\n🎯 Next Steps:")

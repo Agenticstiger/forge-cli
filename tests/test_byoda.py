@@ -37,7 +37,8 @@ from fluid_build.cli.forge_agent_specs import (
 )
 from fluid_build.cli.forge_agents import get_agent, get_all_domain_names, list_agents
 
-_MINIMAL_AGENT_YAML = dedent("""\
+_MINIMAL_AGENT_YAML = dedent(
+    """\
     name: insurance
     domain: Insurance
     description: Expert in insurance data products and actuarial analytics
@@ -76,7 +77,8 @@ _MINIMAL_AGENT_YAML = dedent("""\
     rules: []
     next_step_tips: []
     conditional_next_step_tips: []
-""")
+"""
+)
 
 
 class TestAgentSpecKeywords:

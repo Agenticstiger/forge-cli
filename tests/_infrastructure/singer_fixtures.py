@@ -27,7 +27,8 @@ from typing import Any, Dict, Iterator
 
 import pytest
 
-_TAP_FAKE_SCRIPT = textwrap.dedent("""\
+_TAP_FAKE_SCRIPT = textwrap.dedent(
+    """\
     #!/usr/bin/env python3
     \"\"\"tap-fluid-fake — emits a fixed set of Singer messages for tests.\"\"\"
     import argparse, json, sys
@@ -80,7 +81,8 @@ _TAP_FAKE_SCRIPT = textwrap.dedent("""\
         new_state["bookmarks"][stream] = {"last_id": n_records}
     sys.stdout.write(json.dumps({"type": "STATE", "value": new_state}) + "\\n")
     sys.exit(0)
-    """)
+    """
+)
 
 
 @pytest.fixture

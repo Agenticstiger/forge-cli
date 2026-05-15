@@ -36,7 +36,8 @@ from fluid_build.cli.forge_team_memory import (
     scaffold_team_memory,
 )
 
-_FULL_TEAM_MEMORY = dedent("""\
+_FULL_TEAM_MEMORY = dedent(
+    """\
     conventions:
       naming:
         product_prefix: acme
@@ -66,13 +67,16 @@ _FULL_TEAM_MEMORY = dedent("""\
       dimensions:
         - order_date
         - region
-""")
+"""
+)
 
-_MINIMAL_TEAM_MEMORY = dedent("""\
+_MINIMAL_TEAM_MEMORY = dedent(
+    """\
     conventions:
       defaults:
         provider: local
-""")
+"""
+)
 
 
 class TestLoadTeamMemory:

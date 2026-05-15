@@ -37,7 +37,8 @@ class SqliteBackend(Store):
         self._init_db()
 
     def _init_db(self) -> None:
-        self.conn.execute("""
+        self.conn.execute(
+            """
             create table if not exists store (
                 namespace text not null,
                 key text not null,
@@ -48,7 +49,8 @@ class SqliteBackend(Store):
                 fluid_version text,
                 primary key (namespace, key)
             )
-            """)
+            """
+        )
         self.conn.commit()
 
     def get(self, ns: str, key: str) -> Optional[StoreRecord]:

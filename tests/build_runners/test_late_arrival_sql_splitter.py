@@ -54,20 +54,24 @@ def main_table(con):
     Watermark = max(event_time) = 2026-04-15.
     With a 5-day budget, the threshold = 2026-04-10.
     """
-    con.execute("""
+    con.execute(
+        """
         CREATE TABLE main_events (
             id INTEGER,
             event_time TIMESTAMP,
             payload VARCHAR
         )
-        """)
-    con.execute("""
+        """
+    )
+    con.execute(
+        """
         INSERT INTO main_events VALUES
             (1, TIMESTAMP '2026-04-01 12:00:00', 'old'),
             (2, TIMESTAMP '2026-04-08 12:00:00', 'old-but-borderline'),
             (3, TIMESTAMP '2026-04-12 12:00:00', 'on-time'),
             (4, TIMESTAMP '2026-04-15 12:00:00', 'fresh')
-        """)
+        """
+    )
     return "main_events"
 
 

@@ -45,21 +45,25 @@ def sqlite_db(tmp_path: Path) -> Path:
     db_path = tmp_path / "fixtures.sqlite"
     con = sqlite3.connect(str(db_path))
     cur = con.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             email TEXT NOT NULL,
             created_at DATETIME
         )
-        """)
-    cur.execute("""
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             customer_id INTEGER NOT NULL,
             amount REAL,
             ordered_at DATETIME
         )
-        """)
+        """
+    )
     con.commit()
     con.close()
     return db_path
