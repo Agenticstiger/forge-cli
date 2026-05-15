@@ -30,7 +30,7 @@ jobs:
       - name: Check for catalog changes
         id: diff
         run: |
-          git diff --quiet fluid_build/cli/llm_models.json || echo "changed=true" >> $GITHUB_OUTPUT
+          git diff --quiet fluid_build/cli/llm_models.json || echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Create PR if catalog changed
         if: steps.diff.outputs.changed == 'true'

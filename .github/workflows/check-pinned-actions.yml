@@ -30,9 +30,11 @@ jobs:
         id: check
         run: |
           python scripts/check_pinned_actions.py --strict > report.txt 2>&1 || true
-          echo "report<<REPORT_EOF" >> "$GITHUB_OUTPUT"
-          cat report.txt >> "$GITHUB_OUTPUT"
-          echo "REPORT_EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "report<<REPORT_EOF"
+            cat report.txt
+            echo "REPORT_EOF"
+          } >> "$GITHUB_OUTPUT"
           python scripts/check_pinned_actions.py --strict
         continue-on-error: true
 
@@ -50,6 +52,9 @@ jobs:
           EXISTING=$(gh issue list --label "dependencies" --state open --search "Stale pinned GitHub Actions" --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then
             echo "Issue #${EXISTING} already open — adding comment"
+            # Backticks in the strings below are literal Markdown, not command
+            # substitution — the single quotes are intentional.
+            # shellcheck disable=SC2016
             COMMENT_BODY=$(printf '%s\n' \
               "Monthly check found stale pins (${PIN_TRIGGER}):" \
               '' \
@@ -60,6 +65,9 @@ jobs:
               'Run `python scripts/check_pinned_actions.py` locally for details.')
             gh issue comment "$EXISTING" --body "$COMMENT_BODY"
           else
+            # Backticks in the strings below are literal Markdown, not command
+            # substitution — the single quotes are intentional.
+            # shellcheck disable=SC2016
             ISSUE_BODY=$(printf '%s\n' \
               'The monthly SHA pin check found outdated actions in `PINNED_ACTIONS`.' \
               '' \
