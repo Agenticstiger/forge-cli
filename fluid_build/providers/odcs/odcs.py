@@ -31,6 +31,108 @@ from typing import Any, Dict, List, Optional, Union
 
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderError
 
+# FLUID column type -> ODCS v3.1.0 logicalType.
+#
+# ODCS v3.1.0 defines exactly nine logicalTypes: string, date, timestamp,
+# time, number, integer, object, array, boolean. This table is kept
+# EXHAUSTIVE against the FLUID schema's column-type enum
+# (fluid_build/schemas/fluid-schema-0.7.x.json -> $defs.column.properties.type).
+# A drift test in tests/providers/test_odcs_type_mapping.py fails if the FLUID
+# schema gains a column type that is not mapped here, so a new type can never
+# silently degrade to the "string" default and lose type fidelity in published
+# ODCS contracts.
+_FLUID_TYPE_TO_ODCS_LOGICAL: Dict[str, str] = {
+    # string family
+    "string": "string",
+    "text": "string",
+    "varchar": "string",
+    "varchar2": "string",
+    "nvarchar": "string",
+    "char": "string",
+    "nchar": "string",
+    "character": "string",
+    "clob": "string",
+    "uuid": "string",
+    "uniqueidentifier": "string",
+    "guid": "string",
+    "enum": "string",
+    # binary family -- ODCS has no binary logicalType; binary columns
+    # serialize to text/base64, so "string" is the honest mapping.
+    "binary": "string",
+    "varbinary": "string",
+    "bytes": "string",
+    "blob": "string",
+    "bytea": "string",
+    "raw": "string",
+    "hll": "string",
+    # geospatial family -- ODCS has no geo logicalType; geo values
+    # serialize to WKT / GeoJSON text.
+    "geography": "string",
+    "geometry": "string",
+    "geom": "string",
+    "point": "string",
+    # integer family
+    "int": "integer",
+    "integer": "integer",
+    "int2": "integer",
+    "int4": "integer",
+    "int8": "integer",
+    "int16": "integer",
+    "int32": "integer",
+    "int64": "integer",
+    "tinyint": "integer",
+    "smallint": "integer",
+    "mediumint": "integer",
+    "bigint": "integer",
+    "long": "integer",
+    "longint": "integer",
+    "serial": "integer",
+    "bigserial": "integer",
+    "year": "integer",
+    # number family (floating-point + fixed-point)
+    "float": "number",
+    "float4": "number",
+    "float8": "number",
+    "float32": "number",
+    "float64": "number",
+    "double": "number",
+    "real": "number",
+    "decimal": "number",
+    "dec": "number",
+    "numeric": "number",
+    "number": "number",
+    "bignumeric": "number",
+    "money": "number",
+    # boolean family
+    "bool": "boolean",
+    "boolean": "boolean",
+    "bit": "boolean",
+    # temporal family
+    "date": "date",
+    "time": "time",
+    "datetime": "timestamp",
+    "datetime2": "timestamp",
+    "smalldatetime": "timestamp",
+    "timestamp": "timestamp",
+    "timestamptz": "timestamp",
+    "timestamp_tz": "timestamp",
+    "timestamp_ntz": "timestamp",
+    "timestamp_ltz": "timestamp",
+    "timestampntz": "timestamp",
+    "interval": "string",  # ODCS has no interval/duration logicalType
+    # structured / semi-structured family
+    "json": "object",
+    "jsonb": "object",
+    "object": "object",
+    "variant": "object",
+    "super": "object",
+    "struct": "object",
+    "map": "object",
+    "record": "object",
+    "row": "object",
+    "array": "array",
+}
+
 
 class OdcsProvider(BaseProvider):
     """
@@ -643,9 +745,14 @@ class OdcsProvider(BaseProvider):
 
     def _map_type_to_logical(self, fluid_type: str) -> str:
         """
-        Map FLUID type to ODCS logicalType.
+        Map a FLUID column type to its ODCS v3.1.0 logicalType.
 
-        ODCS v3.1.0 valid logicalTypes: string, date, timestamp, time, number, integer, object, array, boolean
+        ODCS v3.1.0 valid logicalTypes: string, date, timestamp, time,
+        number, integer, object, array, boolean.
+
+        The mapping lives in the module-level ``_FLUID_TYPE_TO_ODCS_LOGICAL``
+        table, kept exhaustive against the FLUID schema's column-type enum —
+        a drift test fails if the schema gains a type that is not mapped.
 
         Args:
             fluid_type: FLUID field type
@@ -653,33 +760,7 @@ class OdcsProvider(BaseProvider):
         Returns:
             ODCS logical type
         """
-        mapping = {
-            "string": "string",
-            "text": "string",
-            "varchar": "string",
-            "char": "string",
-            "int": "integer",
-            "integer": "integer",
-            "bigint": "integer",
-            "long": "integer",
-            "float": "number",
-            "double": "number",
-            "decimal": "number",
-            "numeric": "number",
-            "bool": "boolean",
-            "boolean": "boolean",
-            "date": "date",
-            "datetime": "timestamp",
-            "timestamp": "timestamp",
-            "time": "time",
-            "json": "object",
-            "object": "object",
-            "array": "array",
-            "binary": "string",  # ODCS doesn't have binary type, use string
-            "bytes": "string",  # ODCS doesn't have binary type, use string
-        }
-
-        return mapping.get(fluid_type.lower(), "string")
+        return _FLUID_TYPE_TO_ODCS_LOGICAL.get(fluid_type.lower(), "string")
 
     def _map_type_to_physical(self, fluid_type: str, provider: Optional[str]) -> Optional[str]:
         """
