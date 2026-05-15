@@ -23,15 +23,31 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-TEMPLATES_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "fluid_build"
-    / "forge"
-    / "core"
-    / "pipeline_templates.py"
-)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# ``PINNED_ACTIONS`` (the action@tag -> action@sha map for generated CI
+# templates) lives in ``pipeline_systems/_base.py``. It used to live in
+# ``pipeline_templates.py``; that module now only re-exports it, so the
+# scanner reads the file that actually holds the dict literal.
+TEMPLATES_PATH = REPO_ROOT / "fluid_build" / "forge" / "core" / "pipeline_systems" / "_base.py"
+
+WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
 GITHUB_API_HOST = "api.github.com"
+
+# A `uses:` reference inside a workflow file. Captures the action ref
+# (``owner/repo`` plus optional ``/subpath``) and whatever follows the ``@``.
+# Local actions (``./path``) and reusable-workflow refs to the same repo are
+# intentionally not matched — only external ``owner/repo@ref`` forms.
+WORKFLOW_USES_RE = re.compile(
+    r"^\s*-?\s*uses:\s*"
+    r"(?P<action>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._/-]+)"
+    r"@(?P<ref>[^\s#]+)",
+    re.MULTILINE,
+)
+
+# A fully pinned ref is a 40-character lowercase hex commit SHA.
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _github_api_json(url: str) -> object:
@@ -101,8 +117,57 @@ def get_latest_release_sha(owner: str, repo: str, tag_prefix: str) -> dict | Non
     return None
 
 
+def scan_workflows_for_unpinned() -> list[tuple[str, int, str]]:
+    """Scan ``.github/workflows/*.yml`` for actions not pinned to a commit SHA.
+
+    Returns a list of ``(filename, line_number, "action@ref")`` tuples, one per
+    unpinned ``uses:`` reference. An empty list means every external action in
+    every workflow file is SHA-pinned.
+    """
+    findings: list[tuple[str, int, str]] = []
+    if not WORKFLOWS_DIR.is_dir():
+        return findings
+
+    for path in sorted(WORKFLOWS_DIR.glob("*.yml")) + sorted(WORKFLOWS_DIR.glob("*.yaml")):
+        text = path.read_text()
+        for match in WORKFLOW_USES_RE.finditer(text):
+            action = match.group("action")
+            ref = match.group("ref")
+            # Local composite actions resolve to a path, never owner/repo@ref,
+            # so the regex already excludes them. Anything reaching here is an
+            # external action and must be pinned to a 40-hex commit SHA.
+            if SHA_RE.match(ref):
+                continue
+            line_no = text.count("\n", 0, match.start()) + 1
+            findings.append((path.name, line_no, f"{action}@{ref}"))
+    return findings
+
+
+def check_workflow_pins() -> int:
+    """Fail (return 1) if any workflow file references an unpinned action."""
+    print("Scanning .github/workflows/ for unpinned actions...\n")
+    findings = scan_workflows_for_unpinned()
+    if not findings:
+        print("  All workflow actions are pinned to a commit SHA.\n")
+        return 0
+
+    print(f"  {len(findings)} unpinned action reference(s) found:")
+    for filename, line_no, ref in findings:
+        print(f"  UNPINNED  {filename}:{line_no}  {ref}")
+    print(
+        "\nEvery external action must be pinned to a full 40-char commit SHA "
+        "(e.g. `uses: actions/checkout@<sha>  # v5.0.1`).\n"
+    )
+    return 1
+
+
 def main() -> int:
     strict = "--strict" in sys.argv
+
+    # Correctness gate (always blocking): no workflow file may reference an
+    # action by floating tag/branch. This runs regardless of --strict because
+    # an unpinned action is a security regression, not a staleness warning.
+    workflow_rc = check_workflow_pins()
 
     source = TEMPLATES_PATH.read_text()
     entries = ENTRY_RE.findall(source)
@@ -133,11 +198,15 @@ def main() -> int:
         print(f"{len(stale)} action(s) are outdated:")
         for display, old_ver, new_ver, new_sha in stale:
             print(f"  {display}: {old_ver} -> {new_ver} ({new_sha[:12]})")
-        print("\nUpdate PINNED_ACTIONS in fluid_build/forge/core/pipeline_templates.py")
-        return 1 if strict else 0
+        print("\nUpdate PINNED_ACTIONS in fluid_build/forge/core/pipeline_systems/_base.py")
+        stale_rc = 1 if strict else 0
     else:
         print("All pinned actions are up to date.")
-        return 0
+        stale_rc = 0
+
+    # An unpinned workflow action is always a hard failure; template staleness
+    # is only fatal under --strict. The worse of the two wins.
+    return max(workflow_rc, stale_rc)
 
 
 if __name__ == "__main__":

@@ -40,38 +40,41 @@ jobs:
         if: steps.check.outcome == 'failure'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Report passed via env so the issue-body shell strings below stay
+          # fully indented inside this YAML block scalar (no column-0 heredoc).
+          PIN_REPORT: ${{ steps.check.outputs.report }}
+          PIN_TRIGGER: ${{ github.event.schedule && 'scheduled' || 'manual' }}
+          PIN_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # Check if an open issue already exists
           EXISTING=$(gh issue list --label "dependencies" --state open --search "Stale pinned GitHub Actions" --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then
             echo "Issue #${EXISTING} already open — adding comment"
-            gh issue comment "$EXISTING" --body "$(cat <<'BODY'
-Monthly check found stale pins (${{ github.event.schedule && 'scheduled' || 'manual' }}):
-
-```
-${{ steps.check.outputs.report }}
-```
-
-Run `python scripts/check_pinned_actions.py` locally for details.
-BODY
-)"
+            COMMENT_BODY=$(printf '%s\n' \
+              "Monthly check found stale pins (${PIN_TRIGGER}):" \
+              '' \
+              '```' \
+              "${PIN_REPORT}" \
+              '```' \
+              '' \
+              'Run `python scripts/check_pinned_actions.py` locally for details.')
+            gh issue comment "$EXISTING" --body "$COMMENT_BODY"
           else
+            ISSUE_BODY=$(printf '%s\n' \
+              'The monthly SHA pin check found outdated actions in `PINNED_ACTIONS`.' \
+              '' \
+              '```' \
+              "${PIN_REPORT}" \
+              '```' \
+              '' \
+              '### How to fix' \
+              '1. Run `python scripts/check_pinned_actions.py` to see which pins are stale' \
+              '2. Update the SHAs in `fluid_build/forge/core/pipeline_systems/_base.py`' \
+              '3. Verify with `python scripts/check_pinned_actions.py --strict`' \
+              '' \
+              "This issue was created automatically by the [check-pinned-actions](${PIN_RUN_URL}) workflow.")
             gh issue create \
               --title "Stale pinned GitHub Actions in generated CI templates" \
               --label "dependencies" \
-              --body "$(cat <<'BODY'
-The monthly SHA pin check found outdated actions in `PINNED_ACTIONS` (pipeline_templates.py).
-
-```
-${{ steps.check.outputs.report }}
-```
-
-### How to fix
-1. Run `python scripts/check_pinned_actions.py` to see which pins are stale
-2. Update the SHAs in `fluid_build/forge/core/pipeline_templates.py`
-3. Verify with `python scripts/check_pinned_actions.py --strict`
-
-This issue was created automatically by the [check-pinned-actions](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) workflow.
-BODY
-)"
+              --body "$ISSUE_BODY"
           fi
