@@ -231,6 +231,15 @@ PROVIDER_ENV_VARS: Dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "gemini": "GOOGLE_API_KEY",
+    # GitHub Models — litellm's ``github/`` provider reads GITHUB_API_KEY.
+    # Inside GitHub Actions this is the built-in GITHUB_TOKEN (granted the
+    # ``models: read`` permission), so CI exercises the LLM path with no
+    # provider API key at all. Selected explicitly via
+    # ``--llm-provider github`` / ``FLUID_LLM_PROVIDER=github`` — github is
+    # deliberately NOT added to the auto-inference helpers, so a stray
+    # GITHUB_TOKEN present in any CI environment can never hijack provider
+    # selection.
+    "github": "GITHUB_API_KEY",
 }
 
 PROVIDER_DISPLAY_NAMES: Dict[str, str] = {

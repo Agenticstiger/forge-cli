@@ -115,6 +115,7 @@ def test_provider_lookup_caches():
         ("gemini", "gemini-2.5-flash", "gemini/gemini-2.5-flash"),
         ("groq", "llama-3.1-70b-versatile", "groq/llama-3.1-70b-versatile"),
         ("bedrock", "anthropic.claude-3-sonnet-v1:0", "bedrock/anthropic.claude-3-sonnet-v1:0"),
+        ("github", "gpt-4o-mini", "github/gpt-4o-mini"),
     ],
 )
 def test_model_name_translation(provider_name, model, expected):
@@ -129,6 +130,48 @@ def test_model_prefix_override_via_env(monkeypatch):
     from fluid_build.cli.forge_copilot_llm_litellm import _litellm_model_for
 
     assert _litellm_model_for("openai", "gpt-4o") == "azure/gpt-4o"
+
+
+# ---------------------------------------------------------------------------
+# GitHub Models — litellm `github/` provider, zero-API-key in CI
+# ---------------------------------------------------------------------------
+
+
+def test_github_provider_routes_to_litellm():
+    """``github`` resolves to a LiteLLMProvider — GitHub Models needs no
+    bespoke provider class, just litellm's ``github/`` prefix."""
+    from fluid_build.cli.forge_copilot_llm_litellm import LiteLLMProvider
+    from fluid_build.cli.forge_copilot_llm_providers import get_llm_provider
+
+    provider = get_llm_provider("github")
+    assert isinstance(provider, LiteLLMProvider)
+    assert provider.name == "github"
+
+
+def test_github_api_key_env_var_is_registered():
+    """``GITHUB_API_KEY`` is the resolver env var for the github provider —
+    in GitHub Actions this is the built-in ``GITHUB_TOKEN``."""
+    from fluid_build.cli.forge_copilot_llm_providers import PROVIDER_ENV_VARS
+
+    assert PROVIDER_ENV_VARS["github"] == "GITHUB_API_KEY"
+
+
+def test_github_api_key_resolves_from_env():
+    """``_resolve_api_key`` picks up ``GITHUB_API_KEY`` for the github provider."""
+    from fluid_build.cli.forge_copilot_llm_providers import _resolve_api_key
+
+    assert _resolve_api_key("github", {"GITHUB_API_KEY": "ghp-fake-token"}) == "ghp-fake-token"
+
+
+def test_github_provider_is_not_auto_inferred():
+    """A stray ``GITHUB_API_KEY`` must NOT auto-select the github provider.
+
+    GitHub Actions sets ``GITHUB_TOKEN`` in every run, so github is
+    opt-in only (``FLUID_LLM_PROVIDER=github`` / ``--llm-provider github``).
+    """
+    from fluid_build.cli.forge_copilot_llm_providers import _infer_provider_from_env
+
+    assert _infer_provider_from_env({"GITHUB_API_KEY": "ghp-fake-token"}) != "github"
 
 
 # ---------------------------------------------------------------------------

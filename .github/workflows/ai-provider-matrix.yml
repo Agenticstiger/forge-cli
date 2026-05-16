@@ -45,17 +45,39 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # Skip-clean: secrets cannot be read in a job-level `if:`, so this
+      # precheck sets an output the real steps gate on. When this
+      # provider's API key isn't configured the job ends green (skipped)
+      # instead of failing — no false red, no nightly issue spam.
+      - name: Check for the provider API key
+        id: gate
+        run: |
+          case "${{ matrix.provider }}" in
+            gemini)    key="${GEMINI_API_KEY}" ;;
+            openai)    key="${OPENAI_API_KEY}" ;;
+            anthropic) key="${ANTHROPIC_API_KEY}" ;;
+            *)         key="" ;;
+          esac
+          if [ -n "$key" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No API key configured for ${{ matrix.provider }} — skipping its live E2E."
+          fi
+
       - name: Install forge-cli and dbt gate dependencies
+        if: steps.gate.outputs.enabled == 'true'
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,local]" dbt-duckdb
 
       - name: Run strict hosted-provider E2E
+        if: steps.gate.outputs.enabled == 'true'
         run: |
           PYTHONPATH=. python scripts/e2e_all_modes.py --phases 7
 
       - name: Upload provider scorecard
-        if: always()
+        if: always() && steps.gate.outputs.enabled == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ai-provider-matrix-${{ matrix.provider }}
