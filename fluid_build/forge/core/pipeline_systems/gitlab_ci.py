@@ -378,7 +378,7 @@ class GitLabCITemplate(BasePipelineTemplate):
             {
                 "security-scan": {
                     "stage": "security",
-                    "script": ["fluid validate --security-only", "trivy fs ."],
+                    "script": ["fluid validate --security-only", "osv-scanner scan source -r ."],
                     "artifacts": {"reports": {"sast": "security-report.json"}},
                 },
                 "compliance-check": {

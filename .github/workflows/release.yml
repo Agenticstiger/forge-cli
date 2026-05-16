@@ -213,6 +213,22 @@ jobs:
           test -f release-smoke/contract.fluid.yaml || { echo "::error::scaffold failed"; exit 1; }
           echo "Release smoke test passed"
 
+      - name: Generate CycloneDX SBOM
+        # SBOM of exactly what the released wheel installs (the isolated
+        # venv built above). Shipped as a release artifact for supply-chain
+        # transparency — what JFrog Xray / CRA-minded consumers expect.
+        run: |
+          pip install "cyclonedx-bom==7.3.0"
+          cyclonedx-py environment /tmp/test-install \
+            --of JSON --output-file sbom.cdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 30
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -456,6 +472,11 @@ jobs:
             echo "$NOTES"
           } > release-notes.md
 
+      - name: Download SBOM
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5.0.0
+        with:
+          name: sbom
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
         with:
@@ -463,7 +484,9 @@ jobs:
           name: "FLUID Build ${{ needs.quality-gate.outputs.version }}"
           body_path: release-notes.md
           prerelease: ${{ needs.quality-gate.outputs.is_prerelease == 'true' }}
-          files: dist/*
+          files: |
+            dist/*
+            sbom.cdx.json
 
   # ──────────────────────────────────────────────────────────────
   # 5. Build and push Docker image to GHCR
@@ -507,6 +530,42 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=${{ needs.quality-gate.outputs.profile }}-latest
             type=raw,value=latest,enable=${{ needs.quality-gate.outputs.is_prerelease == 'false' }}
+
+      # Build the image locally first so it can be vulnerability-scanned
+      # before it is ever pushed. The gha layer cache makes the push
+      # build below near-instant.
+      - name: Build image for scanning (no push)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          load: true
+          tags: forge-cli:scan
+          build-args: |
+            PROFILE=${{ needs.quality-gate.outputs.profile }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Grype (Anchore) — scans the image for OS + library CVEs that
+      # pip-audit cannot see (base-image packages). Pinned by version
+      # and verified by SHA256 — no third-party GitHub Action.
+      - name: Install Grype (pinned + checksum-verified)
+        run: |
+          GRYPE_VERSION=0.112.0
+          GRYPE_SHA256=acb14a030010fe9bdb9594b4ae108d9d14ef2f926d936aa0916dc62c89c058ea
+          curl -sSL -o grype.tar.gz \
+            "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.tar.gz"
+          echo "${GRYPE_SHA256}  grype.tar.gz" | sha256sum -c -
+          tar -xzf grype.tar.gz grype
+          ./grype version
+
+      - name: Scan image for HIGH/CRITICAL CVEs (gate)
+        # Fails the release on a HIGH/CRITICAL finding that has a fix
+        # available. `--only-fixed` excludes unpatched base-image CVEs
+        # (a Debian slim base always carries some) so the gate stays
+        # actionable rather than permanently red.
+        run: ./grype forge-cli:scan --fail-on high --only-fixed
 
       - name: Build and push Docker image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
