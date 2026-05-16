@@ -1291,6 +1291,13 @@ class OutputPortMcpServer:
         )
         config = uvicorn.Config(app, host=host, port=port, log_level="info")
         server = uvicorn.Server(config)
+        # Stash the uvicorn Server so stop_http() (or a test harness,
+        # or a future SIGTERM handler for the HTTP path) can flip
+        # ``should_exit`` and unwind serve() cleanly. Without this the
+        # only way to stop an HTTP-mode gateway was process kill —
+        # and a test that spun one in a daemon thread leaked a
+        # spinning event loop for the rest of the run.
+        self._uvicorn_server = server
         self.state.logger.info(
             "output_port_http_serve_start",
             extra={
@@ -1301,7 +1308,21 @@ class OutputPortMcpServer:
                 "auth_enabled": auth_validator.is_enabled(),
             },
         )
-        await server.serve()
+        try:
+            await server.serve()
+        finally:
+            self._uvicorn_server = None
+
+    def stop_http(self) -> None:
+        """Signal a running HTTP/SSE transport to shut down.
+
+        Sets uvicorn's ``should_exit`` flag so the ``serve()`` loop
+        returns at its next iteration. Safe to call from any thread
+        (the flag is a plain bool uvicorn polls). No-op when the
+        gateway isn't running in HTTP mode."""
+        server = getattr(self, "_uvicorn_server", None)
+        if server is not None:
+            server.should_exit = True
 
     async def run_async(self) -> None:
         """Run the server on the SDK stdio transport until the

@@ -401,9 +401,15 @@ def _running_sse_server(server: OutputPortMcpServer, port: int):
     try:
         yield
     finally:
-        # uvicorn doesn't expose a clean stop from another thread;
-        # daemon=True lets the test finish without blocking.
-        pass
+        # CLEANLY stop uvicorn — ``stop_http()`` flips ``should_exit``
+        # so serve() unwinds, then we join the thread. Relying on
+        # ``daemon=True`` alone leaked a spinning uvicorn event loop
+        # for the remainder of a full ``pytest tests/`` run, starving
+        # every later test of CPU (a ~4-min suite ballooned past
+        # 20 min). Joining with a timeout keeps the test bounded even
+        # if uvicorn is wedged.
+        server.stop_http()
+        thread.join(timeout=5.0)
 
 
 @pytest.mark.asyncio
