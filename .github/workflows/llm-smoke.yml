@@ -1,0 +1,55 @@
+# GitHub Models LLM smoke test — exercises the forge-cli LLM codepath
+# with ZERO provider API keys.
+#
+# The built-in GITHUB_TOKEN (granted the `models: read` permission)
+# authenticates litellm's `github/` provider, so every PR gets a
+# real-inference check of the LLM path for free — no maintainer-supplied
+# OPENAI_API_KEY / GEMINI_API_KEY / ANTHROPIC_API_KEY.
+#
+# Non-blocking: the smoke step is `continue-on-error` so a GitHub Models
+# outage or rate-limit never fails an unrelated PR. Promote it to a hard
+# gate once it has proven stable.
+#
+# Fork PRs are skipped — a fork's GITHUB_TOKEN does not carry model
+# access; fork PRs keep the free DuckDB end-to-end coverage in ci.yml.
+name: LLM Smoke (GitHub Models)
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  github-models-smoke:
+    name: GitHub Models smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Skip fork PRs: their GITHUB_TOKEN cannot call GitHub Models.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install forge-cli
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Smoke-test the LLM path against GitHub Models
+        # Non-blocking: a GitHub Models outage / rate-limit must not fail
+        # an unrelated PR. Promote to a hard gate once proven stable.
+        continue-on-error: true
+        env:
+          FLUID_LLM_PROVIDER: github
+          FLUID_LLM_MODEL: gpt-4o-mini
+          GITHUB_API_KEY: ${{ github.token }}
+        run: python scripts/llm_smoke.py

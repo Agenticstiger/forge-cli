@@ -110,6 +110,10 @@ _DEFAULT_MODEL_BY_PROVIDER: Dict[str, str] = {
     "vertex_ai": "gemini-2.5-flash",
     "mistral": "mistral-large-latest",
     "cohere": "command-r-plus",
+    # GitHub Models hosts the OpenAI family (plus Llama / Mistral /
+    # DeepSeek). gpt-4o-mini is a small, cheap default that sits well
+    # within the GitHub Models free-tier rate limits.
+    "github": "gpt-4o-mini",
 }
 
 
@@ -129,6 +133,9 @@ _LITELLM_PREFIX_BY_PROVIDER: Dict[str, str] = {
     "cohere": "cohere",
     # Ollama uses ``ollama/<model>`` with api_base; treated specially below.
     "ollama": "ollama",
+    # GitHub Models — litellm routes ``github/<model>`` to the GitHub
+    # Models inference API, authenticating with GITHUB_API_KEY.
+    "github": "github",
 }
 
 
