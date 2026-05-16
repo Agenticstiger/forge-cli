@@ -71,7 +71,6 @@ from fluid_build.copilot.store.audit_trail import (
     rotate_audit_directory,
     write_audit_event,
 )
-from fluid_build.observability.run_id import get_or_create_run_id
 
 from ._expose_utils import (
     _annotate_engine_error,
@@ -83,17 +82,38 @@ from .policy import OutputPortPolicy
 from .query_compiler import compile_free_form_sql, compile_semantic_query
 from .tools import check_tool_permission, derive_advertised_tools
 
-# Optional OTel emission. Loaded lazily so the server keeps working
-# when forge-cli's observability extras are not configured.
-try:
-    from fluid_build.observability.tracing import _get_tracer, _otel_enabled
-except ImportError:  # pragma: no cover - defensive
+# NOTE: ``fluid_build.observability`` is imported LAZILY (inside the
+# functions that use it), never at module top. Importing an
+# ``observability`` submodule forces ``observability/__init__.py`` to
+# run, which chains reporter → build_runners → cli/__init__ → back
+# into ``observability`` — a circular import that only breaks when
+# this module is imported before ``fluid_build.cli``. Deferring the
+# import to call time sidesteps the cycle entirely; by the time any
+# gateway method runs, both packages are fully initialised.
 
-    def _get_tracer():  # type: ignore[no-redef]
+
+def _get_run_id() -> str:
+    """Lazily resolve the cross-stage run-id. Returns "" on any
+    failure so a missing observability extra never blocks the
+    gateway."""
+    try:
+        from fluid_build.observability.run_id import get_or_create_run_id
+
+        return get_or_create_run_id()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _get_tracer():
+    """Lazily resolve the OTel tracer. Returns None when tracing is
+    disabled or the observability extra is absent — callers guard
+    with a None check via :class:`_NoOpSpanCtx`."""
+    try:
+        from fluid_build.observability.tracing import _get_tracer as _resolve
+
+        return _resolve()
+    except Exception:  # noqa: BLE001
         return None
-
-    def _otel_enabled() -> bool:  # type: ignore[no-redef]
-        return False
 
 
 SERVER_NAME = "forge-cli-output-port-mcp"
@@ -334,7 +354,11 @@ class SessionState:
     # tokeniser would add tiktoken dep without changing the gate
     # outcome at typical contract caps).
     _tokens_today: int = 0
-    _tokens_today_window_start: float = 0.0
+    # Window start MUST default to "now", not 0.0 — time.monotonic()
+    # returns a large arbitrary value, so a 0.0 default would make
+    # the very first check_token_budget() see ``now - 0.0`` >> the
+    # 24h window and wipe the counter before it was ever read.
+    _tokens_today_window_start: float = field(default_factory=time.monotonic)
     # Daily window resets at 24-hour boundaries (rolling, not
     # calendar-day, so the gate doesn't reset at midnight in a
     # different timezone than the operator expected).
@@ -538,10 +562,9 @@ class OutputPortMcpServer:
         # Auto-resolve the run_id so audit events + OTel spans
         # share the same correlation token as every other forge-cli
         # CLI stage that the operator runs against the same workspace.
-        try:
-            run_id = get_or_create_run_id()
-        except Exception:  # noqa: BLE001
-            run_id = ""
+        # ``_get_run_id`` is itself lazy + exception-safe (deferred
+        # observability import to dodge the cli↔observability cycle).
+        run_id = _get_run_id()
         self.state = SessionState(
             contract=contract,
             expose=expose,
