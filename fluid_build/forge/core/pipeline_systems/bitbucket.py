@@ -233,7 +233,7 @@ class BitbucketTemplate(BasePipelineTemplate):
                         audit_comment,
                         audit["body"],
                     ],
-                    "artifacts": ["runtime/compliance-report.json", "runtime/trivy-results.sarif"],
+                    "artifacts": ["runtime/compliance-report.json", "runtime/osv-results.sarif"],
                 }
             }
             pipeline["pipelines"]["branches"]["main"].append(audit_step)

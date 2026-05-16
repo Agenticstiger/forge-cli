@@ -319,6 +319,9 @@ jobs:
   security:
     name: Security Scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write  # upload Semgrep SARIF to GitHub code scanning
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
@@ -329,13 +332,35 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e ".[dev]"
-          pip install bandit pip-audit
+          pip install bandit pip-audit "semgrep==1.163.0"
       - name: Bandit security scan
         run: bandit -r fluid_build/ -c pyproject.toml --severity-level medium -q
       - name: pip-audit dependency CVE scan
         # Fails the build on any known-vulnerable dependency. Keeps the
         # litellm / jinja2 / h11 / cryptography CVE floors honest over time.
         run: pip-audit --desc
+      # Semgrep custom rules — forge-cli repo-specific invariants from
+      # CLAUDE.md (deleted-module imports, SQL-safety helper bypass,
+      # copilot workspace_root confinement). Generic SAST is CodeQL's job.
+      - name: Semgrep custom-rule gate
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: semgrep scan --config .semgrep/fluid-rules.yml --error fluid_build/
+      - name: Semgrep SARIF (advisory — code-scanning surface)
+        if: always()
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          semgrep scan --config .semgrep/fluid-rules.yml \
+            --sarif --output semgrep.sarif fluid_build/ || true
+      - name: Upload Semgrep SARIF
+        # Skipped on fork PRs — their GITHUB_TOKEN cannot write
+        # security-events. The gate step above still runs and still blocks.
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@7fc1baf373eb073c686865bd453d412d506a05a2  # v3.35.1
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
 
   license-check:
     name: License Headers
@@ -347,3 +372,22 @@ jobs:
           python-version: "3.12"
       - name: Check license headers
         run: python scripts/check_license_headers.py
+
+  # Dependency review — blocks PRs that introduce known-vulnerable
+  # dependencies. First-party GitHub action; requires the dependency
+  # graph (Settings -> Code security). A license policy can be added
+  # later via `deny-licenses` once the project agrees one.
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    # Only meaningful on PRs — the action diffs the dependency graph
+    # between the base and head refs.
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - name: Dependency review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294  # v5.0.0
+        with:
+          fail-on-severity: high

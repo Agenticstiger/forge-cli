@@ -404,6 +404,7 @@ markers = [
     "policy: Tests for policy validators",
     "runtime: Tests for runtime generators",
     "live_llm: Tests that call a real LLM (cost ~$0.0001/run; require an API key in env)",
+    "redteam: Deterministic adversarial tests for the agentic layer (zero-token, no LLM)",
 ]
 
 [tool.coverage.run]

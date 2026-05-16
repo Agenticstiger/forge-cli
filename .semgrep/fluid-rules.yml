@@ -1,0 +1,77 @@
+# Custom Semgrep rules — forge-cli repo-specific invariants.
+#
+# These encode structural conventions documented in CLAUDE.md that
+# generic SAST cannot express. Generic vulnerability classes (injection,
+# weak crypto, taint flow, etc.) are covered by GitHub CodeQL; this file
+# is ONLY for forge-cli's own conventions.
+#
+# Gating contract: every rule is `severity: ERROR`. CI runs
+#   semgrep scan --config .semgrep/fluid-rules.yml --error fluid_build/
+# so a match fails the build. After editing, run:
+#   semgrep --validate --config .semgrep/fluid-rules.yml
+rules:
+  # CLAUDE.md (2026-04-23): cli/execute.py and cli/compile.py were deleted.
+  # A regex (not an AST pattern) keeps this robust across import forms.
+  - id: fluid-import-deleted-module
+    languages: [python]
+    severity: ERROR
+    message: >-
+      `fluid_build.cli.execute` and `fluid_build.cli.compile` were removed.
+      Use `fluid_build.build_runners` (`run_builds_from_args`) instead of
+      `cli.execute`, and `fluid_build.cli.bundle` instead of `cli.compile`.
+    metadata:
+      category: maintainability
+      references:
+        - CLAUDE.md
+    pattern-regex: '(?m)^\s*(?:from|import)\s+fluid_build\.cli\.(?:execute|compile)\b'
+
+  # CLAUDE.md (SQL safety): every DDL string literal must route through
+  # quote_string_literal in providers/_sql_safety.py. Inline quote
+  # doubling diverges from the central escaper and breaks under
+  # non-default Snowflake escape settings.
+  - id: fluid-ddl-raw-quote-doubling
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Inline single-quote doubling bypasses `quote_string_literal` in
+      `fluid_build/providers/_sql_safety.py`. Route SQL string literals
+      through that central helper instead of an inline `.replace()`.
+    metadata:
+      category: security
+      references:
+        - CLAUDE.md
+    paths:
+      include:
+        - "/fluid_build/providers/**"
+      exclude:
+        - "/fluid_build/providers/_sql_safety.py"
+    patterns:
+      - pattern: $X.replace("'", "''")
+
+  # CLAUDE.md (copilot agent loop): path-accepting @forge_tool tools must
+  # be confined. A tool whose signature takes `workspace_root` only gets
+  # it injected when the decorator declares `workspace_root_aware=True`.
+  - id: fluid-copilot-tool-missing-workspace-root
+    languages: [python]
+    severity: ERROR
+    message: >-
+      This @forge_tool takes a `workspace_root` parameter but its decorator
+      is missing `workspace_root_aware=True`. Without that flag the
+      dispatcher will not inject `workspace_root`, bypassing the
+      path-confinement boundary for an LLM-driven tool.
+    metadata:
+      category: security
+      references:
+        - CLAUDE.md
+    paths:
+      include:
+        - "/fluid_build/cli/forge_copilot_tools.py"
+    patterns:
+      - pattern: |
+          @forge_tool(...)
+          def $FUNC(..., workspace_root, ...):
+              ...
+      - pattern-not: |
+          @forge_tool(..., workspace_root_aware=True, ...)
+          def $FUNC(..., workspace_root, ...):
+              ...

@@ -25,6 +25,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Upgrade the packaging toolchain — the slim base ships older pip /
+# setuptools / wheel that carry fixable advisories the release Grype
+# gate would (correctly) flag. Keeping them current keeps the image clean.
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
 # ============================================
 # Build stage — install from source
 # ============================================
