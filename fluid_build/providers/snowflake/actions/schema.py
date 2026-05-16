@@ -20,6 +20,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict
 
+from ..._sql_safety import quote_string_literal
 from ..connection import SnowflakeConnection
 from ..util.config import get_connection_params
 from ..util.names import (
@@ -61,7 +62,10 @@ def ensure_schema(action: Dict[str, Any], provider) -> Dict[str, Any]:
 
         with SnowflakeConnection(**params) as conn:
             # Check existence
-            check_sql = f"SHOW SCHEMAS LIKE '{schema}' IN DATABASE {quote_identifier(database)}"
+            check_sql = (
+                f"SHOW SCHEMAS LIKE {quote_string_literal(schema)} "
+                f"IN DATABASE {quote_identifier(database)}"
+            )
             result = conn.execute(check_sql)
 
             if result and len(result) > 0:
@@ -81,8 +85,7 @@ def ensure_schema(action: Dict[str, Any], provider) -> Dict[str, Any]:
             qualified_name = build_qualified_name(database, schema)
             create_sql = f"CREATE {'TRANSIENT ' if transient else ''}SCHEMA {qualified_name}"
             if comment:
-                escaped_comment = comment.replace("'", "''")
-                create_sql += f" COMMENT = '{escaped_comment}'"
+                create_sql += f" COMMENT = {quote_string_literal(str(comment))}"
 
             conn.execute(create_sql)
 

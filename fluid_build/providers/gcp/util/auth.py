@@ -210,7 +210,17 @@ def _is_workload_identity() -> bool:
 
 
 def _check_metadata_service() -> bool:
-    """Check if GCP metadata service is available."""
+    """Check if GCP metadata service is available.
+
+    Security: the IMDS probe MUST go *directly* to
+    ``metadata.google.internal``. The bare ``urllib.request.urlopen``
+    silently honours the ``http_proxy`` / ``HTTP_PROXY`` environment
+    variables, so a poisoned proxy could intercept this request and
+    forge a 200 (falsely asserting "running on GCP") or harvest the
+    ``Metadata-Flavor`` probe. Build an explicit opener with an empty
+    :class:`urllib.request.ProxyHandler` so no proxy is ever consulted
+    for this one call, regardless of the ambient environment.
+    """
     try:
         import urllib.request
 
@@ -219,7 +229,10 @@ def _check_metadata_service() -> bool:
             headers={"Metadata-Flavor": "Google"},
         )
 
-        with urllib.request.urlopen(request, timeout=2) as response:
+        # Empty ProxyHandler({}) == "use no proxy"; this overrides any
+        # http_proxy/https_proxy env var for this opener only.
+        no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with no_proxy_opener.open(request, timeout=2) as response:
             return response.status == 200
 
     except Exception:

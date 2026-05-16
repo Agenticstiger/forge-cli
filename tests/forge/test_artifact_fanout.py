@@ -36,6 +36,8 @@ from fluid_build.forge.core.artifact_fanout import (
     FanoutError,
     _contract_has_orchestration_engine,
     _contract_is_reference_only,
+    _emit_policies,
+    _expose_level_policies,
     parse_emit_set,
     run_fanout,
 )
@@ -120,25 +122,28 @@ class TestParseEmitSet:
         out = parse_emit_set("odps", reference_only=False, logger=logger)
         assert out == ["odps"]
 
-    def test_reference_only_drops_schedule_and_policies(self, logger):
+    def test_reference_only_does_not_drop_schedule_or_policies(self, logger):
+        """B6 regression: a reference-only build pattern must NOT strip
+        ``schedule`` or ``policies``. Those emit keys describe orchestration
+        and access control, both independent of where the transformation
+        logic lives. ``schedule`` is gated separately on
+        ``orchestration.engine`` inside run_fanout."""
         out = parse_emit_set(
             "odps-bitol,odcs,schedule,policies",
             reference_only=True,
             logger=logger,
         )
-        assert "schedule" not in out
-        assert "policies" not in out
+        assert "schedule" in out
+        assert "policies" in out
         assert "odps-bitol" in out
         assert "odcs" in out
 
-    def test_reference_only_keeps_catalog_emits(self, logger):
-        """Reference-only products still need catalog artifacts (ODCS,
-        ODPS-Bitol) — only execution-owned emitters (schedule, policies) are
-        skipped because those live in the product's own repo. OPDS is not
-        in the default set while its emitter is being fixed."""
-        out = parse_emit_set(None, reference_only=True, logger=logger)
-        # Order is canonical (EMIT_KEYS order); OPDS excluded pending fix.
-        assert out == ["odps-bitol", "odcs"]
+    def test_reference_only_emit_set_identical_to_non_reference(self, logger):
+        """B6: the build pattern no longer changes the resolved emit set —
+        reference-only and non-reference produce identical output."""
+        ref = parse_emit_set(None, reference_only=True, logger=logger)
+        non_ref = parse_emit_set(None, reference_only=False, logger=logger)
+        assert ref == non_ref == list(DEFAULT_EMIT)
 
     def test_output_order_is_canonical(self, logger):
         """Regardless of input order, output follows EMIT_KEYS canonical
@@ -155,11 +160,11 @@ class TestParseEmitSet:
         out = parse_emit_set("odcs,odcs,odcs,odps-bitol", reference_only=False, logger=logger)
         assert out.count("odcs") == 1
 
-    def test_reference_only_skip_set_matches_docs(self):
-        """The plan document + generate_ci.py both reference this set; if
-        we ever diverge, both pipelines disagree on what 'reference-only'
-        means. Pin the set."""
-        assert set(REFERENCE_ONLY_SKIP) == {"schedule", "policies"}
+    def test_reference_only_skip_set_is_empty(self):
+        """B6: the build pattern gates no emit key. ``REFERENCE_ONLY_SKIP``
+        is intentionally empty — schedule is gated on orchestration.engine,
+        policies emits a warned-empty file when no access policy exists."""
+        assert REFERENCE_ONLY_SKIP == ()
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +366,79 @@ class TestRunFanout:
             run_fanout(bundle_tgz, out_dir, emit_raw=None, manifest_path=None, logger=logger)
         # schedule/ must not exist
         assert not (out_dir / "schedule").exists()
+
+
+# ---------------------------------------------------------------------------
+# B7 — expose-level governance policy in policy/bindings.json
+# ---------------------------------------------------------------------------
+
+
+def _contract_with_expose_policy() -> dict:
+    """A v0.7.x contract with a full expose-level policy block."""
+    return {
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_table",
+                    "location": {"database": "DB", "schema": "S", "table": "ORDERS"},
+                },
+                "contract": {"schema": [{"name": "id", "type": "NUMBER"}]},
+                "policy": {
+                    "classification": "Confidential",
+                    "authz": {
+                        "readers": ["role:analyst"],
+                        "columnRestrictions": [
+                            {"principal": "role:contractor", "columns": ["ssn"], "access": "deny"}
+                        ],
+                    },
+                    "privacy": {
+                        "masking": [{"column": "ssn", "strategy": "hash"}],
+                        "rowLevelPolicy": {"expression": "region = current_region()"},
+                    },
+                },
+            }
+        ]
+    }
+
+
+class TestExposeLevelPolicies:
+    def test_harvests_authz_masking_and_row_level(self):
+        out = _expose_level_policies(_contract_with_expose_policy())
+        assert len(out) == 1
+        entry = out[0]
+        assert entry["exposeId"] == "orders"
+        assert entry["classification"] == "Confidential"
+        assert entry["authz"]["readers"] == ["role:analyst"]
+        assert entry["authz"]["columnRestrictions"][0]["columns"] == ["ssn"]
+        assert entry["privacy"]["masking"][0]["strategy"] == "hash"
+        assert entry["privacy"]["rowLevelPolicy"]["expression"] == "region = current_region()"
+
+    def test_exposes_without_policy_are_skipped(self):
+        contract = {"exposes": [{"exposeId": "x", "binding": {"platform": "local"}}]}
+        assert _expose_level_policies(contract) == []
+
+    def test_empty_policy_block_skipped(self):
+        contract = {"exposes": [{"exposeId": "x", "policy": {}}]}
+        assert _expose_level_policies(contract) == []
+
+    def test_no_exposes_returns_empty(self):
+        assert _expose_level_policies({}) == []
+
+    def test_emit_policies_writes_expose_policies_into_bindings(self, tmp_path, logger):
+        """B7: the on-disk bindings.json must carry an exposePolicies array."""
+        contract_path = tmp_path / "contract.fluid.yaml"
+        contract_path.write_text(yaml.safe_dump(_contract_with_expose_policy()))
+
+        out_dir = tmp_path / "policy"
+        written = _emit_policies(contract_path, out_dir, logger)
+        assert len(written) == 1
+        payload = json.loads(written[0].read_text())
+        assert "bindings" in payload
+        assert "exposePolicies" in payload
+        assert payload["exposePolicies"][0]["exposeId"] == "orders"
+        assert "masking" in payload["exposePolicies"][0]["privacy"]
 
 
 # ---------------------------------------------------------------------------

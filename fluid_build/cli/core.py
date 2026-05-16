@@ -163,6 +163,25 @@ class FluidCLIError(_BaseCLIError):
         if self.event in common_suggestions and not self.suggestions:
             self.suggestions = common_suggestions[self.event]
 
+    def format_for_user(self, console: Console) -> None:
+        """Render this error for the user with Rich formatting.
+
+        Defined on the base class so every ``FluidCLIError`` the
+        top-level ``cli/__init__.py`` handler catches can be formatted.
+        Previously only ``ExecutionError`` carried this, so a bare
+        ``FluidCLIError`` (e.g. a path-validation rejection from
+        ``validate_cli_path``) crashed the handler with AttributeError.
+        """
+        console.print(f"[red]❌ {self.message}[/red]")
+        if self.context:
+            console.print(f"[dim]Details: {self.context}[/dim]")
+        if self.suggestions:
+            console.print("\n[yellow]💡 Suggestions:[/yellow]")
+            for suggestion in self.suggestions:
+                console.print(f"  • {suggestion}")
+        if self.docs_url:
+            console.print(f"\n[cyan]📖 Documentation: {self.docs_url}[/cyan]")
+
 
 # Specific exception types for better error handling
 class ContractNotFoundError(FluidCLIError):
@@ -251,25 +270,6 @@ class ExecutionError(FluidCLIError):
                 "Try --dry-run first to validate",
             ],
         )
-
-    def format_for_user(self, console: Console) -> None:
-        """Format error message for user display"""
-        # Main error message
-        console.print(f"[red]❌ {self.message}[/red]")
-
-        # Context details (if any)
-        if self.context:
-            console.print(f"[dim]Details: {self.context}[/dim]")
-
-        # Suggestions (if any)
-        if self.suggestions:
-            console.print("\n[yellow]💡 Suggestions:[/yellow]")
-            for suggestion in self.suggestions:
-                console.print(f"  • {suggestion}")
-
-        # Documentation link (if available)
-        if self.docs_url:
-            console.print(f"\n[cyan]📖 Documentation: {self.docs_url}[/cyan]")
 
 
 @dataclass

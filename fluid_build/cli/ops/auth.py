@@ -85,10 +85,14 @@ class KeychainBackend(AuthBackend):
 
     def delete(self, ref: str) -> None:
         import keyring  # type: ignore
+        from keyring.errors import KeyringError
 
         try:
             keyring.delete_password(self.service, ref)
-        except Exception:  # noqa: BLE001
+        except KeyringError:
+            # Best-effort cleanup — a missing entry or backend hiccup on
+            # delete is non-fatal. Narrowed from a bare ``except`` so a
+            # real bug is no longer silently swallowed.
             pass
 
 

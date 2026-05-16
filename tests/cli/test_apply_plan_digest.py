@@ -27,7 +27,7 @@ Three attack shapes verified here:
     2. **Missing digest**: attacker strips ``planDigest`` to bypass the
        gate (hoping the verifier falls through to success). Must also
        hard-fail with the same event.
-    3. **Emergency opt-out**: operator passes ``--no-verify-digest``
+    3. **Emergency opt-out**: operator passes ``--no-verify-plan-binding``
        (legit DR scenario — bundle unreachable). Gate waives with a
        WARNING-level log entry, apply proceeds.
 
@@ -55,12 +55,29 @@ from fluid_build.forge.core.plan_digest import inject_digests
 # ---------------------------------------------------------------------------
 
 
+def _embedded_contract() -> Dict[str, Any]:
+    """A schema-valid v0.7.x contract for the plan's embedded ``contract``.
+
+    ``fluid apply`` now runs a pre-0.7 + JSON-schema gate on the embedded
+    contract before any DDL — the plan-binding gate's
+    ``--no-verify-plan-binding`` waiver does not cover this separate
+    structural gate — so the embedded contract must be valid. Built via
+    ``shape_contract`` so it tracks the bundled schema.
+    """
+    from fluid_build.forge.product_types import ProductTypeAnswer, shape_contract
+
+    contract = shape_contract(ProductTypeAnswer(product_type="ADP", name="orders"))
+    contract["id"] = "orders"
+    contract["name"] = "Orders"
+    return contract
+
+
 def _minimal_plan() -> Dict[str, Any]:
     """Structurally realistic plan body — matches plan.py output shape."""
     return {
         "format_version": "0.7.1",
         "generated_at": 1700000000,
-        "contract": {"id": "orders", "name": "Orders", "version": "0.7.1"},
+        "contract": _embedded_contract(),
         "actions": [
             {
                 "step": 1,
@@ -78,13 +95,16 @@ def _minimal_plan() -> Dict[str, Any]:
 def _fake_args(**overrides: Any) -> argparse.Namespace:
     """Stand-in for the argparse namespace consumed by ``_verify_plan_digests``.
 
-    Only two attrs matter for the gate — ``no_verify_digest`` (the
-    emergency waiver) and ``contract`` (for telemetry, not logic). Any
-    other attribute lookups get ``MagicMock`` auto-behaviour, which we
-    don't want to trigger — hence using a real Namespace, not a Mock."""
+    Only two attrs matter for the gate — ``no_verify_plan_binding`` (the
+    emergency waiver for the plan/bundle digest gate) and ``contract``
+    (for telemetry, not logic). ``no_verify_federation`` is carried too
+    so the namespace mirrors the real argparse surface. Any other
+    attribute lookups get ``MagicMock`` auto-behaviour, which we don't
+    want to trigger — hence using a real Namespace, not a Mock."""
     ns = argparse.Namespace(
         contract="runtime/plan.json",
-        no_verify_digest=False,
+        no_verify_plan_binding=False,
+        no_verify_federation=False,
     )
     for k, v in overrides.items():
         setattr(ns, k, v)
@@ -154,6 +174,7 @@ class TestVerifyPlanDigestsMissingDigest:
     def test_missing_plan_digest_caught(self) -> None:
         plan = _minimal_plan()
         plan["bundleDigest"] = ""
+        plan["bindingMode"] = "raw"
         # No planDigest field at all.
 
         logger = logging.getLogger("fluid_build.cli.apply.test")
@@ -173,7 +194,7 @@ class TestVerifyPlanDigestsMissingDigest:
 class TestVerifyPlanDigestsEmergencyOptOut:
     """Attacker shape #3 (inverted): legit operator DR scenario.
 
-    --no-verify-digest is a POWERFUL flag. These tests ensure (a) it
+    --no-verify-plan-binding is a POWERFUL flag. These tests ensure (a) it
     actually waives, (b) it logs loudly enough that audit trails see it.
     """
 
@@ -193,7 +214,7 @@ class TestVerifyPlanDigestsEmergencyOptOut:
         caplog.set_level(logging.WARNING)
         logger = logging.getLogger("fluid_build.cli.apply.emergency")
         # Waiver is set → no raise even with tampered plan.
-        _verify_plan_digests(plan, _fake_args(no_verify_digest=True), logger)
+        _verify_plan_digests(plan, _fake_args(no_verify_plan_binding=True), logger)
 
     def test_waiver_emits_warning_log(self, caplog: pytest.LogCaptureFixture) -> None:
         """Audit-trail invariant: the waiver MUST surface at WARNING
@@ -202,10 +223,10 @@ class TestVerifyPlanDigestsEmergencyOptOut:
 
         caplog.set_level(logging.WARNING)
         logger = logging.getLogger("fluid_build.cli.apply.emergency_log")
-        _verify_plan_digests(plan, _fake_args(no_verify_digest=True), logger)
+        _verify_plan_digests(plan, _fake_args(no_verify_plan_binding=True), logger)
 
         messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any("no-verify-digest" in m.lower() for m in messages), messages
+        assert any("no-verify-plan-binding" in m.lower() for m in messages), messages
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +234,9 @@ class TestVerifyPlanDigestsEmergencyOptOut:
 # ---------------------------------------------------------------------------
 
 
-class TestNoVerifyDigestFlag:
-    """The flag must be reachable via argparse so operators can pass it."""
+class TestNoVerifyPlanBindingFlag:
+    """The plan-binding waiver flag must be reachable via argparse so
+    operators can pass it."""
 
     def _parser(self) -> argparse.ArgumentParser:
         p = argparse.ArgumentParser()
@@ -224,26 +246,40 @@ class TestNoVerifyDigestFlag:
 
     def test_flag_defaults_false(self) -> None:
         args = self._parser().parse_args(["apply", "plan.json"])
-        assert args.no_verify_digest is False
+        assert args.no_verify_plan_binding is False
 
     def test_flag_sets_true(self) -> None:
-        args = self._parser().parse_args(["apply", "plan.json", "--no-verify-digest"])
-        assert args.no_verify_digest is True
+        args = self._parser().parse_args(["apply", "plan.json", "--no-verify-plan-binding"])
+        assert args.no_verify_plan_binding is True
 
     def test_flag_compatible_with_mode(self) -> None:
-        """Passing --no-verify-digest alongside --mode must not conflict
-        at parse time (semantic compatibility is tested below)."""
+        """Passing --no-verify-plan-binding alongside --mode must not
+        conflict at parse time (semantic compatibility is tested below)."""
         args = self._parser().parse_args(
             [
                 "apply",
                 "plan.json",
                 "--mode",
                 "amend",
-                "--no-verify-digest",
+                "--no-verify-plan-binding",
             ]
         )
         assert args.mode == "amend"
-        assert args.no_verify_digest is True
+        assert args.no_verify_plan_binding is True
+
+    def test_federation_flag_is_independent(self) -> None:
+        """The digest gate is split into two flags: passing
+        --no-verify-plan-binding must NOT waive the federation gate, and
+        vice versa. Each defaults False and toggles independently."""
+        parser = self._parser()
+
+        plan_only = parser.parse_args(["apply", "plan.json", "--no-verify-plan-binding"])
+        assert plan_only.no_verify_plan_binding is True
+        assert plan_only.no_verify_federation is False
+
+        fed_only = parser.parse_args(["apply", "plan.json", "--no-verify-federation"])
+        assert fed_only.no_verify_federation is True
+        assert fed_only.no_verify_plan_binding is False
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +327,8 @@ class TestApplyRunInvokesVerification:
             env="dev",
             mode=None,
             allow_data_loss=False,
-            no_verify_digest=False,
+            no_verify_plan_binding=False,
+            no_verify_federation=False,
             build_id=None,
             dry_run=False,
             yes=True,
@@ -330,3 +367,102 @@ class TestApplyRunInvokesVerification:
             apply_mod.run(args, logger)
 
         assert exc_info.value.event == "apply_plan_digest_plan_tamper"
+
+
+class TestApplyPlanTOCTOUSnapshot:
+    """J4: after ``_verify_plan_digests`` succeeds, ``apply.run`` deep-copies
+    the verified plan and dispatches from that frozen snapshot. The point is
+    that the structure driving provider dispatch is provably the one the
+    digest covered — not a sibling alias mutated between verify and use.
+    """
+
+    def _flat_plan_args(self, plan_path: Path, tmp_path: Path) -> argparse.Namespace:
+        return argparse.Namespace(
+            contract=str(plan_path),
+            env="dev",
+            # mode=None (amend default) is compatible with a plan that
+            # records no mode; ``dry_run=True`` keeps dispatch off a real
+            # provider without tripping the plan/apply mode-mismatch gate.
+            mode=None,
+            allow_data_loss=False,
+            no_verify_plan_binding=False,
+            no_verify_federation=False,
+            build_id=None,
+            dry_run=True,
+            yes=True,
+            verbose=False,
+            debug=False,
+            workspace_dir=tmp_path,
+            state_file=None,
+            config_override=None,
+            report=None,
+            report_format="html",
+            metrics_export="none",
+            notify=None,
+            rollback_strategy="none",
+            require_approval=False,
+            backup_state=False,
+            validate_dependencies=False,
+            timeout=120,
+            parallel_phases=False,
+            max_workers=4,
+            keep_temp_files=False,
+            profile=False,
+            delay=2,
+            fail_fast=False,
+            no_output=False,
+            provider="local",
+            project=None,
+            region=None,
+            provider_config=None,
+        )
+
+    def test_dispatch_reads_deepcopied_plan_not_loaded_alias(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The plan dict (and its embedded ``contract`` child) consumed
+        downstream must be a deep copy — a distinct object from the one
+        ``read_json`` returned. If apply dispatched from the loaded alias,
+        a post-verification mutation of that alias would silently feed an
+        unverified structure into provider dispatch."""
+        from fluid_build.cli import apply as apply_mod
+
+        plan = inject_digests(_minimal_plan(), bundle_path=None)
+        plan_path = tmp_path / "plan.json"
+        plan_path.write_text(json.dumps(plan))
+
+        # The exact dict object ``read_json`` hands back. Keep a handle on
+        # its nested ``contract`` so we can assert identity later.
+        loaded = json.loads(plan_path.read_text())
+        loaded_contract_obj = loaded["contract"]
+
+        captured: Dict[str, Any] = {}
+
+        real_deepcopy = __import__("copy").deepcopy
+
+        def _spy_deepcopy(obj):
+            result = real_deepcopy(obj)
+            # Record the first deepcopy of the plan dict (the J4 snapshot).
+            if isinstance(obj, dict) and "contract" in obj and "snapshot" not in captured:
+                captured["snapshot"] = result
+                captured["source"] = obj
+            return result
+
+        monkeypatch.setattr(apply_mod, "hydrate_dotenv", lambda *a, **kw: None)
+        monkeypatch.setattr("fluid_build.cli.apply.read_json", lambda *a, **kw: loaded)
+        monkeypatch.setattr("copy.deepcopy", _spy_deepcopy)
+
+        logger = logging.getLogger("fluid_build.cli.apply.toctou")
+        rc = apply_mod.run(self._flat_plan_args(plan_path, tmp_path), logger)
+
+        # Dry-run path returns 0 without provider dispatch.
+        assert rc == 0
+        # A deep copy of the verified plan WAS taken.
+        assert "snapshot" in captured, "apply.run did not deep-copy the verified plan"
+        snapshot = captured["snapshot"]
+        # The snapshot equals the loaded plan but is a distinct object,
+        # and its embedded contract is NOT the loaded alias — the J4
+        # guarantee that dispatch can never see a swapped sibling.
+        assert snapshot == loaded
+        assert snapshot["contract"] is not loaded_contract_obj
+        assert captured["source"] is loaded

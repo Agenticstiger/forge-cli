@@ -25,6 +25,7 @@ This test spawns the actual ``fluid forge --agent --blank`` subprocess (the
 real wire format) and parses the JSON-Lines event stream. If it passes, the
 agent's shell wrapper in the IDE is contract-compatible.
 """
+
 from __future__ import annotations
 
 import json

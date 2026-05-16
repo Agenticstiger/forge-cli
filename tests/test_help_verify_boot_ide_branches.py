@@ -269,21 +269,30 @@ class TestBootstrapImp:
 
 class TestValidateContractObj:
     @patch("fluid_build.cli.bootstrap._imp")
-    def test_valid_via_schema(self, mock_imp):
+    def test_valid_via_schema_manager(self, mock_imp):
         from fluid_build.cli.bootstrap import validate_contract_obj
 
+        mock_result = MagicMock()
+        mock_result.is_valid = True
+        mock_manager = MagicMock()
+        mock_manager.validate_contract.return_value = mock_result
         mock_mod = MagicMock()
-        mock_mod.validate_contract.return_value = (True, None)
+        mock_mod.FluidSchemaManager.return_value = mock_manager
         mock_imp.return_value = mock_mod
         ok, err = validate_contract_obj({"id": "test"})
         assert ok is True
 
     @patch("fluid_build.cli.bootstrap._imp")
-    def test_invalid_via_schema(self, mock_imp):
+    def test_invalid_via_schema_manager(self, mock_imp):
         from fluid_build.cli.bootstrap import validate_contract_obj
 
+        mock_result = MagicMock()
+        mock_result.is_valid = False
+        mock_result.errors = ["schema error"]
+        mock_manager = MagicMock()
+        mock_manager.validate_contract.return_value = mock_result
         mock_mod = MagicMock()
-        mock_mod.validate_contract.return_value = (False, "schema error")
+        mock_mod.FluidSchemaManager.return_value = mock_manager
         mock_imp.return_value = mock_mod
         ok, err = validate_contract_obj({"id": "test"})
         assert ok is False
@@ -293,10 +302,9 @@ class TestValidateContractObj:
     def test_fallback_valid(self, mock_imp):
         from fluid_build.cli.bootstrap import validate_contract_obj
 
-        mock_mod = MagicMock(spec=[])  # no validate_contract attribute
-        mock_imp.return_value = mock_mod
+        mock_imp.side_effect = ImportError("no schema manager")
         contract = {
-            "fluidVersion": "0.5.7",
+            "fluidVersion": "0.7.3",
             "kind": "DataContract",
             "id": "test",
             "name": "Test",
@@ -308,7 +316,7 @@ class TestValidateContractObj:
     def test_missing_field(self):
         from fluid_build.cli.bootstrap import validate_contract_obj
 
-        contract = {"fluidVersion": "0.5.7", "kind": "DataContract"}
+        contract = {"fluidVersion": "0.7.3", "kind": "DataContract"}
         ok, err = validate_contract_obj(contract)
         assert ok is False
         assert "id" in err

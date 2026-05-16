@@ -17,20 +17,57 @@ Command Center reporter with circuit breaker and async queue.
 """
 
 import logging
+import os
 import queue
 import threading
 import time
 from enum import Enum
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 try:
     import requests
 except ImportError:
     requests = None  # type: ignore
 
+# Reuse the canonical SSRF post-DNS-resolution gate (RFC1918,
+# link-local 169.254.0.0/16 — AWS/GCP metadata — loopback, reserved;
+# fails closed on DNS errors).
+from fluid_build.build_runners._alerter import _hostname_is_private
+
 from .config import CommandCenterConfig
 
 logger = logging.getLogger(__name__)
+
+# Opt-in allow-list for a Command Center on a genuinely internal
+# address; loopback (the local dev default) is always permitted. The
+# SSRF concern is a config-supplied URL bouncing the X-API-Key header
+# to a cloud-metadata endpoint.
+_CC_HOST_ALLOWLIST_ENV = "FLUID_COMMAND_CENTER_HOST_ALLOWLIST"
+_CC_ALWAYS_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _command_center_host_allowed(url: Optional[str]) -> bool:
+    """Return True when ``url``'s host is safe for the reporter to POST to.
+
+    Loopback and any host on ``FLUID_COMMAND_CENTER_HOST_ALLOWLIST`` are
+    permitted; any other host resolving to a private/link-local/
+    loopback/cloud-metadata address is refused via
+    :func:`_hostname_is_private`. A URL with no host is refused.
+    """
+    if not url:
+        return False
+    host = urlparse(url).hostname
+    if not host:
+        return False
+    if host in _CC_ALWAYS_ALLOWED_HOSTS:
+        return True
+    suffixes = [
+        s.strip() for s in os.environ.get(_CC_HOST_ALLOWLIST_ENV, "").split(",") if s.strip()
+    ]
+    if any(host == s or host.endswith("." + s) for s in suffixes):
+        return True
+    return not _hostname_is_private(host)
 
 
 class CircuitState(Enum):
@@ -200,6 +237,23 @@ class CommandCenterReporter:
 
         if not requests:
             logger.warning("requests library not installed, Command Center integration disabled")
+            self.enabled = False
+            return
+
+        # SSRF gate: ``config.url`` is user/config-supplied and every
+        # event POST carries the X-API-Key header. Refuse to start the
+        # reporter against a host that resolves to a private/link-local/
+        # cloud-metadata address unless it is loopback (local dev) or
+        # explicitly allow-listed — otherwise a poisoned config could
+        # exfil the API key to e.g. http://169.254.169.254/.
+        if not _command_center_host_allowed(self.config.url):
+            logger.warning(
+                "Command Center URL host resolves to a private/loopback/"
+                "link-local/cloud-metadata address; reporter disabled to "
+                "prevent SSRF (API-key exfil). Set %s=<host-suffix> to allow "
+                "a genuinely internal Command Center endpoint.",
+                _CC_HOST_ALLOWLIST_ENV,
+            )
             self.enabled = False
             return
 

@@ -331,3 +331,285 @@ class TestPlatformAwareForbiddenPaths:
         else:
             # Linux / other Unix
             assert "/etc" in FORBIDDEN_PATHS
+
+
+class TestForbiddenPathGapsF4:
+    """F4: ``FORBIDDEN_PATHS`` must additionally cover ``/opt``,
+    ``/Library``, and ``/var/lib`` on macOS + Linux, and the validator
+    must reject Windows device/UNC namespace prefixes."""
+
+    def setup_method(self):
+        self.validator = SecurePathValidator(SecurityContext())
+
+    @pytest.mark.skipif(
+        sys.platform.startswith("win"),
+        reason="Unix forbidden-path additions",
+    )
+    @pytest.mark.parametrize("forbidden", ["/opt", "/Library", "/var/lib"])
+    def test_new_forbidden_prefixes_present(self, forbidden):
+        from fluid_build.cli.security import FORBIDDEN_PATHS
+
+        assert forbidden in FORBIDDEN_PATHS
+
+    @pytest.mark.skipif(
+        sys.platform.startswith("win"),
+        reason="Unix forbidden-path additions",
+    )
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "/opt/fluid_f4_target.yaml",
+            "/var/lib/fluid_f4_target.yaml",
+        ],
+    )
+    def test_new_forbidden_prefixes_rejected(self, target):
+        """A path under one of the F4-added system directories is
+        rejected by the path-security check."""
+        with pytest.raises(FluidCLIError) as exc:
+            self.validator._validate_path_security(Path(target), "write")
+        assert exc.value.event == "forbidden_path_access"
+
+    def test_var_lib_does_not_block_private_var_temp(self):
+        """The narrow ``/var/lib`` entry must NOT block the macOS
+        ``/private/var/folders`` temp tree (pytest's tmp_path lives
+        there). Regression guard for the documented exclusion."""
+        # /private/var/folders/... is NOT relative to /var/lib.
+        self.validator._validate_path_security(
+            Path("/private/var/folders/xx/fluid_tmp/file.yaml"), "write"
+        )
+
+    @pytest.mark.parametrize(
+        "device_path",
+        [
+            "\\\\?\\C:\\Windows\\System32\\config\\SAM",
+            "\\\\.\\PhysicalDrive0",
+            "//?/C:/Windows/win.ini",
+        ],
+    )
+    def test_windows_device_prefix_rejected(self, device_path):
+        """F4: Windows ``\\\\?\\`` / ``\\\\.\\`` device namespace
+        prefixes are rejected on the raw (pre-resolve) input — the FLUID
+        CLI never reads/writes through the device namespace."""
+        with pytest.raises(FluidCLIError) as exc:
+            self.validator._reject_raw_traversal(device_path, "read")
+        assert exc.value.event == "forbidden_path_access"
+
+
+class TestValidateCliPathF1:
+    """F1: ``validate_cli_path`` is the shared chokepoint the 11-stage
+    pipeline routes every operator-supplied path argument through."""
+
+    def test_valid_read_returns_resolved_path(self, tmp_path):
+        from fluid_build.cli.security import validate_cli_path
+
+        f = tmp_path / "contract.fluid.yaml"
+        f.write_text("fluidVersion: '0.7.3'\n", encoding="utf-8")
+        result = validate_cli_path(f, mode="read", file_type="contract")
+        assert result == f.resolve()
+
+    def test_read_rejects_traversal(self):
+        from fluid_build.cli.security import validate_cli_path
+
+        with pytest.raises(FluidCLIError) as exc:
+            validate_cli_path("../../etc/passwd", mode="read")
+        assert exc.value.event == "path_traversal_detected"
+
+    @pytest.mark.skipif(
+        sys.platform.startswith("win"),
+        reason="Exercises POSIX forbidden-system-path rejection",
+    )
+    def test_read_rejects_forbidden_system_path(self):
+        from fluid_build.cli.security import validate_cli_path
+
+        with pytest.raises(FluidCLIError) as exc:
+            validate_cli_path("/etc/passwd", mode="read")
+        assert exc.value.event == "forbidden_path_access"
+
+    def test_read_missing_file_raises_file_not_found(self, tmp_path):
+        from fluid_build.cli.security import validate_cli_path
+
+        with pytest.raises(FluidCLIError) as exc:
+            validate_cli_path(tmp_path / "nope.yaml", mode="read")
+        assert exc.value.event == "file_not_found"
+
+    def test_read_missing_file_allowed_when_must_exist_false(self, tmp_path):
+        """A non-existent path is acceptable for a write target."""
+        from fluid_build.cli.security import validate_cli_path
+
+        target = tmp_path / "sub" / "plan.json"
+        result = validate_cli_path(target, mode="write", must_exist=False, file_type="output")
+        assert result == target.resolve()
+
+    def test_read_accepts_tgz_bundle_extension(self, tmp_path):
+        """Pipeline bundles (.tgz / .tar.gz) are accepted even though
+        those suffixes are not in ALLOWED_FILE_EXTENSIONS."""
+        from fluid_build.cli.security import validate_cli_path
+
+        bundle = tmp_path / "product.fluid.bundle.tgz"
+        bundle.write_bytes(b"fake-tgz")
+        result = validate_cli_path(bundle, mode="read", file_type="bundle")
+        assert result == bundle.resolve()
+
+    def test_read_accepts_tar_gz_bundle_extension(self, tmp_path):
+        from fluid_build.cli.security import validate_cli_path
+
+        bundle = tmp_path / "product.tar.gz"
+        bundle.write_bytes(b"fake-tgz")
+        result = validate_cli_path(bundle, mode="read", file_type="bundle")
+        assert result == bundle.resolve()
+
+    def test_read_rejects_disallowed_extension(self, tmp_path):
+        """Non-bundle files still go through the extension allowlist."""
+        from fluid_build.cli.security import validate_cli_path
+
+        bad = tmp_path / "payload.exe"
+        bad.write_text("x", encoding="utf-8")
+        with pytest.raises(FluidCLIError) as exc:
+            validate_cli_path(bad, mode="read", file_type="contract")
+        assert exc.value.event == "invalid_file_extension"
+
+    def test_read_rejects_symlink(self, tmp_path):
+        """F6: an explicitly-passed symlinked read path is rejected
+        (the auto-find guard only covers CWD discovery)."""
+        from fluid_build.cli.security import validate_cli_path
+
+        real = tmp_path / "real.fluid.yaml"
+        real.write_text("fluidVersion: '0.7.3'\n", encoding="utf-8")
+        link = tmp_path / "link.fluid.yaml"
+        link.symlink_to(real)
+        with pytest.raises(FluidCLIError) as exc:
+            validate_cli_path(link, mode="read", file_type="contract")
+        assert exc.value.event == "symlink_path_rejected"
+
+    def test_write_rejects_traversal(self):
+        from fluid_build.cli.security import validate_cli_path
+
+        with pytest.raises(FluidCLIError) as exc:
+            validate_cli_path("../../etc/evil.json", mode="write", must_exist=False)
+        assert exc.value.event == "path_traversal_detected"
+
+    @pytest.mark.skipif(
+        sys.platform.startswith("win"),
+        reason="Exercises POSIX forbidden-system-path rejection",
+    )
+    def test_write_rejects_forbidden_system_path(self):
+        from fluid_build.cli.security import validate_cli_path
+
+        with pytest.raises(FluidCLIError) as exc:
+            validate_cli_path("/etc/fluid_f1_write_target.json", mode="write", must_exist=False)
+        assert exc.value.event == "forbidden_path_access"
+
+
+class TestSnowsqlPasswordNotInArgv:
+    """A4: the SnowSQL auth path must never place the Snowflake password
+    on the subprocess command line.
+
+    A password passed as ``snowsql -p <pw>`` (or ``--password``) is
+    visible to any local user via ``ps`` / ``/proc/<pid>/cmdline`` and
+    is captured verbatim into ``CalledProcessError.__str__``. SnowSQL
+    reads the password from the ``SNOWSQL_PWD`` environment variable
+    instead — ``SnowflakeAuthProvider._login_with_snowsql`` /
+    ``_check_auth_with_snowsql`` build the argv from
+    ``-a/-u/-w/-d/-r`` only and never append a password flag. These
+    tests pin that invariant against regression.
+    """
+
+    @staticmethod
+    def _completed(returncode=0, stdout="MYUSER", stderr=""):
+        import subprocess
+        from unittest.mock import Mock
+
+        cp = Mock(spec=subprocess.CompletedProcess)
+        cp.returncode = returncode
+        cp.stdout = stdout
+        cp.stderr = stderr
+        return cp
+
+    def _provider(self):
+        import logging
+
+        from fluid_build.cli.auth import SnowflakeAuthProvider
+
+        # ``password`` is set on the config — if the SnowSQL path ever
+        # started forwarding it to argv, this is the value that would
+        # leak. The connector path is not exercised here; we call the
+        # SnowSQL argv builders directly.
+        return SnowflakeAuthProvider(
+            {
+                "account": "myaccount",
+                "user": "myuser",
+                "warehouse": "wh",
+                "database": "db",
+                "role": "ANALYST",
+                "password": "sup3r-s3cret-pw",
+            },
+            logging.getLogger("test_a4_snowsql"),
+        )
+
+    @staticmethod
+    def _assert_no_password_in_argv(argv, secret):
+        # No password-bearing flag.
+        assert "-p" not in argv, f"SnowSQL argv must not carry -p: {argv}"
+        assert "--password" not in argv, f"SnowSQL argv must not carry --password: {argv}"
+        # The secret value itself must never appear as any token.
+        assert secret not in argv, "Snowflake password leaked into SnowSQL argv"
+        for token in argv:
+            assert secret not in str(token), "Snowflake password leaked into a SnowSQL argv token"
+
+    def test_login_with_snowsql_argv_has_no_password(self):
+        captured = []
+
+        def _fake_run(command, *a, **kw):
+            captured.append(list(command))
+            return self._completed(returncode=0, stdout="MYUSER")
+
+        provider = self._provider()
+        # No rich console so the code path is the plain-CLI branch.
+        provider.console = None
+        with patch("subprocess.run", side_effect=_fake_run):
+            result = provider._login_with_snowsql()
+
+        # version probe + the SELECT CURRENT_USER() query.
+        assert captured, "expected snowsql to be invoked"
+        for argv in captured:
+            self._assert_no_password_in_argv(argv, "sup3r-s3cret-pw")
+        assert result.status.name == "AUTHENTICATED"
+
+    def test_check_auth_with_snowsql_argv_has_no_password(self):
+        captured = []
+
+        def _fake_run(command, *a, **kw):
+            captured.append(list(command))
+            return self._completed(returncode=0, stdout="MYUSER")
+
+        provider = self._provider()
+        with patch("subprocess.run", side_effect=_fake_run):
+            result = provider._check_auth_with_snowsql()
+
+        assert captured, "expected snowsql to be invoked"
+        for argv in captured:
+            self._assert_no_password_in_argv(argv, "sup3r-s3cret-pw")
+        assert result.status.name == "AUTHENTICATED"
+
+    def test_snowsql_query_argv_carries_only_connection_flags(self):
+        """The connection-bearing argv carries exactly the non-secret
+        identity flags — account/user/warehouse/database/role — and a
+        ``-q`` query, nothing resembling a credential."""
+        captured = []
+
+        def _fake_run(command, *a, **kw):
+            captured.append(list(command))
+            return self._completed(returncode=0, stdout="MYUSER")
+
+        provider = self._provider()
+        provider.console = None
+        with patch("subprocess.run", side_effect=_fake_run):
+            provider._login_with_snowsql()
+
+        # The query invocation is the longest argv (has -q + SQL).
+        query_argv = max(captured, key=len)
+        assert query_argv[0] == "snowsql"
+        assert "-q" in query_argv
+        for flag in ("-a", "-u", "-w", "-d", "-r"):
+            assert flag in query_argv, f"expected connection flag {flag} in {query_argv}"
+        self._assert_no_password_in_argv(query_argv, "sup3r-s3cret-pw")

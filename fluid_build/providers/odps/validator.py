@@ -16,61 +16,91 @@
 """
 OPDS JSON Schema Validator
 
-Provides validation against the official OPDS v4.1 JSON Schema specification.
-Uses jsonschema library for comprehensive validation when available.
+Validates OPDS (Open Data Product Specification) artifacts against the
+official OPDS v4.1 JSON Schema.
+
+The schema is VENDORED alongside this module (``odps-schema-v4.1.json``),
+copied verbatim from the upstream specification repository
+github.com/Open-Data-Product-Initiative/v4.1. Vendoring — rather than
+fetching the schema over the network at validation time — keeps validation
+deterministic, offline-capable, and pinned to a known schema version. This
+mirrors how the ODCS provider bundles ``odcs-schema-v3.1.0.json``.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.error import URLError
-from urllib.request import urlopen
 
 LOG = logging.getLogger(__name__)
 
-# Cache for downloaded schemas
+# In-memory parsed-schema cache, keyed by OPDS version.
 _SCHEMA_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
-def validate_against_opds_schema(
-    opds_data: Dict[str, Any], schema_url: str, version: str = "4.1"
-) -> Tuple[bool, Optional[List[str]]]:
+def _load_bundled_schema(version: str) -> Optional[Dict[str, Any]]:
+    """Load the vendored OPDS JSON Schema for ``version`` from disk.
+
+    Returns ``None`` when no schema is bundled for that version — the caller
+    then falls back to basic structural validation.
     """
-    Validate OPDS data against the official JSON Schema.
+    if version in _SCHEMA_CACHE:
+        return _SCHEMA_CACHE[version]
+    schema_path = Path(__file__).parent / f"odps-schema-v{version}.json"
+    if not schema_path.is_file():
+        LOG.debug("opds_schema_not_bundled", extra={"version": version})
+        return None
+    try:
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:  # pragma: no cover - defensive
+        LOG.error("opds_schema_load_failed", extra={"version": version, "error": str(e)})
+        return None
+    _SCHEMA_CACHE[version] = schema
+    return schema
+
+
+def validate_against_opds_schema(
+    opds_data: Dict[str, Any], version: str = "4.1"
+) -> Tuple[bool, Optional[List[str]], str]:
+    """
+    Validate OPDS data against the vendored official JSON Schema.
 
     Args:
         opds_data: OPDS data dictionary to validate
-        schema_url: URL to the OPDS JSON schema (raw GitHub URL)
-        version: OPDS version for context
+        version: OPDS version (selects the bundled ``odps-schema-v{version}.json``)
 
     Returns:
-        Tuple of (is_valid, list_of_errors)
+        ``(is_valid, errors, validation_type)`` — ``validation_type`` is
+        ``"full_schema"`` when the bundled JSON Schema was applied, or
+        ``"basic"`` when it fell back to structural validation (jsonschema
+        not installed, or no schema bundled for ``version``).
     """
     try:
         import jsonschema
     except ImportError:
         LOG.warning(
-            "jsonschema library not available - skipping full schema validation. "
+            "jsonschema not installed - falling back to basic OPDS validation. "
             "Install with: pip install jsonschema"
         )
-        return _basic_validation(opds_data, version)
+        valid, errors = _basic_validation(opds_data, version)
+        return valid, errors, "basic"
+
+    schema = _load_bundled_schema(version)
+    if schema is None:
+        valid, errors = _basic_validation(opds_data, version)
+        return valid, errors, "basic"
 
     try:
-        # Get or download schema
-        schema = _get_schema(schema_url)
-
-        # Validate against schema
         validator = jsonschema.Draft202012Validator(schema)
         errors = list(validator.iter_errors(opds_data))
 
-        # Filter out known OPDS v4.1 schema false-positives.
-        # The official schema declares product.dataAccess as both
-        # "type": "object" (inline) and "$ref": "#/$defs/DataAccess"
-        # which has "type": "array" — these are mutually exclusive
-        # constraints that cannot both be satisfied.  This is a bug
-        # in the upstream schema; our array representation is correct.
+        # Filter a known upstream OPDS v4.1 schema false-positive: the
+        # official schema declares ``product.dataAccess`` as both an inline
+        # ``"type": "object"`` and a ``"$ref"`` to a ``"type": "array"``
+        # ``$def`` — mutually exclusive constraints. Our array
+        # representation is the correct one.
         errors = [
             e
             for e in errors
@@ -78,64 +108,28 @@ def validate_against_opds_schema(
         ]
 
         if errors:
-            error_messages = []
+            error_messages: List[str] = []
             for error in errors[:10]:  # Limit to first 10 errors
                 path = ".".join(str(p) for p in error.path) if error.path else "root"
                 error_messages.append(f"{path}: {error.message}")
-
             if len(errors) > 10:
                 error_messages.append(f"... and {len(errors) - 10} more errors")
-
             LOG.debug(
                 "opds_validation_failed",
-                extra={
-                    "version": version,
-                    "error_count": len(errors),
-                    "errors": error_messages[:5],
-                },
+                extra={"version": version, "error_count": len(errors)},
             )
-            return False, error_messages
+            return False, error_messages, "full_schema"
 
-        LOG.debug("opds_validation_success", extra={"version": version, "schema_url": schema_url})
-        return True, None
+        LOG.debug("opds_validation_success", extra={"version": version})
+        return True, None, "full_schema"
 
     except jsonschema.SchemaError as e:
         LOG.error("opds_schema_invalid", extra={"error": str(e)})
-        return False, [f"Schema validation error: {e}"]
-    except Exception as e:
+        return False, [f"Schema validation error: {e}"], "full_schema"
+    except Exception as e:  # pragma: no cover - defensive
         LOG.error("opds_validation_error", extra={"error": str(e)})
-        # Fall back to basic validation
-        return _basic_validation(opds_data, version)
-
-
-def _get_schema(schema_url: str) -> Dict[str, Any]:
-    """
-    Get OPDS schema from cache or download it.
-
-    Args:
-        schema_url: Raw GitHub URL to the schema JSON file
-
-    Returns:
-        Schema dictionary
-    """
-    if schema_url in _SCHEMA_CACHE:
-        LOG.debug("opds_schema_cache_hit", extra={"url": schema_url})
-        return _SCHEMA_CACHE[schema_url]
-
-    try:
-        LOG.debug("opds_schema_download", extra={"url": schema_url})
-        with urlopen(schema_url, timeout=10) as response:
-            schema_text = response.read().decode("utf-8")
-            schema = json.loads(schema_text)
-            _SCHEMA_CACHE[schema_url] = schema
-            LOG.debug("opds_schema_downloaded", extra={"url": schema_url})
-            return schema
-    except URLError as e:
-        LOG.error("opds_schema_download_failed", extra={"url": schema_url, "error": str(e)})
-        raise RuntimeError(f"Failed to download OPDS schema from {schema_url}: {e}")
-    except json.JSONDecodeError as e:
-        LOG.error("opds_schema_parse_failed", extra={"url": schema_url, "error": str(e)})
-        raise RuntimeError(f"Failed to parse OPDS schema JSON: {e}")
+        valid, errors_basic = _basic_validation(opds_data, version)
+        return valid, errors_basic, "basic"
 
 
 def _basic_validation(opds_data: Dict[str, Any], version: str) -> Tuple[bool, Optional[List[str]]]:
@@ -208,16 +202,19 @@ def validate_opds_structure(
     opds_data: Dict[str, Any],
     version: str = "4.1",
     use_full_schema: bool = True,
-    schema_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Validate OPDS data structure and return detailed results.
 
+    Full JSON-Schema validation runs against the vendored official OPDS
+    schema (``odps-schema-v{version}.json``) when ``use_full_schema`` is set
+    and a schema is bundled for ``version``; otherwise basic structural
+    validation runs.
+
     Args:
         opds_data: OPDS data dictionary to validate
         version: OPDS version (default: "4.1")
-        use_full_schema: Whether to use full JSON schema validation
-        schema_url: Optional schema URL (uses default for version if not provided)
+        use_full_schema: Whether to attempt full JSON schema validation
 
     Returns:
         Dictionary with validation results:
@@ -228,34 +225,20 @@ def validate_opds_structure(
             "version": str
         }
     """
-    if schema_url is None:
-        # Use raw GitHub URL for version 4.1
-        if version == "4.1":
-            schema_url = "https://raw.githubusercontent.com/Open-Data-Product-Initiative/v4.1/main/source/schema/odps.json"
-        else:
-            use_full_schema = False  # No schema available for other versions
+    if use_full_schema:
+        valid, errors, validation_type = validate_against_opds_schema(opds_data, version)
+        return {
+            "valid": valid,
+            "errors": errors,
+            "validation_type": validation_type,
+            "version": version,
+        }
 
-    if use_full_schema and schema_url:
-        try:
-            valid, errors = validate_against_opds_schema(opds_data, schema_url, version)
-            return {
-                "valid": valid,
-                "errors": errors,
-                "validation_type": "full_schema",
-                "version": version,
-                "schema_url": schema_url,
-            }
-        except Exception as e:
-            LOG.warning("opds_full_validation_failed_fallback_to_basic", extra={"error": str(e)})
-            # Fall through to basic validation
-
-    # Basic validation
     valid, errors = _basic_validation(opds_data, version)
     return {"valid": valid, "errors": errors, "validation_type": "basic", "version": version}
 
 
-def clear_schema_cache():
-    """Clear the cached schemas (useful for testing or forcing re-download)."""
-    global _SCHEMA_CACHE
+def clear_schema_cache() -> None:
+    """Clear the in-memory parsed-schema cache (useful for tests)."""
     _SCHEMA_CACHE.clear()
     LOG.info("opds_schema_cache_cleared")

@@ -515,7 +515,12 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             team_obj = dp.get("team")
             if not isinstance(team_obj, dict):
                 team_obj = {}
-            team_obj.setdefault("name", tid)
+            # The slugified team id (``tid``) must always win. ``_to_data_product_odps``
+            # already sets ``team["name"]`` to the raw display name (e.g. "Customer
+            # Platform"), so ``setdefault`` here would be a no-op and the un-slugified
+            # name would reach the wire — Entropy/DMM then rejects the publish with
+            # HTTP 422 "Could not find team by id '<display name>'".
+            team_obj["name"] = tid
             dp["team"] = team_obj
             self._ensure_odps_output_port_display_names(dp, fluid)
             # Per Entropy's ``dataproduct-0.0.1.json`` schema, ``inputPorts``

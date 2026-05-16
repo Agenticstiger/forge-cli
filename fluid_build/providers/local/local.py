@@ -459,19 +459,46 @@ class LocalProvider(BaseProvider):
                         {"path": p, "table": c.get("id") or _guess_table_name_from_path(Path(p))}
                     )
 
-        # Decide output
+        # Decide output — honour the declared path AND format from the first expose.
+        # A contract that declares ``format: parquet`` at an ``output/*.parquet``
+        # path previously had apply silently write a CSV to the wrong (default)
+        # path. Fix: read format from ``binding.format`` / ``format`` fields and
+        # use the binding ``location.path`` or ``path`` field as declared.
         output_paths: List[str] = []
         exposes = contract.get("exposes") or []
         if exposes:
-            loc = exposes[0].get("location") or {}
+            first_expose = exposes[0]
+            # Resolve location from binding (v0.7.x) or direct location key (legacy).
+            binding = first_expose.get("binding") or {}
+            loc = binding.get("location") or first_expose.get("location") or {}
             out_path = loc.get("path")
+
+            # Resolve declared output format so parquet contracts write parquet.
+            fmt_raw = (binding.get("format") or first_expose.get("format") or "").lower()
+            # Normalise aliases.
+            if fmt_raw in {"parquet", "pq"}:
+                declared_fmt = "parquet"
+            else:
+                declared_fmt = "csv"
+
             if out_path:
-                output_paths = [out_path]
+                # Coerce the extension to match the declared format so we write
+                # to the exact path the contract specifies.
+                out_path_obj = Path(out_path)
+                if declared_fmt == "parquet" and out_path_obj.suffix.lower() not in {
+                    ".parquet",
+                    ".pq",
+                }:
+                    # Contract declares parquet but path has wrong/no extension.
+                    out_path = str(out_path_obj.with_suffix(".parquet"))
+                output_paths = [{"path": out_path, "format": declared_fmt}]
             else:
                 cid = contract.get("id") or "product"
-                output_paths = [f"runtime/out/{cid.replace('.', '_')}.csv"]
+                stem = cid.replace(".", "_")
+                ext = ".parquet" if declared_fmt == "parquet" else ".csv"
+                output_paths = [{"path": f"runtime/out/{stem}{ext}", "format": declared_fmt}]
         else:
-            output_paths = ["runtime/out/output.csv"]
+            output_paths = [{"path": "runtime/out/output.csv", "format": "csv"}]
 
         # Fallback SQL if none found
         if not sql_text:

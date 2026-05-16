@@ -211,7 +211,7 @@ from fluid_build.cli._forge_ci_scaffolder import (  # noqa: E402,F401
     resolve_ci_choice as _resolve_ci_choice,
 )
 from fluid_build.cli._forge_ci_scaffolder import (  # noqa: E402,F401
-    scaffold_ci_pipeline as _legacy_scaffold_ci_pipeline,
+    scaffold_ci_pipeline as _scaffold_ci_pipeline_impl,
 )
 from fluid_build.cli._forge_modes_context import (  # noqa: E402,F401
     _apply_workspace_defaults,
@@ -241,7 +241,7 @@ def _scaffold_ci_pipeline(
     ``fluid_build.cli.forge_modes._scaffold_ci_pipeline`` keep working
     because we forward through the module-attribute-access pattern.
     """
-    return _legacy_scaffold_ci_pipeline(
+    return _scaffold_ci_pipeline_impl(
         args,
         target_dir,
         context,
@@ -1122,15 +1122,13 @@ def run_domain_agent_mode(
         return 1
 
 
-# Legacy template-contract coercion + richer-receipt enrichment —
-# physically extracted to ``cli/_legacy_template_coercion.py``
-# (~519 LOC). Re-exported here under the same names so existing
-# test patches on ``fluid_build.cli.forge_modes.<helper>`` flow
-# through to the moved functions via the module-attribute-access
+# Pre-write receipt enrichment — physically extracted to
+# ``cli/_receipt_enrichment.py``. Re-exported here under the same
+# name so existing test patches on
+# ``fluid_build.cli.forge_modes._populate_richer_receipt`` flow
+# through to the moved function via the module-attribute-access
 # indirection pattern.
-from fluid_build.cli._legacy_template_coercion import (  # noqa: E402,F401
-    _coerce_dq_rules,
-    _coerce_template_contract_to_v073,
+from fluid_build.cli._receipt_enrichment import (  # noqa: E402,F401
     _populate_richer_receipt,
 )
 

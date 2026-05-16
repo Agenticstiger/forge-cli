@@ -554,19 +554,25 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     "steps": [
                         {"name": "Checkout", "uses": _pin_action("actions/checkout@v4")},
                         {
-                            "name": "Run Trivy vulnerability scanner",
-                            "uses": _pin_action("aquasecurity/trivy-action@v0"),
+                            "name": "Run OSV-Scanner vulnerability scan",
+                            "uses": _pin_action("google/osv-scanner-action/osv-scanner-action@v2"),
                             "with": {
-                                "scan-type": "fs",
-                                "format": "sarif",
-                                "output": "trivy-results.sarif",
+                                "scan-args": (
+                                    "--format=sarif\n"
+                                    "--output=osv-results.sarif\n"
+                                    "--recursive\n"
+                                    "./"
+                                ),
                             },
+                            # Advisory: findings surface via SARIF upload but
+                            # do not fail the job (parity with the prior step).
+                            "continue-on-error": True,
                         },
                         {"name": "FLUID Security Check", "run": "fluid validate --security-only"},
                         {
                             "name": "Upload SARIF",
                             "uses": _pin_action("github/codeql-action/upload-sarif@v3"),
-                            "with": {"sarif_file": "trivy-results.sarif"},
+                            "with": {"sarif_file": "osv-results.sarif"},
                             "if": "always()",
                         },
                     ],

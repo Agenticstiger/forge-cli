@@ -32,6 +32,7 @@ Five shapes verified:
 5. ``invoke_streaming`` falls back to blocking (it yields the full text as
    one chunk).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

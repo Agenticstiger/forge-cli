@@ -20,6 +20,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict
 
+from ..._sql_safety import SqlAllowlistError, parse_and_allowlist_sql
 from ..connection import SnowflakeConnection
 from ..util.config import get_connection_params
 from ..util.names import build_qualified_name, normalize_table_name, quote_identifier
@@ -39,6 +40,17 @@ def ensure_view(action: Dict[str, Any], provider) -> Dict[str, Any]:
     provider.debug_kv(
         event="ensure_view_started", database=database, schema=schema, name=name, secure=secure
     )
+
+    # A view body must be a single SELECT (CTEs / UNION allowed). Reject any
+    # DDL/DML or multi-statement payload fail-closed before opening a
+    # connection so a crafted ``query`` cannot smuggle side effects.
+    try:
+        parse_and_allowlist_sql(query, surface="view_body")
+    except SqlAllowlistError as e:
+        provider.err_kv(
+            event="ensure_view_rejected", database=database, schema=schema, name=name, reason=str(e)
+        )
+        raise
 
     try:
         params = get_connection_params(
@@ -94,6 +106,19 @@ def ensure_materialized_view(action: Dict[str, Any], provider) -> Dict[str, Any]
     provider.debug_kv(
         event="ensure_materialized_view_started", database=database, schema=schema, name=name
     )
+
+    # Same allowlist as a plain view — the body must be a single SELECT.
+    try:
+        parse_and_allowlist_sql(query, surface="view_body")
+    except SqlAllowlistError as e:
+        provider.err_kv(
+            event="ensure_materialized_view_rejected",
+            database=database,
+            schema=schema,
+            name=name,
+            reason=str(e),
+        )
+        raise
 
     try:
         params = get_connection_params(

@@ -361,3 +361,162 @@ class TestHelpers:
         result = _make_result(checks_passed=50)
         count = _estimate_passed_checks(result, PolicyCategory.SENSITIVITY)
         assert count >= 0
+
+
+# ---------------------------------------------------------------------------
+# B3 / B4 / B5 — failure counter, strict-mode banner, --output for rich
+# ---------------------------------------------------------------------------
+
+
+class TestRealFailureCount:
+    """B3: only CRITICAL/ERROR violations count as failures; advisories don't."""
+
+    def test_advisory_only_run_has_zero_failures(self):
+        from fluid_build.cli.policy_check import _advisory_count, _real_failure_count
+
+        violations = [
+            _make_violation(severity=PolicySeverity.WARNING),
+            _make_violation(severity=PolicySeverity.INFO),
+        ]
+        # The engine increments checks_failed once per violation (=2 here),
+        # but neither is a genuine failure.
+        result = _make_result(violations=violations, checks_passed=8, checks_failed=2)
+        assert _real_failure_count(result) == 0
+        assert _advisory_count(result) == 2
+
+    def test_blocking_violations_counted_as_failures(self):
+        from fluid_build.cli.policy_check import _advisory_count, _real_failure_count
+
+        violations = [
+            _make_violation(severity=PolicySeverity.CRITICAL),
+            _make_violation(severity=PolicySeverity.ERROR),
+            _make_violation(severity=PolicySeverity.WARNING),
+        ]
+        result = _make_result(violations=violations, checks_passed=5, checks_failed=3)
+        assert _real_failure_count(result) == 2
+        assert _advisory_count(result) == 1
+
+
+class TestCheckPasses:
+    """B4: the verdict predicate is strict-aware and is the single source
+    of truth for both the banner and the exit code."""
+
+    def test_passes_when_only_advisories_non_strict(self):
+        from fluid_build.cli.policy_check import _check_passes
+
+        result = _make_result(violations=[_make_violation(severity=PolicySeverity.WARNING)])
+        assert _check_passes(result, strict=False) is True
+
+    def test_fails_when_only_advisories_strict(self):
+        from fluid_build.cli.policy_check import _check_passes
+
+        result = _make_result(violations=[_make_violation(severity=PolicySeverity.WARNING)])
+        assert _check_passes(result, strict=True) is False
+
+    def test_fails_on_blocking_violation_regardless_of_strict(self):
+        from fluid_build.cli.policy_check import _check_passes
+
+        result = _make_result(violations=[_make_violation(severity=PolicySeverity.ERROR)])
+        assert _check_passes(result, strict=False) is False
+        assert _check_passes(result, strict=True) is False
+
+    def test_passes_clean_run(self):
+        from fluid_build.cli.policy_check import _check_passes
+
+        result = _make_result(checks_passed=10)
+        assert _check_passes(result, strict=False) is True
+        assert _check_passes(result, strict=True) is True
+
+
+class TestStrictBannerConsistency:
+    """B4: in strict mode the banner and exit code must agree."""
+
+    def _run_with_mocked_engine(self, args, result):
+        from fluid_build.cli import policy_check
+
+        with patch.object(Path, "exists", return_value=True):
+            with patch(
+                "fluid_build.cli.policy_check.load_contract_with_overlay",
+                return_value={"id": "x"},
+            ):
+                mock_engine = MagicMock()
+                mock_engine.enforce_all.return_value = result
+                with patch(
+                    "fluid_build.cli.policy_check.SchemaBasedPolicyEngine",
+                    return_value=mock_engine,
+                ):
+                    return policy_check.run(args, logger)
+
+    def test_strict_advisory_only_exits_1_and_renders_failed(self, capsys):
+        """A strict run with only advisories: exit 1 and a FAILED verdict."""
+        args = _make_args(strict=True, format="rich")
+        result = _make_result(
+            violations=[_make_violation(severity=PolicySeverity.WARNING)],
+            checks_passed=9,
+            checks_failed=1,
+        )
+        code = self._run_with_mocked_engine(args, result)
+        assert code == 1
+
+    def test_non_strict_advisory_only_exits_0(self):
+        args = _make_args(strict=False, format="rich")
+        result = _make_result(
+            violations=[_make_violation(severity=PolicySeverity.WARNING)],
+            checks_passed=9,
+            checks_failed=1,
+        )
+        code = self._run_with_mocked_engine(args, result)
+        assert code == 0
+
+
+class TestOutputHonoredForRichFormat:
+    """B5: --output is honored for the default rich format, not just JSON."""
+
+    def test_rich_format_with_output_writes_json_report(self, tmp_path):
+        from fluid_build.cli import policy_check
+
+        out_file = str(tmp_path / "report.json")
+        args = _make_args(format="rich", output=out_file)
+        result = _make_result(checks_passed=10)
+
+        with patch.object(Path, "exists", return_value=True):
+            with patch(
+                "fluid_build.cli.policy_check.load_contract_with_overlay",
+                return_value={"id": "x"},
+            ):
+                mock_engine = MagicMock()
+                mock_engine.enforce_all.return_value = result
+                with patch(
+                    "fluid_build.cli.policy_check.SchemaBasedPolicyEngine",
+                    return_value=mock_engine,
+                ):
+                    code = policy_check.run(args, logger)
+
+        assert code == 0
+        assert Path(out_file).exists(), "B5: --output ignored for rich format"
+        data = json.loads(Path(out_file).read_text())
+        assert "is_compliant" in data
+
+    def test_text_format_with_output_writes_json_report(self, tmp_path):
+        from fluid_build.cli import policy_check
+
+        out_file = str(tmp_path / "report.json")
+        args = _make_args(format="text", output=out_file)
+        result = _make_result(checks_passed=10)
+
+        with patch.object(Path, "exists", return_value=True):
+            with patch(
+                "fluid_build.cli.policy_check.load_contract_with_overlay",
+                return_value={"id": "x"},
+            ):
+                mock_engine = MagicMock()
+                mock_engine.enforce_all.return_value = result
+                with patch(
+                    "fluid_build.cli.policy_check.SchemaBasedPolicyEngine",
+                    return_value=mock_engine,
+                ):
+                    with patch.object(policy_check, "RICH_AVAILABLE", False):
+                        code = policy_check.run(args, logger)
+
+        assert code == 0
+        assert Path(out_file).exists()

@@ -254,7 +254,7 @@ class TektonTemplate(BasePipelineTemplate):
                 # Append a dedicated security-audit task into the
                 # tasks.yaml manifest so the rendered YAML carries the
                 # explicit "Security and Compliance Audit" task name +
-                # the security/scan/policy/audit/vulnerability/trivy
+                # the security/scan/policy/audit/vulnerability/osv-scanner
                 # keywords.
                 audit_comment = "\n".join(f"# {ln}" for ln in audit["comment"]) + "\n"
                 audit_task = {

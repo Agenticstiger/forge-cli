@@ -26,6 +26,7 @@ import os
 import platform
 import re
 import signal
+import stat
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -63,6 +64,16 @@ def _build_forbidden_paths() -> Set[str]:
         # uses ``/tmp``. The review's concern is config + binary +
         # password locations; ``/etc`` (and its ``/private/etc``
         # resolved form) is the one that actually matters there.
+        #
+        # F4: ``/opt`` (third-party installs), ``/Library`` (system +
+        # app support / LaunchAgents), and ``/var/lib`` (service state)
+        # are added. ``/var/lib`` is deliberately narrower than bare
+        # ``/var`` so the macOS ``/private/var/folders`` temp tree
+        # (pytest's ``tmp_path`` on macOS) remains reachable.
+        # NOTE: bare ``/var`` is intentionally absent — on macOS it
+        # resolves to ``/private/var`` anyway (inert), and on Linux it
+        # over-broadly blocks Jenkins/Docker workspace paths under
+        # ``/var/jenkins_home``. See the Linux branch note below.
         return {
             "/etc",
             "/private/etc",
@@ -71,7 +82,9 @@ def _build_forbidden_paths() -> Set[str]:
             "/sbin",
             "/root",
             "/System",
-            "/var",  # legacy entry; inert on macOS under .resolve() but kept for parity
+            "/Library",
+            "/opt",
+            "/var/lib",
         }
     if system == "Windows":
         return {
@@ -80,8 +93,35 @@ def _build_forbidden_paths() -> Set[str]:
             "C:\\Program Files (x86)",
             "C:\\ProgramData",
         }
-    # Linux and other Unix-likes
-    return {"/etc", "/usr", "/bin", "/sbin", "/var", "/root"}
+    # Linux and other Unix-likes.
+    # F4: ``/opt`` (third-party installs), ``/Library`` (harmless on
+    # Linux but kept for cross-platform parity), and ``/var/lib``
+    # (service state — databases, container layers) are added.
+    #
+    # NOTE: bare ``/var`` is intentionally NOT in this set. Jenkins
+    # workspaces live at ``/var/jenkins_home/…`` and Docker bind-mounts
+    # commonly resolve under ``/var/jenkins_home`` or ``/var/lib/docker``.
+    # ``/var/lib`` (already present) is the specific concern (service
+    # state / container layers); blocking all of ``/var`` is over-broad
+    # and breaks every Jenkins-container pipeline build at Stage 1 (bundle).
+    return {
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/var/lib",
+        "/root",
+        "/opt",
+        "/Library",
+    }
+
+
+# F4: Windows device / UNC path prefixes. ``\\?\`` and ``\\.\`` reach the
+# raw device namespace and bypass the usual drive-letter forbidden-path
+# checks; ``\\`` is a bare UNC share. Any operator-supplied path that
+# starts with one of these is rejected outright — the FLUID CLI never has
+# a legitimate reason to read or write through the device namespace.
+_WINDOWS_DEVICE_PREFIXES = ("\\\\?\\", "\\\\.\\", "//?/", "//./")
 
 
 FORBIDDEN_PATHS = _build_forbidden_paths()
@@ -170,6 +210,22 @@ class SecurePathValidator:
         """
         if not self.security_context.enable_path_validation:
             return
+        # F4: reject Windows device / UNC namespace prefixes BEFORE
+        # ``Path.resolve()`` (which would otherwise normalise them into a
+        # shape the drive-letter forbidden-path check can't reason about).
+        raw_str = str(raw_path)
+        if raw_str.startswith(_WINDOWS_DEVICE_PREFIXES):
+            raise FluidCLIError(
+                1,
+                "forbidden_path_access",
+                f"Windows device/UNC path prefix is not allowed in {operation} path: {raw_path}",
+                context={"path": raw_str, "operation": operation},
+                suggestions=[
+                    "Use a normal drive-letter or relative path",
+                    "Avoid the \\\\?\\ / \\\\.\\ device namespace",
+                    "Specify files within your project directory",
+                ],
+            )
         raw_parts = Path(raw_path).parts
         if ".." in raw_parts:
             raise FluidCLIError(
@@ -320,6 +376,124 @@ class SecurePathValidator:
             )
 
 
+# Bundle extensions accepted by the 11-stage pipeline. ``fluid validate``
+# and ``fluid apply`` both take a ``.tgz`` / ``.tar.gz`` content-addressable
+# bundle as a first-class input, but those suffixes are intentionally NOT
+# in ``ALLOWED_FILE_EXTENSIONS`` (that set gates generic file reads). The
+# CLI-path helper below widens the extension allowlist for exactly these
+# pipeline inputs without loosening the generic file-read surface.
+_BUNDLE_EXTENSIONS = (".tgz", ".tar.gz")
+
+
+def validate_cli_path(
+    path: Union[str, Path],
+    *,
+    mode: str = "read",
+    must_exist: bool = True,
+    file_type: str = "path",
+) -> Path:
+    """Validate an operator-supplied CLI path argument.
+
+    This is the shared chokepoint the 11-stage pipeline commands route
+    every positional ``contract`` / plan argument and every ``--out`` /
+    ``--report`` / ``--cache-dir`` style flag through, BEFORE the path
+    reaches ``open()`` / ``read_json`` / ``load_contract_with_overlay`` /
+    ``_parse_file``. It exists so the per-command call sites stay a single
+    line and the traversal / forbidden-path / symlink rules are enforced
+    identically everywhere.
+
+    Why not just call ``validate_input_path`` / ``validate_output_path``
+    directly?
+
+      * ``validate_input_path`` enforces ``ALLOWED_FILE_EXTENSIONS``,
+        which excludes ``.tgz`` / ``.tar.gz`` — but those ARE valid
+        pipeline inputs (bundles). This helper widens the allowlist for
+        bundle suffixes only.
+      * Write targets (``--out runtime/plan.json``) legitimately do not
+        exist yet; callers must be able to opt out of the existence
+        check without hand-rolling the traversal logic.
+      * It adds an explicit symlink rejection for read paths so F6
+        (explicit ``--contract`` paths bypassing the auto-find symlink
+        guard) is closed wherever this helper is used.
+
+    Args:
+        path: The raw operator-supplied path (string or ``Path``).
+        mode: ``"read"`` for inputs, ``"write"`` for outputs. Drives
+            whether the output-directory writability probe runs.
+        must_exist: When ``True`` (default for reads) the path must
+            already exist. Pass ``False`` for write targets that the
+            command will create.
+        file_type: Human-readable noun used in error messages
+            (``"contract"``, ``"plan"``, ``"report"``, ...).
+
+    Returns:
+        The resolved, validated :class:`pathlib.Path`.
+
+    Raises:
+        FluidCLIError: on traversal (``..``), Windows device/UNC
+            prefixes, forbidden system paths, excessive depth, a
+            read-mode symlink, or a missing required input.
+    """
+    validator = SecurePathValidator(get_security_context())
+
+    # Pre-resolve checks (``..`` segments, Windows device prefixes) MUST
+    # see the raw input — ``Path.resolve()`` collapses both.
+    validator._reject_raw_traversal(path, mode)
+
+    resolved = Path(path).resolve()
+
+    # Forbidden-path + depth checks operate on the resolved/canonical path.
+    validator._validate_path_security(resolved, mode)
+
+    if mode == "read":
+        if must_exist and not resolved.exists():
+            raise FluidCLIError(
+                1,
+                "file_not_found",
+                f"{file_type.title()} not found: {path}",
+                suggestions=[
+                    "Check the file path is correct",
+                    "Ensure you're in the correct directory",
+                    "Verify file permissions",
+                ],
+            )
+        # F6: reject symlinked read targets. ``auto_find_contract`` already
+        # skips symlinks on the CWD-discovery path, but an explicitly
+        # passed ``--contract`` / plan path got no such guard. A symlink
+        # planted in a writable workspace could redirect a pipeline read
+        # to an out-of-tree file; rejecting it here closes that gap for
+        # every command that routes through this helper.
+        try:
+            is_link = Path(path).is_symlink() or resolved.is_symlink()
+        except OSError:
+            is_link = False
+        if is_link:
+            raise FluidCLIError(
+                1,
+                "symlink_path_rejected",
+                f"Symlinked {file_type} paths are not allowed: {path}",
+                context={"path": str(path), "operation": mode},
+                suggestions=[
+                    "Pass the real (non-symlink) path to the file",
+                    "Symlinks are rejected to prevent TOCTOU redirection",
+                ],
+            )
+        # Extension check — widen the allowlist for pipeline bundles.
+        if resolved.is_file():
+            suffix = resolved.suffix.lower()
+            name_lower = resolved.name.lower()
+            is_bundle = any(name_lower.endswith(ext) for ext in _BUNDLE_EXTENSIONS)
+            if not is_bundle:
+                validator._validate_file_extension(resolved)
+                validator._validate_file_size(resolved)
+    else:
+        # Write target — confirm the parent directory is creatable and
+        # writable (mirrors ``validate_output_path``).
+        validator._validate_output_directory(resolved)
+
+    return resolved
+
+
 class SecureFileOperations:
     """Secure file operations with validation and error handling"""
 
@@ -329,18 +503,49 @@ class SecureFileOperations:
         self.logger = logging.getLogger(__name__)
 
     def read_file_safe(self, path: Union[str, Path], file_type: str = "file") -> str:
-        """Safely read a file with validation"""
+        """Safely read a file with validation.
+
+        SECURITY (F5): the file is opened with ``O_NOFOLLOW`` immediately
+        after path validation and read against that single file
+        descriptor, closing the TOCTOU window in which a symlink-swap
+        between ``validate_input_path`` and the read could redirect it to
+        a different target. ``O_NOFOLLOW`` / ``O_CLOEXEC`` do not exist on
+        Windows — ``getattr(..., 0)`` makes them no-ops there.
+        """
         validated_path = self.validator.validate_input_path(path, file_type)
 
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         try:
-            content = validated_path.read_text(encoding="utf-8")
+            fd = os.open(validated_path, flags)
+        except OSError as exc:
+            # ELOOP here means the final path component became a symlink
+            # between validation and open (a swap attempt); this also
+            # covers permission errors and the file vanishing.
+            raise FluidCLIError(
+                1,
+                "file_permission_denied",
+                f"Could not securely open file: {path}",
+                suggestions=[
+                    "Check file permissions and that the path is not a symlink",
+                    "Ensure you have read access to the file",
+                ],
+            ) from exc
 
-            # Content validation
-            if self.security_context.enable_content_validation:
-                self._scan_content_for_warnings(content, validated_path)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            raise FluidCLIError(
+                1,
+                "file_not_regular",
+                f"Refusing to read a non-regular file: {path}",
+                suggestions=["The path must point to a regular file"],
+            )
 
-            return content
-
+        # ``os.fdopen`` takes ownership of the descriptor; the with-block
+        # closes it on every exit path (including the decode error below).
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as fh:
+                content = fh.read()
         except UnicodeDecodeError:
             raise FluidCLIError(
                 1,
@@ -352,17 +557,12 @@ class SecureFileOperations:
                     "Use a text editor to re-save the file",
                 ],
             )
-        except PermissionError:
-            raise FluidCLIError(
-                1,
-                "file_permission_denied",
-                f"Permission denied reading file: {path}",
-                suggestions=[
-                    "Check file permissions",
-                    "Ensure you have read access to the file",
-                    "Run with appropriate permissions",
-                ],
-            )
+
+        # Content validation
+        if self.security_context.enable_content_validation:
+            self._scan_content_for_warnings(content, validated_path)
+
+        return content
 
     def write_file_safe(
         self, path: Union[str, Path], content: str, file_type: str = "output"
@@ -627,6 +827,7 @@ __all__ = [
     "ProductionLogger",
     "get_security_context",
     "set_security_context",
+    "validate_cli_path",
     "validate_input_file",
     "validate_output_file",
     "read_file_secure",

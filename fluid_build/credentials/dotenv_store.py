@@ -21,10 +21,34 @@ Supports .env, .env.{environment}, and .env.local patterns.
 
 import logging
 import os
+import stat
 from pathlib import Path
 from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _warn_if_world_readable(path: Path) -> None:
+    """Warn when a credential-bearing ``.env`` file is group/other-readable.
+
+    Real secrets live in ``.env`` / ``.env.local`` — on a shared host a
+    group- or other-readable mode leaks them. POSIX-only (Windows
+    ``st_mode`` does not carry these permission bits).
+    """
+    if os.name != "posix":
+        return
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return
+    if mode & 0o077:
+        logger.warning(
+            "Credential file %s is mode %o — readable by group/other. " "Run: chmod 600 %s",
+            path,
+            mode,
+            path,
+        )
+
 
 try:
     from dotenv import dotenv_values, load_dotenv
@@ -107,6 +131,7 @@ class DotEnvCredentialStore:
 
         for env_file in env_files:
             if env_file.exists():
+                _warn_if_world_readable(env_file)
                 logger.debug(f"Loading credentials from {env_file.name}")
                 try:
                     values = dotenv_values(env_file)
@@ -179,6 +204,14 @@ class DotEnvCredentialStore:
             for key, description in credentials.items():
                 f.write(f"# {description}\n")
                 f.write(f"{key}=your_{key.lower()}_here\n\n")
+
+        # Defence-in-depth: the example file carries only placeholders, but
+        # operators routinely ``cp .env.example .env`` and fill in real
+        # secrets — start it owner-only so a copy inherits a safe mode.
+        try:
+            os.chmod(output_path, 0o600)
+        except (NotImplementedError, OSError):
+            pass
 
         logger.info(f"Created example file: {output_path}")
 

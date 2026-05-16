@@ -18,8 +18,8 @@ jobs:
     name: Lint & Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
@@ -44,8 +44,8 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -132,7 +132,7 @@ jobs:
       # ── Artifacts ───────────────────────────────────────────────
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: test-results-py${{ matrix.python-version }}
           path: |
@@ -142,7 +142,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.12'
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2  # v6.0.0
         with:
           files: coverage.xml
           # Coverage upload is informational. If Codecov is down or
@@ -174,8 +174,8 @@ jobs:
         # ""     = no version pin → latest 1.x (this is what users get today)
         mcp-version: ["1.20", ""]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
@@ -202,8 +202,8 @@ jobs:
     name: Build Smoke Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
@@ -272,8 +272,8 @@ jobs:
         # quoting regressions that contributors hit in the wild.
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
@@ -319,22 +319,75 @@ jobs:
   security:
     name: Security Scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write  # upload Semgrep SARIF to GitHub code scanning
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
-      - run: pip install bandit
+          cache: pip
+      - name: Install project + scanners
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install bandit pip-audit "semgrep==1.163.0"
       - name: Bandit security scan
         run: bandit -r fluid_build/ -c pyproject.toml --severity-level medium -q
+      - name: pip-audit dependency CVE scan
+        # Fails the build on any known-vulnerable dependency. Keeps the
+        # litellm / jinja2 / h11 / cryptography CVE floors honest over time.
+        run: pip-audit --desc
+      # Semgrep custom rules — forge-cli repo-specific invariants from
+      # CLAUDE.md (deleted-module imports, SQL-safety helper bypass,
+      # copilot workspace_root confinement). Generic SAST is CodeQL's job.
+      - name: Semgrep custom-rule gate
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: semgrep scan --config .semgrep/fluid-rules.yml --error fluid_build/
+      - name: Semgrep SARIF (advisory — code-scanning surface)
+        if: always()
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          semgrep scan --config .semgrep/fluid-rules.yml \
+            --sarif --output semgrep.sarif fluid_build/ || true
+      - name: Upload Semgrep SARIF
+        # Skipped on fork PRs — their GITHUB_TOKEN cannot write
+        # security-events. The gate step above still runs and still blocks.
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@7fc1baf373eb073c686865bd453d412d506a05a2  # v3.35.1
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
 
   license-check:
     name: License Headers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
       - name: Check license headers
         run: python scripts/check_license_headers.py
+
+  # Dependency review — blocks PRs that introduce known-vulnerable
+  # dependencies. First-party GitHub action; requires the dependency
+  # graph (Settings -> Code security). A license policy can be added
+  # later via `deny-licenses` once the project agrees one.
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    # Only meaningful on PRs — the action diffs the dependency graph
+    # between the base and head refs.
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - name: Dependency review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294  # v5.0.0
+        with:
+          fail-on-severity: high

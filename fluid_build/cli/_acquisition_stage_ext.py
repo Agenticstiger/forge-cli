@@ -200,11 +200,15 @@ def verify_acquisition(contract: Dict[str, Any], workdir: Path) -> List[VerifyRe
             results.append(result)
             continue
 
+        # Bug A4-4: runners emit lowercase state values ("succeeded", "partial")
+        # via RunState.value, but this check previously required uppercase.
+        # Use case-insensitive comparison so all casing variants (uppercase
+        # legacy records, lowercase new records, mixed) are handled uniformly.
         state = record.get("state", "UNKNOWN")
         result.checks.append(
             VerifyCheck(
                 name="run_state_succeeded",
-                passed=state in ("SUCCEEDED", "PARTIAL"),
+                passed=str(state).upper() in ("SUCCEEDED", "PARTIAL"),
                 detail=f"state={state}",
             )
         )

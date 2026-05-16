@@ -66,18 +66,96 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
+from urllib.parse import urlparse
 
 import yaml
+
+# Reuse the canonical SSRF post-DNS-resolution gate rather than
+# re-deriving a private-range list here. ``_hostname_is_private``
+# resolves the host and returns True for RFC1918, link-local
+# (169.254.0.0/16 — AWS/GCP metadata), loopback, unspecified, and
+# reserved ranges (and fails closed on DNS errors).
+from fluid_build.build_runners._alerter import _hostname_is_private
+from fluid_build.util.safe_yaml import load_yaml_safe
 
 LOG = logging.getLogger("fluid.forge.federation")
 
 FEDERATION_MANIFEST_FILENAME = "federation/upstreams.yaml"
 FEDERATION_CACHE_DIRNAME = "federation"
+
+# HTTP-client hardening defaults for every outbound federation fetch.
+# ``follow_redirects=False`` is the SSRF-safe default — a public
+# endpoint that 30x-redirects to http://169.254.169.254/ must NOT be
+# chased silently. Where a redirect is genuinely expected the fetcher
+# uses an explicit small cap and re-runs the host gate on each hop.
+_FEDERATION_HTTP_TIMEOUT = 15.0
+_FEDERATION_MAX_REDIRECTS = 3
+
+# Opt-in allow-list for operators whose federation endpoint genuinely
+# lives on an internal/private address (a corporate registry behind a
+# VPN, a self-hosted catalog on an RFC1918 host). Comma-separated host
+# suffixes; empty/unset → default-deny private destinations.
+_FEDERATION_HOST_ALLOWLIST_ENV = "FLUID_FEDERATION_HOST_ALLOWLIST"
+
+# ``workspace.id`` is interpolated into a filesystem path
+# (``~/.cache/fluid/federation-git/<id>`` and the digest-cache file).
+# Constrain it to a conservative slug so a tampered manifest row can't
+# smuggle ``../`` traversal or absolute-path segments into those sinks.
+_WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+class FederationSsrfError(ValueError):
+    """Raised when a federation endpoint host fails the SSRF guard."""
+
+
+def _federation_host_on_allowlist(hostname: str) -> bool:
+    """Return True when ``FLUID_FEDERATION_HOST_ALLOWLIST`` is set and
+    ``hostname`` matches one of its comma-separated suffixes exactly or
+    as a dotted suffix. Empty/unset → False (no allow-list configured).
+    """
+    suffixes = [
+        s.strip()
+        for s in os.environ.get(_FEDERATION_HOST_ALLOWLIST_ENV, "").split(",")
+        if s.strip()
+    ]
+    if not suffixes:
+        return False
+    return any(hostname == s or hostname.endswith("." + s) for s in suffixes)
+
+
+def _guard_federation_url(url: str, *, workspace_id: str) -> str:
+    """Raise :class:`FederationSsrfError` when ``url``'s host resolves to
+    a private/link-local/loopback/metadata address; return ``url`` on
+    success.
+
+    The allow-list (``FLUID_FEDERATION_HOST_ALLOWLIST``) trumps the IP
+    check so operators with a genuine internal endpoint can opt in.
+    DNS resolution failures fail closed (``_hostname_is_private``
+    returns True for unresolvable hosts).
+    """
+    host = urlparse(url).hostname
+    if not host:
+        raise FederationSsrfError(
+            f"federation workspace {workspace_id!r}: endpoint has no resolvable host"
+        )
+    if _federation_host_on_allowlist(host):
+        return url
+    if _hostname_is_private(host):
+        raise FederationSsrfError(
+            f"federation workspace {workspace_id!r}: endpoint host {host!r} "
+            "resolves to a private/loopback/link-local/cloud-metadata address. "
+            "Refusing the outbound request to prevent SSRF (metadata exfil, "
+            f"internal-service abuse). Set {_FEDERATION_HOST_ALLOWLIST_ENV}="
+            "<host-suffix> to allow a genuinely-internal federation endpoint."
+        )
+    return url
+
 
 # Allow-list of URL schemes accepted on ``workspaces[].endpoint``.
 # This is the security boundary that prevents argument-injection at the
@@ -181,6 +259,18 @@ class FederatedWorkspace:
     def from_dict(cls, d: Mapping[str, Any]) -> "FederatedWorkspace":
         auth = d.get("auth") or {}
         ws_id = str(d["id"])
+        # ``id`` is interpolated into filesystem paths (the git clone
+        # cache dir and the per-workspace digest-cache filename). Reject
+        # anything outside a conservative slug so a tampered manifest
+        # row cannot smuggle ``../`` traversal or absolute segments into
+        # those path sinks.
+        if not _WORKSPACE_ID_RE.match(ws_id):
+            raise ValueError(
+                f"federation workspace id {ws_id!r} is invalid: must match "
+                f"{_WORKSPACE_ID_RE.pattern} (alphanumerics, dot, dash, "
+                "underscore; 1-64 chars). It is used as a filesystem path "
+                "component, so traversal/absolute segments are refused."
+            )
         endpoint = _validate_federation_endpoint(str(d["endpoint"]), workspace_id=ws_id)
         return cls(
             id=ws_id,
@@ -218,7 +308,7 @@ def load_federation_manifest(workspace_root: Path) -> FederationManifest:
         return FederationManifest()
     try:
         with path.open() as f:
-            doc = yaml.safe_load(f) or {}
+            doc = load_yaml_safe(f) or {}
     except (OSError, yaml.YAMLError) as exc:
         LOG.warning("federation_manifest_unreadable: path=%s error=%s", path, exc)
         return FederationManifest()
@@ -402,8 +492,6 @@ def _read_secret_value(secret_ref: Optional[str]) -> Optional[str]:
     """
     if not secret_ref:
         return None
-    import os
-
     val = os.environ.get(secret_ref)
     return val.strip() if val else None
 
@@ -422,45 +510,31 @@ def _fetch_digest_via_http(
     * ``oidc`` / ``bearer`` / ``http_token`` — ``Authorization:
       Bearer <secret>``.
     * ``none`` / unset — no Authorization header.
-    """
-    try:
-        import urllib.error
-        import urllib.request
-    except ImportError:  # pragma: no cover — stdlib
-        return None
 
+    Security: the endpoint host is run through the SSRF guard
+    (:func:`_guard_federation_url`) before the request, and the
+    request itself uses :func:`_federation_http_get` which disables
+    redirect-following (``follow_redirects=False``) so a public
+    endpoint cannot 30x-bounce the auth-bearing request to a
+    cloud-metadata address. On HTTP error only the *host* is logged —
+    pre-auth tokens can sit in the URL path.
+    """
     base = workspace.endpoint.rstrip("/")
     url = f"{base}/{product_id}/{version}/digest"
-    req = urllib.request.Request(url, method="GET")
 
+    headers = {"Accept": "text/plain"}
     secret = _read_secret_value(workspace.auth_secret_ref)
     mode = (workspace.auth_mode or "none").lower()
     if secret:
         if mode == "basic":
-            req.add_header("Authorization", f"Basic {secret}")
+            headers["Authorization"] = f"Basic {secret}"
         elif mode in ("oidc", "bearer", "http_token", "token"):
-            req.add_header("Authorization", f"Bearer {secret}")
-    req.add_header("Accept", "text/plain")
+            headers["Authorization"] = f"Bearer {secret}"
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = resp.read().decode("utf-8", errors="replace").strip()
-    except urllib.error.HTTPError as exc:
-        LOG.warning(
-            "federation_http_fetch_http_error: workspace=%s url=%s status=%s",
-            workspace.id,
-            url,
-            exc.code,
-        )
+    body = _federation_http_get(url, headers=headers, workspace=workspace, expect_json=False)
+    if body is None:
         return None
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        LOG.warning(
-            "federation_http_fetch_network_error: workspace=%s url=%s err=%s",
-            workspace.id,
-            url,
-            exc,
-        )
-        return None
+    body = str(body).strip()
 
     if not body or not body.startswith("sha"):
         LOG.warning(
@@ -480,39 +554,21 @@ def _fetch_digest_via_catalog(
     Convention: GET ``<endpoint>/products/<product_id>/versions/<version>``
     returns JSON ``{"digest": "sha256:..."}``. Same auth shape as
     ``_fetch_digest_via_http``.
-    """
-    try:
-        import urllib.error
-        import urllib.request
-    except ImportError:  # pragma: no cover
-        return None
 
+    Security: same SSRF guard + redirect-disabled fetch as
+    :func:`_fetch_digest_via_http` (see :func:`_federation_http_get`).
+    """
     base = workspace.endpoint.rstrip("/")
     url = f"{base}/products/{product_id}/versions/{version}"
-    req = urllib.request.Request(url, method="GET")
 
+    headers = {"Accept": "application/json"}
     secret = _read_secret_value(workspace.auth_secret_ref)
     mode = (workspace.auth_mode or "none").lower()
     if secret and mode in ("oidc", "bearer", "http_token", "token", "catalog_token"):
-        req.add_header("Authorization", f"Bearer {secret}")
-    req.add_header("Accept", "application/json")
+        headers["Authorization"] = f"Bearer {secret}"
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as exc:
-        LOG.warning(
-            "federation_catalog_fetch_http_error: workspace=%s status=%s",
-            workspace.id,
-            exc.code,
-        )
-        return None
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        LOG.warning(
-            "federation_catalog_fetch_error: workspace=%s err=%s",
-            workspace.id,
-            exc,
-        )
+    payload = _federation_http_get(url, headers=headers, workspace=workspace, expect_json=True)
+    if payload is None:
         return None
 
     digest = payload.get("digest") if isinstance(payload, dict) else None
@@ -524,6 +580,99 @@ def _fetch_digest_via_catalog(
         )
         return None
     return digest
+
+
+def _federation_http_get(
+    url: str,
+    *,
+    headers: Mapping[str, str],
+    workspace: FederatedWorkspace,
+    expect_json: bool,
+) -> Optional[Any]:
+    """Shared SSRF-guarded HTTP GET for the federation fetchers.
+
+    Migrated off ``urllib.request.urlopen`` (which followed up to 10
+    redirects by default and re-sent ``Authorization`` cross-host).
+    This uses :mod:`httpx` with ``follow_redirects=False`` and a small
+    explicit ``max_redirects`` cap; every redirect hop's ``Location``
+    host is re-run through :func:`_guard_federation_url` before the
+    request follows it.
+
+    Returns the decoded body (``str`` when ``expect_json`` is False,
+    the parsed object when True), or ``None`` on any network / HTTP /
+    SSRF-guard / decode failure. Only the *host* is logged on error —
+    never the full URL, which can carry pre-auth tokens in the path.
+    """
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover — httpx is a project dep
+        LOG.warning("federation_http_fetch_httpx_unavailable: workspace=%s", workspace.id)
+        return None
+
+    host = urlparse(url).hostname or "?"
+    try:
+        current = _guard_federation_url(url, workspace_id=workspace.id)
+    except FederationSsrfError as exc:
+        LOG.warning("federation_http_fetch_ssrf_blocked: workspace=%s err=%s", workspace.id, exc)
+        return None
+
+    try:
+        with httpx.Client(
+            timeout=_FEDERATION_HTTP_TIMEOUT,
+            follow_redirects=False,
+            verify=True,
+        ) as client:
+            resp = client.get(current, headers=dict(headers))
+            # Genuine-redirect path: follow a small, bounded number of
+            # hops, re-checking the host gate before each one. This is
+            # the SSRF-safe manual-redirect pattern — never let httpx
+            # chase a 30x to an internal address on its own.
+            hops = 0
+            while resp.is_redirect and hops < _FEDERATION_MAX_REDIRECTS:
+                location = resp.headers.get("location")
+                if not location:
+                    break
+                next_url = str(httpx.URL(current).join(location))
+                try:
+                    current = _guard_federation_url(next_url, workspace_id=workspace.id)
+                except FederationSsrfError as exc:
+                    LOG.warning(
+                        "federation_http_fetch_ssrf_blocked_on_redirect: " "workspace=%s err=%s",
+                        workspace.id,
+                        exc,
+                    )
+                    return None
+                resp = client.get(current, headers=dict(headers))
+                hops += 1
+            if resp.is_redirect:
+                LOG.warning(
+                    "federation_http_fetch_too_many_redirects: workspace=%s host=%s",
+                    workspace.id,
+                    host,
+                )
+                return None
+            resp.raise_for_status()
+            if expect_json:
+                return resp.json()
+            return resp.text
+    except httpx.HTTPStatusError as exc:
+        LOG.warning(
+            "federation_http_fetch_http_error: workspace=%s host=%s status=%s",
+            workspace.id,
+            host,
+            exc.response.status_code,
+        )
+        return None
+    except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
+        # Log only the exception class — httpx error messages can echo
+        # the request URL, which may carry an auth token in the path.
+        LOG.warning(
+            "federation_http_fetch_network_error: workspace=%s host=%s err=%s",
+            workspace.id,
+            host,
+            type(exc).__name__,
+        )
+        return None
 
 
 def _fetch_digest_via_git(
@@ -560,7 +709,7 @@ def _fetch_digest_via_git(
         return "sha256:" + hashlib.sha256(contract_text.encode("utf-8")).hexdigest()
 
     try:
-        contract = yaml.safe_load(contract_text) or {}
+        contract = load_yaml_safe(contract_text) or {}
         return compute_contract_digest(contract)
     except Exception as exc:  # pragma: no cover — defensive
         LOG.warning(
@@ -580,13 +729,12 @@ def _git_read_contract(workspace: FederatedWorkspace, product_id: str) -> Option
     cloned repo under ``~/.cache/fluid/federation-git/<workspace_id>``
     so repeated fetches don't re-clone.
 
-    The cache is keyed by ``workspace.id`` (manifest-stable), not by
-    endpoint URL, so rewriting the endpoint without renaming the
-    workspace re-clones into the same dir — operators get a clean
-    sync without manual rm-rf.
+    The cache is keyed by ``workspace.id`` (manifest-stable, and
+    validated against :data:`_WORKSPACE_ID_RE` at construction so it is
+    a safe path component), not by endpoint URL, so rewriting the
+    endpoint without renaming the workspace re-clones into the same
+    dir — operators get a clean sync without manual rm-rf.
     """
-    import os
-
     cache_dir = Path(os.path.expanduser("~/.cache/fluid/federation-git")) / workspace.id
     cache_dir.parent.mkdir(parents=True, exist_ok=True)
 
@@ -670,25 +818,38 @@ def _git_clone_or_pull_via_gitpython(
                     workspace_id,
                 )
             except (GitCommandError, AttributeError, ValueError) as exc:
+                # ``GitCommandError.__str__`` echoes the full command
+                # line, which in HTTPS mode embeds the auth token from
+                # the manifest's secret_ref
+                # (``https://x-access-token:<TOKEN>@host``). Log only
+                # the exception class — never the message body. The
+                # shell-out fallback already does this; mirror it here.
                 LOG.debug(
                     "federation_git_gitpython_refresh_skipped: workspace=%s "
                     "err=%s — using stale cache",
                     workspace_id,
-                    exc,
+                    type(exc).__name__,
                 )
         return True
     except GitCommandError as exc:
+        # See the note above — ``GitCommandError`` stringifies to the
+        # token-bearing clone URL. Surface only the class plus a static
+        # message; refuse to echo the command line.
         LOG.warning(
-            "federation_git_gitpython_failed: workspace=%s err=%s",
+            "federation_git_gitpython_failed: workspace=%s err=%s — "
+            "git operation failed (authentication or remote error); "
+            "refusing to echo the command line",
             workspace_id,
-            exc,
+            type(exc).__name__,
         )
         return False
     except Exception as exc:  # pragma: no cover — defensive
+        # Non-git exceptions can still wrap the URL in their repr;
+        # stay class-only here too for consistency.
         LOG.warning(
             "federation_git_gitpython_unexpected: workspace=%s err=%s",
             workspace_id,
-            exc,
+            type(exc).__name__,
         )
         return False
 
@@ -727,10 +888,16 @@ def _git_clone_or_pull_via_shellout(*, auth_url: str, cache_dir: Path, workspace
             FileNotFoundError,
             subprocess.TimeoutExpired,
         ) as exc:
+            # ``CalledProcessError.__str__`` echoes the full git argv,
+            # which embeds the token-bearing clone URL in HTTPS mode.
+            # Log only the exception class — never the body — to match
+            # the refresh branch below and the gitpython path.
             LOG.warning(
-                "federation_git_clone_failed: workspace=%s err=%s",
+                "federation_git_clone_failed: workspace=%s err=%s — "
+                "git clone failed (authentication or remote error); "
+                "refusing to echo the command line",
                 workspace_id,
-                exc,
+                type(exc).__name__,
             )
             return False
     else:
@@ -775,21 +942,41 @@ def _git_clone_or_pull_via_shellout(*, auth_url: str, cache_dir: Path, workspace
     return True
 
 
+# SECURITY (G2): product_id is interpolated into filesystem paths under
+# the git-clone cache. It originates from upstream contracts' consumes[]
+# and the federation manifest, so it is attacker-influenced — restrict it
+# to a data-product identifier shape (must start alphanumeric, no path
+# separators) so a value like "../../etc" cannot traverse out of the clone.
+_PRODUCT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
+
 def _read_first_existing_contract(
     cache_dir: Path, workspace: FederatedWorkspace, product_id: str
 ) -> Optional[str]:
     """Resolve the product path inside a cloned repo. Convention:
     ``<product_id>/contract.fluid.yaml``. Tolerates dot-paths that
     map to nested directories."""
+    if not _PRODUCT_ID_RE.fullmatch(product_id or ""):
+        LOG.warning(
+            "federation_git_contract_rejected: workspace=%s — product_id is not "
+            "a valid data-product identifier (path-traversal guard)",
+            workspace.id,
+        )
+        return None
+    cache_root = cache_dir.resolve()
     candidate_paths = [
         cache_dir / product_id / "contract.fluid.yaml",
         cache_dir / product_id.replace(".", "/") / "contract.fluid.yaml",
         cache_dir / f"{product_id}.fluid.yaml",
     ]
     for path in candidate_paths:
-        if path.is_file():
+        resolved = path.resolve()
+        # Defence-in-depth: confirm the resolved path stays in the clone.
+        if not resolved.is_relative_to(cache_root):
+            continue
+        if resolved.is_file():
             try:
-                return path.read_text(encoding="utf-8")
+                return resolved.read_text(encoding="utf-8")
             except OSError as exc:  # pragma: no cover
                 LOG.warning(
                     "federation_git_contract_read_failed: path=%s err=%s",
@@ -944,6 +1131,7 @@ __all__ = [
     "FederatedConsumeViolation",
     "FederatedWorkspace",
     "FederationManifest",
+    "FederationSsrfError",
     "fetch_federated_digest",
     "get_cached_digest",
     "load_federation_manifest",

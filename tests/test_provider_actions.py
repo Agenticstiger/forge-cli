@@ -138,6 +138,8 @@ class TestProviderActionParser:
         assert any(a.action_type == ActionType.SCHEDULE_TASK for a in actions)
 
     def test_extract_labels(self):
+        # GCP/BigQuery targets apply GCP's lowercase ``[a-z0-9_-]`` label
+        # constraint to label *values*.
         parser = ProviderActionParser()
         contract = {
             "id": "My-Product",
@@ -147,11 +149,12 @@ class TestProviderActionParser:
             "labels": {"costCenter": "42"},
         }
         expose = {
+            "binding": {"platform": "gcp"},
             "tags": ["expose-tag"],
             "labels": {"custom": "val"},
             "policy": {"classification": "confidential"},
         }
-        labels = parser._extract_labels(contract, expose)
+        labels = parser._extract_labels(contract, expose, provider="gcp")
         assert labels["fluid_contract_id"] == "my-product"
         assert labels["fluid_layer"] == "gold"
         assert labels["fluid_domain"] == "finance"

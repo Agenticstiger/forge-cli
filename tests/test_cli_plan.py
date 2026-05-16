@@ -40,12 +40,23 @@ LOG = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# A real on-disk contract file. ``plan.run()`` routes the positional
+# ``contract`` arg through ``validate_cli_path`` (path-traversal
+# hardening), which rejects a non-existent path before the mocked
+# loader is reached — so the default must point at a file that exists.
+_REAL_CONTRACT = tempfile.NamedTemporaryFile(  # noqa: SIM115 — lives for the test session
+    suffix=".fluid.yaml", delete=False, mode="w"
+)
+_REAL_CONTRACT.write("fluidVersion: '0.7.3'\nid: dp-test\n")
+_REAL_CONTRACT.close()
+
+
 def _make_args(**kwargs):
     """Build a minimal argparse Namespace for plan tests."""
     defaults = dict(
-        contract="contract.fluid.yaml",
+        contract=_REAL_CONTRACT.name,
         env=None,
-        out="runtime/plan.json",
+        out="plan.json",
         verbose=False,
         validate_actions=False,
         estimate_cost=False,
@@ -58,13 +69,22 @@ def _make_args(**kwargs):
     return argparse.Namespace(**defaults)
 
 
-def _minimal_contract(version="0.5.7"):
-    return {
-        "id": "dp-test",
-        "name": "Test Product",
-        "fluidVersion": version,
-        "exposes": [],
-    }
+def _minimal_contract(version="0.7.3"):
+    """A schema-valid v0.7.x contract.
+
+    ``fluid plan`` now runs the pre-0.7 rejection + JSON-schema validation
+    gate on the loaded contract before planning (bug-fix: a structurally
+    broken / end-of-life contract used to reach a signed plan.json with
+    exit 0). Test fixtures fed to ``plan.run`` must therefore be valid.
+    Built via ``shape_contract`` so it tracks the schema.
+    """
+    from fluid_build.forge.product_types import ProductTypeAnswer, shape_contract
+
+    contract = shape_contract(ProductTypeAnswer(product_type="SDP", name="test"))
+    contract["id"] = "dp-test"
+    contract["name"] = "Test Product"
+    contract["fluidVersion"] = version
+    return contract
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +183,7 @@ class TestRegister(unittest.TestCase):
         subparsers = parser.add_subparsers()
         register(subparsers)
         args = parser.parse_args(["plan", "c.yaml"])
-        self.assertEqual(args.out, "runtime/plan.json")
+        self.assertEqual(args.out, "plan.json")
 
     def test_register_sets_func(self):
         parser = argparse.ArgumentParser()
@@ -396,7 +416,10 @@ class TestPlanEmitsOpField(unittest.TestCase):
         display/viz tooling) on every action."""
         from unittest.mock import MagicMock
 
-        mock_load.return_value = _minimal_contract(version="0.7.1")
+        # ``_should_use_provider_actions`` is mocked True below, so the
+        # contract version need not be 0.7.1 — use the schema-valid
+        # default (0.7.3) so the new pre-plan validation gate passes.
+        mock_load.return_value = _minimal_contract()
         mock_should_use.return_value = True
 
         # Fake a ProviderAction with action_type.value = "ensure_table"
@@ -526,8 +549,15 @@ class TestSchedulePlannerInvocation(unittest.TestCase):
     """Pin Path-B scheduling: when ``orchestration.engine`` is a native
     scheduler (eventbridge / snowflake_tasks / mwaa), plan.py must invoke
     the provider planner and merge the schedule actions into the plan.
-    Regression here would silently break scheduled deployments."""
+    Regression here would silently break scheduled deployments.
 
+    These tests inject a top-level ``orchestration`` key — a Path-B
+    feature surface the bundled JSON schema does not yet model — so the
+    new pre-plan schema-validation gate is stubbed out: the unit under
+    test is schedule-action emission, not contract validity.
+    """
+
+    @patch("fluid_build.cli.plan._gate_contract_for_plan_or_apply")
     @patch("fluid_build.cli.plan._display_plan_simple")
     @patch("fluid_build.cli.plan._plan_legacy")
     @patch("fluid_build.cli.plan._should_use_provider_actions")
@@ -538,6 +568,7 @@ class TestSchedulePlannerInvocation(unittest.TestCase):
         mock_should_use,
         mock_legacy,
         _mock_display,
+        _mock_gate,
     ):
         """Path-A engines (airflow) are handled by ``generate schedule``,
         NOT by plan.py. plan must NOT add provider actions for them."""
@@ -560,6 +591,7 @@ class TestSchedulePlannerInvocation(unittest.TestCase):
             # No schedule actions appended for Path-A engines.
             self.assertEqual(plan["total_actions"], 0)
 
+    @patch("fluid_build.cli.plan._gate_contract_for_plan_or_apply")
     @patch("fluid_build.cli.plan._display_plan_simple")
     @patch("fluid_build.cli.plan._plan_legacy")
     @patch("fluid_build.cli.plan._should_use_provider_actions")
@@ -570,6 +602,7 @@ class TestSchedulePlannerInvocation(unittest.TestCase):
         mock_should_use,
         mock_legacy,
         _mock_display,
+        _mock_gate,
     ):
         """Path-B eventbridge contract must result in schedule actions
         appearing in plan.json with ``op=eventbridge.ensure_schedule``
@@ -601,6 +634,7 @@ class TestSchedulePlannerInvocation(unittest.TestCase):
             self.assertIn("lambda.ensure_function", ops)
             self.assertIn("eventbridge.ensure_schedule", ops)
 
+    @patch("fluid_build.cli.plan._gate_contract_for_plan_or_apply")
     @patch("fluid_build.cli.plan._display_plan_simple")
     @patch("fluid_build.cli.plan._plan_legacy")
     @patch("fluid_build.cli.plan._should_use_provider_actions")
@@ -611,6 +645,7 @@ class TestSchedulePlannerInvocation(unittest.TestCase):
         mock_should_use,
         mock_legacy,
         _mock_display,
+        _mock_gate,
     ):
         """If SchedulePlanner itself raises, plan.py must warn and
         proceed — planning DDL is more important than wiring schedules."""

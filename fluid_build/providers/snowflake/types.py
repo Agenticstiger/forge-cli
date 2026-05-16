@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from fluid_build.providers._sql_safety import quote_string_literal
+
 
 class AuthenticationType(Enum):
     """Supported authentication types."""
@@ -116,8 +118,7 @@ class TableColumn:
 
         if self.comment or self.description:
             comment_text = self.comment or self.description
-            escaped_comment = comment_text.replace("'", "''")
-            parts.append(f"COMMENT '{escaped_comment}'")
+            parts.append(f"COMMENT {quote_string_literal(comment_text)}")
 
         return " ".join(parts)
 

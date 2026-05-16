@@ -542,19 +542,31 @@ class SnowflakeProviderEnhanced(BaseProvider):
     def _aggregate_sub_status(sub_results: List[Dict[str, Any]]) -> str:
         """Roll up status across sub-actions.
 
-        - any ``error`` → overall ``error`` (first one wins for reason)
-        - any ``success`` → overall ``success``
+        Priority order:
+        - any ``error`` → overall ``error``
+        - any ``changed`` status → overall ``changed`` (resource was created/modified;
+          this is what ensure_schema / ensure_table return when they create something)
+        - any ``success`` → overall ``success`` (legacy alias)
+        - any ``ok`` → overall ``ok`` (resource already existed)
         - otherwise → ``skipped``
 
-        Matches the semantics of the Phase 6F test suite in
-        :mod:`tests.providers.test_snowflake_abstract_ops`.
+        Bug A5-3 fix: the previous implementation only checked for ``error`` and
+        ``success``, never returning ``ok`` or ``changed``.  As a result
+        ``_handle_abstract_provision_dataset`` always aggregated to ``skipped``
+        even when ensure_schema / ensure_table created real infrastructure, causing
+        the apply summary to report ``Actions applied: 0`` despite schema_created
+        and table_created events being logged.
         """
         if not sub_results:
             return "skipped"
         if any(r.get("status") == "error" for r in sub_results):
             return "error"
+        if any(r.get("status") == "changed" for r in sub_results):
+            return "changed"
         if any(r.get("status") == "success" for r in sub_results):
             return "success"
+        if any(r.get("status") == "ok" for r in sub_results):
+            return "ok"
         return "skipped"
 
     def _handle_abstract_provision_dataset(self, action: Dict[str, Any]) -> Dict[str, Any]:

@@ -31,6 +31,7 @@ Three adversarial shapes verified:
    when the wrapper-level check is bypassed (simulates a future regression
    in the wrapper).
 """
+
 from __future__ import annotations
 
 from pathlib import Path

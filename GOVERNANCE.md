@@ -49,7 +49,7 @@ Maintainers are responsible for the overall direction of the project. They have 
 
 | Name | GitHub |
 |------|--------|
-| Speculator55005 | [@jeffwatson-ai](https://github.com/jeffwatson-ai) |
+| Jeff Watson | [@jeffwatson-ai](https://github.com/jeffwatson-ai) |
 | Christopher Ducci | [@doochman](https://github.com/doochman) |
 | Marcel Miciak | [@Marcel-Miciak](https://github.com/Marcel-Miciak) |
 

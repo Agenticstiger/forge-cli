@@ -12,21 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Render a contract's ``quality.tests[]`` block as a dbt ``schema.yml`` document.
+"""Render a contract's data-quality block as a dbt ``schema.yml`` document.
 
-Output schema follows dbt's tests semantics:
-- ``not_null``, ``unique``, ``accepted_values``, ``relationships`` are emitted
-  as built-in tests where the contract's test ``type`` matches.
-- Numeric ``range`` checks emit a ``dbt_utils.expression_is_true`` test
-  (requires the ``dbt-utils`` package; documented in the dbt-tests subcommand
-  help).
-- Anything else falls through as a structured comment so the generated YAML
-  is still valid + the operator sees the contract intent.
+Reads the FLUID v0.7.x contract shape:
 
-The output is one YAML doc per contract; tests for each expose are grouped
-under that expose's column entries. The sentinel ``# managed-by: fluid``
-header lets re-runs detect and overwrite without clobbering hand-edits
-outside that block (the runner enforces the boundary).
+* ``exposes[].contract.schema[]``  — tabular columns (``{name, type, ...}``)
+* ``exposes[].contract.dq.rules[]`` — data-quality rules (``dqRule``)
+* ``exposes[].binding.location.table`` — the physical table the dbt model
+  binds to (falls back to ``exposeId``)
+
+Each ``dqRule`` carries a ``type`` from the v0.7.3 enum
+(``completeness | uniqueness | valid_values | accuracy | freshness |
+schema | anomaly_detection | drift_detection``) and a ``selector`` —
+the column the rule targets, or ``"*"`` for a table-wide rule.
+
+Mapping to dbt's built-in generic tests (the four dbt ships:
+``not_null``, ``unique``, ``accepted_values``, ``relationships``):
+
+================= ==================================================
+``dqRule.type``   dbt test
+================= ==================================================
+completeness      ``not_null`` (column) — the canonical "no NULLs" check
+uniqueness        ``unique`` (column)
+valid_values      ``accepted_values`` with the rule's value list
+accuracy          ``dbt_utils.expression_is_true`` placeholder when a
+                  threshold is given, else a ``fluid_accuracy_*``
+                  sentinel test name
+freshness         ``dbt_utils.recency`` when a column + window is
+                  present, else a ``fluid_freshness_*`` sentinel
+schema /          model-level sentinel test names — dbt surfaces a
+anomaly_detection clean "test not found" error pointing at the gap
+drift_detection   rather than silently dropping the contract intent
+================= ==================================================
+
+Output schema follows dbt's tests semantics. ``not_null`` / ``unique``
+are emitted as bare string test names (dbt convention); everything
+else is a single-key dict. The output is one YAML doc covering every
+expose; column-targeting rules attach under the matching
+``columns[].tests`` entry, ``"*"``-targeting rules attach at the
+model level.
+
+The sentinel ``# managed-by: fluid`` header lets re-runs detect and
+overwrite without clobbering hand-edits outside that block (the runner
+enforces the boundary).
 """
 
 from __future__ import annotations
@@ -37,9 +65,12 @@ from typing import Any, Mapping, Sequence
 # to clobber a hand-edited one.
 MANAGED_BY_SENTINEL = "# managed-by: fluid"
 
+# Selector value that marks a table-wide (not column-scoped) dq rule.
+_TABLE_SELECTOR = "*"
+
 
 def render_dbt_tests(contract: Mapping[str, Any]) -> str:
-    """Render a parsed fluid contract as a dbt schema.yml string.
+    """Render a parsed FLUID contract as a dbt schema.yml string.
 
     The returned text is a single multi-doc YAML stream. Callers should
     write it to ``<dbt_project>/models/<schema>/schema.yml`` or similar.
@@ -47,7 +78,8 @@ def render_dbt_tests(contract: Mapping[str, Any]) -> str:
     Parameters
     ----------
     contract:
-        Parsed contract dict (as produced by ``loader.load_with_overlay``).
+        Parsed contract dict (FLUID v0.7.x — as produced by
+        ``loader.load_with_overlay``).
 
     Returns
     -------
@@ -72,7 +104,11 @@ def render_dbt_tests(contract: Mapping[str, Any]) -> str:
 
     doc: dict[str, Any] = {"version": 2, "models": models}
     body = yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
-    return f"{MANAGED_BY_SENTINEL}\n# Generated from fluid contract — do not edit between the sentinels.\n{body}"
+    return (
+        f"{MANAGED_BY_SENTINEL}\n"
+        "# Generated from fluid contract — do not edit between the sentinels.\n"
+        f"{body}"
+    )
 
 
 def _expose_to_model(expose: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -80,19 +116,19 @@ def _expose_to_model(expose: Mapping[str, Any]) -> dict[str, Any] | None:
     name = _model_name(expose)
     if not name:
         return None
-    columns = _columns_with_tests(expose)
-    description = expose.get("description") or ""
+
+    rules = _dq_rules(expose)
+    tests_by_column, model_tests = _group_rules(rules)
+
+    columns = _columns_with_tests(expose, tests_by_column)
+    description = expose.get("description") or expose.get("title") or ""
 
     model: dict[str, Any] = {
         "name": name,
         "description": description,
     }
 
-    # Model-level (table-wide) tests come from quality.tests[] entries
-    # without a ``column`` field — typically row-count and freshness
-    # checks. We map them to dbt-utils / dbt-expectations equivalents so
-    # they round-trip into ``dbt test`` instead of being silently dropped.
-    model_tests = _model_level_tests(expose)
+    # Table-wide (``selector: "*"``) rules become dbt model-level tests.
     if model_tests:
         model["tests"] = model_tests
 
@@ -104,184 +140,226 @@ def _expose_to_model(expose: Mapping[str, Any]) -> dict[str, Any] | None:
 def _model_name(expose: Mapping[str, Any]) -> str:
     """Best-effort name lookup for the dbt model.
 
-    Prefers the binding location's table identifier, falls back to the
-    expose id. dbt models are named after their source table so this is
-    the right hook for downstream ``dbt test`` runs to bind to.
+    Prefers the binding location's table identifier (FLUID v0.7.x
+    ``binding.location.table``), falls back to the exposeId. dbt models
+    are named after their source table so this is the right hook for
+    downstream ``dbt test`` runs to bind to.
     """
     binding = expose.get("binding")
     if isinstance(binding, Mapping):
         location = binding.get("location")
         if isinstance(location, Mapping):
-            props = location.get("properties")
-            if isinstance(props, Mapping):
-                table = props.get("table") or props.get("name")
-                if isinstance(table, str) and table:
-                    return table
-    eid = expose.get("id") or expose.get("exposeId")
+            # v0.7.x: binding.location.table (also accept dataset/topic-style
+            # identifiers as a fallback for non-table bindings).
+            table = (
+                location.get("table")
+                or location.get("name")
+                or location.get("topic")
+                or location.get("object")
+            )
+            if isinstance(table, str) and table:
+                return table
+    eid = expose.get("exposeId") or expose.get("id")
     return eid if isinstance(eid, str) else ""
 
 
-def _columns_with_tests(expose: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Build the dbt ``columns:`` block, attaching per-column tests."""
-    cols_in = expose.get("schema") or []
-    tests_by_column = _tests_grouped_by_column(expose)
+def _dq_rules(expose: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return the ``contract.dq.rules[]`` list for an expose (v0.7.x shape)."""
+    contract = expose.get("contract")
+    if not isinstance(contract, Mapping):
+        return []
+    dq = contract.get("dq")
+    if not isinstance(dq, Mapping):
+        return []
+    rules = dq.get("rules")
+    if not isinstance(rules, Sequence) or isinstance(rules, (str, bytes)):
+        return []
+    return [r for r in rules if isinstance(r, Mapping)]
+
+
+def _group_rules(
+    rules: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, list[Any]], list[Any]]:
+    """Split dq rules into per-column tests and model-level tests.
+
+    A rule's ``selector`` is the column it targets; ``"*"`` (or an empty
+    selector) marks a table-wide rule that maps to a dbt model-level test.
+    """
+    by_column: dict[str, list[Any]] = {}
+    model_tests: list[Any] = []
+
+    for rule in rules:
+        selector = rule.get("selector")
+        selector = selector.strip() if isinstance(selector, str) else ""
+
+        if selector and selector != _TABLE_SELECTOR:
+            dbt_test = _convert_column_rule(rule, selector)
+            if dbt_test is not None:
+                by_column.setdefault(selector, []).append(dbt_test)
+        else:
+            dbt_test = _convert_model_rule(rule)
+            if dbt_test is not None:
+                model_tests.append(dbt_test)
+
+    return by_column, model_tests
+
+
+def _columns_with_tests(
+    expose: Mapping[str, Any], tests_by_column: Mapping[str, list[Any]]
+) -> list[dict[str, Any]]:
+    """Build the dbt ``columns:`` block, attaching per-column tests.
+
+    Reads ``contract.schema[]`` (v0.7.x) — an array of ``{name, type}``
+    column objects.
+    """
+    contract = expose.get("contract")
+    cols_in: Sequence[Any] = []
+    if isinstance(contract, Mapping):
+        schema = contract.get("schema")
+        if isinstance(schema, Sequence) and not isinstance(schema, (str, bytes)):
+            cols_in = schema
 
     out: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for col in cols_in:
         if not isinstance(col, Mapping):
             continue
         name = col.get("name")
-        if not isinstance(name, str):
+        if not isinstance(name, str) or not name:
             continue
+        seen.add(name)
         col_block: dict[str, Any] = {"name": name}
-        if col.get("description"):
-            col_block["description"] = col["description"]
-        col_tests = tests_by_column.get(name, [])
+        desc = col.get("description") or col.get("businessName")
+        if desc:
+            col_block["description"] = desc
+        col_tests = tests_by_column.get(name)
         if col_tests:
             col_block["tests"] = col_tests
         out.append(col_block)
+
+    # A dq rule may target a column not declared in contract.schema[]
+    # (author error, or schema discovered at runtime). Don't silently
+    # drop the test — emit a column entry for it so dbt still runs it.
+    for col_name, col_tests in tests_by_column.items():
+        if col_name in seen:
+            continue
+        out.append({"name": col_name, "tests": col_tests})
+
     return out
 
 
-def _tests_grouped_by_column(expose: Mapping[str, Any]) -> dict[str, list[Any]]:
-    """Walk ``quality.tests[]`` and emit dbt-shaped test entries, keyed by column."""
-    quality = expose.get("quality") or {}
-    if not isinstance(quality, Mapping):
-        return {}
-    tests = quality.get("tests") or []
-    if not isinstance(tests, Sequence):
-        return {}
+def _convert_column_rule(rule: Mapping[str, Any], column: str) -> Any | None:
+    """Map one column-scoped ``dqRule`` to a dbt test entry (string or dict)."""
+    kind = _rule_type(rule)
 
-    grouped: dict[str, list[Any]] = {}
-    for t in tests:
-        if not isinstance(t, Mapping):
-            continue
-        column = t.get("column")
-        if not isinstance(column, str):
-            # Column-less tests are emitted at the model level — see
-            # :func:`_model_level_tests`. Skip here.
-            continue
-        dbt_test = _convert_test(t)
-        if dbt_test is not None:
-            grouped.setdefault(column, []).append(dbt_test)
-    return grouped
-
-
-def _model_level_tests(expose: Mapping[str, Any]) -> list[Any]:
-    """Render quality.tests[] entries without a column as dbt model-level tests.
-
-    Mapping table:
-      ``row_count_anomaly`` → ``dbt_utils.expression_is_true: count(*) > 0``
-                              (placeholder — operator tightens with a real
-                              threshold; see comment marker below)
-      ``freshness`` → ``dbt_utils.recency`` when ``column`` + ``max_age``
-                      are present, else a comment marker
-      everything else → comment-style placeholder so the operator sees intent
-    """
-    quality = expose.get("quality") or {}
-    if not isinstance(quality, Mapping):
-        return []
-    tests = quality.get("tests") or []
-    if not isinstance(tests, Sequence):
-        return []
-
-    out: list[Any] = []
-    for t in tests:
-        if not isinstance(t, Mapping):
-            continue
-        if isinstance(t.get("column"), str):
-            # column-level — handled by _tests_grouped_by_column.
-            continue
-        kind = str(t.get("type") or "").strip().lower()
-
-        if kind == "row_count_anomaly":
-            threshold = t.get("threshold") or t.get("min_rows")
-            if isinstance(threshold, (int, float)):
-                out.append(
-                    {"dbt_utils.expression_is_true": {"expression": f"count(*) > {threshold}"}}
-                )
-            else:
-                # Sentinel: dbt parses this as a string test name. Users
-                # who haven't defined ``fluid_row_count_anomaly`` will get
-                # a clear "test not found" error pointing at the gap.
-                out.append("fluid_row_count_anomaly")
-        elif kind == "freshness":
-            ts_col = t.get("column_name") or "updated_at"
-            max_age = t.get("max_age") or t.get("threshold")
-            if isinstance(max_age, str):
-                out.append(
-                    {
-                        "dbt_utils.recency": {
-                            "field": ts_col,
-                            "datepart": "day",
-                            "interval": 1,
-                            "_fluid_max_age": max_age,
-                        }
-                    }
-                )
-            else:
-                out.append("fluid_freshness_check")
-        else:
-            # Unknown table-level test — emit a sentinel string test name
-            # so dbt surfaces a clean error rather than silently dropping
-            # the fluid contract intent.
-            out.append(f"fluid_unmapped_{kind}")
-    return out
-
-
-def _convert_test(test: Mapping[str, Any]) -> Any | None:
-    """Map one fluid quality test to a dbt test entry (string or dict)."""
-    kind = test.get("type") or ""
-    if not isinstance(kind, str):
-        return None
-    kind = kind.strip().lower()
-
-    if kind == "not_null":
+    if kind == "completeness":
+        # Completeness == "no NULLs" in the column → dbt's not_null.
         return "not_null"
-    if kind == "unique":
+
+    if kind == "uniqueness":
         return "unique"
-    if kind == "accepted_values":
-        values = test.get("values")
-        if isinstance(values, Sequence):
-            return {"accepted_values": {"values": list(values)}}
-        return None
-    if kind == "relationships":
-        to_model = test.get("to") or test.get("relation")
-        field = test.get("field") or "id"
-        if isinstance(to_model, str):
+
+    if kind == "valid_values":
+        values = _valid_values(rule)
+        if values:
+            return {"accepted_values": {"values": values}}
+        # No value list on the rule — emit a sentinel so the operator
+        # sees the gap rather than dropping a declared check silently.
+        return f"fluid_valid_values_{column}"
+
+    if kind == "accuracy":
+        threshold = rule.get("threshold")
+        operator = rule.get("operator") or ">="
+        if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
+            # Accuracy is contract-specific; surface it as a dbt_utils
+            # expression placeholder the operator can tune to their own
+            # accuracy predicate. The threshold + operator are preserved
+            # in the expression so the intent isn't lost.
+            expr = f"-- accuracy({column}) {operator} {threshold}: replace with predicate"
+            return {"dbt_utils.expression_is_true": {"expression": expr}}
+        return f"fluid_accuracy_{column}"
+
+    if kind == "freshness":
+        # Column-scoped freshness → dbt_utils.recency on that column.
+        window = rule.get("window") or rule.get("threshold")
+        rec: dict[str, Any] = {
+            "field": column,
+            "datepart": "day",
+            "interval": 1,
+        }
+        if window is not None:
+            rec["_fluid_window"] = str(window)
+        return {"dbt_utils.recency": rec}
+
+    if kind in ("schema", "anomaly_detection", "drift_detection"):
+        # No dbt built-in maps cleanly — emit a sentinel test name so dbt
+        # surfaces a clean "test not found" error pointing at the gap.
+        return f"fluid_{kind}_{column}"
+
+    # Unknown / unmapped type — leave the operator a breadcrumb.
+    return f"fluid_unmapped_{kind}_{column}"
+
+
+def _convert_model_rule(rule: Mapping[str, Any]) -> Any | None:
+    """Map one table-wide (``selector: "*"``) ``dqRule`` to a model-level test."""
+    kind = _rule_type(rule)
+
+    if kind == "freshness":
+        window = rule.get("window") or rule.get("threshold")
+        if window is not None:
             return {
-                "relationships": {
-                    "to": to_model,
-                    "field": field,
+                "dbt_utils.recency": {
+                    "field": "updated_at",
+                    "datepart": "day",
+                    "interval": 1,
+                    "_fluid_window": str(window),
                 }
             }
-        return None
-    if kind == "range":
-        # dbt-utils is the canonical dbt test for numeric ranges. Emit
-        # the dict form so downstream packages can pick it up.
-        col = test.get("column")
-        if not isinstance(col, str):
-            return None
-        lo = test.get("min")
-        hi = test.get("max")
-        if lo is None and hi is None:
-            return None
-        bits = []
-        if lo is not None:
-            bits.append(f"{col} >= {lo}")
-        if hi is not None:
-            bits.append(f"{col} <= {hi}")
-        expr = " AND ".join(bits)
-        return {"dbt_utils.expression_is_true": {"expression": expr}}
-    if kind == "regex":
-        # No clean dbt built-in — emit a custom test marker. The user
-        # can implement ``regex_match`` as a generic dbt test in their
-        # project; we provide the shape.
-        col = test.get("column")
-        pattern = test.get("pattern")
-        if not isinstance(col, str) or not isinstance(pattern, str):
-            return None
-        return {"regex_match": {"pattern": pattern}}
+        return "fluid_freshness_check"
 
-    # Unknown type — leave the operator a breadcrumb but don't crash.
-    return {f"_fluid_unknown_{kind}": dict(test)}
+    if kind in ("anomaly_detection", "drift_detection"):
+        threshold = rule.get("threshold")
+        if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
+            return {"dbt_utils.expression_is_true": {"expression": f"count(*) > {threshold}"}}
+        return f"fluid_{kind}"
+
+    if kind in ("completeness", "uniqueness", "valid_values", "accuracy", "schema"):
+        # These need a column to be meaningful; a "*" selector for them is
+        # an authoring smell. Emit a sentinel so the operator sees it.
+        return f"fluid_{kind}_table_level"
+
+    return f"fluid_unmapped_{kind}"
+
+
+def _rule_type(rule: Mapping[str, Any]) -> str:
+    """Normalised lowercase ``dqRule.type``."""
+    kind = rule.get("type") or ""
+    return kind.strip().lower() if isinstance(kind, str) else ""
+
+
+def _valid_values(rule: Mapping[str, Any]) -> list[Any]:
+    """Extract the value list for a ``valid_values`` rule.
+
+    The v0.7.3 ``dqRule`` schema has no dedicated value-list field, so the
+    value set is carried either on an explicit ``validValues`` / ``values``
+    key (used by the quality engine) or parsed from a ``description`` of
+    the form ``"<col> valid values: a, b, c."`` — mirrors
+    ``providers/quality_engine.py``'s parsing so the dbt artifact and the
+    live checker agree on the value set.
+    """
+    for key in ("validValues", "values"):
+        raw = rule.get(key)
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+            vals = [v for v in raw if v is not None]
+            if vals:
+                return vals
+
+    description = rule.get("description")
+    if isinstance(description, str) and " valid values:" in description.lower():
+        import re
+
+        m = re.search(r"valid values:\s*([^.]+)", description, re.IGNORECASE)
+        if m:
+            return [v.strip() for v in m.group(1).split(",") if v.strip()]
+
+    return []

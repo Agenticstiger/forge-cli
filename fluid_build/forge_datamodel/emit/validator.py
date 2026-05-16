@@ -122,7 +122,6 @@ class FluidContractValidator:
             findings.extend(lint_logical_semantic_quality(logical))
 
         if contract is not None:
-            contract_for_schema = _strip_contract_provenance(contract)
             # Honor the contract's own ``fluidVersion`` when present so a
             # contract emitted at one schema version validates against that
             # version, not whichever default the validator was initialized
@@ -130,7 +129,7 @@ class FluidContractValidator:
             # for contracts that omit the field.
             target_version = contract.get("fluidVersion") or self.version
             validation = self.schema_manager.validate_contract(
-                contract_for_schema,
+                contract,
                 schema_version=target_version,
                 offline_only=True,
             )
@@ -252,18 +251,6 @@ def _lint_contract_semantics(
 
 def _non_empty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
-
-
-def _strip_contract_provenance(contract: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove the forge envelope before strict FLUID schema validation."""
-    metadata = contract.get("metadata")
-    if not isinstance(metadata, dict) or "provenance" not in metadata:
-        return contract
-    clean = dict(contract)
-    clean_metadata = dict(metadata)
-    clean_metadata.pop("provenance", None)
-    clean["metadata"] = clean_metadata
-    return clean
 
 
 def _lint_against_skeleton(logical: LogicalDraft, pack: IndustryPack) -> List[ValidationFinding]:

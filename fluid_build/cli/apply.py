@@ -177,6 +177,25 @@ def _run_apply_hooks(
     return 1
 
 
+def _gate_contract_for_apply(contract: Dict[str, Any], logger: logging.Logger) -> None:
+    """Reject pre-0.7 + schema-invalid contracts before any DDL.
+
+    Thin wrapper over ``cli/plan.py::_gate_contract_for_plan_or_apply`` so
+    the pre-0.7 rejection and JSON-schema validation logic lives in exactly
+    one place (DRY). ``fluid apply`` calls this on the contract it is about
+    to apply — whether loaded from a ``.fluid.yaml`` or extracted from a
+    pre-built ``plan.json`` — so an end-of-life or structurally-broken
+    contract never reaches a provider with exit 0.
+
+    Raises:
+        CLIError: ``contract_version_unsupported`` for pre-0.7 contracts,
+            ``apply_contract_invalid`` for schema-invalid contracts.
+    """
+    from fluid_build.cli.plan import _gate_contract_for_plan_or_apply
+
+    _gate_contract_for_plan_or_apply(contract, logger, command="apply")
+
+
 # ==========================================
 # CLI Command Registration & Execution
 # ==========================================
@@ -238,11 +257,32 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     mode_group.add_argument(
-        "--no-verify-digest",
+        "--bundle",
+        default=None,
+        help=(
+            "Path to the .tgz bundle this plan.json was generated against. "
+            "When the plan carries a bundleDigest it is re-verified against "
+            "this bundle before any DDL; auto-discovered from a sibling "
+            ".tgz when omitted."
+        ),
+    )
+    # SECURITY: the plan-binding gate and the federation upstream-digest
+    # gate are distinct trust domains — a single ``--no-verify-digest``
+    # waiver for both was a security finding. Each now has its own
+    # narrowly-scoped escape hatch; both log at WARNING for audit.
+    mode_group.add_argument(
+        "--no-verify-plan-binding",
+        action="store_true",
+        default=False,
+        help="Skip plan/bundle digest verification (DR escape hatch). Logged at WARNING for audit.",
+    )
+    mode_group.add_argument(
+        "--no-verify-federation",
         action="store_true",
         default=False,
         help=(
-            "Skip plan/bundle digest verification (DR escape hatch). Logged at WARNING for audit."
+            "Skip the federated-consumes upstream-digest gate (DR escape "
+            "hatch). Logged at WARNING for audit."
         ),
     )
 
@@ -375,6 +415,20 @@ def register(subparsers: argparse._SubParsersAction):
     advanced_group.add_argument(
         "--config-override", help="JSON string to override contract configuration"
     )
+    # ``--provider`` MUST be registered explicitly: without it, argparse
+    # abbreviation-matching silently folds ``--provider local`` into
+    # ``--provider-config`` (its only registered ``--provider*`` sibling),
+    # populating ``provider_config`` with a provider name. Harmless until
+    # ``--provider-config`` became a path validated against the filesystem.
+    advanced_group.add_argument(
+        "--provider", help="Override provider name (default: from contract binding)"
+    )
+    advanced_group.add_argument(
+        "--project", help="Override project/account (default: from contract)"
+    )
+    advanced_group.add_argument(
+        "--region", help="Override region/location (default: from contract)"
+    )
     advanced_group.add_argument(
         "--provider-config", help="Path to provider-specific configuration file"
     )
@@ -496,25 +550,57 @@ def _actions_from_source(
     return [{"op": "ensure_dataset"}, {"op": "ensure_table"}]
 
 
-def _verify_plan_digests(plan_data: Dict[str, Any], args, logger: logging.Logger) -> None:
+def _resolve_bundle_path(plan_data: Dict[str, Any], args, logger: logging.Logger):
+    """Locate the .tgz bundle a plan.json was generated against.
+
+    Returns ``None`` when the plan declares no ``bundleDigest`` (a raw
+    plan with no bundle to pin). When a ``bundleDigest`` IS present and no
+    bundle can be located, this still returns ``None`` — and
+    ``verify_plan_binding`` then fails closed with ``bundle-missing``.
+    """
+    if not plan_data.get("bundleDigest"):
+        return None
+    explicit = getattr(args, "bundle", None)
+    if explicit:
+        return Path(explicit)
+    # Auto-discover a single sibling bundle next to the plan.json.
+    plan_dir = Path(args.contract).resolve().parent
+    candidates = sorted(plan_dir.glob("*.tgz")) + sorted(plan_dir.glob("*.tar.gz"))
+    if len(candidates) == 1:
+        logger.info("Auto-discovered bundle for plan-binding: %s", candidates[0])
+        return candidates[0]
+    if len(candidates) > 1:
+        logger.warning(
+            "Multiple .tgz bundles next to %s — pass --bundle to disambiguate.",
+            args.contract,
+        )
+    return None
+
+
+def _verify_plan_digests(
+    plan_data: Dict[str, Any], args, logger: logging.Logger, *, bundle_path=None
+) -> None:
     """Enforce the stage-7 plan-binding gate.
 
     Cryptographic "apply consumes exact plan" guarantee: before any DDL runs,
     recompute ``planDigest`` over the plan body and compare against the
-    value stored in ``plan.json``. Mismatch → ``CLIError`` with a stable
-    ``event`` field so CI logs can classify the failure.
+    value stored in ``plan.json``. When the plan carries a non-empty
+    ``bundleDigest``, the bundle is also re-verified — a missing bundle
+    fails closed (``bundle-missing``) rather than silently skipping.
+    Mismatch → ``CLIError`` with a stable ``event`` field so CI logs can
+    classify the failure.
 
-    ``--no-verify-digest`` waives the check for legitimate emergencies
-    (bundle unreachable during DR). The waiver is logged at WARNING level
-    so audit trails show the operator made the call.
+    ``--no-verify-plan-binding`` waives the check for legitimate
+    emergencies (bundle unreachable during DR). The waiver is logged at
+    WARNING level so audit trails show the operator made the call.
 
     Plans without a ``planDigest`` field are treated as tamper signals —
     legitimate plans always carry one. This catches both (a) plans produced
     by an older fluid version and (b) plans that had the digest stripped.
     """
-    if getattr(args, "no_verify_digest", False):
+    if getattr(args, "no_verify_plan_binding", False):
         logger.warning(
-            "--no-verify-digest: plan-binding verification was SKIPPED. "
+            "--no-verify-plan-binding: plan-binding verification was SKIPPED. "
             "This is an emergency escape hatch; the apply may be running "
             "against a tampered or stale plan. Make sure this is recorded "
             "in the change log."
@@ -526,7 +612,7 @@ def _verify_plan_digests(plan_data: Dict[str, Any], args, logger: logging.Logger
     from ..forge.core.plan_digest import PlanBindingError, verify_plan_binding
 
     try:
-        verify_plan_binding(plan_data, bundle_path=None)
+        verify_plan_binding(plan_data, bundle_path=bundle_path)
     except PlanBindingError as exc:
         # ``exc.kind`` is either ``bundle-mismatch`` or ``plan-tamper``.
         # Surface it as the stable event field so CI log parsers can match.
@@ -560,6 +646,30 @@ def run(args, logger: logging.Logger) -> int:
                     "found in the current directory."
                 )
             },
+        )
+
+    # F1 / F6: validate every operator-supplied path argument (traversal,
+    # forbidden system paths, symlink) before any of them reach
+    # ``read_json`` / ``load_contract_with_overlay`` / ``open()``. The
+    # positional argument may be a contract OR a pre-built ``.json``
+    # plan; ``--bundle`` is a ``.tgz``; ``--report`` / ``--state-file``
+    # are write targets; ``--provider-config`` is an input file.
+    from fluid_build.cli.security import validate_cli_path
+
+    args.contract = str(validate_cli_path(args.contract, mode="read", file_type="contract"))
+    if getattr(args, "bundle", None):
+        args.bundle = str(validate_cli_path(args.bundle, mode="read", file_type="bundle"))
+    if getattr(args, "provider_config", None):
+        args.provider_config = str(
+            validate_cli_path(args.provider_config, mode="read", file_type="provider config")
+        )
+    if getattr(args, "report", None):
+        args.report = str(
+            validate_cli_path(args.report, mode="write", must_exist=False, file_type="report")
+        )
+    if getattr(args, "state_file", None):
+        args.state_file = validate_cli_path(
+            args.state_file, mode="write", must_exist=False, file_type="state file"
         )
 
     start_time = time.time()
@@ -655,12 +765,37 @@ def run(args, logger: logging.Logger) -> int:
 
             # --- Plan-binding verification (stage-7 apply gate) ---
             # Before ANY DDL runs, re-verify the plan's ``planDigest``
-            # (catches tampering between stages 6 and 7). ``bundleDigest``
-            # verification is skipped here because the plan is consumed
-            # standalone — the canonical path where both digests verify is
-            # ``fluid apply <bundle.tgz> --plan plan.json`` (Phase 7 wiring).
-            # ``--no-verify-digest`` waives the gate for emergency hotfixes.
-            _verify_plan_digests(plan_data, args, logger)
+            # (catches tampering between stages 6 and 7) AND, when the plan
+            # carries a non-empty ``bundleDigest``, the bundle it was bound
+            # to (from --bundle or an auto-discovered sibling .tgz). A
+            # non-empty bundleDigest with no bundle available fails closed.
+            # ``--no-verify-plan-binding`` waives the gate for emergencies.
+            _verify_plan_digests(
+                plan_data,
+                args,
+                logger,
+                bundle_path=_resolve_bundle_path(plan_data, args, logger),
+            )
+
+            # SECURITY (TOCTOU): re-verification snapshot.
+            # ``_verify_plan_digests`` just proved the planDigest over
+            # ``plan_data`` as loaded. Capture a deep copy of that
+            # exact, attested structure NOW, before any downstream code
+            # runs. ``verified_plan_data`` is the frozen reference: it
+            # is what the digest covered and nothing mutates it.
+            # Provider dispatch derives the contract from this copy
+            # (see ``contract = verified_plan_data.get("contract")``
+            # below), so the structure that actually drives DDL is
+            # provably the one that was digest-checked — not a sibling
+            # alias that could have been swapped between verify and
+            # use. Operator-supplied ``--config-override`` is still
+            # applied afterwards (that is an explicit apply-time input,
+            # not plan tampering), but it mutates a child of this
+            # verified copy, never the loaded ``plan_data``.
+            import copy as _copy
+
+            verified_plan_data = _copy.deepcopy(plan_data)
+            plan_data = verified_plan_data
 
             # --- Plan/apply mode-mismatch gate ---
             # ``fluid plan x.yaml --output p.json`` records the mode it
@@ -698,6 +833,16 @@ def run(args, logger: logging.Logger) -> int:
 
             contract = plan_data.get("contract", {})
 
+            # --- Pre-apply contract gate (embedded-contract path) ---------
+            # A pre-built plan.json embeds the full contract. The plan-binding
+            # digest gate above proves the plan wasn't tampered with, but a
+            # plan minted from a pre-0.7 / schema-invalid contract by an
+            # older fluid (before the plan-time gate existed) could still
+            # reach apply. Re-run the same gates on the embedded contract so
+            # apply never executes DDL for an unsupported / broken contract.
+            if isinstance(contract, dict) and contract:
+                _gate_contract_for_apply(contract, logger)
+
             # --- Plan-format detection ---
             # Two plan.json shapes exist today:
             #
@@ -731,6 +876,14 @@ def run(args, logger: logging.Logger) -> int:
             # Load contract
             logger.info(f"Loading FLUID contract: {args.contract}")
             contract = load_contract_with_overlay(args.contract, args.env, logger)
+
+            # --- Pre-apply contract gate ----------------------------------
+            # ``fluid apply`` used to apply ANY contract — including a
+            # pre-0.7 end-of-life contract or a structurally-broken one —
+            # with exit 0. Run the same gates ``fluid validate`` runs
+            # (pre-0.7 rejection + JSON-schema validation) BEFORE any DDL.
+            # A failure raises ``CLIError`` → non-zero exit, no apply.
+            _gate_contract_for_apply(contract, logger)
 
             # Run plugin-registered apply-time hooks (entry-point group
             # ``fluid_build.apply_hooks``). Plugins can use these to verify
@@ -802,9 +955,9 @@ def run(args, logger: logging.Logger) -> int:
         # compares against the pinned ``upstreamDigest``. Drift produces
         # a typed ``FederatedConsumeViolation`` per drifted row and we
         # abort apply before any DDL — same loud-failure posture as the
-        # plan-binding gate. ``--no-verify-digest`` is the DR escape
+        # plan-binding gate. ``--no-verify-federation`` is the DR escape
         # hatch (logged at WARNING).
-        if not getattr(args, "no_verify_digest", False):
+        if not getattr(args, "no_verify_federation", False):
             try:
                 from fluid_build.forge.federation import validate_federated_consumes
 
@@ -842,7 +995,7 @@ def run(args, logger: logging.Logger) -> int:
                 )
         else:
             logger.warning(
-                "--no-verify-digest: federation digest gate was SKIPPED. "
+                "--no-verify-federation: federation digest gate was SKIPPED. "
                 "Federated consumes[] entries with drifted upstreams will "
                 "apply against stale data. Make sure this is recorded in "
                 "the change log."
@@ -897,6 +1050,14 @@ def run(args, logger: logging.Logger) -> int:
                     if "platform" in runtime:
                         provider_name = runtime["platform"]
                         break
+
+            # Explicit CLI flags override the contract-derived values.
+            if getattr(args, "provider", None):
+                provider_name = args.provider
+            if getattr(args, "project", None):
+                project = args.project
+            if getattr(args, "region", None):
+                region = args.region
 
             # For AWS, extract region from binding.location or env vars and let
             # resolve_account_and_region() discover the account via STS.

@@ -487,7 +487,7 @@ def _collect_and_validate_api_key(
             # Litellm-only provider (groq, bedrock, azure, vertex_ai,
             # mistral, cohere, ...). Synthesise a LiteLLMProvider so
             # the validation + persistence path doesn't need a
-            # legacy class for every provider litellm speaks.
+            # dedicated class for every provider litellm speaks.
             try:
                 from fluid_build.cli.forge_copilot_llm_litellm import (
                     get_litellm_provider,
@@ -743,7 +743,8 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
                     console.print(f"[dim]Using Ollama ({config.model}).[/dim]")
                 LOG.info("Inline AI setup: loaded ollama from config")
                 return config
-            # Cloud provider — key is in keyring, env, or legacy plaintext config.
+            # Cloud provider — key is in the opt-in plaintext config
+            # or, preferentially, the OS keyring.
             api_key = saved.get("api_key") or _load_key_from_keyring(pname)
             if api_key:
                 set_session_env(pname, api_key)
@@ -757,7 +758,8 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
                 return config
             # Config exists but no key anywhere — fall through to prompt.
 
-    # 2. Check cloud-provider env vars (backward compat / CI).
+    # 2. Check cloud-provider env vars (e.g. CI environments that
+    #    inject ANTHROPIC_API_KEY / OPENAI_API_KEY directly).
     for pname, env_var in PROVIDER_ENV_VARS.items():
         env_key = os.environ.get(env_var)
         if env_key:
@@ -1080,9 +1082,9 @@ def _run_ai_command(args, logger: logging.Logger) -> int:
                 cprint("Cleared saved AI config and API keys.")
             return 0
 
-        # V1.5 — metadata-source catalog wizard.
+        # Metadata-source catalog wizard.
         # Routes to the dedicated source-setup module when --source
-        # is set; otherwise falls through to the legacy LLM-provider
+        # is set; otherwise falls through to the LLM-provider
         # wizard. Kept as a single ``setup`` subcommand (rather
         # than a separate ``setup-source`` verb) so the operator's
         # mental model is "fluid ai setup configures my AI / data

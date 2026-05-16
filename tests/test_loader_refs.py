@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 from textwrap import dedent
 
@@ -908,3 +909,65 @@ class TestLoadWithOverlayListMerge:
 
         result = load_with_overlay(tmp_path / "contract.fluid.yaml")
         assert result["exposes"][0]["exposeId"] == "p1"
+
+
+# ===========================================================================
+# F3: $ref resolver routes forbidden-path screening through the
+# platform-aware SecurePathValidator instead of a hand-rolled Linux-only
+# prefix list. macOS (/etc → /private/etc) and Windows are now covered.
+# ===========================================================================
+
+
+class TestRefResolverPlatformAwareBlocking:
+    """The ``$ref`` resolver must reject refs that traverse into a
+    system directory, using the same platform-aware deny set as the
+    rest of the CLI (``cli/security.py``)."""
+
+    def test_absolute_ref_still_rejected(self, tmp_path):
+        """An absolute ``$ref`` path is rejected outright (relative-only
+        rule predates F3, must still hold)."""
+        tree = {"section": {"$ref": "/etc/passwd"}}
+        with pytest.raises(RefResolutionError, match="must be a relative path"):
+            _resolve_refs(tree, tmp_path)
+
+    def test_traversal_ref_into_etc_rejected(self, tmp_path):
+        """A relative ``$ref`` that climbs out of the workspace into
+        ``/etc`` is rejected as a blocked system path."""
+        # Build enough ``../`` to climb from tmp_path to the filesystem
+        # root, then descend into /etc.
+        depth = len(tmp_path.resolve().parts) - 1
+        climb = "/".join([".."] * depth)
+        ref = f"./{climb}/etc/passwd" if climb else "./etc/passwd"
+        tree = {"section": {"$ref": ref}}
+        with pytest.raises(RefResolutionError, match="blocked system path"):
+            _resolve_refs(tree, tmp_path)
+
+    @pytest.mark.skipif(
+        not sys.platform.startswith("darwin"),
+        reason="Exercises macOS /etc → /private/etc symlink resolution",
+    )
+    def test_traversal_ref_into_private_etc_rejected_on_macos(self, tmp_path):
+        """F3 core fix: on macOS ``/etc`` resolves to ``/private/etc``.
+        The OLD hand-rolled prefix list only checked ``/etc/`` / ``/var/``
+        — it MISSED ``/private/etc``, so a $ref resolving there slipped
+        through. The platform-aware validator includes ``/private/etc``,
+        so the deny now fires."""
+        depth = len(tmp_path.resolve().parts) - 1
+        climb = "/".join([".."] * depth)
+        # Target /private/etc directly — this is the resolved macOS form
+        # of /etc that the legacy Linux-only check could not catch.
+        ref = f"./{climb}/private/etc/passwd" if climb else "./private/etc/passwd"
+        tree = {"section": {"$ref": ref}}
+        with pytest.raises(RefResolutionError, match="blocked system path"):
+            _resolve_refs(tree, tmp_path)
+
+    def test_legitimate_sibling_ref_still_allowed(self, tmp_path):
+        """F3 must not over-block: a normal relative ``../sibling/``
+        ref inside the project tree still resolves (monorepo layouts)."""
+        sibling = tmp_path / "shared"
+        _write_yaml(sibling / "common.yaml", {"classification": "Internal"})
+        product = tmp_path / "product"
+        product.mkdir()
+        tree = {"policy": {"$ref": "../shared/common.yaml"}}
+        result = _resolve_refs(tree, product)
+        assert result["policy"]["classification"] == "Internal"

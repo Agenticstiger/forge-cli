@@ -480,10 +480,16 @@ class TestJenkinsPipelineTemplateGenerator:
         assert "--allow-data-loss" in content
 
     def test_output_contains_no_verify_digest_escape_hatch(self, generator):
-        """Stage 7 emergency plan-binding waiver flag."""
+        """Stage 7 emergency digest-gate waiver. The single
+        ``NO_VERIFY_DIGEST`` CI-operator param now appends BOTH
+        narrowly-scoped CLI flags so the one knob waives the
+        plan-binding gate and the federation upstream-digest gate."""
         content = self._generate(generator)["Jenkinsfile"]
         assert "name: 'NO_VERIFY_DIGEST'" in content
-        assert "--no-verify-digest" in content
+        assert "--no-verify-plan-binding" in content
+        assert "--no-verify-federation" in content
+        # Old single flag must be fully retired from generated output.
+        assert "--no-verify-digest" not in content
 
     def test_output_contains_diff_drift_gate_toggle(self, generator):
         """Stage 5 --exit-on-drift behavior must be toggleable."""

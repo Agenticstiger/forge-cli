@@ -26,9 +26,7 @@ the latter generates dbt/SQL project *files* at ``fluid generate
 speed-transformation`` time; this one *executes* those projects at
 ``fluid apply --build`` time.
 
-Migrated from ``fluid_build/cli/execute.py`` as part of the 11-stage
-pipeline split. The deprecated ``fluid execute`` subcommand is gone;
-callers use :func:`run_builds_from_args` directly.
+Callers invoke :func:`run_builds_from_args` directly.
 """
 
 from .base import (

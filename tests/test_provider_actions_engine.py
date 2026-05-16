@@ -165,13 +165,23 @@ class TestInferFromLegacy:
         assert actions[0].provider == "local"
 
 
-# ── _extract_labels ──────────────────────────────────────────────────
+# ── _extract_labels (GCP target — label values get GCP sanitization) ──
 class TestExtractLabels:
+    """GCP/BigQuery exposures: label *values* are lowercased + ``[a-z0-9_-]``.
+
+    Every case here passes ``provider="gcp"`` so the GCP label constraint
+    applies — these assertions pin the GCP-target behavior. Non-GCP target
+    behavior (verbatim preservation) is pinned in
+    :class:`TestExtractLabelsPlatformAware`.
+    """
+
     def setup_method(self):
         self.parser = ProviderActionParser()
 
     def test_contract_id_and_name(self):
-        labels = self.parser._extract_labels({"id": "My-Contract", "name": "Hello World"}, {})
+        labels = self.parser._extract_labels(
+            {"id": "My-Contract", "name": "Hello World"}, {}, provider="gcp"
+        )
         assert labels["fluid_contract_id"] == "my-contract"
         assert labels["fluid_contract_name"] == "hello_world"
 
@@ -183,22 +193,26 @@ class TestExtractLabels:
                 "owner": {"team": "Data Eng"},
             }
         }
-        labels = self.parser._extract_labels(contract, {})
+        labels = self.parser._extract_labels(contract, {}, provider="gcp")
         assert labels["fluid_layer"] == "gold"
         assert labels["fluid_domain"] == "finance"
         assert labels["fluid_team"] == "data_eng"
 
     def test_contract_custom_labels(self):
-        labels = self.parser._extract_labels({"labels": {"Cost-Center": "CC99"}}, {})
+        labels = self.parser._extract_labels(
+            {"labels": {"Cost-Center": "CC99"}}, {}, provider="gcp"
+        )
         assert labels["cost-center"] == "cc99"
 
     def test_contract_tags(self):
-        labels = self.parser._extract_labels({"tags": ["PII", "real-time"]}, {})
+        labels = self.parser._extract_labels({"tags": ["PII", "real-time"]}, {}, provider="gcp")
         assert labels["tag_pii"] == "true"
         assert labels["tag_real-time"] == "true"
 
     def test_exposure_labels_and_tags(self):
-        labels = self.parser._extract_labels({}, {"labels": {"env": "prod"}, "tags": ["critical"]})
+        labels = self.parser._extract_labels(
+            {}, {"labels": {"env": "prod"}, "tags": ["critical"]}, provider="gcp"
+        )
         assert labels["env"] == "prod"
         assert labels["tag_critical"] == "true"
 
@@ -206,6 +220,7 @@ class TestExtractLabels:
         labels = self.parser._extract_labels(
             {},
             {"policy": {"classification": "PII", "authn": "oauth2"}},
+            provider="gcp",
         )
         assert labels["data_classification"] == "pii"
         assert labels["authn_method"] == "oauth2"
@@ -214,18 +229,131 @@ class TestExtractLabels:
         labels = self.parser._extract_labels(
             {},
             {"policy": {"labels": {"review": "done"}, "tags": ["compliance"]}},
+            provider="gcp",
         )
         assert labels["policy_review"] == "done"
         assert labels["policy_compliance"] == "true"
 
     def test_label_key_starts_with_digit(self):
-        labels = self.parser._extract_labels({"labels": {"1abc": "val"}}, {})
+        # Key normalization is platform-independent — keys feed into action
+        # param dict keys, so they are always identifier-shaped.
+        labels = self.parser._extract_labels({"labels": {"1abc": "val"}}, {}, provider="gcp")
         assert "label_1abc" in labels
 
     def test_empty_sanitized_key_skipped(self):
         # A label key that sanitizes to empty should be skipped
-        labels = self.parser._extract_labels({"labels": {"": "x"}}, {})
+        labels = self.parser._extract_labels({"labels": {"": "x"}}, {}, provider="gcp")
         assert "" not in labels
+
+
+# ── _extract_labels (platform-aware value sanitization — BUG-1 fix) ───
+class TestExtractLabelsPlatformAware:
+    """Non-GCP targets must keep label *values* verbatim.
+
+    Regression guard for the lossy-mangling bug: ``sanitize_label_value``
+    used to run GCP's ``[a-z0-9_-]`` lowercase rewrite on every target,
+    silently corrupting Snowflake / AWS / local label values in
+    ``plan.json`` (CJK collapsed to underscores, ``NO`` → ``no``,
+    ``1.2.3`` → ``1_2_3``).
+    """
+
+    def setup_method(self):
+        self.parser = ProviderActionParser()
+
+    def test_snowflake_preserves_cjk_value(self):
+        labels = self.parser._extract_labels(
+            {"labels": {"segment": "用户三百六十度"}}, {}, provider="snowflake"
+        )
+        assert labels["segment"] == "用户三百六十度"
+
+    def test_snowflake_preserves_case_and_dots(self):
+        contract = {
+            "id": "My-Product",
+            "name": "My Product",
+            "metadata": {"layer": "Gold", "owner": {"team": "Data Eng"}},
+            "labels": {"version": "1.2.3", "approved": "NO"},
+        }
+        labels = self.parser._extract_labels(contract, {}, provider="snowflake")
+        # Verbatim — no lowercasing, no char substitution.
+        assert labels["fluid_contract_id"] == "My-Product"
+        assert labels["fluid_contract_name"] == "My Product"
+        assert labels["fluid_layer"] == "Gold"
+        assert labels["fluid_team"] == "Data Eng"
+        assert labels["version"] == "1.2.3"
+        assert labels["approved"] == "NO"
+
+    def test_aws_preserves_value_verbatim(self):
+        labels = self.parser._extract_labels(
+            {}, {"policy": {"classification": "PII"}}, provider="aws"
+        )
+        assert labels["data_classification"] == "PII"
+
+    def test_local_preserves_value_verbatim(self):
+        labels = self.parser._extract_labels({}, {"labels": {"env": "PROD-East"}}, provider="local")
+        assert labels["env"] == "PROD-East"
+
+    def test_gcp_still_sanitizes_value(self):
+        # The GCP path remains lossy by design — GCP labels require it.
+        labels = self.parser._extract_labels(
+            {"labels": {"version": "1.2.3", "approved": "NO"}}, {}, provider="gcp"
+        )
+        assert labels["version"] == "1_2_3"
+        assert labels["approved"] == "no"
+
+    def test_platform_derived_from_binding_when_provider_omitted(self):
+        # When the caller omits ``provider``, the platform is re-derived
+        # from the exposure's binding — Snowflake binding ⇒ verbatim.
+        labels = self.parser._extract_labels(
+            {"labels": {"team": "Data-Eng"}},
+            {"binding": {"platform": "snowflake"}},
+        )
+        assert labels["team"] == "Data-Eng"
+
+    def test_binding_format_bigquery_table_triggers_gcp_sanitization(self):
+        # A ``bigquery_table`` binding format implies a GCP target even if
+        # ``provider`` is not explicitly "gcp".
+        labels = self.parser._extract_labels(
+            {"labels": {"team": "Data Eng"}},
+            {"binding": {"format": "bigquery_table"}},
+        )
+        assert labels["team"] == "data_eng"
+
+    def test_unknown_provider_defaults_to_verbatim(self):
+        # Unknown / absent platform defaults to non-GCP (local) ⇒ verbatim.
+        labels = self.parser._extract_labels(
+            {"labels": {"team": "Data Eng"}}, {}, provider="databricks"
+        )
+        assert labels["team"] == "Data Eng"
+
+    def test_legacy_inference_threads_platform_into_labels(self):
+        # End-to-end through the public ``parse()`` path: a Snowflake
+        # exposure must round-trip the label value into the action params.
+        contract = {
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "binding": {"platform": "snowflake"},
+                    "labels": {"cost_center": "FIN-2024"},
+                }
+            ]
+        }
+        actions = self.parser.parse(contract)
+        provision = next(a for a in actions if a.action_id == "provision_orders")
+        assert provision.params["labels"]["cost_center"] == "FIN-2024"
+
+    def test_legacy_inference_gcp_exposure_sanitizes_labels(self):
+        contract = {
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "binding": {"platform": "gcp"},
+                    "labels": {"cost_center": "FIN-2024"},
+                }
+            ]
+        }
+        actions = self.parser.parse(contract)
+        provision = next(a for a in actions if a.action_id == "provision_orders")
+        assert provision.params["labels"]["cost_center"] == "fin-2024"
 
 
 # ── Dependency graph + cycle detection ───────────────────────────────

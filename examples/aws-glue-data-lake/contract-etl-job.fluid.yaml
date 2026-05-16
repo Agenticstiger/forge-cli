@@ -1,6 +1,3 @@
-# Pinned to 0.7.1: uses ``orchestration`` block and ``build.engine: glue``,
-# both removed/restricted in 0.7.2. Bump together with the Glue provider
-# rewrite.
 fluidVersion: "0.7.1"
 kind: DataProduct
 id: analytics.data_lake.sales_etl
@@ -19,7 +16,7 @@ labels:
   platform: aws
 
 metadata:
-  layer: Transform
+  layer: Silver
   owner:
     team: data-engineering
     email: data-eng@company.com
@@ -28,62 +25,68 @@ metadata:
 
 build:
   engine: glue
+  pattern: multi-stage
   properties:
-    job_name: sales-csv-to-iceberg
-    role: "{{ env.GLUE_ETL_ROLE }}"
-    script_location: "s3://{{ env.DATA_LAKE_BUCKET }}/scripts/sales_etl.py"
-    command_name: glueetl
-    glue_version: "4.0"
-    worker_type: G.1X
-    number_of_workers: 5
-    timeout: 120
-    max_retries: 1
-    description: "Transform raw sales CSV → curated Iceberg table"
-    default_arguments:
-      "--enable-glue-datacatalog": "true"
-      "--TempDir": "s3://{{ env.DATA_LAKE_BUCKET }}/glue-temp/"
-      "--job-bookmark-option": "job-bookmark-enable"
-      "--SOURCE_DATABASE": "sales_db"
-      "--SOURCE_TABLE": "raw_sales"
-      "--TARGET_DATABASE": "sales_db"
-      "--TARGET_TABLE": "curated_sales"
-    extra_py_files: []
-    extra_jars: []
-    connections: []
+    stages:
+      - name: ensure_database
+        dependsOn: []
+      - name: run_crawler
+        dependsOn: [ensure_database]
+      - name: run_etl
+        dependsOn: [run_crawler]
+      - name: verify_output
+        dependsOn: [run_etl]
 
 # ─── Orchestration ───────────────────────────────────────────
 
 orchestration:
-  schedule: daily
-  timezone: UTC
   engine: airflow
-  tasks:
-    - taskId: ensure_database
-      type: provider_action
-      action: aws.glue.ensure_database
-      params:
+  airflow:
+    dagId: sales_csv_to_iceberg
+    schedule: "@daily"
+
+# ─── Expose: ETL Output Table ────────────────────────────────
+
+exposes:
+  - exposeId: curated_sales
+    title: Curated Sales (ETL Output)
+    version: "1.0.0"
+    kind: table
+
+    binding:
+      platform: aws
+      format: iceberg
+      location:
         database: sales_db
+        table: curated_sales
+        bucket: "{{ env.DATA_LAKE_BUCKET }}"
+        path: iceberg/sales/curated/
+        region: "{{ env.AWS_REGION }}"
 
-    - taskId: run_crawler
-      type: provider_action
-      action: aws.glue.run_crawler
-      params:
-        crawler_name: sales-raw-crawler
-      dependsOn: [ensure_database]
-
-    - taskId: run_etl
-      type: provider_action
-      action: aws.glue.ensure_job
-      params:
-        name: sales-csv-to-iceberg
-        role: "{{ env.GLUE_ETL_ROLE }}"
-        script_location: "s3://{{ env.DATA_LAKE_BUCKET }}/scripts/sales_etl.py"
-      dependsOn: [run_crawler]
-
-    - taskId: verify_output
-      type: provider_action
-      action: aws.athena.execute_query
-      params:
-        query: "SELECT COUNT(*) AS row_count FROM sales_db.curated_sales WHERE order_date = current_date"
-        database: sales_db
-      dependsOn: [run_etl]
+    contract:
+      schema:
+        - name: order_id
+          type: string
+          required: true
+          description: Unique order identifier
+        - name: order_date
+          type: date
+          required: true
+          description: Date the order was placed
+        - name: customer_id
+          type: string
+          required: true
+          description: Customer identifier
+          sensitivity: pseudonymized
+        - name: product_sku
+          type: string
+          required: true
+        - name: quantity
+          type: integer
+          required: true
+        - name: unit_price
+          type: decimal(10,2)
+          required: true
+        - name: total_amount
+          type: decimal(12,2)
+          required: true

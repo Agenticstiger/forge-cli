@@ -324,9 +324,15 @@ class GovernanceValidator:
     def get_table_properties(self) -> Dict[str, Any]:
         """Get table properties (clustering, retention, etc.)"""
         try:
+            # ``self.table`` is already ``validate_ident``-ed, so the only
+            # special character it can contain is ``_`` — a LIKE wildcard.
+            # Escape it with a pinned ``ESCAPE '\\'`` and route the pattern
+            # through ``quote_string_literal`` so the single-quote handling
+            # matches the central SQL-safety helper (no inline ``.replace``).
+            like_pattern = quote_string_literal(self.table.replace("_", "\\_"))
             self.cursor.execute(
-                "SHOW TABLES LIKE '{}' IN {}".format(
-                    self.table.replace("_", "\\_"),
+                "SHOW TABLES LIKE {} ESCAPE '\\\\' IN {}".format(
+                    like_pattern,
                     _qualified_name(self.database, self.schema),
                 )
             )

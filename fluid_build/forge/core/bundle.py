@@ -259,6 +259,35 @@ def write_tgz(out_path: Path, files: Dict[str, bytes]) -> None:
     out_path.write_bytes(gz_buf.getvalue())
 
 
+# Bundles are caller-supplied (federation, marketplace, CI artifact
+# mirrors), so ``validate_manifest`` runs against untrusted bytes BEFORE
+# the SHA-256 gate can reject them. Cap per-member and per-archive reads
+# so a decompression-bomb tar cannot OOM the process first.
+MAX_BUNDLE_MEMBER_BYTES = 64 * 1024 * 1024  # 64 MiB per file
+MAX_BUNDLE_MEMBERS = 10_000
+
+
+def read_tar_member_bounded(
+    tar: tarfile.TarFile, path: str, *, cap: int = MAX_BUNDLE_MEMBER_BYTES
+) -> bytes:
+    """Read a single tar member, refusing to buffer more than ``cap`` bytes.
+
+    ``tarfile`` reports a member's *declared* size, which an attacker
+    controls — so read ``cap + 1`` bytes and raise if the member is at or
+    over the cap rather than trusting the header.
+    """
+    fh = tar.extractfile(path)
+    if fh is None:
+        raise ValueError(f"{path!r} is not a regular file in the bundle")
+    data = fh.read(cap + 1)
+    if len(data) > cap:
+        raise ValueError(
+            f"bundle member {path!r} exceeds the {cap}-byte read cap "
+            "(possible decompression bomb)"
+        )
+    return data
+
+
 def validate_manifest(tgz_path: Path) -> None:
     """Verify that every file in the tgz matches its MANIFEST.json SHA-256.
 
@@ -268,13 +297,15 @@ def validate_manifest(tgz_path: Path) -> None:
     """
     with tarfile.open(tgz_path, mode="r:gz") as tar:
         names = tar.getnames()
+        if len(names) > MAX_BUNDLE_MEMBERS:
+            raise ValueError(
+                f"{tgz_path} contains {len(names)} entries, exceeding the "
+                f"{MAX_BUNDLE_MEMBERS}-entry bundle cap"
+            )
         if "MANIFEST.json" not in names:
             raise ValueError(f"MANIFEST.json missing from {tgz_path}")
 
-        manifest_member = tar.extractfile("MANIFEST.json")
-        if manifest_member is None:
-            raise ValueError(f"MANIFEST.json is not a regular file in {tgz_path}")
-        manifest = json.loads(manifest_member.read().decode("utf-8"))
+        manifest = json.loads(read_tar_member_bounded(tar, "MANIFEST.json").decode("utf-8"))
 
         declared_files = manifest.get("files") or {}
         expected_paths = set(declared_files.keys())
@@ -294,7 +325,7 @@ def validate_manifest(tgz_path: Path) -> None:
         # Per-file hash check + rebuild merkle input.
         merkle_input = ""
         for path in sorted(expected_paths):
-            data = tar.extractfile(path).read()
+            data = read_tar_member_bounded(tar, path)
             actual = "sha256:" + hashlib.sha256(data).hexdigest()
             expected = declared_files[path]
             if actual != expected:

@@ -26,6 +26,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# First keyring-backend failure per process is surfaced at WARNING (see
+# ``get_credential``) so a misconfigured backend is visible instead of
+# silently degrading every credential lookup to a fall-through.
+_keyring_error_warned = False
+
 try:
     import keyring
     from keyring.errors import KeyringError, PasswordDeleteError
@@ -94,7 +99,19 @@ class KeyringCredentialStore:
             return value
         except KeyringError:
             # Don't include exception text — backend errors can echo creds.
-            logger.debug("Failed to retrieve credential from keyring")
+            # Surface the FIRST failure per process at WARNING so a broken
+            # backend (no DBus, locked keychain) is visible; subsequent
+            # failures stay at DEBUG to avoid log spam.
+            global _keyring_error_warned
+            if not _keyring_error_warned:
+                _keyring_error_warned = True
+                logger.warning(
+                    "OS keyring backend is unavailable or erroring — "
+                    "credential lookups will fall through to other sources. "
+                    "Check your keyring configuration."
+                )
+            else:
+                logger.debug("Failed to retrieve credential from keyring")
             return None
 
     @staticmethod

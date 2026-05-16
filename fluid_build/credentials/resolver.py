@@ -19,6 +19,7 @@ Base credential resolver with multi-source fallback support.
 import logging
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -93,6 +94,10 @@ class BaseCredentialResolver(ABC):
         """
         self.provider = provider
         self.config = config or CredentialConfig()
+        # Cache entries are ``(value, monotonic_expiry)`` tuples so the
+        # advertised ``cache_duration_seconds`` TTL is actually honored —
+        # a long-running process must not hold a decrypted credential in
+        # memory indefinitely.
         self._cache: Dict[str, Any] = {}
 
         logger.debug(f"Initialized {provider} credential resolver")
@@ -127,12 +132,17 @@ class BaseCredentialResolver(ABC):
         Raises:
             CredentialError: If required credential not found
         """
-        # Check cache first
+        # Check cache first — honor the configured TTL.
         cache_key = f"{self.provider}.{key}"
-        if cache_key in self._cache:
-            # Constant-only log: ``cached_value`` is in scope.
-            logger.debug("Credential retrieved from cache")
-            return self._cache[cache_key]
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            cached_value, expires_at = cached
+            if time.monotonic() < expires_at:
+                # Constant-only log: ``cached_value`` is in scope.
+                logger.debug("Credential retrieved from cache")
+                return cached_value
+            # TTL elapsed — drop the stale entry and re-resolve.
+            del self._cache[cache_key]
 
         # Try each source in priority order
         value = None
@@ -207,9 +217,12 @@ class BaseCredentialResolver(ABC):
                 f"Required credential not found: {self.provider}.{key}", suggestions=suggestions
             )
 
-        # Cache the result
+        # Cache the result with a monotonic expiry stamp.
         if value is not None:
-            self._cache[cache_key] = value
+            self._cache[cache_key] = (
+                value,
+                time.monotonic() + self.config.cache_duration_seconds,
+            )
 
         return value
 
@@ -289,8 +302,11 @@ class BaseCredentialResolver(ABC):
         keyring_key = f"{self.provider}.{key}"
         try:
             return KeyringCredentialStore.get_credential(keyring_key)
-        except KeyringError as e:
-            logger.debug("Failed to read from keyring: %s", e)
+        except KeyringError:
+            # Never interpolate the exception — keyring backend errors can
+            # echo credential material. The first-failure WARNING is
+            # emitted inside ``KeyringCredentialStore.get_credential``.
+            logger.debug("Failed to read from keyring (backend error)")
             return None
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("Unexpected error reading from keyring: %s", e)

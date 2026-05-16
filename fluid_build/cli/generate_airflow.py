@@ -19,8 +19,8 @@ Usage:
     fluid generate-airflow contract.yaml -o dags/my_dag.py
 
 For contracts WITH an orchestration section, delegates to 'fluid export --engine airflow'.
-For contracts WITHOUT orchestration (builds-only), uses the legacy DAG generator
-which infers tasks from provider actions and builds.
+For contracts WITHOUT orchestration (builds-only), uses the provider-action DAG
+generator which infers tasks from provider actions and builds.
 """
 
 import argparse

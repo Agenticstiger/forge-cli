@@ -100,12 +100,25 @@ def _write_output(
         if not gv_fmt.isalnum():
             raise ValueError(f"Invalid Graphviz format: {gv_fmt}")
 
-        # Use secure temporary file for DOT input
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".dot", delete=False, encoding="utf-8"
-        ) as tmp_dot:
-            tmp_dot.write(dot)
-            tmp_dot_path = tmp_dot.name
+        # Use a secure temporary file for DOT input. The DOT body can
+        # carry contract ids / column names, so create it with an
+        # unpredictable name via ``mkstemp`` and immediately tighten the
+        # mode to 0o600 — ``NamedTemporaryFile`` leaves it group/world
+        # readable on a default umask, exposing the transient file to
+        # any local user for the lifetime of the ``dot`` render.
+        tmp_fd, tmp_dot_path = tempfile.mkstemp(prefix="fluid-viz-", suffix=".dot")
+        try:
+            os.chmod(tmp_dot_path, 0o600)
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp_dot:
+                tmp_dot.write(dot)
+        except BaseException:
+            # Don't leak the descriptor / file if setup fails.
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+            Path(tmp_dot_path).unlink(missing_ok=True)
+            raise
 
         try:
             result_file = out_path if config.format != "html" else out_path.with_suffix(".svg")

@@ -70,6 +70,16 @@ def _hostname_is_private(hostname: str) -> bool:
     ranges (this catches AWS/GCP metadata at 169.254.169.254 and
     on-host services). DNS resolution errors fall back to refusing the
     request (better to fail-closed than fan-out to unknowns).
+
+    .. note::
+
+        This is the canonical SSRF post-DNS-resolution gate for the
+        whole codebase. It is deliberately re-used by the federation
+        digest fetchers (:mod:`fluid_build.forge.federation`), the
+        OpenLineage HTTP emitter (:mod:`fluid_build.build_runners._lineage`),
+        and the Command Center client/reporter rather than each call
+        site re-deriving its own private-range list. When extending the
+        blocked set, extend it *here* so every consumer benefits.
     """
     try:
         addresses = socket.getaddrinfo(hostname, None)

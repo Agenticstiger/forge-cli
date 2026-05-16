@@ -41,7 +41,24 @@ from fluid_build.cli.console import cprint
 # filesystem path aren't caught by generic pattern matching — they need
 # flag-aware stripping.
 _REDACTED = "***REDACTED***"
-_SENSITIVE_FLAG_SUFFIXES = ("-secret", "-key", "-token", "-password", "-passphrase")
+_SENSITIVE_FLAG_SUFFIXES = (
+    "-secret",
+    "-key",
+    "-token",
+    "-password",
+    "-passphrase",
+    "-credential",
+    "-credentials",
+    "-pat",
+    "-connection-string",
+    "-conn-string",
+    "-dsn",
+    "-cert",
+    "-bearer",
+    "-token-file",
+    "-key-file",
+    "-key-path",
+)
 _SENSITIVE_FLAGS = frozenset(
     {
         "--password",
@@ -75,6 +92,14 @@ def _sanitize_argv(command: List[str]) -> List[str]:
     redact_next = False
     for arg in command:
         if redact_next:
+            # Always redact the token after a sensitive flag. We do NOT
+            # skip tokens that look like flags: a secret value can
+            # legitimately start with '-', and a redaction function must
+            # fail safe (over-redact) rather than risk leaking a secret.
+            # The only cost is cosmetic — a valueless mode flag (e.g.
+            # databricks ``--token``) followed by another flag will see
+            # that next flag redacted in DEBUG logs. Harmless; never a
+            # missed secret.
             out.append(_REDACTED)
             redact_next = False
             continue
@@ -172,7 +197,14 @@ class AuthProvider:
             result = subprocess.run(command, capture_output=capture_output, text=True, check=check)
             return result
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"Command failed: {e}")
+            # S-011: ``CalledProcessError.__str__`` embeds the full argv,
+            # so an f-string of ``e`` leaks ``--password hunter2`` shapes
+            # at ERROR. Route the argv through ``_sanitize_argv`` instead.
+            self.logger.error(
+                "Command failed: rc=%s argv=%s",
+                e.returncode,
+                " ".join(_sanitize_argv(command)),
+            )
             raise
         except FileNotFoundError as e:
             self.logger.error(f"Command not found: {command[0]} - {e}")

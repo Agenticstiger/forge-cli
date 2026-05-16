@@ -318,18 +318,36 @@ def run(args, logger: logging.Logger) -> int:
         agent_name = getattr(args, "agent", None)
         if agent_name:
             from fluid_build.cli.forge_agent_specs import scaffold_user_agent
+            from fluid_build.cli.security import validate_cli_path
 
+            # F7: the ``--dir`` value reaches a filesystem write here too —
+            # validate it through the platform-aware path validator before
+            # ``scaffold_user_agent`` touches disk.
             target = getattr(args, "target_dir", None)
-            target_path = Path(target).resolve() if target else None
+            target_path = (
+                validate_cli_path(
+                    target, mode="write", must_exist=False, file_type="target directory"
+                )
+                if target
+                else None
+            )
             path = scaffold_user_agent(agent_name, target_dir=target_path)
             success(f"Created {path}")
             cprint("Edit the file to customize questions, rules, and suggestions.")
             cprint(f"Then run: fluid forge --domain {agent_name}")
 
         # If --dir is specified, switch to that directory first.
+        # F7: route the operator-supplied directory through the
+        # platform-aware path validator BEFORE mkdir/chdir so a value
+        # like ``--dir /etc`` (or ``--dir ../../../etc``) is rejected
+        # rather than silently scaffolding into a system directory.
         target_dir = getattr(args, "target_dir", None)
         if target_dir:
-            target_path = Path(target_dir).resolve()
+            from fluid_build.cli.security import validate_cli_path
+
+            target_path = validate_cli_path(
+                target_dir, mode="write", must_exist=False, file_type="target directory"
+            )
             target_path.mkdir(parents=True, exist_ok=True)
             os.chdir(target_path)
             logger.debug("Changed working directory to %s", target_path)

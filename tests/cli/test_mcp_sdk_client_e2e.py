@@ -35,6 +35,7 @@ Three shapes verified:
 3. SDK↔SDK call_tool against ``forge_run mode='blank'`` — produces a
    real contract.fluid.yaml on disk.
 """
+
 from __future__ import annotations
 
 import asyncio

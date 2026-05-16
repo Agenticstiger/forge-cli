@@ -54,8 +54,14 @@ def extract_snowflake_tags(contract: Dict[str, Any], exposure: Dict[str, Any]) -
         return sanitized[:256]  # Snowflake max identifier length
 
     def sanitize_tag_value(value: str) -> str:
-        """Snowflake tag values: escape single quotes."""
-        return str(value).replace("'", "''")[:256]
+        """Truncate a Snowflake tag value to the 256-char limit.
+
+        The single-quote escaping / literal-wrapping is owned by the
+        DDL boundary (every consumer routes the value through
+        ``_sql_safety.quote_string_literal`` when emitting ``SET TAG``).
+        Escaping here too would double-escape the literal.
+        """
+        return str(value)[:256]
 
     # 1. Contract-level metadata
     if contract.get("id"):
@@ -155,7 +161,9 @@ def extract_column_tags(field: Dict[str, Any]) -> Dict[str, str]:
         return re.sub(r"[^a-zA-Z0-9_]", "_", key.upper())[:256]
 
     def sanitize_tag_value(value: str) -> str:
-        return str(value).replace("'", "''")[:256]
+        # Truncate only — the DDL boundary owns single-quote escaping
+        # (see extract_snowflake_tags.sanitize_tag_value for rationale).
+        return str(value)[:256]
 
     # Direct Snowflake tag
     if "snowflakeTag" in labels:

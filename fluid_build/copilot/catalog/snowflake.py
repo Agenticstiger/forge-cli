@@ -257,9 +257,9 @@ class SnowflakeCatalogAdapter(CatalogAdapter):
                       FROM {database}.INFORMATION_SCHEMA.TABLES
                      WHERE TABLE_SCHEMA  = %s
                        AND TABLE_TYPE    = 'BASE TABLE'
-                """.replace(  # nosec B608
+                """.replace(
                     "{database}", db_quoted
-                )
+                )  # nosec B608
                 if scope.tables:
                     placeholders = ", ".join("%s" for _ in scope.tables)
                     cur.execute(
@@ -309,9 +309,9 @@ class SnowflakeCatalogAdapter(CatalogAdapter):
                       FROM {database}.INFORMATION_SCHEMA.TABLES
                      WHERE TABLE_SCHEMA  = %s
                        AND TABLE_NAME    = %s
-                    """.replace(  # nosec B608
+                    """.replace(
                     "{database}", db_quoted
-                )
+                )  # nosec B608
                 cur.execute(
                     header_sql,
                     [sch, name],
@@ -335,9 +335,9 @@ class SnowflakeCatalogAdapter(CatalogAdapter):
                      WHERE TABLE_SCHEMA  = %s
                        AND TABLE_NAME    = %s
                      ORDER BY ORDINAL_POSITION
-                    """.replace(  # nosec B608
+                    """.replace(
                     "{database}", db_quoted
-                )
+                )  # nosec B608
                 cur.execute(
                     columns_sql,
                     [sch, name],
@@ -549,9 +549,9 @@ class SnowflakeCatalogAdapter(CatalogAdapter):
                    AND TC.TABLE_SCHEMA    = %s
                    AND TC.TABLE_NAME      = %s
                  ORDER BY KCU.ORDINAL_POSITION
-                """.replace(  # nosec B608
+                """.replace(
                 "{database}", db_quoted
-            )
+            )  # nosec B608
             cur.execute(
                 pk_sql,
                 [sch, name],
@@ -599,9 +599,9 @@ class SnowflakeCatalogAdapter(CatalogAdapter):
                    AND TC.TABLE_SCHEMA    = %s
                    AND TC.TABLE_NAME      = %s
                  ORDER BY TC.CONSTRAINT_NAME, KCU.ORDINAL_POSITION
-                """.replace(  # nosec B608
+                """.replace(
                 "{database}", db_quoted
-            )
+            )  # nosec B608
             cur.execute(
                 fk_sql,
                 [sch, name],

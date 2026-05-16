@@ -38,9 +38,18 @@ on:
   workflow_dispatch:
     inputs:
       providers:
-        description: "Comma-separated providers to run (snowflake, bigquery, aws, all)"
-        type: string
+        description: "Which provider integration suite(s) to run"
+        type: choice
         default: "all"
+        # Enumerated rather than free-form: the per-job `if:` guards use a
+        # lenient `contains()` check, so an unconstrained string could
+        # silently match (or miss) a job. A choice input bounds the input
+        # to exactly the suites this workflow knows how to run.
+        options:
+          - all
+          - snowflake
+          - bigquery
+          - aws
 
 permissions:
   contents: read
@@ -72,8 +81,8 @@ jobs:
       contains(fromJSON('["all", "snowflake"]'), inputs.providers) ||
       contains(inputs.providers, 'snowflake')
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
@@ -143,8 +152,8 @@ jobs:
       contains(fromJSON('["all", "bigquery"]'), inputs.providers) ||
       contains(inputs.providers, 'bigquery')
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
@@ -158,7 +167,7 @@ jobs:
       # trusts this repo+ref combination.
       - name: Authenticate to GCP via WIF
         id: gcp-auth
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
@@ -192,8 +201,8 @@ jobs:
       contains(fromJSON('["all", "aws"]'), inputs.providers) ||
       contains(inputs.providers, 'aws')
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
@@ -205,7 +214,7 @@ jobs:
       # OIDC role assumption: the role's trust policy must allow this
       # repo+ref combination. Returns short-lived temporary credentials.
       - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
         with:
           role-to-assume: ${{ secrets.AWS_INTEGRATION_ROLE }}
           role-session-name: forge-ci-${{ github.run_id }}
@@ -510,7 +519,7 @@ jobs:
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@v7
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
         with:
           script: |
             const failed = [];

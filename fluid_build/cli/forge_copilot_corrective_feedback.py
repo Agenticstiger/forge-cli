@@ -45,12 +45,14 @@ Usage in :mod:`forge_copilot_agent_loop`::
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+import re
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "build_corrective_messages",
     "build_schema_validation_message",
     "build_join_key_repair_message",
+    "strip_additional_props_from_contract",
     "diagnose_tool_failure",
     "TOOL_ERROR_GUIDANCE",
 ]
@@ -199,6 +201,70 @@ def build_corrective_messages(
     return messages
 
 
+# ---------------------------------------------------------------------------
+# additionalProperties error parsing helpers
+# ---------------------------------------------------------------------------
+
+# Matches the jsonschema error message shape for additionalProperties:
+#   "Additional properties are not allowed ('foo' was unexpected)"
+#   "Additional properties are not allowed ('foo', 'bar' were unexpected)"
+_ADDITIONAL_PROPS_RE = re.compile(
+    r"Additional properties are not allowed \((.+?) w(?:as|ere) unexpected\)",
+    re.IGNORECASE,
+)
+
+# Matches a quoted key name from the additionalProperties error message.
+_QUOTED_KEY_RE = re.compile(r"'([^']+)'")
+
+
+def _parse_additional_props_error(error_text: str) -> Optional[Tuple[str, List[str]]]:
+    """Parse an additionalProperties error string.
+
+    Handles two shapes:
+    * Raw jsonschema message:
+      ``Additional properties are not allowed ('policy' was unexpected)``
+    * Path-prefixed validator message (from ``schema_manager.py``):
+      ``exposes[0].semantics: Additional properties are not allowed ('policy' was unexpected)``
+    * Schema-validation-prefixed (from ``forge_copilot_runtime.py``):
+      ``Schema validation: exposes[0].semantics: Additional properties are not allowed (...)``
+
+    Returns ``(json_path, [offending_keys])`` or ``None`` when the text
+    doesn't match the additionalProperties pattern.
+    """
+    match = _ADDITIONAL_PROPS_RE.search(error_text)
+    if not match:
+        return None
+
+    offending_keys = _QUOTED_KEY_RE.findall(match.group(1))
+    if not offending_keys:
+        return None
+
+    # Extract leading path prefix (everything before the "Additional…" message).
+    prefix_text = error_text[: match.start()].strip().rstrip(":")
+
+    # Strip a "Schema validation: " prefix emitted by the runtime wrapper.
+    for strip_prefix in ("Schema validation:", "schema validation:"):
+        if prefix_text.lower().startswith(strip_prefix.lower()):
+            prefix_text = prefix_text[len(strip_prefix) :].strip().lstrip(":")
+
+    json_path = prefix_text.strip() or "root"
+    return json_path, offending_keys
+
+
+def _build_additional_props_instruction(json_path: str, offending_keys: List[str]) -> str:
+    """Return an explicit removal instruction for an additionalProperties violation."""
+    keys_fmt = ", ".join(f"``{k}``" for k in offending_keys)
+    return (
+        f"  [REMOVE REQUIRED] At JSON path ``{json_path}``: "
+        f"the key(s) {keys_fmt} are NOT part of the schema "
+        f"(``additionalProperties`` is ``false`` there). "
+        f"You MUST DELETE {keys_fmt} from your output — "
+        f"do not rename, move, or keep them under a different parent. "
+        f"If you need to express this concept, place it inside a field "
+        f"that the schema allows (e.g. ``metadata.tags`` or ``description``)."
+    )
+
+
 def build_schema_validation_message(errors: Sequence[str]) -> Dict[str, str]:
     """Phase 3 — self-healing schema validation as a corrective message.
 
@@ -208,23 +274,171 @@ def build_schema_validation_message(errors: Sequence[str]) -> Dict[str, str]:
     history and the next agent turn re-emits with the violations
     listed by JSON path.
 
+    ``additionalProperties`` errors receive a special, forceful treatment:
+    the exact offending key(s) and their JSON path are named explicitly,
+    and the LLM is told to **remove** those keys (not rename or relocate
+    them). This is critical because a vague "fix schema errors" message
+    causes the LLM to re-emit the same violation on every repair attempt.
+
     Returns a single ``user``-role message; the LLM treats it the
     same as a tool-call error.
     """
     if not errors:
         return {"role": "user", "content": ""}
-    bullets = "\n".join(f"  - {e}" for e in errors[:30])
+
+    bullet_lines: List[str] = []
+    additional_props_instructions: List[str] = []
+
+    for error in errors[:30]:
+        parsed = _parse_additional_props_error(error)
+        if parsed is not None:
+            json_path, offending_keys = parsed
+            # Emit a forceful, explicit removal instruction instead of the
+            # raw error text so the LLM understands it must DELETE the key.
+            instruction = _build_additional_props_instruction(json_path, offending_keys)
+            bullet_lines.append(instruction)
+            additional_props_instructions.append(instruction)
+        else:
+            bullet_lines.append(f"  - {error}")
+
+    bullets = "\n".join(bullet_lines)
+
+    removal_section = ""
+    if additional_props_instructions:
+        removal_section = (
+            "\n\nCRITICAL — schema ``additionalProperties`` violations detected:\n"
+            "The schema blocks extra keys with ``additionalProperties: false``. "
+            "You MUST remove every key flagged above — the schema rejects any "
+            "key that is not in its explicit ``properties`` list. "
+            "Do NOT simply rename the key or move it to a sibling; DELETE it."
+        )
+
     return {
         "role": "user",
         "content": (
             "The contract you produced has schema validation errors:\n"
-            f"{bullets}\n\n"
+            f"{bullets}"
+            f"{removal_section}\n\n"
             "Please re-emit the contract with these issues fixed. "
             "Read the existing seed_contract for the expected shape and "
             "match every field name + value enumeration exactly. "
             "Do NOT change unrelated parts of the contract."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Last-resort programmatic key stripping for additionalProperties violations
+#
+# When the LLM fails all repair attempts with the same additionalProperties
+# error, the only way to unblock is to surgically DELETE the offending keys
+# from the emitted contract before the final validation pass. This is purely
+# structural — it never invents content, only removes keys that the schema
+# explicitly forbids. The resulting contract is then re-validated; if that
+# passes, it's returned as the generation result (with a warning logged).
+#
+# Design note: stripping is ONLY applied on the last attempt (attempt ==
+# max_attempts) when EVERY remaining error is an additionalProperties
+# violation whose path we can parse. Mixed errors (missing required fields,
+# type mismatches, etc.) are left for the LLM — stripping would create a
+# structurally incomplete contract in those cases.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_json_path(obj: Any, path_str: str) -> Any:
+    """Walk a dict/list using a path string like ``exposes[0].semantics``.
+
+    Returns the target node, or ``None`` when any segment is missing or
+    the path is not reachable. Raises nothing — failure is silent.
+    """
+    if path_str in ("root", "", None):
+        return obj
+    current = obj
+    # Split on "." but keep array-index tokens like "[0]" attached to their
+    # preceding key (e.g. "exposes[0]" → key "exposes", index 0).
+    # We iterate character-by-character to handle nested arrays cleanly.
+    tokens: List[str] = []
+    buf = ""
+    for ch in path_str:
+        if ch == ".":
+            if buf:
+                tokens.append(buf)
+                buf = ""
+        else:
+            buf += ch
+    if buf:
+        tokens.append(buf)
+
+    for token in tokens:
+        if current is None:
+            return None
+        # token may be "key[0]" or "key[0][1]" etc.
+        key_part, *index_parts = token.split("[")
+        if key_part:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(key_part)
+        for idx_raw in index_parts:
+            idx_str = idx_raw.rstrip("]")
+            try:
+                idx = int(idx_str)
+            except ValueError:
+                return None
+            if not isinstance(current, list) or idx >= len(current):
+                return None
+            current = current[idx]
+    return current
+
+
+def strip_additional_props_from_contract(
+    contract: Dict[str, Any],
+    schema_errors: Sequence[str],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Programmatically remove keys that violate ``additionalProperties: false``.
+
+    Parses every error in *schema_errors* via
+    :func:`_parse_additional_props_error`. For each parsed violation,
+    resolves the JSON path inside *contract* and deletes the offending
+    key(s) in-place on a deep copy. Returns ``(patched_contract,
+    stripped_log)`` where *stripped_log* lists every key that was
+    removed (for structured logging / audit). Keys that cannot be
+    located (e.g. because the path is not reachable) are silently
+    skipped — the caller still gets the best-effort patched dict.
+
+    This is a LAST-RESORT operation. It is only safe when the errors
+    are purely additionalProperties violations — the caller is
+    responsible for checking that no missing-required-property or
+    type-mismatch errors are mixed in.
+
+    Args:
+        contract: The contract dict as emitted by the LLM.
+        schema_errors: Iterable of error strings (may include the
+            ``"Schema validation: "`` prefix).
+
+    Returns:
+        ``(patched_contract, stripped_log)`` — a deep copy of
+        *contract* with offending keys removed, plus a list of
+        ``"<path>.<key>"`` strings describing what was deleted.
+    """
+    import copy
+
+    patched = copy.deepcopy(contract)
+    stripped_log: List[str] = []
+
+    for error in schema_errors:
+        parsed = _parse_additional_props_error(error)
+        if parsed is None:
+            continue
+        json_path, offending_keys = parsed
+        node = _resolve_json_path(patched, json_path)
+        if not isinstance(node, dict):
+            continue
+        for key in offending_keys:
+            if key in node:
+                del node[key]
+                stripped_log.append(f"{json_path}.{key}" if json_path != "root" else key)
+
+    return patched, stripped_log
 
 
 # ---------------------------------------------------------------------------

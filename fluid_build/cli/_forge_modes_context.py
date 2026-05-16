@@ -383,36 +383,3 @@ def _print_discovery_hint(console: Any) -> None:
         "[dim]Tip: drop sample CSV, Parquet, or JSON files in this directory "
         "(or use [bold]--discovery-path[/bold]) and copilot will use their schemas[/dim]"
     )
-
-
-# ---------------------------------------------------------------------------
-# CI/CD auto-scaffolding hook (post-copilot)
-# ---------------------------------------------------------------------------
-
-
-# CI/CD auto-scaffolder — physically extracted to
-# ``cli/_forge_ci_scaffolder.py``. The constants + functions are
-# re-exported here under the same names so existing imports keep
-# resolving.
-from fluid_build.cli._forge_ci_scaffolder import (  # noqa: E402
-    _CI_COMPLEXITY_CHOICES,
-    _CI_COMPLEXITY_VALUES,
-    _CI_PROVIDER_ALIASES,
-    _CI_PROVIDER_CHOICES,
-    _CI_PROVIDER_VALUES,
-)
-from fluid_build.cli._forge_ci_scaffolder import (
-    ci_killswitch_enabled as _ci_killswitch_enabled,
-)
-from fluid_build.cli._forge_ci_scaffolder import (
-    normalize_ci_provider as _normalize_ci_provider,
-)
-from fluid_build.cli._forge_ci_scaffolder import (
-    prompt_ci_menu as _prompt_ci_menu,
-)
-from fluid_build.cli._forge_ci_scaffolder import (
-    resolve_ci_choice as _resolve_ci_choice,
-)
-from fluid_build.cli._forge_ci_scaffolder import (
-    scaffold_ci_pipeline as _legacy_scaffold_ci_pipeline,
-)

@@ -87,12 +87,17 @@ def _run_from_jdbc_source(args: Any, logger: logging.Logger) -> int:
         )
         return 1
 
-    # Synthesise a minimal contract from the introspected tables. Each
-    # table becomes one ``exposes[]`` entry with its column list. The
-    # operator can then refine via ``fluid forge --refine``.
+    # Synthesise a minimal valid v0.7.3 contract from the introspected
+    # tables. Each table becomes one ``exposes[]`` entry with its column
+    # list. Required top-level fields: fluidVersion, kind, id, name,
+    # metadata (with owner), exposes (with exposeId, kind, binding,
+    # contract.schema using "type" only). The operator can then refine
+    # via ``fluid forge --refine``.
+    product_id = (args.name or db.database).lower().replace(" ", "_")
     contract: Dict[str, Any] = {
         "fluidVersion": "0.7.3",
-        "id": (args.name or db.database).lower().replace(" ", "_"),
+        "kind": "DataProduct",
+        "id": product_id,
         "name": args.name or db.database,
         "description": (
             f"Forged from {args.source} via duckdb introspection. "
@@ -101,6 +106,9 @@ def _run_from_jdbc_source(args: Any, logger: logging.Logger) -> int:
         "metadata": {
             "layer": "Bronze",
             "productType": "SDP",
+            "owner": {
+                "team": "data-platform",
+            },
         },
         "exposes": [],
     }
@@ -110,15 +118,20 @@ def _run_from_jdbc_source(args: Any, logger: logging.Logger) -> int:
             schema_block.append(
                 {
                     "name": col.name,
-                    "logicalType": _map_jdbc_type_to_logical(col.type_name),
-                    "physicalType": col.type_name,
-                    "nullable": col.nullable,
+                    "type": _map_jdbc_type_to_logical(col.type_name),
                 }
             )
         contract["exposes"].append(
             {
-                "id": table.name,
-                "name": table.name,
+                "exposeId": table.name,
+                "kind": "table",
+                "binding": {
+                    "platform": "local",
+                    "format": "other",
+                    "location": {
+                        "path": f"./out/{table.name}",
+                    },
+                },
                 "contract": {
                     "schema": schema_block,
                 },
@@ -132,6 +145,24 @@ def _run_from_jdbc_source(args: Any, logger: logging.Logger) -> int:
     import yaml as _yaml
 
     output_path.write_text(_yaml.safe_dump(contract, sort_keys=False))
+
+    # Validate the emitted contract in-process before reporting success.
+    # A contract that fails schema validation must never exit 0 — the
+    # operator would silently get a broken artifact.
+    from fluid_build.schema_manager import validate_contract_file
+
+    vr = validate_contract_file(str(output_path), offline_only=True, logger=logger)
+    if not vr.is_valid:
+        error_lines = "\n  ".join(str(e) for e in vr.errors)
+        cprint(
+            f"[red]✗ Emitted contract failed schema validation "
+            f"({len(vr.errors)} error(s)):[/red]\n  {error_lines}\n"
+            f"[yellow]Hint:[/yellow] The file was written to "
+            f"[cyan]{output_path}[/cyan] for inspection."
+        )
+        logger.error("jdbc_emitter_invalid_contract: %d error(s)", len(vr.errors))
+        return 1
+
     cprint(
         f"[green]✓[/green] Forged {len(db.tables)}-table SDP contract from "
         f"{args.source} into [cyan]{output_path}[/cyan]"

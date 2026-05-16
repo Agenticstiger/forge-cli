@@ -15,7 +15,7 @@
 """Tests for ``fluid generate speed-transformation`` feature set.
 
 Covers the five change points described in the plan file at
-``/Users/A200004702/.claude/plans/here-is-the-setup-breezy-bunny.md``:
+``~/.claude/plans/here-is-the-setup-breezy-bunny.md``:
 
 1. Bootstrap interview — ``data_modeling_technique`` default + alias
    normalisation.

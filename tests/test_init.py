@@ -16,6 +16,7 @@
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -821,3 +822,55 @@ class TestRunRouting:
         from fluid_build.cli.init import run
 
         assert run(_make_args(), logger) == 1
+
+
+class TestInitDirValidationF7:
+    """F7: ``fluid init --dir`` must route the operator-supplied
+    directory through the platform-aware path validator BEFORE the
+    ``mkdir`` + ``chdir``, so a value like ``--dir /etc`` is rejected
+    instead of silently scaffolding into a system directory."""
+
+    @pytest.mark.skipif(
+        sys.platform.startswith("win"),
+        reason="Exercises POSIX forbidden-system-path rejection",
+    )
+    @patch("fluid_build.cli.init.detect_mode", return_value="blank")
+    def test_dir_into_forbidden_system_path_rejected(self, _mock_detect, logger):
+        """``--dir /etc/...`` is rejected — ``run()`` returns 1 and never
+        chdir's into the system directory."""
+        from fluid_build.cli.init import run
+
+        cwd_before = os.getcwd()
+        rc = run(_make_args(blank=True, target_dir="/etc/fluid_f7_init_target"), logger)
+        assert rc == 1
+        # The forbidden directory must NOT have become the cwd.
+        assert os.getcwd() == cwd_before
+
+    @patch("fluid_build.cli.init.detect_mode", return_value="blank")
+    def test_dir_with_traversal_rejected(self, _mock_detect, logger):
+        """A ``..``-laden ``--dir`` is rejected before any filesystem
+        side effect."""
+        from fluid_build.cli.init import run
+
+        cwd_before = os.getcwd()
+        rc = run(_make_args(blank=True, target_dir="../../../etc/fluid_f7_traversal"), logger)
+        assert rc == 1
+        assert os.getcwd() == cwd_before
+
+    @patch("fluid_build.cli.init.blank_mode", return_value=0)
+    @patch("fluid_build.cli.init.detect_mode", return_value="blank")
+    def test_legitimate_dir_still_accepted(self, _mock_detect, _mock_blank, tmp_path, logger):
+        """F7 must not over-block: a normal new directory under a
+        writable parent is still created and entered."""
+        from fluid_build.cli.init import run
+
+        cwd_before = os.getcwd()
+        try:
+            target = tmp_path / "new_project"
+            rc = run(_make_args(blank=True, target_dir=str(target)), logger)
+            assert rc == 0
+            assert target.is_dir()
+            # ``run()`` chdir'd into the validated target.
+            assert Path(os.getcwd()).resolve() == target.resolve()
+        finally:
+            os.chdir(cwd_before)

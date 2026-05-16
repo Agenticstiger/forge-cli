@@ -1253,7 +1253,7 @@ def run(args, _logger: Optional[logging.Logger] = None) -> int:
             is_acquisition_contract,
             schedule_sync_acquisition,
         )
-        from fluid_build.loader import load_contract_with_overlay
+        from fluid_build.cli._common import load_contract_with_overlay
 
         for cp in getattr(args, "contracts", []) or []:
             try:

@@ -32,6 +32,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from fluid_build.providers._sql_safety import quote_string_literal
 from fluid_build.providers.validation_provider import ValidationIssue
 
 LOG = logging.getLogger("fluid.providers.quality_engine")
@@ -505,7 +506,7 @@ def _check_validity(
         )
     col = _validate_ident(selector)
     # Build SQL with quoted string literals for valid values
-    escaped = ", ".join("'{}'".format(v.replace("'", "''")) for v in valid_values)
+    escaped = ", ".join(quote_string_literal(str(v)) for v in valid_values)
     sql = (
         f"SELECT COUNT(*) AS invalid_count FROM {table_ref} "
         f'WHERE "{col}" IS NOT NULL AND "{col}" NOT IN ({escaped})'

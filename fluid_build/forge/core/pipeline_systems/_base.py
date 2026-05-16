@@ -49,7 +49,7 @@ PINNED_ACTIONS = {
     "actions/setup-python@v5": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",  # v5.6.0
     "actions/upload-artifact@v4": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",  # v4.6.2
     "actions/download-artifact@v4": "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",  # v4.3.0
-    "aquasecurity/trivy-action@v0": "aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1",  # v0.35.0
+    "google/osv-scanner-action/osv-scanner-action@v2": "google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2",  # v2.3.8
     "github/codeql-action/upload-sarif@v3": "github/codeql-action/upload-sarif@7fc1baf373eb073c686865bd453d412d506a05a2",  # v3.35.1
     "google-github-actions/auth@v2": "google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed",  # v2.1.13
     "aws-actions/configure-aws-credentials@v4": "aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a",  # v4.3.1
@@ -512,8 +512,8 @@ class BasePipelineTemplate:
           ``fluid policy-apply``, ``fluid audit --compliance``), and
         * the canonical step name + comment-banner with the keywords
           (``security scan``, ``vulnerability``, ``policy``, ``audit``,
-          ``trivy``, ``sast``) so CI assertions and operator search both
-          succeed.
+          ``osv-scanner``, ``sast``) so CI assertions and operator search
+          both succeed.
 
         Returns ``{"name", "comment", "body"}`` — each subclass adapts
         the trio into its native primitive (Azure DevOps stage / Bitbucket
@@ -525,7 +525,7 @@ class BasePipelineTemplate:
             return {}
         # The shell body. Single POSIX sh body so every CI system can
         # paste it as-is. ``|| true`` on the optional scanner so a
-        # missing trivy binary doesn't fail the pipeline — operators
+        # missing osv-scanner binary doesn't fail the pipeline — operators
         # promote it from "advisory" to "blocking" by removing the
         # ``|| true`` once the binary is on the runner.
         body = (
@@ -533,24 +533,25 @@ class BasePipelineTemplate:
             "# FLUID security scan + compliance audit — advanced/enterprise tier.\n"
             "# Surfaces: SAST signal (via fluid validate), policy check\n"
             "# (via fluid policy-apply --mode dry-run), and audit / SBOM /\n"
-            "# vulnerability scan (via fluid audit + optional trivy fs).\n"
+            "# vulnerability scan (via fluid audit + optional osv-scanner).\n"
             "fluid validate --security-only || true\n"
             "if [ -f dist/artifacts/policy/bindings.json ]; then\n"
             "  fluid policy-apply dist/artifacts/policy/bindings.json "
             '--mode dry-run --env "${FLUID_ENV:-dev}" || true\n'
             "fi\n"
             "fluid audit --compliance --output runtime/compliance-report.json || true\n"
-            "# Optional: trivy fs scan if the binary is on the runner.\n"
-            "if command -v trivy >/dev/null 2>&1; then\n"
-            "  trivy fs . --format sarif --output runtime/trivy-results.sarif || true\n"
+            "# Optional: OSV-Scanner vulnerability scan if the binary is on the runner.\n"
+            "if command -v osv-scanner >/dev/null 2>&1; then\n"
+            "  osv-scanner scan source -r . --format sarif "
+            "--output runtime/osv-results.sarif || true\n"
             "fi\n"
         )
         comment_lines = [
             "Security + compliance audit (advanced/enterprise tier).",
             "Runs SAST-style fluid validate, policy enforcement dry-run,",
-            "compliance audit + SBOM, and an optional trivy vulnerability",
-            "scan. Snyk / other scanners can replace trivy without breaking",
-            "the rest of the stage.",
+            "compliance audit + SBOM, and an optional OSV-Scanner",
+            "vulnerability scan. Any SCA scanner can replace it without",
+            "breaking the rest of the stage.",
         ]
         return {
             "name": "Security and Compliance Audit",
@@ -801,11 +802,18 @@ class BasePipelineTemplate:
                 default_run=True,
                 # Stage 7 uses POSIX ``set --`` + if/then/fi so
                 # parameter-controlled flags (mode, allow-data-loss,
-                # no-verify-digest, build-id) stay as individual argv
+                # no-verify-*, build-id) stay as individual argv
                 # tokens regardless of unquoted env-var expansion. This
                 # is the security-hardened pattern from stage 11 applied
                 # here — avoids the ``${APPLY_BUILD_FLAG}`` argument-
                 # smuggling bug fixed in commit D2.
+                #
+                # NO_VERIFY_DIGEST is the single CI-operator knob; when
+                # true it appends BOTH --no-verify-plan-binding and
+                # --no-verify-federation so the one-knob waives the
+                # plan-binding gate and the federation upstream-digest
+                # gate together (the digest gate is split into two
+                # narrowly-scoped flags at the CLI).
                 command=(
                     "set -eu; "
                     'set -- runtime/plan.json --mode "${APPLY_MODE:-amend}" '
@@ -816,7 +824,7 @@ class BasePipelineTemplate:
                     'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]; then '
                     'set -- "$@" --allow-data-loss; fi; '
                     'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]; then '
-                    'set -- "$@" --no-verify-digest; fi; '
+                    'set -- "$@" --no-verify-plan-binding --no-verify-federation; fi; '
                     'fluid apply "$@"'
                 ),
             ),
@@ -1105,7 +1113,9 @@ class BasePipelineTemplate:
                     "NO_VERIFY_DIGEST",
                     "boolean",
                     "false",
-                    "Stage 7: emergency escape from plan-binding verification. Audit log flag.",
+                    "Stage 7: emergency escape — waives BOTH the plan-binding "
+                    "and federation upstream-digest gates "
+                    "(--no-verify-plan-binding --no-verify-federation). Audit log flag.",
                 ),
                 (
                     "PUBLISH_TARGETS",

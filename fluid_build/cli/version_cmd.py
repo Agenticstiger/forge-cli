@@ -134,7 +134,7 @@ def _detect_features() -> Dict[str, bool]:
     """Detect which FLUID features are available"""
     features = {
         "core_validation": True,  # Always available
-        "legacy_057": True,  # Always available
+        "core_07x_support": True,  # Always available
     }
 
     # Check 0.7.1+ features
@@ -237,7 +237,7 @@ API: {cli_info["api_version"]}
 
         feature_names = {
             "core_validation": "Core Validation",
-            "legacy_057": "FLUID 0.7.x Support",
+            "core_07x_support": "FLUID 0.7.x Support",
             "0.7.1_support": "FLUID 0.7.1+ Support",
             "provider_actions": "Provider Actions",
             "sovereignty": "Sovereignty Constraints",

@@ -21,13 +21,48 @@ Converts FLUID contract specifications into concrete GCP resource operations.
 """
 
 import logging
+import re
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from fluid_build.providers._planner_base import BasePlanner
+from fluid_build.providers._sql_safety import validate_ident
 
 from ..util.logging import format_event
 from ..util.names import normalize_bucket_name, normalize_dataset_name
+
+# GCP project IDs are 6-30 chars of lowercase letters, digits and hyphens,
+# starting with a letter and not ending with a hyphen. They legitimately
+# contain hyphens, so ``_sql_safety.validate_ident`` (which rejects ``-``)
+# cannot vet them — this dedicated check guards the project component of a
+# BigQuery fully-qualified name before it is interpolated into DDL/DML.
+_GCP_PROJECT_RE = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
+
+
+def _validate_bq_project(project: str) -> str:
+    """Validate a GCP project ID before interpolating it into a BQ FQN.
+
+    Returns the project ID unchanged when valid; raises ``ValueError``
+    otherwise. ``project`` flows into a backtick-quoted BigQuery FQN in
+    CTAS / INSERT DDL — backticked or not, an unvetted value is an
+    injection vector, so the project component is allowlisted by shape.
+    """
+    if not isinstance(project, str) or not _GCP_PROJECT_RE.match(project):
+        raise ValueError(f"Invalid GCP project ID: {project!r}")
+    return project
+
+
+def _validated_bq_fqn(project: str, dataset: str, table: str) -> str:
+    """Build a validated backtick-quoted ``project.dataset.table`` FQN.
+
+    The project component is checked via :func:`_validate_bq_project`
+    (hyphens allowed); ``dataset`` and ``table`` are checked via
+    :func:`fluid_build.providers._sql_safety.validate_ident` because
+    BigQuery normalizes both to ``[A-Za-z0-9_]``.
+    """
+    return (
+        f"`{_validate_bq_project(project)}." f"{validate_ident(dataset)}.{validate_ident(table)}`"
+    )
 
 
 class GcpPlanner(BasePlanner):
@@ -473,7 +508,8 @@ def _bq_wrap_sql_for_target(
         if upper_head.startswith(kw):
             return sql_text
     body = sql_text.rstrip().rstrip(";")
-    fqn = f"`{proj}.{dataset}.{table}`"
+    # Validate every component of the FQN before it lands in DDL/DML.
+    fqn = _validated_bq_fqn(proj, dataset, table)
     if is_destructive:
         return f"CREATE OR REPLACE TABLE {fqn} AS\n{body}"
     return f"INSERT INTO {fqn}\n{body}"
@@ -523,10 +559,11 @@ def _plan_replace_snapshots(
         if not (proj and dataset and table):
             continue
         backup = f"BACKUP_{table}_{backup_ts}"
-        sql = (
-            f"CREATE TABLE IF NOT EXISTS `{proj}.{dataset}.{backup}` AS "
-            f"SELECT * FROM `{proj}.{dataset}.{table}`"
-        )
+        # Validate every FQN component (project shape + dataset/table
+        # identifiers) before the CTAS backup statement is emitted.
+        backup_fqn = _validated_bq_fqn(proj, dataset, backup)
+        source_fqn = _validated_bq_fqn(proj, dataset, table)
+        sql = f"CREATE TABLE IF NOT EXISTS {backup_fqn} AS SELECT * FROM {source_fqn}"
         actions.append(
             {
                 "id": f"snapshot_{expose.get('exposeId')}",

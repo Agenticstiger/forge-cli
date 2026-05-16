@@ -20,6 +20,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict
 
+from ..._sql_safety import validate_sql_language, validate_sql_type
 from ..connection import SnowflakeConnection
 from ..util.config import get_connection_params
 from ..util.names import build_qualified_name, normalize_table_name
@@ -58,20 +59,24 @@ def ensure_udf(action: Dict[str, Any], provider) -> Dict[str, Any]:
         with SnowflakeConnection(**params) as conn:
             qualified_name = build_qualified_name(database, schema, name)
 
-            # Build parameter list
+            # Build parameter list. ``param_type`` is interpolated raw into the
+            # CREATE FUNCTION DDL — route every type through the allowlist so a
+            # contract param ``type`` cannot smuggle DDL (BUG-SQL-TYPE).
             param_list = []
             for param in parameters:
                 param_name = param.get("name")
                 param_type = param.get("type")
                 if param_name and param_type:
-                    param_list.append(f"{param_name} {param_type}")
+                    param_list.append(f"{param_name} {validate_sql_type(param_type)}")
 
             params_str = ", ".join(param_list) if param_list else ""
 
-            # Create or replace UDF
+            # Create or replace UDF. ``return_type`` and ``language`` are
+            # raw-interpolated — allowlist both. The ``body`` is legitimately
+            # arbitrary function code and is intentionally left unvalidated.
             create_sql = f"CREATE OR REPLACE FUNCTION {qualified_name}({params_str})\n"
-            create_sql += f"RETURNS {return_type}\n"
-            create_sql += f"LANGUAGE {language}\n"
+            create_sql += f"RETURNS {validate_sql_type(return_type)}\n"
+            create_sql += f"LANGUAGE {validate_sql_language(language)}\n"
             create_sql += f"AS\n{body}"
 
             conn.execute(create_sql)

@@ -495,6 +495,27 @@ def _plaintext_source_secrets_allowed() -> bool:
 
 
 def _path_is_private(path: Path) -> bool:
+    """True when ``path`` is not group/world-accessible.
+
+    SECURITY_REVIEW B6: the POSIX-permission check (``st_mode & 0o077``)
+    is meaningless on Windows — ``st_mode`` there carries no POSIX
+    group/other bits, so the bitwise-AND is always 0 and the gate would
+    spuriously *pass* (report "private") for files an NTFS ACL leaves
+    world-readable. Windows access control is ACL-based, not POSIX-bit
+    based; ``chmod 600`` has no equivalent. On Windows we therefore skip
+    the POSIX-bit gate entirely and return ``True`` (the plaintext-secret
+    gate degrades to the ``FLUID_ALLOW_PLAINTEXT_SOURCE_SECRETS`` opt-in
+    alone — ACL hardening is the operator's responsibility there). On
+    POSIX the original check stands.
+    """
+    if os.name == "nt":
+        _log.debug(
+            "fluid.copilot.catalog.credentials.posix_perm_check_skipped: "
+            "%s — Windows has no POSIX mode bits; ACL hardening is the "
+            "operator's responsibility.",
+            path,
+        )
+        return True
     try:
         return (path.stat().st_mode & 0o077) == 0
     except OSError:
@@ -741,9 +762,9 @@ class CredentialResolver:
                         yaml_secret_fields.setdefault(key, value)
                     else:
                         merged[key] = value
-            legacy_secrets = non_sensitive.get("secrets")
-            if isinstance(legacy_secrets, Mapping) and legacy_secrets:
-                yaml_secret_fields.update(dict(legacy_secrets))
+            explicit_secrets = non_sensitive.get("secrets")
+            if isinstance(explicit_secrets, Mapping) and explicit_secrets:
+                yaml_secret_fields.update(dict(explicit_secrets))
             # Apply the plaintext gate uniformly for any secrets
             # discovered in the YAML (whether from the explicit
             # ``secrets:`` block or harvested from the flat shape).
