@@ -189,3 +189,15 @@ try:  # pragma: no cover
     )
 except ImportError:
     pass
+
+# Keyless emulator fixtures (moto / fakesnow) for the `emulated`-marked
+# provider integration tests. Optional dependency: the `test-emulators`
+# extra. Absent it, the import is skipped and the emulator tests skip.
+try:  # pragma: no cover — exercised at collection time
+    from tests._infrastructure.emulator_fixtures import (  # noqa: F401
+        bigquery_emulator_client,
+        fakesnow_patch,
+        moto_glue_client,
+    )
+except ImportError:
+    pass

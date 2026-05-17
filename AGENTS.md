@@ -170,6 +170,16 @@ make demo           # validate → plan → apply on example contract
 - **Emitting new SQL DDL**: identifiers must go through `fluid_build/providers/_sql_safety.py::validate_ident`; string literals through `quote_string_literal`. Inline `.replace("'", "''")` is considered a regression — it diverges from the central helper.
 - **Adding a secret pattern to logs**: extend `fluid_build/providers/snowflake/util/logging.py::SENSITIVE_PATTERNS`/`SENSITIVE_KEYS` AND mirror the addition into `fluid_build/observability/secret_redactor.py` to keep the two redactor layers symmetric.
 
+### Adding an integration test
+
+Integration tests run in **three stages**, auto-discovered by **pytest marker** — adding a test is just dropping a file with the right marker; no workflow edit is needed.
+
+- **Stage 1 — community (keyless, light).** Every PR, including forks. Drop `tests/providers/test_<x>_emulated*.py`, set `pytestmark = [pytest.mark.integration, pytest.mark.emulated]`, and request an in-process fixture from `tests/_infrastructure/emulator_fixtures.py`: `moto_glue_client` (AWS) or `fakesnow_patch` (Snowflake). `ci.yml`'s `emulated-integration` job runs `pytest -m emulated`. Locally: `pip install -e ".[dev,local,test-emulators]"` then `pytest -m emulated`.
+- **Stage 2 — admin (heavy emulated).** Docker-based emulators. Set `pytestmark = [pytest.mark.integration, pytest.mark.emulated_heavy]` and use `bigquery_emulator_client` (GCP) or the LocalStack endpoint (`FLUID_LOCALSTACK_ENDPOINT`). `integration-emulated-heavy.yml` runs `pytest -m emulated_heavy`, gated by the `ci:integration-emulated` label + the `integration-emulated` environment's approval. Locally: `pip install -e ".[dev,test-emulators-heavy]"` (Docker required).
+- **Stage 3 — admin (live).** Real credentials. Drop `tests/providers/test_<x>_live*.py`, mark it `integration` plus the provider marker (`aws` / `gcp` / `snowflake`) — or `live_llm` for an LLM test — and `skipif` on the credential env vars (mirror `tests/providers/test_aws_live_happy_path.py`). Runs post-merge in `integration.yml` and, when armed, in `integration-live.yml` (label `ci:integration-live` + the `integration-live` environment).
+
+Stages 2 and 3 are admin-gated (maintainer label + required-reviewer approval) and use **separate environments**, so approving an emulated run never exposes the live credentials. Never give `ci.yml` cloud secrets — fork-PR safety depends on it staying secret-free.
+
 ### Code Conventions
 
 - Python 3.10+ target

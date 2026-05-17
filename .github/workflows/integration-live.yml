@@ -1,0 +1,194 @@
+# Admin-gated integration tests — REAL cloud providers + a real LLM, run
+# against an open PR's code.
+#
+# This is the only lane that runs untrusted PR code with credentials in
+# scope. It is protected by TWO independent layers:
+#
+#   1. `INTEGRATION_LIVE_ARMED` — a repository *variable*. Until it is set
+#      to 'true' the job below never starts, so the lane ships INERT: no
+#      runs, no approval prompts, nothing to leak. An admin arms it later,
+#      after the environment + secrets are in place.
+#
+#   2. `environment: integration-live` — a GitHub Environment with a
+#      required reviewer. Once armed, every run PAUSES until an admin
+#      approves it, re-prompting on each new push. The approval IS the
+#      security decision: the approver MUST review the PR diff (including
+#      any `.github/workflows/**` change) for credential exfiltration
+#      before approving. The protection rule lives on the environment
+#      object server-side — a PR editing this file cannot bypass it.
+#
+# Triggered by the maintainer-only `ci:integration-live` label (a trusted
+# member vouching the diff is safe — the GitHub-native `/ok-to-test`) or by
+# manual workflow_dispatch. integration-label-guard.yml strips the label on
+# every new push so the vouch must be renewed.
+#
+# Cloud auth is OIDC (AWS IAM role, GCP workload-identity) — no cloud
+# credentials are stored. The only stored secrets are the Snowflake
+# key-pair and the LLM API key, held as secrets on the `integration-live`
+# environment. Every credentialed step is skip-clean: a partially-armed
+# environment ends green (skipped), never red.
+name: Integration (live, admin-gated)
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write  # OIDC for the AWS IAM role + GCP workload-identity
+
+concurrency:
+  # Cancel a superseded run (e.g. a new push while one is pending approval)
+  # so the gate never holds stale code and cost stays bounded.
+  group: integration-live-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live-integration:
+    name: Live integration (real credentials)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Layer 1 — inert until armed; only the maintainer-applied label (or a
+    # manual dispatch) triggers it.
+    if: >-
+      vars.INTEGRATION_LIVE_ARMED == 'true' &&
+      ( github.event_name == 'workflow_dispatch' ||
+        contains(github.event.pull_request.labels.*.name, 'ci:integration-live') )
+    # Layer 2 — required-reviewer approval gate. The rule is configured on
+    # the environment object; this reference is what makes the run pause.
+    environment: integration-live
+    env:
+      FORGE_CI_RUN_TAG: "forge-ci-${{ github.run_id }}-${{ github.run_attempt }}"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install with provider extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,aws,gcp,snowflake]"
+
+      # Skip-clean: secrets cannot gate a job-level `if:`. This precheck
+      # sets per-provider outputs the credentialed steps gate on, so a
+      # partially-armed environment (variable set, a secret still missing)
+      # ends green (skipped) rather than failing.
+      - name: Check which credentials are configured
+        id: gate
+        env:
+          AWS_ROLE: ${{ secrets.AWS_INTEGRATION_ROLE }}
+          GCP_WIF: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SA: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+          SF_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SF_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SF_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+          LLM_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          [ -n "$AWS_ROLE" ] && echo "aws=true" >> "$GITHUB_OUTPUT" || echo "aws=false" >> "$GITHUB_OUTPUT"
+          if [ -n "$GCP_WIF" ] && [ -n "$GCP_SA" ]; then
+            echo "gcp=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gcp=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$SF_ACCOUNT" ] && [ -n "$SF_USER" ] && [ -n "$SF_KEY" ]; then
+            echo "snowflake=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "snowflake=false" >> "$GITHUB_OUTPUT"
+          fi
+          [ -n "$LLM_KEY" ] && echo "llm=true" >> "$GITHUB_OUTPUT" || echo "llm=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::integration-live armed; credential groups — aws/gcp/snowflake/llm gated below."
+
+      # ── AWS — OIDC role assumption, no static keys ──────────────────
+      - name: Configure AWS credentials via OIDC
+        if: steps.gate.outputs.aws == 'true'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.AWS_INTEGRATION_ROLE }}
+          role-session-name: forge-live-${{ github.run_id }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Run AWS integration tests
+        if: steps.gate.outputs.aws == 'true'
+        timeout-minutes: 12
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_GLUE_DATABASE: ${{ secrets.AWS_GLUE_DATABASE }}
+        run: python -m pytest -v -m "integration and aws" tests/providers/test_aws_live_happy_path.py
+
+      - name: Cleanup AWS test artifacts
+        if: always() && steps.gate.outputs.aws == 'true'
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_GLUE_DATABASE: ${{ secrets.AWS_GLUE_DATABASE }}
+        run: python scripts/cleanup_aws_test_artifacts.py
+
+      # ── GCP — workload-identity federation, no static key ───────────
+      - name: Authenticate to GCP via WIF
+        if: steps.gate.outputs.gcp == 'true'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Run BigQuery integration tests
+        if: steps.gate.outputs.gcp == 'true'
+        timeout-minutes: 12
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GCP_LOCATION: ${{ secrets.GCP_LOCATION }}
+        run: python -m pytest -v -m "integration and gcp" tests/providers/test_bigquery_live_happy_path.py
+
+      - name: Cleanup BigQuery test artifacts
+        if: always() && steps.gate.outputs.gcp == 'true'
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+        run: python scripts/cleanup_bigquery_test_artifacts.py
+
+      # ── Snowflake — key-pair auth (no OIDC for Snowflake service users) ──
+      - name: Stage the Snowflake private key
+        if: steps.gate.outputs.snowflake == 'true'
+        env:
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          key_path="${RUNNER_TEMP}/snowflake_key.p8"
+          printf '%s' "$SNOWFLAKE_PRIVATE_KEY" > "$key_path"
+          chmod 600 "$key_path"
+          echo "SNOWFLAKE_PRIVATE_KEY_PATH=${key_path}" >> "$GITHUB_ENV"
+
+      - name: Run Snowflake integration tests
+        if: steps.gate.outputs.snowflake == 'true'
+        timeout-minutes: 12
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
+        run: |
+          python -m pytest -v -m "integration and snowflake" \
+            tests/providers/test_snowflake_live_happy_path.py \
+            tests/providers/test_snowflake_governance_live.py
+
+      # ── LLM — real provider key (no OIDC path for LLM APIs) ─────────
+      - name: Run live LLM tests
+        if: steps.gate.outputs.llm == 'true'
+        timeout-minutes: 12
+        env:
+          FLUID_LIVE_LLM: "1"
+          FLUID_LLM_PROVIDER: anthropic
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # In-process backstop to the dedicated key's provider-side spend
+          # cap — RunCostTracker aborts the run if it is exceeded.
+          FLUID_COST_LIMIT_USD: "1.00"
+        run: python -m pytest -v -m live_llm
+
+      - name: Credential-group summary
+        if: always()
+        run: |
+          echo "armed=${{ vars.INTEGRATION_LIVE_ARMED }}"
+          echo "aws=${{ steps.gate.outputs.aws }} gcp=${{ steps.gate.outputs.gcp }}" \
+               "snowflake=${{ steps.gate.outputs.snowflake }} llm=${{ steps.gate.outputs.llm }}"
