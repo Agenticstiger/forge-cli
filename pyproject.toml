@@ -249,7 +249,7 @@ dev = [
 # ci.yml `emulated-integration` job so Stage-1 provider integration tests
 # run on every PR — including from forks — with zero cloud credentials.
 test-emulators = [
-  "moto>=5",
+  "moto[glue]>=5",
   "fakesnow>=0.9",
 ]
 
