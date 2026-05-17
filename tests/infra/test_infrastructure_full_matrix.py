@@ -8,7 +8,7 @@
 
 """Infrastructure layer — full matrix (Slice H).
 
-Asserts every back-end (Docker / Kubernetes / Terraform) emits deterministic
+Asserts every back-end (Docker / Kubernetes / OpenTofu) emits deterministic
 artifacts for every engine that supports managed mode. Validators run on
 the emitted artifacts. NO hyperscaler SDK imports allowed.
 """
@@ -16,6 +16,7 @@ the emitted artifacts. NO hyperscaler SDK imports allowed.
 from __future__ import annotations
 
 import importlib
+import json
 import pkgutil
 from pathlib import Path
 from typing import Any, Dict
@@ -26,7 +27,7 @@ import yaml
 from fluid_build.infra import (
     DockerComposeGenerator,
     HelmGenerator,
-    TerraformGenerator,
+    OpenTofuGenerator,
     build_values_overlay,
     get_chart,
     get_generator,
@@ -101,10 +102,15 @@ def _contract_with_managed_engine(
 
 class TestGeneratorRegistry:
     def test_all_three_targets_registered(self):
-        for target in ("docker", "kubernetes", "terraform"):
+        for target in ("docker", "kubernetes", "opentofu"):
             gen = get_generator(target)
             assert gen is not None
             assert gen.target == target
+
+    def test_terraform_is_back_compat_alias_for_opentofu(self):
+        # Contracts authored before the OpenTofu rename used target "terraform";
+        # it stays a recognised alias resolving to the same generator.
+        assert get_generator("terraform") is get_generator("opentofu")
 
     def test_unknown_target_returns_none(self):
         assert get_generator("aws-cdk") is None
@@ -289,50 +295,50 @@ class TestHelmGenerator:
         assert result.ok, result.errors
 
 
-# ── Terraform generator ────────────────────────────────────────────────
+# ── OpenTofu generator ─────────────────────────────────────────────────
 
 
-class TestTerraformGenerator:
-    def test_emits_main_tf_per_engine(self):
-        gen = TerraformGenerator()
+class TestOpenTofuGenerator:
+    def test_emits_main_tf_json_per_engine(self):
+        gen = OpenTofuGenerator()
         bundle = gen.generate(_contract_with_managed_engine("airbyte"))
-        names = {f.relative_path for f in bundle.files}
-        assert {"main.tf", "variables.tf", "versions.tf"} <= names
-        main = next(f.content for f in bundle.files if f.relative_path == "main.tf")
-        assert 'resource "helm_release" "airbyte"' in main
-        assert 'resource "kubernetes_namespace" "airbyte"' in main
+        assert {f.relative_path for f in bundle.files} == {"main.tf.json"}
+        doc = json.loads(bundle.files[0].content)
+        assert "airbyte" in doc["resource"]["helm_release"]
+        assert "airbyte" in doc["resource"]["kubernetes_namespace_v1"]
 
-    def test_versions_tf_pins_providers(self):
-        gen = TerraformGenerator()
+    def test_pins_providers(self):
+        gen = OpenTofuGenerator()
         bundle = gen.generate(_contract_with_managed_engine("airbyte"))
-        versions = next(f.content for f in bundle.files if f.relative_path == "versions.tf")
-        assert "required_providers" in versions
-        assert "hashicorp/helm" in versions
-        assert "hashicorp/kubernetes" in versions
+        doc = json.loads(bundle.files[0].content)
+        providers = doc["terraform"]["required_providers"]
+        assert providers["helm"]["source"] == "hashicorp/helm"
+        assert providers["kubernetes"]["source"] == "hashicorp/kubernetes"
 
-    def test_variables_tf_includes_default_values(self):
-        gen = TerraformGenerator()
+    def test_variable_default_carries_values_json(self):
+        gen = OpenTofuGenerator()
         bundle = gen.generate(_contract_with_managed_engine("airbyte"))
-        variables = next(f.content for f in bundle.files if f.relative_path == "variables.tf")
-        assert 'variable "airbyte_values"' in variables
-        # default is a heredoc — must contain JSON that parses.
-        eot_start = variables.index("<<EOT") + len("<<EOT\n")
-        eot_end = variables.index("\nEOT", eot_start)
-        json_str = variables[eot_start:eot_end]
-        import json
-
-        parsed = json.loads(json_str)
+        doc = json.loads(bundle.files[0].content)
+        # The variable default is a native JSON string — no HCL heredoc.
+        parsed = json.loads(doc["variable"]["airbyte_values"]["default"])
         assert "global" in parsed or "server" in parsed
 
     def test_safe_id_handles_kebab_case(self):
-        gen = TerraformGenerator()
+        gen = OpenTofuGenerator()
         bundle = gen.generate(_contract_with_managed_engine("kafka-connect"))
-        main = next(f.content for f in bundle.files if f.relative_path == "main.tf")
-        # Resource ids must be valid Terraform identifiers (no dashes).
-        assert 'resource "helm_release" "kafka_connect"' in main
+        doc = json.loads(bundle.files[0].content)
+        # Resource ids must be valid OpenTofu identifiers (no dashes).
+        assert "kafka_connect" in doc["resource"]["helm_release"]
+
+    def test_emits_canonical_sorted_json(self):
+        gen = OpenTofuGenerator()
+        bundle = gen.generate(_contract_with_managed_engine("airbyte"))
+        content = bundle.files[0].content
+        # Byte-stable: re-dumping the parsed doc with sorted keys is a no-op.
+        assert content == json.dumps(json.loads(content), indent=2, sort_keys=True) + "\n"
 
     def test_validate_passes_for_valid_module(self):
-        gen = TerraformGenerator()
+        gen = OpenTofuGenerator()
         bundle = gen.generate(_contract_with_managed_engine("airbyte"))
         result = gen.validate(bundle)
         assert result.ok, result.errors
@@ -340,13 +346,27 @@ class TestTerraformGenerator:
     def test_validate_catches_missing_helm_release(self):
         from fluid_build.infra.base import ArtifactBundle, make_file
 
-        bad = make_file("main.tf", 'resource "kubernetes_namespace" "x" {}\n')
-        # Need to also include versions.tf with required_providers to isolate the helm_release error.
-        versions = make_file("versions.tf", "required_providers {}")
-        bundle = ArtifactBundle.of("terraform", [bad, versions])
-        result = TerraformGenerator().validate(bundle)
+        bad = make_file(
+            "main.tf.json",
+            json.dumps(
+                {
+                    "terraform": {"required_providers": {"helm": {}}},
+                    "resource": {"kubernetes_namespace": {"x": {}}},
+                }
+            ),
+        )
+        bundle = ArtifactBundle.of("opentofu", [bad])
+        result = OpenTofuGenerator().validate(bundle)
         assert not result.ok
         assert any("helm_release" in e for e in result.errors)
+
+    def test_validate_catches_invalid_json(self):
+        from fluid_build.infra.base import ArtifactBundle, make_file
+
+        bundle = ArtifactBundle.of("opentofu", [make_file("main.tf.json", "{not json")])
+        result = OpenTofuGenerator().validate(bundle)
+        assert not result.ok
+        assert any("invalid JSON" in e for e in result.errors)
 
 
 # ── Values overlay ─────────────────────────────────────────────────────
@@ -478,7 +498,7 @@ class TestCrossBackendDeterminism:
     @pytest.mark.parametrize("engine", ["airbyte", "kafka-connect", "debezium", "meltano"])
     def test_all_three_backends_produce_artifacts(self, engine: str):
         contract = _contract_with_managed_engine(engine)
-        for target in ("docker", "kubernetes", "terraform"):
+        for target in ("docker", "kubernetes", "opentofu"):
             gen = get_generator(target)
             assert gen is not None
             bundle = gen.generate(contract)
@@ -487,5 +507,5 @@ class TestCrossBackendDeterminism:
             if target == "docker":
                 # Docker always emits compose + env template even if services dict is empty.
                 assert any(f.relative_path == "docker-compose.yaml" for f in bundle.files)
-            elif target in ("kubernetes", "terraform"):
+            elif target in ("kubernetes", "opentofu"):
                 assert len(bundle.files) > 0

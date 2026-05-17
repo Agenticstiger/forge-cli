@@ -11,7 +11,7 @@
 Three back-ends:
 - ``docker``     — emit ``docker-compose.yaml`` (local dev / CI)
 - ``kubernetes`` — emit Helm values overlay + Helm release manifest (prod, hyperscaler-agnostic)
-- ``terraform`` — emit OpenTofu module wrapping the same Helm chart (audit-friendly)
+- ``opentofu``   — emit an OpenTofu ``.tf.json`` module wrapping the same Helm chart (audit-friendly)
 
 The generators are pure functions of (contract, env) and produce
 checksummed artifacts under ``.fluid/artifacts/<contract-id>/infra/``.
@@ -37,7 +37,7 @@ from .base import (
 from .charts import CHART_REGISTRY, ChartRef, get_chart, register_chart
 from .docker import DockerComposeGenerator
 from .kubernetes import HelmGenerator
-from .terraform import TerraformGenerator
+from .opentofu import OpenTofuGenerator
 from .values import build_values_overlay
 
 __all__ = [
@@ -47,7 +47,7 @@ __all__ = [
     "InfraValidationResult",
     "DockerComposeGenerator",
     "HelmGenerator",
-    "TerraformGenerator",
+    "OpenTofuGenerator",
     "CHART_REGISTRY",
     "ChartRef",
     "GENERATORS",
@@ -59,10 +59,15 @@ __all__ = [
 ]
 
 
-# Auto-register the three built-in generators.
+# Auto-register the built-in generators.
 register_generator("docker", DockerComposeGenerator())
 register_generator("kubernetes", HelmGenerator())
-register_generator("terraform", TerraformGenerator())
+_opentofu_generator = OpenTofuGenerator()
+register_generator("opentofu", _opentofu_generator)
+# ``terraform`` stays a recognised target for back-compat: the contract
+# schema still accepts it for products authored before the OpenTofu
+# rename. Both keys resolve to the same generator.
+register_generator("terraform", _opentofu_generator)
 
 
 def assert_chart_in_sync(*, chart: str, declared_version: str, live_version: str) -> None:

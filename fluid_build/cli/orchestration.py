@@ -631,7 +631,7 @@ class FluidPlanGenerator:
 
     def _analyze_contract(self):
         if "infrastructure" in self.contract:
-            self.detected_providers.add("terraform")
+            self.detected_providers.add("opentofu")
             infra_str = str(self.contract["infrastructure"]).lower()
             if "gcp" in infra_str:
                 self.detected_providers.add("gcp")
@@ -648,7 +648,7 @@ class FluidPlanGenerator:
 
     def _generate_phases(self) -> List[PhaseExecution]:
         phases: List[PhaseExecution] = []
-        if "terraform" in self.detected_providers or "gcp" in self.detected_providers:
+        if "opentofu" in self.detected_providers or "gcp" in self.detected_providers:
             phases.append(self._create_infrastructure_phase())
         if "sources" in self.contract:
             phases.append(self._create_ingestion_phase())
@@ -671,13 +671,13 @@ class FluidPlanGenerator:
                 ExecutionAction(
                     id="provision_infrastructure",
                     phase=ExecutionPhase.INFRASTRUCTURE,
-                    provider="terraform",
+                    provider="opentofu",
                     operation="apply",
                     description="Provision cloud infrastructure",
                     timeout_seconds=1800,
                     rollback_operation="destroy",
                     metadata={
-                        "terraform_config": self.contract.get("infrastructure", {}),
+                        "opentofu_config": self.contract.get("infrastructure", {}),
                         "environment": self.environment,
                     },
                 )

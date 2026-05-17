@@ -3236,7 +3236,8 @@
               "enum": [
                 "docker",
                 "kubernetes",
-                "terraform"
+                "terraform",
+                "opentofu"
               ]
             },
             "profile": {

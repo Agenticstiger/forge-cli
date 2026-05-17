@@ -234,7 +234,7 @@ class TestGenerateArtifactsPerEngine:
     """
 
     @pytest.mark.parametrize("engine", ["duckdb", "dlt"])
-    @pytest.mark.parametrize("target", ["kubernetes", "terraform"])
+    @pytest.mark.parametrize("target", ["kubernetes", "opentofu"])
     def test_embedded_engine_yields_empty_bundle(self, engine: str, target: str):
         gen = get_generator(target)
         bundle = gen.generate(_managed_contract(engine))
@@ -242,7 +242,7 @@ class TestGenerateArtifactsPerEngine:
         assert bundle.files == [], f"{engine}/{target} should produce no managed artifacts"
 
     @pytest.mark.parametrize("engine", ["airbyte", "meltano", "kafka-connect", "debezium"])
-    @pytest.mark.parametrize("target", ["docker", "kubernetes", "terraform"])
+    @pytest.mark.parametrize("target", ["docker", "kubernetes", "opentofu"])
     def test_server_engine_yields_artifacts(self, engine: str, target: str):
         gen = get_generator(target)
         bundle = gen.generate(_managed_contract(engine))
@@ -263,7 +263,7 @@ class TestValidateArtifactsPerEngine:
         [
             ("airbyte", "docker"),
             ("airbyte", "kubernetes"),
-            ("airbyte", "terraform"),
+            ("airbyte", "opentofu"),
             ("kafka-connect", "kubernetes"),
             ("debezium", "kubernetes"),
             ("meltano", "kubernetes"),
