@@ -432,6 +432,17 @@ def register(subparsers: argparse._SubParsersAction):
     advanced_group.add_argument(
         "--provider-config", help="Path to provider-specific configuration file"
     )
+    advanced_group.add_argument(
+        "--engine",
+        choices=["native", "opentofu"],
+        default="native",
+        help="Apply engine — native (default), or opentofu (compile to .tf.json and run tofu)",
+    )
+    advanced_group.add_argument(
+        "--state-backend",
+        help="OpenTofu remote state backend for --engine opentofu "
+        "(s3://bucket/key or gcs://bucket/prefix)",
+    )
 
     p.set_defaults(cmd=COMMAND, func=run)
 
@@ -734,6 +745,14 @@ def run(args, logger: logging.Logger) -> int:
         dry_run=effective_dry_run,
         mode=resolved_mode.value,
     )
+
+    # Opt-in OpenTofu apply engine — compile the contract to `.tf.json`
+    # and delegate to `tofu`. Fully isolated; the native path below is
+    # the default and is unchanged.
+    if getattr(args, "engine", "native") == "opentofu":
+        from fluid_build.cli._apply_opentofu_engine import apply_via_opentofu
+
+        return apply_via_opentofu(args, logger)
 
     try:
         # --- Build execution mode (absorbed from legacy 'fluid execute') ---

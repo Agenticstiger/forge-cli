@@ -1,0 +1,37 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+"""OpenTofu engine + provider version pins — the single source of truth.
+
+Pins use the pessimistic ``~>`` constraint so patch/minor updates flow
+while majors are held. Re-verify against the OpenTofu registry before a
+release; scattered version literals elsewhere are a regression.
+"""
+
+from __future__ import annotations
+
+from typing import Dict
+
+#: Minimum OpenTofu version. 1.6 is OpenTofu's first GA release and the
+#: floor for config-driven ``import {}`` blocks.
+REQUIRED_TOFU_VERSION = ">= 1.6"
+
+#: Provider local-name -> ``{source, version}``. ``source`` addresses are
+#: OpenTofu-registry namespaces; the Snowflake provider moved out of the
+#: ``Snowflake-Labs`` org to the official ``snowflakedb`` org at v2.
+PROVIDER_PINS: Dict[str, Dict[str, str]] = {
+    "google": {"source": "hashicorp/google", "version": "~> 6.0"},
+    "aws": {"source": "hashicorp/aws", "version": "~> 5.0"},
+    "snowflake": {"source": "snowflakedb/snowflake", "version": "~> 2.0"},
+}
+
+
+def required_providers(*names: str) -> Dict[str, Dict[str, str]]:
+    """Return the OpenTofu ``required_providers`` map for the given
+    provider local-names (e.g. ``required_providers("google")``)."""
+    return {name: dict(PROVIDER_PINS[name]) for name in names}
