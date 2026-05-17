@@ -98,5 +98,15 @@
     "name": "tests",
     "color": "c2e0c6",
     "description": "Test coverage or test infrastructure changes"
+  },
+  {
+    "name": "ci:integration-live",
+    "color": "d93f0b",
+    "description": "Maintainer vouch — run the admin-gated live integration lane on this PR"
+  },
+  {
+    "name": "ci:integration-emulated",
+    "color": "f9d0c4",
+    "description": "Maintainer vouch — run the admin-gated heavy-emulated lane (bigquery-emulator + LocalStack)"
   }
 ]

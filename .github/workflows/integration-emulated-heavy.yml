@@ -1,0 +1,93 @@
+# Stage 2 — admin-gated heavy emulated integration tests.
+#
+# Docker-based emulators that are too heavy for the keyless community lane
+# (ci.yml `emulated-integration`, Stage 1):
+#   • bigquery-emulator (GCP) — keyless, but a Docker container;
+#   • LocalStack (AWS S3 + Glue) — needs a LOCALSTACK_AUTH_TOKEN, Docker.
+#
+# Admin-gated the same way as the live lane (Stage 3): a maintainer applies
+# the `ci:integration-emulated` label and the job pauses for the
+# `integration-emulated` environment's required reviewer. integration-label-
+# guard.yml strips the label on each new push so the vouch must be renewed.
+#
+# `integration-emulated` is a SEPARATE environment from `integration-live`
+# — it holds only LOCALSTACK_AUTH_TOKEN, so approving an emulated run can
+# never expose the real cloud/LLM credentials.
+#
+# The LocalStack half is skip-clean: with no LOCALSTACK_AUTH_TOKEN the
+# bigquery-emulator test still runs and the LocalStack test skips.
+name: Integration (emulated heavy, admin-gated)
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-emulated-heavy-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  emulated-heavy:
+    name: Heavy emulated integration (bigquery-emulator + LocalStack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'ci:integration-emulated')
+    environment: integration-emulated
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install with heavy-emulator extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,test-emulators-heavy]"
+
+      # Skip-clean: a secret cannot gate a job-level `if:`. With no token
+      # the LocalStack steps skip and only bigquery-emulator runs.
+      - name: Check for the LocalStack auth token
+        id: gate
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+        run: |
+          if [ -n "$LOCALSTACK_AUTH_TOKEN" ]; then
+            echo "localstack=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "localstack=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::LOCALSTACK_AUTH_TOKEN not configured — running bigquery-emulator only; LocalStack tests will skip."
+          fi
+
+      - name: Start LocalStack
+        if: steps.gate.outputs.localstack == 'true'
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+        run: |
+          # Pin to an exact LocalStack version when arming this lane —
+          # the repo convention is fully-pinned container images.
+          docker run -d --name fluid-localstack -p 4566:4566 \
+            -e LOCALSTACK_AUTH_TOKEN="$LOCALSTACK_AUTH_TOKEN" \
+            localstack/localstack:stable
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:4566/_localstack/health >/dev/null 2>&1; then
+              echo "LocalStack ready after ~$((i * 2))s"; break
+            fi
+            sleep 2
+          done
+
+      - name: Run heavy emulated integration tests
+        timeout-minutes: 15
+        env:
+          FLUID_LOCALSTACK_ENDPOINT: http://localhost:4566
+        run: python -m pytest -v -m emulated_heavy
+
+      - name: Stop LocalStack
+        if: always() && steps.gate.outputs.localstack == 'true'
+        run: docker rm -f fluid-localstack || true
