@@ -1143,9 +1143,9 @@ multidict==6.7.1 \
     # via
     #   aiohttp
     #   yarl
-openai==2.24.0 \
-    --hash=sha256:1e5769f540dbd01cb33bc4716a23e67b9d695161a734aff9c5f925e2bf99a673 \
-    --hash=sha256:fed30480d7d6c884303287bde864980a4b137b60553ffbcf9ab4a233b7a73d94
+openai==2.37.0 \
+    --hash=sha256:814633888b8f3b1ffd6615697c6e4ef93632d08b7c2e28c8c5ef3556e5a10107 \
+    --hash=sha256:f4bc562cc5f3a43d40d678105572d9d44765f6e0f50c125f63055419b72f4bd9
     # via litellm
 packaging==26.2 \
     --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e \
