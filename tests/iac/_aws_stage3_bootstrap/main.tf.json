@@ -59,6 +59,20 @@
         "assume_role_policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
       }
     },
+    "aws_iam_role_policy": {
+      "ec2_pass_role": {
+        "//": "The EC2 runner needs iam:PassRole on every bootstrap-managed role it might attach during a fluid apply on real AWS — Redshift Serverless namespace creation passes the spectrum role, Lambda passes the lambda-exec role, etc. Scoped tightly to the four bootstrap role ARNs so the EC2 cannot escalate to passing arbitrary roles.",
+        "name": "fluid-iactest-ec2-pass-role",
+        "role": "${aws_iam_role.fluid_ec2_test.name}",
+        "policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"iam:PassRole\"],\"Resource\":[\"${aws_iam_role.fluid_lambda_exec.arn}\",\"${aws_iam_role.fluid_sfn_exec.arn}\",\"${aws_iam_role.fluid_glue_exec.arn}\",\"${aws_iam_role.fluid_redshift_spectrum.arn}\"]}]}"
+      },
+      "ec2_redshift_vpc_endpoint": {
+        "//": "aws_redshiftserverless_endpoint_access creates a Redshift-managed VPC endpoint under the hood — the role needs DescribeSubnets / DescribeSecurityGroups / CreateVpcEndpoint to do that. Read-only EC2 perms plus the specific CreateVpcEndpoint action.",
+        "name": "fluid-iactest-ec2-redshift-vpc-endpoint",
+        "role": "${aws_iam_role.fluid_ec2_test.name}",
+        "policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"ec2:DescribeSubnets\",\"ec2:DescribeSecurityGroups\",\"ec2:DescribeVpcs\",\"ec2:DescribeNetworkInterfaces\",\"ec2:DescribeVpcEndpoints\",\"ec2:DescribeAvailabilityZones\",\"ec2:CreateVpcEndpoint\",\"ec2:ModifyVpcEndpoint\",\"ec2:DeleteVpcEndpoints\",\"ec2:CreateTags\"],\"Resource\":\"*\"}]}"
+      }
+    },
     "aws_iam_role_policy_attachment": {
       "lambda_basic": {
         "role": "${aws_iam_role.fluid_lambda_exec.name}",
@@ -317,7 +331,7 @@
     "aws_instance": {
       "fluid_test_runner": {
         "ami": "${data.aws_ami.al2023.id}",
-        "instance_type": "t3.micro",
+        "instance_type": "t3.small",
         "subnet_id": "${aws_subnet.fluid_test_a.id}",
         "iam_instance_profile": "${aws_iam_instance_profile.fluid_ec2_test.name}",
         "vpc_security_group_ids": ["${aws_security_group.fluid_ec2.id}"],

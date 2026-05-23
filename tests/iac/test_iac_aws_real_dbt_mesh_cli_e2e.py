@@ -466,6 +466,13 @@ def test_real_cli_dbt_redshift_serverless_amend_and_build(
                         "iam_role_arn": aws_real_role_arn("spectrum"),
                         "subnet_ids": subnet_ids,
                         "security_group_ids": [redshift_sg_id],
+                        # Private VPC access — emits an
+                        # aws_redshiftserverless_endpoint_access. Without
+                        # this the workgroup's natural hostname has no
+                        # DNS entry inside the VPC and dbt-redshift
+                        # cannot connect even though the EC2 and the
+                        # workgroup share the same VPC.
+                        "private_endpoint_subnets": subnet_ids,
                     },
                 },
             }
@@ -504,7 +511,13 @@ def test_real_cli_dbt_redshift_serverless_amend_and_build(
         profile="iac_aws_dbt_redshift",
         model_name=model_name,
         model_sql=(
-            "{{ config(materialized='table') }}\n"
+            # post_hook grants SELECT to PUBLIC so the verification
+            # query (issued via redshift-data API by a *different* IAM
+            # identity than the one that built the table on the EC2)
+            # can read the materialised row. By default Redshift tables
+            # are only readable by the creator + superusers.
+            "{{ config(materialized='table', "
+            "post_hook=\"GRANT SELECT ON {{ this }} TO PUBLIC\") }}\n"
             "SELECT 42::int AS answer, 'hello'::varchar AS greeting\n"
         ),
     )
@@ -531,13 +544,13 @@ def test_real_cli_dbt_redshift_serverless_amend_and_build(
     # filesystem has the 30 GB block device we provisioned in the
     # bootstrap.
     ssm = aws_real_boto("ssm")
-    workdir = f"/var/lib/fluid-runs/{aws_real_project.uid}"
+    workdir = f"/var/fluid-runs/{aws_real_project.uid}"
     commands = [
         "set -euxo pipefail",
         # Reclaim disk from prior runs so the venv install doesn't
         # ENOSPC out on a long-lived test EC2.
-        "sudo rm -rf /var/lib/fluid-runs/* /tmp/fluid-run-*",
-        "sudo mkdir -p /var/lib/fluid-runs && sudo chmod 1777 /var/lib/fluid-runs",
+        "sudo rm -rf /var/fluid-runs/* /tmp/fluid-run-*",
+        "sudo mkdir -p /var/fluid-runs && sudo chmod 1777 /var/fluid-runs",
         # Idempotent system-package install: python3.11 / pip / git / unzip.
         # AL2023's dnf reaches Amazon Linux repos via AWS-internal routing
         # even without NAT, so this works either way.
@@ -575,6 +588,63 @@ def test_real_cli_dbt_redshift_serverless_amend_and_build(
         f"export FLUID_AWS_SFN_ROLE_ARN={os.environ['FLUID_AWS_SFN_ROLE_ARN']}",
         f"export FLUID_AWS_GLUE_ROLE_ARN={os.environ['FLUID_AWS_GLUE_ROLE_ARN']}",
         f"export FLUID_AWS_SPECTRUM_ROLE_ARN={os.environ['FLUID_AWS_SPECTRUM_ROLE_ARN']}",
+        # Force the IAM auth path in the dbt-redshift profile generator.
+        # On the EC2 we authenticate via the instance role (no
+        # ``AWS_PROFILE`` env), and forge-cli's profile generator
+        # otherwise falls through to password mode and writes
+        # ``host: ''`` — which makes redshift_connector fail with
+        # ``gaierror`` on an empty hostname.
+        "export REDSHIFT_USE_IAM=1",
+        # Two-phase apply: ``--mode amend`` (IaC only) provisions the
+        # Redshift Serverless namespace + workgroup. Then we wait for
+        # the workgroup's VPC-internal DNS hostname to resolve before
+        # the second ``--mode amend-and-build`` invocation runs dbt.
+        # Tofu apply waits for ``status=AVAILABLE`` but the
+        # private-zone DNS entry can lag by 10-60s after that, and
+        # dbt-redshift's first connection attempt fails hard with
+        # ``gaierror`` (not a retry-eligible Database Error).
+        "python -m fluid_build.cli apply contract.fluid.yaml --mode amend --yes",
+        # Resolve the workgroup hostname before running dbt. Extract the
+        # endpoint from the live AWS API (boto3) rather than parsing
+        # the emitted .tf.json, then poll until ``getent hosts``
+        # returns an A record.
+        "python3.11 - <<'PYEOF'\n"
+        "import json, subprocess, time, boto3, yaml, sys\n"
+        "with open('contract.fluid.yaml') as f:\n"
+        "    contract = yaml.safe_load(f)\n"
+        "wg = None\n"
+        "for exp in contract.get('exposes', []):\n"
+        "    loc = (exp.get('binding') or {}).get('location') or {}\n"
+        "    if loc.get('workgroup'):\n"
+        "        wg = loc['workgroup']\n"
+        "        break\n"
+        "if not wg:\n"
+        "    print('no workgroup in contract', file=sys.stderr); sys.exit(0)\n"
+        "rs = boto3.client('redshift-serverless')\n"
+        "host = rs.get_workgroup(workgroupName=wg)['workgroup']['endpoint']['address']\n"
+        "print(f'waiting for DNS: {host}', flush=True)\n"
+        "for i in range(60):\n"
+        "    r = subprocess.run(['getent', 'hosts', host], capture_output=True, text=True)\n"
+        "    if r.returncode == 0 and r.stdout.strip():\n"
+        "        print(f'  resolved after {i*3}s: {r.stdout.strip()}', flush=True)\n"
+        "        break\n"
+        "    time.sleep(3)\n"
+        "else:\n"
+        "    print(f'  DNS never resolved for {host}', file=sys.stderr); sys.exit(1)\n"
+        "PYEOF",
+        # Dump the dbt profile forge-cli would generate, so we can see
+        # what host dbt-redshift actually receives.
+        "python3.11 - <<'PYEOF'\n"
+        "import yaml, json\n"
+        "from fluid_build.build_runners.dbt.profiles import _build_generated_dbt_profile\n"
+        "with open('contract.fluid.yaml') as f: c = yaml.safe_load(f)\n"
+        "build = c.get('builds') and c['builds'][0] or c.get('build')\n"
+        "p = _build_generated_dbt_profile(build, {})\n"
+        "print('=== generated dbt profile ===')\n"
+        "print(yaml.safe_dump(p, sort_keys=False))\n"
+        "PYEOF",
+        # Now the build phase. IaC is already applied (tofu plan = 0
+        # changes), so this is effectively just the dbt run.
         "python -m fluid_build.cli apply contract.fluid.yaml --mode amend-and-build --yes",
         f"echo OK > {workdir}/done",
     ]
