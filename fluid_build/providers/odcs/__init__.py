@@ -22,6 +22,9 @@ ODCS contracts define the data structure, quality, and SLA requirements.
 ODCS Specification: https://github.com/bitol-io/open-data-contract-standard
 """
 
+from fluid_build.providers import register_provider
+
 from .odcs import OdcsProvider
 
+register_provider("odcs", OdcsProvider)
 __all__ = ["OdcsProvider"]

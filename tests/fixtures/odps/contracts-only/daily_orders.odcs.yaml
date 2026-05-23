@@ -1,0 +1,78 @@
+version: 1.0.0
+apiVersion: v3.1.0
+kind: DataContract
+id: commerce.orders-product.daily_orders
+status: active
+name: Orders Product
+description:
+  purpose: Orders data product with daily and hourly outputs
+tags:
+- orders
+- production
+domain: commerce
+tenant: acme
+team:
+  name: commerce-team
+  members:
+  - name: Alice
+    username: alice@acme.com
+    role: data-owner
+schema:
+- name: daily_orders
+  logicalType: object
+  physicalType: table
+  properties:
+  - name: order_date
+    logicalType: date
+    physicalType: DATE
+    required: true
+    tags:
+    - primary-key
+    quality:
+    - type: library
+      metric: nullValues
+      mustBe: 0
+      dimension: completeness
+      description: Field 'order_date' must not contain null values
+    - type: library
+      metric: duplicateValues
+      mustBe: 0
+      dimension: uniqueness
+      description: Primary key field 'order_date' must contain only unique values
+    primaryKey: true
+  - name: order_count
+    logicalType: integer
+    physicalType: INT64
+    required: true
+    quality:
+    - type: library
+      metric: nullValues
+      mustBe: 0
+      dimension: completeness
+      description: Field 'order_count' must not contain null values
+  - name: total_amount
+    logicalType: number
+    physicalType: NUMERIC
+    required: true
+    quality:
+    - type: library
+      metric: nullValues
+      mustBe: 0
+      dimension: completeness
+      description: Field 'total_amount' must not contain null values
+  description: Daily order aggregates
+servers:
+- server: daily_orders
+  type: bigquery
+  project: acme-prod
+  dataset: orders
+- server: customers_raw
+  type: snowflake
+  account: company-prod
+  database: RAW_DB
+  schema: CUSTOMERS
+slaProperties:
+- property: availability
+  value: 0.9990000000000001
+- property: interval
+  value: PT1H
