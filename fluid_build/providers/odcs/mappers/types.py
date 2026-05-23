@@ -12,21 +12,110 @@ from __future__ import annotations
 from typing import Dict, Mapping, Optional, Tuple
 
 
-# FLUID source type → ODCS v3.1.0 logicalType (enum: string,date,timestamp,time,
-# number,integer,object,array,boolean)
-_FLUID_TO_LOGICAL: Dict[str, str] = {
-    "string": "string", "text": "string", "varchar": "string", "char": "string",
-    "int": "integer", "integer": "integer", "bigint": "integer", "long": "integer",
-    "float": "number", "double": "number", "decimal": "number", "numeric": "number",
-    "bool": "boolean", "boolean": "boolean",
+# FLUID source type → ODCS v3.1.0 logicalType.
+# ODCS logicalType enum: string, date, time, timestamp, integer, number,
+# object, array, boolean.
+#
+# The map is exhaustive against the FLUID 0.7.3 column-type enum
+# (fluid_build/schemas/fluid-schema-0.7.3.json $defs.column.properties.type)
+# so a new column type can never silently degrade to the "string" default
+# and lose type fidelity in published ODCS contracts. The drift guard in
+# tests/providers/test_odcs_type_mapping.py fails if any FLUID schema type
+# is missing here.
+_FLUID_TYPE_TO_ODCS_LOGICAL: Dict[str, str] = {
+    # string family
+    "string": "string",
+    "text": "string",
+    "varchar": "string",
+    "varchar2": "string",
+    "nvarchar": "string",
+    "char": "string",
+    "nchar": "string",
+    "character": "string",
+    "clob": "string",
+    "uuid": "string",
+    "uniqueidentifier": "string",
+    "guid": "string",
+    "enum": "string",
+    # binary family — ODCS has no binary logicalType; binary columns
+    # serialize to text/base64, so "string" is the honest mapping.
+    "binary": "string",
+    "varbinary": "string",
+    "bytes": "string",
+    "blob": "string",
+    "bytea": "string",
+    "raw": "string",
+    "hll": "string",
+    # geospatial family — ODCS has no geo logicalType; geo values
+    # serialize to WKT / GeoJSON text.
+    "geography": "string",
+    "geometry": "string",
+    "geom": "string",
+    "point": "string",
+    # integer family
+    "int": "integer",
+    "integer": "integer",
+    "int2": "integer",
+    "int4": "integer",
+    "int8": "integer",
+    "int16": "integer",
+    "int32": "integer",
+    "int64": "integer",
+    "tinyint": "integer",
+    "smallint": "integer",
+    "mediumint": "integer",
+    "bigint": "integer",
+    "long": "integer",
+    "longint": "integer",
+    "serial": "integer",
+    "bigserial": "integer",
+    "year": "integer",
+    # number family (floating-point + fixed-point)
+    "float": "number",
+    "float4": "number",
+    "float8": "number",
+    "float32": "number",
+    "float64": "number",
+    "double": "number",
+    "real": "number",
+    "decimal": "number",
+    "dec": "number",
+    "numeric": "number",
+    "number": "number",
+    "bignumeric": "number",
+    "money": "number",
+    # boolean family
+    "bool": "boolean",
+    "boolean": "boolean",
+    "bit": "boolean",
+    # temporal family
     "date": "date",
-    "datetime": "timestamp", "timestamp": "timestamp",
     "time": "time",
-    "json": "object", "object": "object",
+    "datetime": "timestamp",
+    "datetime2": "timestamp",
+    "smalldatetime": "timestamp",
+    "timestamp": "timestamp",
+    "timestamptz": "timestamp",
+    "timestamp_tz": "timestamp",
+    "timestamp_ntz": "timestamp",
+    "timestamp_ltz": "timestamp",
+    "timestampntz": "timestamp",
+    "interval": "string",  # ODCS has no interval/duration logicalType
+    # structured / semi-structured family
+    "json": "object",
+    "jsonb": "object",
+    "object": "object",
+    "variant": "object",
+    "super": "object",
+    "struct": "object",
+    "map": "object",
+    "record": "object",
+    "row": "object",
     "array": "array",
-    # ODCS has no binary logical type; store as string and preserve physical
-    "binary": "string", "bytes": "string",
 }
+
+# Back-compat alias for any imports that target the older private name.
+_FLUID_TO_LOGICAL = _FLUID_TYPE_TO_ODCS_LOGICAL
 
 # ODCS logicalType → FLUID type (lossy; physicalType pass-through preserves
 # the original source-system flavour)
@@ -50,7 +139,7 @@ _LOGICAL_TO_FLUID: Dict[str, str] = {
 
 def fluid_to_logical(fluid_type: str) -> str:
     """FLUID type → ODCS logicalType (best-effort, defaults to ``string``)."""
-    return _FLUID_TO_LOGICAL.get(str(fluid_type).lower(), "string")
+    return _FLUID_TYPE_TO_ODCS_LOGICAL.get(str(fluid_type).lower(), "string")
 
 
 def logical_to_fluid(logical_type: str) -> str:

@@ -31,6 +31,7 @@ from .mappers import sla as _sla_mapper
 from .mappers import team as _team_mapper
 from .mappers.base import ExportCtx, get_field_passthrough
 from .mappers.types import (
+    _FLUID_TYPE_TO_ODCS_LOGICAL,
     fluid_to_logical,
     fluid_to_odcs_status,
     fluid_to_physical,
@@ -197,4 +198,4 @@ class OdcsProvider(_OdcsProviderImpl):
         _validate(odcs, self.schema)
 
 
-__all__ = ["OdcsProvider"]
+__all__ = ["OdcsProvider", "_FLUID_TYPE_TO_ODCS_LOGICAL"]
