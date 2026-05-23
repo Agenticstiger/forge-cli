@@ -102,6 +102,12 @@ class AwsIacPlugin:
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
         tags = {"managed_by": "fluid", "fluid_contract": cid}
 
+        # Account-level Lake Formation settings: admins + LF-tag
+        # definitions. Emitted once per contract, before per-exposure
+        # resources so the LF tag-definitions exist before any
+        # resource_lf_tags association references them.
+        _emit_lf_account_settings(resources, contract, cid, tags)
+
         for exposure in contract.get("exposes") or []:
             binding = exposure.get("binding") or {}
             if binding.get("platform") != "aws":
@@ -114,6 +120,11 @@ class AwsIacPlugin:
             _emit_kinesis(resources, loc, cid, tags)
             _emit_redshift_serverless(resources, loc, cid, tags)
             _emit_redshift_external_schema(resources, loc, cid, tags)
+            # Per-exposure Lake Formation: location registration,
+            # principal grants, LF-tag associations, row/column filters.
+            # Only fires when the binding carries a governance.lakeFormation
+            # block — every existing AWS contract is unaffected.
+            _emit_lakeformation(resources, binding, loc, fmt, cid, tags)
         # Glue ETL jobs / Step Functions / the Lambda schedule path —
         # the planner's build & orchestration ops.
         _emit_from_actions(resources, actions, cid)
@@ -126,13 +137,28 @@ class AwsIacPlugin:
     def emit_data(
         self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()
     ) -> Dict[str, Any]:
-        """``archive_file`` data sources — inline Lambda source, zipped by ``tofu``."""
+        """``archive_file`` data sources — inline Lambda source, zipped by ``tofu``.
+
+        Also emits ``aws_caller_identity`` when any Lake Formation
+        resource references the caller's account ID (data-cells filters
+        and certain LF grants need ``catalog_id``). The data source is
+        a no-op when not referenced.
+        """
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        data: Dict[str, Any] = {}
         archives: Dict[str, Any] = {}
         for action in actions or []:
             if isinstance(action, Mapping) and action.get("op") == "lambda.ensure_function":
                 _emit_lambda_archive(archives, action, cid)
-        return {"archive_file": archives} if archives else {}
+        if archives:
+            data["archive_file"] = archives
+        # Lake Formation data-cells filters (and other LF resources) need
+        # the calling AWS account ID as ``catalog_id``. Emit the
+        # ``aws_caller_identity`` data source when any LF feature is used
+        # so downstream resources can ``tofu_ref`` ``account_id`` off it.
+        if _contract_uses_lakeformation(contract):
+            data.setdefault("aws_caller_identity", {})["fluid_lf_caller"] = {}
+        return data
 
     def credential_env(self, env: Mapping[str, str]) -> Dict[str, str]:
         """The ``hashicorp/aws`` provider reads the standard ``AWS_*``
@@ -743,3 +769,249 @@ def _wire_aws_deps(resources: Dict[str, Any], cid: str) -> None:
                 deps.append(f"aws_glue_catalog_database.{glue_key}")
         if deps:
             body["depends_on"] = deps
+
+
+# ---------------------------------------------------------------------------
+# Lake Formation — emit
+# ---------------------------------------------------------------------------
+#
+# Two emit surfaces:
+#
+#   * ``_emit_lf_account_settings`` — fires ONCE per contract before any
+#     per-exposure emit. Honours top-level ``governance.lakeFormation``:
+#     ``admins`` → ``aws_lakeformation_data_lake_settings``,
+#     ``tagDefinitions`` → one ``aws_lakeformation_lf_tag`` per key.
+#     Must run before per-resource ``resource_lf_tags`` associations so
+#     the tag keys exist for the association to reference.
+#
+#   * ``_emit_lakeformation`` — fires per AWS exposure. Honours
+#     ``binding.governance.lakeFormation``:
+#     ``registerLocation`` → ``aws_lakeformation_resource`` on the
+#         binding's ``s3://<bucket>/<path>``,
+#     ``grants[]`` → one ``aws_lakeformation_permissions`` per principal
+#         (with ``columns`` choosing ``table_with_columns`` vs ``table``),
+#     ``tags{}`` → one ``aws_lakeformation_resource_lf_tags`` per table,
+#     ``rowFilter`` → one ``aws_lakeformation_data_cells_filter``.
+#
+# Design notes:
+#   - LF resources are emitted alongside the Glue catalog table they
+#     reference; OpenTofu's value-reference edges (``${aws_glue_catalog_table
+#     .{...}.name}``) provide the ordering, no manual ``depends_on``
+#     needed. Where a reference would be circular (e.g. tag definitions
+#     vs tag associations from different exposures), explicit
+#     ``depends_on`` is set.
+#   - Empty governance blocks emit nothing — every existing contract
+#     stays at zero LF surface area.
+#   - LF is Glue-catalog-backed, so the per-exposure emit only fires for
+#     formats in ``_GLUE_CATALOG_FORMATS``. Redshift / Kinesis / Lambda
+#     bindings ignore any governance.lakeFormation block by design (LF
+#     doesn't manage those resources).
+
+
+def _contract_uses_lakeformation(contract: Mapping[str, Any]) -> bool:
+    """True if the contract has any LF block — top-level or per-exposure."""
+    if (contract.get("governance") or {}).get("lakeFormation"):
+        return True
+    for exposure in contract.get("exposes") or []:
+        binding = exposure.get("binding") or {}
+        if (binding.get("governance") or {}).get("lakeFormation"):
+            return True
+    return False
+
+
+def _emit_lf_account_settings(
+    resources: Dict[str, Any], contract: Mapping[str, Any], cid: str, tags: Dict[str, str]
+) -> None:
+    gov = (contract.get("governance") or {}).get("lakeFormation") or {}
+    admins = gov.get("admins") or []
+    tag_defs = gov.get("tagDefinitions") or {}
+
+    if admins:
+        # ``aws_lakeformation_data_lake_settings`` is a singleton per
+        # account+region. Use a stable resource name so re-applying with
+        # the same contract is idempotent.
+        resources.setdefault("aws_lakeformation_data_lake_settings", {})[
+            safe_ident(f"{cid}_lf_settings")
+        ] = {
+            "admins": list(admins),
+        }
+
+    for tag_key, tag_values in tag_defs.items():
+        if not tag_values:
+            continue
+        resources.setdefault("aws_lakeformation_lf_tag", {})[
+            safe_ident(f"{cid}_lf_tag_{tag_key}")
+        ] = {
+            "key": str(tag_key),
+            "values": list(tag_values),
+        }
+
+
+def _emit_lakeformation(
+    resources: Dict[str, Any],
+    binding: Mapping[str, Any],
+    loc: Mapping[str, Any],
+    fmt: str,
+    cid: str,
+    tags: Dict[str, str],
+) -> None:
+    """Emit per-exposure LF resources. No-op when the binding has no
+    ``governance.lakeFormation`` block."""
+    gov = (binding.get("governance") or {}).get("lakeFormation") or {}
+    if not gov:
+        return
+    # LF only meaningfully manages access to Glue-catalog-backed formats
+    # (file formats on S3). Redshift/Kinesis bindings have their own
+    # access-control models and are skipped here.
+    if str(fmt or "").lower() not in _GLUE_CATALOG_FORMATS:
+        return
+
+    database = loc.get("database")
+    table = loc.get("table")
+    if not database:
+        return
+
+    bucket = loc.get("bucket")
+    path = (loc.get("path") or "").lstrip("/")
+
+    # 1. Register the S3 location with Lake Formation.
+    if gov.get("registerLocation") and bucket:
+        loc_key = safe_ident(f"{cid}_lf_loc_{bucket}_{path or 'root'}")
+        s3_uri = f"s3://{bucket}/{path}" if path else f"s3://{bucket}"
+        resources.setdefault("aws_lakeformation_resource", {})[loc_key] = {
+            "arn": f"arn:aws:s3:::{bucket}/{path}" if path else f"arn:aws:s3:::{bucket}",
+            # ``use_service_linked_role: true`` is the default safe path
+            # — LF uses the AWSServiceRoleForLakeFormationDataAccess SLR
+            # to access objects under the registered location.
+            "use_service_linked_role": True,
+        }
+
+    db_key = safe_ident(f"{cid}_{database}")
+    table_key = safe_ident(f"{cid}_{database}_{table}") if table else None
+
+    # 2. Principal grants. Each grant becomes one aws_lakeformation_permissions
+    #    resource targeting either .table or .table_with_columns (when
+    #    columns / excludedColumns is set).
+    for idx, grant in enumerate(gov.get("grants") or []):
+        principal = grant.get("principal")
+        perms = list(grant.get("permissions") or [])
+        if not principal or not perms:
+            continue
+        body: Dict[str, Any] = {
+            "principal": principal,
+            "permissions": perms,
+        }
+        gp = grant.get("permissionsWithGrantOption")
+        if gp:
+            body["permissions_with_grant_option"] = list(gp)
+        cols = grant.get("columns")
+        excluded = grant.get("excludedColumns")
+        if (cols or excluded) and table_key:
+            twc: Dict[str, Any] = {
+                "database_name": tofu_ref(
+                    f"aws_glue_catalog_table.{table_key}.database_name"
+                ),
+                "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
+            }
+            if cols:
+                twc["column_names"] = list(cols)
+            if excluded:
+                twc["excluded_column_names"] = list(excluded)
+            body["table_with_columns"] = [twc]
+        elif table_key:
+            body["table"] = [
+                {
+                    "database_name": tofu_ref(
+                        f"aws_glue_catalog_table.{table_key}.database_name"
+                    ),
+                    "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
+                }
+            ]
+        else:
+            # Database-level grant when no table is bound.
+            body["database"] = [
+                {"name": tofu_ref(f"aws_glue_catalog_database.{db_key}.name")}
+            ]
+        # Stable resource key — principal + perms hashed so multiple
+        # grants on the same exposure don't collide.
+        body_key = safe_ident(f"{cid}_lf_grant_{table or database}_{idx}")
+        resources.setdefault("aws_lakeformation_permissions", {})[body_key] = body
+
+    # 3. LF-tag associations on the table (LF-TBAC).
+    tag_assoc = gov.get("tags") or {}
+    if tag_assoc and table_key:
+        lf_tags = [
+            {"key": str(k), "value": str(v)} for k, v in tag_assoc.items() if v
+        ]
+        if lf_tags:
+            assoc_key = safe_ident(f"{cid}_lf_tags_{table}")
+            resources.setdefault("aws_lakeformation_resource_lf_tags", {})[assoc_key] = {
+                "table": [
+                    {
+                        "database_name": tofu_ref(
+                            f"aws_glue_catalog_table.{table_key}.database_name"
+                        ),
+                        "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
+                    }
+                ],
+                "lf_tag": lf_tags,
+                # The tag KEYS must exist before this association can be
+                # applied. The matching ``aws_lakeformation_lf_tag``
+                # resources come from the contract-level
+                # ``governance.lakeFormation.tagDefinitions`` block.
+                "depends_on": [
+                    f"aws_lakeformation_lf_tag.{safe_ident(f'{cid}_lf_tag_{k}')}"
+                    for k in tag_assoc
+                ],
+            }
+
+    # 4. Row-level (and optional column-level) filter.
+    row_filter = gov.get("rowFilter")
+    if row_filter and table_key:
+        filter_name = row_filter.get("name")
+        row_expr = row_filter.get("rowExpression")
+        if filter_name and row_expr:
+            col_names = row_filter.get("columnNames")
+            excluded_cols = row_filter.get("excludedColumnNames")
+            all_cols = bool(row_filter.get("allColumns"))
+            # Exactly one of column_names / column_wildcard must be set.
+            # When the contract gives explicit columnNames, use those;
+            # excludedColumnNames maps to column_wildcard with excludes;
+            # otherwise default to wildcard (every column visible — the
+            # row-only-filter case).
+            col_block: Dict[str, Any]
+            if col_names:
+                col_block = {"column_names": list(col_names)}
+            elif excluded_cols:
+                col_block = {
+                    "column_wildcard": [
+                        {"excluded_column_names": list(excluded_cols)}
+                    ]
+                }
+            else:
+                # ``allColumns`` is the explicit form; absence defaults to it
+                # because LF requires one of these and "wildcard" is the
+                # natural row-only-filter behaviour.
+                col_block = {"column_wildcard": [{}]}
+            body = {
+                "table_data": [
+                    {
+                        "table_catalog_id": tofu_ref(
+                            "data.aws_caller_identity.fluid_lf_caller.account_id"
+                        ),
+                        "database_name": tofu_ref(
+                            f"aws_glue_catalog_table.{table_key}.database_name"
+                        ),
+                        "table_name": tofu_ref(
+                            f"aws_glue_catalog_table.{table_key}.name"
+                        ),
+                        "name": filter_name,
+                        "row_filter": [{"filter_expression": row_expr}],
+                        **col_block,
+                    }
+                ]
+            }
+            filter_key = safe_ident(f"{cid}_lf_filter_{table}_{filter_name}")
+            resources.setdefault("aws_lakeformation_data_cells_filter", {})[
+                filter_key
+            ] = body

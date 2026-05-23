@@ -289,6 +289,10 @@
       "$ref": "#/$defs/lineage",
       "description": "Optional lineage tracking for better data governance."
     },
+    "governance": {
+      "$ref": "#/$defs/governance",
+      "description": "Contract-level governance: account/project-wide settings (e.g. AWS Lake Formation admins and LF-tag definitions). Per-resource grants and tag associations live under binding.governance."
+    },
     "schemaEvolution": {
       "$ref": "#/$defs/schemaEvolution",
       "description": "Optional schema evolution strategy for managing changes."
@@ -1354,6 +1358,155 @@
           "type": "object",
           "description": "Provider-specific binding properties (e.g., cluster_by, comment for Snowflake).",
           "additionalProperties": true
+        },
+        "governance": {
+          "$ref": "#/$defs/bindingGovernance",
+          "description": "Per-resource governance: registerLocation, principal grants, tag associations, row/column filters. Account-wide governance (admins, tag definitions) lives at the contract top-level governance block."
+        }
+      }
+    },
+    "governance": {
+      "type": "object",
+      "description": "Account/project-wide governance settings. Today only the lakeFormation block is supported; future cloud-specific blocks may live alongside it (e.g. snowflake masking-policy registries, gcp organization-policies).",
+      "additionalProperties": false,
+      "properties": {
+        "lakeFormation": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "AWS Lake Formation account-wide settings: data-lake admins and LF-tag (TBAC) definitions. Applies to the AWS account the contract's IaC apply targets.",
+          "properties": {
+            "admins": {
+              "type": "array",
+              "description": "IAM principal ARNs (roles or users) granted Lake Formation admin privileges. Emitted as aws_lakeformation_data_lake_settings.admins. Idempotent: re-applying with the same set is a no-op; principals not listed are NOT removed (LF resource semantics preserve other admins).",
+              "items": {
+                "type": "string",
+                "pattern": "^arn:aws[a-z0-9-]*:iam::"
+              },
+              "uniqueItems": true
+            },
+            "tagDefinitions": {
+              "type": "object",
+              "description": "LF-TBAC tag-key definitions. Each entry is a tag key mapped to its allowed string values. Emitted as one aws_lakeformation_lf_tag per key; values are the tag's allowed-values list. Field idiom borrowed from OpenMetadata's classification-label model — see ODCS roles + OpenMetadata data contracts spec.",
+              "additionalProperties": {
+                "type": "array",
+                "items": {"type": "string"},
+                "uniqueItems": true,
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "bindingGovernance": {
+      "type": "object",
+      "description": "Per-resource (per-exposure) governance. Currently scoped to AWS Lake Formation; future cloud-specific blocks may sit alongside (e.g. gcpIamPolicy, snowflakeMaskingPolicy).",
+      "additionalProperties": false,
+      "properties": {
+        "lakeFormation": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Per-resource LF settings: location registration, principal grants, LF-tag associations, row/column filters. Applies only to formats backed by S3 + Glue catalog (iceberg/parquet/csv/json/avro/orc/delta).",
+          "properties": {
+            "registerLocation": {
+              "type": "boolean",
+              "default": false,
+              "description": "When true, emit aws_lakeformation_resource that registers the binding's S3 path with Lake Formation. Required before LF can manage access to objects under that path."
+            },
+            "grants": {
+              "type": "array",
+              "description": "Principal-based LF grants on this exposure's database/table. Each entry maps a principal to a permission set (and optional column projection). Emitted as aws_lakeformation_permissions resources. Field idiom adapted from ODCS v3 roles[] (principal + access-type), bound to IAM ARNs since LF is cloud-specific.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["principal", "permissions"],
+                "properties": {
+                  "principal": {
+                    "type": "string",
+                    "description": "IAM principal ARN (role or user) receiving the grant.",
+                    "pattern": "^arn:aws[a-z0-9-]*:iam::"
+                  },
+                  "permissions": {
+                    "type": "array",
+                    "description": "LF permissions granted. Valid values per the hashicorp/aws aws_lakeformation_permissions resource.",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "ALL",
+                        "SELECT",
+                        "ALTER",
+                        "DROP",
+                        "DELETE",
+                        "INSERT",
+                        "DESCRIBE",
+                        "CREATE_TABLE",
+                        "CREATE_DATABASE",
+                        "DATA_LOCATION_ACCESS"
+                      ]
+                    },
+                    "uniqueItems": true,
+                    "minItems": 1
+                  },
+                  "permissionsWithGrantOption": {
+                    "type": "array",
+                    "description": "Subset of permissions the principal can re-grant. Maps to aws_lakeformation_permissions.permissions_with_grant_option.",
+                    "items": {"type": "string"},
+                    "uniqueItems": true
+                  },
+                  "columns": {
+                    "type": "array",
+                    "description": "Optional column-level restriction. When set, the grant is emitted against aws_lakeformation_permissions.table_with_columns instead of .table, allowing the principal to read only the listed columns.",
+                    "items": {"type": "string"},
+                    "uniqueItems": true
+                  },
+                  "excludedColumns": {
+                    "type": "array",
+                    "description": "Opposite of columns: every column EXCEPT these is granted. Maps to table_with_columns.excluded_column_names. Mutually exclusive with columns.",
+                    "items": {"type": "string"},
+                    "uniqueItems": true
+                  }
+                }
+              }
+            },
+            "tags": {
+              "type": "object",
+              "description": "LF-tag (TBAC) associations applied to this table. Keys must reference tag definitions declared in the contract's top-level governance.lakeFormation.tagDefinitions. Emitted as aws_lakeformation_resource_lf_tags.",
+              "additionalProperties": {"type": "string"}
+            },
+            "rowFilter": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Row-level (and optionally column-level) filter applied to all reads of this table via LF. Emitted as aws_lakeformation_data_cells_filter. The filter must then be granted to principals via grants[].permissions including SELECT — LF enforces both layers.",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "Filter name (must be unique per table)."
+                },
+                "rowExpression": {
+                  "type": "string",
+                  "description": "PartiQL-flavoured row predicate. ``ALL`` lets every row through (use when only column filtering is intended)."
+                },
+                "columnNames": {
+                  "type": "array",
+                  "description": "Columns visible through the filter. Mutually exclusive with allColumns / excludedColumnNames.",
+                  "items": {"type": "string"},
+                  "uniqueItems": true
+                },
+                "excludedColumnNames": {
+                  "type": "array",
+                  "description": "Columns hidden through the filter (everything else is visible).",
+                  "items": {"type": "string"},
+                  "uniqueItems": true
+                },
+                "allColumns": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Convenience for the LF column-wildcard form (every column visible). When true, columnNames / excludedColumnNames must be omitted."
+                }
+              },
+              "required": ["name", "rowExpression"]
+            }
+          }
         }
       }
     },
