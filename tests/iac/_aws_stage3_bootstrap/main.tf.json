@@ -1,0 +1,355 @@
+{
+  "terraform": {
+    "required_version": ">= 1.6",
+    "required_providers": {
+      "aws": {
+        "source": "hashicorp/aws",
+        "version": "~> 5.0"
+      }
+    }
+  },
+  "provider": {
+    "aws": {
+      "region": "eu-west-1"
+    }
+  },
+  "//": "Stage 3 bootstrap — IAM roles + an EC2-in-VPC runner used by tests whose dbt build dispatches via postgres-wire to Redshift Serverless. The four IAM roles serve the AWS-plugin contracts (Lambda / SFN / Glue / Redshift Spectrum). The VPC bits (VPC + 3 AZ subnets + SGs + SSM endpoints + EC2 + role) only matter for tests whose contracts attach the workgroup to the bootstrap's private subnets — see test_iac_aws_real_dbt_mesh_cli_e2e.py::test_real_cli_dbt_redshift_serverless_amend_and_build. The EC2 has no public IP; ops go through SSM over VPC endpoints — no NAT, no internet gateway, no public ingress ever opened.",
+
+  "data": {
+    "aws_ami": {
+      "al2023": {
+        "most_recent": true,
+        "owners": ["amazon"],
+        "filter": [
+          {"name": "name", "values": ["al2023-ami-2023.*-kernel-6.1-x86_64"]},
+          {"name": "architecture", "values": ["x86_64"]},
+          {"name": "virtualization-type", "values": ["hvm"]}
+        ]
+      }
+    }
+  },
+
+  "resource": {
+    "aws_iam_role": {
+      "fluid_lambda_exec": {
+        "name": "fluid-iactest-lambda-exec",
+        "tags": {"managed_by": "fluid", "purpose": "stage3-iac-testing"},
+        "assume_role_policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+      },
+      "fluid_sfn_exec": {
+        "name": "fluid-iactest-sfn-exec",
+        "tags": {"managed_by": "fluid", "purpose": "stage3-iac-testing"},
+        "assume_role_policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"states.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+      },
+      "fluid_glue_exec": {
+        "name": "fluid-iactest-glue-exec",
+        "tags": {"managed_by": "fluid", "purpose": "stage3-iac-testing"},
+        "assume_role_policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"glue.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+      },
+      "fluid_redshift_spectrum": {
+        "name": "fluid-iactest-redshift-spectrum",
+        "tags": {"managed_by": "fluid", "purpose": "stage3-iac-testing"},
+        "//": "Trusts both classic Redshift and Redshift Serverless service principals so a single role serves the external-schema bridge on both.",
+        "assume_role_policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":[\"redshift.amazonaws.com\",\"redshift-serverless.amazonaws.com\"]},\"Action\":\"sts:AssumeRole\"}]}"
+      },
+      "fluid_ec2_test": {
+        "name": "fluid-iactest-ec2-role",
+        "tags": {"managed_by": "fluid", "purpose": "stage3-iac-testing"},
+        "//": "EC2 instance role: SSM-managed (no SSH key), can pull source from S3, can talk to Redshift Serverless via Data API.",
+        "assume_role_policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+      }
+    },
+    "aws_iam_role_policy_attachment": {
+      "lambda_basic": {
+        "role": "${aws_iam_role.fluid_lambda_exec.name}",
+        "policy_arn": "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      },
+      "sfn_lambda_invoke": {
+        "role": "${aws_iam_role.fluid_sfn_exec.name}",
+        "policy_arn": "arn:aws:iam::aws:policy/service-role/AWSLambdaRole"
+      },
+      "glue_service": {
+        "role": "${aws_iam_role.fluid_glue_exec.name}",
+        "policy_arn": "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+      },
+      "spectrum_glue_read": {
+        "role": "${aws_iam_role.fluid_redshift_spectrum.name}",
+        "policy_arn": "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+      },
+      "spectrum_s3_read": {
+        "role": "${aws_iam_role.fluid_redshift_spectrum.name}",
+        "policy_arn": "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      },
+      "ec2_ssm_core": {
+        "role": "${aws_iam_role.fluid_ec2_test.name}",
+        "policy_arn": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      },
+      "ec2_s3_full": {
+        "role": "${aws_iam_role.fluid_ec2_test.name}",
+        "policy_arn": "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+      },
+      "ec2_redshift_data": {
+        "role": "${aws_iam_role.fluid_ec2_test.name}",
+        "policy_arn": "arn:aws:iam::aws:policy/AmazonRedshiftDataFullAccess"
+      },
+      "ec2_redshift_full": {
+        "role": "${aws_iam_role.fluid_ec2_test.name}",
+        "policy_arn": "arn:aws:iam::aws:policy/AmazonRedshiftFullAccess"
+      }
+    },
+    "aws_iam_instance_profile": {
+      "fluid_ec2_test": {
+        "name": "fluid-iactest-ec2-profile",
+        "role": "${aws_iam_role.fluid_ec2_test.name}"
+      }
+    },
+
+    "aws_vpc": {
+      "fluid_test": {
+        "cidr_block": "10.20.0.0/16",
+        "enable_dns_support": true,
+        "enable_dns_hostnames": true,
+        "tags": {"Name": "fluid-iactest-vpc", "managed_by": "fluid", "purpose": "stage3-iac-testing"}
+      }
+    },
+    "aws_subnet": {
+      "fluid_test_a": {
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "cidr_block": "10.20.1.0/24",
+        "availability_zone": "eu-west-1a",
+        "tags": {"Name": "fluid-iactest-subnet-a", "managed_by": "fluid"}
+      },
+      "fluid_test_b": {
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "cidr_block": "10.20.2.0/24",
+        "availability_zone": "eu-west-1b",
+        "tags": {"Name": "fluid-iactest-subnet-b", "managed_by": "fluid"}
+      },
+      "fluid_test_c": {
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "cidr_block": "10.20.3.0/24",
+        "availability_zone": "eu-west-1c",
+        "tags": {"Name": "fluid-iactest-subnet-c", "managed_by": "fluid"}
+      },
+      "fluid_test_public": {
+        "//": "Public subnet hosts the NAT gateway only. The EC2 runner and Redshift Serverless workgroup both stay in private subnets a/b/c.",
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "cidr_block": "10.20.0.0/24",
+        "availability_zone": "eu-west-1a",
+        "map_public_ip_on_launch": false,
+        "tags": {"Name": "fluid-iactest-subnet-public", "managed_by": "fluid"}
+      }
+    },
+    "aws_route_table": {
+      "fluid_test": {
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "tags": {"Name": "fluid-iactest-rt", "managed_by": "fluid"}
+      },
+      "fluid_test_public": {
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "tags": {"Name": "fluid-iactest-rt-public", "managed_by": "fluid"}
+      }
+    },
+    "aws_route_table_association": {
+      "a": {"subnet_id": "${aws_subnet.fluid_test_a.id}", "route_table_id": "${aws_route_table.fluid_test.id}"},
+      "b": {"subnet_id": "${aws_subnet.fluid_test_b.id}", "route_table_id": "${aws_route_table.fluid_test.id}"},
+      "c": {"subnet_id": "${aws_subnet.fluid_test_c.id}", "route_table_id": "${aws_route_table.fluid_test.id}"},
+      "public": {
+        "subnet_id": "${aws_subnet.fluid_test_public.id}",
+        "route_table_id": "${aws_route_table.fluid_test_public.id}"
+      }
+    },
+    "aws_internet_gateway": {
+      "fluid_test": {
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "tags": {"Name": "fluid-iactest-igw", "managed_by": "fluid"}
+      }
+    },
+    "aws_route": {
+      "public_internet": {
+        "route_table_id": "${aws_route_table.fluid_test_public.id}",
+        "destination_cidr_block": "0.0.0.0/0",
+        "gateway_id": "${aws_internet_gateway.fluid_test.id}"
+      },
+      "private_nat": {
+        "route_table_id": "${aws_route_table.fluid_test.id}",
+        "destination_cidr_block": "0.0.0.0/0",
+        "nat_gateway_id": "${aws_nat_gateway.fluid_test.id}"
+      }
+    },
+    "aws_eip": {
+      "fluid_nat": {
+        "domain": "vpc",
+        "tags": {"Name": "fluid-iactest-nat-eip", "managed_by": "fluid"}
+      }
+    },
+    "aws_nat_gateway": {
+      "fluid_test": {
+        "//": "NAT gateway gives the private-subnet EC2 outbound internet for pip/PyPI/Github. Costs about USD 0.045/hour plus data; destroy when tests are not running. The Redshift Serverless workgroup never gets a public endpoint either way.",
+        "allocation_id": "${aws_eip.fluid_nat.id}",
+        "subnet_id": "${aws_subnet.fluid_test_public.id}",
+        "tags": {"Name": "fluid-iactest-nat", "managed_by": "fluid"},
+        "depends_on": ["aws_internet_gateway.fluid_test"]
+      }
+    },
+
+    "aws_security_group": {
+      "fluid_ec2": {
+        "name": "fluid-iactest-ec2-sg",
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "description": "EC2 in fluid test VPC: outbound to Redshift Serverless and AWS endpoints",
+        "tags": {"managed_by": "fluid"}
+      },
+      "fluid_redshift": {
+        "name": "fluid-iactest-redshift-sg",
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "description": "Redshift Serverless workgroup SG: inbound 5439 from EC2 SG only",
+        "tags": {"managed_by": "fluid"}
+      },
+      "fluid_endpoint": {
+        "name": "fluid-iactest-endpoint-sg",
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "description": "Interface VPC endpoints: accepts HTTPS from EC2 SG",
+        "tags": {"managed_by": "fluid"}
+      }
+    },
+    "aws_security_group_rule": {
+      "ec2_egress_all": {
+        "type": "egress",
+        "security_group_id": "${aws_security_group.fluid_ec2.id}",
+        "from_port": 0,
+        "to_port": 0,
+        "protocol": "-1",
+        "cidr_blocks": ["0.0.0.0/0"],
+        "description": "All egress (VPC endpoints + Redshift Serverless)"
+      },
+      "redshift_ingress_5439": {
+        "type": "ingress",
+        "security_group_id": "${aws_security_group.fluid_redshift.id}",
+        "from_port": 5439,
+        "to_port": 5439,
+        "protocol": "tcp",
+        "source_security_group_id": "${aws_security_group.fluid_ec2.id}",
+        "description": "Postgres-wire from EC2 SG only"
+      },
+      "endpoint_ingress_443": {
+        "type": "ingress",
+        "security_group_id": "${aws_security_group.fluid_endpoint.id}",
+        "from_port": 443,
+        "to_port": 443,
+        "protocol": "tcp",
+        "source_security_group_id": "${aws_security_group.fluid_ec2.id}",
+        "description": "HTTPS from EC2 to VPC endpoints"
+      }
+    },
+
+    "aws_vpc_endpoint": {
+      "ssm": {
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "service_name": "com.amazonaws.eu-west-1.ssm",
+        "vpc_endpoint_type": "Interface",
+        "subnet_ids": [
+          "${aws_subnet.fluid_test_a.id}",
+          "${aws_subnet.fluid_test_b.id}",
+          "${aws_subnet.fluid_test_c.id}"
+        ],
+        "security_group_ids": ["${aws_security_group.fluid_endpoint.id}"],
+        "private_dns_enabled": true,
+        "tags": {"managed_by": "fluid"}
+      },
+      "ssmmessages": {
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "service_name": "com.amazonaws.eu-west-1.ssmmessages",
+        "vpc_endpoint_type": "Interface",
+        "subnet_ids": [
+          "${aws_subnet.fluid_test_a.id}",
+          "${aws_subnet.fluid_test_b.id}",
+          "${aws_subnet.fluid_test_c.id}"
+        ],
+        "security_group_ids": ["${aws_security_group.fluid_endpoint.id}"],
+        "private_dns_enabled": true,
+        "tags": {"managed_by": "fluid"}
+      },
+      "ec2messages": {
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "service_name": "com.amazonaws.eu-west-1.ec2messages",
+        "vpc_endpoint_type": "Interface",
+        "subnet_ids": [
+          "${aws_subnet.fluid_test_a.id}",
+          "${aws_subnet.fluid_test_b.id}",
+          "${aws_subnet.fluid_test_c.id}"
+        ],
+        "security_group_ids": ["${aws_security_group.fluid_endpoint.id}"],
+        "private_dns_enabled": true,
+        "tags": {"managed_by": "fluid"}
+      },
+      "s3": {
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "service_name": "com.amazonaws.eu-west-1.s3",
+        "vpc_endpoint_type": "Gateway",
+        "route_table_ids": ["${aws_route_table.fluid_test.id}"],
+        "tags": {"managed_by": "fluid"}
+      },
+      "redshift_data": {
+        "vpc_id": "${aws_vpc.fluid_test.id}",
+        "service_name": "com.amazonaws.eu-west-1.redshift-data",
+        "vpc_endpoint_type": "Interface",
+        "subnet_ids": [
+          "${aws_subnet.fluid_test_a.id}",
+          "${aws_subnet.fluid_test_b.id}",
+          "${aws_subnet.fluid_test_c.id}"
+        ],
+        "security_group_ids": ["${aws_security_group.fluid_endpoint.id}"],
+        "private_dns_enabled": true,
+        "tags": {"managed_by": "fluid"}
+      }
+    },
+
+    "aws_s3_bucket": {
+      "fluid_test_source": {
+        "//": "Prefix MUST start with ``fluid-iacboot-`` (not ``fluid-iactest-``) so the per-test sweeper's prefix match does NOT catch this bootstrap-managed bucket. The bootstrap and tests share the same account, so naming discipline is the cheapest way to keep the sweeper from nuking persistent test infra at session end.",
+        "bucket_prefix": "fluid-iacboot-source-",
+        "force_destroy": true,
+        "tags": {"managed_by": "fluid", "purpose": "stage3-iac-testing"}
+      }
+    },
+
+    "aws_instance": {
+      "fluid_test_runner": {
+        "ami": "${data.aws_ami.al2023.id}",
+        "instance_type": "t3.micro",
+        "subnet_id": "${aws_subnet.fluid_test_a.id}",
+        "iam_instance_profile": "${aws_iam_instance_profile.fluid_ec2_test.name}",
+        "vpc_security_group_ids": ["${aws_security_group.fluid_ec2.id}"],
+        "associate_public_ip_address": false,
+        "root_block_device": [
+          {
+            "volume_size": 30,
+            "volume_type": "gp3",
+            "delete_on_termination": true,
+            "encrypted": true
+          }
+        ],
+        "tags": {"Name": "fluid-iactest-runner", "managed_by": "fluid", "purpose": "stage3-iac-testing"},
+        "//": "user_data installs Python 3.11, pip, git, OpenTofu. dbt-redshift + the forge-cli source are pulled from S3 by the test via SSM send-command.",
+        "user_data": "#!/bin/bash\nset -euo pipefail\nexec > /var/log/fluid-bootstrap.log 2>&1\ndnf install -y python3.11 python3.11-pip git tar gzip unzip\nln -sf /usr/bin/python3.11 /usr/local/bin/python3\nln -sf /usr/bin/pip3.11 /usr/local/bin/pip3\n# OpenTofu install\ncurl -fsSL https://get.opentofu.org/install-opentofu.sh -o /tmp/install-opentofu.sh\nchmod +x /tmp/install-opentofu.sh\n/tmp/install-opentofu.sh --install-method rpm\necho 'bootstrap complete' > /var/log/fluid-ready\n"
+      }
+    }
+  },
+  "output": {
+    "lambda_role_arn": {"value": "${aws_iam_role.fluid_lambda_exec.arn}"},
+    "sfn_role_arn": {"value": "${aws_iam_role.fluid_sfn_exec.arn}"},
+    "glue_role_arn": {"value": "${aws_iam_role.fluid_glue_exec.arn}"},
+    "spectrum_role_arn": {"value": "${aws_iam_role.fluid_redshift_spectrum.arn}"},
+    "vpc_id": {"value": "${aws_vpc.fluid_test.id}"},
+    "vpc_subnet_ids": {"value": [
+      "${aws_subnet.fluid_test_a.id}",
+      "${aws_subnet.fluid_test_b.id}",
+      "${aws_subnet.fluid_test_c.id}"
+    ]},
+    "ec2_sg_id": {"value": "${aws_security_group.fluid_ec2.id}"},
+    "redshift_sg_id": {"value": "${aws_security_group.fluid_redshift.id}"},
+    "ec2_instance_id": {"value": "${aws_instance.fluid_test_runner.id}"},
+    "source_bucket": {"value": "${aws_s3_bucket.fluid_test_source.bucket}"}
+  }
+}

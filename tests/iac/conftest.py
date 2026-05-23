@@ -992,3 +992,312 @@ def glue_job_action(
         "default_arguments": {"--enable-metrics": "true"},
         "tags": {"managed_by": "fluid"},
     }
+
+
+# ===========================================================================
+# AWS Stage 3 — REAL AWS account (no emulator, real billable resources)
+# ===========================================================================
+#
+# Triple-gated:
+#   * ``tofu`` on PATH
+#   * boto3 can authenticate (caller-identity returns a non-root :user/...)
+#   * the four ``FLUID_AWS_*_ROLE_ARN`` env vars are set
+#   * the explicit opt-in flag ``FLUID_IAC_LIVE_AWS=1``
+#
+# Every test provisions into resources with a unique
+# ``fluid-iactest-<uuid>`` prefix; teardown destroys; a session finalizer
+# sweeps any survivors. No pre-existing AWS resources are ever touched.
+
+
+def _aws_live_ready() -> Tuple[bool, str]:
+    """Return ``(enabled, skip_reason)`` for the real-AWS Stage-3 tier."""
+    if runner.tofu_path() is None:
+        return False, "the `tofu` (OpenTofu) binary is not on PATH"
+    if os.environ.get("FLUID_IAC_LIVE_AWS", "").strip().lower() not in _TRUE:
+        return False, "live AWS tests are opt-in — set FLUID_IAC_LIVE_AWS=1"
+    for var in (
+        "FLUID_AWS_LAMBDA_ROLE_ARN",
+        "FLUID_AWS_SFN_ROLE_ARN",
+        "FLUID_AWS_GLUE_ROLE_ARN",
+        "FLUID_AWS_SPECTRUM_ROLE_ARN",
+    ):
+        if not os.environ.get(var):
+            return False, f"missing IAM role ARN: ${var}"
+    try:
+        import boto3
+
+        sts = boto3.client("sts")
+        identity = sts.get_caller_identity()
+        if identity.get("Arn", "").endswith(":root"):
+            return False, "live AWS tests refuse to run with root credentials"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"AWS auth check failed: {exc}"
+    return True, ""
+
+
+AWS_LIVE_ENABLED, AWS_LIVE_SKIP_REASON = _aws_live_ready()
+# Throwaway resource-name prefix so the sweeper can find leftovers.
+AWS_LIVE_PREFIX = "fluid-iactest"
+
+
+def aws_real_boto(service: str) -> Any:
+    """A boto3 client for real AWS — uses the default credentials chain
+    (AWS_PROFILE / env / ~/.aws/credentials). No endpoint override.
+
+    Region is resolved explicitly from ``AWS_REGION`` / ``AWS_DEFAULT_REGION``
+    rather than relying on boto3's default chain: when ``AWS_PROFILE`` is set
+    and the profile carries its own ``region = …`` in ``~/.aws/config``,
+    botocore prefers the profile region over the ``AWS_REGION`` env var
+    (documented quirk). Tofu honours ``AWS_REGION`` directly, so without
+    this override the test's boto client would query a different region
+    than the one tofu provisioned into.
+    """
+    import boto3
+
+    region = (
+        os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    )
+    return boto3.client(service, region_name=region)
+
+
+def _aws_live_uuid() -> str:
+    """Short uppercase-hex token for unique resource names per test."""
+    return uuid.uuid4().hex[:10]
+
+
+class RealAwsProject:
+    """A per-test ``tofu`` workdir bound to real AWS — emit + apply + destroy.
+
+    No provider override; the ``hashicorp/aws`` provider self-configures
+    from ``AWS_*`` env / ``~/.aws/credentials``. Resource names are scoped
+    by the per-test uuid suffix so concurrent runs never collide.
+    """
+
+    def __init__(self, workdir: Path, env: Mapping[str, str]) -> None:
+        self.workdir = workdir
+        self.env = dict(env)
+        self.applied = False
+        self.uid = _aws_live_uuid()
+
+    def name(self, slug: str) -> str:
+        """``fluid-iactest-<slug>-<uid>`` — unique, sweeper-discoverable."""
+        return f"{AWS_LIVE_PREFIX}-{slug}-{self.uid}"
+
+    def emit(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        actions: Sequence[Mapping[str, Any]] = (),
+    ) -> str:
+        plugin = get_iac_plugin("aws")
+        text = build_module(plugin, contract, actions=actions)
+        (self.workdir / "main.tf.json").write_text(text, encoding="utf-8")
+        return text
+
+    def init(self):
+        return runner.tofu_init(str(self.workdir), backend=False, env=self.env)
+
+    def plan(self):
+        return runner.tofu_plan(str(self.workdir), env=self.env)
+
+    def apply(self):
+        result = runner.tofu_apply(str(self.workdir), env=self.env)
+        self.applied = True
+        return result
+
+    def destroy(self):
+        return runner.tofu_destroy(str(self.workdir), env=self.env)
+
+    def apply_ok(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        actions: Sequence[Mapping[str, Any]] = (),
+    ):
+        """Emit + init + plan + apply with assertions at each step."""
+        self.emit(contract, actions=actions)
+        init = self.init()
+        assert init.ok, f"tofu init failed:\n{init.stderr or init.stdout}"
+        plan = self.plan()
+        assert plan.ok, f"tofu plan failed:\n{plan.stderr or plan.stdout}"
+        applied = self.apply()
+        assert applied.ok, f"tofu apply failed:\n{applied.stderr or applied.stdout}"
+        return applied
+
+
+@pytest.fixture(scope="session")
+def aws_account() -> Dict[str, str]:
+    """Session-scoped real-AWS account identity. Skips when the gate is shut.
+
+    Returns ``{"account_id": ..., "user_arn": ..., "region": ...}``.
+    """
+    if not AWS_LIVE_ENABLED:
+        pytest.skip(AWS_LIVE_SKIP_REASON)
+    import boto3
+
+    sts = boto3.client("sts")
+    identity = sts.get_caller_identity()
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    return {
+        "account_id": identity["Account"],
+        "user_arn": identity["Arn"],
+        "region": region,
+    }
+
+
+@pytest.fixture
+def aws_real_project(
+    aws_account: Dict[str, str], tofu_env: Dict[str, str], tmp_path: Path
+) -> Iterator[RealAwsProject]:
+    """A :class:`RealAwsProject` bound to a fresh workdir.
+
+    Teardown: best-effort ``tofu destroy`` so applied resources don't
+    linger. The session-end ``_aws_live_sweeper`` is the belt-and-
+    suspenders net.
+    """
+    project = RealAwsProject(tmp_path, tofu_env)
+    try:
+        yield project
+    finally:
+        if project.applied:
+            with contextlib.suppress(Exception):
+                project.destroy()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _aws_live_sweeper(request) -> Iterator[None]:
+    """Session finalizer: list and delete any ``fluid-iactest-*`` resources
+    still present in the account when the test session ends.
+
+    Catches resources that a crashed or interrupted test left behind. Only
+    fires when the live tier is enabled; otherwise a no-op so plain test
+    runs don't touch any AWS API.
+
+    Region note: every boto client below passes ``region_name`` explicitly
+    — when ``AWS_PROFILE`` is set and the profile carries its own
+    ``region = …`` in ``~/.aws/config``, botocore prefers that over the
+    ``AWS_REGION`` env var. Without the explicit region, the sweeper
+    would scan ``us-east-1`` (profile default) and silently miss any
+    test that ran in another region — which is exactly how a
+    Redshift Serverless workgroup once leaked at $2.88/hour.
+
+    Coverage: S3 buckets, Glue databases/tables, Kinesis streams,
+    Lambda functions, Step Functions state machines, Redshift Serverless
+    namespaces + workgroups (workgroup first, then namespace —
+    AWS rejects namespace deletes while a workgroup still attaches).
+    """
+    yield
+    if not AWS_LIVE_ENABLED:
+        return
+    try:
+        import boto3
+    except Exception:  # noqa: BLE001
+        return
+
+    region = (
+        os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    )
+
+    def _client(service: str):
+        return boto3.client(service, region_name=region)
+
+    # S3 buckets — global namespace; region doesn't matter for listing.
+    # Bootstrap-managed buckets use the ``fluid-iacboot-*`` prefix so
+    # they never match ``AWS_LIVE_PREFIX`` here. As defense-in-depth
+    # we additionally re-check the bucket's tags and skip anything
+    # tagged ``purpose=stage3-iac-testing``.
+    def _is_bootstrap_resource(client_get_tags) -> bool:
+        try:
+            tags = client_get_tags() or []
+        except Exception:  # noqa: BLE001
+            return False
+        for t in tags:
+            if t.get("Key") == "purpose" and t.get("Value") == "stage3-iac-testing":
+                return True
+        return False
+
+    with contextlib.suppress(Exception):
+        s3 = _client("s3")
+        s3r = boto3.resource("s3", region_name=region)
+        for entry in s3.list_buckets().get("Buckets", []):
+            name = entry["Name"]
+            if not name.startswith(AWS_LIVE_PREFIX):
+                continue
+            if _is_bootstrap_resource(
+                lambda: s3.get_bucket_tagging(Bucket=name).get("TagSet")
+            ):
+                continue
+            with contextlib.suppress(Exception):
+                s3r.Bucket(name).objects.all().delete()
+                s3r.Bucket(name).object_versions.all().delete()
+                s3.delete_bucket(Bucket=name)
+    # Glue databases — must drop tables first.
+    with contextlib.suppress(Exception):
+        glue = _client("glue")
+        for db in glue.get_databases().get("DatabaseList", []):
+            name = db["Name"]
+            if not name.startswith(AWS_LIVE_PREFIX.replace("-", "_")):
+                continue
+            with contextlib.suppress(Exception):
+                for tbl in glue.get_tables(DatabaseName=name).get("TableList", []):
+                    glue.delete_table(DatabaseName=name, Name=tbl["Name"])
+                glue.delete_database(Name=name)
+    # Kinesis streams.
+    with contextlib.suppress(Exception):
+        ks = _client("kinesis")
+        for name in ks.list_streams().get("StreamNames", []):
+            if name.startswith(AWS_LIVE_PREFIX):
+                with contextlib.suppress(Exception):
+                    ks.delete_stream(StreamName=name, EnforceConsumerDeletion=True)
+    # Lambda functions.
+    with contextlib.suppress(Exception):
+        lam = _client("lambda")
+        paginator = lam.get_paginator("list_functions")
+        for page in paginator.paginate():
+            for fn in page.get("Functions", []):
+                if fn["FunctionName"].startswith(AWS_LIVE_PREFIX):
+                    with contextlib.suppress(Exception):
+                        lam.delete_function(FunctionName=fn["FunctionName"])
+    # Step Functions state machines.
+    with contextlib.suppress(Exception):
+        sfn = _client("stepfunctions")
+        paginator = sfn.get_paginator("list_state_machines")
+        for page in paginator.paginate():
+            for sm in page.get("stateMachines", []):
+                if sm["name"].startswith(AWS_LIVE_PREFIX):
+                    with contextlib.suppress(Exception):
+                        sfn.delete_state_machine(stateMachineArn=sm["stateMachineArn"])
+    # Redshift Serverless — workgroups MUST go before namespaces. Both
+    # are billable while AVAILABLE; the workgroup at base-capacity-8
+    # alone is ~$2.88/hour, so this is the highest-impact sweep target.
+    with contextlib.suppress(Exception):
+        rs = _client("redshift-serverless")
+        for wg in rs.list_workgroups().get("workgroups", []):
+            if wg["workgroupName"].startswith(AWS_LIVE_PREFIX):
+                with contextlib.suppress(Exception):
+                    rs.delete_workgroup(workgroupName=wg["workgroupName"])
+        for ns in rs.list_namespaces().get("namespaces", []):
+            if ns["namespaceName"].startswith(AWS_LIVE_PREFIX):
+                with contextlib.suppress(Exception):
+                    rs.delete_namespace(namespaceName=ns["namespaceName"])
+
+
+def aws_real_iceberg_contract(
+    bucket: str, database: str, table: str, *, cid: str = "iac.aws.real"
+) -> Dict[str, Any]:
+    """An Iceberg-on-Glue contract for Stage 3, using real-AWS-safe names."""
+    return aws_iceberg_contract(bucket, database=database, table=table, cid=cid)
+
+
+def aws_real_role_arn(kind: str) -> str:
+    """Resolve one of the four bootstrap IAM role ARNs from the env."""
+    key = {
+        "lambda": "FLUID_AWS_LAMBDA_ROLE_ARN",
+        "sfn": "FLUID_AWS_SFN_ROLE_ARN",
+        "glue": "FLUID_AWS_GLUE_ROLE_ARN",
+        "spectrum": "FLUID_AWS_SPECTRUM_ROLE_ARN",
+    }[kind]
+    arn = os.environ.get(key)
+    if not arn:
+        raise RuntimeError(f"missing ${key} — Stage 3 bootstrap not applied?")
+    return arn
