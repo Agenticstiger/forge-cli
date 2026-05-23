@@ -38,6 +38,15 @@ from .generate_iac import _resolve_provider, native_actions
 
 def apply_via_opentofu(args, logger: logging.Logger) -> int:
     """Run ``fluid apply`` through the OpenTofu engine. Returns an exit code."""
+    # Plan-binding verification — must run BEFORE any tofu apply so a
+    # tampered plan.json is rejected before infra changes. The native
+    # apply path (cli/apply.py::_verify_plan_digests) had this gate; the
+    # OpenTofu cutover initially bypassed it, which silently disabled
+    # plan-binding for every cloud provider that cut over (aws / gcp /
+    # snowflake). This is the same gate, replicated here so the
+    # OpenTofu path matches the native path's stage-7 guarantee.
+    _verify_plan_binding_for_opentofu(args, logger)
+
     contract = _load_contract(args, logger)
     provider = _resolve_provider(contract, getattr(args, "provider", None) or "auto")
 
@@ -146,6 +155,63 @@ def resolve_apply_engine(args, logger: logging.Logger) -> str:
     except Exception:  # noqa: BLE001 — cannot classify the contract → safe default
         return "native"
     return resolve_engine(None, provider)
+
+
+def _verify_plan_binding_for_opentofu(args, logger: logging.Logger) -> None:
+    """Stage-7 plan-binding gate, OpenTofu-engine edition.
+
+    Mirrors :func:`fluid_build.cli.apply._verify_plan_digests` — same
+    semantics, replicated here to avoid a circular import (this module
+    is imported by ``cli/apply.py``). When the apply input is a
+    ``plan.json``, recompute ``planDigest`` over the plan body and
+    re-verify the ``bundleDigest`` if present.
+
+    Honours ``--no-verify-plan-binding`` (logged at WARNING). Plans
+    without a ``planDigest`` are treated as tamper signals.
+    """
+    src = str(getattr(args, "contract", "") or "")
+    if not src.endswith(".json"):
+        return  # raw contract input — no plan to verify
+    if getattr(args, "no_verify_plan_binding", False):
+        logger.warning(
+            "--no-verify-plan-binding: plan-binding verification was SKIPPED. "
+            "This is an emergency escape hatch; the apply may be running "
+            "against a tampered or stale plan. Make sure this is recorded "
+            "in the change log."
+        )
+        return
+    try:
+        with open(src, encoding="utf-8") as handle:
+            plan_data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CLIError(
+            1, "opentofu_engine_plan_unreadable",
+            {"error": f"{src}: {exc}"},
+        )
+    # Local import — keeps the plan_digest import + tarfile dependency
+    # off the hot path for raw-contract applies.
+    from ..forge.core.plan_digest import PlanBindingError, verify_plan_binding
+
+    # Find an adjacent .tgz bundle if present (no --bundle arg on the
+    # CLI today). The plan_digest module's verify_plan_binding accepts
+    # bundle_path=None and only enforces bundle verification when the
+    # plan carries a non-empty bundleDigest AND a bundle is available.
+    bundle_path = None
+    bundle_arg = getattr(args, "bundle", None)
+    if bundle_arg and Path(bundle_arg).exists():
+        bundle_path = Path(bundle_arg)
+    else:
+        candidate = Path(src).with_suffix(".tgz")
+        if candidate.exists():
+            bundle_path = candidate
+    try:
+        verify_plan_binding(plan_data, bundle_path=bundle_path)
+    except PlanBindingError as exc:
+        raise CLIError(
+            1,
+            f"apply_plan_digest_{exc.kind.replace('-', '_')}",
+            {"kind": exc.kind, "error": str(exc)},
+        )
 
 
 def _load_contract(args, logger: logging.Logger) -> Dict[str, Any]:
