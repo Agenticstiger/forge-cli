@@ -110,57 +110,57 @@ providers:
     resource_types: 9
     architecture: "Full BaseProvider with 5-phase planning"
     
+  # ODPI v4.1 — Open Data Product Initiative (Linux Foundation).
+  # Export-only single JSON document. Distinct from Bitol ODPS v1.0.0
+  # below. Reached via ``fluid opds --spec odpi-4.1``.
   odps:
     # MANUAL CONTROL
-    status: alpha
-    note: "Experimental - MaxCompute support in early stages"
+    status: beta
+    note: "ODPI v4.1 (Linux Foundation) export — legacy opt-in via --spec odpi-4.1"
     blockers:
-      - "Very early stage - needs foundational work"
-      - "Increase test coverage from 30%"
-      - "Complete basic resource types"
-    target_release: "future"
-    
+      - "Export-only; no import or apply"
+      - "Will be deprecated once Bitol ODPS covers all biz-lab use cases"
+    target_release: "deprecate-when-bitol-covers-all"
+
     # AUTO-UPDATED
     test_coverage: 30
     code_size: 1351
     last_tested: "2026-01-20T00:00:00Z"
-    
+
     # Provider metadata
     docs_complete: false
     resource_types: 2
-    architecture: "Legacy pattern (needs refactor to BaseProvider)"
-    blockers:
-      - "Refactor to use BaseProvider pattern"
-      - "Implement proper plan() and apply() methods"
-      - "Add basic error handling and retry logic"
-      - "Write README with setup instructions"
-      - "Add at least 1 integration test"
-    target_release: "1.1.0"
-    
+    architecture: "ODPI v4.1 exporter (FLUID → ODPI JSON)"
+
+  # Bitol Open Data Product Standard v1.0.0 — bidirectional provider with
+  # contractId resolution to per-port ODCS contracts. Canonical name for
+  # new work is ``odps_bitol``; the ``odps-standard`` legacy name remains
+  # registered for back-compat.
   odps_standard:
     # MANUAL CONTROL
     status: beta
-    note: "ODPS v1.0.0 export provider - production ready, well tested"
+    note: "Bitol ODPS v1.0.0 bidirectional provider with contractId resolver"
     blockers:
       - "Complete documentation with real-world examples"
       - "Add API integration tests (when backend available)"
     target_release: "0.9.0"
-    
+
     # AUTO-UPDATED
-    test_coverage: 100  # 25/25 tests passing
-    code_size: 479
-    last_tested: "2026-01-20T00:00:00Z"
-    
+    test_coverage: 100  # export 11 + import 15 + resolver 17 + 29 legacy = 72 tests
+    code_size: 1600  # provider + mappers + resolver + validation
+    last_tested: "2026-05-24T00:00:00Z"
+
     # Provider metadata
     docs_complete: true
-    resource_types: 0  # Export-only provider
-    architecture: "Export provider (FLUID → ODPS Standard v1.0.0)"
+    resource_types: 0  # Conversion provider
+    architecture: "Bidirectional (FLUID ↔ Bitol ODPS v1.0.0 + per-port ODCS)"
     features:
-      - "Export FLUID contracts to Bitol.io ODPS format"
+      - "Export FLUID contracts to Bitol ODPS v1.0.0 + sibling ODCS fragments"
+      - "Import ODPS / ODCS / directory bundles via three entry points"
+      - "ContractResolver: local file probes + http(s) fetch with cache"
+      - "Linking invariant enforced: port.contractId == odcs.id"
       - "Entropy Data marketplace integration"
-      - "PII detection and classification"
-      - "Team/owner extraction"
-      - "Unicode and special character support"
+      - "PII detection, team/owner extraction, unicode-safe"
     
   odcs:
     # MANUAL CONTROL
