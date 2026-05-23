@@ -844,6 +844,235 @@ def localstack_project(
 
 
 # ---------------------------------------------------------------------------
+# GCP Stage 2 — Docker-emulator harness (analogous to LocalStack)
+# ---------------------------------------------------------------------------
+#
+# Three emulator processes (all canonical ports, all OSS):
+#
+#   * goccy/bigquery-emulator   — HTTP 9050 / gRPC 9060
+#   * fsouza/fake-gcs-server    — HTTP 4443 (use ``-scheme http``)
+#   * gcloud beta emulators pubsub — TCP 8085
+#
+# The tofu ``hashicorp/google`` provider exposes per-service
+# ``*_custom_endpoint`` knobs (``bigquery_custom_endpoint``,
+# ``storage_custom_endpoint``, ``pubsub_custom_endpoint``) — the override
+# block emitted here aims those at the three emulators while the
+# plugin's ``main.tf.json`` stays portable + credential-free.
+#
+# Quad-gated, same shape as LocalStack:
+#   * ``tofu`` on PATH
+#   * the three emulators reachable on their TCP ports
+#   * the explicit opt-in ``FLUID_IAC_LIVE_GCP_EMULATOR=1``
+#
+# Why not testcontainers-python? The existing LocalStack fixture style
+# is small, well-understood, and lets the GCP suite stay parallel to
+# the AWS suite. Adding a dependency to manage 3 short-lived containers
+# wouldn't pay for itself. See
+# ``tests/iac/_gcp_emulator/docker-compose.yml`` for the recommended
+# local startup; CI runs the same compose file before invoking pytest.
+
+
+GCP_EMULATOR_BIGQUERY = os.environ.get(
+    "FLUID_GCP_BIGQUERY_EMULATOR", "http://localhost:9050"
+)
+GCP_EMULATOR_STORAGE = os.environ.get(
+    "FLUID_GCP_STORAGE_EMULATOR", "http://localhost:4443"
+)
+GCP_EMULATOR_PUBSUB = os.environ.get("PUBSUB_EMULATOR_HOST", "localhost:8085")
+GCP_EMULATOR_PROJECT = os.environ.get("FLUID_GCP_EMULATOR_PROJECT", "fluid-emulator")
+
+
+def _gcp_emulator_port_reachable(host_and_port: str, default_port: int) -> bool:
+    """TCP-probe a ``host:port`` pair with a 2 s timeout."""
+    import socket as _socket
+
+    host, _, port = host_and_port.replace("http://", "").replace("https://", "").partition(":")
+    try:
+        with _socket.socket() as sock:
+            sock.settimeout(2)
+            return sock.connect_ex((host or "localhost", int(port or default_port))) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _gcp_emulator_ready() -> tuple[bool, str]:
+    """Return ``(enabled, skip_reason)`` for the GCP Stage-2 emulator tier."""
+    if runner.tofu_path() is None:
+        return False, "the `tofu` (OpenTofu) binary is not on PATH"
+    if os.environ.get("FLUID_IAC_LIVE_GCP_EMULATOR", "").strip().lower() not in _TRUE:
+        return False, (
+            "GCP emulator tests are opt-in — set FLUID_IAC_LIVE_GCP_EMULATOR=1 "
+            "and start the emulators (tests/iac/_gcp_emulator/docker-compose.yml)"
+        )
+    missing: List[str] = []
+    if not _gcp_emulator_port_reachable(GCP_EMULATOR_BIGQUERY, 9050):
+        missing.append(f"BigQuery emulator at {GCP_EMULATOR_BIGQUERY}")
+    if not _gcp_emulator_port_reachable(GCP_EMULATOR_STORAGE, 4443):
+        missing.append(f"GCS emulator at {GCP_EMULATOR_STORAGE}")
+    if not _gcp_emulator_port_reachable(GCP_EMULATOR_PUBSUB, 8085):
+        missing.append(f"Pub/Sub emulator at {GCP_EMULATOR_PUBSUB}")
+    if missing:
+        return False, "GCP emulators not reachable: " + " / ".join(missing)
+    return True, ""
+
+
+GCP_EMULATOR_ENABLED, GCP_EMULATOR_SKIP_REASON = _gcp_emulator_ready()
+
+
+def gcp_provider_override(
+    *,
+    project: str = GCP_EMULATOR_PROJECT,
+    bigquery_endpoint: str = GCP_EMULATOR_BIGQUERY,
+    storage_endpoint: str = GCP_EMULATOR_STORAGE,
+    pubsub_endpoint: str = GCP_EMULATOR_PUBSUB,
+) -> Dict[str, Any]:
+    """A sidecar ``provider`` block aiming the google provider at the
+    three local emulators.
+
+    Each provider field is required-by-default for the matching API
+    surface. Note the provider's idiosyncratic naming:
+        ``big_query_custom_endpoint``  (underscore in big_query!)
+        ``storage_custom_endpoint``
+        ``pubsub_custom_endpoint``
+    Trailing-slash conventions match the provider's own examples.
+    """
+    bq = bigquery_endpoint.rstrip("/")
+    gcs = storage_endpoint.rstrip("/")
+    ps = pubsub_endpoint
+    if not ps.startswith("http"):
+        ps = f"http://{ps}"
+    return {
+        "provider": {
+            "google": {
+                "project": project,
+                "big_query_custom_endpoint": f"{bq}/bigquery/v2/",
+                "storage_custom_endpoint": f"{gcs}/storage/v1/",
+                "pubsub_custom_endpoint": f"{ps}/v1/",
+                # The emulators ignore auth; an in-memory dummy token
+                # stops the provider from looking for ADC.
+                "access_token": "emulator-dummy-token",
+            }
+        }
+    }
+
+
+def gcp_emulator_bigquery_client(*, project: str = GCP_EMULATOR_PROJECT):
+    """A ``google.cloud.bigquery.Client`` pointed at the BigQuery emulator."""
+    from google.cloud import bigquery
+    from google.api_core.client_options import ClientOptions
+    from google.auth.credentials import AnonymousCredentials
+
+    return bigquery.Client(
+        project=project,
+        credentials=AnonymousCredentials(),
+        client_options=ClientOptions(api_endpoint=GCP_EMULATOR_BIGQUERY),
+    )
+
+
+def gcp_emulator_storage_client(*, project: str = GCP_EMULATOR_PROJECT):
+    """A ``google.cloud.storage.Client`` pointed at the fake-gcs-server."""
+    from google.cloud import storage as _storage
+    from google.auth.credentials import AnonymousCredentials
+
+    client = _storage.Client(
+        project=project,
+        credentials=AnonymousCredentials(),
+        client_options={"api_endpoint": GCP_EMULATOR_STORAGE},
+    )
+    return client
+
+
+class GcpEmulatorProject:
+    """A per-test ``tofu`` workdir pinned at the three GCP emulators.
+
+    Mirrors :class:`LocalStackProject` — emit + init + plan + apply +
+    destroy, with the provider-override sidecar overlaying the plugin's
+    portable ``main.tf.json``.
+    """
+
+    def __init__(self, workdir: Path, env: Mapping[str, str], *,
+                 project: str = GCP_EMULATOR_PROJECT) -> None:
+        self.workdir = workdir
+        self.env = dict(env)
+        # The emulators ignore credentials; the dummy access token stops
+        # the provider from trying to resolve real ADC.
+        self.env["GOOGLE_OAUTH_ACCESS_TOKEN"] = "emulator-dummy-token"
+        self.project = project
+        self.applied = False
+
+    def emit(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        actions: Sequence[Mapping[str, Any]] = (),
+    ) -> str:
+        plugin = get_iac_plugin("gcp")
+        text = build_module(plugin, contract, actions=actions)
+        (self.workdir / "main.tf.json").write_text(text, encoding="utf-8")
+        (self.workdir / "provider.tf.json").write_text(
+            json.dumps(gcp_provider_override(project=self.project)),
+            encoding="utf-8",
+        )
+        return text
+
+    def init(self):
+        return runner.tofu_init(str(self.workdir), backend=False, env=self.env)
+
+    def plan(self):
+        return runner.tofu_plan(str(self.workdir), env=self.env)
+
+    def apply(self):
+        result = runner.tofu_apply(str(self.workdir), env=self.env)
+        self.applied = True
+        return result
+
+    def destroy(self):
+        return runner.tofu_destroy(str(self.workdir), env=self.env)
+
+    def apply_ok(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        actions: Sequence[Mapping[str, Any]] = (),
+    ):
+        self.emit(contract, actions=actions)
+        init = self.init()
+        assert init.ok, f"tofu init failed:\n{init.stderr or init.stdout}"
+        plan = self.plan()
+        assert plan.ok, f"tofu plan failed:\n{plan.stderr or plan.stdout}"
+        applied = self.apply()
+        assert applied.ok, f"tofu apply failed:\n{applied.stderr or applied.stdout}"
+        return applied
+
+
+@pytest.fixture
+def gcp_emulator_project(
+    tofu_env: Dict[str, str], tmp_path: Path
+) -> Iterator[GcpEmulatorProject]:
+    """A :class:`GcpEmulatorProject` bound to a fresh workdir.
+
+    The emulators reset their state on container restart but not between
+    individual ``tofu apply`` invocations, so per-test resource names
+    should be unique (use ``aws_real_project``-style UUID suffixes if
+    multiple tests touch the same dataset/bucket/topic).
+
+    Teardown: best-effort ``tofu destroy``. Failures during destroy do
+    not fail the test — emulator semantics around resource lifecycle
+    are looser than real GCP, and a subsequent emulator restart wipes
+    state anyway.
+    """
+    if not GCP_EMULATOR_ENABLED:
+        pytest.skip(GCP_EMULATOR_SKIP_REASON)
+    project = GcpEmulatorProject(tmp_path, tofu_env)
+    try:
+        yield project
+    finally:
+        if project.applied:
+            with contextlib.suppress(Exception):
+                project.destroy()
+
+
+# ---------------------------------------------------------------------------
 # Pure-data AWS contract / action builders — importable from test modules
 # ---------------------------------------------------------------------------
 
