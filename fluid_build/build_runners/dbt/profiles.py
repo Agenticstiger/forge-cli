@@ -267,12 +267,25 @@ def _build_generated_dbt_profile(
     if platform in {"aws", "redshift"}:
         cluster_id = resources.get("cluster_id") or os.getenv("REDSHIFT_CLUSTER_ID")
         iam_profile = os.getenv("REDSHIFT_IAM_PROFILE") or os.getenv("AWS_PROFILE")
-        use_iam = bool(cluster_id) and bool(iam_profile or os.getenv("REDSHIFT_USE_IAM"))
+        # Redshift Serverless: contract carries a workgroup (and optionally
+        # a namespace) instead of a provisioned cluster_id. dbt-redshift
+        # 1.9+ talks to Serverless via ``method: iam`` +
+        # ``is_serverless: true`` + ``serverless_work_group`` — no static
+        # admin password needed; AWS_PROFILE-based IAM auth resolves
+        # temporary creds via ``redshift-serverless:GetCredentials``.
+        workgroup = (
+            resources.get("workgroup")
+            or resources.get("serverless_work_group")
+            or os.getenv("REDSHIFT_SERVERLESS_WORKGROUP")
+        )
+        use_iam = bool(iam_profile or os.getenv("REDSHIFT_USE_IAM")) and bool(
+            cluster_id or workgroup
+        )
 
         output = {
             "type": "redshift",
             "host": resources.get("host") or os.getenv("REDSHIFT_HOST", ""),
-            "user": os.getenv("REDSHIFT_USER", ""),
+            "user": resources.get("user") or os.getenv("REDSHIFT_USER", ""),
             "port": int(resources.get("port") or os.getenv("REDSHIFT_PORT") or 5439),
             "dbname": resources.get("database") or os.getenv("REDSHIFT_DATABASE", ""),
             "schema": resources.get("schema") or "public",
@@ -281,12 +294,34 @@ def _build_generated_dbt_profile(
 
         if use_iam:
             output["method"] = "iam"
-            output["cluster_id"] = cluster_id
             if iam_profile:
                 output["iam_profile"] = iam_profile
-            region = os.getenv("REDSHIFT_REGION") or os.getenv("AWS_REGION")
+            region = (
+                resources.get("region")
+                or os.getenv("REDSHIFT_REGION")
+                or os.getenv("AWS_REGION")
+            )
             if region:
                 output["region"] = region
+            if workgroup:
+                # Serverless: dbt-redshift derives the endpoint host from
+                # ``serverless_work_group`` + region + acct_id (no
+                # cluster_id). Host stays blank so dbt picks the Serverless
+                # path. ``serverless_acct_id`` is required by dbt-redshift
+                # 1.10+ when ``is_serverless`` is true.
+                output["is_serverless"] = True
+                output["serverless_work_group"] = str(workgroup)
+                acct = (
+                    resources.get("account_id")
+                    or resources.get("serverless_acct_id")
+                    or os.getenv("AWS_ACCOUNT_ID")
+                )
+                if acct:
+                    output["serverless_acct_id"] = str(acct)
+                # Serverless has no cluster_id; clear any stale value.
+                output.pop("cluster_id", None)
+            elif cluster_id:
+                output["cluster_id"] = cluster_id
         else:
             output["password"] = os.getenv("REDSHIFT_PASSWORD", "")
 

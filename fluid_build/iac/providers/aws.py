@@ -156,6 +156,18 @@ class AwsIacPlugin:
         return {}
 
 
+#: Bindings whose ``location.database`` field names a Glue catalog
+#: database (the mesh-interface case). For Redshift-flavoured formats
+#: the ``database`` field names a *Redshift* database internal to the
+#: workgroup and must NOT trigger a Glue catalog emit — doing so used
+#: to create a phantom Glue DB called ``"fluid"`` per Redshift test
+#: that collided across runs and broke applies with
+#: ``AlreadyExistsException``.
+_GLUE_CATALOG_FORMATS: frozenset = frozenset(
+    {"iceberg", "parquet", "csv", "json", "avro", "orc", "delta"}
+)
+
+
 def _emit_glue(
     resources: Dict[str, Any],
     loc: Mapping[str, Any],
@@ -166,6 +178,11 @@ def _emit_glue(
 ) -> None:
     database = loc.get("database")
     if not database:
+        return
+    # Only file/lakehouse formats use the Glue catalog as their
+    # storage-and-schema registry. Redshift-flavoured bindings (whose
+    # ``database`` is internal to the workgroup) skip this emit.
+    if str(fmt or "").lower() not in _GLUE_CATALOG_FORMATS:
         return
     db_name = safe_ident(f"{cid}_{database}")
     resources.setdefault("aws_glue_catalog_database", {}).setdefault(db_name, {"name": database})
