@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Bitol ODPS v1.0.0 — bidirectional provider** (`BitolOdpsProvider`,
+  registered as `odps_bitol`; back-compat alias `odps-standard`).
+  Export emits the canonical fragments layout: 1 ODPS doc + N sibling
+  `<contractId>.odcs.yaml` files; the linking invariant
+  `port.contractId == odcs.id` is enforced and asserted in tests.
+- **`ContractResolver`** — resolves port `contractId` references through
+  local probes + http(s) fetch + cache; refuses HTML-with-200 and
+  non-http(s) schemes; `--no-remote` hermetic mode.
+- **Three import entry points** for `fluid opds import`: single ODPS
+  file, directory bundle (ODPS + sibling ODCS, or ODCS-only), or a lone
+  ODCS file. All converge on one validated FLUID.
+- **`fluid opds export --spec bitol-1.0.0|odpi-4.1`** — `--spec`
+  dispatcher with Bitol ODPS v1.0.0 default; ODPI v4.1 opt-in for
+  back-compat. `--out-dir`, `--validate-strict`, `--format` flags.
+  Legacy `--version 4.1` survives as a hidden deprecated alias.
+- **`fluid forge --seed-from <path>`** — copilot accepts an ODCS
+  contract, a Bitol ODPS product file, or a directory bundle as a
+  structural seed. The seed's schema/quality/qos are ground truth.
+  Pre-processor at `fluid_build.cli.forge_copilot_seed.load_seed`;
+  `--seed-no-remote` flag for hermetic CI.
+- **ODCS bidirectional provider — modular architecture.** `providers/odcs/`
+  split into `provider.py` + `mappers/{metadata,team,schema,servers,
+  sla,quality,types}.py` + `validation.py` + `io.py`. Pure-function
+  mappers with paired `to_fluid()` / `to_odcs()`; per-level
+  `odcs_passthrough` buckets preserve unmodeled ODCS fields for
+  lossless round-trip. `OdcsProvider.roundtrip_check()` returns a
+  structured diff used by tests and the forge ground-truth guard.
+
+### Changed
+- **ODCS schema validation default-on with warn-on-fail.** Vendored
+  ODCS v3.1.0 JSON Schema now runs on every export by default
+  (`ODCS_VALIDATE=true`); failures warn rather than raise. Hard fail
+  via `ODCS_VALIDATE_STRICT=true` or by calling `validate_contract()`.
+- **ODCS type table now exhaustive against the FLUID 0.7.3 column-type
+  enum** (79 types). Drift guard in
+  `tests/providers/test_odcs_type_mapping.py` fails CI if a new FLUID
+  schema type is missing from `_FLUID_TYPE_TO_ODCS_LOGICAL`.
+- **Bitol ODPS input ports — three-source merge.** `ports.py::to_odps()`
+  walks `consumes[]` (FLUID 0.7.2 canonical), `builds[]` (SDP source
+  streams), and `expects[]` (FLUID 0.7.1 legacy) — de-duped by name.
+  Uses upstream's `util.contract.consumes_to_canonical_ports` +
+  `builds_to_canonical_input_ports` for the normalization.
+
 ## [0.8.3rc1] — 2026-05-12
 
 Pre-release candidate of the first stable line after `v0.8.0`. Stacks the
