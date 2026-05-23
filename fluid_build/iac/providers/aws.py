@@ -211,7 +211,17 @@ def _emit_glue(
     if str(fmt or "").lower() not in _GLUE_CATALOG_FORMATS:
         return
     db_name = safe_ident(f"{cid}_{database}")
-    resources.setdefault("aws_glue_catalog_database", {}).setdefault(db_name, {"name": database})
+    # ``parameters`` and other Lake-Formation-managed fields drift
+    # post-create (AWS sets things like ``CreatedBy``,
+    # ``last_commit_time``, LF auto-flags). See the table emit below
+    # for the same rationale.
+    resources.setdefault("aws_glue_catalog_database", {}).setdefault(
+        db_name,
+        {
+            "name": database,
+            "lifecycle": {"ignore_changes": ["parameters"]},
+        },
+    )
 
     table = loc.get("table")
     if not table:
@@ -230,6 +240,17 @@ def _emit_glue(
         "table_type": "EXTERNAL_TABLE",
         "parameters": parameters,
         "storage_descriptor": storage,
+        # AWS Glue silently augments tables post-create with operational
+        # parameters (``CrawlerSchemaDeserializerVersion``,
+        # ``UPDATED_BY_CRAWLER``, Lake Formation auto-flags, last-updated
+        # timestamps, ...). Re-applying our credentials-free .tf.json
+        # would then plan an "update" to reset those — non-idempotent
+        # churn that has no semantic effect. ``ignore_changes`` on the
+        # whole ``parameters`` map keeps post-apply state aligned;
+        # forge-cli's own parameters (``classification`` / ``managed_by``
+        # / ``table_type``) ARE set on Create so they always start
+        # correctly. Same rationale for the Glue catalog database below.
+        "lifecycle": {"ignore_changes": ["parameters"]},
     }
 
 
