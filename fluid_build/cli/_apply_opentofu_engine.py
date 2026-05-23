@@ -6,11 +6,12 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""The OpenTofu apply engine — ``fluid apply --engine opentofu``.
+"""The OpenTofu apply engine behind ``fluid apply``.
 
 Compiles the contract to a ``.tf.json`` module and delegates to ``tofu``
-(init → plan → apply) instead of forge-cli's native per-cloud apply.
-Fully isolated: the native engine remains the default and is untouched.
+(init → plan → apply). Engine selection is automatic and per-provider —
+the cloud providers route here, ``local`` keeps its native apply; there
+is no user-facing engine switch.
 
 Flow: load contract → emit ``.tf.json`` (+ optional remote backend) →
 ``tofu init`` → ``tofu plan`` (the review point; ``--mode dry-run`` stops
@@ -28,10 +29,11 @@ from fluid_build.cli.console import cprint
 from fluid_build.iac import build_module, get_iac_plugin, runner
 from fluid_build.iac.backend import parse_backend
 from fluid_build.iac.credentials import build_tofu_env, credential_report
+from fluid_build.iac.naming import safe_ident
 
-from ._common import CLIError, load_contract_with_overlay
+from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
 from ._logging import info
-from .generate_iac import _resolve_provider
+from .generate_iac import _resolve_provider, native_actions
 
 
 def apply_via_opentofu(args, logger: logging.Logger) -> int:
@@ -51,18 +53,32 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
             1,
             "opentofu_engine_no_tofu",
             {
-                "error": "the `tofu` binary is required for --engine opentofu — "
-                "install it from https://opentofu.org/docs/intro/install/"
+                "error": "the `tofu` binary is required to provision cloud "
+                "infrastructure — install it from "
+                "https://opentofu.org/docs/intro/install/"
             },
         )
 
     backend = parse_backend(getattr(args, "state_backend", None))
-    workdir = Path(getattr(args, "workspace_dir", None) or ".") / ".fluid" / "iac" / provider
+    # Per-contract workdir + state: each contract owns an isolated ``tofu``
+    # state, so applying contract B never plans to destroy contract A's
+    # resources (they share the provider but not the state).
+    workdir = (
+        Path(getattr(args, "workspace_dir", None) or ".")
+        / ".fluid"
+        / "iac"
+        / provider
+        / safe_ident(contract.get("id") or "contract")
+    )
     workdir.mkdir(parents=True, exist_ok=True)
     module_path = workdir / "main.tf.json"
-    module_path.write_text(build_module(plugin, contract, backend=backend), encoding="utf-8")
+    actions = native_actions(contract, logger)
+    module_path.write_text(
+        build_module(plugin, contract, actions=actions, backend=backend), encoding="utf-8"
+    )
 
     env = build_tofu_env()
+    env.update(plugin.credential_env(env))
     present, _absent = credential_report(plugin, env)
 
     cprint(f"\nOpenTofu engine — provider: {provider}")
@@ -73,6 +89,8 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     init = runner.tofu_init(str(workdir), backend=backend is not None, env=env)
     if not init.ok:
         raise CLIError(1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)})
+
+    _adopt_existing(plugin, contract, actions, str(workdir), env, logger)
 
     plan = runner.tofu_plan(str(workdir), env=env)
     if not plan.ok:
@@ -106,12 +124,38 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
         )
     applied = runner.change_summary(apply_result)
     cprint(f"\n  tofu apply complete: +{applied['add']} ~{applied['change']} -{applied['remove']}")
+
     info(logger, "opentofu_apply_ok", provider=provider, **applied)
     return 0
 
 
+def resolve_apply_engine(args, logger: logging.Logger) -> str:
+    """Resolve the apply engine for ``fluid apply`` — automatic, per-provider.
+
+    There is no user-facing engine switch: the cloud providers (all cut
+    over) compile the contract to ``.tf.json`` and run ``tofu``; ``local``
+    keeps its native apply. The per-provider mapping lives in
+    ``iac.cutover``. Any failure to classify the contract falls back to
+    ``native`` — the safe default.
+    """
+    from fluid_build.iac.cutover import resolve_engine
+
+    try:
+        contract = _load_contract(args, logger)
+        provider = _resolve_provider(contract, getattr(args, "provider", None) or "auto")
+    except Exception:  # noqa: BLE001 — cannot classify the contract → safe default
+        return "native"
+    return resolve_engine(None, provider)
+
+
 def _load_contract(args, logger: logging.Logger) -> Dict[str, Any]:
-    """Load the contract dict from a ``.fluid.yaml`` file or a ``.json`` plan."""
+    """Load the contract dict from a ``.fluid.yaml`` file or a ``.json`` plan.
+
+    ``{{ env.* }}`` placeholders are resolved before the contract reaches the
+    emitter — the OpenTofu data-plane is emitted straight from the contract's
+    ``exposes[]``, so an unresolved template would otherwise land verbatim in
+    the ``.tf.json``.
+    """
     src = str(args.contract)
     if src.endswith(".json"):
         with open(src, encoding="utf-8") as handle:
@@ -123,8 +167,47 @@ def _load_contract(args, logger: logging.Logger) -> Dict[str, Any]:
                 "opentofu_engine_no_contract",
                 {"error": f"{src}: plan has no embedded contract"},
             )
-        return contract
-    return load_contract_with_overlay(src, getattr(args, "env", None), logger)
+    else:
+        contract = load_contract_with_overlay(src, getattr(args, "env", None), logger)
+    return resolve_env_templates_in_contract(contract)
+
+
+def _adopt_existing(
+    plugin: Any,
+    contract: Mapping[str, Any],
+    actions: Any,
+    workdir: str,
+    env: Mapping[str, str],
+    logger: logging.Logger,
+) -> None:
+    """Brownfield adoption — ``tofu import`` each declared resource that
+    already exists in the cloud, so ``tofu apply`` reconciles it instead of
+    failing "already exists" against pre-provisioned infrastructure.
+
+    Best-effort: a candidate already in state is skipped; one that does not
+    exist in the cloud fails to import and is left for ``tofu apply`` to
+    create. Genuine apply-time errors still surface from ``tofu apply``.
+    """
+    candidates = plugin.discover_imports(contract, actions)
+    if not candidates:
+        return
+    in_state = set(runner.tofu_state_list(workdir, env=env))
+    adopted = 0
+    for block in candidates:
+        if block.to in in_state:
+            continue
+        result = runner.tofu_import(workdir, block.to, block.id, env=env)
+        if result.ok:
+            adopted += 1
+        else:
+            logger.debug(
+                "opentofu: import skipped %s (id=%s): %s",
+                block.to,
+                block.id,
+                _tail(result.stderr or result.stdout, 200),
+            )
+    if adopted:
+        cprint(f"  brownfield:  adopted {adopted} pre-existing resource(s) into state")
 
 
 def _data_loss_blocked(changes: Mapping[str, int], allow_data_loss: bool) -> bool:

@@ -8,9 +8,9 @@
 
 """IaC plugin registry.
 
-Keyed by cloud name — a distinct axis from ``infra.register_generator``
-(artifact target) and ``providers.register_provider`` (apply provider).
-Mirrors the shape of those registries so the pattern is familiar.
+Keyed by cloud name — a distinct axis from ``providers.register_provider``
+(the apply-provider registry). Mirrors that registry's shape so the
+pattern is familiar.
 """
 
 from __future__ import annotations

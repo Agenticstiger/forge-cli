@@ -21,7 +21,7 @@ multiple providers, handles dependencies, manages rollbacks, and ensures
 comprehensive observability throughout the deployment process.
 
 Key Responsibilities:
-- Infrastructure provisioning (Terraform, Cloud resources)
+- Infrastructure provisioning (OpenTofu engine, cloud resources)
 - Data transformation execution (dbt, Spark, SQL)
 - Quality gate enforcement (tests, validations, SLA checks)
 - Governance policy application (security, compliance, discovery)
@@ -433,14 +433,8 @@ def register(subparsers: argparse._SubParsersAction):
         "--provider-config", help="Path to provider-specific configuration file"
     )
     advanced_group.add_argument(
-        "--engine",
-        choices=["native", "opentofu"],
-        default="native",
-        help="Apply engine — native (default), or opentofu (compile to .tf.json and run tofu)",
-    )
-    advanced_group.add_argument(
         "--state-backend",
-        help="OpenTofu remote state backend for --engine opentofu "
+        help="OpenTofu remote state backend for cloud apply "
         "(s3://bucket/key or gcs://bucket/prefix)",
     )
 
@@ -746,13 +740,26 @@ def run(args, logger: logging.Logger) -> int:
         mode=resolved_mode.value,
     )
 
-    # Opt-in OpenTofu apply engine — compile the contract to `.tf.json`
-    # and delegate to `tofu`. Fully isolated; the native path below is
-    # the default and is unchanged.
-    if getattr(args, "engine", "native") == "opentofu":
-        from fluid_build.cli._apply_opentofu_engine import apply_via_opentofu
+    # Apply-engine resolution is automatic and per-provider — no user
+    # switch. The cloud providers compile the contract to `.tf.json` and
+    # delegate to `tofu`; `local` keeps the native path below.
+    from fluid_build.cli._apply_opentofu_engine import (
+        apply_via_opentofu,
+        resolve_apply_engine,
+    )
 
-        return apply_via_opentofu(args, logger)
+    if resolve_apply_engine(args, logger) == "opentofu":
+        rc = apply_via_opentofu(args, logger)
+        # The OpenTofu engine provisions infrastructure only. Build-augmented
+        # modes (amend-and-build / replace-and-build) still need their build
+        # phase to run — mirror the native dispatch below so ``--build`` is
+        # not silently dropped on the cloud-provider path.
+        if rc == 0 and needs_build(resolved_mode):
+            args.build_id = resolved_build_id
+            from fluid_build.build_runners import run_builds_from_args
+
+            return run_builds_from_args(args, logger, force_run=True)
+        return rc
 
     try:
         # --- Build execution mode (absorbed from legacy 'fluid execute') ---

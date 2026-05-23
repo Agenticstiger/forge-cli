@@ -21,9 +21,11 @@ dbt-adapter pattern).
 from __future__ import annotations
 
 from .base import IacProviderPlugin
+from .cutover import OPENTOFU_DEFAULT_PROVIDERS, default_engine, resolve_engine
 from .importer import ImportBlock
 from .module import assemble_tofu_document, build_module, render_tofu_json
 from .registry import IAC_PLUGINS, get_iac_plugin, register_iac_plugin
+from .shadow import LogicalResource, ShadowReport, shadow_compare
 from .versions import PROVIDER_PINS, REQUIRED_TOFU_VERSION, required_providers
 
 __all__ = [
@@ -38,6 +40,12 @@ __all__ = [
     "PROVIDER_PINS",
     "REQUIRED_TOFU_VERSION",
     "required_providers",
+    "OPENTOFU_DEFAULT_PROVIDERS",
+    "default_engine",
+    "resolve_engine",
+    "LogicalResource",
+    "ShadowReport",
+    "shadow_compare",
 ]
 
 

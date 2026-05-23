@@ -6,7 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Credential plumbing for ``fluid apply --engine opentofu``.
+"""Credential plumbing for ``fluid apply`` (the OpenTofu engine).
 
 The ``tofu`` child process inherits the full environment, so cloud
 credentials present in the environment (or in standard credential files

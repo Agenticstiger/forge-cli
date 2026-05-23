@@ -24,3 +24,26 @@ def safe_ident(value: Any) -> str:
     if cleaned[0].isdigit():
         cleaned = f"r_{cleaned}"
     return cleaned
+
+
+class TofuExpr(str):
+    """A string the emitter built as a deliberate OpenTofu expression — a
+    resource cross-reference like ``${google_bigquery_dataset.x.dataset_id}``.
+
+    ``render_tofu_json`` escapes ``${`` / ``%{`` in every *contract-derived*
+    string so a contract cannot inject OpenTofu interpolation, but leaves
+    ``TofuExpr`` values untouched. Only ever construct one from emitter-
+    controlled text (literal resource types/attributes + ``safe_ident``
+    output) — never from raw contract content.
+    """
+
+    __slots__ = ()
+
+
+def tofu_ref(expression: str) -> TofuExpr:
+    """Wrap an emitter-built interpolation ``expression`` as ``${expression}``.
+
+    For resource cross-references only. The renderer leaves the result
+    un-escaped; every non-``TofuExpr`` string is treated as a literal.
+    """
+    return TofuExpr("${" + expression + "}")

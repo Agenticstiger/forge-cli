@@ -146,6 +146,39 @@ def tofu_destroy(workdir: str, *, env: Optional[Mapping[str, str]] = None) -> To
     )
 
 
+def tofu_state_list(workdir: str, *, env: Optional[Mapping[str, str]] = None) -> List[str]:
+    """``tofu state list`` — resource addresses currently tracked in state.
+
+    Returns an empty list when there is no state yet (fresh workdir) or the
+    command fails — callers treat "not in state" as "not yet adopted".
+    """
+    result = _run(["state", "list"], workdir=workdir, env=env, command="state-list")
+    if not result.ok:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def tofu_import(
+    workdir: str,
+    address: str,
+    resource_id: str,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> TofuResult:
+    """``tofu import`` — adopt one pre-existing cloud resource into state.
+
+    Best-effort by design: importing a resource that does not exist fails
+    with a clear provider error, which the caller tolerates (the resource
+    is then created by ``tofu apply`` instead).
+    """
+    return _run(
+        ["import", "-input=false", "-no-color", address, resource_id],
+        workdir=workdir,
+        env=env,
+        command="import",
+    )
+
+
 def change_summary(result: TofuResult) -> Dict[str, int]:
     """Extract the ``{add, change, remove}`` counts from a plan/apply result."""
     for event in result.events:
