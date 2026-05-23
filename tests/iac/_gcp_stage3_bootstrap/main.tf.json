@@ -1,0 +1,102 @@
+{
+  "//": "Stage 3 GCP bootstrap — provisions the fluid-iactest-runner service account, the project-level role bindings the live tests need, and the impersonation grant from the runner's user principal. Run once per GCP project. The test suite gates on ``FLUID_IAC_LIVE_GCP=1`` plus reachable ADC.",
+
+  "terraform": {
+    "required_version": ">= 1.6",
+    "required_providers": {
+      "google": {
+        "source": "hashicorp/google",
+        "version": "~> 6.0"
+      }
+    }
+  },
+
+  "provider": {
+    "google": {
+      "project": "${var.project_id}",
+      "region": "${var.region}"
+    }
+  },
+
+  "variable": {
+    "project_id": {
+      "type": "string",
+      "description": "GCP project ID hosting the Stage-3 test resources."
+    },
+    "region": {
+      "type": "string",
+      "default": "europe-west1",
+      "description": "Default region for regional resources (BQ datasets, Cloud Run services, etc.)."
+    },
+    "user_principal": {
+      "type": "string",
+      "description": "IAM principal that will impersonate the test SA. Format: ``user:alice@example.com`` or ``group:eng@example.com``. Granted ``roles/iam.serviceAccountTokenCreator`` on the SA so ADC-based impersonation works without service-account key files (which the project's org policy blocks)."
+    }
+  },
+
+  "resource": {
+    "google_project_service": {
+      "bigquery":              {"project": "${var.project_id}", "service": "bigquery.googleapis.com",           "disable_on_destroy": false},
+      "storage":               {"project": "${var.project_id}", "service": "storage.googleapis.com",            "disable_on_destroy": false},
+      "pubsub":                {"project": "${var.project_id}", "service": "pubsub.googleapis.com",             "disable_on_destroy": false},
+      "iam":                   {"project": "${var.project_id}", "service": "iam.googleapis.com",                "disable_on_destroy": false},
+      "iamcredentials":        {"project": "${var.project_id}", "service": "iamcredentials.googleapis.com",     "disable_on_destroy": false},
+      "cloudresourcemanager":  {"project": "${var.project_id}", "service": "cloudresourcemanager.googleapis.com","disable_on_destroy": false},
+      "serviceusage":          {"project": "${var.project_id}", "service": "serviceusage.googleapis.com",       "disable_on_destroy": false}
+    },
+
+    "google_service_account": {
+      "fluid_test_runner": {
+        "account_id": "fluid-iactest-runner",
+        "display_name": "Fluid Stage 3 test runner",
+        "project": "${var.project_id}",
+        "description": "Service account impersonated by tests/iac/test_iac_gcp_real_e2e.py. Provisioned + destroyed per test via tofu, identity scoped to fluid-iactest-* resources."
+      }
+    },
+
+    "google_project_iam_member": {
+      "sa_bigquery": {
+        "project": "${var.project_id}",
+        "role":    "roles/bigquery.admin",
+        "member":  "serviceAccount:${google_service_account.fluid_test_runner.email}"
+      },
+      "sa_storage": {
+        "project": "${var.project_id}",
+        "role":    "roles/storage.admin",
+        "member":  "serviceAccount:${google_service_account.fluid_test_runner.email}"
+      },
+      "sa_pubsub": {
+        "project": "${var.project_id}",
+        "role":    "roles/pubsub.admin",
+        "member":  "serviceAccount:${google_service_account.fluid_test_runner.email}"
+      },
+      "sa_sa_user": {
+        "//": "The SA needs ``iam.serviceAccountUser`` on itself so that tofu (impersonating it) can attach the SA to Cloud Run / Composer / etc. during apply. Also lets the SA pass itself to BigQuery scheduled queries.",
+        "project": "${var.project_id}",
+        "role":    "roles/iam.serviceAccountUser",
+        "member":  "serviceAccount:${google_service_account.fluid_test_runner.email}"
+      },
+      "sa_token_creator": {
+        "//": "Needed so the SA can mint tokens for ADC-style impersonation chains (e.g. a Cloud Run service impersonating this SA at runtime).",
+        "project": "${var.project_id}",
+        "role":    "roles/iam.serviceAccountTokenCreator",
+        "member":  "serviceAccount:${google_service_account.fluid_test_runner.email}"
+      }
+    },
+
+    "google_service_account_iam_member": {
+      "user_can_impersonate": {
+        "//": "Grants the runner's user principal ``serviceAccountTokenCreator`` on the test SA. Combined with ADC, this lets tofu (and Python SDKs) impersonate the SA from the user's auth — no SA JSON key file needed, which matters when org policy ``constraints/iam.disableServiceAccountKeyCreation`` is set.",
+        "service_account_id": "${google_service_account.fluid_test_runner.name}",
+        "role":               "roles/iam.serviceAccountTokenCreator",
+        "member":             "${var.user_principal}"
+      }
+    }
+  },
+
+  "output": {
+    "project_id":   {"value": "${var.project_id}"},
+    "region":       {"value": "${var.region}"},
+    "test_sa_email":{"value": "${google_service_account.fluid_test_runner.email}"}
+  }
+}

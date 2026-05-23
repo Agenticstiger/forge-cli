@@ -1530,3 +1530,271 @@ def aws_real_role_arn(kind: str) -> str:
     if not arn:
         raise RuntimeError(f"missing ${key} — Stage 3 bootstrap not applied?")
     return arn
+
+
+# ---------------------------------------------------------------------------
+# GCP Stage 3 — real-GCP harness (cloud-side e2e via Application Default Credentials)
+# ---------------------------------------------------------------------------
+#
+# Mirrors the AWS Stage 3 harness: per-test ``tofu`` workdir bound to a
+# real GCP project + service-account impersonation, with a session
+# sweeper that cleans up any ``fluid-iactest-*`` resources at session
+# end (BigQuery datasets, GCS buckets, Pub/Sub topics).
+#
+# Quad-gated:
+#   * ``tofu`` on PATH
+#   * ADC reachable (``GOOGLE_APPLICATION_CREDENTIALS`` or
+#     ``~/.config/gcloud/application_default_credentials.json``)
+#   * the explicit opt-in ``FLUID_IAC_LIVE_GCP=1``
+#   * project + test-SA env vars from the bootstrap
+#
+# Why impersonation, not SA keys: many GCP orgs enforce
+# ``constraints/iam.disableServiceAccountKeyCreation`` (a CIS+SOC2-friendly
+# guard against leaked credentials). The bootstrap grants the runner's
+# user principal ``serviceAccountTokenCreator`` on the test SA so ADC
+# + impersonation works without any key material on disk.
+
+
+GCP_LIVE_PREFIX = "fluid-iactest"
+
+
+def _gcp_adc_path() -> Optional[str]:
+    """Return the ADC file path if findable, else None."""
+    p = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if p and Path(p).exists():
+        return p
+    home_adc = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+    if home_adc.exists():
+        return str(home_adc)
+    return None
+
+
+def _gcp_live_ready() -> Tuple[bool, str]:
+    """Return ``(enabled, skip_reason)`` for the real-GCP Stage-3 tier."""
+    if runner.tofu_path() is None:
+        return False, "the `tofu` (OpenTofu) binary is not on PATH"
+    if os.environ.get("FLUID_IAC_LIVE_GCP", "").strip().lower() not in _TRUE:
+        return False, "live GCP tests are opt-in — set FLUID_IAC_LIVE_GCP=1"
+    if not os.environ.get("FLUID_GCP_PROJECT"):
+        return False, "missing $FLUID_GCP_PROJECT — apply tests/iac/_gcp_stage3_bootstrap and source its outputs"
+    if not os.environ.get("FLUID_GCP_TEST_SA"):
+        return False, "missing $FLUID_GCP_TEST_SA — apply the bootstrap module"
+    adc = _gcp_adc_path()
+    if not adc:
+        return False, (
+            "no Application Default Credentials found. Run "
+            "`gcloud auth application-default login` or set "
+            "GOOGLE_APPLICATION_CREDENTIALS"
+        )
+    return True, ""
+
+
+GCP_LIVE_ENABLED, GCP_LIVE_SKIP_REASON = _gcp_live_ready()
+GCP_LIVE_PROJECT = os.environ.get("FLUID_GCP_PROJECT", "")
+GCP_LIVE_TEST_SA = os.environ.get("FLUID_GCP_TEST_SA", "")
+GCP_LIVE_REGION = os.environ.get("FLUID_GCP_REGION", "europe-west1")
+
+
+def _gcp_live_uuid() -> str:
+    """Short hex token unique per test."""
+    return uuid.uuid4().hex[:10]
+
+
+def gcp_real_client(service: str) -> Any:
+    """Return a google-cloud-* client authenticated as the user, impersonating
+    the test SA. Service: 'bigquery' | 'storage' | 'pubsub_publisher' |
+    'pubsub_subscriber'. The impersonation lets the test verify resources
+    created by tofu (which also impersonates) without needing the SA's
+    own key material on disk.
+    """
+    from google.auth import default as _default
+    from google.auth import impersonated_credentials
+
+    source_creds, _ = _default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    target = impersonated_credentials.Credentials(
+        source_credentials=source_creds,
+        target_principal=GCP_LIVE_TEST_SA,
+        target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        lifetime=3600,
+    )
+    if service == "bigquery":
+        from google.cloud import bigquery
+        return bigquery.Client(project=GCP_LIVE_PROJECT, credentials=target)
+    if service == "storage":
+        from google.cloud import storage
+        return storage.Client(project=GCP_LIVE_PROJECT, credentials=target)
+    if service == "pubsub_publisher":
+        from google.cloud import pubsub_v1
+        return pubsub_v1.PublisherClient(credentials=target)
+    if service == "pubsub_subscriber":
+        from google.cloud import pubsub_v1
+        return pubsub_v1.SubscriberClient(credentials=target)
+    raise ValueError(f"unknown service for gcp_real_client: {service}")
+
+
+class GcpRealProject:
+    """A per-test ``tofu`` workdir bound to real GCP via impersonation.
+
+    The plugin emits a credential-free ``main.tf.json``; the harness
+    overlays a sidecar ``provider.tf.json`` setting ``project`` +
+    ``impersonate_service_account``. Resource names use the per-test
+    UUID suffix so concurrent runs never collide.
+    """
+
+    def __init__(self, workdir: Path, env: Mapping[str, str]) -> None:
+        self.workdir = workdir
+        self.env = dict(env)
+        self.applied = False
+        self.uid = _gcp_live_uuid()
+
+    def name(self, slug: str) -> str:
+        """``fluid-iactest-<slug>-<uid>``. Resource-naming rules differ
+        by GCP service (BQ datasets want ``[a-zA-Z0-9_]`` only; GCS
+        buckets want lowercase alphanumeric + dashes; Pub/Sub topics
+        are lenient). Callers normalise with ``.replace("-", "_")``
+        for BQ, leave hyphens for GCS / Pub/Sub.
+        """
+        return f"{GCP_LIVE_PREFIX}-{slug}-{self.uid}"
+
+    def emit(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        actions: Sequence[Mapping[str, Any]] = (),
+    ) -> str:
+        plugin = get_iac_plugin("gcp")
+        text = build_module(plugin, contract, actions=actions)
+        (self.workdir / "main.tf.json").write_text(text, encoding="utf-8")
+        # Sidecar provider override — pins ``project`` and triggers
+        # impersonation. tofu merges every ``*.tf.json`` in the workdir.
+        (self.workdir / "provider.tf.json").write_text(
+            json.dumps(
+                {
+                    "provider": {
+                        "google": {
+                            "project": GCP_LIVE_PROJECT,
+                            "region": GCP_LIVE_REGION,
+                            "impersonate_service_account": GCP_LIVE_TEST_SA,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return text
+
+    def init(self):
+        return runner.tofu_init(str(self.workdir), backend=False, env=self.env)
+
+    def plan(self):
+        return runner.tofu_plan(str(self.workdir), env=self.env)
+
+    def apply(self):
+        result = runner.tofu_apply(str(self.workdir), env=self.env)
+        self.applied = True
+        return result
+
+    def destroy(self):
+        return runner.tofu_destroy(str(self.workdir), env=self.env)
+
+    def apply_ok(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        actions: Sequence[Mapping[str, Any]] = (),
+    ):
+        self.emit(contract, actions=actions)
+        init = self.init()
+        assert init.ok, f"tofu init failed:\n{init.stderr or init.stdout}"
+        plan = self.plan()
+        assert plan.ok, f"tofu plan failed:\n{plan.stderr or plan.stdout}"
+        applied = self.apply()
+        assert applied.ok, f"tofu apply failed:\n{applied.stderr or applied.stdout}"
+        return applied
+
+
+@pytest.fixture(scope="session")
+def gcp_account() -> Dict[str, str]:
+    """Session-scoped real-GCP identity. Skips when the gate is shut."""
+    if not GCP_LIVE_ENABLED:
+        pytest.skip(GCP_LIVE_SKIP_REASON)
+    return {
+        "project_id": GCP_LIVE_PROJECT,
+        "region": GCP_LIVE_REGION,
+        "test_sa": GCP_LIVE_TEST_SA,
+    }
+
+
+@pytest.fixture
+def gcp_real_project(
+    gcp_account: Dict[str, str], tofu_env: Dict[str, str], tmp_path: Path
+) -> Iterator[GcpRealProject]:
+    """A :class:`GcpRealProject` bound to a fresh workdir.
+
+    Teardown: best-effort ``tofu destroy``. The session-end sweeper is
+    the belt-and-suspenders net (catches resources left behind by
+    crashed tests).
+    """
+    if not GCP_LIVE_ENABLED:
+        pytest.skip(GCP_LIVE_SKIP_REASON)
+    project = GcpRealProject(tmp_path, tofu_env)
+    try:
+        yield project
+    finally:
+        if project.applied:
+            with contextlib.suppress(Exception):
+                project.destroy()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _gcp_live_sweeper(request) -> Iterator[None]:
+    """Session finalizer: nuke any ``fluid-iactest-*`` GCP resources
+    still present in the project at session end.
+
+    BigQuery: lists datasets matching the prefix and deletes them
+    (with ``delete_contents=true`` to drop any straggling tables).
+    GCS: empties + deletes matching buckets.
+    Pub/Sub: deletes matching topics + subscriptions.
+
+    Only fires when the live tier is enabled.
+    """
+    yield
+    if not GCP_LIVE_ENABLED:
+        return
+    bq_prefix = GCP_LIVE_PREFIX.replace("-", "_")  # BQ dataset names disallow hyphens
+    with contextlib.suppress(Exception):
+        bq = gcp_real_client("bigquery")
+        for ds in bq.list_datasets():
+            if not ds.dataset_id.startswith(bq_prefix):
+                continue
+            with contextlib.suppress(Exception):
+                bq.delete_dataset(ds.dataset_id, delete_contents=True, not_found_ok=True)
+    with contextlib.suppress(Exception):
+        gcs = gcp_real_client("storage")
+        for b in gcs.list_buckets(prefix=GCP_LIVE_PREFIX):
+            with contextlib.suppress(Exception):
+                # Empty any objects first, then delete.
+                bkt = gcs.bucket(b.name)
+                for blob in bkt.list_blobs():
+                    with contextlib.suppress(Exception):
+                        blob.delete()
+                bkt.delete(force=True)
+    with contextlib.suppress(Exception):
+        from google.cloud import pubsub_v1
+
+        pub = gcp_real_client("pubsub_publisher")
+        for topic in pub.list_topics(request={"project": f"projects/{GCP_LIVE_PROJECT}"}):
+            name = topic.name.rsplit("/", 1)[-1]
+            if not name.startswith(GCP_LIVE_PREFIX):
+                continue
+            with contextlib.suppress(Exception):
+                pub.delete_topic(request={"topic": topic.name})
+        sub_client = gcp_real_client("pubsub_subscriber")
+        for sub in sub_client.list_subscriptions(
+            request={"project": f"projects/{GCP_LIVE_PROJECT}"}
+        ):
+            sname = sub.name.rsplit("/", 1)[-1]
+            if not sname.startswith(GCP_LIVE_PREFIX):
+                continue
+            with contextlib.suppress(Exception):
+                sub_client.delete_subscription(request={"subscription": sub.name})
