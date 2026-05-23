@@ -71,6 +71,22 @@
         "name": "fluid-iactest-ec2-redshift-vpc-endpoint",
         "role": "${aws_iam_role.fluid_ec2_test.name}",
         "policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"ec2:DescribeSubnets\",\"ec2:DescribeSecurityGroups\",\"ec2:DescribeVpcs\",\"ec2:DescribeNetworkInterfaces\",\"ec2:DescribeVpcEndpoints\",\"ec2:DescribeAvailabilityZones\",\"ec2:CreateVpcEndpoint\",\"ec2:ModifyVpcEndpoint\",\"ec2:DeleteVpcEndpoints\",\"ec2:CreateTags\"],\"Resource\":\"*\"}]}"
+      },
+      "ec2_lakeformation": {
+        "//": "Lake Formation IAM perms for the EC2 runner: register resources, manage admin settings, create/grant LF-tags, set permissions, create data filters, plus the underlying Glue catalog read/write the LF resources need.",
+        "name": "fluid-iactest-ec2-lakeformation",
+        "role": "${aws_iam_role.fluid_ec2_test.name}",
+        "policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"lakeformation:GetDataLakeSettings\",\"lakeformation:PutDataLakeSettings\",\"lakeformation:RegisterResource\",\"lakeformation:DeregisterResource\",\"lakeformation:DescribeResource\",\"lakeformation:ListResources\",\"lakeformation:GrantPermissions\",\"lakeformation:RevokePermissions\",\"lakeformation:BatchGrantPermissions\",\"lakeformation:BatchRevokePermissions\",\"lakeformation:ListPermissions\",\"lakeformation:CreateLFTag\",\"lakeformation:DeleteLFTag\",\"lakeformation:GetLFTag\",\"lakeformation:ListLFTags\",\"lakeformation:UpdateLFTag\",\"lakeformation:AddLFTagsToResource\",\"lakeformation:RemoveLFTagsFromResource\",\"lakeformation:GetResourceLFTags\",\"lakeformation:CreateDataCellsFilter\",\"lakeformation:DeleteDataCellsFilter\",\"lakeformation:GetDataCellsFilter\",\"lakeformation:ListDataCellsFilter\",\"lakeformation:UpdateDataCellsFilter\",\"glue:GetCatalog\",\"glue:GetDatabases\",\"glue:GetTables\",\"glue:GetPartitions\",\"glue:CreateDatabase\",\"glue:UpdateDatabase\",\"glue:DeleteDatabase\",\"glue:CreateTable\",\"glue:UpdateTable\",\"glue:DeleteTable\",\"sts:GetCallerIdentity\"],\"Resource\":\"*\"}]}"
+      }
+    },
+
+    "aws_lakeformation_data_lake_settings": {
+      "fluid_iactest": {
+        "//": "Make the test IAM user fluid-stage3-tester a Lake Formation admin. Required before any aws_lakeformation_* resource emitted by a contract can be applied — only LF admins can register S3 locations, grant permissions, define tags, etc. The EC2 runner role is ALSO added so the SSM-on-EC2 dbt-redshift VPC path can apply LF resources.",
+        "admins": [
+          "arn:aws:iam::156845521635:user/fluid-stage3-tester",
+          "${aws_iam_role.fluid_ec2_test.arn}"
+        ]
       }
     },
     "aws_iam_role_policy_attachment": {
