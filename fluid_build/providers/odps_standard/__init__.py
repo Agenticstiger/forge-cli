@@ -5,23 +5,23 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""Bitol Open Data Product Standard v1.0.0 provider.
 
-# fluid_build/providers/odps_standard/__init__.py
+Public surface:
+  - :class:`BitolOdpsProvider` — the new modular implementation.
+  - :class:`OdpsStandardProvider` — back-compat alias (same class).
+
+Specification: https://github.com/bitol-io/open-data-product-standard
 """
-ODPS (Open Data Product Standard) Provider - Bitol.io
 
-This provider exports FLUID contracts to ODPS format for data marketplace
-integration, particularly with Entropy Data.
-
-ODPS Specification: https://github.com/bitol-io/open-data-product-standard
-"""
+from fluid_build.providers import register_provider
 
 from .odps import OdpsStandardProvider
+from .provider import BitolOdpsProvider
 
-__all__ = ["OdpsStandardProvider"]
+# Register under both names — the canonical name is ``odps_bitol`` per the
+# Phase 5 disambiguation plan; the ``odps-standard`` legacy name still works.
+register_provider("odps_bitol", BitolOdpsProvider)
+register_provider("odps-standard", OdpsStandardProvider)
+
+__all__ = ["BitolOdpsProvider", "OdpsStandardProvider"]
