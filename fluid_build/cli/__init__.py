@@ -25,7 +25,15 @@ from typing import List, Optional
 from fluid_build.cli.console import cprint, info, warning
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_banner import compact_next_line
-from fluid_build.observability import install_secret_redacting_filter
+
+# Import the leaf module directly (not via ``fluid_build.observability``) so
+# we don't trigger the package's full ``__init__`` here. The package init
+# loads ``observability.reporter`` which pulls in ``build_runners`` →
+# ``build_runners.base`` → ``cli._common`` → re-enters this module before
+# ``install_secret_redacting_filter`` is bound. ``secret_redactor`` itself
+# is a stdlib-only leaf (``logging``/``re``/``traceback``) and has no
+# transitive deps back into this package.
+from fluid_build.observability.secret_redactor import install_secret_redacting_filter
 
 from ._common import CLIError
 from ._errors import FluidUserError as _FluidUserError
