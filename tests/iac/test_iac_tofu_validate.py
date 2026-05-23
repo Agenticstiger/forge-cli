@@ -41,6 +41,7 @@ _SAMPLE_CONTRACTS = {
                         "table": "orders",
                         "bucket": "demo-fluid-lake",
                         "path": "orders/",
+                        "stream": "demo-events",
                     },
                 },
                 "contract": {"schema": [{"name": "id", "type": "integer", "required": True}]},
@@ -49,6 +50,14 @@ _SAMPLE_CONTRACTS = {
     },
     "gcp": {
         "id": "demo.gcp",
+        "metadata": {
+            "policies": {
+                "readers": {
+                    "principals": ["analyst@example.com"],
+                    "permissions": ["read"],
+                }
+            }
+        },
         "exposes": [
             {
                 "exposeId": "events",
@@ -57,11 +66,61 @@ _SAMPLE_CONTRACTS = {
                     "location": {"dataset": "demo", "table": "events"},
                 },
                 "contract": {"schema": [{"name": "id", "type": "integer", "required": True}]},
-            }
+            },
+            {
+                "exposeId": "stream",
+                "binding": {
+                    "platform": "gcp",
+                    "format": "pubsub_topic",
+                    "location": {"topic": "demo-topic", "subscription": "demo-sub"},
+                },
+            },
+            {
+                "exposeId": "lake",
+                "binding": {
+                    "platform": "gcp",
+                    "format": "gcs_bucket",
+                    "location": {"bucket": "demo-fluid-gcs"},
+                },
+            },
         ],
     },
     "snowflake": {
         "id": "demo.snowflake",
+        "security": {
+            "access_control": {
+                "grants": [
+                    {
+                        "role": "ANALYST",
+                        "privilege": "SELECT",
+                        "object_type": "TABLE",
+                        "object_name": "DEMO_DB.PUBLIC.EVENTS",
+                    },
+                    {
+                        "role": "LOADER",
+                        "privilege": "USAGE",
+                        "object_type": "DATABASE",
+                        "object_name": "DEMO_DB",
+                    },
+                ]
+            },
+            "policies": {
+                "masking": [
+                    {
+                        "name": "MASK_EMAIL",
+                        "body": "CASE WHEN CURRENT_ROLE() = 'ADMIN' THEN val ELSE '***' END",
+                        "signature": "(val VARCHAR) RETURNS VARCHAR",
+                    }
+                ],
+                "row_access": [
+                    {
+                        "name": "TENANT_ISOLATION",
+                        "condition": "tenant_id = CURRENT_ACCOUNT()",
+                        "signature": "(tenant_id VARCHAR) RETURNS BOOLEAN",
+                    }
+                ],
+            },
+        },
         "exposes": [
             {
                 "exposeId": "events",
@@ -82,6 +141,197 @@ _SAMPLE_CONTRACTS = {
 }
 
 
+# Per-cloud native-planner actions — exercises the `emit(contract, actions)`
+# path (schedule / orchestration resources the planner interprets).
+_SAMPLE_ACTIONS = {
+    "snowflake": [
+        {
+            "op": "sf.stream.ensure",
+            "database": "DEMO_DB",
+            "schema": "PUBLIC",
+            "name": "EVENTS_STREAM",
+            "source_table": "EVENTS",
+            "append_only": True,
+        },
+        {
+            "op": "sf.task.ensure",
+            "database": "DEMO_DB",
+            "schema": "PUBLIC",
+            "name": "DAILY_ROLLUP",
+            "sql": "INSERT INTO DEMO_DB.PUBLIC.AGG SELECT COUNT(*) FROM DEMO_DB.PUBLIC.EVENTS",
+            "schedule": "USING CRON 0 2 * * * UTC",
+            "warehouse": "COMPUTE_WH",
+            "after": [],
+        },
+        {"op": "sf.task.resume", "name": "DAILY_ROLLUP"},
+        {
+            "op": "sf.view.materialized.ensure",
+            "database": "DEMO_DB",
+            "schema": "PUBLIC",
+            "name": "EVENTS_RECENT",
+            "query": "SELECT * FROM DEMO_DB.PUBLIC.EVENTS",
+            "secure": True,
+        },
+        {
+            "op": "sf.procedure.ensure",
+            "database": "DEMO_DB",
+            "schema": "PUBLIC",
+            "name": "REFRESH_AGG",
+            "language": "SQL",
+            "parameters": [],
+            "body": "BEGIN INSERT INTO DEMO_DB.PUBLIC.AGG SELECT 1; RETURN 'ok'; END;",
+        },
+        {
+            "op": "sf.udf.ensure",
+            "database": "DEMO_DB",
+            "schema": "PUBLIC",
+            "name": "MASK_EMAIL_FN",
+            "language": "SQL",
+            "return_type": "VARCHAR",
+            "parameters": [{"name": "email", "type": "VARCHAR"}],
+            "body": "REGEXP_REPLACE(email, '.+@', '***@')",
+        },
+    ],
+    "gcp": [
+        {
+            "op": "run.ensure_service",
+            "project": "demo",
+            "region": "us-central1",
+            "service_name": "fluid-demo",
+            "image": "gcr.io/fluid-forge/runner:latest",
+            "cpu": "1",
+            "memory": "512Mi",
+            "concurrency": 1,
+            "timeout": 300,
+            "env_vars": {"FLUID_CONTRACT_ID": "demo.gcp"},
+            "labels": {"managed-by": "fluid-forge"},
+            "max_instances": 10,
+            "min_instances": 0,
+        },
+        {
+            "op": "scheduler.ensure_job",
+            "project": "demo",
+            "location": "us-central1",
+            "job_name": "fluid-demo-job",
+            "description": "Scheduled execution",
+            "schedule": "0 2 * * *",
+            "timezone": "UTC",
+            "target": {
+                "http_target": {
+                    "uri": "https://fluid-demo-abc-us-central1.a.run.app/execute",
+                    "http_method": "POST",
+                    "headers": {"Content-Type": "application/json"},
+                    "oidc_token": {
+                        "service_account_email": "sched@demo.iam.gserviceaccount.com",
+                        "audience": "https://fluid-demo-abc-us-central1.a.run.app",
+                    },
+                }
+            },
+            "retry_config": {"retry_count": 3, "max_doublings": 3},
+            "attempt_deadline": "300s",
+        },
+        {
+            "op": "ps.ensure_topic",
+            "project": "demo",
+            "topic": "fluid-demo-events",
+            "labels": {"managed-by": "fluid-forge"},
+            "message_retention_duration": "604800s",
+        },
+        {
+            "op": "ps.ensure_subscription",
+            "project": "demo",
+            "topic": "fluid-demo-events",
+            "subscription": "fluid-demo-sub",
+            "ack_deadline_seconds": 60,
+            "push_config": {
+                "push_endpoint": "https://fluid-demo-abc-us-central1.a.run.app/pubsub",
+                "attributes": {"x-goog-version": "v1"},
+            },
+        },
+        {
+            "op": "iam.bind_bq_table",
+            "project": "demo",
+            "dataset": "demo",
+            "table": "events",
+            "policies": {
+                "readers": {"principals": ["analyst@example.com"], "permissions": ["read"]}
+            },
+        },
+        {
+            "op": "composer.deploy_dag",
+            "project": "demo",
+            "location": "us-central1",
+            "environment": "fluid-composer",
+            "dag_id": "fluid_demo",
+            "dag_bucket": "us-central1-fluid-composer-abc123-bucket",
+            "dag_content": (
+                "from airflow import DAG\n"
+                "import datetime\n"
+                "with DAG('fluid_demo', start_date=datetime.datetime(2024, 1, 1),\n"
+                "         schedule_interval='@daily', catchup=False) as dag:\n"
+                "    pass\n"
+            ),
+        },
+    ],
+    "aws": [
+        {
+            "op": "glue.ensure_job",
+            "name": "demo-etl",
+            "role": "arn:aws:iam::123456789012:role/GlueETLRole",
+            "script_location": "s3://demo-fluid-staging/scripts/etl.py",
+            "command_name": "glueetl",
+            "glue_version": "4.0",
+            "worker_type": "G.1X",
+            "number_of_workers": 10,
+            "timeout": 2880,
+            "default_arguments": {"--enable-metrics": "true"},
+            "tags": {"managed_by": "fluid"},
+        },
+        {
+            "op": "stepfunctions.ensure_state_machine",
+            "state_machine_name": "fluid-workflow-demo",
+            "definition": '{"StartAt":"Done","States":{"Done":{"Type":"Pass","End":true}}}',
+            "role_arn": "arn:aws:iam::123456789012:role/StepFunctionsExecutionRole",
+            "type": "STANDARD",
+            "tags": {"managed_by": "fluid"},
+        },
+        {
+            "op": "lambda.ensure_function",
+            "function_name": "fluid-workflow-demo-fn",
+            "runtime": "python3.11",
+            "handler": "index.handler",
+            "role": "arn:aws:iam::123456789012:role/fluid-workflow-execution",
+            "code": {"ZipFile": "def handler(event, context):\n    return {'ok': True}\n"},
+            "timeout": 300,
+            "memory_size": 256,
+            "environment": {"CONTRACT_ID": "demo.aws"},
+            "tags": {"managed_by": "fluid"},
+        },
+        {
+            "op": "eventbridge.ensure_schedule",
+            "schedule_name": "fluid-demo-schedule",
+            "schedule_expression": "rate(1 hour)",
+            "timezone": "UTC",
+            "state": "ENABLED",
+            "flexible_time_window": {"mode": "OFF"},
+            "target": {
+                "arn": "arn:aws:lambda:us-east-1:123456789012:function:fluid-workflow-demo-fn",
+                "role_arn": "arn:aws:iam::123456789012:role/EventBridgeSchedulerRole",
+                "input": '{"execution_type": "scheduled"}',
+            },
+        },
+        {
+            "op": "lambda.add_permission",
+            "function_name": "fluid-workflow-demo-fn",
+            "statement_id": "AllowSchedulerInvoke",
+            "action": "lambda:InvokeFunction",
+            "principal": "scheduler.amazonaws.com",
+            "source_arn": "arn:aws:scheduler:us-east-1:123456789012:schedule/default/fluid-demo-schedule",
+        },
+    ],
+}
+
+
 @pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
 @pytest.mark.parametrize("cloud", sorted(_SAMPLE_CONTRACTS))
 def test_emitted_tfjson_passes_tofu_validate(cloud, tmp_path):
@@ -89,7 +339,9 @@ def test_emitted_tfjson_passes_tofu_validate(cloud, tmp_path):
     if plugin is None:
         pytest.skip(f"no IaC plugin registered for {cloud}")
 
-    (tmp_path / "main.tf.json").write_text(build_module(plugin, _SAMPLE_CONTRACTS[cloud]))
+    (tmp_path / "main.tf.json").write_text(
+        build_module(plugin, _SAMPLE_CONTRACTS[cloud], actions=_SAMPLE_ACTIONS.get(cloud, ()))
+    )
 
     init = subprocess.run(
         [_TOFU, "init", "-backend=false", "-input=false", "-no-color"],

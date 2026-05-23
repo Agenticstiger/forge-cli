@@ -76,3 +76,104 @@ class TestApplyViaOpentofuGuards:
         with pytest.raises(CLIError) as exc:
             engine.apply_via_opentofu(args, logging.getLogger("test"))
         assert "tofu" in str(exc.value).lower()
+
+
+class TestResolveApplyEngine:
+    """Engine resolution is automatic and per-provider — no user switch."""
+
+    def test_resolves_opentofu_for_cutover_provider(self):
+        # GCP is cut over — a GCP contract resolves to the OpenTofu engine.
+        args = argparse.Namespace(contract=str(_GCP_CONTRACT), env=None, provider=None)
+        assert engine.resolve_apply_engine(args, logging.getLogger("test")) == "opentofu"
+
+    def test_unclassifiable_contract_falls_back_to_native(self):
+        args = argparse.Namespace(contract="/no/such/contract.yaml", env=None, provider=None)
+        assert engine.resolve_apply_engine(args, logging.getLogger("test")) == "native"
+
+
+class TestBrownfieldAdoption:
+    """`_adopt_existing` tofu-imports pre-existing resources so `tofu apply`
+    reconciles brownfield infra instead of failing 'already exists'."""
+
+    def test_imports_only_candidates_not_already_in_state(self, monkeypatch):
+        from fluid_build.iac.importer import ImportBlock
+
+        imported: list = []
+        monkeypatch.setattr(
+            engine.runner, "tofu_state_list", lambda *a, **k: ["snowflake_database.d"]
+        )
+
+        def _fake_import(workdir, addr, rid, *, env=None):
+            imported.append((addr, rid))
+            return engine.runner.TofuResult("import", 0, "", "")
+
+        monkeypatch.setattr(engine.runner, "tofu_import", _fake_import)
+
+        class _Plugin:
+            def discover_imports(self, contract, actions=()):
+                return [
+                    ImportBlock(to="snowflake_database.d", id="D"),  # in state → skip
+                    ImportBlock(to="snowflake_schema.s", id='"D"."S"'),  # → import
+                ]
+
+        engine._adopt_existing(_Plugin(), {}, [], "/wd", {}, logging.getLogger("test"))
+        assert imported == [("snowflake_schema.s", '"D"."S"')]
+
+    def test_no_candidates_skips_state_query(self, monkeypatch):
+        calls: list = []
+        monkeypatch.setattr(
+            engine.runner, "tofu_state_list", lambda *a, **k: calls.append("listed") or []
+        )
+
+        class _Plugin:
+            def discover_imports(self, contract, actions=()):
+                return []
+
+        engine._adopt_existing(_Plugin(), {}, [], "/wd", {}, logging.getLogger("test"))
+        assert calls == []
+
+    def test_failed_import_is_tolerated(self, monkeypatch):
+        from fluid_build.iac.importer import ImportBlock
+
+        monkeypatch.setattr(engine.runner, "tofu_state_list", lambda *a, **k: [])
+        monkeypatch.setattr(
+            engine.runner,
+            "tofu_import",
+            lambda *a, **k: engine.runner.TofuResult("import", 1, "", "non-existent object"),
+        )
+
+        class _Plugin:
+            def discover_imports(self, contract, actions=()):
+                return [ImportBlock(to="snowflake_table.t", id='"D"."S"."T"')]
+
+        # A non-existent resource fails to import — must not raise; `tofu
+        # apply` then creates it.
+        engine._adopt_existing(_Plugin(), {}, [], "/wd", {}, logging.getLogger("test"))
+
+
+class TestPerContractState:
+    """Each contract applies into its own ``tofu`` workdir + state."""
+
+    def test_workdir_includes_contract_id_segment(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(engine.runner, "tofu_path", lambda: "/usr/bin/tofu")
+        monkeypatch.setattr(
+            engine.runner, "tofu_init", lambda *a, **k: engine.runner.TofuResult("init", 0, "", "")
+        )
+        monkeypatch.setattr(
+            engine.runner,
+            "tofu_plan",
+            lambda *a, **k: engine.runner.TofuResult("plan", 0, "", "", events=[]),
+        )
+        args = argparse.Namespace(
+            contract=str(_GCP_CONTRACT),
+            env=None,
+            provider=None,
+            workspace_dir=tmp_path,
+            state_backend=None,
+            dry_run=True,
+            allow_data_loss=False,
+        )
+        assert engine.apply_via_opentofu(args, logging.getLogger("test")) == 0
+        modules = list((tmp_path / ".fluid" / "iac" / "gcp").glob("*/main.tf.json"))
+        assert len(modules) == 1  # emitted under .fluid/iac/gcp/<contract-id>/
+        assert modules[0].parent.parent.name == "gcp"

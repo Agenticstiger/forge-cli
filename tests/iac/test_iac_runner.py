@@ -77,3 +77,24 @@ def test_runner_init_and_validate_on_emitted_module(tmp_path):
 
     validate = runner.tofu_validate(str(tmp_path))
     assert validate.ok, validate.stderr or validate.stdout
+
+
+class TestStateList:
+    pytestmark = pytest.mark.unit
+
+    def test_state_list_parses_addresses(self, monkeypatch):
+        monkeypatch.setattr(
+            runner,
+            "_run",
+            lambda *a, **k: runner.TofuResult(
+                "state-list", 0, "snowflake_database.x\nsnowflake_schema.y\n\n", ""
+            ),
+        )
+        assert runner.tofu_state_list("/wd") == ["snowflake_database.x", "snowflake_schema.y"]
+
+    def test_state_list_empty_when_no_state(self, monkeypatch):
+        # `tofu state list` exits non-zero when there is no state yet.
+        monkeypatch.setattr(
+            runner, "_run", lambda *a, **k: runner.TofuResult("state-list", 1, "", "no state")
+        )
+        assert runner.tofu_state_list("/wd") == []
