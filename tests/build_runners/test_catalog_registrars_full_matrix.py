@@ -340,6 +340,102 @@ class TestRegisterAllDispatcher:
         assert outcome.results == []
 
 
+# ── build_registrar factory + publish-path auto-wiring ────────────────────
+
+
+class TestBuildRegistrarFactory:
+    """``build_registrar`` resolves built-in registrars from env config."""
+
+    def test_unconfigured_target_returns_none(self, monkeypatch):
+        from fluid_build.build_runners.catalog_registrars import build_registrar
+
+        for var in ("FLUID_CATALOG_DATAHUB_URL", "DATAHUB_GMS_URL"):
+            monkeypatch.delenv(var, raising=False)
+        assert build_registrar("datahub") is None
+
+    def test_unknown_target_returns_none(self):
+        from fluid_build.build_runners.catalog_registrars import build_registrar
+
+        assert build_registrar("nonexistent-catalog") is None
+
+    def test_datahub_built_from_fluid_env(self, monkeypatch):
+        from fluid_build.build_runners.catalog_registrars import build_registrar
+
+        monkeypatch.setenv("FLUID_CATALOG_DATAHUB_URL", "https://dh.example")
+        monkeypatch.setenv("FLUID_CATALOG_DATAHUB_TOKEN", "tok")
+        reg = build_registrar("datahub")
+        assert isinstance(reg, DataHubRegistrar)
+        assert reg.base_url == "https://dh.example"
+        assert reg.api_token == "tok"
+
+    def test_datahub_honours_native_env(self, monkeypatch):
+        from fluid_build.build_runners.catalog_registrars import build_registrar
+
+        monkeypatch.delenv("FLUID_CATALOG_DATAHUB_URL", raising=False)
+        monkeypatch.setenv("DATAHUB_GMS_URL", "https://gms.example")
+        reg = build_registrar("datahub")
+        assert isinstance(reg, DataHubRegistrar)
+        assert reg.base_url == "https://gms.example"
+
+    def test_glue_honours_aws_region(self, monkeypatch):
+        from fluid_build.build_runners.catalog_registrars import build_registrar
+
+        for var in ("FLUID_CATALOG_GLUE_REGION", "AWS_REGION"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-west-2")
+        reg = build_registrar("glue")
+        assert isinstance(reg, GlueCatalogRegistrar)
+        assert reg.region == "eu-west-2"
+
+    def test_unity_honours_databricks_env(self, monkeypatch):
+        from fluid_build.build_runners.catalog_registrars import build_registrar
+
+        for var in ("FLUID_CATALOG_UNITY_URL", "FLUID_CATALOG_UNITY_TOKEN"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("DATABRICKS_HOST", "https://dbc.example")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dbtok")
+        reg = build_registrar("unity")
+        assert isinstance(reg, UnityCatalogRegistrar)
+        assert reg.base_url == "https://dbc.example"
+        assert reg.workspace_token == "dbtok"
+
+    def test_register_all_resolves_builtin_when_unregistered(self, datahub_mock, monkeypatch):
+        """A planned target with env config dispatches end-to-end without an
+        explicit register_registrar() — proves the publish-path wiring."""
+        from fluid_build.build_runners import _catalog as orch
+        from fluid_build.cli._acquisition_stage_ext import _ensure_builtin_registrars
+
+        orch._REGISTRY.pop("datahub", None)
+        monkeypatch.setenv("FLUID_CATALOG_DATAHUB_URL", "https://datahub.test")
+        try:
+            _ensure_builtin_registrars(["datahub"])
+            assert isinstance(orch.get_registrar("datahub"), DataHubRegistrar)
+            outcome = register_all(
+                CatalogPlan(targets=["datahub"]),
+                "bronze.x",
+                "orders",
+                _contract_with_columns(columns=[{"name": "id", "type": "string"}]),
+                {},
+            )
+            assert all(r.succeeded for r in outcome.results), outcome.results
+        finally:
+            orch._REGISTRY.pop("datahub", None)
+
+    def test_explicit_registration_wins_over_builtin(self, monkeypatch):
+        """An explicitly-registered registrar is not replaced by the built-in."""
+        from fluid_build.build_runners import _catalog as orch
+        from fluid_build.cli._acquisition_stage_ext import _ensure_builtin_registrars
+
+        sentinel = DataHubRegistrar(base_url="https://explicit.test")
+        monkeypatch.setenv("FLUID_CATALOG_DATAHUB_URL", "https://builtin.test")
+        register_registrar("datahub", sentinel)
+        try:
+            _ensure_builtin_registrars(["datahub"])
+            assert orch.get_registrar("datahub") is sentinel
+        finally:
+            orch._REGISTRY.pop("datahub", None)
+
+
 # ── Cross-target: every registrar produces a ``RegistrationResult`` ────
 
 

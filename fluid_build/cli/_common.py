@@ -266,6 +266,34 @@ def load_contract_with_overlay(
     return contract
 
 
+def resolve_env_templates_in_contract(contract: Any) -> Any:
+    """Recursively resolve ``{{ env.VAR }}`` placeholders throughout a contract.
+
+    Walks dicts and lists and delegates every string to the canonical
+    ``resolve_env_templates`` (the single-source-of-truth resolver shared by
+    the Snowflake provider and the CLI). Unresolved placeholders are left
+    intact so a missing variable surfaces loudly rather than silently
+    becoming an empty name.
+
+    The OpenTofu emit path (``fluid apply`` / ``fluid generate iac``) reads
+    the contract's ``exposes[]`` data-plane directly, so env templates must
+    be resolved before the contract reaches the emitter — otherwise a literal
+    ``{{ env.SNOWFLAKE_DATABASE }}`` lands in the ``.tf.json``.
+    """
+    from fluid_build.providers.snowflake.util.config import resolve_env_templates
+
+    def _walk(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {key: _walk(value) for key, value in obj.items()}
+        if isinstance(obj, list):
+            return [_walk(item) for item in obj]
+        if isinstance(obj, str):
+            return resolve_env_templates(obj)
+        return obj
+
+    return _walk(contract)
+
+
 # Alias → canonical mapping table, applied at contract-load time.
 # Add entries here whenever a human-friendly synonym diverges from the
 # schema-enforced enum value. Keep the canonical name as the schema's

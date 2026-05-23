@@ -127,7 +127,6 @@ gcp = [
 # Snowflake provider
 snowflake = [
   "snowflake-connector-python>=4.4",
-  "snowflake-snowpark-python>=1.15 ; python_version >= '3.10'",
   "dbt-snowflake>=1.7 ; python_version >= '3.10'",
 ]
 
@@ -249,7 +248,10 @@ dev = [
 # ci.yml `emulated-integration` job so Stage-1 provider integration tests
 # run on every PR — including from forks — with zero cloud credentials.
 test-emulators = [
-  "moto[glue]>=5",
+  # `server` pulls Flask so `ThreadedMotoServer` can back the OpenTofu
+  # autogenerator e2e — `tofu`, a Go binary, needs a real HTTP endpoint
+  # and cannot use moto's in-process `mock_aws`.
+  "moto[glue,server]>=5",
   "fakesnow>=0.9",
 ]
 

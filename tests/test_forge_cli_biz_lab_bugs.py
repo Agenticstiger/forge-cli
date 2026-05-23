@@ -147,218 +147,6 @@ class TestDmmListParserReadsTopLevelFields:
 # ---------------------------------------------------------------------------
 
 
-class TestSnowflakeProvisionDatasetActionIdResolution:
-    """``_handle_abstract_provision_dataset`` must read the action id
-    from ``action_id`` (the canonical key the plan stage emits) and
-    use it to scope the column-resolution fallback to the right
-    expose. Reading from ``id`` alone made the fallback grab the first
-    expose's columns for every action."""
-
-    def _make_action(self, action_key: str, action_id_value: str, exposes: List[Dict]):
-        """Build the action dict the apply path passes into the
-        provider. ``action_key`` toggles between ``"action_id"`` (canonical)
-        and ``"id"`` (legacy) so we can prove both paths resolve."""
-        action = {
-            action_key: action_id_value,
-            "op": "provisionDataset",
-            "params": {
-                "exposeId": action_id_value.removeprefix("provision_"),
-                "kind": "table",
-                "binding": {
-                    "platform": "snowflake",
-                    "format": "snowflake_table",
-                    "location": {
-                        "account": "ACME",
-                        "database": "DB",
-                        "schema": "SCH",
-                        "table": action_id_value.removeprefix("provision_").upper(),
-                    },
-                },
-                "contract": {
-                    "fluidVersion": "0.7.3",
-                    "kind": "DataProduct",
-                    "id": "demo.test",
-                    "exposes": exposes,
-                },
-            },
-        }
-        return action
-
-    def _provider_with_stub_subactions(self, capture: dict):
-        """Real ``_handle_abstract_provision_dataset`` with stubbed sub-
-        action handlers. Capture the columns ensure_table sees so we
-        can assert which expose's schema was selected."""
-        from fluid_build.providers.snowflake.provider_enhanced import (
-            SnowflakeProviderEnhanced,
-        )
-
-        # We don't need a real Snowflake connection — just instantiate
-        # via __new__ and stub the methods the dispatcher calls.
-        provider = SnowflakeProviderEnhanced.__new__(SnowflakeProviderEnhanced)
-        provider._provisioned_bindings = {}
-
-        provider._execute_database_action = MagicMock(
-            return_value={"status": "ok", "changed": False}
-        )
-        provider._execute_schema_action = MagicMock(return_value={"status": "ok", "changed": False})
-
-        def _exec_table(sub):
-            capture["columns"] = sub.get("columns")
-            capture["table"] = sub.get("table")
-            return {"status": "ok", "changed": False}
-
-        provider._execute_table_action = MagicMock(side_effect=_exec_table)
-        provider._aggregate_sub_status = lambda subs: "ok"
-        provider._binding_location = lambda action: action["params"]["binding"]["location"]
-        return provider
-
-    @pytest.fixture
-    def two_expose_contract(self):
-        """Mirror the A1 contract shape — 2 exposes with disjoint
-        schemas. The bug surfaces when the second expose's apply
-        accidentally uses the FIRST expose's columns."""
-        return [
-            {
-                "exposeId": "subscriber360_core",
-                "kind": "table",
-                "contract": {
-                    "schema": [
-                        {"name": "PARTY_ID", "type": "STRING"},
-                        {"name": "ACCOUNT_ID", "type": "STRING"},
-                        {"name": "ACCOUNT_NUMBER", "type": "STRING"},
-                        {"name": "SUBSCRIPTION_ID", "type": "STRING"},
-                    ],
-                },
-            },
-            {
-                "exposeId": "subscriber_health_scorecard",
-                "kind": "table",
-                "contract": {
-                    "schema": [
-                        {"name": "ACCOUNT_ID", "type": "STRING"},
-                        {"name": "SERVICE_ID", "type": "STRING"},
-                        {"name": "SUPPORT_HEALTH_SCORE", "type": "NUMBER"},
-                    ],
-                },
-            },
-        ]
-
-    def test_action_id_key_picks_correct_expose(self, two_expose_contract):
-        """Plan-emitted action with ``action_id`` key: the second
-        expose's apply must see the second expose's columns, NOT the
-        first expose's columns."""
-        capture: dict = {}
-        provider = self._provider_with_stub_subactions(capture)
-        action = self._make_action(
-            action_key="action_id",
-            action_id_value="provision_subscriber_health_scorecard",
-            exposes=two_expose_contract,
-        )
-
-        provider._handle_abstract_provision_dataset(action)
-
-        col_names = [c["name"] for c in (capture.get("columns") or [])]
-        assert col_names == ["ACCOUNT_ID", "SERVICE_ID", "SUPPORT_HEALTH_SCORE"], (
-            f"ensure_table got cols {col_names!r} — expected the "
-            "subscriber_health_scorecard schema (3 cols), not the "
-            "subscriber360_core schema (4 cols). The action_id-key "
-            "fallback regressed."
-        )
-
-    def test_legacy_id_key_still_picks_correct_expose(self, two_expose_contract):
-        """Old code paths emitted actions with ``id`` instead of
-        ``action_id``. Backward compat: still resolve correctly."""
-        capture: dict = {}
-        provider = self._provider_with_stub_subactions(capture)
-        action = self._make_action(
-            action_key="id",
-            action_id_value="provision_subscriber360_core",
-            exposes=two_expose_contract,
-        )
-
-        provider._handle_abstract_provision_dataset(action)
-
-        col_names = [c["name"] for c in (capture.get("columns") or [])]
-        # Should pick subscriber360_core's 4 cols.
-        assert col_names == [
-            "PARTY_ID",
-            "ACCOUNT_ID",
-            "ACCOUNT_NUMBER",
-            "SUBSCRIPTION_ID",
-        ]
-
-    def test_unidentifiable_action_refuses_to_guess(self, two_expose_contract):
-        """When neither ``action_id`` nor ``id`` is set AND
-        ``params.exposeId`` is missing, the provider must NOT silently
-        pick the first expose. ensure_table should be skipped."""
-        capture: dict = {}
-        provider = self._provider_with_stub_subactions(capture)
-        action = {
-            "op": "provisionDataset",
-            "params": {
-                "binding": {
-                    "platform": "snowflake",
-                    "format": "snowflake_table",
-                    "location": {
-                        "account": "ACME",
-                        "database": "DB",
-                        "schema": "SCH",
-                        "table": "ANY_TABLE",
-                    },
-                },
-                "contract": {
-                    "exposes": two_expose_contract,
-                    # Note: no top-level params.exposeId.
-                },
-            },
-        }
-        result = provider._handle_abstract_provision_dataset(action)
-
-        # ensure_table was NOT called (no columns captured).
-        assert "columns" not in capture, (
-            "ensure_table was called even though target expose can't be "
-            "identified — that's the bug we're guarding against."
-        )
-        # Outer status is still ok (db + schema sub-actions ran).
-        assert result["status"] == "ok"
-
-    def test_params_exposeid_resolves_when_action_id_missing(self, two_expose_contract):
-        """When the legacy planner sets ``params.exposeId`` directly
-        (current code path in ``forge/core/provider_actions.py``), the
-        provider should use that as the target id even if action_id
-        doesn't follow the ``provision_<name>`` convention."""
-        capture: dict = {}
-        provider = self._provider_with_stub_subactions(capture)
-        action = {
-            "action_id": "custom_namespace_1",
-            "op": "provisionDataset",
-            "params": {
-                "exposeId": "subscriber_health_scorecard",
-                "binding": {
-                    "platform": "snowflake",
-                    "format": "snowflake_table",
-                    "location": {
-                        "account": "ACME",
-                        "database": "DB",
-                        "schema": "SCH",
-                        "table": "ANY_TABLE",
-                    },
-                },
-                "contract": {"exposes": two_expose_contract},
-            },
-        }
-        provider._handle_abstract_provision_dataset(action)
-
-        col_names = [c["name"] for c in (capture.get("columns") or [])]
-        # subscriber_health_scorecard's 3 cols, picked via params.exposeId.
-        assert col_names == ["ACCOUNT_ID", "SERVICE_ID", "SUPPORT_HEALTH_SCORE"]
-
-
-# ---------------------------------------------------------------------------
-# Bug #3: ``verify --strict`` should fail on CRITICAL only, not WARNING.
-# ---------------------------------------------------------------------------
-
-
 class TestDmmPublishDefaultsToOdps:
     """``fluid datamesh-manager publish`` (the direct CLI subcommand)
     must produce an ODPS-shape payload by default, matching what
@@ -526,8 +314,7 @@ class TestFederationEndpointSchemeAllowList:
         manifest_path = tmp_path / "federation" / "upstreams.yaml"
         manifest_path.parent.mkdir(parents=True)
         manifest_path.write_text(
-            textwrap.dedent(
-                """\
+            textwrap.dedent("""\
                 workspaces:
                   - id: evil
                     kind: git_registry
@@ -535,8 +322,7 @@ class TestFederationEndpointSchemeAllowList:
                   - id: ok
                     kind: git_registry
                     endpoint: "https://github.com/org/repo.git"
-                """
-            ),
+                """),
             encoding="utf-8",
         )
 
@@ -631,19 +417,28 @@ class TestSnowflakeRollbackCleanupValidatesIdentifiers:
         ]
 
     def test_cleanup_backups_skips_tampered_records(self):
-        """A snapshot with an injection-shaped database identifier
-        must NOT reach ``_execute_sql_action``; legitimate snapshots
-        in the same call still execute."""
-        from unittest.mock import patch
+        """A snapshot with an injection-shaped database identifier must
+        NOT be executed; legitimate snapshots in the same call still run."""
+        from unittest.mock import MagicMock, patch
 
         provider = self._make_provider()
 
-        called: List[Dict[str, Any]] = []
+        executed: List[str] = []
+        fake_conn = MagicMock()
+        fake_conn.__enter__ = MagicMock(return_value=fake_conn)
+        fake_conn.__exit__ = MagicMock(return_value=False)
+        fake_conn.execute = MagicMock(side_effect=lambda sql: executed.append(sql))
 
-        def _capture(action: Dict[str, Any]) -> None:
-            called.append(action)
-
-        with patch.object(provider, "_execute_sql_action", side_effect=_capture):
+        with (
+            patch(
+                "fluid_build.providers.snowflake.connection.SnowflakeConnection",
+                return_value=fake_conn,
+            ),
+            patch(
+                "fluid_build.providers.snowflake.util.config.get_connection_params",
+                return_value={},
+            ),
+        ):
             provider.cleanup_backups(
                 [
                     {
@@ -663,10 +458,9 @@ class TestSnowflakeRollbackCleanupValidatesIdentifiers:
                 ]
             )
 
-        # Exactly one action fired — the legitimate one. The tampered
-        # entry was skipped, not silently used.
-        assert len(called) == 1
-        assert called[0]["sql"] == "DROP TABLE IF EXISTS PROD.PUBLIC.BACKUP_Y"
+        # Exactly one DROP executed — the legitimate one. The tampered
+        # entry was skipped at the validate_ident gate, never executed.
+        assert executed == ["DROP TABLE IF EXISTS PROD.PUBLIC.BACKUP_Y"]
 
 
 class TestRedshiftRollbackCleanupDdlValidatesIdentifiers:

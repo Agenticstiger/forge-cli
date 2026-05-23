@@ -30,11 +30,6 @@ try:
 except ImportError:
     requests = None  # type: ignore
 
-# Reuse the canonical SSRF post-DNS-resolution gate (RFC1918,
-# link-local 169.254.0.0/16 — AWS/GCP metadata — loopback, reserved;
-# fails closed on DNS errors).
-from fluid_build.build_runners._alerter import _hostname_is_private
-
 from .config import CommandCenterConfig
 
 logger = logging.getLogger(__name__)
@@ -55,6 +50,14 @@ def _command_center_host_allowed(url: Optional[str]) -> bool:
     loopback/cloud-metadata address is refused via
     :func:`_hostname_is_private`. A URL with no host is refused.
     """
+    # Imported here, not at module scope: ``build_runners`` imports
+    # ``cli._common`` → ``cli/__init__`` → ``observability``, so a
+    # top-level import would form an ``observability ↔ cli`` cycle.
+    # Reuses the canonical SSRF post-DNS-resolution gate (RFC1918,
+    # link-local 169.254.0.0/16 — AWS/GCP metadata — loopback,
+    # reserved; fails closed on DNS errors).
+    from fluid_build.build_runners._alerter import _hostname_is_private
+
     if not url:
         return False
     host = urlparse(url).hostname

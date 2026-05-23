@@ -205,14 +205,21 @@ def in_memory_exporter(monkeypatch):
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
         InMemorySpanExporter,
     )
+    from opentelemetry.util._once import Once
 
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
     # Install fresh tracer provider with in-memory exporter.
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    # The module's lazy init would create its own provider; pre-set
-    # one that the module will pick up via trace.get_tracer_provider.
+    # OTEL's set_tracer_provider is one-shot: once any provider is set —
+    # by an earlier test, or as a side effect of importing the CLI — a
+    # later set_tracer_provider is silently ignored ("Overriding of
+    # current TracerProvider is not allowed"). Reset the one-shot guard
+    # so this test installs its own provider; monkeypatch restores both
+    # globals afterwards, so global tracer state is left as it was.
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
     trace.set_tracer_provider(provider)
     # Reset module cache so _get_tracer re-uses our provider.
     monkeypatch.setattr(tracing, "_tracer", None)

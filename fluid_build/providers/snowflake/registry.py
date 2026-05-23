@@ -233,7 +233,7 @@ def _register_all_actions():
         ActionDefinition(
             name="sf.database.ensure",
             description="Create or ensure Snowflake database exists",
-            handler=None,  # Imported at runtime
+            handler=None,
             phase="infrastructure",
             parameters=[
                 ActionParameter(

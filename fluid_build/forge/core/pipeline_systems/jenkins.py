@@ -664,7 +664,7 @@ pipeline {{
                 // via shell redirection.
                 sh '''{CD}if [ -f dist/artifacts/policy/bindings.json ]; then \\
                          fluid policy-apply dist/artifacts/policy/bindings.json \\
-                           --mode "${{POLICY_APPLY_MODE}}" --env "${{FLUID_ENV:-dev}}" \\
+                           --mode "${{POLICY_APPLY_MODE}}" \\
                            > runtime/policy-apply-report.json 2>&1 || \\
                          {{ cat runtime/policy-apply-report.json; exit 1; }}; \\
                        else echo "no dist/artifacts/policy/bindings.json — skipping stage 8"; fi'''

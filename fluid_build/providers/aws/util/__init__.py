@@ -15,4 +15,4 @@
 # fluid_build/providers/aws/util/__init__.py
 """AWS utility modules."""
 
-__all__ = ["auth", "config", "logging", "retry", "names"]
+__all__ = ["auth", "config", "logging", "names"]

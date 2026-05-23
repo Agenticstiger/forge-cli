@@ -42,7 +42,10 @@ from fluid_build.observability.reporter import (
 )
 
 _CLIENT_PRIV = "fluid_build.cli._command_center._hostname_is_private"
-_REPORTER_PRIV = "fluid_build.observability.reporter._hostname_is_private"
+# reporter.py imports _hostname_is_private lazily (inside the gate
+# function) to avoid an observability ↔ cli circular import, so it is
+# patched at its source module rather than re-exported on reporter.
+_REPORTER_PRIV = "fluid_build.build_runners._alerter._hostname_is_private"
 
 
 # ──────────────────── the shared gate (client copy) ────────────────────

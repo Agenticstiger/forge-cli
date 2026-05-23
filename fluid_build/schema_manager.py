@@ -24,16 +24,22 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import yaml
 
 from .errors import ValidationError as FluidValidationError
+
+# A schema fetch is best-effort — bundled schemas cover every supported
+# version, and a missing version is a permanent error. The remote fetch is
+# bounded by this hard wall-clock deadline so a slow or unreachable host
+# fails fast instead of blocking the CLI for minutes.
+_SCHEMA_FETCH_DEADLINE_SEC = 15
 
 # Try to import jsonschema for proper validation
 try:
@@ -461,33 +467,49 @@ class FluidSchemaManager:
         return None
 
     def _fetch_schema(self, version: SchemaVersion) -> Optional[Dict[str, Any]]:
-        """Fetch schema from remote repository."""
+        """Fetch a schema from the remote repository — best-effort.
+
+        Bounded by a hard wall-clock deadline (``_SCHEMA_FETCH_DEADLINE_SEC``):
+        the fetch runs on a daemon thread that is abandoned if it does not
+        finish in time, so an unreachable host — or a slow one with several
+        CDN IPs to time out against — fails fast instead of blocking the CLI
+        for minutes. A missing schema version is a permanent error.
+        """
         if not version.schema_url:
             return None
 
-        try:
-            self.logger.info(f"Fetching schema from {version.schema_url}")
-            req = Request(version.schema_url)
-            req.add_header("User-Agent", "FLUID-Build-Tool/1.0")
+        outcome: Dict[str, Any] = {}
 
-            with urlopen(req, timeout=self.timeout) as response:
-                if response.status == 200:
-                    content = response.read().decode("utf-8")
-                    schema = json.loads(content)
-                    self.logger.debug(f"Successfully fetched schema for v{version}")
-                    return schema
-                else:
-                    self.logger.warning(f"HTTP {response.status} fetching schema for v{version}")
+        def _worker() -> None:
+            try:
+                req = Request(version.schema_url)
+                req.add_header("User-Agent", "FLUID-Build-Tool/1.0")
+                with urlopen(req, timeout=self.timeout) as response:
+                    if response.status == 200:
+                        outcome["schema"] = json.loads(response.read().decode("utf-8"))
+                    else:
+                        outcome["error"] = f"HTTP {response.status}"
+            except Exception as exc:  # noqa: BLE001 — surfaced by the caller
+                outcome["error"] = exc
 
-        except HTTPError as e:
-            self.logger.warning(f"HTTP error fetching schema for v{version}: {e}")
-        except URLError as e:
-            self.logger.warning(f"URL error fetching schema for v{version}: {e}")
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            self.logger.warning(f"Invalid schema content for v{version}: {e}")
-        except Exception as e:
-            self.logger.warning(f"Unexpected error fetching schema for v{version}: {e}")
+        self.logger.info(f"Fetching schema from {version.schema_url}")
+        worker = threading.Thread(target=_worker, name=f"schema-fetch-{version}", daemon=True)
+        worker.start()
+        worker.join(timeout=_SCHEMA_FETCH_DEADLINE_SEC)
 
+        if worker.is_alive():
+            self.logger.warning(
+                f"Schema fetch for v{version} exceeded "
+                f"{_SCHEMA_FETCH_DEADLINE_SEC}s — giving up"
+            )
+            return None
+
+        schema = outcome.get("schema")
+        if schema is not None:
+            self.logger.debug(f"Successfully fetched schema for v{version}")
+            return schema
+        if "error" in outcome:
+            self.logger.warning(f"Could not fetch schema for v{version}: {outcome['error']}")
         return None
 
     def find_compatible_version(

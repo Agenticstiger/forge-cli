@@ -258,15 +258,34 @@ class TestPublishAcquisition:
         results = publish_acquisition(contract, tmp_path)
         assert results == []
 
-    def test_publish_missing_registrar_records_failure(self, tmp_path: Path):
-        # No registrar pre-registered for "datahub" — orchestrator records the failure.
+    def test_publish_missing_registrar_records_failure(self, tmp_path: Path, monkeypatch):
+        # No registrar pre-registered for "datahub" AND no built-in env
+        # config — the orchestrator records the failure.
         from fluid_build.build_runners import _catalog as orch
 
+        for var in ("FLUID_CATALOG_DATAHUB_URL", "DATAHUB_GMS_URL"):
+            monkeypatch.delenv(var, raising=False)
         orch._REGISTRY.pop("datahub", None)
         results = publish_acquisition(_base_contract(), tmp_path)
         assert len(results) == 1
         assert results[0].succeeded is False
         assert "No registrar" in (results[0].error or "")
+
+    def test_publish_auto_wires_builtin_registrar_from_env(self, tmp_path: Path, monkeypatch):
+        # A declared target with env config needs no explicit
+        # register_registrar() — publish_acquisition wires the built-in.
+        from fluid_build.build_runners import _catalog as orch
+        from fluid_build.build_runners.catalog_registrars import DataHubRegistrar
+
+        orch._REGISTRY.pop("datahub", None)
+        monkeypatch.setenv("FLUID_CATALOG_DATAHUB_URL", "https://datahub.test")
+        try:
+            publish_acquisition(_base_contract(), tmp_path)
+            registrar = orch.get_registrar("datahub")
+            assert isinstance(registrar, DataHubRegistrar)
+            assert registrar.base_url == "https://datahub.test"
+        finally:
+            orch._REGISTRY.pop("datahub", None)
 
 
 # ── Stage: schedule-sync ─────────────────────────────────────────────────

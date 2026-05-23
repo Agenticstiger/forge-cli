@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -39,25 +38,22 @@ from typing import Any, ClassVar, Dict, FrozenSet, Iterator, List, Optional
 
 from fluid_build.api.runner import (
     RunContext,
-    Runner,
     RunnerCapability,
     RunPlan,
     RunResult,
     RunState,
     StreamResult,
 )
-from fluid_build.api.schema import SchemaColumn, SchemaFingerprint
+from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.api.state import Cursor
 from fluid_build.providers._sql_safety import validate_ident
 
 from .._acquisition_common import (
     extract_source_schemas,
-    generate_run_id,
     resolve_connection_secrets,
     utc_now_iso,
     write_run_record_and_finalize,
 )
-from .._fingerprint import fingerprint_from_columns
 
 LOG = logging.getLogger("fluid.acquire.meltano")
 
@@ -574,13 +570,9 @@ class MeltanoRunner:
 
 
 def _execute(ctx: RunContext, runner: MeltanoRunner) -> RunResult:
-    started_at = utc_now_iso()
+    from .._acquisition_common import begin_acquisition_run
 
-    # Schema-evolution gate (shared across all 6 acquisition runners).
-    from .._acquisition_common import enforce_schema_policy_or_raise
-
-    enforce_schema_policy_or_raise(ctx, runner)
-    t_start = time.time()
+    started_at, t_start = begin_acquisition_run(ctx, runner)
 
     props = ctx.contract.get("builds", [{}])[0].get("properties", {})
     meltano_props = props.get("meltano", {}) or {}
@@ -852,18 +844,9 @@ def _execute(ctx: RunContext, runner: MeltanoRunner) -> RunResult:
 
 
 def _failed(ctx: RunContext, started_at: str, t_start: float, err: str) -> RunResult:
-    return RunResult(
-        run_id=ctx.run_id,
-        state=RunState.FAILED,
-        streams=[],
-        started_at=started_at,
-        finished_at=utc_now_iso(),
-        records_total=0,
-        bytes_total=0,
-        dlq_records=0,
-        error=err,
-        facets={"engine": "meltano", "duration_seconds": time.time() - t_start},
-    )
+    from .._acquisition_common import failed_run_result
+
+    return failed_run_result(ctx, engine="meltano", started_at=started_at, t_start=t_start, err=err)
 
 
 # ── Top-level entry point used by build_runners.base ────────────────────
@@ -878,42 +861,14 @@ def execute_meltano_build(
     sample_rows: Optional[int] = None,
     state_root: Optional[Path] = None,
 ) -> int:
-    from fluid_build.api.hooks import HookChain
-    from fluid_build.api.runner import RunContext
-    from fluid_build.api.source import SinkSpec, SourceSpec
-    from fluid_build.build_runners._cost import InMemoryCostTracker
-    from fluid_build.build_runners._lineage import NullLineageEmitter
-    from fluid_build.build_runners._state import FileStateStore
+    from .._acquisition_common import build_acquisition_run_context
 
-    from .._acquisition_common import get_acquisition_build_props
-    from ..base import _resolve_env_placeholders
-
-    props = get_acquisition_build_props(build)
-    source_dict = props.get("source")
-    if not source_dict:
-        LOG.error("acquisition build missing properties.source")
-        return 1
-    source_dict = _resolve_env_placeholders(source_dict)
-    source = SourceSpec.from_dict(source_dict)
-    sink = SinkSpec.from_dict(props.get("sink"))
-
-    state_root = state_root or (contract_dir / ".fluid")
-    store = FileStateStore(state_root)
-
-    ctx = RunContext(
-        run_id=generate_run_id(),
-        product_id=contract.get("id", "unknown"),
-        build_id=build.get("id", "unknown"),
-        contract=contract,
-        source=source,
-        sink=sink,
-        state_store=store,
-        hook_chain=HookChain(hooks=[]),
-        lineage=NullLineageEmitter(),
-        cost_tracker=InMemoryCostTracker(),
-        workdir=str(contract_dir),
-        sample_rows=sample_rows,
+    ctx = build_acquisition_run_context(
+        build, contract, contract_dir, sample_rows=sample_rows, state_root=state_root
     )
+    if ctx is None:
+        return 1
+    store = ctx.state_store
     runner = MeltanoRunner()
     if dry_run:
         plan = runner.plan(ctx)
