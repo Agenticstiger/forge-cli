@@ -255,6 +255,26 @@ def discover_local_context(
                     provider_counts.update(summary.get("providers") or [])
                 continue
 
+            # Phase 7 — sniff ODCS / Bitol ODPS docs by filename hint
+            # (*.odcs.yaml, *.odps.yaml) so the interview step can offer
+            # them as ``--seed-from`` candidates. Adds an entry to
+            # ``detected_sources`` rather than ``existing_contracts``
+            # because these are *standards-format* sources, not FLUID.
+            _name_lower = path.name.lower()
+            if (
+                _name_lower.endswith((".odcs.yaml", ".odcs.yml", ".odcs.json"))
+                or _name_lower.endswith((".odps.yaml", ".odps.yml", ".odps.json"))
+            ):
+                kind = "odcs" if ".odcs" in _name_lower else "odps"
+                detected_sources.append(
+                    {
+                        "path": str(path.relative_to(scan_root)),
+                        "kind": f"standard-{kind}",
+                        "suggested_use": "fluid forge --seed-from",
+                    }
+                )
+                continue
+
             if suffix == ".sql" and len(report.sql_files) < MAX_SQL_FILES:
                 report.sql_files.append(_summarize_sql_file(path))
                 if "models" in {part.lower() for part in path.parts}:

@@ -133,10 +133,11 @@ providers:
     architecture: "ODPI v4.1 exporter (FLUID → ODPI JSON)"
 
   # Bitol Open Data Product Standard v1.0.0 — bidirectional provider with
-  # contractId resolution to per-port ODCS contracts. Canonical name for
-  # new work is ``odps_bitol``; the ``odps-standard`` legacy name remains
-  # registered for back-compat.
-  odps_standard:
+  # contractId resolution to per-port ODCS contracts. Canonical block name
+  # is ``odps_bitol``; the legacy ``odps_standard`` block is kept as a
+  # YAML anchor so existing consumers of features.yaml (CI dashboards,
+  # provider listings) continue resolving the old key for one release.
+  odps_bitol: &odps_bitol
     # MANUAL CONTROL
     status: beta
     note: "Bitol ODPS v1.0.0 bidirectional provider with contractId resolver"
@@ -161,6 +162,11 @@ providers:
       - "Linking invariant enforced: port.contractId == odcs.id"
       - "Entropy Data marketplace integration"
       - "PII detection, team/owner extraction, unicode-safe"
+
+  # Legacy alias — same content as ``odps_bitol`` above. Kept for one
+  # release so existing consumers of features.yaml that key on
+  # ``odps_standard`` continue working unchanged.
+  odps_standard: *odps_bitol
     
   odcs:
     # MANUAL CONTROL

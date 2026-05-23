@@ -367,7 +367,38 @@ def run_ai_copilot_mode(
             "from_product_list": get_cli_arg_fn(args, "from_product_list"),
             "from_workspace": list(get_cli_arg_fn(args, "from_workspace", []) or []),
             "also_emit": get_cli_arg_fn(args, "also_emit"),
+            # Phase 7 — structural seed from an ODCS / Bitol ODPS document.
+            # When --seed-from is set, the FLUID skeleton from the standard
+            # is treated as ground truth (schema/quality/qos must not be
+            # mutated by the LLM). The post-validation guard in
+            # generate_copilot_artifacts enforces this.
+            "seed_from": get_cli_arg_fn(args, "seed_from"),
+            "seed_no_remote": bool(get_cli_arg_fn(args, "seed_no_remote", False)),
         }
+
+        # Phase 7 — load the structural seed up-front so failures surface
+        # before any LLM tokens are spent. The SeedResult rides on
+        # context.structural_seed; the runtime picks it up and uses it as
+        # the LLM seed_contract + ground-truth diff source.
+        _seed_from = copilot_options.get("seed_from")
+        if _seed_from:
+            try:
+                from fluid_build.cli.forge_copilot_seed import load_seed as _load_seed
+
+                _allow_remote = not copilot_options.get("seed_no_remote", False)
+                context["structural_seed"] = _load_seed(
+                    _seed_from, allow_remote=_allow_remote
+                )
+                logger.info(
+                    "forge_seed_loaded",
+                    extra={
+                        "path": str(_seed_from),
+                        "expose_count": len((context["structural_seed"].fluid.get("exposes") or [])),
+                    },
+                )
+            except Exception as _seed_exc:  # noqa: BLE001 — surface and exit cleanly
+                console_error(f"--seed-from failed: {_seed_exc}")
+                return 1
 
         # Phase 3: when --from-product / --from-product-list is set, resolve
         # the upstream products NOW (before we hit the LLM) so violations

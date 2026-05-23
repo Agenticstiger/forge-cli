@@ -748,6 +748,34 @@ def generate_copilot_artifacts(
                 validation_errors = schema_errors + list(validation_errors)
         except Exception as exc:  # noqa: BLE001 — never block on validator failure
             logger.debug("self_healing_schema_validate_failed: %s", exc)
+        # Phase 7 — structural-seed ground-truth guard. When the user
+        # passed ``fluid forge --seed-from`` (an ODCS contract or Bitol
+        # ODPS product), the SeedResult was loaded by forge_modes and
+        # stashed on context. The schema/quality/qos in the seed are
+        # treated as ground truth; the LLM may augment but not mutate
+        # them. If the validated payload diverges from those ground-truth
+        # paths, the mismatch report is fed into the repair loop as
+        # validation errors so the next attempt sees the precise paths
+        # that need to revert to the seed.
+        structural_seed = context.get("structural_seed") if isinstance(context, Mapping) else None
+        if structural_seed is not None and not validation_errors:
+            try:
+                from fluid_build.cli.forge_copilot_seed import diff_against_seed
+
+                mismatches = diff_against_seed(
+                    structural_seed, normalized.get("contract") or {}
+                )
+                if mismatches:
+                    seed_errors = [
+                        f"Ground-truth violation at {m['path']}: "
+                        f"seed={m['seed']!r}, candidate={m['candidate']!r}"
+                        for m in mismatches[:8]
+                    ]
+                    validation_errors = list(seed_errors) + list(validation_errors)
+                    report.validation_errors = validation_errors
+            except Exception as exc:  # noqa: BLE001 — never block on guard failure
+                logger.debug("structural_seed_guard_failed: %s", exc)
+
         report.validation_errors = validation_errors
         report.validation_warnings = validation_warnings
 
