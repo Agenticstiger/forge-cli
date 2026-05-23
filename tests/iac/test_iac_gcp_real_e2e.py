@@ -346,7 +346,15 @@ def test_real_cli_dbt_bigquery_amend_and_build(gcp_real_project, gcp_account, tm
                 "binding": {
                     "platform": "gcp",
                     "format": "bigquery_table",
-                    "location": {"dataset": dataset_id, "table": "events_seed"},
+                    "location": {
+                        "dataset": dataset_id,
+                        "table": "events_seed",
+                        # ``region`` lands as ``location`` on the
+                        # ``google_bigquery_dataset`` resource — defaults
+                        # to ``US`` if omitted. dbt-bigquery's profile
+                        # below pins the same region; both must agree.
+                        "region": GCP_LIVE_REGION,
+                    },
                 },
                 "contract": {"schema": [{"name": "id", "type": "string"}]},
             }
@@ -385,9 +393,20 @@ def test_real_cli_dbt_bigquery_amend_and_build(gcp_real_project, gcp_account, tm
         "FLUID_GCP_PROJECT": GCP_LIVE_PROJECT,
         "FLUID_GCP_TEST_SA": GCP_LIVE_TEST_SA,
         "FLUID_GCP_REGION": GCP_LIVE_REGION,
-        # dbt-bigquery's oauth method uses Application Default Credentials
-        # + the impersonation env (forge-cli's profile generator wires
-        # GCP_IMPERSONATE_SERVICE_ACCOUNT into the profile).
+        # The hashicorp/google provider self-configures from the
+        # environment when no static ``project`` is in the provider
+        # block — forge-cli's GcpIacPlugin.provider_block() returns
+        # ``{}`` to stay credential-free. So we provide the project
+        # via the provider's documented env var. Same for the
+        # impersonation target.
+        "GOOGLE_PROJECT": GCP_LIVE_PROJECT,
+        "GOOGLE_CLOUD_PROJECT": GCP_LIVE_PROJECT,
+        "GOOGLE_REGION": GCP_LIVE_REGION,
+        "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": GCP_LIVE_TEST_SA,
+        # dbt-bigquery's oauth method picks impersonation up via the
+        # forge-cli profile generator (which writes
+        # impersonate_service_account when GCP_IMPERSONATE_SERVICE_ACCOUNT
+        # is set).
         "GCP_IMPERSONATE_SERVICE_ACCOUNT": GCP_LIVE_TEST_SA,
     }
 
@@ -432,7 +451,13 @@ def test_real_gcp_mesh_dual_port_end_to_end(gcp_real_project, gcp_account, tmp_p
 
     Verification: SELECT through the CDP view returns the aggregate row.
     """
-    dataset_id = gcp_real_project.name("mesh").replace("-", "_")
+    # Distinct datasets for SDP+ADP vs CDP — the mesh's natural boundary.
+    # Each ``fluid apply`` invocation has its own tofu state; sharing a
+    # single dataset across two invocations would double-emit the
+    # dataset resource and collide. Cross-dataset references via fully-
+    # qualified ``project.dataset.table`` are exactly the mesh pattern.
+    dataset_sdp = gcp_real_project.name("mesh_a").replace("-", "_")
+    dataset_cdp = gcp_real_project.name("mesh_c").replace("-", "_")
     sdp_table = "events_seed"
     adp_model = f"agg_{gcp_real_project.uid}"
     cdp_view = f"cdp_v_{gcp_real_project.uid}"
@@ -454,7 +479,11 @@ def test_real_gcp_mesh_dual_port_end_to_end(gcp_real_project, gcp_account, tmp_p
                 "binding": {
                     "platform": "gcp",
                     "format": "bigquery_table",
-                    "location": {"dataset": dataset_id, "table": sdp_table},
+                    "location": {
+                        "dataset": dataset_sdp,
+                        "table": sdp_table,
+                        "region": GCP_LIVE_REGION,
+                    },
                 },
                 "contract": {"schema": [
                     {"name": "id", "type": "string"},
@@ -473,7 +502,7 @@ def test_real_gcp_mesh_dual_port_end_to_end(gcp_real_project, gcp_account, tmp_p
                     "platform": "bigquery",
                     "resources": {
                         "project": GCP_LIVE_PROJECT,
-                        "dataset": dataset_id,
+                        "dataset": dataset_sdp,
                         "location": GCP_LIVE_REGION,
                     },
                 }
@@ -499,6 +528,10 @@ def test_real_gcp_mesh_dual_port_end_to_end(gcp_real_project, gcp_account, tmp_p
         "FLUID_GCP_PROJECT": GCP_LIVE_PROJECT,
         "FLUID_GCP_TEST_SA": GCP_LIVE_TEST_SA,
         "FLUID_GCP_REGION": GCP_LIVE_REGION,
+        "GOOGLE_PROJECT": GCP_LIVE_PROJECT,
+        "GOOGLE_CLOUD_PROJECT": GCP_LIVE_PROJECT,
+        "GOOGLE_REGION": GCP_LIVE_REGION,
+        "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": GCP_LIVE_TEST_SA,
         "GCP_IMPERSONATE_SERVICE_ACCOUNT": GCP_LIVE_TEST_SA,
     }
     rc = _fluid(
@@ -530,11 +563,17 @@ def test_real_gcp_mesh_dual_port_end_to_end(gcp_real_project, gcp_account, tmp_p
                     "platform": "gcp",
                     "format": "bigquery_view",
                     "location": {
-                        "dataset": dataset_id,
+                        "dataset": dataset_cdp,
                         "view": cdp_view,
+                        "region": GCP_LIVE_REGION,
+                        # Cross-dataset reference: the CDP view reads the
+                        # ADP table that lives in the SDP+ADP dataset.
+                        # This is exactly the mesh pattern — consumer
+                        # product references an aggregate product via
+                        # fully-qualified table path.
                         "query": (
                             f"SELECT row_count FROM "
-                            f"`{GCP_LIVE_PROJECT}.{dataset_id}.{adp_model}`"
+                            f"`{GCP_LIVE_PROJECT}.{dataset_sdp}.{adp_model}`"
                         ),
                     },
                 },
@@ -556,6 +595,6 @@ def test_real_gcp_mesh_dual_port_end_to_end(gcp_real_project, gcp_account, tmp_p
     # ADP aggregate.
     bq = gcp_real_client("bigquery")
     row = next(iter(bq.query(
-        f"SELECT row_count FROM `{GCP_LIVE_PROJECT}.{dataset_id}.{cdp_view}`"
+        f"SELECT row_count FROM `{GCP_LIVE_PROJECT}.{dataset_cdp}.{cdp_view}`"
     ).result()))
     assert row.row_count == 2
