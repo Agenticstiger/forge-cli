@@ -600,6 +600,43 @@ def _emit_redshift_serverless(
         wg_body["security_group_ids"] = list(loc["security_group_ids"])
     resources.setdefault("aws_redshiftserverless_workgroup", {}).setdefault(wg_key, wg_body)
 
+    # Private VPC access: when the workgroup is not publicly accessible
+    # AND the contract supplies ``private_endpoint_subnets``, emit an
+    # ``aws_redshiftserverless_endpoint_access`` resource. Without this
+    # the workgroup's natural hostname
+    # (``<wg>.<acct>.<region>.redshift-serverless.amazonaws.com``) has
+    # no published DNS entry in the workgroup's VPC and clients running
+    # inside that VPC (e.g. dbt-redshift on an EC2) cannot resolve it
+    # — ``getent hosts`` fails with NXDOMAIN even after the workgroup
+    # is AVAILABLE. The endpoint-access resource creates a dedicated
+    # VPC ENI with a published DNS hostname; its ``.address`` is what
+    # the dbt-redshift profile uses as ``host``.
+    ep_subnets = loc.get("private_endpoint_subnets")
+    if ep_subnets:
+        ep_key = safe_ident(f"{cid}_rs_ep_{workgroup}")
+        # endpoint_name has length / charset constraints similar to the
+        # workgroup. Reuse the workgroup name + ``-ep`` so the address
+        # is deterministic and human-readable.
+        endpoint_name = f"{workgroup}-ep"[:30]
+        ep_body: Dict[str, Any] = {
+            "endpoint_name": endpoint_name,
+            "workgroup_name": tofu_ref(
+                f"aws_redshiftserverless_workgroup.{wg_key}.workgroup_name"
+            ),
+            "subnet_ids": list(ep_subnets),
+        }
+        if loc.get("private_endpoint_security_group_ids"):
+            ep_body["vpc_security_group_ids"] = list(
+                loc["private_endpoint_security_group_ids"]
+            )
+        elif loc.get("security_group_ids"):
+            # Default: reuse the workgroup's SG (port 5439 already open
+            # from the right source SG).
+            ep_body["vpc_security_group_ids"] = list(loc["security_group_ids"])
+        resources.setdefault("aws_redshiftserverless_endpoint_access", {}).setdefault(
+            ep_key, ep_body
+        )
+
 
 def _emit_redshift_external_schema(
     resources: Dict[str, Any], loc: Mapping[str, Any], cid: str, tags: Dict[str, str]

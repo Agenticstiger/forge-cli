@@ -290,6 +290,24 @@ def _build_generated_dbt_profile(
             "dbname": resources.get("database") or os.getenv("REDSHIFT_DATABASE", ""),
             "schema": resources.get("schema") or "public",
             "threads": int(resources.get("threads") or props.get("threads") or 4),
+            # Retry the initial connection: when forge-cli's amend-and-build
+            # provisions a fresh Redshift Serverless workgroup and then
+            # dispatches the dbt build in one go, the workgroup is
+            # AVAILABLE in the AWS API but its VPC-internal DNS entry
+            # can take ~10-60 s to propagate. The default ``retries: 1``
+            # gives up before propagation finishes; ``5`` is enough
+            # in practice without dragging out genuinely broken setups.
+            "retries": int(
+                resources.get("retries")
+                or props.get("retries")
+                or os.getenv("REDSHIFT_RETRIES")
+                or 5
+            ),
+            "connect_timeout": int(
+                resources.get("connect_timeout")
+                or props.get("connect_timeout")
+                or 60
+            ),
         }
 
         if use_iam:
@@ -304,11 +322,17 @@ def _build_generated_dbt_profile(
             if region:
                 output["region"] = region
             if workgroup:
-                # Serverless: dbt-redshift derives the endpoint host from
-                # ``serverless_work_group`` + region + acct_id (no
-                # cluster_id). Host stays blank so dbt picks the Serverless
-                # path. ``serverless_acct_id`` is required by dbt-redshift
-                # 1.10+ when ``is_serverless`` is true.
+                # Serverless: dbt-redshift's ``__base_kwargs`` passes
+                # ``host`` straight through to ``redshift_connector``,
+                # which then parses the host string for serverless
+                # detection (``is_serverless_host`` flag set by
+                # ``"redshift-serverless" in host``). An empty host
+                # breaks that detection and the connect raises
+                # ``gaierror`` even when ``is_serverless: true`` is set
+                # in the profile. So derive the canonical endpoint
+                # hostname here when we have everything needed
+                # (workgroup + acct + region) and the operator didn't
+                # supply an explicit ``host``.
                 output["is_serverless"] = True
                 output["serverless_work_group"] = str(workgroup)
                 acct = (
@@ -318,6 +342,11 @@ def _build_generated_dbt_profile(
                 )
                 if acct:
                     output["serverless_acct_id"] = str(acct)
+                if not output["host"] and acct and region:
+                    output["host"] = (
+                        f"{workgroup}.{acct}.{region}"
+                        ".redshift-serverless.amazonaws.com"
+                    )
                 # Serverless has no cluster_id; clear any stale value.
                 output.pop("cluster_id", None)
             elif cluster_id:
