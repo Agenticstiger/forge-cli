@@ -86,9 +86,19 @@ def _acquisition_contract() -> Dict[str, Any]:
 
 class TestDmmRegistrar:
     @respx.mock
-    def test_register_happy_path_uses_bearer_auth(self):
-        route = respx.put(
+    def test_register_happy_path_publishes_product_and_contract(self):
+        """DMM's canonical publish is two-step: a data-product PUT
+        (ODPS body) + one data-contract PUT per asset (ODCS body).
+        That matches what ``DataMeshManagerProvider._publish_odcs_per_expose``
+        does, and what the DMM UI surfaces as a data product with
+        linked contract pages.
+        """
+        dp_route = respx.put(
             "https://api.datamesh-manager.com/api/data-products/bronze.crm.salesforce_accounts"
+        ).mock(return_value=httpx.Response(200, json={"ok": True}))
+        dc_route = respx.put(
+            "https://api.datamesh-manager.com/api/datacontracts/"
+            "bronze.crm.salesforce_accounts.accounts_raw"
         ).mock(return_value=httpx.Response(200, json={"ok": True}))
         registrar = DataMeshManagerRegistrar(api_token="t-123")
         result = registrar.register(
@@ -100,26 +110,36 @@ class TestDmmRegistrar:
         assert result.succeeded is True
         assert result.target == "datamesh_manager"
         assert result.urn == "dmm://bronze.crm.salesforce_accounts/accounts_raw"
-        assert route.called
-        # Bearer auth header sent.
-        req = route.calls[0].request
-        assert req.headers["Authorization"] == "Bearer t-123"
-        body = json.loads(req.content)
-        assert body["id"] == "bronze.crm.salesforce_accounts"
-        assert body["owner"]["team"] == "data-platform"
-        # Classifications round-tripped to ports.schema.
-        email_field = next(f for f in body["ports"][0]["schema"] if f["name"] == "Email")
-        assert email_field["classifications"] == ["pii", "email"]
+        # Both PUTs landed
+        assert dp_route.called, "data-product PUT must fire"
+        assert dc_route.called, "datacontract PUT must fire (per-asset ODCS)"
+        # Bearer auth on both calls.
+        for call in (*dp_route.calls, *dc_route.calls):
+            assert call.request.headers["Authorization"] == "Bearer t-123"
+        # Data-product body is ODPS-shaped (carries the id at the top
+        # level matching the DMM path-route).
+        dp_body = json.loads(dp_route.calls[0].request.content)
+        assert dp_body["id"] == "bronze.crm.salesforce_accounts"
+        # Datacontract body is ODCS-shaped — pin the contract id matches
+        # the path so DMM's UI link between port → contract resolves.
+        dc_body = json.loads(dc_route.calls[0].request.content)
+        assert dc_body["id"] == "bronze.crm.salesforce_accounts.accounts_raw"
 
     @respx.mock
-    def test_register_4xx_surfaces_as_error(self):
-        respx.put("https://api.datamesh-manager.com/api/data-products/bronze.x").mock(
-            return_value=httpx.Response(403, text="forbidden")
-        )
+    def test_register_4xx_on_data_product_surfaces_as_error(self):
+        """4xx on the data-product PUT short-circuits the contract PUTs
+        — DMM rejects orphan contracts (their lookups go through the
+        owning product) so failing fast is the right move."""
+        # Use the contract's actual id + an existing expose so the
+        # canonical layer can derive a real payload; the 4xx still
+        # fires on the data-product PUT below.
+        respx.put(
+            "https://api.datamesh-manager.com/api/data-products/bronze.crm.salesforce_accounts"
+        ).mock(return_value=httpx.Response(403, text="forbidden"))
         registrar = DataMeshManagerRegistrar(api_token="t-x")
         result = registrar.register(
-            product_id="bronze.x",
-            expose_id="raw",
+            product_id="bronze.crm.salesforce_accounts",
+            expose_id="accounts_raw",
             contract=_acquisition_contract(),
             classifications={},
         )
@@ -152,16 +172,29 @@ class TestDmmRegistrar:
 class TestPublishAcquisitionToDmm:
     @respx.mock
     def test_publish_acquisition_dispatches_to_dmm(self, tmp_path: Path):
-        # The user's flow: contract has ``catalog.register: [datamesh_manager]``,
-        # publish_acquisition picks it up, our registrar publishes.
+        """Acquisition contract → DMM canonical publish.
+
+        The new ``publish_acquisition`` calls ``register_payload`` once
+        per contract — for DMM that fires both PUTs (data product +
+        per-asset contract). The result projects to a per-expose
+        PublishResult so existing CLI display code keeps working;
+        ``urn`` here is the DMM data-product URN (the canonical
+        identity), not the per-expose URN the legacy path emitted.
+        """
         from fluid_build.build_runners import _catalog as orch
         from fluid_build.cli._acquisition_stage_ext import publish_acquisition
 
         respx.put(
             "https://api.datamesh-manager.com/api/data-products/bronze.crm.salesforce_accounts"
         ).mock(return_value=httpx.Response(200, json={"ok": True}))
+        respx.put(
+            "https://api.datamesh-manager.com/api/datacontracts/"
+            "bronze.crm.salesforce_accounts.accounts_raw"
+        ).mock(return_value=httpx.Response(200, json={"ok": True}))
 
-        orch.register_registrar("datamesh_manager", DataMeshManagerRegistrar(api_token="t"))
+        orch.register_registrar(
+            "datamesh_manager", DataMeshManagerRegistrar(api_token="t")
+        )
         try:
             results = publish_acquisition(_acquisition_contract(), tmp_path)
         finally:
@@ -169,7 +202,9 @@ class TestPublishAcquisitionToDmm:
         assert len(results) == 1
         assert results[0].target == "datamesh_manager"
         assert results[0].succeeded is True
-        assert results[0].urn == "dmm://bronze.crm.salesforce_accounts/accounts_raw"
+        # Canonical URN is the DMM data-product URN — that's what an
+        # operator clicks through to in the DMM UI.
+        assert results[0].urn == "dmm://bronze.crm.salesforce_accounts"
 
     @respx.mock
     def test_publish_acquisition_dmm_5xx_surfaces_failure(self, tmp_path: Path):

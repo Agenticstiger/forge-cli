@@ -257,7 +257,7 @@ async def publish_contract(
 
     # Get catalog config
     catalog_config = config.get_catalog_config(catalog_name)
-    if not catalog_config:
+    if not catalog_config and not endpoint_override:
         return PublishResult(
             success=False,
             catalog_id=catalog_name,
@@ -267,8 +267,11 @@ async def publish_contract(
 
     # Apply per-invocation endpoint override (from ``--target name:endpoint``).
     # Shallow-copy so we don't mutate the shared config dict across targets.
+    # The override is intentionally allowed to seed an otherwise-empty
+    # config so ``--target datahub:https://datahub.company.com`` works
+    # without a prior YAML / env-var setup.
     if endpoint_override:
-        catalog_config = dict(catalog_config)
+        catalog_config = dict(catalog_config) if catalog_config else {}
         catalog_config["endpoint"] = endpoint_override
         if verbose:
             logger.info(f"🔧 {catalog_name}: endpoint overridden to {endpoint_override}")

@@ -323,14 +323,34 @@ class KafkaConnectMockServer:
 
 
 class DataHubMockServer:
-    """Captures DataHub GMS entity registrations."""
+    """Captures DataHub GMS entity registrations.
+
+    Three lanes:
+
+    - ``entities`` — legacy Snapshot envelopes posted to
+      ``/entities?action=ingest`` (Dataset and similar).
+    - ``proposals`` — MetadataChangeProposals posted to
+      ``/aspects?action=ingestProposal`` (DataProduct, Domain, and
+      anything DataHub only exposes via the MCP API).
+    - ``deletes`` — soft-delete URNs posted to
+      ``/entities?action=delete``.
+
+    Tests that historically asserted ``len(entities) == N`` keep
+    working — the new lanes only capture the new endpoints.
+    """
 
     def __init__(self) -> None:
         self.entities: List[Dict[str, Any]] = []
+        self.proposals: List[Dict[str, Any]] = []
+        self.deletes: List[str] = []
         self.calls: List[str] = []
 
     def attach(self, router: "respx.Router") -> None:
         router.post("/entities?action=ingest").mock(side_effect=self._ingest)
+        router.post("/aspects?action=ingestProposal").mock(
+            side_effect=self._ingest_proposal
+        )
+        router.post("/entities?action=delete").mock(side_effect=self._delete)
 
     def _ingest(self, request: Any) -> Any:
         import httpx
@@ -339,6 +359,40 @@ class DataHubMockServer:
         body = json.loads(request.content)
         self.entities.append(body)
         return httpx.Response(200, json={"value": "ok"})
+
+    def _ingest_proposal(self, request: Any) -> Any:
+        import httpx
+
+        self.calls.append("ingestProposal")
+        body = json.loads(request.content)
+        # The aspect payload is JSON-string-wrapped inside the MCP envelope
+        # (DataHub's GenericAspect shape). Materialise it back to a dict so
+        # tests don't have to double-parse to assert on aspect content.
+        proposal = body.get("proposal") or {}
+        aspect_str = (proposal.get("aspect") or {}).get("value")
+        if isinstance(aspect_str, str):
+            try:
+                proposal = {**proposal, "_aspect_value": json.loads(aspect_str)}
+            except Exception:  # noqa: BLE001 — best-effort, leave raw
+                pass
+        self.proposals.append(proposal)
+        return httpx.Response(200, json={"value": "ok"})
+
+    def _delete(self, request: Any) -> Any:
+        import httpx
+
+        self.calls.append("delete")
+        body = json.loads(request.content)
+        urn = body.get("urn")
+        if urn:
+            self.deletes.append(urn)
+        return httpx.Response(200, json={"value": "ok"})
+
+    # Convenience accessors for tests asserting on the new lanes.
+    def proposals_for(self, entity_type: str) -> List[Dict[str, Any]]:
+        """Return MCP proposals matching ``entity_type`` (``dataProduct``,
+        ``domain``, …)."""
+        return [p for p in self.proposals if p.get("entityType") == entity_type]
 
 
 class MarquezMockServer:
