@@ -28,6 +28,16 @@ PROVIDER_PINS: Dict[str, Dict[str, str]] = {
     "google": {"source": "hashicorp/google", "version": "~> 6.0"},
     "aws": {"source": "hashicorp/aws", "version": "~> 5.0"},
     "snowflake": {"source": "snowflakedb/snowflake", "version": "~> 2.0"},
+    # `archive` zips Lambda source inline (`data.archive_file`) so the AWS
+    # emitter ships function code without a separate packaging step.
+    "archive": {"source": "hashicorp/archive", "version": "~> 2.0"},
+    # `null` provides ``null_resource`` — the documented community bridge for
+    # operations that have no first-party Terraform resource in
+    # ``hashicorp/aws``. The AWS plugin uses it to run the
+    # ``CREATE EXTERNAL SCHEMA ... FROM DATA CATALOG`` SQL via the
+    # ``redshift-data`` API (no ``aws_redshiftserverless_external_schema``
+    # exists today; filed upstream — see ``AUTOGEN_SPIKE.md``).
+    "null": {"source": "hashicorp/null", "version": "~> 3.0"},
 }
 
 

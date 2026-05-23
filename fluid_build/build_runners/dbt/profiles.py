@@ -183,6 +183,87 @@ def _build_generated_dbt_profile(
 
         return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
 
+    if platform in {"athena", "aws-athena"}:
+        # dbt-athena-community. Iceberg materialization is *per-model* config
+        # (``{{ config(materialized='table', table_type='iceberg') }}``) and
+        # stays out of the profile entirely. ``database`` defaults to the
+        # AWS-default Glue catalog; ``schema`` is the data product's Glue
+        # database (the mesh interface). Credentials follow the boto3 chain
+        # — set ``AWS_PROFILE`` or attach an instance role.
+        output: Dict[str, Any] = {
+            "type": "athena",
+            "s3_staging_dir": (
+                resources.get("s3_staging_dir")
+                or props.get("s3_staging_dir")
+                or os.getenv("ATHENA_S3_STAGING_DIR")
+                or os.getenv("S3_STAGING_DIR")
+                or ""
+            ),
+            "region_name": (
+                resources.get("region")
+                or resources.get("region_name")
+                or os.getenv("AWS_REGION")
+                or os.getenv("AWS_DEFAULT_REGION")
+                or ""
+            ),
+            "database": resources.get("database") or "awsdatacatalog",
+            "schema": resources.get("schema") or resources.get("glue_database") or "default",
+            "threads": int(resources.get("threads") or props.get("threads") or 4),
+        }
+        # Iceberg writes need a separate data prefix from the staging dir.
+        data_dir = (
+            resources.get("s3_data_dir")
+            or props.get("s3_data_dir")
+            or os.getenv("ATHENA_S3_DATA_DIR")
+            or os.getenv("S3_DATA_DIR")
+        )
+        if data_dir:
+            output["s3_data_dir"] = data_dir
+        # boto3 resolves credentials; ``aws_profile_name`` is the cleanest
+        # explicit path. Instance roles / IRSA need no profile key.
+        aws_profile = os.getenv("AWS_PROFILE") or resources.get("aws_profile_name")
+        if aws_profile:
+            output["aws_profile_name"] = aws_profile
+        work_group = resources.get("work_group") or os.getenv("ATHENA_WORK_GROUP")
+        if work_group:
+            output["work_group"] = work_group
+        return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
+
+    if platform in {"glue", "aws-glue"}:
+        # dbt-glue (aws-samples). Workers / worker_type follow the canonical
+        # ``sample_profiles.yml``. ``session_provisioning_timeout_in_seconds``
+        # is bumped to 240 — the upstream default of 20 is too low for cold
+        # interactive sessions.
+        output = {
+            "type": "glue",
+            "role_arn": (
+                resources.get("role_arn")
+                or os.getenv("GLUE_ROLE_ARN")
+                or os.getenv("AWS_GLUE_ROLE_ARN")
+                or ""
+            ),
+            "region": (
+                resources.get("region")
+                or os.getenv("AWS_REGION")
+                or os.getenv("AWS_DEFAULT_REGION")
+                or ""
+            ),
+            "workers": int(resources.get("workers") or props.get("workers") or 5),
+            "worker_type": str(resources.get("worker_type") or props.get("worker_type") or "G.1X"),
+            "schema": resources.get("schema") or resources.get("glue_database") or "default",
+            "session_provisioning_timeout_in_seconds": int(
+                resources.get("session_provisioning_timeout_in_seconds")
+                or props.get("session_provisioning_timeout_in_seconds")
+                or 240
+            ),
+            "threads": int(resources.get("threads") or props.get("threads") or 4),
+        }
+        if resources.get("glue_version"):
+            output["glue_version"] = str(resources["glue_version"])
+        if resources.get("location"):
+            output["location"] = str(resources["location"])
+        return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
+
     if platform in {"aws", "redshift"}:
         cluster_id = resources.get("cluster_id") or os.getenv("REDSHIFT_CLUSTER_ID")
         iam_profile = os.getenv("REDSHIFT_IAM_PROFILE") or os.getenv("AWS_PROFILE")

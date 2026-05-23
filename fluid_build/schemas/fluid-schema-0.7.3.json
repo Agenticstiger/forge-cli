@@ -1242,6 +1242,7 @@
           "enum": [
             "bigquery_table",
             "snowflake_table",
+            "snowflake_view",
             "gcs_file",
             "s3_file",
             "http_api",
@@ -1253,6 +1254,9 @@
             "parquet",
             "csv",
             "json",
+            "redshift_table",
+            "redshift_serverless",
+            "redshift_external_schema",
             "other"
           ]
         },
@@ -3479,7 +3483,10 @@
             "composer",
             "mwaa",
             "databricks",
-            "snowflake"
+            "snowflake",
+            "athena",
+            "glue",
+            "redshift"
           ]
         },
         "executor": {
