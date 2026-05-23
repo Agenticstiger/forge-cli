@@ -125,8 +125,17 @@ class OdcsProvider(BaseProvider):
         for mapper in EXPORT_PIPELINE:
             mapper.to_odcs(ctx)
 
-        if self.schema and os.getenv("ODCS_VALIDATE", "false").lower() == "true":
-            validate(odcs, self.schema)
+        # Default-on schema validation against the vendored ODCS v3.1.0 JSON
+        # Schema. Warns rather than raises so a payload with unmodeled extras
+        # still emits — callers opt into hard fail via ODCS_VALIDATE_STRICT=true
+        # or by calling validate_contract() directly.
+        if self.schema and os.getenv("ODCS_VALIDATE", "true").lower() == "true":
+            try:
+                validate(odcs, self.schema)
+            except ProviderError as exc:
+                if os.getenv("ODCS_VALIDATE_STRICT", "false").lower() == "true":
+                    raise
+                self.logger.warning("ODCS validation: %s", exc)
 
         # Second-pass validation through ``vowl`` (optional). Off by default
         # so the dependency is opt-in; flip ``ODCS_VOWL_VALIDATE=true`` (or
