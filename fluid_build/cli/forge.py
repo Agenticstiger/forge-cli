@@ -369,6 +369,30 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     parser.add_argument(
+        "--seed-from",
+        dest="seed_from",
+        help=(
+            "[experimental — pre-processor only] Structural seed for the LLM. "
+            "Accepts a Bitol ODPS file (*.odps.yaml), a directory containing "
+            "the ODPS doc + sibling ODCS files (or only ODCS files), or a "
+            "lone ODCS file (*.odcs.yaml). The schema/quality/qos from the "
+            "seed are treated as ground truth; the LLM fills in builds, "
+            "execution, and governance. Today the seed pre-processor "
+            "(fluid_build.cli.forge_copilot_seed.load_seed) is callable as "
+            "a library; the copilot runtime hand-off + ground-truth diff "
+            "guard wiring is on a follow-up commit."
+        ),
+    )
+    parser.add_argument(
+        "--seed-no-remote",
+        dest="seed_no_remote",
+        action="store_true",
+        help=(
+            "[experimental] When --seed-from has http(s) contractId references, "
+            "refuse to fetch them. Honoured by the pre-processor."
+        ),
+    )
+    parser.add_argument(
         "--yes",
         "-y",
         action="store_true",
