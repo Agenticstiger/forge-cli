@@ -156,12 +156,16 @@ def _expose_to_output_port(
 ) -> Optional[Dict[str, Any]]:
     from fluid_build.providers.base import ProviderError
 
-    name = expose.get("exposeId") or expose.get("id")
+    # Bitol ODPS v1.0.0 OutputPort requires ``name``. Accept any of
+    # FLUID's three name-bearing fields (LLM-generated contracts vary
+    # by template): ``exposeId`` (canonical), ``id`` (FLUID 0.7.1
+    # legacy), ``name`` (forge AI default when neither is set).
+    name = expose.get("exposeId") or expose.get("id") or expose.get("name")
     if not name:
         raise ProviderError(
-            "FLUID expose is missing 'id/exposeId' — Bitol ODPS v1.0.0 "
-            "OutputPort requires a stable port name. Set either "
-            "expose.id or expose.exposeId."
+            "FLUID expose has no usable name — Bitol ODPS v1.0.0 "
+            "OutputPort requires a stable port name. Set expose.exposeId, "
+            "expose.id, or expose.name."
         )
 
     port: Dict[str, Any] = {

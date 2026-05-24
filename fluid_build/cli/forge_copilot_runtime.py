@@ -679,6 +679,18 @@ def generate_copilot_artifacts(
         project_memory=project_memory,
     )
 
+    # Phase 7 — structural-seed wiring. When ``fluid forge --seed-from``
+    # was used, the FLUID skeleton from the ODCS/ODPS document IS the
+    # seed the LLM should augment. Override ``seed_contract`` (which was
+    # built from templates/discovery) with the actual seed so the user
+    # prompt's seed slot shows the structure to preserve, not a template
+    # suggestion. Without this override, the system prompt instruction
+    # added below talks about a seed the LLM never sees → it hallucinates
+    # an unrelated contract or fails to produce a valid one.
+    _structural_seed = context.get("structural_seed") if isinstance(context, Mapping) else None
+    if _structural_seed is not None and getattr(_structural_seed, "fluid", None):
+        seed_contract = _structural_seed.fluid
+
     attempts: List[GenerationAttemptReport] = []
     previous_errors: List[str] = []
     previous_payload: Optional[Dict[str, Any]] = None
@@ -691,7 +703,6 @@ def generate_copilot_artifacts(
     # guard below enforces it; the prompt addition just gives the model
     # the chance to comply on the first attempt.
     _seed_ground_truth_extension = ""
-    _structural_seed = context.get("structural_seed") if isinstance(context, Mapping) else None
     if _structural_seed is not None:
         _seed_exposes = (
             (_structural_seed.fluid or {}).get("exposes") or []
