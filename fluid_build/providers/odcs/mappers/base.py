@@ -11,6 +11,10 @@ Every ODCS section maps to one module under :mod:`fluid_build.providers.odcs.map
 exposing a pair of pure functions: :func:`to_fluid` (ODCS → FLUID) and
 :func:`to_odcs` (FLUID → ODCS). Pass-through data lives under a single key
 per level so the round-trip surface is auditable in one place.
+
+Pass-through accessors + ``fluid_id`` are produced by the shared factory
+in :mod:`fluid_build.providers._mapper_common` so the ODCS and Bitol-ODPS
+providers stay protocol-identical without code duplication.
 """
 
 from __future__ import annotations
@@ -18,47 +22,24 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+
+from fluid_build.providers._mapper_common import (
+    fluid_id,
+    make_passthrough_helpers,
+)
 
 
 PASSTHROUGH_KEY = "odcs_passthrough"
 
-
-def metadata_passthrough(fluid: MutableMapping[str, Any]) -> Dict[str, Any]:
-    """Get or create the contract-level pass-through bucket under ``metadata``."""
-    metadata = fluid.setdefault("metadata", {})
-    if not isinstance(metadata, dict):
-        metadata = dict(metadata)
-        fluid["metadata"] = metadata
-    return metadata.setdefault(PASSTHROUGH_KEY, {})
-
-
-def get_metadata_passthrough(fluid: Mapping[str, Any]) -> Mapping[str, Any]:
-    metadata = fluid.get("metadata") or {}
-    if not isinstance(metadata, Mapping):
-        return {}
-    pt = metadata.get(PASSTHROUGH_KEY)
-    return pt if isinstance(pt, Mapping) else {}
-
-
-def expose_passthrough(expose: MutableMapping[str, Any]) -> Dict[str, Any]:
-    """Get or create an expose's pass-through bucket."""
-    return expose.setdefault(PASSTHROUGH_KEY, {})
-
-
-def get_expose_passthrough(expose: Mapping[str, Any]) -> Mapping[str, Any]:
-    pt = expose.get(PASSTHROUGH_KEY)
-    return pt if isinstance(pt, Mapping) else {}
-
-
-def field_passthrough(fld: MutableMapping[str, Any]) -> Dict[str, Any]:
-    """Get or create a field's pass-through bucket."""
-    return fld.setdefault(PASSTHROUGH_KEY, {})
-
-
-def get_field_passthrough(fld: Mapping[str, Any]) -> Mapping[str, Any]:
-    pt = fld.get(PASSTHROUGH_KEY)
-    return pt if isinstance(pt, Mapping) else {}
+(
+    metadata_passthrough,
+    get_metadata_passthrough,
+    expose_passthrough,
+    get_expose_passthrough,
+    field_passthrough,
+    get_field_passthrough,
+) = make_passthrough_helpers(PASSTHROUGH_KEY)
 
 
 @dataclass
@@ -81,14 +62,15 @@ class ExportCtx:
     options: Dict[str, Any] = field(default_factory=dict)
 
 
-def fluid_id(fluid: Mapping[str, Any]) -> Optional[str]:
-    """Resolve a FLUID contract's id from any of the supported locations."""
-    if "id" in fluid:
-        return fluid["id"]
-    contract = fluid.get("contract")
-    if isinstance(contract, Mapping) and contract.get("id"):
-        return contract["id"]
-    metadata = fluid.get("metadata")
-    if isinstance(metadata, Mapping) and metadata.get("id"):
-        return metadata["id"]
-    return None
+__all__ = [
+    "PASSTHROUGH_KEY",
+    "metadata_passthrough",
+    "get_metadata_passthrough",
+    "expose_passthrough",
+    "get_expose_passthrough",
+    "field_passthrough",
+    "get_field_passthrough",
+    "ImportCtx",
+    "ExportCtx",
+    "fluid_id",
+]

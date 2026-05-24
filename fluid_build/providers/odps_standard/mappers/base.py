@@ -7,8 +7,9 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Section mapper protocol + pass-through namespace for the Bitol ODPS provider.
 
-Mirrors the design of :mod:`fluid_build.providers.odcs.mappers.base` so the
-two providers share the same modular vocabulary. Per-level pass-through
+Mirrors the design of :mod:`fluid_build.providers.odcs.mappers.base` — both
+modules share the same accessor protocol via
+:mod:`fluid_build.providers._mapper_common`. Per-level pass-through
 namespaces:
 
 - contract-level → ``metadata.odps_passthrough.*``
@@ -21,48 +22,30 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+
+from fluid_build.providers._mapper_common import (
+    fluid_id,
+    make_passthrough_helpers,
+)
 
 
 PASSTHROUGH_KEY = "odps_passthrough"
 
-
-def metadata_passthrough(fluid: MutableMapping[str, Any]) -> Dict[str, Any]:
-    metadata = fluid.setdefault("metadata", {})
-    if not isinstance(metadata, dict):
-        metadata = dict(metadata)
-        fluid["metadata"] = metadata
-    return metadata.setdefault(PASSTHROUGH_KEY, {})
-
-
-def get_metadata_passthrough(fluid: Mapping[str, Any]) -> Mapping[str, Any]:
-    metadata = fluid.get("metadata") or {}
-    if not isinstance(metadata, Mapping):
-        return {}
-    pt = metadata.get(PASSTHROUGH_KEY)
-    return pt if isinstance(pt, Mapping) else {}
-
-
-def expose_passthrough(expose: MutableMapping[str, Any]) -> Dict[str, Any]:
-    return expose.setdefault(PASSTHROUGH_KEY, {})
-
-
-def get_expose_passthrough(expose: Mapping[str, Any]) -> Mapping[str, Any]:
-    pt = expose.get(PASSTHROUGH_KEY)
-    return pt if isinstance(pt, Mapping) else {}
-
-
-def expect_passthrough(expect: MutableMapping[str, Any]) -> Dict[str, Any]:
-    return expect.setdefault(PASSTHROUGH_KEY, {})
-
-
-def get_expect_passthrough(expect: Mapping[str, Any]) -> Mapping[str, Any]:
-    pt = expect.get(PASSTHROUGH_KEY)
-    return pt if isinstance(pt, Mapping) else {}
+(
+    metadata_passthrough,
+    get_metadata_passthrough,
+    expose_passthrough,
+    get_expose_passthrough,
+    expect_passthrough,
+    get_expect_passthrough,
+) = make_passthrough_helpers(PASSTHROUGH_KEY)
 
 
 @dataclass
 class ImportCtx:
+    """Mutable context threaded through ODPS → FLUID mappers."""
+
     odps: Mapping[str, Any]
     fluid: MutableMapping[str, Any]
     logger: logging.Logger
@@ -71,22 +54,12 @@ class ImportCtx:
 
 @dataclass
 class ExportCtx:
+    """Mutable context threaded through FLUID → ODPS mappers."""
+
     fluid: Mapping[str, Any]
     odps: MutableMapping[str, Any]
     logger: logging.Logger
     options: Dict[str, Any] = field(default_factory=dict)
-
-
-def fluid_id(fluid: Mapping[str, Any]) -> Optional[str]:
-    if "id" in fluid:
-        return fluid["id"]
-    contract = fluid.get("contract")
-    if isinstance(contract, Mapping) and contract.get("id"):
-        return contract["id"]
-    metadata = fluid.get("metadata")
-    if isinstance(metadata, Mapping) and metadata.get("id"):
-        return metadata["id"]
-    return None
 
 
 def contract_id_for_port(product_id: str, port_name: str) -> str:
@@ -97,3 +70,18 @@ def contract_id_for_port(product_id: str, port_name: str) -> str:
     Bitol ODPS fragments mode.
     """
     return f"{product_id}.{port_name}"
+
+
+__all__ = [
+    "PASSTHROUGH_KEY",
+    "metadata_passthrough",
+    "get_metadata_passthrough",
+    "expose_passthrough",
+    "get_expose_passthrough",
+    "expect_passthrough",
+    "get_expect_passthrough",
+    "ImportCtx",
+    "ExportCtx",
+    "fluid_id",
+    "contract_id_for_port",
+]
