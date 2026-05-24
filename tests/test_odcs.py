@@ -489,61 +489,63 @@ class TestRunOdcsImport:
 
 
 class TestRunOdcsValidate:
-    def test_valid_contract_returns_0(self, tmp_path):
+    """Tests for the multi-pass validator (jsonschema + vowl + roundtrip).
+
+    The runner imports ``collect_errors`` / ``validate_via_vowl`` /
+    ``roundtrip_check`` from ``fluid_build.providers.odcs.validation``
+    inside the function body. Tests mock those directly via the absolute
+    import path so each pass can be steered independently.
+    """
+
+    def _args(self, odcs_file, *, report=None, roundtrip=False, vowl=False):
         import argparse
 
+        return argparse.Namespace(
+            odcs_file=str(odcs_file),
+            report=report,
+            roundtrip=roundtrip,
+            vowl=vowl,
+        )
+
+    def test_valid_contract_returns_0(self, tmp_path):
         odcs_file = tmp_path / "c.yaml"
         odcs_file.write_text(yaml.dump(_odcs_contract()))
-
-        args = argparse.Namespace(odcs_file=str(odcs_file))
-
-        mock_provider = MagicMock()
-        mock_provider._validate_odcs = MagicMock()
-
         with (
-            patch("fluid_build.cli.odcs.OdcsProvider", return_value=mock_provider),
+            patch(
+                "fluid_build.providers.odcs.validation.collect_errors",
+                return_value=[],
+            ),
             patch("fluid_build.cli.odcs.cprint"),
         ):
-            code = _run_odcs_validate(args)
-
+            code = _run_odcs_validate(self._args(odcs_file))
         assert code == 0
 
     def test_invalid_contract_returns_1(self, tmp_path):
-        import argparse
-
         odcs_file = tmp_path / "c.yaml"
         odcs_file.write_text(yaml.dump(_odcs_contract()))
-
-        args = argparse.Namespace(odcs_file=str(odcs_file))
-
-        mock_provider = MagicMock()
-        mock_provider._validate_odcs.side_effect = ValueError("invalid schema")
-
         with (
-            patch("fluid_build.cli.odcs.OdcsProvider", return_value=mock_provider),
+            patch(
+                "fluid_build.providers.odcs.validation.collect_errors",
+                return_value=[
+                    {"path": "schema.0", "message": "missing required", "validator": "required"}
+                ],
+            ),
             patch("fluid_build.cli.odcs.cprint"),
         ):
-            code = _run_odcs_validate(args)
-
+            code = _run_odcs_validate(self._args(odcs_file))
         assert code == 1
 
     def test_json_file_parsed_correctly(self, tmp_path):
-        import argparse
-
         odcs_file = tmp_path / "c.json"
         odcs_file.write_text(json.dumps(_odcs_contract()))
-
-        args = argparse.Namespace(odcs_file=str(odcs_file))
-
-        mock_provider = MagicMock()
-        mock_provider._validate_odcs = MagicMock()
-
         with (
-            patch("fluid_build.cli.odcs.OdcsProvider", return_value=mock_provider),
+            patch(
+                "fluid_build.providers.odcs.validation.collect_errors",
+                return_value=[],
+            ),
             patch("fluid_build.cli.odcs.cprint"),
         ):
-            code = _run_odcs_validate(args)
-
+            code = _run_odcs_validate(self._args(odcs_file))
         assert code == 0
 
 

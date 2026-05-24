@@ -77,15 +77,22 @@ class AirbyteRestClient:
         api_token: Optional[str] = None,
         timeout_seconds: int = 30,
     ):
-        import httpx
+        # SSRF guard — Airbyte server_url comes from contract.fluid.yaml
+        # and carries a Bearer token in headers. allow_private=True for
+        # cluster-internal Airbyte; the hook still scheme-checks +
+        # DNS-pins. follow_redirects=False (httpx already strips
+        # Authorization cross-host, but a same-host redirect to an
+        # alternate path would still receive the token).
+        from fluid_build.util.safe_http import safe_httpx_client
 
         headers: Dict[str, str] = {}
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        self._client = httpx.Client(
-            base_url=server_url.rstrip("/"),
+        self._client = safe_httpx_client(
+            base_url=server_url,
             headers=headers,
-            timeout=timeout_seconds,
+            timeout=float(timeout_seconds),
+            allow_private=True,
         )
 
     def close(self) -> None:

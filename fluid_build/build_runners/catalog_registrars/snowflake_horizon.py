@@ -40,7 +40,7 @@ class SnowflakeHorizonRegistrar(CatalogRegistrar):
         contract: Dict[str, Any],
         classifications: Dict[str, List[str]],
     ) -> RegistrationResult:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         urn = f"snowflake://{self.database}.{self.schema}.{expose_id.upper()}"
         payload = self._build_payload(expose_id, contract, classifications)
@@ -51,7 +51,11 @@ class SnowflakeHorizonRegistrar(CatalogRegistrar):
         if self.auth_token:
             headers["Authorization"] = f'Snowflake Token="{self.auth_token}"'
         try:
-            with httpx.Client(base_url=self.account_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.account_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.post(
                     "/api/v2/databases/{db}/schemas/{schema}/tables".format(
                         db=self.database, schema=self.schema
@@ -67,11 +71,15 @@ class SnowflakeHorizonRegistrar(CatalogRegistrar):
             )
 
     def unregister(self, product_id: str, expose_id: str) -> RegistrationResult:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         urn = f"snowflake://{self.database}.{self.schema}.{expose_id.upper()}"
         try:
-            with httpx.Client(base_url=self.account_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.account_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.delete(
                     f"/api/v2/databases/{self.database}/schemas/{self.schema}/tables/{expose_id.upper()}"
                 )

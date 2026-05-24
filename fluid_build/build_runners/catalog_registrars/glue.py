@@ -42,7 +42,7 @@ class GlueCatalogRegistrar(CatalogRegistrar):
         contract: Dict[str, Any],
         classifications: Dict[str, List[str]],
     ) -> RegistrationResult:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         urn = f"glue://{self.database_name}/{expose_id}"
         payload = self._create_table_payload(expose_id, contract, classifications)
@@ -51,9 +51,10 @@ class GlueCatalogRegistrar(CatalogRegistrar):
             "X-Amz-Target": "AWSGlue.CreateTable",
         }
         try:
-            with httpx.Client(
+            with safe_httpx_client(
                 base_url=self.base_url_override or f"https://glue.{self.region}.amazonaws.com",
-                timeout=self.timeout_seconds,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
             ) as c:
                 r = c.post("/", json=payload, headers=headers)
                 r.raise_for_status()
@@ -62,13 +63,14 @@ class GlueCatalogRegistrar(CatalogRegistrar):
             return RegistrationResult(target="glue", urn=urn, succeeded=False, error=str(exc))
 
     def unregister(self, product_id: str, expose_id: str) -> RegistrationResult:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         urn = f"glue://{self.database_name}/{expose_id}"
         try:
-            with httpx.Client(
+            with safe_httpx_client(
                 base_url=self.base_url_override or f"https://glue.{self.region}.amazonaws.com",
-                timeout=self.timeout_seconds,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
             ) as c:
                 r = c.post(
                     "/",

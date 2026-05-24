@@ -145,6 +145,19 @@ Three guarantees that hold across every catalog: **read-only metadata access** (
 
 The same flow is exposed via the MCP `forge_from_source` tool — Claude Code, Cursor, and any MCP client can drive a catalog forge from inside the editor. See the [catalogs walkthrough](https://agenticstiger.github.io/forge_docs/cli/catalogs/) for per-catalog privilege grants and end-to-end demos.
 
+### Which ODPS? — Bitol vs ODPI disambiguation
+
+The CLI surfaces **two** standards under the `opds`/`odps` command. They share the three-letter slug but are different specs.
+
+| Standard | What it is | Spec | CLI selector |
+|---|---|---|---|
+| **Bitol ODPS v1.0.0** | Open Data Product Standard. Bidirectional; product wrapper that references ODCS contracts by `contractId`. | [bitol-io/open-data-product-standard](https://github.com/bitol-io/open-data-product-standard) | `fluid opds --spec bitol-1.0.0` *(default)* |
+| **ODPI v4.1** | Open Data Product Initiative (Linux Foundation). Export-only; single JSON document. | [Open-Data-Product-Initiative/v4.1](https://github.com/Open-Data-Product-Initiative/v4.1) | `fluid opds --spec odpi-4.1` |
+
+Bitol ODPS export emits **1 ODPS doc + N sibling `<contractId>.odcs.yaml`** files — the canonical Bitol fragments layout. Import reverses it: a single ODPS file, a directory bundle, or a lone ODCS file all converge on one validated FLUID contract. `fluid forge --seed-from <path>` accepts the same three input shapes as a structural seed for AI authoring.
+
+The legacy `--version 4.1` flag still works as a hidden alias for `--spec odpi-4.1`.
+
 ### From dev to CI — `fluid generate ci`
 
 When you're ready to run the full 11-stage pipeline in CI instead of manually, one command emits the pipeline file for your CI system:
