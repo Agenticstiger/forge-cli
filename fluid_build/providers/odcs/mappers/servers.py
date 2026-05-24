@@ -210,6 +210,20 @@ def _server_details_from_location(location: Mapping[str, Any], provider: str) ->
         for key in ("host", "port", "account", "database", "schema", "warehouse"):
             if key in location:
                 details[key] = location[key]
+        # ODCS v3.1.0 SnowflakeServer requires {account, database, schema}.
+        # Real forge-AI runs against Gemini Flash routinely emit a binding
+        # like ``{database: <name>, schema: <name>}`` without ``account``,
+        # which fails vendored-schema validation. Synthesize env-var
+        # placeholders for the required-but-missing fields so the
+        # generated contract is valid out of the box; deploy-time
+        # substitution fills them in. Users / LLMs that DID provide the
+        # field win — we only fill gaps.
+        for required_key, env_var in (
+            ("account", "${SNOWFLAKE_ACCOUNT}"),
+            ("database", "${SNOWFLAKE_DATABASE}"),
+            ("schema", "${SNOWFLAKE_SCHEMA}"),
+        ):
+            details.setdefault(required_key, env_var)
     elif p in ("aws", "s3"):
         # ODCS S3Server: location (URI), endpointUrl, format, delimiter
         loc_val = location.get("location") or _build_s3_uri(

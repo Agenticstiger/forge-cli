@@ -619,6 +619,58 @@ def _self_evaluate_contract(
     return None
 
 
+def _format_seed_mismatch_for_repair(mismatch: Mapping[str, Any]) -> str:
+    """Compact repair feedback for a single ground-truth seed mismatch.
+
+    Pre-fix, the feedback dumped the entire seed list AND the entire
+    candidate list per mismatch — ``seed=[{name: ..., quality: [...]},
+    ...]; candidate=[{...}]`` produced ~1.5KB per mismatch, ~12KB
+    total for an 8-mismatch payload. Live testing with Gemini Flash
+    showed that on the third repair attempt the model gave up and
+    returned prose ("parse error - Response did not contain a valid
+    JSON object"). The verbose feedback was the proximate cause.
+
+    For schema-list mismatches (the overwhelmingly common shape) this
+    helper extracts just the field-name diff — the actionable signal
+    — and drops the field-level quality/passthrough payload. Other
+    mismatch shapes get a value-truncated fallback.
+    """
+    path = mismatch.get("path", "<unknown>")
+    seed = mismatch.get("seed")
+    candidate = mismatch.get("candidate")
+
+    # Schema-list mismatch — the renamed-fields case. Extract just the
+    # ordered list of names from both sides; that's the load-bearing
+    # diff the LLM needs to act on.
+    if isinstance(seed, list) and isinstance(candidate, list):
+        seed_names = [
+            item.get("name") for item in seed if isinstance(item, Mapping) and item.get("name")
+        ]
+        candidate_names = [
+            item.get("name") for item in candidate if isinstance(item, Mapping) and item.get("name")
+        ]
+        if seed_names or candidate_names:
+            return (
+                f"Seed schema mismatch at {path}: "
+                f"seed field names={seed_names}, "
+                f"candidate field names={candidate_names}. "
+                f"DO NOT RENAME — restore the seed names exactly."
+            )
+
+    # Fallback for non-schema-list mismatches — truncate so a single
+    # huge value doesn't dominate the repair context.
+    def _trunc(value: Any, *, limit: int = 200) -> str:
+        text = repr(value)
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
+    return (
+        f"Seed ground-truth violation at {path}: "
+        f"seed={_trunc(seed)}, candidate={_trunc(candidate)}"
+    )
+
+
 def generate_copilot_artifacts(
     context: Mapping[str, Any],
     *,
@@ -718,6 +770,16 @@ def generate_copilot_artifacts(
             "classification)\n"
             "  - quality / validation rules\n"
             "  - qos / SLA expectations\n\n"
+            "CRITICAL — DO NOT RENAME FIELDS. Copy every field name from the "
+            "seed exactly, character-for-character. NEVER substitute "
+            "'better-sounding' synonyms (e.g. ``order_date`` → "
+            "``order_completion_date`` is a violation; ``amount`` → "
+            "``order_item_price`` is a violation). The same rule applies to "
+            "expose names, contract field names, and column names — they are "
+            "load-bearing identifiers, not labels you can improve. If you think "
+            "the seed name is poor, leave it alone — the post-validation guard "
+            "WILL reject any rename and you'll have to redo the whole "
+            "generation.\n\n"
             "PRECEDENCE: when intent or context conflicts with seed schema/qos, "
             "the SEED WINS. Intent steers builds, executes, governance, and any "
             "field the seed doesn't model — never schema/quality/qos. A "
@@ -806,11 +868,7 @@ def generate_copilot_artifacts(
 
                 mismatches = diff_against_seed(structural_seed, normalized.get("contract") or {})
                 if mismatches:
-                    seed_errors = [
-                        f"Ground-truth violation at {m['path']}: "
-                        f"seed={m['seed']!r}, candidate={m['candidate']!r}"
-                        for m in mismatches[:8]
-                    ]
+                    seed_errors = [_format_seed_mismatch_for_repair(m) for m in mismatches[:8]]
                     validation_errors = list(seed_errors) + list(validation_errors)
                     report.validation_errors = validation_errors
             except Exception as exc:  # noqa: BLE001
