@@ -12,7 +12,10 @@ schema:
     properties:
       - name: id
         logicalType: string
+# Smallest vowl-strict-pass servers entry — minimal fixture must round-trip
+# AND pass the (now default-on) vowl second pass.
 servers:
-  - server: local
-    type: local
-    path: /tmp/minimal
+  - server: prod
+    type: bigquery
+    project: example_project
+    dataset: example_dataset

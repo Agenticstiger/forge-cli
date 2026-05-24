@@ -39,18 +39,55 @@ def load_schema() -> Optional[Dict[str, Any]]:
 def validate(odcs: Mapping[str, Any], schema: Mapping[str, Any]) -> None:
     """Validate an ODCS contract against the v3.1.0 JSON Schema.
 
-    Raises :class:`ProviderError` on validation failure. Silently no-ops when
-    the optional :mod:`jsonschema` dependency is not installed.
+    Raises :class:`ProviderError` on validation failure carrying ALL
+    violations (not just the first). Silently no-ops when the optional
+    :mod:`jsonschema` dependency is not installed.
+    """
+    errors = collect_errors(odcs, schema)
+    if errors:
+        # Cap at 20 lines of detail so the exception message stays
+        # readable; full structured list is available via collect_errors().
+        head = errors[:20]
+        more = f" (+{len(errors) - 20} more)" if len(errors) > 20 else ""
+        body = "; ".join(f"{e['path'] or '<root>'}: {e['message']}" for e in head)
+        raise ProviderError(f"ODCS validation failed ({len(errors)} error(s)): {body}{more}")
+
+
+def collect_errors(
+    odcs: Mapping[str, Any], schema: Mapping[str, Any]
+) -> List[Dict[str, Any]]:
+    """Return EVERY ODCS schema violation as a structured list.
+
+    Each entry has::
+
+        {
+            "path": "schema.0.relationships.0",  # dotted instance path
+            "message": "'type' was unexpected",
+            "validator": "unevaluatedProperties",
+        }
+
+    Empty list = valid. No-op (empty list) when :mod:`jsonschema` is not
+    installed. Used by ``validate()`` (which raises on non-empty) and by
+    ``fluid odcs validate --report`` (which serializes to JSON for CI).
     """
     try:
         import jsonschema
     except ImportError:
         LOG.warning("jsonschema not installed, skipping ODCS validation")
-        return
-    try:
-        jsonschema.validate(instance=odcs, schema=schema)
-    except jsonschema.ValidationError as exc:
-        raise ProviderError(f"ODCS validation failed: {exc.message}") from exc
+        return []
+
+    validator_cls = jsonschema.validators.validator_for(schema)
+    validator = validator_cls(schema)
+    out: List[Dict[str, Any]] = []
+    for err in validator.iter_errors(odcs):
+        out.append(
+            {
+                "path": ".".join(str(p) for p in err.absolute_path),
+                "message": err.message,
+                "validator": err.validator,
+            }
+        )
+    return out
 
 
 def validate_via_vowl(odcs: Mapping[str, Any]) -> Optional[Dict[str, Any]]:

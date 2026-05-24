@@ -363,8 +363,35 @@ def register(subparsers) -> None:
     import_cmd.set_defaults(func=lambda args, logger=None: _run_odcs_import(args))
 
     # odcs validate
-    validate = odcs_sub.add_parser("validate", help="Validate ODCS contract file")
+    validate = odcs_sub.add_parser(
+        "validate",
+        help="Validate ODCS contract file",
+        description=(
+            "Validate an ODCS YAML/JSON file. Default: jsonschema first-pass + "
+            "vowl second-pass (when installed via `pip install fluid-build[odcs-strict]`). "
+            "All violations are collected — exit code is 1 if any check fails."
+        ),
+    )
     validate.add_argument("odcs_file", help="Path to ODCS file")
+    validate.add_argument(
+        "--report",
+        dest="report",
+        default=None,
+        help="Write structured JSON validation report to this path (for CI gates).",
+    )
+    validate.add_argument(
+        "--roundtrip",
+        action="store_true",
+        help="Also verify the contract round-trips losslessly through "
+        "OdcsProvider.import_contract → render and report any diff.",
+    )
+    validate.add_argument(
+        "--no-vowl",
+        dest="vowl",
+        action="store_false",
+        default=True,
+        help="Skip the vowl second-pass even if installed.",
+    )
     validate.set_defaults(func=lambda args, logger=None: _run_odcs_validate(args))
 
     # odcs info
@@ -434,9 +461,29 @@ def _run_odcs_import(args):
 
 
 def _run_odcs_validate(args):
-    """Run ODCS validate command."""
+    """Run ODCS validate command — multi-pass with structured report.
+
+    Passes:
+      1. jsonschema against the vendored ODCS v3.1.0 schema. ALL violations
+         collected via collect_errors().
+      2. vowl second-pass (when installed via the ``odcs-strict`` extra).
+         Catches semantic issues jsonschema misses (format validation,
+         unevaluated-properties enforcement, …).
+      3. (opt-in) round-trip: import → render → diff. Catches mapper
+         regressions that don't break the spec but lose data.
+
+    Exit code is 1 iff any pass surfaces a violation. With ``--report PATH``
+    every result is also serialised to a JSON file for CI gates.
+    """
     import json
     from pathlib import Path
+
+    from fluid_build.providers.odcs.validation import (
+        collect_errors,
+        load_schema,
+        roundtrip_check,
+        validate_via_vowl,
+    )
 
     file_path = Path(args.odcs_file)
     with open(file_path) as f:
@@ -447,15 +494,80 @@ def _run_odcs_validate(args):
         else:
             odcs_data = json.load(f)
 
-    # Validate using provider
-    provider = OdcsProvider()
-    try:
-        provider._validate_odcs(odcs_data)
-        cprint("✓ Validation passed")
-        return 0
-    except Exception as e:
-        cprint(f"✗ Validation failed: {e}")
-        return 1
+    report: dict = {
+        "file": str(file_path),
+        "passes": {},
+        "ok": True,
+    }
+
+    # Pass 1 — jsonschema (multi-error)
+    schema = load_schema()
+    if schema:
+        errors = collect_errors(odcs_data, schema)
+        report["passes"]["jsonschema"] = {
+            "ok": not errors,
+            "errors": errors,
+        }
+        if errors:
+            report["ok"] = False
+            cprint(f"✗ jsonschema: {len(errors)} error(s)")
+            for e in errors[:10]:
+                cprint(f"   {e['path'] or '<root>'}: {e['message'][:120]}")
+            if len(errors) > 10:
+                cprint(f"   ... +{len(errors) - 10} more")
+        else:
+            cprint("✓ jsonschema: clean")
+    else:
+        report["passes"]["jsonschema"] = {"ok": False, "errors": [], "skipped": "schema not vendored"}
+
+    # Pass 2 — vowl (opt-in; defaults on when installed)
+    vowl_enabled = getattr(args, "vowl", True)
+    if vowl_enabled:
+        try:
+            diag = validate_via_vowl(odcs_data)
+        except Exception as exc:  # noqa: BLE001 — vowl bundles its own errors
+            report["passes"]["vowl"] = {"ok": False, "error": str(exc)[:300]}
+            report["ok"] = False
+            cprint(f"✗ vowl: {type(exc).__name__}: {str(exc)[:200]}")
+        else:
+            if diag is None:
+                report["passes"]["vowl"] = {"ok": True, "skipped": "vowl not installed"}
+                cprint("○ vowl: not installed (pip install 'fluid-build[odcs-strict]')")
+            else:
+                report["passes"]["vowl"] = {"ok": True, "diagnostics": diag}
+                cprint(
+                    f"✓ vowl: api={diag.get('api_version')} "
+                    f"schemas={len(diag.get('schemas', []))} "
+                    f"checks={diag.get('total_checks')}"
+                )
+
+    # Pass 3 — round-trip (opt-in)
+    if getattr(args, "roundtrip", False):
+        try:
+            rt = OdcsProvider().roundtrip_check(odcs_data)
+        except Exception as exc:  # noqa: BLE001
+            report["passes"]["roundtrip"] = {"ok": False, "error": str(exc)[:300]}
+            report["ok"] = False
+            cprint(f"✗ roundtrip: {type(exc).__name__}: {str(exc)[:200]}")
+        else:
+            report["passes"]["roundtrip"] = rt
+            if rt["equal"]:
+                cprint("✓ roundtrip: lossless")
+            else:
+                report["ok"] = False
+                cprint(
+                    f"✗ roundtrip: missing={len(rt['missing'])} "
+                    f"extra={len(rt['extra'])} changed={len(rt['changed'])}"
+                )
+
+    # Optional structured report (CI gate)
+    if getattr(args, "report", None):
+        report_path = Path(args.report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2, default=str))
+        cprint(f"📄 Report: {report_path}")
+
+    return 0 if report["ok"] else 1
 
 
 def _run_odcs_info(args):

@@ -116,6 +116,26 @@ sdk = [
   "fluid-provider-sdk>=0.1.0",
 ]
 
+# Stricter ODCS validation via vowl (MIT, GovTech Data Practice).
+# Bitol vendor-listed validation engine that aggregates ALL violations
+# (no first-error-only), runs format checks (uuid/email/ipv4/...),
+# auto-derives SQL data checks from contract metadata, and can run
+# them against real data sources via Ibis.
+#
+# Today we use vowl's *spec-parsing* side only — when this extra is
+# installed and ``ODCS_VOWL_VALIDATE=true`` (or ``fluid odcs validate
+# --vowl``), ``OdcsProvider.render`` runs a vowl second pass to catch
+# semantic issues jsonschema doesn't surface (stricter format
+# validation, unevaluated-properties enforcement, etc.).
+#
+# Borrowed-not-built per /borrow-before-build:
+#   PyPI:    https://pypi.org/project/vowl/
+#   GitHub:  https://github.com/govtech-data-practice/vowl
+#   Listed:  https://github.com/bitol-io/open-data-contract-standard/blob/main/vendors.md
+odcs-strict = [
+  "vowl>=0.0.2",
+]
+
 # Local provider (DuckDB)
 local = [
   "duckdb>=1.0",
