@@ -71,9 +71,7 @@ class OdcsProvider(_OdcsProviderImpl):
         return _team_mapper._team_to_owner(team) or {}
 
     # --- field quality --------------------------------------------------
-    def _extract_field_quality(
-        self, field: Mapping[str, Any]
-    ) -> Optional[List[Dict[str, Any]]]:
+    def _extract_field_quality(self, field: Mapping[str, Any]) -> Optional[List[Dict[str, Any]]]:
         if not getattr(self, "include_quality_checks", True):
             return None
         return _quality_mapper.to_odcs_property(field)
@@ -95,9 +93,7 @@ class OdcsProvider(_OdcsProviderImpl):
         return prop
 
     # --- SLA ------------------------------------------------------------
-    def _extract_sla_properties(
-        self, fluid: Mapping[str, Any]
-    ) -> Optional[List[Dict[str, Any]]]:
+    def _extract_sla_properties(self, fluid: Mapping[str, Any]) -> Optional[List[Dict[str, Any]]]:
         if not getattr(self, "include_sla", True):
             return None
         ctx = ExportCtx(
@@ -121,9 +117,7 @@ class OdcsProvider(_OdcsProviderImpl):
         return ctx.odcs.get("quality")
 
     # --- schema (import) -----------------------------------------------
-    def _odcs_schema_to_expose(
-        self, odcs: Mapping[str, Any]
-    ) -> Optional[Dict[str, Any]]:
+    def _odcs_schema_to_expose(self, odcs: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         """DEPRECATED. Legacy helper that flattens every SchemaObject in an
         ODCS contract into a single FLUID expose. Kept only for back-compat
         with one specific test in ``tests/test_odcs_mappings.py``; will be
@@ -168,9 +162,7 @@ class OdcsProvider(_OdcsProviderImpl):
         return logical_to_fluid(logical_type)
 
     # --- servers (import / export) -------------------------------------
-    def _odcs_server_to_expect(
-        self, server: Mapping[str, Any]
-    ) -> Optional[Dict[str, Any]]:
+    def _odcs_server_to_expect(self, server: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         return _servers_mapper._server_to_expect(server)
 
     def _map_provider_to_server_type(self, provider: str) -> str:
@@ -179,15 +171,11 @@ class OdcsProvider(_OdcsProviderImpl):
     def _map_server_type_to_provider(self, server_type: str) -> str:
         return server_type_to_provider(server_type)
 
-    def _extract_location_from_server(
-        self, server: Mapping[str, Any]
-    ) -> Dict[str, Any]:
+    def _extract_location_from_server(self, server: Mapping[str, Any]) -> Dict[str, Any]:
         return _servers_mapper._location_from_server(server)
 
     # --- expose scoping (legacy name) ---------------------------------
-    def _filter_to_expose(
-        self, fluid: Mapping[str, Any], expose_id: str
-    ) -> Dict[str, Any]:
+    def _filter_to_expose(self, fluid: Mapping[str, Any], expose_id: str) -> Dict[str, Any]:
         return self._scope_to_expose(fluid, expose_id)
 
     # --- validation -----------------------------------------------------

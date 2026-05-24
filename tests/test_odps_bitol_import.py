@@ -53,39 +53,29 @@ def provider() -> BitolOdpsProvider:
 
 
 class TestImportContract:
-    def test_emits_one_expose_per_output_port(
-        self, provider: BitolOdpsProvider
-    ) -> None:
+    def test_emits_one_expose_per_output_port(self, provider: BitolOdpsProvider) -> None:
         fluid = provider.import_contract(_bundle_product_path())
         assert len(fluid["exposes"]) == 2
 
-    def test_each_expose_carries_a_populated_schema(
-        self, provider: BitolOdpsProvider
-    ) -> None:
+    def test_each_expose_carries_a_populated_schema(self, provider: BitolOdpsProvider) -> None:
         fluid = provider.import_contract(_bundle_product_path())
         for expose in fluid["exposes"]:
             schema = expose.get("contract", {}).get("schema", [])
             assert schema, f"expose {expose['id']} has no schema"
             assert all("name" in field for field in schema)
 
-    def test_qos_carries_back_from_slaProperties(
-        self, provider: BitolOdpsProvider
-    ) -> None:
+    def test_qos_carries_back_from_slaProperties(self, provider: BitolOdpsProvider) -> None:
         fluid = provider.import_contract(_bundle_product_path())
         # daily_orders had qos.availability + freshnessSLO; sla preservation
         # round-trips into the first expose's qos block.
         daily = next(e for e in fluid["exposes"] if e["id"] == "daily_orders")
         assert "qos" in daily
 
-    def test_metadata_owner_team_present(
-        self, provider: BitolOdpsProvider
-    ) -> None:
+    def test_metadata_owner_team_present(self, provider: BitolOdpsProvider) -> None:
         fluid = provider.import_contract(_bundle_product_path())
         assert fluid.get("owner", {}).get("team") == "commerce-team"
 
-    def test_passthrough_source_captured(
-        self, provider: BitolOdpsProvider
-    ) -> None:
+    def test_passthrough_source_captured(self, provider: BitolOdpsProvider) -> None:
         fluid = provider.import_contract(_bundle_product_path())
         pt = (fluid.get("metadata") or {}).get("odps_passthrough") or {}
         assert "source" in pt, "import must preserve the original ODPS doc"
@@ -97,25 +87,19 @@ class TestImportContract:
 
 
 class TestImportDirectory:
-    def test_directory_import_matches_file_import(
-        self, provider: BitolOdpsProvider
-    ) -> None:
+    def test_directory_import_matches_file_import(self, provider: BitolOdpsProvider) -> None:
         from_file = provider.import_contract(_bundle_product_path())
         from_dir = provider.import_directory(BUNDLE_DIR)
         assert from_file == from_dir
 
 
 class TestImportOdcsOnlyDirectory:
-    def test_emits_one_expose_per_odcs_file(
-        self, provider: BitolOdpsProvider
-    ) -> None:
+    def test_emits_one_expose_per_odcs_file(self, provider: BitolOdpsProvider) -> None:
         fluid = provider.import_directory(CONTRACTS_ONLY)
         n_files = len(list(CONTRACTS_ONLY.glob("*.odcs.yaml")))
         assert len(fluid["exposes"]) == n_files
 
-    def test_warning_recorded_in_passthrough(
-        self, provider: BitolOdpsProvider
-    ) -> None:
+    def test_warning_recorded_in_passthrough(self, provider: BitolOdpsProvider) -> None:
         fluid = provider.import_directory(CONTRACTS_ONLY)
         pt = (fluid.get("metadata") or {}).get("odps_passthrough") or {}
         assert pt.get("odcs_only_directory") is True
@@ -164,26 +148,18 @@ class TestBundleRoundTrip:
 
 
 class TestNegative:
-    def test_dangling_contract_id_raises_for_output_port(
-        self, provider: BitolOdpsProvider
-    ) -> None:
+    def test_dangling_contract_id_raises_for_output_port(self, provider: BitolOdpsProvider) -> None:
         # Output ports MUST resolve; lenient=False (default) raises
         with pytest.raises(ProviderError):
             provider.import_contract(BROKEN / "dangling-port.odps.yaml", lenient=False)
 
-    def test_dangling_contract_id_lenient_warns(
-        self, provider: BitolOdpsProvider
-    ) -> None:
+    def test_dangling_contract_id_lenient_warns(self, provider: BitolOdpsProvider) -> None:
         # With lenient=True, unresolved output ports are warn-and-continue
-        fluid = provider.import_contract(
-            BROKEN / "dangling-port.odps.yaml", lenient=True
-        )
+        fluid = provider.import_contract(BROKEN / "dangling-port.odps.yaml", lenient=True)
         # The expose stub still gets created — just without a contract body
         assert len(fluid["exposes"]) == 1
 
-    def test_two_odps_docs_in_directory_raises(
-        self, provider: BitolOdpsProvider
-    ) -> None:
+    def test_two_odps_docs_in_directory_raises(self, provider: BitolOdpsProvider) -> None:
         with pytest.raises(ProviderError, match="found 2 ODPS docs"):
             provider.import_directory(BROKEN / "two-odps-docs")
 

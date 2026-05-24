@@ -87,9 +87,9 @@ class TestLinkingInvariant:
     def test_contract_id_follows_convention(self, bundle: dict) -> None:
         product_id = bundle["product"]["id"]
         for port in bundle["product"].get("outputPorts", []):
-            assert port["contractId"].startswith(f"{product_id}."), (
-                f"contractId must be `{{productId}}.<port>` — got {port['contractId']!r}"
-            )
+            assert port["contractId"].startswith(
+                f"{product_id}."
+            ), f"contractId must be `{{productId}}.<port>` — got {port['contractId']!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -123,13 +123,11 @@ class TestOutDirLayout:
             product = yaml.safe_load(f)
         for port in product.get("outputPorts", []):
             # Bitol fragments mode: only contractId references — no inline body
-            assert "contract" not in port, (
-                "fragments mode must not embed contract bodies in the ODPS doc"
-            )
+            assert (
+                "contract" not in port
+            ), "fragments mode must not embed contract bodies in the ODPS doc"
 
-    def test_odcs_filenames_match_contract_ids(
-        self, fluid: dict, tmp_path: Path
-    ) -> None:
+    def test_odcs_filenames_match_contract_ids(self, fluid: dict, tmp_path: Path) -> None:
         prov = BitolOdpsProvider()
         prov.strict_validation = False
         bundle = prov.render(fluid, out_dir=tmp_path)
@@ -171,9 +169,7 @@ class TestCoverage:
 
 
 class TestNegative:
-    def test_duplicate_expose_id_raises_before_writing(
-        self, fluid: dict, tmp_path: Path
-    ) -> None:
+    def test_duplicate_expose_id_raises_before_writing(self, fluid: dict, tmp_path: Path) -> None:
         bad = yaml.safe_load(yaml.dump(fluid))
         # Force a duplicate output-port name
         bad["exposes"].append(dict(bad["exposes"][0]))

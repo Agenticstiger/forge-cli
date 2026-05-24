@@ -82,13 +82,9 @@ class TestEdgeContract:
     )
     def test_nested_object_properties_survive(self, edge_odcs: dict) -> None:
         rebuilt = OdcsProvider().render(OdcsProvider().import_contract(edge_odcs))
-        payload = next(
-            p for p in rebuilt["schema"][0]["properties"] if p["name"] == "payload"
-        )
+        payload = next(p for p in rebuilt["schema"][0]["properties"] if p["name"] == "payload")
         assert "properties" in payload
-        inner = next(
-            p for p in payload["properties"] if p["name"] == "inner_struct"
-        )
+        inner = next(p for p in payload["properties"] if p["name"] == "inner_struct")
         assert any(p["name"] == "leaf" for p in inner["properties"])
 
 
@@ -166,16 +162,19 @@ class TestRemoteContractFixture:
             "    dataset: ext_dataset\n"
         )
 
-        with patch(
-            "fluid_build.providers.odps_standard.resolver._fetch_bytes",
-            return_value=(
-                200,
-                {"content-type": "application/yaml"},
-                odcs_yaml.encode("utf-8"),
+        with (
+            patch(
+                "fluid_build.providers.odps_standard.resolver._fetch_bytes",
+                return_value=(
+                    200,
+                    {"content-type": "application/yaml"},
+                    odcs_yaml.encode("utf-8"),
+                ),
             ),
-        ), patch(
-            "fluid_build.providers.odps_standard.resolver._assert_safe_url",
-            return_value=None,
+            patch(
+                "fluid_build.providers.odps_standard.resolver._assert_safe_url",
+                return_value=None,
+            ),
         ):
             provider = BitolOdpsProvider()
             fluid = provider.import_contract(self.FIXTURE, allow_remote=True)

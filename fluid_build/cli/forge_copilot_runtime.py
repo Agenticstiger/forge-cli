@@ -804,9 +804,7 @@ def generate_copilot_artifacts(
             try:
                 from fluid_build.cli.forge_copilot_seed import diff_against_seed
 
-                mismatches = diff_against_seed(
-                    structural_seed, normalized.get("contract") or {}
-                )
+                mismatches = diff_against_seed(structural_seed, normalized.get("contract") or {})
                 if mismatches:
                     seed_errors = [
                         f"Ground-truth violation at {m['path']}: "
@@ -820,9 +818,7 @@ def generate_copilot_artifacts(
                 # of the user's ground-truth contract. If it crashes we
                 # need to know — otherwise an LLM mutation could ship
                 # without the guard ever firing.
-                logger.warning(
-                    "structural_seed_guard_failed (mutation may not be caught): %s", exc
-                )
+                logger.warning("structural_seed_guard_failed (mutation may not be caught): %s", exc)
 
             # Phase 7 (F2) — post-generation ODCS round-trip guarantee.
             # Beyond the ground-truth diff (which catches mutation of specific
@@ -836,7 +832,7 @@ def generate_copilot_artifacts(
 
                     odcs_prov = OdcsProvider()
                     fluid_dict = normalized.get("contract") or {}
-                    for expose in (fluid_dict.get("exposes") or []):
+                    for expose in fluid_dict.get("exposes") or []:
                         if not isinstance(expose, Mapping):
                             continue
                         eid = expose.get("exposeId") or expose.get("id")
@@ -865,9 +861,7 @@ def generate_copilot_artifacts(
                         report.validation_errors = validation_errors
                 except Exception as exc:  # noqa: BLE001
                     # Same loud-fail rationale as the seed guard above.
-                    logger.warning(
-                        "structural_seed_roundtrip_guarantee_failed: %s", exc
-                    )
+                    logger.warning("structural_seed_roundtrip_guarantee_failed: %s", exc)
 
         report.validation_errors = validation_errors
         report.validation_warnings = validation_warnings

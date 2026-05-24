@@ -26,7 +26,6 @@ from .base import (
     metadata_passthrough,
 )
 
-
 # ----- ODCS → FLUID --------------------------------------------------------
 
 
@@ -59,9 +58,7 @@ def to_fluid(ctx: ImportCtx) -> None:
         target["qos"] = qos
 
 
-def _apply_sla_to_qos(
-    prop: Mapping[str, Any], qos: Dict[str, Any], labels: Dict[str, Any]
-) -> None:
+def _apply_sla_to_qos(prop: Mapping[str, Any], qos: Dict[str, Any], labels: Dict[str, Any]) -> None:
     name = prop.get("property")
     value = prop.get("value")
     unit = prop.get("unit")
@@ -70,9 +67,7 @@ def _apply_sla_to_qos(
     if name == "availability":
         try:
             fraction = float(value)
-            qos["availability"] = (
-                f"{fraction * 100:g}%" if fraction <= 1 else f"{fraction:g}%"
-            )
+            qos["availability"] = f"{fraction * 100:g}%" if fraction <= 1 else f"{fraction:g}%"
         except (TypeError, ValueError):
             qos["availability"] = str(value)
     elif name in ("interval", "frequency", "latency", "retention"):

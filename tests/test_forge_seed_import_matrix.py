@@ -53,9 +53,9 @@ from fluid_build.providers.odps_standard import BitolOdpsProvider
 # ``commerce.orders-product.input.customers_raw`` input port in our fixture
 # — every contract in the matrix has unresolvable input ports because we're
 # not feeding their upstream contracts.
-logging.getLogger(
-    "fluid_build.providers.odps_standard.provider.BitolOdpsProvider"
-).setLevel(logging.ERROR)
+logging.getLogger("fluid_build.providers.odps_standard.provider.BitolOdpsProvider").setLevel(
+    logging.ERROR
+)
 
 
 _FIXTURES = Path(__file__).parent / "fixtures"
@@ -137,10 +137,7 @@ def _counts(fluid: dict) -> Tuple[int, int]:
     """Two numbers we care about across both paths: number of exposes and
     total schema fields summed across exposes."""
     n_exposes = len(fluid.get("exposes") or [])
-    n_fields = sum(
-        len(e.get("contract", {}).get("schema", []))
-        for e in fluid.get("exposes") or []
-    )
+    n_fields = sum(len(e.get("contract", {}).get("schema", [])) for e in fluid.get("exposes") or [])
     return n_exposes, n_fields
 
 
@@ -201,9 +198,7 @@ class TestSeedEveryShape:
         input_path = _input_for_shape(bundle, shape_label, tmp_path)
         seed = load_seed(input_path, allow_remote=False)
         n_exposes = len(seed.fluid.get("exposes", []))
-        schema_paths = [
-            p for p in seed.ground_truth_paths if p.endswith(".contract.schema")
-        ]
+        schema_paths = [p for p in seed.ground_truth_paths if p.endswith(".contract.schema")]
         assert len(schema_paths) == n_exposes
 
     @pytest.mark.parametrize("shape_label,_", SHAPES)
@@ -218,9 +213,7 @@ class TestSeedEveryShape:
         mutated = yaml.safe_load(yaml.dump(seed.fluid))
         mutated["exposes"][0].setdefault("contract", {})["schema"] = []
         mismatches = diff_against_seed(seed, mutated)
-        assert mismatches, (
-            f"{shape_label}: diff guard failed to catch schema mutation"
-        )
+        assert mismatches, f"{shape_label}: diff guard failed to catch schema mutation"
 
     @pytest.mark.parametrize("shape_label,_", SHAPES)
     def test_seed_diff_guard_identity_is_clean(
@@ -245,9 +238,7 @@ class TestImportAndSeedAgree:
     """
 
     @pytest.mark.parametrize("shape_label,_", SHAPES)
-    def test_counts_match(
-        self, bundle: Path, tmp_path: Path, shape_label: str, _: str
-    ) -> None:
+    def test_counts_match(self, bundle: Path, tmp_path: Path, shape_label: str, _: str) -> None:
         input_path = _input_for_shape(bundle, shape_label, tmp_path)
         op1 = _counts(_import_fluid(input_path))
         op2 = _counts(_seed_fluid(input_path))
@@ -258,9 +249,7 @@ class TestImportAndSeedAgree:
         )
 
     @pytest.mark.parametrize("shape_label,_", SHAPES)
-    def test_expose_ids_match(
-        self, bundle: Path, tmp_path: Path, shape_label: str, _: str
-    ) -> None:
+    def test_expose_ids_match(self, bundle: Path, tmp_path: Path, shape_label: str, _: str) -> None:
         """Same expose ids in same order — a stronger pin than just counts."""
         input_path = _input_for_shape(bundle, shape_label, tmp_path)
         op1_ids = [e.get("id") for e in _import_fluid(input_path).get("exposes", [])]

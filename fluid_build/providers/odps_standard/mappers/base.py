@@ -29,7 +29,6 @@ from fluid_build.providers._mapper_common import (
     make_passthrough_helpers,
 )
 
-
 PASSTHROUGH_KEY = "odps_passthrough"
 
 (

@@ -43,7 +43,6 @@ from .base import (
 )
 from .types import provider_to_port_type
 
-
 # ----- FLUID → ODPS --------------------------------------------------------
 
 
@@ -103,9 +102,7 @@ def _build_input_ports(
             continue
         seen_names.add(name)
         contract_id = (
-            canonical.get("contract_id")
-            or canonical.get("reference")
-            or canonical.get("name")
+            canonical.get("contract_id") or canonical.get("reference") or canonical.get("name")
         )
         input_ports.append(
             {
@@ -151,9 +148,7 @@ def _build_input_ports(
     return input_ports
 
 
-def _expose_to_output_port(
-    expose: Mapping[str, Any], product_id: str
-) -> Optional[Dict[str, Any]]:
+def _expose_to_output_port(expose: Mapping[str, Any], product_id: str) -> Optional[Dict[str, Any]]:
     from fluid_build.providers.base import ProviderError
 
     # Bitol ODPS v1.0.0 OutputPort requires ``name``. Accept any of
@@ -197,9 +192,7 @@ def _expose_to_output_port(
     return port
 
 
-def _expect_to_input_port(
-    expect: Mapping[str, Any], product_id: str
-) -> Optional[Dict[str, Any]]:
+def _expect_to_input_port(expect: Mapping[str, Any], product_id: str) -> Optional[Dict[str, Any]]:
     name = expect.get("id")
     if not name:
         return None

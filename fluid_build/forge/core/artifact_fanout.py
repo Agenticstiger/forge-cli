@@ -406,7 +406,7 @@ def _emit_odps_bitol(contract_path: Path, out_dir: Path, logger: logging.Logger)
     product_path = out_dir / f"{product_id}.odps.yaml"
     if product_path.exists():
         written.append(product_path)
-    for contract_id in (bundle.get("contracts") or {}):
+    for contract_id in bundle.get("contracts") or {}:
         sibling = out_dir / f"{contract_id}.odcs.yaml"
         if sibling.exists():
             written.append(sibling)

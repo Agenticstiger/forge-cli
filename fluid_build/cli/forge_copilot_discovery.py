@@ -261,10 +261,9 @@ def discover_local_context(
             # ``detected_sources`` rather than ``existing_contracts``
             # because these are *standards-format* sources, not FLUID.
             _name_lower = path.name.lower()
-            if (
-                _name_lower.endswith((".odcs.yaml", ".odcs.yml", ".odcs.json"))
-                or _name_lower.endswith((".odps.yaml", ".odps.yml", ".odps.json"))
-            ):
+            if _name_lower.endswith(
+                (".odcs.yaml", ".odcs.yml", ".odcs.json")
+            ) or _name_lower.endswith((".odps.yaml", ".odps.yml", ".odps.json")):
                 kind = "odcs" if ".odcs" in _name_lower else "odps"
                 detected_sources.append(
                     {

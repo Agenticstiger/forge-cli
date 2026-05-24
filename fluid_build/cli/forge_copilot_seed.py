@@ -52,9 +52,7 @@ SHAPE_DIRECTORY = "directory"
 SHAPE_ODCS_ONLY_DIRECTORY = "odcs-only-directory"
 
 
-def load_seed(
-    seed_from: Union[str, Path], *, allow_remote: bool = False
-) -> SeedResult:
+def load_seed(seed_from: Union[str, Path], *, allow_remote: bool = False) -> SeedResult:
     """Detect the input shape and run the matching importer.
 
     Detection order:
@@ -143,11 +141,7 @@ def _load_directory(path: Path, *, allow_remote: bool) -> SeedResult:
     provider.strict_validation = False
     fluid = provider.import_directory(path, allow_remote=allow_remote, lenient=True)
     pt = (fluid.get("metadata") or {}).get("odps_passthrough") or {}
-    shape = (
-        SHAPE_ODCS_ONLY_DIRECTORY
-        if pt.get("odcs_only_directory")
-        else SHAPE_DIRECTORY
-    )
+    shape = SHAPE_ODCS_ONLY_DIRECTORY if pt.get("odcs_only_directory") else SHAPE_DIRECTORY
     provenance: List[Dict[str, Any]] = [
         {"shape": shape, "source": "local", "origin": str(path)},
     ]
@@ -220,9 +214,7 @@ def resolve_at_path(fluid: Mapping[str, Any], path: str) -> Any:
     return cursor
 
 
-def diff_against_seed(
-    seed: SeedResult, candidate: Mapping[str, Any]
-) -> List[Dict[str, Any]]:
+def diff_against_seed(seed: SeedResult, candidate: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """Compare ground-truth values in ``candidate`` against the seed.
 
     Returns a list of ``{"path", "seed", "candidate"}`` entries for paths
@@ -234,7 +226,5 @@ def diff_against_seed(
         seed_value = resolve_at_path(seed.fluid, path)
         cand_value = resolve_at_path(candidate, path)
         if seed_value != cand_value:
-            mismatches.append(
-                {"path": path, "seed": seed_value, "candidate": cand_value}
-            )
+            mismatches.append({"path": path, "seed": seed_value, "candidate": cand_value})
     return mismatches

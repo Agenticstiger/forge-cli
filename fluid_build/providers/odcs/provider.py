@@ -43,17 +43,13 @@ class OdcsProvider(BaseProvider):
         self.odcs_version = "v3.1.0"
         self.odcs_spec_url = "https://github.com/bitol-io/open-data-contract-standard"
         self.schema = load_schema()
-        self.include_quality_checks = (
-            os.getenv("ODCS_INCLUDE_QUALITY", "true").lower() == "true"
-        )
+        self.include_quality_checks = os.getenv("ODCS_INCLUDE_QUALITY", "true").lower() == "true"
         self.include_sla = os.getenv("ODCS_INCLUDE_SLA", "true").lower() == "true"
         # Whether ``render()`` runs vowl's parser as a second-pass validator
         # on the emitted ODCS. Off by default so the vowl dependency stays
         # opt-in; flipped on by ``BitolOdpsProvider`` when ``strict_validation``
         # is set so the per-port ODCS contracts go through vowl too.
-        self._vowl_validate_on_export = (
-            os.getenv("ODCS_VOWL_VALIDATE", "false").lower() == "true"
-        )
+        self._vowl_validate_on_export = os.getenv("ODCS_VOWL_VALIDATE", "false").lower() == "true"
 
     @property
     def name(self) -> str:
@@ -183,9 +179,7 @@ class OdcsProvider(BaseProvider):
 
     # ---- import ---------------------------------------------------------
 
-    def import_contract(
-        self, odcs: Union[Mapping[str, Any], str, Path]
-    ) -> Dict[str, Any]:
+    def import_contract(self, odcs: Union[Mapping[str, Any], str, Path]) -> Dict[str, Any]:
         odcs_data = read_input(odcs) if isinstance(odcs, (str, Path)) else dict(odcs)
         if self.schema:
             try:
@@ -233,16 +227,13 @@ class OdcsProvider(BaseProvider):
 
     # ---- internal helpers ----------------------------------------------
 
-    def _scope_to_expose(
-        self, fluid: Mapping[str, Any], expose_id: str
-    ) -> Dict[str, Any]:
+    def _scope_to_expose(self, fluid: Mapping[str, Any], expose_id: str) -> Dict[str, Any]:
         """Filter a FLUID contract to a single output port for per-port export."""
         scoped = copy.deepcopy(dict(fluid))
         exposes = [
             e
             for e in scoped.get("exposes", [])
-            if isinstance(e, dict)
-            and (e.get("exposeId") == expose_id or e.get("id") == expose_id)
+            if isinstance(e, dict) and (e.get("exposeId") == expose_id or e.get("id") == expose_id)
         ]
         if not exposes:
             available = [
@@ -251,8 +242,7 @@ class OdcsProvider(BaseProvider):
                 if isinstance(e, dict)
             ]
             raise ProviderError(
-                f"Expose '{expose_id}' not found in contract. "
-                f"Available exposeIds: {available}"
+                f"Expose '{expose_id}' not found in contract. " f"Available exposeIds: {available}"
             )
         scoped["exposes"] = exposes
         product_id = fluid_id(fluid)

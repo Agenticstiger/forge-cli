@@ -48,6 +48,7 @@ class OdpsStandardProvider(_BitolOdpsProvider):
         self.odps_spec_url = self.spec_url
         # Match upstream default; can be overridden via ODPS_DEFAULT_PORT_VERSION.
         import os as _os
+
         self.default_port_version = _os.getenv("ODPS_DEFAULT_PORT_VERSION", "1.0.0")
         # Legacy callers (e.g. DataMeshManagerProvider's publish path) feed
         # partially-populated contracts to this back-compat alias and expect

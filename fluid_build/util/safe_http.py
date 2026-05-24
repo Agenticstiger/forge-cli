@@ -149,15 +149,12 @@ def resolve_and_validate(hostname: str, *, allow_private: bool = False) -> str:
                     },
                 )
                 raise UnsafeURLError(
-                    f"refusing fetch from non-public address {addr} "
-                    f"(hostname {hostname!r})"
+                    f"refusing fetch from non-public address {addr} " f"(hostname {hostname!r})"
                 )
     return addrs[0]
 
 
-def assert_safe_url(
-    url: str, *, allow_private: bool = False
-) -> Tuple[str, str]:
+def assert_safe_url(url: str, *, allow_private: bool = False) -> Tuple[str, str]:
     """Validate ``url`` for SSRF and return ``(hostname, pinned_ip)``.
 
     The returned IP is used to force the TCP connect call to the
@@ -203,9 +200,7 @@ def _make_request_pin_hook(*, allow_private: bool):
     """
 
     def _hook(request) -> None:
-        hostname, pinned_ip = assert_safe_url(
-            str(request.url), allow_private=allow_private
-        )
+        hostname, pinned_ip = assert_safe_url(str(request.url), allow_private=allow_private)
         request.url = request.url.copy_with(host=pinned_ip)
         request.headers["Host"] = hostname
         request.extensions["sni_hostname"] = hostname
@@ -283,18 +278,14 @@ def fetch_bytes(
     ``Content-Length`` header (which can lie). Raises
     :class:`UnsafeURLError` for any SSRF-rejectable URL.
     """
-    with safe_httpx_client(
-        allow_private=allow_private, timeout=timeout
-    ) as client:
+    with safe_httpx_client(allow_private=allow_private, timeout=timeout) as client:
         with client.stream("GET", url, headers=headers or {}) as response:
             chunks = []
             total = 0
             for chunk in response.iter_bytes():
                 total += len(chunk)
                 if total > max_bytes:
-                    raise UnsafeURLError(
-                        f"response from {url!r} exceeds {max_bytes} bytes"
-                    )
+                    raise UnsafeURLError(f"response from {url!r} exceeds {max_bytes} bytes")
                 chunks.append(chunk)
             return response.status_code, dict(response.headers), b"".join(chunks)
 

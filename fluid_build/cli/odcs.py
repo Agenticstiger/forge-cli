@@ -474,14 +474,13 @@ def _run_odcs_validate(args):
     import json
     from pathlib import Path
 
+    from fluid_build.cli._common import load_yaml_json
     from fluid_build.providers.odcs.validation import (
         collect_errors,
         load_schema,
         roundtrip_check,
         validate_via_vowl,
     )
-
-    from fluid_build.cli._common import load_yaml_json
 
     file_path = Path(args.odcs_file)
     odcs_data = load_yaml_json(file_path)
@@ -510,7 +509,11 @@ def _run_odcs_validate(args):
         else:
             cprint("✓ jsonschema: clean")
     else:
-        report["passes"]["jsonschema"] = {"ok": False, "errors": [], "skipped": "schema not vendored"}
+        report["passes"]["jsonschema"] = {
+            "ok": False,
+            "errors": [],
+            "skipped": "schema not vendored",
+        }
 
     # Pass 2 — vowl (opt-in; defaults on when installed)
     vowl_enabled = getattr(args, "vowl", True)

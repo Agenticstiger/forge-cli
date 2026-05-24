@@ -104,6 +104,7 @@ class TestAssertSafeURL:
     def test_userinfo_confusion_not_a_bypass(self) -> None:
         """``https://safe.com@169.254.169.254/`` parses host as the IMDS
         address — urlparse extracts the authority correctly."""
+
         def _fake(_host, _port, *_a, **_kw):
             return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))]
 
@@ -113,6 +114,7 @@ class TestAssertSafeURL:
 
     def test_allow_private_lets_localhost_through(self) -> None:
         """``allow_private=True`` opt-out for trusted localhost dev tools."""
+
         def _fake(_host, _port, *_a, **_kw):
             return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 0))]
 
@@ -152,9 +154,7 @@ class TestHttpxPinning:
         request = httpx.Request("GET", "https://attacker.example/x")
 
         def _fake(_host, _port, *_a, **_kw):
-            return [
-                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))
-            ]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))]
 
         with patch("fluid_build.util.safe_http.socket.getaddrinfo", side_effect=_fake):
             with pytest.raises(UnsafeURLError):
@@ -166,9 +166,7 @@ class TestSafeHttpxClient:
 
     def test_base_url_validated_at_construction(self) -> None:
         def _imds(_host, _port, *_a, **_kw):
-            return [
-                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))
-            ]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))]
 
         with patch("fluid_build.util.safe_http.socket.getaddrinfo", side_effect=_imds):
             with pytest.raises(UnsafeURLError):
@@ -177,9 +175,7 @@ class TestSafeHttpxClient:
     def test_require_https_rejects_http_base(self) -> None:
         # No DNS lookup needed — scheme check fires first.
         with pytest.raises(UnsafeURLError, match="non-https"):
-            safe_httpx_client(
-                base_url="http://api.example.com/", require_https=True
-            )
+            safe_httpx_client(base_url="http://api.example.com/", require_https=True)
 
     def test_follow_redirects_default_false(self) -> None:
         def _ok(_host, _port, *_a, **_kw):
@@ -205,9 +201,7 @@ class TestSafeHttpxClient:
             return httpx.Response(200, text="ok")
 
         def _ok(_host, _port, *_a, **_kw):
-            return [
-                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))
-            ]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
 
         with patch("fluid_build.util.safe_http.socket.getaddrinfo", side_effect=_ok):
             client = httpx.Client(
@@ -230,16 +224,13 @@ class TestSafeHttpxClient:
     def test_per_request_url_revalidated(self) -> None:
         """A safe base_url + an unsafe per-request override must still
         be blocked at request time."""
+
         def _resolve(host, _port, *_a, **_kw):
             if host == "safe.test":
                 return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("1.1.1.1", 0))]
-            return [
-                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))
-            ]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))]
 
-        with patch(
-            "fluid_build.util.safe_http.socket.getaddrinfo", side_effect=_resolve
-        ):
+        with patch("fluid_build.util.safe_http.socket.getaddrinfo", side_effect=_resolve):
             client = safe_httpx_client(base_url="https://safe.test/")
             try:
                 with pytest.raises(UnsafeURLError):
@@ -263,9 +254,7 @@ class TestFetchBytes:
         from fluid_build.util.safe_http import fetch_bytes
 
         def _imds(_host, _port, *_a, **_kw):
-            return [
-                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))
-            ]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))]
 
         with patch("fluid_build.util.safe_http.socket.getaddrinfo", side_effect=_imds):
             with pytest.raises(UnsafeURLError):
@@ -288,9 +277,7 @@ class TestFetchBytes:
             return httpx.Response(200, content=large_body)
 
         def _ok(_host, _port, *_a, **_kw):
-            return [
-                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))
-            ]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
 
         # Bypass real network by routing safe_httpx_client through a
         # MockTransport. We need to patch the factory's httpx.Client
@@ -301,7 +288,9 @@ class TestFetchBytes:
             kwargs["transport"] = httpx.MockTransport(_mock_transport)
             return real_safe_httpx(*args, **kwargs)
 
-        with patch("fluid_build.util.safe_http.socket.getaddrinfo", side_effect=_ok), \
-             patch("fluid_build.util.safe_http.safe_httpx_client", side_effect=_patched_factory):
+        with (
+            patch("fluid_build.util.safe_http.socket.getaddrinfo", side_effect=_ok),
+            patch("fluid_build.util.safe_http.safe_httpx_client", side_effect=_patched_factory),
+        ):
             with pytest.raises(UnsafeURLError, match="exceeds"):
                 fetch_bytes("https://safe.test/big", max_bytes=100)

@@ -100,9 +100,9 @@ class TestSchemaPropertyRoundTrip:
     ) -> None:
         original_tags = full_contract["schema"][0]["properties"][0]["tags"]
         reexported_tags = reexported["schema"][0]["properties"][0]["tags"]
-        assert original_tags == reexported_tags, (
-            "primary-key boolean must not bleed into the tags list on round-trip"
-        )
+        assert (
+            original_tags == reexported_tags
+        ), "primary-key boolean must not bleed into the tags list on round-trip"
         assert reexported["schema"][0]["properties"][0].get("primaryKey") is True
 
     def test_property_level_quality_preserved_verbatim(
@@ -134,15 +134,13 @@ class TestObjectLevelRoundTrip:
 
 
 class TestSlaRoundTrip:
-    def test_sla_properties_verbatim(
-        self, full_contract: dict, reexported: dict
-    ) -> None:
+    def test_sla_properties_verbatim(self, full_contract: dict, reexported: dict) -> None:
         # The verbatim pass-through path means the full slaProperties list is
         # reproduced byte-for-byte, units and all.
         original = full_contract["slaProperties"]
         reexported_sla = reexported["slaProperties"]
         assert len(reexported_sla) == len(original)
-        for orig, new in zip(original, reexported_sla):
+        for orig, new in zip(original, reexported_sla, strict=False):
             assert new["property"] == orig["property"]
             assert new["value"] == orig["value"]
             assert new.get("unit") == orig.get("unit")
@@ -193,12 +191,11 @@ class TestVowlSecondPassValidation:
     check. When vowl isn't installed the render path silently skips it.
     """
 
-    def test_validate_via_vowl_skips_cleanly_when_not_installed(
-        self, monkeypatch
-    ) -> None:
+    def test_validate_via_vowl_skips_cleanly_when_not_installed(self, monkeypatch) -> None:
         """If vowl can't be imported, ``validate_via_vowl`` returns None and
         does NOT raise. Lets us keep it as an opt-in extra."""
         import sys
+
         from fluid_build.providers.odcs.validation import validate_via_vowl
 
         # Force the import to fail by hiding the vowl module
@@ -252,9 +249,7 @@ class TestVowlSecondPassValidation:
         with pytest.raises(ProviderError, match="vowl"):
             validate_via_vowl(odcs)
 
-    def test_odcs_provider_runs_vowl_when_env_flag_set(
-        self, monkeypatch, caplog
-    ) -> None:
+    def test_odcs_provider_runs_vowl_when_env_flag_set(self, monkeypatch, caplog) -> None:
         """``ODCS_VOWL_VALIDATE=true`` flips on the second-pass at render-time
         without needing any code-level opt-in."""
         pytest.importorskip("vowl")
@@ -267,8 +262,7 @@ class TestVowlSecondPassValidation:
             provider.render(_load("contract-full.yaml"))
         # The export path should have logged the vowl diagnostic line
         assert any("vowl: ODCS" in r.message for r in caplog.records), (
-            f"expected a 'vowl: ODCS …' log line; got: "
-            f"{[r.message for r in caplog.records]}"
+            f"expected a 'vowl: ODCS …' log line; got: " f"{[r.message for r in caplog.records]}"
         )
 
     def test_bitol_provider_propagates_strict_mode_to_vowl_on_render(self) -> None:
@@ -278,6 +272,7 @@ class TestVowlSecondPassValidation:
         pytest.importorskip("vowl")
 
         import yaml
+
         from fluid_build.providers.odps_standard import BitolOdpsProvider
 
         prov = BitolOdpsProvider()  # ODPS_STRICT defaults to 'true'
@@ -287,10 +282,7 @@ class TestVowlSecondPassValidation:
         # construction-time-only set bug).
         prov.strict_validation = False
         with open(
-            Path(__file__).parent
-            / "fixtures"
-            / "fluid"
-            / "contract-multi-expose.fluid.yaml"
+            Path(__file__).parent / "fixtures" / "fluid" / "contract-multi-expose.fluid.yaml"
         ) as f:
             fluid = yaml.safe_load(f)
         prov.render(fluid)

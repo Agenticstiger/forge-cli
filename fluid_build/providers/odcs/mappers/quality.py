@@ -35,7 +35,6 @@ from .base import (
     metadata_passthrough,
 )
 
-
 # ----- ODCS → FLUID --------------------------------------------------------
 
 
@@ -120,9 +119,7 @@ def to_odcs_property(fld: Mapping[str, Any]) -> Optional[List[Dict[str, Any]]]:
                     "metric": "nullValues",
                     "mustBe": 0,
                     "dimension": "completeness",
-                    "description": (
-                        f"Primary key field '{name}' must not contain null values"
-                    ),
+                    "description": (f"Primary key field '{name}' must not contain null values"),
                 }
             )
 
@@ -170,16 +167,12 @@ def _validation_to_quality(
     if val_type == "min_value" and val_value is not None:
         return {
             "type": "text",
-            "description": (
-                f"Field '{name}' must be greater than or equal to {val_value}"
-            ),
+            "description": (f"Field '{name}' must be greater than or equal to {val_value}"),
         }
     if val_type == "max_value" and val_value is not None:
         return {
             "type": "text",
-            "description": (
-                f"Field '{name}' must be less than or equal to {val_value}"
-            ),
+            "description": (f"Field '{name}' must be less than or equal to {val_value}"),
         }
     if val_type in ("allowed_values", "enum") and val_values:
         values_str = ", ".join(str(v) for v in val_values[:5])

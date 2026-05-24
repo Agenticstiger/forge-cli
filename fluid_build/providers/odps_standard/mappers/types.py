@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from typing import Dict
 
-
 _FLUID_TO_BITOL_STATUS: Dict[str, str] = {
     "draft": "draft",
     "active": "active",

@@ -29,7 +29,6 @@ from .base import (
 )
 from .types import bitol_to_fluid_status, fluid_to_bitol_status
 
-
 API_VERSION = "v1.0.0"
 KIND = "DataProduct"
 

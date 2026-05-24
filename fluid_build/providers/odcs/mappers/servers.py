@@ -27,7 +27,6 @@ from .base import (
 )
 from .types import provider_to_server_type, server_type_to_provider
 
-
 # ----- ODCS → FLUID --------------------------------------------------------
 
 
@@ -55,12 +54,7 @@ def _server_to_expect(server: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     expect: Dict[str, Any] = {
         # ODCS canonical id lives at ``server`` (v3.1.0); ``name`` is accepted
         # for back-compat with legacy fixtures, then ``id``.
-        "id": (
-            server.get("server")
-            or server.get("name")
-            or server.get("id")
-            or "dependency"
-        ),
+        "id": (server.get("server") or server.get("name") or server.get("id") or "dependency"),
         "provider": server_type_to_provider(server_type),
     }
     location = _location_from_server(server)
@@ -72,8 +66,18 @@ def _server_to_expect(server: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
 def _location_from_server(server: Mapping[str, Any]) -> Dict[str, Any]:
     location: Dict[str, Any] = {}
     for key in (
-        "project", "dataset", "table", "account", "database", "schema",
-        "bucket", "path", "region", "host", "port", "format",
+        "project",
+        "dataset",
+        "table",
+        "account",
+        "database",
+        "schema",
+        "bucket",
+        "path",
+        "region",
+        "host",
+        "port",
+        "format",
     ):
         if key in server:
             location[key] = server[key]
@@ -161,9 +165,7 @@ def _expect_to_server(expect: Any) -> Optional[Dict[str, Any]]:
     return server
 
 
-def _server_details_from_location(
-    location: Mapping[str, Any], provider: str
-) -> Dict[str, Any]:
+def _server_details_from_location(location: Mapping[str, Any], provider: str) -> Dict[str, Any]:
     """Map FLUID binding/location → ODCS server-type-specific allowed fields.
 
     ODCS v3.1.0 servers use ``unevaluatedProperties: false`` — emitting any
@@ -185,9 +187,8 @@ def _server_details_from_location(
                 details[key] = location[key]
     elif p in ("aws", "s3"):
         # ODCS S3Server: location (URI), endpointUrl, format, delimiter
-        loc_val = (
-            location.get("location")
-            or _build_s3_uri(location.get("bucket"), location.get("path") or location.get("key"))
+        loc_val = location.get("location") or _build_s3_uri(
+            location.get("bucket"), location.get("path") or location.get("key")
         )
         if loc_val:
             details["location"] = loc_val
@@ -228,10 +229,25 @@ def _server_details_from_location(
         # Custom / unknown provider → ODCS server.type=custom which accepts
         # the union of all server-type fields. Copy any that match the union.
         custom_keys = {
-            "account", "catalog", "database", "dataset", "delimiter",
-            "endpointUrl", "format", "host", "location", "path", "port",
-            "project", "region", "regionName", "schema", "serviceName",
-            "stagingDir", "warehouse", "stream",
+            "account",
+            "catalog",
+            "database",
+            "dataset",
+            "delimiter",
+            "endpointUrl",
+            "format",
+            "host",
+            "location",
+            "path",
+            "port",
+            "project",
+            "region",
+            "regionName",
+            "schema",
+            "serviceName",
+            "stagingDir",
+            "warehouse",
+            "stream",
         }
         for key, value in location.items():
             if key in custom_keys:

@@ -61,9 +61,7 @@ class TestLocalResolution:
     def test_cache_hit_avoids_re_read(self) -> None:
         resolver = ContractResolver(base_path=FIXTURE_DIR, allow_remote=False)
         first = resolver.resolve(_first_odcs_id())
-        with patch(
-            "fluid_build.providers.odps_standard.resolver.read_input"
-        ) as mock_read:
+        with patch("fluid_build.providers.odps_standard.resolver.read_input") as mock_read:
             second = resolver.resolve(_first_odcs_id())
             mock_read.assert_not_called()
         assert first is second
@@ -101,9 +99,7 @@ class TestErrors:
         assert "missing.contract" in msg
         assert "Tried:" in msg
 
-    def test_remote_fetch_disabled_raises_on_url_contract_id(
-        self, tmp_path: Path
-    ) -> None:
+    def test_remote_fetch_disabled_raises_on_url_contract_id(self, tmp_path: Path) -> None:
         resolver = ContractResolver(base_path=tmp_path, allow_remote=False)
         with pytest.raises(RemoteFetchDisabled):
             resolver.resolve("https://example.com/contract.odcs.yaml")
@@ -144,16 +140,19 @@ class TestLooksLikeUrl:
 class TestRemoteResolution:
     def test_html_with_200_is_refused(self, tmp_path: Path) -> None:
         resolver = ContractResolver(base_path=tmp_path, allow_remote=True)
-        with patch(
-            "fluid_build.providers.odps_standard.resolver._fetch_bytes",
-            return_value=(
-                200,
-                {"content-type": "text/html"},
-                b"<html><body>404</body></html>",
+        with (
+            patch(
+                "fluid_build.providers.odps_standard.resolver._fetch_bytes",
+                return_value=(
+                    200,
+                    {"content-type": "text/html"},
+                    b"<html><body>404</body></html>",
+                ),
             ),
-        ), patch(
-            "fluid_build.providers.odps_standard.resolver._assert_safe_url",
-            return_value=None,
+            patch(
+                "fluid_build.providers.odps_standard.resolver._assert_safe_url",
+                return_value=None,
+            ),
         ):
             with pytest.raises(ContractNotFound):
                 resolver.resolve("https://example.com/c.odcs.yaml")
@@ -173,12 +172,15 @@ class TestRemoteResolution:
             }
         ).encode()
         resolver = ContractResolver(base_path=tmp_path, allow_remote=True)
-        with patch(
-            "fluid_build.providers.odps_standard.resolver._fetch_bytes",
-            return_value=(200, {"content-type": "application/json"}, body),
-        ) as mock_fetch, patch(
-            "fluid_build.providers.odps_standard.resolver._assert_safe_url",
-            return_value=None,
+        with (
+            patch(
+                "fluid_build.providers.odps_standard.resolver._fetch_bytes",
+                return_value=(200, {"content-type": "application/json"}, body),
+            ) as mock_fetch,
+            patch(
+                "fluid_build.providers.odps_standard.resolver._assert_safe_url",
+                return_value=None,
+            ),
         ):
             first = resolver.resolve("https://example.com/remote.contract")
             second = resolver.resolve("https://example.com/remote.contract")
@@ -301,9 +303,7 @@ class TestSSRFGuard:
         resolver.index_directory(tmp_path)
         assert "https://attacker.example/contract" not in resolver._index
 
-    def test_absolute_path_contract_id_does_not_escape_base(
-        self, tmp_path: Path
-    ) -> None:
+    def test_absolute_path_contract_id_does_not_escape_base(self, tmp_path: Path) -> None:
         """A poisoned contractId beginning with '/' must NOT cause the
         resolver to probe outside ``base_path``. ``Path("base") /
         "/etc/hostname"`` silently discards the base — guarded here."""
@@ -315,9 +315,7 @@ class TestSSRFGuard:
             try:
                 c.resolve().relative_to(base_resolved)
             except ValueError:
-                pytest.fail(
-                    f"candidate {c} escapes base_path {tmp_path}"
-                )
+                pytest.fail(f"candidate {c} escapes base_path {tmp_path}")
 
     def test_allows_public_address(self) -> None:
         def _fake_getaddrinfo(_host, _port, *_a, **_kw):
@@ -330,9 +328,7 @@ class TestSSRFGuard:
             # Should not raise
             _assert_safe_url("https://example.com/contract.odcs.yaml")
 
-    def test_resolver_surfaces_unsafe_url_as_contract_not_found(
-        self, tmp_path: Path
-    ) -> None:
+    def test_resolver_surfaces_unsafe_url_as_contract_not_found(self, tmp_path: Path) -> None:
         """A poisoned contractId pointing at IMDS must NOT make the
         request. The resolver translates the SSRF rejection into a
         ContractNotFound so the caller treats it as a missing reference
@@ -340,16 +336,15 @@ class TestSSRFGuard:
         resolver = ContractResolver(base_path=tmp_path, allow_remote=True)
 
         def _fake_getaddrinfo(_host, _port, *_a, **_kw):
-            return [
-                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))
-            ]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 0))]
 
-        with patch(
-            "fluid_build.util.safe_http.socket.getaddrinfo",
-            side_effect=_fake_getaddrinfo,
-        ), patch(
-            "fluid_build.providers.odps_standard.resolver._fetch_bytes"
-        ) as mock_fetch:
+        with (
+            patch(
+                "fluid_build.util.safe_http.socket.getaddrinfo",
+                side_effect=_fake_getaddrinfo,
+            ),
+            patch("fluid_build.providers.odps_standard.resolver._fetch_bytes") as mock_fetch,
+        ):
             with pytest.raises(ContractNotFound):
                 resolver.resolve("https://attacker.example/redir")
             # _fetch_bytes must NOT have been reached — the resolver's
@@ -380,12 +375,15 @@ class TestSSRFGuard:
         parsing. The cap fires inside safe_http.fetch_bytes; the resolver
         translates the resulting UnsafeURLError into ContractNotFound."""
         resolver = ContractResolver(base_path=tmp_path, allow_remote=True)
-        with patch(
-            "fluid_build.providers.odps_standard.resolver._fetch_bytes",
-            side_effect=UnsafeURLError("response exceeds size cap"),
-        ), patch(
-            "fluid_build.providers.odps_standard.resolver._assert_safe_url",
-            return_value=("h", "1.1.1.1"),
+        with (
+            patch(
+                "fluid_build.providers.odps_standard.resolver._fetch_bytes",
+                side_effect=UnsafeURLError("response exceeds size cap"),
+            ),
+            patch(
+                "fluid_build.providers.odps_standard.resolver._assert_safe_url",
+                return_value=("h", "1.1.1.1"),
+            ),
         ):
             with pytest.raises(ContractNotFound):
                 resolver.resolve("https://example.com/big")
@@ -404,12 +402,15 @@ class TestSSRFGuard:
             }
         ).encode()
         resolver = ContractResolver(base_path=tmp_path, allow_remote=True)
-        with patch(
-            "fluid_build.providers.odps_standard.resolver._fetch_bytes",
-            return_value=(200, {"content-type": "application/json"}, body),
-        ), patch(
-            "fluid_build.providers.odps_standard.resolver._assert_safe_url",
-            return_value=None,
+        with (
+            patch(
+                "fluid_build.providers.odps_standard.resolver._fetch_bytes",
+                return_value=(200, {"content-type": "application/json"}, body),
+            ),
+            patch(
+                "fluid_build.providers.odps_standard.resolver._assert_safe_url",
+                return_value=None,
+            ),
         ):
             with pytest.raises(ContractValidationError) as exc_info:
                 resolver.resolve("https://example.com/c")

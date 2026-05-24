@@ -29,7 +29,6 @@ from .base import (
 )
 from .types import fluid_to_odcs_status, odcs_to_fluid_status
 
-
 ODCS_API_VERSION = "v3.1.0"
 ODCS_KIND = "DataContract"
 

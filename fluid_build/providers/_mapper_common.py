@@ -27,14 +27,13 @@ from __future__ import annotations
 from collections.abc import Mapping, MutableMapping
 from typing import Any, Callable, Dict, Optional, Tuple
 
-
 PassthroughHelpers = Tuple[
     Callable[[MutableMapping[str, Any]], Dict[str, Any]],  # metadata set
-    Callable[[Mapping[str, Any]], Mapping[str, Any]],      # metadata get
+    Callable[[Mapping[str, Any]], Mapping[str, Any]],  # metadata get
     Callable[[MutableMapping[str, Any]], Dict[str, Any]],  # expose set
-    Callable[[Mapping[str, Any]], Mapping[str, Any]],      # expose get
+    Callable[[Mapping[str, Any]], Mapping[str, Any]],  # expose get
     Callable[[MutableMapping[str, Any]], Dict[str, Any]],  # field/expect set
-    Callable[[Mapping[str, Any]], Mapping[str, Any]],      # field/expect get
+    Callable[[Mapping[str, Any]], Mapping[str, Any]],  # field/expect get
 ]
 
 

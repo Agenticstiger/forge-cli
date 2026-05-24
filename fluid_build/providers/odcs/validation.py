@@ -53,9 +53,7 @@ def validate(odcs: Mapping[str, Any], schema: Mapping[str, Any]) -> None:
         raise ProviderError(f"ODCS validation failed ({len(errors)} error(s)): {body}{more}")
 
 
-def collect_errors(
-    odcs: Mapping[str, Any], schema: Mapping[str, Any]
-) -> List[Dict[str, Any]]:
+def collect_errors(odcs: Mapping[str, Any], schema: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """Return EVERY ODCS schema violation as a structured list.
 
     Each entry has::
@@ -126,9 +124,7 @@ def validate_via_vowl(odcs: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def roundtrip_check(
-    odcs: Mapping[str, Any], reconstructed: Mapping[str, Any]
-) -> Dict[str, Any]:
+def roundtrip_check(odcs: Mapping[str, Any], reconstructed: Mapping[str, Any]) -> Dict[str, Any]:
     """Compare an original ODCS dict to one rebuilt via ``import → export``.
 
     Returns a structured diff::

@@ -49,11 +49,14 @@ def _noop_pin_hook_factory(*, allow_private: bool = False):  # noqa: ARG001
 def _disable_ssrf_guard_for_build_runner_tests():
     """Replace the SSRF guard primitives with no-ops for build-runner
     tests so respx-mocked hostnames work without real DNS."""
-    with patch(
-        "fluid_build.util.safe_http.assert_safe_url",
-        side_effect=_noop_assert_safe_url,
-    ), patch(
-        "fluid_build.util.safe_http._make_request_pin_hook",
-        side_effect=_noop_pin_hook_factory,
+    with (
+        patch(
+            "fluid_build.util.safe_http.assert_safe_url",
+            side_effect=_noop_assert_safe_url,
+        ),
+        patch(
+            "fluid_build.util.safe_http._make_request_pin_hook",
+            side_effect=_noop_pin_hook_factory,
+        ),
     ):
         yield

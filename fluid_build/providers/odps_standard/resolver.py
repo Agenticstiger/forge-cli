@@ -323,9 +323,7 @@ class ContractResolver:
         except Exception as exc:  # httpx.HTTPError + network errors
             raise ContractNotFound(contract_id, [url]) from exc
 
-        content_type = headers.get("content-type", "") or headers.get(
-            "Content-Type", ""
-        )
+        content_type = headers.get("content-type", "") or headers.get("Content-Type", "")
 
         # Refuse HTML-with-200 — common when the URL is wrong or it returned a portal page
         if "text/html" in content_type.lower() or body.lstrip().startswith(b"<"):
@@ -362,9 +360,7 @@ class ContractResolver:
             contract_id=contract_id,
         )
 
-    def _validate(
-        self, contract_id: str, data: Mapping[str, Any], *, origin: str
-    ) -> None:
+    def _validate(self, contract_id: str, data: Mapping[str, Any], *, origin: str) -> None:
         if self.odcs_provider is None or not self.odcs_provider.schema:
             return
         try:
@@ -375,9 +371,7 @@ class ContractResolver:
                 f"failed ODCS validation: {exc}"
             ) from exc
 
-    def _cache_and_return(
-        self, contract_id: str, resolved: ResolvedContract
-    ) -> ResolvedContract:
+    def _cache_and_return(self, contract_id: str, resolved: ResolvedContract) -> ResolvedContract:
         self._cache[contract_id] = resolved
         return resolved
 

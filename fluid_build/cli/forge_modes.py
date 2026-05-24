@@ -373,9 +373,7 @@ def run_ai_copilot_mode(
             # mutated by the LLM). The post-validation guard in
             # generate_copilot_artifacts enforces this.
             "seed_from": get_cli_arg_fn(args, "seed_from"),
-            "seed_allow_remote": bool(
-                get_cli_arg_fn(args, "seed_allow_remote", False)
-            ),
+            "seed_allow_remote": bool(get_cli_arg_fn(args, "seed_allow_remote", False)),
             "seed_no_remote": bool(get_cli_arg_fn(args, "seed_no_remote", False)),
         }
 
@@ -393,14 +391,14 @@ def run_ai_copilot_mode(
                 _allow_remote = copilot_options.get("seed_allow_remote", False)
                 if copilot_options.get("seed_no_remote", False):
                     _allow_remote = False
-                context["structural_seed"] = _load_seed(
-                    _seed_from, allow_remote=_allow_remote
-                )
+                context["structural_seed"] = _load_seed(_seed_from, allow_remote=_allow_remote)
                 logger.info(
                     "forge_seed_loaded",
                     extra={
                         "path": str(_seed_from),
-                        "expose_count": len((context["structural_seed"].fluid.get("exposes") or [])),
+                        "expose_count": len(
+                            (context["structural_seed"].fluid.get("exposes") or [])
+                        ),
                     },
                 )
             except Exception as _seed_exc:  # noqa: BLE001 — surface and exit cleanly
@@ -754,8 +752,7 @@ def run_ai_copilot_mode(
                 _seed_candidates = [
                     s
                     for s in _detected
-                    if isinstance(s, dict)
-                    and str(s.get("kind", "")).startswith("standard-")
+                    if isinstance(s, dict) and str(s.get("kind", "")).startswith("standard-")
                 ]
                 if _seed_candidates:
                     try:
