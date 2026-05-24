@@ -134,8 +134,32 @@ def _expose_to_server(expose: Any) -> Optional[Dict[str, Any]]:
         loc = expose.get("location")
         location = loc if isinstance(loc, Mapping) else None
     if isinstance(location, Mapping):
-        server.update(_server_details_from_location(location, provider))
+        merged = _merge_binding_into_location(location, binding)
+        server.update(_server_details_from_location(merged, provider))
     return server
+
+
+def _merge_binding_into_location(
+    location: Mapping[str, Any], binding: Optional[Mapping[str, Any]]
+) -> Mapping[str, Any]:
+    """FLUID exposes carry server-shaped fields like ``format`` at the
+    *binding* level (sibling of ``location``). ODCS's LocalServer (and
+    several other server types) requires ``format`` on the server
+    record itself. Merge any such binding-level field into the
+    location dict so :func:`_server_details_from_location` sees them
+    in one place. Location wins over binding when both are set.
+    """
+    if not isinstance(binding, Mapping):
+        return location
+    # Fields that ODCS expects on the server record but FLUID puts at
+    # the binding sibling level (e.g. binding.format alongside
+    # binding.location). Extend as new server types surface them.
+    _BINDING_LIFTED = ("format", "delimiter", "endpointUrl")
+    merged: Dict[str, Any] = dict(location)
+    for key in _BINDING_LIFTED:
+        if key not in merged and key in binding:
+            merged[key] = binding[key]
+    return merged
 
 
 def _expect_to_server(expect: Any) -> Optional[Dict[str, Any]]:
@@ -161,7 +185,8 @@ def _expect_to_server(expect: Any) -> Optional[Dict[str, Any]]:
         loc = expect.get("location")
         location = loc if isinstance(loc, Mapping) else None
     if isinstance(location, Mapping):
-        server.update(_server_details_from_location(location, provider))
+        merged = _merge_binding_into_location(location, binding)
+        server.update(_server_details_from_location(merged, provider))
     return server
 
 
