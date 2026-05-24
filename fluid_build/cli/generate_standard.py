@@ -229,20 +229,29 @@ def _export_odps(contract_path: str, env, out: str, logger: logging.Logger) -> i
 
 
 def _export_odps_bitol(contract_path: str, env, out: str, logger: logging.Logger) -> int:
-    """Export to ODPS-Bitol v1.0 format — delegates to existing odps_standard module."""
+    """Export to Bitol ODPS v1.0.0 — bare product file at ``out``.
+
+    Bare product only (no per-port ODCS siblings). For the canonical Bitol
+    fragments bundle (1 ODPS + N ``<contractId>.odcs.yaml`` together in
+    one directory) call ``BitolOdpsProvider.render(out_dir=...)`` directly
+    or use ``fluid generate artifacts --emit odps-bitol`` which routes
+    through ``artifact_fanout._emit_odps_bitol``.
+    """
     try:
         from fluid_build.loader import load_contract
-        from fluid_build.providers.odps_standard import OdpsStandardProvider
+        from fluid_build.providers.odps_standard import BitolOdpsProvider
 
         c = load_contract(contract_path)
-        provider = OdpsStandardProvider()
-        result = provider.render(c)
+        provider = BitolOdpsProvider()
+        provider.strict_validation = False  # bare-product flow shouldn't enforce sibling validation
+        bundle = provider.render(c)
+        product = bundle["product"]
 
         os.makedirs(os.path.dirname(out), exist_ok=True)
         import yaml as _yaml
 
         with open(out, "w", encoding="utf-8") as f:
-            _yaml.safe_dump(result, f, default_flow_style=False)
+            _yaml.safe_dump(product, f, default_flow_style=False)
         info(logger, "generate_standard_odps_bitol_ok", out=out)
         return 0
     except ImportError:

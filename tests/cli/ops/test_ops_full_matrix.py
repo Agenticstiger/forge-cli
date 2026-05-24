@@ -324,12 +324,17 @@ class TestDoctor:
 
     def test_ingestion_scope_passes_for_installed_extras(self):
         report = run_doctor(DoctorScope.INGESTION)
-        # duckdb + httpx are guaranteed in the [dev,local] install (core
-        # deps); dlt / meltano / airbyte are optional and ride along
-        # heavier extras that contributors don't always install. Assert
-        # the floor: at least the two core-dep modules import.
+        # httpx is a guaranteed dep (transitive of the core install);
+        # duckdb / dlt / meltano / airbyte ride heavier extras
+        # ([local] for duckdb; per-runner extras for the others) that
+        # contributors don't always install. Asserting ≥2 OK results
+        # used to assume the [dev,local] combo — but the bare [dev]
+        # install only carries httpx, and that's the realistic CI
+        # floor. So: at least 1 OK (httpx), no error-severity entries.
         oks = [r for r in report.results if r.severity is Severity.OK]
-        assert len(oks) >= 2
+        errs = [r for r in report.results if r.severity is Severity.ERROR]
+        assert len(oks) >= 1, f"no INGESTION module imports OK: {report.results}"
+        assert not errs, f"INGESTION scope returned ERROR results: {errs}"
 
     def test_infra_scope_warns_for_missing_binaries(self):
         report = run_doctor(DoctorScope.INFRA)

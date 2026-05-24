@@ -619,6 +619,58 @@ def _self_evaluate_contract(
     return None
 
 
+def _format_seed_mismatch_for_repair(mismatch: Mapping[str, Any]) -> str:
+    """Compact repair feedback for a single ground-truth seed mismatch.
+
+    Pre-fix, the feedback dumped the entire seed list AND the entire
+    candidate list per mismatch — ``seed=[{name: ..., quality: [...]},
+    ...]; candidate=[{...}]`` produced ~1.5KB per mismatch, ~12KB
+    total for an 8-mismatch payload. Live testing with Gemini Flash
+    showed that on the third repair attempt the model gave up and
+    returned prose ("parse error - Response did not contain a valid
+    JSON object"). The verbose feedback was the proximate cause.
+
+    For schema-list mismatches (the overwhelmingly common shape) this
+    helper extracts just the field-name diff — the actionable signal
+    — and drops the field-level quality/passthrough payload. Other
+    mismatch shapes get a value-truncated fallback.
+    """
+    path = mismatch.get("path", "<unknown>")
+    seed = mismatch.get("seed")
+    candidate = mismatch.get("candidate")
+
+    # Schema-list mismatch — the renamed-fields case. Extract just the
+    # ordered list of names from both sides; that's the load-bearing
+    # diff the LLM needs to act on.
+    if isinstance(seed, list) and isinstance(candidate, list):
+        seed_names = [
+            item.get("name") for item in seed if isinstance(item, Mapping) and item.get("name")
+        ]
+        candidate_names = [
+            item.get("name") for item in candidate if isinstance(item, Mapping) and item.get("name")
+        ]
+        if seed_names or candidate_names:
+            return (
+                f"Seed schema mismatch at {path}: "
+                f"seed field names={seed_names}, "
+                f"candidate field names={candidate_names}. "
+                f"DO NOT RENAME — restore the seed names exactly."
+            )
+
+    # Fallback for non-schema-list mismatches — truncate so a single
+    # huge value doesn't dominate the repair context.
+    def _trunc(value: Any, *, limit: int = 200) -> str:
+        text = repr(value)
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
+    return (
+        f"Seed ground-truth violation at {path}: "
+        f"seed={_trunc(seed)}, candidate={_trunc(candidate)}"
+    )
+
+
 def generate_copilot_artifacts(
     context: Mapping[str, Any],
     *,
@@ -679,12 +731,64 @@ def generate_copilot_artifacts(
         project_memory=project_memory,
     )
 
+    # Phase 7 — structural-seed wiring. When ``fluid forge --seed-from``
+    # was used, the FLUID skeleton from the ODCS/ODPS document IS the
+    # seed the LLM should augment. Override ``seed_contract`` (which was
+    # built from templates/discovery) with the actual seed so the user
+    # prompt's seed slot shows the structure to preserve, not a template
+    # suggestion. Without this override, the system prompt instruction
+    # added below talks about a seed the LLM never sees → it hallucinates
+    # an unrelated contract or fails to produce a valid one.
+    _structural_seed = context.get("structural_seed") if isinstance(context, Mapping) else None
+    if _structural_seed is not None and getattr(_structural_seed, "fluid", None):
+        seed_contract = _structural_seed.fluid
+
     attempts: List[GenerationAttemptReport] = []
     previous_errors: List[str] = []
     previous_payload: Optional[Dict[str, Any]] = None
 
+    # Phase 7 (H + I) — structural-seed ground-truth contract. When the
+    # user passed ``fluid forge --seed-from``, we prepend a precedence
+    # rule to the system prompt so the LLM knows seed-derived
+    # schema/quality/qos are immutable, and intent / context-derived
+    # builds/executes/governance are the LLM's job. The post-validation
+    # guard below enforces it; the prompt addition just gives the model
+    # the chance to comply on the first attempt.
+    _seed_ground_truth_extension = ""
+    if _structural_seed is not None:
+        _seed_exposes = (
+            (_structural_seed.fluid or {}).get("exposes") or []
+            if hasattr(_structural_seed, "fluid")
+            else []
+        )
+        _seed_ground_truth_extension = (
+            "\n\nSTRUCTURAL-SEED GROUND-TRUTH CONTRACT (from --seed-from):\n"
+            "An ODCS/Bitol-ODPS document was supplied as the structural seed for "
+            f"this generation. The following {len(_seed_exposes)} expose(s) "
+            "MUST be preserved verbatim from the seed:\n"
+            "  - schema (field names, types, required flags, primaryKey, "
+            "classification)\n"
+            "  - quality / validation rules\n"
+            "  - qos / SLA expectations\n\n"
+            "CRITICAL — DO NOT RENAME FIELDS. Copy every field name from the "
+            "seed exactly, character-for-character. NEVER substitute "
+            "'better-sounding' synonyms (e.g. ``order_date`` → "
+            "``order_completion_date`` is a violation; ``amount`` → "
+            "``order_item_price`` is a violation). The same rule applies to "
+            "expose names, contract field names, and column names — they are "
+            "load-bearing identifiers, not labels you can improve. If you think "
+            "the seed name is poor, leave it alone — the post-validation guard "
+            "WILL reject any rename and you'll have to redo the whole "
+            "generation.\n\n"
+            "PRECEDENCE: when intent or context conflicts with seed schema/qos, "
+            "the SEED WINS. Intent steers builds, executes, governance, and any "
+            "field the seed doesn't model — never schema/quality/qos. A "
+            "post-validation guard runs after generation; mismatches against "
+            "the seed are surfaced as repair feedback and the loop retries.\n"
+        )
+
     for attempt_index in range(1, max_attempts + 1):
-        system_prompt = build_system_prompt(capabilities)
+        system_prompt = build_system_prompt(capabilities) + _seed_ground_truth_extension
         user_prompt = build_user_prompt(
             context=context,
             discovery_report=discovery_report,
@@ -748,6 +852,75 @@ def generate_copilot_artifacts(
                 validation_errors = schema_errors + list(validation_errors)
         except Exception as exc:  # noqa: BLE001 — never block on validator failure
             logger.debug("self_healing_schema_validate_failed: %s", exc)
+        # Phase 7 — structural-seed ground-truth guard. When the user
+        # passed ``fluid forge --seed-from`` (an ODCS contract or Bitol
+        # ODPS product), the SeedResult was loaded by forge_modes and
+        # stashed on context. The schema/quality/qos in the seed are
+        # treated as ground truth; the LLM may augment but not mutate
+        # them. If the validated payload diverges from those ground-truth
+        # paths, the mismatch report is fed into the repair loop as
+        # validation errors so the next attempt sees the precise paths
+        # that need to revert to the seed.
+        structural_seed = context.get("structural_seed") if isinstance(context, Mapping) else None
+        if structural_seed is not None and not validation_errors:
+            try:
+                from fluid_build.cli.forge_copilot_seed import diff_against_seed
+
+                mismatches = diff_against_seed(structural_seed, normalized.get("contract") or {})
+                if mismatches:
+                    seed_errors = [_format_seed_mismatch_for_repair(m) for m in mismatches[:8]]
+                    validation_errors = list(seed_errors) + list(validation_errors)
+                    report.validation_errors = validation_errors
+            except Exception as exc:  # noqa: BLE001
+                # Loud-fail: the seed guard is what stops silent mutation
+                # of the user's ground-truth contract. If it crashes we
+                # need to know — otherwise an LLM mutation could ship
+                # without the guard ever firing.
+                logger.warning("structural_seed_guard_failed (mutation may not be caught): %s", exc)
+
+            # Phase 7 (F2) — post-generation ODCS round-trip guarantee.
+            # Beyond the ground-truth diff (which catches mutation of specific
+            # paths), confirm the generated FLUID still re-exports to an ODCS
+            # document structurally equal to the seed's ODCS shape. Catches
+            # subtle losses (e.g., the LLM kept the field but reordered into a
+            # different schema object) that the path-diff misses.
+            if not validation_errors:
+                try:
+                    from fluid_build.providers.odcs import OdcsProvider
+
+                    odcs_prov = OdcsProvider()
+                    fluid_dict = normalized.get("contract") or {}
+                    for expose in fluid_dict.get("exposes") or []:
+                        if not isinstance(expose, Mapping):
+                            continue
+                        eid = expose.get("exposeId") or expose.get("id")
+                        if not eid:
+                            continue
+                        # Render this expose's ODCS; the import → re-render
+                        # should be idempotent given the lossless-round-trip
+                        # contract. Failure here = either a mapper regression
+                        # or the LLM produced an expose that can't round-trip.
+                        try:
+                            odcs = odcs_prov.render(fluid_dict, expose_id=eid)
+                            rt = odcs_prov.roundtrip_check(odcs)
+                            if not rt["equal"]:
+                                validation_errors.append(
+                                    f"Round-trip guarantee broken for expose '{eid}': "
+                                    f"missing={len(rt['missing'])} "
+                                    f"extra={len(rt['extra'])} "
+                                    f"changed={len(rt['changed'])}"
+                                )
+                        except Exception as exc:  # noqa: BLE001 — surface per-expose only
+                            validation_errors.append(
+                                f"Round-trip render failed for expose '{eid}': "
+                                f"{type(exc).__name__}: {str(exc)[:120]}"
+                            )
+                    if validation_errors:
+                        report.validation_errors = validation_errors
+                except Exception as exc:  # noqa: BLE001
+                    # Same loud-fail rationale as the seed guard above.
+                    logger.warning("structural_seed_roundtrip_guarantee_failed: %s", exc)
+
         report.validation_errors = validation_errors
         report.validation_warnings = validation_warnings
 

@@ -60,6 +60,16 @@ class TestDiscovererRegistry:
 
 
 class TestFilesystemDiscoverer:
+    # FilesystemDiscoverer._columns_for() lazy-imports duckdb to introspect
+    # CSV / Parquet / JSON column schemas. duckdb is an optional dependency
+    # (in the `local` extra, not `dev`), so the whole class skips when it's
+    # absent — keeps the unit-test floor low for contributors who don't
+    # install the optional warehouse deps.
+    pytestmark = pytest.mark.skipif(
+        __import__("importlib.util", fromlist=["find_spec"]).find_spec("duckdb") is None,
+        reason="duckdb optional dep (install fluid_build[local]) not present",
+    )
+
     def test_discovers_csv_columns(self, tmp_path: Path):
         f = tmp_path / "orders.csv"
         f.write_text("id,name,amount\n1,a,1.0\n2,b,2.0\n", encoding="utf-8")

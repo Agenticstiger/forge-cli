@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 from datetime import timedelta
@@ -26,6 +27,11 @@ from typing import Any, Dict, List, Optional
 from fluid_build.schema_manager import FluidSchemaManager
 
 from ..base import Store, StoreRecord, utc_now
+
+# Word-boundary pattern for the keyword/hybrid search fallback. Underscores,
+# dashes, dots, and slashes all read as separators so a stored
+# ``telco_customer_360`` matches a query of ``telco customer 360``.
+_SEARCH_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 
 
 class FileBackend(Store):
@@ -136,11 +142,25 @@ class FileBackend(Store):
             record = self.get(ns, query)
             return [record] if record else []
 
-        needle = (query or "").lower()
+        # Tokenised AND-match for keyword/hybrid modes — the prior
+        # strict-substring path missed natural-language queries that
+        # crossed underscores or differed in spacing
+        # (``"telco customer"`` vs the stored ``"telco_customer_360"``).
+        # Underscores, dashes, dots, and slashes all read as word
+        # boundaries; case-insensitive throughout. Vector backends
+        # produce real similarity scores upstream of this — the
+        # FileBackend's heuristic is the keyword fallback, not the
+        # canonical semantic surface.
+        tokens = [t for t in _SEARCH_TOKEN_PATTERN.findall((query or "").lower()) if t]
+        if not tokens:
+            return []
         matches: List[StoreRecord] = []
         for record in self.query(ns, limit=max(limit, 1000)):
-            haystack = json.dumps(record.value, sort_keys=True, default=str).lower()
-            if needle in haystack:
+            haystack = _SEARCH_TOKEN_PATTERN.findall(
+                json.dumps(record.value, sort_keys=True, default=str).lower()
+            )
+            haystack_set = set(haystack)
+            if all(token in haystack_set for token in tokens):
                 matches.append(record)
             if len(matches) >= limit:
                 break

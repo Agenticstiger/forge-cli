@@ -367,7 +367,58 @@ def run_ai_copilot_mode(
             "from_product_list": get_cli_arg_fn(args, "from_product_list"),
             "from_workspace": list(get_cli_arg_fn(args, "from_workspace", []) or []),
             "also_emit": get_cli_arg_fn(args, "also_emit"),
+            # Phase 7 — structural seed from an ODCS / Bitol ODPS document.
+            # When --seed-from is set, the FLUID skeleton from the standard
+            # is treated as ground truth (schema/quality/qos must not be
+            # mutated by the LLM). The post-validation guard in
+            # generate_copilot_artifacts enforces this.
+            "seed_from": get_cli_arg_fn(args, "seed_from"),
+            "seed_allow_remote": bool(get_cli_arg_fn(args, "seed_allow_remote", False)),
+            "seed_no_remote": bool(get_cli_arg_fn(args, "seed_no_remote", False)),
         }
+
+        # Phase 7 — load the structural seed up-front so failures surface
+        # before any LLM tokens are spent. The SeedResult rides on
+        # context.structural_seed; the runtime picks it up and uses it as
+        # the LLM seed_contract + ground-truth diff source.
+        _seed_from = copilot_options.get("seed_from")
+        if _seed_from:
+            try:
+                from fluid_build.cli.forge_copilot_seed import load_seed as _load_seed
+
+                # Default OFF (SSRF defence). --seed-allow-remote opts in.
+                # --seed-no-remote remains accepted as a no-op alias.
+                _allow_remote = copilot_options.get("seed_allow_remote", False)
+                if copilot_options.get("seed_no_remote", False):
+                    _allow_remote = False
+                context["structural_seed"] = _load_seed(_seed_from, allow_remote=_allow_remote)
+                logger.info(
+                    "forge_seed_loaded",
+                    extra={
+                        "path": str(_seed_from),
+                        "expose_count": len(
+                            (context["structural_seed"].fluid.get("exposes") or [])
+                        ),
+                    },
+                )
+            except Exception as _seed_exc:  # noqa: BLE001 — surface and exit cleanly
+                # Don't interpolate the exception text — for --seed-allow-remote
+                # paths the underlying exception can carry fragments of the
+                # fetched remote body (jsonschema field values). Log to the
+                # structured logger so operators with a debug log handler can
+                # still recover details, but never to stderr verbatim.
+                logger.warning(
+                    "forge_seed_failed",
+                    extra={
+                        "path": str(_seed_from),
+                        "exc_type": type(_seed_exc).__name__,
+                    },
+                )
+                console_error(
+                    f"--seed-from failed for {_seed_from!s}: "
+                    f"{type(_seed_exc).__name__} (run with --verbose for details)"
+                )
+                return 1
 
         # Phase 3: when --from-product / --from-product-list is set, resolve
         # the upstream products NOW (before we hit the LLM) so violations
@@ -690,6 +741,33 @@ def run_ai_copilot_mode(
                 context["existing_products"] = [
                     {"id": c.get("id", ""), "name": c.get("name", "")} for c in existing_contracts
                 ]
+
+            # Phase 7 (F1) — surface detected ODCS / Bitol ODPS docs as
+            # structural-seed candidates when --seed-from wasn't passed.
+            # The discovery sniffer tags them with kind: ``standard-odcs``
+            # / ``standard-odps`` and suggested_use ``fluid forge
+            # --seed-from``. Non-interactive: just log + skip.
+            if not context.get("structural_seed") and console:
+                _detected = getattr(discovery_report, "detected_sources", None) or []
+                _seed_candidates = [
+                    s
+                    for s in _detected
+                    if isinstance(s, dict) and str(s.get("kind", "")).startswith("standard-")
+                ]
+                if _seed_candidates:
+                    try:
+                        console.print(
+                            f"\n[dim]💡 Detected {len(_seed_candidates)} ODCS/ODPS "
+                            f"document(s) in the workspace. To use one as a "
+                            f"structural seed for this run, re-invoke with "
+                            f"[/dim][cyan]fluid forge --seed-from "
+                            f"{_seed_candidates[0]['path']}[/cyan][dim] "
+                            f"— the schema/quality/qos from the seed will be "
+                            f"preserved verbatim while the LLM fills in "
+                            f"builds/executes/governance.[/dim]\n"
+                        )
+                    except Exception:  # noqa: BLE001 — never block on console formatting
+                        pass
 
             # Resolve preliminary target_dir for early scaffold (samples/ + models/).
             # If --target-dir was provided, use it. Otherwise we'll use a

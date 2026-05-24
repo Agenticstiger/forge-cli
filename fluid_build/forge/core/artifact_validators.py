@@ -66,7 +66,7 @@ LOG = logging.getLogger("fluid.forge.core.artifact_validators")
 _REPO_ROOT: Path = Path(__file__).parent.parent.parent
 _ODCS_SCHEMA_PATH: Path = _REPO_ROOT / "providers" / "odcs" / "odcs-schema-v3.1.0.json"
 _ODPS_BITOL_SCHEMA_PATH: Path = (
-    _REPO_ROOT / "providers" / "odps_standard" / "odps-bitol-schema-v1.0.0.json"
+    _REPO_ROOT / "providers" / "odps_standard" / "schemas" / "odps-product-v1.0.0.json"
 )
 
 

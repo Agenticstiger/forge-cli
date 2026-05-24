@@ -276,7 +276,9 @@ def test_provider_render_raises_provider_error_for_expose_without_id():
         "exposes": [{"title": "no-id-here", "contract": {"schema": []}}],
     }
 
-    with pytest.raises(ProviderError, match="id/exposeId"):
+    # Error message updated in May 2026 audit pass to also accept
+    # ``expose.name`` (LLM-generated contracts often only set name).
+    with pytest.raises(ProviderError, match="exposeId, expose.id, or expose.name"):
         provider.render(contract)
 
 

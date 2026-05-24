@@ -12,30 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# fluid_build/cli/opds.py
 """
-ODPS (Open Data Product Specification) CLI Commands
+ODPS / OPDS CLI — two specifications under one user-facing command.
 
-Provides commands for exporting FLUID contracts to ODPS format with support
-for multiple specification versions.
+Specifications dispatched via ``--spec``:
 
-Official Specification:
-- v4.1: https://github.com/Open-Data-Product-Initiative/v4.1
-- Schema: https://github.com/Open-Data-Product-Initiative/v4.1/blob/main/source/schema/odps.yaml
+- ``bitol-1.0.0`` (**default**) — Bitol Open Data Product Standard v1.0.0.
+  Bidirectional. Export emits 1 ODPS doc + N sibling ``<contractId>.odcs.yaml``
+  files (canonical Bitol fragments layout). Import accepts an ODPS file,
+  a directory bundle, or a lone ODCS file. Backed by
+  :class:`fluid_build.providers.odps_standard.BitolOdpsProvider`.
 
-Standards Compliance:
-- ODPS v4.1 (default) - Linux Foundation / Open Data Product Initiative
-- Future version support through version parameter
-- Full metadata preservation
-- Validation against official schema
+- ``odpi-4.1`` — Open Data Product Initiative v4.1 (Linux Foundation).
+  Export-only single JSON document. Backed by the legacy
+  ``fluid_build.providers.odps`` provider.
 
-Note: The CLI command is 'opds' for historical reasons, but this implements
-the official ODPS (Open Data Product Specification) standard.
+The legacy ``--version 4.1`` flag still works as a hidden deprecated alias
+for ``--spec odpi-4.1``.
 
-Usage:
-    fluid opds export <contract> [--version 4.1] [--out file.json]
-    fluid opds validate <odps-file> [--version 4.1]
-    fluid opds info [--version 4.1]
+Usage::
+
+    fluid opds export <contract> [--spec bitol-1.0.0|odpi-4.1] [--out file] [--out-dir DIR]
+    fluid opds import <path>     [--spec bitol-1.0.0] [--allow-remote] [--lenient] [-o OUT]
+    fluid opds validate <file>   [--spec ...]
+    fluid opds info              [--spec ...]
 """
 
 from __future__ import annotations
@@ -51,68 +51,72 @@ from fluid_build.cli.console import error as console_error
 
 LOG = logging.getLogger("fluid.cli.opds")
 
-# ODPS specification versions and their schema URLs
-ODPS_VERSIONS = {
+
+# --- spec dispatcher constants ---------------------------------------------
+
+SPEC_BITOL_1_0_0 = "bitol-1.0.0"
+SPEC_ODPI_4_1 = "odpi-4.1"
+DEFAULT_SPEC = SPEC_BITOL_1_0_0
+SUPPORTED_SPECS = (SPEC_BITOL_1_0_0, SPEC_ODPI_4_1)
+
+BITOL_SPEC_URL = "https://github.com/bitol-io/open-data-product-standard"
+ODPI_4_1_SPEC_URL = "https://github.com/Open-Data-Product-Initiative/v4.1"
+ODPI_4_1_SCHEMA_URL = (
+    "https://github.com/Open-Data-Product-Initiative/v4.1/blob/main/source/schema/odps.json"
+)
+ODPI_4_1_SCHEMA_URL_RAW = "https://raw.githubusercontent.com/Open-Data-Product-Initiative/v4.1/main/source/schema/odps.json"
+
+# Back-compat shape for the legacy ``--version`` flag and info display.
+ODPS_VERSIONS: Dict[str, Dict[str, Any]] = {
     "4.1": {
-        "spec_url": "https://github.com/Open-Data-Product-Initiative/v4.1",
-        "schema_url": "https://github.com/Open-Data-Product-Initiative/v4.1/blob/main/source/schema/odps.json",
-        "schema_url_raw": "https://raw.githubusercontent.com/Open-Data-Product-Initiative/v4.1/main/source/schema/odps.json",
-        "description": "ODPS v4.1 - Current stable version with full JSON Schema",
+        "spec_url": ODPI_4_1_SPEC_URL,
+        "schema_url": ODPI_4_1_SCHEMA_URL,
+        "schema_url_raw": ODPI_4_1_SCHEMA_URL_RAW,
+        "description": "ODPI v4.1 — Open Data Product Initiative (Linux Foundation)",
         "status": "stable",
         "default": True,
     },
-    # Future versions can be added here
-    # "5.0": {
-    #     "spec_url": "https://github.com/Open-Data-Product-Initiative/v5.0",
-    #     "schema_url": "...",
-    #     "description": "ODPS v5.0 - Next generation",
-    #     "status": "draft",
-    #     "default": False
-    # }
 }
 
-DEFAULT_VERSION = next(v for v, info in ODPS_VERSIONS.items() if info.get("default", False))
+# Legacy alias — pre-Phase-4 code used ``DEFAULT_VERSION`` to mean "the
+# only supported ODPS version". Kept as a re-export so callers that
+# imported it (e.g. tests/test_opds_ext.py) don't have to be rewritten.
+# New code should use ``DEFAULT_SPEC`` and the ``--spec`` flag instead.
+DEFAULT_VERSION = "4.1"
+
+
+def resolve_spec(args: argparse.Namespace) -> str:
+    """Resolve the active ``--spec`` from CLI args.
+
+    Precedence: ``--spec`` > legacy ``--version 4.1`` > default.
+    Emits a deprecation warning when ``--version`` is the only signal.
+    """
+    spec = getattr(args, "spec", None)
+    if isinstance(spec, str) and spec in SUPPORTED_SPECS:
+        return spec
+    legacy_version = getattr(args, "version", None)
+    if isinstance(legacy_version, str) and legacy_version == "4.1":
+        LOG.warning("--version 4.1 is deprecated; use --spec odpi-4.1 instead")
+        return SPEC_ODPI_4_1
+    return DEFAULT_SPEC
 
 
 def get_version_info(version: str) -> Dict[str, Any]:
-    """Get information about a specific ODPS version."""
+    """Get information about a specific ODPS version (legacy --version support)."""
     if version not in ODPS_VERSIONS:
         available = ", ".join(ODPS_VERSIONS.keys())
         raise ValueError(f"Unsupported ODPS version: {version}. Available: {available}")
     return ODPS_VERSIONS[version]
 
 
+# --- export ---------------------------------------------------------------
+
+
 def cmd_opds_export(args: argparse.Namespace, logger: logging.Logger) -> int:
-    """
-    Export FLUID contract to ODPS format.
+    """Export a FLUID contract to ODPS — dispatched by ``--spec``."""
+    from fluid_build.cli.bootstrap import load_contract_with_overlay
 
-    Args:
-        args.contract: Path to FLUID contract file
-        args.version: ODPS specification version (default: 4.1)
-        args.out: Output file path or '-' for stdout
-        args.env: Optional environment overlay
-        args.validate: Validate output against schema (default: true)
-        args.pretty: Pretty-print JSON output (default: true)
-
-    Returns:
-        0 on success, non-zero on error
-    """
-    from fluid_build.cli.bootstrap import build_provider, load_contract_with_overlay
-
-    version = getattr(args, "version", DEFAULT_VERSION)
-    version_info = get_version_info(version)
-
-    logger.debug(
-        "opds_export_start",
-        extra={
-            "contract": args.contract,
-            "version": version,
-            "spec": version_info["spec_url"],
-            "output": getattr(args, "out", "-"),
-        },
-    )
-
-    # Load contract
+    spec = resolve_spec(args)
     try:
         contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
     except Exception as e:
@@ -120,329 +124,499 @@ def cmd_opds_export(args: argparse.Namespace, logger: logging.Logger) -> int:
         console_error(f"Error loading contract: {e}")
         return 1
 
-    # Build OPDS provider
+    if spec == SPEC_BITOL_1_0_0:
+        return _export_bitol(args, contract, logger)
+    if spec == SPEC_ODPI_4_1:
+        return _export_odpi_v4_1(args, contract, logger)
+    console_error(f"Unsupported --spec {spec!r}; supported: {SUPPORTED_SPECS}")
+    return 2
+
+
+def _export_bitol(
+    args: argparse.Namespace, contract: Dict[str, Any], logger: logging.Logger
+) -> int:
+    """Bitol ODPS v1.0.0 export — 1 ODPS doc + N sibling ODCS contracts."""
+    from fluid_build.providers.odps_standard import BitolOdpsProvider
+
+    out = getattr(args, "out", "-")
+    out_dir = getattr(args, "out_dir", None)
+    validate_strict = getattr(args, "validate_strict", True)
+    fmt = (getattr(args, "format", "yaml") or "yaml").lower()
+
+    provider = BitolOdpsProvider()
+    provider.strict_validation = bool(validate_strict)
+
+    try:
+        bundle = provider.render(
+            contract,
+            out=out if out and out != "-" and not out_dir else None,
+            out_dir=out_dir,
+            fmt=fmt,
+        )
+    except Exception as e:
+        logger.error("opds_export_failed", extra={"error": str(e), "spec": SPEC_BITOL_1_0_0})
+        console_error(f"Error exporting to Bitol ODPS: {e}")
+        return 1
+
+    if out == "-" and not out_dir:
+        # Stdout dump of the product doc — JSON for unambiguous pipeline use.
+        cprint(json.dumps(bundle["product"], indent=2, ensure_ascii=False))
+    else:
+        contract_count = len(bundle.get("contracts") or {})
+        location = out_dir if out_dir else out
+        cprint(
+            f"✓ Exported Bitol ODPS v1.0.0: 1 product + "
+            f"{contract_count} ODCS contract(s) → {location}"
+        )
+    return 0
+
+
+def _export_odpi_v4_1(
+    args: argparse.Namespace, contract: Dict[str, Any], logger: logging.Logger
+) -> int:
+    """Legacy ODPI v4.1 export path (single JSON document)."""
+    from fluid_build.cli.bootstrap import build_provider
+
     try:
         provider = build_provider("odps", None, None, logger)
     except Exception as e:
         logger.error("provider_build_failed", extra={"error": str(e)})
-        console_error(f"Error building OPDS provider: {e}")
+        console_error(f"Error building ODPI provider: {e}")
         return 1
 
-    # Set version-specific configuration
-    provider.opds_version = version
-    provider.opds_spec_url = version_info["spec_url"]
-    provider.opds_schema_url = version_info["schema_url"]
+    provider.opds_version = "4.1"
+    provider.opds_spec_url = ODPI_4_1_SPEC_URL
+    provider.opds_schema_url = ODPI_4_1_SCHEMA_URL
 
-    # Render to OPDS
+    out_path = getattr(args, "out", "-")
     try:
-        result = provider.render(contract, out=getattr(args, "out", "-"), fmt="opds")
-
-        # Output handling
-        out_path = getattr(args, "out", "-")
+        result = provider.render(contract, out=out_path, fmt="opds")
         if out_path == "-":
-            # Print to stdout with optional pretty printing
             if getattr(args, "pretty", True):
                 cprint(json.dumps(result, indent=2, ensure_ascii=False))
             else:
                 cprint(json.dumps(result, ensure_ascii=False))
         else:
-            logger.debug(
-                "opds_export_success",
-                extra={
-                    "output": out_path,
-                    "version": version,
-                    "size_bytes": Path(out_path).stat().st_size if Path(out_path).exists() else 0,
-                },
-            )
-            cprint(f"✓ Exported to OPDS v{version}: {out_path}")
-            cprint(f"  Specification: {version_info['spec_url']}")
-
+            cprint(f"✓ Exported to ODPI v4.1: {out_path}")
+            cprint(f"  Specification: {ODPI_4_1_SPEC_URL}")
         return 0
-
     except Exception as e:
-        logger.error("opds_export_failed", extra={"error": str(e)})
-        console_error(f"Error exporting to OPDS: {e}")
+        logger.error("opds_export_failed", extra={"error": str(e), "spec": SPEC_ODPI_4_1})
+        console_error(f"Error exporting to ODPI: {e}")
         return 1
+
+
+# --- import ---------------------------------------------------------------
+
+
+def cmd_opds_import(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """Import an ODPS / ODCS file or directory → one validated FLUID contract.
+
+    Input dispatch:
+      - Path ends in ``.odcs.yaml``/``.odcs.yml``/``.odcs.json`` →
+        :meth:`OdcsProvider.import_contract` (single-expose FLUID).
+      - Path is a file with ``kind: DataProduct`` (or ``.odps.yaml``) →
+        :meth:`BitolOdpsProvider.import_contract` with resolver.
+      - Path is a directory → :meth:`BitolOdpsProvider.import_directory`.
+
+    ``--spec odpi-4.1`` is reserved for the legacy provider, which is
+    export-only and rejects import with a clear error.
+    """
+    spec = resolve_spec(args)
+    if spec == SPEC_ODPI_4_1:
+        console_error("ODPI v4.1 is export-only; import is supported only for --spec bitol-1.0.0")
+        return 2
+
+    in_path = Path(args.path)
+    if not in_path.exists():
+        console_error(f"Input path not found: {in_path}")
+        return 1
+
+    # Default to remote-off (SSRF defence). --allow-remote opts in;
+    # --no-remote remains accepted as a no-op for back-compat.
+    allow_remote = bool(getattr(args, "allow_remote", False))
+    if getattr(args, "no_remote", False) and allow_remote:
+        console_error(
+            "--no-remote and --allow-remote are mutually exclusive; "
+            "honouring --no-remote (default behaviour)."
+        )
+        allow_remote = False
+    lenient = bool(getattr(args, "lenient", False))
+    out = getattr(args, "out", None)
+    fmt = (getattr(args, "format", "yaml") or "yaml").lower()
+
+    try:
+        fluid = _dispatch_import(in_path, allow_remote=allow_remote, lenient=lenient)
+    except Exception as e:
+        logger.error("opds_import_failed", extra={"error": str(e), "path": str(in_path)})
+        console_error(f"Error importing: {e}")
+        return 1
+
+    if out and out != "-":
+        out_path = Path(out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if fmt == "json":
+            out_path.write_text(json.dumps(fluid, indent=2, ensure_ascii=False))
+        else:
+            import yaml
+
+            out_path.write_text(yaml.dump(fluid, default_flow_style=False, sort_keys=False))
+        cprint(f"✓ Imported {in_path} → {out_path}")
+    else:
+        if fmt == "json":
+            cprint(json.dumps(fluid, indent=2, ensure_ascii=False))
+        else:
+            import yaml
+
+            cprint(yaml.dump(fluid, default_flow_style=False, sort_keys=False))
+    return 0
+
+
+def _dispatch_import(path: Path, *, allow_remote: bool, lenient: bool) -> Dict[str, Any]:
+    """Choose the right import method based on the input path's shape/content."""
+    if path.is_dir():
+        from fluid_build.providers.odps_standard import BitolOdpsProvider
+
+        return BitolOdpsProvider().import_directory(
+            path, allow_remote=allow_remote, lenient=lenient
+        )
+
+    suffixes = {s.lower() for s in path.suffixes}
+    name_lower = path.name.lower()
+
+    if ".odcs" in suffixes or name_lower.endswith((".odcs.yaml", ".odcs.yml", ".odcs.json")):
+        from fluid_build.providers.odcs import OdcsProvider
+
+        return OdcsProvider().import_contract(path)
+
+    if ".odps" in suffixes or name_lower.endswith((".odps.yaml", ".odps.yml", ".odps.json")):
+        from fluid_build.providers.odps_standard import BitolOdpsProvider
+
+        return BitolOdpsProvider().import_contract(path, allow_remote=allow_remote, lenient=lenient)
+
+    # Last resort: sniff the file's ``kind`` field
+    from fluid_build.providers.odcs.io import read_input
+
+    data = read_input(path)
+    kind = data.get("kind") if isinstance(data, dict) else None
+    if kind == "DataProduct":
+        from fluid_build.providers.odps_standard import BitolOdpsProvider
+
+        return BitolOdpsProvider().import_contract(path, allow_remote=allow_remote, lenient=lenient)
+    if kind == "DataContract":
+        from fluid_build.providers.odcs import OdcsProvider
+
+        return OdcsProvider().import_contract(path)
+
+    raise ValueError(
+        f"Cannot determine input type for {path}: "
+        f"expected a directory, *.odps.yaml, *.odcs.yaml, or a file with "
+        f"kind: DataProduct or kind: DataContract"
+    )
+
+
+# --- validate / info ------------------------------------------------------
 
 
 def cmd_opds_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
-    """
-    Validate an OPDS file against the specification schema.
-
-    Args:
-        args.file: Path to OPDS JSON file
-        args.version: OPDS specification version to validate against
-        args.full_schema: Use full JSON schema validation (default: true)
-
-    Returns:
-        0 if valid, non-zero if invalid
-    """
-    version = getattr(args, "version", DEFAULT_VERSION)
-    version_info = get_version_info(version)
-    use_full_schema = getattr(args, "full_schema", True)
-
-    logger.info(
-        "opds_validate_start",
-        extra={
-            "file": args.file,
-            "version": version,
-            "schema": version_info["schema_url"],
-            "full_validation": use_full_schema,
-        },
-    )
-
-    # Load OPDS file
-    try:
-        path = Path(args.file)
-        if not path.exists():
-            console_error(f"Error: File not found: {args.file}")
-            return 1
-
-        with open(path, encoding="utf-8") as f:
-            opds_data = json.load(f)
-
-        # Check if this is a wrapped format (from render())
-        if "artifacts" in opds_data and isinstance(opds_data["artifacts"], dict):
-            logger.info("opds_validate_unwrap", extra={"format": "wrapped"})
-            opds_data = opds_data["artifacts"]
-    except Exception as e:
-        console_error(f"Error loading OPDS file: {e}")
+    """Validate an ODPS file against the chosen spec."""
+    spec = resolve_spec(args)
+    path = Path(args.file)
+    if not path.exists():
+        console_error(f"Error: File not found: {args.file}")
         return 1
 
-    # Use comprehensive validator if available
+    if spec == SPEC_BITOL_1_0_0:
+        from fluid_build.providers.base import ProviderError
+        from fluid_build.providers.odps_standard import BitolOdpsProvider
+        from fluid_build.providers.odps_standard.io import read_input
+
+        try:
+            odps_data = read_input(path)
+        except Exception as e:
+            console_error(f"Error loading ODPS file: {e}")
+            return 1
+        if not isinstance(odps_data, dict):
+            console_error(f"Error: {path} did not parse as a mapping")
+            return 1
+        try:
+            BitolOdpsProvider().validate_product(odps_data)
+        except ProviderError as e:
+            console_error(f"✗ Bitol ODPS validation failed: {e}")
+            return 1
+        cprint(f"✓ Bitol ODPS v1.0.0 file is valid: {path}")
+        cprint(f"  Spec: {BITOL_SPEC_URL}")
+        return 0
+
+    # ODPI v4.1 — legacy structural validator
     try:
         from fluid_build.providers.odps.validator import validate_opds_structure
 
+        with open(path, encoding="utf-8") as f:
+            opds_data = json.load(f)
+        if "artifacts" in opds_data and isinstance(opds_data["artifacts"], dict):
+            opds_data = opds_data["artifacts"]
         result = validate_opds_structure(
             opds_data,
-            version=version,
-            use_full_schema=use_full_schema,
+            version="4.1",
+            use_full_schema=getattr(args, "full_schema", True),
+            schema_url=ODPI_4_1_SCHEMA_URL_RAW,
         )
-
-        if not result["valid"]:
+        if not result.get("valid"):
             console_error(
-                f"✗ OPDS validation failed ({result.get('validation_type', 'unknown')} validation)"
+                f"✗ ODPI v4.1 validation failed ({result.get('validation_type', 'unknown')})"
             )
-            if result.get("errors"):
-                console_error("\nErrors:")
-                for error in result["errors"]:
-                    console_error(f"  - {error}")
-            logger.error("opds_invalid", extra=result)
+            for err in result.get("errors", []) or []:
+                console_error(f"  - {err}")
             return 1
-
-        # Validation successful
-        validation_type = result.get("validation_type", "basic")
-        cprint(f"✓ OPDS file is valid (v{version} {validation_type} validation)")
-        cprint(f"  Data Product: {opds_data.get('dataProductId')}")
-        cprint(f"  Name: {opds_data.get('dataProductName')}")
-        cprint(f"  Schema Reference: {version_info['schema_url']}")
-
-        if result.get("warnings"):
-            cprint("\nWarnings:")
-            for warning in result["warnings"]:
-                cprint(f"  ⚠ {warning}")
-
-        if validation_type == "full_schema":
-            cprint("\n✓ Validated against official JSON Schema")
-            cprint(f"  {version_info.get('schema_url_raw', version_info['schema_url'])}")
-
-        logger.info(
-            "opds_valid",
-            extra={"file": args.file, "version": version, "validation_type": validation_type},
-        )
+        cprint(f"✓ ODPI v4.1 file is valid: {path}")
+        cprint(f"  Schema: {ODPI_4_1_SCHEMA_URL}")
         return 0
-
     except ImportError:
-        logger.warning("opds_validator_unavailable", extra={"message": "Using basic validation"})
-        # Fall back to basic validation
-        pass
-
-    # Basic validation fallback
-    required_fields = ["dataProductId", "dataProductName", "dataProductDescription"]
-    missing = [f for f in required_fields if f not in opds_data]
-
-    if missing:
-        console_error(f"✗ OPDS validation failed: Missing required fields: {', '.join(missing)}")
-        logger.error("opds_invalid", extra={"missing_fields": missing})
+        console_error("ODPI v4.1 validator not available")
         return 1
-
-    # Check version metadata if present
-    if "version" in opds_data:
-        cprint(f"  OPDS version in file: {opds_data['version']}")
-
-    cprint(f"✓ OPDS file is valid (v{version} basic validation)")
-    cprint(f"  Data Product: {opds_data.get('dataProductId')}")
-    cprint(f"  Name: {opds_data.get('dataProductName')}")
-    cprint(f"  Schema Reference: {version_info['schema_url']}")
-
-    logger.info("opds_valid", extra={"file": args.file, "version": version})
-    return 0
+    except Exception as e:
+        console_error(f"Error validating ODPI file: {e}")
+        return 1
 
 
 def cmd_opds_info(args: argparse.Namespace, logger: logging.Logger) -> int:
-    """
-    Display information about OPDS specification versions.
+    """Show spec information for Bitol ODPS or ODPI v4.1."""
+    # Legacy ``--version`` path: validate against ODPS_VERSIONS first so
+    # garbage values still produce the historical "unsupported version"
+    # error rather than silently routing to the default.
+    legacy_version = getattr(args, "version", None)
+    if isinstance(legacy_version, str) and legacy_version not in ODPS_VERSIONS:
+        console_error(
+            f"Unsupported ODPS version: {legacy_version}. "
+            f"Available: {', '.join(ODPS_VERSIONS.keys())}"
+        )
+        return 1
 
-    Args:
-        args.version: Optional specific version to show info for
-        args.json: Output in JSON format
-
-    Returns:
-        0 on success
-    """
-    if hasattr(args, "version") and args.version:
-        # Show info for specific version
-        try:
-            version_info = get_version_info(args.version)
-
-            if getattr(args, "json", False):
-                cprint(json.dumps({args.version: version_info}, indent=2))
-            else:
-                cprint(f"OPDS Version {args.version}")
-                cprint("=" * 60)
-                cprint(f"Description:  {version_info['description']}")
-                cprint(f"Status:       {version_info['status']}")
-                cprint(f"Spec URL:     {version_info['spec_url']}")
-                cprint(f"Schema URL:   {version_info['schema_url']}")
-                if version_info.get("default"):
-                    cprint("Default:      Yes")
-        except ValueError as e:
-            console_error(str(e))
-            return 1
-    else:
-        # Show all versions
-        if getattr(args, "json", False):
-            cprint(json.dumps(ODPS_VERSIONS, indent=2))
+    spec = resolve_spec(args)
+    if getattr(args, "json", False):
+        if spec == SPEC_BITOL_1_0_0:
+            info = {
+                "spec": SPEC_BITOL_1_0_0,
+                "name": "Bitol Open Data Product Standard",
+                "version": "1.0.0",
+                "spec_url": BITOL_SPEC_URL,
+                "media_type": "application/odps+yaml;version=1.0.0",
+                "license": "Apache-2.0",
+            }
         else:
-            cprint("ODPS (Open Data Product Specification) Versions")
-            cprint("=" * 60)
-            cprint()
+            info = ODPS_VERSIONS["4.1"]
+        cprint(json.dumps(info, indent=2))
+        return 0
 
-            for version, info in ODPS_VERSIONS.items():
-                default_marker = " [DEFAULT]" if info.get("default") else ""
-                status_marker = f" ({info['status'].upper()})" if info["status"] != "stable" else ""
-                cprint(f"Version {version}{default_marker}{status_marker}")
-                cprint(f"  {info['description']}")
-                cprint(f"  Spec:   {info['spec_url']}")
-                cprint(f"  Schema: {info['schema_url']}")
-                cprint()
-
-            cprint("Usage:")
-            cprint("  fluid odps export contract.yaml --version 4.1")
-            cprint("  fluid odps validate output.json --version 4.1")
-
+    if spec == SPEC_BITOL_1_0_0:
+        cprint("Bitol Open Data Product Standard v1.0.0")
+        cprint("=" * 60)
+        cprint(f"Spec URL:   {BITOL_SPEC_URL}")
+        cprint("Media type: application/odps+yaml;version=1.0.0")
+        cprint("License:    Apache-2.0")
+    else:
+        info = ODPS_VERSIONS["4.1"]
+        cprint("ODPI Version 4.1")
+        cprint("=" * 60)
+        cprint(f"Description: {info['description']}")
+        cprint(f"Status:      {info['status']}")
+        cprint(f"Spec URL:    {info['spec_url']}")
+        cprint(f"Schema URL:  {info['schema_url']}")
     return 0
+
+
+# --- argparse wiring ------------------------------------------------------
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
     """Register ODPS commands with the CLI."""
 
-    # Main ODPS command group
     odps = subparsers.add_parser(
         "odps",
-        help="Export and validate ODPS (Open Data Product Specification) format",
-        description="""
-        Work with ODPS (Open Data Product Specification) format.
-        
-        The Open Data Product Specification is a vendor-neutral, open-source standard
-        for describing data products. This command supports exporting FLUID contracts
-        to ODPS format and validating ODPS files.
-        
-        Official Specification: https://github.com/Open-Data-Product-Initiative
-        """,
+        aliases=["opds"],
+        help="Bitol ODPS v1.0.0 (default) or ODPI v4.1 — export, import, validate",
+        description=(
+            "Work with the ODPS family of standards. Two specifications, dispatched via --spec:\n"
+            f"  bitol-1.0.0  Bitol Open Data Product Standard v1.0.0 (default, bidirectional).\n"
+            f"  odpi-4.1     Open Data Product Initiative v4.1 (Linux Foundation, export-only).\n\n"
+            f"Bitol ODPS: {BITOL_SPEC_URL}\n"
+            f"ODPI v4.1:  {ODPI_4_1_SPEC_URL}"
+        ),
     )
 
     odps_sub = odps.add_subparsers(dest="odps_command", help="ODPS operations")
 
-    # odps export
+    # --- export
     export = odps_sub.add_parser(
         "export",
-        help="Export FLUID contract to ODPS format",
-        description="""
-        Export a FLUID contract to ODPS (Open Data Product Specification) JSON format.
-        
-        Supports multiple OPDS specification versions for future compatibility.
-        Output can be written to a file or stdout for pipeline integration.
-        """,
+        help="Export FLUID contract to ODPS",
+        description=(
+            "Export a FLUID contract to ODPS. --spec selects the target spec; default is "
+            "bitol-1.0.0 (1 ODPS doc + N sibling ODCS contracts). --spec odpi-4.1 emits a "
+            "single ODPI v4.1 JSON document."
+        ),
     )
     export.add_argument("contract", help="Path to FLUID contract file (YAML/JSON)")
     export.add_argument(
+        "--spec",
+        default=None,
+        choices=list(SUPPORTED_SPECS),
+        help=f"Target specification (default: {DEFAULT_SPEC}).",
+    )
+    # Deprecated alias — kept for back-compat. Hidden from --help.
+    export.add_argument(
         "--version",
-        default=DEFAULT_VERSION,
+        default=None,
         choices=list(ODPS_VERSIONS.keys()),
-        help=f"ODPS specification version (default: {DEFAULT_VERSION})",
+        help=argparse.SUPPRESS,
     )
     export.add_argument(
         "--out", default="-", help="Output file path, or '-' for stdout (default: stdout)"
     )
-    export.add_argument("--env", help="Environment name for overlay application")
     export.add_argument(
-        "--validate",
-        action="store_true",
-        default=True,
-        help="Validate output against OPDS schema (default: true)",
+        "--out-dir",
+        dest="out_dir",
+        default=None,
+        help=(
+            "(bitol-1.0.0 only) Directory for the ODPS doc + per-port ODCS files. "
+            "Mutually exclusive with --out."
+        ),
     )
     export.add_argument(
-        "--no-validate", dest="validate", action="store_false", help="Skip validation of output"
+        "--format",
+        "-f",
+        default="yaml",
+        choices=["yaml", "json"],
+        help="Output format for file/dir writes (default: yaml). Stdout always uses JSON.",
+    )
+    export.add_argument("--env", help="Environment name for overlay application")
+    export.add_argument(
+        "--validate-strict",
+        dest="validate_strict",
+        action="store_true",
+        default=True,
+        help="(bitol-1.0.0) Validate emitted docs against vendored schemas (default: true).",
+    )
+    export.add_argument(
+        "--no-validate-strict",
+        dest="validate_strict",
+        action="store_false",
+        help="(bitol-1.0.0) Downgrade schema validation to warnings.",
     )
     export.add_argument(
         "--pretty",
         action="store_true",
         default=True,
-        help="Pretty-print JSON output (default: true)",
+        help="(odpi-4.1) Pretty-print JSON output (default: true)",
     )
     export.add_argument(
         "--compact",
         dest="pretty",
         action="store_false",
-        help="Compact JSON output (no indentation)",
+        help="(odpi-4.1) Compact JSON output (no indentation).",
     )
     export.set_defaults(func=cmd_opds_export)
 
-    # odps validate
+    # --- import (Bitol ODPS only)
+    importp = odps_sub.add_parser(
+        "import",
+        help="Import an ODPS / ODCS file or directory → one FLUID contract",
+        description=(
+            "Import a Bitol ODPS product file, a directory containing the ODPS doc + "
+            "sibling ODCS files (or just ODCS files), or a single ODCS contract file. "
+            "Always emits one validated FLUID contract."
+        ),
+    )
+    importp.add_argument(
+        "path",
+        help="Input path — a .odps.yaml file, a directory, or a .odcs.yaml file.",
+    )
+    importp.add_argument(
+        "--spec",
+        default=None,
+        choices=list(SUPPORTED_SPECS),
+        help=f"Specification (default: {DEFAULT_SPEC}). odpi-4.1 is export-only.",
+    )
+    importp.add_argument(
+        "-o", "--out", default=None, help="Output FLUID file path (default: stdout)"
+    )
+    importp.add_argument(
+        "-f", "--format", default="yaml", choices=["yaml", "json"], help="Output format"
+    )
+    importp.add_argument(
+        "--allow-remote",
+        dest="allow_remote",
+        action="store_true",
+        help=(
+            "Allow http(s) fetch when resolving contractId references. "
+            "Default is OFF (since the May 2026 SSRF hardening). The "
+            "fetcher rejects internal/private IPs and pins the validated "
+            "IP at the TCP layer; even so, only enable when you trust "
+            "the upstream catalog."
+        ),
+    )
+    importp.add_argument(
+        "--no-remote",
+        dest="no_remote",
+        action="store_true",
+        help=argparse.SUPPRESS,  # deprecated — default is already remote-off
+    )
+    importp.add_argument(
+        "--lenient",
+        action="store_true",
+        help="Downgrade output-port resolution failures to warnings (input ports are always lenient).",
+    )
+    importp.set_defaults(func=cmd_opds_import)
+
+    # --- validate
     validate = odps_sub.add_parser(
         "validate",
-        help="Validate an ODPS file against specification",
-        description="""
-        Validate an ODPS JSON file against the official specification schema.
-        
-        Performs structural validation and checks required fields according to
-        the ODPS specification version.
-        """,
+        help="Validate an ODPS file against the chosen spec",
     )
-    validate.add_argument("file", help="Path to ODPS JSON file")
+    validate.add_argument("file", help="Path to ODPS YAML/JSON file")
+    validate.add_argument(
+        "--spec",
+        default=None,
+        choices=list(SUPPORTED_SPECS),
+        help=f"Specification (default: {DEFAULT_SPEC}).",
+    )
     validate.add_argument(
         "--version",
-        default=DEFAULT_VERSION,
+        default=None,
         choices=list(ODPS_VERSIONS.keys()),
-        help=f"ODPS version to validate against (default: {DEFAULT_VERSION})",
+        help=argparse.SUPPRESS,
     )
     validate.add_argument(
         "--full-schema",
         action="store_true",
         default=True,
-        help="Use full JSON schema validation (default: true, requires jsonschema library)",
+        help="(odpi-4.1) Use full JSON schema validation (default: true)",
     )
     validate.add_argument(
         "--no-full-schema",
         dest="full_schema",
         action="store_false",
-        help="Skip full JSON schema validation, use basic validation only",
+        help="(odpi-4.1) Skip full JSON schema validation, basic only",
     )
     validate.set_defaults(func=cmd_opds_validate)
 
-    # odps info
+    # --- info
     info = odps_sub.add_parser(
         "info",
-        help="Display ODPS specification version information",
-        description="""
-        Show information about supported ODPS specification versions.
-        
-        Displays specification URLs, schema references, and version status.
-        """,
+        help="Display spec information",
     )
     info.add_argument(
-        "--version", choices=list(ODPS_VERSIONS.keys()), help="Show info for specific version only"
+        "--spec",
+        default=None,
+        choices=list(SUPPORTED_SPECS),
+        help=f"Specification (default: {DEFAULT_SPEC}).",
+    )
+    info.add_argument(
+        "--version",
+        default=None,
+        choices=list(ODPS_VERSIONS.keys()),
+        help=argparse.SUPPRESS,
     )
     info.add_argument("--json", action="store_true", help="Output in JSON format")
     info.set_defaults(func=cmd_opds_info)
