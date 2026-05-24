@@ -91,6 +91,21 @@ dependencies = [
   # custom-SQL / task-body / view-body surfaces. Borrowed-not-built per
   # /borrow-before-build: https://github.com/tobymao/sqlglot
   "sqlglot>=25.0",
+  # Bitol-vendor-listed Python library for ODCS v3.1.0. Provides typed
+  # Pydantic v2 models + ``from_file()`` / ``to_yaml()`` for lossless
+  # ODCS YAML I/O. Maintained by the ``datacontract`` org (same folks
+  # who ship ``datacontract-cli``).
+  #
+  # Borrowed-not-built per /borrow-before-build:
+  #   PyPI:    https://pypi.org/project/open-data-contract-standard/
+  #   GitHub:  https://github.com/datacontract/open-data-contract-standard-python
+  #   Listed:  https://github.com/bitol-io/open-data-contract-standard/blob/main/vendors.md
+  #
+  # Powers fluid_build.providers.odcs.io for ODCS file I/O. Mapper-based
+  # FLUID ↔ ODCS conversion stays on plain dicts so the pass-through
+  # buckets that preserve unmodeled fields keep their round-trip
+  # fidelity contract.
+  "open-data-contract-standard>=3.1.2",
   # Optional UX nicety on Windows; no-op elsewhere
   "colorama>=0.4.6; platform_system == 'Windows'",
 ]
