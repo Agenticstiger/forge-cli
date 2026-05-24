@@ -722,6 +722,34 @@ def run_ai_copilot_mode(
                     {"id": c.get("id", ""), "name": c.get("name", "")} for c in existing_contracts
                 ]
 
+            # Phase 7 (F1) — surface detected ODCS / Bitol ODPS docs as
+            # structural-seed candidates when --seed-from wasn't passed.
+            # The discovery sniffer tags them with kind: ``standard-odcs``
+            # / ``standard-odps`` and suggested_use ``fluid forge
+            # --seed-from``. Non-interactive: just log + skip.
+            if not context.get("structural_seed") and console:
+                _detected = getattr(discovery_report, "detected_sources", None) or []
+                _seed_candidates = [
+                    s
+                    for s in _detected
+                    if isinstance(s, dict)
+                    and str(s.get("kind", "")).startswith("standard-")
+                ]
+                if _seed_candidates:
+                    try:
+                        console.print(
+                            f"\n[dim]💡 Detected {len(_seed_candidates)} ODCS/ODPS "
+                            f"document(s) in the workspace. To use one as a "
+                            f"structural seed for this run, re-invoke with "
+                            f"[/dim][cyan]fluid forge --seed-from "
+                            f"{_seed_candidates[0]['path']}[/cyan][dim] "
+                            f"— the schema/quality/qos from the seed will be "
+                            f"preserved verbatim while the LLM fills in "
+                            f"builds/executes/governance.[/dim]\n"
+                        )
+                    except Exception:  # noqa: BLE001 — never block on console formatting
+                        pass
+
             # Resolve preliminary target_dir for early scaffold (samples/ + models/).
             # If --target-dir was provided, use it. Otherwise we'll use a
             # temporary name; the final target_dir is resolved after the
