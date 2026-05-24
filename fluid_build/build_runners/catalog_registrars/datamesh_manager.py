@@ -181,9 +181,13 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                 target=self.target, urn=urn, succeeded=False, error="DMM_API_KEY not set"
             )
         try:
-            import httpx
+            from fluid_build.util.safe_http import safe_httpx_client
 
-            with httpx.Client(base_url=self.api_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.api_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.delete(
                     f"/api/data-products/{product_id}",
                     headers={"Authorization": f"Bearer {self.api_token}"},
@@ -218,10 +222,14 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         minimal native shape — derived directly from the canonical
         payload — when ODPS rendering wasn't available.
         """
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         body = self._render_dmm_data_product_body(payload)
-        with httpx.Client(base_url=self.api_url, timeout=self.timeout_seconds) as c:
+        with safe_httpx_client(
+            base_url=self.api_url,
+            timeout=float(self.timeout_seconds),
+            allow_private=True,
+        ) as c:
             r = c.put(
                 f"/api/data-products/{payload.product.product_id}",
                 json=body,
@@ -240,7 +248,7 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         own per-port linkage convention (see
         ``DataMeshManagerProvider._publish_odcs_per_expose``).
         """
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         body = self._render_dmm_data_contract_body(asset)
         if body is None:
@@ -248,7 +256,11 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             # than POSTing an empty body that DMM would reject. The
             # data-product PUT above still landed.
             return
-        with httpx.Client(base_url=self.api_url, timeout=self.timeout_seconds) as c:
+        with safe_httpx_client(
+            base_url=self.api_url,
+            timeout=float(self.timeout_seconds),
+            allow_private=True,
+        ) as c:
             r = c.put(
                 f"/api/datacontracts/{contract_id}",
                 json=body,

@@ -266,9 +266,13 @@ class DataHubRegistrar(CatalogRegistrar):
         Used for Dataset entities — DataHub still accepts the snapshot
         shape on this endpoint but rejects DataProduct / Domain there
         (they have no DataProductSnapshot / DomainSnapshot models)."""
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
-        with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as c:
+        with safe_httpx_client(
+            base_url=self.base_url,
+            timeout=float(self.timeout_seconds),
+            allow_private=True,
+        ) as c:
             r = c.post("/entities?action=ingest", json=envelope, headers=self._headers())
             r.raise_for_status()
 
@@ -288,7 +292,7 @@ class DataHubRegistrar(CatalogRegistrar):
         ``GenericAspect``; this is DataHub's own envelope shape, not
         an artefact of this client.
         """
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         payload = {
             "proposal": {
@@ -302,16 +306,24 @@ class DataHubRegistrar(CatalogRegistrar):
                 },
             }
         }
-        with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as c:
+        with safe_httpx_client(
+            base_url=self.base_url,
+            timeout=float(self.timeout_seconds),
+            allow_private=True,
+        ) as c:
             r = c.post(
                 "/aspects?action=ingestProposal", json=payload, headers=self._headers()
             )
             r.raise_for_status()
 
     def _post_delete(self, urn: str) -> None:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
-        with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as c:
+        with safe_httpx_client(
+            base_url=self.base_url,
+            timeout=float(self.timeout_seconds),
+            allow_private=True,
+        ) as c:
             r = c.post(
                 "/entities?action=delete", json={"urn": urn}, headers=self._headers()
             )

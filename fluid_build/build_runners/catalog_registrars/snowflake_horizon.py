@@ -106,11 +106,15 @@ class SnowflakeHorizonRegistrar(CatalogRegistrar):
         return RegistrationResult(target="snowflake_horizon", urn=urn, succeeded=True)
 
     def unregister(self, product_id: str, expose_id: str) -> RegistrationResult:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         urn = f"snowflake://{self.database}.{self.schema}.{expose_id.upper()}"
         try:
-            with httpx.Client(base_url=self.account_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.account_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.delete(
                     f"/api/v2/databases/{self.database}/schemas/{self.schema}/tables/"
                     f"{expose_id.upper()}"
@@ -135,11 +139,15 @@ class SnowflakeHorizonRegistrar(CatalogRegistrar):
     def _post_create_table(
         self, payload: CatalogPublicationPayload, asset: AssetPayload
     ) -> None:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         body = self._build_payload(payload, asset)
         url = f"/api/v2/databases/{self.database}/schemas/{self.schema}/tables"
-        with httpx.Client(base_url=self.account_url, timeout=self.timeout_seconds) as c:
+        with safe_httpx_client(
+            base_url=self.account_url,
+            timeout=float(self.timeout_seconds),
+            allow_private=True,
+        ) as c:
             r = c.post(url, json=body, headers=self._headers())
             r.raise_for_status()
 

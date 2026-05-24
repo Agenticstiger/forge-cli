@@ -98,12 +98,16 @@ class UnityCatalogRegistrar(CatalogRegistrar):
         return RegistrationResult(target="unity", urn=urn, succeeded=True)
 
     def unregister(self, product_id: str, expose_id: str) -> RegistrationResult:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         full_name = f"{self.catalog_name}.{self.schema_name}.{expose_id}"
         urn = f"unity://{full_name}"
         try:
-            with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.base_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.delete(f"/api/2.1/unity-catalog/tables/{full_name}")
                 r.raise_for_status()
             return RegistrationResult(target="unity", urn=urn, succeeded=True)
@@ -119,9 +123,13 @@ class UnityCatalogRegistrar(CatalogRegistrar):
         return headers
 
     def _post(self, body: Dict[str, Any]) -> None:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
-        with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as c:
+        with safe_httpx_client(
+            base_url=self.base_url,
+            timeout=float(self.timeout_seconds),
+            allow_private=True,
+        ) as c:
             r = c.post(
                 "/api/2.1/unity-catalog/tables", json=body, headers=self._headers()
             )
