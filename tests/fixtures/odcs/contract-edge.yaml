@@ -1,0 +1,56 @@
+# Edge-case ODCS contract — covers shapes the round-trip mappers must not lose:
+#  - string-form ``team`` (legacy ODCS v2 wire format we still accept on import)
+#  - exotic / dialect-specific logicalTypes (uuid, bignumeric, jsonb, struct, …)
+#  - deeply-nested object properties (struct-in-struct)
+#  - slaProperties spanning multiple unit families (time + percentage + count)
+apiVersion: v3.1.0
+kind: DataContract
+id: edge.contract
+name: edge-case contract
+version: 1.0.0
+status: active
+domain: edge-cases
+team: "legacy-string-team-name"  # ODCS v2 wire format — provider must accept + round-trip
+description:
+  purpose: Exercise round-trip fidelity on the long-tail ODCS shapes.
+schema:
+  - name: edge_table
+    logicalType: object
+    physicalType: table
+    properties:
+      - name: id
+        logicalType: string
+        format: uuid
+        required: true
+        primaryKey: true
+      - name: amount
+        logicalType: number
+        physicalType: BIGNUMERIC
+      - name: payload
+        logicalType: object
+        physicalType: jsonb
+        properties:
+          - name: inner_struct
+            logicalType: object
+            properties:
+              - name: leaf
+                logicalType: string
+              - name: leaf_count
+                logicalType: integer
+      - name: tags_array
+        logicalType: array
+slaProperties:
+  - property: maxStaleness
+    value: 24
+    unit: h
+  - property: availability
+    value: 99.5
+    unit: "%"
+  - property: errorRate
+    value: 10
+    unit: count
+servers:
+  - server: prod
+    type: bigquery
+    project: edge_project
+    dataset: edge_dataset
