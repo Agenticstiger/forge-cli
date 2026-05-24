@@ -27,7 +27,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 from fluid_build.providers.base import ProviderError
 from fluid_build.providers.odcs import OdcsProvider
@@ -53,7 +53,7 @@ SHAPE_ODCS_ONLY_DIRECTORY = "odcs-only-directory"
 
 
 def load_seed(
-    seed_from: Union[str, Path], *, allow_remote: bool = True
+    seed_from: Union[str, Path], *, allow_remote: bool = False
 ) -> SeedResult:
     """Detect the input shape and run the matching importer.
 

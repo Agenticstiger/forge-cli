@@ -190,12 +190,21 @@ class OdcsProvider(BaseProvider):
         if self.schema:
             try:
                 self.validate_contract(odcs_data)
-            except ProviderError as exc:
-                # validation failures during import are non-fatal — log and
+            except ProviderError:
+                # Validation failures during import are non-fatal — log and
                 # continue so partially-malformed contracts can still be
-                # inspected. Strict-mode callers should call validate_contract
-                # themselves first.
-                self.logger.warning("ODCS import validation warning: %s", exc)
+                # inspected. We deliberately do NOT interpolate the
+                # exception text: jsonschema includes offending field
+                # values in its messages, and when ``odcs`` came from a
+                # remote fetch via ContractResolver, that text would leak
+                # response-body fragments into WARNING logs. Strict-mode
+                # callers should call validate_contract themselves first
+                # to surface the detail safely.
+                self.logger.warning(
+                    "ODCS import validation warning (call validate_contract "
+                    "for details — message omitted to avoid leaking remote "
+                    "response bodies into logs)"
+                )
 
         fluid: Dict[str, Any] = {}
         ctx = ImportCtx(odcs=odcs_data, fluid=fluid, logger=self.logger)

@@ -38,7 +38,7 @@ class DataHubRegistrar(CatalogRegistrar):
         contract: Dict[str, Any],
         classifications: Dict[str, List[str]],
     ) -> RegistrationResult:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         urn = self._urn(product_id, expose_id, contract)
         envelope = self._build_envelope(urn, expose_id, contract, classifications)
@@ -46,7 +46,11 @@ class DataHubRegistrar(CatalogRegistrar):
         if self.api_token:
             headers["Authorization"] = f"Bearer {self.api_token}"
         try:
-            with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.base_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.post("/entities?action=ingest", json=envelope, headers=headers)
                 r.raise_for_status()
             return RegistrationResult(target="datahub", urn=urn, succeeded=True)
@@ -57,9 +61,13 @@ class DataHubRegistrar(CatalogRegistrar):
         urn = self._urn(product_id, expose_id, {})
         # DataHub soft-deletion via GMS POST /entities?action=delete.
         try:
-            import httpx
+            from fluid_build.util.safe_http import safe_httpx_client
 
-            with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.base_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.post(
                     "/entities?action=delete",
                     json={"urn": urn},

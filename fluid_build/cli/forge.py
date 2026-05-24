@@ -384,13 +384,22 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     parser.add_argument(
+        "--seed-allow-remote",
+        dest="seed_allow_remote",
+        action="store_true",
+        help=(
+            "[experimental] When --seed-from has http(s) contractId "
+            "references, allow http(s) fetch. Default is OFF (since "
+            "the May 2026 SSRF hardening); the fetcher rejects "
+            "internal/private IPs and pins the validated IP, but "
+            "still only enable when you trust the upstream catalog."
+        ),
+    )
+    parser.add_argument(
         "--seed-no-remote",
         dest="seed_no_remote",
         action="store_true",
-        help=(
-            "[experimental] When --seed-from has http(s) contractId references, "
-            "refuse to fetch them. Honoured by the pre-processor."
-        ),
+        help=argparse.SUPPRESS,  # deprecated — default is already remote-off
     )
     parser.add_argument(
         "--yes",

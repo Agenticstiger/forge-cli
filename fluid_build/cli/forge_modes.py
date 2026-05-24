@@ -373,6 +373,9 @@ def run_ai_copilot_mode(
             # mutated by the LLM). The post-validation guard in
             # generate_copilot_artifacts enforces this.
             "seed_from": get_cli_arg_fn(args, "seed_from"),
+            "seed_allow_remote": bool(
+                get_cli_arg_fn(args, "seed_allow_remote", False)
+            ),
             "seed_no_remote": bool(get_cli_arg_fn(args, "seed_no_remote", False)),
         }
 
@@ -385,7 +388,11 @@ def run_ai_copilot_mode(
             try:
                 from fluid_build.cli.forge_copilot_seed import load_seed as _load_seed
 
-                _allow_remote = not copilot_options.get("seed_no_remote", False)
+                # Default OFF (SSRF defence). --seed-allow-remote opts in.
+                # --seed-no-remote remains accepted as a no-op alias.
+                _allow_remote = copilot_options.get("seed_allow_remote", False)
+                if copilot_options.get("seed_no_remote", False):
+                    _allow_remote = False
                 context["structural_seed"] = _load_seed(
                     _seed_from, allow_remote=_allow_remote
                 )
@@ -397,7 +404,22 @@ def run_ai_copilot_mode(
                     },
                 )
             except Exception as _seed_exc:  # noqa: BLE001 — surface and exit cleanly
-                console_error(f"--seed-from failed: {_seed_exc}")
+                # Don't interpolate the exception text — for --seed-allow-remote
+                # paths the underlying exception can carry fragments of the
+                # fetched remote body (jsonschema field values). Log to the
+                # structured logger so operators with a debug log handler can
+                # still recover details, but never to stderr verbatim.
+                logger.warning(
+                    "forge_seed_failed",
+                    extra={
+                        "path": str(_seed_from),
+                        "exc_type": type(_seed_exc).__name__,
+                    },
+                )
+                console_error(
+                    f"--seed-from failed for {_seed_from!s}: "
+                    f"{type(_seed_exc).__name__} (run with --verbose for details)"
+                )
                 return 1
 
         # Phase 3: when --from-product / --from-product-list is set, resolve

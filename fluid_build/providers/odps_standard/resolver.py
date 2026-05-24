@@ -28,21 +28,29 @@ from __future__ import annotations
 
 import json
 import logging
+import socket  # noqa: F401 — re-exported for tests that patch resolver.socket
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-from urllib.error import URLError
 from urllib.parse import urlparse
-from urllib.request import urlopen
 
 from fluid_build.providers.base import ProviderError
 from fluid_build.providers.odcs.io import read_input
 from fluid_build.providers.odcs.provider import OdcsProvider
+from fluid_build.util.safe_http import (
+    DEFAULT_TIMEOUT,
+    MAX_REMOTE_BYTES,
+    UnsafeURLError,
+)
+from fluid_build.util.safe_http import (
+    assert_safe_url as _assert_safe_url,
+)
+from fluid_build.util.safe_http import (
+    fetch_bytes as _fetch_bytes,
+)
 
 LOG = logging.getLogger(__name__)
-
-DEFAULT_TIMEOUT = 10  # seconds for http(s) fetch
 # Probing matrix sized for the common case (Bitol fragments layout: ODPS doc
 # + sibling ODCS files, optionally nested under contracts/). Previously we
 # probed {"", contracts, odcs, odcs/contracts} × {full-id, last-segment} × 6
@@ -108,8 +116,10 @@ class ContractResolver:
         Directory to probe for local candidates. May be a file (its parent
         directory is used) or a directory.
     allow_remote:
-        If ``False``, raise :class:`RemoteFetchDisabled` whenever a URL is the
-        only viable candidate. Default ``True``.
+        If ``False`` (the default since the May 2026 SSRF hardening),
+        raise :class:`RemoteFetchDisabled` whenever a URL is the only
+        viable candidate. Set explicitly to ``True`` to opt in to
+        http(s) fetch. The CLIs expose this as ``--allow-remote``.
     timeout:
         Socket timeout for http(s) fetches.
     odcs_provider:
@@ -124,8 +134,8 @@ class ContractResolver:
     """
 
     base_path: Optional[Path] = None
-    allow_remote: bool = True
-    timeout: int = DEFAULT_TIMEOUT
+    allow_remote: bool = False
+    timeout: float = DEFAULT_TIMEOUT
     odcs_provider: Optional[OdcsProvider] = None
     candidate_extensions: tuple = DEFAULT_EXTENSIONS
     candidate_subdirs: tuple = DEFAULT_SUBDIRS
@@ -192,7 +202,14 @@ class ContractResolver:
         if _looks_like_url(contract_id):
             if not self.allow_remote:
                 raise RemoteFetchDisabled(
-                    f"Cannot resolve contractId {contract_id!r}: remote fetch disabled"
+                    f"Cannot resolve contractId {contract_id!r}: remote "
+                    f"fetch is disabled by default (SSRF defence). "
+                    f"Opt in with --allow-remote (fluid opds import), "
+                    f"--seed-allow-remote (fluid forge), or "
+                    f"allow_remote=True (Python library). The fetcher "
+                    f"rejects internal/private IPs and pins the validated "
+                    f"IP at the TCP layer; even so, only enable when you "
+                    f"trust the upstream catalog."
                 )
             tried.append(contract_id)
             resolved = self._load_remote(contract_id, contract_id)
@@ -206,17 +223,28 @@ class ContractResolver:
     def _local_candidates(self, contract_id: str) -> List[Path]:
         if self.base_path is None:
             return []
-        # The contractId may itself contain dots (e.g. "product.daily_orders").
-        # We probe both the full id and the last segment (port name) to be lenient.
+        # A poisoned contractId can carry an absolute path or ``..``
+        # segments. ``Path("base") / "/etc/hostname"`` silently discards
+        # ``base`` (Python `pathlib` semantics), letting the resolver
+        # ``read_input()`` an arbitrary file. Refuse contractIds that
+        # would escape ``base_path`` after construction.
         stems = [contract_id]
         if "." in contract_id:
             stems.append(contract_id.rsplit(".", 1)[-1])
+        base_resolved = self.base_path.resolve()
         candidates: List[Path] = []
         for sub in self.candidate_subdirs:
             sub_dir = self.base_path / sub if sub else self.base_path
             for stem in stems:
                 for ext in self.candidate_extensions:
-                    candidates.append(sub_dir / f"{stem}{ext}")
+                    candidate = sub_dir / f"{stem}{ext}"
+                    try:
+                        resolved = candidate.resolve()
+                    except (OSError, RuntimeError):
+                        continue
+                    if not _is_within(resolved, base_resolved):
+                        continue
+                    candidates.append(candidate)
         return candidates
 
     def _try_hint(
@@ -231,7 +259,10 @@ class ContractResolver:
         # Hint is a URL
         if not self.allow_remote:
             raise RemoteFetchDisabled(
-                f"Cannot resolve contractId {contract_id!r} via hint URL: remote fetch disabled"
+                f"Cannot resolve contractId {contract_id!r} via hint URL: "
+                f"remote fetch is disabled by default (SSRF defence). "
+                f"Opt in with --allow-remote, --seed-allow-remote, or "
+                f"allow_remote=True."
             )
         tried.append(str(hint))
         return self._load_remote(contract_id, str(hint))
@@ -245,8 +276,18 @@ class ContractResolver:
         if not isinstance(data, Mapping):
             return
         odcs_id = data.get("id")
-        if isinstance(odcs_id, str):
-            self._index.setdefault(odcs_id, path)
+        if not isinstance(odcs_id, str):
+            return
+        # Refuse to index a local file under a URL-shaped id — otherwise
+        # a low-trust file dropped into the workspace can pre-empt a
+        # remote fetch later (cache-poison across allow_remote flips).
+        if _looks_like_url(odcs_id):
+            LOG.warning(
+                "skip_url_shaped_local_id",
+                extra={"id": odcs_id, "path": str(path)},
+            )
+            return
+        self._index.setdefault(odcs_id, path)
 
     def _load_local(self, contract_id: str, path: Path) -> Optional[ResolvedContract]:
         try:
@@ -265,27 +306,55 @@ class ContractResolver:
         )
 
     def _load_remote(self, contract_id: str, url: str) -> Optional[ResolvedContract]:
+        # Defence in depth: assert_safe_url also fires inside fetch_bytes
+        # at request time; running it here too lets unit tests mock the
+        # high-level fetcher without bypassing the SSRF guard.
         try:
-            with urlopen(url, timeout=self.timeout) as response:
-                content_type = response.headers.get("Content-Type", "")
-                body = response.read()
-        except URLError as exc:
+            _assert_safe_url(url)
+        except UnsafeURLError as exc:
             raise ContractNotFound(contract_id, [url]) from exc
+
+        try:
+            _status, headers, body = _fetch_bytes(
+                url, timeout=self.timeout, max_bytes=MAX_REMOTE_BYTES
+            )
+        except UnsafeURLError as exc:
+            raise ContractNotFound(contract_id, [url]) from exc
+        except Exception as exc:  # httpx.HTTPError + network errors
+            raise ContractNotFound(contract_id, [url]) from exc
+
+        content_type = headers.get("content-type", "") or headers.get(
+            "Content-Type", ""
+        )
 
         # Refuse HTML-with-200 — common when the URL is wrong or it returned a portal page
         if "text/html" in content_type.lower() or body.lstrip().startswith(b"<"):
             raise ContractNotFound(contract_id, [url])
 
-        text = body.decode("utf-8", errors="strict")
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            import yaml
+        import yaml
 
-            data = yaml.safe_load(text)
+        try:
+            text = body.decode("utf-8", errors="strict")
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                data = yaml.safe_load(text)
+        except (UnicodeDecodeError, yaml.YAMLError):
+            # Don't propagate parser exception text — it can include body fragments
+            raise ContractNotFound(contract_id, [url]) from None
         if not isinstance(data, Mapping):
             raise ContractNotFound(contract_id, [url])
-        self._validate(contract_id, data, origin=url)
+        try:
+            self._validate(contract_id, data, origin=url)
+        except ContractValidationError:
+            # Scrub: the inner ProviderError's text often contains the offending
+            # value from the fetched body (jsonschema includes field values in
+            # its messages). Replace with a generic message so a remote
+            # response can't be exfiltrated via stderr/logs.
+            raise ContractValidationError(
+                f"Resolved contract for {contract_id!r} from {url} "
+                f"failed ODCS validation (remote response body omitted from error)"
+            ) from None
         return ResolvedContract(
             odcs=dict(data),
             source="remote",
@@ -316,3 +385,18 @@ class ContractResolver:
 def _looks_like_url(value: str) -> bool:
     parsed = urlparse(value)
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def _is_within(candidate: Path, base: Path) -> bool:
+    """True iff ``candidate`` is the same path as or a descendant of ``base``."""
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
+# SSRF primitives live in fluid_build.util.safe_http and are re-exported
+# at the top of this module for back-compat. The connection-layer DNS
+# pinning, host-IP filter, redirect re-validation, body cap, and
+# ftp/file/data refusal all flow from there.

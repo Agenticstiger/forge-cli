@@ -198,7 +198,7 @@ class BitolOdpsProvider(BaseProvider):
         odps_doc: Union[Mapping[str, Any], str, Path],
         *,
         base_path: Optional[Union[str, Path]] = None,
-        allow_remote: bool = True,
+        allow_remote: bool = False,
         resolver: Optional[ContractResolver] = None,
         lenient: bool = False,
     ) -> Dict[str, Any]:

@@ -33,7 +33,7 @@ for ``--spec odpi-4.1``.
 Usage::
 
     fluid opds export <contract> [--spec bitol-1.0.0|odpi-4.1] [--out file] [--out-dir DIR]
-    fluid opds import <path>     [--spec bitol-1.0.0] [--no-remote] [--lenient] [-o OUT]
+    fluid opds import <path>     [--spec bitol-1.0.0] [--allow-remote] [--lenient] [-o OUT]
     fluid opds validate <file>   [--spec ...]
     fluid opds info              [--spec ...]
 """
@@ -236,7 +236,15 @@ def cmd_opds_import(args: argparse.Namespace, logger: logging.Logger) -> int:
         console_error(f"Input path not found: {in_path}")
         return 1
 
-    allow_remote = not getattr(args, "no_remote", False)
+    # Default to remote-off (SSRF defence). --allow-remote opts in;
+    # --no-remote remains accepted as a no-op for back-compat.
+    allow_remote = bool(getattr(args, "allow_remote", False))
+    if getattr(args, "no_remote", False) and allow_remote:
+        console_error(
+            "--no-remote and --allow-remote are mutually exclusive; "
+            "honouring --no-remote (default behaviour)."
+        )
+        allow_remote = False
     lenient = bool(getattr(args, "lenient", False))
     out = getattr(args, "out", None)
     fmt = (getattr(args, "format", "yaml") or "yaml").lower()
@@ -547,10 +555,22 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "-f", "--format", default="yaml", choices=["yaml", "json"], help="Output format"
     )
     importp.add_argument(
+        "--allow-remote",
+        dest="allow_remote",
+        action="store_true",
+        help=(
+            "Allow http(s) fetch when resolving contractId references. "
+            "Default is OFF (since the May 2026 SSRF hardening). The "
+            "fetcher rejects internal/private IPs and pins the validated "
+            "IP at the TCP layer; even so, only enable when you trust "
+            "the upstream catalog."
+        ),
+    )
+    importp.add_argument(
         "--no-remote",
         dest="no_remote",
         action="store_true",
-        help="Disable http(s) fetch when resolving contractId references.",
+        help=argparse.SUPPRESS,  # deprecated — default is already remote-off
     )
     importp.add_argument(
         "--lenient",

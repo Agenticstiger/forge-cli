@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `port.contractId == odcs.id` is enforced and asserted in tests.
 - **`ContractResolver`** — resolves port `contractId` references through
   local probes + http(s) fetch + cache; refuses HTML-with-200 and
-  non-http(s) schemes; `--no-remote` hermetic mode.
+  non-http(s) schemes. Remote fetch is **OFF by default** (SSRF defence);
+  opt in with `--allow-remote`.
 - **Three import entry points** for `fluid opds import`: single ODPS
   file, directory bundle (ODPS + sibling ODCS, or ODCS-only), or a lone
   ODCS file. All converge on one validated FLUID.
@@ -26,8 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fluid forge --seed-from <path>`** — copilot accepts an ODCS
   contract, a Bitol ODPS product file, or a directory bundle as a
   structural seed. The seed's schema/quality/qos are ground truth.
-  Pre-processor at `fluid_build.cli.forge_copilot_seed.load_seed`;
-  `--seed-no-remote` flag for hermetic CI.
+  Pre-processor at `fluid_build.cli.forge_copilot_seed.load_seed`.
+  Remote fetch of `contractId` references is **OFF by default**
+  (SSRF defence); opt in with `--seed-allow-remote`.
 - **ODCS bidirectional provider — modular architecture.** `providers/odcs/`
   split into `provider.py` + `mappers/{metadata,team,schema,servers,
   sla,quality,types}.py` + `validation.py` + `io.py`. Pure-function
@@ -35,6 +37,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `odcs_passthrough` buckets preserve unmodeled ODCS fields for
   lossless round-trip. `OdcsProvider.roundtrip_check()` returns a
   structured diff used by tests and the forge ground-truth guard.
+
+### Security
+- **`fluid_build.util.safe_http` — shared SSRF guard for every HTTP fetch.**
+  One factory (`safe_httpx_client`) that all outbound http(s) calls now
+  route through: scheme allowlist + private/loopback/link-local/CGNAT/6to4
+  /NAT64/ORCHIDv2/IPv6-SR/RFC-TEST-NET filter + IPv4-mapped IPv6 unwrap
+  (closes a Python 3.10/3.11 bypass) + reject-all on mixed-public+private
+  DNS + connection-layer DNS pin (via httpx's first-class `sni_hostname`
+  extension) + `follow_redirects=False` default + streaming body cap.
+  Migrated 7 fetch surfaces: `ContractResolver` (the original site),
+  `KafkaConnectRestClient`, Kafka Connect schema-registry client, the
+  Airbyte REST client, all five catalog registrars (Glue / DataHub /
+  OpenMetadata / Unity / Snowflake Horizon / DataMesh Manager), the
+  Databricks auth-provider's API check, and the schema-manager remote
+  fetcher. Borrow-before-build receipts in `fluid_build/util/safe_http.py`
+  header — CIDR list + IPv4-mapped unwrap from `requests-hardened`
+  (Saleor, BSD-3); httpx DNS-pin recipe from the maintainer-blessed
+  `sni_hostname` extension docs.
+- **SSRF hardening on `ContractResolver` http(s) fetch path.**
+  - Rejects non-http(s) schemes and any private / loopback / link-local
+    / multicast / reserved / unspecified IP address.
+  - Reject-all on mixed-public+private DNS answers (an attacker cannot
+    mix a public A with a private AAAA).
+  - Extended CIDR deny-list (borrowed from `requests-hardened` —
+    Saleor, BSD-3): carrier-grade NAT `100.64.0.0/10`, 6to4
+    `192.88.99.0/24` + `2002::/16`, NAT64 `64:ff9b::/96` +
+    `64:ff9b:1::/48`, ORCHIDv2 `2001:20::/28`, IPv6 SR `5f00::/16`,
+    RFC TEST-NETs, class-E reserved.
+  - **IPv4-mapped IPv6 unwrap** (`::ffff:169.254.169.254`) — closes a
+    real SSRF bypass on Python 3.10/3.11 (stdlib `is_private` recursion
+    into IPv4-mapped only landed in 3.12).
+  - **DNS-rebind defence** — pins the validated IP at the TCP-connect
+    layer via custom `HTTPConnection` / `HTTPSConnection` subclasses;
+    HTTPS preserves the original hostname for SNI + cert validation.
+    Preserves stdlib's `sys.audit("http.client.connect")` hook.
+  - **Redirect re-validation** — `_SafeRedirectHandler` re-runs the
+    full guard on every `Location:` target and re-pins the new IP.
+    Cap at 3 redirects (down from urllib's default 10).
+  - **Body size cap** — 10 MiB; oversized responses are dropped before
+    parsing.
+  - **Error-message scrubbing** — `ContractValidationError` for remote
+    fetches no longer carries the jsonschema body fragments; `__cause__`
+    is cleared. `OdcsProvider.import_contract` warning likewise omits
+    the exception text.
+  - **No-op handlers for ftp/file/data schemes** so any future direct
+    use of `_SAFE_OPENER` cannot inherit `urllib`'s default `FTPHandler`
+    / `FileHandler` / `DataHandler`.
+  - **Path-traversal guard** — refuses `contract_id` values that
+    escape `base_path` (e.g. `/etc/hostname` via `Path / "/abs"`).
+  - **Cache-poison defence** — local files whose `id` is URL-shaped
+    are not indexed (otherwise they could pre-empt a later remote
+    fetch when `allow_remote` is flipped on).
+  - **Audit log** emitted on every block (`ssrf_guard_blocked`,
+    `skip_url_shaped_local_id`).
+- **BREAKING — `allow_remote` defaults to `False` across CLI + library.**
+  `fluid opds import` and `fluid forge --seed-from` no longer fetch
+  http(s) `contractId` references unless `--allow-remote` /
+  `--seed-allow-remote` is passed explicitly. Python callers of
+  `BitolOdpsProvider().import_contract(...)`,
+  `BitolOdpsProvider().import_directory(...)`,
+  `ContractResolver(...)`, and `forge_copilot_seed.load_seed(...)`
+  must now pass `allow_remote=True` for the previous behaviour.
+  `--no-remote` and `--seed-no-remote` are retained as hidden no-op
+  aliases.
 
 ### Changed
 - **ODCS schema validation default-on with warn-on-fail.** Vendored

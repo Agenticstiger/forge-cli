@@ -166,31 +166,16 @@ class TestRemoteContractFixture:
             "    dataset: ext_dataset\n"
         )
 
-        class _FakeResponse:
-            def __init__(self, body: bytes) -> None:
-                self._body = body
-
-            def read(self) -> bytes:
-                return self._body
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def getheader(self, name: str, default=None):
-                if name.lower() == "content-type":
-                    return "application/yaml"
-                return default
-
-            @property
-            def headers(self):
-                return {"Content-Type": "application/yaml"}
-
         with patch(
-            "fluid_build.providers.odps_standard.resolver.urlopen",
-            return_value=_FakeResponse(odcs_yaml.encode("utf-8")),
+            "fluid_build.providers.odps_standard.resolver._fetch_bytes",
+            return_value=(
+                200,
+                {"content-type": "application/yaml"},
+                odcs_yaml.encode("utf-8"),
+            ),
+        ), patch(
+            "fluid_build.providers.odps_standard.resolver._assert_safe_url",
+            return_value=None,
         ):
             provider = BitolOdpsProvider()
             fluid = provider.import_contract(self.FIXTURE, allow_remote=True)
