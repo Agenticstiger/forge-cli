@@ -90,12 +90,7 @@ def _read_try_register_entries() -> List[Tuple[str, str, str]]:
     `_try_register` call passes ``method=...`` (e.g. the legacy
     datamesh_manager entry uses ``method="add_parser"``).
     """
-    bootstrap_src = (
-        Path(__file__).parents[2]
-        / "fluid_build"
-        / "cli"
-        / "bootstrap.py"
-    ).read_text()
+    bootstrap_src = (Path(__file__).parents[2] / "fluid_build" / "cli" / "bootstrap.py").read_text()
     return [
         (mod, cmd, method or "register")
         for cmd, mod, method in _TRY_REGISTER_RE.findall(bootstrap_src)
