@@ -114,8 +114,6 @@ _FLUID_TYPE_TO_ODCS_LOGICAL: Dict[str, str] = {
     "array": "array",
 }
 
-# Back-compat alias for any imports that target the older private name.
-_FLUID_TO_LOGICAL = _FLUID_TYPE_TO_ODCS_LOGICAL
 
 # ODCS logicalType → FLUID type (lossy; physicalType pass-through preserves
 # the original source-system flavour)
