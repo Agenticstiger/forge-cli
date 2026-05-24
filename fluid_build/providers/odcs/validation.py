@@ -91,29 +91,15 @@ def collect_errors(
 
 
 def validate_via_vowl(odcs: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """Second-pass ODCS validation via the ``vowl`` library (optional).
+    """Optional second-pass ODCS validation via the ``vowl`` library.
 
-    Runs on the way out of every export to give us an independent, native
-    ODCS-tooling sanity check that the emitted contract is parseable by a
-    real ODCS consumer — not just spec-shape-valid against the vendored
-    JSON Schema. ``vowl`` is an official Bitol ODCS vendor (UK Government
-    Digital Service) and shipped as an MIT-licensed library, so importing
-    it here doesn't bring forge-cli into competition with another data-
-    contract toolchain — it's pure standards-body validation.
+    Why: ``jsonschema`` alone misses format-level (uuid/email/...) and
+    unevaluated-properties enforcement; vowl is the Bitol-vendor-listed
+    validator that catches them. Pip-extra: ``fluid-build[odcs-strict]``.
 
-    Behaviour:
-      - Soft-imports ``vowl``. If absent, returns ``None`` so callers can
-        skip the second pass cleanly. The first-pass ``jsonschema``
-        validation still ran.
-      - Builds ``vowl.Contract(odcs_dict)`` which runs vowl's own
-        jsonschema validation against the version-appropriate ODCS schema
-        (supports v2.2.1..v3.1.0; ours only vendors v3.1.0).
-      - Enumerates the resolved check references so any lazy parse errors
-        surface here too.
-      - Returns a small diagnostic dict ``{api_version, schemas, total_checks}``
-        the export path can log/expose.
-      - Re-raises any vowl exception as :class:`ProviderError` with a
-        ``vowl:`` prefix so the source of the failure is obvious.
+    Returns ``None`` when vowl isn't installed (so callers can skip
+    cleanly). Returns ``{api_version, schemas, total_checks}`` on
+    success. Raises :class:`ProviderError` on validation failure.
     """
     try:
         from vowl import Contract  # type: ignore[import-untyped]
@@ -121,10 +107,16 @@ def validate_via_vowl(odcs: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         LOG.debug("vowl not installed, skipping second-pass ODCS validation")
         return None
 
+    # Narrow the exception scope: vowl raises jsonschema-derived
+    # ValidationError on bad input; other exceptions (system errors,
+    # KeyboardInterrupt, MemoryError) should propagate unwrapped so we
+    # don't hide real bugs behind a generic "vowl failed" message.
+    import jsonschema  # type: ignore[import-untyped]
+
     try:
         contract = Contract(dict(odcs))
         refs = contract.get_check_references_by_schema()
-    except Exception as exc:
+    except (jsonschema.ValidationError, jsonschema.SchemaError, ValueError, KeyError) as exc:
         raise ProviderError(f"vowl: {type(exc).__name__}: {exc}") from exc
 
     return {

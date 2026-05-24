@@ -70,8 +70,14 @@ class OdpsStandardProvider(_BitolOdpsProvider):
     ) -> Dict[str, Any]:
         """Render returning the bare product dict (legacy contract).
 
-        Use :class:`BitolOdpsProvider.render` directly if you want the
-        product + per-port contracts bundle.
+        **DEPRECATED — return-shape diverges from the canonical Bitol
+        bundle.** Use :class:`BitolOdpsProvider` for new code; its
+        ``render()`` returns ``{"product": ..., "contracts": {...}}`` so
+        the per-port ODCS contracts are reachable. This shim unwraps to
+        the bare product dict for back-compat with the original Phase-2
+        ``OdpsStandardProvider.render()`` callers (catalog providers,
+        DMM publish, CI templates, the upstream ``cli/odps_standard``
+        legacy export path).
         """
         bundle = super().render(src, out=out, fmt=fmt, out_dir=out_dir)
         return bundle["product"]

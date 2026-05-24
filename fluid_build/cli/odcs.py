@@ -253,14 +253,10 @@ def validate_command(odcs_file: str):
         # Load ODCS file
         click.echo(f"Loading ODCS file: {odcs_file}")
 
-        file_path = Path(odcs_file)
-        with open(file_path) as f:
-            if file_path.suffix in (".yaml", ".yml"):
-                import yaml
+        from fluid_build.cli._common import load_yaml_json
 
-                odcs_data = yaml.safe_load(f)
-            else:
-                odcs_data = json.load(f)
+        file_path = Path(odcs_file)
+        odcs_data = load_yaml_json(file_path)
 
         # Validate using provider
         provider = OdcsProvider()
@@ -485,14 +481,10 @@ def _run_odcs_validate(args):
         validate_via_vowl,
     )
 
-    file_path = Path(args.odcs_file)
-    with open(file_path) as f:
-        if file_path.suffix in (".yaml", ".yml"):
-            import yaml
+    from fluid_build.cli._common import load_yaml_json
 
-            odcs_data = yaml.safe_load(f)
-        else:
-            odcs_data = json.load(f)
+    file_path = Path(args.odcs_file)
+    odcs_data = load_yaml_json(file_path)
 
     report: dict = {
         "file": str(file_path),

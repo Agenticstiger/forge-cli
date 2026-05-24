@@ -804,8 +804,14 @@ def generate_copilot_artifacts(
                     ]
                     validation_errors = list(seed_errors) + list(validation_errors)
                     report.validation_errors = validation_errors
-            except Exception as exc:  # noqa: BLE001 — never block on guard failure
-                logger.debug("structural_seed_guard_failed: %s", exc)
+            except Exception as exc:  # noqa: BLE001
+                # Loud-fail: the seed guard is what stops silent mutation
+                # of the user's ground-truth contract. If it crashes we
+                # need to know — otherwise an LLM mutation could ship
+                # without the guard ever firing.
+                logger.warning(
+                    "structural_seed_guard_failed (mutation may not be caught): %s", exc
+                )
 
             # Phase 7 (F2) — post-generation ODCS round-trip guarantee.
             # Beyond the ground-truth diff (which catches mutation of specific
@@ -846,8 +852,11 @@ def generate_copilot_artifacts(
                             )
                     if validation_errors:
                         report.validation_errors = validation_errors
-                except Exception as exc:  # noqa: BLE001 — never block on guarantee failure
-                    logger.debug("structural_seed_roundtrip_guarantee_failed: %s", exc)
+                except Exception as exc:  # noqa: BLE001
+                    # Same loud-fail rationale as the seed guard above.
+                    logger.warning(
+                        "structural_seed_roundtrip_guarantee_failed: %s", exc
+                    )
 
         report.validation_errors = validation_errors
         report.validation_warnings = validation_warnings
