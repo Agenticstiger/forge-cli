@@ -206,10 +206,30 @@ def _server_details_from_location(location: Mapping[str, Any], provider: str) ->
         for key in ("project", "dataset"):
             if key in location:
                 details[key] = location[key]
+        # ODCS BigQueryServer requires {project, dataset}.
+        for required_key, env_var in (
+            ("project", "${GCP_PROJECT}"),
+            ("dataset", "${BIGQUERY_DATASET}"),
+        ):
+            details.setdefault(required_key, env_var)
     elif p == "snowflake":
         for key in ("host", "port", "account", "database", "schema", "warehouse"):
             if key in location:
                 details[key] = location[key]
+        # ODCS v3.1.0 SnowflakeServer requires {account, database, schema}.
+        # Real forge-AI runs against Gemini Flash routinely emit a binding
+        # like ``{database: <name>, schema: <name>}`` without ``account``,
+        # which fails vendored-schema validation. Synthesize env-var
+        # placeholders for the required-but-missing fields so the
+        # generated contract is valid out of the box; deploy-time
+        # substitution fills them in. Users / LLMs that DID provide the
+        # field win — we only fill gaps.
+        for required_key, env_var in (
+            ("account", "${SNOWFLAKE_ACCOUNT}"),
+            ("database", "${SNOWFLAKE_DATABASE}"),
+            ("schema", "${SNOWFLAKE_SCHEMA}"),
+        ):
+            details.setdefault(required_key, env_var)
     elif p in ("aws", "s3"):
         # ODCS S3Server: location (URI), endpointUrl, format, delimiter
         loc_val = location.get("location") or _build_s3_uri(
@@ -220,36 +240,75 @@ def _server_details_from_location(location: Mapping[str, Any], provider: str) ->
         for key in ("endpointUrl", "format", "delimiter"):
             if key in location:
                 details[key] = location[key]
+        # ODCS S3Server requires {location}.
+        details.setdefault("location", "${S3_LOCATION}")
     elif p == "kafka":
         host = location.get("host") or location.get("account")
         if host:
             details["host"] = host
         if "format" in location:
             details["format"] = location["format"]
+        # ODCS KafkaServer requires {host, format}.
+        details.setdefault("host", "${KAFKA_BOOTSTRAP_SERVERS}")
+        details.setdefault("format", "json")
     elif p in ("postgres", "postgresql"):
         for key in ("host", "port", "database", "schema"):
             if key in location:
                 details[key] = location[key]
+        # ODCS PostgreSQLServer requires {host, database}.
+        for required_key, env_var in (
+            ("host", "${POSTGRES_HOST}"),
+            ("database", "${POSTGRES_DATABASE}"),
+        ):
+            details.setdefault(required_key, env_var)
     elif p == "mysql":
         for key in ("host", "port", "database"):
             if key in location:
                 details[key] = location[key]
+        # ODCS MySQLServer requires {host, database}.
+        for required_key, env_var in (
+            ("host", "${MYSQL_HOST}"),
+            ("database", "${MYSQL_DATABASE}"),
+        ):
+            details.setdefault(required_key, env_var)
     elif p == "databricks":
         for key in ("host", "catalog", "schema"):
             if key in location:
                 details[key] = location[key]
+        # ODCS DatabricksServer requires {host, catalog, schema}.
+        for required_key, env_var in (
+            ("host", "${DATABRICKS_HOST}"),
+            ("catalog", "${DATABRICKS_CATALOG}"),
+            ("schema", "${DATABRICKS_SCHEMA}"),
+        ):
+            details.setdefault(required_key, env_var)
     elif p == "redshift":
         for key in ("host", "database", "schema", "region", "account"):
             if key in location:
                 details[key] = location[key]
+        # ODCS RedshiftServer requires {host, database}.
+        for required_key, env_var in (
+            ("host", "${REDSHIFT_HOST}"),
+            ("database", "${REDSHIFT_DATABASE}"),
+        ):
+            details.setdefault(required_key, env_var)
     elif p == "local":
         for key in ("path", "format"):
             if key in location:
                 details[key] = location[key]
+        # ODCS LocalServer requires {path, format}.
+        details.setdefault("path", "./data")
+        details.setdefault("format", "csv")
     elif p in ("athena",):
         for key in ("stagingDir", "schema", "catalog", "regionName"):
             if key in location:
                 details[key] = location[key]
+        # ODCS AthenaServer requires {stagingDir, schema}.
+        for required_key, env_var in (
+            ("stagingDir", "${ATHENA_STAGING_DIR}"),
+            ("schema", "${ATHENA_SCHEMA}"),
+        ):
+            details.setdefault(required_key, env_var)
     else:
         # Custom / unknown provider → ODCS server.type=custom which accepts
         # the union of all server-type fields. Copy any that match the union.
