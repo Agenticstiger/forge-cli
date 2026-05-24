@@ -201,8 +201,16 @@ def _make_request_pin_hook(*, allow_private: bool):
 
     def _hook(request) -> None:
         hostname, pinned_ip = assert_safe_url(str(request.url), allow_private=allow_private)
+        port = request.url.port
         request.url = request.url.copy_with(host=pinned_ip)
-        request.headers["Host"] = hostname
+        # The Host header MUST include the port when the URL has a
+        # non-default one — AWS-style services (Glue, S3, …) validate
+        # the Host header for SigV4 routing and reject a bare
+        # hostname when the request was made to ``host:port``. Without
+        # this, ``safe_httpx_client`` worked against DataHub /
+        # OpenMetadata (which ignore Host) but failed with 400 against
+        # LocalStack/Glue.
+        request.headers["Host"] = f"{hostname}:{port}" if port else hostname
         request.extensions["sni_hostname"] = hostname
 
     return _hook

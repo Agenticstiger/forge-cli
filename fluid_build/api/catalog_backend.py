@@ -15,7 +15,7 @@
 """Catalog backend plugin registry.
 
 A *catalog backend* is a metadata catalog the CLI can push FLUID
-contracts into (DataHub, OpenMetadata, Unity Catalog, AWS Glue,
+contracts into (DataHub, OpenMetadata, AWS Glue,
 Snowflake Horizon, …). The registry here is the single declaration
 point for a backend — once a registrar module under
 ``fluid_build/build_runners/catalog_registrars/<name>.py`` calls
@@ -80,7 +80,7 @@ class CatalogBackendSpec:
     Attributes:
         name: Canonical id used by ``--target <name>`` and
             ``properties.catalog.register: [<name>]``. Lowercase
-            kebab-case is the convention (``datahub``, ``unity``,
+            kebab-case is the convention (``datahub``, ``glue``,
             ``snowflake_horizon``). Aliases come from ``aliases``.
         registrar_factory: Called once per publish with the resolved
             catalog config dict; must return an instance satisfying
@@ -88,7 +88,7 @@ class CatalogBackendSpec:
             factory owns all per-target config interpretation — the
             framework just hands it the resolved dict.
         aliases: Additional names that map to this backend. Allows
-            ``--target unity-catalog`` and ``--target unity`` without
+            ``--target aws-glue`` and ``--target glue`` without
             redeclaration.
         env_vars: Mapping of config-dict keys → ordered list of
             environment variables the framework consults when filling
@@ -100,8 +100,8 @@ class CatalogBackendSpec:
         capabilities: Frozen set of :class:`CatalogCapability` strings
             describing what this backend persists. Empty set means
             "just a dataset emitter, no product / lineage / specs"
-            (matches the historical behaviour of Glue / Unity /
-            Snowflake Horizon before the canonical refactor).
+            (matches the historical behaviour of Glue / Snowflake
+            Horizon before the canonical refactor).
         description: One-line human description shown by
             ``fluid publish --list-catalogs`` and friends.
     """

@@ -14,7 +14,6 @@ Each fixture wraps the canonical REST shape of one external service:
 - Kafka Connect REST (`/connectors`, `/connectors/<name>/status`)
 - DataHub GMS (`/entities`)
 - OpenMetadata (`/api/v1/services`, `/tables`)
-- Unity Catalog REST (`/api/2.1/unity-catalog/...`)
 - AWS Glue Catalog (boto3 stub via responses or moto)
 - Snowflake Horizon (HTTP RPC)
 - Marquez (OpenLineage receiver)
@@ -80,14 +79,6 @@ def marquez_mock() -> Iterator["MarquezMockServer"]:
 def openmetadata_mock() -> Iterator["OpenMetadataMockServer"]:
     server = OpenMetadataMockServer()
     with respx.mock(base_url="https://openmetadata.test", assert_all_called=False) as router:
-        server.attach(router)
-        yield server
-
-
-@pytest.fixture
-def unity_mock() -> Iterator["UnityMockServer"]:
-    server = UnityMockServer()
-    with respx.mock(base_url="https://databricks.test", assert_all_called=False) as router:
         server.attach(router)
         yield server
 
@@ -440,37 +431,6 @@ class OpenMetadataMockServer:
         self.calls.append("delete_table")
         name = request.url.path.rsplit("/", 1)[-1]
         self.deletions.append(name)
-        return httpx.Response(200)
-
-
-class UnityMockServer:
-    """Captures Unity Catalog table CRUD."""
-
-    def __init__(self) -> None:
-        self.tables: List[Dict[str, Any]] = []
-        self.deletions: List[str] = []
-        self.calls: List[str] = []
-
-    def attach(self, router: "respx.Router") -> None:
-        router.post("/api/2.1/unity-catalog/tables").mock(side_effect=self._post)
-        router.delete(
-            host="databricks.test", path__regex=r"^/api/2\.1/unity-catalog/tables/.+$"
-        ).mock(side_effect=self._delete)
-
-    def _post(self, request: Any) -> Any:
-        import httpx
-
-        self.calls.append("post_table")
-        body = json.loads(request.content)
-        self.tables.append(body)
-        return httpx.Response(200, json={**body, "table_id": f"uc-{len(self.tables)}"})
-
-    def _delete(self, request: Any) -> Any:
-        import httpx
-
-        self.calls.append("delete_table")
-        full_name = request.url.path.split("/", 5)[-1]
-        self.deletions.append(full_name)
         return httpx.Response(200)
 
 

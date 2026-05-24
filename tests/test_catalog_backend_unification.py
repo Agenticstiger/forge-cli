@@ -88,7 +88,7 @@ class TestPluginBackendsExposedViaTarget:
 
     @pytest.mark.parametrize(
         "target",
-        ["datahub", "openmetadata", "unity", "unity-catalog", "glue", "aws-glue",
+        ["datahub", "openmetadata", "glue", "aws-glue",
          "snowflake_horizon", "snowflake-horizon"],
     )
     def test_target_is_in_catalog_providers(self, target):
@@ -98,10 +98,8 @@ class TestPluginBackendsExposedViaTarget:
         )
 
     def test_aliases_resolve_to_same_provider_class(self):
-        """``unity`` and ``unity-catalog`` are the same backend; same for
-        ``glue`` / ``aws-glue`` and ``snowflake_horizon`` /
-        ``snowflake-horizon``."""
-        assert CATALOG_PROVIDERS["unity"] is CATALOG_PROVIDERS["unity-catalog"]
+        """``glue`` / ``aws-glue`` and ``snowflake_horizon`` /
+        ``snowflake-horizon`` are alias pairs."""
         assert CATALOG_PROVIDERS["glue"] is CATALOG_PROVIDERS["aws-glue"]
         assert (
             CATALOG_PROVIDERS["snowflake_horizon"]
@@ -147,19 +145,18 @@ class TestBackendRegistry:
         assert get_catalog_backend("nonexistent-future-backend") is None
 
     def test_aliases_in_all_names(self):
-        spec = get_catalog_backend("unity")
+        """``glue`` exposes ``aws-glue`` as an alias."""
+        spec = get_catalog_backend("glue")
         assert spec is not None
-        assert "unity-catalog" in spec.all_names
-        assert get_catalog_backend("unity-catalog") is spec
+        assert "aws-glue" in spec.all_names
+        assert get_catalog_backend("aws-glue") is spec
 
     def test_all_catalog_backend_names_covers_known_backends(self):
         names = set(all_catalog_backend_names())
-        # The five plug-in backends + their aliases
+        # Plug-in backends + their aliases
         for required in (
             "datahub",
             "openmetadata",
-            "unity",
-            "unity-catalog",
             "glue",
             "aws-glue",
             "snowflake_horizon",
@@ -398,13 +395,6 @@ class TestSpecDrivenEnvVarOverrides:
                 "endpoint",
                 "https://om.from-env",
             ),
-            (
-                "DATABRICKS_HOST",
-                "unity",
-                "endpoint",
-                "https://databricks.from-env",
-            ),
-            ("DATABRICKS_TOKEN", "unity", "api_token", "tok-from-env"),
             ("AWS_REGION", "glue", "region", "eu-west-1"),
             ("AWS_ACCOUNT_ID", "glue", "catalog_id", "123456789012"),
             (

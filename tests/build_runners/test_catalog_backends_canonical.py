@@ -17,7 +17,6 @@ pin that invariant for the four registrar-backed plug-ins:
 
 * DataHub → ``customProperties`` on DatasetSnapshot / DataProduct
 * OpenMetadata → ``extension`` on Table
-* Unity → ``properties`` on Table
 * Glue → ``Parameters`` on TableInput
 * Snowflake Horizon → markdown blocks inside ``comment``
 
@@ -38,7 +37,6 @@ from fluid_build.build_runners.catalog_registrars import (
     GlueCatalogRegistrar,
     OpenMetadataRegistrar,
     SnowflakeHorizonRegistrar,
-    UnityCatalogRegistrar,
 )
 
 
@@ -137,26 +135,6 @@ class TestOpenMetadataCanonicalFields:
 
 
 # ---------------------------------------------------------------------------
-# Unity — properties map
-# ---------------------------------------------------------------------------
-
-
-class TestUnityCanonicalFields:
-    def test_properties_carry_canonical_fields(self, payload, unity_mock):
-        UnityCatalogRegistrar(base_url="https://databricks.test").register_payload(
-            payload
-        )
-        table = unity_mock.tables[0]
-        props = table.get("properties") or {}
-        assert props.get("fluid_layer") == "Bronze"
-        assert props.get("fluid_product_type") == "SDP"
-        assert props.get("fluid_domain") == "commerce"
-        assert "fluid_contract" in props
-        assert "odps_spec" in props
-        assert "odcs_contract" in props
-
-
-# ---------------------------------------------------------------------------
 # Glue — Parameters map
 # ---------------------------------------------------------------------------
 
@@ -238,16 +216,15 @@ class TestCapabilityDeclarations:
         assert om.supports(CatalogCapability.PER_ASSET_CONTRACT)
         assert om.supports(CatalogCapability.PRODUCT_SPECS)
 
-    def test_unity_and_glue_declare_attachment_capabilities(self, backends):
-        """Both have a native string→string map (``properties`` /
-        ``Parameters``) that can carry the canonical fields."""
+    def test_glue_declares_attachment_capabilities(self, backends):
+        """Glue's native string→string ``Parameters`` map carries the
+        canonical fields."""
         from fluid_build.api.catalog_backend import CatalogCapability
 
-        for name in ("unity", "glue"):
-            spec = backends[name]
-            assert spec.supports(CatalogCapability.CUSTOM_PROPERTIES)
-            assert spec.supports(CatalogCapability.PER_ASSET_CONTRACT)
-            assert spec.supports(CatalogCapability.PRODUCT_SPECS)
+        spec = backends["glue"]
+        assert spec.supports(CatalogCapability.CUSTOM_PROPERTIES)
+        assert spec.supports(CatalogCapability.PER_ASSET_CONTRACT)
+        assert spec.supports(CatalogCapability.PRODUCT_SPECS)
 
     def test_snowflake_horizon_declares_specs_but_not_custom_props(self, backends):
         """Horizon attaches specs as markdown inside ``comment``; that

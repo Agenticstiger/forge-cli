@@ -224,7 +224,6 @@ try:  # pragma: no cover — exercised at collection time
         marquez_mock,
         openmetadata_mock,
         snowflake_horizon_mock,
-        unity_mock,
     )
 except ImportError:
     pass

@@ -29,7 +29,6 @@ from fluid_build.build_runners.catalog_registrars import (
     GlueCatalogRegistrar,
     OpenMetadataRegistrar,
     SnowflakeHorizonRegistrar,
-    UnityCatalogRegistrar,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -188,43 +187,6 @@ class TestOpenMetadataRegistrar:
         assert "bronze.x.orders" in openmetadata_mock.deletions[0]
 
 
-# ── Unity Catalog ───────────────────────────────────────────────────────
-
-
-class TestUnityCatalogRegistrar:
-    def test_register_success(self, unity_mock):
-        registrar = UnityCatalogRegistrar(
-            base_url="https://databricks.test",
-            workspace_token="t",
-            catalog_name="forge",
-            schema_name="bronze",
-        )
-        result = registrar.register(
-            "bronze.x",
-            "orders",
-            _contract_with_columns(columns=[{"name": "id", "type": "bigint"}]),
-            {},
-        )
-        assert result.succeeded
-        assert "unity://" in result.urn
-        body = unity_mock.tables[0]
-        assert body["catalog_name"] == "forge"
-        assert body["schema_name"] == "bronze"
-        assert body["name"] == "orders"
-
-    def test_table_type_is_managed_delta(self, unity_mock):
-        registrar = UnityCatalogRegistrar(base_url="https://databricks.test")
-        registrar.register("bronze.x", "orders", _contract_with_columns(columns=[]), {})
-        body = unity_mock.tables[0]
-        assert body["table_type"] == "MANAGED"
-        assert body["data_source_format"] == "DELTA"
-
-    def test_unregister(self, unity_mock):
-        registrar = UnityCatalogRegistrar(base_url="https://databricks.test")
-        result = registrar.unregister("bronze.x", "orders")
-        assert result.succeeded
-
-
 # ── AWS Glue ────────────────────────────────────────────────────────────
 
 
@@ -372,7 +334,6 @@ class TestProtocolConformance:
         [
             lambda: DataHubRegistrar(base_url="https://datahub.test"),
             lambda: OpenMetadataRegistrar(base_url="https://openmetadata.test"),
-            lambda: UnityCatalogRegistrar(base_url="https://databricks.test"),
             lambda: GlueCatalogRegistrar(base_url_override="https://glue.us-east-1.amazonaws.com"),
             lambda: SnowflakeHorizonRegistrar(account_url="https://acme.snowflakecomputing.com"),
         ],
@@ -382,7 +343,6 @@ class TestProtocolConformance:
         registrar_factory,
         datahub_mock,
         openmetadata_mock,
-        unity_mock,
         glue_mock,
         snowflake_horizon_mock,
     ):

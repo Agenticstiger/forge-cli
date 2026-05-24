@@ -130,19 +130,43 @@ class GlueCatalogRegistrar(CatalogRegistrar):
     def _post_create_table(
         self, payload: CatalogPublicationPayload, asset: AssetPayload
     ) -> None:
+        """Upsert a Glue table — Create on first call, Update on
+        ``AlreadyExistsException`` so re-publishing the same FLUID
+        contract is idempotent (catalogs are inherently upsert-shaped).
+        AWS Glue uses different ``X-Amz-Target`` headers for the two
+        operations on the same flat ``POST /`` endpoint."""
         from fluid_build.util.safe_http import safe_httpx_client
 
-        headers = {
-            "Content-Type": "application/x-amz-json-1.1",
-            "X-Amz-Target": "AWSGlue.CreateTable",
-        }
+        body = self._create_table_payload(payload, asset)
+        endpoint = (
+            self.base_url_override
+            or f"https://glue.{self.region}.amazonaws.com"
+        )
         with safe_httpx_client(
-            base_url=self.base_url_override
-            or f"https://glue.{self.region}.amazonaws.com",
+            base_url=endpoint,
             timeout=float(self.timeout_seconds),
             allow_private=True,
         ) as c:
-            r = c.post("/", json=self._create_table_payload(payload, asset), headers=headers)
+            r = c.post(
+                "/",
+                json=body,
+                headers={
+                    "Content-Type": "application/x-amz-json-1.1",
+                    "X-Amz-Target": "AWSGlue.CreateTable",
+                },
+            )
+            if r.status_code == 400 and "AlreadyExistsException" in (r.text or ""):
+                # Fall through to UpdateTable. Glue's UpdateTable expects
+                # the same ``DatabaseName`` + ``TableInput`` shape as
+                # CreateTable, so we re-POST the body unchanged.
+                r = c.post(
+                    "/",
+                    json=body,
+                    headers={
+                        "Content-Type": "application/x-amz-json-1.1",
+                        "X-Amz-Target": "AWSGlue.UpdateTable",
+                    },
+                )
             r.raise_for_status()
 
     def _create_table_payload(
