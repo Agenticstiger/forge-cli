@@ -348,6 +348,12 @@ include = ["fluid_build*"]
 # Ensure non-.py assets ship in wheels (schemas, templates, static HTML, etc.)
 [tool.setuptools.package-data]
 fluid_build = [
+  # PEP 561 marker — tells consumers' type checkers (mypy, pyright) to
+  # honour the inline type annotations in this package. Without this,
+  # downstream code that imports ``fluid_build.engine`` sees the careful
+  # ``Optional[Path]`` / ``ClassVar[str]`` / typed-result annotations as
+  # ``Any`` regardless of how strict the consumer's mypy config is.
+  "py.typed",
   "build-manifest.yaml",
   "features.yaml",
   # ``cli/llm_models.json`` is the provider/tier catalog that
