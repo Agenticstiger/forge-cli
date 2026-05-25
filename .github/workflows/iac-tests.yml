@@ -114,10 +114,18 @@ jobs:
           tofu_version: 1.12.0
 
       - name: Install Python deps
+        # The ``test-emulators-heavy`` extra ships the GCP + AWS SDK
+        # clients the Stage 2 tests use to talk to the BigQuery / GCS /
+        # Pub/Sub emulators and LocalStack (``google-auth``,
+        # ``google-cloud-bigquery``, ``google-cloud-storage``,
+        # ``google-cloud-pubsub``, ``boto3``). Installing the full
+        # ``[gcp]`` extra here would needlessly pull dbt-bigquery and
+        # google-cloud-dataplex; the emulator tier only needs the SDK
+        # clients themselves.
         run: |
           python -m venv .venv
           .venv/bin/pip install --quiet --upgrade pip
-          .venv/bin/pip install --quiet -e '.[dev]'
+          .venv/bin/pip install --quiet -e '.[dev,test-emulators-heavy]'
 
       - name: Start LocalStack (when token is configured)
         if: env.HAS_LOCALSTACK_TOKEN == 'true'

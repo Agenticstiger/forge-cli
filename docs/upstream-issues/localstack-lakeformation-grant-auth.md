@@ -48,9 +48,12 @@ deferred; tier 3 (real AWS) is the canonical pin.
 
 ## To file
 
-```bash
-gh issue create \
-  --repo localstack/localstack-pro \
-  --title "Lake Formation: DataLakeAdmin cannot call GrantPermissions (auth quirk)" \
-  --body-file docs/upstream-issues/localstack-lakeformation-grant-auth.body.md
-```
+LocalStack's public GitHub repo (`localstack/localstack`) was archived
+on 2026-03-23 (still resolvable but read-only); the Pro repo
+(`localstack/localstack-pro`) is private and only visible to org
+members. File this through LocalStack's support portal at
+<https://app.localstack.cloud/community> (free-tier accounts can file
+community issues) or via the LocalStack Slack
+(<https://slack.localstack.cloud/>) — paste the body below into the
+"Issue title" + "Description" fields. The text in `.body.md` is
+formatted to fit either channel verbatim.
