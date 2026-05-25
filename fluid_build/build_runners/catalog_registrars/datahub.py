@@ -10,18 +10,40 @@
 
 A FLUID contract IS a data product, so the primary entity we emit is a
 DataHub ``DataProduct`` (``urn:li:dataProduct:<contract.id>``) with the
-contract's exposes wired in as the product's *assets*. Each expose
-becomes a Dataset entity (``urn:li:dataset:(urn:li:dataPlatform:...,
-<contract.id>.<expose.exposeId>,PROD)``) carrying schema, ownership,
-glossary terms, lineage edges, and the per-asset ODCS contract.
-When the contract declares a domain we also emit a Domain entity and
-link both the DataProduct and the Datasets to it.
+contract's exposes wired in as the product's *assets*.
 
-DataHub historically accepts two ingestion shapes. DataProduct +
-Domain are only available via the v2 ``MetadataChangeProposal`` API
-at ``/aspects?action=ingestProposal``; Dataset still goes through the
-legacy snapshot API at ``/entities?action=ingest``. This module uses
-both.
+Entity emission map:
+
+* **Dataset** (``urn:li:dataset:(...)``) — one per expose; carries
+  schema, ownership, glossary terms, lineage.
+* **DataContract** (``urn:li:dataContract:<product>.<expose>``) — one
+  per expose; the per-asset ODCS document lives here as ``rawContract``
+  on ``dataContractProperties``. This is DataHub's first-class home
+  for ODCS-style contracts; the UI renders it as a dedicated "Data
+  Contract" page bound to the dataset.
+* **DataProduct** (``urn:li:dataProduct:<contract.id>``) — one per
+  contract; lists every expose under ``assets``. Tags travel on the
+  native ``globalTags`` aspect. Links to the source FLUID + ODPS
+  YAML files travel on ``institutionalMemory`` + ``externalUrl`` so
+  the multi-KB documents are *referenced* rather than inlined.
+* **Domain** (``urn:li:domain:<id>``) — when the contract declares
+  one; both the DataProduct and the Datasets are linked via the
+  native ``domains`` aspect.
+
+What we deliberately do **not** do: stuff multi-KB YAML blobs into
+``customProperties``. DataHub indexes those values in search and
+ships them on every entity GET — both the wrong tradeoff for source
+documents that have proper homes elsewhere. The full FLUID + ODPS
+specs are reachable via ``institutionalMemory`` (link to source
+repo). The full ODCS contract is reachable via the DataContract
+entity's ``rawContract`` field.
+
+API shapes: Dataset goes through the legacy snapshot API at
+``/entities?action=ingest`` (DataHub's DatasetSnapshot union still
+accepts schema + ownership + lineage there). Every other entity
+(DataProduct, Domain, DataContract, Tag) goes through the v2
+``MetadataChangeProposal`` API at ``/aspects?action=ingestProposal``
+because there's no matching Snapshot union for them.
 
 The translator reads exclusively from
 :class:`~fluid_build.api.catalog_publication.CatalogPublicationPayload`.
@@ -55,39 +77,79 @@ class DataHubRegistrar(CatalogRegistrar):
     base_url: str = "https://datahub.test"
     api_token: Optional[str] = None
     timeout_seconds: int = 30
+    # Base URL for spec source-of-truth documents. When set, the
+    # registrar emits ``institutionalMemory`` links + a
+    # ``dataProductProperties.externalUrl`` pointing at
+    # ``<spec_source_base_url>/<product_id>/{contract.fluid.yaml, spec.odps.yaml}``
+    # so DataHub references the source documents instead of inlining
+    # multi-KB YAML blobs in ``customProperties``. Set via env var
+    # ``FLUID_CATALOG_DATAHUB_SPEC_BASE_URL``.
+    spec_source_base_url: Optional[str] = None
+    # Capability cache: set on first publish. ``None`` means "untested";
+    # ``True`` means the server accepted structured-property definitions
+    # at bootstrap; ``False`` means the server is too old and we should
+    # fall back to customProperties for FLUID classification.
+    _structured_properties_supported: Optional[bool] = None
 
     # ── Canonical entry point ─────────────────────────────────────────
 
-    def register_payload(
-        self, payload: CatalogPublicationPayload
-    ) -> RegistrationResult:
+    def register_payload(self, payload: CatalogPublicationPayload) -> RegistrationResult:
         """Publish *payload* to DataHub end-to-end.
 
         Order of HTTP calls (each idempotent on its own):
 
-        1. Domain (MCP) — when ``payload.product.domain`` is set.
-        2. For every asset:
-           a. Dataset (snapshot) carrying schema, ownership, lineage,
-              per-asset ODCS, and FLUID custom properties.
+        1. **Domain** (MCP) — when ``payload.product.domain`` is set.
+        2. **Per asset**:
+           a. Dataset (snapshot) — schema, ownership, lineage, small
+              typed FLUID property tags.
            b. Dataset → Domain (MCP) when domain is set.
-        3. DataProduct (MCP) listing every asset under ``assets``,
-           carrying the source FLUID YAML + ODPS spec as custom
-           properties.
-        4. DataProduct → Domain (MCP) when domain is set.
+           c. DataContract (MCP) — ``urn:li:dataContract:<product>.<expose>``
+              carrying the full ODCS YAML as ``rawContract``. Renders
+              in the UI as the dataset's Data Contract tab.
+        3. **DataProduct** (MCP) — lists every asset under ``assets``,
+           plus ``globalTags`` (native tag aspect) and
+           ``institutionalMemory`` links pointing at the source
+           FLUID + ODPS YAML files in the contract repo (when
+           ``spec_source_base_url`` is configured).
+        4. **DataProduct → Domain** (MCP) when domain is set.
         """
         product_id = payload.product.product_id
         product_urn = self._product_urn(product_id)
         domain_name = payload.product.domain
         domain_urn = self._domain_urn(domain_name) if domain_name else None
         dataset_urns: List[str] = []
+        contract_urns: List[str] = []
+        assertion_urns: List[str] = []
 
         try:
+            # One-shot per-registrar bootstrap of FLUID structured-property
+            # definitions. Idempotent; capability-detected so older
+            # DataHub OSS releases (no structuredProperty entity model)
+            # gracefully fall back to the customProperties path.
+            self._bootstrap_structured_properties_once()
             if domain_urn:
                 self._publish_domain(domain_name, domain_urn)
             for asset in payload.assets:
                 dataset_urn = self._dataset_urn(product_id, asset)
                 self._publish_dataset(payload, asset, dataset_urn, domain_urn)
                 dataset_urns.append(dataset_urn)
+                if asset.odcs_yaml:
+                    # Emit Assertion entities derived from ODCS field
+                    # rules (required / unique / library notNull /
+                    # library unique) BEFORE the DataContract MCP so
+                    # the contract can reference live URNs in its
+                    # dataQuality bucket.
+                    asset_assertions = self._publish_assertions_for_asset(
+                        product_id=product_id, asset=asset, dataset_urn=dataset_urn
+                    )
+                    assertion_urns.extend(u for u, _ in asset_assertions)
+                    contract_urn = self._publish_data_contract(
+                        product_id,
+                        asset,
+                        dataset_urn,
+                        assertions=asset_assertions,
+                    )
+                    contract_urns.append(contract_urn)
             self._publish_dataproduct(payload, product_urn, domain_urn)
         except Exception as exc:  # noqa: BLE001
             return RegistrationResult(
@@ -95,7 +157,11 @@ class DataHubRegistrar(CatalogRegistrar):
                 urn=product_urn,
                 succeeded=False,
                 error=str(exc),
-                metadata={"dataset_urns": dataset_urns},
+                metadata={
+                    "dataset_urns": dataset_urns,
+                    "contract_urns": contract_urns,
+                    "assertion_urns": assertion_urns,
+                },
             )
 
         return RegistrationResult(
@@ -104,6 +170,8 @@ class DataHubRegistrar(CatalogRegistrar):
             succeeded=True,
             metadata={
                 "dataset_urns": dataset_urns,
+                "contract_urns": contract_urns,
+                "assertion_urns": assertion_urns,
                 # Back-compat singular: the legacy ``register`` path
                 # surfaced a single ``dataset_urn`` in metadata; preserve
                 # it (first asset) for callers still reading that key.
@@ -145,15 +213,18 @@ class DataHubRegistrar(CatalogRegistrar):
         scoped = dataclasses.replace(payload, assets=scoped_assets)
 
         product_urn = self._product_urn(scoped.product.product_id)
-        domain_urn = (
-            self._domain_urn(scoped.product.domain) if scoped.product.domain else None
-        )
+        domain_urn = self._domain_urn(scoped.product.domain) if scoped.product.domain else None
 
         try:
             if domain_urn:
                 self._publish_domain(scoped.product.domain, domain_urn)
             dataset_urn = self._dataset_urn(scoped.product.product_id, scoped.assets[0])
             self._publish_dataset(scoped, scoped.assets[0], dataset_urn, domain_urn)
+            contract_urn: Optional[str] = None
+            if scoped.assets[0].odcs_yaml:
+                contract_urn = self._publish_data_contract(
+                    scoped.product.product_id, scoped.assets[0], dataset_urn
+                )
             # DataProduct payload uses the FULL ``payload`` (all
             # assets), not the scoped one — the product entity has to
             # describe the whole thing regardless of which expose
@@ -172,7 +243,10 @@ class DataHubRegistrar(CatalogRegistrar):
             target="datahub",
             urn=product_urn,
             succeeded=True,
-            metadata={"dataset_urn": dataset_urn},
+            metadata={
+                "dataset_urn": dataset_urn,
+                "contract_urn": contract_urn,
+            },
         )
 
     def unregister(self, product_id: str, expose_id: str) -> RegistrationResult:
@@ -232,6 +306,12 @@ class DataHubRegistrar(CatalogRegistrar):
                 aspect_name="domains",
                 aspect={"domains": [domain_urn]},
             )
+        # Typed FLUID classification via structuredProperties when the
+        # server supports them. On older servers this no-ops and the
+        # values stay in customProperties as the back-compat fallback.
+        self._maybe_publish_structured_properties(
+            entity_type="dataset", entity_urn=dataset_urn, payload=payload
+        )
 
     def _publish_dataproduct(
         self,
@@ -252,6 +332,222 @@ class DataHubRegistrar(CatalogRegistrar):
                 aspect_name="domains",
                 aspect={"domains": [domain_urn]},
             )
+        # First-class tag aspect rather than a customProperties map.
+        # Tag entities are auto-created on first reference by DataHub
+        # so we don't need a separate Tag MCP per tag.
+        if payload.product.tags:
+            self._post_mcp(
+                entity_type="dataProduct",
+                entity_urn=product_urn,
+                aspect_name="globalTags",
+                aspect={"tags": [{"tag": self._tag_urn(t)} for t in payload.product.tags]},
+            )
+        # institutionalMemory links replace the YAML blobs that used
+        # to live in customProperties. Only emitted when the operator
+        # configures a source-of-truth base URL — otherwise the field
+        # is left absent (better than a dangling link).
+        memory = self._build_institutional_memory(payload)
+        if memory:
+            self._post_mcp(
+                entity_type="dataProduct",
+                entity_urn=product_urn,
+                aspect_name="institutionalMemory",
+                aspect=memory,
+            )
+        # Typed FLUID classification via structuredProperties when the
+        # server supports them — same pattern as the dataset side.
+        self._maybe_publish_structured_properties(
+            entity_type="dataProduct", entity_urn=product_urn, payload=payload
+        )
+
+    def _publish_data_contract(
+        self,
+        product_id: str,
+        asset: AssetPayload,
+        dataset_urn: str,
+        assertions: Optional[List[tuple[str, str]]] = None,
+    ) -> str:
+        """Emit a first-class ``DataContract`` entity for *asset*.
+
+        DataHub's ``dataContractProperties`` aspect is the canonical
+        home for ODCS-style contracts: it links the contract to its
+        dataset via ``entity`` and carries the raw YAML body on
+        ``rawContract``. The UI renders this as a Data Contract page
+        attached to the dataset, far better UX than a multi-KB string
+        crammed into ``customProperties.odcs_contract``.
+
+        When *assertions* is provided, each ``(urn, bucket)`` tuple
+        gets routed into the matching DataContract bucket
+        (``schema`` / ``freshness`` / ``dataQuality``) — that's how the
+        UI knows which Assertion entities the contract enforces.
+        ODCS quality rules → Assertion translation lives in
+        :mod:`_datahub_assertions`; the caller publishes the Assertion
+        MCPs before this DataContract is upserted so the references
+        resolve immediately.
+
+        We also stamp ``dataContractStatus.state = ACTIVE`` so the
+        contract isn't shown as pending — these contracts represent
+        what's published, not draft work.
+        """
+        contract_urn = self._data_contract_urn(product_id, asset.asset_id)
+        # Each DataContract bucket is a list of ``{assertion: <urn>}``
+        # entries (the MCP-aspect shape — the GraphQL surface uses
+        # ``assertionUrn`` instead). Populate from the per-asset
+        # translator output; leave empty when no rules translated.
+        buckets: Dict[str, List[Dict[str, Any]]] = {
+            "schema": [],
+            "freshness": [],
+            "dataQuality": [],
+        }
+        for assertion_urn, bucket_name in assertions or ():
+            if bucket_name in buckets:
+                buckets[bucket_name].append({"assertion": assertion_urn})
+
+        properties: Dict[str, Any] = {
+            "entity": dataset_urn,
+            **buckets,
+        }
+        if asset.odcs_yaml:
+            properties["rawContract"] = asset.odcs_yaml
+        self._post_mcp(
+            entity_type="dataContract",
+            entity_urn=contract_urn,
+            aspect_name="dataContractProperties",
+            aspect=properties,
+        )
+        self._post_mcp(
+            entity_type="dataContract",
+            entity_urn=contract_urn,
+            aspect_name="dataContractStatus",
+            aspect={"state": "ACTIVE"},
+        )
+        return contract_urn
+
+    # ── Structured-property bootstrap ────────────────────────────────
+
+    def _bootstrap_structured_properties_once(self) -> None:
+        """Upsert FLUID structured-property definitions on the server.
+
+        Idempotent (re-PUT with the same body is a no-op) and cached
+        per registrar instance via ``_structured_properties_supported``
+        so we don't pay the round trip on every publish. Capability-
+        detected: if the server returns 4xx (older DataHub without
+        the structuredProperty entity model) we mark the feature
+        unsupported and the publish path falls back to
+        ``customProperties`` for FLUID classification.
+        """
+        if self._structured_properties_supported is not None:
+            return  # already bootstrapped (success or detected-unsupported)
+        from ._datahub_structured_properties import (
+            ALL_DEFINITIONS,
+            structured_property_urn,
+        )
+
+        try:
+            for definition in ALL_DEFINITIONS:
+                qualified = definition["qualifiedName"]
+                urn = structured_property_urn(qualified)
+                self._post_mcp(
+                    entity_type="structuredProperty",
+                    entity_urn=urn,
+                    aspect_name="propertyDefinition",
+                    aspect=definition,
+                )
+            self._structured_properties_supported = True
+            LOG.info("DataHub structured properties bootstrapped (fluid.layer + fluid.productType)")
+        except Exception as exc:  # noqa: BLE001 — capability detect, non-fatal
+            self._structured_properties_supported = False
+            LOG.info(
+                "DataHub server doesn't support structured properties — "
+                "falling back to customProperties (%s)",
+                exc,
+            )
+
+    def _maybe_publish_structured_properties(
+        self, *, entity_type: str, entity_urn: str, payload: CatalogPublicationPayload
+    ) -> None:
+        """Attach ``fluid.layer`` + ``fluid.productType`` to *entity_urn*
+        when the server supports structured properties. No-op on
+        unsupported servers (callers still emit the same values in
+        ``customProperties`` for those — see
+        ``_fluid_classification_custom_properties``)."""
+        if not self._structured_properties_supported:
+            return
+        from ._datahub_structured_properties import assignment_for
+
+        body = assignment_for(
+            layer=payload.product.layer,
+            product_type=payload.product.product_type,
+        )
+        if not body["properties"]:
+            return
+        self._post_mcp(
+            entity_type=entity_type,
+            entity_urn=entity_urn,
+            aspect_name="structuredProperties",
+            aspect=body,
+        )
+
+    # ── Assertion translation (ODCS → DataHub) ───────────────────────
+
+    def _publish_assertions_for_asset(
+        self, *, product_id: str, asset: AssetPayload, dataset_urn: str
+    ) -> List[tuple[str, str]]:
+        """Translate the per-asset ODCS quality rules into DataHub
+        ``Assertion`` entities and PUT them. Returns ``(urn, bucket)``
+        tuples for the caller to thread into the DataContract bundle.
+
+        Failures on individual assertions log + skip — better to land
+        a partial set than abort the whole publish over a rule the
+        translator doesn't yet understand.
+        """
+        if not asset.odcs_yaml:
+            return []
+        try:
+            import yaml as _yaml
+
+            odcs = _yaml.safe_load(asset.odcs_yaml)
+        except Exception:  # noqa: BLE001
+            LOG.debug(
+                "ODCS YAML parse failed for assertion translation on asset %s",
+                asset.asset_id,
+                exc_info=True,
+            )
+            return []
+        if not isinstance(odcs, dict):
+            return []
+
+        from ._datahub_assertions import odcs_to_assertions
+
+        emissions = odcs_to_assertions(
+            odcs=odcs,
+            product_id=product_id,
+            expose_id=asset.asset_id,
+            dataset_urn=dataset_urn,
+        )
+        published: List[tuple[str, str]] = []
+        audit_stamp = self._audit_stamp()
+        for emission in emissions:
+            # Stamp lastUpdated on every emission so DataHub orders
+            # them by recency; the translator left ``time: 0`` so the
+            # registrar can fill the wall clock here.
+            info = dict(emission.info)
+            info["lastUpdated"] = audit_stamp
+            try:
+                self._post_mcp(
+                    entity_type="assertion",
+                    entity_urn=emission.urn,
+                    aspect_name="assertionInfo",
+                    aspect=info,
+                )
+                published.append((emission.urn, emission.bucket))
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(
+                    "DataHub assertion PUT failed for %s (non-fatal): %s",
+                    emission.urn,
+                    exc,
+                )
+        return published
 
     # ── HTTP helpers ──────────────────────────────────────────────────
 
@@ -311,9 +607,7 @@ class DataHubRegistrar(CatalogRegistrar):
             timeout=float(self.timeout_seconds),
             allow_private=True,
         ) as c:
-            r = c.post(
-                "/aspects?action=ingestProposal", json=payload, headers=self._headers()
-            )
+            r = c.post("/aspects?action=ingestProposal", json=payload, headers=self._headers())
             r.raise_for_status()
 
     def _post_delete(self, urn: str) -> None:
@@ -324,9 +618,7 @@ class DataHubRegistrar(CatalogRegistrar):
             timeout=float(self.timeout_seconds),
             allow_private=True,
         ) as c:
-            r = c.post(
-                "/entities?action=delete", json={"urn": urn}, headers=self._headers()
-            )
+            r = c.post("/entities?action=delete", json={"urn": urn}, headers=self._headers())
             r.raise_for_status()
 
     # ── URN builders ──────────────────────────────────────────────────
@@ -354,6 +646,89 @@ class DataHubRegistrar(CatalogRegistrar):
         domain name through verbatim (after stripping) so two contracts
         in the same domain land on the same URN."""
         return f"urn:li:domain:{domain_name.strip()}"
+
+    @staticmethod
+    def _data_contract_urn(product_id: str, expose_id: str) -> str:
+        """DataContract URN — ``urn:li:dataContract:<product>.<expose>``.
+
+        Matches the per-asset id shape every other backend uses (DMM
+        publishes ODCS at ``/api/datacontracts/{product_id}.{expose_id}``
+        with the same id) so a navigator can move between catalogs
+        without an ID translation table.
+        """
+        return f"urn:li:dataContract:{product_id}.{expose_id}"
+
+    @staticmethod
+    def _tag_urn(name: str) -> str:
+        return f"urn:li:tag:{name}"
+
+    def _spec_url(self, product_id: str, filename: str) -> Optional[str]:
+        """Build a source-of-truth URL for *filename* under *product_id*.
+
+        Returns ``None`` when ``spec_source_base_url`` isn't configured
+        so callers can skip the corresponding ``institutionalMemory``
+        element rather than emitting a dangling link.
+        """
+        if not self.spec_source_base_url:
+            return None
+        return f"{self.spec_source_base_url.rstrip('/')}/{product_id}/{filename}"
+
+    def _build_institutional_memory(
+        self, payload: CatalogPublicationPayload
+    ) -> Optional[Dict[str, Any]]:
+        """Build the DataProduct ``institutionalMemory`` aspect linking
+        to the source FLUID + ODPS YAML documents. Returns ``None``
+        when no URLs are configured — better to omit the aspect than
+        to emit broken links."""
+        product_id = payload.product.product_id
+        elements: List[Dict[str, Any]] = []
+        for filename, label in (
+            ("contract.fluid.yaml", "FLUID source contract"),
+            ("spec.odps.yaml", "ODPS data product spec"),
+        ):
+            url = self._spec_url(product_id, filename)
+            if not url:
+                continue
+            elements.append(
+                {
+                    "url": url,
+                    "description": label,
+                    "createStamp": self._audit_stamp(),
+                }
+            )
+        if not elements:
+            return None
+        return {"elements": elements}
+
+    def _build_dataset_institutional_memory(
+        self, payload: CatalogPublicationPayload, asset: AssetPayload
+    ) -> Optional[Dict[str, Any]]:
+        """Build the Dataset's ``institutionalMemory`` link to the
+        per-asset ODCS YAML.
+
+        Rationale: DataHub OSS exposes the ``DataContract`` entity
+        we emit, but its ``rawContract`` field (where we stash the
+        ODCS YAML) is **not** in the OSS GraphQL schema — only Acryl
+        Cloud renders that field. Without this link, an OSS operator
+        navigating to a dataset has no clickable path to read the
+        contract document. The link lands in the dataset's
+        Documentation → Links section and is fully OSS-renderable.
+
+        Skipped when ``spec_source_base_url`` isn't configured (we
+        don't fabricate a URL that 404s).
+        """
+        url = self._spec_url(payload.product.product_id, f"{asset.asset_id}.odcs.yaml")
+        if not url:
+            return None
+        return {
+            "elements": [
+                {
+                    "url": url,
+                    "description": (f"ODCS data contract for output port '{asset.asset_id}'"),
+                    "createStamp": self._audit_stamp(),
+                }
+            ]
+        }
 
     # ── Aspect builders — payload-driven ──────────────────────────────
 
@@ -406,19 +781,18 @@ class DataHubRegistrar(CatalogRegistrar):
                 }
             return field
 
-        # Dataset-level custom properties: FLUID classification chips +
-        # the per-asset ODCS contract. The ODCS YAML is the same
-        # payload DMM PUTs to ``/api/datacontracts/{product_id}.{expose_id}``;
-        # DataHub has no separate contract surface so we inline it.
+        # Dataset-level custom properties carry only the small typed
+        # FLUID classification chips. The ODCS contract for this
+        # dataset lives on a first-class ``DataContract`` entity
+        # (see :meth:`_publish_data_contract`) — NOT here. Domain
+        # is published via the native ``domains`` aspect, not as a
+        # custom string. Dot-notation keys mirror DataHub's own
+        # convention for ingestion-source-tagged properties.
         custom_properties: Dict[str, str] = {}
         if product.layer:
-            custom_properties["fluid_layer"] = product.layer
+            custom_properties["fluid.layer"] = product.layer
         if product.product_type:
-            custom_properties["fluid_product_type"] = product.product_type
-        if product.domain:
-            custom_properties["fluid_domain"] = product.domain
-        if asset.odcs_yaml:
-            custom_properties["odcs_contract"] = asset.odcs_yaml
+            custom_properties["fluid.productType"] = product.product_type
 
         aspects: List[Dict[str, Any]] = [
             {
@@ -446,9 +820,7 @@ class DataHubRegistrar(CatalogRegistrar):
                     "platform": f"urn:li:dataPlatform:{asset.platform}",
                     "version": 0,
                     "hash": "",
-                    "platformSchema": {
-                        "com.linkedin.schema.OtherSchema": {"rawSchema": "{}"}
-                    },
+                    "platformSchema": {"com.linkedin.schema.OtherSchema": {"rawSchema": "{}"}},
                     "fields": [_schema_field(c) for c in asset.schema],
                 }
             },
@@ -469,9 +841,15 @@ class DataHubRegistrar(CatalogRegistrar):
                 }
                 for edge in asset.upstreams
             ]
-            aspects.append(
-                {"com.linkedin.dataset.UpstreamLineage": {"upstreams": upstreams}}
-            )
+            aspects.append({"com.linkedin.dataset.UpstreamLineage": {"upstreams": upstreams}})
+
+        # institutionalMemory link to the ODCS YAML — OSS-renderable
+        # workaround for DataHub OSS not exposing DataContract.rawContract
+        # in GraphQL. The link appears in the dataset's
+        # Documentation → Links section.
+        memory = self._build_dataset_institutional_memory(payload, asset)
+        if memory:
+            aspects.append({"com.linkedin.common.InstitutionalMemory": memory})
 
         return {
             "entity": {
@@ -484,35 +862,28 @@ class DataHubRegistrar(CatalogRegistrar):
             }
         }
 
-    def _build_dataproduct_properties(
-        self, payload: CatalogPublicationPayload
-    ) -> Dict[str, Any]:
-        """Build the DataProductProperties aspect.
+    def _build_dataproduct_properties(self, payload: CatalogPublicationPayload) -> Dict[str, Any]:
+        """Build the ``dataProductProperties`` aspect.
 
-        ``customProperties`` carries the FLUID-native classification
-        AND the source FLUID + ODPS specs — mirroring how DMM
-        distributes the same data across
-        ``/api/dataproducts/{id}`` (ODPS body) and the
-        ``contract.fluid.yaml`` file living alongside it. ``assets``
-        lists every expose of the contract so the DataProduct page's
-        Assets tab renders the full backing.
+        Carries only small typed FLUID metadata in ``customProperties``
+        (layer, product type, version). Domain is published via the
+        native ``domains`` aspect; tags via ``globalTags``; and the
+        source FLUID + ODPS YAML documents are *linked* via
+        ``institutionalMemory`` and ``externalUrl`` rather than
+        inlined here — multi-KB YAML in customProperties bloats every
+        entity GET and pollutes search.
+
+        ``assets`` lists every expose of the contract so the
+        DataProduct page's Assets tab renders the full backing.
         """
         product = payload.product
         custom_properties: Dict[str, str] = {}
         if product.layer:
-            custom_properties["fluid_layer"] = product.layer
+            custom_properties["fluid.layer"] = product.layer
         if product.product_type:
-            custom_properties["fluid_product_type"] = product.product_type
-        if product.domain:
-            custom_properties["fluid_domain"] = product.domain
+            custom_properties["fluid.productType"] = product.product_type
         if product.version:
-            custom_properties["fluid_version"] = product.version
-        for tag in product.tags:
-            custom_properties.setdefault(f"fluid_tag.{tag}", "true")
-        if payload.specs.fluid_yaml:
-            custom_properties["fluid_contract"] = payload.specs.fluid_yaml
-        if payload.specs.odps_yaml:
-            custom_properties["odps_spec"] = payload.specs.odps_yaml
+            custom_properties["fluid.version"] = product.version
 
         assets = [
             {"destinationUrn": self._dataset_urn(product.product_id, asset)}
@@ -520,12 +891,20 @@ class DataHubRegistrar(CatalogRegistrar):
             if asset.asset_id
         ]
 
-        return {
+        body: Dict[str, Any] = {
             "name": product.name or product.product_id,
             "description": product.description,
             "customProperties": custom_properties,
             "assets": assets,
         }
+        # ``externalUrl`` points at the primary source-of-truth
+        # document — the FLUID contract — when an operator has
+        # configured a base URL. DataHub's UI shows this as an
+        # "External URL" link in the product header.
+        ext_url = self._spec_url(product.product_id, "contract.fluid.yaml")
+        if ext_url:
+            body["externalUrl"] = ext_url
+        return body
 
 
 # ── Plugin registration ─────────────────────────────────────────────────
@@ -544,10 +923,16 @@ from ._factory_helpers import pick_endpoint, pick_int, pick_token  # noqa: E402
 
 
 def _build_datahub_registrar(config: dict) -> DataHubRegistrar:
+    import os
+
     return DataHubRegistrar(
         base_url=pick_endpoint(config, default="https://datahub.test"),
         api_token=pick_token(config),
         timeout_seconds=pick_int(config, "timeout", 30),
+        spec_source_base_url=(
+            config.get("spec_source_base_url")
+            or os.environ.get("FLUID_CATALOG_DATAHUB_SPEC_BASE_URL")
+        ),
     )
 
 
