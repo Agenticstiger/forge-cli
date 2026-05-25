@@ -156,14 +156,15 @@ async def test_plan_respects_explicit_output_path(tmp_path, monkeypatch):
     captured = {}
 
     def fake_run(ns, logger):
-        captured["output"] = ns.output
-        Path(ns.output).write_text(json.dumps({"phases": [1]}))
+        # CLI's argparse uses ``dest="out"`` (not ``output``).
+        captured["out"] = ns.out
+        Path(ns.out).write_text(json.dumps({"phases": [1]}))
         return 0
 
     monkeypatch.setattr("fluid_build.cli.plan.run", fake_run)
     result = await engine.plan(contract, output=explicit_output)
 
-    assert captured["output"] == str(explicit_output)
+    assert captured["out"] == str(explicit_output)
     assert result.artifacts["plan"] == {"phases": [1]}
 
 
@@ -216,10 +217,111 @@ async def test_diff_parses_json_output(tmp_path, monkeypatch):
     a.write_text("kind: x")
     b.write_text("kind: y")
 
+    captured = {}
+
     def fake_run(ns, logger):
+        # CLI uses ``dest="baseline"`` (not ``other``).
+        captured["contract"] = ns.contract
+        captured["baseline"] = ns.baseline
         print(json.dumps({"changes": [{"path": "kind", "from": "x", "to": "y"}]}))
         return 0
 
     monkeypatch.setattr("fluid_build.cli.diff.run", fake_run)
     result = await engine.diff(a, b)
+    assert captured["contract"] == str(a)
+    assert captured["baseline"] == str(b)
     assert result.artifacts["diff"]["changes"][0]["from"] == "x"
+
+
+# ── Integration: namespace-shape regression guards ────────────────────
+#
+# These tests are the antidote to the bug pattern flagged in PR #142's
+# review: the engine wrapper monkeypatched the CLI stages in every test,
+# so an ``argparse.Namespace`` with a wrong field name silently passed
+# every unit test but blew up on the first real call. These integration
+# tests construct the namespace via :func:`engine._build_namespace` and
+# verify it carries every attribute the real ``cli/<stage>.run()``
+# reads. If a future ``add_argument`` upstream introduces a new
+# ``args.<x>`` dereference, the build_namespace machinery picks up the
+# default from the CLI's own argparse — these tests confirm the shape.
+
+
+def _read_args_referenced(cli_module_name: str) -> set[str]:
+    """Return the set of ``args.<x>`` attributes the CLI's ``run()`` and
+    its callees reference, by static grep on the module source."""
+    import importlib
+    import inspect
+    import re
+
+    cli_mod = importlib.import_module(f"fluid_build.cli.{cli_module_name}")
+    src = inspect.getsource(cli_mod)
+    return set(re.findall(r"args\.([a-zA-Z_][a-zA-Z0-9_]*)", src))
+
+
+def _engine_namespace_for(stage_name: str, overrides: dict) -> argparse.Namespace:
+    """Build the engine's namespace for ``stage_name`` without running."""
+    import importlib
+
+    from fluid_build import engine as _engine
+
+    stage_mod = importlib.import_module(f"fluid_build.cli.{stage_name}")
+    return _engine._build_namespace(stage_mod, overrides)
+
+
+import argparse  # noqa: E402 — used by the helpers above
+
+
+def test_validate_namespace_carries_every_field_the_stage_reads():
+    """If a real ``fluid validate`` call would dereference an attribute,
+    the engine's namespace must already have it set. This is what
+    monkeypatched tests can't catch."""
+    referenced = _read_args_referenced("validate")
+    ns = _engine_namespace_for("validate", {"contract": "/tmp/x"})
+    missing = [a for a in referenced if not hasattr(ns, a)]
+    assert not missing, (
+        f"engine.validate's namespace is missing fields the CLI reads: {sorted(missing)}. "
+        "The CLI's argparse should be the source of truth — fix _build_namespace, "
+        "not this assertion."
+    )
+
+
+def test_plan_namespace_carries_every_field_the_stage_reads():
+    referenced = _read_args_referenced("plan")
+    ns = _engine_namespace_for("plan", {"contract": "/tmp/x"})
+    missing = [a for a in referenced if not hasattr(ns, a)]
+    assert not missing, f"engine.plan namespace missing: {sorted(missing)}"
+
+
+def test_apply_namespace_carries_every_field_the_stage_reads():
+    referenced = _read_args_referenced("apply")
+    ns = _engine_namespace_for("apply", {"contract": "/tmp/x"})
+    missing = [a for a in referenced if not hasattr(ns, a)]
+    assert not missing, f"engine.apply namespace missing: {sorted(missing)}"
+
+
+def test_diff_namespace_carries_every_field_the_stage_reads():
+    referenced = _read_args_referenced("diff")
+    ns = _engine_namespace_for("diff", {"contract": "/tmp/a", "baseline": "/tmp/b"})
+    missing = [a for a in referenced if not hasattr(ns, a)]
+    assert not missing, f"engine.diff namespace missing: {sorted(missing)}"
+
+
+def test_plan_namespace_uses_cli_dest_names_not_engine_kwarg_names():
+    """The original bug: engine sent ``output=``, CLI argparse used
+    ``dest="out"``. The auto-namespace + the wrapper's explicit
+    ``overrides["out"]`` together prove the right field shows up."""
+    from pathlib import Path as _P
+
+    ns = _engine_namespace_for("plan", {"contract": "/tmp/c", "out": "/tmp/plan.json"})
+    assert ns.out == "/tmp/plan.json"
+    # And ``output`` was never on the CLI's argparse, so it should not
+    # leak onto the namespace from the wrapper's defaults.
+    assert not hasattr(ns, "output") or ns.output is None
+    del _P  # silence flake8 on macOS pytest runners
+
+
+def test_diff_namespace_uses_baseline_not_other():
+    """The original bug: engine sent ``other=`` (no such CLI arg)."""
+    ns = _engine_namespace_for("diff", {"contract": "/tmp/a", "baseline": "/tmp/b"})
+    assert ns.baseline == "/tmp/b"
+    assert not hasattr(ns, "other") or ns.other is None
