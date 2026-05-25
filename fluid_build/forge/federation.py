@@ -81,7 +81,7 @@ import yaml
 # resolves the host and returns True for RFC1918, link-local
 # (169.254.0.0/16 — AWS/GCP metadata), loopback, unspecified, and
 # reserved ranges (and fails closed on DNS errors).
-from fluid_build.build_runners._alerter import _hostname_is_private
+from fluid_build._net import _hostname_is_private
 from fluid_build.util.safe_yaml import load_yaml_safe
 
 LOG = logging.getLogger("fluid.forge.federation")
