@@ -58,6 +58,49 @@ the existing CLI semantics so the cutover can be incremental.
 Provider plugin contract is intentionally out of scope (master-
 roadmap Domain 12).
 
+Phase 1 limits — READ BEFORE INTEGRATING
+----------------------------------------
+
+The wrapper is a true thin pass-through. That means it inherits some
+behaviour from the CLI that is sharp-edged when invoked in-process.
+Each of these is documented per-stage too; this section is the
+all-in-one summary.
+
+1. **Concurrency**: stage calls **serialize through a process-wide
+   lock** (``_STAGE_LOCK``). ``contextlib.redirect_stdout`` is process-
+   global and not safe for concurrent threaded use — the lock is the
+   pragmatic Phase 1 fix. Two ``await engine.validate(...)`` calls in
+   the same process will not run in parallel even when wrapped in
+   ``asyncio.gather``. Phase 2 (pure-function stages, structured
+   output) removes the need for stdout capture and this lock.
+
+2. **Cancellation is best-effort**: every wrapper except ``publish``
+   dispatches via ``asyncio.to_thread``, and Python threads cannot be
+   cancelled. When the awaiting task is cancelled, the stage thread
+   keeps running — possibly for hours against a real cloud. Callers
+   must assume side-effects continue after ``CancelledError``.
+
+3. **``apply`` mutates ``os.environ``**: the CLI's apply stage loads
+   process-CWD dotenv files into the process environment. The engine
+   snapshots ``os.environ`` before the call and restores it after, but
+   this is only safe under ``_STAGE_LOCK`` — don't bypass it.
+
+4. **Kwarg names are stable from this PR forward**: the engine surface
+   is now a public API. Adding new optional kwargs is fine; renaming or
+   removing existing ones is a breaking change. Phase 2's pure-function
+   refactor preserves these names where possible and marks any
+   rename as a deliberate API break.
+
+5. **Captured stderr includes log records**: the wrapper attaches a
+   handler to ``fluid_build.cli.<stage>`` for the call duration so
+   ``result.stderr`` carries the stage's ``logger.info / .warning /
+   .error`` output alongside raw ``print()``. Captured stdout is
+   ``print()``-only.
+
+6. **Lazy stage imports**: each stage module is imported on first call.
+   First ``apply`` pays the Rich + dbt-runner import cost (hundreds of
+   ms); subsequent calls are fast.
+
 Example
 -------
 
@@ -91,13 +134,29 @@ import asyncio
 import io
 import json
 import logging
+import os
+import threading
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 __all__ = [
+    # Exceptions
     "EngineError",
+    "EngineUsageError",
+    "ValidateFailed",
+    "PlanFailed",
+    "ApplyFailed",
+    "DiffFailed",
+    "PublishFailed",
+    "BundleFailed",
+    "VerifyFailed",
+    "PolicyApplyFailed",
+    "GenerateArtifactsFailed",
+    "ValidateArtifactsFailed",
+    "ScheduleSyncFailed",
+    # Result types
     "StageResult",
     "ValidateResult",
     "PlanResult",
@@ -110,6 +169,7 @@ __all__ = [
     "GenerateArtifactsResult",
     "ValidateArtifactsResult",
     "ScheduleSyncResult",
+    # Public callables
     "validate",
     "plan",
     "apply",
@@ -122,6 +182,56 @@ __all__ = [
     "validate_artifacts",
     "schedule_sync",
 ]
+
+
+# ── Concurrency and capture safety ────────────────────────────────────
+#
+# IMPORTANT FOR CONSUMERS
+# -----------------------
+#
+# Phase 1's capture mechanism (``contextlib.redirect_stdout`` +
+# ``redirect_stderr``) patches process-global ``sys.stdout`` / ``sys.stderr``.
+# Python's contextlib docs state this is unsafe for "library code and
+# most threaded applications" — exactly our situation.
+#
+# To avoid silent cross-contamination of captured output between concurrent
+# in-process calls, the engine acquires a **process-wide lock**
+# (``_STAGE_LOCK``) for the duration of each ``_run_sync_stage`` call.
+# Calls into the engine therefore **serialize** through this lock — even
+# when wrapped in ``asyncio.gather(...)``.
+#
+# Why a lock and not per-thread fd dup (à la ``wurlitzer``)? The fd-dup
+# approach handles C-extension output too, but it's a complexity bump
+# (per-thread pipes, drain threads, OS-specific fd handling) and a new
+# dependency. Phase 1 prioritises correctness over throughput. Phase 2
+# replaces this with per-stage pure functions that emit structured
+# output directly — at which point neither stdout capture nor this lock
+# is needed.
+#
+# Cancellation
+# ------------
+#
+# ``await engine.apply(...)`` (and every other ``_run_sync_stage`` call)
+# dispatches via ``asyncio.to_thread``. Python threads CANNOT be cancelled.
+# When a consumer's task is cancelled (timeout, client disconnect, shutdown)
+# the awaiter receives ``CancelledError`` but the underlying stage thread
+# keeps running — possibly for hours against a real cloud. Provider
+# connections stay open, side-effects keep happening.
+#
+# Cancellation is therefore **best-effort** in Phase 1. A future
+# ``CancellationToken`` mechanism (Pulumi automation API style) is part of
+# Phase 2's pure-function refactor.
+#
+# Multi-tenant env mutation in apply()
+# ------------------------------------
+#
+# ``fluid_build.cli.apply.run`` calls ``hydrate_dotenv(Path.cwd(), ...)``
+# which writes the **process's** CWD dotenv into ``os.environ``. In a
+# server consumer (CC backend) running multiple tenants' applies, this
+# would leak credentials across tenants. The engine's ``apply`` wrapper
+# snapshots ``os.environ`` before the call and restores it after — safe
+# under the process-wide lock above, racy if the lock is bypassed.
+_STAGE_LOCK = threading.Lock()
 
 
 # ── Result types ──────────────────────────────────────────────────────
@@ -145,8 +255,18 @@ class StageResult:
         dict for the plan stage, validation report parsed into a
         dict for validate, etc.).
     stdout, stderr
-        Verbatim captured CLI output. Useful for surfacing in audit
-        logs, UIs, or for diagnosing failures.
+        Verbatim captured CLI output (raw ``print()`` output PLUS log
+        records emitted by the stage's own logger during the call).
+        Useful for surfacing in audit logs, UIs, or for diagnosing
+        failures.
+
+    Note on ``_stage_name``
+    ----------------------
+
+    Each subclass declares ``_stage_name: ClassVar[str] = "..."`` so the
+    name is a class-level constant — it is NOT a constructor argument
+    and does NOT appear in ``repr`` or equality. ``raise_for_status``
+    reads it to pick the right :class:`EngineError` subtype.
     """
 
     exit_code: int
@@ -154,16 +274,28 @@ class StageResult:
     stdout: str = ""
     stderr: str = ""
 
+    # Subclasses override this; consulted by ``raise_for_status`` to
+    # decide which typed exception to raise. ClassVar (not a dataclass
+    # field) so it isn't a constructor arg and doesn't surface in
+    # ``repr`` / equality / ``dataclasses.fields(...)``.
+    _stage_name: ClassVar[str] = "unknown"
+
     @property
     def success(self) -> bool:
         return self.exit_code == 0
 
     def raise_for_status(self) -> None:
-        """Raise ``EngineError`` if the stage failed. Mirrors the
-        ``requests.Response.raise_for_status`` ergonomics."""
+        """Raise the stage-specific :class:`EngineError` subclass if the
+        stage failed. Mirrors ``requests.Response.raise_for_status``.
+
+        The raised exception type is one of :class:`ValidateFailed`,
+        :class:`PlanFailed`, :class:`ApplyFailed`, etc. — all of which
+        subclass :class:`EngineError`, so callers can catch broadly
+        (``except EngineError``) or narrowly (``except PlanFailed``).
+        """
         if not self.success:
-            stage = getattr(self, "_stage_name", "unknown")
-            raise EngineError(stage, self)
+            exc_cls = _ERROR_CLASSES.get(self._stage_name, EngineError)
+            raise exc_cls(self._stage_name, self)
 
 
 @dataclass
@@ -171,7 +303,7 @@ class ValidateResult(StageResult):
     """Result of :func:`validate`. ``artifacts["report"]`` is the
     validation report dict when output_format="json"."""
 
-    _stage_name: str = "validate"
+    _stage_name: ClassVar[str] = "validate"
 
 
 @dataclass
@@ -179,21 +311,21 @@ class PlanResult(StageResult):
     """Result of :func:`plan`. ``artifacts["plan"]`` is the parsed
     ``plan.json`` body when one was written."""
 
-    _stage_name: str = "plan"
+    _stage_name: ClassVar[str] = "plan"
 
 
 @dataclass
 class ApplyResult(StageResult):
     """Result of :func:`apply`."""
 
-    _stage_name: str = "apply"
+    _stage_name: ClassVar[str] = "apply"
 
 
 @dataclass
 class DiffResult(StageResult):
     """Result of :func:`diff`."""
 
-    _stage_name: str = "diff"
+    _stage_name: ClassVar[str] = "diff"
 
 
 @dataclass
@@ -201,14 +333,14 @@ class PublishResult(StageResult):
     """Result of :func:`publish`. Publish already has an upstream
     async surface; this wrapper does not add a thread hop."""
 
-    _stage_name: str = "publish"
+    _stage_name: ClassVar[str] = "publish"
 
 
 @dataclass
 class BundleResult(StageResult):
     """Result of :func:`bundle`."""
 
-    _stage_name: str = "bundle"
+    _stage_name: ClassVar[str] = "bundle"
 
 
 @dataclass
@@ -216,14 +348,14 @@ class VerifyResult(StageResult):
     """Result of :func:`verify`. ``artifacts['report']`` is the parsed
     drift report when ``out=`` was supplied."""
 
-    _stage_name: str = "verify"
+    _stage_name: ClassVar[str] = "verify"
 
 
 @dataclass
 class PolicyApplyResult(StageResult):
     """Result of :func:`policy_apply`."""
 
-    _stage_name: str = "policy_apply"
+    _stage_name: ClassVar[str] = "policy_apply"
 
 
 @dataclass
@@ -231,7 +363,7 @@ class GenerateArtifactsResult(StageResult):
     """Result of :func:`generate_artifacts`. ``artifacts['manifest']``
     is the parsed ``MANIFEST.json`` from the output dir."""
 
-    _stage_name: str = "generate_artifacts"
+    _stage_name: ClassVar[str] = "generate_artifacts"
 
 
 @dataclass
@@ -239,7 +371,7 @@ class ValidateArtifactsResult(StageResult):
     """Result of :func:`validate_artifacts`. ``artifacts['report']`` is
     the parsed JSON report when ``report=`` was supplied."""
 
-    _stage_name: str = "validate_artifacts"
+    _stage_name: ClassVar[str] = "validate_artifacts"
 
 
 @dataclass
@@ -247,11 +379,23 @@ class ScheduleSyncResult(StageResult):
     """Result of :func:`schedule_sync`. ``artifacts['report']`` is the
     parsed sync result when ``report=`` was supplied."""
 
-    _stage_name: str = "schedule_sync"
+    _stage_name: ClassVar[str] = "schedule_sync"
+
+
+# ── Exception hierarchy ───────────────────────────────────────────────
 
 
 class EngineError(RuntimeError):
     """A stage exited non-zero. Carries the :class:`StageResult`.
+
+    This is the base for every stage-specific failure (:class:`PlanFailed`,
+    :class:`ApplyFailed`, etc.). Catch broadly (``except EngineError``) when
+    you want any stage failure; catch narrowly (``except PlanFailed``) when
+    you want to handle a specific stage's failure differently.
+
+    Use ``raise EngineError(stage, result) from underlying`` to preserve a
+    causal exception when one is available (Python's standard ``__cause__``
+    chain).
 
     Security note for stage authors
     -------------------------------
@@ -280,16 +424,125 @@ class EngineError(RuntimeError):
         self.result = result
 
 
+class EngineUsageError(ValueError):
+    """Raised when a consumer calls the engine with arguments the wrapper
+    itself rejects (e.g. ``engine.apply(..., yes=False, dry_run=False)``
+    has no way to surface an interactive prompt through the in-process
+    surface).
+
+    This is a wrapper-level usage error, NOT a stage failure — the stage
+    was never called. Subclasses ``ValueError`` (not :class:`EngineError`)
+    because the issue is in the caller's invocation, not in the stage's
+    logic. Catching ``EngineError`` will NOT catch usage errors.
+    """
+
+
+class ValidateFailed(EngineError):
+    """``fluid validate`` exited non-zero."""
+
+
+class PlanFailed(EngineError):
+    """``fluid plan`` exited non-zero."""
+
+
+class ApplyFailed(EngineError):
+    """``fluid apply`` exited non-zero."""
+
+
+class DiffFailed(EngineError):
+    """``fluid diff`` exited non-zero (incl. exit-on-drift signal)."""
+
+
+class PublishFailed(EngineError):
+    """``fluid publish`` failed (catalog handshake, signing, etc.)."""
+
+
+class BundleFailed(EngineError):
+    """``fluid bundle`` exited non-zero."""
+
+
+class VerifyFailed(EngineError):
+    """``fluid verify`` exited non-zero (drift detected, strict mode)."""
+
+
+class PolicyApplyFailed(EngineError):
+    """``fluid policy-apply`` exited non-zero."""
+
+
+class GenerateArtifactsFailed(EngineError):
+    """``fluid generate artifacts`` exited non-zero."""
+
+
+class ValidateArtifactsFailed(EngineError):
+    """``fluid validate-artifacts`` exited non-zero (tamper / format)."""
+
+
+class ScheduleSyncFailed(EngineError):
+    """``fluid schedule-sync`` exited non-zero."""
+
+
+# Resolved by ``StageResult.raise_for_status`` to pick a typed subtype.
+# Unknown stages fall through to the base ``EngineError``.
+_ERROR_CLASSES: dict[str, type[EngineError]] = {
+    "validate": ValidateFailed,
+    "plan": PlanFailed,
+    "apply": ApplyFailed,
+    "diff": DiffFailed,
+    "publish": PublishFailed,
+    "bundle": BundleFailed,
+    "verify": VerifyFailed,
+    "policy_apply": PolicyApplyFailed,
+    "generate_artifacts": GenerateArtifactsFailed,
+    "validate_artifacts": ValidateArtifactsFailed,
+    "schedule_sync": ScheduleSyncFailed,
+}
+
+
 # ── Internal: argparse.Namespace builder + stage runner ───────────────
 
 
 def _logger(stage: str) -> logging.Logger:
     """Per-stage logger. Records go to the engine's own namespace so
-    consumers can filter without affecting the CLI's own log topics."""
-    log = logging.getLogger(f"fluid.engine.{stage}")
-    if not log.handlers:
-        log.addHandler(logging.NullHandler())
-    return log
+    consumers can filter without affecting the CLI's own log topics.
+
+    Note: this is the logger the engine PASSES to ``stage_module.run(ns,
+    logger)``. Many stages ignore it and use their own
+    ``logging.getLogger(__name__)`` instead — those records are captured
+    separately by :func:`_run_sync_stage`'s in-flight handler.
+    """
+    return logging.getLogger(f"fluid.engine.{stage}")
+
+
+class _BufferingHandler(logging.Handler):
+    """Logging handler that appends formatted records to a StringIO buffer.
+
+    Used by :func:`_run_sync_stage` to capture ``logger.info / .warning /
+    .error`` calls from the wrapped stage into ``result.stderr``. Without
+    this, ``result.stderr`` only contains raw ``print(..., file=stderr)``
+    output and misses the bulk of stage diagnostics, which go through
+    ``logging``.
+
+    Defaults to ``DEBUG`` level so the handler captures anything the
+    logger lets through. The owning ``_run_sync_stage`` also lowers the
+    stage logger's own effective level to ``DEBUG`` for the duration of
+    the call (restored afterwards) — without that, the logger's own
+    level filter (often inherited as ``WARNING`` from root) drops INFO
+    records before they ever reach a handler.
+    """
+
+    def __init__(self, buffer: io.StringIO) -> None:
+        super().__init__(level=logging.DEBUG)
+        self._buffer = buffer
+        # Format records inline so the buffer carries the level + message,
+        # not the raw record object. Keep it minimal — consumers usually
+        # surface this in a UI / API response.
+        self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._buffer.write(self.format(record) + "\n")
+        except Exception:  # pragma: no cover - never let logging crash the stage
+            self.handleError(record)
 
 
 def _build_namespace(stage_module: Any, overrides: dict[str, Any]) -> argparse.Namespace:
@@ -376,24 +629,78 @@ async def _run_sync_stage(
     stage_module: Any,
     ns: argparse.Namespace,
     result_cls: type[StageResult] = StageResult,
+    *,
+    env_snapshot: bool = False,
 ) -> StageResult:
     """Run a sync ``cli/<stage>.run(args, logger) -> int`` in a worker
-    thread, capturing stdout/stderr/exit-code.
+    thread, capturing stdout/stderr/exit-code + the stage's log records.
 
-    The stage modules expect to print to real stdout/stderr; we
-    redirect those into in-memory buffers so the engine surface
-    stays quiet by default and consumers get the captured output as
-    part of the result.
+    Concurrency safety
+    ------------------
+
+    Acquires :data:`_STAGE_LOCK` for the duration of the stage call. This
+    is a process-wide lock — concurrent calls into the engine serialize
+    through it. See the module docstring for rationale.
+
+    Log-record capture
+    ------------------
+
+    Attaches a :class:`_BufferingHandler` to ``fluid_build.cli.<stage>``
+    (the logger the stage modules actually use via
+    ``logging.getLogger(__name__)``) for the duration of the call. Without
+    this, ``result.stderr`` would only contain raw ``print()`` output and
+    miss everything the stage emits through ``logger.info / .warning /
+    .error``. The handler is detached in a ``finally`` so it doesn't leak.
+
+    Env snapshot
+    ------------
+
+    When ``env_snapshot=True`` (set by :func:`apply`), takes a snapshot of
+    ``os.environ`` before the call and restores it after. The ``apply``
+    stage mutates ``os.environ`` via ``hydrate_dotenv``; without this
+    restore, a tenant's dotenv leaks into subsequent calls.
     """
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
-    log = _logger(stage_name)
+    engine_log = _logger(stage_name)
+    # The stage modules use ``logging.getLogger(__name__)`` — that's
+    # ``fluid_build.cli.<stage>``, NOT the engine's per-stage logger.
+    stage_logger_name = stage_module.__name__  # e.g. "fluid_build.cli.validate"
+    stage_logger = logging.getLogger(stage_logger_name)
+    capture_handler = _BufferingHandler(stderr_buf)
 
     def _invoke() -> int:
-        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
-            return stage_module.run(ns, log)
+        stage_logger.addHandler(capture_handler)
+        # Lower the stage logger's effective level so INFO/DEBUG records
+        # reach the handler. Without this, a logger inheriting WARNING
+        # from root would filter INFO before it ever hit the buffer.
+        # Restored in the ``finally`` so we don't leave the logger noisy.
+        previous_level = stage_logger.level
+        stage_logger.setLevel(logging.DEBUG)
+        env_backup: dict[str, str] | None = None
+        if env_snapshot:
+            env_backup = os.environ.copy()
+        try:
+            with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+                return stage_module.run(ns, engine_log)
+        finally:
+            stage_logger.setLevel(previous_level)
+            stage_logger.removeHandler(capture_handler)
+            if env_backup is not None:
+                # Restore env atomically: clear new keys the stage added
+                # then re-apply the snapshot.
+                added = set(os.environ) - set(env_backup)
+                for key in added:
+                    os.environ.pop(key, None)
+                for key, value in env_backup.items():
+                    if os.environ.get(key) != value:
+                        os.environ[key] = value
 
-    exit_code = await asyncio.to_thread(_invoke)
+    def _locked_invoke() -> int:
+        with _STAGE_LOCK:
+            return _invoke()
+
+    exit_code = await asyncio.to_thread(_locked_invoke)
     return result_cls(
         exit_code=exit_code,
         stdout=stdout_buf.getvalue(),
@@ -565,15 +872,45 @@ async def apply(
     call is safe — same conservative default the CC backend uses for
     its durable apply endpoint.
 
-    The full set of CLI flags (``--config-override``, ``--timeout``,
+    Required combinations
+    ---------------------
+
+    A non-dry-run call MUST explicitly opt out of the interactive prompt
+    via ``yes=True``. The wrapped CLI calls ``input("Proceed? [y/N]: ")``
+    when ``yes=False`` and the apply isn't dry-run; from an in-process
+    consumer (CC backend, notebook, etc.) the prompt either never
+    surfaces (stdout is redirected into the result buffer) or blocks
+    on stdin forever. The engine refuses the combination with an
+    :class:`EngineUsageError`. Callers that want an interactive flow
+    should wrap their own confirmation around the call.
+
+    Env safety
+    ----------
+
+    The wrapped ``cli.apply.run`` calls ``hydrate_dotenv(Path.cwd(), ...)``
+    which writes the process CWD's dotenv into ``os.environ``. In a
+    multi-tenant server this would leak credentials across tenants. The
+    engine snapshots ``os.environ`` before the call and restores it on
+    exit — safe under the process-wide stage lock, racy if that lock is
+    bypassed (don't).
+
+    Additional CLI flags (``--config-override``, ``--timeout``,
     ``--parallel-phases``, ``--notify``, ``--metrics-export``,
     ``--debug``, ``--workspace-dir``, ``--state-file``,
-    ``--provider-config``, ``--report``, ``--build-id``, …) are
-    accepted via :func:`_build_namespace`'s defaults — the engine
-    surface intentionally narrows the typed kwargs to the ones the
-    Command Center actually drives. Pass extras through a follow-up
-    PR if a new use case needs them.
+    ``--provider-config``, ``--report``, ``--build-id``, …) all default
+    correctly via :func:`_build_namespace`. The engine surface
+    intentionally narrows the typed kwargs to the ones the Command
+    Center actually drives. Pass extras through a follow-up PR if a new
+    use case needs them.
     """
+    if not dry_run and not yes:
+        raise EngineUsageError(
+            "engine.apply(...) with dry_run=False requires yes=True. "
+            "The in-process surface has no way to surface the CLI's "
+            "interactive 'Proceed? [y/N]:' prompt. Pass yes=True when "
+            "you're sure, or keep dry_run=True for a preview."
+        )
+
     from fluid_build.cli import apply as _apply
 
     overrides: dict[str, Any] = {
@@ -591,7 +928,7 @@ async def apply(
     if bundle is not None:
         overrides["bundle"] = str(bundle)
     ns = _build_namespace(_apply, overrides)
-    return await _run_sync_stage("apply", _apply, ns, ApplyResult)
+    return await _run_sync_stage("apply", _apply, ns, ApplyResult, env_snapshot=True)
 
 
 async def diff(
@@ -658,6 +995,7 @@ async def publish(
     skip_health_check: bool = False,
     verbose: bool = False,
     endpoint_override: Optional[str] = None,
+    config: Optional[Any] = None,
 ) -> PublishResult:
     """Run ``fluid publish`` in-process.
 
@@ -665,41 +1003,70 @@ async def publish(
     ``publish_contract`` function in the CLI module — we call it
     directly instead of going through ``asyncio.to_thread``.
 
+    Config caching
+    --------------
+
+    When ``config`` is ``None`` the wrapper instantiates a fresh
+    ``FluidConfig()`` per call. ``FluidConfig.__init__`` scans ``$HOME``,
+    CWD, ``$FLUID_CONFIG``, and environment variables — non-trivial cost
+    for tight publish loops. Callers that publish many contracts should
+    construct one ``FluidConfig`` and pass it via this kwarg.
+
     Multi-tenant note
     -----------------
 
-    The wrapper instantiates a fresh ``FluidConfig()`` on every call.
-    ``FluidConfig.__init__`` resolves credentials from ``$HOME``,
-    the CWD, ``$FLUID_CONFIG``, and environment variables — meaning
-    in a multi-tenant CC backend, ``publish`` picks up the SERVER's
-    identity, not a per-request operator identity. This is the
-    intended behaviour today (the CC's publish endpoint is admin-
-    gated and the server credential is the canonical "publish on
-    behalf of the org" identity), but it's worth surfacing here
-    because the other stages have no such ambient state. If/when the
-    CC introduces per-operator publish credentials, this is the line
-    that needs to change.
+    ``FluidConfig`` resolves credentials from process-global ambient
+    state (``$HOME`` / CWD / ``$FLUID_CONFIG`` / env). In a multi-tenant
+    CC backend, the default behaviour publishes with the SERVER's
+    identity, not a per-request operator identity. This is intended
+    today (the CC's publish endpoint is admin-gated and the server
+    credential is the canonical "publish on behalf of the org" identity),
+    but it's worth surfacing here because the other stages have no such
+    ambient state. If/when the CC introduces per-operator publish
+    credentials, callers should pass an explicit ``config`` per request.
+
+    Cancellation
+    ------------
+
+    Because ``publish_contract`` is natively async (no thread hop),
+    ``CancelledError`` propagates cleanly through this wrapper IF
+    ``publish_contract`` itself observes cancellation in its inner
+    awaits. Other wrappers (which dispatch via ``asyncio.to_thread``)
+    cannot be cancelled cleanly — see module docstring.
     """
     from fluid_build.cli import publish as _publish
-    from fluid_build.config_manager import FluidConfig
 
     log = _logger("publish")
-    config = FluidConfig()
 
+    if config is None:
+        from fluid_build.config_manager import FluidConfig
+
+        config = FluidConfig()
+
+    # Note: publish does NOT acquire ``_STAGE_LOCK`` because it bypasses
+    # the to_thread dispatch and ``publish_contract`` is natively async.
+    # Concurrent publish calls in the same process would still hit the
+    # stdout-redirect contamination issue, so we use a fd-scoped capture
+    # via per-call buffers but document that concurrent publishes share
+    # process-global stdout/stderr.
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
+    stage_logger = logging.getLogger(_publish.__name__)
+    capture_handler = _BufferingHandler(stderr_buf)
+    stage_logger.addHandler(capture_handler)
     try:
-        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
-            upstream_result = await _publish.publish_contract(
-                contract_path=Path(contract),
-                catalog_name=catalog or "default",
-                config=config,
-                dry_run=dry_run,
-                verify_only=verify_only,
-                skip_health_check=skip_health_check,
-                verbose=verbose,
-                endpoint_override=endpoint_override,
-            )
+        with _STAGE_LOCK:
+            with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+                upstream_result = await _publish.publish_contract(
+                    contract_path=Path(contract),
+                    catalog_name=catalog or "default",
+                    config=config,
+                    dry_run=dry_run,
+                    verify_only=verify_only,
+                    skip_health_check=skip_health_check,
+                    verbose=verbose,
+                    endpoint_override=endpoint_override,
+                )
         success = bool(getattr(upstream_result, "success", False))
         return PublishResult(
             exit_code=0 if success else 1,
@@ -707,13 +1074,19 @@ async def publish(
             stdout=stdout_buf.getvalue(),
             stderr=stderr_buf.getvalue(),
         )
-    except Exception as exc:  # pragma: no cover - upstream failure surfacing
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+        # Let these propagate — they're not stage failures, they're
+        # process-level signals or async cancellation.
+        raise
+    except Exception as exc:  # noqa: BLE001 - upstream failure surfacing
         log.exception("publish failed")
         return PublishResult(
             exit_code=2,
             stdout=stdout_buf.getvalue(),
             stderr=stderr_buf.getvalue() + f"\n{type(exc).__name__}: {exc}\n",
         )
+    finally:
+        stage_logger.removeHandler(capture_handler)
 
 
 # ── Phase 1.1: remaining 11-stage commands ────────────────────────────
