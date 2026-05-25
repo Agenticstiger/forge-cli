@@ -87,18 +87,20 @@ jobs:
     name: "Stage 2 — docker emulators"
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
-    services:
-      # LocalStack — AWS emulator. Free Community tier covers what we
-      # exercise (S3 / Glue / Kinesis / Lambda / SFN / etc.).
-      localstack:
-        image: localstack/localstack:latest
-        ports:
-          - 4566:4566
-        env:
-          SERVICES: s3,glue,iam,kinesis,lambda,stepfunctions,athena,events,scheduler,sns,sqs,secretsmanager,cloudwatch
-      # GCP emulators come up via docker compose below (the BigQuery
-      # emulator's healthcheck needs a probe pattern that isn't
-      # expressible as a `services:` block).
+    # LocalStack and GCP emulators are started as step-level docker
+    # commands AFTER checkout (rather than via the job-level
+    # ``services:`` block) so that:
+    #   1. LocalStack can be skipped cleanly when the optional
+    #      ``LOCALSTACK_AUTH_TOKEN`` secret isn't set — the modern
+    #      ``localstack/localstack:latest`` image now requires a token
+    #      at startup even for community features (LocalStack 2026.x).
+    #      Without the token the service container fails before
+    #      ``actions/checkout`` runs, cascading every downstream step.
+    #   2. The GCP emulators (BigQuery + GCS + Pub/Sub) are
+    #      token-free and always start, so the GCP half of Stage 2
+    #      runs on every PR regardless of LocalStack availability.
+    env:
+      HAS_LOCALSTACK_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -117,6 +119,22 @@ jobs:
           .venv/bin/pip install --quiet --upgrade pip
           .venv/bin/pip install --quiet -e '.[dev]'
 
+      - name: Start LocalStack (when token is configured)
+        if: env.HAS_LOCALSTACK_TOKEN == 'true'
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+        run: |
+          docker run -d --name localstack \
+            -p 4566:4566 \
+            -e LOCALSTACK_AUTH_TOKEN="$LOCALSTACK_AUTH_TOKEN" \
+            -e SERVICES="s3,glue,iam,kinesis,lambda,stepfunctions,athena,events,scheduler,sns,sqs,secretsmanager,cloudwatch" \
+            localstack/localstack:latest
+          # Health-check — wait up to 60 s for the gateway to respond.
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:4566/_localstack/health > /dev/null && break
+            sleep 2
+          done
+
       - name: Start GCP emulators
         run: |
           docker compose -f tests/iac/_gcp_emulator/docker-compose.yml up -d
@@ -127,12 +145,20 @@ jobs:
           done
 
       - name: Stage 2 — AWS LocalStack
+        if: env.HAS_LOCALSTACK_TOKEN == 'true'
         env:
           FLUID_IAC_LIVE_LOCALSTACK: "1"
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
           AWS_DEFAULT_REGION: us-east-1
         run: .venv/bin/python -m pytest tests/iac/test_iac_aws_localstack_e2e.py -q --no-header
+
+      - name: Stage 2 — AWS LocalStack (skipped — no token)
+        if: env.HAS_LOCALSTACK_TOKEN != 'true'
+        run: |
+          echo "::notice::Skipping LocalStack tests — set the LOCALSTACK_AUTH_TOKEN repo secret to enable them."
+          echo "LocalStack 2026.x requires an auth token even for community features; see"
+          echo "https://docs.localstack.cloud/getting-started/auth-token/ for free-tier setup."
 
       - name: Stage 2 — GCP emulator
         env:
@@ -142,8 +168,12 @@ jobs:
           FLUID_GCP_STORAGE_EMULATOR: "http://localhost:4443"
         run: .venv/bin/python -m pytest tests/iac/test_iac_gcp_emulator_e2e.py -q --no-header
 
+      - name: Stop LocalStack
+        if: always() && env.HAS_LOCALSTACK_TOKEN == 'true'
+        run: docker rm -f localstack || true
+
       - name: Stop GCP emulators
-        if: always()
+        if: always() && hashFiles('tests/iac/_gcp_emulator/docker-compose.yml') != ''
         run: docker compose -f tests/iac/_gcp_emulator/docker-compose.yml down
 
   # -------------------------------------------------------------------
