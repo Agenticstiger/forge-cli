@@ -111,6 +111,7 @@ def build_registrar(
     from fluid_build.build_runners.catalog_registrars._provider_adapter import (
         ProviderBackedRegistrar,
     )
+
     adapter = ProviderBackedRegistrar(target=target)
     adapter._provider = instance  # type: ignore[assignment]
     return adapter

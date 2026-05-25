@@ -48,9 +48,7 @@ class OpenMetadataRegistrar(CatalogRegistrar):
     api_token: Optional[str] = None
     timeout_seconds: int = 30
 
-    def register_payload(
-        self, payload: CatalogPublicationPayload
-    ) -> RegistrationResult:
+    def register_payload(self, payload: CatalogPublicationPayload) -> RegistrationResult:
         product_urn = f"forge://{payload.product.product_id}"
         last_err: Optional[str] = None
         published: List[str] = []
@@ -146,9 +144,7 @@ class OpenMetadataRegistrar(CatalogRegistrar):
             r.raise_for_status()
 
     @staticmethod
-    def _build_payload(
-        payload: CatalogPublicationPayload, asset: AssetPayload
-    ) -> Dict[str, Any]:
+    def _build_payload(payload: CatalogPublicationPayload, asset: AssetPayload) -> Dict[str, Any]:
         product = payload.product
 
         # ``extension`` is OpenMetadata's free-form JSON object on the

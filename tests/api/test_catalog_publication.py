@@ -85,9 +85,7 @@ class TestProductPayload:
 
     def test_owner_normalised(self):
         payload = CatalogPublicationPayload.from_contract(_contract())
-        assert payload.product.owner == OwnerPayload(
-            team="data-platform", email="dp@example.test"
-        )
+        assert payload.product.owner == OwnerPayload(team="data-platform", email="dp@example.test")
 
     def test_missing_owner_yields_none(self):
         contract = _contract()
@@ -245,9 +243,7 @@ class TestSpecBundle:
     def test_renderers_tolerate_minimal_contract(self):
         """A contract missing optional fields must still produce *some*
         payload — render failures degrade to None rather than aborting."""
-        payload = CatalogPublicationPayload.from_contract(
-            {"id": "x.y", "exposes": []}
-        )
+        payload = CatalogPublicationPayload.from_contract({"id": "x.y", "exposes": []})
         # ODCS needs an expose to render; absence yields None per-asset
         # (we don't even have an asset here). Fluid/ODPS may render
         # or may degrade to None — either is fine, but the call must

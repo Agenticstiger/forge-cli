@@ -274,9 +274,7 @@ class TestPublishAcquisition:
         from fluid_build.build_runners import _catalog as orch
 
         contract = _base_contract()
-        contract["builds"][0]["properties"]["catalog"]["register"] = [
-            "nonexistent-catalog-xyz"
-        ]
+        contract["builds"][0]["properties"]["catalog"]["register"] = ["nonexistent-catalog-xyz"]
         orch._REGISTRY.pop("nonexistent-catalog-xyz", None)
         results = publish_acquisition(contract, tmp_path)
         assert len(results) == 1

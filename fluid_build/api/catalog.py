@@ -64,9 +64,7 @@ class CatalogRegistrar(Protocol):
 
     target: str
 
-    def register_payload(
-        self, payload: "CatalogPublicationPayload"
-    ) -> RegistrationResult: ...
+    def register_payload(self, payload: "CatalogPublicationPayload") -> RegistrationResult: ...
 
     def unregister(self, product_id: str, expose_id: str) -> RegistrationResult: ...
 

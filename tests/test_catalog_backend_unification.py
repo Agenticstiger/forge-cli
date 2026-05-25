@@ -88,8 +88,7 @@ class TestPluginBackendsExposedViaTarget:
 
     @pytest.mark.parametrize(
         "target",
-        ["datahub", "openmetadata", "glue", "aws-glue",
-         "snowflake_horizon", "snowflake-horizon"],
+        ["datahub", "openmetadata", "glue", "aws-glue", "snowflake_horizon", "snowflake-horizon"],
     )
     def test_target_is_in_catalog_providers(self, target):
         assert target in CATALOG_PROVIDERS, (
@@ -101,18 +100,13 @@ class TestPluginBackendsExposedViaTarget:
         """``glue`` / ``aws-glue`` and ``snowflake_horizon`` /
         ``snowflake-horizon`` are alias pairs."""
         assert CATALOG_PROVIDERS["glue"] is CATALOG_PROVIDERS["aws-glue"]
-        assert (
-            CATALOG_PROVIDERS["snowflake_horizon"]
-            is CATALOG_PROVIDERS["snowflake-horizon"]
-        )
+        assert CATALOG_PROVIDERS["snowflake_horizon"] is CATALOG_PROVIDERS["snowflake-horizon"]
 
     def test_instantiating_plugin_provider_builds_registrar(self):
         """``get_catalog_provider`` for a plug-in backend returns a
         :class:`RegistrarBackedCatalogProvider` instance whose internal
         registrar is the one declared by the spec's factory."""
-        provider = get_catalog_provider(
-            "datahub", {"endpoint": "https://dh.x", "api_token": "tok"}
-        )
+        provider = get_catalog_provider("datahub", {"endpoint": "https://dh.x", "api_token": "tok"})
         assert isinstance(provider, RegistrarBackedCatalogProvider)
         assert provider.name == "datahub"
         # The registrar carries the config through unchanged
@@ -312,9 +306,7 @@ class TestTargetDataHubReachesGmsEndpoint:
         # ``PublishResult.details['urn']`` — see the adapter for
         # context). Pin both shapes so future refactors of either layer
         # don't silently drop the linkage.
-        assert result.catalog_url and result.catalog_url.startswith(
-            "urn:li:dataProduct:"
-        )
+        assert result.catalog_url and result.catalog_url.startswith("urn:li:dataProduct:")
         assert datahub_mock.proposals_for("dataProduct"), (
             "DataHub mock recorded no DataProduct MCP — register() must "
             "publish the FLUID contract as a DataProduct, not only its "
@@ -371,9 +363,7 @@ class TestRegisterAllReachesPluginBackends:
         unknown targets so existing CI scripts that assert on the
         error message keep working."""
         plan = CatalogPlan(targets=["nonexistent-catalog"])
-        outcome = register_all(
-            plan, product_id="x", expose_id="y", contract={"exposes": []}
-        )
+        outcome = register_all(plan, product_id="x", expose_id="y", contract={"exposes": []})
         assert outcome.failed
         assert "No registrar configured" in outcome.failed[0].error
 
@@ -425,9 +415,7 @@ class TestSpecDrivenEnvVarOverrides:
             f"config[{expected_key!r}] for target {target!r}; got {config!r}"
         )
 
-    def test_fluid_namespaced_env_var_takes_priority_over_upstream(
-        self, monkeypatch
-    ):
+    def test_fluid_namespaced_env_var_takes_priority_over_upstream(self, monkeypatch):
         """``FLUID_CATALOG_*`` is the project-scoped namespace; when
         both are set, fluid wins (matches secrets-pipeline ergonomics
         — you can override per-project without unsetting the shell

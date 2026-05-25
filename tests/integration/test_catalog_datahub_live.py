@@ -365,10 +365,7 @@ class TestSurfaceSymmetryLive:
             assert results_b[0].urn == product_urn
 
             envelope = _gms_wait_for_urn(urn)
-            assert (
-                envelope["value"]["com.linkedin.metadata.snapshot.DatasetSnapshot"]["urn"]
-                == urn
-            )
+            assert envelope["value"]["com.linkedin.metadata.snapshot.DatasetSnapshot"]["urn"] == urn
         finally:
             _gms_delete(urn)
             _gms_delete(_expected_product_urn(unique_product_id))
@@ -395,9 +392,9 @@ class TestEnvVarResolutionLive:
         # FluidConfig should resolve datahub's endpoint from
         # DATAHUB_GMS_URL alone (no catalogs.datahub block in YAML).
         config = FluidConfig().get_catalog_config("datahub")
-        assert config.get("endpoint") == DATAHUB_GMS_URL, (
-            f"env-var resolution didn't reach FluidConfig: {config!r}"
-        )
+        assert (
+            config.get("endpoint") == DATAHUB_GMS_URL
+        ), f"env-var resolution didn't reach FluidConfig: {config!r}"
 
         # Now run the acquisition path which uses FluidConfig internally
         from fluid_build.cli._acquisition_stage_ext import publish_acquisition

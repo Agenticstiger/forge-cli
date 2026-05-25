@@ -95,9 +95,7 @@ class ProviderBackedRegistrar(CatalogRegistrar):
                 LOG.debug("contract_yaml round-trip failed for %s", product_id, exc_info=True)
             publish_result = _run_coro_blocking(provider.publish(asset))
         except Exception as exc:  # noqa: BLE001
-            return RegistrationResult(
-                target=self.target, urn=urn, succeeded=False, error=str(exc)
-            )
+            return RegistrationResult(target=self.target, urn=urn, succeeded=False, error=str(exc))
         return RegistrationResult(
             target=self.target,
             urn=publish_result.catalog_url or urn,
@@ -112,9 +110,7 @@ class ProviderBackedRegistrar(CatalogRegistrar):
             provider = self._resolved_provider()
             ok = _run_coro_blocking(provider.delete(product_id))
         except Exception as exc:  # noqa: BLE001
-            return RegistrationResult(
-                target=self.target, urn=urn, succeeded=False, error=str(exc)
-            )
+            return RegistrationResult(target=self.target, urn=urn, succeeded=False, error=str(exc))
         return RegistrationResult(target=self.target, urn=urn, succeeded=bool(ok))
 
 

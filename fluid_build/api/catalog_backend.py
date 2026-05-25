@@ -63,14 +63,16 @@ class CatalogCapability(str, Enum):
     Values are the string the user writes in declarations / docs.
     """
 
-    DATA_PRODUCT = "data_product"        # First-class product entity (DataHub DataProduct, DMM /api/dataproducts)
-    DOMAIN = "domain"                    # Domain entity / tagging (DataHub Domain, OpenMetadata Domain)
-    LINEAGE = "lineage"                  # Reads contract.consumes[] → emits lineage edges
+    DATA_PRODUCT = (
+        "data_product"  # First-class product entity (DataHub DataProduct, DMM /api/dataproducts)
+    )
+    DOMAIN = "domain"  # Domain entity / tagging (DataHub Domain, OpenMetadata Domain)
+    LINEAGE = "lineage"  # Reads contract.consumes[] → emits lineage edges
     PER_ASSET_CONTRACT = "per_asset_contract"  # Attaches ODCS per asset (DMM /api/datacontracts, DataHub custom prop)
-    PRODUCT_SPECS = "product_specs"      # Attaches fluid + ODPS at the product level
+    PRODUCT_SPECS = "product_specs"  # Attaches fluid + ODPS at the product level
     CUSTOM_PROPERTIES = "custom_properties"  # Free-form key-value map on entities
-    GLOSSARY_TERMS = "glossary_terms"    # Maps classifications → glossary tags
-    OWNERSHIP = "ownership"              # First-class ownership aspect
+    GLOSSARY_TERMS = "glossary_terms"  # Maps classifications → glossary tags
+    OWNERSHIP = "ownership"  # First-class ownership aspect
 
 
 @dataclass(frozen=True)

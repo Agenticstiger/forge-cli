@@ -91,7 +91,9 @@ pytestmark = [
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _run_fluid_publish(*args: str, env_extra: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+def _run_fluid_publish(
+    *args: str, env_extra: Optional[Dict[str, str]] = None
+) -> subprocess.CompletedProcess:
     """Invoke ``fluid publish`` in a subprocess against the *worktree's*
     ``fluid_build``, with stdout/stderr captured for assertion."""
     launcher = (
@@ -140,12 +142,8 @@ def _gms_wait_for_urn(urn: str, *, deadline_seconds: float = 30.0) -> Dict[str, 
             envelope = _gms_get(urn)
             if envelope:
                 last_envelope = envelope
-                snapshot = envelope["value"][
-                    "com.linkedin.metadata.snapshot.DatasetSnapshot"
-                ]
-                aspect_names = {
-                    list(a.keys())[0].split(".")[-1] for a in snapshot["aspects"]
-                }
+                snapshot = envelope["value"]["com.linkedin.metadata.snapshot.DatasetSnapshot"]
+                aspect_names = {list(a.keys())[0].split(".")[-1] for a in snapshot["aspects"]}
                 if "DatasetProperties" in aspect_names:
                     return envelope
         except Exception as exc:  # noqa: BLE001
@@ -310,17 +308,10 @@ def lineage_chain(tmp_path_factory) -> Tuple[Dict[str, Path], Dict[str, str]]:
         paths[role] = p
 
     urns = {
-        "sdp": (
-            f"urn:li:dataset:(urn:li:dataPlatform:{platform},"
-            f"{sdp_id}.orders,PROD)"
-        ),
-        "adp": (
-            f"urn:li:dataset:(urn:li:dataPlatform:{platform},"
-            f"{adp_id}.orders_daily,PROD)"
-        ),
+        "sdp": (f"urn:li:dataset:(urn:li:dataPlatform:{platform}," f"{sdp_id}.orders,PROD)"),
+        "adp": (f"urn:li:dataset:(urn:li:dataPlatform:{platform}," f"{adp_id}.orders_daily,PROD)"),
         "cdp": (
-            f"urn:li:dataset:(urn:li:dataPlatform:{platform},"
-            f"{cdp_id}.revenue_monthly,PROD)"
+            f"urn:li:dataset:(urn:li:dataPlatform:{platform}," f"{cdp_id}.revenue_monthly,PROD)"
         ),
     }
 
@@ -362,9 +353,9 @@ class TestProductTypeMatrix:
         # classification — this is what shows up under "Properties" in
         # the DataHub UI and lets an analyst filter by product type.
         props = aspects["DatasetProperties"].get("customProperties", {})
-        assert props.get("fluid_layer") == expected_layer, (
-            f"role={role}: expected fluid_layer={expected_layer}, got {props!r}"
-        )
+        assert (
+            props.get("fluid_layer") == expected_layer
+        ), f"role={role}: expected fluid_layer={expected_layer}, got {props!r}"
         assert props.get("fluid_product_type") == expected_product_type
         assert props.get("fluid_domain") == "commerce"
 
@@ -390,9 +381,9 @@ class TestLineageE2E:
 
         envelope = _gms_wait_for_urn(urns["sdp"])
         aspects = _aspects(envelope)
-        assert "UpstreamLineage" not in aspects, (
-            f"SDP must not declare upstream FLUID products: {aspects.keys()}"
-        )
+        assert (
+            "UpstreamLineage" not in aspects
+        ), f"SDP must not declare upstream FLUID products: {aspects.keys()}"
 
     def test_adp_upstream_points_at_sdp(self, lineage_chain):
         paths, urns = lineage_chain
@@ -408,9 +399,9 @@ class TestLineageE2E:
         upstreams = aspects.get("UpstreamLineage", {}).get("upstreams", [])
         assert upstreams, "ADP must declare an UpstreamLineage aspect"
         upstream_urns = {u["dataset"] for u in upstreams}
-        assert urns["sdp"] in upstream_urns, (
-            f"ADP upstream {upstream_urns} should include SDP {urns['sdp']}"
-        )
+        assert (
+            urns["sdp"] in upstream_urns
+        ), f"ADP upstream {upstream_urns} should include SDP {urns['sdp']}"
         # TRANSFORMED is the right LineageType for a Silver-tier ADP
         # built from a Bronze-tier SDP via aggregation / join logic.
         assert all(u["type"] == "TRANSFORMED" for u in upstreams)
@@ -527,9 +518,7 @@ class TestFluidPublishCliShapes:
         p = tmp_path / "dryrun.fluid.yaml"
         p.write_text(yaml.safe_dump(contract))
 
-        result = _run_fluid_publish(
-            str(p), "--target", "datahub", "--dry-run", "--quiet"
-        )
+        result = _run_fluid_publish(str(p), "--target", "datahub", "--dry-run", "--quiet")
         assert result.returncode == 0, result.stderr
 
         # Give GMS a generous beat then assert that no *real* aspects
@@ -540,19 +529,14 @@ class TestFluidPublishCliShapes:
         # include ``DatasetProperties`` (which the registrar would
         # write on a real publish).
         time.sleep(2.0)
-        urn = (
-            f"urn:li:dataset:(urn:li:dataPlatform:snowflake,"
-            f"{product_id}.probe,PROD)"
-        )
+        urn = f"urn:li:dataset:(urn:li:dataPlatform:snowflake," f"{product_id}.probe,PROD)"
         envelope = _gms_get(urn)
         if envelope is not None:
             snapshot = envelope["value"]["com.linkedin.metadata.snapshot.DatasetSnapshot"]
-            aspect_names = {
-                list(a.keys())[0].split(".")[-1] for a in snapshot["aspects"]
-            }
-            assert "DatasetProperties" not in aspect_names, (
-                f"--dry-run wrote DatasetProperties to GMS: aspects={aspect_names}"
-            )
+            aspect_names = {list(a.keys())[0].split(".")[-1] for a in snapshot["aspects"]}
+            assert (
+                "DatasetProperties" not in aspect_names
+            ), f"--dry-run wrote DatasetProperties to GMS: aspects={aspect_names}"
 
 
 # ---------------------------------------------------------------------------
@@ -620,9 +604,7 @@ class TestDataProductAndDomainEmissionE2E:
                     envelope = body
                     break
             time.sleep(1.0)
-        assert envelope is not None, (
-            f"DataProduct {product_urn} did not become readable within 30s"
-        )
+        assert envelope is not None, f"DataProduct {product_urn} did not become readable within 30s"
 
         props = envelope["aspects"]["dataProductProperties"]["value"]
         # The DataProduct carries the FLUID-native classification so an
@@ -635,8 +617,7 @@ class TestDataProductAndDomainEmissionE2E:
         # the DataProduct page's Assets tab renders the full backing.
         asset_urns = {a["destinationUrn"] for a in props.get("assets") or []}
         assert (
-            "urn:li:dataset:(urn:li:dataPlatform:snowflake,"
-            f"{contract['id']}.orders,PROD)"
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake," f"{contract['id']}.orders,PROD)"
         ) in asset_urns
 
     def test_domain_entity_created_from_contract_domain(self, lineage_chain):

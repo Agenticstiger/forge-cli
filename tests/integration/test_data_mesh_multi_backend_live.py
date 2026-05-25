@@ -128,12 +128,15 @@ def _build_mesh_chain(ts: int) -> Dict[str, Dict[str, Any]]:
         layer="Bronze",
         product_type="SDP",
         exposes=[
-            ("orders", [
-                ("order_id", "string", True),
-                ("customer_id", "string", True),
-                ("amount_usd", "decimal", True),
-                ("ordered_at", "timestamp", True),
-            ]),
+            (
+                "orders",
+                [
+                    ("order_id", "string", True),
+                    ("customer_id", "string", True),
+                    ("amount_usd", "decimal", True),
+                    ("ordered_at", "timestamp", True),
+                ],
+            ),
         ],
     )
     chain["sdp_clicks"] = _make_contract(
@@ -144,12 +147,15 @@ def _build_mesh_chain(ts: int) -> Dict[str, Dict[str, Any]]:
         layer="Bronze",
         product_type="SDP",
         exposes=[
-            ("clicks", [
-                ("click_id", "string", True),
-                ("customer_id", "string", True),
-                ("campaign_id", "string", True),
-                ("clicked_at", "timestamp", True),
-            ]),
+            (
+                "clicks",
+                [
+                    ("click_id", "string", True),
+                    ("customer_id", "string", True),
+                    ("campaign_id", "string", True),
+                    ("clicked_at", "timestamp", True),
+                ],
+            ),
         ],
     )
     chain["sdp_invoices"] = _make_contract(
@@ -160,12 +166,15 @@ def _build_mesh_chain(ts: int) -> Dict[str, Dict[str, Any]]:
         layer="Bronze",
         product_type="SDP",
         exposes=[
-            ("invoices", [
-                ("invoice_id", "string", True),
-                ("order_id", "string", True),
-                ("total_usd", "decimal", True),
-                ("issued_at", "timestamp", True),
-            ]),
+            (
+                "invoices",
+                [
+                    ("invoice_id", "string", True),
+                    ("order_id", "string", True),
+                    ("total_usd", "decimal", True),
+                    ("issued_at", "timestamp", True),
+                ],
+            ),
         ],
     )
 
@@ -179,12 +188,15 @@ def _build_mesh_chain(ts: int) -> Dict[str, Dict[str, Any]]:
         product_type="ADP",
         consumes=[(chain["sdp_clicks"]["id"], "clicks")],
         exposes=[
-            ("attribution", [
-                ("customer_id", "string", True),
-                ("campaign_id", "string", True),
-                ("first_click_at", "timestamp", True),
-                ("last_click_at", "timestamp", True),
-            ]),
+            (
+                "attribution",
+                [
+                    ("customer_id", "string", True),
+                    ("campaign_id", "string", True),
+                    ("first_click_at", "timestamp", True),
+                    ("last_click_at", "timestamp", True),
+                ],
+            ),
         ],
     )
     chain["adp_daily_orders"] = _make_contract(
@@ -199,13 +211,16 @@ def _build_mesh_chain(ts: int) -> Dict[str, Dict[str, Any]]:
             (chain["adp_click_attribution"]["id"], "attribution"),
         ],
         exposes=[
-            ("orders_daily", [
-                ("order_date", "date", True),
-                ("customer_id", "string", True),
-                ("campaign_id", "string", False),  # nullable — not every order has a click
-                ("order_count", "integer", True),
-                ("revenue_usd", "decimal", True),
-            ]),
+            (
+                "orders_daily",
+                [
+                    ("order_date", "date", True),
+                    ("customer_id", "string", True),
+                    ("campaign_id", "string", False),  # nullable — not every order has a click
+                    ("order_count", "integer", True),
+                    ("revenue_usd", "decimal", True),
+                ],
+            ),
         ],
     )
     chain["adp_daily_revenue"] = _make_contract(
@@ -220,12 +235,15 @@ def _build_mesh_chain(ts: int) -> Dict[str, Dict[str, Any]]:
             (chain["sdp_orders"]["id"], "orders"),
         ],
         exposes=[
-            ("revenue_daily", [
-                ("revenue_date", "date", True),
-                ("gross_usd", "decimal", True),
-                ("net_usd", "decimal", True),
-                ("invoice_count", "integer", True),
-            ]),
+            (
+                "revenue_daily",
+                [
+                    ("revenue_date", "date", True),
+                    ("gross_usd", "decimal", True),
+                    ("net_usd", "decimal", True),
+                    ("invoice_count", "integer", True),
+                ],
+            ),
         ],
     )
 
@@ -242,11 +260,14 @@ def _build_mesh_chain(ts: int) -> Dict[str, Dict[str, Any]]:
             (chain["adp_daily_revenue"]["id"], "revenue_daily"),
         ],
         exposes=[
-            ("attribution_monthly", [
-                ("month", "string", True),
-                ("campaign_id", "string", True),
-                ("attributed_revenue_usd", "decimal", True),
-            ]),
+            (
+                "attribution_monthly",
+                [
+                    ("month", "string", True),
+                    ("campaign_id", "string", True),
+                    ("attributed_revenue_usd", "decimal", True),
+                ],
+            ),
         ],
     )
     chain["cdp_exec_dashboard"] = _make_contract(
@@ -258,12 +279,15 @@ def _build_mesh_chain(ts: int) -> Dict[str, Dict[str, Any]]:
         product_type="CDP",
         consumes=[(chain["adp_daily_revenue"]["id"], "revenue_daily")],
         exposes=[
-            ("kpis_monthly", [
-                ("month", "string", True),
-                ("revenue_usd", "decimal", True),
-                ("orders", "integer", True),
-                ("avg_order_value_usd", "decimal", True),
-            ]),
+            (
+                "kpis_monthly",
+                [
+                    ("month", "string", True),
+                    ("revenue_usd", "decimal", True),
+                    ("orders", "integer", True),
+                    ("avg_order_value_usd", "decimal", True),
+                ],
+            ),
         ],
     )
 
@@ -298,9 +322,7 @@ def _make_contract(
             },
             "tags": [domain, product_type.lower()],
         },
-        "consumes": [
-            {"productId": p, "exposeId": e} for p, e in (consumes or [])
-        ],
+        "consumes": [{"productId": p, "exposeId": e} for p, e in (consumes or [])],
         "exposes": [
             {
                 "exposeId": expose_id,
@@ -369,9 +391,14 @@ class TestDataHubMesh:
         write is friendlier for assertions when the upstream's full
         aspects are already present."""
         order = [
-            "sdp_orders", "sdp_clicks", "sdp_invoices",
-            "adp_click_attribution", "adp_daily_orders", "adp_daily_revenue",
-            "cdp_revenue_attribution", "cdp_exec_dashboard",
+            "sdp_orders",
+            "sdp_clicks",
+            "sdp_invoices",
+            "adp_click_attribution",
+            "adp_daily_orders",
+            "adp_daily_revenue",
+            "cdp_revenue_attribution",
+            "cdp_exec_dashboard",
         ]
         results = {}
         for key in order:
@@ -443,16 +470,13 @@ class TestDataHubMesh:
         adp = mesh["contracts"]["adp_daily_orders"]
         upstream = mesh["contracts"]["adp_click_attribution"]
         dataset_urn = (
-            f"urn:li:dataset:(urn:li:dataPlatform:snowflake,"
-            f"{adp['id']}.orders_daily,PROD)"
+            f"urn:li:dataset:(urn:li:dataPlatform:snowflake," f"{adp['id']}.orders_daily,PROD)"
         )
         envelope = self._wait(dataset_urn, want_aspect="upstreamLineage")
         upstreams = envelope["aspects"]["upstreamLineage"]["value"]["upstreams"]
         urns = {u["dataset"] for u in upstreams}
         # The marketing-domain ADP's URN must be among the upstreams.
-        assert any(upstream["id"] in u for u in urns), (
-            f"cross-domain edge missing: {urns}"
-        )
+        assert any(upstream["id"] in u for u in urns), f"cross-domain edge missing: {urns}"
 
     def test_per_asset_odcs_attached_to_dataset(self, published, mesh):
         """Each Dataset carries its own ODCS contract (the per-asset
@@ -552,17 +576,15 @@ class TestGlueMesh:
             ("cdp_exec_dashboard", "forge_finance", "kpis_monthly"),
         ],
     )
-    def test_every_table_carries_canonical_parameters(
-        self, published, mesh, key, db, asset
-    ):
+    def test_every_table_carries_canonical_parameters(self, published, mesh, key, db, asset):
         table = self._get_table(db, asset)
         params = table.get("Parameters") or {}
         contract = mesh["contracts"][key]
 
         # Classification fields
-        assert params.get("fluid_layer") == contract["metadata"]["layer"], (
-            f"{key}: fluid_layer mismatch — params={params}"
-        )
+        assert (
+            params.get("fluid_layer") == contract["metadata"]["layer"]
+        ), f"{key}: fluid_layer mismatch — params={params}"
         assert params.get("fluid_product_type") == contract["metadata"]["productType"]
         assert params.get("fluid_domain") == contract["domain"]
         # Spec attachments — proof the canonical layer ran once and
@@ -621,9 +643,7 @@ class TestOpenMetadataMesh:
 
     @pytest.fixture(scope="class")
     def registrar(self) -> OpenMetadataRegistrar:
-        return OpenMetadataRegistrar(
-            base_url=OPENMETADATA_URL, api_token=OPENMETADATA_JWT
-        )
+        return OpenMetadataRegistrar(base_url=OPENMETADATA_URL, api_token=OPENMETADATA_JWT)
 
     def test_smoke_publish_each_role(self, registrar, mesh):
         """Smoke level — each role publishes without HTTP-layer error.

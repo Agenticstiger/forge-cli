@@ -86,9 +86,7 @@ class RegistrarBackedCatalogProvider(BaseCatalogProvider):
         exposes = contract.get("exposes") or []
         if exposes:
             first = exposes[0] or {}
-            return str(
-                first.get("exposeId") or first.get("name") or first.get("id") or ""
-            )
+            return str(first.get("exposeId") or first.get("name") or first.get("id") or "")
         return ""
 
     @staticmethod
@@ -161,9 +159,7 @@ class RegistrarBackedCatalogProvider(BaseCatalogProvider):
                 # Third-party registrar that hasn't migrated — fall back
                 # to the legacy per-expose path so they keep working.
                 product_id = payload.product.product_id or asset.id
-                expose_id = (
-                    payload.assets[0].asset_id if payload.assets else asset.id
-                )
+                expose_id = payload.assets[0].asset_id if payload.assets else asset.id
                 result = await asyncio.to_thread(
                     self._registrar.register, product_id, expose_id, contract, {}
                 )
@@ -220,8 +216,7 @@ def build_registrar_backed_provider(
         _spec = spec  # type: ignore[assignment]
 
     _Provider.__name__ = (
-        spec.name.replace("-", "_").replace("_", " ").title().replace(" ", "")
-        + "CatalogProvider"
+        spec.name.replace("-", "_").replace("_", " ").title().replace(" ", "") + "CatalogProvider"
     )
     _Provider.__qualname__ = _Provider.__name__
     _PROVIDER_CACHE[spec.name] = _Provider

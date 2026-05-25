@@ -45,9 +45,7 @@ class GlueCatalogRegistrar(CatalogRegistrar):
     timeout_seconds: int = 30
     base_url_override: Optional[str] = None
 
-    def register_payload(
-        self, payload: CatalogPublicationPayload
-    ) -> RegistrationResult:
+    def register_payload(self, payload: CatalogPublicationPayload) -> RegistrationResult:
         product_urn = f"glue://{self.database_name}/{payload.product.product_id}"
         last_err: Optional[str] = None
         published: List[str] = []
@@ -103,8 +101,7 @@ class GlueCatalogRegistrar(CatalogRegistrar):
         urn = f"glue://{self.database_name}/{expose_id}"
         try:
             with safe_httpx_client(
-                base_url=self.base_url_override
-                or f"https://glue.{self.region}.amazonaws.com",
+                base_url=self.base_url_override or f"https://glue.{self.region}.amazonaws.com",
                 timeout=float(self.timeout_seconds),
                 allow_private=True,
             ) as c:
@@ -127,9 +124,7 @@ class GlueCatalogRegistrar(CatalogRegistrar):
 
     # ── helpers ──────────────────────────────────────────────────────
 
-    def _post_create_table(
-        self, payload: CatalogPublicationPayload, asset: AssetPayload
-    ) -> None:
+    def _post_create_table(self, payload: CatalogPublicationPayload, asset: AssetPayload) -> None:
         """Upsert a Glue table — Create on first call, Update on
         ``AlreadyExistsException`` so re-publishing the same FLUID
         contract is idempotent (catalogs are inherently upsert-shaped).
@@ -138,10 +133,7 @@ class GlueCatalogRegistrar(CatalogRegistrar):
         from fluid_build.util.safe_http import safe_httpx_client
 
         body = self._create_table_payload(payload, asset)
-        endpoint = (
-            self.base_url_override
-            or f"https://glue.{self.region}.amazonaws.com"
-        )
+        endpoint = self.base_url_override or f"https://glue.{self.region}.amazonaws.com"
         with safe_httpx_client(
             base_url=endpoint,
             timeout=float(self.timeout_seconds),

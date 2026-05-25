@@ -45,20 +45,14 @@ class SnowflakeHorizonRegistrar(CatalogRegistrar):
     schema: str = "BRONZE"
     timeout_seconds: int = 30
 
-    def register_payload(
-        self, payload: CatalogPublicationPayload
-    ) -> RegistrationResult:
+    def register_payload(self, payload: CatalogPublicationPayload) -> RegistrationResult:
         product_urn = (
-            f"snowflake://{self.database}.{self.schema}."
-            f"{payload.product.product_id.upper()}"
+            f"snowflake://{self.database}.{self.schema}." f"{payload.product.product_id.upper()}"
         )
         last_err: Optional[str] = None
         published: List[str] = []
         for asset in payload.assets:
-            urn = (
-                f"snowflake://{self.database}.{self.schema}."
-                f"{asset.asset_id.upper()}"
-            )
+            urn = f"snowflake://{self.database}.{self.schema}." f"{asset.asset_id.upper()}"
             try:
                 self._post_create_table(payload, asset)
                 published.append(urn)
@@ -120,9 +114,7 @@ class SnowflakeHorizonRegistrar(CatalogRegistrar):
                     f"{expose_id.upper()}"
                 )
                 r.raise_for_status()
-            return RegistrationResult(
-                target="snowflake_horizon", urn=urn, succeeded=True
-            )
+            return RegistrationResult(target="snowflake_horizon", urn=urn, succeeded=True)
         except Exception as exc:  # noqa: BLE001
             return RegistrationResult(
                 target="snowflake_horizon", urn=urn, succeeded=False, error=str(exc)
@@ -136,9 +128,7 @@ class SnowflakeHorizonRegistrar(CatalogRegistrar):
             headers["Authorization"] = f'Snowflake Token="{self.auth_token}"'
         return headers
 
-    def _post_create_table(
-        self, payload: CatalogPublicationPayload, asset: AssetPayload
-    ) -> None:
+    def _post_create_table(self, payload: CatalogPublicationPayload, asset: AssetPayload) -> None:
         from fluid_build.util.safe_http import safe_httpx_client
 
         body = self._build_payload(payload, asset)
@@ -152,9 +142,7 @@ class SnowflakeHorizonRegistrar(CatalogRegistrar):
             r.raise_for_status()
 
     @staticmethod
-    def _build_payload(
-        payload: CatalogPublicationPayload, asset: AssetPayload
-    ) -> Dict[str, Any]:
+    def _build_payload(payload: CatalogPublicationPayload, asset: AssetPayload) -> Dict[str, Any]:
         product = payload.product
         # Build a markdown comment that surfaces in the Snowsight UI.
         # YAML fences keep the embedded specs readable both in the UI
@@ -174,18 +162,12 @@ class SnowflakeHorizonRegistrar(CatalogRegistrar):
         if meta_lines:
             sections.append("FLUID classification:\n" + "\n".join(meta_lines))
         if asset.odcs_yaml:
-            sections.append(
-                "ODCS contract (Bitol v3.1):\n```yaml\n" + asset.odcs_yaml + "\n```"
-            )
+            sections.append("ODCS contract (Bitol v3.1):\n```yaml\n" + asset.odcs_yaml + "\n```")
         if payload.specs.fluid_yaml:
-            sections.append(
-                "FLUID contract:\n```yaml\n" + payload.specs.fluid_yaml + "\n```"
-            )
+            sections.append("FLUID contract:\n```yaml\n" + payload.specs.fluid_yaml + "\n```")
         if payload.specs.odps_yaml:
             sections.append(
-                "ODPS data product spec (v1.0.0):\n```yaml\n"
-                + payload.specs.odps_yaml
-                + "\n```"
+                "ODPS data product spec (v1.0.0):\n```yaml\n" + payload.specs.odps_yaml + "\n```"
             )
         comment = "\n\n".join(sections)
 

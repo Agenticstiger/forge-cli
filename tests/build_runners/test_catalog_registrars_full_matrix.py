@@ -94,9 +94,9 @@ class TestDataHubRegistrar:
         assert result.urn == "urn:li:dataProduct:bronze.x"
         assert "snowflake" in result.metadata["dataset_urn"]
         assert datahub_mock.entities, "DataHub mock recorded dataset snapshot"
-        assert datahub_mock.proposals_for("dataProduct"), (
-            "DataHub mock recorded DataProduct MCP proposal"
-        )
+        assert datahub_mock.proposals_for(
+            "dataProduct"
+        ), "DataHub mock recorded DataProduct MCP proposal"
 
     def test_classifications_become_glossary_terms(self, datahub_mock):
         """``classifications`` map column → list of glossary-term labels.
@@ -145,10 +145,7 @@ class TestDataHubRegistrar:
         result = registrar.unregister("bronze.x", "orders")
         assert result.succeeded
         assert "urn:li:dataProduct:bronze.x" in datahub_mock.deletes
-        assert any(
-            "urn:li:dataset:" in u and "bronze.x.orders" in u
-            for u in datahub_mock.deletes
-        )
+        assert any("urn:li:dataset:" in u and "bronze.x.orders" in u for u in datahub_mock.deletes)
 
 
 # ── OpenMetadata ────────────────────────────────────────────────────────

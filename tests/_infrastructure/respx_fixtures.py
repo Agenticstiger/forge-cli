@@ -338,9 +338,7 @@ class DataHubMockServer:
 
     def attach(self, router: "respx.Router") -> None:
         router.post("/entities?action=ingest").mock(side_effect=self._ingest)
-        router.post("/aspects?action=ingestProposal").mock(
-            side_effect=self._ingest_proposal
-        )
+        router.post("/aspects?action=ingestProposal").mock(side_effect=self._ingest_proposal)
         router.post("/entities?action=delete").mock(side_effect=self._delete)
 
     def _ingest(self, request: Any) -> Any:

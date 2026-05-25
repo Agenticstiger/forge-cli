@@ -195,9 +195,7 @@ class CatalogPublicationPayload:
         )
         # Normalise classifications to immutable tuples so the payload
         # stays hashable / shareable across threads.
-        norm_classifications = {
-            str(col): tuple(labels) for col, labels in classifications.items()
-        }
+        norm_classifications = {str(col): tuple(labels) for col, labels in classifications.items()}
         return cls(
             product=product,
             assets=assets,
@@ -234,17 +232,13 @@ def _build_product(contract: Mapping[str, Any]) -> ProductPayload:
     )
 
 
-def _build_asset(
-    contract: Mapping[str, Any], expose: Mapping[str, Any]
-) -> AssetPayload:
+def _build_asset(contract: Mapping[str, Any], expose: Mapping[str, Any]) -> AssetPayload:
     if not isinstance(expose, Mapping):
         # Defensive — schema validation should catch this earlier, but
         # the canonical layer must never raise on bad input. Return a
         # placeholder so the rest of the payload still builds.
         return AssetPayload(asset_id="<malformed>", platform="forge")
-    expose_id = str(
-        expose.get("exposeId") or expose.get("name") or expose.get("id") or ""
-    )
+    expose_id = str(expose.get("exposeId") or expose.get("name") or expose.get("id") or "")
     binding = expose.get("binding") or {}
     platform = str((binding.get("platform") if isinstance(binding, Mapping) else None) or "forge")
     location = dict((binding.get("location") or {})) if isinstance(binding, Mapping) else {}
@@ -260,9 +254,7 @@ def _build_asset(
             upstream_platform=ref.get("platform"),
         )
         for ref in (contract.get("consumes") or [])
-        if isinstance(ref, Mapping)
-        and ref.get("productId")
-        and ref.get("exposeId")
+        if isinstance(ref, Mapping) and ref.get("productId") and ref.get("exposeId")
     )
     return AssetPayload(
         asset_id=expose_id,
@@ -311,9 +303,7 @@ def _render_odps_yaml(contract: Mapping[str, Any]) -> Optional[str]:
         return None
 
 
-def _render_odcs_yaml(
-    contract: Mapping[str, Any], expose_id: str
-) -> Optional[str]:
+def _render_odcs_yaml(contract: Mapping[str, Any], expose_id: str) -> Optional[str]:
     if not expose_id:
         return None
     try:
