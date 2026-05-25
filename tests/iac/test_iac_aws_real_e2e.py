@@ -297,10 +297,25 @@ def test_real_athena_query_executes_against_iceberg(aws_real_project, aws_accoun
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    not __import__("importlib.util").util.find_spec("dbt.adapters.athena"),
-    reason="needs dbt-athena-community installed",
-)
+def _have_dbt_athena() -> bool:
+    """``importlib.util.find_spec`` walks the import chain — when the
+    parent package ``dbt`` itself isn't installed it raises
+    ``ModuleNotFoundError`` instead of returning ``None``. Wrap the
+    probe so a CI environment without dbt-athena doesn't crash module
+    collection. Mirrors the helper in ``test_iac_aws_dbt_athena_e2e.py``
+    and ``test_iac_aws_real_dbt_mesh_cli_e2e.py``."""
+    try:
+        import dbt.adapters.athena  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+_HAVE_DBT_ATHENA = _have_dbt_athena()
+
+
+@pytest.mark.skipif(not _HAVE_DBT_ATHENA, reason="needs dbt-athena-community installed")
 def test_real_dbt_athena_materialises_table_into_glue_catalog(aws_real_project, tmp_path):
     """The full ``--mode amend-and-build`` path against real Athena:
 
