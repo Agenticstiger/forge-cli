@@ -304,9 +304,7 @@ def _build_generated_dbt_profile(
                 or 5
             ),
             "connect_timeout": int(
-                resources.get("connect_timeout")
-                or props.get("connect_timeout")
-                or 60
+                resources.get("connect_timeout") or props.get("connect_timeout") or 60
             ),
         }
 
@@ -315,9 +313,7 @@ def _build_generated_dbt_profile(
             if iam_profile:
                 output["iam_profile"] = iam_profile
             region = (
-                resources.get("region")
-                or os.getenv("REDSHIFT_REGION")
-                or os.getenv("AWS_REGION")
+                resources.get("region") or os.getenv("REDSHIFT_REGION") or os.getenv("AWS_REGION")
             )
             if region:
                 output["region"] = region
@@ -344,8 +340,7 @@ def _build_generated_dbt_profile(
                     output["serverless_acct_id"] = str(acct)
                 if not output["host"] and acct and region:
                     output["host"] = (
-                        f"{workgroup}.{acct}.{region}"
-                        ".redshift-serverless.amazonaws.com"
+                        f"{workgroup}.{acct}.{region}" ".redshift-serverless.amazonaws.com"
                     )
                 # Serverless has no cluster_id; clear any stale value.
                 output.pop("cluster_id", None)

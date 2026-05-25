@@ -126,7 +126,8 @@ forge-cli/
 |------|-------|
 | CLI entrypoint | `fluid_build/cli/__init__.py` → `main()` |
 | Command implementations | `fluid_build/cli/*.py` (one per 11-stage step, plus supporting commands) |
-| Provider plugins | `fluid_build/providers/{local,gcp,aws,snowflake,odps,odcs}/` |
+| Provider plugins (planning) | `fluid_build/providers/{local,gcp,aws,snowflake,odps,odcs}/` — `plan()` emits abstract actions |
+| **IaC emitter (apply)** | `fluid_build/iac/` — modular OpenTofu plugin registry. `cli/_apply_opentofu_engine.py` compiles the contract to `main.tf.json` and shells `tofu` for cloud providers. `cli/generate_iac.py` is `fluid generate iac` for review-only emit. One plugin per cloud at `iac/providers/{aws,gcp,snowflake}.py` (dbt-adapter pattern). |
 | Path-B schedulers | `fluid_build/providers/aws/plan/schedule.py` (EventBridge/MWAA/Lambda/Step-Functions via stage 6 `SchedulePlanner`) |
 | Contract schemas | `fluid_build/schemas/*.json` (0.7.2 is latest; `SchemaManager.latest_bundled_version()` is the dynamic lookup) |
 | Policy engine | `fluid_build/policy/` (compiler, agent_policy, sovereignty, guardrails) |
@@ -138,7 +139,7 @@ forge-cli/
 | Forge (AI creation) | `fluid_build/forge/` (templates, generators, extensions) |
 | Log redaction (global) | `fluid_build/observability/secret_redactor.py` — `SecretRedactingFilter` wired into Python logging |
 | SQL safety helpers | `fluid_build/providers/_sql_safety.py` — `validate_ident`, `quote_string_literal` (required for every DDL f-string) |
-| Test suite | `tests/` — mirrors `fluid_build/` structure |
+| Test suite | `tests/` — mirrors `fluid_build/` structure; IaC tier 1/2/3 lives at `tests/iac/` |
 | Smoke scripts | `scripts/smoke_phase_6b.py` + `scripts/smoke_a1.py` — operator / contributor validation against real Snowflake |
 
 ### Development Commands

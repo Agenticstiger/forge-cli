@@ -255,6 +255,66 @@ Key env vars added this session:
 | `FLUID_RUN_ID` | override or pre-seed cross-stage run-id |
 | `FLUID_COST_LIMIT_USD_PER_PRODUCT` | per-product cost ceiling (separate from the existing per-run cap) |
 
+## Recent architectural changes worth knowing (2026-05-25, OpenTofu autogen)
+
+The `feat/opentofu-iac-autogen` branch retires the hand-rolled per-cloud
+apply paths and routes `fluid apply` (for cloud providers) through a
+modular **OpenTofu emitter**. `AUTOGEN_SPIKE.md` (repo root) is the
+canonical architecture doc; `HONESTLY_TESTED.md` is the coverage matrix.
+Headline items:
+
+- **New module `fluid_build/iac/`** — plugin-registry / runner / module
+  builder / credentials / backend / importer / shadow / cutover. One
+  `IacProviderPlugin` per cloud (`iac/providers/{aws,gcp,snowflake}.py`),
+  borrowed from dbt's adapter pattern (Pulumi confirms the shape). Adding
+  Azure later is one new file + one `register_iac_plugin()` line; zero
+  core edits.
+- **`fluid generate iac <contract>`** — emits a deterministic
+  `main.tf.json` (canonical JSON, `sort_keys`, credential-free) for
+  review before any apply.
+- **`fluid apply` on cloud providers routes through OpenTofu** — not a
+  user-facing flag, the per-provider mapping lives in `iac/cutover.py`.
+  `local` keeps its native apply.
+- **Plan-binding integrity is replicated** —
+  `_apply_opentofu_engine.py::_verify_plan_binding_for_opentofu` mirrors
+  the native engine's `_verify_plan_digests` gate so a tampered
+  `plan.json` is rejected before any `tofu apply`.
+- **Operational hardening** — `runner.py` carries a per-command timeout
+  (default 1800s, override with `FLUID_TOFU_TIMEOUT_SECONDS`), a
+  `require_tofu_version()` gate (floor 1.6.0), and the
+  `--allow-data-loss` override emits an audit-trail WARNING +
+  structured `opentofu_destructive_gate_override` event.
+- **Catalog registrars retired** — `build_runners/catalog_registrars/`
+  loses `glue.py` + `snowflake_horizon.py` (~514 LOC). Glue table
+  parameters / column comments + Snowflake Horizon markdown comments
+  are folded into the IaC emit (`iac/providers/aws.py::_emit_glue`,
+  `iac/providers/snowflake.py::_build_horizon_table_comment`). The
+  remaining catalog backends (`datahub`, `openmetadata`,
+  `datamesh_manager`) keep their registrar shape.
+- **Cross-account / cross-project access** uses **existing schema fields**
+  — Lake Formation grants via `binding.governance.lakeFormation`, BQ
+  cross-project via `metadata.policies` → dataset `access[]` block.
+  No new schema fields beyond the LF block.
+- **Test coverage** is three-tier: unit (`tests/iac/test_iac_*.py`),
+  emulator (LocalStack Pro / GCP emulators), live cloud (gated by
+  `FLUID_IAC_LIVE_{AWS,GCP,SNOWFLAKE}=1` env vars). Snowflake live tests
+  source creds from the `snowflake-biz-lab` repo's `.env`. Coverage
+  matrix in `HONESTLY_TESTED.md`.
+
+Key env vars added by this branch:
+
+| env var | what it does |
+|---|---|
+| `FLUID_TOFU_TIMEOUT_SECONDS` | per-`tofu` invocation wall-clock cap (default 1800) |
+| `FLUID_IAC_LIVE_AWS=1` | enable Stage 3 live AWS tests (real cloud) |
+| `FLUID_IAC_LIVE_GCP=1` | enable Stage 3 live GCP tests (real cloud) |
+| `FLUID_IAC_LIVE_SNOWFLAKE=1` | enable Stage 3 live Snowflake tests (real cloud) |
+
+Drafted upstream issues for known external gaps live in
+`docs/upstream-issues/` (snowflakedb/snowflake v2 tag-masking
+association removal; two LocalStack Pro quirks: Lambda in
+docker-in-docker, Lake Formation DataLakeAdmin → GrantPermissions).
+
 ## Working style
 
 - **Goal-driven execution.** For non-trivial tasks, state success criteria before implementing and loop until verified. Transform imperatives into tests: "add redactor coverage" → "new pattern is masked by a test assertion"; "fix the bug" → "reproducing test passes first, then fix makes it green".

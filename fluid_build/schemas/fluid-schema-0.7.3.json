@@ -3275,11 +3275,10 @@
             "enum": [
               "datahub",
               "openmetadata",
-              "unity",
-              "glue",
-              "snowflake_horizon"
+              "datamesh_manager"
             ]
-          }
+          },
+          "description": "Catalog targets the publish stage will auto-register against. ``glue`` and ``snowflake_horizon`` are intentionally absent — their publish-side metadata is now emitted into ``aws_glue_catalog_table`` and ``snowflake_table`` directly by the IaC plugins (one source of truth, drift detection via tofu state). ``unity`` was dropped earlier when the OSS Unity Catalog publish-side registrar proved too fragile."
         },
         "documentation": {
           "type": "string",

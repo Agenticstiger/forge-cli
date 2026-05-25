@@ -156,6 +156,8 @@ class TestPerContractState:
 
     def test_workdir_includes_contract_id_segment(self, monkeypatch, tmp_path):
         monkeypatch.setattr(engine.runner, "tofu_path", lambda: "/usr/bin/tofu")
+        # Skip the version-floor probe (subprocess fork against a fake path).
+        monkeypatch.setattr(engine.runner, "require_tofu_version", lambda: None)
         monkeypatch.setattr(
             engine.runner, "tofu_init", lambda *a, **k: engine.runner.TofuResult("init", 0, "", "")
         )
@@ -163,6 +165,16 @@ class TestPerContractState:
             engine.runner,
             "tofu_plan",
             lambda *a, **k: engine.runner.TofuResult("plan", 0, "", "", events=[]),
+        )
+        # ``_adopt_existing`` now finds candidates (GCP discover_imports
+        # is no longer a stub); short-circuit the state-list + import
+        # subprocess shells so this test keeps focusing on the workdir
+        # layout invariant it owns.
+        monkeypatch.setattr(engine.runner, "tofu_state_list", lambda *a, **k: [])
+        monkeypatch.setattr(
+            engine.runner,
+            "tofu_import",
+            lambda *a, **k: engine.runner.TofuResult("import", 1, "", "stub"),
         )
         args = argparse.Namespace(
             contract=str(_GCP_CONTRACT),

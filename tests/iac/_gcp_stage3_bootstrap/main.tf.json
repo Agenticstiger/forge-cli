@@ -51,6 +51,13 @@
         "display_name": "Fluid Stage 3 test runner",
         "project": "${var.project_id}",
         "description": "Service account impersonated by tests/iac/test_iac_gcp_real_e2e.py. Provisioned + destroyed per test via tofu, identity scoped to fluid-iactest-* resources."
+      },
+      "fluid_test_consumer": {
+        "//": "Cross-project-consumer proxy SA for Stage 3 cross-project tests. The deployer (fluid_test_runner OR the user principal) gets serviceAccountTokenCreator on this SA so the test session can impersonate it and verify that the contract's google_bigquery_dataset_iam_member grant actually authorises a BQ read. A REAL cross-project test would have this SA in a SECOND project — same member-string syntax (serviceAccount:<email>@<project>.iam.gserviceaccount.com), same dataset-IAM grant shape. Boundary-crossing across projects/folders is the only thing we can't exercise on a single sandbox project.",
+        "account_id": "fluid-iactest-consumer",
+        "display_name": "Fluid Stage 3 cross-project consumer",
+        "project": "${var.project_id}",
+        "description": "Consumer proxy SA for cross-project IAM-grant LOGIC tests."
       }
     },
 
@@ -90,13 +97,26 @@
         "service_account_id": "${google_service_account.fluid_test_runner.name}",
         "role":               "roles/iam.serviceAccountTokenCreator",
         "member":             "${var.user_principal}"
+      },
+      "user_can_impersonate_consumer": {
+        "//": "Same token-creator grant for the consumer SA so the test session can impersonate it.",
+        "service_account_id": "${google_service_account.fluid_test_consumer.name}",
+        "role":               "roles/iam.serviceAccountTokenCreator",
+        "member":             "${var.user_principal}"
+      },
+      "runner_can_impersonate_consumer": {
+        "//": "Also let the runner SA mint consumer tokens — supports the impersonation chain when tests run via the runner SA (e.g., via WIF in CI).",
+        "service_account_id": "${google_service_account.fluid_test_consumer.name}",
+        "role":               "roles/iam.serviceAccountTokenCreator",
+        "member":             "serviceAccount:${google_service_account.fluid_test_runner.email}"
       }
     }
   },
 
   "output": {
-    "project_id":   {"value": "${var.project_id}"},
-    "region":       {"value": "${var.region}"},
-    "test_sa_email":{"value": "${google_service_account.fluid_test_runner.email}"}
+    "project_id":      {"value": "${var.project_id}"},
+    "region":          {"value": "${var.region}"},
+    "test_sa_email":   {"value": "${google_service_account.fluid_test_runner.email}"},
+    "consumer_sa_email":{"value": "${google_service_account.fluid_test_consumer.email}"}
   }
 }

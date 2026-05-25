@@ -608,3 +608,127 @@ class TestAwsRedshiftModuleOutput:
         doc = json.loads(text)
         assert "null" in doc["terraform"]["required_providers"]
         assert doc["terraform"]["required_providers"]["null"]["source"] == "hashicorp/null"
+
+
+# ── Glue catalog metadata enrichment (absorbed from the retired registrar) ──
+
+
+class TestAwsGlueCatalogEnrichment:
+    """The retired ``catalog_registrars.glue.GlueCatalogRegistrar`` used
+    to push table description / column comments / fluid_layer +
+    fluid_product_type + fluid_domain + fluid_contract + forge.pii.<col>
+    parameters via ``glue:UpdateTable``. Those land on
+    ``aws_glue_catalog_table`` directly now — one source of truth, one
+    tofu apply, drift detection for free.
+
+    Coverage moves here from ``test_catalog_registrars_full_matrix.py``
+    (TestGlueRegistrar) and ``test_catalog_backends_canonical.py``
+    (TestGlueCanonicalFields). Pinning at the dict level — the .tf.json
+    string is covered by ``test_iac_tofu_validate.py``.
+    """
+
+    @staticmethod
+    def _enriched_contract() -> dict:
+        return {
+            "id": "bronze.commerce",
+            "name": "Bronze commerce orders",
+            "description": "Customer order ledger",
+            "domain": "commerce",
+            "fluidVersion": "0.7.3",
+            "metadata": {
+                "layer": "Bronze",
+                "productType": "SDP",
+                "description": "Silver-layer aggregations of customer orders",
+                "owner": {"team": "data-eng", "email": "x@x.co"},
+            },
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "binding": {
+                        "platform": "aws",
+                        "format": "parquet",
+                        "location": {
+                            "database": "commerce",
+                            "table": "orders",
+                            "bucket": "fluid-bronze-commerce",
+                            "path": "orders/",
+                        },
+                    },
+                    "contract": {
+                        "schema": [
+                            {"name": "id", "type": "string", "description": "Order id"},
+                            # ``tags`` is the existing v0.7.3 column field —
+                            # the IaC emit projects each column's tags to
+                            # the canonical ``forge.pii.<col>`` parameter.
+                            {
+                                "name": "email",
+                                "type": "string",
+                                "description": "Customer email",
+                                "tags": ["pii", "email"],
+                            },
+                        ]
+                    },
+                }
+            ],
+        }
+
+    def test_table_description_lands_on_glue_resource(self):
+        res = _aws().emit(self._enriched_contract())
+        tbl = next(iter(res["aws_glue_catalog_table"].values()))
+        # ``metadata.description`` wins over the bare ``contract.description``
+        # — analyst-facing field, lives on the Glue table's first-class
+        # ``description`` (NOT in the parameters map, so visible in the
+        # AWS console table header).
+        assert tbl["description"] == "Silver-layer aggregations of customer orders"
+
+    def test_per_column_comments_propagate(self):
+        res = _aws().emit(self._enriched_contract())
+        tbl = next(iter(res["aws_glue_catalog_table"].values()))
+        cols = {c["name"]: c.get("comment") for c in tbl["storage_descriptor"]["columns"]}
+        assert cols["id"] == "Order id"
+        assert cols["email"] == "Customer email"
+
+    def test_fluid_metadata_parameters_set(self):
+        res = _aws().emit(self._enriched_contract())
+        params = next(iter(res["aws_glue_catalog_table"].values()))["parameters"]
+        assert params["fluid_layer"] == "Bronze"
+        assert params["fluid_product_type"] == "SDP"
+        assert params["fluid_domain"] == "commerce"
+        assert params["fluid_version"] == "0.7.3"
+        # The existing infrastructure-side parameters are preserved.
+        assert params["classification"] == "parquet"
+        assert params["managed_by"] == "fluid"
+
+    def test_column_tags_become_forge_pii_parameters(self):
+        # ``forge.pii.<col>`` is the legacy Glue layout that analyst
+        # dashboards built on — the IaC emit projects ``column.tags[]``
+        # (the existing v0.7.3 field on ``$defs.column``) to this
+        # parameter so existing tooling keeps working. Zero schema
+        # changes — we read what's already there.
+        res = _aws().emit(self._enriched_contract())
+        params = next(iter(res["aws_glue_catalog_table"].values()))["parameters"]
+        assert params["forge.pii.email"] == "pii,email"
+
+    def test_fluid_contract_yaml_attached(self):
+        res = _aws().emit(self._enriched_contract())
+        params = next(iter(res["aws_glue_catalog_table"].values()))["parameters"]
+        assert "fluid_contract" in params
+        # It's the contract YAML — should mention the contract id verbatim.
+        assert "bronze.commerce" in params["fluid_contract"]
+
+    def test_minimal_contract_omits_optional_enrichments(self):
+        # A contract with no description / no metadata / no column tags
+        # does NOT add a ``description`` field or fluid_* parameters
+        # beyond the infrastructure essentials. Existing zero-metadata
+        # contracts are unaffected.
+        res = _aws().emit(_contract([_glue_exposure(database="d", table="t", bucket="b")]))
+        tbl = next(iter(res["aws_glue_catalog_table"].values()))
+        # No ``description`` field when the contract has none.
+        assert "description" not in tbl
+        params = tbl["parameters"]
+        # No fluid_layer / fluid_product_type / forge.pii.* either.
+        assert "fluid_layer" not in params
+        assert "fluid_product_type" not in params
+        assert not any(k.startswith("forge.pii.") for k in params)
+        # But the infra-side parameters remain.
+        assert params["managed_by"] == "fluid"

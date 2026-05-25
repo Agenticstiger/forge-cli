@@ -87,7 +87,5 @@ def test_real_gcp_idempotency_apply_twice_no_changes(gcp_real_project, gcp_accou
     assert second_apply.ok, second_apply.stderr or second_apply.stdout
     apply_summary = runner.change_summary(second_apply)
     assert (
-        apply_summary["add"] == 0
-        and apply_summary["change"] == 0
-        and apply_summary["remove"] == 0
+        apply_summary["add"] == 0 and apply_summary["change"] == 0 and apply_summary["remove"] == 0
     ), f"second apply caused churn: {apply_summary}"

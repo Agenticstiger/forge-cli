@@ -289,9 +289,7 @@ def test_real_cli_apply_amend_creates_resources(aws_real_project, aws_account):
 
     s3 = aws_real_boto("s3")
     bucket_names = {b["Name"] for b in s3.list_buckets()["Buckets"]}
-    assert bucket in bucket_names, (
-        f"bucket {bucket!r} not in S3 after amend apply"
-    )
+    assert bucket in bucket_names, f"bucket {bucket!r} not in S3 after amend apply"
 
 
 # ---------------------------------------------------------------------------
@@ -345,9 +343,9 @@ def test_real_cli_apply_plan_binding_tamper_rejected(aws_real_project, aws_accou
 
     s3 = aws_real_boto("s3")
     bucket_names = {b["Name"] for b in s3.list_buckets()["Buckets"]}
-    assert bucket not in bucket_names, (
-        "tampered apply created the bucket — verify gate not blocking"
-    )
+    assert (
+        bucket not in bucket_names
+    ), "tampered apply created the bucket — verify gate not blocking"
 
 
 def test_real_cli_apply_no_verify_plan_binding_bypass(aws_real_project, aws_account):

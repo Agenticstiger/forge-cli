@@ -44,6 +44,7 @@ import pytest
 from fluid_build.iac import runner
 
 from .conftest import (
+    aws_cross_account_iceberg_contract,
     aws_iceberg_contract,
     aws_kinesis_contract,
     aws_s3_only_contract,
@@ -97,6 +98,51 @@ def test_iceberg_on_glue_round_trip(localstack_project, localstack_endpoint):
     assert table["Parameters"]["table_type"] == "ICEBERG"
     cols = {c["Name"]: c["Type"] for c in table["StorageDescriptor"]["Columns"]}
     assert cols == {"event_id": "string", "occurred_at": "timestamp", "amount": "decimal(12,2)"}
+
+
+def test_cross_account_lf_grant_plus_s3_bucket_policy_round_trip(
+    localstack_project, localstack_endpoint
+):
+    """Cross-account LF grant + S3 bucket policy apply cleanly on LocalStack.
+
+    LocalStack's free tier does not enforce LF cross-account semantics
+    end-to-end (RAM share + organization checks), but it DOES accept the
+    ``aws_lakeformation_permissions`` and ``aws_s3_bucket_policy``
+    resource shapes — which is what we're verifying. The point of
+    Stage 2 here is "tofu apply does not crash on the new emit"; the
+    "does the consumer principal actually get authorised" check lives
+    in Stage 3 (same-account-two-role proxy).
+
+    Asserts:
+      * ``tofu apply`` exit-0 with the new emit.
+      * ``GetBucketPolicy`` returns a policy containing the consumer
+        principal's ARN — verifies the resource landed where we said.
+    """
+    bucket = "fluid-ls-xacc-iceberg"
+    contract = aws_cross_account_iceberg_contract(
+        bucket=bucket,
+        database="mesh_silver_xacc",
+        table="events",
+        # An ARN in a *different* account — same shape an OrganizationAccount
+        # consumer would have. LocalStack doesn't verify the account exists.
+        consumer_principal="arn:aws:iam::222222222222:role/consumer-role",
+        cid="iac.aws.ls.xacc",
+    )
+    localstack_project.apply_ok(contract)
+
+    s3 = localstack_boto("s3", localstack_endpoint)
+    # GetBucketPolicy returns the policy doc as a JSON string.
+    policy_resp = s3.get_bucket_policy(Bucket=bucket)
+    policy_doc = json.loads(policy_resp["Policy"])
+    assert policy_doc["Version"] == "2012-10-17"
+    stmts = policy_doc["Statement"]
+    assert len(stmts) == 2, f"expected List + Get statements, got {len(stmts)}"
+    principals = {s["Principal"]["AWS"] for s in stmts}
+    assert principals == {
+        "arn:aws:iam::222222222222:role/consumer-role"
+    }, f"cross-account principal not in policy doc; got {principals}"
+    actions = {a for s in stmts for a in s["Action"]}
+    assert {"s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"} <= actions
 
 
 def test_kinesis_stream_round_trip(localstack_project, localstack_endpoint):

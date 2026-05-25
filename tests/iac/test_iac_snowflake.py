@@ -1285,3 +1285,93 @@ class TestSnowflakeDependencyWiring:
                     )
         # And the wiring is not vacuous — at least one resource picked up a dep.
         assert any_dep_seen, "dependency wiring produced no depends_on at all"
+
+
+# ── Snowflake catalog enrichment (no schema additions) ─────────────────
+
+
+def _enriched_snowflake_contract() -> dict:
+    """A snowflake contract carrying all the catalog-style metadata
+    that the retired Horizon registrar used to push: product
+    description, layer / productType / domain / version, per-column
+    descriptions. Every field already exists in v0.7.3 — no new schema
+    surface."""
+    return {
+        "fluidVersion": "0.7.3",
+        "kind": "DataProduct",
+        "id": "silver.commerce.orders",
+        "name": "Snowflake catalog enrichment test",
+        "domain": "commerce",
+        "description": "Silver orders carried in the table comment",
+        "metadata": {
+            "layer": "Silver",
+            "productType": "ADP",
+            "description": "Customer orders — silver layer",
+            "owner": {"team": "data-eng", "email": "x@x.co"},
+        },
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "kind": "table",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_table",
+                    "location": {
+                        "database": "COMMERCE",
+                        "schema": "ORDERS",
+                        "table": "ORDERS",
+                    },
+                },
+                "contract": {
+                    "schema": [
+                        {
+                            "name": "ID",
+                            "type": "string",
+                            "required": True,
+                            "description": "Order id",
+                        },
+                        {"name": "EMAIL", "type": "string", "description": "Customer email"},
+                    ]
+                },
+            }
+        ],
+    }
+
+
+class TestSnowflakeCatalogEnrichment:
+    """Catalog-style metadata (table comment + per-column comments)
+    that the retired ``SnowflakeHorizonRegistrar`` used to push via
+    raw HTTP now lands directly on ``snowflake_table`` — sourced from
+    fields the v0.7.3 schema ALREADY provided. Zero new schema
+    additions for this work."""
+
+    def test_table_comment_carries_horizon_markdown(self):
+        # Absorbed from the retired Horizon registrar's _build_payload:
+        # markdown comment with description + FLUID classification +
+        # FLUID contract YAML. Snowsight + DESC TABLE see this verbatim.
+        res = _sf().emit(_enriched_snowflake_contract(), [])
+        tbl = next(iter(res["snowflake_table"].values()))
+        comment = tbl.get("comment") or ""
+        assert "Customer orders — silver layer" in comment
+        assert "fluid_layer: Silver" in comment
+        assert "fluid_product_type: ADP" in comment
+        assert "fluid_domain: commerce" in comment
+        # The FLUID contract YAML is fenced and embedded.
+        assert "```yaml" in comment
+        assert "silver.commerce.orders" in comment
+
+    def test_per_column_comments_on_snowflake_table(self):
+        res = _sf().emit(_enriched_snowflake_contract(), [])
+        tbl = next(iter(res["snowflake_table"].values()))
+        cols = {c["name"]: c.get("comment") for c in tbl["column"]}
+        assert cols["ID"] == "Order id"
+        assert cols["EMAIL"] == "Customer email"
+
+    def test_no_governance_block_emits_no_tag_resources(self):
+        # The v0.7.3 schema has NO governance.snowflake block on this
+        # branch — emitting any snowflake_tag* resource here would be
+        # a regression. Pins the schema-minimum invariant.
+        res = _sf().emit(_enriched_snowflake_contract(), [])
+        assert "snowflake_tag" not in res
+        assert "snowflake_tag_association" not in res
+        assert "snowflake_tag_masking_policy_association" not in res

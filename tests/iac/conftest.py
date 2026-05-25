@@ -872,12 +872,8 @@ def localstack_project(
 # local startup; CI runs the same compose file before invoking pytest.
 
 
-GCP_EMULATOR_BIGQUERY = os.environ.get(
-    "FLUID_GCP_BIGQUERY_EMULATOR", "http://localhost:9050"
-)
-GCP_EMULATOR_STORAGE = os.environ.get(
-    "FLUID_GCP_STORAGE_EMULATOR", "http://localhost:4443"
-)
+GCP_EMULATOR_BIGQUERY = os.environ.get("FLUID_GCP_BIGQUERY_EMULATOR", "http://localhost:9050")
+GCP_EMULATOR_STORAGE = os.environ.get("FLUID_GCP_STORAGE_EMULATOR", "http://localhost:4443")
 GCP_EMULATOR_PUBSUB = os.environ.get("PUBSUB_EMULATOR_HOST", "localhost:8085")
 GCP_EMULATOR_PROJECT = os.environ.get("FLUID_GCP_EMULATOR_PROJECT", "fluid-emulator")
 
@@ -958,9 +954,9 @@ def gcp_provider_override(
 
 def gcp_emulator_bigquery_client(*, project: str = GCP_EMULATOR_PROJECT):
     """A ``google.cloud.bigquery.Client`` pointed at the BigQuery emulator."""
-    from google.cloud import bigquery
     from google.api_core.client_options import ClientOptions
     from google.auth.credentials import AnonymousCredentials
+    from google.cloud import bigquery
 
     return bigquery.Client(
         project=project,
@@ -971,8 +967,8 @@ def gcp_emulator_bigquery_client(*, project: str = GCP_EMULATOR_PROJECT):
 
 def gcp_emulator_storage_client(*, project: str = GCP_EMULATOR_PROJECT):
     """A ``google.cloud.storage.Client`` pointed at the fake-gcs-server."""
-    from google.cloud import storage as _storage
     from google.auth.credentials import AnonymousCredentials
+    from google.cloud import storage as _storage
 
     client = _storage.Client(
         project=project,
@@ -990,8 +986,9 @@ class GcpEmulatorProject:
     portable ``main.tf.json``.
     """
 
-    def __init__(self, workdir: Path, env: Mapping[str, str], *,
-                 project: str = GCP_EMULATOR_PROJECT) -> None:
+    def __init__(
+        self, workdir: Path, env: Mapping[str, str], *, project: str = GCP_EMULATOR_PROJECT
+    ) -> None:
         self.workdir = workdir
         self.env = dict(env)
         # The emulators ignore credentials; the dummy access token stops
@@ -1046,9 +1043,7 @@ class GcpEmulatorProject:
 
 
 @pytest.fixture
-def gcp_emulator_project(
-    tofu_env: Dict[str, str], tmp_path: Path
-) -> Iterator[GcpEmulatorProject]:
+def gcp_emulator_project(tofu_env: Dict[str, str], tmp_path: Path) -> Iterator[GcpEmulatorProject]:
     """A :class:`GcpEmulatorProject` bound to a fresh workdir.
 
     The emulators reset their state on container restart but not between
@@ -1129,6 +1124,66 @@ def aws_kinesis_contract(stream: str, cid: str = "iac.aws.kinesis") -> Dict[str,
                     "platform": "aws",
                     "format": "kafka_topic",
                     "location": {"stream": stream, "shard_count": 2},
+                },
+            }
+        ],
+    }
+
+
+def aws_cross_account_iceberg_contract(
+    bucket: str,
+    database: str,
+    table: str,
+    *,
+    consumer_principal: str,
+    cid: str = "iac.aws.xacc",
+) -> Dict[str, Any]:
+    """Iceberg-on-Glue contract with an LF grant to a non-deployer principal.
+
+    Any IAM-principal LF grant on a Glue-catalog-backed S3 binding
+    triggers BOTH:
+
+      * ``aws_lakeformation_permissions`` granting SELECT/DESCRIBE
+      * ``aws_s3_bucket_policy`` granting s3:GetObject + s3:ListBucket
+
+    The pairing is automatic — the canonical AWS LF cross-account pattern
+    (the aws-lakeformation-best-practices cross-account FAQ + Komminar's
+    Terraform article both spell it out: LF alone does not authorise
+    object-byte reads; a bucket-policy companion is required). No
+    opt-in flag — emitting both is correct for in-account principals
+    too (the bucket policy is additive on top of their IAM read).
+    """
+    return {
+        "id": cid,
+        "name": "AWS X-acc Iceberg",
+        "exposes": [
+            {
+                "exposeId": "events",
+                "binding": {
+                    "platform": "aws",
+                    "format": "iceberg",
+                    "location": {
+                        "database": database,
+                        "table": table,
+                        "bucket": bucket,
+                        "path": f"silver/{table}/",
+                    },
+                    "governance": {
+                        "lakeFormation": {
+                            "grants": [
+                                {
+                                    "principal": consumer_principal,
+                                    "permissions": ["SELECT", "DESCRIBE"],
+                                }
+                            ]
+                        }
+                    },
+                },
+                "contract": {
+                    "schema": [
+                        {"name": "event_id", "type": "string", "required": True},
+                        {"name": "amount", "type": "decimal(12,2)"},
+                    ]
                 },
             }
         ],
@@ -1283,9 +1338,7 @@ def aws_real_boto(service: str) -> Any:
     """
     import boto3
 
-    region = (
-        os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
-    )
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
     return boto3.client(service, region_name=region)
 
 
@@ -1423,9 +1476,7 @@ def _aws_live_sweeper(request) -> Iterator[None]:
     except Exception:  # noqa: BLE001
         return
 
-    region = (
-        os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
-    )
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
 
     def _client(service: str):
         return boto3.client(service, region_name=region)
@@ -1452,9 +1503,7 @@ def _aws_live_sweeper(request) -> Iterator[None]:
             name = entry["Name"]
             if not name.startswith(AWS_LIVE_PREFIX):
                 continue
-            if _is_bootstrap_resource(
-                lambda: s3.get_bucket_tagging(Bucket=name).get("TagSet")
-            ):
+            if _is_bootstrap_resource(lambda: s3.get_bucket_tagging(Bucket=name).get("TagSet")):
                 continue
             with contextlib.suppress(Exception):
                 s3r.Bucket(name).objects.all().delete()
@@ -1519,12 +1568,18 @@ def aws_real_iceberg_contract(
 
 
 def aws_real_role_arn(kind: str) -> str:
-    """Resolve one of the four bootstrap IAM role ARNs from the env."""
+    """Resolve one of the bootstrap IAM role ARNs from the env."""
     key = {
         "lambda": "FLUID_AWS_LAMBDA_ROLE_ARN",
         "sfn": "FLUID_AWS_SFN_ROLE_ARN",
         "glue": "FLUID_AWS_GLUE_ROLE_ARN",
         "spectrum": "FLUID_AWS_SPECTRUM_ROLE_ARN",
+        # Cross-account-consumer proxy role — trust policy allows any
+        # IAM identity in the deployer's account to sts:AssumeRole. Used
+        # by the Stage 3 cross-account proxy tests as the "principal in
+        # account B" — same trust-policy shape a real cross-account
+        # consumer would have, just collapsed onto a single sandbox.
+        "consumer": "FLUID_AWS_CONSUMER_ROLE_ARN",
     }[kind]
     arn = os.environ.get(key)
     if not arn:
@@ -1576,7 +1631,10 @@ def _gcp_live_ready() -> Tuple[bool, str]:
     if os.environ.get("FLUID_IAC_LIVE_GCP", "").strip().lower() not in _TRUE:
         return False, "live GCP tests are opt-in — set FLUID_IAC_LIVE_GCP=1"
     if not os.environ.get("FLUID_GCP_PROJECT"):
-        return False, "missing $FLUID_GCP_PROJECT — apply tests/iac/_gcp_stage3_bootstrap and source its outputs"
+        return (
+            False,
+            "missing $FLUID_GCP_PROJECT — apply tests/iac/_gcp_stage3_bootstrap and source its outputs",
+        )
     if not os.environ.get("FLUID_GCP_TEST_SA"):
         return False, "missing $FLUID_GCP_TEST_SA — apply the bootstrap module"
     adc = _gcp_adc_path()
@@ -1593,6 +1651,13 @@ GCP_LIVE_ENABLED, GCP_LIVE_SKIP_REASON = _gcp_live_ready()
 GCP_LIVE_PROJECT = os.environ.get("FLUID_GCP_PROJECT", "")
 GCP_LIVE_TEST_SA = os.environ.get("FLUID_GCP_TEST_SA", "")
 GCP_LIVE_REGION = os.environ.get("FLUID_GCP_REGION", "europe-west1")
+# Cross-project-consumer proxy SA — same project for now (boundary
+# crossing needs a second sandbox project). Used by the Stage 3 GCP
+# cross-project proxy test as the "principal in project B"; same
+# member-string syntax + dataset-IAM grant shape a real cross-project
+# consumer would have. See tests/iac/_gcp_stage3_bootstrap/main.tf.json
+# (fluid_test_consumer SA + output ``consumer_sa_email``).
+GCP_LIVE_CONSUMER_SA = os.environ.get("FLUID_GCP_CONSUMER_SA", "")
 
 
 def _gcp_live_uuid() -> str:
@@ -1600,34 +1665,44 @@ def _gcp_live_uuid() -> str:
     return uuid.uuid4().hex[:10]
 
 
-def gcp_real_client(service: str) -> Any:
+def gcp_real_client(service: str, *, target_sa: Optional[str] = None) -> Any:
     """Return a google-cloud-* client authenticated as the user, impersonating
-    the test SA. Service: 'bigquery' | 'storage' | 'pubsub_publisher' |
+    a target SA. Service: 'bigquery' | 'storage' | 'pubsub_publisher' |
     'pubsub_subscriber'. The impersonation lets the test verify resources
     created by tofu (which also impersonates) without needing the SA's
     own key material on disk.
+
+    ``target_sa`` defaults to ``GCP_LIVE_TEST_SA`` (the deployer/runner SA).
+    Pass ``GCP_LIVE_CONSUMER_SA`` to take the consumer's credentials —
+    used by the Stage 3 cross-project proxy tests to verify the consumer
+    actually gets the access the contract's dataset-IAM grant promised.
     """
     from google.auth import default as _default
     from google.auth import impersonated_credentials
 
+    target_principal = target_sa or GCP_LIVE_TEST_SA
     source_creds, _ = _default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
     target = impersonated_credentials.Credentials(
         source_credentials=source_creds,
-        target_principal=GCP_LIVE_TEST_SA,
+        target_principal=target_principal,
         target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
         lifetime=3600,
     )
     if service == "bigquery":
         from google.cloud import bigquery
+
         return bigquery.Client(project=GCP_LIVE_PROJECT, credentials=target)
     if service == "storage":
         from google.cloud import storage
+
         return storage.Client(project=GCP_LIVE_PROJECT, credentials=target)
     if service == "pubsub_publisher":
         from google.cloud import pubsub_v1
+
         return pubsub_v1.PublisherClient(credentials=target)
     if service == "pubsub_subscriber":
         from google.cloud import pubsub_v1
+
         return pubsub_v1.SubscriberClient(credentials=target)
     raise ValueError(f"unknown service for gcp_real_client: {service}")
 

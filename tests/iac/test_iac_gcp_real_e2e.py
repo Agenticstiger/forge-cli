@@ -269,8 +269,9 @@ def _have_dbt_bigquery() -> bool:
 _HAVE_DBT_BIGQUERY = _have_dbt_bigquery()
 
 
-def _fluid(*args: str, cwd: Path, env_overrides: Optional[Mapping[str, str]] = None,
-           timeout: int = 600) -> subprocess.CompletedProcess:
+def _fluid(
+    *args: str, cwd: Path, env_overrides: Optional[Mapping[str, str]] = None, timeout: int = 600
+) -> subprocess.CompletedProcess:
     """Invoke the fluid CLI as subprocess. Same shape as the AWS dbt-mesh suite."""
     env = os.environ.copy()
     env.setdefault("PYTHONUTF8", "1")
@@ -383,8 +384,7 @@ def test_real_cli_dbt_bigquery_amend_and_build(gcp_real_project, gcp_account, tm
         profile="iac_gcp_dbt_bq",
         model_name=model_name,
         model_sql=(
-            "{{ config(materialized='table') }}\n"
-            "SELECT 42 AS answer, 'hello' AS greeting\n"
+            "{{ config(materialized='table') }}\n" "SELECT 42 AS answer, 'hello' AS greeting\n"
         ),
     )
 
@@ -413,7 +413,8 @@ def test_real_cli_dbt_bigquery_amend_and_build(gcp_real_project, gcp_account, tm
     rc = _fluid(
         "apply",
         "contract.fluid.yaml",
-        "--mode", "amend-and-build",
+        "--mode",
+        "amend-and-build",
         "--yes",
         cwd=gcp_real_project.workdir,
         env_overrides=env_overrides,
@@ -427,9 +428,13 @@ def test_real_cli_dbt_bigquery_amend_and_build(gcp_real_project, gcp_account, tm
         )
 
     bq = gcp_real_client("bigquery")
-    row = next(iter(bq.query(
-        f"SELECT answer, greeting FROM `{GCP_LIVE_PROJECT}.{dataset_id}.{model_name}`"
-    ).result()))
+    row = next(
+        iter(
+            bq.query(
+                f"SELECT answer, greeting FROM `{GCP_LIVE_PROJECT}.{dataset_id}.{model_name}`"
+            ).result()
+        )
+    )
     assert row.answer == 42
     assert row.greeting == "hello"
 
@@ -485,10 +490,12 @@ def test_real_gcp_mesh_dual_port_end_to_end(gcp_real_project, gcp_account, tmp_p
                         "region": GCP_LIVE_REGION,
                     },
                 },
-                "contract": {"schema": [
-                    {"name": "id", "type": "string"},
-                    {"name": "region", "type": "string"},
-                ]},
+                "contract": {
+                    "schema": [
+                        {"name": "id", "type": "string"},
+                        {"name": "region", "type": "string"},
+                    ]
+                },
             }
         ],
         "build": {
@@ -535,9 +542,13 @@ def test_real_gcp_mesh_dual_port_end_to_end(gcp_real_project, gcp_account, tmp_p
         "GCP_IMPERSONATE_SERVICE_ACCOUNT": GCP_LIVE_TEST_SA,
     }
     rc = _fluid(
-        "apply", "contract.fluid.yaml",
-        "--mode", "amend-and-build", "--yes",
-        cwd=sdp_adp_dir, env_overrides=env_overrides,
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "amend-and-build",
+        "--yes",
+        cwd=sdp_adp_dir,
+        env_overrides=env_overrides,
     )
     gcp_real_project.applied = True
     if rc.returncode != 0:
@@ -582,8 +593,13 @@ def test_real_gcp_mesh_dual_port_end_to_end(gcp_real_project, gcp_account, tmp_p
     }
     _write_yaml(cdp_dir / "contract.fluid.yaml", contract_c)
     rc = _fluid(
-        "apply", "contract.fluid.yaml", "--mode", "amend-and-build", "--yes",
-        cwd=cdp_dir, env_overrides=env_overrides,
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "amend-and-build",
+        "--yes",
+        cwd=cdp_dir,
+        env_overrides=env_overrides,
     )
     if rc.returncode != 0:
         pytest.fail(
@@ -594,7 +610,11 @@ def test_real_gcp_mesh_dual_port_end_to_end(gcp_real_project, gcp_account, tmp_p
     # Mesh assertion — SELECT through the CDP view returns the
     # ADP aggregate.
     bq = gcp_real_client("bigquery")
-    row = next(iter(bq.query(
-        f"SELECT row_count FROM `{GCP_LIVE_PROJECT}.{dataset_cdp}.{cdp_view}`"
-    ).result()))
+    row = next(
+        iter(
+            bq.query(
+                f"SELECT row_count FROM `{GCP_LIVE_PROJECT}.{dataset_cdp}.{cdp_view}`"
+            ).result()
+        )
+    )
     assert row.row_count == 2

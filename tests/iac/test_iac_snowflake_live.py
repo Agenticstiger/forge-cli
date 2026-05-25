@@ -26,6 +26,7 @@ works for resources whose database / schema is supplied out of band).
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import pytest
@@ -404,3 +405,102 @@ def test_live_task_with_minute_interval_schedule(tofu_project, live_db, sf_conne
         "EVERY_5_MIN",
         in_clause=f'IN SCHEMA "{live_db}"."{_SCHEMA}"',
     )
+
+
+# ---------------------------------------------------------------------------
+# Catalog enrichment — table COMMENT + per-column comments
+#
+# Absorbed from the retired SnowflakeHorizonRegistrar. Reads ONLY existing
+# v0.7.3 schema fields (``description`` / ``metadata.description`` /
+# ``metadata.layer`` / ``metadata.productType`` / ``domain`` /
+# ``fluidVersion`` / ``column.description``) — zero new schema surface.
+# ---------------------------------------------------------------------------
+
+
+def test_live_table_carries_horizon_markdown_comment(tofu_project, live_db, sf_connection):
+    """The IaC plugin's catalog-style enrichment lands on the real
+    Snowflake table:
+
+    * Table COMMENT — visible via ``SHOW TABLES`` — carries the markdown
+      block: description + FLUID classification + the contract YAML,
+      mirroring what the retired ``SnowflakeHorizonRegistrar`` used to
+      push via raw HTTP.
+    * Per-column comments — visible via ``DESC TABLE`` — carry each
+      column's ``description``.
+
+    Pins the "zero new schema fields" claim: every contract field
+    below already existed in v0.7.3 before this branch.
+    """
+    contract = {
+        "fluidVersion": "0.7.3",
+        "kind": "DataProduct",
+        "id": "iac.livetest.horizon",
+        "name": "Horizon catalog enrichment",
+        "domain": "commerce",
+        "description": "Silver orders with PII columns",
+        "metadata": {
+            "layer": "Silver",
+            "productType": "ADP",
+            "description": "Customer orders — silver layer (live test)",
+            "owner": {"team": "data-eng", "email": "x@x.co"},
+        },
+        "exposes": [
+            {
+                "exposeId": "t",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_table",
+                    "location": {
+                        "database": live_db,
+                        "schema": _SCHEMA,
+                        "table": "ORDERS",
+                    },
+                },
+                "contract": {
+                    "schema": [
+                        {
+                            "name": "ID",
+                            "type": "string",
+                            "required": True,
+                            "description": "Order id",
+                        },
+                        {
+                            "name": "EMAIL",
+                            "type": "string",
+                            "description": "Customer email",
+                        },
+                    ]
+                },
+            }
+        ],
+    }
+    tofu_project.apply_ok(contract)
+
+    # Table COMMENT — SHOW TABLES exposes it as a named column. Look it
+    # up by header so this is robust to Snowflake adding new columns.
+    with contextlib.closing(sf_connection.cursor()) as cur:
+        cur.execute(f'SHOW TABLES LIKE \'ORDERS\' IN SCHEMA "{live_db}"."{_SCHEMA}"')
+        rows = cur.fetchall()
+        headers = [c[0].lower() for c in cur.description]
+    assert rows, "ORDERS table not created"
+    comment = rows[0][headers.index("comment")] or ""
+    assert (
+        "Customer orders — silver layer (live test)" in comment
+    ), f"product description not in table comment: {comment[:200]!r}"
+    assert "fluid_layer: Silver" in comment
+    assert "fluid_product_type: ADP" in comment
+    assert "fluid_domain: commerce" in comment
+    # YAML fence + contract id round-trip through the comment.
+    assert "```yaml" in comment
+    assert "iac.livetest.horizon" in comment
+
+    # Per-column comments — DESC TABLE has a ``comment`` column too.
+    with contextlib.closing(sf_connection.cursor()) as cur:
+        cur.execute(f'DESC TABLE "{live_db}"."{_SCHEMA}"."ORDERS"')
+        col_rows = cur.fetchall()
+        col_headers = [c[0].lower() for c in cur.description]
+    col_comment_idx = col_headers.index("comment")
+    col_name_idx = col_headers.index("name")
+    by_name = {r[col_name_idx]: r[col_comment_idx] for r in col_rows}
+    assert by_name["ID"] == "Order id"
+    assert by_name["EMAIL"] == "Customer email"

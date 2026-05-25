@@ -20,14 +20,42 @@ embeds them in argv or in the ``.tf.json``.
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
+# Per-command wall-clock cap. A hung ``tofu`` (e.g., an unauthenticated
+# interactive auth prompt that ``-input=false`` did not catch, or a cloud
+# API that hangs the keepalive) is a real prod-risk; CI workflow timeouts
+# are too coarse a backstop. Default 30min — long enough for a real apply
+# of dozens of resources, short enough that a stuck process surfaces.
+# Override with ``FLUID_TOFU_TIMEOUT_SECONDS`` if a particular apply
+# legitimately exceeds it (e.g., Lake Formation tag propagation, which
+# can take many minutes for the eventual consistency to settle).
+_DEFAULT_TOFU_TIMEOUT_SECONDS = 1800
+_MIN_REQUIRED_VERSION = (1, 6, 0)
+
+
+def _resolve_timeout() -> int:
+    raw = os.environ.get("FLUID_TOFU_TIMEOUT_SECONDS")
+    if not raw:
+        return _DEFAULT_TOFU_TIMEOUT_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_TOFU_TIMEOUT_SECONDS
+    return value if value > 0 else _DEFAULT_TOFU_TIMEOUT_SECONDS
+
 
 class TofuError(RuntimeError):
     """The ``tofu`` binary is unavailable on PATH."""
+
+
+class TofuVersionError(RuntimeError):
+    """The discovered ``tofu`` is older than the required minimum."""
 
 
 @dataclass
@@ -60,6 +88,51 @@ def _require_tofu() -> str:
     return path
 
 
+_VERSION_RE = re.compile(r"OpenTofu\s+v?(\d+)\.(\d+)\.(\d+)", re.IGNORECASE)
+
+
+def tofu_version() -> Optional[tuple]:
+    """Return the installed ``tofu`` version tuple, or ``None`` on failure.
+
+    Cheap probe (``tofu --version``) called once per CLI invocation and
+    cached on the process; intended for the engine's startup gate, not
+    for hot-path use.
+    """
+    path = tofu_path()
+    if path is None:
+        return None
+    try:
+        proc = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    match = _VERSION_RE.search(proc.stdout) or _VERSION_RE.search(proc.stderr)
+    if not match:
+        return None
+    return tuple(int(p) for p in match.groups())
+
+
+def require_tofu_version() -> None:
+    """Fail loud if the installed ``tofu`` is older than the supported floor.
+
+    Catches the silent-mixup case where a host has ``terraform`` installed
+    but no ``tofu``, OR the case where an out-of-date ``tofu`` builds an
+    incompatible plan — the apply engine would otherwise discover the
+    mismatch only mid-apply, after partial state has been mutated.
+    """
+    version = tofu_version()
+    if version is None:
+        # ``tofu --version`` did not parse — keep going (a future tofu
+        # output format change should not brick the engine). The
+        # downstream commands will surface any real failure.
+        return
+    if version < _MIN_REQUIRED_VERSION:
+        raise TofuVersionError(
+            f"tofu {'.'.join(str(p) for p in version)} is older than the "
+            f"required minimum {'.'.join(str(p) for p in _MIN_REQUIRED_VERSION)} — "
+            "upgrade from https://opentofu.org/docs/intro/install/"
+        )
+
+
 def _parse_json_events(stdout: str) -> List[Dict[str, Any]]:
     """Parse OpenTofu's newline-delimited JSON log stream."""
     events: List[Dict[str, Any]] = []
@@ -82,13 +155,34 @@ def _run(
     command: str,
 ) -> TofuResult:
     tofu = _require_tofu()
-    proc = subprocess.run(
-        [tofu, *args],
-        cwd=workdir,
-        env=dict(env) if env is not None else None,
-        capture_output=True,
-        text=True,
-    )
+    timeout = _resolve_timeout()
+    try:
+        proc = subprocess.run(
+            [tofu, *args],
+            cwd=workdir,
+            env=dict(env) if env is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Surface the partial output if any — the timeout itself is the
+        # signal (apply engine treats a TofuResult with returncode != 0
+        # as a failure). Use returncode=124 to mirror coreutils ``timeout``.
+        return TofuResult(
+            command=command,
+            returncode=124,
+            stdout=(
+                (exc.stdout or b"").decode("utf-8", errors="replace")
+                if isinstance(exc.stdout, (bytes, bytearray))
+                else (exc.stdout or "")
+            ),
+            stderr=(
+                f"`tofu {command}` exceeded the {timeout}s wall-clock "
+                "limit (FLUID_TOFU_TIMEOUT_SECONDS overrides the default)."
+            ),
+            events=[],
+        )
     events = _parse_json_events(proc.stdout) if "-json" in args else []
     return TofuResult(
         command=command,

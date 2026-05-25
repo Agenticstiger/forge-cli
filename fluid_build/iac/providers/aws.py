@@ -17,11 +17,43 @@ via Spectrum. A pure function of the contract; no credentials, no network.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping
+import json
+import os
+from typing import Any, Dict, Iterable, List, Mapping, Optional
+
+import yaml
 
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref
 from ..versions import required_providers
+
+
+def _resolve_catalog_id() -> str:
+    """Resolve the AWS account id for Glue catalog import ids.
+
+    Priority: ``AWS_ACCOUNT_ID`` env var → ``sts:GetCallerIdentity``.
+    Returns ``""`` on failure (no boto3, no creds, network error) —
+    callers gate on a truthy return so the missing-catalog-id case
+    suppresses the import block instead of emitting a malformed one.
+    Cached on the process via a module-level dict on the first call.
+    """
+    if "AWS_ACCOUNT_ID" in os.environ and os.environ["AWS_ACCOUNT_ID"].strip():
+        return os.environ["AWS_ACCOUNT_ID"].strip()
+    cached = _CATALOG_ID_CACHE.get("value")
+    if cached is not None:
+        return cached
+    try:
+        import boto3
+
+        identity = boto3.client("sts").get_caller_identity()
+        value = str(identity.get("Account") or "")
+    except Exception:  # noqa: BLE001 — best-effort; emit no import on failure
+        value = ""
+    _CATALOG_ID_CACHE["value"] = value
+    return value
+
+
+_CATALOG_ID_CACHE: Dict[str, str] = {}
 
 # FLUID column type → Hive/Glue column type.
 _HIVE_TYPES = {
@@ -115,7 +147,7 @@ class AwsIacPlugin:
             loc = binding.get("location") or {}
             fmt = binding.get("format") or "parquet"
             schema = (exposure.get("contract") or {}).get("schema") or []
-            _emit_glue(resources, loc, fmt, schema, cid, tags)
+            _emit_glue(resources, loc, fmt, schema, cid, tags, contract=contract)
             _emit_s3(resources, loc, cid, tags)
             _emit_kinesis(resources, loc, cid, tags)
             _emit_redshift_serverless(resources, loc, cid, tags)
@@ -168,13 +200,94 @@ class AwsIacPlugin:
     def discover_imports(
         self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()
     ) -> List[ImportBlock]:
-        """Brownfield ``tofu import`` candidates — not yet wired for AWS.
+        """Brownfield ``tofu import`` candidates for each contract-declared AWS resource.
 
-        The apply engine adopts pre-existing resources the moment this
-        returns candidates; until then a first ``tofu apply`` against
-        pre-existing AWS infrastructure may need a manual ``tofu import``.
+        Mirrors what :meth:`emit` produces; the apply engine calls
+        ``tofu import`` for each block before ``tofu apply``. Imports
+        that miss (the resource doesn't exist yet) are tolerated by
+        ``_adopt_existing`` and left for ``tofu apply`` to create.
+
+        Import IDs follow the ``hashicorp/aws`` provider's documented
+        identifiers:
+
+          * ``aws_glue_catalog_database`` — ``{catalog_id}:{name}``
+            (catalog_id = AWS account id; required by the provider)
+          * ``aws_glue_catalog_table`` — ``{catalog_id}:{database}:{name}``
+          * ``aws_s3_bucket`` — bucket name
+          * ``aws_kinesis_stream`` — stream name
+          * ``aws_redshiftserverless_namespace`` — namespace name
+
+        The catalog_id is read from ``AWS_ACCOUNT_ID`` if set; otherwise
+        a call to ``sts:GetCallerIdentity`` resolves it (one call per
+        invocation, cached). Without it, ``tofu import`` on the Glue
+        resources fails ``Invalid import id`` and the apply then fails
+        ``AlreadyExistsException`` — verified by the live brownfield
+        test pinning this behaviour.
         """
-        return []
+        cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        blocks: List[ImportBlock] = []
+        seen: set[str] = set()
+
+        def _add(address: str, resource_id: str) -> None:
+            if address not in seen:
+                seen.add(address)
+                blocks.append(ImportBlock(to=address, id=resource_id))
+
+        # Resolve catalog_id once — only when needed (Glue catalog refs).
+        contract_needs_catalog_id = any(
+            (b.get("binding") or {}).get("platform") == "aws"
+            and ((b.get("binding") or {}).get("location") or {}).get("database")
+            and str(((b.get("binding") or {}).get("format")) or "").lower() in _GLUE_CATALOG_FORMATS
+            for b in contract.get("exposes") or []
+        )
+        catalog_id = _resolve_catalog_id() if contract_needs_catalog_id else ""
+
+        for exposure in contract.get("exposes") or []:
+            binding = exposure.get("binding") or {}
+            if binding.get("platform") != "aws":
+                continue
+            loc = binding.get("location") or {}
+            fmt = binding.get("format") or "parquet"
+            database = loc.get("database")
+            table = loc.get("table")
+            bucket = loc.get("bucket")
+            stream = loc.get("stream")
+            namespace = loc.get("namespace") or loc.get("workgroup")
+
+            # Glue catalog resources — only file/lakehouse formats use
+            # the Glue catalog (mirrors ``_emit_glue``'s gate).
+            if database and catalog_id and str(fmt or "").lower() in _GLUE_CATALOG_FORMATS:
+                db_key = safe_ident(f"{cid}_{database}")
+                # provider id: ``{catalog_id}:{name}``
+                _add(
+                    f"aws_glue_catalog_database.{db_key}",
+                    f"{catalog_id}:{database}",
+                )
+                if table:
+                    table_key = safe_ident(f"{cid}_{database}_{table}")
+                    # provider id: ``{catalog_id}:{database}:{name}``
+                    _add(
+                        f"aws_glue_catalog_table.{table_key}",
+                        f"{catalog_id}:{database}:{table}",
+                    )
+
+            # S3 bucket — provider id is the bucket name.
+            if bucket:
+                bucket_key = safe_ident(f"{cid}_{bucket}")
+                _add(f"aws_s3_bucket.{bucket_key}", bucket)
+
+            # Kinesis stream — provider id is the stream name.
+            if stream:
+                stream_key = safe_ident(f"{cid}_{stream}")
+                _add(f"aws_kinesis_stream.{stream_key}", stream)
+
+            # Redshift Serverless namespace — provider id is the
+            # namespace name.
+            if namespace:
+                ns_key = safe_ident(f"{cid}_{namespace}")
+                _add(f"aws_redshiftserverless_namespace.{ns_key}", namespace)
+
+        return blocks
 
     def provider_block(self) -> Dict[str, Any]:
         """No static provider configuration — the ``hashicorp/aws`` provider
@@ -201,6 +314,8 @@ def _emit_glue(
     schema: List[Mapping[str, Any]],
     cid: str,
     tags: Dict[str, str],
+    *,
+    contract: Optional[Mapping[str, Any]] = None,
 ) -> None:
     database = loc.get("database")
     if not database:
@@ -226,15 +341,69 @@ def _emit_glue(
     table = loc.get("table")
     if not table:
         return
+    # The IaC plugin now owns the catalog-metadata enrichments the
+    # old ``catalog_registrars.glue`` registrar used to push via
+    # ``glue:UpdateTable`` (retired in this branch). Folding it here
+    # gives a single source of truth + drift detection — the registrar
+    # had write-once-on-create semantics and never reconciled the
+    # parameters again. Mirrors how the Glue Terraform Registry
+    # examples model catalog metadata + descriptions in one resource.
     storage: Dict[str, Any] = {"columns": _columns(schema)}
     bucket = loc.get("bucket")
     if bucket:
         storage["location"] = f"s3://{bucket}/{(loc.get('path') or '').lstrip('/')}"
-    parameters = {"classification": fmt, "managed_by": "fluid"}
+    parameters: Dict[str, str] = {"classification": fmt, "managed_by": "fluid"}
     if "iceberg" in str(fmt).lower():
         # AWS Glue / Athena identify an Iceberg table via this parameter.
         parameters["table_type"] = "ICEBERG"
-    resources.setdefault("aws_glue_catalog_table", {})[safe_ident(f"{cid}_{database}_{table}")] = {
+
+    # Contract-driven enrichments (absorbed from the retired registrar).
+    description = ""
+    if contract is not None:
+        meta = contract.get("metadata") or {}
+        layer = meta.get("layer")
+        product_type = meta.get("productType") or meta.get("product_type")
+        domain = contract.get("domain")
+        version = contract.get("fluidVersion")
+        if layer:
+            parameters["fluid_layer"] = str(layer)
+        if product_type:
+            parameters["fluid_product_type"] = str(product_type)
+        if domain:
+            parameters["fluid_domain"] = str(domain)
+        if version:
+            parameters["fluid_version"] = str(version)
+        # Column-level tags from the contract's ``schema[].tags`` field
+        # (already in v0.7.3 — ``$defs.column.properties.tags``). Emitted
+        # as the legacy ``forge.pii.<col>`` Glue parameter the retired
+        # registrar used to push, so existing analyst dashboards built
+        # on those parameter keys keep working. No new schema fields
+        # needed — we read what the contract already carries.
+        for col in schema or []:
+            col_tags = col.get("tags") or []
+            if col_tags:
+                parameters[f"forge.pii.{col.get('name')}"] = ",".join(str(t) for t in col_tags)
+        # ``fluid_contract`` carries the canonical FLUID YAML so the
+        # AWS console + boto3 GetTable callers see the full contract
+        # without leaving the catalog. Truncated at 50KB which is
+        # well under Glue's ``Parameters`` value limit (512KB per
+        # value, 8 MB per map).
+        try:
+            fluid_yaml = yaml.safe_dump(dict(contract), sort_keys=False)
+            if len(fluid_yaml) <= 50_000:
+                parameters["fluid_contract"] = fluid_yaml
+        except Exception:  # noqa: BLE001 — best-effort, drop on yaml error
+            pass
+
+        # Table-level description — first non-empty of
+        # ``metadata.description`` / contract-level ``description``.
+        # We deliberately do NOT fall back to ``contract.name`` because
+        # name is an identifier, not a free-text description; the
+        # Glue console renders it as the header which would duplicate
+        # the table name with no analyst value.
+        description = meta.get("description") or contract.get("description") or ""
+
+    table_body: Dict[str, Any] = {
         "name": table,
         "database_name": tofu_ref(f"aws_glue_catalog_database.{db_name}.name"),
         "table_type": "EXTERNAL_TABLE",
@@ -248,10 +417,17 @@ def _emit_glue(
         # churn that has no semantic effect. ``ignore_changes`` on the
         # whole ``parameters`` map keeps post-apply state aligned;
         # forge-cli's own parameters (``classification`` / ``managed_by``
-        # / ``table_type``) ARE set on Create so they always start
-        # correctly. Same rationale for the Glue catalog database below.
+        # / ``table_type`` / ``fluid_*``) ARE set on Create so they
+        # always start correctly. To force a contract-driven re-set
+        # use ``--mode replace`` or ``tofu taint``.
         "lifecycle": {"ignore_changes": ["parameters"]},
     }
+    if description:
+        table_body["description"] = description
+
+    resources.setdefault("aws_glue_catalog_table", {})[
+        safe_ident(f"{cid}_{database}_{table}")
+    ] = table_body
 
 
 def _emit_s3(
@@ -667,15 +843,11 @@ def _emit_redshift_serverless(
         endpoint_name = f"{workgroup}-ep"[:30]
         ep_body: Dict[str, Any] = {
             "endpoint_name": endpoint_name,
-            "workgroup_name": tofu_ref(
-                f"aws_redshiftserverless_workgroup.{wg_key}.workgroup_name"
-            ),
+            "workgroup_name": tofu_ref(f"aws_redshiftserverless_workgroup.{wg_key}.workgroup_name"),
             "subnet_ids": list(ep_subnets),
         }
         if loc.get("private_endpoint_security_group_ids"):
-            ep_body["vpc_security_group_ids"] = list(
-                loc["private_endpoint_security_group_ids"]
-            )
+            ep_body["vpc_security_group_ids"] = list(loc["private_endpoint_security_group_ids"])
         elif loc.get("security_group_ids"):
             # Default: reuse the workgroup's SG (port 5439 already open
             # from the right source SG).
@@ -910,6 +1082,18 @@ def _emit_lakeformation(
     db_key = safe_ident(f"{cid}_{database}")
     table_key = safe_ident(f"{cid}_{database}_{table}") if table else None
 
+    # Collected during the grant loop, drained after into a single
+    # aws_s3_bucket_policy resource per bucket. A consumer asking for
+    # genuine cross-account read needs BOTH the LF permission (catalog
+    # read) AND a bucket policy (object read on the underlying S3
+    # storage); for in-account principals the bucket policy is benign
+    # (additive on top of IAM). The aws-lakeformation-best-practices
+    # cross-account FAQ and the canonical Terraform pattern by Komminar
+    # both spell this out: LF alone is not sufficient. So we always
+    # emit the policy when LF grants reference IAM principals — no
+    # opt-in flag needed.
+    bucket_principals: List[str] = []
+
     # 2. Principal grants. Each grant becomes one aws_lakeformation_permissions
     #    resource targeting either .table or .table_with_columns (when
     #    columns / excludedColumns is set).
@@ -929,9 +1113,7 @@ def _emit_lakeformation(
         excluded = grant.get("excludedColumns")
         if (cols or excluded) and table_key:
             twc: Dict[str, Any] = {
-                "database_name": tofu_ref(
-                    f"aws_glue_catalog_table.{table_key}.database_name"
-                ),
+                "database_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.database_name"),
                 "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
             }
             if cols:
@@ -942,28 +1124,75 @@ def _emit_lakeformation(
         elif table_key:
             body["table"] = [
                 {
-                    "database_name": tofu_ref(
-                        f"aws_glue_catalog_table.{table_key}.database_name"
-                    ),
+                    "database_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.database_name"),
                     "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
                 }
             ]
         else:
             # Database-level grant when no table is bound.
-            body["database"] = [
-                {"name": tofu_ref(f"aws_glue_catalog_database.{db_key}.name")}
-            ]
+            body["database"] = [{"name": tofu_ref(f"aws_glue_catalog_database.{db_key}.name")}]
         # Stable resource key — principal + perms hashed so multiple
         # grants on the same exposure don't collide.
         body_key = safe_ident(f"{cid}_lf_grant_{table or database}_{idx}")
         resources.setdefault("aws_lakeformation_permissions", {})[body_key] = body
 
+        # Every IAM-principal LF grant on a Glue-catalog-backed S3
+        # binding gets a matching bucket-policy statement. For
+        # cross-account principals this is REQUIRED (LF alone doesn't
+        # authorise object reads); for in-account principals it's
+        # additive (they already have IAM read). One resource per
+        # bucket — drained after the loop.
+        if isinstance(principal, str) and principal.startswith("arn:"):
+            bucket_principals.append(principal)
+
+    # 2b. S3 bucket policy — one resource per bucket, statements for
+    #     every LF-grant principal. We deliberately overwrite any
+    #     existing fluid-emitted bucket policy on the same bucket
+    #     because there is exactly one aws_s3_bucket_policy slot per
+    #     bucket — multiple LF grants on the same exposure share one
+    #     policy doc.
+    if bucket_principals and bucket:
+        bucket_key = safe_ident(f"{cid}_{bucket}")
+        bucket_arn = f"arn:aws:s3:::{bucket}"
+        # ListBucket targets the bucket ARN itself; GetObject targets
+        # the per-object ARN under the configured path prefix (or
+        # everything if no path).
+        object_arn = f"arn:aws:s3:::{bucket}/{path}*" if path else f"arn:aws:s3:::{bucket}/*"
+        statements: List[Dict[str, Any]] = []
+        for sid_idx, p in enumerate(bucket_principals):
+            statements.append(
+                {
+                    "Sid": f"FluidLfBucketList{sid_idx}",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": p},
+                    "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+                    "Resource": bucket_arn,
+                }
+            )
+            statements.append(
+                {
+                    "Sid": f"FluidLfBucketGet{sid_idx}",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": p},
+                    "Action": ["s3:GetObject"],
+                    "Resource": object_arn,
+                }
+            )
+        policy_doc = json.dumps(
+            {"Version": "2012-10-17", "Statement": statements},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        policy_key = safe_ident(f"{cid}_lf_bucket_policy_{bucket}")
+        resources.setdefault("aws_s3_bucket_policy", {})[policy_key] = {
+            "bucket": tofu_ref(f"aws_s3_bucket.{bucket_key}.id"),
+            "policy": policy_doc,
+        }
+
     # 3. LF-tag associations on the table (LF-TBAC).
     tag_assoc = gov.get("tags") or {}
     if tag_assoc and table_key:
-        lf_tags = [
-            {"key": str(k), "value": str(v)} for k, v in tag_assoc.items() if v
-        ]
+        lf_tags = [{"key": str(k), "value": str(v)} for k, v in tag_assoc.items() if v]
         if lf_tags:
             assoc_key = safe_ident(f"{cid}_lf_tags_{table}")
             resources.setdefault("aws_lakeformation_resource_lf_tags", {})[assoc_key] = {
@@ -981,8 +1210,7 @@ def _emit_lakeformation(
                 # resources come from the contract-level
                 # ``governance.lakeFormation.tagDefinitions`` block.
                 "depends_on": [
-                    f"aws_lakeformation_lf_tag.{safe_ident(f'{cid}_lf_tag_{k}')}"
-                    for k in tag_assoc
+                    f"aws_lakeformation_lf_tag.{safe_ident(f'{cid}_lf_tag_{k}')}" for k in tag_assoc
                 ],
             }
 
@@ -1004,11 +1232,7 @@ def _emit_lakeformation(
             if col_names:
                 col_block = {"column_names": list(col_names)}
             elif excluded_cols:
-                col_block = {
-                    "column_wildcard": [
-                        {"excluded_column_names": list(excluded_cols)}
-                    ]
-                }
+                col_block = {"column_wildcard": [{"excluded_column_names": list(excluded_cols)}]}
             else:
                 # ``allColumns`` is the explicit form; absence defaults to it
                 # because LF requires one of these and "wildcard" is the
@@ -1023,9 +1247,7 @@ def _emit_lakeformation(
                         "database_name": tofu_ref(
                             f"aws_glue_catalog_table.{table_key}.database_name"
                         ),
-                        "table_name": tofu_ref(
-                            f"aws_glue_catalog_table.{table_key}.name"
-                        ),
+                        "table_name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
                         "name": filter_name,
                         "row_filter": [{"filter_expression": row_expr}],
                         **col_block,
@@ -1033,6 +1255,4 @@ def _emit_lakeformation(
                 ]
             }
             filter_key = safe_ident(f"{cid}_lf_filter_{table}_{filter_name}")
-            resources.setdefault("aws_lakeformation_data_cells_filter", {})[
-                filter_key
-            ] = body
+            resources.setdefault("aws_lakeformation_data_cells_filter", {})[filter_key] = body

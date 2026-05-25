@@ -91,16 +91,12 @@ def test_real_lf_location_register_and_grant(aws_real_project, aws_account):
     grantee = aws_real_role_arn("spectrum")
     region = aws_account["region"]
 
-    contract = aws_iceberg_contract(
-        bucket, database=glue_db, table="events", cid="iac.aws.lf.loc"
-    )
+    contract = aws_iceberg_contract(bucket, database=glue_db, table="events", cid="iac.aws.lf.loc")
     # Inject the LF block onto the single exposure.
     contract["exposes"][0]["binding"]["governance"] = {
         "lakeFormation": {
             "registerLocation": True,
-            "grants": [
-                {"principal": grantee, "permissions": ["SELECT", "DESCRIBE"]}
-            ],
+            "grants": [{"principal": grantee, "permissions": ["SELECT", "DESCRIBE"]}],
         }
     }
 
@@ -149,9 +145,7 @@ def test_real_lf_tag_definitions_and_associations(aws_real_project, aws_account)
     classification_key = f"fluid_class_{uid}"
     domain_key = f"fluid_dom_{uid}"
 
-    contract = aws_iceberg_contract(
-        bucket, database=glue_db, table="events", cid="iac.aws.lf.tbac"
-    )
+    contract = aws_iceberg_contract(bucket, database=glue_db, table="events", cid="iac.aws.lf.tbac")
     contract["governance"] = {
         "lakeFormation": {
             "tagDefinitions": {
@@ -262,9 +256,7 @@ def _safe_describe_resource(lf, s3_arn: str):
         return None
 
 
-def _list_lf_permissions_for_table(
-    lf, *, principal: str, database: str, table: str
-):
+def _list_lf_permissions_for_table(lf, *, principal: str, database: str, table: str):
     """Return permissions on database.table for the given principal."""
     try:
         resp = lf.list_permissions(

@@ -169,17 +169,28 @@ def _bundle_then_plan(
     """``fluid bundle`` then ``fluid plan <bundle.tgz>`` — the canonical
     11-stage flow that produces both ``bundleDigest`` and ``planDigest``."""
     rc = _fluid(
-        "bundle", "contract.fluid.yaml",
-        "--out", bundle_name, "--format", "tgz",
-        cwd=workdir, env_overrides=_live_env(), timeout=180,
+        "bundle",
+        "contract.fluid.yaml",
+        "--out",
+        bundle_name,
+        "--format",
+        "tgz",
+        cwd=workdir,
+        env_overrides=_live_env(),
+        timeout=180,
     )
     assert rc.returncode == 0, f"bundle failed:\n{rc.stderr or rc.stdout}"
     bundle_path = workdir / bundle_name
     assert bundle_path.exists()
 
     rc = _fluid(
-        "plan", bundle_name, "--out", plan_name,
-        cwd=workdir, env_overrides=_live_env(), timeout=180,
+        "plan",
+        bundle_name,
+        "--out",
+        plan_name,
+        cwd=workdir,
+        env_overrides=_live_env(),
+        timeout=180,
     )
     assert rc.returncode == 0, f"plan failed:\n{rc.stderr or rc.stdout}"
     plan_path = workdir / plan_name
@@ -269,9 +280,7 @@ def _tamper_plan_json(plan_path: Path) -> None:
     plan_path.write_text(json.dumps(doc))
 
 
-def test_real_cli_apply_plan_binding_tamper_rejected_gcp(
-    gcp_real_project, gcp_account
-):
+def test_real_cli_apply_plan_binding_tamper_rejected_gcp(gcp_real_project, gcp_account):
     """A tampered plan.json (from the bundle flow, so digests are
     populated) must be rejected — PlanBindingError surfaces as
     non-zero exit. BQ dataset must NOT be created."""
@@ -281,14 +290,17 @@ def test_real_cli_apply_plan_binding_tamper_rejected_gcp(
     _tamper_plan_json(plan_path)
 
     apply_rc = _fluid(
-        "apply", "plan.json", "--mode", "amend", "--yes",
+        "apply",
+        "plan.json",
+        "--mode",
+        "amend",
+        "--yes",
         cwd=gcp_real_project.workdir,
         env_overrides=_live_env(),
         timeout=180,
     )
     assert apply_rc.returncode != 0, (
-        f"fluid-apply ACCEPTED a tampered plan.json\n"
-        f"stdout:\n{apply_rc.stdout[-2000:]}"
+        f"fluid-apply ACCEPTED a tampered plan.json\n" f"stdout:\n{apply_rc.stdout[-2000:]}"
     )
     combined = (apply_rc.stdout + apply_rc.stderr).lower()
     assert (
@@ -303,16 +315,12 @@ def test_real_cli_apply_plan_binding_tamper_rejected_gcp(
 
     try:
         bq.get_dataset(f"{GCP_LIVE_PROJECT}.{dataset_id}")
-        pytest.fail(
-            f"tampered apply created the dataset {dataset_id} — verify gate broken"
-        )
+        pytest.fail(f"tampered apply created the dataset {dataset_id} — verify gate broken")
     except NotFound:
         pass
 
 
-def test_real_cli_apply_no_verify_plan_binding_bypass_gcp(
-    gcp_real_project, gcp_account
-):
+def test_real_cli_apply_no_verify_plan_binding_bypass_gcp(gcp_real_project, gcp_account):
     """``--no-verify-plan-binding`` bypasses the plan-binding gate — same
     tampered plan as the previous test applies cleanly with a WARNING."""
     dataset_id = gcp_real_project.name("clibypass").replace("-", "_")
@@ -321,8 +329,12 @@ def test_real_cli_apply_no_verify_plan_binding_bypass_gcp(
     _tamper_plan_json(plan_path)
 
     rc = _fluid(
-        "apply", "plan.json", "--mode", "amend",
-        "--no-verify-plan-binding", "--yes",
+        "apply",
+        "plan.json",
+        "--mode",
+        "amend",
+        "--no-verify-plan-binding",
+        "--yes",
         cwd=gcp_real_project.workdir,
         env_overrides=_live_env(),
         timeout=600,

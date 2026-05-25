@@ -67,6 +67,18 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
                 "https://opentofu.org/docs/intro/install/"
             },
         )
+    # Fail loud if `tofu` is older than the supported floor — a stale
+    # binary would otherwise be discovered only mid-apply, after partial
+    # state has been mutated. See ``runner.require_tofu_version`` for the
+    # version floor.
+    try:
+        runner.require_tofu_version()
+    except runner.TofuVersionError as exc:
+        raise CLIError(
+            1,
+            "opentofu_engine_unsupported_tofu_version",
+            {"error": str(exc)},
+        )
 
     backend = parse_backend(getattr(args, "state_backend", None))
     # Per-contract workdir + state: each contract owns an isolated ``tofu``
@@ -109,7 +121,8 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
 
     # Data-loss gate — `tofu` has no CTAS/CLONE data snapshot (see
     # AUTOGEN_SPIKE.md, risk R1), so a destructive plan fails closed.
-    if _data_loss_blocked(changes, bool(getattr(args, "allow_data_loss", False))):
+    allow_data_loss = bool(getattr(args, "allow_data_loss", False))
+    if _data_loss_blocked(changes, allow_data_loss):
         raise CLIError(
             1,
             "opentofu_data_loss_gate",
@@ -117,6 +130,28 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
                 "error": f"plan destroys {changes['remove']} resource(s); `tofu` does not "
                 "snapshot data — re-run with --allow-data-loss to proceed"
             },
+        )
+    if allow_data_loss and int(changes.get("remove", 0)) > 0:
+        # Audit-trail: every destructive apply through the override is
+        # logged at WARNING so CI log-scrapers + operators have a
+        # paper-trail. Matches the same posture as the native engine's
+        # _verify_plan_binding bypass warning.
+        logger.warning(
+            "--allow-data-loss: bypassing the data-loss gate; %d resource(s) "
+            "will be destroyed by `tofu apply`. Provider: %s. Plan changes: "
+            "+%d ~%d -%d.",
+            int(changes.get("remove", 0)),
+            provider,
+            changes["add"],
+            changes["change"],
+            changes["remove"],
+        )
+        info(
+            logger,
+            "opentofu_destructive_gate_override",
+            provider=provider,
+            resources_to_destroy=int(changes.get("remove", 0)),
+            **changes,
         )
 
     if bool(getattr(args, "dry_run", False)):
@@ -185,7 +220,8 @@ def _verify_plan_binding_for_opentofu(args, logger: logging.Logger) -> None:
             plan_data = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
         raise CLIError(
-            1, "opentofu_engine_plan_unreadable",
+            1,
+            "opentofu_engine_plan_unreadable",
             {"error": f"{src}: {exc}"},
         )
     # Local import — keeps the plan_digest import + tarfile dependency

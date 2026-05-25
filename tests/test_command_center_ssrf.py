@@ -42,10 +42,12 @@ from fluid_build.observability.reporter import (
 )
 
 _CLIENT_PRIV = "fluid_build.cli._command_center._hostname_is_private"
-# reporter.py imports _hostname_is_private lazily (inside the gate
-# function) to avoid an observability ↔ cli circular import, so it is
-# patched at its source module rather than re-exported on reporter.
-_REPORTER_PRIV = "fluid_build.build_runners._alerter._hostname_is_private"
+# reporter.py imports ``_hostname_is_private`` at top level from
+# the tier-0 ``fluid_build._net`` leaf (PR #139 fixed the structural
+# observability ↔ build_runners cycle, so the previous lazy import
+# is no longer needed). Patch the alias bound on the reporter module
+# itself — that's the name the gate function actually looks up.
+_REPORTER_PRIV = "fluid_build.observability.reporter._hostname_is_private"
 
 
 # ──────────────────── the shared gate (client copy) ────────────────────

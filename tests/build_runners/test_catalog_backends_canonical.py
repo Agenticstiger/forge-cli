@@ -37,10 +37,11 @@ import pytest
 from fluid_build.api.catalog_publication import CatalogPublicationPayload
 from fluid_build.build_runners.catalog_registrars import (
     DataHubRegistrar,
-    GlueCatalogRegistrar,
     OpenMetadataRegistrar,
-    SnowflakeHorizonRegistrar,
 )
+
+# ``GlueCatalogRegistrar`` and ``SnowflakeHorizonRegistrar`` were retired
+# in favour of the IaC plugins — see catalog_registrars/__init__.py docstring.
 
 
 def _contract() -> Dict[str, Any]:
@@ -451,49 +452,14 @@ class TestOpenMetadataCanonicalFields:
 
 
 # ---------------------------------------------------------------------------
-# Glue — Parameters map
+# Glue + Snowflake Horizon — retired
 # ---------------------------------------------------------------------------
-
-
-class TestGlueCanonicalFields:
-    def test_parameters_carry_canonical_fields(self, payload, glue_mock):
-        GlueCatalogRegistrar(
-            base_url_override="https://glue.us-east-1.amazonaws.com",
-            database_name="forge_bronze",
-        ).register_payload(payload)
-        # Glue's mock stores the whole CreateTable body, so the
-        # Parameters map sits inside ``TableInput`` (matching the
-        # native Glue API shape).
-        table_input = glue_mock.tables[0]["TableInput"]
-        params = table_input.get("Parameters") or {}
-        assert params.get("fluid_layer") == "Bronze"
-        assert params.get("fluid_product_type") == "SDP"
-        assert params.get("fluid_domain") == "commerce"
-        assert "fluid_contract" in params
-        assert "odps_spec" in params
-        assert "odcs_contract" in params
-
-
-# ---------------------------------------------------------------------------
-# Snowflake Horizon — markdown blocks inside `comment`
-# ---------------------------------------------------------------------------
-
-
-class TestSnowflakeHorizonCanonicalFields:
-    def test_comment_embeds_canonical_fields(self, payload, snowflake_horizon_mock):
-        SnowflakeHorizonRegistrar(
-            account_url="https://acme.snowflakecomputing.com"
-        ).register_payload(payload)
-        comment = snowflake_horizon_mock.tables[0]["comment"]
-        # The Snowflake backend doesn't have a free-form properties map,
-        # so canonical fields get expressed as a "FLUID classification:"
-        # bullet block followed by spec-named fenced YAML blocks.
-        assert "fluid_layer: Bronze" in comment
-        assert "fluid_product_type: SDP" in comment
-        assert "fluid_domain: commerce" in comment
-        assert "ODCS contract" in comment
-        assert "FLUID contract" in comment
-        assert "ODPS data product spec" in comment
+#
+# The canonical-fields-on-Parameters-map (Glue) and canonical-fields-as-
+# markdown-comment (Snowflake Horizon) assertions used to live here. Both
+# registrars were retired in favour of the IaC plugins, which set the
+# same fields directly on aws_glue_catalog_table / snowflake_table.
+# Coverage moves to tests/iac/test_iac_aws.py and tests/iac/test_iac_snowflake.py.
 
 
 # ---------------------------------------------------------------------------
@@ -532,23 +498,12 @@ class TestCapabilityDeclarations:
         assert om.supports(CatalogCapability.PER_ASSET_CONTRACT)
         assert om.supports(CatalogCapability.PRODUCT_SPECS)
 
-    def test_glue_declares_attachment_capabilities(self, backends):
-        """Glue's native string→string ``Parameters`` map carries the
-        canonical fields."""
-        from fluid_build.api.catalog_backend import CatalogCapability
-
-        spec = backends["glue"]
-        assert spec.supports(CatalogCapability.CUSTOM_PROPERTIES)
-        assert spec.supports(CatalogCapability.PER_ASSET_CONTRACT)
-        assert spec.supports(CatalogCapability.PRODUCT_SPECS)
-
-    def test_snowflake_horizon_declares_specs_but_not_custom_props(self, backends):
-        """Horizon attaches specs as markdown inside ``comment``; that
-        satisfies PRODUCT_SPECS / PER_ASSET_CONTRACT but is honest
-        about NOT having a free-form key-value map."""
-        from fluid_build.api.catalog_backend import CatalogCapability
-
-        sh = backends["snowflake_horizon"]
-        assert sh.supports(CatalogCapability.PER_ASSET_CONTRACT)
-        assert sh.supports(CatalogCapability.PRODUCT_SPECS)
-        assert not sh.supports(CatalogCapability.CUSTOM_PROPERTIES)
+    def test_glue_and_snowflake_horizon_retired(self, backends):
+        """Catalog-backend declarations for ``glue`` and
+        ``snowflake_horizon`` were dropped when the registrars were
+        retired. The same fields now ship via the IaC plugins
+        (aws_glue_catalog_table / snowflake_table). Asserting their
+        absence pins the API contract: ``fluid publish --list-catalogs``
+        no longer advertises them."""
+        assert "glue" not in backends
+        assert "snowflake_horizon" not in backends

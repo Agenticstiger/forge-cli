@@ -146,9 +146,7 @@ def _write_contract(workdir: Path, contract: Dict[str, Any]) -> None:
     )
 
 
-def test_real_gcp_destructive_apply_blocked_without_allow_flag(
-    gcp_real_project, gcp_account
-):
+def test_real_gcp_destructive_apply_blocked_without_allow_flag(gcp_real_project, gcp_account):
     """Apply 2 datasets, then re-apply with B removed WITHOUT
     ``--allow-data-loss``. Gate blocks (non-zero exit); B still exists."""
     cid = "iac.gcp.real.replace.block"
@@ -157,7 +155,11 @@ def test_real_gcp_destructive_apply_blocked_without_allow_flag(
 
     _write_contract(gcp_real_project.workdir, _two_dataset_contract(ds_a, ds_b, cid))
     rc = _fluid(
-        "apply", "contract.fluid.yaml", "--mode", "amend", "--yes",
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "amend",
+        "--yes",
         cwd=gcp_real_project.workdir,
         env_overrides=_live_env(),
         timeout=300,
@@ -168,19 +170,22 @@ def test_real_gcp_destructive_apply_blocked_without_allow_flag(
     # Phase 2 — drop ds_b, no allow flag.
     _write_contract(gcp_real_project.workdir, _one_dataset_contract(ds_a, cid))
     rc = _fluid(
-        "apply", "contract.fluid.yaml", "--mode", "replace", "--yes",
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "replace",
+        "--yes",
         cwd=gcp_real_project.workdir,
         env_overrides=_live_env(),
         timeout=120,
     )
     assert rc.returncode != 0, (
-        f"data-loss gate did not fire for GCP destructive apply.\n"
-        f"stdout:\n{rc.stdout[-2000:]}"
+        f"data-loss gate did not fire for GCP destructive apply.\n" f"stdout:\n{rc.stdout[-2000:]}"
     )
     combined = (rc.stdout + rc.stderr).lower()
-    assert "data_loss" in combined or "data loss" in combined or "destroy" in combined, (
-        f"expected data-loss keyword. last 2000:\n{combined[-2000:]}"
-    )
+    assert (
+        "data_loss" in combined or "data loss" in combined or "destroy" in combined
+    ), f"expected data-loss keyword. last 2000:\n{combined[-2000:]}"
 
     # Dataset B must still exist.
     bq = gcp_real_client("bigquery")
@@ -188,9 +193,7 @@ def test_real_gcp_destructive_apply_blocked_without_allow_flag(
     assert ds.dataset_id == ds_b, "dataset B was destroyed despite gate"
 
 
-def test_real_gcp_destructive_apply_succeeds_with_allow_flag(
-    gcp_real_project, gcp_account
-):
+def test_real_gcp_destructive_apply_succeeds_with_allow_flag(gcp_real_project, gcp_account):
     """Same destructive change with ``--allow-data-loss``: ds_b is gone."""
     cid = "iac.gcp.real.replace.allow"
     ds_a = gcp_real_project.name("ralwa").replace("-", "_")
@@ -198,7 +201,11 @@ def test_real_gcp_destructive_apply_succeeds_with_allow_flag(
 
     _write_contract(gcp_real_project.workdir, _two_dataset_contract(ds_a, ds_b, cid))
     rc = _fluid(
-        "apply", "contract.fluid.yaml", "--mode", "amend", "--yes",
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "amend",
+        "--yes",
         cwd=gcp_real_project.workdir,
         env_overrides=_live_env(),
         timeout=300,
@@ -208,8 +215,12 @@ def test_real_gcp_destructive_apply_succeeds_with_allow_flag(
 
     _write_contract(gcp_real_project.workdir, _one_dataset_contract(ds_a, cid))
     rc = _fluid(
-        "apply", "contract.fluid.yaml", "--mode", "replace",
-        "--allow-data-loss", "--yes",
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "replace",
+        "--allow-data-loss",
+        "--yes",
         cwd=gcp_real_project.workdir,
         env_overrides=_live_env(),
         timeout=300,

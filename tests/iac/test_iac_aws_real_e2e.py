@@ -93,16 +93,63 @@ def test_real_s3_bucket_round_trip(aws_real_project, aws_account):
 
 def test_real_iceberg_on_glue_round_trip(aws_real_project, aws_account):
     """``aws_glue_catalog_table`` with ``Parameters.table_type=ICEBERG`` —
-    Glue accepts the Iceberg hint, Athena will be able to query it."""
+    Glue accepts the Iceberg hint, Athena will be able to query it. Also
+    pins the catalog-enrichment fields that absorbed the retired
+    ``GlueCatalogRegistrar`` (table Description, fluid_layer /
+    fluid_product_type / fluid_domain / fluid_contract parameters,
+    per-column Comments) — proves the IaC fold-in lands on real AWS."""
     bucket = aws_real_project.name("iceberg-bucket")
     glue_db = aws_real_project.name("iceberg_db").replace("-", "_")
     contract = aws_iceberg_contract(bucket, database=glue_db, table="events")
+    # Add the catalog enrichments the retired registrar used to push —
+    # every field below is already in the v0.7.3 schema (layer +
+    # productType under metadata; description on metadata/contract;
+    # domain + fluidVersion at the top level; column.description +
+    # column.tags on schema entries). Zero schema additions for this.
+    contract.setdefault("metadata", {})
+    contract["metadata"].update(
+        {
+            "layer": "Silver",
+            "productType": "ADP",
+            "description": "Iceberg events table — IaC-managed catalog metadata",
+        }
+    )
+    contract["domain"] = "commerce"
+    contract["fluidVersion"] = "0.7.3"
+    # Add column descriptions + tags so we can verify per-column
+    # Comment + the forge.pii.<col> Parameter both land.
+    contract["exposes"][0]["contract"]["schema"] = [
+        {"name": "event_id", "type": "string", "required": True, "description": "Event id"},
+        {
+            "name": "amount",
+            "type": "decimal(12,2)",
+            "description": "Amount in USD",
+            "tags": ["pii", "financial"],
+        },
+    ]
     aws_real_project.apply_ok(contract)
 
     glue = aws_real_boto("glue")
     assert glue.get_database(Name=glue_db)["Database"]["Name"] == glue_db
     table = glue.get_table(DatabaseName=glue_db, Name="events")["Table"]
     assert table["TableType"] == "EXTERNAL_TABLE"
+
+    # Catalog-enrichment fields absorbed from the retired Glue registrar:
+    assert table.get("Description") == "Iceberg events table — IaC-managed catalog metadata"
+    params = table.get("Parameters") or {}
+    assert params.get("fluid_layer") == "Silver"
+    assert params.get("fluid_product_type") == "ADP"
+    assert params.get("fluid_domain") == "commerce"
+    assert params.get("fluid_version") == "0.7.3"
+    assert "fluid_contract" in params  # the full FLUID YAML
+    # Per-column descriptions surface as Glue column Comments.
+    col_comments = {c["Name"]: c.get("Comment") for c in table["StorageDescriptor"]["Columns"]}
+    assert col_comments.get("event_id") == "Event id"
+    assert col_comments.get("amount") == "Amount in USD"
+    # column.tags[] (the existing v0.7.3 field) becomes the legacy
+    # forge.pii.<col> parameter so analyst dashboards built on the
+    # retired Glue registrar's parameter keys keep working.
+    assert params.get("forge.pii.amount") == "pii,financial"
     assert table["Parameters"]["table_type"] == "ICEBERG"
 
 

@@ -156,9 +156,7 @@ def _write_contract(workdir: Path, contract: Dict[str, Any]) -> None:
     )
 
 
-def test_real_aws_destructive_apply_blocked_without_allow_flag(
-    aws_real_project, aws_account
-):
+def test_real_aws_destructive_apply_blocked_without_allow_flag(aws_real_project, aws_account):
     """Apply 2 buckets, then re-apply with bucket B removed WITHOUT
     ``--allow-data-loss``. Gate must block (non-zero exit) and bucket B
     must STILL exist in AWS."""
@@ -169,7 +167,11 @@ def test_real_aws_destructive_apply_blocked_without_allow_flag(
     # Phase 1 — provision both buckets.
     _write_contract(aws_real_project.workdir, _two_bucket_contract(bucket_a, bucket_b, cid))
     rc = _fluid(
-        "apply", "contract.fluid.yaml", "--mode", "amend", "--yes",
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "amend",
+        "--yes",
         cwd=aws_real_project.workdir,
         env_overrides=_live_env(),
         timeout=300,
@@ -177,15 +179,19 @@ def test_real_aws_destructive_apply_blocked_without_allow_flag(
     aws_real_project.applied = True
     assert rc.returncode == 0, rc.stderr or rc.stdout
     names = {b["Name"] for b in aws_real_boto("s3").list_buckets()["Buckets"]}
-    assert bucket_a in names and bucket_b in names, (
-        f"phase-1 apply didn't create both buckets — got {names & {bucket_a, bucket_b}}"
-    )
+    assert (
+        bucket_a in names and bucket_b in names
+    ), f"phase-1 apply didn't create both buckets — got {names & {bucket_a, bucket_b}}"
 
     # Phase 2 — rewrite contract to drop bucket B, re-apply WITHOUT
     # ``--allow-data-loss``. The gate must block.
     _write_contract(aws_real_project.workdir, _one_bucket_contract(bucket_a, cid))
     rc = _fluid(
-        "apply", "contract.fluid.yaml", "--mode", "replace", "--yes",
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "replace",
+        "--yes",
         cwd=aws_real_project.workdir,
         env_overrides=_live_env(),
         timeout=120,
@@ -196,9 +202,7 @@ def test_real_aws_destructive_apply_blocked_without_allow_flag(
     )
     combined = (rc.stdout + rc.stderr).lower()
     assert (
-        "data_loss" in combined
-        or "data loss" in combined
-        or "destroy" in combined
+        "data_loss" in combined or "data loss" in combined or "destroy" in combined
     ), f"expected data-loss-related error. last 2000:\n{combined[-2000:]}"
 
     # Bucket B must still exist — gate blocked BEFORE the destroy.
@@ -209,9 +213,7 @@ def test_real_aws_destructive_apply_blocked_without_allow_flag(
     )
 
 
-def test_real_aws_destructive_apply_succeeds_with_allow_flag(
-    aws_real_project, aws_account
-):
+def test_real_aws_destructive_apply_succeeds_with_allow_flag(aws_real_project, aws_account):
     """Same destructive change WITH ``--allow-data-loss``: bucket B is
     cleanly destroyed and removed from AWS."""
     cid = "iac.aws.real.replace.allow"
@@ -220,7 +222,11 @@ def test_real_aws_destructive_apply_succeeds_with_allow_flag(
 
     _write_contract(aws_real_project.workdir, _two_bucket_contract(bucket_a, bucket_b, cid))
     rc = _fluid(
-        "apply", "contract.fluid.yaml", "--mode", "amend", "--yes",
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "amend",
+        "--yes",
         cwd=aws_real_project.workdir,
         env_overrides=_live_env(),
         timeout=300,
@@ -230,8 +236,12 @@ def test_real_aws_destructive_apply_succeeds_with_allow_flag(
 
     _write_contract(aws_real_project.workdir, _one_bucket_contract(bucket_a, cid))
     rc = _fluid(
-        "apply", "contract.fluid.yaml", "--mode", "replace",
-        "--allow-data-loss", "--yes",
+        "apply",
+        "contract.fluid.yaml",
+        "--mode",
+        "replace",
+        "--allow-data-loss",
+        "--yes",
         cwd=aws_real_project.workdir,
         env_overrides=_live_env(),
         timeout=300,

@@ -282,6 +282,7 @@ def test_emu_pubsub_sdk_create_read():
     """Emulator half: create a topic + subscription via google-cloud-pubsub
     against the gcloud emulator, read them back."""
     import os
+
     # google-cloud-pubsub reads PUBSUB_EMULATOR_HOST from env (already set
     # by the outer test harness). Explicit ANYWAY for documentation.
     os.environ.setdefault("PUBSUB_EMULATOR_HOST", "localhost:8085")

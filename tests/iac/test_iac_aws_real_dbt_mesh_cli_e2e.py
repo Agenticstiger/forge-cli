@@ -71,7 +71,6 @@ from tests.iac.conftest import (
     aws_real_role_arn,
 )
 
-
 # ---------------------------------------------------------------------------
 # Skip gates
 # ---------------------------------------------------------------------------
@@ -178,7 +177,9 @@ def _write_dbt_project(
     models.mkdir(exist_ok=True)
     (models / f"{model_name}.sql").write_text(model_sql, encoding="utf-8")
     if sources:
-        (models / "_sources.yml").write_text(yaml.safe_dump(sources, sort_keys=False), encoding="utf-8")
+        (models / "_sources.yml").write_text(
+            yaml.safe_dump(sources, sort_keys=False), encoding="utf-8"
+        )
     if dependencies:
         (project_dir / "dependencies.yml").write_text(
             yaml.safe_dump(dependencies, sort_keys=False), encoding="utf-8"
@@ -414,9 +415,7 @@ def _ssm_run_and_wait(
 @pytest.mark.skipif(not AWS_LIVE_ENABLED, reason=AWS_LIVE_SKIP_REASON)
 @pytest.mark.skipif(not _HAVE_DBT_REDSHIFT, reason="needs dbt-redshift installed")
 @pytest.mark.skipif(not _VPC_BOOTSTRAP_READY, reason=_VPC_BOOTSTRAP_SKIP_REASON)
-def test_real_cli_dbt_redshift_serverless_amend_and_build(
-    aws_real_project, aws_account, tmp_path
-):
+def test_real_cli_dbt_redshift_serverless_amend_and_build(aws_real_project, aws_account, tmp_path):
     """``fluid apply --mode amend-and-build`` against private Redshift
     Serverless, executed FROM a private-subnet EC2 via SSM.
 
@@ -517,7 +516,7 @@ def test_real_cli_dbt_redshift_serverless_amend_and_build(
             # can read the materialised row. By default Redshift tables
             # are only readable by the creator + superusers.
             "{{ config(materialized='table', "
-            "post_hook=\"GRANT SELECT ON {{ this }} TO PUBLIC\") }}\n"
+            'post_hook="GRANT SELECT ON {{ this }} TO PUBLIC") }}\n'
             "SELECT 42::int AS answer, 'hello'::varchar AS greeting\n"
         ),
     )
@@ -788,6 +787,31 @@ def test_real_cli_dbt_mesh_amend_and_build(aws_real_project, aws_account):
     adp_table = glue.get_table(DatabaseName=glue_db, Name=adp_model)["Table"]
     assert adp_table["Name"] == adp_model
 
+    # The bootstrap activates Lake Formation on this account (admins =
+    # fluid-stage3-tester + EC2 runner). LF gates every Glue catalog
+    # read — including reads from Redshift Spectrum's external schema.
+    # The ADP table is created by dbt-athena via CTAS *at runtime* (not
+    # by IaC apply), so it isn't known to the contract's
+    # ``governance.lakeFormation.grants[]`` block. Grant Spectrum
+    # SELECT on the ADP table here, after dbt-athena materialises it.
+    # This mirrors the real-world mesh pattern: the producer's
+    # ADP-layer publishing pipeline registers consumer-role grants on
+    # each materialised table.
+    lf = aws_real_boto("lakeformation")
+    spectrum_arn = aws_real_role_arn("spectrum")
+    lf.grant_permissions(
+        Principal={"DataLakePrincipalIdentifier": spectrum_arn},
+        Resource={"Table": {"DatabaseName": glue_db, "Name": adp_model}},
+        Permissions=["SELECT", "DESCRIBE"],
+    )
+    # LF + Glue catalog also need a database-level DESCRIBE so Spectrum
+    # can resolve the cross-database name through the external schema.
+    lf.grant_permissions(
+        Principal={"DataLakePrincipalIdentifier": spectrum_arn},
+        Resource={"Database": {"Name": glue_db}},
+        Permissions=["DESCRIBE"],
+    )
+
     # --- Contract 2: CDP Redshift Serverless + external schema → Glue ---
     cdp_dir = aws_real_project.workdir / "cdp"
     cdp_dir.mkdir(exist_ok=True)
@@ -856,7 +880,17 @@ def test_real_cli_dbt_mesh_amend_and_build(aws_real_project, aws_account):
         if desc["Status"] in ("FINISHED", "FAILED", "ABORTED"):
             break
         time.sleep(1)
-    assert desc["Status"] == "FINISHED", desc
+    # Surface the full Redshift Spectrum error reason on failure —
+    # the legacy assertion was truncating `desc` repr.
+    if desc["Status"] != "FINISHED":
+        raise AssertionError(
+            f"Redshift Spectrum query FAILED on mesh ADP table.\n"
+            f"  Status: {desc['Status']}\n"
+            f"  StateChangeReason: {desc.get('Error') or desc.get('StateChangeReason')!r}\n"
+            f"  QueryString: {desc.get('QueryString')!r}\n"
+            f"  WorkgroupName: {desc.get('WorkgroupName')!r}\n"
+            f"  full desc keys: {sorted(desc.keys())}"
+        )
     rows = rsdata.get_statement_result(Id=sid)
     # Empty SDP → ADP aggregate is 0; we just confirm the query path works.
     assert "Records" in rows, rows

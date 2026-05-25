@@ -26,6 +26,11 @@
           {"name": "virtualization-type", "values": ["hvm"]}
         ]
       }
+    },
+    "aws_caller_identity": {
+      "deployer": {
+        "//": "The deployer is the principal applying this bootstrap (the fluid-stage3-tester IAM user / SSO identity). The cross-account proxy role's trust policy references this account id so any identity in the deployer's account can sts:AssumeRole into the consumer role — minimum surface to test the cross-account IAM grant LOGIC on a single sandbox account."
+      }
     }
   },
 
@@ -57,6 +62,12 @@
         "tags": {"managed_by": "fluid", "purpose": "stage3-iac-testing"},
         "//": "EC2 instance role: SSM-managed (no SSH key), can pull source from S3, can talk to Redshift Serverless via Data API.",
         "assume_role_policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+      },
+      "fluid_consumer_test": {
+        "name": "fluid-iactest-consumer",
+        "tags": {"managed_by": "fluid", "purpose": "stage3-iac-testing"},
+        "//": "Cross-account-consumer proxy role for Stage 3 cross-account tests. Trust policy allows any IAM identity in the deployer's account to sts:AssumeRole, so the test session (running as fluid-stage3-tester) can take this role's credentials and verify that LF SELECT + the bucket policy grant actually authorise an Athena read. A real cross-account test would have this role in a SECOND account — same trust-policy shape, same IAM permission grants. Boundary-crossing (network + STS across accounts) is the only thing we can't exercise on a single sandbox account.",
+        "assume_role_policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::${data.aws_caller_identity.deployer.account_id}:root\"},\"Action\":\"sts:AssumeRole\"}]}"
       }
     },
     "aws_iam_role_policy": {
@@ -77,6 +88,12 @@
         "name": "fluid-iactest-ec2-lakeformation",
         "role": "${aws_iam_role.fluid_ec2_test.name}",
         "policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"lakeformation:GetDataLakeSettings\",\"lakeformation:PutDataLakeSettings\",\"lakeformation:RegisterResource\",\"lakeformation:DeregisterResource\",\"lakeformation:DescribeResource\",\"lakeformation:ListResources\",\"lakeformation:GrantPermissions\",\"lakeformation:RevokePermissions\",\"lakeformation:BatchGrantPermissions\",\"lakeformation:BatchRevokePermissions\",\"lakeformation:ListPermissions\",\"lakeformation:CreateLFTag\",\"lakeformation:DeleteLFTag\",\"lakeformation:GetLFTag\",\"lakeformation:ListLFTags\",\"lakeformation:UpdateLFTag\",\"lakeformation:AddLFTagsToResource\",\"lakeformation:RemoveLFTagsFromResource\",\"lakeformation:GetResourceLFTags\",\"lakeformation:CreateDataCellsFilter\",\"lakeformation:DeleteDataCellsFilter\",\"lakeformation:GetDataCellsFilter\",\"lakeformation:ListDataCellsFilter\",\"lakeformation:UpdateDataCellsFilter\",\"glue:GetCatalog\",\"glue:GetDatabases\",\"glue:GetTables\",\"glue:GetPartitions\",\"glue:CreateDatabase\",\"glue:UpdateDatabase\",\"glue:DeleteDatabase\",\"glue:CreateTable\",\"glue:UpdateTable\",\"glue:DeleteTable\",\"sts:GetCallerIdentity\"],\"Resource\":\"*\"}]}"
+      },
+      "consumer_athena_read": {
+        "//": "Minimum permission set for a cross-account *consumer* — read-only Athena + Glue + S3 + LF GetDataAccess. Mirrors what a real cross-account consumer in account B would need to query data shared from account A: the LF permission alone authorises catalog metadata reads, but Athena's S3 object reads + query-result-staging path still need IAM permission on the consumer side.",
+        "name": "fluid-iactest-consumer-athena-read",
+        "role": "${aws_iam_role.fluid_consumer_test.name}",
+        "policy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"athena:StartQueryExecution\",\"athena:GetQueryExecution\",\"athena:GetQueryResults\",\"athena:GetQueryResultsStream\",\"athena:StopQueryExecution\",\"athena:GetWorkGroup\",\"athena:ListWorkGroups\",\"athena:ListQueryExecutions\"],\"Resource\":\"*\"},{\"Effect\":\"Allow\",\"Action\":[\"glue:GetCatalog\",\"glue:GetDatabase\",\"glue:GetDatabases\",\"glue:GetTable\",\"glue:GetTables\",\"glue:GetPartitions\",\"glue:SearchTables\"],\"Resource\":\"*\"},{\"Effect\":\"Allow\",\"Action\":[\"lakeformation:GetDataAccess\"],\"Resource\":\"*\"},{\"Effect\":\"Allow\",\"Action\":[\"s3:GetBucketLocation\",\"s3:ListBucket\",\"s3:GetObject\",\"s3:PutObject\",\"s3:AbortMultipartUpload\",\"s3:ListMultipartUploadParts\"],\"Resource\":[\"arn:aws:s3:::fluid-iactest-*\",\"arn:aws:s3:::fluid-iactest-*/*\"]}]}"
       }
     },
 
@@ -371,6 +388,7 @@
     "sfn_role_arn": {"value": "${aws_iam_role.fluid_sfn_exec.arn}"},
     "glue_role_arn": {"value": "${aws_iam_role.fluid_glue_exec.arn}"},
     "spectrum_role_arn": {"value": "${aws_iam_role.fluid_redshift_spectrum.arn}"},
+    "consumer_role_arn": {"value": "${aws_iam_role.fluid_consumer_test.arn}"},
     "vpc_id": {"value": "${aws_vpc.fluid_test.id}"},
     "vpc_subnet_ids": {"value": [
       "${aws_subnet.fluid_test_a.id}",

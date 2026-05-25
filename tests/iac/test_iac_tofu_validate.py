@@ -358,3 +358,106 @@ def test_emitted_tfjson_passes_tofu_validate(cloud, tmp_path):
         text=True,
     )
     assert validate.returncode == 0, validate.stderr or validate.stdout
+
+
+# Per-cloud cross-account / cross-project shapes. Stage 1 unit tests
+# pin the dict; this pins the *.tf.json against the real ``tofu``
+# binary — catches any provider-schema mismatch in the new
+# aws_s3_bucket_policy + google_bigquery_dataset_iam_member emits.
+_CROSS_ACCOUNT_CONTRACTS = {
+    "aws": {
+        "id": "demo.aws.xacc",
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "binding": {
+                    "platform": "aws",
+                    "format": "parquet",
+                    "location": {
+                        "database": "demo",
+                        "table": "orders",
+                        "bucket": "demo-fluid-xacc",
+                        "path": "orders/",
+                    },
+                    "governance": {
+                        "lakeFormation": {
+                            "grants": [
+                                {
+                                    "principal": "arn:aws:iam::222222222222:role/consumer",
+                                    "permissions": ["SELECT", "DESCRIBE"],
+                                }
+                            ]
+                        }
+                    },
+                },
+                "contract": {"schema": [{"name": "id", "type": "integer", "required": True}]},
+            }
+        ],
+    },
+    "gcp": {
+        "id": "demo.gcp.xproj",
+        "metadata": {
+            # Cross-project access via the existing metadata.policies
+            # surface — _bq_access_entries maps the SA to a user_by_email
+            # row on the dataset's access[] block. BQ accepts cross-project
+            # SA emails verbatim via user_by_email. Zero new schema
+            # fields needed for cross-project sharing.
+            "policies": {
+                "consumers": {
+                    "principals": ["consumer@other-project.iam.gserviceaccount.com"],
+                    "permissions": ["read"],
+                }
+            },
+        },
+        "exposes": [
+            {
+                "exposeId": "events",
+                "binding": {
+                    "platform": "gcp",
+                    "format": "bigquery_table",
+                    "location": {"dataset": "demo_xproj", "table": "events"},
+                },
+                "contract": {"schema": [{"name": "id", "type": "integer", "required": True}]},
+            }
+        ],
+    },
+}
+
+
+@pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
+@pytest.mark.parametrize("cloud", sorted(_CROSS_ACCOUNT_CONTRACTS))
+def test_cross_account_emit_passes_tofu_validate(cloud, tmp_path):
+    """The cross-account/cross-project emit must produce ``.tf.json``
+    that real ``tofu`` accepts. Catches provider-schema drift on
+    ``aws_s3_bucket_policy`` and ``google_bigquery_dataset_iam_member``
+    that the dict-level Stage 1 tests can't surface."""
+    plugin = IAC_PLUGINS.get(cloud)
+    if plugin is None:
+        pytest.skip(f"no IaC plugin registered for {cloud}")
+
+    (tmp_path / "main.tf.json").write_text(build_module(plugin, _CROSS_ACCOUNT_CONTRACTS[cloud]))
+
+    init = subprocess.run(
+        [_TOFU, "init", "-backend=false", "-input=false", "-no-color"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert init.returncode == 0, init.stderr or init.stdout
+
+    validate = subprocess.run(
+        [_TOFU, "validate", "-no-color"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert validate.returncode == 0, validate.stderr or validate.stdout
+
+
+# Snowflake Horizon declarative tag governance was scoped OUT in the
+# "minimum schema changes" pass — defining tags / binding masking
+# policies to tags requires either new schema surface (which we don't
+# want) or out-of-band Snowsight setup (which contracts shouldn't own).
+# Catalog-style enrichment (table COMMENT + per-column comments) is
+# covered without any schema change at
+# ``tests/iac/test_iac_snowflake.py::TestSnowflakeCatalogEnrichment``.

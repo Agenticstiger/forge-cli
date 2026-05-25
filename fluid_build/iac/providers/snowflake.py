@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
+import yaml
+
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
 from ..versions import required_providers
@@ -106,7 +108,7 @@ class SnowflakeIacPlugin:
                 first_loc = loc
             fmt = binding.get("format")
             schema_cols = (exposure.get("contract") or {}).get("schema") or []
-            _emit_snowflake(resources, loc, fmt, schema_cols, cid)
+            _emit_snowflake(resources, loc, fmt, schema_cols, cid, contract=contract)
         _emit_grants(resources, contract, cid)
         # Streams / tasks / views / procedures / functions — the planner
         # already interpreted the `streams[]`, `views[]`, `build` and
@@ -286,6 +288,8 @@ def _emit_snowflake(
     fmt: Any,
     schema_cols: List[Mapping[str, Any]],
     cid: str,
+    *,
+    contract: Mapping[str, Any] = None,  # type: ignore[assignment]
 ) -> None:
     """Emit a Snowflake exposure — its database, schema, and table (or view).
 
@@ -293,6 +297,12 @@ def _emit_snowflake(
     the table carries the contract's column schema. ``snowflake_table`` is a
     v2 preview resource, so :meth:`SnowflakeIacPlugin.provider_block` enables
     ``snowflake_table_resource``.
+
+    Catalog-style enrichments (table COMMENT + per-column comments) are
+    folded in here from the retired ``catalog_registrars.snowflake_horizon``
+    registrar — Snowsight reads the table comment verbatim, surfacing the
+    FLUID classification + contract YAML to analysts without a separate
+    publish step.
     """
     database = loc.get("database")
     schema_name = loc.get("schema")
@@ -323,16 +333,21 @@ def _emit_snowflake(
     db_ref = tofu_ref(f"snowflake_database.{db_res}.name")
     sc_ref = tofu_ref(f"snowflake_schema.{sc_res}.name")
 
+    table_comment = _build_horizon_table_comment(contract) if contract else ""
+
     if fmt == "snowflake_view":
-        resources.setdefault("snowflake_view", {})[tbl_res] = {
+        view_body = {
             "name": table,
             "database": db_ref,
             "schema": sc_ref,
             "statement": loc.get("query") or f"SELECT * FROM {table}",
         }
+        if table_comment:
+            view_body["comment"] = table_comment
+        resources.setdefault("snowflake_view", {})[tbl_res] = view_body
         return
 
-    resources.setdefault("snowflake_table", {})[tbl_res] = {
+    table_body: Dict[str, Any] = {
         "name": table,
         "database": db_ref,
         "schema": sc_ref,
@@ -341,6 +356,10 @@ def _emit_snowflake(
                 "name": col.get("name"),
                 "type": _sf_type(col.get("type")),
                 "nullable": not col.get("required", False),
+                # Per-column ``comment`` — absorbed from the retired
+                # Snowflake Horizon registrar's ``columns[].comment``.
+                # Snowflake surfaces this in DESC TABLE + Snowsight.
+                **({"comment": col["description"]} if col.get("description") else {}),
             }
             for col in schema_cols
         ],
@@ -353,6 +372,44 @@ def _emit_snowflake(
         # ``fluid verify`` is the gate that checks the live table vs contract.
         "lifecycle": {"ignore_changes": ["column"]},
     }
+    if table_comment:
+        table_body["comment"] = table_comment
+    resources.setdefault("snowflake_table", {})[tbl_res] = table_body
+
+
+def _build_horizon_table_comment(contract: Mapping[str, Any]) -> str:
+    """Render the markdown table COMMENT that Snowsight + DESC TABLE expose
+    to analysts. Mirrors the retired ``SnowflakeHorizonRegistrar._build_payload``
+    so existing reader tooling keeps working — sections in the same order
+    (description → FLUID classification → FLUID contract YAML).
+    """
+    meta = contract.get("metadata") or {}
+    sections: List[str] = []
+    desc = meta.get("description") or contract.get("description")
+    if desc:
+        sections.append(str(desc))
+    meta_lines: List[str] = []
+    if meta.get("layer"):
+        meta_lines.append(f"- fluid_layer: {meta['layer']}")
+    product_type = meta.get("productType") or meta.get("product_type")
+    if product_type:
+        meta_lines.append(f"- fluid_product_type: {product_type}")
+    if contract.get("domain"):
+        meta_lines.append(f"- fluid_domain: {contract['domain']}")
+    if contract.get("fluidVersion"):
+        meta_lines.append(f"- fluid_version: {contract['fluidVersion']}")
+    if meta_lines:
+        sections.append("FLUID classification:\n" + "\n".join(meta_lines))
+    try:
+        fluid_yaml = yaml.safe_dump(dict(contract), sort_keys=False)
+        # Snowflake's table comment is unbounded but Snowsight renders
+        # long comments awkwardly; cap at ~50 KB which fits a fairly
+        # large contract verbatim.
+        if len(fluid_yaml) <= 50_000:
+            sections.append("FLUID contract:\n```yaml\n" + fluid_yaml + "\n```")
+    except Exception:  # noqa: BLE001 — best-effort, drop on yaml error
+        pass
+    return "\n\n".join(sections)
 
 
 # Snowflake object types granted via ``on_account_object``; every other

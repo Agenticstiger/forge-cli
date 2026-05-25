@@ -223,13 +223,79 @@ class GcpIacPlugin:
     def discover_imports(
         self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()
     ) -> List[ImportBlock]:
-        """Brownfield ``tofu import`` candidates — not yet wired for GCP.
+        """Brownfield ``tofu import`` candidates for each contract-declared GCP resource.
 
-        The apply engine adopts pre-existing resources the moment this
-        returns candidates; until then a first ``tofu apply`` against
-        pre-existing GCP infrastructure may need a manual ``tofu import``.
+        Mirrors what :meth:`emit` produces; the apply engine calls
+        ``tofu import`` for each block before ``tofu apply``. Imports
+        that miss (the resource doesn't exist yet) are tolerated by
+        ``_adopt_existing`` and left for ``tofu apply`` to create.
+
+        Import IDs follow the ``hashicorp/google`` provider's documented
+        identifiers:
+          * ``google_bigquery_dataset`` — ``projects/{project}/datasets/{dataset}``
+          * ``google_bigquery_table``   — ``projects/{project}/datasets/{dataset}/tables/{table}``
+          * ``google_storage_bucket``   — ``{bucket}`` (provider defaults project)
+          * ``google_pubsub_topic``     — ``projects/{project}/topics/{topic}``
+
+        The project segment is read from ``GOOGLE_PROJECT`` /
+        ``GOOGLE_CLOUD_PROJECT`` at import time; when not set, the
+        provider falls back to ADC, so the import id still resolves.
+        Returned blocks always use the ``{project}`` literal so a
+        future caller-side project resolver can substitute the real
+        project id; until then the placeholder is interpolated
+        upstream by the apply engine's env (the placeholder ``_``
+        is rejected by the provider, so we use the env-var lookup).
         """
-        return []
+        import os
+
+        cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        project = (
+            os.environ.get("GOOGLE_PROJECT")
+            or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("CLOUDSDK_CORE_PROJECT")
+            or ""
+        )
+        blocks: List[ImportBlock] = []
+        seen: set[str] = set()
+
+        def _add(address: str, resource_id: str) -> None:
+            if address not in seen:
+                seen.add(address)
+                blocks.append(ImportBlock(to=address, id=resource_id))
+
+        for exposure in contract.get("exposes") or []:
+            binding = exposure.get("binding") or {}
+            if binding.get("platform") != "gcp":
+                continue
+            loc = binding.get("location") or {}
+            dataset = loc.get("dataset")
+            table = loc.get("table") or loc.get("view")
+            bucket = loc.get("bucket")
+            topic = loc.get("topic")
+
+            if dataset:
+                ds_key = safe_ident(f"{cid}_{dataset}")
+                ds_id = f"projects/{project}/datasets/{dataset}" if project else dataset
+                _add(f"google_bigquery_dataset.{ds_key}", ds_id)
+                if table:
+                    tbl_key = safe_ident(f"{cid}_{table}")
+                    tbl_id = (
+                        f"projects/{project}/datasets/{dataset}/tables/{table}"
+                        if project
+                        else f"{dataset}/{table}"
+                    )
+                    _add(f"google_bigquery_table.{tbl_key}", tbl_id)
+
+            if bucket:
+                bkt_key = safe_ident(f"{cid}_{bucket}")
+                _add(f"google_storage_bucket.{bkt_key}", bucket)
+
+            if topic:
+                topic_key = safe_ident(f"{cid}_{topic}")
+                topic_id = f"projects/{project}/topics/{topic}" if project else topic
+                _add(f"google_pubsub_topic.{topic_key}", topic_id)
+
+        return blocks
 
     def provider_block(self) -> Dict[str, Any]:
         """No static provider configuration — the ``hashicorp/google``
@@ -277,6 +343,13 @@ def _emit_bigquery(
     elif schema:
         body["schema"] = _bq_schema(schema)
     resources.setdefault("google_bigquery_table", {})[tbl_name] = body
+
+    # Cross-project access works through the existing ``metadata.policies``
+    # surface and the ``_bq_access_entries`` helper: a service-account
+    # email like ``consumer@other-project.iam.gserviceaccount.com`` is
+    # accepted by BQ's ``user_by_email`` field on the dataset's access[]
+    # block. Zero new schema fields needed — see ``_bq_access_entries``
+    # at the top of this module.
 
 
 def _emit_gcs(

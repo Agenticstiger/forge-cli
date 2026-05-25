@@ -67,6 +67,17 @@ def _apply_args(contract_path: Path, workspace_dir: Path, **overrides) -> argpar
         "state_backend": None,
         "dry_run": False,
         "allow_data_loss": False,
+        # The test writes a hand-crafted synthetic plan.json carrying
+        # only ``{"contract": ...}`` — no bundle, no actions array, no
+        # bindingMode field. The OpenTofu engine's plan-binding gate
+        # (added by commit 4c9163f for the security fix) would
+        # otherwise reject this with
+        # ``apply_plan_digest_binding_mode_missing``. This test
+        # exercises the apply path, not plan-binding integrity (that
+        # lives in ``test_iac_snowflake_real_cli_matrix_e2e.py`` with
+        # a real bundle → plan → apply chain), so the bypass is the
+        # right call here.
+        "no_verify_plan_binding": True,
     }
     base.update(overrides)
     return argparse.Namespace(**base)
