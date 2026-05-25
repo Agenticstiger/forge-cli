@@ -261,10 +261,11 @@ def _build_checks() -> List[DoctorCheck]:
             ),
         ),
         DoctorCheck(
-            "module:unity_registrar",
+            "module:datamesh_manager_registrar",
             DoctorScope.CATALOG,
             lambda: _check_python_module(
-                "fluid_build.build_runners.catalog_registrars.unity", DoctorScope.CATALOG
+                "fluid_build.build_runners.catalog_registrars.datamesh_manager",
+                DoctorScope.CATALOG,
             ),
         ),
         DoctorCheck(
@@ -283,6 +284,13 @@ def _build_checks() -> List[DoctorCheck]:
             ),
         ),
     ]
+    # Unity Catalog publish registrar dropped in
+    # ``feat(catalog): drop Unity Catalog publish registrar`` — the OSS
+    # v0.4 server doesn't fit the canonical-payload promise (MANAGED
+    # disabled, EXTERNAL URI required, no UPSERT primitive). Doctor
+    # used to import-check ``catalog_registrars.unity``; with the
+    # module gone that check would now WARN forever. Removed from the
+    # registry so ``doctor --scope catalog`` returns all-OK.
 
 
 def run_doctor(scope: DoctorScope) -> DoctorReport:

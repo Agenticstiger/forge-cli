@@ -151,6 +151,17 @@ def resolve_and_validate(hostname: str, *, allow_private: bool = False) -> str:
                 raise UnsafeURLError(
                     f"refusing fetch from non-public address {addr} " f"(hostname {hostname!r})"
                 )
+    # Prefer IPv4 over IPv6 when both are returned. macOS / many dev
+    # tools (LocalStack, Entropy Data, Unity Catalog OSS, …) bind
+    # 127.0.0.1 only and reject ::1 connects; getaddrinfo on
+    # ``localhost`` may return AAAA first. Picking the first IPv4
+    # answer when one exists keeps the SSRF guard's "pin to a single
+    # address" guarantee while avoiding spurious connect-refused
+    # against IPv4-only dev services. Public hostnames typically
+    # support dual-stack so this never bites real traffic.
+    for addr in addrs:
+        if ":" not in addr:
+            return addr
     return addrs[0]
 
 
@@ -201,8 +212,16 @@ def _make_request_pin_hook(*, allow_private: bool):
 
     def _hook(request) -> None:
         hostname, pinned_ip = assert_safe_url(str(request.url), allow_private=allow_private)
+        port = request.url.port
         request.url = request.url.copy_with(host=pinned_ip)
-        request.headers["Host"] = hostname
+        # The Host header MUST include the port when the URL has a
+        # non-default one — AWS-style services (Glue, S3, …) validate
+        # the Host header for SigV4 routing and reject a bare
+        # hostname when the request was made to ``host:port``. Without
+        # this, ``safe_httpx_client`` worked against DataHub /
+        # OpenMetadata (which ignore Host) but failed with 400 against
+        # LocalStack/Glue.
+        request.headers["Host"] = f"{hostname}:{port}" if port else hostname
         request.extensions["sni_hostname"] = hostname
 
     return _hook

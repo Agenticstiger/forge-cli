@@ -259,11 +259,24 @@ class TestPublishAcquisition:
         assert results == []
 
     def test_publish_missing_registrar_records_failure(self, tmp_path: Path):
-        # No registrar pre-registered for "datahub" — orchestrator records the failure.
+        """Unknown target → orchestrator records ``No registrar configured``.
+
+        Pre-unification, this test pointed at ``datahub`` because the
+        sync ``_REGISTRY`` was never auto-populated; now every backend
+        declared via :func:`register_catalog_backend` is reachable
+        through ``build_registrar``, so the only way to genuinely hit
+        the "missing registrar" path is to ask for a backend name
+        that exists nowhere — neither the legacy ``_REGISTRY`` nor
+        ``CATALOG_PROVIDERS``. Using a deliberately fake name pins the
+        intent (error reporting for genuinely unknown targets) without
+        relying on the no-longer-true "datahub isn't wired" premise.
+        """
         from fluid_build.build_runners import _catalog as orch
 
-        orch._REGISTRY.pop("datahub", None)
-        results = publish_acquisition(_base_contract(), tmp_path)
+        contract = _base_contract()
+        contract["builds"][0]["properties"]["catalog"]["register"] = ["nonexistent-catalog-xyz"]
+        orch._REGISTRY.pop("nonexistent-catalog-xyz", None)
+        results = publish_acquisition(contract, tmp_path)
         assert len(results) == 1
         assert results[0].succeeded is False
         assert "No registrar" in (results[0].error or "")
