@@ -30,13 +30,13 @@ Phase 1 scope
   stage (``publish``) already had an ``async def run_async`` upstream
   — we wire to that directly without the thread hop.
 
-* Five commands covered: ``validate``, ``plan``, ``apply``, ``diff``,
-  ``publish``. These are the stages present in the released PyPI
-  package (``fluid-forge==0.7.9``) and the highest-leverage targets
-  for in-process consumers. The other 6 stages (``bundle``,
-  ``generate``, ``generate-artifacts``, ``validate-artifacts``,
-  ``policy-apply``, ``verify``, ``schedule-sync``) will land in Phase
-  1.1 once they ship to PyPI.
+* Eleven commands covered. Phase 1 shipped ``validate``, ``plan``,
+  ``apply``, ``diff``, ``publish``; Phase 1.1 added the remaining
+  six 11-stage pipeline commands (``bundle``, ``verify``,
+  ``policy_apply``, ``generate_artifacts``, ``validate_artifacts``,
+  ``schedule_sync``). ``fluid generate`` itself is a subcommand
+  router; consumers call ``generate_artifacts`` directly today;
+  ``generate_iac`` / ``generate_ci`` are sequenced for follow-ups.
 
 * No new logic. No new validation. No new error semantics. Each
   wrapper builds an ``argparse.Namespace`` mimicking the CLI's
@@ -104,11 +104,23 @@ __all__ = [
     "ApplyResult",
     "DiffResult",
     "PublishResult",
+    "BundleResult",
+    "VerifyResult",
+    "PolicyApplyResult",
+    "GenerateArtifactsResult",
+    "ValidateArtifactsResult",
+    "ScheduleSyncResult",
     "validate",
     "plan",
     "apply",
     "diff",
     "publish",
+    "bundle",
+    "verify",
+    "policy_apply",
+    "generate_artifacts",
+    "validate_artifacts",
+    "schedule_sync",
 ]
 
 
@@ -190,6 +202,52 @@ class PublishResult(StageResult):
     async surface; this wrapper does not add a thread hop."""
 
     _stage_name: str = "publish"
+
+
+@dataclass
+class BundleResult(StageResult):
+    """Result of :func:`bundle`."""
+
+    _stage_name: str = "bundle"
+
+
+@dataclass
+class VerifyResult(StageResult):
+    """Result of :func:`verify`. ``artifacts['report']`` is the parsed
+    drift report when ``out=`` was supplied."""
+
+    _stage_name: str = "verify"
+
+
+@dataclass
+class PolicyApplyResult(StageResult):
+    """Result of :func:`policy_apply`."""
+
+    _stage_name: str = "policy_apply"
+
+
+@dataclass
+class GenerateArtifactsResult(StageResult):
+    """Result of :func:`generate_artifacts`. ``artifacts['manifest']``
+    is the parsed ``MANIFEST.json`` from the output dir."""
+
+    _stage_name: str = "generate_artifacts"
+
+
+@dataclass
+class ValidateArtifactsResult(StageResult):
+    """Result of :func:`validate_artifacts`. ``artifacts['report']`` is
+    the parsed JSON report when ``report=`` was supplied."""
+
+    _stage_name: str = "validate_artifacts"
+
+
+@dataclass
+class ScheduleSyncResult(StageResult):
+    """Result of :func:`schedule_sync`. ``artifacts['report']`` is the
+    parsed sync result when ``report=`` was supplied."""
+
+    _stage_name: str = "schedule_sync"
 
 
 class EngineError(RuntimeError):
@@ -656,3 +714,249 @@ async def publish(
             stdout=stdout_buf.getvalue(),
             stderr=stderr_buf.getvalue() + f"\n{type(exc).__name__}: {exc}\n",
         )
+
+
+# ── Phase 1.1: remaining 11-stage commands ────────────────────────────
+
+
+async def bundle(
+    contract: Path | str | None = None,
+    *,
+    out: Optional[Path | str] = None,
+    env: Optional[str] = None,
+    output_format: Optional[str] = None,
+    sign: bool = False,
+    sign_key: Optional[str] = None,
+    attest: bool = False,
+) -> BundleResult:
+    """Run ``fluid bundle`` in-process.
+
+    Resolves $ref pointers and emits a single bundled contract (yaml/
+    json/tgz). The ``tgz`` format is the canonical input to every
+    downstream stage of the 11-stage pipeline; choose it for any
+    pipeline-driving use. Set ``contract=None`` to let the stage
+    auto-find ``contract.fluid.yaml`` in the CWD.
+    """
+    from fluid_build.cli import bundle as _bundle
+
+    overrides: dict[str, Any] = {
+        "env": env,
+        "format": output_format,
+        "sign": sign,
+        "sign_key": sign_key,
+        "attest": attest,
+    }
+    if contract is not None:
+        overrides["contract"] = str(contract)
+    if out is not None:
+        overrides["out"] = str(out)
+    ns = _build_namespace(_bundle, overrides)
+    result = await _run_sync_stage("bundle", _bundle, ns, BundleResult)
+    if out is not None and out != "-":
+        result.artifacts["bundle_path"] = str(out)
+    return result
+
+
+async def verify(
+    contract: Path | str,
+    *,
+    expose_id: Optional[str] = None,
+    strict: bool = False,
+    out: Optional[Path | str] = None,
+    show_diffs: bool = False,
+    env: Optional[str] = None,
+) -> VerifyResult:
+    """Run ``fluid verify`` in-process.
+
+    Stage-9 of the 11-stage pipeline. Re-reads the deployed resources
+    and compares against the contract's declared shape; surfaces drift.
+    When ``out`` is supplied, the JSON drift report is parsed into
+    ``result.artifacts['report']``.
+    """
+    from fluid_build.cli import verify as _verify
+
+    overrides: dict[str, Any] = {
+        "contract": str(contract),
+        "expose_id": expose_id,
+        "strict": strict,
+        "show_diffs": show_diffs,
+        "env": env,
+    }
+    if out is not None:
+        overrides["out"] = str(out)
+    ns = _build_namespace(_verify, overrides)
+    result = await _run_sync_stage("verify", _verify, ns, VerifyResult)
+    if out is not None and Path(out).exists():
+        try:
+            result.artifacts["report"] = json.loads(Path(out).read_text())
+            result.artifacts["report_path"] = str(out)
+        except (json.JSONDecodeError, OSError):
+            logging.getLogger("fluid.engine.verify").debug(
+                "could not parse verify report=%s", out, exc_info=True
+            )
+    return result
+
+
+async def policy_apply(
+    bindings: Path | str,
+    *,
+    mode: str = "check",
+) -> PolicyApplyResult:
+    """Run ``fluid policy-apply`` (alias of ``fluid policy apply``) in-process.
+
+    Stage-8 of the 11-stage pipeline. Applies compiled IAM bindings
+    (the output of ``fluid policy compile``). ``mode`` is ``"check"``
+    (dry-run, the safe default) or ``"enforce"`` (write the bindings
+    to the provider).
+    """
+    from fluid_build.cli import policy_apply as _policy_apply
+
+    if mode not in ("check", "enforce"):
+        raise ValueError(f"policy_apply mode must be 'check' or 'enforce', got {mode!r}")
+
+    ns = _build_namespace(_policy_apply, {"bindings": str(bindings), "mode": mode})
+    return await _run_sync_stage("policy_apply", _policy_apply, ns, PolicyApplyResult)
+
+
+async def generate_artifacts(
+    bundle: Path | str,
+    *,
+    out: Optional[Path | str] = None,
+    emit: Optional[str] = None,
+    manifest: Optional[Path | str] = None,
+) -> GenerateArtifactsResult:
+    """Run ``fluid generate artifacts`` in-process.
+
+    Stage-3 of the 11-stage pipeline. Reads a Phase-2 bundle (.tgz) or
+    a raw resolved contract (.yaml) and emits ODPS v4.1, ODPS-Bitol,
+    ODCS per-port, OPDS, schedule DAGs, and compiled policy bindings
+    into the output directory with a unified ``MANIFEST.json``.
+    """
+    from fluid_build.cli import generate_artifacts as _gen_artifacts
+
+    out_dir = str(out) if out is not None else "dist/artifacts"
+    manifest_path = str(manifest) if manifest is not None else str(Path(out_dir) / "MANIFEST.json")
+    ns = _build_namespace(
+        _gen_artifacts,
+        {
+            "bundle": str(bundle),
+            "out": out_dir,
+            "emit": emit,
+            "manifest": manifest_path,
+        },
+    )
+    result = await _run_sync_stage(
+        "generate_artifacts", _gen_artifacts, ns, GenerateArtifactsResult
+    )
+    if Path(manifest_path).exists():
+        try:
+            result.artifacts["manifest"] = json.loads(Path(manifest_path).read_text())
+            result.artifacts["manifest_path"] = manifest_path
+        except (json.JSONDecodeError, OSError):
+            logging.getLogger("fluid.engine.generate_artifacts").debug(
+                "could not parse manifest=%s", manifest_path, exc_info=True
+            )
+    return result
+
+
+async def validate_artifacts(
+    artifacts_dir: Path | str,
+    *,
+    manifest: Optional[Path | str] = None,
+    opa_policy_dir: str = "tests/policies",
+    report: Optional[Path | str] = None,
+    strict: bool = False,
+    fail_fast: bool = False,
+    verbose: bool = False,
+    quiet: bool = False,
+    output_format: str = "text",
+) -> ValidateArtifactsResult:
+    """Run ``fluid validate-artifacts`` in-process.
+
+    Stage-4 of the 11-stage pipeline. Re-verifies every file's SHA-256
+    against ``MANIFEST.json`` (tamper gate), then runs per-format
+    validators. Optional OPA conftest + dbt parse when those tools
+    are on PATH.
+    """
+    from fluid_build.cli import validate_artifacts as _validate_artifacts
+
+    overrides: dict[str, Any] = {
+        "artifacts_dir": str(artifacts_dir),
+        "opa_policy_dir": opa_policy_dir,
+        "strict": strict,
+        "fail_fast": fail_fast,
+        "verbose": verbose,
+        "quiet": quiet,
+        "format": output_format,
+    }
+    if manifest is not None:
+        overrides["manifest"] = str(manifest)
+    if report is not None:
+        overrides["report"] = str(report)
+    ns = _build_namespace(_validate_artifacts, overrides)
+    result = await _run_sync_stage(
+        "validate_artifacts", _validate_artifacts, ns, ValidateArtifactsResult
+    )
+    if report is not None and Path(report).exists():
+        try:
+            result.artifacts["report"] = json.loads(Path(report).read_text())
+            result.artifacts["report_path"] = str(report)
+        except (json.JSONDecodeError, OSError):
+            logging.getLogger("fluid.engine.validate_artifacts").debug(
+                "could not parse report=%s", report, exc_info=True
+            )
+    return result
+
+
+async def schedule_sync(
+    *,
+    scheduler: str,
+    dags_dir: Path | str,
+    destination: Optional[str] = None,
+    environment_name: Optional[str] = None,
+    location: Optional[str] = None,
+    workspace: Optional[str] = None,
+    env: str = "dev",
+    dry_run: bool = True,
+    timeout: int = 600,
+    report: Optional[Path | str] = None,
+    bundle_path: Optional[Path | str] = None,
+    verify_signature: bool = False,
+    verify_key: Optional[str] = None,
+) -> ScheduleSyncResult:
+    """Run ``fluid schedule-sync`` in-process.
+
+    Stage-11 of the 11-stage pipeline. Pushes generated DAG files to a
+    scheduler endpoint. ``dry_run`` defaults to ``True`` to match the
+    safe-by-default ergonomics of the apply wrapper.
+    """
+    from fluid_build.cli import schedule_sync as _schedule_sync
+
+    overrides: dict[str, Any] = {
+        "scheduler": scheduler,
+        "dags_dir": str(dags_dir),
+        "destination": destination,
+        "environment_name": environment_name,
+        "location": location,
+        "workspace": workspace,
+        "env": env,
+        "dry_run": dry_run,
+        "timeout": timeout,
+        "verify_signature": verify_signature,
+        "verify_key": verify_key,
+    }
+    if report is not None:
+        overrides["report"] = str(report)
+    if bundle_path is not None:
+        overrides["bundle"] = str(bundle_path)
+    ns = _build_namespace(_schedule_sync, overrides)
+    result = await _run_sync_stage("schedule_sync", _schedule_sync, ns, ScheduleSyncResult)
+    if report is not None and Path(report).exists():
+        try:
+            result.artifacts["report"] = json.loads(Path(report).read_text())
+            result.artifacts["report_path"] = str(report)
+        except (json.JSONDecodeError, OSError):
+            logging.getLogger("fluid.engine.schedule_sync").debug(
+                "could not parse report=%s", report, exc_info=True
+            )
+    return result

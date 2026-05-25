@@ -325,3 +325,220 @@ def test_diff_namespace_uses_baseline_not_other():
     ns = _engine_namespace_for("diff", {"contract": "/tmp/a", "baseline": "/tmp/b"})
     assert ns.baseline == "/tmp/b"
     assert not hasattr(ns, "other") or ns.other is None
+
+
+# ── Phase 1.1: bundle ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_bundle_returns_bundle_result_type(tmp_path, monkeypatch):
+    contract = tmp_path / "c.fluid.yaml"
+    contract.write_text("apiVersion: fluid.dev/v1\n")
+    out_path = tmp_path / "bundled.tgz"
+
+    captured = {}
+
+    def fake_run(ns, logger):
+        captured["contract"] = ns.contract
+        captured["format"] = ns.format
+        captured["out"] = ns.out
+        out_path.write_bytes(b"fake-tgz-bytes")
+        return 0
+
+    monkeypatch.setattr("fluid_build.cli.bundle.run", fake_run)
+    result = await engine.bundle(contract, out=out_path, output_format="tgz")
+
+    assert isinstance(result, engine.BundleResult)
+    assert result.success
+    assert captured["contract"] == str(contract)
+    assert captured["format"] == "tgz"
+    assert captured["out"] == str(out_path)
+
+
+# ── Phase 1.1: verify ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_verify_reads_back_report_artifact(tmp_path, monkeypatch):
+    contract = tmp_path / "c.fluid.yaml"
+    contract.write_text("apiVersion: fluid.dev/v1\n")
+    out_path = tmp_path / "drift.json"
+    report_body = {"drift": [], "verified_at": "now"}
+
+    def fake_run(ns, logger):
+        out_path.write_text(json.dumps(report_body))
+        return 0
+
+    monkeypatch.setattr("fluid_build.cli.verify.run", fake_run)
+    result = await engine.verify(contract, out=out_path, show_diffs=True, strict=True)
+
+    assert isinstance(result, engine.VerifyResult)
+    assert result.artifacts["report"] == report_body
+    assert result.artifacts["report_path"] == str(out_path)
+
+
+# ── Phase 1.1: policy_apply ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_policy_apply_defaults_to_check_mode(tmp_path, monkeypatch):
+    bindings = tmp_path / "bindings.json"
+    bindings.write_text("{}")
+
+    captured = {}
+
+    def fake_run(ns, logger):
+        captured["mode"] = ns.mode
+        captured["bindings"] = ns.bindings
+        return 0
+
+    monkeypatch.setattr("fluid_build.cli.policy_apply.run", fake_run)
+    await engine.policy_apply(bindings)
+    assert captured["mode"] == "check"
+    assert captured["bindings"] == str(bindings)
+
+
+@pytest.mark.asyncio
+async def test_policy_apply_rejects_unknown_mode(tmp_path):
+    bindings = tmp_path / "bindings.json"
+    bindings.write_text("{}")
+    with pytest.raises(ValueError, match="must be 'check' or 'enforce'"):
+        await engine.policy_apply(bindings, mode="nuke")
+
+
+# ── Phase 1.1: generate_artifacts ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_generate_artifacts_reads_back_manifest(tmp_path, monkeypatch):
+    bundle_path = tmp_path / "bundle.tgz"
+    bundle_path.write_bytes(b"fake")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    manifest_body = {"files": {"a.json": "sha256:abc"}, "digest": "sha256:xyz"}
+
+    def fake_run(ns, logger):
+        Path(ns.manifest).write_text(json.dumps(manifest_body))
+        return 0
+
+    monkeypatch.setattr("fluid_build.cli.generate_artifacts.run", fake_run)
+    result = await engine.generate_artifacts(bundle_path, out=out_dir)
+
+    assert isinstance(result, engine.GenerateArtifactsResult)
+    assert result.success
+    assert result.artifacts["manifest"] == manifest_body
+
+
+# ── Phase 1.1: validate_artifacts ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_validate_artifacts_reads_back_report(tmp_path, monkeypatch):
+    artifacts_dir = tmp_path / "dist"
+    artifacts_dir.mkdir()
+    report_path = tmp_path / "va.json"
+    report_body = {"status": "ok", "issues": [], "summary": {"errors": 0}}
+
+    captured = {}
+
+    def fake_run(ns, logger):
+        captured["strict"] = ns.strict
+        captured["artifacts_dir"] = ns.artifacts_dir
+        report_path.write_text(json.dumps(report_body))
+        return 0
+
+    monkeypatch.setattr("fluid_build.cli.validate_artifacts.run", fake_run)
+    result = await engine.validate_artifacts(artifacts_dir, report=report_path, strict=True)
+
+    assert isinstance(result, engine.ValidateArtifactsResult)
+    assert result.artifacts["report"] == report_body
+    assert captured["strict"] is True
+
+
+# ── Phase 1.1: schedule_sync ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_schedule_sync_defaults_to_dry_run(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(ns, logger):
+        captured["dry_run"] = ns.dry_run
+        captured["scheduler"] = ns.scheduler
+        return 0
+
+    monkeypatch.setattr("fluid_build.cli.schedule_sync.run", fake_run)
+    await engine.schedule_sync(scheduler="airflow", dags_dir="dist/schedule/")
+    assert captured["dry_run"] is True
+    assert captured["scheduler"] == "airflow"
+
+
+@pytest.mark.asyncio
+async def test_schedule_sync_forwards_signature_verification(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(ns, logger):
+        captured["verify_signature"] = ns.verify_signature
+        captured["bundle"] = ns.bundle
+        captured["verify_key"] = ns.verify_key
+        return 0
+
+    monkeypatch.setattr("fluid_build.cli.schedule_sync.run", fake_run)
+    await engine.schedule_sync(
+        scheduler="airflow",
+        dags_dir="dist/schedule/",
+        bundle_path="bundle.tgz",
+        verify_signature=True,
+        verify_key="awskms://key-id",
+    )
+    assert captured["verify_signature"] is True
+    assert captured["bundle"] == "bundle.tgz"
+    assert captured["verify_key"] == "awskms://key-id"
+
+
+# ── Phase 1.1: namespace-shape regression guards ──────────────────────
+
+
+def test_bundle_namespace_carries_every_field_the_stage_reads():
+    referenced = _read_args_referenced("bundle")
+    ns = _engine_namespace_for("bundle", {"contract": "/tmp/c"})
+    missing = [a for a in referenced if not hasattr(ns, a)]
+    assert not missing, f"engine.bundle namespace missing: {sorted(missing)}"
+
+
+def test_verify_namespace_carries_every_field_the_stage_reads():
+    referenced = _read_args_referenced("verify")
+    ns = _engine_namespace_for("verify", {"contract": "/tmp/c"})
+    missing = [a for a in referenced if not hasattr(ns, a)]
+    assert not missing, f"engine.verify namespace missing: {sorted(missing)}"
+
+
+def test_policy_apply_namespace_carries_every_field_the_stage_reads():
+    referenced = _read_args_referenced("policy_apply")
+    ns = _engine_namespace_for("policy_apply", {"bindings": "/tmp/b"})
+    missing = [a for a in referenced if not hasattr(ns, a)]
+    assert not missing, f"engine.policy_apply namespace missing: {sorted(missing)}"
+
+
+def test_generate_artifacts_namespace_carries_every_field_the_stage_reads():
+    referenced = _read_args_referenced("generate_artifacts")
+    ns = _engine_namespace_for("generate_artifacts", {"bundle": "/tmp/b.tgz"})
+    missing = [a for a in referenced if not hasattr(ns, a)]
+    assert not missing, f"engine.generate_artifacts namespace missing: {sorted(missing)}"
+
+
+def test_validate_artifacts_namespace_carries_every_field_the_stage_reads():
+    referenced = _read_args_referenced("validate_artifacts")
+    ns = _engine_namespace_for("validate_artifacts", {"artifacts_dir": "/tmp/d"})
+    missing = [a for a in referenced if not hasattr(ns, a)]
+    assert not missing, f"engine.validate_artifacts namespace missing: {sorted(missing)}"
+
+
+def test_schedule_sync_namespace_carries_every_field_the_stage_reads():
+    referenced = _read_args_referenced("schedule_sync")
+    ns = _engine_namespace_for(
+        "schedule_sync",
+        {"scheduler": "airflow", "dags_dir": "/tmp/d"},
+    )
+    missing = [a for a in referenced if not hasattr(ns, a)]
+    assert not missing, f"engine.schedule_sync namespace missing: {sorted(missing)}"
