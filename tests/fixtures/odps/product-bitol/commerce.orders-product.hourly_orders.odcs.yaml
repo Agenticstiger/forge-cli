@@ -1,0 +1,72 @@
+version: 1.0.0
+apiVersion: v3.1.0
+kind: DataContract
+id: commerce.orders-product.hourly_orders
+status: active
+name: Orders Product
+description:
+  purpose: Orders data product with daily and hourly outputs
+tags:
+- orders
+- production
+domain: commerce
+tenant: acme
+team:
+  name: commerce-team
+  members:
+  - name: Alice
+    username: alice@acme.com
+    role: data-owner
+schema:
+- name: hourly_orders
+  logicalType: object
+  physicalType: topic
+  properties:
+  - name: order_id
+    logicalType: string
+    physicalType: string
+    required: true
+    tags:
+    - primary-key
+    quality:
+    - type: library
+      metric: nullValues
+      mustBe: 0
+      dimension: completeness
+      description: Field 'order_id' must not contain null values
+    - type: library
+      metric: duplicateValues
+      mustBe: 0
+      dimension: uniqueness
+      description: Primary key field 'order_id' must contain only unique values
+    primaryKey: true
+  - name: customer_id
+    logicalType: string
+    physicalType: string
+    required: true
+    quality:
+    - type: library
+      metric: nullValues
+      mustBe: 0
+      dimension: completeness
+      description: Field 'customer_id' must not contain null values
+  - name: amount
+    logicalType: number
+    physicalType: number
+    required: true
+    quality:
+    - type: library
+      metric: nullValues
+      mustBe: 0
+      dimension: completeness
+      description: Field 'amount' must not contain null values
+  description: Hourly order stream
+servers:
+- server: hourly_orders
+  type: kafka
+  host: kafka-prod.acme:9092
+- server: customers_raw
+  type: snowflake
+  account: company-prod
+  database: RAW_DB
+  schema: CUSTOMERS

@@ -68,10 +68,14 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                 error="DMM_API_KEY not set; refusing anonymous publish",
             )
         try:
-            import httpx
+            from fluid_build.util.safe_http import safe_httpx_client
 
             payload = self._build_payload(product_id, expose_id, contract, classifications)
-            with httpx.Client(base_url=self.api_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.api_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.put(
                     f"/api/data-products/{product_id}",
                     json=payload,
@@ -98,9 +102,13 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                 target=self.target, urn=urn, succeeded=False, error="DMM_API_KEY not set"
             )
         try:
-            import httpx
+            from fluid_build.util.safe_http import safe_httpx_client
 
-            with httpx.Client(base_url=self.api_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.api_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.delete(
                     f"/api/data-products/{product_id}",
                     headers={"Authorization": f"Bearer {self.api_token}"},

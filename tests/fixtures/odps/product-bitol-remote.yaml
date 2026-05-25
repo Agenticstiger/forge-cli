@@ -1,0 +1,17 @@
+# Remote-contractId fixture — port's contractId is an https URL.
+# Tests two paths:
+#  - allow_remote=True  : resolver attempts the fetch (mock in test)
+#  - allow_remote=False : RemoteFetchDisabled raised immediately
+apiVersion: v1.0.0
+kind: DataProduct
+id: remote.example.product
+name: Remote Example Product
+version: 1.0.0
+status: draft
+team:
+  members:
+    - name: data-platform
+outputPorts:
+  - name: external_users
+    version: 1.0.0
+    contractId: https://example.invalid/contracts/users-v1.odcs.yaml

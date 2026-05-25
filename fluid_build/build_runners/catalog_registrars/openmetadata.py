@@ -36,7 +36,7 @@ class OpenMetadataRegistrar(CatalogRegistrar):
         contract: Dict[str, Any],
         classifications: Dict[str, List[str]],
     ) -> RegistrationResult:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         urn = f"forge://{product_id}/{expose_id}"
         payload = self._build_payload(product_id, expose_id, contract, classifications)
@@ -44,7 +44,11 @@ class OpenMetadataRegistrar(CatalogRegistrar):
         if self.api_token:
             headers["Authorization"] = f"Bearer {self.api_token}"
         try:
-            with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.base_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.put("/api/v1/tables", json=payload, headers=headers)
                 r.raise_for_status()
             return RegistrationResult(target="openmetadata", urn=urn, succeeded=True)
@@ -54,11 +58,15 @@ class OpenMetadataRegistrar(CatalogRegistrar):
             )
 
     def unregister(self, product_id: str, expose_id: str) -> RegistrationResult:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         urn = f"forge://{product_id}/{expose_id}"
         try:
-            with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.base_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.delete(f"/api/v1/tables/name/{product_id}.{expose_id}")
                 r.raise_for_status()
             return RegistrationResult(target="openmetadata", urn=urn, succeeded=True)

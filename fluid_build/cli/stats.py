@@ -70,6 +70,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Emit machine-readable JSON instead of a table.",
     )
+    # Wire the dispatcher — `ProductionCLI._execute_command` looks up
+    # `args.func`. Without this, `fluid stats` errors with "No command
+    # function found" instead of running. Pinned by
+    # tests/cli/test_subcommand_dispatch_smoke.py.
+    p.set_defaults(func=run)
 
 
 def run(args, logger: logging.Logger) -> int:

@@ -1,0 +1,21 @@
+# Minimal ODCS contract — only required + name fields populated.
+version: "1.0.0"
+apiVersion: v3.1.0
+kind: DataContract
+id: minimal.contract
+status: draft
+name: minimal
+schema:
+  - name: minimal_table
+    logicalType: object
+    physicalType: table
+    properties:
+      - name: id
+        logicalType: string
+# Smallest vowl-strict-pass servers entry — minimal fixture must round-trip
+# AND pass the (now default-on) vowl second pass.
+servers:
+  - server: prod
+    type: bigquery
+    project: example_project
+    dataset: example_dataset

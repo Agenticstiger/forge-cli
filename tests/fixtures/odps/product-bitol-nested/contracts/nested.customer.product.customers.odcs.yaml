@@ -1,0 +1,21 @@
+apiVersion: v3.1.0
+kind: DataContract
+id: nested.customer.product.customers
+name: Customers
+version: 1.0.0
+status: active
+schema:
+  - name: customers
+    logicalType: object
+    physicalType: table
+    properties:
+      - name: customer_id
+        logicalType: string
+        primaryKey: true
+      - name: email
+        logicalType: string
+servers:
+  - server: prod
+    type: bigquery
+    project: nested_project
+    dataset: customer_dataset

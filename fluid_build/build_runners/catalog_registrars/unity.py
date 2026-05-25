@@ -35,7 +35,7 @@ class UnityCatalogRegistrar(CatalogRegistrar):
         contract: Dict[str, Any],
         classifications: Dict[str, List[str]],
     ) -> RegistrationResult:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         full_name = f"{self.catalog_name}.{self.schema_name}.{expose_id}"
         urn = f"unity://{full_name}"
@@ -44,7 +44,11 @@ class UnityCatalogRegistrar(CatalogRegistrar):
         if self.workspace_token:
             headers["Authorization"] = f"Bearer {self.workspace_token}"
         try:
-            with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.base_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.post("/api/2.1/unity-catalog/tables", json=payload, headers=headers)
                 r.raise_for_status()
             return RegistrationResult(target="unity", urn=urn, succeeded=True)
@@ -52,12 +56,16 @@ class UnityCatalogRegistrar(CatalogRegistrar):
             return RegistrationResult(target="unity", urn=urn, succeeded=False, error=str(exc))
 
     def unregister(self, product_id: str, expose_id: str) -> RegistrationResult:
-        import httpx
+        from fluid_build.util.safe_http import safe_httpx_client
 
         full_name = f"{self.catalog_name}.{self.schema_name}.{expose_id}"
         urn = f"unity://{full_name}"
         try:
-            with httpx.Client(base_url=self.base_url, timeout=self.timeout_seconds) as c:
+            with safe_httpx_client(
+                base_url=self.base_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
                 r = c.delete(f"/api/2.1/unity-catalog/tables/{full_name}")
                 r.raise_for_status()
             return RegistrationResult(target="unity", urn=urn, succeeded=True)

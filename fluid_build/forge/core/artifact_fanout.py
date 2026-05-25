@@ -380,19 +380,37 @@ def _emit_odps(contract_path: Path, out_dir: Path, logger: logging.Logger) -> Li
 
 
 def _emit_odps_bitol(contract_path: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:
-    """Bypass ``generate_standard._export_odps_bitol`` — it calls a wrong method
-    name (``provider.export()``) and AttributeErrors at runtime. Call the
-    provider's real ``render()`` method directly. TODO: file a separate fix
-    for ``_export_odps_bitol`` so other call sites stop hitting the bug."""
-    from fluid_build.providers.odps_standard import OdpsStandardProvider
+    """Emit a complete Bitol ODPS v1.0.0 bundle: 1 product + N sibling ODCS.
+
+    Uses ``BitolOdpsProvider.render(out_dir=...)`` directly so the bundle
+    is self-contained inside ``odps-bitol/`` — every ``contractId`` in the
+    product file resolves to a sibling ``<contractId>.odcs.yaml`` in the
+    same directory. This means ``--emit odps-bitol`` alone produces a
+    usable Bitol bundle; you no longer need ``--emit odps-bitol,odcs``
+    just to avoid dangling ``contractId`` references.
+
+    ``_emit_odcs`` still emits per-port ODCS to ``odcs/`` for the
+    catalog-fanout consumer that prefers one-format-per-subdir layout.
+    """
+    from fluid_build.providers.odps_standard import BitolOdpsProvider
 
     contract = _load_contract(contract_path)
-    slug = _slug_from_contract(contract)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{slug}.odps-bitol.yaml"
-    provider = OdpsStandardProvider()
-    provider.render(contract, out=out, fmt="yaml")
-    return [out]
+
+    provider = BitolOdpsProvider()
+    bundle = provider.render(contract, out_dir=out_dir, fmt="yaml")
+
+    written: List[Path] = []
+    product = bundle.get("product") or {}
+    product_id = product.get("id") or product.get("name") or "product"
+    product_path = out_dir / f"{product_id}.odps.yaml"
+    if product_path.exists():
+        written.append(product_path)
+    for contract_id in bundle.get("contracts") or {}:
+        sibling = out_dir / f"{contract_id}.odcs.yaml"
+        if sibling.exists():
+            written.append(sibling)
+    return written
 
 
 def _emit_odcs(contract_path: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:
