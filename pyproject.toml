@@ -276,6 +276,15 @@ dev = [
   "types-PyYAML>=6.0.12",
   "black==26.3.1",
   "requests>=2.32.5",
+  # Architecture linter — declarative TOML contracts (under
+  # ``[tool.importlinter]`` below) enforced by the ``lint-imports`` CLI.
+  # Borrowed-not-built per /borrow-before-build (seddonym/import-linter,
+  # BSD-2, used by Google langextract / MLRun / Open edX). Pins the
+  # invariant that ``fluid_build.observability`` must not depend on
+  # ``fluid_build.build_runners`` (the cycle root that previously broke
+  # ``cli/__init__.py`` at import time) and that the tier-0
+  # ``fluid_build._net`` leaf module stays free of fluid_build upstreams.
+  "import-linter>=2.0",
 ]
 
 # Light (in-process) integration-test emulators — Stage 1. moto mocks the
@@ -486,3 +495,53 @@ exclude_lines = [
     "raise NotImplementedError",
     "\\.\\.\\.",
 ]
+
+# ── import-linter contracts ────────────────────────────────────────────
+#
+# Run locally:  ``.venv/bin/lint-imports``  (exit 0 = pass, 1 = violation)
+#
+# These contracts close the gap that surfaced when ``cli/__init__.py``
+# import-time blew up with a cycle through ``observability →
+# build_runners → cli``.  The structural fix landed (the canonical SSRF
+# gate ``_hostname_is_private`` moved out of ``build_runners._alerter``
+# into the tier-0 ``fluid_build._net`` leaf module), and these contracts
+# stop the cycle from being re-introduced by a future drive-by edit.
+[tool.importlinter]
+root_package = "fluid_build"
+# Skip cycle-graph construction for any module that fails to import
+# under the linter's analysis venv (e.g. a provider whose heavy SDK
+# isn't pinned in the dev extra). Contract violations still surface;
+# only unrelated dependency import errors are tolerated.
+include_external_packages = false
+
+[[tool.importlinter.contracts]]
+name = "observability must not depend on build_runners"
+type = "forbidden"
+source_modules = ["fluid_build.observability"]
+forbidden_modules = ["fluid_build.build_runners"]
+# Direct, indirect, and any-descendant imports all count. The
+# canonical SSRF gate now lives in ``fluid_build._net``; there should
+# be zero edges from observability into build_runners after the
+# 2026-05 hardening.
+allow_indirect_imports = false
+as_packages = true
+
+[[tool.importlinter.contracts]]
+name = "fluid_build._net is tier-0 (no fluid_build upstreams)"
+type = "forbidden"
+source_modules = ["fluid_build._net"]
+forbidden_modules = [
+  "fluid_build.cli",
+  "fluid_build.observability",
+  "fluid_build.build_runners",
+  "fluid_build.forge",
+  "fluid_build.providers",
+  "fluid_build.copilot",
+  "fluid_build.api",
+  "fluid_build.credentials",
+]
+# ``_net`` is the tier-0 cross-cutting primitive module (stdlib-only
+# SSRF gate today). Any upward edge here would re-create the cycle
+# class this contract exists to prevent.
+allow_indirect_imports = false
+as_packages = true
