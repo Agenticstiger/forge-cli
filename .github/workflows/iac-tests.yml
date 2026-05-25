@@ -64,7 +64,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install OpenTofu
-        uses: opentofu/setup-opentofu@v1
+        uses: opentofu/setup-opentofu@v2
         with:
           tofu_version: 1.12.0
 
@@ -109,7 +109,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install OpenTofu
-        uses: opentofu/setup-opentofu@v1
+        uses: opentofu/setup-opentofu@v2
         with:
           tofu_version: 1.12.0
 
@@ -204,7 +204,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install OpenTofu
-        uses: opentofu/setup-opentofu@v1
+        uses: opentofu/setup-opentofu@v2
         with:
           tofu_version: 1.12.0
 
@@ -253,7 +253,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install OpenTofu
-        uses: opentofu/setup-opentofu@v1
+        uses: opentofu/setup-opentofu@v2
         with:
           tofu_version: 1.12.0
 
