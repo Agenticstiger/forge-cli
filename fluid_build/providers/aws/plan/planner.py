@@ -163,7 +163,7 @@ def plan_actions(
     1. Infrastructure — S3 buckets, Glue databases.
     2. IAM — roles, policies.
     3. Replace snapshots — currently a no-op here (S3 prefix-copy
-       backups are emitted in ``aws.py::AWSProvider.plan``).
+       backups are emitted in ``provider.py::AwsProvider.plan``).
     4. Expose — Glue tables, Athena views, Redshift tables.
     5. Build — dbt / Lambda / Glue jobs.
     6. Schedule — EventBridge / Step Functions.

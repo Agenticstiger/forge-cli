@@ -9,7 +9,8 @@
 """Shared helpers for acquisition runners.
 
 - ``RunIdGenerator`` — ULID-style monotonic ids that survive replay.
-- ``build_run_context`` — assemble a ``RunContext`` from a contract + build.
+- ``build_acquisition_run_context`` — assemble the ``RunContext`` shared by
+  every acquisition runner (source/sink resolution + state store).
 - ``utc_now_iso`` — single source of truth for timestamps.
 - ``finalize_run_result`` — convert a ``RunResult`` to an exit code AND
   surface failures to the user (single point that handles redaction +
@@ -30,7 +31,10 @@ import re
 import secrets
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+LOG = logging.getLogger("fluid.build_runners.acquisition")
 
 # Strips ANSI CSI sequences and ASCII control chars from error strings
 # before they reach the user's terminal. Compiled once at import.
@@ -76,6 +80,93 @@ def get_acquisition_build_props(build: Dict[str, Any]) -> Dict[str, Any]:
 
 def is_acquisition_build(build: Dict[str, Any]) -> bool:
     return build.get("pattern") == "acquisition"
+
+
+def build_acquisition_run_context(
+    build: Dict[str, Any],
+    contract: Dict[str, Any],
+    contract_dir: Path,
+    *,
+    sample_rows: Any = None,
+    state_root: Optional[Path] = None,
+    hook_chain: Any = None,
+) -> Optional[Any]:
+    """Assemble the ``RunContext`` shared by every acquisition runner.
+
+    Resolves ``properties.source`` / ``sink``, env-interpolates the source
+    connection, opens the ``FileStateStore`` (rooted at ``state_root`` or
+    ``<contract_dir>/.fluid``), and builds the context. Returns ``None``
+    when ``properties.source`` is absent — the caller returns exit code 1.
+    ``hook_chain`` defaults to an empty chain; the duckdb runner passes
+    one built from ``properties.preLand``.
+    """
+    from fluid_build.api.hooks import HookChain
+    from fluid_build.api.runner import RunContext
+    from fluid_build.api.source import SinkSpec, SourceSpec
+
+    from ._cost import InMemoryCostTracker
+    from ._lineage import NullLineageEmitter
+    from ._state import FileStateStore
+    from .base import _resolve_env_placeholders
+
+    props = get_acquisition_build_props(build)
+    source_dict = props.get("source")
+    if not source_dict:
+        LOG.error("acquisition build missing properties.source")
+        return None
+    source_dict = _resolve_env_placeholders(source_dict)
+    source = SourceSpec.from_dict(source_dict)
+    sink = SinkSpec.from_dict(props.get("sink"))
+
+    store = FileStateStore(state_root or (contract_dir / ".fluid"))
+    return RunContext(
+        run_id=generate_run_id(),
+        product_id=contract.get("id", "unknown"),
+        build_id=build.get("id", "unknown"),
+        contract=contract,
+        source=source,
+        sink=sink,
+        state_store=store,
+        hook_chain=hook_chain if hook_chain is not None else HookChain(hooks=[]),
+        lineage=NullLineageEmitter(),
+        cost_tracker=InMemoryCostTracker(),
+        workdir=str(contract_dir),
+        sample_rows=sample_rows,
+    )
+
+
+def begin_acquisition_run(ctx: Any, runner: Any) -> Tuple[str, float]:
+    """Open an acquisition run — timestamp, schema-policy gate, duration clock.
+
+    Returns ``(started_at, t_start)``; raises if the schema-evolution gate
+    rejects the run. Shared by every acquisition runner's ``_execute``.
+    """
+    started_at = utc_now_iso()
+    enforce_schema_policy_or_raise(ctx, runner)
+    t_start = time.time()
+    return started_at, t_start
+
+
+def failed_run_result(ctx: Any, *, engine: str, started_at: str, t_start: float, err: str) -> Any:
+    """Build a FAILED ``RunResult`` — the shared per-runner failure factory.
+
+    Keyword-only so the call site is unambiguous regardless of how each
+    runner historically ordered its ``_failed`` arguments.
+    """
+    from fluid_build.api.runner import RunResult, RunState
+
+    return RunResult(
+        run_id=ctx.run_id,
+        state=RunState.FAILED,
+        streams=[],
+        started_at=started_at,
+        finished_at=utc_now_iso(),
+        records_total=0,
+        bytes_total=0,
+        dlq_records=0,
+        error=err,
+        facets={"engine": engine, "duration_seconds": time.time() - t_start},
+    )
 
 
 def setdefault_env(key: str, value: Optional[str]) -> bool:

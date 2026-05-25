@@ -27,12 +27,6 @@ from fluid_build.build_runners._acquisition_common import (
     setdefault_env,
     utc_now_iso,
 )
-from fluid_build.build_runners._anomaly import (
-    EwmaState,
-    ewma_update,
-    ewma_z_score,
-    iqr_score,
-)
 from fluid_build.build_runners._cost import (
     BudgetExceededError,
     InMemoryCostTracker,
@@ -45,7 +39,6 @@ from fluid_build.build_runners._credentials import (
 )
 from fluid_build.build_runners._dlq import DLQConfig, DLQOverflowError, DLQWriter
 from fluid_build.build_runners._fingerprint import fingerprint_from_columns
-from fluid_build.build_runners._idempotency import DEFAULT_KEY_TEMPLATE, format_key
 from fluid_build.build_runners._retention import RetentionConfig, parse_iso_duration
 from fluid_build.build_runners._retry import RetryPolicy, is_retryable, with_retry
 from fluid_build.build_runners._schema_evolution import EvolutionAction, resolve
@@ -572,28 +565,6 @@ class TestRetry:
             )
 
 
-# ── _idempotency ─────────────────────────────────────────────────────────
-
-
-class TestIdempotencyKey:
-    def test_default_template_with_pk(self):
-        k = format_key(DEFAULT_KEY_TEMPLATE, "r1", "orders", {"id": 42, "name": "x"})
-        assert k == "r1:orders:42"
-
-    def test_default_template_falls_back_to_hash(self):
-        k1 = format_key(DEFAULT_KEY_TEMPLATE, "r1", "orders", {"name": "alice"})
-        k2 = format_key(DEFAULT_KEY_TEMPLATE, "r1", "orders", {"name": "alice"})
-        assert k1 == k2  # deterministic
-        assert k1.startswith("r1:orders:")
-        # Different record → different key
-        k3 = format_key(DEFAULT_KEY_TEMPLATE, "r1", "orders", {"name": "bob"})
-        assert k1 != k3
-
-    def test_custom_template(self):
-        k = format_key("{run_id}-{country}-{record_pk}", "r1", "orders", {"id": 7, "country": "US"})
-        assert k == "r1-US-7"
-
-
 # ── _fingerprint ─────────────────────────────────────────────────────────
 
 
@@ -730,27 +701,6 @@ class TestCost:
         t = InMemoryCostTracker()
         cap = BudgetCap(rows=100, on_exceed="abort")
         gate_or_raise(t, cap, prior_usage={"rows": 50})  # no raise
-
-
-# ── _anomaly ─────────────────────────────────────────────────────────────
-
-
-class TestAnomaly:
-    def test_ewma_warmup_returns_seed(self):
-        s = ewma_update(None, 100.0)
-        assert s.mean == 100.0
-
-    def test_ewma_z_score_zero_for_stable_series(self):
-        s: EwmaState | None = None
-        for x in [100.0] * 10:
-            s = ewma_update(s, x)
-        assert s is not None
-        assert ewma_z_score(s, 100.0) == 0.0
-
-    def test_iqr_score_outlier_detection(self):
-        history = [10.0, 11.0, 9.0, 12.0, 10.5, 9.5, 11.5]
-        score = iqr_score(history, 50.0)
-        assert score > 1.0
 
 
 # ── _retention ───────────────────────────────────────────────────────────

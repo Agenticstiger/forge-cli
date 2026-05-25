@@ -405,15 +405,15 @@ def parse_and_allowlist_sql(
 
     ``surface`` selects the policy:
 
-    * ``"custom"``  — :func:`~fluid_build.providers.snowflake.actions.sql.execute_sql`.
+    * ``"custom"`` — an inline-SQL pipeline operation.
       Permits the DDL/DML the pipeline legitimately emits (CREATE/ALTER/DROP of
       object kinds, INSERT/UPDATE/DELETE/MERGE/COPY/TRUNCATE, GRANT, SELECT).
       Rejects account/role-level DDL (CREATE USER, DROP ROLE, CREATE WAREHOUSE,
       ALTER ACCOUNT, ...) and any statement sqlglot cannot structurally model.
-    * ``"task_body"`` — :func:`~fluid_build.providers.snowflake.actions.task.ensure_task`.
+    * ``"task_body"`` — a Snowflake task body.
       A Snowflake task body is a *single* statement: CALL / INSERT / UPDATE /
       DELETE / MERGE / SELECT. Multi-statement bodies and DDL are rejected.
-    * ``"view_body"`` — :func:`~fluid_build.providers.snowflake.actions.view.ensure_view`.
+    * ``"view_body"`` — a Snowflake view body.
       A view body must be a *single* SELECT (CTEs / UNION allowed). Any DDL,
       DML, or multiple statements are rejected.
 

@@ -19,10 +19,8 @@ Export utilities for GCP provider.
 Supports exporting FLUID contracts to various formats:
 - OPDS (Open Data Product Standard)
 - DOT (GraphViz dependency graphs)
-- Terraform configurations
 """
 
-import json
 from collections.abc import Mapping
 from typing import Any, Dict, List, Union
 
@@ -314,120 +312,6 @@ def export_dot_graph(src: Union[Mapping[str, Any], List[Mapping[str, Any]]]) -> 
             "contracts": len(contracts),
         },
     }
-
-
-def export_terraform(src: Union[Mapping[str, Any], List[Mapping[str, Any]]]) -> Dict[str, Any]:
-    """
-    Export FLUID contracts as Terraform configuration.
-
-    Generates Terraform HCL for GCP resources.
-
-    Args:
-        src: FLUID contract or list of contracts
-
-    Returns:
-        Terraform configuration structure
-    """
-    contracts = src if isinstance(src, list) else [src]
-
-    terraform_config = {
-        "terraform": {
-            "required_providers": {"google": {"source": "hashicorp/google", "version": "~> 4.0"}}
-        },
-        "provider": {
-            "google": {
-                "project": "${var.project_id}",
-                "region": "${var.region}",
-            }
-        },
-        "variable": {
-            "project_id": {"description": "GCP project ID", "type": "string"},
-            "region": {"description": "GCP region", "type": "string", "default": "us-central1"},
-        },
-        "resource": {},
-    }
-
-    # Generate resources for each contract
-    for contract in contracts:
-        contract_resources = _contract_to_terraform_resources(contract)
-        terraform_config["resource"].update(contract_resources)
-
-    return {
-        "format": "terraform",
-        "content": terraform_config,
-        "metadata": {
-            "generated_at": _utc_timestamp(),
-            "generator": "fluid-forge-gcp-provider",
-            "contracts": len(contracts),
-        },
-    }
-
-
-def _contract_to_terraform_resources(contract: Mapping[str, Any]) -> Dict[str, Any]:
-    """
-    Convert FLUID contract to Terraform resources.
-
-    Args:
-        contract: FLUID contract specification
-
-    Returns:
-        Dictionary of Terraform resource definitions
-    """
-    resources = {}
-    contract_id = contract.get("id", "unknown").replace(".", "_")
-
-    # Create resources for exposures
-    for i, exposure in enumerate(contract.get("exposes", [])):
-        location = exposure.get("location", {})
-        format_type = location.get("format")
-        properties = location.get("properties", {})
-
-        if format_type == "bigquery_table":
-            dataset_name = properties.get("dataset", "")
-            table_name = properties.get("table", "")
-
-            # BigQuery dataset resource
-            dataset_resource_name = f"dataset_{contract_id}_{dataset_name}"
-            if dataset_resource_name not in resources.get("google_bigquery_dataset", {}):
-                resources.setdefault("google_bigquery_dataset", {})[dataset_resource_name] = {
-                    "dataset_id": dataset_name,
-                    "location": properties.get("location", "US"),
-                    "description": f"Dataset for {contract.get('name', contract_id)}",
-                    "labels": {
-                        "managed_by": "fluid_build",
-                        "contract_id": contract_id,
-                    },
-                }
-
-            # BigQuery table resource
-            table_resource_name = f"table_{contract_id}_{table_name}"
-            resources.setdefault("google_bigquery_table", {})[table_resource_name] = {
-                "dataset_id": f"${{google_bigquery_dataset.{dataset_resource_name}.dataset_id}}",
-                "table_id": table_name,
-                "description": exposure.get("description", ""),
-                "labels": {
-                    "managed_by": "fluid_build",
-                    "contract_id": contract_id,
-                },
-            }
-
-            # Add schema if provided
-            schema = exposure.get("schema", [])
-            if schema:
-                schema_json = json.dumps(
-                    [
-                        {
-                            "name": field.get("name"),
-                            "type": field.get("type", "STRING"),
-                            "mode": field.get("mode", "NULLABLE"),
-                            "description": field.get("description", ""),
-                        }
-                        for field in schema
-                    ]
-                )
-                resources["google_bigquery_table"][table_resource_name]["schema"] = schema_json
-
-    return resources
 
 
 def _utc_timestamp() -> str:

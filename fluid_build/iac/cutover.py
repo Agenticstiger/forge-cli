@@ -1,0 +1,47 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+"""Per-provider apply-engine registry.
+
+``fluid apply`` resolves its engine per provider — there is no user-facing
+switch. A provider listed in ``OPENTOFU_DEFAULT_PROVIDERS`` compiles its
+contract to ``.tf.json`` and runs ``tofu``; any other provider keeps its
+native apply. The OpenTofu migration cut the clouds over one at a time
+behind this registry (the strangler-fig pattern — see ``AUTOGEN_SPIKE.md``);
+it is now the stable extension point for adding a new cloud.
+"""
+
+from __future__ import annotations
+
+from typing import FrozenSet, Optional
+
+#: Providers whose default apply engine is OpenTofu. A cutover PR adds a
+#: name here and, in the same PR, retires that provider's native CRUD.
+#:
+#: ``gcp``, ``aws``, ``snowflake`` — all cut over: their ``actions/``
+#: packages and native apply paths are retired (see ``AUTOGEN_SPIKE.md``);
+#: ``fluid apply`` compiles their contracts to ``.tf.json`` and runs
+#: ``tofu``. The OpenTofu engine is the default for every provider.
+OPENTOFU_DEFAULT_PROVIDERS: FrozenSet[str] = frozenset({"aws", "gcp", "snowflake"})
+
+
+def default_engine(provider: str) -> str:
+    """Return the default apply engine (``native``/``opentofu``) for ``provider``."""
+    return "opentofu" if provider in OPENTOFU_DEFAULT_PROVIDERS else "native"
+
+
+def resolve_engine(explicit: Optional[str], provider: str) -> str:
+    """Resolve the apply engine for a run.
+
+    A non-``None`` ``explicit`` (``native``/``opentofu``) is a programmatic
+    override and wins; ``None`` or ``"auto"`` means "no override" — the
+    per-provider default from ``OPENTOFU_DEFAULT_PROVIDERS`` applies.
+    """
+    if explicit in ("native", "opentofu"):
+        return explicit
+    return default_engine(provider)

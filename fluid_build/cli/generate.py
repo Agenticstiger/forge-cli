@@ -47,6 +47,7 @@ def register(subparsers: argparse._SubParsersAction):
           schedule               Generate schedule/orchestration artifacts (Airflow, Dagster, Prefect)
           ci                     Generate CI/CD pipelines (GitHub Actions, GitLab CI)
           standard               Export to data product standards (OPDS, ODCS, ODPS, ODPS-Bitol)
+          iac                    Compile a contract to an OpenTofu .tf.json module
           artifacts              Stage-3 fanout: bundle → ODPS, ODCS, OPDS, schedule, policies
 
         When called without a subcommand, shows available subcommands.
@@ -80,6 +81,7 @@ Examples:
         generate_artifacts,
         generate_ci,
         generate_dbt_tests,
+        generate_iac,
         generate_schedule,
         generate_speed_transformation,
         generate_standard,
@@ -91,6 +93,7 @@ Examples:
     generate_standard.register_subcommand(sub)
     generate_artifacts.register_subcommand(sub)
     generate_dbt_tests.register_subcommand(sub)
+    generate_iac.register_subcommand(sub)
 
     # Default handler (backward compat: no subcommand → transformation)
     p.set_defaults(cmd=COMMAND, func=run)
@@ -128,6 +131,11 @@ def run(args: Any, logger: logging.Logger) -> int:
 
         return generate_standard.run(args, logger)
 
+    if sub == "iac":
+        from . import generate_iac
+
+        return generate_iac.run(args, logger)
+
     if sub == "artifacts":
         from . import generate_artifacts
 
@@ -148,6 +156,7 @@ def run(args: Any, logger: logging.Logger) -> int:
         cprint("  schedule               Generate schedule artifacts (Airflow, Dagster, Prefect)")
         cprint("  ci                     Generate CI/CD pipelines (GitHub Actions, GitLab CI)")
         cprint("  standard               Export to standards (OPDS, ODCS, ODPS, ODPS-Bitol)")
+        cprint("  iac                    Compile a contract to an OpenTofu .tf.json module")
         cprint("")
         cprint("Examples:")
         cprint("  fluid generate transformation")

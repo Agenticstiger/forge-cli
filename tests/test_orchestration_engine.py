@@ -252,7 +252,7 @@ class TestFluidPlanGenerator:
     def test_analyze_detects_infrastructure(self):
         gen = FluidPlanGenerator({"infrastructure": {"provider": "gcp", "resources": []}})
         gen._analyze_contract()
-        assert "terraform" in gen.detected_providers
+        assert "opentofu" in gen.detected_providers
         assert "gcp" in gen.detected_providers
 
     def test_analyze_detects_aws(self):

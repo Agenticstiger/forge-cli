@@ -173,20 +173,6 @@ _ACQUISITION_RUNNER_REGISTRY: Dict[str, tuple] = {
 }
 
 
-def register_acquisition_runner(engine: str, *, module_path: str, function_name: str) -> None:
-    """Register a custom acquisition-engine runner.
-
-    Third-party packages that ship their own runner can call this at
-    import time to extend the dispatch table without monkey-patching.
-
-    ``module_path`` is the dotted import path; ``function_name`` is
-    the callable resolved from that module. The function must accept
-    the same kwargs as the built-in runners
-    (``build, contract, contract_dir, *, dry_run, sample_rows``).
-    """
-    _ACQUISITION_RUNNER_REGISTRY[engine.lower()] = (module_path, function_name)
-
-
 def _execute_acquisition_build(
     build: Dict[str, Any],
     contract: Dict[str, Any],

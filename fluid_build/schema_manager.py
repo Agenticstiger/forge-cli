@@ -464,10 +464,11 @@ class FluidSchemaManager:
         SSRF-guarded — schema_url is normally a hardcoded
         raw.githubusercontent.com URL (gated by the strict version
         regex in SchemaVersion.parse), but SchemaVersion accepts an
-        explicit override too. Routing through safe_httpx_client closes
-        the gap if a future code path lets a contract supply schema_url
-        directly. allow_private=False since legitimate schema sources
-        are public registries.
+        explicit override too. Routing through ``safe_http.fetch_bytes``
+        closes the gap if a future code path lets a contract supply
+        ``schema_url`` directly, and bounds the request by
+        ``self.timeout`` so an unreachable host fails fast instead of
+        blocking the CLI for minutes.
         """
         if not version.schema_url:
             return None
