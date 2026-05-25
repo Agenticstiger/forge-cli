@@ -39,10 +39,21 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from .._acquisition_common import (
-    apply_loopback_host_override,
-    register_source_adapter,
-)
+from .._acquisition_common import register_source_adapter
+
+# NOTE: we deliberately do NOT call ``apply_loopback_host_override``
+# here. Meltano taps (tap-postgres / tap-mysql / tap-mssql) run as
+# host subprocesses out of the lab's ``.venv.fluid-dev/bin/`` — they
+# are not containerised, so the operator's shell ``host: localhost``
+# resolves correctly without translation. Calling the override would
+# mistranslate ``localhost`` into ``host.docker.internal`` and break
+# host-side runs on macOS (where that name is unresolvable).
+#
+# The Airbyte runner DOES apply the override because PyAirbyte runs
+# each source connector as a Docker container with its own loopback.
+# Engine-specific: each runner decides based on whether its execution
+# model is in-process / subprocess / containerised. See the docstring
+# on ``apply_loopback_host_override`` in ``_acquisition_common.py``.
 
 
 def _coerce_port(connection: Dict[str, Any]) -> None:
@@ -63,9 +74,8 @@ def _meltano_postgres(connection: Dict[str, Any]) -> Dict[str, Any]:
     """FLUID generic connection → Singer ``tap-postgres`` config.
 
     Field names are identical (host, port, database, user, password) so
-    only port-coercion + SSL default + loopback override are needed."""
+    only port-coercion + SSL default is needed."""
     _coerce_port(connection)
-    apply_loopback_host_override(connection)
     connection.setdefault("ssl", "false")
     return connection
 
@@ -74,7 +84,6 @@ def _meltano_postgres(connection: Dict[str, Any]) -> Dict[str, Any]:
 def _meltano_mysql(connection: Dict[str, Any]) -> Dict[str, Any]:
     """FLUID generic connection → Singer ``tap-mysql`` config."""
     _coerce_port(connection)
-    apply_loopback_host_override(connection)
     return connection
 
 
@@ -82,5 +91,4 @@ def _meltano_mysql(connection: Dict[str, Any]) -> Dict[str, Any]:
 def _meltano_mssql(connection: Dict[str, Any]) -> Dict[str, Any]:
     """FLUID generic connection → Singer ``tap-mssql`` config."""
     _coerce_port(connection)
-    apply_loopback_host_override(connection)
     return connection

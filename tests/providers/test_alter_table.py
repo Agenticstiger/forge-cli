@@ -140,6 +140,40 @@ class TestAlterTableShape:
         assert "DROP COLUMN" in sql
         assert "RENAME COLUMN" in sql
 
+    def test_set_nullable_true_emits_drop_not_null(self) -> None:
+        """Toggling a column to nullable emits ``ALTER COLUMN ... DROP
+        NOT NULL`` — the missing branch surfaced by the lab's pre3
+        Meltano scenario where relaxing ``required: true`` on a bronze
+        contract was previously a silent no-op against the warehouse,
+        forcing operators to DROP+CREATE the table."""
+        prov = _provider()
+        with _patched_connection() as conn:
+            table_action.alter_table(
+                _action([{"kind": "set_nullable", "name": "RATING_STATUS", "nullable": True}]),
+                prov,
+            )
+        sql = _executed_sql(conn)
+        assert "ALTER COLUMN" in sql
+        assert "DROP NOT NULL" in sql
+        assert "RATING_STATUS" in sql.upper()
+
+    def test_set_nullable_false_emits_set_not_null(self) -> None:
+        """The inverse: tightening a column to NOT NULL emits ``SET
+        NOT NULL``. Snowflake will reject the ALTER if any existing
+        row has a NULL there, which is correct strict-by-default
+        semantics — the planner / operator owns choosing when this is
+        safe."""
+        prov = _provider()
+        with _patched_connection() as conn:
+            table_action.alter_table(
+                _action([{"kind": "set_nullable", "name": "USAGE_ID", "nullable": False}]),
+                prov,
+            )
+        sql = _executed_sql(conn)
+        assert "ALTER COLUMN" in sql
+        assert "SET NOT NULL" in sql
+        assert "USAGE_ID" in sql.upper()
+
 
 class TestAlterTableTypeSafety:
     """ADD COLUMN routes the column type through the validate_sql_type allowlist."""

@@ -166,11 +166,12 @@ def alter_table(action: Dict[str, Any], provider) -> Dict[str, Any]:
 
     Each entry in ``action["alterations"]`` is a dict whose ``"kind"`` key
     selects the alteration: ``"add_column"`` / ``"drop_column"`` /
-    ``"rename_column"``. ``"kind"`` is deliberately a distinct key from a
-    column's ``"type"`` — an ``add_column`` alteration carries a real
-    column data type under ``"type"``, e.g.::
+    ``"rename_column"`` / ``"set_nullable"``. ``"kind"`` is deliberately
+    a distinct key from a column's ``"type"`` — an ``add_column``
+    alteration carries a real column data type under ``"type"``, e.g.::
 
-        {"kind": "add_column", "name": "amount", "type": "NUMBER(38,0)"}
+        {"kind": "add_column",   "name": "amount", "type": "NUMBER(38,0)"}
+        {"kind": "set_nullable", "name": "amount", "nullable": true}
 
     (Previously both the alteration kind and the column type were read
     from ``"type"``, which made the ``add_column`` branch structurally
@@ -227,6 +228,26 @@ def alter_table(action: Dict[str, Any], provider) -> Dict[str, Any]:
                     old_name = normalize_column_name(alteration["old_name"])
                     new_name = normalize_column_name(alteration["new_name"])
                     alter_sql = f"ALTER TABLE {qualified_name} RENAME COLUMN {quote_identifier(old_name)} TO {quote_identifier(new_name)}"
+                    conn.execute(alter_sql)
+
+                elif alter_type == "set_nullable":
+                    # Toggle a column's NOT NULL constraint. Snowflake
+                    # accepts ``DROP NOT NULL`` even on columns that
+                    # weren't NOT NULL to begin with (no-op), and
+                    # ``SET NOT NULL`` succeeds only when no existing
+                    # row has a NULL in that column. Surfaced when a
+                    # FLUID contract toggles ``required: true/false``
+                    # on an existing column; without this branch the
+                    # change was a silent no-op against the warehouse
+                    # (table kept the original constraint forever),
+                    # forcing operators to DROP+CREATE the table.
+                    column_name = normalize_column_name(alteration["name"])
+                    nullable = alteration.get("nullable", True)
+                    direction = "DROP" if nullable else "SET"
+                    alter_sql = (
+                        f"ALTER TABLE {qualified_name} ALTER COLUMN "
+                        f"{quote_identifier(column_name)} {direction} NOT NULL"
+                    )
                     conn.execute(alter_sql)
 
             provider.info_kv(

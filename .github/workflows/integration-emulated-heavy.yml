@@ -91,3 +91,96 @@ jobs:
       - name: Stop LocalStack
         if: always() && steps.gate.outputs.localstack == 'true'
         run: docker rm -f fluid-localstack || true
+
+  # ────────────────────────────────────────────────────────────────────
+  # DataHub Quickstart lane — exercises the canonical DataHubRegistrar
+  # against a real DataHub OSS GMS booted via the project's Docker
+  # Quickstart. Same admin-gate as the bigquery / LocalStack lane.
+  #
+  # Why a separate job (not folded into emulated-heavy above):
+  #   - DataHub Quickstart is its own multi-container stack (GMS,
+  #     frontend, MySQL, Kafka, Elasticsearch) — running it alongside
+  #     LocalStack on one runner peaks at ~12 GB RAM, which exceeds
+  #     `ubuntu-latest`'s 7 GB limit.
+  #   - Quickstart pull + boot is ~3-4 min on a cold runner; isolating
+  #     it lets the bigquery-emulator job finish independently and
+  #     keeps the failure surface attributable.
+  #
+  # Secret-less. The `datahub` CLI exposes a self-contained Quickstart
+  # via `docker compose` against pinned tags; no DataHub Cloud token
+  # is involved. Tests run via the `tests/integration/test_catalog_datahub_live.py`
+  # + `tests/integration/test_catalog_datahub_lineage_e2e.py` matrix
+  # (gated on `DATAHUB_GMS_URL` being set — skip-clean if the boot
+  # times out).
+  datahub-integration:
+    name: DataHub Quickstart integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'ci:integration-emulated')
+    environment: integration-emulated
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install fluid-build + acryl-datahub CLI
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          # acryl-datahub provides the `datahub docker quickstart` helper
+          # which stands up the GMS + frontend + storage + Kafka stack.
+          # Pin to a specific minor — the docker-compose shape evolves
+          # version to version and we want repeatable boots.
+          python -m pip install "acryl-datahub==1.5.0.6"
+
+      - name: Start DataHub Quickstart
+        id: quickstart
+        env:
+          # Quickstart resolves the version tag from the CLI itself; pin
+          # via env so we control which docker images get pulled. Matches
+          # the lab's local Quickstart pin so behaviour is identical.
+          DATAHUB_VERSION: v1.5.0.6
+        run: |
+          # `--quickstart-compose-file` defaults to the embedded
+          # docker-compose-without-neo4j.yml, which has the smaller
+          # footprint (no Neo4j) — sufficient for our catalog tests.
+          datahub docker quickstart --version "$DATAHUB_VERSION" --no-pull-images || true
+          # Wait for GMS REST on :8080 — that's the endpoint
+          # ``safe_httpx_client`` connects to via DATAHUB_GMS_URL.
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:8080/config >/dev/null 2>&1; then
+              echo "DataHub GMS ready after ~$((i * 4))s"
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            sleep 4
+          done
+          if ! curl -sf http://localhost:8080/config >/dev/null 2>&1; then
+            echo "::warning::DataHub GMS did not come up in 6 minutes — skipping tests"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run DataHub integration tests
+        if: steps.quickstart.outputs.ready == 'true'
+        timeout-minutes: 15
+        env:
+          DATAHUB_GMS_URL: http://localhost:8080
+        run: |
+          python -m pytest -v \
+            tests/integration/test_catalog_datahub_live.py \
+            tests/integration/test_catalog_datahub_lineage_e2e.py
+
+      - name: Collect DataHub logs on failure
+        if: failure()
+        run: |
+          datahub docker check || true
+          docker compose -p datahub logs --tail=200 || true
+
+      - name: Tear down DataHub Quickstart
+        if: always()
+        run: |
+          datahub docker nuke --keep-data 2>&1 | tail -5 || true
