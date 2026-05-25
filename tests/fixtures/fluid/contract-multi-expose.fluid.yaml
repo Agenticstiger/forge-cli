@@ -1,0 +1,78 @@
+# Multi-expose FLUID contract — drives the Bitol ODPS export tests.
+# Two output ports + one input port, with qos, owner, schema, and tags.
+fluidVersion: "0.7.1"
+kind: DataContract
+id: commerce.orders-product
+name: orders-product
+
+metadata:
+  version: "1.0.0"
+  name: "Orders Product"
+  description: "Orders data product with daily and hourly outputs"
+  status: active
+  domain: commerce
+  tenant: acme
+  tags:
+    - orders
+    - production
+
+owner:
+  team: commerce-team
+  name: Alice
+  email: alice@acme.com
+  role: data-owner
+
+exposes:
+  - id: daily_orders
+    exposeId: daily_orders
+    version: "1.0.0"
+    description: "Daily order aggregates"
+    binding:
+      platform: bigquery
+      location:
+        project: acme-prod
+        dataset: orders
+    contract:
+      schema:
+        - name: order_date
+          type: date
+          required: true
+          tags: [primary-key]
+        - name: order_count
+          type: bigint
+          required: true
+        - name: total_amount
+          type: decimal
+          required: true
+    qos:
+      availability: "99.9%"
+      freshnessSLO: "PT1H"
+
+  - id: hourly_orders
+    exposeId: hourly_orders
+    version: "1.0.0"
+    description: "Hourly order stream"
+    binding:
+      platform: kafka
+      location:
+        host: kafka-prod.acme:9092
+    contract:
+      schema:
+        - name: order_id
+          type: string
+          required: true
+          tags: [primary-key]
+        - name: customer_id
+          type: string
+          required: true
+        - name: amount
+          type: decimal
+          required: true
+
+expects:
+  - id: customers_raw
+    provider: snowflake
+    location:
+      account: company-prod
+      database: RAW_DB
+      schema: CUSTOMERS

@@ -96,9 +96,19 @@ class KafkaConnectRestClient:
     """Minimal REST client for the Kafka Connect API."""
 
     def __init__(self, base_url: str, *, timeout_seconds: int = 30):
-        import httpx
+        # SSRF guard — Kafka Connect ``server_url`` comes from
+        # contract.fluid.yaml, which may be operator-supplied. Route
+        # through safe_httpx_client so a poisoned URL pointing at IMDS
+        # / RFC1918 cannot exfil connector configs (which carry DB
+        # creds). allow_private=True because Kafka Connect endpoints
+        # commonly live on private cluster networks.
+        from fluid_build.util.safe_http import safe_httpx_client
 
-        self._client = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout_seconds)
+        self._client = safe_httpx_client(
+            base_url=base_url,
+            timeout=float(timeout_seconds),
+            allow_private=True,
+        )
 
     def close(self) -> None:
         self._client.close()

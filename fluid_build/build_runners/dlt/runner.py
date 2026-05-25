@@ -113,9 +113,14 @@ def _make_sql_database_source(connection: Dict[str, Any], streams: List[str]) ->
             ),
         ) from exc
 
-    from .._acquisition_common import apply_loopback_host_override
-
-    apply_loopback_host_override(connection)
+    # NOTE: do NOT apply ``apply_loopback_host_override`` here. dlt runs
+    # in-process (the dlt SQL source talks to Postgres directly from
+    # fluid's Python process via SQLAlchemy + psycopg), so the operator's
+    # shell-level ``localhost`` is correct. The Airbyte runner DOES need
+    # the override because PyAirbyte runs each source as a Docker
+    # container with its own loopback. Calling the override here would
+    # mistranslate ``host: localhost`` into ``host.docker.internal`` and
+    # break host-side dlt runs on macOS where that name is unresolvable.
 
     # Use SQLAlchemy's URL builder so credentials with URL-special characters
     # (``@``, ``:``, ``/``, ``%``) are safely percent-encoded. Building URLs

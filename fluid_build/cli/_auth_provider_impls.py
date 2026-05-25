@@ -991,16 +991,28 @@ class DatabricksAuthProvider(AuthProvider):
 
     def _validate_via_api(self, host: str, token: str) -> AuthResult:
         """Validate Databricks credentials via REST API (no CLI needed)."""
-        import urllib.request
+        # SSRF guard — host is operator config and the request carries
+        # a Databricks Bearer token. allow_private=True for self-hosted
+        # / VPC workspaces; require_https=True so the token never rides
+        # an http:// connection. The hook still scheme-validates and
+        # DNS-pins the connection.
+        from fluid_build.util.safe_http import safe_httpx_client
 
-        url = f"{host.rstrip('/')}/api/2.0/preview/scim/v2/Me"
-        req = urllib.request.Request(
-            url,
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-        )
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
+            with safe_httpx_client(
+                base_url=host,
+                timeout=15.0,
+                allow_private=True,
+                require_https=True,
+            ) as client:
+                resp = client.get(
+                    "/api/2.0/preview/scim/v2/Me",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/json",
+                    },
+                )
+            data = resp.json()
             return AuthResult(
                 provider=self.name,
                 status=AuthStatus.AUTHENTICATED,

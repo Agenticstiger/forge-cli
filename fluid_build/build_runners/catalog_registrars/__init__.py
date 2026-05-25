@@ -6,14 +6,22 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Built-in catalog registrars satisfying ``api.catalog.CatalogRegistrar``.
+"""Built-in catalog registrars — every backend consumes
+:class:`~fluid_build.api.catalog_publication.CatalogPublicationPayload`.
 
 Five targets covered (one module each):
-- ``datahub``           — DataHub GMS REST
-- ``openmetadata``      — OpenMetadata REST
-- ``unity``             — Databricks Unity Catalog REST
-- ``glue``              — AWS Glue Catalog (HTTP — no boto3 dependency in this layer)
-- ``snowflake_horizon`` — Snowflake Horizon (HTTP RPC)
+
+- ``datahub``           — DataHub GMS REST + MCP (DataProduct + Domain + Datasets)
+- ``openmetadata``      — OpenMetadata REST (Tables + extension)
+- ``glue``              — AWS Glue Data Catalog (Tables + Parameters)
+- ``snowflake_horizon`` — Snowflake Horizon (Tables + markdown comments)
+- ``datamesh_manager``  — Data Mesh Manager / Entropy Data
+                          (PUT /data-products in ODPS + /datacontracts in ODCS per asset)
+
+Importing this package triggers each module's ``register_catalog_backend(...)``
+side-effect so ``fluid publish --target <name>`` and contract
+``properties.catalog.register: [<name>]`` both resolve through a single
+declaration site.
 
 ``build_registrar(target)`` constructs the registrar for a target from
 environment configuration. Catalog endpoints and tokens are *deployment*
@@ -22,6 +30,14 @@ config, not contract content — the ``acquisitionCatalog`` schema block is
 are resolved from the environment. The publish stage
 (``cli/_acquisition_stage_ext.py``) calls ``build_registrar`` to populate the
 ``_catalog`` dispatcher registry before dispatching.
+
+A Databricks Unity Catalog *read* adapter still lives under
+``fluid_build/copilot/catalog/unity.py`` for ``forge``-side discovery;
+the publish-side registrar was dropped because the OSS Unity Catalog
+server's strict v0.4+ table-create validation made round-tripping the
+canonical payload too fragile for a generic publish path. Databricks-
+hosted UC remains addressable via the upstream Databricks SDK if
+needed in the future.
 """
 
 from __future__ import annotations
@@ -32,17 +48,17 @@ from typing import Dict, Optional
 from fluid_build.api.catalog import CatalogRegistrar
 
 from .datahub import DataHubRegistrar
+from .datamesh_manager import DataMeshManagerRegistrar
 from .glue import GlueCatalogRegistrar
 from .openmetadata import OpenMetadataRegistrar
 from .snowflake_horizon import SnowflakeHorizonRegistrar
-from .unity import UnityCatalogRegistrar
 
 __all__ = [
     "DataHubRegistrar",
+    "DataMeshManagerRegistrar",
     "GlueCatalogRegistrar",
     "OpenMetadataRegistrar",
     "SnowflakeHorizonRegistrar",
-    "UnityCatalogRegistrar",
     "build_registrar",
 ]
 
@@ -87,18 +103,6 @@ def build_registrar(target: str) -> Optional[CatalogRegistrar]:
         return OpenMetadataRegistrar(
             base_url=url,
             api_token=_env("FLUID_CATALOG_OPENMETADATA_TOKEN"),
-        )
-    if target == "unity":
-        url = _env("FLUID_CATALOG_UNITY_URL", "DATABRICKS_HOST")
-        if not url:
-            return None
-        return UnityCatalogRegistrar(
-            base_url=url,
-            **_kwargs(
-                workspace_token=_env("FLUID_CATALOG_UNITY_TOKEN", "DATABRICKS_TOKEN"),
-                catalog_name=_env("FLUID_CATALOG_UNITY_CATALOG"),
-                schema_name=_env("FLUID_CATALOG_UNITY_SCHEMA"),
-            ),
         )
     if target == "glue":
         region = _env("FLUID_CATALOG_GLUE_REGION", "AWS_REGION", "AWS_DEFAULT_REGION")

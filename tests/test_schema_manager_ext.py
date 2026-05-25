@@ -171,39 +171,40 @@ class TestFetchSchema:
         v = SchemaVersion.parse("0.9.0")
         schema_data = {"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"}
 
-        mock_response = MagicMock()
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-        mock_response.status = 200
-        mock_response.read.return_value = json.dumps(schema_data).encode("utf-8")
-
-        with patch("fluid_build.schema_manager.urlopen", return_value=mock_response):
+        with patch(
+            "fluid_build.util.safe_http.fetch_bytes",
+            return_value=(
+                200,
+                {"content-type": "application/json"},
+                json.dumps(schema_data).encode("utf-8"),
+            ),
+        ):
             result = m._fetch_schema(v)
         assert result is not None
         assert result["type"] == "object"
 
     def test_fetch_schema_http_error(self, tmp_path):
-        from urllib.error import HTTPError
-
+        # schema_manager._fetch_schema now routes through
+        # fluid_build.util.safe_http.fetch_bytes (SSRF-guarded). Non-200
+        # statuses surface to schema_manager via the tuple return, not via
+        # urllib HTTPError. Simulate that.
         m = self._make_manager(tmp_path)
         v = SchemaVersion.parse("0.9.0")
 
         with patch(
-            "fluid_build.schema_manager.urlopen",
-            side_effect=HTTPError(url="", code=404, msg="Not Found", hdrs=None, fp=None),
+            "fluid_build.util.safe_http.fetch_bytes",
+            return_value=(404, {"content-type": "text/plain"}, b"Not Found"),
         ):
             result = m._fetch_schema(v)
         assert result is None
 
     def test_fetch_schema_url_error(self, tmp_path):
-        from urllib.error import URLError
-
         m = self._make_manager(tmp_path)
         v = SchemaVersion.parse("0.9.0")
 
         with patch(
-            "fluid_build.schema_manager.urlopen",
-            side_effect=URLError("connection refused"),
+            "fluid_build.util.safe_http.fetch_bytes",
+            side_effect=ConnectionError("connection refused"),
         ):
             result = m._fetch_schema(v)
         assert result is None
@@ -212,13 +213,10 @@ class TestFetchSchema:
         m = self._make_manager(tmp_path)
         v = SchemaVersion.parse("0.9.0")
 
-        mock_response = MagicMock()
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-        mock_response.status = 200
-        mock_response.read.return_value = b"not valid json {"
-
-        with patch("fluid_build.schema_manager.urlopen", return_value=mock_response):
+        with patch(
+            "fluid_build.util.safe_http.fetch_bytes",
+            return_value=(200, {"content-type": "application/json"}, b"not valid json {"),
+        ):
             result = m._fetch_schema(v)
         assert result is None
 

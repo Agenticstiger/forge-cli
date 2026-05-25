@@ -278,6 +278,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--interactive", action="store_true", help="Interactive mode for configuration"
     )
+    # Wire the dispatcher — without this, `fluid generate-pipeline` errors
+    # with "No command function found". Pinned by
+    # tests/cli/test_subcommand_dispatch_smoke.py.
+    parser.set_defaults(func=run)
 
 
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:

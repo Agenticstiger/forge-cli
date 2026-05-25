@@ -94,6 +94,22 @@ def _imp(mod: str, attr: str | None = None):
     return getattr(m, attr) if attr else m
 
 
+def load_yaml_json(path: Path) -> Any:
+    """Load a YAML or JSON file by suffix. Single source of truth for the
+    ``if .yaml then yaml.safe_load else json.load`` pattern that was
+    previously duplicated across ``cli/opds.py``, ``cli/odcs.py``, and
+    ``forge/core/artifact_fanout.py``.
+    """
+    import json as _json
+
+    with open(path) as f:
+        if path.suffix in (".yaml", ".yml"):
+            import yaml as _yaml
+
+            return _yaml.safe_load(f)
+        return _json.load(f)
+
+
 def _is_bundle_path(path: str) -> bool:
     """True when *path* looks like a Phase-2 pipeline bundle (.tgz / .tar.gz).
 

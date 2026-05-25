@@ -24,22 +24,14 @@ from __future__ import annotations
 import json
 import logging
 import re
-import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-from urllib.request import Request, urlopen
 
 import yaml
 
 from .errors import ValidationError as FluidValidationError
-
-# A schema fetch is best-effort — bundled schemas cover every supported
-# version, and a missing version is a permanent error. The remote fetch is
-# bounded by this hard wall-clock deadline so a slow or unreachable host
-# fails fast instead of blocking the CLI for minutes.
-_SCHEMA_FETCH_DEADLINE_SEC = 15
 
 # Try to import jsonschema for proper validation
 try:
@@ -467,49 +459,43 @@ class FluidSchemaManager:
         return None
 
     def _fetch_schema(self, version: SchemaVersion) -> Optional[Dict[str, Any]]:
-        """Fetch a schema from the remote repository — best-effort.
+        """Fetch schema from remote repository.
 
-        Bounded by a hard wall-clock deadline (``_SCHEMA_FETCH_DEADLINE_SEC``):
-        the fetch runs on a daemon thread that is abandoned if it does not
-        finish in time, so an unreachable host — or a slow one with several
-        CDN IPs to time out against — fails fast instead of blocking the CLI
-        for minutes. A missing schema version is a permanent error.
+        SSRF-guarded — schema_url is normally a hardcoded
+        raw.githubusercontent.com URL (gated by the strict version
+        regex in SchemaVersion.parse), but SchemaVersion accepts an
+        explicit override too. Routing through ``safe_http.fetch_bytes``
+        closes the gap if a future code path lets a contract supply
+        ``schema_url`` directly, and bounds the request by
+        ``self.timeout`` so an unreachable host fails fast instead of
+        blocking the CLI for minutes.
         """
         if not version.schema_url:
             return None
 
-        outcome: Dict[str, Any] = {}
+        from fluid_build.util.safe_http import UnsafeURLError, fetch_bytes
 
-        def _worker() -> None:
-            try:
-                req = Request(version.schema_url)
-                req.add_header("User-Agent", "FLUID-Build-Tool/1.0")
-                with urlopen(req, timeout=self.timeout) as response:
-                    if response.status == 200:
-                        outcome["schema"] = json.loads(response.read().decode("utf-8"))
-                    else:
-                        outcome["error"] = f"HTTP {response.status}"
-            except Exception as exc:  # noqa: BLE001 — surfaced by the caller
-                outcome["error"] = exc
-
-        self.logger.info(f"Fetching schema from {version.schema_url}")
-        worker = threading.Thread(target=_worker, name=f"schema-fetch-{version}", daemon=True)
-        worker.start()
-        worker.join(timeout=_SCHEMA_FETCH_DEADLINE_SEC)
-
-        if worker.is_alive():
-            self.logger.warning(
-                f"Schema fetch for v{version} exceeded "
-                f"{_SCHEMA_FETCH_DEADLINE_SEC}s — giving up"
+        try:
+            self.logger.info(f"Fetching schema from {version.schema_url}")
+            status, _headers, body = fetch_bytes(
+                version.schema_url,
+                timeout=self.timeout,
+                headers={"User-Agent": "FLUID-Build-Tool/1.0"},
             )
-            return None
-
-        schema = outcome.get("schema")
-        if schema is not None:
+            if status != 200:
+                self.logger.warning(f"HTTP {status} fetching schema for v{version}")
+                return None
+            content = body.decode("utf-8")
+            schema = json.loads(content)
             self.logger.debug(f"Successfully fetched schema for v{version}")
             return schema
-        if "error" in outcome:
-            self.logger.warning(f"Could not fetch schema for v{version}: {outcome['error']}")
+        except UnsafeURLError as e:
+            self.logger.warning(f"Refusing schema URL for v{version}: {e}")
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self.logger.warning(f"Invalid schema content for v{version}: {e}")
+        except Exception as e:
+            self.logger.warning(f"Unexpected error fetching schema for v{version}: {e}")
+
         return None
 
     def find_compatible_version(

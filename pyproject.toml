@@ -91,6 +91,21 @@ dependencies = [
   # custom-SQL / task-body / view-body surfaces. Borrowed-not-built per
   # /borrow-before-build: https://github.com/tobymao/sqlglot
   "sqlglot>=25.0",
+  # Bitol-vendor-listed Python library for ODCS v3.1.0. Provides typed
+  # Pydantic v2 models + ``from_file()`` / ``to_yaml()`` for lossless
+  # ODCS YAML I/O. Maintained by the ``datacontract`` org (same folks
+  # who ship ``datacontract-cli``).
+  #
+  # Borrowed-not-built per /borrow-before-build:
+  #   PyPI:    https://pypi.org/project/open-data-contract-standard/
+  #   GitHub:  https://github.com/datacontract/open-data-contract-standard-python
+  #   Listed:  https://github.com/bitol-io/open-data-contract-standard/blob/main/vendors.md
+  #
+  # Powers fluid_build.providers.odcs.io for ODCS file I/O. Mapper-based
+  # FLUID ↔ ODCS conversion stays on plain dicts so the pass-through
+  # buckets that preserve unmodeled fields keep their round-trip
+  # fidelity contract.
+  "open-data-contract-standard>=3.1.2",
   # Optional UX nicety on Windows; no-op elsewhere
   "colorama>=0.4.6; platform_system == 'Windows'",
 ]
@@ -99,6 +114,26 @@ dependencies = [
 # Provider SDK (install once published)
 sdk = [
   "fluid-provider-sdk>=0.1.0",
+]
+
+# Stricter ODCS validation via vowl (MIT, GovTech Data Practice).
+# Bitol vendor-listed validation engine that aggregates ALL violations
+# (no first-error-only), runs format checks (uuid/email/ipv4/...),
+# auto-derives SQL data checks from contract metadata, and can run
+# them against real data sources via Ibis.
+#
+# Today we use vowl's *spec-parsing* side only — when this extra is
+# installed and ``ODCS_VOWL_VALIDATE=true`` (or ``fluid odcs validate
+# --vowl``), ``OdcsProvider.render`` runs a vowl second pass to catch
+# semantic issues jsonschema doesn't surface (stricter format
+# validation, unevaluated-properties enforcement, etc.).
+#
+# Borrowed-not-built per /borrow-before-build:
+#   PyPI:    https://pypi.org/project/vowl/
+#   GitHub:  https://github.com/govtech-data-practice/vowl
+#   Listed:  https://github.com/bitol-io/open-data-contract-standard/blob/main/vendors.md
+odcs-strict = [
+  "vowl>=0.0.2",
 ]
 
 # Local provider (DuckDB)
@@ -235,6 +270,7 @@ dev = [
   "pytest-randomly>=3.15",       # Randomize test order to catch hidden deps
   "respx>=0.21",                 # HTTPX request mocking — used by acquisition test matrix
   "hypothesis>=6.100",           # Property-based testing — used by tests/property/
+  "deepdiff>=7.0",               # Structural diff — used by OdcsProvider.roundtrip_check
   "mypy>=1.10",
   "ruff>=0.5",
   "types-PyYAML>=6.0.12",

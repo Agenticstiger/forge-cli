@@ -158,6 +158,57 @@ def _disable_copilot_self_eval(monkeypatch):
     monkeypatch.setenv("FLUID_COPILOT_SELF_EVAL", "0")
 
 
+def _noop_assert_safe_url(url, *, allow_private=False):  # noqa: ARG001
+    """Replacement for safe_http.assert_safe_url used in unit tests.
+
+    Returns a sentinel ``(hostname, pinned_ip)`` so callers that unpack
+    the tuple keep working without doing a real DNS lookup. Synthetic
+    test hostnames like ``airbyte.test`` / ``databricks.test`` /
+    ``kafka-connect.test`` are NOT in any DNS, so the real function
+    would raise UnsafeURLError on every test that constructs a
+    safe_httpx_client.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    return parsed.hostname or "test", "127.0.0.1"
+
+
+def _noop_pin_hook_factory(*, allow_private: bool = False):  # noqa: ARG001
+    def _hook(request) -> None:  # noqa: ARG001
+        return None
+
+    return _hook
+
+
+@pytest.fixture(autouse=True)
+def _disable_ssrf_guard_for_unit_tests(request):
+    """Replace the SSRF guard primitives with no-ops for the unit-test
+    suite so respx-mocked synthetic hostnames work without real DNS.
+
+    The guard itself is tested explicitly in ``tests/util/test_safe_http.py``
+    — we DON'T noop there. Detection by path so the policy stays local
+    to one file even if new tests land for the guard later.
+    """
+    fspath = str(getattr(request.node, "fspath", "") or "")
+    if "tests/util/test_safe_http.py" in fspath:
+        # The SSRF guard's own tests need the real implementation.
+        yield
+        return
+
+    with (
+        patch(
+            "fluid_build.util.safe_http.assert_safe_url",
+            side_effect=_noop_assert_safe_url,
+        ),
+        patch(
+            "fluid_build.util.safe_http._make_request_pin_hook",
+            side_effect=_noop_pin_hook_factory,
+        ),
+    ):
+        yield
+
+
 # ── Source-aligned acquisition test infrastructure (Slice A) ────────────
 #
 # Re-export the shared fixtures from tests/_infrastructure/ so individual
@@ -173,7 +224,6 @@ try:  # pragma: no cover — exercised at collection time
         marquez_mock,
         openmetadata_mock,
         snowflake_horizon_mock,
-        unity_mock,
     )
 except ImportError:
     pass

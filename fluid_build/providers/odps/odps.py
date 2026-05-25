@@ -14,13 +14,19 @@
 
 # fluid_build/providers/odps/odps.py
 """
-ODPS (Open Data Product Specification) Provider
+ODPI v4.1 (Open Data Product Initiative) Provider — Linux Foundation spec.
 
-High-quality implementation of ODPS export functionality for FLUID contracts.
-Provides comprehensive metadata extraction, validation, and standards compliance.
+**Distinct from Bitol ODPS v1.0.0.** Despite sharing the "ODPS" three-letter
+slug, the Bitol Open Data Product Standard (v1.0.0, ``providers/odps_standard/``,
+class :class:`BitolOdpsProvider`) is a separate specification with its own
+schema, JSON format, and ``contractId``-based linkage to ODCS. This module
+implements the **older** ODPI v4.1 spec from the Linux Foundation's Open Data
+Product Initiative — single-JSON-document export, no import support.
+
+Selected via ``fluid opds export --spec odpi-4.1``; the Bitol ODPS v1.0.0
+path is the default (``--spec bitol-1.0.0``).
 
 Official Specification: https://github.com/Open-Data-Product-Initiative/v4.1
-Standard: Linux Foundation / Open Data Product Initiative
 """
 
 from __future__ import annotations

@@ -340,6 +340,40 @@ class TestValidateArtifactsOrchestrator:
         # stopped before both files reported.
         assert report.status == "fail"
 
+    def test_odcs_sibling_inside_odps_bitol_bundle_validates_as_odcs(self, tmp_path):
+        """Bitol's ``odps-bitol/`` bundle is self-contained: the ODPS
+        product file and its sibling ODCS contracts live side-by-side
+        so every ``contractId`` resolves to a co-located file. The
+        dispatcher must therefore validate ``odps-bitol/*.odcs.yaml``
+        as ODCS, not as ODPS (the previous behaviour silently rejected
+        every Bitol bundle that contained sibling contracts — i.e.,
+        every realistic bundle — at validate-artifacts).
+        """
+        odcs_body = (
+            b"apiVersion: v3.1.0\n"
+            b"kind: DataContract\n"
+            b"id: bronze.demo.invoice\n"
+            b"name: invoice\n"
+            b"version: 1.0.0\n"
+            b"status: active\n"
+            b"schema:\n"
+            b"- name: invoice\n"
+            b"  logicalType: object\n"
+            b"  physicalType: table\n"
+            b"  properties:\n"
+            b"  - name: id\n"
+            b"    logicalType: string\n"
+            b"    physicalType: VARCHAR\n"
+        )
+        _write_manifest(tmp_path, {"odps-bitol/bronze.demo.invoice.odcs.yaml": odcs_body})
+        report = validate_artifacts(tmp_path)
+        # The sibling ODCS contract should validate cleanly via the
+        # ODCS validator (not get rejected by the ODPS validator).
+        assert report.status == "pass", (
+            "sibling ODCS in odps-bitol/ bundle should validate as ODCS, not ODPS. "
+            f"issues: {[i.to_dict() for i in report.issues]}"
+        )
+
     def test_report_has_stable_shape(self, tmp_path):
         _write_manifest(tmp_path, {"schedule/dags/good.py": b"pass\n"})
         report = validate_artifacts(tmp_path)

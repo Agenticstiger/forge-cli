@@ -66,7 +66,7 @@ LOG = logging.getLogger("fluid.forge.core.artifact_validators")
 _REPO_ROOT: Path = Path(__file__).parent.parent.parent
 _ODCS_SCHEMA_PATH: Path = _REPO_ROOT / "providers" / "odcs" / "odcs-schema-v3.1.0.json"
 _ODPS_BITOL_SCHEMA_PATH: Path = (
-    _REPO_ROOT / "providers" / "odps_standard" / "odps-bitol-schema-v1.0.0.json"
+    _REPO_ROOT / "providers" / "odps_standard" / "schemas" / "odps-product-v1.0.0.json"
 )
 
 
@@ -702,10 +702,24 @@ def validate_dbt_parse(project_dir: Path, *, strict: bool) -> List[ValidationIss
 
 
 def _dispatch_by_prefix(path: str, content: bytes) -> Callable[[str, bytes], List[ValidationIssue]]:
-    """Return the validator function for a bundle-relative path."""
+    """Return the validator function for a bundle-relative path.
+
+    Note: the ``odps-bitol/`` bundle is intentionally
+    **self-contained** — it ships the ODPS product file (``*.odps.*``)
+    alongside its sibling ODCS contracts (``*.odcs.*``) so every
+    ``contractId`` resolves to a co-located file (see
+    :func:`fluid_build.forge.core.artifact_fanout._emit_odps_bitol`).
+    The dispatcher therefore checks the file-name suffix within the
+    Bitol bundle, not just the directory prefix.
+    """
     if path.startswith("odcs/"):
         return validate_odcs
     if path.startswith("odps-bitol/"):
+        # Sibling ODCS contracts in the Bitol bundle must be validated
+        # as ODCS, not as ODPS — they're an ODCS-shaped document.
+        lower = path.lower()
+        if any(lower.endswith(ext) for ext in (".odcs.yaml", ".odcs.yml", ".odcs.json")):
+            return validate_odcs
         return validate_odps_bitol
     if path.startswith("schedule/") and path.endswith(".py"):
         return validate_dag_python

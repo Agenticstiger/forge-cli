@@ -29,7 +29,6 @@ from fluid_build.build_runners.catalog_registrars import (
     GlueCatalogRegistrar,
     OpenMetadataRegistrar,
     SnowflakeHorizonRegistrar,
-    UnityCatalogRegistrar,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -69,6 +68,20 @@ def _contract_with_columns(
 
 class TestDataHubRegistrar:
     def test_register_success(self, datahub_mock):
+        """A successful registration writes:
+
+        * a ``DatasetSnapshot`` (legacy ``/entities?action=ingest``) for
+          the expose's physical asset — captured by ``mock.entities``;
+        * one or more MCPs (``/aspects?action=ingestProposal``) for the
+          DataProduct itself (and a Domain when the contract has one) —
+          captured by ``mock.proposals``.
+
+        The returned URN is the **DataProduct** URN, not the dataset
+        URN, because a FLUID contract is fundamentally a data product
+        — that's what an operator searches for in the UI. The dataset
+        URN is preserved in ``result.metadata['dataset_urn']`` for
+        callers that still need it.
+        """
         registrar = DataHubRegistrar(base_url="https://datahub.test")
         contract = _contract_with_columns(
             columns=[
@@ -78,10 +91,20 @@ class TestDataHubRegistrar:
         )
         result = registrar.register("bronze.x", "orders", contract, {"email": ["email"]})
         assert result.succeeded
-        assert "snowflake" in result.urn
-        assert datahub_mock.entities, "DataHub mock recorded ingestion"
+        assert result.urn == "urn:li:dataProduct:bronze.x"
+        assert "snowflake" in result.metadata["dataset_urn"]
+        assert datahub_mock.entities, "DataHub mock recorded dataset snapshot"
+        assert datahub_mock.proposals_for(
+            "dataProduct"
+        ), "DataHub mock recorded DataProduct MCP proposal"
 
     def test_classifications_become_glossary_terms(self, datahub_mock):
+        """``classifications`` map column → list of glossary-term labels.
+        Each label is emitted as a ``GlossaryTermAssociation`` record
+        with a ``urn:li:glossaryTerm:<label>`` URN — that's the shape
+        the real DataHub GMS accepts (live integration test pins this;
+        the old assertion on a bare-string list silently passed because
+        the mock never validated against the GMS schema)."""
         registrar = DataHubRegistrar(base_url="https://datahub.test")
         contract = _contract_with_columns(
             columns=[{"name": "email", "type": "STRING"}, {"name": "phone", "type": "STRING"}]
@@ -100,8 +123,11 @@ class TestDataHubRegistrar:
         fields = schema_aspect["com.linkedin.schema.SchemaMetadata"]["fields"]
         email_field = next(f for f in fields if f["fieldPath"] == "email")
         phone_field = next(f for f in fields if f["fieldPath"] == "phone")
-        assert "email" in email_field["glossaryTerms"]
-        assert "pii" in phone_field["glossaryTerms"]
+        email_urns = {t["urn"] for t in email_field["glossaryTerms"]["terms"]}
+        phone_urns = {t["urn"] for t in phone_field["glossaryTerms"]["terms"]}
+        assert "urn:li:glossaryTerm:email" in email_urns
+        assert "urn:li:glossaryTerm:phone" in phone_urns
+        assert "urn:li:glossaryTerm:pii" in phone_urns
 
     def test_register_failure_on_network_error(self, monkeypatch):
         registrar = DataHubRegistrar(base_url="http://no-such-host.invalid:9")
@@ -110,23 +136,16 @@ class TestDataHubRegistrar:
         assert not result.succeeded
         assert result.error is not None
 
-    def test_unregister_success(self, datahub_mock, monkeypatch):
-        # Add a custom delete handler.
-        import httpx
-        import respx
-
-        with respx.mock(base_url="https://datahub.test", assert_all_called=False) as router:
-            calls = []
-
-            def delete_handler(request):
-                calls.append(request)
-                return httpx.Response(200, json={})
-
-            router.post("/entities?action=delete").mock(side_effect=delete_handler)
-            registrar = DataHubRegistrar(base_url="https://datahub.test")
-            result = registrar.unregister("bronze.x", "orders")
-            assert result.succeeded
-            assert calls
+    def test_unregister_soft_deletes_dataset_and_dataproduct(self, datahub_mock):
+        """``unregister`` mirrors ``register``: it soft-deletes both the
+        DataProduct and its dataset asset so the UI no longer surfaces
+        either. The DataHub mock's ``deletes`` lane records every
+        delete URN so the test asserts on both shapes."""
+        registrar = DataHubRegistrar(base_url="https://datahub.test")
+        result = registrar.unregister("bronze.x", "orders")
+        assert result.succeeded
+        assert "urn:li:dataProduct:bronze.x" in datahub_mock.deletes
+        assert any("urn:li:dataset:" in u and "bronze.x.orders" in u for u in datahub_mock.deletes)
 
 
 # ── OpenMetadata ────────────────────────────────────────────────────────
@@ -163,43 +182,6 @@ class TestOpenMetadataRegistrar:
         result = registrar.unregister("bronze.x", "orders")
         assert result.succeeded
         assert "bronze.x.orders" in openmetadata_mock.deletions[0]
-
-
-# ── Unity Catalog ───────────────────────────────────────────────────────
-
-
-class TestUnityCatalogRegistrar:
-    def test_register_success(self, unity_mock):
-        registrar = UnityCatalogRegistrar(
-            base_url="https://databricks.test",
-            workspace_token="t",
-            catalog_name="forge",
-            schema_name="bronze",
-        )
-        result = registrar.register(
-            "bronze.x",
-            "orders",
-            _contract_with_columns(columns=[{"name": "id", "type": "bigint"}]),
-            {},
-        )
-        assert result.succeeded
-        assert "unity://" in result.urn
-        body = unity_mock.tables[0]
-        assert body["catalog_name"] == "forge"
-        assert body["schema_name"] == "bronze"
-        assert body["name"] == "orders"
-
-    def test_table_type_is_managed_delta(self, unity_mock):
-        registrar = UnityCatalogRegistrar(base_url="https://databricks.test")
-        registrar.register("bronze.x", "orders", _contract_with_columns(columns=[]), {})
-        body = unity_mock.tables[0]
-        assert body["table_type"] == "MANAGED"
-        assert body["data_source_format"] == "DELTA"
-
-    def test_unregister(self, unity_mock):
-        registrar = UnityCatalogRegistrar(base_url="https://databricks.test")
-        result = registrar.unregister("bronze.x", "orders")
-        assert result.succeeded
 
 
 # ── AWS Glue ────────────────────────────────────────────────────────────
@@ -445,7 +427,6 @@ class TestProtocolConformance:
         [
             lambda: DataHubRegistrar(base_url="https://datahub.test"),
             lambda: OpenMetadataRegistrar(base_url="https://openmetadata.test"),
-            lambda: UnityCatalogRegistrar(base_url="https://databricks.test"),
             lambda: GlueCatalogRegistrar(base_url_override="https://glue.us-east-1.amazonaws.com"),
             lambda: SnowflakeHorizonRegistrar(account_url="https://acme.snowflakecomputing.com"),
         ],
@@ -455,7 +436,6 @@ class TestProtocolConformance:
         registrar_factory,
         datahub_mock,
         openmetadata_mock,
-        unity_mock,
         glue_mock,
         snowflake_horizon_mock,
     ):
