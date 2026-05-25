@@ -20,7 +20,6 @@ import requests
 
 from fluid_build.cli.datamesh_manager import _cmd_publish, _publish_exit_code
 from fluid_build.providers.base import ProviderError
-from fluid_build.providers.catalogs.datamesh_manager import DataMeshManagerCatalogProvider
 from fluid_build.providers.datamesh_manager import DataMeshManagerProvider
 
 
@@ -494,30 +493,6 @@ def test_apply_dry_run_odps_source_system_mode_does_not_restore_product_input_po
     assert result["odps_lineage_mode"] == "source-system"
     assert "inputPorts" not in result["payload"]
     assert len(result["access_agreements"]) == 2
-
-
-def test_catalog_provider_passes_odps_lineage_mode_to_dmm_provider():
-    catalog = DataMeshManagerCatalogProvider(
-        {
-            "auth": {"api_key": "dummy"},
-            "endpoint": "https://api.entropy-data.com",
-            "odps_lineage_mode": "source-system",
-        }
-    )
-
-    assert catalog._provider.odps_lineage_mode == "source-system"
-
-
-def test_catalog_provider_passes_explicit_access_auto_approval_to_dmm_provider():
-    catalog = DataMeshManagerCatalogProvider(
-        {
-            "auth": {"api_key": "dummy"},
-            "endpoint": "https://api.entropy-data.com",
-            "auto_approve_access": "true",
-        }
-    )
-
-    assert catalog._provider.auto_approve_access is True
 
 
 def test_apply_odps_default_lineage_mode_does_not_upsert_product_references():

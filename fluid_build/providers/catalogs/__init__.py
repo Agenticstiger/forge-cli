@@ -17,39 +17,42 @@
 Single source of truth for ``fluid publish --target`` targets. Two
 classes of backend land here:
 
-1. **Native async providers** (``fluid-command-center``,
-   ``datamesh-manager``) — full :class:`BaseCatalogProvider` subclasses
-   with their own custom config shapes (multiple auth modes, ODCS /
-   ODPS toggles, circuit breakers). Hand-wired below.
+1. **Native async providers** (only ``fluid-command-center`` now) —
+   full :class:`BaseCatalogProvider` subclasses with custom config
+   shapes (multiple auth modes, circuit breakers). Hand-wired below.
 
 2. **Registrar-backed plug-in backends** — every catalog declared via
-   :func:`~fluid_build.api.catalog_backend.register_catalog_backend`.
-   Each registrar module under
+   :func:`~fluid_build.api.catalog_backend.register_catalog_backend`,
+   including Data Mesh Manager. Each registrar module under
    ``fluid_build/build_runners/catalog_registrars/<name>.py`` calls
-   that function at import time; here we import the registrar package
-   to trigger those calls, then auto-populate ``CATALOG_PROVIDERS``
-   with one entry per declared backend (canonical name + each alias).
+   ``register_catalog_backend`` at import time; here we import the
+   registrar package to trigger those calls, then auto-populate
+   ``CATALOG_PROVIDERS`` with one entry per declared backend
+   (canonical name + each alias).
 
 The contract-driven acquisition path
 (``properties.catalog.register: [...]``) goes through
 ``build_runners/_catalog.py::build_registrar``, which consults this
 same registry plus the symmetric ``ProviderBackedRegistrar`` adapter
-so the native async providers are also reachable from contracts.
+so the native async provider is also reachable from contracts.
 
 Adding a new catalog: drop a new ``catalog_registrars/<name>.py`` file
 with a registrar dataclass + a ``register_catalog_backend(...)`` call.
 No edits to this module, ``config_manager``, or test fixtures
 required.
+
+Note: the legacy ``DataMeshManagerCatalogProvider`` async wrapper
+(``providers/catalogs/datamesh_manager.py``) was removed so DMM has
+exactly **one** publish path — the canonical
+:class:`~fluid_build.build_runners.catalog_registrars.datamesh_manager.DataMeshManagerRegistrar`.
+That registrar consumes the rendered ODPS spec (with
+``outputPorts[].contractId`` linkage + ``inputPorts[]`` derived from
+``consumes[]``) so lineage and per-asset ODCS contracts both publish
+correctly through the same code path the other backends use.
 """
 
 from .base import BaseCatalogProvider, CatalogAsset, PublishResult
 from .fluid_cc import FluidCommandCenterProvider
-
-# Lazy-import optional native async backends ─ don't crash if deps are missing
-try:
-    from .datamesh_manager import DataMeshManagerCatalogProvider
-except Exception:
-    DataMeshManagerCatalogProvider = None  # type: ignore[assignment,misc]
 
 # Importing the registrar package triggers each module's
 # ``register_catalog_backend(...)`` side effect, populating the
@@ -73,11 +76,6 @@ CATALOG_PROVIDERS = {
     "fluid-command-center": FluidCommandCenterProvider,
     "fluid_cc": FluidCommandCenterProvider,
 }
-
-if DataMeshManagerCatalogProvider is not None:
-    CATALOG_PROVIDERS["datamesh-manager"] = DataMeshManagerCatalogProvider
-    CATALOG_PROVIDERS["entropy-data"] = DataMeshManagerCatalogProvider
-    CATALOG_PROVIDERS["dmm"] = DataMeshManagerCatalogProvider
 
 # Auto-register every plug-in backend declared via register_catalog_backend.
 # Native providers above keep priority over any backend that shares a name —

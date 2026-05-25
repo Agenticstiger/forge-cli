@@ -94,7 +94,7 @@ class TestDmmRegistrar:
         linked contract pages.
         """
         dp_route = respx.put(
-            "https://api.datamesh-manager.com/api/data-products/bronze.crm.salesforce_accounts"
+            "https://api.datamesh-manager.com/api/dataproducts/bronze.crm.salesforce_accounts"
         ).mock(return_value=httpx.Response(200, json={"ok": True}))
         dc_route = respx.put(
             "https://api.datamesh-manager.com/api/datacontracts/"
@@ -134,7 +134,7 @@ class TestDmmRegistrar:
         # canonical layer can derive a real payload; the 4xx still
         # fires on the data-product PUT below.
         respx.put(
-            "https://api.datamesh-manager.com/api/data-products/bronze.crm.salesforce_accounts"
+            "https://api.datamesh-manager.com/api/dataproducts/bronze.crm.salesforce_accounts"
         ).mock(return_value=httpx.Response(403, text="forbidden"))
         registrar = DataMeshManagerRegistrar(api_token="t-x")
         result = registrar.register(
@@ -174,27 +174,25 @@ class TestPublishAcquisitionToDmm:
     def test_publish_acquisition_dispatches_to_dmm(self, tmp_path: Path):
         """Acquisition contract → DMM canonical publish.
 
-        The new ``publish_acquisition`` calls ``register_payload`` once
-        per contract — for DMM that fires both PUTs (data product +
-        per-asset contract). The result projects to a per-expose
-        PublishResult so existing CLI display code keeps working;
-        ``urn`` here is the DMM data-product URN (the canonical
-        identity), not the per-expose URN the legacy path emitted.
+        ``publish_acquisition`` calls ``register_payload`` once per
+        contract — for DMM that fires two PUTs (per-asset ODCS contract,
+        then the ODPS data product). The result projects to a per-expose
+        PublishResult so existing CLI display code keeps working; ``urn``
+        here is the DMM data-product URN (the canonical identity), not
+        the per-expose URN the legacy path emitted.
         """
         from fluid_build.build_runners import _catalog as orch
         from fluid_build.cli._acquisition_stage_ext import publish_acquisition
 
         respx.put(
-            "https://api.datamesh-manager.com/api/data-products/bronze.crm.salesforce_accounts"
+            "https://api.datamesh-manager.com/api/dataproducts/bronze.crm.salesforce_accounts"
         ).mock(return_value=httpx.Response(200, json={"ok": True}))
         respx.put(
             "https://api.datamesh-manager.com/api/datacontracts/"
             "bronze.crm.salesforce_accounts.accounts_raw"
         ).mock(return_value=httpx.Response(200, json={"ok": True}))
 
-        orch.register_registrar(
-            "datamesh_manager", DataMeshManagerRegistrar(api_token="t")
-        )
+        orch.register_registrar("datamesh_manager", DataMeshManagerRegistrar(api_token="t"))
         try:
             results = publish_acquisition(_acquisition_contract(), tmp_path)
         finally:
@@ -211,8 +209,14 @@ class TestPublishAcquisitionToDmm:
         from fluid_build.build_runners import _catalog as orch
         from fluid_build.cli._acquisition_stage_ext import publish_acquisition
 
+        # Contracts publish FIRST in the canonical order, so they need to
+        # succeed before we can exercise a 502 on the data-product PUT.
         respx.put(
-            "https://api.datamesh-manager.com/api/data-products/bronze.crm.salesforce_accounts"
+            "https://api.datamesh-manager.com/api/datacontracts/"
+            "bronze.crm.salesforce_accounts.accounts_raw"
+        ).mock(return_value=httpx.Response(200, json={"ok": True}))
+        respx.put(
+            "https://api.datamesh-manager.com/api/dataproducts/bronze.crm.salesforce_accounts"
         ).mock(return_value=httpx.Response(502, text="bad gateway"))
 
         orch.register_registrar("datamesh_manager", DataMeshManagerRegistrar(api_token="t"))
@@ -223,3 +227,118 @@ class TestPublishAcquisitionToDmm:
         assert len(results) == 1
         assert results[0].succeeded is False
         assert "502" in (results[0].error or "")
+
+
+# ── Publish order (load-bearing for DMM UI contract-chip rendering) ───────
+
+
+class TestDmmSourceSystemUpsert:
+    """Source-aligned data products declare their ingestion source under
+    ``builds[].properties.source``. The DMM registrar must upsert a
+    SourceSystem entity per unique source AND inject ``sourceSystemId``
+    onto the data product's matching input port so the SDP renders in
+    DMM with an upstream lineage edge instead of free-floating.
+    """
+
+    @respx.mock
+    def test_source_system_upserted_before_data_product(self):
+        from fluid_build.api.catalog_publication import CatalogPublicationPayload
+
+        sys_route = respx.put("https://api.datamesh-manager.com/api/sourcesystems/salesforce").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        respx.put(
+            "https://api.datamesh-manager.com/api/datacontracts/"
+            "bronze.crm.salesforce_accounts.accounts_raw"
+        ).mock(return_value=httpx.Response(200, json={"ok": True}))
+        dp_route = respx.put(
+            "https://api.datamesh-manager.com/api/dataproducts/bronze.crm.salesforce_accounts"
+        ).mock(return_value=httpx.Response(200, json={"ok": True}))
+
+        payload = CatalogPublicationPayload.from_contract(_acquisition_contract(), {})
+        result = DataMeshManagerRegistrar(api_token="t").register_payload(payload)
+        assert result.succeeded is True
+        assert sys_route.called, "SourceSystem PUT must fire for SDP build source"
+
+        # Body shape: id+name+owner+custom{type,kind,...}
+        body = json.loads(sys_route.calls[0].request.content)
+        assert body["id"] == "salesforce"
+        assert body["owner"] == "data-platform"
+        assert body["custom"]["kind"] == "salesforce"
+        # kind_to_dmm_type maps Salesforce → "Salesforce" (TitleCase)
+        assert "type" in body["custom"]
+
+        # The data-product PUT body must reference the SourceSystem via
+        # inputPorts[].sourceSystemId — otherwise DMM won't draw the
+        # upstream edge on the lineage graph.
+        dp_body = json.loads(dp_route.calls[0].request.content)
+        ips = dp_body.get("inputPorts") or []
+        assert ips, "data product must carry inputPorts wiring to the SourceSystem"
+        assert any(
+            ip.get("sourceSystemId") == "salesforce" for ip in ips
+        ), "at least one inputPort must reference the upserted SourceSystem"
+
+        # URN surfaces on metadata for catalog observability.
+        assert "dmm://sourcesystems/salesforce" in result.metadata.get("source_system_urns", [])
+
+    @respx.mock
+    def test_source_system_failure_is_non_fatal(self):
+        """If the SourceSystem PUT fails (4xx/5xx), the publish keeps
+        going — at worst the lineage graph degrades, the data product
+        still lands."""
+        from fluid_build.api.catalog_publication import CatalogPublicationPayload
+
+        respx.put("https://api.datamesh-manager.com/api/sourcesystems/salesforce").mock(
+            return_value=httpx.Response(500, text="dmm down")
+        )
+        respx.put(
+            "https://api.datamesh-manager.com/api/datacontracts/"
+            "bronze.crm.salesforce_accounts.accounts_raw"
+        ).mock(return_value=httpx.Response(200, json={"ok": True}))
+        respx.put(
+            "https://api.datamesh-manager.com/api/dataproducts/bronze.crm.salesforce_accounts"
+        ).mock(return_value=httpx.Response(200, json={"ok": True}))
+
+        payload = CatalogPublicationPayload.from_contract(_acquisition_contract(), {})
+        result = DataMeshManagerRegistrar(api_token="t").register_payload(payload)
+        # Overall publish still succeeded.
+        assert result.succeeded is True
+        # Failed upsert is reflected in metadata (no URN listed).
+        assert result.metadata.get("source_system_urns") == []
+
+
+class TestDmmPublishOrder:
+    """Entropy's ``OpenDataProductStandardUpdateService`` resolves each
+    ``outputPorts[].contractId`` to an internal ``data_contract`` FK at
+    the moment of the data-product PUT. If the per-asset contracts
+    don't exist yet, the FK stays null and the UI shows
+    "Add Data Contract…" forever. So the contracts MUST be PUT before
+    the data product. This test pins the order — flipping it back would
+    silently regress the contract-chip rendering.
+    """
+
+    @respx.mock
+    def test_per_asset_contracts_publish_before_data_product(self):
+        from fluid_build.api.catalog_publication import CatalogPublicationPayload
+
+        ordered_paths: list[str] = []
+
+        def _record(request):
+            ordered_paths.append(request.url.path)
+            return httpx.Response(200, json={"ok": True})
+
+        respx.put(
+            "https://api.datamesh-manager.com/api/datacontracts/"
+            "bronze.crm.salesforce_accounts.accounts_raw"
+        ).mock(side_effect=_record)
+        respx.put(
+            "https://api.datamesh-manager.com/api/dataproducts/bronze.crm.salesforce_accounts"
+        ).mock(side_effect=_record)
+
+        payload = CatalogPublicationPayload.from_contract(_acquisition_contract(), {})
+        result = DataMeshManagerRegistrar(api_token="t").register_payload(payload)
+        assert result.succeeded is True
+
+        per_asset_path = "/api/datacontracts/bronze.crm.salesforce_accounts.accounts_raw"
+        product_path = "/api/dataproducts/bronze.crm.salesforce_accounts"
+        assert ordered_paths.index(per_asset_path) < ordered_paths.index(product_path)

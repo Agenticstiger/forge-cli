@@ -151,6 +151,17 @@ def resolve_and_validate(hostname: str, *, allow_private: bool = False) -> str:
                 raise UnsafeURLError(
                     f"refusing fetch from non-public address {addr} " f"(hostname {hostname!r})"
                 )
+    # Prefer IPv4 over IPv6 when both are returned. macOS / many dev
+    # tools (LocalStack, Entropy Data, Unity Catalog OSS, …) bind
+    # 127.0.0.1 only and reject ::1 connects; getaddrinfo on
+    # ``localhost`` may return AAAA first. Picking the first IPv4
+    # answer when one exists keeps the SSRF guard's "pin to a single
+    # address" guarantee while avoiding spurious connect-refused
+    # against IPv4-only dev services. Public hostnames typically
+    # support dual-stack so this never bites real traffic.
+    for addr in addrs:
+        if ":" not in addr:
+            return addr
     return addrs[0]
 
 
