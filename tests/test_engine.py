@@ -24,7 +24,6 @@ For each public function we verify:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import sys
 from pathlib import Path

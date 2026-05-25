@@ -91,7 +91,6 @@ import asyncio
 import io
 import json
 import logging
-import sys
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -340,13 +339,23 @@ async def plan(
             if default_path.exists():
                 plan_path = default_path
         except (TypeError, OSError):
-            pass
+            # ``contract`` may be a non-path-like or unreadable; the
+            # artifact readback is best-effort and never blocks the
+            # caller. The stage's exit code is the authoritative signal.
+            logging.getLogger("fluid.engine.plan").debug(
+                "could not derive default plan_path next to %s", contract, exc_info=True
+            )
     if plan_path and Path(plan_path).exists():
         try:
             result.artifacts["plan"] = json.loads(Path(plan_path).read_text())
             result.artifacts["plan_path"] = str(plan_path)
         except (json.JSONDecodeError, OSError):
-            pass
+            # Stage wrote something at plan_path but it isn't valid
+            # JSON or the file disappeared between exists() and read.
+            # Surfaced as missing artifact, not an engine error.
+            logging.getLogger("fluid.engine.plan").debug(
+                "could not parse plan_path=%s", plan_path, exc_info=True
+            )
     return result
 
 
@@ -403,7 +412,11 @@ async def diff(
         try:
             result.artifacts["diff"] = json.loads(result.stdout)
         except json.JSONDecodeError:
-            pass
+            # Stage emitted non-JSON despite format=json — keep the raw
+            # text in result.stdout, leave artifacts['diff'] unset.
+            logging.getLogger("fluid.engine.diff").debug(
+                "diff stage stdout was not valid JSON", exc_info=True
+            )
     return result
 
 
