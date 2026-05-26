@@ -183,29 +183,169 @@ def _build_generated_dbt_profile(
 
         return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
 
+    if platform in {"athena", "aws-athena"}:
+        # dbt-athena-community. Iceberg materialization is *per-model* config
+        # (``{{ config(materialized='table', table_type='iceberg') }}``) and
+        # stays out of the profile entirely. ``database`` defaults to the
+        # AWS-default Glue catalog; ``schema`` is the data product's Glue
+        # database (the mesh interface). Credentials follow the boto3 chain
+        # — set ``AWS_PROFILE`` or attach an instance role.
+        output: Dict[str, Any] = {
+            "type": "athena",
+            "s3_staging_dir": (
+                resources.get("s3_staging_dir")
+                or props.get("s3_staging_dir")
+                or os.getenv("ATHENA_S3_STAGING_DIR")
+                or os.getenv("S3_STAGING_DIR")
+                or ""
+            ),
+            "region_name": (
+                resources.get("region")
+                or resources.get("region_name")
+                or os.getenv("AWS_REGION")
+                or os.getenv("AWS_DEFAULT_REGION")
+                or ""
+            ),
+            "database": resources.get("database") or "awsdatacatalog",
+            "schema": resources.get("schema") or resources.get("glue_database") or "default",
+            "threads": int(resources.get("threads") or props.get("threads") or 4),
+        }
+        # Iceberg writes need a separate data prefix from the staging dir.
+        data_dir = (
+            resources.get("s3_data_dir")
+            or props.get("s3_data_dir")
+            or os.getenv("ATHENA_S3_DATA_DIR")
+            or os.getenv("S3_DATA_DIR")
+        )
+        if data_dir:
+            output["s3_data_dir"] = data_dir
+        # boto3 resolves credentials; ``aws_profile_name`` is the cleanest
+        # explicit path. Instance roles / IRSA need no profile key.
+        aws_profile = os.getenv("AWS_PROFILE") or resources.get("aws_profile_name")
+        if aws_profile:
+            output["aws_profile_name"] = aws_profile
+        work_group = resources.get("work_group") or os.getenv("ATHENA_WORK_GROUP")
+        if work_group:
+            output["work_group"] = work_group
+        return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
+
+    if platform in {"glue", "aws-glue"}:
+        # dbt-glue (aws-samples). Workers / worker_type follow the canonical
+        # ``sample_profiles.yml``. ``session_provisioning_timeout_in_seconds``
+        # is bumped to 240 — the upstream default of 20 is too low for cold
+        # interactive sessions.
+        output = {
+            "type": "glue",
+            "role_arn": (
+                resources.get("role_arn")
+                or os.getenv("GLUE_ROLE_ARN")
+                or os.getenv("AWS_GLUE_ROLE_ARN")
+                or ""
+            ),
+            "region": (
+                resources.get("region")
+                or os.getenv("AWS_REGION")
+                or os.getenv("AWS_DEFAULT_REGION")
+                or ""
+            ),
+            "workers": int(resources.get("workers") or props.get("workers") or 5),
+            "worker_type": str(resources.get("worker_type") or props.get("worker_type") or "G.1X"),
+            "schema": resources.get("schema") or resources.get("glue_database") or "default",
+            "session_provisioning_timeout_in_seconds": int(
+                resources.get("session_provisioning_timeout_in_seconds")
+                or props.get("session_provisioning_timeout_in_seconds")
+                or 240
+            ),
+            "threads": int(resources.get("threads") or props.get("threads") or 4),
+        }
+        if resources.get("glue_version"):
+            output["glue_version"] = str(resources["glue_version"])
+        if resources.get("location"):
+            output["location"] = str(resources["location"])
+        return {profile_name: {"target": target_name, "outputs": {target_name: output}}}
+
     if platform in {"aws", "redshift"}:
         cluster_id = resources.get("cluster_id") or os.getenv("REDSHIFT_CLUSTER_ID")
         iam_profile = os.getenv("REDSHIFT_IAM_PROFILE") or os.getenv("AWS_PROFILE")
-        use_iam = bool(cluster_id) and bool(iam_profile or os.getenv("REDSHIFT_USE_IAM"))
+        # Redshift Serverless: contract carries a workgroup (and optionally
+        # a namespace) instead of a provisioned cluster_id. dbt-redshift
+        # 1.9+ talks to Serverless via ``method: iam`` +
+        # ``is_serverless: true`` + ``serverless_work_group`` — no static
+        # admin password needed; AWS_PROFILE-based IAM auth resolves
+        # temporary creds via ``redshift-serverless:GetCredentials``.
+        workgroup = (
+            resources.get("workgroup")
+            or resources.get("serverless_work_group")
+            or os.getenv("REDSHIFT_SERVERLESS_WORKGROUP")
+        )
+        use_iam = bool(iam_profile or os.getenv("REDSHIFT_USE_IAM")) and bool(
+            cluster_id or workgroup
+        )
 
         output = {
             "type": "redshift",
             "host": resources.get("host") or os.getenv("REDSHIFT_HOST", ""),
-            "user": os.getenv("REDSHIFT_USER", ""),
+            "user": resources.get("user") or os.getenv("REDSHIFT_USER", ""),
             "port": int(resources.get("port") or os.getenv("REDSHIFT_PORT") or 5439),
             "dbname": resources.get("database") or os.getenv("REDSHIFT_DATABASE", ""),
             "schema": resources.get("schema") or "public",
             "threads": int(resources.get("threads") or props.get("threads") or 4),
+            # Retry the initial connection: when forge-cli's amend-and-build
+            # provisions a fresh Redshift Serverless workgroup and then
+            # dispatches the dbt build in one go, the workgroup is
+            # AVAILABLE in the AWS API but its VPC-internal DNS entry
+            # can take ~10-60 s to propagate. The default ``retries: 1``
+            # gives up before propagation finishes; ``5`` is enough
+            # in practice without dragging out genuinely broken setups.
+            "retries": int(
+                resources.get("retries")
+                or props.get("retries")
+                or os.getenv("REDSHIFT_RETRIES")
+                or 5
+            ),
+            "connect_timeout": int(
+                resources.get("connect_timeout") or props.get("connect_timeout") or 60
+            ),
         }
 
         if use_iam:
             output["method"] = "iam"
-            output["cluster_id"] = cluster_id
             if iam_profile:
                 output["iam_profile"] = iam_profile
-            region = os.getenv("REDSHIFT_REGION") or os.getenv("AWS_REGION")
+            region = (
+                resources.get("region") or os.getenv("REDSHIFT_REGION") or os.getenv("AWS_REGION")
+            )
             if region:
                 output["region"] = region
+            if workgroup:
+                # Serverless: dbt-redshift's ``__base_kwargs`` passes
+                # ``host`` straight through to ``redshift_connector``,
+                # which then parses the host string for serverless
+                # detection (``is_serverless_host`` flag set by
+                # ``"redshift-serverless" in host``). An empty host
+                # breaks that detection and the connect raises
+                # ``gaierror`` even when ``is_serverless: true`` is set
+                # in the profile. So derive the canonical endpoint
+                # hostname here when we have everything needed
+                # (workgroup + acct + region) and the operator didn't
+                # supply an explicit ``host``.
+                output["is_serverless"] = True
+                output["serverless_work_group"] = str(workgroup)
+                acct = (
+                    resources.get("account_id")
+                    or resources.get("serverless_acct_id")
+                    or os.getenv("AWS_ACCOUNT_ID")
+                )
+                if acct:
+                    output["serverless_acct_id"] = str(acct)
+                if not output["host"] and acct and region:
+                    output["host"] = (
+                        f"{workgroup}.{acct}.{region}" ".redshift-serverless.amazonaws.com"
+                    )
+                # Serverless has no cluster_id; clear any stale value.
+                output.pop("cluster_id", None)
+            elif cluster_id:
+                output["cluster_id"] = cluster_id
         else:
             output["password"] = os.getenv("REDSHIFT_PASSWORD", "")
 

@@ -100,10 +100,10 @@ def map_fluid_type_to_snowflake(fluid_type: str) -> str:
     - unknown type → ``"VARCHAR"`` (safe fallback)
 
     The parameterised passthrough branch is a SQL-injection boundary: the
-    returned string is interpolated raw into ``CREATE TABLE`` DDL downstream
-    (``actions/table.py``). A malformed ``(...)`` payload — anything beyond
-    ``(N)`` / ``(N,N)`` — is rejected with :class:`SqlTypeError` here rather
-    than passed through verbatim (BUG-SQL-TYPE defense-in-depth).
+    returned string is interpolated into ``CREATE TABLE`` DDL downstream.
+    A malformed ``(...)`` payload — anything beyond ``(N)`` / ``(N,N)`` — is
+    rejected with :class:`SqlTypeError` here rather than passed through
+    verbatim (BUG-SQL-TYPE defense-in-depth).
     """
     raw_type = (fluid_type or "string").strip()
     lower_type = raw_type.lower()

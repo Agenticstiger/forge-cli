@@ -25,6 +25,7 @@ path has a clear, discoverable home.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -327,14 +328,13 @@ class DbtDetector(ProjectDetector):
 
 
 class TerraformDetector(ProjectDetector):
-    """Detect and parse Terraform configurations"""
+    """Detect and parse Terraform / OpenTofu configurations"""
 
     def can_detect(self, path: Path) -> bool:
-        tf_files = list(path.glob("*.tf"))
-        return len(tf_files) > 0
+        return bool(list(path.glob("*.tf")) or list(path.glob("*.tf.json")))
 
     def scan(self, path: Path, logger: logging.Logger) -> Dict[str, Any]:
-        """Scan Terraform files"""
+        """Scan Terraform / OpenTofu (.tf and .tf.json) files"""
 
         results = {
             "project_type": "terraform",
@@ -344,22 +344,37 @@ class TerraformDetector(ProjectDetector):
         }
 
         tf_files = list(path.glob("*.tf"))
+        tf_json_files = list(path.glob("*.tf.json"))
 
         if RICH_AVAILABLE:
-            console.print(f"\n🔍 Found {len(tf_files)} Terraform files")
+            console.print(
+                f"\n🔍 Found {len(tf_files) + len(tf_json_files)} Terraform/OpenTofu files"
+            )
 
-        # Parse Terraform files (simplified)
+        # Parse HCL files (simplified — a real implementation would use an HCL parser).
         for tf_file in tf_files:
             content = tf_file.read_text()
-
-            # Look for data sources and resources
-            # This is simplified - real implementation would use HCL parser
             if 'resource "google_bigquery_dataset"' in content:
                 results["metadata"]["target_platform"] = "gcp"
             elif 'resource "snowflake_database"' in content:
                 results["metadata"]["target_platform"] = "snowflake"
 
-        results["metadata"]["files_count"] = len(tf_files)
+        # Parse .tf.json files structurally — the HCL substring checks above
+        # never match JSON syntax.
+        for tf_file in tf_json_files:
+            try:
+                doc = json.loads(tf_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if not isinstance(doc, dict):
+                continue
+            resource_types = (doc.get("resource") or {}).keys()
+            if "google_bigquery_dataset" in resource_types:
+                results["metadata"]["target_platform"] = "gcp"
+            elif "snowflake_database" in resource_types:
+                results["metadata"]["target_platform"] = "snowflake"
+
+        results["metadata"]["files_count"] = len(tf_files) + len(tf_json_files)
 
         return results
 

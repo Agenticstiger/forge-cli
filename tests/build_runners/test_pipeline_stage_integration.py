@@ -33,7 +33,6 @@ from fluid_build.build_runners.base import (
     is_acquisition_build,
     is_dbt_build,
 )
-from fluid_build.infra import get_generator
 from fluid_build.schema_manager import FluidSchemaManager
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -222,58 +221,6 @@ class TestApplyDispatchPerEngine:
         contract = _minimal_acquisition_contract(engine)
         build = contract["builds"][0]
         assert is_acquisition_build(build)
-
-
-# ── Stage 4: generate-artifacts (managed mode) per engine ─────────────
-
-
-class TestGenerateArtifactsPerEngine:
-    """Embedded engines (DuckDB / dlt) emit empty bundles for k8s/tofu;
-    server engines (Airbyte / Meltano / Kafka Connect / Debezium) emit
-    real bundles. Verify both behaviors per engine.
-    """
-
-    @pytest.mark.parametrize("engine", ["duckdb", "dlt"])
-    @pytest.mark.parametrize("target", ["kubernetes", "terraform"])
-    def test_embedded_engine_yields_empty_bundle(self, engine: str, target: str):
-        gen = get_generator(target)
-        bundle = gen.generate(_managed_contract(engine))
-        # Embedded engines have no managed-mode chart.
-        assert bundle.files == [], f"{engine}/{target} should produce no managed artifacts"
-
-    @pytest.mark.parametrize("engine", ["airbyte", "meltano", "kafka-connect", "debezium"])
-    @pytest.mark.parametrize("target", ["docker", "kubernetes", "terraform"])
-    def test_server_engine_yields_artifacts(self, engine: str, target: str):
-        gen = get_generator(target)
-        bundle = gen.generate(_managed_contract(engine))
-        if target == "docker":
-            # docker always emits compose + .env.template (services may be empty
-            # for engines without a matching compose preset, e.g. dlt).
-            assert any(f.relative_path == "docker-compose.yaml" for f in bundle.files)
-        else:
-            assert bundle.files, f"{engine}/{target} expected artifacts, got none"
-
-
-# ── Stage 5: validate-artifacts ────────────────────────────────────────
-
-
-class TestValidateArtifactsPerEngine:
-    @pytest.mark.parametrize(
-        "engine, target",
-        [
-            ("airbyte", "docker"),
-            ("airbyte", "kubernetes"),
-            ("airbyte", "terraform"),
-            ("kafka-connect", "kubernetes"),
-            ("debezium", "kubernetes"),
-            ("meltano", "kubernetes"),
-        ],
-    )
-    def test_artifacts_validate(self, engine: str, target: str):
-        gen = get_generator(target)
-        bundle = gen.generate(_managed_contract(engine))
-        result = gen.validate(bundle)
-        assert result.ok, result.errors
 
 
 # ── Stage 6: ordered plan (infra → provider → builds) ─────────────────

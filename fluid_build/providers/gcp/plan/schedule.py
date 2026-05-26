@@ -135,6 +135,18 @@ def _plan_composer_dag(
     contract_id = contract.get("id", "unknown")
     dag_id = properties.get("dag_id", f"fluid_{contract_id}")
 
+    # Render the DAG and resolve its target bucket so a declarative engine
+    # can upload it. A Composer environment's DAG bucket is auto-named and
+    # not derivable, so the operator supplies it via `dag_gcs_bucket`.
+    dag_bucket = properties.get("dag_gcs_bucket")
+    try:
+        from ..codegen.airflow import generate_airflow_dag
+
+        dag_content = generate_airflow_dag(contract, project, location)
+    except Exception as exc:  # noqa: BLE001 — DAG rendering is best-effort
+        logger.warning(format_event("composer_dag_render_failed", error=str(exc)))
+        dag_content = None
+
     # 1. Deploy DAG to Composer environment
     actions.append(
         {
@@ -144,6 +156,8 @@ def _plan_composer_dag(
             "location": location,
             "environment": environment,
             "dag_id": dag_id,
+            "dag_bucket": dag_bucket,
+            "dag_content": dag_content,
             "schedule_interval": trigger.get("cron"),
             "description": f"FLUID data product pipeline for {contract.get('name', contract_id)}",
             "tags": [

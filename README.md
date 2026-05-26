@@ -73,6 +73,8 @@ plan → apply → policy-apply → verify → publish → schedule-sync
 
 You rarely run all 11 by hand; `fluid generate ci` emits a parameterized CI pipeline (Jenkins, GitHub Actions, GitLab CI, Azure DevOps, Bitbucket, CircleCI, Tekton) that runs every stage in order with cryptographic binding between stages 6 and 7 — apply refuses to proceed if the plan has been tampered with since it was computed. See [AGENTS.md](AGENTS.md#the-11-stage-pipeline) for the full stage lifecycle and [the apply mode matrix](AGENTS.md#apply-mode-matrix) (`dry-run`, `create-only`, `amend`, `amend-and-build`, `replace`, `replace-and-build`).
 
+**Under the hood (cloud providers): OpenTofu autogen.** `fluid apply` compiles the contract to a deterministic OpenTofu `main.tf.json` and delegates apply / state / drift / idempotency to the `tofu` binary — battle-tested infrastructure code instead of hand-rolled per-cloud apply. The emitter is modular: one `IacProviderPlugin` per cloud (`fluid_build/iac/providers/{aws,gcp,snowflake}.py`, dbt-adapter pattern). Preview the emitted module before applying with `fluid generate iac <contract>`. See [AUTOGEN_SPIKE.md](AUTOGEN_SPIKE.md) for the architecture and [HONESTLY_TESTED.md](HONESTLY_TESTED.md) for the coverage matrix (unit / emulator / live cloud).
+
 ---
 
 ## 🤯 Why We Built This

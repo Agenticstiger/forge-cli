@@ -422,31 +422,16 @@ def _ensure_glue_table(database: str, table: str, params: dict, region: str):
 
 
 def _execute_provider_action(action: str, params: dict, account_id: str, region: str):
-    """Execute generic provider action by dispatching to the appropriate actions module."""
-    logger.info(f"Executing action: {action}")
+    """Provider-action tasks are retired.
 
-    parts = action.split('.')
-    if len(parts) < 3:
-        logger.warning(f"Unrecognised action format: {action}")
-        return
-
-    service, operation = parts[1], parts[2]
-
-    # Dispatch to the concrete AWS action implementations
-    if service == 'glue':
-        from fluid_build.providers.aws.actions import glue as glue_actions
-        handler = getattr(glue_actions, operation, None)
-        if handler:
-            handler({**params, 'region': region, 'account_id': account_id})
-            return
-    elif service == 's3':
-        from fluid_build.providers.aws.actions import s3 as s3_actions
-        handler = getattr(s3_actions, operation, None)
-        if handler:
-            handler({**params, 'region': region, 'account_id': account_id})
-            return
-
-    logger.warning(f"No handler found for action: {action}")
+    forge-cli compiles the contract to OpenTofu and runs ``tofu`` — a
+    generated DAG no longer performs native cloud CRUD. Provision
+    infrastructure with ``fluid apply`` (the OpenTofu engine).
+    """
+    raise RuntimeError(
+        f"provider-action task {action!r} is retired: provision infrastructure "
+        "with `fluid apply` (the OpenTofu engine), then re-generate this DAG"
+    )
 '''
 
 

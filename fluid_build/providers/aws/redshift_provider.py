@@ -14,9 +14,8 @@
 
 """Standalone Redshift provider for rollback / DDL emission.
 
-The full AWS provider (``fluid_build.providers.aws.AwsProvider``) handles the
-plan/apply lifecycle for AWS resources including Redshift via
-``actions/redshift.py``. But Redshift's rollback semantics are
+The full AWS provider (``fluid_build.providers.aws.AwsProvider``) handles
+Redshift planning. Redshift's rollback semantics are
 SQL-DDL-based (``DROP`` + ``CREATE TABLE AS SELECT`` inside a transaction)
 while the rest of AWS (S3 / Glue / Athena) uses prefix-copy semantics.
 
@@ -49,11 +48,10 @@ from ..base import ApplyResult, BaseProvider
 class RedshiftProvider(BaseProvider):
     """Thin Redshift provider — owns rollback semantics only.
 
-    ``plan`` and ``apply`` delegate to the full ``AwsProvider`` (which
-    routes Redshift actions to ``actions/redshift.py::execute_sql``);
-    this class exists primarily so ``restore_ddl`` and
-    ``cleanup_backups`` participate in the modular rollback dispatch
-    instead of living in a ``_legacy_restore_ddl`` if/elif chain.
+    ``plan`` delegates to the full ``AwsProvider``; this class exists
+    primarily so ``restore_ddl`` and ``cleanup_backups`` participate in
+    the modular rollback dispatch instead of living in a
+    ``_legacy_restore_ddl`` if/elif chain.
     """
 
     name = "redshift"
@@ -65,8 +63,7 @@ class RedshiftProvider(BaseProvider):
         return ProviderMetadata(
             name="redshift",
             display_name="Amazon Redshift",
-            description="Redshift-only provider — rollback DDL surface for "
-            "the AWS provider's Redshift actions.",
+            description="Redshift-only provider — rollback DDL surface for the AWS provider.",
             version="0.7.3",
             author="Agentics Transformation Ltd",
             supported_platforms=["redshift"],
@@ -91,10 +88,8 @@ class RedshiftProvider(BaseProvider):
     ) -> List[Dict[str, Any]]:
         """Delegate Redshift planning to the full AWS provider.
 
-        Redshift contracts plan/apply through ``AwsProvider`` — there's
-        only one Redshift-specific code path (``actions/redshift.py``)
-        and rebuilding the full plan dispatcher here would duplicate
-        ~600 LOC for no gain.
+        Redshift contracts plan through ``AwsProvider``; rebuilding the
+        full plan dispatcher here would duplicate ~600 LOC for no gain.
         """
         from .provider import AwsProvider
 

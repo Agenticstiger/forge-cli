@@ -51,6 +51,7 @@ def register(subparsers: argparse._SubParsersAction):
           standard               Export to data product standards
                                  (Bitol ODPS v1.0.0 = default ``--format odps``;
                                  ODCS; LF/ODPI v4.1 opt-in ``--format odps-v4.1``)
+          iac                    Compile a contract to an OpenTofu .tf.json module
           artifacts              Stage-3 fanout: bundle → ODCS, Bitol ODPS,
                                  LF/ODPI ODPS v4.1, schedule, policies
 
@@ -88,6 +89,7 @@ Examples:
         generate_artifacts,
         generate_ci,
         generate_dbt_tests,
+        generate_iac,
         generate_schedule,
         generate_speed_transformation,
         generate_standard,
@@ -99,6 +101,7 @@ Examples:
     generate_standard.register_subcommand(sub)
     generate_artifacts.register_subcommand(sub)
     generate_dbt_tests.register_subcommand(sub)
+    generate_iac.register_subcommand(sub)
 
     # Default handler (backward compat: no subcommand → transformation)
     p.set_defaults(cmd=COMMAND, func=run)
@@ -136,6 +139,11 @@ def run(args: Any, logger: logging.Logger) -> int:
 
         return generate_standard.run(args, logger)
 
+    if sub == "iac":
+        from . import generate_iac
+
+        return generate_iac.run(args, logger)
+
     if sub == "artifacts":
         from . import generate_artifacts
 
@@ -159,6 +167,7 @@ def run(args: Any, logger: logging.Logger) -> int:
             "  standard               Export to standards (Bitol ODPS v1.0.0 = default; "
             "ODCS; LF/ODPI v4.1 opt-in via --format odps-v4.1)"
         )
+        cprint("  iac                    Compile a contract to an OpenTofu .tf.json module")
         cprint("")
         cprint("Examples:")
         cprint("  fluid generate transformation")

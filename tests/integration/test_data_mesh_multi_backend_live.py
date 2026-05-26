@@ -62,9 +62,12 @@ import pytest
 from fluid_build.api.catalog_publication import CatalogPublicationPayload
 from fluid_build.build_runners.catalog_registrars import (
     DataHubRegistrar,
-    GlueCatalogRegistrar,
     OpenMetadataRegistrar,
 )
+
+# ``GlueCatalogRegistrar`` retired — coverage moves to
+# tests/iac/test_iac_aws_real_e2e.py (the IaC plugin emits the same
+# Parameters map directly on aws_glue_catalog_table).
 
 DATAHUB_GMS_URL = os.environ.get("DATAHUB_GMS_URL")
 GLUE_ENDPOINT = os.environ.get("FLUID_CATALOG_GLUE_URL")
@@ -514,112 +517,14 @@ class TestDataHubMesh:
 
 
 # ---------------------------------------------------------------------------
-# Glue (via LocalStack Pro) — Parameters map carries every canonical field
+# Glue mesh — retired
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(
-    not GLUE_ENDPOINT,
-    reason="Set FLUID_CATALOG_GLUE_URL to the LocalStack endpoint (e.g. http://localhost:4566)",
-)
-class TestGlueMesh:
-    """Every product publishes to a per-domain Glue database
-    (``forge_<domain>``). Each Table's ``Parameters`` map carries the
-    canonical FLUID classification + all three spec attachments."""
-
-    @pytest.fixture(scope="class")
-    def published(self, mesh) -> List[Tuple[str, str]]:
-        """Publish every (product, asset) → Glue table. One registrar
-        per domain so the database routing is honest about
-        cross-domain isolation (Glue databases are flat, not nested,
-        so the domain → database mapping is the obvious projection)."""
-        out: List[Tuple[str, str]] = []
-        for key, contract in mesh["contracts"].items():
-            domain = contract["domain"]
-            registrar = GlueCatalogRegistrar(
-                base_url_override=GLUE_ENDPOINT,
-                region="us-east-1",
-                database_name=f"forge_{domain}",
-            )
-            r = registrar.register_payload(mesh["payloads"][key])
-            assert r.succeeded, f"{key}: {r.error}"
-            for asset in mesh["payloads"][key].assets:
-                out.append((f"forge_{domain}", asset.asset_id))
-        return out
-
-    @staticmethod
-    def _get_table(database: str, name: str) -> Dict[str, Any]:
-        import httpx
-
-        with httpx.Client(base_url=GLUE_ENDPOINT, timeout=10.0) as c:
-            r = c.post(
-                "/",
-                json={"DatabaseName": database, "Name": name},
-                headers={
-                    "Content-Type": "application/x-amz-json-1.1",
-                    "X-Amz-Target": "AWSGlue.GetTable",
-                },
-            )
-            r.raise_for_status()
-        return r.json()["Table"]
-
-    @pytest.mark.parametrize(
-        "key,db,asset",
-        [
-            ("sdp_orders", "forge_commerce", "orders"),
-            ("sdp_clicks", "forge_marketing", "clicks"),
-            ("sdp_invoices", "forge_finance", "invoices"),
-            ("adp_click_attribution", "forge_marketing", "attribution"),
-            ("adp_daily_orders", "forge_commerce", "orders_daily"),
-            ("adp_daily_revenue", "forge_finance", "revenue_daily"),
-            ("cdp_revenue_attribution", "forge_commerce", "attribution_monthly"),
-            ("cdp_exec_dashboard", "forge_finance", "kpis_monthly"),
-        ],
-    )
-    def test_every_table_carries_canonical_parameters(self, published, mesh, key, db, asset):
-        table = self._get_table(db, asset)
-        params = table.get("Parameters") or {}
-        contract = mesh["contracts"][key]
-
-        # Classification fields
-        assert (
-            params.get("fluid_layer") == contract["metadata"]["layer"]
-        ), f"{key}: fluid_layer mismatch — params={params}"
-        assert params.get("fluid_product_type") == contract["metadata"]["productType"]
-        assert params.get("fluid_domain") == contract["domain"]
-        # Spec attachments — proof the canonical layer ran once and
-        # the artifacts travel with every backend.
-        assert "fluid_contract" in params
-        assert "odps_spec" in params
-        assert "odcs_contract" in params
-        # ODCS contract id encodes the per-asset shape DMM expects.
-        assert f"id: {contract['id']}.{asset}" in params["odcs_contract"]
-
-    def test_columns_round_trip_through_glue(self, published, mesh):
-        """Pick a non-trivial expose and verify schema columns landed."""
-        contract = mesh["contracts"]["adp_daily_orders"]
-        table = self._get_table("forge_commerce", "orders_daily")
-        col_names = {c["Name"] for c in table["StorageDescriptor"]["Columns"]}
-        expected = {col["name"] for col in contract["exposes"][0]["contract"]["schema"]}
-        assert expected <= col_names
-
-    def test_cross_domain_consume_visible_via_odcs_lineage(self, published, mesh):
-        """Glue has no native cross-database lineage shape — the
-        canonical layer surfaces consumes via the embedded ODCS
-        contract under ``odcs_contract`` (DMM treats this as the
-        contract-level provenance). We assert the upstream product id
-        is present in the rendered ODCS YAML on the consuming
-        dataset's table parameters."""
-        cdp = mesh["contracts"]["adp_daily_orders"]
-        upstream = mesh["contracts"]["adp_click_attribution"]
-        table = self._get_table("forge_commerce", "orders_daily")
-        params = table.get("Parameters") or {}
-        # ODCS attached to the consuming dataset. The cross-domain
-        # marketing product id appears in the fluid_contract attachment
-        # via consumes[].productId — that's the contract-level provenance
-        # statement, not yet ODCS's native lineage.
-        assert upstream["id"] in params["fluid_contract"]
-
+#
+# Glue catalog metadata (the per-domain Parameters map) is now emitted
+# directly by the IaC plugin on aws_glue_catalog_table. The matching
+# real-cloud assertions live in tests/iac/test_iac_aws_real_e2e.py +
+# tests/iac/test_iac_aws_real_lakeformation_e2e.py (the LF tests touch
+# the same fluid_layer / fluid_product_type / fluid_domain Parameters).
 
 # ---------------------------------------------------------------------------
 # OpenMetadata — needs JWT + parent hierarchy bootstrap

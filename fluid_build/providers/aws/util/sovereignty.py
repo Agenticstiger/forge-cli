@@ -313,17 +313,3 @@ def validate_sovereignty(contract: Dict[str, Any], binding: Dict[str, Any]) -> N
     """
     validator = SovereigntyValidator()
     validator.validate(contract, binding)
-
-
-def extract_sovereignty_tags(contract: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Convenience function to extract sovereignty tags.
-
-    Args:
-        contract: FLUID contract
-
-    Returns:
-        Dictionary of AWS tags
-    """
-    validator = SovereigntyValidator()
-    return validator.extract_tags(contract)

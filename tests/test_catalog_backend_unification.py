@@ -88,7 +88,11 @@ class TestPluginBackendsExposedViaTarget:
 
     @pytest.mark.parametrize(
         "target",
-        ["datahub", "openmetadata", "glue", "aws-glue", "snowflake_horizon", "snowflake-horizon"],
+        # ``glue`` and ``snowflake_horizon`` were retired on this branch —
+        # their publish-side metadata now lands directly on
+        # aws_glue_catalog_table / snowflake_table via the IaC plugins.
+        # See HONESTLY_TESTED.md "Code that was retired" §.
+        ["datahub", "openmetadata"],
     )
     def test_target_is_in_catalog_providers(self, target):
         assert target in CATALOG_PROVIDERS, (
@@ -96,11 +100,19 @@ class TestPluginBackendsExposedViaTarget:
             f"{sorted(CATALOG_PROVIDERS.keys())}"
         )
 
-    def test_aliases_resolve_to_same_provider_class(self):
-        """``glue`` / ``aws-glue`` and ``snowflake_horizon`` /
-        ``snowflake-horizon`` are alias pairs."""
-        assert CATALOG_PROVIDERS["glue"] is CATALOG_PROVIDERS["aws-glue"]
-        assert CATALOG_PROVIDERS["snowflake_horizon"] is CATALOG_PROVIDERS["snowflake-horizon"]
+    @pytest.mark.parametrize(
+        "retired_target", ["glue", "aws-glue", "snowflake_horizon", "snowflake-horizon"]
+    )
+    def test_retired_targets_no_longer_resolve(self, retired_target):
+        """The Glue + Snowflake Horizon catalog registrars were retired
+        in favour of the IaC plugins. Pinning their absence keeps the
+        deletion intentional — re-adding either would surprise users
+        with a redundant publish stage that fights tofu state."""
+        assert retired_target not in CATALOG_PROVIDERS, (
+            f"--target {retired_target!r} was deleted on this branch but is "
+            f"still in CATALOG_PROVIDERS — regression. keys: "
+            f"{sorted(CATALOG_PROVIDERS.keys())}"
+        )
 
     def test_instantiating_plugin_provider_builds_registrar(self):
         """``get_catalog_provider`` for a plug-in backend returns a
@@ -138,25 +150,22 @@ class TestBackendRegistry:
     def test_get_catalog_backend_returns_none_for_unknown(self):
         assert get_catalog_backend("nonexistent-future-backend") is None
 
-    def test_aliases_in_all_names(self):
-        """``glue`` exposes ``aws-glue`` as an alias."""
-        spec = get_catalog_backend("glue")
-        assert spec is not None
-        assert "aws-glue" in spec.all_names
-        assert get_catalog_backend("aws-glue") is spec
+    def test_retired_backends_no_longer_resolve(self):
+        """The ``glue`` + ``snowflake_horizon`` backends (and their hyphenated
+        aliases) were retired — coverage moves to the IaC plugins."""
+        for retired in ("glue", "aws-glue", "snowflake_horizon", "snowflake-horizon"):
+            assert get_catalog_backend(retired) is None, f"backend {retired!r} should be retired"
 
     def test_all_catalog_backend_names_covers_known_backends(self):
         names = set(all_catalog_backend_names())
-        # Plug-in backends + their aliases
-        for required in (
-            "datahub",
-            "openmetadata",
-            "glue",
-            "aws-glue",
-            "snowflake_horizon",
-            "snowflake-horizon",
-        ):
+        # Plug-in backends + their aliases that ARE still alive.
+        for required in ("datahub", "openmetadata"):
             assert required in names, f"backend {required!r} missing from registry: {names}"
+        # And the retired ones must be absent.
+        for retired in ("glue", "aws-glue", "snowflake_horizon", "snowflake-horizon"):
+            assert (
+                retired not in names
+            ), f"retired backend {retired!r} leaked back into registry: {names}"
 
 
 # ---------------------------------------------------------------------------
@@ -385,20 +394,11 @@ class TestSpecDrivenEnvVarOverrides:
                 "endpoint",
                 "https://om.from-env",
             ),
-            ("AWS_REGION", "glue", "region", "eu-west-1"),
-            ("AWS_ACCOUNT_ID", "glue", "catalog_id", "123456789012"),
-            (
-                "SNOWFLAKE_ACCOUNT_URL",
-                "snowflake_horizon",
-                "endpoint",
-                "https://sf.from-env",
-            ),
-            (
-                "SNOWFLAKE_AUTH_TOKEN",
-                "snowflake_horizon",
-                "api_token",
-                "tok-from-env",
-            ),
+            # ``glue`` + ``snowflake_horizon`` env-var resolution rows
+            # were removed when the registrars were retired — the IaC
+            # plugins read AWS_REGION / AWS_ACCOUNT_ID + Snowflake creds
+            # directly via the tofu provider's env-var contract; no
+            # publish-side resolution needed.
         ],
     )
     def test_upstream_conventional_env_var_resolves(

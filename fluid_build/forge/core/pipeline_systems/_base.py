@@ -346,10 +346,10 @@ class BasePipelineTemplate:
             "policy_apply": (
                 "if [ -f dist/artifacts/policy/bindings.json ]; then "
                 "fluid policy-apply dist/artifacts/policy/bindings.json "
-                "--mode enforce --env ${FLUID_ENV:-dev}; "
+                "--mode enforce; "
                 "elif [ -f runtime/policy/bindings.json ]; then "
                 "fluid policy-apply runtime/policy/bindings.json "
-                "--mode enforce --env ${FLUID_ENV:-dev}; "
+                "--mode enforce; "
                 "fi"
             ),
             # 11-stage pipeline stage 9 — post-apply reconciliation. --strict

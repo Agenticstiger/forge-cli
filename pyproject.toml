@@ -162,7 +162,6 @@ gcp = [
 # Snowflake provider
 snowflake = [
   "snowflake-connector-python>=4.4",
-  "snowflake-snowpark-python>=1.15 ; python_version >= '3.10'",
   "dbt-snowflake>=1.7 ; python_version >= '3.10'",
 ]
 
@@ -304,15 +303,26 @@ dev = [
 # ci.yml `emulated-integration` job so Stage-1 provider integration tests
 # run on every PR — including from forks — with zero cloud credentials.
 test-emulators = [
-  "moto[glue]>=5",
+  # `server` pulls Flask so `ThreadedMotoServer` can back the OpenTofu
+  # autogenerator e2e — `tofu`, a Go binary, needs a real HTTP endpoint
+  # and cannot use moto's in-process `mock_aws`.
+  "moto[glue,server]>=5",
   "fakesnow>=0.9",
 ]
 
-# Heavy (Docker-based) integration-test emulators — Stage 2. google-cloud-
-# bigquery drives the `bigquery-emulator` container; boto3 drives LocalStack.
-# Installed by the admin-gated integration-emulated-heavy.yml workflow.
+# Heavy (Docker-based) integration-test emulators — Stage 2. These
+# clients drive the GCP emulators (BigQuery / GCS / Pub/Sub) and
+# LocalStack respectively, all via real HTTP endpoints.
+#
+# google-auth is pulled in transitively but listed explicitly so the
+# iac-tests.yml Stage 2 install (which uses just this extra) gets
+# ``AnonymousCredentials`` for the emulator clients without going
+# through the heavier full ``[gcp]`` extra.
 test-emulators-heavy = [
+  "google-auth>=2.29",
   "google-cloud-bigquery>=3.20",
+  "google-cloud-storage>=2.16",
+  "google-cloud-pubsub>=2.38",
   "boto3>=1.34",
 ]
 

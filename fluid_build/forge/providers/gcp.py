@@ -58,7 +58,7 @@ class GCPProvider(InfrastructureProvider):
 
     def generate_config(self, context: GenerationContext) -> Dict[str, Any]:
         return {
-            "config/gcp/terraform.tf": "# GCP Terraform configuration",
+            "config/gcp/main.tf.json": "# GCP OpenTofu configuration",
             "config/gcp/bigquery.sql": "# BigQuery setup",
             ".github/workflows/deploy-gcp.yml": "# GCP deployment workflow",
         }
@@ -70,7 +70,7 @@ class GCPProvider(InfrastructureProvider):
         return len(errors) == 0, errors
 
     def get_required_tools(self) -> List[str]:
-        return ["gcloud", "terraform"]
+        return ["gcloud", "tofu"]
 
     def get_environment_variables(self) -> List[str]:
         return ["GOOGLE_APPLICATION_CREDENTIALS", "GCP_PROJECT_ID", "GCP_REGION"]

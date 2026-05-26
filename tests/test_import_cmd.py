@@ -489,6 +489,74 @@ class TestTerraformDetector:
             results = TerraformDetector().scan(tmp_path, logger)
         assert results["metadata"]["files_count"] == 2
 
+    # ---- .tf.json (OpenTofu autogen) -------------------------------------
+    # Branch ``feat/opentofu-iac-autogen`` extended TerraformDetector to
+    # also recognise ``.tf.json`` files: `fluid generate iac` emits those,
+    # and a user re-importing their own emitted module must be picked up
+    # by the migration detector. The HCL substring checks in ``scan`` do
+    # not match JSON syntax, so a structural pass over the resource map
+    # is required.
+
+    def test_can_detect_tf_json(self, tmp_path):
+        """``.tf.json`` (the format emitted by ``fluid generate iac``)
+        is detected even when no ``.tf`` files are present."""
+        import json as _json
+
+        from fluid_build.cli.import_cmd import TerraformDetector
+
+        (tmp_path / "main.tf.json").write_text(_json.dumps({"resource": {}}))
+        assert TerraformDetector().can_detect(tmp_path) is True
+
+    def test_scan_detects_gcp_from_tf_json(self, tmp_path, logger):
+        """A ``.tf.json`` containing a ``google_bigquery_dataset`` resource
+        sets target_platform to ``gcp`` — same outcome as the HCL form."""
+        import json as _json
+
+        from fluid_build.cli.import_cmd import TerraformDetector
+
+        doc = {"resource": {"google_bigquery_dataset": {"ds": {"dataset_id": "x"}}}}
+        (tmp_path / "main.tf.json").write_text(_json.dumps(doc))
+        with patch("fluid_build.cli.import_cmd.RICH_AVAILABLE", False):
+            results = TerraformDetector().scan(tmp_path, logger)
+        assert results["metadata"].get("target_platform") == "gcp"
+
+    def test_scan_detects_snowflake_from_tf_json(self, tmp_path, logger):
+        """A ``.tf.json`` containing a ``snowflake_database`` resource
+        sets target_platform to ``snowflake``."""
+        import json as _json
+
+        from fluid_build.cli.import_cmd import TerraformDetector
+
+        doc = {"resource": {"snowflake_database": {"db": {"name": "X"}}}}
+        (tmp_path / "main.tf.json").write_text(_json.dumps(doc))
+        with patch("fluid_build.cli.import_cmd.RICH_AVAILABLE", False):
+            results = TerraformDetector().scan(tmp_path, logger)
+        assert results["metadata"].get("target_platform") == "snowflake"
+
+    def test_scan_handles_malformed_tf_json(self, tmp_path, logger):
+        """A corrupt ``.tf.json`` does not crash the scan — the
+        malformed file is skipped and the count still reflects it."""
+        from fluid_build.cli.import_cmd import TerraformDetector
+
+        (tmp_path / "broken.tf.json").write_text("{not-valid-json")
+        with patch("fluid_build.cli.import_cmd.RICH_AVAILABLE", False):
+            results = TerraformDetector().scan(tmp_path, logger)
+        # File was counted (broken or not), but no platform was extracted.
+        assert results["metadata"]["files_count"] == 1
+        assert "target_platform" not in results["metadata"]
+
+    def test_scan_counts_tf_and_tf_json(self, tmp_path, logger):
+        """Mixed-format projects count both file kinds toward the total."""
+        import json as _json
+
+        from fluid_build.cli.import_cmd import TerraformDetector
+
+        (tmp_path / "main.tf").write_text("resource {}")
+        (tmp_path / "generated.tf.json").write_text(_json.dumps({"resource": {}}))
+        with patch("fluid_build.cli.import_cmd.RICH_AVAILABLE", False):
+            results = TerraformDetector().scan(tmp_path, logger)
+        assert results["metadata"]["files_count"] == 2
+
 
 # ===========================================================================
 # SqlFileDetector

@@ -279,7 +279,44 @@ def load_contract_with_overlay(
     # JSON-schema enum check, forcing trial-and-error to discover the
     # canonical names.
     contract = _normalize_contract_aliases(contract)
+    # Structural alias: the schema declares BOTH ``build:`` (singular
+    # legacy) and ``builds:`` (plural, current) as valid top-level keys.
+    # Every downstream consumer (build_runners, planners, validators)
+    # only reads ``builds`` — without this normalization a contract
+    # authored with the legacy ``build:`` form has its build silently
+    # dropped on the way into ``fluid apply --mode amend-and-build``
+    # (the runner logs "No builds defined in contract" and returns 0).
+    # Coerce here so both schema forms behave identically end-to-end.
+    contract = _normalize_singular_build_key(contract)
     return contract
+
+
+def resolve_env_templates_in_contract(contract: Any) -> Any:
+    """Recursively resolve ``{{ env.VAR }}`` placeholders throughout a contract.
+
+    Walks dicts and lists and delegates every string to the canonical
+    ``resolve_env_templates`` (the single-source-of-truth resolver shared by
+    the Snowflake provider and the CLI). Unresolved placeholders are left
+    intact so a missing variable surfaces loudly rather than silently
+    becoming an empty name.
+
+    The OpenTofu emit path (``fluid apply`` / ``fluid generate iac``) reads
+    the contract's ``exposes[]`` data-plane directly, so env templates must
+    be resolved before the contract reaches the emitter — otherwise a literal
+    ``{{ env.SNOWFLAKE_DATABASE }}`` lands in the ``.tf.json``.
+    """
+    from fluid_build.providers.snowflake.util.config import resolve_env_templates
+
+    def _walk(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {key: _walk(value) for key, value in obj.items()}
+        if isinstance(obj, list):
+            return [_walk(item) for item in obj]
+        if isinstance(obj, str):
+            return resolve_env_templates(obj)
+        return obj
+
+    return _walk(contract)
 
 
 # Alias → canonical mapping table, applied at contract-load time.
@@ -315,6 +352,39 @@ _FIELD_ALIASES = {
         "redshift-table": "redshift_table",
     },
 }
+
+
+def _normalize_singular_build_key(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Coerce legacy singular ``build:`` into ``builds: [build]``.
+
+    The 0.7.3 schema declares both top-level keys: ``build`` (singular,
+    flagged "legacy" in the description) and ``builds`` (array, current).
+    Downstream consumers — ``build_runners.base.run_builds_from_args``,
+    the planner, the policy gate — only read ``builds`` (plural). A
+    contract authored with the singular form therefore had its build
+    silently dropped, and ``fluid apply --mode amend-and-build`` logged
+    "No builds defined in contract" and returned 0 with nothing run.
+
+    This normalization closes the loop: after it runs, both schema
+    forms behave identically. If both keys are present the plural form
+    wins (it's the canonical one and may already contain the singular
+    entry plus siblings); if only ``build`` is present we promote it.
+    """
+    if not isinstance(contract, dict):
+        return contract
+    if "builds" in contract:
+        # Plural already present — drop the legacy singular to avoid
+        # downstream confusion. If the user set both, plural wins.
+        if "build" in contract:
+            contract = dict(contract)
+            del contract["build"]
+        return contract
+    build = contract.get("build")
+    if isinstance(build, dict):
+        contract = dict(contract)
+        contract["builds"] = [build]
+        del contract["build"]
+    return contract
 
 
 def _normalize_contract_aliases(contract: Dict[str, Any]) -> Dict[str, Any]:

@@ -86,6 +86,15 @@ def run(args, logger: logging.Logger) -> int:
         with open(bindings_path, encoding="utf-8") as f:
             data = json.load(f)
 
+        # An empty bindings file is a legitimate no-op, not an error: a
+        # contract with no ``accessPolicy`` grants — every raw bronze / SDP
+        # acquisition product — compiles to zero bindings. There is nothing
+        # to apply and no provider to resolve, so succeed cleanly rather than
+        # failing ``provider_not_specified`` in ``build_provider`` below.
+        if not (data.get("bindings") or []):
+            info(logger, "policy_apply_result", status="noop", note="no bindings to apply")
+            return 0
+
         # Provider and project come from the bindings file (set by policy-compile
         # from the contract schema).  CLI flags and env vars are overrides only.
         bindings_provider, bindings_project = _resolve_from_bindings(data)

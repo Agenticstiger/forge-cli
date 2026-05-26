@@ -33,9 +33,10 @@ except ImportError:
 # Reuse the canonical SSRF post-DNS-resolution gate (RFC1918,
 # link-local 169.254.0.0/16 — AWS/GCP metadata — loopback, reserved;
 # fails closed on DNS errors). Sourced from the tier-0 ``_net`` module
-# so this observability surface does NOT need to import build_runners
-# at package-init time (which previously re-entered cli/__init__.py
-# and broke import).
+# (PR #139) so this observability surface does NOT need to import
+# build_runners at package-init time — the structural cycle fix
+# removes the need for the function-local import that previously
+# guarded against re-entering ``cli/__init__.py``.
 from fluid_build._net import _hostname_is_private
 
 from .config import CommandCenterConfig

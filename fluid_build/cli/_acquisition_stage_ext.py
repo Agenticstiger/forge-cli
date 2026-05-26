@@ -265,6 +265,26 @@ class PublishResult:
     error: Optional[str] = None
 
 
+def _ensure_builtin_registrars(targets: List[str]) -> None:
+    """Register a built-in, env-configured registrar for any planned target
+    that has none.
+
+    Explicit registrations (a custom registrar, or a test's fake) are left
+    untouched — ``get_registrar`` is checked first, so they take precedence
+    over the built-ins. Targets with no environment config resolve to no
+    registrar; the dispatcher then records a clear "not configured" result.
+    """
+    from fluid_build.build_runners import _catalog as orch
+    from fluid_build.build_runners.catalog_registrars import build_registrar
+
+    for target in targets:
+        if orch.get_registrar(target) is not None:
+            continue
+        registrar = build_registrar(target)
+        if registrar is not None:
+            orch.register_registrar(target, registrar)
+
+
 def publish_acquisition(contract: Dict[str, Any], workdir: Path) -> List[PublishResult]:
     """Register every acquisition build's catalog targets exactly once.
 
@@ -279,7 +299,10 @@ def publish_acquisition(contract: Dict[str, Any], workdir: Path) -> List[Publish
     ``catalogs.<target>`` blocks) and threaded through so backends
     declared only in ``providers/catalogs/CATALOG_PROVIDERS`` (the CLI
     ``--target`` registry) work here automatically — keeping the two
-    surfaces from drifting.
+    surfaces from drifting. As a fallback for backends that haven't
+    migrated to the unified config path, :func:`_ensure_builtin_registrars`
+    pre-wires env-configured registrars into the legacy ``_catalog``
+    dispatcher so a target declared in the contract still resolves.
     """
     from fluid_build.api.catalog_publication import CatalogPublicationPayload
     from fluid_build.build_runners import _catalog as catalog_orchestrator
@@ -297,6 +320,7 @@ def publish_acquisition(contract: Dict[str, Any], workdir: Path) -> List[Publish
         )
         if not plan.targets:
             continue
+        _ensure_builtin_registrars(plan.targets)
         outcome = catalog_orchestrator.register_all_payload(
             plan,
             payload,

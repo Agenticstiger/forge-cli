@@ -25,19 +25,14 @@ Pin every layer:
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 
 from fluid_build.build_runners._late_arrival import (
-    ArrivalClassification,
     classify_arrival,
     parse_iso_duration,
-    side_output_record,
     side_output_table_name,
-    write_late_event_to_disk,
 )
 
 
@@ -123,65 +118,7 @@ class TestClassifyArrival:
         assert result.category == "late"
 
 
-class TestSideOutputRecord:
-    def test_preserves_payload_verbatim(self):
-        wm = datetime(2026, 5, 2, 12, 0, 0, tzinfo=timezone.utc)
-        evt = datetime(2026, 5, 2, 11, 50, 0, tzinfo=timezone.utc)
-        cls_ = classify_arrival(
-            event_time=evt,
-            current_watermark=wm,
-            allowed_lateness=timedelta(minutes=5),
-        )
-        payload = {"order_id": "ORD-123", "amount": 99.99}
-        record = side_output_record(
-            payload=payload,
-            classification=cls_,
-            event_time=evt,
-            current_watermark=wm,
-            allowed_lateness=timedelta(minutes=5),
-        )
-        assert record["payload"] == payload
-        meta = record["_late_arrival_metadata"]
-        assert meta["lateness_seconds"] == 600.0
-        assert meta["allowed_lateness_seconds"] == 300.0
-
-
 class TestNaming:
     def test_side_output_table_suffix(self):
         assert side_output_table_name("orders") == "orders__late_events"
         assert side_output_table_name("public.orders") == "public.orders__late_events"
-
-
-class TestDiskWriter:
-    def test_writes_jsonl_file(self, tmp_path: Path):
-        record = {"_late_arrival_metadata": {"reason": "test"}, "payload": {"x": 1}}
-        write_late_event_to_disk(
-            workspace_root=tmp_path,
-            product_id="silver.orders",
-            target_table="public.orders",
-            record=record,
-        )
-        out_path = (
-            tmp_path
-            / ".fluid"
-            / "silver.orders"
-            / "runtime"
-            / "late-events"
-            / "public.orders.jsonl"
-        )
-        assert out_path.is_file()
-        line = out_path.read_text(encoding="utf-8").strip()
-        parsed = json.loads(line)
-        assert parsed["payload"] == {"x": 1}
-
-    def test_appends_subsequent_writes(self, tmp_path: Path):
-        for i in range(3):
-            write_late_event_to_disk(
-                workspace_root=tmp_path,
-                product_id="p1",
-                target_table="t1",
-                record={"_late_arrival_metadata": {}, "payload": {"i": i}},
-            )
-        out_path = tmp_path / ".fluid" / "p1" / "runtime" / "late-events" / "t1.jsonl"
-        lines = out_path.read_text(encoding="utf-8").strip().split("\n")
-        assert len(lines) == 3

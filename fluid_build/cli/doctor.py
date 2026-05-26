@@ -566,15 +566,16 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
         )
 
     try:
-        from fluid_build.providers.aws.actions import glue, iam, s3  # noqa: F401
+        from fluid_build.iac import get_iac_plugin
 
+        aws_iac_ready = get_iac_plugin("aws") is not None
         checks.append(
             {
                 "check": "AWS Provider Actions",
                 "category": "providers",
-                "status": "✅ Available",
+                "status": "✅ Available" if aws_iac_ready else "⚠️  Not available",
                 "ok": True,
-                "details": "S3, Glue, IAM actions (service-level dispatch)",
+                "details": "AWS provisioning via the OpenTofu engine (contract → .tf.json → tofu)",
             }
         )
     except Exception:
