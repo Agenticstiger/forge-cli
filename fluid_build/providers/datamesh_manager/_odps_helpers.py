@@ -213,16 +213,35 @@ def remove_odps_product_consume_input_ports(
     def _is_product_consume(port: Any) -> bool:
         if not isinstance(port, Mapping):
             return False
-        if str(port.get("name", "")) in product_port_names:
+        name = str(port.get("name", ""))
+        # Fast path — original (pre-Gap-3) behavior. A port whose name is
+        # exactly a canonical product-consume exposeId is a product-consume
+        # regardless of contractId. This is the legacy path that
+        # ``test_removes_input_ports_key_when_only_product_consumes_exist``
+        # exercises (port has only ``name``, no ``contractId``).
+        if name in product_port_names:
             return True
-        contract_id = str(port.get("contractId", ""))
-        # contractId equals the upstream productId for product-to-product
-        # consumes (set by the bitol mapper). May also be the per-port form
-        # ``{productId}.{exposeId}`` — strip the suffix and recheck.
-        if contract_id in product_contract_ids:
-            return True
-        head = contract_id.rsplit(".", 1)[0] if "." in contract_id else contract_id
-        return head in product_contract_ids
+        # Dedup-rename path — only since 2026-05 (Gap 3). When the bitol
+        # mapper hits two consumes sharing the same exposeId, it prefixes
+        # the 2nd with the upstream productId tail (``{tail}__{base}``).
+        # That port's NAME no longer matches the canonical exposeId, but
+        # its contractId still points at the upstream product. We require
+        # BOTH (base name matches a canonical exposeId AND contractId
+        # points at an upstream product) to avoid over-matching: a port
+        # whose contractId happens to equal a product-consume's
+        # upstream-productId but whose name is a DIFFERENT exposeId with
+        # its own ``sourceSystem`` is a legit source-system port, not a
+        # product-consume to be stripped.
+        if "__" in name:
+            base = name.split("__", 1)[1]
+            if base in product_port_names:
+                contract_id = str(port.get("contractId", ""))
+                if contract_id in product_contract_ids:
+                    return True
+                head = contract_id.rsplit(".", 1)[0] if "." in contract_id else contract_id
+                if head in product_contract_ids:
+                    return True
+        return False
 
     retained = [port for port in input_ports if not _is_product_consume(port)]
     if retained:

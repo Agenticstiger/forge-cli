@@ -209,13 +209,9 @@ The publish command enables the full data product lifecycle: develop → deploy 
         action="store_true",
         default=False,
         help=(
-            "(DataMesh Manager only) Auto-approve product-to-product Access "
-            "agreements generated from consumes[]. WITHOUT this flag, DMM "
-            "creates the agreements in 'pending' status and the lineage graph "
-            "in the UI stays empty until you approve them manually. "
-            "Equivalent to setting DMM_AUTO_APPROVE_ACCESS=true. Recommended "
-            "for local sandboxes / lab demos; production should leave pending "
-            "for human review."
+            "(DMM only) Auto-approve Access agreements so DMM renders lineage "
+            "immediately; without this, edges stay 'pending'. Same as "
+            "DMM_AUTO_APPROVE_ACCESS=true. Sandboxes only."
         ),
     )
 
