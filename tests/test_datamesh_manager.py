@@ -560,23 +560,27 @@ class TestCmdPublish:
 
 
 class TestCmdList:
-    def test_list_json_format(self):
+    def test_list_json_format(self, capsys):
+        # ``--format json`` bypasses Rich (which line-wraps mid-string and
+        # breaks ``json.loads`` on the consumer side; pinned at gap 7) and
+        # writes directly to stdout. Capture the raw stdout via capsys.
         args = _make_args(format="json")
         products = [{"info": {"id": "p1", "name": "Product 1"}, "teamId": "t1"}]
         mock_provider = MagicMock()
         mock_provider.list_products.return_value = products
 
-        printed = []
-        with (
-            patch("fluid_build.cli.datamesh_manager._make_provider", return_value=mock_provider),
-            patch(
-                "fluid_build.cli.datamesh_manager.cprint", side_effect=lambda t: printed.append(t)
-            ),
-        ):
+        with patch("fluid_build.cli.datamesh_manager._make_provider", return_value=mock_provider):
             result = _cmd_list(args)
 
+        captured = capsys.readouterr()
         assert result == 0
-        assert any("p1" in str(l) for l in printed)
+        assert "p1" in captured.out
+        # The output MUST round-trip through json.loads — that's the very
+        # invariant Rich-wrapping broke (the gap that motivated this fix).
+        import json as _json
+
+        round_tripped = _json.loads(captured.out)
+        assert round_tripped == products
 
     def test_list_table_format_rich(self):
         args = _make_args(format="table")

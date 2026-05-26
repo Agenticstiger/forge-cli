@@ -147,18 +147,26 @@ Three guarantees that hold across every catalog: **read-only metadata access** (
 
 The same flow is exposed via the MCP `forge_from_source` tool — Claude Code, Cursor, and any MCP client can drive a catalog forge from inside the editor. See the [catalogs walkthrough](https://agenticstiger.github.io/forge_docs/cli/catalogs/) for per-catalog privilege grants and end-to-end demos.
 
-### Which ODPS? — Bitol vs ODPI disambiguation
+### Which ODPS? — Bitol center stage, LF/ODPI in the back pocket
 
-The CLI surfaces **two** standards under the `opds`/`odps` command. They share the three-letter slug but are different specs.
+This codebase treats **Bitol Open Data Product Standard v1.0.0 as the
+default, center-stage ODPS**. The Linux Foundation / ODPI Open Data Product
+Specification v4.1 is supported as a secondary, opt-in target for catalogs
+that require it. Both standards share the three-letter ODPS acronym but are
+different specs published by different organisations.
 
-| Standard | What it is | Spec | CLI selector |
-|---|---|---|---|
-| **Bitol ODPS v1.0.0** | Open Data Product Standard. Bidirectional; product wrapper that references ODCS contracts by `contractId`. | [bitol-io/open-data-product-standard](https://github.com/bitol-io/open-data-product-standard) | `fluid opds --spec bitol-1.0.0` *(default)* |
-| **ODPI v4.1** | Open Data Product Initiative (Linux Foundation). Export-only; single JSON document. | [Open-Data-Product-Initiative/v4.1](https://github.com/Open-Data-Product-Initiative/v4.1) | `fluid opds --spec odpi-4.1` |
+| Standard | Role | What it is | Spec | CLI selector | `--format` |
+|---|---|---|---|---|---|
+| **Bitol ODPS v1.0.0** | **default** | Open Data Product **Standard**. Bidirectional; product wrapper that references ODCS contracts by `contractId`. | [bitol-io/open-data-product-standard](https://github.com/bitol-io/open-data-product-standard) | `fluid odps --spec bitol-1.0.0` *(default)* | `--format odps` *(default)* / `--format odps-bitol` |
+| **LF/ODPI ODPS v4.1** | opt-in | Open Data Product **Specification**. Hosted by the Linux Foundation / Open Data Product **Initiative** (ODPI). Export-only; single JSON document. | [Open-Data-Product-Initiative/v4.1](https://github.com/Open-Data-Product-Initiative/v4.1) | `fluid odps --spec odps-4.1` | `--format odps-v4.1` |
 
 Bitol ODPS export emits **1 ODPS doc + N sibling `<contractId>.odcs.yaml`** files — the canonical Bitol fragments layout. Import reverses it: a single ODPS file, a directory bundle, or a lone ODCS file all converge on one validated FLUID contract. `fluid forge --seed-from <path>` accepts the same three input shapes as a structural seed for AI authoring.
 
-The legacy `--version 4.1` flag still works as a hidden alias for `--spec odpi-4.1`.
+Back-compat aliases (all emit a WARNING pointing at the canonical form):
+- `fluid opds` — letter-swap of `fluid odps`
+- `--spec odpi-4.1` and `--version 4.1` — historical labels for the LF/ODPI v4.1 spec
+- `--format opds` — historical default of `--format odps-v4.1` (LF/ODPI v4.1 JSON; **does NOT** map to the Bitol-default `--format odps`)
+- `fluid export-opds` — equivalent to `fluid generate standard --format odps-v4.1`
 
 ### From dev to CI — `fluid generate ci`
 

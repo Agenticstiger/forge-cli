@@ -204,6 +204,16 @@ The publish command enables the full data product lifecycle: develop → deploy 
     advanced_group.add_argument(
         "--show-metrics", action="store_true", help="Show detailed metrics after publish"
     )
+    advanced_group.add_argument(
+        "--auto-approve-access",
+        action="store_true",
+        default=False,
+        help=(
+            "(DMM only) Auto-approve Access agreements so DMM renders lineage "
+            "immediately; without this, edges stay 'pending'. Same as "
+            "DMM_AUTO_APPROVE_ACCESS=true. Sandboxes only."
+        ),
+    )
 
     p.set_defaults(cmd=COMMAND, func=run)
 
@@ -450,6 +460,16 @@ async def run_async(args, logger: logging.Logger) -> int:
     # that only sources a launchpad (which exports only FLUID_SECRETS_FILE)
     # would otherwise see empty DMM_API_KEY and fail the health check.
     hydrate_dotenv(Path.cwd(), environment=getattr(args, "env", None))
+
+    # Wire --auto-approve-access into DMM_AUTO_APPROVE_ACCESS so the
+    # DataMeshManagerRegistrar (which __post_init__ reads the env) picks it
+    # up. Setting the env var here is the minimal-surface way to thread
+    # the flag through to the registrar without modifying every layer of
+    # the catalog provider dataclass construction.
+    if getattr(args, "auto_approve_access", False):
+        import os
+
+        os.environ["DMM_AUTO_APPROVE_ACCESS"] = "true"
 
     config = FluidConfig()
     console = Console() if RICH_AVAILABLE else None

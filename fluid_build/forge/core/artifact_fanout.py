@@ -19,7 +19,7 @@ artifacts plus a unified MANIFEST.json hashed over every output file.
 Dispatches to existing emitters (``generate standard``, ``policy-compile``,
 ``generate schedule``) without duplicating their logic.
 
-Output layout (default emit set — opds/odps opt-in pending emitter fix)::
+Output layout (default emit set — LF/ODPI ODPS v4.1 opt-in pending emitter fix)::
 
     <out>/
     ├── MANIFEST.json                       # SHA-256 per file + merkle root
@@ -32,9 +32,15 @@ Output layout (default emit set — opds/odps opt-in pending emitter fix)::
 
 Opt-in emitters (broken shape — see trello-verify-odps-linux-foundation)::
 
-    <out>/opds/<product>.opds.json          # should be OPDS v4.1 but emits
-                                            # a homebrew {specVersion: "1.0", ...}
+    <out>/opds/<product>.opds.json          # should be ODPS v4.1 (LF/ODPI) but
+                                            # emits a homebrew {specVersion: "1.0", ...}
                                             # shape that does NOT conform
+
+Note on terminology: this codebase historically used the letter-swap "OPDS"
+to refer to the Linux Foundation's Open Data Product Specification, whose
+canonical acronym is ODPS. The subdir name ``opds/`` and the emit key
+``opds`` are kept for back-compat; new code should use the canonical
+``odps`` key, with ``opds`` as a deprecated alias.
 
 dbt is NOT emitted here. Per plan decision D4, dbt project files are
 execution artifacts, not catalog artifacts — they stay in the product's
@@ -51,9 +57,9 @@ bindings file when the contract declares no access policy.
 
 Upstream versions verified 2026-04-22:
 
-- ODCS v3.1.0: bitol-io/open-data-contract-standard
-- ODPS-Bitol v1.0.0: bitol-io/open-data-product-standard
-- OPDS v4.1: Open-Data-Product-Initiative/v4.1 (emitter needs fix)
+- ODCS v3.1.0:               bitol-io/open-data-contract-standard
+- ODPS-Bitol v1.0.0:         bitol-io/open-data-product-standard
+- ODPS v4.1 (LF/ODPI):       Open-Data-Product-Initiative/v4.1 (emitter needs fix)
 """
 
 from __future__ import annotations
@@ -93,15 +99,17 @@ EMIT_KEYS: Tuple[str, ...] = (
 #
 # - odcs         → bitol-io/open-data-contract-standard v3.1.0 — conformant ✅
 # - odps-bitol   → bitol-io/open-data-product-standard v1.0.0 — conformant ✅
-# - opds         → Open-Data-Product-Initiative/v4.1 — our emitter produces a
-#                  homebrew shape ({specVersion: "1.0", ...}) that does NOT
-#                  match OPDS v4.1's expected shape ({schema, version, product}).
-#                  Opt-in only until fixed (see trello-verify-odps-linux-foundation).
-# - odps         → alias of the broken OPDS emitter, same reason.
+# - odps         → Open-Data-Product-Initiative/v4.1 (LF ODPS v4.1) — our
+#                  emitter produces a homebrew shape ({specVersion: "1.0", ...})
+#                  that does NOT match ODPS v4.1's expected shape
+#                  ({schema, version, product}). Opt-in only until fixed
+#                  (see trello-verify-odps-linux-foundation).
+# - opds         → deprecated letter-swap alias of ``odps`` — same broken
+#                  emitter, kept only for back-compat with pre-2026-05 callers.
 # - schedule     → DAG/flow files; shape is scheduler-specific not schema-pinned
 # - policies     → compiled IAM bindings; shape is internal
 #
-# Users can explicitly opt in to broken emitters via --emit opds,odps,...
+# Users can explicitly opt in to broken emitters via --emit odps,opds,...
 # while upstream alignment work is in flight.
 DEFAULT_EMIT: Tuple[str, ...] = (
     "odps-bitol",
@@ -314,6 +322,25 @@ def parse_emit_set(
         raise FanoutError(
             f"unknown --emit keys: {sorted(unknown)}. Valid: {sorted(EMIT_KEYS)}",
             key=unknown[0],
+        )
+
+    # Deprecation note for the letter-swap alias. ``opds`` is still routed to
+    # its own subdir / emitter (different on-disk path than ``odps``), so we
+    # don't auto-rewrite — just nudge the operator toward the canonical key.
+    if "opds" in requested:
+        logger.warning(
+            "deprecated_emit_key",
+            extra={
+                "alias": "opds",
+                "canonical": "odps",
+                "note": (
+                    "--emit opds is a deprecated letter-swap alias of --emit odps; "
+                    "both target the Linux Foundation / ODPI ODPS v4.1 spec. The "
+                    "two keys still route to different on-disk subdirectories "
+                    "(opds/ vs odps/) for back-compat — pass --emit odps for the "
+                    "canonical layout."
+                ),
+            },
         )
 
     # Auto-skip for reference-only.

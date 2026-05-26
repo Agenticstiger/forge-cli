@@ -22,7 +22,8 @@ validators:
     MANIFEST.json          → SHA-256 re-verify (tamper gate)
     odcs/*.odcs.yaml       → JSON Schema (vendored ODCS v3.1.0)
     odps-bitol/*.yaml      → JSON Schema (vendored ODPS-Bitol v1.0.0)
-    opds/*.opds.json       → (opt-in) OPDS v4.1 validation — pending fix
+    odps/*.odps.json       → (opt-in) ODPS v4.1 (LF/ODPI) validation — pending fix
+    opds/*.opds.json       → (back-compat) same as odps/ — kept for legacy callers
     schedule/dags/*.py     → py_compile
     schedule/flows/*.py    → py_compile
     policy/bindings.json   → key-check + OPA conftest (optional)

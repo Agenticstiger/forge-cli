@@ -378,8 +378,13 @@ class BasePipelineTemplate:
                 "fi"
             ),
             "visualize": "fluid viz-plan --output pipeline-viz.html && fluid viz-graph --output dependency-graph.png",
-            "publish_opds": "fluid export-opds --output opds-catalog.json",
-            "marketplace_publish": "fluid marketplace publish --catalog opds-catalog.json",
+            # Canonical key: ``publish_odps`` emits the LF/ODPI ODPS v4.1
+            # JSON via the (non-deprecated) ``fluid generate standard
+            # --format odps-v4.1`` path. The ``publish_opds`` alias below
+            # keeps pre-2026-05 templates / overrides resolving.
+            "publish_odps": ("fluid generate standard --format odps-v4.1 --out odps-catalog.json"),
+            "publish_opds": ("fluid generate standard --format odps-v4.1 --out odps-catalog.json"),
+            "marketplace_publish": "fluid marketplace publish --catalog odps-catalog.json",
             # Plain `fluid doctor` — `--extended` requires scripts/diagnose.sh
             # in the workspace, which fresh forge-generated variants don't
             # ship. Users who set up extended diagnostics can edit the

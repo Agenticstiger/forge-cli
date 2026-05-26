@@ -28,7 +28,7 @@ Every contract is delivered through an 11-stage pipeline. Each stage is a hard g
 |---|---|---|
 | 1 | `fluid bundle contract.fluid.yaml --format tgz` | Deterministic tgz + `MANIFEST.json` (SHA-256 merkle root). Root of trust for every downstream stage. |
 | 2 | `fluid validate <bundle.tgz>` | Extension-routed: schema (JSON-Schema) + sqlglot (embedded SQL) + openapi-spec-validator (OpenAPI ports). |
-| 3 | `fluid generate artifacts <bundle.tgz>` | Fanout: ODCS + ODPS-Bitol + OPDS + schedule DAGs + policy bindings. Writes a unified MANIFEST. |
+| 3 | `fluid generate artifacts <bundle.tgz>` | Fanout: ODCS + **Bitol ODPS v1.0.0 (default)** + LF/ODPI ODPS v4.1 (opt-in) + schedule DAGs + policy bindings. Writes a unified MANIFEST. (`--emit opds` accepted as a deprecated letter-swap alias of `--emit odps`.) |
 | 4 | `fluid validate-artifacts dist/artifacts/` | Re-verifies SHA-256 + per-format schema validators. OPA `conftest` integration for policy tests. |
 | 5 | `fluid diff --exit-on-drift --env <env>` | Compares live warehouse schema against contract. Hard gate — no plan against an unknown baseline. |
 | 6 | `fluid plan --out runtime/plan.json --html` | Emits `bundleDigest` + `planDigest` cryptographic binding fields. `fluid apply` verifies both before any DDL. |

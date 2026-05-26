@@ -14,12 +14,15 @@
 
 # fluid_build/cli/odps_standard.py
 """
-ODPS-Bitol (Bitol.io Data Product Standard) CLI Commands
+ODPS-Bitol (Bitol.io Open Data Product Standard v1.0.0) CLI Commands
 
-Commands for exporting FLUID contracts to ODPS-Bitol v1.0 format.
+Commands for exporting FLUID contracts to Bitol ODPS v1.0.0 format.
 
-Note: This is Bitol.io's proprietary ODPS variant for Entropy Data marketplace.
-Different from the official ODPS v4.1 (Linux Foundation) - use 'opds' command for that.
+Two distinct standards share the ODPS acronym:
+  - Bitol's Open Data Product **Standard** v1.0.0 (this file)
+  - Linux Foundation / ODPI's Open Data Product **Specification** v4.1
+    (use ``fluid odps export --spec odps-4.1`` for that, or ``fluid opds``
+    as a deprecated alias).
 
 Specification: https://github.com/bitol-io/open-data-product-standard
 """

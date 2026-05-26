@@ -165,7 +165,10 @@ class TestGoogleCloudAuthProvider:
 
         p = self._make_provider()
         p._run_command = MagicMock(side_effect=Exception("not installed"))
-        result = asyncio.run(p.check_auth())
+        # Disable the google.auth SDK path so the test doesn't pick up the
+        # developer's real gcloud Application Default Credentials.
+        with patch.object(p, "_has_sdk", return_value=False):
+            result = asyncio.run(p.check_auth())
         assert result.status in (AuthStatus.ERROR, AuthStatus.NOT_AUTHENTICATED)
 
     def test_check_auth_authenticated(self):
@@ -195,7 +198,10 @@ class TestGoogleCloudAuthProvider:
                 raise subprocess.CalledProcessError(1, "gcloud")
 
         p._run_command = mock_run
-        result = asyncio.run(p.check_auth())
+        # Disable the google.auth SDK path so the test doesn't pick up real
+        # host gcloud Application Default Credentials.
+        with patch.object(p, "_has_sdk", return_value=False):
+            result = asyncio.run(p.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
     def test_logout_success(self):
@@ -260,7 +266,11 @@ class TestAWSAuthProvider:
 
         p = self._make_provider()
         p._run_command = MagicMock(side_effect=Exception("not found"))
-        result = asyncio.run(p.check_auth())
+        # Disable the boto3 SDK path so the test doesn't pick up real
+        # host AWS credentials (was causing this test to read the live
+        # `arn:aws:iam::*` from the developer's machine).
+        with patch.object(p, "_has_boto3", return_value=False):
+            result = asyncio.run(p.check_auth())
         assert result.status in (AuthStatus.ERROR, AuthStatus.NOT_AUTHENTICATED)
 
     def test_check_auth_not_authenticated(self):
@@ -276,7 +286,9 @@ class TestAWSAuthProvider:
             raise subprocess.CalledProcessError(1, "aws")
 
         p._run_command = mock_run
-        result = asyncio.run(p.check_auth())
+        # Disable the boto3 SDK path so the test doesn't pick up real host creds.
+        with patch.object(p, "_has_boto3", return_value=False):
+            result = asyncio.run(p.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
     def test_logout(self):

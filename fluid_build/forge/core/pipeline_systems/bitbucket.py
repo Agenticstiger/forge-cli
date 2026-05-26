@@ -245,9 +245,9 @@ class BitbucketTemplate(BasePipelineTemplate):
                 "script": [
                     commands["publish_catalog"],
                     commands["visualize"],
-                    commands["publish_opds"],
+                    commands["publish_odps"],
                 ],
-                "artifacts": ["pipeline-viz.html", "dependency-graph.png", "opds-catalog.json"],
+                "artifacts": ["pipeline-viz.html", "dependency-graph.png", "odps-catalog.json"],
             }
         }
 

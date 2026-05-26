@@ -212,7 +212,9 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
     gen_tbl.add_row("  generate transformation", "dbt, SQL, Spark artifacts")
     gen_tbl.add_row("  generate schedule", "Airflow, Dagster, Prefect DAGs")
     gen_tbl.add_row("  generate ci", "GitHub Actions, GitLab CI pipelines")
-    gen_tbl.add_row("  generate standard", "OPDS, ODCS, ODPS, ODPS-Bitol")
+    gen_tbl.add_row(
+        "  generate standard", "Bitol ODPS v1.0.0 (default), ODCS, LF/ODPI v4.1 (opt-in)"
+    )
     console.print(gen_tbl)
     console.print()
 
@@ -556,7 +558,9 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
         ),
     ),
     "export-opds": (
-        "Export a FLUID contract to OPDS (Open Data Product Specification) JSON.",
+        "[deprecated alias] Export a FLUID contract to LF/ODPI ODPS v4.1 JSON. "
+        "Prefer `fluid generate standard --format odps-v4.1` for new scripts. "
+        "(For Bitol ODPS v1.0.0 — the center-stage default — use `--format odps`.)",
         (
             "  fluid export-opds contract.fluid.yaml\n"
             "  fluid export-opds contract.fluid.yaml --out my-product.opds.json\n"

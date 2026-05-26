@@ -416,7 +416,7 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                                 "displayName": "Generate visualizations",
                             },
                             {
-                                "script": commands["publish_opds"],
+                                "script": commands["publish_odps"],
                                 "displayName": "Export OPDS catalog",
                             },
                             {
@@ -426,7 +426,7 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
                             {
                                 "task": "PublishBuildArtifacts@1",
                                 "inputs": {
-                                    "pathToPublish": "opds-catalog.json",
+                                    "pathToPublish": "odps-catalog.json",
                                     "artifactName": "marketplace-artifacts",
                                 },
                             },
