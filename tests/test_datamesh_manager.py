@@ -569,9 +569,7 @@ class TestCmdList:
         mock_provider = MagicMock()
         mock_provider.list_products.return_value = products
 
-        with patch(
-            "fluid_build.cli.datamesh_manager._make_provider", return_value=mock_provider
-        ):
+        with patch("fluid_build.cli.datamesh_manager._make_provider", return_value=mock_provider):
             result = _cmd_list(args)
 
         captured = capsys.readouterr()

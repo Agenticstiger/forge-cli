@@ -169,9 +169,7 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                         agreement["id"],
                         upstream,
                     )
-                    access_urns.append(
-                        f"dmm://access/{agreement['id']}?skipped=missing_upstream"
-                    )
+                    access_urns.append(f"dmm://access/{agreement['id']}?skipped=missing_upstream")
                     continue
                 self._put_access_agreement(agreement)
                 access_urns.append(f"dmm://access/{agreement['id']}")
@@ -640,10 +638,7 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             "id": team_id,
             "name": team_id.replace("-", " ").replace("_", " ").title(),
             "type": "Data Product Team",
-            "description": (
-                "Auto-created by forge-cli on first publish referencing "
-                "this team."
-            ),
+            "description": ("Auto-created by forge-cli on first publish referencing " "this team."),
         }
         try:
             with safe_httpx_client(
