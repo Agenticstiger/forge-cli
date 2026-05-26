@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-05-26
+
 ### Added (DMM CLI surface + lineage UX)
 - **`fluid dmm wipe`** — multi-pass FK-aware mass delete of every DataProduct
   in the tenant. Supersedes the ad-hoc helper scripts everyone was writing.
