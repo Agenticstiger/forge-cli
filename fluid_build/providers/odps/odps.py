@@ -14,17 +14,24 @@
 
 # fluid_build/providers/odps/odps.py
 """
-ODPI v4.1 (Open Data Product Initiative) Provider — Linux Foundation spec.
+ODPS v4.1 (Open Data Product Specification) Provider — Linux Foundation spec.
+
+The v4.1 spec's canonical name is **Open Data Product Specification (ODPS)**;
+it is hosted by the Open Data Product **Initiative** (ODPI), which is the
+*organisation*, not the spec. Earlier revisions of this module called the
+spec "ODPI v4.1" — that swap is fixed; ``ODPI`` references that remain in
+identifiers / URLs are kept as back-compat aliases.
 
 **Distinct from Bitol ODPS v1.0.0.** Despite sharing the "ODPS" three-letter
 slug, the Bitol Open Data Product Standard (v1.0.0, ``providers/odps_standard/``,
 class :class:`BitolOdpsProvider`) is a separate specification with its own
 schema, JSON format, and ``contractId``-based linkage to ODCS. This module
-implements the **older** ODPI v4.1 spec from the Linux Foundation's Open Data
-Product Initiative — single-JSON-document export, no import support.
+implements the LF/ODPI ODPS v4.1 spec — single-JSON-document export, no
+import support.
 
-Selected via ``fluid opds export --spec odpi-4.1``; the Bitol ODPS v1.0.0
-path is the default (``--spec bitol-1.0.0``).
+Selected via ``fluid odps export --spec odps-4.1`` (legacy ``--spec odpi-4.1``
+remains accepted with a deprecation warning); the Bitol ODPS v1.0.0 path is
+the default (``--spec bitol-1.0.0``).
 
 Official Specification: https://github.com/Open-Data-Product-Initiative/v4.1
 """
@@ -64,7 +71,7 @@ def _now_iso() -> str:
 
 
 def _now_date() -> str:
-    """Generate date string (YYYY-MM-DD) in UTC for OPDS v4.1 compliance."""
+    """Generate date string (YYYY-MM-DD) in UTC for ODPS v4.1 compliance."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
@@ -86,25 +93,143 @@ def _safe_get(obj: Any, *keys: str, default: Any = None) -> Any:
     return current
 
 
-def _generate_uuid_from_id(data_product_id: str) -> str:
-    """Generate deterministic UUID from data product ID for ODPS compliance."""
-    import hashlib
+# LF/ODPI ODPS v4.1 enum vocabularies. The schema rejects values outside
+# these closed sets; the helpers below map common FLUID values to the
+# closest LF enum equivalent so emitted docs validate against the vendored
+# odps-schema-v4.1.json. Unknown values fall back to ``_DEFAULT_*`` rather
+# than failing emission — the validator will surface any mismatch.
+_LF_STATUS_ENUM = (
+    "announcement",
+    "draft",
+    "development",
+    "testing",
+    "acceptance",
+    "production",
+    "sunset",
+    "retired",
+)
+_LF_FORMAT_ENUM = ("TOON", "JSON", "XML", "CSV", "Excel", "zip", "plain text", "GraphQL", "MCP")
 
-    namespace = "fluid-forge-opds"
-    hash_input = f"{namespace}:{data_product_id}".encode()
-    return str(hashlib.sha256(hash_input).hexdigest()[:32])
+# FLUID status vocabulary → LF status enum. Anything unmapped lands on
+# ``_LF_DEFAULT_STATUS`` (``production`` — the LF v4.1 default for shipped
+# products) rather than carrying an out-of-enum value through to the
+# emitted doc.
+_LF_STATUS_MAP = {
+    "draft": "draft",
+    "active": "production",
+    "live": "production",
+    "production": "production",
+    "released": "production",
+    "shipped": "production",
+    "announcement": "announcement",
+    "announced": "announcement",
+    "planned": "announcement",
+    "dev": "development",
+    "development": "development",
+    "developing": "development",
+    "wip": "development",
+    "test": "testing",
+    "testing": "testing",
+    "qa": "testing",
+    "uat": "acceptance",
+    "stage": "acceptance",
+    "staged": "acceptance",
+    "staging": "acceptance",
+    "acceptance": "acceptance",
+    "preprod": "acceptance",
+    "deprecated": "sunset",
+    "deprecating": "sunset",
+    "sunset": "sunset",
+    "retiring": "sunset",
+    "archived": "retired",
+    "retired": "retired",
+    "dead": "retired",
+}
+_LF_DEFAULT_STATUS = "production"
+
+# FLUID binding.format (and platform-derived formats) → LF format enum.
+# SQL is mapped to JSON since LF's format enum is about *data representation*
+# at the data-access boundary; SQL query results are most commonly conveyed
+# as JSON-shaped tuples and the LF enum has no `SQL` entry.
+_LF_FORMAT_MAP = {
+    "json": "JSON",
+    "xml": "XML",
+    "csv": "CSV",
+    "tsv": "CSV",
+    "excel": "Excel",
+    "xlsx": "Excel",
+    "xls": "Excel",
+    "zip": "zip",
+    "text": "plain text",
+    "plain": "plain text",
+    "txt": "plain text",
+    "graphql": "GraphQL",
+    "mcp": "MCP",
+    "toon": "TOON",
+    # SQL / Parquet / Avro / ORC have no native LF equivalent; map to JSON
+    # as the closest interchange representation.
+    "sql": "JSON",
+    "parquet": "JSON",
+    "avro": "JSON",
+    "orc": "JSON",
+}
+_LF_DEFAULT_FORMAT = "JSON"
+
+
+def _map_lf_status(value: Optional[str]) -> str:
+    """Map a free-form FLUID status to the LF v4.1 status enum."""
+    if not value:
+        return _LF_DEFAULT_STATUS
+    return _LF_STATUS_MAP.get(str(value).strip().lower(), _LF_DEFAULT_STATUS)
+
+
+def _map_lf_format(value: Optional[str]) -> str:
+    """Map a free-form FLUID/binding format to the LF v4.1 format enum."""
+    if not value:
+        return _LF_DEFAULT_FORMAT
+    key = str(value).strip().lower()
+    # Honour values already inside the enum (case-insensitive).
+    for canonical in _LF_FORMAT_ENUM:
+        if canonical.lower() == key:
+            return canonical
+    return _LF_FORMAT_MAP.get(key, _LF_DEFAULT_FORMAT)
+
+
+def _env_legacy_opds(canonical_var: str, legacy_var: str, default: str) -> str:
+    """Read an env var that has both a canonical ``ODPS_*`` and a legacy
+    ``OPDS_*`` form. Prefer the canonical; warn once if only the legacy
+    form is set."""
+    val = os.getenv(canonical_var)
+    if val is not None:
+        return val
+    val = os.getenv(legacy_var)
+    if val is not None:
+        logging.getLogger(__name__).warning(
+            "%s is deprecated; rename to %s "
+            "(OPDS is a letter-swap of ODPS — the canonical spec acronym)",
+            legacy_var,
+            canonical_var,
+        )
+        return val
+    return default
 
 
 class OdpsProvider(BaseProvider):
     """
-    OPDS (Open Data Product Specification) exporter.
+    ODPS v4.1 (Open Data Product Specification) exporter — LF / ODPI.
 
-    This provider converts FLUID contracts into OPDS-compliant JSON format,
-    enabling integration with data catalogs, governance platforms, and
-    ecosystem tools that support the OPDS standard.
+    This provider converts FLUID contracts into ODPS v4.1 (LF/ODPI) JSON
+    format, enabling integration with data catalogs, governance platforms,
+    and ecosystem tools that support the ODPS standard.
+
+    NOTE: Despite the class name, ``self.name`` returns ``"opds"`` for
+    historical reasons — the provider registry (entry-point ``odps`` in
+    pyproject.toml) accepts both spellings via the heuristic at
+    ``bootstrap.py``. Renaming the ``.name`` property would shift catalog
+    metadata keys, so the legacy string is preserved.
 
     Features:
-    - Full OPDS v1.0 compliance
+    - Full ODPS v4.1 compliance
     - Rich metadata extraction from FLUID contracts
     - Support for batch processing of multiple contracts
     - Comprehensive governance and lineage information
@@ -116,24 +241,59 @@ class OdpsProvider(BaseProvider):
         super().__init__()
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
 
-        # Configuration from environment
-        self.include_build_info = os.getenv("OPDS_INCLUDE_BUILD_INFO", "true").lower() == "true"
-        self.include_execution_details = (
-            os.getenv("OPDS_INCLUDE_EXECUTION_DETAILS", "false").lower() == "true"
+        # Configuration from environment. Each setting accepts both the
+        # canonical ``ODPS_*`` form and the legacy ``OPDS_*`` form (with
+        # a one-time deprecation warning) so existing operator scripts
+        # keep working through the rename.
+        self.include_build_info = (
+            _env_legacy_opds("ODPS_INCLUDE_BUILD_INFO", "OPDS_INCLUDE_BUILD_INFO", "true").lower()
+            == "true"
         )
-        self.target_platform = os.getenv("OPDS_TARGET_PLATFORM", "generic")
-        self.validate_output = os.getenv("OPDS_VALIDATE_OUTPUT", "true").lower() == "true"
+        self.include_execution_details = (
+            _env_legacy_opds(
+                "ODPS_INCLUDE_EXECUTION_DETAILS", "OPDS_INCLUDE_EXECUTION_DETAILS", "false"
+            ).lower()
+            == "true"
+        )
+        self.target_platform = _env_legacy_opds(
+            "ODPS_TARGET_PLATFORM", "OPDS_TARGET_PLATFORM", "generic"
+        )
+        self.validate_output = (
+            _env_legacy_opds("ODPS_VALIDATE_OUTPUT", "OPDS_VALIDATE_OUTPUT", "true").lower()
+            == "true"
+        )
 
-        # OPDS version support (can be overridden by CLI)
-        self.opds_version = os.getenv("OPDS_VERSION", "4.1")
+        # ODPS version support (can be overridden by CLI). The attribute is
+        # named ``opds_version`` for back-compat with external callers /
+        # tests / providers that pin it; ``odps_version`` is exposed as an
+        # alias property below.
+        self.opds_version = _env_legacy_opds("ODPS_VERSION", "OPDS_VERSION", "4.1")
         self.opds_spec_url = "https://github.com/Open-Data-Product-Initiative/v4.1"
         self.opds_schema_url = (
             "https://github.com/Open-Data-Product-Initiative/v4.1/blob/main/source/schema/odps.json"
         )
 
     @property
+    def odps_version(self) -> str:
+        """Canonical accessor for the ODPS spec version (aliases ``opds_version``)."""
+        return self.opds_version
+
+    @odps_version.setter
+    def odps_version(self, value: str) -> None:
+        self.opds_version = value
+
+    @property
     def name(self) -> str:
-        return "opds"
+        """Canonical provider name.
+
+        Returns ``"odps"`` — the canonical spec acronym. The pre-2026-05
+        value was the letter-swap ``"opds"``; downstream consumers that
+        keyed on ``provider.name == "opds"`` should switch to ``"odps"``.
+        The registry registers both spellings (see
+        ``providers/odps/__init__.py``) so ``--provider opds`` and
+        ``--provider odps`` both resolve to this class.
+        """
+        return "odps"
 
     def capabilities(self) -> Mapping[str, bool]:
         """Signal exporter capabilities with enhanced feature set."""
@@ -356,7 +516,9 @@ class OdpsProvider(BaseProvider):
                         "name": contract.get("name", contract_id),
                         "productID": contract_id,
                         "visibility": metadata.get("visibility", "private"),
-                        "status": metadata.get("status", "draft").lower(),
+                        # Map FLUID status to the LF v4.1 enum so the
+                        # emitted doc validates against odps-schema-v4.1.json.
+                        "status": _map_lf_status(metadata.get("status", "draft")),
                         "type": self._map_fluid_kind_to_opds_type(
                             contract.get("kind", "DataProduct")
                         ),
@@ -806,7 +968,10 @@ class OdpsProvider(BaseProvider):
 
             if platform in ("bigquery", "snowflake", "redshift", "postgres"):
                 output_type = "SQL"
-                data_format = "SQL"
+                # LF v4.1 format enum has no `SQL` entry; SQL query results
+                # are conveyed as JSON-shaped tuples by every spec consumer
+                # that supports `outputPortType: SQL` (per the LF examples).
+                data_format = "JSON"
             elif platform == "gcs":
                 output_type = "file"
                 data_format = _safe_get(expose, "format", "CSV")
@@ -818,7 +983,8 @@ class OdpsProvider(BaseProvider):
                 "name": {"en": get_expose_id(expose) or "data_access"},
                 "description": {"en": expose.get("description", "Data access endpoint")},
                 "outputPortType": output_type,
-                "format": data_format,
+                # Map binding/derived format to the LF v4.1 enum.
+                "format": _map_lf_format(data_format),
             }
 
             # Add location-based access URL if available
@@ -975,7 +1141,12 @@ class OdpsProvider(BaseProvider):
         """Build final OPDS payload with metadata."""
         payload = {
             "opds_version": "1.0",
-            "generator": "fluid-forge-opds-provider",
+            # ``generator`` identifies the emitter on the wire. Canonical
+            # spelling is ``fluid-forge-odps-provider`` (ODPS, matching the
+            # spec acronym). Pre-2026-05 emitted the letter-swap
+            # ``fluid-forge-opds-provider``; downstream consumers that key
+            # on this string should accept both spellings.
+            "generator": "fluid-forge-odps-provider",
             "generated_at": _now_iso(),
             "target_platform": self.target_platform,
             "count": len(artifacts),

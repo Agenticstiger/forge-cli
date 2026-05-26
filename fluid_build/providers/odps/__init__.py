@@ -18,5 +18,12 @@ from .odps import (
     OdpsProvider,  # class OdpsProvider(BaseProvider) with name="odps"; implements render()
 )
 
+# Canonical name (matches the pyproject.toml entry-point + OdpsProvider.name).
 register_provider("odps", OdpsProvider)
+# Back-compat alias so pre-2026-05 invocations of ``--provider opds`` (and
+# anyone who registered against the letter-swap key) keep resolving to the
+# same class. The CLI argparse ``choices=[..., "odps", "opds", ...]`` accepts
+# both spellings; the registry needs to honor the letter-swap to match.
+register_provider("opds", OdpsProvider, override=False)
+
 __all__ = ["OdpsProvider"]

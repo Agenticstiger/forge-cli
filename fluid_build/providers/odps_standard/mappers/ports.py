@@ -85,25 +85,53 @@ def _build_input_ports(
     3. ``expects[]`` (FLUID 0.7.1 legacy) — handled inline via
        :func:`_expect_to_input_port` for back-compat.
 
-    De-duped by port ``name`` so authors who wire both ``consumes`` and
-    ``builds.source`` for the same upstream get one InputPort, not two.
+    De-duped by ``(name, contract_id)`` so authors who wire both ``consumes``
+    and ``builds.source`` for the same upstream get one InputPort, not two —
+    but two ``consumes[]`` that target *different* upstream products with the
+    same ``exposeId`` (e.g. both ``silver.b1`` and ``silver.b2`` expose
+    ``data_analytics_platform``) each produce their own InputPort with a
+    disambiguating name (``b1__data_analytics_platform`` / ``b2__…``). Before
+    this dedup keyed by name alone, the second consume was silently dropped
+    and downstream catalogs lost half the lineage.
     """
     input_ports: List[Dict[str, Any]] = []
-    seen_names: set = set()
+    seen: set = set()  # ``(name, contract_id)`` tuples — true dedup key.
+    seen_names: set = set()  # ``name`` only — drives the collision-rename path.
     logger = getattr(ctx, "logger", None)
     default_version = (ctx.options or {}).get("default_port_version", "1.0.0")
+
+    def _unique_name(base: str, ref: Optional[str]) -> str:
+        """Return ``base`` if not yet used, otherwise a disambiguated form
+        derived from ``ref`` (the upstream productId). Falls back to a
+        numeric suffix when ``ref`` is missing or already collides too."""
+        if base not in seen_names:
+            return base
+        if ref:
+            # productId is dot-segmented; take the tail segment as the
+            # disambiguator so the resulting name stays readable.
+            tail = str(ref).rsplit(".", 1)[-1]
+            candidate = f"{tail}__{base}" if tail and tail != base else f"{ref}__{base}"
+            if candidate not in seen_names:
+                return candidate
+        # Last resort: numeric suffix.
+        i = 2
+        while f"{base}_{i}" in seen_names:
+            i += 1
+        return f"{base}_{i}"
 
     # Path 1 — consumes[]
     for canonical in consumes_to_canonical_ports(
         fluid, default_version=default_version, logger=logger
     ):
-        name = canonical["name"]
-        if name in seen_names:
-            continue
-        seen_names.add(name)
         contract_id = (
             canonical.get("contract_id") or canonical.get("reference") or canonical.get("name")
         )
+        dedup_key = (canonical["name"], str(contract_id) if contract_id else None)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        name = _unique_name(canonical["name"], canonical.get("reference"))
+        seen_names.add(name)
         input_ports.append(
             {
                 "name": name,

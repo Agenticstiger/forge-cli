@@ -89,13 +89,55 @@ class _PublishFlowMixin:
         *,
         auto_approve_access: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Create Entropy Access agreements for FLUID ``consumes``."""
+        """Create Entropy Access agreements for FLUID ``consumes``.
+
+        Pre-flight: enumerate existing DataProduct IDs and skip access
+        agreements for upstream products that don't exist yet (DMM returns
+        a generic ``404`` on PUT in that case, which is hard to read in a
+        publish log). Each skipped agreement gets a row in the returned
+        results so the operator sees the missing-upstream warning.
+        """
         payloads = self._build_access_agreements(fluid, consumer_product_id)
         results: List[Dict[str, Any]] = []
+
+        # Pre-flight: build the set of existing product IDs so we can detect
+        # missing upstreams without a noisy 404 mid-publish.
+        existing_product_ids: set[str] = set()
+        try:
+            for prod in self.list_products() or []:
+                pid = prod.get("id")
+                if pid:
+                    existing_product_ids.add(str(pid))
+        except Exception:  # noqa: BLE001 — best effort; fall back to PUT-and-pray
+            existing_product_ids = set()
 
         for payload in payloads:
             access_id = payload["id"]
             provider = payload.get("provider", {})
+            upstream_pid = str(provider.get("dataProductId") or "")
+            if existing_product_ids and upstream_pid and upstream_pid not in existing_product_ids:
+                # Surface a structured skip rather than letting DMM 404.
+                self._log.warning(
+                    "Skipping Access agreement %s: upstream product %s does not exist in DMM",
+                    access_id,
+                    upstream_pid,
+                )
+                results.append(
+                    {
+                        "access_id": access_id,
+                        "success": False,
+                        "skipped": True,
+                        "reason": "missing_upstream_product",
+                        "provider_data_product_id": upstream_pid,
+                        "provider_output_port_id": provider.get("outputPortId"),
+                        "consumer_data_product_id": consumer_product_id,
+                        "error": (
+                            f"upstream product '{upstream_pid}' not published — "
+                            f"publish it first or remove the consume from the contract"
+                        ),
+                    }
+                )
+                continue
             try:
                 put_resp = self._request("PUT", f"/api/access/{access_id}", json_body=payload)
                 approve_resp = None

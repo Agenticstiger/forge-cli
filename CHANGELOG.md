@@ -7,6 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (DMM CLI surface + lineage UX)
+- **`fluid dmm wipe`** — multi-pass FK-aware mass delete of every DataProduct
+  in the tenant. Supersedes the ad-hoc helper scripts everyone was writing.
+  `--yes` to skip confirmation; `--max-passes <n>` to bound retry attempts.
+- **`fluid dmm list-contracts` / `get-contract` / `delete-contract`** —
+  parity with the DataProduct surface for the long-overlooked DataContracts
+  side of the DMM API.
+- **`fluid dmm delete` enriched error** — on DMM's `422 Cannot delete
+  because data product is in use` lock, the CLI now enumerates the
+  consumer products holding the FK and prints them in the error so the
+  operator knows what to delete first.
+- **`fluid dmm publish` access-agreement visibility** — output now shows
+  the count + approval status of Access agreements created from
+  `consumes[]`. When any are left `pending` the CLI prints a yellow hint
+  pointing at `--auto-approve-access` / `DMM_AUTO_APPROVE_ACCESS=true`.
+  This closes the most common "I published but the DMM lineage graph is
+  empty" footgun: DMM only renders lineage from APPROVED agreements.
+- **`fluid dmm publish --auto-approve-access` / `--no-auto-approve-access`** —
+  explicit flags overriding the env var, with help text that explains
+  the lineage-rendering implications.
+
+### Fixed (DMM + emitter bugs)
+- **`OdpsStandardProvider.render()` no longer drops duplicate-exposeId
+  consumes.** Previously, two `consumes[]` entries sharing an `exposeId`
+  (e.g. both upstream products expose `data_analytics_platform`) collapsed
+  to ONE InputPort via name-keyed dedup; the second was silently dropped.
+  Now dedup is keyed by `(name, contract_id)` and collisions are
+  disambiguated by tail-of-productId prefix (`b2__data_analytics_platform`),
+  so every consume produces its own InputPort. Pinned by
+  `tests/test_odps_cli_spec.py::TestInputPortDuplicateExposeIdHandling`.
+- **`_publish_access_agreements` pre-flight upstream check.** Previously,
+  if a `consumes[].productId` pointed at a product that didn't exist in
+  DMM, the access PUT returned a generic `404` mid-publish. Now the
+  publisher lists existing products first and surfaces a structured
+  `missing_upstream_product` warning per skipped agreement, naming the
+  upstream that needs publishing first.
+- **`fluid dmm list --format json`** — Rich console line-wrapping injected
+  literal newlines into JSON string values, breaking `json.loads()` for
+  pipe consumers. Now bypasses Rich for `--format json` and writes
+  directly to stdout.
+- **`generator: "fluid-forge-opds-provider"` payload literal** in the LF
+  v4.1 wrapper renamed to `fluid-forge-odps-provider` for naming
+  consistency with the canonical spec acronym. Wire-visible field;
+  downstream consumers that keyed on the old string should accept both.
+
+### Removed (dead code)
+- `_generate_uuid_from_id` + `_CANONICAL_UUID_NAMESPACE` +
+  `_LEGACY_UUID_NAMESPACE` + the `FLUID_LEGACY_UUID_NAMESPACE` env var
+  escape hatch (added in Phase 8.2 as a thoughtful migration path) —
+  **deleted**: zero callers in the codebase, no production path depends on
+  it. If a future caller needs deterministic UUIDs from a product id, the
+  helper is a 3-liner; re-introduce it with explicit wiring at that time.
+
+### Changed (BEHAVIOR — read carefully)
+- **`fluid generate standard` defaults reordered: Bitol ODPS v1.0.0 is now
+  the center-stage `--format odps`.** Previously `--format odps` routed to
+  the LF/ODPI v4.1 emitter (which itself silently fell back to a
+  5-field degenerate placeholder because the underlying `cli.opds.run`
+  symbol didn't exist). The fix:
+  - `--format odps` → emits **Bitol Open Data Product Standard v1.0.0**
+    (bare product YAML via `BitolOdpsProvider().render()`).
+  - `--format odps-bitol` → explicit alias of `--format odps` (kept for
+    callers that want disambiguation in CI logs).
+  - `--format odps-v4.1` (NEW) → emits **LF/ODPI Open Data Product
+    Specification v4.1** (bare JSON via `OdpsProvider().render()` with
+    the `artifacts:` wrapper unwrapped).
+  - `--format opds` → deprecated letter-swap alias of `--format odps-v4.1`
+    (NOT `--format odps`) — emits a WARNING + the LF/ODPI v4.1 JSON.
+    Reasoning: in this codebase `--format opds` has always *meant* the
+    LF/ODPI export (the historical default of that flag), so back-compat
+    callers keep getting the spec they actually consume.
+  - `fluid export-opds` → also fixed; now emits a real LF/ODPI v4.1 JSON
+    (was: same degenerate fallback). Logs a DEPRECATION warning pointing at
+    `fluid generate standard --format odps-v4.1`.
+  - All previously-emitted degenerate shapes (`{specVersion: "4.1", id,
+    name, domain, owner}` and `{specVersion: "1.0", id, title, owner,
+    domain, exposes[]}`) are GONE — every path now produces a real spec
+    doc.
+- **`fluid generate standard --list` output reordered Bitol-first**
+  (`odps` → `odps-bitol` → `odcs` → `odps-v4.1` → `opds`). The README
+  "Which ODPS?" section, AGENTS.md pipeline row, and the rich help
+  formatter table are all reordered to lead with Bitol.
+
+### Changed
+- **ODPS / OPDS naming alignment with upstream specifications.** Resolved a
+  long-standing letter-swap that treated the canonical acronym **ODPS**
+  (Open Data Product Specification — Linux Foundation / ODPI v4.1) and the
+  letter-swap **OPDS** as if they were separate standards in user-facing
+  help text and emit-set listings. Two distinct standards do share the
+  ODPS acronym (Bitol's *Standard* v1.0.0 and the LF *Specification* v4.1)
+  and both are now disambiguated by full name everywhere the names appear.
+  - `fluid odps` is the canonical subcommand; `fluid opds` remains as a
+    documented deprecated alias.
+  - `--spec odps-4.1` is the canonical id for the LF/ODPI spec;
+    `--spec odpi-4.1` (which swapped the *spec* name for the *org* name) is
+    accepted with a WARNING that points at the correct id.
+  - `--format opds`, `--emit opds`, and the `OPDS_*` env vars
+    (`OPDS_VERSION`, `OPDS_INCLUDE_BUILD_INFO`, `OPDS_INCLUDE_EXECUTION_DETAILS`,
+    `OPDS_TARGET_PLATFORM`, `OPDS_VALIDATE_OUTPUT`) are accepted with a
+    one-time WARNING that names the canonical ODPS form.
+  - `pyproject.toml`: added `[odps]` extra as the canonical name; `[opds]`
+    is kept as a back-compat empty alias that depends on `[odps]`. The
+    `[all]` umbrella now references `[odps]`.
+  - Internals: `SPEC_ODPS_4_1` / `ODPS_4_1_*_URL` are the canonical names
+    in `fluid_build.cli.opds`; `SPEC_ODPI_4_1` / `ODPI_4_1_*_URL` remain
+    as module-level back-compat aliases.
+  - The `OdpsProvider.name` property and the deterministic UUID namespace
+    string (`"fluid-forge-opds"`) are intentionally **unchanged** to
+    preserve wire-format keys and deterministic IDs across releases.
+  - Test coverage: every existing OPDS test (`tests/test_opds_*`,
+    `tests/test_contract_compatibility_matrix.py`,
+    `tests/forge/test_artifact_fanout.py`,
+    `tests/test_pipeline_templates_branches.py`,
+    `tests/test_forge_seed_import_matrix.py`,
+    `tests/test_forge_copilot_seed.py`,
+    `tests/cli/test_subcommand_dispatch_smoke.py`) re-runs green after the
+    rename + back-compat aliases.
+
 ### Added
 - **Bitol ODPS v1.0.0 — bidirectional provider** (`BitolOdpsProvider`,
   registered as `odps_bitol`; back-compat alias `odps-standard`).
