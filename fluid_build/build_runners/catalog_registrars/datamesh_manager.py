@@ -58,6 +58,13 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
     api_url: Optional[str] = None
     api_token: Optional[str] = None
     timeout_seconds: int = 30
+    # When True, POST ``/api/access/{id}/approve`` after PUTting each
+    # access agreement. DMM only renders lineage from APPROVED agreements
+    # — without this, product-to-product edges stay in 'pending' status
+    # and the UI lineage graph is empty for any product with consumes[].
+    # Defaults False (production safe); sandboxes opt in via
+    # ``DMM_AUTO_APPROVE_ACCESS=true``.
+    auto_approve_access: bool = False
 
     def __post_init__(self) -> None:
         # Late env-var fallback so env state at register-time wins.
@@ -65,6 +72,11 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             self.api_url or os.environ.get("DMM_API_URL") or "https://api.datamesh-manager.com"
         )
         self.api_token = self.api_token or os.environ.get("DMM_API_KEY")
+        # Env-var fallback for auto-approve. Explicit constructor value wins;
+        # the env var only fires when not set (i.e. default False).
+        if not self.auto_approve_access:
+            env_value = os.environ.get("DMM_AUTO_APPROVE_ACCESS", "").strip().lower()
+            self.auto_approve_access = env_value in {"1", "true", "yes", "on"}
 
     # ── Canonical entry point ─────────────────────────────────────────
 
@@ -121,6 +133,15 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         access_urns: List[str] = []
         source_system_urns: List[str] = []
         try:
+            # Upsert the owner team FIRST — DMM rejects datacontracts whose
+            # ``info.owner`` references a team-id that doesn't exist with a
+            # 422. The native ``fluid dmm publish`` path auto-creates teams
+            # before publishing; this registrar (Surface B / catalog-target)
+            # path was missing the same step, causing all team-referencing
+            # publishes via ``fluid publish --target datamesh-manager`` to
+            # fail. Non-fatal — a team upsert failure logs WARNING and the
+            # downstream PUT will surface the real error.
+            self._ensure_owner_team(payload)
             for sys_urn in self._ensure_source_systems(payload):
                 source_system_urns.append(sys_urn)
             for asset in payload.assets:
@@ -129,7 +150,29 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                 self._put_data_contract(contract_id, asset)
                 contract_urns.append(contract_urn)
             self._put_data_product(payload)
+            # Pre-flight: enumerate existing DMM DataProduct IDs so we can
+            # SKIP access-agreement PUTs whose upstream product doesn't
+            # exist yet (DMM otherwise returns a generic ``404`` mid-publish
+            # that's hard to read in a CI log). Mirrors the native
+            # provider's Gap-9 pre-flight check in
+            # ``providers/datamesh_manager/_publish_flow.py``.
+            existing_pids = self._existing_product_ids()
             for agreement in self._build_access_agreements(payload):
+                upstream = (agreement.get("provider") or {}).get("dataProductId")
+                if existing_pids and upstream and str(upstream) not in existing_pids:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "Skipping Access agreement %s: upstream product '%s' "
+                        "is not published in DMM yet. Publish it first or "
+                        "remove the consume from the contract.",
+                        agreement["id"],
+                        upstream,
+                    )
+                    access_urns.append(
+                        f"dmm://access/{agreement['id']}?skipped=missing_upstream"
+                    )
+                    continue
                 self._put_access_agreement(agreement)
                 access_urns.append(f"dmm://access/{agreement['id']}")
         except Exception as exc:  # noqa: BLE001 — both HTTP + transport errors
@@ -520,6 +563,116 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                     parts.append("0")
                 port["version"] = ".".join(parts[:3])
 
+    # ── Pre-flight: enumerate existing DMM products ──────────────────
+
+    def _existing_product_ids(self) -> set[str]:
+        """Return the set of DataProduct IDs currently in the DMM tenant.
+
+        Best-effort: a failed GET returns an empty set (which disables the
+        pre-flight skip — the access PUT then proceeds blindly, matching
+        the pre-2026-05 behavior). Lifted out so the access-agreement
+        loop in ``register_payload`` can skip PUTs whose upstream product
+        doesn't exist without inflicting a noisy 404 on the operator's
+        publish log.
+        """
+        from fluid_build.util.safe_http import safe_httpx_client
+
+        try:
+            with safe_httpx_client(
+                base_url=self.api_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
+                r = c.get("/api/dataproducts", headers=self._headers())
+                if r.status_code != 200:
+                    return set()
+                data = r.json()
+                if not isinstance(data, list):
+                    return set()
+                return {str(p.get("id")) for p in data if isinstance(p, dict) and p.get("id")}
+        except Exception:  # noqa: BLE001 — best effort; disable pre-flight on failure
+            return set()
+
+    # ── Owner team upsert ────────────────────────────────────────────
+    #
+    # DMM requires the data-contract's ``info.owner`` (and the data
+    # product's ``team.name``) to reference an EXISTING team id. The
+    # native ``fluid dmm publish`` path auto-creates teams before
+    # publish; this registrar previously skipped that step, so every
+    # contract referencing a non-existing team failed publish with
+    # ``422 owner '<team-id>' is not a known team ID``. We mirror the
+    # native path: PUT /api/teams/{id} upsert, idempotent.
+
+    def _ensure_owner_team(self, payload: "CatalogPublicationPayload") -> None:
+        """Upsert the owner team referenced by the contract.
+
+        Payload shape mirrors the native provider's
+        ``_build_team_payload`` (notably ``type: "Data Product Team"`` —
+        DMM rejects the PUT with ``400 Failed to read request`` without
+        it). Non-fatal: if the upsert fails (HTTP error, missing perms,
+        etc.) we log WARNING and let the downstream contract PUT surface
+        the real cause. DMM tolerates re-PUT of an existing team.
+        """
+        owner = payload.product.owner if payload.product else None
+        team_id = (owner.team if owner else None) or "unknown"
+        if not team_id or team_id == "unknown":
+            return
+        # GET first — if it already exists, skip the PUT (avoids 4xx noise
+        # and matches native provider's behavior).
+        from fluid_build.util.safe_http import safe_httpx_client
+
+        try:
+            with safe_httpx_client(
+                base_url=self.api_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
+                head = c.get(f"/api/teams/{team_id}", headers=self._headers())
+                if head.status_code == 200:
+                    return
+        except Exception:  # noqa: BLE001 — best-effort GET; proceed to PUT regardless
+            pass
+
+        # Construct the canonical Bitol team payload. ``type`` is REQUIRED
+        # — without it DMM returns 400 "Failed to read request" because
+        # the deserializer can't pick a TeamType.
+        team_body: Dict[str, Any] = {
+            "id": team_id,
+            "name": team_id.replace("-", " ").replace("_", " ").title(),
+            "type": "Data Product Team",
+            "description": (
+                "Auto-created by forge-cli on first publish referencing "
+                "this team."
+            ),
+        }
+        try:
+            with safe_httpx_client(
+                base_url=self.api_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
+                r = c.put(
+                    f"/api/teams/{team_id}",
+                    json=team_body,
+                    headers=self._headers(),
+                )
+                if r.status_code >= 400:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "DMM PUT /teams/%s returned %s — downstream contract "
+                        "publish will fail if team doesn't exist. Body: %s",
+                        team_id,
+                        r.status_code,
+                        (r.text or "")[:200],
+                    )
+        except Exception as exc:  # noqa: BLE001 — non-fatal upsert
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Team upsert /teams/%s failed (non-fatal): %s", team_id, exc
+            )
+
     # ── Source systems — SDP build-source lineage in DMM ─────────────
     #
     # Source-aligned data products (SDPs) declare their ingestion source
@@ -708,8 +861,9 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         ``_render_dmm_data_product_body``).
 
         Agreement id is deterministic
-        (``{consumer}__consumes__{provider}__{output_port}``) so a
-        re-publish upserts cleanly rather than minting duplicates.
+        (``{consumer}__uses__{provider}__{output_port}``, matching the
+        native provider's slug) so a re-publish upserts cleanly rather
+        than minting duplicates.
         """
         from datetime import datetime, timezone
 
@@ -760,7 +914,14 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
 
     def _put_access_agreement(self, agreement: Dict[str, Any]) -> None:
         """``PUT /api/access/{id}`` for one agreement. Idempotent —
-        same body re-PUT just refreshes the resource."""
+        same body re-PUT just refreshes the resource.
+
+        When ``self.auto_approve_access`` is True (or
+        ``DMM_AUTO_APPROVE_ACCESS=true`` in env), follows the PUT with a
+        ``POST /api/access/{id}/approve`` so DMM's lineage graph renders
+        the edge immediately. Without approval the edge stays 'pending'
+        and the UI shows the product as having no upstreams.
+        """
         from fluid_build.util.safe_http import safe_httpx_client
 
         with safe_httpx_client(
@@ -779,6 +940,26 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                     f"{r.status_code}: " + (r.text or "")[:512]
                 )
 
+            if self.auto_approve_access:
+                approve_r = c.post(
+                    f"/api/access/{agreement['id']}/approve",
+                    headers=self._headers(),
+                )
+                if approve_r.status_code >= 400:
+                    # Approve is best-effort — DMM may return 4xx if the
+                    # agreement is already approved or in a non-pending
+                    # state. Log but don't fail the publish.
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "DMM POST /access/%s/approve returned %s — agreement "
+                        "remains in whatever state DMM returned (likely "
+                        "already-approved). Body: %s",
+                        agreement["id"],
+                        approve_r.status_code,
+                        (approve_r.text or "")[:200],
+                    )
+
 
 # Access-agreement ids must be URL-safe (DMM routes by id). Slug rule
 # matches the legacy provider's: alphanumeric + dot/dash/underscore.
@@ -786,7 +967,15 @@ _ACCESS_ID_UNSAFE = __import__("re").compile(r"[^A-Za-z0-9._-]")
 
 
 def _slug_access_id(consumer: str, provider: str, output_port: str) -> str:
-    raw = f"{consumer}__consumes__{provider}__{output_port}"
+    # The slug uses ``__uses__`` to match the native provider's
+    # ``_access_agreement_id`` format (see
+    # ``providers/datamesh_manager/_publish_flow.py``). Previously the
+    # registrar slugged with ``__consumes__`` — different access IDs in
+    # DMM for the same conceptual edge, so a contract re-published through
+    # the registrar would create a parallel access record next to the
+    # native provider's existing one, and DMM could end up with two
+    # competing approval states for one upstream→downstream lineage edge.
+    raw = f"{consumer}__uses__{provider}__{output_port}"
     return _ACCESS_ID_UNSAFE.sub("_", raw).strip("_")
 
 

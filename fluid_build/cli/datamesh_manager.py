@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 
 from fluid_build.cli.console import cprint, success
 from fluid_build.cli.console import error as console_error
@@ -103,9 +104,23 @@ def add_parser(subparsers):
     pub.add_argument(
         "--auto-approve-access",
         action="store_true",
+        default=None,  # sentinel — let env var DMM_AUTO_APPROVE_ACCESS take effect
         help=(
-            "Automatically approve Entropy Access agreements generated from consumes[]. "
-            "Use only for local sandboxes; production workflows should review Access separately."
+            "Auto-approve product-to-product Access agreements generated from "
+            "consumes[]. WITHOUT this flag, DMM creates the agreements in "
+            "'pending' status and the lineage graph in the UI stays empty "
+            "until you approve them manually. Equivalent to setting "
+            "DMM_AUTO_APPROVE_ACCESS=true. Recommended for local sandboxes / "
+            "lab demos; production should leave pending for human review."
+        ),
+    )
+    pub.add_argument(
+        "--no-auto-approve-access",
+        dest="auto_approve_access",
+        action="store_false",
+        help=(
+            "Force pending Access agreements (no auto-approve) even when "
+            "DMM_AUTO_APPROVE_ACCESS=true in env. Use to override a sandbox-wide default."
         ),
     )
     pub.add_argument(
@@ -177,6 +192,50 @@ def add_parser(subparsers):
         help="Output format (default: table)",
     )
     tm.set_defaults(func=_cmd_teams)
+
+    # --- wipe --------------------------------------------------------------
+    wp = dmm_sub.add_parser(
+        "wipe",
+        help="Delete EVERY DataProduct in the tenant (multi-pass FK-aware)",
+    )
+    wp.add_argument("--api-key", help="Entropy Data API key")
+    wp.add_argument("--api-url", help="API base URL")
+    wp.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    wp.add_argument(
+        "--max-passes",
+        type=int,
+        default=8,
+        help="Max delete passes before giving up on residual FK locks (default: 8)",
+    )
+    wp.set_defaults(func=_cmd_wipe)
+
+    # --- list-contracts ----------------------------------------------------
+    lc = dmm_sub.add_parser("list-contracts", help="List all data contracts")
+    lc.add_argument("--api-key", help="Entropy Data API key")
+    lc.add_argument("--api-url", help="API base URL")
+    lc.add_argument(
+        "--format",
+        "-f",
+        choices=["table", "json"],
+        default="table",
+        help="Output format (default: table)",
+    )
+    lc.set_defaults(func=_cmd_list_contracts)
+
+    # --- get-contract ------------------------------------------------------
+    gc = dmm_sub.add_parser("get-contract", help="Get a data contract by ID")
+    gc.add_argument("contract_id", help="Data contract ID")
+    gc.add_argument("--api-key", help="Entropy Data API key")
+    gc.add_argument("--api-url", help="API base URL")
+    gc.set_defaults(func=_cmd_get_contract)
+
+    # --- delete-contract ---------------------------------------------------
+    dc = dmm_sub.add_parser("delete-contract", help="Delete a data contract by ID")
+    dc.add_argument("contract_id", help="Data contract ID")
+    dc.add_argument("--api-key", help="Entropy Data API key")
+    dc.add_argument("--api-url", help="API base URL")
+    dc.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    dc.set_defaults(func=_cmd_delete_contract)
 
     return parser
 
@@ -353,6 +412,40 @@ def _print_publish_result(result):
                 lines.append(f"[red]Validation:[/red] {odcs['validation_error']}")
             if not odcs.get("success") and odcs.get("error"):
                 lines.append(f"[red]Error:[/red] {odcs['error']}")
+        # Access agreements (product-to-product lineage). Surface count +
+        # approval state, and if any are pending point the operator at the
+        # flag — DMM only renders lineage from APPROVED agreements, so a
+        # silent "pending" pile is the most common cause of an empty
+        # lineage graph in the UI.
+        access = result.get("access_agreements") or []
+        if access:
+            ok = sum(1 for a in access if a.get("success"))
+            approved = sum(1 for a in access if a.get("auto_approved"))
+            pending = ok - approved
+            lines.append("")
+            if approved == ok:
+                lines.append(
+                    f"[green]🔗 Lineage:[/green] {approved}/{ok} Access agreements "
+                    f"auto-approved (lineage will render in DMM UI)"
+                )
+            elif pending > 0:
+                lines.append(
+                    f"[yellow]🔗 Lineage:[/yellow] {ok} Access agreement(s) created "
+                    f"({approved} approved, [bold]{pending} pending[/bold])"
+                )
+                lines.append(
+                    "[yellow]   ↳ DMM only renders lineage from APPROVED agreements.[/yellow]"
+                )
+                lines.append(
+                    "[yellow]     Re-publish with [bold]--auto-approve-access[/bold] "
+                    "(or [bold]DMM_AUTO_APPROVE_ACCESS=true[/bold]) to render lineage now.[/yellow]"
+                )
+            for ag in access:
+                if not ag.get("success"):
+                    aid = ag.get("access_id", "?")
+                    lines.append(f"[red]❌ Access:[/red] {aid}")
+                    if ag.get("error"):
+                        lines.append(f"[red]Error:[/red] {ag['error']}")
         console.print(Panel("\n".join(lines), title="Data Mesh Manager", border_style="green"))
     else:
         success(f"Published data product: {product_id}")
@@ -380,7 +473,12 @@ def _cmd_list(args, logger=None):
         fmt = getattr(args, "format", "table")
 
         if fmt == "json":
-            cprint(json.dumps(products, indent=2))
+            # Bypass Rich console entirely — its line-wrapping injects literal
+            # newlines into JSON string values which breaks ``json.loads`` for
+            # callers piping the output. Write directly to stdout.
+            sys.stdout.write(json.dumps(products, indent=2))
+            sys.stdout.write("\n")
+            sys.stdout.flush()
             return 0
 
         if RICH_AVAILABLE:
@@ -430,6 +528,27 @@ def _cmd_get(args, logger=None):
         return 1
 
 
+def _find_consumers(provider: DataMeshManagerProvider, product_id: str) -> list[str]:
+    """Return product IDs whose ``consumes[].productId`` references ``product_id``.
+
+    Used to enrich the ``422 Cannot delete because data product is in use``
+    error with the list of products holding the FK lock.
+    """
+    consumers: list[str] = []
+    try:
+        for prod in provider.list_products():
+            for ip in prod.get("inputPorts") or []:
+                cid = ip.get("contractId") or ""
+                if cid == product_id or cid.startswith(f"{product_id}."):
+                    pid = prod.get("id")
+                    if pid and pid not in consumers:
+                        consumers.append(pid)
+                        break
+    except Exception:  # noqa: BLE001 — best-effort enrichment, never raises
+        pass
+    return consumers
+
+
 def _cmd_delete(args, logger=None):
     """Delete a data product."""
     try:
@@ -440,13 +559,95 @@ def _cmd_delete(args, logger=None):
                 return 0
 
         provider = _make_provider(args)
-        ok = provider.delete(args.product_id)
+        try:
+            ok = provider.delete(args.product_id)
+        except ProviderError as exc:
+            # On DMM's 422 "in use" FK lock, enrich with the consumer list so
+            # the operator knows what to delete first (or use --cascade).
+            msg = str(exc)
+            if "in use" in msg or "422" in msg:
+                consumers = _find_consumers(provider, args.product_id)
+                if consumers:
+                    console_error(
+                        f"Cannot delete '{args.product_id}' — referenced by:\n  "
+                        + "\n  ".join(f"- {c}" for c in consumers)
+                        + "\nDelete the consumers first or use `fluid dmm wipe --cascade`."
+                    )
+                    return 1
+            raise
+
         if ok:
             cprint(f"Deleted: {args.product_id}")
         else:
             console_error(f"Failed to delete: {args.product_id}")
             return 1
         return 0
+    except ProviderError as exc:
+        console_error(f"Error: {exc}")
+        return 1
+
+
+def _cmd_wipe(args, logger=None):
+    """Mass-delete every DataProduct in the tenant.
+
+    Multi-pass: DMM rejects deletes of products that are referenced by other
+    products' ``consumes[]``. Successive passes drain consumer→producer.
+    """
+    try:
+        if not getattr(args, "yes", False):
+            confirm = input(
+                "Delete EVERY DataProduct in this DMM tenant? This cannot be undone. [y/N] "
+            )
+            if confirm.lower() not in ("y", "yes"):
+                cprint("Cancelled.")
+                return 0
+
+        provider = _make_provider(args)
+        products = provider.list_products()
+        if not products:
+            cprint("(tenant already empty)")
+            return 0
+
+        cprint(f"Wiping {len(products)} DataProduct(s) from {provider.api_url} ...")
+        remaining = list(products)
+        deleted = 0
+        max_passes = max(1, int(getattr(args, "max_passes", 0)) or 8)
+        for attempt in range(1, max_passes + 1):
+            if not remaining:
+                break
+            cprint(f"  -- pass {attempt}: {len(remaining)} remaining --")
+            next_round = []
+            progress = 0
+            for prod in remaining:
+                pid = prod.get("id")
+                if not pid:
+                    continue
+                try:
+                    provider.delete(pid)
+                    cprint(f"    ✓ {pid}")
+                    deleted += 1
+                    progress += 1
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc)
+                    if "in use" in msg or "422" in msg:
+                        next_round.append(prod)
+                    else:
+                        console_error(f"    ✗ {pid}: {msg[:200]}")
+            if progress == 0 and next_round:
+                cprint(f"  ! no progress; {len(next_round)} still in use after pass {attempt}")
+                for prod in next_round:
+                    pid = prod.get("id", "?")
+                    consumers = _find_consumers(provider, pid)
+                    if consumers:
+                        cprint(f"    ✗ {pid} blocked by: {', '.join(consumers)}")
+                    else:
+                        cprint(f"    ✗ {pid}: in use (DMM rejects delete; no visible consumer)")
+                break
+            remaining = next_round
+
+        final = len(provider.list_products())
+        cprint(f"Done: {deleted} deleted, {final} remain.")
+        return 0 if final == 0 else 1
     except ProviderError as exc:
         console_error(f"Error: {exc}")
         return 1
@@ -524,3 +725,90 @@ def _print_dry_run(result):
             cprint(f"URL:    {odcs.get('url', '?')}")
             cprint()
             cprint(json.dumps(odcs.get("payload", {}), indent=2))
+
+
+# ---------------------------------------------------------------------------
+# DataContract commands (gap 6 — parity with DataProduct surface)
+# ---------------------------------------------------------------------------
+
+
+def _list_contracts(provider: DataMeshManagerProvider) -> list[dict]:
+    """List all data contracts in the tenant via the REST API."""
+    resp = provider._request("GET", "/api/datacontracts")
+    data = resp.json() if callable(getattr(resp, "json", None)) else resp
+    return data if isinstance(data, list) else []
+
+
+def _cmd_list_contracts(args, logger=None):
+    """List all data contracts."""
+    try:
+        provider = _make_provider(args)
+        contracts = _list_contracts(provider)
+        fmt = getattr(args, "format", "table")
+
+        if fmt == "json":
+            sys.stdout.write(json.dumps(contracts, indent=2))
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return 0
+
+        if RICH_AVAILABLE:
+            console = Console()
+            table = Table(title="Entropy Data — Data Contracts")
+            table.add_column("ID", style="cyan")
+            table.add_column("Name", style="bold")
+            table.add_column("API Version")
+            table.add_column("Status")
+            for c in contracts:
+                table.add_row(
+                    str(c.get("id", "?")),
+                    str(
+                        c.get("info", {}).get("title")
+                        if isinstance(c.get("info"), dict)
+                        else c.get("name", "?")
+                    ),
+                    str(c.get("apiVersion", "?")),
+                    str(c.get("status", "?")),
+                )
+            console.print(table)
+            console.print(f"\n[dim]Total: {len(contracts)} contract(s)[/dim]")
+        else:
+            for c in contracts:
+                cprint(f"  {c.get('id', '?')}")
+            cprint(f"\nTotal: {len(contracts)} contract(s)")
+        return 0
+    except ProviderError as exc:
+        console_error(f"Error: {exc}")
+        return 1
+
+
+def _cmd_get_contract(args, logger=None):
+    """Get a data contract by ID."""
+    try:
+        provider = _make_provider(args)
+        resp = provider._request("GET", f"/api/datacontracts/{args.contract_id}")
+        data = resp.json() if callable(getattr(resp, "json", None)) else resp
+        sys.stdout.write(json.dumps(data, indent=2, default=str))
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        return 0
+    except ProviderError as exc:
+        console_error(f"Error: {exc}")
+        return 1
+
+
+def _cmd_delete_contract(args, logger=None):
+    """Delete a data contract by ID."""
+    try:
+        if not getattr(args, "yes", False):
+            confirm = input(f"Delete data contract '{args.contract_id}'? [y/N] ")
+            if confirm.lower() not in ("y", "yes"):
+                cprint("Cancelled.")
+                return 0
+        provider = _make_provider(args)
+        provider._request("DELETE", f"/api/datacontracts/{args.contract_id}")
+        cprint(f"Deleted contract: {args.contract_id}")
+        return 0
+    except ProviderError as exc:
+        console_error(f"Error: {exc}")
+        return 1

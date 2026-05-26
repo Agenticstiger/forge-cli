@@ -693,7 +693,11 @@ class TestGoogleCloudAdditional:
             MagicMock(returncode=1),  # print-access-token – fails
         ]
         provider = GoogleCloudAuthProvider({}, LOG)
-        result = _run(provider.check_auth())
+        # Disable google.auth SDK fast-path so the test doesn't pick up the
+        # developer's real Application Default Credentials (the previous
+        # behavior leaked the live ``fluidtesting`` project into the assert).
+        with patch.object(provider, "_has_sdk", return_value=False):
+            result = _run(provider.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
     @patch.object(GoogleCloudAuthProvider, "_run_command")
@@ -704,7 +708,10 @@ class TestGoogleCloudAdditional:
             subprocess.CalledProcessError(1, "gcloud"),
         ]
         provider = GoogleCloudAuthProvider({}, LOG)
-        result = _run(provider.check_auth())
+        # Disable google.auth SDK fast-path so the test doesn't pick up the
+        # developer's real Application Default Credentials.
+        with patch.object(provider, "_has_sdk", return_value=False):
+            result = _run(provider.check_auth())
         assert result.status == AuthStatus.NOT_AUTHENTICATED
 
     @patch.object(GoogleCloudAuthProvider, "_run_command")

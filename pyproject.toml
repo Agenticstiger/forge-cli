@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Agentics Transformation Pty Ltd" }]
-keywords = ["data products", "FLUID", "opds", "gitops", "gcp", "snowflake", "duckdb", "composer", "dbt", "dataform"]
+keywords = ["data products", "FLUID", "odps", "odcs", "gitops", "gcp", "snowflake", "duckdb", "composer", "dbt", "dataform"]
 
 # Optional but useful for PyPI/pipx users and internal catalogs
 classifiers = [
@@ -178,9 +178,19 @@ viz = [
   "graphviz>=0.20",
 ]
 
-# OPDS export (spec conversion)
-opds = [
+# ODPS / OPDS export (spec conversion). Two distinct standards both
+# abbreviated ODPS: Bitol Open Data Product Standard v1.0.0 and the LF/ODPI
+# Open Data Product Specification v4.1. Both are covered by this extra.
+odps = [
   "ruamel.yaml>=0.18",
+]
+
+# Back-compat alias — earlier docs / install scripts used ``[opds]`` for the
+# letter-swap of ODPS. Kept as an empty alias that depends on ``[odps]`` so
+# existing ``pip install "data-product-forge[opds]"`` invocations keep
+# working through the rename.
+opds = [
+  "data-product-forge[odps]",
 ]
 
 # Optional TUI extras
@@ -308,7 +318,7 @@ test-emulators-heavy = [
 
 # One-shot install for contributors
 all = [
-  "data-product-forge[local,aws,gcp,snowflake,viz,opds,tui,copilot,vector,postgres,docs,dev]"
+  "data-product-forge[local,aws,gcp,snowflake,viz,odps,tui,copilot,vector,postgres,docs,dev]"
 ]
 
 [project.scripts]

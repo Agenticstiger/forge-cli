@@ -49,9 +49,40 @@ from fluid_build.util.contract import consumes_to_canonical_ports, kind_to_dmm_t
 LOG = logging.getLogger("fluid.providers.datamesh_manager.odps")
 
 
+# One-shot tracking of legacy ``"opds"`` spec strings seen on the wire from
+# the DMM upstream. We only WARN once per process so audit aggregators can
+# count occurrences without flooding the log; this lets us measure how
+# quickly upstream callers migrate off the letter-swap.
+_LEGACY_OPDS_SPEC_WARNED = False
+
+
 def is_odps_spec(value: Optional[str]) -> bool:
-    """True when ``value`` names ODPS-Bitol (or its ``opds`` legacy alias)."""
+    """True when ``value`` names ODPS (canonical) or its ``opds`` legacy alias.
+
+    The DMM upstream historically sent both ``"odps"`` and ``"opds"`` for
+    the same Bitol ODPS v1.0.0 shape — this helper accepts both as part of
+    the **downstream protocol contract** with DMM. We cannot tighten to
+    canonical-only without coordinating an upstream change.
+
+    The first ``"opds"`` sighting per process emits a WARNING (via
+    ``"opds_legacy_spec_string"``) so audit aggregators can track upstream
+    migration off the letter-swap.
+    """
+    global _LEGACY_OPDS_SPEC_WARNED
     spec = str(value or "").strip().lower()
+    if spec == "opds" and not _LEGACY_OPDS_SPEC_WARNED:
+        LOG.warning(
+            "opds_legacy_spec_string",
+            extra={
+                "canonical": "odps",
+                "note": (
+                    "DMM upstream sent the legacy letter-swap spec id 'opds'; "
+                    "accepting for back-compat. Track this event to gauge "
+                    "upstream migration off the letter-swap."
+                ),
+            },
+        )
+        _LEGACY_OPDS_SPEC_WARNED = True
     return spec in {"odps", "opds"}
 
 
@@ -143,33 +174,57 @@ def remove_odps_product_consume_input_ports(
 ) -> None:
     """Remove product-to-product consumes from ODPS input ports.
 
-    Entropy's graph uses Access resources for product-to-product
-    lineage. If we keep product consumes as ODPS input ports, those
-    upstream products have to be mirrored as SourceSystems and the
-    UI renders duplicate graph nodes. Explicit source-system
-    consumes remain as input ports.
+    Entropy's graph uses Access resources for product-to-product lineage.
+    If we keep product consumes as ODPS input ports, those upstream
+    products have to be mirrored as SourceSystems and the UI renders
+    duplicate graph nodes. Explicit source-system consumes remain as input
+    ports.
+
+    Matching strategy: we identify product-consume ports by **both**
+    ``(id, name)`` (the canonical exposeId — matches the inputPort before
+    the dedup-rename in :func:`fluid_build.providers.odps_standard.mappers
+    .ports.map_input_ports`) **and** ``contractId == upstream productId``
+    (which survives the dedup-rename intact). The dedup-rename happens
+    when two consumes share an exposeId — the second gets a productId-tail
+    prefix on its name but the contractId points at the original upstream
+    productId. Without the contractId check, dedup-renamed ports leak
+    through as inputPorts on gold products that consume two ports from
+    the same silver upstream.
     """
     input_ports = odps_payload.get("inputPorts")
     if not isinstance(input_ports, list) or not input_ports:
         return
 
     product_port_names: set[str] = set()
+    product_contract_ids: set[str] = set()
     for canonical in consumes_to_canonical_ports(fluid, logger=LOG):
-        if not canonical.get("reference") or canonical.get("source_system_id"):
+        reference = canonical.get("reference")
+        if not reference or canonical.get("source_system_id"):
             continue
         for key in ("id", "name"):
             value = canonical.get(key)
             if value:
                 product_port_names.add(str(value))
+        product_contract_ids.add(str(reference))
 
-    if not product_port_names:
+    if not product_port_names and not product_contract_ids:
         return
 
-    retained = [
-        port
-        for port in input_ports
-        if not (isinstance(port, Mapping) and str(port.get("name", "")) in product_port_names)
-    ]
+    def _is_product_consume(port: Any) -> bool:
+        if not isinstance(port, Mapping):
+            return False
+        if str(port.get("name", "")) in product_port_names:
+            return True
+        contract_id = str(port.get("contractId", ""))
+        # contractId equals the upstream productId for product-to-product
+        # consumes (set by the bitol mapper). May also be the per-port form
+        # ``{productId}.{exposeId}`` — strip the suffix and recheck.
+        if contract_id in product_contract_ids:
+            return True
+        head = contract_id.rsplit(".", 1)[0] if "." in contract_id else contract_id
+        return head in product_contract_ids
+
+    retained = [port for port in input_ports if not _is_product_consume(port)]
     if retained:
         odps_payload["inputPorts"] = retained
     else:

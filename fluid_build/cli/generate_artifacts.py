@@ -15,10 +15,11 @@
 """``fluid generate artifacts`` — pipeline stage 3.
 
 Fanout wrapper that takes a stage-1 bundle (.tgz) and emits catalog-ready
-artifacts (ODPS, ODCS, OPDS, schedule DAGs, policy bindings) into a
-single directory with a unified MANIFEST.json. Delegates all emission
-to existing per-format commands; orchestration lives in
-``fluid_build.forge.core.artifact_fanout``.
+artifacts (ODCS, ODPS-Bitol, ODPS v4.1 LF/ODPI, schedule DAGs, policy
+bindings) into a single directory with a unified MANIFEST.json. The legacy
+``opds`` emit key is a deprecated letter-swap alias of ``odps`` (same
+target spec). Delegates all emission to existing per-format commands;
+orchestration lives in ``fluid_build.forge.core.artifact_fanout``.
 
 Registered as a subcommand of ``fluid generate``:
 
@@ -40,12 +41,13 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
     """Register as a subcommand of ``fluid generate``."""
     p = subparsers.add_parser(
         "artifacts",
-        help="Fanout bundle → catalog artifacts (ODPS, ODCS, OPDS, schedule, policies)",
+        help="Fanout bundle → catalog artifacts (ODCS, ODPS LF/ODPI, ODPS-Bitol, schedule, policies)",
         description=(
             "Stage-3 of the 11-stage pipeline. Reads a Phase-2 bundle and emits "
-            "ODPS v4.1, ODPS-Bitol, ODCS per-port, OPDS, schedule DAGs, and "
+            "ODCS per-port, ODPS-Bitol, ODPS v4.1 (LF/ODPI), schedule DAGs, and "
             "compiled policy bindings into <out>/, with a unified MANIFEST.json "
-            "hashed over every emitted file."
+            "hashed over every emitted file. The legacy ``opds`` emit key is a "
+            "deprecated letter-swap alias of ``odps``."
         ),
         epilog=(
             "Examples:\n"
@@ -75,10 +77,11 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
         "--emit",
         default=None,
         help=(
-            "Comma-separated emit selector. Valid: odps, odps-bitol, odcs, opds, "
-            "schedule, policies. Default: all six. ``dbt`` is NOT a valid emit key "
-            "— dbt projects are execution artifacts (see `fluid generate "
-            "speed-transformation`)."
+            "Comma-separated emit selector. Valid: odps, odps-bitol, odcs, schedule, "
+            "policies. ``opds`` is also accepted as a deprecated letter-swap alias "
+            "of ``odps`` (same LF/ODPI ODPS v4.1 target). Default: all six. ``dbt`` "
+            "is NOT a valid emit key — dbt projects are execution artifacts (see "
+            "`fluid generate speed-transformation`)."
         ),
     )
     p.add_argument(

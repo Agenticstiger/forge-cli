@@ -1435,9 +1435,10 @@ async def generate_artifacts(
     """Run ``fluid generate artifacts`` in-process.
 
     Stage-3 of the 11-stage pipeline. Reads a Phase-2 bundle (.tgz) or
-    a raw resolved contract (.yaml) and emits ODPS v4.1, ODPS-Bitol,
-    ODCS per-port, OPDS, schedule DAGs, and compiled policy bindings
-    into the output directory with a unified ``MANIFEST.json``.
+    a raw resolved contract (.yaml) and emits ODCS per-port, ODPS-Bitol,
+    ODPS v4.1 (LF/ODPI), schedule DAGs, and compiled policy bindings into
+    the output directory with a unified ``MANIFEST.json``. (``opds`` is
+    accepted as a deprecated letter-swap alias of ``odps``.)
     """
     from fluid_build.cli import generate_artifacts as _gen_artifacts
 

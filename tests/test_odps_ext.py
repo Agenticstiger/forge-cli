@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from fluid_build.cli.opds import (
+from fluid_build.cli.odps import (
     DEFAULT_VERSION,
     ODPS_VERSIONS,
     cmd_opds_export,
@@ -65,7 +65,7 @@ class TestGetVersionInfo:
 
 
 class TestCmdOpdsExport:
-    @patch("fluid_build.cli.opds.cprint")
+    @patch("fluid_build.cli.odps.cprint")
     @patch("fluid_build.cli.bootstrap.build_provider")
     @patch("fluid_build.cli.bootstrap.load_contract_with_overlay")
     def test_export_stdout_pretty(self, mock_load, mock_build, mock_cprint):
@@ -85,7 +85,7 @@ class TestCmdOpdsExport:
         assert result == 0
         mock_cprint.assert_called()
 
-    @patch("fluid_build.cli.opds.cprint")
+    @patch("fluid_build.cli.odps.cprint")
     @patch("fluid_build.cli.bootstrap.build_provider")
     @patch("fluid_build.cli.bootstrap.load_contract_with_overlay")
     def test_export_stdout_compact(self, mock_load, mock_build, _mock_cprint):
@@ -104,7 +104,7 @@ class TestCmdOpdsExport:
         result = cmd_opds_export(args, LOG)
         assert result == 0
 
-    @patch("fluid_build.cli.opds.cprint")
+    @patch("fluid_build.cli.odps.cprint")
     @patch("fluid_build.cli.bootstrap.build_provider")
     @patch("fluid_build.cli.bootstrap.load_contract_with_overlay")
     def test_export_to_file(self, mock_load, mock_build, _mock_cprint):
@@ -130,7 +130,7 @@ class TestCmdOpdsExport:
         finally:
             os.unlink(tmp_path)
 
-    @patch("fluid_build.cli.opds.console_error")
+    @patch("fluid_build.cli.odps.console_error")
     @patch(
         "fluid_build.cli.bootstrap.load_contract_with_overlay", side_effect=Exception("bad file")
     )
@@ -143,7 +143,7 @@ class TestCmdOpdsExport:
         result = cmd_opds_export(args, LOG)
         assert result == 1
 
-    @patch("fluid_build.cli.opds.console_error")
+    @patch("fluid_build.cli.odps.console_error")
     @patch("fluid_build.cli.bootstrap.build_provider", side_effect=Exception("no provider"))
     @patch("fluid_build.cli.bootstrap.load_contract_with_overlay", return_value={})
     def test_export_provider_error(self, _mock_load, _mock_build, _mock_err):
@@ -155,7 +155,7 @@ class TestCmdOpdsExport:
         result = cmd_opds_export(args, LOG)
         assert result == 1
 
-    @patch("fluid_build.cli.opds.console_error")
+    @patch("fluid_build.cli.odps.console_error")
     @patch("fluid_build.cli.bootstrap.build_provider")
     @patch("fluid_build.cli.bootstrap.load_contract_with_overlay", return_value={})
     def test_export_render_error(self, _mock_load, mock_build, _mock_err):
@@ -186,7 +186,7 @@ class TestCmdOpdsValidate:
         args.version = "4.1"
         args.full_schema = True
 
-        with patch("fluid_build.cli.opds.console_error"):
+        with patch("fluid_build.cli.odps.console_error"):
             result = cmd_opds_validate(args, LOG)
         assert result == 1
 
@@ -212,7 +212,7 @@ class TestCmdOpdsValidate:
                 "warnings": [],
             }
             with (
-                patch("fluid_build.cli.opds.cprint"),
+                patch("fluid_build.cli.odps.cprint"),
                 patch(
                     "fluid_build.providers.odps.validator.validate_opds_structure",
                     return_value=mock_result,
@@ -241,7 +241,7 @@ class TestCmdOpdsValidate:
                 "errors": ["Missing required fields: dataProductName, dataProductDescription"],
             }
             with (
-                patch("fluid_build.cli.opds.console_error"),
+                patch("fluid_build.cli.odps.console_error"),
                 patch(
                     "fluid_build.providers.odps.validator.validate_opds_structure",
                     return_value=mock_result,
@@ -276,7 +276,7 @@ class TestCmdOpdsValidate:
                 "warnings": [],
             }
             with (
-                patch("fluid_build.cli.opds.cprint"),
+                patch("fluid_build.cli.odps.cprint"),
                 patch(
                     "fluid_build.providers.odps.validator.validate_opds_structure",
                     return_value=mock_result,
@@ -298,7 +298,7 @@ class TestCmdOpdsValidate:
             args.version = "4.1"
             args.full_schema = True
 
-            with patch("fluid_build.cli.opds.console_error"):
+            with patch("fluid_build.cli.odps.console_error"):
                 result = cmd_opds_validate(args, LOG)
             assert result == 1
         finally:
@@ -327,7 +327,7 @@ class TestCmdOpdsValidate:
             }
 
             with (
-                patch("fluid_build.cli.opds.cprint"),
+                patch("fluid_build.cli.odps.cprint"),
                 patch(
                     "fluid_build.providers.odps.validator.validate_opds_structure",
                     return_value=mock_result,
@@ -357,7 +357,7 @@ class TestCmdOpdsValidate:
             }
 
             with (
-                patch("fluid_build.cli.opds.console_error"),
+                patch("fluid_build.cli.odps.console_error"),
                 patch(
                     "fluid_build.providers.odps.validator.validate_opds_structure",
                     return_value=mock_result,
@@ -391,7 +391,7 @@ class TestCmdOpdsValidate:
                 "warnings": [],
             }
             with (
-                patch("fluid_build.cli.opds.cprint"),
+                patch("fluid_build.cli.odps.cprint"),
                 patch(
                     "fluid_build.providers.odps.validator.validate_opds_structure",
                     return_value=mock_result,
@@ -409,7 +409,7 @@ class TestCmdOpdsValidate:
 
 
 class TestCmdOpdsInfo:
-    @patch("fluid_build.cli.opds.cprint")
+    @patch("fluid_build.cli.odps.cprint")
     def test_info_all_versions(self, _mock_cprint):
         args = MagicMock()
         args.version = None
@@ -420,7 +420,7 @@ class TestCmdOpdsInfo:
         result = cmd_opds_info(args, LOG)
         assert result == 0
 
-    @patch("fluid_build.cli.opds.cprint")
+    @patch("fluid_build.cli.odps.cprint")
     def test_info_specific_version(self, _mock_cprint):
         args = MagicMock()
         args.version = "4.1"
@@ -429,7 +429,7 @@ class TestCmdOpdsInfo:
         result = cmd_opds_info(args, LOG)
         assert result == 0
 
-    @patch("fluid_build.cli.opds.cprint")
+    @patch("fluid_build.cli.odps.cprint")
     def test_info_json_output(self, _mock_cprint):
         args = MagicMock()
         args.version = "4.1"
@@ -438,7 +438,7 @@ class TestCmdOpdsInfo:
         result = cmd_opds_info(args, LOG)
         assert result == 0
 
-    @patch("fluid_build.cli.opds.cprint")
+    @patch("fluid_build.cli.odps.cprint")
     def test_info_all_json(self, _mock_cprint):
         args = MagicMock()
         args.version = None
@@ -447,7 +447,7 @@ class TestCmdOpdsInfo:
         result = cmd_opds_info(args, LOG)
         assert result == 0
 
-    @patch("fluid_build.cli.opds.console_error")
+    @patch("fluid_build.cli.odps.console_error")
     def test_info_invalid_version(self, _mock_err):
         args = MagicMock()
         args.version = "99.99"
