@@ -485,7 +485,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short --strict-markers --disable-warnings"
+addopts = "-v --tb=short --strict-markers --disable-warnings -m 'not live_llm and not live_judge'"
 markers = [
     "unit: Unit tests (fast, no I/O)",
     "integration: Integration tests (may need network/files)",
@@ -499,9 +499,11 @@ markers = [
     "policy: Tests for policy validators",
     "runtime: Tests for runtime generators",
     "live_llm: Tests that call a real LLM (cost ~$0.0001/run; require an API key in env)",
+    "live_judge: Opt-in tests that call the real JudgeAgent against an LLM (cost ~$0.001/run; require an API key in env)",
     "redteam: Deterministic adversarial tests for the agentic layer (zero-token, no LLM)",
     "emulated: Stage-1 keyless integration tests backed by in-process emulators (moto, fakesnow); run on every PR via ci.yml",
     "emulated_heavy: Stage-2 Docker-based emulated integration tests (bigquery-emulator, LocalStack); admin-gated via integration-emulated-heavy.yml",
+    "live_postgres: Opt-in tests that require a real Postgres reachable on localhost:55432/tpch (see tests/fixtures/sandboxes/from-source-postgres/); skipped when the sandbox is unreachable",
 ]
 
 [tool.coverage.run]

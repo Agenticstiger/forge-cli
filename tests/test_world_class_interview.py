@@ -269,9 +269,61 @@ def test_progress_format_contains_question_position():
         _format_progress,
     )
 
-    p = InterviewProgress(asked=0, total=4, cumulative_usd=0.0, cap_usd=1.0)
+    # ``asked`` is the 1-indexed position of the question we're about
+    # to ask. The caller pre-increments before calling ``_format_progress``.
+    p = InterviewProgress(asked=1, total=4, cumulative_usd=0.0, cap_usd=1.0)
     assert "Q1/4" in _format_progress(p)
     assert "$" in _format_progress(p)  # budget shown
+
+
+def test_progress_format_no_overflow_on_last_question():
+    """H23 regression: ``[Q3/2]`` on the second-of-two prompt is wrong;
+    the counter must never exceed ``total``.
+    """
+    from fluid_build.cli._world_class_interview import (
+        InterviewProgress,
+        _format_progress,
+    )
+
+    p = InterviewProgress(asked=2, total=2)
+    assert "Q2/2" in _format_progress(p)
+    # And the production overflow path: if a caller ever pre-increments
+    # past ``total`` (e.g. a re-asked question), the renderer clamps to
+    # ``total`` rather than rendering ``Q3/2``.
+    p_overflow = InterviewProgress(asked=3, total=2)
+    assert "Q2/2" in _format_progress(p_overflow)
+    assert "Q3/2" not in _format_progress(p_overflow)
+
+
+def test_progress_runs_q1_through_qn_without_overflow():
+    """H23: the world-class bootstrap loop pre-increments ``asked``
+    before rendering each prompt, so the user sees Q1/N, Q2/N, ...,
+    QN/N — never Q(N+1)/N or skipping Q1.
+    """
+    from typing import List
+    from unittest import mock
+
+    state = _State()
+    sig = InterviewSignals()
+    captured_prompts: List[str] = []
+
+    def _capture(_console, prompt, **_kw):
+        captured_prompts.append(prompt)
+        return "answer"
+
+    with (
+        mock.patch("fluid_build.cli._world_class_interview.collect_signals", return_value=sig),
+        mock.patch("fluid_build.cli.forge_dialogs.ask_friendly_text", _capture),
+    ):
+        run_world_class_bootstrap(state=state, console=None)
+
+    n = len(captured_prompts)
+    assert n >= 1
+    # Expect Q1/n through Qn/n in order; never Q0 or Q(n+1).
+    for i, prompt in enumerate(captured_prompts, start=1):
+        assert f"Q{i}/{n}" in prompt, f"prompt {i} should carry 'Q{i}/{n}', got: {prompt!r}"
+        # Overflow guard: no Q(n+1)/n in any prompt.
+        assert f"Q{n + 1}/{n}" not in prompt
 
 
 # ---------------------------------------------------------------------------

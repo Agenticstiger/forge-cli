@@ -27,6 +27,13 @@ from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+# H17 — one-shot log gate so the "Loaded N credentials from .env files" line
+# only renders once per process even when multiple credential consumers
+# (connector / credential-store / catalog-resolver / …) each instantiate
+# their own ``DotEnvCredentialStore``. Tests reset this via the public
+# ``reset_dotenv_load_log()`` helper at the bottom of the module.
+_LOGGED_CRED_COUNT: bool = False
+
 
 def _warn_if_world_readable(path: Path) -> None:
     """Warn when a credential-bearing ``.env`` file is group/other-readable.
@@ -160,7 +167,16 @@ class DotEnvCredentialStore:
 
         # Security: Log loaded keys (NOT values)
         if combined:
-            logger.info(f"Loaded {len(combined)} credentials from .env files")
+            global _LOGGED_CRED_COUNT
+            if not _LOGGED_CRED_COUNT:
+                # H17 — first-loader wins. Subsequent stores from the same
+                # process drop to DEBUG so ``fluid auth status`` doesn't
+                # echo the same banner 7× across connector / store /
+                # resolver bootstraps.
+                logger.info(f"Loaded {len(combined)} credentials from .env files")
+                _LOGGED_CRED_COUNT = True
+            else:
+                logger.debug(f"Loaded {len(combined)} credentials from .env files (duplicate)")
             logger.debug(f"Available keys: {', '.join(sorted(combined.keys()))}")
 
         return combined
@@ -245,3 +261,16 @@ def ensure_gitignore(project_root: Path):
                 f.write(f"{entry}\n")
 
         logger.info(f"Added {len(new_entries)} entries to .gitignore")
+
+
+def reset_dotenv_load_log() -> None:
+    """Reset the one-shot "Loaded N credentials" log gate.
+
+    Used by tests that exercise the first-time log path more than once
+    in a single process. Production code should not need this — the gate
+    intentionally lasts for the lifetime of the process so multi-store
+    bootstraps (connector / credential-store / catalog-resolver) don't
+    each emit the banner.
+    """
+    global _LOGGED_CRED_COUNT
+    _LOGGED_CRED_COUNT = False

@@ -166,6 +166,8 @@ class TestRun:
         args.features_only = True
         args.verbose = False
         args.scope = None  # default to legacy doctor flow (no scoped checks)
+        args.env = False  # not exercising the kill-switch catalog listing
+        args.json = False  # not exercising the structured JSON path
         logger = MagicMock()
 
         result = run(args, logger)
@@ -182,6 +184,8 @@ class TestRun:
         args.features_only = True
         args.verbose = False
         args.scope = None  # default to legacy doctor flow (no scoped checks)
+        args.env = False  # not exercising the kill-switch catalog listing
+        args.json = False  # not exercising the structured JSON path
         logger = MagicMock()
 
         result = run(args, logger)
@@ -218,6 +222,8 @@ class TestRun:
         args.verbose = False
         args.extended = False
         args.scope = None  # default to legacy doctor flow (no scoped checks)
+        args.env = False  # not exercising the kill-switch catalog listing
+        args.json = False  # not exercising the structured JSON path
         args.out_dir = "/tmp/diag"
         logger = MagicMock()
 
@@ -254,6 +260,8 @@ class TestRun:
         args.verbose = False
         args.extended = False
         args.scope = None  # default to legacy doctor flow (no scoped checks)
+        args.env = False  # not exercising the kill-switch catalog listing
+        args.json = False  # not exercising the structured JSON path
         args.out_dir = "/tmp/diag"
         logger = MagicMock()
 
@@ -289,6 +297,8 @@ class TestRun:
         args.verbose = False
         args.extended = True
         args.scope = None  # default to legacy doctor flow
+        args.env = False  # not exercising the kill-switch catalog listing
+        args.json = False  # not exercising the structured JSON path
         args.out_dir = "/tmp/diag"
 
         with pytest.raises(CLIError) as exc:

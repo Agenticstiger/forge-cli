@@ -158,3 +158,76 @@ def test_welcome_scan_no_suggestion_when_mixed(tmp_path):
         )
     findings = run_welcome_scan(start=tmp_path)
     assert findings.suggested_data_product_type == ""
+
+
+class TestProviderHint:
+    """H15 regression: ``FLUID_LLM_PROVIDER`` must dominate ambient env-key
+    inference so the "What I see" panel never disagrees with the rest of
+    the run.  Previously a stray ``OPENAI_API_KEY`` in the shell would
+    silently override a ``FLUID_LLM_PROVIDER=gemini`` selection.
+    """
+
+    def test_fluid_llm_provider_env_dominates_over_openai_key(self, tmp_path, monkeypatch):
+        """With ``FLUID_LLM_PROVIDER=gemini`` set, the hint must be ``gemini``
+        even if ``OPENAI_API_KEY`` is also present in the environment."""
+        from rich.console import Console as RichConsole
+
+        monkeypatch.setenv("FLUID_LLM_PROVIDER", "gemini")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-stale-key-from-other-project")
+
+        findings = run_welcome_scan(start=tmp_path)
+        assert findings.ai_configured is True
+        assert findings.ai_provider_hint == "gemini"
+        assert "openai" not in findings.ai_provider_hint
+
+        # Render through a real recording Rich console so we can assert
+        # on the actual user-visible panel text.
+        out = RichConsole(record=True, width=120, color_system=None)
+        render_welcome(findings, console=out)
+        rendered = out.export_text()
+
+        assert "gemini" in rendered, f"expected 'gemini' in panel output: {rendered!r}"
+        assert (
+            "openai" not in rendered
+        ), f"panel must NOT render 'openai' when FLUID_LLM_PROVIDER=gemini: {rendered!r}"
+
+    def test_saved_ai_config_beats_env_key_inference(self, tmp_path, monkeypatch):
+        """Saved ``~/.fluid/ai_config.json`` provider must dominate ambient
+        env keys (matches ``check_llm_readiness`` resolution ladder).
+
+        Patches ``_load_ai_config`` directly — the real file path is
+        computed against ``Path.home()`` at module-import time, which
+        makes filesystem-based fixtures unreliable here.
+        """
+        monkeypatch.delenv("FLUID_LLM_PROVIDER", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-stale")
+
+        monkeypatch.setattr(
+            "fluid_build.cli.ai_setup._load_ai_config",
+            lambda: {"provider": "gemini", "model": "gemini-2.5-flash"},
+        )
+
+        findings = run_welcome_scan(start=tmp_path)
+        assert findings.ai_provider_hint == "gemini"
+
+    def test_env_key_inference_still_works_as_fallback(self, tmp_path, monkeypatch):
+        """With no explicit selector and no saved config, env keys are the
+        last-resort signal — backwards-compatible with prior behaviour."""
+        monkeypatch.delenv("FLUID_LLM_PROVIDER", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.delenv("CLAUDE_API_KEY", raising=False)
+
+        # Ensure the user's real ``~/.fluid/ai_config.json`` doesn't leak
+        # into this test — force step 2 of the resolution ladder to
+        # return ``None`` so env-var inference (step 3) actually fires.
+        monkeypatch.setattr(
+            "fluid_build.cli.ai_setup._load_ai_config",
+            lambda: None,
+        )
+
+        findings = run_welcome_scan(start=tmp_path)
+        assert findings.ai_configured is True
+        assert findings.ai_provider_hint == "anthropic"

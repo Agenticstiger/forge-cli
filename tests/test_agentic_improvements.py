@@ -202,14 +202,21 @@ class TestExtractUsage:
                 "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
             }
         )
-        assert usage == {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150}
+        # Subset assertion — Wave 1 added cache_creation_input_tokens /
+        # cache_read_input_tokens to the canonical extract_usage shape.
+        # The core counts remain stable.
+        assert usage["input_tokens"] == 100
+        assert usage["output_tokens"] == 50
+        assert usage["total_tokens"] == 150
 
     def test_openai_missing_usage(self):
         from fluid_build.cli.forge_copilot_llm_providers import OpenAIProvider
 
         provider = OpenAIProvider()
         usage = provider.extract_usage({"choices": [{"message": {"content": "hi"}}]})
-        assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        assert usage["input_tokens"] == 0
+        assert usage["output_tokens"] == 0
+        assert usage["total_tokens"] == 0
 
     def test_openai_prompt_cache_usage(self):
         from fluid_build.cli.forge_copilot_llm_providers import OpenAIProvider
@@ -255,7 +262,10 @@ class TestExtractUsage:
                 "usage": {"prompt_tokens": 50, "completion_tokens": 25, "total_tokens": 75},
             }
         )
-        assert usage == {"input_tokens": 50, "output_tokens": 25, "total_tokens": 75}
+        # Subset assertion (see test_openai_usage rationale).
+        assert usage["input_tokens"] == 50
+        assert usage["output_tokens"] == 25
+        assert usage["total_tokens"] == 75
 
     def test_base_provider_returns_zeros(self):
         from fluid_build.cli.forge_copilot_llm_providers import LlmProvider

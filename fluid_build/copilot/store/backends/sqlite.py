@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
@@ -24,6 +25,47 @@ from typing import Any, Dict, List, Optional
 
 from ..base import Store, StoreRecord, utc_now
 from ..namespaces import normalize_namespace
+
+_log = logging.getLogger(__name__)
+
+# Schema version stamped onto the database via ``PRAGMA user_version``.
+# Bump this whenever ``_MIGRATIONS`` grows. Each entry in
+# ``_MIGRATIONS`` is the SQL to run when moving FROM version N TO N+1,
+# so version 1 is "initial schema" and any future version M > 1 is the
+# delta needed to bring a v(M-1) store up to vM.
+#
+# Borrowed pattern: SQLite's built-in ``user_version`` pragma, exactly
+# the shape described in
+# https://gluer.org/blog/sqlites-user_version-pragma-for-schema-versioning/
+# and https://levlaz.org/sqlite-db-migrations-with-pragma-user_version/.
+# Stdlib only — no Alembic / yoyo dependency for ~20 lines of code.
+_SCHEMA_VERSION = 1
+
+# Each entry is a list of SQL statements to apply when stepping the
+# store FROM ``version - 1`` TO ``version``. Adding a column later
+# (the prime reason the previous ``CREATE TABLE IF NOT EXISTS``-only
+# init was a footgun) means appending a new key here and bumping
+# ``_SCHEMA_VERSION``. Example for a hypothetical v2 add::
+#
+#     _MIGRATIONS[2] = [
+#         "alter table store add column owner text",
+#     ]
+_MIGRATIONS: Dict[int, List[str]] = {
+    1: [
+        """
+        create table if not exists store (
+            namespace text not null,
+            key text not null,
+            value_blob text not null,
+            metadata text,
+            created_at text not null,
+            expires_at text,
+            fluid_version text,
+            primary key (namespace, key)
+        )
+        """,
+    ],
+}
 
 
 class SqliteBackend(Store):
@@ -37,21 +79,66 @@ class SqliteBackend(Store):
         self._init_db()
 
     def _init_db(self) -> None:
-        self.conn.execute(
-            """
-            create table if not exists store (
-                namespace text not null,
-                key text not null,
-                value_blob text not null,
-                metadata text,
-                created_at text not null,
-                expires_at text,
-                fluid_version text,
-                primary key (namespace, key)
+        """Bring the database up to ``_SCHEMA_VERSION`` via PRAGMA.
+
+        Read the current ``user_version``; apply every pending migration
+        in numeric order; bump ``user_version`` only after the
+        migration's SQL succeeds. Each migration runs inside a
+        transaction so a half-applied migration won't corrupt the
+        store: if any statement raises, the transaction rolls back and
+        ``user_version`` stays at the prior value, so re-running the
+        constructor retries from the same start point.
+
+        If we encounter a store from a *future* CLI (``user_version``
+        > ``_SCHEMA_VERSION``) we log a warning and leave it alone —
+        rather than rewinding, we trust the human operator to
+        upgrade the CLI before pointing it at the same store.
+        """
+        current = self._current_user_version()
+
+        if current > _SCHEMA_VERSION:
+            _log.warning(
+                "Sqlite store at %s reports schema version %d but this "
+                "CLI only knows about version %d. Proceeding read-only "
+                "is recommended; upgrade fluid-build before writing.",
+                self.path,
+                current,
+                _SCHEMA_VERSION,
             )
-            """
-        )
-        self.conn.commit()
+            return
+
+        if current == _SCHEMA_VERSION:
+            return
+
+        # Apply each pending migration, bumping ``user_version`` only
+        # once the migration's SQL has succeeded so a half-applied
+        # migration won't leave the store in an undefined state.
+        for version in range(current + 1, _SCHEMA_VERSION + 1):
+            statements = _MIGRATIONS.get(version, [])
+            try:
+                with self.conn:  # implicit transaction; commit on success, rollback on raise
+                    for stmt in statements:
+                        self.conn.execute(stmt)
+                    # ``PRAGMA`` can't be parameterised — use an
+                    # f-string but only with the int constant.
+                    self.conn.execute(f"pragma user_version = {int(version)}")
+            except sqlite3.Error as exc:
+                _log.error(
+                    "Sqlite store migration to v%d failed at %s: %s. " "user_version stays at %d.",
+                    version,
+                    self.path,
+                    exc,
+                    self._current_user_version(),
+                )
+                raise
+
+    def _current_user_version(self) -> int:
+        row = self.conn.execute("pragma user_version").fetchone()
+        if row is None:
+            return 0
+        # ``row`` is a sqlite3.Row when row_factory is set; index by 0
+        # to support both Row and plain tuple shapes.
+        return int(row[0])
 
     def get(self, ns: str, key: str) -> Optional[StoreRecord]:
         row = self.conn.execute(

@@ -37,6 +37,7 @@ re-prompt the user) or the input is a real answer.
 
 from __future__ import annotations
 
+import difflib
 import logging
 import shlex
 from dataclasses import dataclass
@@ -208,6 +209,20 @@ def is_slash_command(text: str) -> bool:
     return stripped.startswith(":") and len(stripped) > 1
 
 
+def _suggest_close_command(name: str) -> str:
+    """Return the closest known slash-command name, or empty string.
+
+    H24 — typos like ``:hlp`` or ``:ai-setupx`` should land on a
+    did-you-mean hint instead of leaking through as the user's answer.
+    Uses :func:`difflib.get_close_matches` with a forgiving cutoff
+    (0.6) — same default suggesters across CPython argparse / click.
+    """
+    if not name:
+        return ""
+    matches = difflib.get_close_matches(name, list(_CATALOG.keys()), n=1, cutoff=0.6)
+    return matches[0] if matches else ""
+
+
 def maybe_handle_slash_command(
     text: str,
     *,
@@ -219,6 +234,11 @@ def maybe_handle_slash_command(
     The handler runs synchronously; on return the caller should
     re-prompt the user (or abort if the command raised
     ``KeyboardInterrupt``).
+
+    H24: an unknown command (e.g. ``:bogus``, ``:hlp``) is treated as
+    handled — the message is rendered and the caller re-prompts.  The
+    typo never leaks through as the user's answer.  A did-you-mean
+    suggestion is appended when a close match exists.
     """
     if not is_slash_command(text):
         return False
@@ -232,7 +252,17 @@ def maybe_handle_slash_command(
     cmd = _CATALOG.get(name)
     if cmd is None:
         if console:
-            console.print(f"[yellow]Unknown command: :{name}.  Type :help to list.[/yellow]")
+            suggestion = _suggest_close_command(name)
+            if suggestion:
+                # H24 — did-you-mean keeps the message short; the type-:help
+                # tail line is dropped to avoid the noisy double-mention.
+                console.print(
+                    f"[yellow]Unknown command: :{name}. "
+                    f"Did you mean [bold]:{suggestion}[/bold]? "
+                    "(:help lists all)[/yellow]"
+                )
+            else:
+                console.print(f"[yellow]Unknown command: :{name}. Type :help to list.[/yellow]")
         return True
     cmd.handler(console=console, state=state, args=parts[1:])
     return True

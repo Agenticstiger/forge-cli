@@ -708,3 +708,143 @@ class TestSanitizeArgv:
         out = self._redact(["mysql", "-p", "mypassword"])
         assert "mypassword" not in out
         assert "***REDACTED***" in out
+
+
+# ── H17: Snowflake CLIError + dedup credential log ────────────────────
+
+
+class TestSnowflakeCLIErrorIsImported:
+    """H17 — when SnowSQL is not installed and no connector auth is
+    configured, ``check_auth`` used to fall through to ``_run_command``
+    which raises ``CLIError`` — but ``CLIError`` was not imported in the
+    extracted ``_auth_provider_impls.py`` module, so the
+    ``except CLIError:`` clauses crashed with a bare Python NameError
+    that surfaced to the user as
+    ``Snowflake | Error | name 'CLIError' is not defined``.
+
+    These tests pin the import in place and assert the error message
+    is human-readable rather than a Python traceback.
+    """
+
+    def _make(self, config=None):
+        return SnowflakeAuthProvider(config or {}, LOG)
+
+    def test_cli_error_importable_in_provider_impls(self):
+        """Smoke: ``_auth_provider_impls`` carries the ``CLIError`` symbol."""
+        from fluid_build.cli import _auth_provider_impls
+
+        assert hasattr(_auth_provider_impls, "CLIError"), (
+            "CLIError must be importable inside _auth_provider_impls "
+            "for the snowflake check_auth/login fallback paths"
+        )
+        # Same class as the canonical CLIError in cli._common.
+        from fluid_build.cli._common import CLIError as CanonicalCLIError
+
+        assert _auth_provider_impls.CLIError is CanonicalCLIError
+
+    def test_snowsql_missing_returns_human_readable_error_not_nameerror(self):
+        """When SnowSQL is missing AND no connector auth is configured,
+        the result is a typed error string, not a Python NameError.
+
+        Without the import fix, this test crashed with
+        ``NameError: name 'CLIError' is not defined``.
+        """
+        from fluid_build.cli._common import CLIError as CanonicalCLIError
+
+        p = self._make({"account": "myacct", "user": "myuser"})
+
+        def _raise_cli_error(*args, **kwargs):
+            raise CanonicalCLIError(1, "command_not_found", {"command": "snowsql"})
+
+        with patch.object(p, "_run_command", side_effect=_raise_cli_error):
+            result = _run_async(p.check_auth())
+
+        assert result.status == AuthStatus.ERROR
+        assert "SnowSQL" in (result.error_message or "")
+        # Not a python traceback fragment.
+        assert "NameError" not in (result.error_message or "")
+
+    def test_snowsql_login_missing_cli_returns_typed_error(self):
+        """Same path as above but on the login flow (``_login_with_snowsql``)."""
+        from fluid_build.cli._common import CLIError as CanonicalCLIError
+
+        p = self._make({"account": "myacct", "user": "myuser"})
+
+        def _raise_cli_error(*args, **kwargs):
+            raise CanonicalCLIError(1, "command_not_found", {"command": "snowsql"})
+
+        # ``_login_with_snowsql`` is a sync helper — call directly. The
+        # ``except CLIError:`` block at the top of the function is what
+        # this test pins; without the import fix it crashes with
+        # ``NameError: name 'CLIError' is not defined``.
+        with patch.object(p, "_run_command", side_effect=_raise_cli_error):
+            result = p._login_with_snowsql()
+
+        assert result.status == AuthStatus.ERROR
+        assert "SnowSQL" in (result.error_message or "")
+        assert "NameError" not in (result.error_message or "")
+
+
+class TestDotenvCredentialLogDedup:
+    """H17 — the ``Loaded N credentials from .env files`` info message
+    fires once per ``DotEnvCredentialStore.load()`` call. ``fluid auth
+    status`` would previously echo the same banner 7× because
+    connector / credential-store / catalog-resolver each instantiate
+    their own store. After the fix the banner is gated by a process-wide
+    flag so only the first loader logs at INFO."""
+
+    def _reset(self):
+        from fluid_build.credentials import dotenv_store as ds
+
+        ds.reset_dotenv_load_log()
+
+    def test_loaded_credentials_logged_once(self, caplog, tmp_path, monkeypatch):
+        from fluid_build.credentials.dotenv_store import DotEnvCredentialStore
+
+        self._reset()
+        # Write a .env so the load actually has something to report on.
+        (tmp_path / ".env").write_text("FOO=1\nBAR=2\n")
+
+        # First store load: INFO line.
+        store1 = DotEnvCredentialStore(project_root=tmp_path, environment="dev")
+        # Second store, fresh instance (simulates connector / catalog
+        # resolver each getting their own store).
+        store2 = DotEnvCredentialStore(project_root=tmp_path, environment="dev")
+
+        with caplog.at_level(logging.INFO, logger="fluid_build.credentials.dotenv_store"):
+            store1.load()
+            store2.load()
+
+        info_lines = [
+            rec.getMessage()
+            for rec in caplog.records
+            if rec.levelno >= logging.INFO and "Loaded" in rec.getMessage()
+        ]
+        assert len(info_lines) == 1, (
+            f"expected the 'Loaded N credentials' banner exactly once, "
+            f"got {len(info_lines)}: {info_lines}"
+        )
+
+    def test_reset_dotenv_load_log_re_enables_first_loader(self, caplog, tmp_path, monkeypatch):
+        from fluid_build.credentials.dotenv_store import DotEnvCredentialStore
+
+        self._reset()
+        (tmp_path / ".env").write_text("FOO=1\n")
+
+        with caplog.at_level(logging.INFO, logger="fluid_build.credentials.dotenv_store"):
+            DotEnvCredentialStore(project_root=tmp_path, environment="dev").load()
+        # second call (without reset) drops to DEBUG.
+        with caplog.at_level(logging.INFO, logger="fluid_build.credentials.dotenv_store"):
+            DotEnvCredentialStore(project_root=tmp_path, environment="dev").load()
+        # Now reset and call again → banner reappears.
+        self._reset()
+        with caplog.at_level(logging.INFO, logger="fluid_build.credentials.dotenv_store"):
+            DotEnvCredentialStore(project_root=tmp_path, environment="dev").load()
+
+        info_lines = [
+            rec.getMessage()
+            for rec in caplog.records
+            if rec.levelno >= logging.INFO and "Loaded" in rec.getMessage()
+        ]
+        # First-call INFO + post-reset INFO; middle call should be DEBUG only.
+        assert len(info_lines) == 2

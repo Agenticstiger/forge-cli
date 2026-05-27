@@ -182,18 +182,24 @@ class TestToolRegistryShape:
             assert schema.get("type") == "object"
 
     def test_catalog_tool_schemas_require_credentials(self):
-        """The seven catalog tools (everything except
-        ``list_source_adapters``) MUST require credentials in their
-        schema — that's the whole "no raw secrets over the wire"
-        contract from the security model."""
-        catalog_tools_with_creds = [
+        """Catalog-only tools MUST require credentials in their schema —
+        that's the whole "no raw secrets over the wire" contract from the
+        security model.
+
+        ``forge_from_source`` is the only exception: it ALSO accepts JDBC
+        sources (postgres / postgresql / mysql / sqlite) which carry creds
+        inline in ``uri`` and don't go through the credential resolver. The
+        Python dispatcher does a source-specific required-field check
+        (see ``_dispatch_forge_from_jdbc_source`` and the catalog branch
+        in ``_call_tool``), so credentials is optional at the schema layer
+        and conditionally required at dispatch time."""
+        catalog_only_tools = [
             "list_source_tables",
             "inspect_source_table",
             "list_source_lineage",
             "list_source_glossary",
-            "forge_from_source",
         ]
-        for name in catalog_tools_with_creds:
+        for name in catalog_only_tools:
             cap = TOOL_CAPABILITIES[name]
             schema = cap.input_schema
             assert schema is not None, f"{name} missing input_schema"
@@ -203,6 +209,16 @@ class TestToolRegistryShape:
             assert "credentials" in schema.get(
                 "properties", {}
             ), f"{name} schema must declare credentials property"
+
+        # forge_from_source: credentials property must still be present
+        # (catalog sources need it) but is optional at the JSON Schema
+        # layer because JDBC sources use ``uri`` instead.
+        forge_schema = TOOL_CAPABILITIES["forge_from_source"].input_schema
+        assert forge_schema is not None
+        assert "credentials" in forge_schema.get("properties", {})
+        assert "uri" in forge_schema.get(
+            "properties", {}
+        ), "forge_from_source must advertise 'uri' for JDBC sources"
 
     def test_forge_from_source_schema_has_technique_enum(self):
         """``forge_from_source.technique`` must be a closed enum so

@@ -34,10 +34,15 @@ not to be thread-safe in their environment. The default is parallel.
 from __future__ import annotations
 
 import contextvars
+import hashlib
+import json
 import logging
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Optional, Sequence
+
+import yaml
 
 from fluid_build.cli.forge_copilot_llm_providers import get_catalog_tier_model
 from fluid_build.copilot.agents.base import StageSession
@@ -47,10 +52,16 @@ from fluid_build.copilot.agents.logical_agent import LogicalAgent
 from fluid_build.copilot.agents.readme_agent import ReadmeAgent
 from fluid_build.copilot.agents.transformation_agent import TransformationAgent
 from fluid_build.copilot.agents.validator_agent import ValidatorAgent
+from fluid_build.copilot.checkpoint import (
+    CheckpointStore,
+    JsonStageSerializer,
+    get_default_saver,
+)
 from fluid_build.copilot.schemas.intent import BusinessIntent
 from fluid_build.copilot.schemas.stage_outputs import (
     LogicalDraft,
     PhysicalDraft,
+    ValidationReport,
 )
 from fluid_build.copilot.store.semantic_writer import write_semantic_record
 from fluid_build.forge_datamodel.from_ddl.parser import TableDefinition
@@ -90,7 +101,11 @@ from fluid_build.copilot.agents._coordinator_repair import _RepairLoopMixin
 class StageCoordinator(_RepairLoopMixin):
     """Coordinate staged data-model and physical planning flows."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        checkpoint_store: Optional[CheckpointStore] = None,
+    ) -> None:
         # Coordinator routes through the fine-grained v1.3 split
         # (LogicalAgent + BuilderAgent + ReadmeAgent + TransformationAgent +
         # ValidatorAgent). ``ModelerAgent`` and ``ConceptualAgent`` remain
@@ -120,6 +135,286 @@ class StageCoordinator(_RepairLoopMixin):
         # stage's output and writes findings to the session
         # scratchpad so the repair loop can read them on retry.
         self.critic_agent = CriticAgent()
+        # Checkpointing — resume the staged pipeline on Ctrl-C / OOM.
+        # ``None`` means "lazy-resolve via get_default_saver() on first
+        # use". Tests pass an explicit ``checkpoint_store=`` (mock or
+        # ``NullCheckpointStore``) to bypass the env-var dispatch.
+        self._explicit_saver = checkpoint_store
+        self._saver: Optional[CheckpointStore] = None
+        # Cost tracker reading is process-wide; the coordinator computes
+        # the per-stage USD delta by remembering the running total at
+        # the last checkpoint write. Lock protects parallel-physical
+        # writes that race for the same delta-base.
+        self._cost_at_last_checkpoint: float = 0.0
+        self._cost_lock = threading.Lock()
+        # Hash of the contract once contract_forge lands. Stamped onto
+        # every later stage's checkpoint so the CLI's stale-detector
+        # can spot edits between the user pausing and resuming.
+        self._contract_hash: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Checkpoint helpers
+    # ------------------------------------------------------------------
+
+    def _get_saver(self) -> CheckpointStore:
+        """Lazy-resolve the saver.
+
+        Honours the explicit ``checkpoint_store=`` kwarg first;
+        otherwise falls back to ``get_default_saver()`` (which dispatches
+        on ``FLUID_COPILOT_CHECKPOINT``). Caches the result so every
+        stage uses the same backend within one run.
+        """
+        if self._saver is not None:
+            return self._saver
+        self._saver = self._explicit_saver or get_default_saver()
+        return self._saver
+
+    def _resolve_run_id(self, session: StageSession) -> str:
+        """Pick — and stamp onto the session — the run-id used for
+        checkpoint keys.
+
+        Idempotent: a session that already carries ``run_id`` keeps it
+        (so a resume call deliberately constructed with the prior id
+        finds its prior cursors). Otherwise we mint a new short id and
+        stamp it back so observability spans share the same id.
+        """
+        run_id = getattr(session, "run_id", "") or _new_run_id()
+        try:
+            session.run_id = run_id
+        except Exception:  # pragma: no cover — defensive (frozen dataclass)
+            pass
+        return run_id
+
+    def _stage_cost_delta(self) -> float:
+        """Compute USD spent since the last checkpoint write.
+
+        Reads the cost-tracker's ``breakdown().total_usd`` and subtracts
+        the running base. Updates the base under a lock so two parallel
+        workers don't double-count or skip cost. When the tracker
+        returns ``None`` (unknown model in the price table) the delta
+        falls back to ``0.0`` so the checkpoint write doesn't fail.
+        """
+        try:
+            from fluid_build.copilot.cost import get_run_tracker
+
+            total = get_run_tracker().breakdown().total_usd
+        except Exception:  # pragma: no cover — defensive
+            total = None
+        with self._cost_lock:
+            base = self._cost_at_last_checkpoint
+            if total is None:
+                # Unknown total — don't move the base, return 0 so the
+                # write still happens with an honest "I don't know"
+                # cost figure rather than a misleading delta.
+                return 0.0
+            delta = max(0.0, float(total) - base)
+            self._cost_at_last_checkpoint = float(total)
+        return delta
+
+    def _save_stage(
+        self,
+        run_id: str,
+        stage: str,
+        payload: Any,
+    ) -> None:
+        """Write one stage's cursor.
+
+        ``cost_usd`` is the per-stage delta computed from the global
+        cost tracker; ``contract_hash`` is the canonical hash stamped
+        after ``contract_forge`` (None for the logical stage).
+
+        Best-effort: a checkpoint write failure logs at WARNING and
+        returns. Checkpointing must NEVER poison a forge that
+        otherwise succeeded.
+        """
+        try:
+            saver = self._get_saver()
+            saver.put(
+                run_id,
+                stage,
+                payload,
+                cost_usd=self._stage_cost_delta(),
+                contract_hash=self._contract_hash,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            _log.warning(
+                "checkpoint write for stage %r failed (%s); continuing",
+                stage,
+                exc,
+            )
+
+    @staticmethod
+    def _hash_contract(contract: Dict[str, Any]) -> str:
+        """Canonical sha256 of a contract dict.
+
+        Recipe — ``yaml.safe_dump(contract, sort_keys=True)`` →
+        ``encode("utf-8")`` → ``sha256().hexdigest()``. ``sort_keys=True``
+        is load-bearing: Python dict iteration order differs between
+        runs, and any drift in the serialised bytes would make every
+        resume look stale. ``yaml.safe_dump`` (not ``json.dumps``) is
+        chosen because the contracts that hit disk are YAML and the
+        operator-facing hash should match what's written.
+        """
+        try:
+            blob = yaml.safe_dump(contract, sort_keys=True, default_flow_style=False)
+        except Exception:  # pragma: no cover — defensive
+            # Fall back to json — same byte-deterministic property.
+            blob = json.dumps(contract, sort_keys=True, default=str)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def _run_contract_forge_stage(
+        self,
+        session: StageSession,
+        *,
+        run_id: str,
+        logical: LogicalDraft,
+        engine: str,
+    ) -> Dict[str, Any]:
+        """Run (or restore) the contract_forge stage.
+
+        Centralised so the three entry methods (from_tables / from_intent
+        / from_catalog) all share the same checkpoint shape. The forged
+        contract's canonical hash is stamped on ``self._contract_hash``
+        so every later stage's checkpoint carries it — that's what the
+        CLI's stale-detector compares against.
+        """
+        saver = self._get_saver()
+        with traced_span(
+            "fluid.copilot.contract_forge",
+            {"fluid.copilot.agent": "contract_forge"},
+        ):
+            with saver.skip_if_done(run_id, "contract_forge") as restored:
+                if restored is not None:
+                    # The contract is a plain dict; deserialize without
+                    # an expected_type. ``restored.payload`` was stored
+                    # as a dict, so json.dumps→deserialize is the cheap
+                    # round-trip path.
+                    contract = JsonStageSerializer.deserialize(
+                        restored.payload_kind,
+                        json.dumps(restored.payload, default=str),
+                        expected_type=None,
+                    )
+                    # Restore the hash from the cursor so later stages
+                    # see the same value — avoids a re-hash that could
+                    # diverge on contract dict ordering.
+                    self._contract_hash = restored.contract_hash or self._hash_contract(contract)
+                else:
+                    contract = self.contract_forge_agent.forge_contract(
+                        session, logical=logical, engine=engine
+                    )
+                    self._contract_hash = self._hash_contract(contract)
+                    self._save_stage(run_id, "contract_forge", contract)
+        return contract
+
+    def _maybe_run_post_synthesis_stages(
+        self,
+        *,
+        run_id: str,
+        contract: Dict[str, Any],
+        physical: Optional[PhysicalDraft],
+    ) -> None:
+        """Run the final two checkpointed stages: enrichment + judge.
+
+        Both are fail-open — a failure in either logs at DEBUG and
+        the run still returns a CoordinatorResult to the caller. The
+        purpose of running them here (rather than in the runtime as
+        before) is to bring them inside the checkpoint envelope so
+        a Ctrl-C between validator and judge doesn't lose 30 seconds
+        of work.
+
+        Skipped entirely when ``physical`` is None — without a
+        validated physical artifact there's no enrichment / judge
+        signal to write.
+        """
+        if physical is None:
+            return
+        # Gate: only run when post-synthesis is configured by the
+        # runtime. The legacy runtime path still runs enrichment/judge
+        # directly; the staged path through the coordinator gets them
+        # under the checkpoint envelope. Operators who want to skip
+        # entirely set FLUID_COPILOT_POST_SYNTHESIS=0.
+        if os.environ.get("FLUID_COPILOT_POST_SYNTHESIS") == "0":
+            return
+        saver = self._get_saver()
+        # ----- enrichment -------------------------------------------
+        with saver.skip_if_done(run_id, "enrichment") as restored:
+            if restored is not None:
+                enrichment_artifacts: Optional[Dict[str, Any]] = (
+                    restored.payload if isinstance(restored.payload, dict) else None
+                )
+            else:
+                enrichment_artifacts = self._run_enrichment_stage(contract)
+                # Always save — the dict-or-None payload IS the cursor.
+                # ``None`` means "we tried and got nothing"; the resume
+                # path treats it the same as a hit so we don't re-run.
+                self._save_stage(
+                    run_id,
+                    "enrichment",
+                    enrichment_artifacts if enrichment_artifacts is not None else {},
+                )
+        # Stash on the physical so callers see the enrichment in the
+        # provenance block without a separate read.
+        try:
+            physical.provenance = dict(physical.provenance or {})
+            physical.provenance["enrichment_artifacts"] = enrichment_artifacts
+        except Exception:  # pragma: no cover — defensive
+            pass
+        # ----- judge -------------------------------------------------
+        with saver.skip_if_done(run_id, "judge") as restored:
+            if restored is not None:
+                judge_result: Optional[Dict[str, Any]] = (
+                    restored.payload if isinstance(restored.payload, dict) else None
+                )
+            else:
+                judge_result = self._run_judge_stage(contract, build_artifacts=enrichment_artifacts)
+                self._save_stage(
+                    run_id,
+                    "judge",
+                    judge_result if judge_result is not None else {},
+                )
+        try:
+            physical.provenance = dict(physical.provenance or {})
+            physical.provenance["judge_result"] = judge_result
+        except Exception:  # pragma: no cover — defensive
+            pass
+
+    def _run_enrichment_stage(
+        self,
+        contract: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Best-effort enrichment pass. Returns ``None`` on any failure
+        — checkpointing is orthogonal to enrichment success."""
+        try:
+            from fluid_build.copilot.enrichment import enrich_contract
+
+            return enrich_contract(contract)
+        except Exception as exc:  # noqa: BLE001 — fail-open
+            _log.debug("enrichment stage failed (skipping): %s", exc)
+            return None
+
+    def _run_judge_stage(
+        self,
+        contract: Dict[str, Any],
+        *,
+        build_artifacts: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Best-effort LLM-as-judge pass. Returns ``None`` on any
+        failure or when the judge is disabled by env-var."""
+        try:
+            from fluid_build.copilot.agents.judge_agent import JudgeAgent
+
+            result = JudgeAgent().judge(contract, build_artifacts=build_artifacts)
+            return {
+                "score": getattr(result, "total", None),
+                "axes": {
+                    axis: getattr(score, "score", None)
+                    for axis, score in (getattr(result, "axes", {}) or {}).items()
+                },
+                "model": getattr(result, "model", None),
+            }
+        except Exception as exc:  # noqa: BLE001 — fail-open
+            _log.debug("judge stage failed (skipping): %s", exc)
+            return None
 
     def from_tables(
         self,
@@ -136,7 +431,7 @@ class StageCoordinator(_RepairLoopMixin):
         # ties every nested span (coordinator, logical, builder, ...)
         # under one run_id so observability dashboards can group the
         # full staged-forge lifecycle. No-op when OTEL is disabled.
-        run_id = getattr(session, "run_id", "") or _new_run_id()
+        run_id = self._resolve_run_id(session)
         # Per-product cost attribution — push the project name onto
         # the cost tracker's product stack so every LLM call inside
         # the run credits the right product. Pops in the ``finally``
@@ -171,28 +466,34 @@ class StageCoordinator(_RepairLoopMixin):
             ):
                 with traced_span("fluid.copilot.logical", {"fluid.copilot.agent": "logical"}):
                     logical_budget = self._stage_budget(session, stage="logical")
-                    logical = self._run_logical_with_cooperation(
-                        session,
-                        agent_invoke=lambda: self.logical_agent.from_tables(
-                            session,
-                            name=name,
-                            tables=list(tables),
-                            technique=technique,
-                            source_type=source_type,
-                        ),
-                    )
+                    saver = self._get_saver()
+                    with saver.skip_if_done(run_id, "logical") as restored:
+                        if restored is not None:
+                            logical = JsonStageSerializer.deserialize(
+                                restored.payload_kind,
+                                json.dumps(restored.payload, default=str),
+                                expected_type=LogicalDraft,
+                            )
+                        else:
+                            logical = self._run_logical_with_cooperation(
+                                session,
+                                agent_invoke=lambda: self.logical_agent.from_tables(
+                                    session,
+                                    name=name,
+                                    tables=list(tables),
+                                    technique=technique,
+                                    source_type=source_type,
+                                ),
+                            )
+                            self._save_stage(run_id, "logical", logical)
                     self._check_stage_budget(logical_budget)
                 logical = canonicalize_logical_draft(logical)
                 self._record_agent_event(session, stage="logical", agent=self.logical_agent)
                 self._run_logical_critic(session, logical=logical)
                 self._stamp_annotation_summary(session)
-                with traced_span(
-                    "fluid.copilot.contract_forge",
-                    {"fluid.copilot.agent": "contract_forge"},
-                ):
-                    contract = self.contract_forge_agent.forge_contract(
-                        session, logical=logical, engine=engine
-                    )
+                contract = self._run_contract_forge_stage(
+                    session, run_id=run_id, logical=logical, engine=engine
+                )
                 self._record_agent_event(
                     session,
                     stage="contract_forge",
@@ -201,8 +502,16 @@ class StageCoordinator(_RepairLoopMixin):
                 physical = None
                 if include_physical:
                     physical = self._run_physical_stages(
-                        session, logical=logical, contract=contract, engine=engine
+                        session,
+                        logical=logical,
+                        contract=contract,
+                        engine=engine,
+                        run_id=run_id,
                     )
+                    contract = physical.contract
+                self._maybe_run_post_synthesis_stages(
+                    run_id=run_id, contract=contract, physical=physical
+                )
                 # D7 — auto-write memory/semantic on successful forge (opt-in).
                 # Gated by FLUID_COPILOT_SEMANTIC_MEMORY; swallows errors so
                 # a broken store never poisons a successful forge result.
@@ -231,7 +540,7 @@ class StageCoordinator(_RepairLoopMixin):
         include_physical: bool = False,
     ) -> CoordinatorResult:
         # Phase 3.8 — outermost ``fluid.copilot.staged.invocation`` span.
-        run_id = getattr(session, "run_id", "") or _new_run_id()
+        run_id = self._resolve_run_id(session)
         # Per-product cost attribution — derive product_id from the
         # business intent (the entity name in the intent IS the
         # product). Pops in the matching ``finally`` so a mid-run
@@ -270,26 +579,32 @@ class StageCoordinator(_RepairLoopMixin):
             ):
                 with traced_span("fluid.copilot.logical", {"fluid.copilot.agent": "logical"}):
                     logical_budget = self._stage_budget(session, stage="logical")
-                    logical = self._run_logical_with_cooperation(
-                        session,
-                        agent_invoke=lambda: self.logical_agent.from_intent(
-                            session,
-                            intent=intent,
-                            technique=technique,
-                        ),
-                    )
+                    saver = self._get_saver()
+                    with saver.skip_if_done(run_id, "logical") as restored:
+                        if restored is not None:
+                            logical = JsonStageSerializer.deserialize(
+                                restored.payload_kind,
+                                json.dumps(restored.payload, default=str),
+                                expected_type=LogicalDraft,
+                            )
+                        else:
+                            logical = self._run_logical_with_cooperation(
+                                session,
+                                agent_invoke=lambda: self.logical_agent.from_intent(
+                                    session,
+                                    intent=intent,
+                                    technique=technique,
+                                ),
+                            )
+                            self._save_stage(run_id, "logical", logical)
                     self._check_stage_budget(logical_budget)
                 logical = canonicalize_logical_draft(logical)
                 self._record_agent_event(session, stage="logical", agent=self.logical_agent)
                 self._run_logical_critic(session, logical=logical)
                 self._stamp_annotation_summary(session)
-                with traced_span(
-                    "fluid.copilot.contract_forge",
-                    {"fluid.copilot.agent": "contract_forge"},
-                ):
-                    contract = self.contract_forge_agent.forge_contract(
-                        session, logical=logical, engine=engine
-                    )
+                contract = self._run_contract_forge_stage(
+                    session, run_id=run_id, logical=logical, engine=engine
+                )
                 self._record_agent_event(
                     session,
                     stage="contract_forge",
@@ -298,8 +613,16 @@ class StageCoordinator(_RepairLoopMixin):
                 physical = None
                 if include_physical:
                     physical = self._run_physical_stages(
-                        session, logical=logical, contract=contract, engine=engine
+                        session,
+                        logical=logical,
+                        contract=contract,
+                        engine=engine,
+                        run_id=run_id,
                     )
+                    contract = physical.contract
+                self._maybe_run_post_synthesis_stages(
+                    run_id=run_id, contract=contract, physical=physical
+                )
                 # D7 — auto-write memory/semantic on successful forge (opt-in).
                 # See module-level comment in ``store.semantic_writer`` for
                 # the privacy / predictability rationale behind the opt-in.
@@ -350,7 +673,7 @@ class StageCoordinator(_RepairLoopMixin):
         CLI / MCP-tool layer).
         """
         # Phase 3.8 — outermost ``fluid.copilot.staged.invocation`` span.
-        run_id = getattr(session, "run_id", "") or _new_run_id()
+        run_id = self._resolve_run_id(session)
         # Per-product cost attribution — the catalog scope's name is
         # the product being forged.
         from fluid_build.copilot.cost import get_run_tracker
@@ -383,28 +706,34 @@ class StageCoordinator(_RepairLoopMixin):
             ):
                 with traced_span("fluid.copilot.logical", {"fluid.copilot.agent": "logical"}):
                     logical_budget = self._stage_budget(session, stage="logical")
-                    logical = self._run_logical_with_cooperation(
-                        session,
-                        agent_invoke=lambda: self.logical_agent.from_catalog(
-                            session,
-                            name=name,
-                            adapter=adapter,
-                            scope=scope,
-                            technique=technique,
-                        ),
-                    )
+                    saver = self._get_saver()
+                    with saver.skip_if_done(run_id, "logical") as restored:
+                        if restored is not None:
+                            logical = JsonStageSerializer.deserialize(
+                                restored.payload_kind,
+                                json.dumps(restored.payload, default=str),
+                                expected_type=LogicalDraft,
+                            )
+                        else:
+                            logical = self._run_logical_with_cooperation(
+                                session,
+                                agent_invoke=lambda: self.logical_agent.from_catalog(
+                                    session,
+                                    name=name,
+                                    adapter=adapter,
+                                    scope=scope,
+                                    technique=technique,
+                                ),
+                            )
+                            self._save_stage(run_id, "logical", logical)
                     self._check_stage_budget(logical_budget)
                 logical = canonicalize_logical_draft(logical)
                 self._record_agent_event(session, stage="logical", agent=self.logical_agent)
                 self._run_logical_critic(session, logical=logical)
                 self._stamp_annotation_summary(session)
-                with traced_span(
-                    "fluid.copilot.contract_forge",
-                    {"fluid.copilot.agent": "contract_forge"},
-                ):
-                    contract = self.contract_forge_agent.forge_contract(
-                        session, logical=logical, engine=engine
-                    )
+                contract = self._run_contract_forge_stage(
+                    session, run_id=run_id, logical=logical, engine=engine
+                )
                 self._record_agent_event(
                     session,
                     stage="contract_forge",
@@ -413,8 +742,16 @@ class StageCoordinator(_RepairLoopMixin):
                 physical = None
                 if include_physical:
                     physical = self._run_physical_stages(
-                        session, logical=logical, contract=contract, engine=engine
+                        session,
+                        logical=logical,
+                        contract=contract,
+                        engine=engine,
+                        run_id=run_id,
                     )
+                    contract = physical.contract
+                self._maybe_run_post_synthesis_stages(
+                    run_id=run_id, contract=contract, physical=physical
+                )
                 # D7 — auto-write memory/semantic on successful forge (opt-in).
                 write_semantic_record(
                     session.store,
@@ -439,6 +776,7 @@ class StageCoordinator(_RepairLoopMixin):
         logical: LogicalDraft,
         contract: dict,
         engine: str,
+        run_id: Optional[str] = None,
     ) -> PhysicalDraft:
         """Run builder ∥ readme ∥ transformation, then validator, under spans.
 
@@ -465,27 +803,76 @@ class StageCoordinator(_RepairLoopMixin):
         Postgres via psycopg) rely on their drivers' thread-safety;
         the ``FLUID_COPILOT_PARALLEL_PHYSICAL=0`` escape hatch is the
         last-resort fallback when that assumption breaks.
+
+        Checkpointing: each of builder/readme/transformation gets its
+        own ``skip_if_done`` block inside the worker closure. A partial
+        completion (e.g. readme landed, transformation crashed) means
+        the next ``fluid forge`` run skips readme and re-runs
+        transformation — borrowed from LangGraph's super-step / partial
+        node writes pattern.
         """
         if not _parallel_physical_enabled():
             return self._run_physical_stages_serial(
-                session, logical=logical, contract=contract, engine=engine
+                session,
+                logical=logical,
+                contract=contract,
+                engine=engine,
+                run_id=run_id,
             )
+
+        # Resolve a run-id so the worker closures can call
+        # ``skip_if_done`` without threading the value through.
+        # When the caller didn't pass one (legacy callers), mint a
+        # session-stamped id so the entire run shares one key space.
+        run_id_resolved = run_id or self._resolve_run_id(session)
+        saver = self._get_saver()
 
         def _run_builder() -> PhysicalDraft:
             with traced_span("fluid.copilot.builder", {"fluid.copilot.agent": "builder"}):
-                return self.builder.build_physical(
-                    session, logical=logical, contract=contract, engine=engine
-                )
+                with saver.skip_if_done(run_id_resolved, "builder") as restored:
+                    if restored is not None:
+                        return JsonStageSerializer.deserialize(
+                            restored.payload_kind,
+                            json.dumps(restored.payload, default=str),
+                            expected_type=PhysicalDraft,
+                        )
+                    result = self.builder.build_physical(
+                        session, logical=logical, contract=contract, engine=engine
+                    )
+                    self._save_stage(run_id_resolved, "builder", result)
+                    return result
 
         def _run_readme():
             with traced_span("fluid.copilot.readme", {"fluid.copilot.agent": "readme"}):
-                return self.readme_agent.run(logical, engine=engine)
+                from fluid_build.copilot.schemas.stage_outputs import ReadmeDraft
+
+                with saver.skip_if_done(run_id_resolved, "readme") as restored:
+                    if restored is not None:
+                        return JsonStageSerializer.deserialize(
+                            restored.payload_kind,
+                            json.dumps(restored.payload, default=str),
+                            expected_type=ReadmeDraft,
+                        )
+                    result = self.readme_agent.run(logical, engine=engine)
+                    self._save_stage(run_id_resolved, "readme", result)
+                    return result
 
         def _run_transformation():
             with traced_span(
                 "fluid.copilot.transformation", {"fluid.copilot.agent": "transformation"}
             ):
-                return self.transformation_agent.run(logical, engine=engine)
+                from fluid_build.copilot.schemas.stage_outputs import TransformPlan
+
+                with saver.skip_if_done(run_id_resolved, "transformation") as restored:
+                    if restored is not None:
+                        return JsonStageSerializer.deserialize(
+                            restored.payload_kind,
+                            json.dumps(restored.payload, default=str),
+                            expected_type=TransformPlan,
+                        )
+                    result = self.transformation_agent.run(logical, engine=engine)
+                    self._save_stage(run_id_resolved, "transformation", result)
+                    return result
 
         # ``max_workers=3`` is a hard ceiling: three physical-stage
         # agents, no benefit to more threads, and a named prefix so
@@ -549,12 +936,21 @@ class StageCoordinator(_RepairLoopMixin):
         )
 
         with traced_span("fluid.copilot.validator", {"fluid.copilot.agent": "validator"}):
-            physical.validation = self.validator_agent.run(
-                logical=logical,
-                contract=contract,
-                industry_pack=session.industry_pack,
-                scratchpad=session.get_scratchpad(),
-            )
+            with saver.skip_if_done(run_id_resolved, "validator") as restored:
+                if restored is not None:
+                    physical.validation = JsonStageSerializer.deserialize(
+                        restored.payload_kind,
+                        json.dumps(restored.payload, default=str),
+                        expected_type=ValidationReport,
+                    )
+                else:
+                    physical.validation = self.validator_agent.run(
+                        logical=logical,
+                        contract=contract,
+                        industry_pack=session.industry_pack,
+                        scratchpad=session.get_scratchpad(),
+                    )
+                    self._save_stage(run_id_resolved, "validator", physical.validation)
         self._record_agent_event(session, stage="validator", agent=self.validator_agent)
         # C8 — escalate critic-error findings into the validation
         # report so ``_maybe_repair_physical`` fires when the
@@ -1027,6 +1423,7 @@ class StageCoordinator(_RepairLoopMixin):
         logical: LogicalDraft,
         contract: dict,
         engine: str,
+        run_id: Optional[str] = None,
     ) -> PhysicalDraft:
         """Sequential fallback used when parallel fanout is disabled.
 
@@ -1034,23 +1431,55 @@ class StageCoordinator(_RepairLoopMixin):
         a user reports a threading-related bug: they can flip
         ``FLUID_COPILOT_PARALLEL_PHYSICAL=0`` and immediately land on
         this codepath with no other behavioural difference. Production
-        default is the parallel path above.
+        default is the parallel path above. Checkpointing is applied
+        identically here so the escape hatch doesn't lose resume.
         """
+        from fluid_build.copilot.schemas.stage_outputs import ReadmeDraft, TransformPlan
+
+        run_id_resolved = run_id or self._resolve_run_id(session)
+        saver = self._get_saver()
         with traced_span("fluid.copilot.builder", {"fluid.copilot.agent": "builder"}):
             builder_budget = self._stage_budget(session, stage="builder")
-            physical = self.builder.build_physical(
-                session, logical=logical, contract=contract, engine=engine
-            )
+            with saver.skip_if_done(run_id_resolved, "builder") as restored:
+                if restored is not None:
+                    physical = JsonStageSerializer.deserialize(
+                        restored.payload_kind,
+                        json.dumps(restored.payload, default=str),
+                        expected_type=PhysicalDraft,
+                    )
+                else:
+                    physical = self.builder.build_physical(
+                        session, logical=logical, contract=contract, engine=engine
+                    )
+                    self._save_stage(run_id_resolved, "builder", physical)
             self._check_stage_budget(builder_budget)
         self._record_agent_event(session, stage="builder", agent=self.builder)
         with traced_span("fluid.copilot.readme", {"fluid.copilot.agent": "readme"}):
             readme_budget = self._stage_budget(session, stage="readme")
-            physical.readme = self.readme_agent.run(logical, engine=engine)
+            with saver.skip_if_done(run_id_resolved, "readme") as restored:
+                if restored is not None:
+                    physical.readme = JsonStageSerializer.deserialize(
+                        restored.payload_kind,
+                        json.dumps(restored.payload, default=str),
+                        expected_type=ReadmeDraft,
+                    )
+                else:
+                    physical.readme = self.readme_agent.run(logical, engine=engine)
+                    self._save_stage(run_id_resolved, "readme", physical.readme)
             self._check_stage_budget(readme_budget)
         self._record_agent_event(session, stage="readme", agent=self.readme_agent)
         with traced_span("fluid.copilot.transformation", {"fluid.copilot.agent": "transformation"}):
             tx_budget = self._stage_budget(session, stage="transformation")
-            physical.transform_plan = self.transformation_agent.run(logical, engine=engine)
+            with saver.skip_if_done(run_id_resolved, "transformation") as restored:
+                if restored is not None:
+                    physical.transform_plan = JsonStageSerializer.deserialize(
+                        restored.payload_kind,
+                        json.dumps(restored.payload, default=str),
+                        expected_type=TransformPlan,
+                    )
+                else:
+                    physical.transform_plan = self.transformation_agent.run(logical, engine=engine)
+                    self._save_stage(run_id_resolved, "transformation", physical.transform_plan)
             self._check_stage_budget(tx_budget)
         self._record_agent_event(session, stage="transformation", agent=self.transformation_agent)
         # Pre-emit conformance lint — same as the parallel path.
@@ -1060,12 +1489,21 @@ class StageCoordinator(_RepairLoopMixin):
             contract=contract,
         )
         with traced_span("fluid.copilot.validator", {"fluid.copilot.agent": "validator"}):
-            physical.validation = self.validator_agent.run(
-                logical=logical,
-                contract=contract,
-                industry_pack=session.industry_pack,
-                scratchpad=session.get_scratchpad(),
-            )
+            with saver.skip_if_done(run_id_resolved, "validator") as restored:
+                if restored is not None:
+                    physical.validation = JsonStageSerializer.deserialize(
+                        restored.payload_kind,
+                        json.dumps(restored.payload, default=str),
+                        expected_type=ValidationReport,
+                    )
+                else:
+                    physical.validation = self.validator_agent.run(
+                        logical=logical,
+                        contract=contract,
+                        industry_pack=session.industry_pack,
+                        scratchpad=session.get_scratchpad(),
+                    )
+                    self._save_stage(run_id_resolved, "validator", physical.validation)
         self._record_agent_event(session, stage="validator", agent=self.validator_agent)
         # C8 — escalate critic-error findings (serial path).
         self._escalate_critic_errors_into_report(session, physical=physical)
