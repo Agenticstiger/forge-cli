@@ -228,7 +228,11 @@ def _create_project_agent_loop(
         _agent_loop_panel: Optional[_PreviewPanel] = None
         if not bool(os.environ.get("FLUID_FORGE_NO_PREVIEW")):
             try:
-                _agent_loop_panel = _PreviewPanel(run_id=_new_run_id(), target_dir=target_dir)
+                # S3 spine fix — honour the resume run_id when set, mirror the
+                # ``_create_project_minimal`` path so the agent-loop variant
+                # doesn't drop checkpoints on resume either.
+                _agent_loop_run_id = context.get("_resume_run_id") or _new_run_id()
+                _agent_loop_panel = _PreviewPanel(run_id=_agent_loop_run_id, target_dir=target_dir)
                 _agent_loop_panel.persist_artifacts()
             except Exception:  # noqa: BLE001 — never block the loop on telemetry
                 logger.debug("agent_loop_panel_init_failed", exc_info=True)
@@ -493,6 +497,22 @@ def _create_project_minimal(
         except Exception as exc:  # noqa: BLE001 — UI must never fail the run
             logger.debug("copilot_show_ai_analysis_failed", extra={"error": str(exc)})
 
+        # Gap 5 — opt-in enrichment-to-contract apply pass.
+        # When ``--apply-enrichment`` is set, fill missing slots
+        # (freshness, binding.physical, qualityChecks, dbt suggestions)
+        # using the artifacts the post-synthesis enrichment hook
+        # already produced. Conservative: never overwrites user-set
+        # fields. Renders a unified diff and prompts before writing
+        # unless ``--yes`` is also set.
+        if options.get("apply_enrichment"):
+            contract = _maybe_apply_enrichment(
+                contract=contract,
+                generation_result=generation_result,
+                auto_yes=bool(options.get("auto_yes", False)),
+                logger=logger,
+                console=console,
+            )
+
         # Write the LLM-generated contract using the slice-4 envelope
         # writer.  write_contract injects metadata.provenance with the
         # correct 'fluid forge' command string.
@@ -574,7 +594,19 @@ def _create_project_minimal(
         if _preview_enabled:
             import yaml as _yaml
 
-            _run_id = new_run_id()
+            # S3 spine fix — when this run is RESUMING a prior paused run,
+            # honour the prior run_id so artifacts land in the existing
+            # ``.fluid/agents/<run-id>/`` dir (clearing the .paused marker)
+            # and the coordinator's ``skip_if_done`` checkpoints can
+            # actually short-circuit the cached stages. Without this the
+            # CLI prints "↻ Resuming run X" but mints a fresh id, so the
+            # paused dir never clears and the full LLM cost is paid again.
+            # RETEST-2 (2026-05-27) caught this: P1e's surface wiring was
+            # correct, but the run-id propagation had a final hop missing
+            # here. ``context["_resume_run_id"]`` is set by
+            # ``forge_modes.run_ai_copilot_mode`` (line ~425) so by the
+            # time we reach this site it's either the resume id or None.
+            _run_id = context.get("_resume_run_id") or new_run_id()
             _preview_panel = PreviewPanel(run_id=_run_id, target_dir=target_dir)
             try:
                 _preview_panel.add_file(
@@ -603,6 +635,27 @@ def _create_project_minimal(
                 model=_llm_model_name,
                 started_at=options.get("_started_at", _minimal_started_at),
             )
+            # Surface judge axes + enrichment-applied indicator in the
+            # pre-write preview so the user sees predicted quality BEFORE
+            # commitment (closes the feedback loop — they can iterate on
+            # a low-scoring contract without having to dig into
+            # ``.fluid/agents/<run-id>/judge.json`` post-hoc).
+            try:
+                from fluid_build.cli._preview_panel import QualitySnapshot
+
+                _prov = getattr(generation_result, "provenance", None) or {}
+                _judge_axes = _prov.get("judge_axes") or {}
+                _judge_total = _prov.get("judge_score")
+                if _judge_total is not None or _judge_axes:
+                    _preview_panel.quality = QualitySnapshot(
+                        total=_judge_total,
+                        axes={k: int(v) for k, v in _judge_axes.items() if v is not None},
+                        model=str(_prov.get("judge_model") or ""),
+                        enrichment_applied=bool(_prov.get("enrichment_applied")),
+                        critique_applied=bool(_prov.get("judge_critique_applied")),
+                    )
+            except Exception:  # noqa: BLE001 — preview must never crash the run
+                logger.debug("preview_panel_quality_populate_failed", exc_info=True)
             for attempt in getattr(generation_result, "attempt_reports", None) or []:
                 _preview_panel.append_transcript(
                     {
@@ -1278,3 +1331,108 @@ def _show_existing_products(console: Any, existing_contracts: list) -> None:
         )
     except ImportError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Gap 5 — enrichment apply helper
+# ---------------------------------------------------------------------------
+
+
+def _maybe_apply_enrichment(
+    *,
+    contract: Dict[str, Any],
+    generation_result: Any,
+    auto_yes: bool,
+    logger: logging.Logger,
+    console: Any,
+) -> Dict[str, Any]:
+    """Optionally apply enrichment artifacts back into the contract.
+
+    Returns the patched contract on user-accept, or the original
+    contract on decline / no artifacts / failure (fail-open invariant).
+    """
+    try:
+        from fluid_build.copilot.enrichment_apply import (
+            apply_enrichment_to_contract,
+            render_enrichment_diff,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-open, never block the run
+        logger.debug("enrichment_apply_import_failed: %s", exc)
+        return contract
+
+    provenance = getattr(generation_result, "provenance", None) or {}
+    artifacts = provenance.get("enrichment_artifacts")
+    if not artifacts:
+        if console:
+            try:
+                console.print(
+                    "[dim]--apply-enrichment: no enrichment artifacts available; skipping.[/dim]"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return contract
+
+    run_id = None
+    try:
+        from fluid_build.observability.run_id import get_or_create_run_id
+
+        run_id = get_or_create_run_id(create_persisted_file=False)
+    except Exception:  # noqa: BLE001 — run-id is best-effort
+        pass
+
+    try:
+        patched, changes = apply_enrichment_to_contract(contract, artifacts, run_id=run_id)
+    except Exception as exc:  # noqa: BLE001 — never block on apply failure
+        logger.warning("enrichment_apply_failed: %s", exc, exc_info=True)
+        return contract
+
+    if not changes:
+        if console:
+            try:
+                console.print(
+                    "[dim]--apply-enrichment: contract already enriched (no changes).[/dim]"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return contract
+
+    diff_text = render_enrichment_diff(contract, patched)
+    if console:
+        try:
+            console.print(f"\n[bold]--apply-enrichment: {len(changes)} change(s)[/bold]")
+            for change in changes[:16]:
+                console.print(f"  · {change}")
+            if diff_text:
+                console.print("\n[dim]Unified diff:[/dim]")
+                console.print(diff_text)
+        except Exception:  # noqa: BLE001
+            print(f"--apply-enrichment: {len(changes)} change(s)")  # noqa: T201
+            for change in changes[:16]:
+                print(f"  - {change}")  # noqa: T201
+            if diff_text:
+                print(diff_text)  # noqa: T201
+    else:
+        print(f"--apply-enrichment: {len(changes)} change(s)")  # noqa: T201
+        for change in changes[:16]:
+            print(f"  - {change}")  # noqa: T201
+        if diff_text:
+            print(diff_text)  # noqa: T201
+
+    if auto_yes:
+        return patched
+
+    # Stdin check first so headless / piped invocations don't hang on input().
+    try:
+        if not sys.stdin.isatty():
+            return patched
+    except Exception:  # noqa: BLE001
+        return patched
+
+    try:
+        ans = input(f"\nApply {len(changes)} enrichment change(s)? [y/N] ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return contract
+    except OSError:
+        return patched
+
+    return patched if ans in ("y", "yes") else contract
