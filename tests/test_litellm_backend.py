@@ -196,14 +196,24 @@ def test_extract_text_handles_malformed_payload():
 
 
 def test_extract_usage_returns_canonical_dict():
-    """`{input_tokens, output_tokens, total_tokens}` — the contract every test asserts on."""
+    """`{input_tokens, output_tokens, total_tokens}` — the contract every test asserts on.
+
+    Wave 1 broadened the dict to also include
+    ``cache_creation_input_tokens`` and ``cache_read_input_tokens``
+    (zero when the response carries no Anthropic prompt-cache fields).
+    The canonical-subset contract is still preserved.
+    """
     from fluid_build.cli.forge_copilot_llm_litellm import LiteLLMProvider
 
     p = LiteLLMProvider("anthropic")
     usage = p.extract_usage(
         {"usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}}
     )
-    assert usage == {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150}
+    assert usage["input_tokens"] == 100
+    assert usage["output_tokens"] == 50
+    assert usage["total_tokens"] == 150
+    assert usage["cache_creation_input_tokens"] == 0
+    assert usage["cache_read_input_tokens"] == 0
 
 
 def test_extract_usage_zero_defaults_on_missing():
@@ -211,7 +221,11 @@ def test_extract_usage_zero_defaults_on_missing():
 
     p = LiteLLMProvider("openai")
     usage = p.extract_usage({})
-    assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    assert usage["input_tokens"] == 0
+    assert usage["output_tokens"] == 0
+    assert usage["total_tokens"] == 0
+    assert usage["cache_creation_input_tokens"] == 0
+    assert usage["cache_read_input_tokens"] == 0
 
 
 def test_extract_usage_computes_total_when_missing():
@@ -497,3 +511,180 @@ def test_call_llm_routes_to_litellm_provider(monkeypatch):
     text = call_llm(provider, cfg, "system", "user")
     assert text == "routed"
     fake.completion.assert_called_once()  # didn't go through httpx
+
+
+# ---------------------------------------------------------------------------
+# H1 — RunCostTracker is fed by call_llm + call_llm_streaming
+# ---------------------------------------------------------------------------
+#
+# Regression coverage for the headline bug: ``cost.json`` reported
+# ``cumulative_usd: null, input_tokens: 0, output_tokens: 0`` even
+# when the underlying Gemini call had spent thousands of real tokens.
+# Root cause: ``call_llm`` updated a module-local ``_cumulative_usage``
+# dict but never invoked ``RunCostTracker.record_call``. Now ``call_llm``
+# bridges the delta into the tracker so the preview panel, the cost
+# ceiling, and ``fluid stats`` all see the spend.
+
+
+def test_call_llm_records_into_run_tracker_gemini_shape(monkeypatch):
+    """Gemini-shape usage round-trips through ``RunCostTracker``.
+
+    litellm normalises Gemini responses to the OpenAI shape
+    (``usage.prompt_tokens`` / ``usage.completion_tokens``), so a
+    bare-mock litellm return with that shape proves the bridge wiring
+    works end-to-end for the H1 finding.
+    """
+    fake = _fake_litellm_module(
+        completion_response={
+            "choices": [{"message": {"content": "hello"}}],
+            "usage": {
+                "prompt_tokens": 14,
+                "completion_tokens": 22,
+                "total_tokens": 36,
+            },
+        },
+        completion_cost=0.0123,
+    )
+    monkeypatch.setitem(sys.modules, "litellm", fake)
+
+    from fluid_build.cli.forge_copilot_llm_providers import (
+        LlmConfig,
+        call_llm,
+        get_llm_provider,
+        reset_token_usage,
+    )
+    from fluid_build.copilot.cost import get_run_tracker, reset_run_tracker
+
+    reset_token_usage()
+    reset_run_tracker()
+
+    provider = get_llm_provider("gemini")
+    cfg = LlmConfig(
+        provider="gemini",
+        model="gemini-2.5-flash",
+        endpoint="x",
+        api_key="AIza-fake",
+    )
+    text = call_llm(provider, cfg, "system", "user")
+    assert text == "hello"
+
+    bd = get_run_tracker().breakdown()
+    assert bd.total_calls == 1
+    assert bd.total_input_tokens == 14
+    assert bd.total_output_tokens == 22
+    assert bd.rows[0].provider == "gemini"
+    assert bd.rows[0].model == "gemini-2.5-flash"
+    # The litellm-supplied USD wins via the thread-local bridge.
+    # Rounded to 4 decimals (sub-cent precision) by ``breakdown()``.
+    assert bd.total_usd == pytest.approx(0.0123)
+
+
+def test_call_llm_streaming_records_into_run_tracker_gemini_shape(monkeypatch):
+    """Streaming Gemini surfaces final-chunk usage (because we now pass
+    ``stream_options={'include_usage': True}``) and the tracker is fed.
+
+    Without ``stream_options`` litellm passes nothing to OpenAI/Gemini
+    backends so the closing chunk's ``usage`` block is ``None`` — the
+    streaming path was silently invisible to the tracker. This pin
+    catches a regression where someone drops the include_usage option.
+    """
+    chunks = [
+        {"choices": [{"delta": {"content": "Hel"}}]},
+        {"choices": [{"delta": {"content": "lo"}}]},
+        {
+            "choices": [{"delta": {"content": ""}}],
+            "usage": {"prompt_tokens": 14, "completion_tokens": 22, "total_tokens": 36},
+        },
+    ]
+    fake = mock.MagicMock(spec=["completion", "completion_cost"])
+    fake.completion.return_value = iter(chunks)
+    fake.completion_cost.return_value = 0.000059
+    monkeypatch.setitem(sys.modules, "litellm", fake)
+
+    from fluid_build.cli.forge_copilot_llm_providers import (
+        LlmConfig,
+        call_llm_streaming,
+        get_llm_provider,
+        reset_token_usage,
+    )
+    from fluid_build.copilot.cost import get_run_tracker, reset_run_tracker
+
+    reset_token_usage()
+    reset_run_tracker()
+
+    provider = get_llm_provider("gemini")
+    cfg = LlmConfig(
+        provider="gemini",
+        model="gemini-2.5-flash",
+        endpoint="x",
+        api_key="AIza-fake",
+    )
+    text = "".join(call_llm_streaming(provider, cfg, "system", "user"))
+    assert text == "Hello"
+
+    bd = get_run_tracker().breakdown()
+    assert bd.total_calls == 1, "streaming call must show up in the tracker"
+    assert bd.total_input_tokens == 14
+    assert bd.total_output_tokens == 22
+
+    # And — critical for the H1 streaming regression — the streaming
+    # request must have included stream_options so litellm asked the
+    # provider for the closing usage block.
+    kwargs = fake.completion.call_args.kwargs
+    assert kwargs.get("stream") is True
+    assert (kwargs.get("stream_options") or {}).get("include_usage") is True
+
+
+def test_call_llm_suppression_avoids_double_count(monkeypatch):
+    """``suppress_call_llm_cost_recording`` lets the staged pipeline
+    own the per-call attribution without the bridge double-counting.
+
+    The staged pipeline records via ``record_call(stage=, agent_class=)``
+    so the cost summary's "Per-agent attribution" panel can show
+    "modeler/LogicalAgent  100 in 50 out". If the bridge ALSO recorded
+    a parallel anonymous row, totals would double and the per-agent
+    breakdown would lie. The suppression context fixes that.
+    """
+    fake = _fake_litellm_module(
+        completion_response={
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+    )
+    monkeypatch.setitem(sys.modules, "litellm", fake)
+
+    from fluid_build.cli.forge_copilot_llm_providers import (
+        LlmConfig,
+        call_llm,
+        get_llm_provider,
+        reset_token_usage,
+        suppress_call_llm_cost_recording,
+    )
+    from fluid_build.copilot.cost import get_run_tracker, reset_run_tracker
+
+    reset_token_usage()
+    reset_run_tracker()
+
+    provider = get_llm_provider("openai")
+    cfg = LlmConfig(provider="openai", model="gpt-4o", endpoint="x", api_key="sk-x")
+    with suppress_call_llm_cost_recording():
+        call_llm(provider, cfg, "system", "user")
+    bd = get_run_tracker().breakdown()
+    # Inside the suppression block the bridge is a no-op; the staged
+    # pipeline does its own record_call further down (out of scope
+    # here). Counter must be zero.
+    assert bd.total_calls == 0
+    assert bd.total_input_tokens == 0
+
+
+def test_streaming_build_request_includes_stream_options():
+    """``build_streaming_request`` always sets ``stream_options``
+    even on an empty payload — keeps non-Anthropic backends honest."""
+    from fluid_build.cli.forge_copilot_llm_litellm import LiteLLMProvider
+    from fluid_build.cli.forge_copilot_llm_providers import LlmConfig
+
+    p = LiteLLMProvider("gemini")
+    cfg = LlmConfig(provider="gemini", model="gemini-2.5-flash", endpoint="x", api_key="k")
+    _, _, payload = p.build_streaming_request(cfg, "system", "user")
+    assert payload["stream"] is True
+    assert payload["stream_options"]["include_usage"] is True
