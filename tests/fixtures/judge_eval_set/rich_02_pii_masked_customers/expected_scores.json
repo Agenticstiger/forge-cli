@@ -10,5 +10,5 @@
   "total": 29,
   "tolerance_per_axis": 1,
   "tolerance_total": 4,
-  "rationale": "GDPR-grade contract with masking on every PII column. correctness=5: PK + enums + nullability + min — all tight. completeness=5: owner + DPO + SLA + retention + cadence + consumes[]. security=5: every PII column (customer_id, email, phone, full_name) has classification + masking algorithm + scope — the canonical security-excellent example; gdprApplicable=true is an explicit policy marker. governance=5: classification=restricted + DPO contact + retention by stream + GDPR flag. performance=4: clustering on customer_id (sensible for dim table) but no partition since dim is small; not 5 because for high-volume CDP, signup_date partitioning would help. documentation=5: per-column descriptions on every field, including GDPR article citations."
+  "rationale": "GDPR-grade: PK + enums + DPO contact + SLA + retention + masked PII + per-column docs."
 }

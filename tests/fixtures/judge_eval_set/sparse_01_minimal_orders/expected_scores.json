@@ -10,5 +10,5 @@
   "total": 9,
   "tolerance_per_axis": 2,
   "tolerance_total": 5,
-  "rationale": "Minimal {name,type} columns only. correctness=3 (acceptable): types are reasonable for the values implied (STRING ids, NUMBER amount, TIMESTAMP). completeness=2 (below acceptable): columns are named and typed but no owner, no SLA, no retention, no refresh cadence, no descriptions — minimum-viable schema only. security=1 (severely deficient): no PII tagging despite customer_id being a clear PII-link risk. governance=1 (severely deficient): no owner, no access policies, no retention — present only as 'a contract exists'. performance=1 (severely deficient): no clustering/partition keys declared on what would clearly be a high-volume orders table. documentation=1 (severely deficient): contract has a name and id but no description, no per-column commentary."
+  "rationale": "Minimal {name, type} columns only — no owner, no SLA, no PII tags, no descriptions."
 }

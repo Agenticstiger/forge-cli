@@ -59,7 +59,7 @@ jobs:
 
       - name: Run judge snapshot + A/B tests
         run: |
-          .venv/bin/python -m pytest \
+          python -m pytest \
             tests/copilot/agents/test_judge_agent.py \
             tests/copilot/agents/test_judge_artifacts.py \
             tests/copilot/agents/test_judge_golden_set.py \
@@ -96,6 +96,6 @@ jobs:
           FLUID_LLM_MODEL: gpt-4o-mini
           GITHUB_API_KEY: ${{ github.token }}
         run: |
-          .venv/bin/python -m pytest \
+          python -m pytest \
             tests/copilot/agents/test_judge_live.py \
             -m live_judge -v --tb=short

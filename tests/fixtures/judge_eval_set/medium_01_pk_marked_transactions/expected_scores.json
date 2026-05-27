@@ -10,5 +10,5 @@
   "total": 18,
   "tolerance_per_axis": 2,
   "tolerance_total": 5,
-  "rationale": "Medium contract with PK/FK markers, owner set, enums for currency/status. correctness=4 (good): types good, PK declared, FK referenced, enums constrain values. completeness=3 (acceptable): owner + layer + productType set; no SLA, no retention, no refresh cadence (the canonical 'minimum viable' floor). security=2 (below acceptable): no PII tagging on account_id despite being a linkable identifier. governance=4 (good): owner + team contactable, but no access policies or retention declared. performance=2: TIMESTAMP columns present but no clustering/partition for a transaction-volume table. documentation=3: layer + productType + enum values give context (data dictionary surfaces values), but no per-column free-text descriptions."
+  "rationale": "PK/FK markers + owner + enums; missing SLA, PII tags on account_id, clustering on filed_date."
 }

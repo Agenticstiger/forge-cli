@@ -10,5 +10,5 @@
   "total": 8,
   "tolerance_per_axis": 2,
   "tolerance_total": 5,
-  "rationale": "Sparse customer table with email/phone (clearly PII) but ZERO classification, ZERO masking. correctness=3 (acceptable): types are reasonable. completeness=2: contract present but no SLA, no retention, no owner. security=0 (missing): PII columns (email, phone) unmasked, untagged — this is the canonical security-failure case where 'missing' is the honest score. governance=1 (severely deficient): no owner, no retention, no access policies — 'a contract exists' floor. performance=1: no partition/clustering for what would be a dimension table. documentation=1: no descriptions; product has a name."
+  "rationale": "Customer table with email and phone unmasked + untagged — canonical PII failure case."
 }

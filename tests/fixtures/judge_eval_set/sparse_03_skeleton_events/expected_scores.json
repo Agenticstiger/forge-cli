@@ -10,5 +10,5 @@
   "total": 9,
   "tolerance_per_axis": 2,
   "tolerance_total": 5,
-  "rationale": "Event stream skeleton with device_ip (PII per GDPR), user_id (linkable), payload (potentially PII). correctness=3 (acceptable): shape is plausible. completeness=2: high-volume event table with no partitioning hint, no retention, no owner. security=1 (severely deficient): device_ip and user_id untagged — clear-PII columns visible but uncovered. governance=1: no owner or retention for high-volume PII data; only minimal product metadata. performance=1: event_ts present but no partition/cluster hint despite obvious volume implication. documentation=1: no per-column description; payload is opaque."
+  "rationale": "Event stream with device_ip + user_id untagged; no retention, no partition on event_ts."
 }
