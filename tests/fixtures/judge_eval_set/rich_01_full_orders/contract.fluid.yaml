@@ -1,0 +1,126 @@
+fluidVersion: "0.7.3"
+kind: DataProduct
+id: rich.orders_v2
+name: Orders Mart
+description: |
+  Consumer-aligned Gold data product surfacing fact_orders for the
+  analytics platform. Refreshed hourly via dbt-snowflake; clustered on
+  customer + order_date for cohort + time-series queries.
+domain: commerce
+
+metadata:
+  layer: Gold
+  productType: CDP
+  owner:
+    team: analytics-engineering
+    email: analytics-eng@example.com
+    slackChannel: "#analytics-orders"
+  classification: internal
+  refreshCadence: hourly
+  sla:
+    freshness: "PT1H"
+    availability: "99.9%"
+    p95LatencyMs: 800
+
+retention:
+  runState: P30D
+  runLogs: P180D
+  lineage: P365D
+  data: P730D
+
+consumes:
+  - id: silver.orders_normalized
+  - id: silver.customers_dim
+
+builds:
+  - id: build_orders_mart
+    pattern: transformation
+    engine: dbt
+    properties:
+      materialization: incremental
+      uniqueKey: order_id
+
+exposes:
+  - exposeId: orders_mart
+    name: fact_orders
+    kind: table
+    binding:
+      platform: snowflake
+      format: table
+      location:
+        database: ANALYTICS_PROD
+        schema: COMMERCE
+        table: FACT_ORDERS
+      clustering:
+        - customer_id
+        - order_date
+      partitioning:
+        column: order_date
+        grain: month
+    contract:
+      schema:
+        - name: order_id
+          type: STRING
+          primaryKey: true
+          nullable: false
+          description: "Globally unique order identifier (UUIDv4)."
+        - name: customer_id
+          type: STRING
+          nullable: false
+          classification: pii
+          masking:
+            algorithm: hash_sha256
+            scope: non_owner_role
+          description: "Foreign key to dim_customers. PII-linkable, masked for non-owner consumers."
+          foreignKey:
+            to: dim_customers
+            field: customer_id
+        - name: order_date
+          type: DATE
+          nullable: false
+          description: "Order placement date (UTC, derived from created_at)."
+        - name: amount_cents
+          type: INT64
+          nullable: false
+          min: 0
+          description: "Order total in cents. Always non-negative."
+        - name: currency
+          type: STRING
+          nullable: false
+          enum: ["USD", "EUR", "GBP", "JPY", "AUD"]
+          description: "ISO-4217 currency code."
+        - name: status
+          type: STRING
+          nullable: false
+          enum: ["pending", "confirmed", "shipped", "delivered", "refunded", "cancelled"]
+          description: "Current lifecycle state of the order."
+        - name: shipping_country
+          type: STRING
+          nullable: true
+          description: "ISO-3166-1 alpha-2 destination country code."
+        - name: item_count
+          type: INT64
+          nullable: false
+          min: 1
+          description: "Total line items on the order."
+        - name: discount_cents
+          type: INT64
+          nullable: false
+          min: 0
+          description: "Total discount applied (cents). Zero when no discount."
+        - name: tax_cents
+          type: INT64
+          nullable: false
+          description: "Tax component of amount_cents."
+        - name: channel
+          type: STRING
+          enum: ["web", "ios", "android", "kiosk", "phone"]
+          description: "Order acquisition channel."
+        - name: created_at
+          type: TIMESTAMP
+          nullable: false
+          description: "Order creation timestamp (UTC)."
+        - name: updated_at
+          type: TIMESTAMP
+          nullable: false
+          description: "Last status-change timestamp (UTC)."

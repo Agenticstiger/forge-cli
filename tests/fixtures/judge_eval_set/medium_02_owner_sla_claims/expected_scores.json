@@ -1,0 +1,14 @@
+{
+  "axes": {
+    "correctness": 4,
+    "completeness": 3,
+    "security": 3,
+    "governance": 4,
+    "performance": 2,
+    "documentation": 2
+  },
+  "total": 18,
+  "tolerance_per_axis": 2,
+  "tolerance_total": 6,
+  "rationale": "Medium-rich: owner set, refresh cadence hourly, retention specified, confidential classification. correctness=4 (good): PK + enums + nullability — types tight. completeness=3 (acceptable): owner + cadence + retention set but no explicit SLA terms (freshness/availability) and no column descriptions. security=3 (acceptable): classification=confidential acknowledges sensitivity at the product level, but claimant_name and policy_number remain unmasked and column-level tags are absent — real-LLM scoring may go either way on whether the product-level marker is 'minimum viable'. governance=4 (good): owner contactable + retention by stream + classification. performance=2: no clustering/partition hint despite filed_date being a natural partition. documentation=2: enums for status/claim_type provide some semantic context but no free-text descriptions — real-LLM scoring penalises this more than the rubric suggests. tolerance_total widened to 6 to absorb the per-axis variance observed empirically on a real LLM."
+}

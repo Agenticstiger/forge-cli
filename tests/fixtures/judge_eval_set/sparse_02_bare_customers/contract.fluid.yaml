@@ -1,0 +1,17 @@
+fluidVersion: "0.7.3"
+kind: DataProduct
+id: sparse.customers_bare
+name: customers
+domain: crm
+
+exposes:
+  - name: customers
+    schema:
+      - name: customer_id
+        type: STRING
+      - name: email
+        type: STRING
+      - name: phone
+        type: STRING
+      - name: signup_date
+        type: DATE

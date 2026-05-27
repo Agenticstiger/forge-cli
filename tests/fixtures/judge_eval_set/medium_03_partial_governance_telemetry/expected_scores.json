@@ -1,0 +1,14 @@
+{
+  "axes": {
+    "correctness": 4,
+    "completeness": 3,
+    "security": 2,
+    "governance": 3,
+    "performance": 2,
+    "documentation": 3
+  },
+  "total": 17,
+  "tolerance_per_axis": 2,
+  "tolerance_total": 5,
+  "rationale": "ODCS-style models[] shape exercise. correctness=4 (good): PK + nullability + good numeric types (DOUBLE for metric_value, TIMESTAMP for collected_at). completeness=3 (acceptable): owner + cadence (streaming) set, no retention, no SLA. security=2 (below acceptable): tenant_id is a multi-tenant isolation marker but is untagged; site_code may be sensitive infrastructure data. governance=3: owner team contactable but no retention for streaming data, no access policies — minimum viable. performance=2: collected_at would naturally partition but no hint declared. documentation=3: layer + productType + cadence give context; per-column descriptions absent."
+}
