@@ -46,18 +46,80 @@ def _default_build(build_engine: str, slug: str) -> Dict[str, Any]:
     }
 
 
-def _expose_schema(logical: LogicalDraft) -> List[Dict[str, Any]]:
-    if logical.osi.datasets:
-        dataset = logical.osi.datasets[0]
-        columns = []
+def _expose_schema(
+    logical: LogicalDraft,
+    *,
+    dataset_override: Optional[Any] = None,
+    column_names: Optional[List[str]] = None,
+    primary_keys: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Build the ``exposes[].contract.schema`` block.
+
+    H8 fix (Snowflake e2e finding 06-snowflake-e2e.md):
+
+    * ``dataset_override`` — when set, source columns from THIS
+      specific OSI dataset rather than ``osi.datasets[0]``. Used
+      by the DV2-per-artifact path so a hub expose carries
+      hub columns, not the first-iterated dataset's columns.
+    * ``column_names`` — explicit projection. When set, emit
+      exactly these columns (in order) and look up each type
+      from the global OSI field-type index. Used by DV2 hubs
+      (project to business_key_columns), sats (project to
+      attributes), and links (project to ``<hub>_hk``).
+    * ``primary_keys`` — explicit list of names that should be
+      marked ``required: true``. Used when the projection is
+      a subset of the dataset.
+    """
+    # Build a type lookup across every OSI dataset — DV2 artifacts
+    # often pull columns from join_keys that live on a different
+    # dataset than the "owning" one.
+    type_lookup: Dict[str, str] = {}
+    description_lookup: Dict[str, str] = {}
+    for d in logical.osi.datasets or []:
+        for f in d.fields or []:
+            if f.data_type:
+                type_lookup.setdefault(f.name.lower(), f.data_type)
+            if f.description:
+                description_lookup.setdefault(f.name.lower(), f.description)
+
+    if column_names is not None:
+        pk_set = set(primary_keys or [])
+        out: List[Dict[str, Any]] = []
+        for column in column_names:
+            entry: Dict[str, Any] = {
+                "name": column,
+                "type": type_lookup.get(column.lower(), "STRING"),
+                "required": column in pk_set,
+            }
+            desc = description_lookup.get(column.lower())
+            if desc:
+                entry["description"] = desc
+            out.append(entry)
+        return out or [{"name": "id", "type": "STRING", "required": True}]
+
+    dataset = (
+        dataset_override
+        if dataset_override is not None
+        else (logical.osi.datasets[0] if logical.osi.datasets else None)
+    )
+    if dataset is not None:
+        columns: List[Dict[str, Any]] = []
         for field in dataset.fields:
-            columns.append(
-                {
-                    "name": field.name,
-                    "type": field.data_type or "STRING",
-                    "required": field.name in dataset.primary_key,
-                }
-            )
+            # UX-9 fix: ``field.description`` carries the catalog
+            # ``Comment`` / ``COMMENT`` / glossary blurb that the
+            # adapter read off the source. The Fluid 0.7.x
+            # ``column`` schema accepts ``description`` (string)
+            # natively — we just have to forward it. Empty strings
+            # are dropped so contracts forged from sources without
+            # comments stay clean.
+            entry: Dict[str, Any] = {
+                "name": field.name,
+                "type": field.data_type or "STRING",
+                "required": field.name in dataset.primary_key,
+            }
+            if field.description:
+                entry["description"] = field.description
+            columns.append(entry)
         if columns:
             return columns
     return [{"name": "id", "type": "STRING", "required": True}]
@@ -128,13 +190,32 @@ def _fluid_time_grain(value: str) -> str | None:
     return normalized if normalized in _FLUID_TIME_GRAINS else None
 
 
-def _fluid_semantics(logical: LogicalDraft) -> Dict[str, Any]:
+def _fluid_semantics(
+    logical: LogicalDraft, *, dataset_override: Optional[Any] = None
+) -> Dict[str, Any]:
+    """Build the semantics block for one expose.
+
+    H8 fix (Snowflake e2e finding 06-snowflake-e2e.md): when the
+    caller passes ``dataset_override`` (a specific
+    :class:`OSIDataset`), build the semantics block off THAT dataset
+    instead of always ``logical.osi.datasets[0]``. The dimensional
+    and DV2 emitters now build one expose per artifact (fact, dim,
+    hub, link, satellite); each expose's semantics must reflect the
+    artifact's own columns, not the first-iterated dataset's.
+
+    When ``dataset_override`` is ``None`` (intent / DDL forges with
+    no DV2 / dimensional shape), fall back to the legacy behaviour:
+    the first OSI dataset drives the semantics.
+    """
     semantics: Dict[str, Any] = {
-        "name": logical.osi.name,
+        "name": (dataset_override.name if dataset_override is not None else logical.osi.name),
         "description": logical.osi.description or logical.description,
     }
     datasets = logical.osi.datasets or []
-    first_dataset = datasets[0] if datasets else None
+    if dataset_override is not None:
+        first_dataset = dataset_override
+    else:
+        first_dataset = datasets[0] if datasets else None
     entities: List[Dict[str, Any]] = []
     dimensions: List[Dict[str, Any]] = []
     measures: List[Dict[str, Any]] = []
@@ -348,6 +429,294 @@ def _build_provenance_block(annotations: Any) -> Optional[str]:
     return _json.dumps(rows, separators=(",", ":"), sort_keys=False)
 
 
+# --------------------------------------------------------------------
+# H7 / H8 (Snowflake e2e finding 06-snowflake-e2e.md) — binding helpers
+# --------------------------------------------------------------------
+#
+# H7: when a forge runs against a warehouse catalog
+# (``source_kind == "catalog"`` and ``source_catalog_name`` is one of
+# {snowflake, bigquery, snowflake, redshift, ...}), the emitted
+# ``exposes[].binding`` MUST default to the warehouse, not
+# ``local/parquet/runtime/<slug>.parquet``. Worst-case interop failure:
+# downstream tooling sees a Snowflake-sourced data product as a local
+# parquet file.
+#
+# H8: when the logical model is DV2-shaped, emit ONE expose per
+# physical artifact (hub / link / sat). Previously 90 artifacts
+# collapsed into a single 5-column expose carrying only the
+# last-iterated table's columns.
+
+_WAREHOUSE_CATALOG_BINDINGS: Dict[str, Dict[str, str]] = {
+    # adapter name → default binding hints
+    "snowflake": {"platform": "snowflake", "format": "snowflake_table"},
+    "unity": {"platform": "databricks", "format": "delta_table"},
+    "bigquery": {"platform": "gcp", "format": "bigquery_table"},
+    "dataplex": {"platform": "gcp", "format": "bigquery_table"},
+    "glue": {"platform": "aws", "format": "parquet"},
+}
+
+
+def _binding_for_artifact(
+    *,
+    logical: LogicalDraft,
+    summary: Dict[str, Any],
+    artifact_slug: str,
+    source_tables: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Build the ``binding`` block for one expose.
+
+    Catalog-aware (H7):
+
+    * Snowflake source → ``binding.platform: snowflake``,
+      ``format: snowflake_table``, with ``database`` / ``schema``
+      / ``table`` location keys pulled from the per-table
+      bindings map (``source_summary["source_table_bindings"]``)
+      or the scope-level defaults (``source_database`` /
+      ``source_schema``).
+    * BigQuery / Glue / Unity catalogs map similarly via
+      ``_WAREHOUSE_CATALOG_BINDINGS``.
+    * No catalog source (intent / DDL forge) → legacy
+      ``local/parquet/runtime/<slug>.parquet`` default.
+
+    ``source_tables`` is the artifact's ``mapped_source_tables``
+    list (case-folded match against the per-table bindings).
+    The first match wins; missing/empty falls through to the
+    scope-level defaults.
+    """
+    catalog_name = (summary.get("source_catalog_name") or "").lower()
+    binding_template = _WAREHOUSE_CATALOG_BINDINGS.get(catalog_name)
+    if binding_template is None:
+        # Non-catalog source (intent / DDL) — preserve the legacy
+        # local/parquet default. Operators forging from a real
+        # filesystem path should rebind manually post-forge.
+        return {
+            "platform": "local",
+            "format": "parquet",
+            "location": {"path": f"runtime/{artifact_slug}.parquet"},
+        }
+
+    binding: Dict[str, Any] = {
+        "platform": binding_template["platform"],
+        "format": binding_template["format"],
+    }
+    location: Dict[str, Any] = {}
+
+    # Per-table binding lookup. The first mapped source table that
+    # matches a known table name wins.
+    table_bindings: Dict[str, Dict[str, Any]] = summary.get("source_table_bindings") or {}
+    matched: Optional[Dict[str, Any]] = None
+    for src in source_tables or []:
+        key = (src or "").strip().lower()
+        if key in table_bindings:
+            matched = table_bindings[key]
+            break
+
+    if matched:
+        for k in ("database", "schema", "table"):
+            if matched.get(k):
+                location[k] = matched[k]
+    else:
+        # Scope-level fallback (when the artifact's source table
+        # wasn't recorded in the per-table map — e.g. DV2 links
+        # whose mapped_source_tables[] is empty).
+        if summary.get("source_database"):
+            location["database"] = summary["source_database"]
+        if summary.get("source_schema"):
+            location["schema"] = summary["source_schema"]
+        # No table name available — leave the location.table off
+        # for the link / cross-cutting artifacts.
+
+    if location:
+        binding["location"] = location
+    return binding
+
+
+def _build_dv2_exposes(
+    *,
+    logical: LogicalDraft,
+    summary: Dict[str, Any],
+    contract_slug: str,
+) -> List[Dict[str, Any]]:
+    """Emit one expose per DV2 artifact (H8).
+
+    Order: hubs → links → satellites. Stable across runs.
+
+    Each expose carries:
+    * ``exposeId`` = the artifact's physical table name
+    * ``kind`` = ``"table"``
+    * ``binding`` = catalog-aware (H7) — Snowflake source bindings
+      route to ``platform: snowflake`` with per-table location
+    * ``contract.schema`` = projected to the artifact's columns,
+      typed via the global OSI field-type index (so STRINGs
+      become NUMBER / TIMESTAMP_TZ / TEXT etc. per the source)
+    * ``semantics`` = minimal per-artifact block — primary
+      entity = the artifact, dimensions = its columns
+    * ``labels.dataVaultArtifactType`` = ``"hub"`` / ``"link"`` /
+      ``"satellite"`` so downstream consumers (catalog publishers,
+      dbt-vault transformation generators) can group artifacts.
+    """
+    if logical.dv2 is None:
+        return []
+    exposes: List[Dict[str, Any]] = []
+    technique_label = "data_vault_2"
+
+    def _artifact_semantics(
+        *,
+        artifact_name: str,
+        primary_keys: List[str],
+        columns: List[str],
+    ) -> Dict[str, Any]:
+        """Minimal per-artifact semantics block.
+
+        Every DV2 expose still needs a valid semantics block (the
+        validator pins ``entities`` / ``dimensions`` / ``measures``
+        / ``metrics`` as required non-empty lists). Build the
+        minimum so validation passes — downstream agents can
+        enrich later.
+        """
+        primary_entity_key = primary_keys[0] if primary_keys else artifact_name
+        entities = [
+            {
+                "name": artifact_name,
+                "type": "primary",
+                "expr": primary_entity_key,
+            }
+        ]
+        dims: List[Dict[str, Any]] = []
+        for column in columns:
+            doc: Dict[str, Any] = {"name": column, "type": "categorical", "expr": column}
+            if _is_time_name(column):
+                doc["type"] = "time"
+                doc["typeParams"] = {"timeGranularity": "day"}
+            dims.append(doc)
+        if not dims:
+            # Schema validator requires at least one dimension —
+            # synthesize one from the artifact name.
+            dims.append({"name": artifact_name, "type": "categorical", "expr": artifact_name})
+        return {
+            "name": artifact_name,
+            "description": (
+                logical.osi.description
+                or logical.description
+                or f"Data Vault 2 artifact {artifact_name}."
+            ),
+            "entities": entities,
+            "dimensions": dims,
+            "measures": [{"name": "record_count", "agg": "count", "expr": "*"}],
+            "metrics": [
+                {
+                    "name": "record_count",
+                    "type": "simple",
+                    "measure": "record_count",
+                    "description": "Count of records.",
+                }
+            ],
+        }
+
+    for hub in logical.dv2.hubs:
+        columns = list(hub.business_key_columns) or [f"{_slug(hub.entity_name)}_id"]
+        exposes.append(
+            {
+                "exposeId": hub.hub_table_name,
+                "kind": "table",
+                "version": "1.0.0",
+                "labels": {
+                    "dataVaultArtifactType": "hub",
+                    "dataModelingTechnique": technique_label,
+                    "dvEntityName": hub.entity_name,
+                },
+                "binding": _binding_for_artifact(
+                    logical=logical,
+                    summary=summary,
+                    artifact_slug=hub.hub_table_name,
+                    source_tables=list(hub.mapped_source_tables or []),
+                ),
+                "contract": {
+                    "schema": _expose_schema(
+                        logical,
+                        column_names=columns,
+                        primary_keys=columns,
+                    ),
+                },
+                "semantics": _artifact_semantics(
+                    artifact_name=hub.entity_name,
+                    primary_keys=columns,
+                    columns=columns,
+                ),
+            }
+        )
+    for link in logical.dv2.links:
+        # Link columns are the per-hub hash-keys; the source-system
+        # data types don't carry through (the hash is computed in
+        # the DV2 transform layer). Emit them as STRING.
+        columns = [f"{hub}_hk" for hub in link.hubs_involved] or [f"{link.link_table_name}_id"]
+        exposes.append(
+            {
+                "exposeId": link.link_table_name,
+                "kind": "table",
+                "version": "1.0.0",
+                "labels": {
+                    "dataVaultArtifactType": "link",
+                    "dataModelingTechnique": technique_label,
+                    "dvLinkName": link.link_name,
+                    "dvHubsInvolved": ",".join(link.hubs_involved),
+                },
+                "binding": _binding_for_artifact(
+                    logical=logical,
+                    summary=summary,
+                    artifact_slug=link.link_table_name,
+                    source_tables=None,
+                ),
+                "contract": {
+                    "schema": _expose_schema(
+                        logical,
+                        column_names=columns,
+                        primary_keys=columns,
+                    ),
+                },
+                "semantics": _artifact_semantics(
+                    artifact_name=link.link_name,
+                    primary_keys=columns,
+                    columns=columns,
+                ),
+            }
+        )
+    for sat in logical.dv2.satellites:
+        columns = list(sat.attributes) or ["hash_diff"]
+        exposes.append(
+            {
+                "exposeId": sat.satellite_table_name,
+                "kind": "table",
+                "version": "1.0.0",
+                "labels": {
+                    "dataVaultArtifactType": "satellite",
+                    "dataModelingTechnique": technique_label,
+                    "dvParentHub": sat.parent_hub,
+                    "dvChangeTracking": sat.change_tracking,
+                },
+                "binding": _binding_for_artifact(
+                    logical=logical,
+                    summary=summary,
+                    artifact_slug=sat.satellite_table_name,
+                    source_tables=list(sat.mapped_source_tables or []),
+                ),
+                "contract": {
+                    "schema": _expose_schema(
+                        logical,
+                        column_names=columns,
+                        primary_keys=[],
+                    ),
+                },
+                "semantics": _artifact_semantics(
+                    artifact_name=sat.entity_name,
+                    primary_keys=[],
+                    columns=columns,
+                ),
+            }
+        )
+    return exposes
+
+
 def build_contract_from_logical(
     logical: LogicalDraft,
     *,
@@ -468,6 +837,57 @@ def build_contract_from_logical(
         if provenance_block:
             labels["provenance"] = provenance_block
 
+    # H8 fix (Snowflake e2e finding 06-snowflake-e2e.md): for
+    # DV2-shaped logical drafts, emit one expose per artifact
+    # (hub / link / satellite). Previously a 90-artifact DV2 model
+    # collapsed into a single 5-column expose carrying only the
+    # last-iterated table's columns — a silent data-loss bug.
+    exposes: List[Dict[str, Any]]
+    if logical.dv2 is not None and (
+        logical.dv2.hubs or logical.dv2.links or logical.dv2.satellites
+    ):
+        exposes = _build_dv2_exposes(
+            logical=logical,
+            summary=summary,
+            contract_slug=slug,
+        )
+    else:
+        # Single-expose path: intent / DDL / dimensional (the
+        # dimensional emitter still keeps the legacy single-expose
+        # shape — its semantics block already enumerates every
+        # fact + dimension via ``logical.dimensional`` so the
+        # collapse is intentional, not a data-loss bug).
+        expose: Dict[str, Any] = {
+            "exposeId": slug,
+            "kind": "table",
+            "version": "1.0.0",
+            "binding": _binding_for_artifact(
+                logical=logical,
+                summary=summary,
+                artifact_slug=slug,
+                source_tables=None,
+            ),
+            "contract": {
+                "schema": _expose_schema(logical),
+            },
+            "semantics": _fluid_semantics(logical),
+        }
+        # UX-9 fix: when the source catalog provided a table-level
+        # ``Description`` / ``COMMENT`` (Glue, Snowflake, BQ, …) it
+        # lands on ``logical.osi.datasets[0].description`` via
+        # ``_translate_catalog_table`` → ``_osi_from_tables``. Forward
+        # it to ``exposes[].description`` so the dataset blurb survives
+        # end-to-end. Top-level contract ``description`` already maps
+        # from ``logical.description`` (which carries the data-product
+        # summary, not the source table comment) so we surface the
+        # source table comment at the expose level where it semantically
+        # belongs.
+        if logical.osi.datasets:
+            first_dataset = logical.osi.datasets[0]
+            if first_dataset.description:
+                expose["description"] = first_dataset.description
+        exposes = [expose]
+
     return {
         "fluidVersion": FluidSchemaManager.latest_bundled_version(),
         "kind": "DataProduct",
@@ -478,20 +898,5 @@ def build_contract_from_logical(
         "labels": labels,
         "metadata": metadata,
         "builds": [_default_build(build_engine, slug)],
-        "exposes": [
-            {
-                "exposeId": slug,
-                "kind": "table",
-                "version": "1.0.0",
-                "binding": {
-                    "platform": "local",
-                    "format": "parquet",
-                    "location": {"path": f"runtime/{slug}.parquet"},
-                },
-                "contract": {
-                    "schema": _expose_schema(logical),
-                },
-                "semantics": _fluid_semantics(logical),
-            }
-        ],
+        "exposes": exposes,
     }

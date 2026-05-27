@@ -135,7 +135,11 @@ class DataMeshManagerCatalogAdapter(CatalogAdapter):
         if scope.database:
             params["domain"] = scope.database
         try:
-            data = self._request("GET", "/api/data-products", params=params)
+            # DMM REST endpoint is /api/dataproducts (no hyphen). The
+            # publisher side at providers/datamesh_manager uses the
+            # same path; matching ensures both directions stay in
+            # lock-step with the vendor API surface.
+            data = self._request("GET", "/api/dataproducts", params=params)
         except CatalogError:
             raise
         out: List[CatalogTable] = []
@@ -162,9 +166,12 @@ class DataMeshManagerCatalogAdapter(CatalogAdapter):
     def get_table(self, fqn: str) -> CatalogTable:
         """Fetch one data product's full record + its associated
         contract (if registered)."""
-        product = self._request("GET", f"/api/data-products/{fqn}")
+        product = self._request("GET", f"/api/dataproducts/{fqn}")
+        # Data contracts live at the separate ``/api/datacontracts/{id}``
+        # endpoint in DMM. The data product itself only carries a
+        # pointer; the contract body is fetched via its own path.
         contract = safe_metadata_call(
-            lambda: self._request("GET", f"/api/data-products/{fqn}/contract"),
+            lambda: self._request("GET", f"/api/datacontracts/{fqn}"),
             fallback=None,
             description="dmm contract fetch",
             log_target=fqn,
@@ -204,7 +211,7 @@ class DataMeshManagerCatalogAdapter(CatalogAdapter):
         """DMM tracks lineage between data products via the
         ``lineage`` endpoint."""
         try:
-            data = self._request("GET", f"/api/data-products/{fqn}/lineage")
+            data = self._request("GET", f"/api/dataproducts/{fqn}/lineage")
         except CatalogError as exc:
             _log.debug(
                 "fluid.copilot.catalog.dmm.lineage.skipped: %s — %s",
@@ -223,29 +230,17 @@ class DataMeshManagerCatalogAdapter(CatalogAdapter):
         return CatalogLineage(upstream=upstream, downstream=downstream)
 
     def list_glossary_terms(self, scope: CatalogScope) -> List[GlossaryTerm]:
-        """DMM exposes a /glossary endpoint for the business
-        vocabulary registered with the mesh."""
-        try:
-            data = self._request("GET", "/api/glossary")
-        except CatalogError as exc:
-            _log.debug(
-                "fluid.copilot.catalog.dmm.glossary.skipped: %s",
-                exc,
-            )
-            return []
-        items = data if isinstance(data, list) else data.get("terms") or []
-        out: List[GlossaryTerm] = []
-        for entry in items:
-            out.append(
-                GlossaryTerm(
-                    term=entry.get("name") or "<unknown>",
-                    definition=entry.get("definition") or "",
-                    synonyms=list(entry.get("synonyms") or []),
-                    examples=list(entry.get("examples") or []),
-                    domain=entry.get("domain"),
-                )
-            )
-        return out
+        """DMM has no first-class glossary endpoint.
+
+        DMM models business vocabulary inside data-product /
+        data-contract definitions rather than via a standalone
+        ``/api/glossary`` collection. We return an empty list to
+        keep the cross-adapter shape consistent (mirrors Glue,
+        which also has no first-class glossary). Downstream stages
+        of the forge pipeline already treat ``[]`` as the
+        no-glossary-available signal.
+        """
+        return []
 
     # -----------------------------------------------------------------
     # Audit context
@@ -273,7 +268,7 @@ class DataMeshManagerCatalogAdapter(CatalogAdapter):
                 "Verify DMM_API_URL is correct and reachable from this host.",
                 (
                     "Test the token: curl -H 'Authorization: Bearer <token>' "
-                    "<server>/api/data-products"
+                    "<server>/api/dataproducts"
                 ),
             ],
         )
