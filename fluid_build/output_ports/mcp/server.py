@@ -41,16 +41,14 @@ maintained protocol implementation.
 from __future__ import annotations
 
 import asyncio
-import collections
 import json
 import logging
 import os
-import signal
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Deque, Dict, List, Mapping, Optional
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional
 
 import yaml
 
@@ -59,7 +57,6 @@ import yaml
 # fluid_build.output_ports.mcp.__init__ catches this case for callers
 # that don't need the dispatcher (utility-only imports).
 from mcp.server.lowlevel import Server  # noqa: E402
-from mcp.server.stdio import stdio_server  # noqa: E402
 from mcp.types import (  # noqa: E402
     EmbeddedResource,
     Resource,
@@ -72,6 +69,14 @@ from fluid_build.copilot.store.audit_trail import (
     write_audit_event,
 )
 
+# Tool-call bodies extracted to ``_handlers.py`` (the class kept thin
+# delegating ``_tool_*`` methods). Imported as a module — not
+# ``from _handlers import ...`` — so a test patching
+# ``_handlers.tool_describe`` flows through to the delegation.
+from . import (
+    _handlers,  # noqa: E402
+    _transport,  # noqa: E402
+)
 from ._expose_utils import (
     _annotate_engine_error,
     _jsonable,
@@ -79,7 +84,7 @@ from ._expose_utils import (
 )
 from .drivers import EngineDriver, build_driver
 from .policy import OutputPortPolicy
-from .query_compiler import compile_free_form_sql, compile_semantic_query
+from .query_compiler import QueryValidationError
 from .tools import check_tool_permission, derive_advertised_tools
 
 # NOTE: ``fluid_build.observability`` is imported LAZILY (inside the
@@ -128,164 +133,30 @@ DEFAULT_QUERY_TIMEOUT_SECONDS = 60.0
 DEFAULT_RATE_LIMIT_CALLS = int(os.environ.get("FLUID_MCP_RATE_LIMIT", "60"))
 DEFAULT_RATE_LIMIT_WINDOW_SECONDS = float(os.environ.get("FLUID_MCP_RATE_WINDOW_SECONDS", "60"))
 
+# One-shot guard so the "redis rate-limit backend is experimental"
+# notice fires once per process, the first time it's actually selected.
+_WARNED_RATE_REDIS_EXPERIMENTAL = False
+
 # Backpressure: max concurrent in-flight tool calls per gateway
 # process. Prevents a runaway agent from saturating the engine
 # connection pool. Set 0 to disable.
 DEFAULT_MAX_CONCURRENCY = int(os.environ.get("FLUID_MCP_MAX_CONCURRENCY", "8"))
 
-# Circuit breaker: when a driver fails ``threshold`` times within
-# ``window_seconds``, subsequent calls fast-fail with a
-# ``CircuitOpen`` envelope for ``cooldown_seconds`` instead of
-# hitting the engine. Prevents a downstream outage from cascading
-# into per-call timeouts that pin event-loop slots.
-DEFAULT_CIRCUIT_THRESHOLD = int(os.environ.get("FLUID_MCP_CIRCUIT_THRESHOLD", "5"))
-DEFAULT_CIRCUIT_WINDOW_SECONDS = float(os.environ.get("FLUID_MCP_CIRCUIT_WINDOW_SECONDS", "60"))
-DEFAULT_CIRCUIT_COOLDOWN_SECONDS = float(os.environ.get("FLUID_MCP_CIRCUIT_COOLDOWN_SECONDS", "30"))
-
-
-@dataclass
-class _CircuitBreaker:
-    """Sliding-window failure counter that trips into ``open`` for
-    ``cooldown_seconds`` once ``threshold`` failures land within
-    ``window_seconds``. Half-open behaviour is implicit: the first
-    call after cooldown is allowed; if it fails, the circuit
-    re-opens.
-
-    Single-replica deployments use the in-process counter (default).
-    Multi-replica deployments set
-    ``FLUID_MCP_CIRCUIT_BACKEND=redis`` so a downstream warehouse
-    outage trips the breaker for EVERY gateway replica
-    simultaneously — preventing the thundering-herd retry storm
-    that would otherwise hit the recovering warehouse from N
-    independently-healing breakers. Falls back to in-process on
-    Redis outage (fail-open is documented loud — same posture as
-    the rate-limit Redis backend).
-    """
-
-    threshold: int = DEFAULT_CIRCUIT_THRESHOLD
-    window_seconds: float = DEFAULT_CIRCUIT_WINDOW_SECONDS
-    cooldown_seconds: float = DEFAULT_CIRCUIT_COOLDOWN_SECONDS
-    breaker_key: str = "fluid:mcp:circuit:default"
-    _failures: Deque[float] = field(default_factory=collections.deque)
-    _opened_at: Optional[float] = None
-    _redis_client: Any = None
-    _redis_unavailable: bool = False
-
-    def is_open(self) -> bool:
-        # Try Redis first when configured; fall through to local.
-        if self._is_redis_enabled():
-            redis_state = self._is_open_redis()
-            if redis_state is not None:
-                return redis_state
-        if self._opened_at is None:
-            return False
-        if time.monotonic() - self._opened_at < self.cooldown_seconds:
-            return True
-        # Cooldown elapsed → reset to closed (half-open semantics).
-        self._opened_at = None
-        self._failures.clear()
-        return False
-
-    def record_failure(self) -> bool:
-        """Append a failure timestamp; returns True if the circuit
-        just tripped from this failure."""
-        now = time.monotonic()
-        cutoff = now - self.window_seconds
-        while self._failures and self._failures[0] < cutoff:
-            self._failures.popleft()
-        self._failures.append(now)
-        tripped_local = self._opened_at is None and len(self._failures) >= self.threshold
-        if tripped_local:
-            self._opened_at = now
-        # Mirror to Redis for fleet-wide visibility.
-        if self._is_redis_enabled():
-            self._record_failure_redis(now=now, tripped=tripped_local)
-        return tripped_local
-
-    def record_success(self) -> None:
-        # Successful call partially heals the breaker — clear the
-        # most recent failure so a flaky engine doesn't permanently
-        # accumulate towards the threshold.
-        if self._failures:
-            self._failures.pop()
-
-    # ------------------------------------------------------------------
-    # Redis backend (fleet-wide circuit state)
-    # ------------------------------------------------------------------
-
-    def _is_redis_enabled(self) -> bool:
-        if self._redis_unavailable:
-            return False
-        return os.environ.get("FLUID_MCP_CIRCUIT_BACKEND", "memory").lower() == "redis"
-
-    def _redis(self):
-        if self._redis_client is not None:
-            return self._redis_client
-        try:
-            import redis  # type: ignore[import-not-found]
-
-            url = os.environ.get(
-                "FLUID_MCP_CIRCUIT_REDIS_URL",
-                os.environ.get("FLUID_MCP_RATE_LIMIT_REDIS_URL", "redis://127.0.0.1:6379/0"),
-            )
-            client = redis.Redis.from_url(url, socket_timeout=2.0)
-            client.ping()
-            self._redis_client = client
-            return client
-        except Exception:  # noqa: BLE001
-            self._redis_unavailable = True
-            return None
-
-    def _is_open_redis(self) -> Optional[bool]:
-        """Return True if Redis says the breaker is open, False if
-        closed, None if Redis is unreachable (caller falls back to
-        in-process state)."""
-        client = self._redis()
-        if client is None:
-            return None
-        try:
-            opened_at_raw = client.get(f"{self.breaker_key}:opened_at")
-        except Exception:  # noqa: BLE001
-            self._redis_unavailable = True
-            return None
-        if opened_at_raw is None:
-            return False
-        try:
-            opened_at = float(opened_at_raw)
-        except ValueError:
-            return False
-        if time.time() - opened_at < self.cooldown_seconds:
-            return True
-        # Cooldown elapsed — best-effort clean up so the next
-        # success doesn't re-read stale state.
-        try:
-            client.delete(f"{self.breaker_key}:opened_at", f"{self.breaker_key}:failures")
-        except Exception:  # noqa: BLE001
-            pass
-        return False
-
-    def _record_failure_redis(self, *, now: float, tripped: bool) -> None:
-        client = self._redis()
-        if client is None:
-            return
-        try:
-            now_ms = int(time.time() * 1000)
-            cutoff_ms = now_ms - int(self.window_seconds * 1000)
-            failures_key = f"{self.breaker_key}:failures"
-            opened_key = f"{self.breaker_key}:opened_at"
-            pipe = client.pipeline()
-            pipe.zremrangebyscore(failures_key, 0, cutoff_ms)
-            pipe.zadd(failures_key, {f"{now_ms}-{os.getpid()}": now_ms})
-            pipe.zcard(failures_key)
-            pipe.expire(failures_key, int(self.window_seconds) + 60)
-            _, _, count, _ = pipe.execute()
-            if count >= self.threshold:
-                # Use NX so a peer replica's open marker isn't
-                # overwritten — we want first-tripper-wins semantics.
-                client.set(opened_key, str(time.time()), nx=True, ex=int(self.cooldown_seconds) + 5)
-        except Exception:  # noqa: BLE001
-            self._redis_unavailable = True
-
+# Circuit breaker (sliding-window, optional Redis fleet backend) is
+# physically extracted to ``_circuit.py`` — it crossed the >1500-LOC
+# "extract to natural seams" threshold. Re-imported here so
+# ``from fluid_build.output_ports.mcp.server import _CircuitBreaker``
+# (tests/output_ports/test_pii_audit_circuit_token.py) keeps resolving.
+# ``_CircuitBreaker`` is instantiated below; the DEFAULT_CIRCUIT_*
+# constants are re-exported (not used here) for API stability so
+# ``from ...server import DEFAULT_CIRCUIT_THRESHOLD`` keeps resolving.
+# F401 is intentional on the re-exported constants.
+from ._circuit import (  # noqa: E402,F401
+    DEFAULT_CIRCUIT_COOLDOWN_SECONDS,
+    DEFAULT_CIRCUIT_THRESHOLD,
+    DEFAULT_CIRCUIT_WINDOW_SECONDS,
+    _CircuitBreaker,
+)
 
 # ---------------------------------------------------------------------
 # Session state — bound once at lifespan start, read on every tool call
@@ -323,11 +194,16 @@ class SessionState:
     # events; stable across the gateway lifetime). Mirrors the same
     # contract every other forge-cli CLI stage already honours.
     run_id: str = field(default="")
-    # Sliding-window rate limit: timestamps of the last N tool calls.
-    # When ``rate_limit_calls`` is 0 the window is unused.
+    # Sliding-window rate limit (PyrateLimiter-backed). When
+    # ``rate_limit_calls`` is 0 the gate is disabled.
     rate_limit_calls: int = DEFAULT_RATE_LIMIT_CALLS
     rate_limit_window_seconds: float = DEFAULT_RATE_LIMIT_WINDOW_SECONDS
-    _call_window: Deque[float] = field(default_factory=collections.deque)
+    # Lazily-built PyrateLimiter instances — in-process (single
+    # instance) + optional Redis fleet backend — plus the fail-open
+    # degrade flag. See :meth:`check_rate_limit`.
+    _rate_limiter: Optional[Any] = None
+    _redis_rate_limiter: Optional[Any] = None
+    _rate_redis_unavailable: bool = False
     # In-flight tool-call count INCLUDING calls queued behind the
     # concurrency semaphore; used by graceful-shutdown to drain so
     # nothing is dropped on SIGTERM.
@@ -391,104 +267,115 @@ class SessionState:
 
     def check_rate_limit(self) -> tuple[bool, Optional[str]]:
         """Sliding-window rate-limit check. Returns
-        ``(allowed, deny_reason)`` and prunes expired entries.
-        ``rate_limit_calls=0`` disables the gate.
+        ``(allowed, deny_reason)``. ``rate_limit_calls=0`` disables
+        the gate.
 
-        When ``FLUID_MCP_RATE_LIMIT_BACKEND=redis`` and
-        ``FLUID_MCP_RATE_LIMIT_REDIS_URL`` are set, the window is
-        backed by Redis (sorted-set ZADD/ZCARD pattern) so a fleet
-        of gateway replicas shares a single rate-limit budget.
-        Falls back to the in-process deque when Redis isn't
-        configured. The Redis backend is best-effort: if Redis
-        becomes unreachable we **fail open** (allow the call) and
-        log loud — the alternative is dropping all traffic on a
-        Redis outage, which is worse than transient rate-limit
-        bypass.
+        Borrow-before-build (vutran1710/PyrateLimiter, MIT): the window
+        is a PyrateLimiter ``InMemoryBucket`` for the single-instance
+        default, or a ``RedisBucket`` (same sorted-set sliding window)
+        when ``FLUID_MCP_RATE_LIMIT_BACKEND=redis`` so a fleet of
+        gateway replicas shares one budget. The one behaviour the
+        library leaves to the caller is the **fail-open → in-process
+        degrade**: if Redis is unreachable we warn once and fall back to
+        the in-process limiter (dropping all traffic on a Redis outage
+        is worse than a transient fleet-wide-budget gap).
         """
         if self.rate_limit_calls <= 0:
             return True, None
-        # Per-instance backend uses the in-process deque; multi-
-        # instance backend uses Redis. The decision is made once
-        # per call cheaply; Redis client is cached on the state.
-        backend = os.environ.get("FLUID_MCP_RATE_LIMIT_BACKEND", "memory").lower()
-        if backend == "redis":
-            ok, reason = self._check_rate_limit_redis()
-            if reason != "redis-unavailable-fallback-open":
-                return ok, reason
-            # Fall through to in-process backend on Redis outage.
-        now = time.monotonic()
-        window_start = now - self.rate_limit_window_seconds
-        while self._call_window and self._call_window[0] < window_start:
-            self._call_window.popleft()
-        if len(self._call_window) >= self.rate_limit_calls:
+        limiter, label = self._resolve_rate_limiter()
+        try:
+            acquired = bool(limiter.try_acquire("call", blocking=False))
+        except Exception as exc:  # noqa: BLE001 — Redis hiccup mid-acquire → degrade
+            self.logger.warning(
+                "rate_limit_acquire_failed (%s backend); degrading to in-process: %s",
+                label,
+                exc,
+            )
+            self._rate_redis_unavailable = True
+            acquired = bool(self._inprocess_rate_limiter().try_acquire("call", blocking=False))
+            label = "memory"
+        if not acquired:
+            fleet = ", fleet-wide via Redis" if label == "redis" else ""
             return False, (
                 f"rate-limit-exceeded ({self.rate_limit_calls} calls per "
-                f"{self.rate_limit_window_seconds}s)"
+                f"{self.rate_limit_window_seconds}s{fleet})"
             )
-        self._call_window.append(now)
         return True, None
 
-    def _check_rate_limit_redis(self) -> tuple[bool, Optional[str]]:
-        """Sliding-window rate-limit backed by a Redis sorted set.
+    def _make_rate(self):
+        """Build the PyrateLimiter ``Rate`` from the configured window
+        (interval is milliseconds in PyrateLimiter)."""
+        from pyrate_limiter import Rate
 
-        Key pattern: ``fluid:mcp:rate:{contract_id}:{expose_id}``
-        — fleet-wide, shared across every gateway replica that
-        connects to the same Redis. ZADD adds the call timestamp,
-        ZCARD counts the live entries within the window, ZREMRANGEBYSCORE
-        evicts expired entries. The 3-command pipeline is atomic.
+        return Rate(self.rate_limit_calls, int(self.rate_limit_window_seconds * 1000))
 
-        Connection is cached on the state for reuse. Failures
-        return ``"redis-unavailable-fallback-open"`` so the caller
-        knows to use the in-process backend.
+    def _inprocess_rate_limiter(self):
+        """Lazily build + cache the in-process limiter (per-SessionState
+        ``InMemoryBucket``)."""
+        if self._rate_limiter is None:
+            from pyrate_limiter import InMemoryBucket, Limiter
+
+            self._rate_limiter = Limiter(InMemoryBucket([self._make_rate()]))
+        return self._rate_limiter
+
+    def _resolve_rate_limiter(self) -> "tuple[Any, str]":
+        """Return ``(limiter, backend_label)``.
+
+        Redis-backed (fleet-wide, shared across replicas via a
+        ``RedisBucket`` keyed ``fluid:mcp:rate:{contract}:{expose}``)
+        when ``FLUID_MCP_RATE_LIMIT_BACKEND=redis`` and Redis is
+        reachable; otherwise the in-process limiter. A Redis failure
+        flips ``_rate_redis_unavailable`` and degrades to in-process
+        with a one-shot warning (fail-open — see ``check_rate_limit``).
         """
+        backend = os.environ.get("FLUID_MCP_RATE_LIMIT_BACKEND", "memory").lower()
+        if backend != "redis" or self._rate_redis_unavailable:
+            return self._inprocess_rate_limiter(), "memory"
+        global _WARNED_RATE_REDIS_EXPERIMENTAL
+        if not _WARNED_RATE_REDIS_EXPERIMENTAL:
+            _WARNED_RATE_REDIS_EXPERIMENTAL = True
+            self.logger.warning(
+                "mcp_rate_limit_redis_experimental: FLUID_MCP_RATE_LIMIT_BACKEND=redis "
+                "(fleet-wide shared rate limit) is EXPERIMENTAL and not yet under "
+                "support guarantees. The default in-process limiter covers "
+                "single-replica deployments; enable Redis only once you run multiple "
+                "gateway replicas that must share one budget."
+            )
+        if self._redis_rate_limiter is not None:
+            return self._redis_rate_limiter, "redis"
         try:
             import redis  # type: ignore[import-not-found]
+            from pyrate_limiter import Limiter, RedisBucket
+
+            url = os.environ.get("FLUID_MCP_RATE_LIMIT_REDIS_URL", "redis://127.0.0.1:6379/0")
+            client = getattr(self, "_redis_client", None)
+            if client is None:
+                client = redis.Redis.from_url(url, socket_timeout=2.0)
+                client.ping()
+                self._redis_client = client
+            contract_id = self.contract.get("id") or "default"
+            expose_id = self.expose.get("exposeId") or "default"
+            bucket_key = f"fluid:mcp:rate:{contract_id}:{expose_id}"
+            self._redis_rate_limiter = Limiter(
+                RedisBucket.init([self._make_rate()], client, bucket_key)
+            )
+            return self._redis_rate_limiter, "redis"
         except ImportError:
             self.logger.warning(
                 "FLUID_MCP_RATE_LIMIT_BACKEND=redis but redis-py not installed; "
-                "falling back to in-process rate limit. Install with: "
-                "pip install redis"
+                "using in-process rate limit. Install with: pip install redis"
             )
-            return True, "redis-unavailable-fallback-open"
-
-        url = os.environ.get("FLUID_MCP_RATE_LIMIT_REDIS_URL", "redis://127.0.0.1:6379/0")
-        client = getattr(self, "_redis_client", None)
-        if client is None:
-            try:
-                client = redis.Redis.from_url(url, socket_timeout=2.0)
-                client.ping()
-                self._redis_client = client  # cache on instance
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning("redis_rate_limit_connect_failed: %s", exc)
-                return True, "redis-unavailable-fallback-open"
-
-        contract_id = self.contract.get("id") or "default"
-        expose_id = self.expose.get("exposeId") or "default"
-        key = f"fluid:mcp:rate:{contract_id}:{expose_id}"
-        now_ms = int(time.time() * 1000)
-        window_start_ms = now_ms - int(self.rate_limit_window_seconds * 1000)
-        try:
-            pipe = client.pipeline()
-            pipe.zremrangebyscore(key, 0, window_start_ms)
-            pipe.zcard(key)
-            pipe.zadd(key, {f"{now_ms}-{os.getpid()}": now_ms})
-            pipe.expire(key, int(self.rate_limit_window_seconds) + 60)
-            _, count, _, _ = pipe.execute()
+            self._rate_redis_unavailable = True
+            return self._inprocess_rate_limiter(), "memory"
         except Exception as exc:  # noqa: BLE001
-            self.logger.warning("redis_rate_limit_pipeline_failed: %s", exc)
-            return True, "redis-unavailable-fallback-open"
-        if count >= self.rate_limit_calls:
-            # Roll back our own ZADD so the next call gets a fresh
-            # slot when traffic recedes.
-            try:
-                client.zrem(key, f"{now_ms}-{os.getpid()}")
-            except Exception:  # noqa: BLE001
-                pass
-            return False, (
-                f"rate-limit-exceeded ({self.rate_limit_calls} calls per "
-                f"{self.rate_limit_window_seconds}s, fleet-wide via Redis)"
+            self.logger.warning(
+                "redis_rate_limit_unavailable (%s) — fleet-wide rate limit OFF, "
+                "degrading to in-process. Point FLUID_MCP_RATE_LIMIT_REDIS_URL at "
+                "a reachable Redis to restore it.",
+                exc,
             )
-        return True, None
+            self._rate_redis_unavailable = True
+            return self._inprocess_rate_limiter(), "memory"
 
     def check_token_budget(self, estimated_tokens: int) -> tuple[bool, Optional[str]]:
         """Per-day token-budget check against
@@ -1051,12 +938,21 @@ class OutputPortMcpServer:
                     "message": f"Unknown tool: {name!r}.",
                 }
         except Exception as exc:  # noqa: BLE001
-            # Wire response carries a sanitised, redacted error
-            # message — engine binding details (database / schema /
-            # table) leak threat-model information to the calling
-            # LLM and could be used for reconnaissance. The full
-            # annotated error (with hints + binding context) lands
-            # on the audit trail and the operator log instead.
+            # ENGINE / BINDING failures carry a sanitised, redacted wire
+            # message — binding details (database / schema / table) leak
+            # threat-model information to the calling LLM and could be
+            # used for reconnaissance. The full annotated error (hints +
+            # binding context) lands on the audit trail + operator log.
+            #
+            # A QueryValidationError is the exception: it's pure INPUT
+            # validation (unknown measure, bad filter key, out-of-range
+            # limit, non-SELECT free-form SQL, restricted-column
+            # reference). Its message references only contract-declared
+            # names the caller can already enumerate via `describe`, so
+            # it leaks nothing — and surfacing it VERBATIM lets the agent
+            # self-correct its next call instead of looping blindly
+            # against an opaque "see audit trail".
+            is_validation_error = isinstance(exc, QueryValidationError)
             full_message = _annotate_engine_error(exc, expose=self.state.expose)
             self.state.logger.warning(
                 "output_port_tool_error",
@@ -1087,312 +983,67 @@ class OutputPortMcpServer:
                 "error": type(exc).__name__,
                 "tool": name,
                 "message": (
-                    f"Tool {name!r} failed; see server audit trail for the " "full annotated error."
+                    str(exc)
+                    if is_validation_error
+                    else (
+                        f"Tool {name!r} failed; see server audit trail for the "
+                        "full annotated error."
+                    )
                 ),
             }
         return [TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
 
     # ---- Per-tool implementations -----------------------------------
 
+    # Tool bodies live in ``_handlers.py`` (extracted from this
+    # god-class). These thin delegations keep the method surface +
+    # the ``run_in_executor(None, self._tool_*)`` dispatch unchanged;
+    # ``_handlers.tool_*`` take the bound SessionState explicitly so
+    # they're unit-testable without a full server. Going through the
+    # ``_handlers`` module (not ``from _handlers import``) so a test
+    # patching ``_handlers.tool_describe`` flows through.
     def _tool_describe(self) -> Dict[str, Any]:
-        driver = self.state.get_driver()
-        descriptor = driver.descriptor()
-        return {
-            "exposeId": self.state.expose.get("exposeId"),
-            "title": self.state.expose.get("title"),
-            "kind": self.state.expose.get("kind"),
-            "version": self.state.expose.get("version"),
-            "contract": _jsonable(self.state.expose.get("contract") or {}),
-            "semantics": _jsonable(self.state.expose.get("semantics") or {}),
-            "binding": {
-                "platform": descriptor.platform,
-                "format": descriptor.format,
-                "tableReference": descriptor.table_reference,
-                "dialect": descriptor.dialect,
-                "capabilities": dict(descriptor.capabilities),
-            },
-            "agentPolicy": _jsonable(
-                ((self.state.expose.get("policy") or {}).get("agentPolicy") or {})
-            ),
-        }
+        return _handlers.tool_describe(self.state)
 
     def _tool_sample(self, arguments: Mapping[str, Any]) -> Dict[str, Any]:
-        driver = self.state.get_driver()
-        requested = arguments.get("limit", 10)
-        try:
-            limit = int(requested)
-        except (TypeError, ValueError):
-            limit = 10
-        cap = self.state.policy.max_sample_rows
-        effective = min(max(limit, 1), cap)
-        # Pass caller_attributes so any policy.rowFilters[] in the
-        # contract resolve their ${caller.*} placeholders against
-        # the bound MCP clientInfo. Drivers that don't override
-        # sample() use the base impl, which compiles the filter
-        # into a parameterised WHERE clause.
-        result = driver.sample(limit=effective, caller_attributes=self.state.caller_attributes)
-        return {
-            "exposeId": self.state.expose.get("exposeId"),
-            "columns": list(result.columns),
-            "rows": [_jsonable(row) for row in result.rows],
-            "rowCount": len(result.rows),
-            "truncated": result.truncated,
-            "requestedLimit": limit,
-            "effectiveLimit": effective,
-        }
+        return _handlers.tool_sample(self.state, arguments)
 
     def _tool_query(self, arguments: Mapping[str, Any]) -> Dict[str, Any]:
-        driver = self.state.get_driver()
-        compiled = compile_semantic_query(
-            expose=self.state.expose,
-            arguments=dict(arguments),
-            descriptor=driver.descriptor(),
-        )
-        result = driver.query(compiled=compiled, timeout_seconds=self.state.query_timeout_seconds)
-        return _serialize_query_result(self.state.expose, compiled, result)
+        return _handlers.tool_query(self.state, arguments)
 
     def _tool_query_sql(self, arguments: Mapping[str, Any]) -> Dict[str, Any]:
-        driver = self.state.get_driver()
-        compiled = compile_free_form_sql(
-            expose=self.state.expose,
-            arguments=dict(arguments),
-            descriptor=driver.descriptor(),
-        )
-        result = driver.query(compiled=compiled, timeout_seconds=self.state.query_timeout_seconds)
-        return _serialize_query_result(self.state.expose, compiled, result)
+        return _handlers.tool_query_sql(self.state, arguments)
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
+    # Transport / lifecycle bodies live in ``_transport.py`` (extracted
+    # from this god-class — stdio + HTTP/SSE serving is a distinct
+    # concern from protocol-handler registration + policy). These thin
+    # delegations keep the public method surface + the ``run_stdio``
+    # CLI entry point unchanged. Routed through the ``_transport``
+    # module so a test patching ``_transport.run_async`` flows through.
     async def run_http_async(self, *, host: str = "127.0.0.1", port: int = 8765) -> None:
-        """Serve the gateway over MCP-SSE on ``host:port``.
-
-        Borrowed transport: ``mcp.server.sse.SseServerTransport`` +
-        Starlette + uvicorn. The MCP SDK ships SseServerTransport;
-        Starlette / uvicorn come along as transitive deps of the
-        ``mcp`` extra. Operators connect via
-        ``http://host:port/sse`` from any MCP client that supports
-        the SSE transport (Claude Desktop, MCP Inspector,
-        custom HTTP-MCP clients).
-
-        Identity binding still flows through ``clientInfo`` —
-        SSE-bound sessions are functionally identical to stdio
-        ones; the only difference is the wire transport.
-
-        Authentication: when ``FLUID_MCP_AUTH_TOKEN`` is set in the
-        environment, the gateway requires every HTTP request to
-        carry an ``Authorization: Bearer <token>`` header that
-        matches. Wrong / missing token → 401 Unauthorized BEFORE
-        the SSE handshake runs, so callers can't even open a
-        session. Comparison uses ``hmac.compare_digest`` to defeat
-        timing-side-channel guesses. This is a real defensive
-        layer — better than nothing — but operators MUST still
-        front the gateway with an mTLS / OAuth proxy for production
-        because shared-secret tokens are vulnerable to replay /
-        leakage. See ``examples/mcp-output-port-docker/proxy/`` for
-        a Caddy reverse-proxy template that pairs this gateway with
-        mTLS or OAuth2 enforcement.
-        """
-        import uvicorn
-        from mcp.server.sse import SseServerTransport
-        from starlette.applications import Starlette
-        from starlette.middleware import Middleware
-        from starlette.middleware.base import BaseHTTPMiddleware
-        from starlette.responses import JSONResponse, Response
-        from starlette.routing import Mount, Route
-
-        from .auth import AuthValidator, extract_mtls_identity
-
-        # Resolve the auth strategy from FLUID_MCP_AUTH_MODE
-        # (shared-token / jwt / spiffe / none). When the validator
-        # is unconfigured (mode=none, or shared-token without
-        # FLUID_MCP_AUTH_TOKEN), the gateway runs unauthenticated
-        # and surfaces a loud warning.
-        auth_validator = AuthValidator.from_env()
-        if not auth_validator.is_enabled():
-            self.state.logger.warning(
-                "output_port_http_no_auth_configured: gateway is unauthenticated. "
-                "Set FLUID_MCP_AUTH_MODE=jwt|spiffe|shared-token + matching "
-                "config OR front with mTLS/OAuth proxy before exposing to an "
-                "untrusted network."
-            )
-        # Snapshot for the per-request middleware closure + the
-        # per-call attribute merger inside the SSE handler.
-        state = self.state
-
-        class _AuthMiddleware(BaseHTTPMiddleware):
-            async def dispatch(self, request, call_next):
-                if not auth_validator.is_enabled():
-                    return await call_next(request)
-                decision = auth_validator.validate(dict(request.headers))
-                if not decision.allowed:
-                    return JSONResponse(
-                        {
-                            "error": "unauthorized",
-                            "message": (
-                                f"auth ({decision.identity_kind}) refused: "
-                                f"{decision.deny_reason}"
-                            ),
-                        },
-                        status_code=401,
-                    )
-                # Stash the resolved caller attributes on the request
-                # scope so the SSE handler below can merge them onto
-                # the SessionState (cryptographic identity replaces
-                # self-attestation for downstream rowFilter resolution).
-                request.scope["fluid_auth_attrs"] = dict(decision.caller_attributes)
-                request.scope["fluid_auth_kind"] = decision.identity_kind
-                # Also pull mTLS metadata forwarded by the proxy so
-                # the audit trail records BOTH the JWT identity AND
-                # the cert that carried it.
-                request.scope["fluid_auth_attrs"].update(
-                    extract_mtls_identity(dict(request.headers))
-                )
-                return await call_next(request)
-
-        sse_path = "/sse"
-        messages_path = "/messages/"
-        sse = SseServerTransport(messages_path)
-
-        async def handle_sse(request):
-            # Cryptographic caller_attributes from the authn layer
-            # win over any self-attested clientInfo.* extras the
-            # session is about to bind. We snapshot them here so
-            # the lifespan-bound SessionState picks them up before
-            # the first tools/call arrives.
-            crypto_attrs = request.scope.get("fluid_auth_attrs") or {}
-            if crypto_attrs:
-                state.caller_attributes = {
-                    **state.caller_attributes,
-                    **crypto_attrs,
-                }
-                # Promote sub → model_id / use_case if those claims
-                # were in the JWT mapping but the SDK clientInfo
-                # didn't carry them. Cryptographic identity wins.
-                if "model" in crypto_attrs and not state.model_id:
-                    state.model_id = str(crypto_attrs["model"])
-                if "use_case" in crypto_attrs and not state.use_case:
-                    state.use_case = str(crypto_attrs["use_case"])
-            async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-                await self.server.run(
-                    streams[0],
-                    streams[1],
-                    self.server.create_initialization_options(),
-                )
-            return Response()
-
-        app = Starlette(
-            routes=[
-                Route(sse_path, endpoint=handle_sse),
-                Mount(messages_path, app=sse.handle_post_message),
-            ],
-            middleware=[Middleware(_AuthMiddleware)],
-        )
-        config = uvicorn.Config(app, host=host, port=port, log_level="info")
-        server = uvicorn.Server(config)
-        # Stash the uvicorn Server so stop_http() (or a test harness,
-        # or a future SIGTERM handler for the HTTP path) can flip
-        # ``should_exit`` and unwind serve() cleanly. Without this the
-        # only way to stop an HTTP-mode gateway was process kill —
-        # and a test that spun one in a daemon thread leaked a
-        # spinning event loop for the rest of the run.
-        self._uvicorn_server = server
-        self.state.logger.info(
-            "output_port_http_serve_start",
-            extra={
-                "host": host,
-                "port": port,
-                "sse_path": sse_path,
-                "auth_mode": auth_validator.mode,
-                "auth_enabled": auth_validator.is_enabled(),
-            },
-        )
-        try:
-            await server.serve()
-        finally:
-            self._uvicorn_server = None
+        """Serve the gateway over MCP-SSE (Starlette + uvicorn).
+        See :func:`_transport.run_http_async`."""
+        return await _transport.run_http_async(self, host=host, port=port)
 
     def stop_http(self) -> None:
         """Signal a running HTTP/SSE transport to shut down.
-
-        Sets uvicorn's ``should_exit`` flag so the ``serve()`` loop
-        returns at its next iteration. Safe to call from any thread
-        (the flag is a plain bool uvicorn polls). No-op when the
-        gateway isn't running in HTTP mode."""
-        server = getattr(self, "_uvicorn_server", None)
-        if server is not None:
-            server.should_exit = True
+        See :func:`_transport.stop_http`."""
+        _transport.stop_http(self)
 
     async def run_async(self) -> None:
-        """Run the server on the SDK stdio transport until the
-        client disconnects.
-
-        Installs SIGTERM and SIGINT handlers that flip
-        ``state._shutdown_event`` so the lifespan teardown can drain
-        in-flight tool calls (up to 5s) before tearing down driver
-        connections. SIGHUP is intentionally NOT trapped — operators
-        use it for log-rotation triggers in some deployments.
-        """
-
-        loop = asyncio.get_running_loop()
-
-        def _handle_sig(sig: signal.Signals) -> None:
-            self.state.logger.info(
-                "output_port_signal_received",
-                extra={"signal": sig.name, "in_flight": self.state._in_flight},
-            )
-            if self.state._shutdown_event is not None:
-                self.state._shutdown_event.set()
-            # Cancel the main task so stdio_server unblocks.
-            for task in asyncio.all_tasks(loop):
-                if task is not asyncio.current_task():
-                    task.cancel()
-
-        registered: List[signal.Signals] = []
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(sig, _handle_sig, sig)
-                registered.append(sig)
-            except (NotImplementedError, RuntimeError):
-                # Windows / restricted environments fall back to the
-                # KeyboardInterrupt path in ``run()``.
-                pass
-
-        try:
-            async with stdio_server() as (read_stream, write_stream):
-                await self.server.run(
-                    read_stream,
-                    write_stream,
-                    self.server.create_initialization_options(),
-                )
-        finally:
-            for sig in registered:
-                try:
-                    loop.remove_signal_handler(sig)
-                except (NotImplementedError, RuntimeError):
-                    pass
+        """Run on the SDK stdio transport until the client disconnects
+        (installs SIGTERM/SIGINT drain handlers).
+        See :func:`_transport.run_async`."""
+        return await _transport.run_async(self)
 
     def run(self, *, transport: str = "stdio", host: str = "127.0.0.1", port: int = 8765) -> int:
-        """Synchronous entry point used by the CLI. ``transport``
-        is one of ``"stdio"`` (default — pipe with the MCP client) or
-        ``"http"`` (MCP-SSE on ``host:port``). Returns the process
-        exit code (0 on clean disconnect, non-zero on startup
-        failure)."""
-        try:
-            if transport == "http":
-                asyncio.run(self.run_http_async(host=host, port=port))
-            elif transport == "stdio":
-                asyncio.run(self.run_async())
-            else:
-                raise ValueError(f"unknown transport {transport!r}; supported: stdio, http")
-            return 0
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            # Both arrive on SIGTERM/SIGINT after the lifespan drain.
-            return 0
-        except Exception as exc:  # noqa: BLE001
-            self.state.logger.error("output_port_server_crashed: %s", exc)
-            return 1
+        """Synchronous CLI entry point — dispatch stdio / http.
+        See :func:`_transport.run`."""
+        return _transport.run(self, transport=transport, host=host, port=port)
 
 
 # ---------------------------------------------------------------------
@@ -1504,23 +1155,6 @@ def _read_resource_payload(
         # Best-effort — the server may not have a contract_path bound.
         return uri
     raise ValueError(f"Unknown resource URI: {uri!r}")
-
-
-def _serialize_query_result(
-    expose: Mapping[str, Any], compiled: Any, result: Any
-) -> Dict[str, Any]:
-    """Shape the query result for the wire."""
-    return {
-        "exposeId": expose.get("exposeId"),
-        "columns": list(getattr(result, "columns", ())),
-        "rows": [_jsonable(row) for row in getattr(result, "rows", ())],
-        "rowCount": len(getattr(result, "rows", ()) or ()),
-        "truncated": getattr(result, "truncated", False),
-        "compiled": {
-            "sql": getattr(compiled, "sql", None),
-            "parameters": getattr(compiled, "parameters", None),
-        },
-    }
 
 
 # ---------------------------------------------------------------------

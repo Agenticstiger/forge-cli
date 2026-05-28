@@ -496,3 +496,114 @@ def test_http_sse_bearer_token_required_when_env_var_set(
             assert (
                 resp.status_code == 200
             ), f"authenticated SSE request must be accepted; got {resp.status_code}"
+
+
+# ---------------------------------------------------------------------
+# Validation-error surfacing vs engine-error sanitisation
+#
+# The dispatcher returns a QueryValidationError's message VERBATIM (it
+# references only contract-declared names the agent can see via
+# `describe`, so it leaks nothing and lets the agent self-correct),
+# while every OTHER exception stays sanitised behind "see audit trail"
+# so engine / binding details never reach the model. These drive the
+# REAL dispatcher (not the handler helper) over the in-memory wire.
+# ---------------------------------------------------------------------
+
+
+def _build_semantic_test_contract(tmp_path: Path):
+    """DuckDB/CSV expose WITH a semantic model so the ``query`` tool can
+    compile — and so an unknown-measure query raises a
+    ``QueryValidationError`` rather than failing earlier."""
+    csv_path = write_customer_csv(tmp_path / "customers.csv")
+    expose = make_expose(
+        semantics={
+            "name": "customer_profiles",
+            "measures": [
+                {"name": "customer_count", "agg": "count_distinct", "expr": "customer_id"},
+            ],
+            "dimensions": [{"name": "signup_date", "type": "time"}],
+        },
+        binding={
+            "platform": "local",
+            "format": "csv",
+            "location": {"path": str(csv_path), "table": "customer_profiles"},
+        },
+    )
+    contract = {
+        "fluidVersion": "0.7.4",
+        "kind": "DataProduct",
+        "id": "semantic.local.demo",
+        "exposes": [expose],
+    }
+    return contract, expose
+
+
+@pytest.mark.asyncio
+async def test_query_validation_error_surfaces_message_to_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An unknown-measure ``query`` returns the compiler's helpful
+    ``QueryValidationError`` message VERBATIM (with the known measures
+    listed) so the agent can self-correct — NOT the opaque envelope."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    contract, expose = _build_semantic_test_contract(tmp_path)
+    policy = OutputPortPolicy.from_contract_and_flags(
+        expose=expose, cli_allowed_models=("test-agent",)
+    )
+    server = OutputPortMcpServer(
+        contract=contract, expose=expose, policy=policy, rate_limit_calls=0
+    )
+    server.state.model_id = "test-agent"
+
+    async with create_connected_server_and_client_session(
+        server.server,
+        client_info=Implementation(name="validation-test", version="1.0.0"),
+    ) as client:
+        result = await client.call_tool("query", {"measure": "no_such_measure", "limit": 5})
+    payload = json.loads(result.content[0].text)
+
+    assert payload["error"] == "QueryValidationError", payload
+    assert "Unknown measure" in payload["message"], payload
+    assert "no_such_measure" in payload["message"], payload
+    # The known measure is listed so the agent can pick a valid one.
+    assert "customer_count" in payload["message"], payload
+
+
+@pytest.mark.asyncio
+async def test_engine_error_stays_sanitised_at_the_wire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A non-validation (engine/driver) failure STAYS sanitised — the
+    binding (database / schema / table) embedded in the engine error
+    must never reach the caller; only 'see audit trail' is returned."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    contract, expose = _build_semantic_test_contract(tmp_path)
+    policy = OutputPortPolicy.from_contract_and_flags(
+        expose=expose, cli_allowed_models=("test-agent",)
+    )
+    server = OutputPortMcpServer(
+        contract=contract, expose=expose, policy=policy, rate_limit_calls=0
+    )
+    server.state.model_id = "test-agent"
+
+    secret = "database=topsecret_db table=topsecret_tbl"
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError(f"engine connection failed: {secret}")
+
+    # Patch the lazily-built driver's execute so base.query raises a
+    # genuine (non-validation) engine error carrying binding info.
+    server.state.get_driver().execute = _boom
+
+    async with create_connected_server_and_client_session(
+        server.server,
+        client_info=Implementation(name="engine-error-test", version="1.0.0"),
+    ) as client:
+        result = await client.call_tool("query", {"measure": "customer_count", "limit": 5})
+    payload = json.loads(result.content[0].text)
+
+    assert payload["message"] == (
+        "Tool 'query' failed; see server audit trail for the full annotated error."
+    ), payload
+    # The binding leak must NOT appear anywhere in the wire payload.
+    assert "topsecret" not in json.dumps(payload), payload

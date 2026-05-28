@@ -33,6 +33,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 from unittest.mock import MagicMock, patch
@@ -273,11 +274,13 @@ class TestSnowflakeDriverIntegration:
             ],
         )
         describe = json.loads(responses[2]["result"]["content"][0]["text"])
-        assert describe["engine"]["platform"] == "snowflake"
-        assert describe["engine"]["format"] == "snowflake_table"
-        assert describe["engine"]["dialect"] == "snowflake"
+        # The describe tool emits the bound-engine metadata under the
+        # ``binding`` key (see _handlers.tool_describe), not ``engine``.
+        assert describe["binding"]["platform"] == "snowflake"
+        assert describe["binding"]["format"] == "snowflake_table"
+        assert describe["binding"]["dialect"] == "snowflake"
         assert describe["exposeId"] == self.EXPOSE_ID
-        assert describe["engine"]["tableReference"].endswith(f".{self.TABLE_NAME}")
+        assert describe["binding"]["tableReference"].endswith(f".{self.TABLE_NAME}")
 
     def test_sample_returns_real_rows(self, tmp_path: Path):
         contract = self._render_contract(tmp_path)
@@ -354,7 +357,9 @@ class TestSnowflakeDriverIntegration:
         assert "result" in responses[2], responses[2].get("error")
         payload = json.loads(responses[2]["result"]["content"][0]["text"])
         assert payload["rowCount"] >= 1
-        compiled = payload["compiledSql"]
+        # Query results nest the rendered SQL under compiled.sql
+        # (see _handlers._serialize_query_result), not a flat compiledSql.
+        compiled = payload["compiled"]["sql"]
         assert "GROUP BY" in compiled.upper()
 
     # ------------------------------------------------------------------
@@ -369,7 +374,17 @@ class TestSnowflakeDriverIntegration:
             "method": "initialize",
             "params": {
                 "protocolVersion": "2025-06-18",
-                "clientInfo": {"name": "snowflake-integration", "version": "1.0.0"},
+                # ``model`` is REQUIRED — the gateway's fail-closed
+                # agentPolicy reads caller identity from clientInfo.model
+                # (_bind_caller_identity_from_context). Without it every
+                # tools/call is denied as "missing-model-identity" before
+                # any Snowflake round-trip. The rendered contract sets no
+                # allowedModels, so any non-empty value passes the gate.
+                "clientInfo": {
+                    "name": "snowflake-integration",
+                    "version": "1.0.0",
+                    "model": "snowflake-integration-test",
+                },
                 "capabilities": {},
             },
         }
@@ -436,7 +451,7 @@ exposes:
         env["FLUID_QUIET"] = "1"
         env["FLUID_NONINTERACTIVE"] = "1"
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [
                 sys.executable,
                 "-m",
@@ -450,23 +465,68 @@ exposes:
                 "--max-sample-rows",
                 "5",
             ],
-            input="\n".join(json.dumps(message) for message in messages) + "\n",
             cwd=str(contract.parent),
             env=env,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=120,
         )
-        assert proc.returncode == 0, (
-            f"server exited with rc={proc.returncode}\n"
-            f"stdout: {proc.stdout[-1500:]}\n"
-            f"stderr: {proc.stderr[-1500:]}"
-        )
+        assert proc.stdin is not None and proc.stdout is not None
+        # Only requests (those carrying "id") get responses; the
+        # ``initialized`` notification does not.
+        expected_ids = {m["id"] for m in messages if "id" in m}
         responses: Dict[int, Dict[str, Any]] = {}
-        for line in proc.stdout.splitlines():
-            candidate = line.strip()
-            if not candidate.startswith("{"):
-                continue
-            response = json.loads(candidate)
-            responses[response["id"]] = response
+
+        # Hard wall-clock cap. A wedged server would otherwise block the
+        # readline() below forever (pytest has no per-test timeout here);
+        # killing the process closes stdout so readline() returns "".
+        watchdog = threading.Timer(120, proc.kill)
+        watchdog.start()
+        try:
+            # Pipe every request and FLUSH — but keep stdin OPEN. Closing
+            # stdin is an EOF that tears down the server's read stream and
+            # races any in-flight (executor-backed) response still being
+            # written to stdout. That race is exactly what used to crash
+            # the server with anyio.ClosedResourceError → rc=1 on the
+            # `describe` call (which round-trips through the thread pool).
+            for message in messages:
+                proc.stdin.write(json.dumps(message) + "\n")
+            proc.stdin.flush()
+            # Drain until every request id has a response (or stdout EOFs
+            # because the server exited / the watchdog killed it).
+            while expected_ids - responses.keys():
+                line = proc.stdout.readline()
+                if line == "":
+                    break
+                candidate = line.strip()
+                if not candidate.startswith("{"):
+                    continue
+                response = json.loads(candidate)
+                if "id" in response:
+                    responses[response["id"]] = response
+        finally:
+            watchdog.cancel()
+
+        # All responses collected — let communicate() send the EOF
+        # (it flushes + closes stdin, swallowing BrokenPipeError) so the
+        # server unwinds its lifespan and exits 0, then drains any
+        # trailing stdout/stderr. We must NOT close stdin ourselves
+        # first: communicate() re-flushes stdin and would raise
+        # ValueError("I/O operation on closed file") on an already-closed
+        # handle.
+        try:
+            _, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, stderr = proc.communicate()
+
+        missing = expected_ids - responses.keys()
+        assert not missing, (
+            f"no response for request ids {sorted(missing)} "
+            f"(rc={proc.returncode})\nstderr tail: {stderr[-1500:]}"
+        )
+        assert (
+            proc.returncode == 0
+        ), f"server exited with rc={proc.returncode}\nstderr tail: {stderr[-1500:]}"
         return responses

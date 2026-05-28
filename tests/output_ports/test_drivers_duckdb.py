@@ -103,8 +103,7 @@ def test_query_with_metric_and_dimension(tmp_path):
         limit=10,
         table_reference=descriptor.table_reference,
     )
-    rendered = compiled.render_sql_for_dialect(descriptor.dialect)
-    result = driver.query(sql=rendered, params=compiled.params, projection=compiled.columns)
+    result = driver.query(compiled=compiled)
     assert "customer_count" in result.columns
     assert all("signup_date" in row for row in result.rows)
 
@@ -120,8 +119,7 @@ def test_query_with_filter_uses_parameter_binding(tmp_path):
         limit=10,
         table_reference=descriptor.table_reference,
     )
-    rendered = compiled.render_sql_for_dialect(descriptor.dialect)
-    result = driver.query(sql=rendered, params=compiled.params, projection=compiled.columns)
+    result = driver.query(compiled=compiled)
     assert len(result.rows) == 1
     assert result.rows[0]["total_ltv_usd"] == 850.0
 
@@ -162,3 +160,90 @@ def test_unsupported_binding_raises(tmp_path):
 
     with pytest.raises(UnsupportedBindingError, match="No driver registered"):
         build_driver(expose=expose, contract={"exposes": [expose]})
+
+
+# ---------------------------------------------------------------------
+# Handler-wiring regression tests (keyless, run in CI).
+#
+# These drive the actual MCP tool handlers (``_handlers.tool_query`` /
+# ``tool_query_sql``) end-to-end against DuckDB — handler → compiler →
+# driver. The tests ABOVE call the compiler and the driver DIRECTLY,
+# which is why a long-standing wiring bug went unnoticed for a full
+# release: the handler called ``compile_semantic_query`` /
+# ``compile_free_form_sql`` with ``arguments=`` / ``descriptor=``
+# kwargs they never accepted, and called ``driver.query`` with
+# ``compiled=`` against a ``(sql, params, projection)`` signature — so
+# every real ``query`` / ``query_sql`` MCP call raised TypeError before
+# reaching the engine, while these driver-level tests stayed green.
+# Only the creds-gated Snowflake integration tests (which CI skips)
+# exercised the handler path. These keyless tests close that gap.
+# ---------------------------------------------------------------------
+
+
+def _build_session_state(tmp_path):
+    """A ``SessionState`` bound to the keyless DuckDB/CSV expose, used
+    to drive the tool handlers end-to-end."""
+    import logging
+
+    from fluid_build.output_ports.mcp.policy import OutputPortPolicy
+    from fluid_build.output_ports.mcp.server import SessionState
+
+    csv_path = write_customer_csv(tmp_path / "customers.csv")
+    expose = _expose_for_csv(csv_path)
+    return SessionState(
+        contract={"exposes": [expose]},
+        expose=expose,
+        policy=OutputPortPolicy.from_contract_and_flags(expose=expose),
+        logger=logging.getLogger("test.output_port.handlers"),
+    )
+
+
+def test_tool_query_handler_executes_end_to_end(tmp_path):
+    """``tool_query`` must call ``compile_semantic_query`` + ``driver.query``
+    with the signatures they actually expose (regression for the
+    TypeError-on-every-query wiring bug)."""
+    from fluid_build.output_ports.mcp import _handlers
+
+    state = _build_session_state(tmp_path)
+    payload = _handlers.tool_query(
+        state,
+        {"measure": "customer_count", "dimensions": ["signup_date"], "limit": 10},
+    )
+    assert payload["rowCount"] >= 1
+    assert "customer_count" in payload["columns"]
+    assert "GROUP BY" in payload["compiled"]["sql"].upper()
+
+
+def test_tool_query_handler_defaults_missing_limit(tmp_path):
+    """A missing ``limit`` (the tool schema declares no default) falls
+    back to the server cap instead of crashing the compiler, which
+    rejects ``None``."""
+    from fluid_build.output_ports.mcp import _handlers
+
+    state = _build_session_state(tmp_path)
+    payload = _handlers.tool_query(state, {"measure": "customer_count"})
+    assert payload["rowCount"] >= 1
+    assert "customer_count" in payload["columns"]
+
+
+def test_tool_query_sql_handler_executes_end_to_end(tmp_path):
+    """Same regression as ``tool_query`` but for the free-form
+    ``query_sql`` handler + ``compile_free_form_sql``."""
+    from fluid_build.output_ports.mcp import _handlers
+
+    state = _build_session_state(tmp_path)
+    payload = _handlers.tool_query_sql(state, {"sql": "SELECT customer_id FROM customer_profiles"})
+    assert payload["rowCount"] == 3
+    assert "customer_id" in payload["columns"]
+
+
+def test_tool_query_sql_handler_blocks_pii_alias_bypass(tmp_path):
+    """Security: a free-form SELECT that aliases a PII column to dodge
+    the row-level redactor (``SELECT email AS not_email``) is rejected
+    at compile time — the handler feeds the union of restricted + PII
+    columns into ``compile_free_form_sql``."""
+    from fluid_build.output_ports.mcp import _handlers
+
+    state = _build_session_state(tmp_path)
+    with pytest.raises(ValueError, match="email"):
+        _handlers.tool_query_sql(state, {"sql": "SELECT email AS not_email FROM customer_profiles"})

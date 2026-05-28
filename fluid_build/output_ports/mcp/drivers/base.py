@@ -38,7 +38,10 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..query_compiler import CompiledQuery
 
 
 class RowFilterIdentityMissing(RuntimeError):
@@ -474,17 +477,39 @@ class EngineDriver(ABC):
     def query(
         self,
         *,
-        sql: str,
-        params: Sequence[Any],
-        projection: Sequence[str],
+        compiled: "CompiledQuery",
+        timeout_seconds: Optional[float] = None,
     ) -> QueryResult:
-        """Default ``query`` implementation — execute + project.
+        """Default ``query`` implementation — render for dialect,
+        execute, project.
 
-        ``projection`` is the validated column list from the compiler
-        so we never trust the engine's column-name echo blindly.
+        Takes the whole :class:`CompiledQuery` (not pre-decomposed
+        ``sql`` / ``params`` / ``projection``) so the portable
+        ``:p_<index>`` SQL, its aligned parameter values, and the
+        validated projection always travel together — a mismatched
+        projection can't be passed by accident. This is the signature
+        the MCP tool handlers (``tool_query`` / ``tool_query_sql``)
+        have always called; the previous decomposed signature never
+        matched them, so every ``query`` / ``query_sql`` call raised
+        ``TypeError`` before reaching the engine.
+
+        Dialect rendering happens HERE, centrally, so no caller has to
+        remember to call ``render_sql_for_dialect`` first — the
+        ``execute`` contract ("``sql`` is the ``CompiledQuery.sql``
+        after dialect rendering") is satisfied for every driver from
+        one place. ``timeout_seconds`` is threaded through to
+        ``execute`` (drivers that can enforce a statement timeout do
+        so; the rest ignore it) — it used to be dropped on the floor.
+        ``compiled.columns`` is the validated projection, so we never
+        trust the engine's column-name echo blindly.
         """
-        result = self.execute(sql=sql, params=params)
-        visible_columns, rows = self.project(result.rows, columns=projection)
+        rendered = compiled.render_sql_for_dialect(self.descriptor().dialect)
+        result = self.execute(
+            sql=rendered,
+            params=compiled.params,
+            timeout_seconds=timeout_seconds,
+        )
+        visible_columns, rows = self.project(result.rows, columns=compiled.columns)
         return QueryResult(columns=visible_columns, rows=rows)
 
     # ------------------------------------------------------------------

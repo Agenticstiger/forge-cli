@@ -42,6 +42,23 @@ The compiler enforces three guarantees:
 The free-form ``query_sql`` path (gated by ``--allow-sql``) goes
 through :func:`compile_free_form_sql` instead, which adds a stricter
 SELECT-only check on top of the allowlist.
+
+Borrow-before-build — intentional divergence (per /borrow-before-build):
+    Surveyed **MetricFlow** (dbt-labs, Apache-2.0; the OSI / Open
+    Semantic Interchange reference compiler) and **Cube**. MetricFlow
+    is the canonical metrics→SQL compiler, but it hard-requires a
+    *working dbt project + adapter*; Cube is a standalone server, not
+    an embeddable library. Neither fits forge's model — the semantic
+    spec lives inline in the contract's ``expose.semantics`` (no dbt
+    project, no separate server), and the compiler must run in-process
+    inside the gateway. So this is a deliberately *minimal*,
+    contract-native metric/measure/dimension→SQL compiler (~500 LOC),
+    NOT a general semantic layer.
+    Interop note: ``expose.semantics`` should track the **OSI**
+    (Open Semantic Interchange) spec shape where practical, so a
+    contract's metrics stay portable to MetricFlow-compatible tools as
+    that standard matures. Revisit adopting MetricFlow directly if
+    forge ever assumes a dbt project is present.
 """
 
 from __future__ import annotations
@@ -54,6 +71,32 @@ from fluid_build.providers._sql_safety import (
     validate_ident,
     validate_sql_expression_allowlist,
 )
+
+
+class QueryValidationError(ValueError):
+    """Raised when a ``query`` / ``query_sql`` payload fails INPUT
+    validation — an unknown measure / metric / dimension, a bad filter
+    key, a missing-or-duplicate metric-vs-measure choice, an
+    out-of-range limit, a non-SELECT free-form statement, or a
+    reference to a restricted column.
+
+    Subclasses :class:`ValueError` so existing ``except ValueError`` /
+    ``pytest.raises(ValueError)`` call sites keep working unchanged.
+
+    The distinction matters at the MCP wire boundary. The server's tool
+    dispatcher surfaces a ``QueryValidationError``'s message VERBATIM to
+    the calling agent: every such message references only
+    contract-declared names the agent can already see via the
+    ``describe`` tool (measure / metric / dimension / column names,
+    supported aggregations, the limit bound), so it leaks nothing and
+    lets the agent self-correct its next call instead of looping
+    blindly. Every OTHER exception — engine / driver failures, the
+    ``table_reference`` allowlist guard, and the rendered-statement
+    defence-in-depth sweep (whose message embeds the rendered SQL, and
+    thus the binding's database / schema / table) — stays sanitised
+    behind a generic "see server audit trail" message so binding and
+    engine details never reach the model.
+    """
 
 
 @dataclass(frozen=True)
@@ -186,23 +229,25 @@ def _resolve_metric(metric_name: str, index: _SemanticIndex) -> Tuple[str, Dict[
     """
     metric = index.metrics.get(metric_name)
     if metric is None:
-        raise ValueError(
+        raise QueryValidationError(
             f"Unknown metric {metric_name!r}; "
             f"known: {sorted(index.metrics) or 'none in expose.semantics.metrics'}"
         )
     metric_type = metric.get("type") or "simple"
     if metric_type != "simple":
-        raise ValueError(
+        raise QueryValidationError(
             f"Metric {metric_name!r} has type {metric_type!r}; "
             "Phase-1 query supports only 'simple' metrics. Use a measure "
             "directly or wait for Phase-2 derived/ratio support."
         )
     measure_name = metric.get("measure")
     if not isinstance(measure_name, str):
-        raise ValueError(f"Metric {metric_name!r} is missing a 'measure' reference")
+        raise QueryValidationError(f"Metric {metric_name!r} is missing a 'measure' reference")
     measure = index.measures.get(measure_name)
     if measure is None:
-        raise ValueError(f"Metric {metric_name!r} references unknown measure {measure_name!r}")
+        raise QueryValidationError(
+            f"Metric {metric_name!r} references unknown measure {measure_name!r}"
+        )
     return measure_name, measure
 
 
@@ -217,7 +262,7 @@ def _resolve_dimension(dimension_name: str, index: _SemanticIndex) -> Tuple[str,
     if dimension is not None:
         expr = dimension.get("expr") or dimension_name
         if not isinstance(expr, str):
-            raise ValueError(f"Dimension {dimension_name!r} has non-string expr")
+            raise QueryValidationError(f"Dimension {dimension_name!r} has non-string expr")
         validate_sql_expression_allowlist(expr)
         return validate_ident(dimension_name), expr
     column = index.columns.get(dimension_name)
@@ -226,7 +271,7 @@ def _resolve_dimension(dimension_name: str, index: _SemanticIndex) -> Tuple[str,
             validate_ident(dimension_name),
             validate_ident(dimension_name),
         )
-    raise ValueError(
+    raise QueryValidationError(
         f"Unknown dimension {dimension_name!r}; "
         f"must be defined in expose.semantics.dimensions or contract.schema"
     )
@@ -255,13 +300,13 @@ def _render_measure_expression(measure_name: str, measure: Mapping[str, Any]) ->
     """
     agg_raw = measure.get("agg")
     if not isinstance(agg_raw, str) or agg_raw not in _AGG_FUNCTIONS:
-        raise ValueError(
+        raise QueryValidationError(
             f"Measure {measure_name!r} has unsupported agg "
             f"{agg_raw!r}; supported: {sorted(_AGG_FUNCTIONS)}"
         )
     expr_raw = measure.get("expr") or measure_name
     if not isinstance(expr_raw, str):
-        raise ValueError(f"Measure {measure_name!r} has non-string expr")
+        raise QueryValidationError(f"Measure {measure_name!r} has non-string expr")
     validate_sql_expression_allowlist(expr_raw)
     sql_func = _AGG_FUNCTIONS[agg_raw]
     if agg_raw == "count_distinct":
@@ -297,26 +342,26 @@ def compile_semantic_query(
     agent can't run a full-table scan by accident.
     """
     if (metric is None) == (measure is None):
-        raise ValueError("Exactly one of 'metric' or 'measure' must be provided")
+        raise QueryValidationError("Exactly one of 'metric' or 'measure' must be provided")
     if not isinstance(table_reference, str) or not table_reference.strip():
-        raise ValueError("table_reference must be a non-empty string")
+        raise QueryValidationError("table_reference must be a non-empty string")
     validate_sql_expression_allowlist(table_reference)
 
     index = _index_expose(expose)
     if measure is not None:
         if not isinstance(measure, str):
-            raise ValueError("measure must be a string")
+            raise QueryValidationError("measure must be a string")
         validate_ident(measure)
         measure_definition = index.measures.get(measure)
         if measure_definition is None:
-            raise ValueError(
+            raise QueryValidationError(
                 f"Unknown measure {measure!r}; "
                 f"known: {sorted(index.measures) or 'none in expose.semantics.measures'}"
             )
         measure_name = measure
     else:
         if not isinstance(metric, str):
-            raise ValueError("metric must be a string")
+            raise QueryValidationError("metric must be a string")
         validate_ident(metric)
         measure_name, measure_definition = _resolve_metric(metric, index)
 
@@ -325,7 +370,7 @@ def compile_semantic_query(
     projection_aliases: List[str] = []
     for dimension_name in dimensions or []:
         if not isinstance(dimension_name, str):
-            raise ValueError("Dimension names must be strings")
+            raise QueryValidationError("Dimension names must be strings")
         alias, expr = _resolve_dimension(dimension_name, index)
         select_parts.append(f"{expr} AS {alias}")
         group_columns.append(expr)
@@ -339,10 +384,10 @@ def compile_semantic_query(
     params: List[Any] = []
     for filter_key, filter_value in (filters or {}).items():
         if not isinstance(filter_key, str):
-            raise ValueError("Filter keys must be strings")
+            raise QueryValidationError("Filter keys must be strings")
         validate_ident(filter_key)
         if filter_key not in index.dimensions and filter_key not in index.columns:
-            raise ValueError(
+            raise QueryValidationError(
                 f"Filter key {filter_key!r} is not a known dimension or "
                 f"contract column. Filters must reference predeclared "
                 f"semantics or schema entries."
@@ -351,7 +396,7 @@ def compile_semantic_query(
             # Treat booleans like scalars — most engines accept them; reject
             # lists / dicts / None outright in MVP.
             if filter_value is None or isinstance(filter_value, (list, dict, tuple)):
-                raise ValueError(
+                raise QueryValidationError(
                     f"Filter value for {filter_key!r} must be a scalar; "
                     f"got {type(filter_value).__name__}"
                 )
@@ -364,7 +409,7 @@ def compile_semantic_query(
         params.append(filter_value)
 
     if not isinstance(limit, int) or limit < 1 or limit > 1_000_000:
-        raise ValueError("limit must be an integer in [1, 1_000_000]")
+        raise QueryValidationError("limit must be an integer in [1, 1_000_000]")
 
     sql_lines: List[str] = [
         "SELECT " + ", ".join(select_parts),
@@ -396,6 +441,13 @@ def _validate_rendered_statement(sql: str) -> None:
     interpolations are.
     """
     if any(marker in sql for marker in (";", "--", "/*", "*/")):
+        # Plain ValueError (NOT QueryValidationError) on purpose: the
+        # message embeds the rendered SQL, which carries the binding's
+        # database / schema / table. Keeping it a non-validation error
+        # means the dispatcher sanitises it behind "see audit trail"
+        # rather than surfacing the binding to the calling agent. This
+        # is also a should-never-fire defence-in-depth net, not a
+        # caller-actionable input error.
         raise ValueError(f"Rendered statement contains forbidden marker: {sql!r}")
 
 
@@ -468,12 +520,12 @@ def compile_free_form_sql(
       binding.
     """
     if not isinstance(sql, str):
-        raise ValueError("sql must be a string")
+        raise QueryValidationError("sql must be a string")
     candidate = sql.strip()
     if not candidate:
-        raise ValueError("sql must be a non-empty string")
+        raise QueryValidationError("sql must be a non-empty string")
     if not candidate.lower().lstrip("(").startswith("select"):
-        raise ValueError("Only SELECT statements are allowed in --allow-sql mode")
+        raise QueryValidationError("Only SELECT statements are allowed in --allow-sql mode")
     # ``_sql_safety`` blocks the SELECT keyword in expression mode, so
     # we hand it only the body after the leading SELECT. Splitting on
     # *any* whitespace (``str.split(None, 1)``) defends against the
@@ -482,13 +534,13 @@ def compile_free_form_sql(
     # ``SELECT``) is malformed and rejected outright.
     parts = candidate.split(None, 1)
     if len(parts) < 2:
-        raise ValueError("sql must contain a SELECT body")
+        raise QueryValidationError("sql must contain a SELECT body")
     body = parts[1]
     validate_sql_expression_allowlist(body)
     if not isinstance(limit, int) or limit < 1 or limit > 1_000_000:
-        raise ValueError("limit must be an integer in [1, 1_000_000]")
+        raise QueryValidationError("limit must be an integer in [1, 1_000_000]")
     if not isinstance(table_reference, str) or not table_reference.strip():
-        raise ValueError("table_reference must be a non-empty string")
+        raise QueryValidationError("table_reference must be a non-empty string")
     validate_sql_expression_allowlist(table_reference)
     # Column-mask enforcement — see the ``restricted_columns`` bullet
     # in the docstring above. Strip quoted string literals first so
@@ -500,7 +552,7 @@ def compile_free_form_sql(
             if not isinstance(column, str) or not column:
                 continue
             if _restricted_name_pattern(column).search(scanned):
-                raise ValueError(
+                raise QueryValidationError(
                     f"sql references column {column!r} which is restricted by "
                     f"expose.policy.authz.columnRestrictions / "
                     f"expose.policy.privacy.masking. The free-form "

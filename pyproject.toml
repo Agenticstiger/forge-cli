@@ -93,6 +93,14 @@ dependencies = [
   #   docs:  https://modelcontextprotocol.github.io/python-sdk/
   #   repo:  https://github.com/modelcontextprotocol/python-sdk
   "mcp>=1.20,<2.0",
+  # MCP output-port rate limiter — sliding-window + optional Redis fleet
+  # backend. Borrowed-not-built per /borrow-before-build
+  # (vutran1710/PyrateLimiter, MIT): its RedisBucket uses the same
+  # sorted-set sliding window we'd otherwise hand-roll, and InMemoryBucket
+  # covers the single-instance case. We wrap it with a fail-open →
+  # in-process degrade on Redis outage (the one behaviour the lib leaves
+  # to the caller).
+  "pyrate-limiter>=3,<5",
   # Borrowed SQL parser (MIT) used by fluid_build.providers._sql_safety to
   # AST-classify statement bodies for the Snowflake action surfaces, so a
   # contract cannot smuggle account-level / multi-statement SQL through the
@@ -322,6 +330,13 @@ dev = [
   # ``cli/__init__.py`` at import time) and that the tier-0
   # ``fluid_build._net`` leaf module stays free of fluid_build upstreams.
   "import-linter>=2.0",
+  # SBOM generation — ``scripts/generate_sbom.py`` builds a CycloneDX
+  # 1.5 document via the official model library rather than hand-emitting
+  # JSON (borrow-before-build; CycloneDX/cyclonedx-python-lib, Apache-2.0).
+  # Already present transitively via pip-audit/cyclonedx-bom; declared
+  # explicitly because the script now imports it directly.
+  "cyclonedx-python-lib>=8",
+  "packageurl-python>=0.11",
 ]
 
 # Light (in-process) integration-test emulators — Stage 1. moto mocks the
