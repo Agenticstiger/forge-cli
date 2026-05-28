@@ -26,6 +26,15 @@ exposes:
           type: STRING
           required: true
           sensitivity: cleartext
+        - name: email
+          type: STRING
+          businessName: Email Address
+          # `sensitivity: pii` makes the gateway redact this column's
+          # VALUES (→ "[REDACTED-PII]") on every sample / query result
+          # while keeping the column visible. The agent learns the field
+          # exists but never sees a real address. No flag, no proxy —
+          # governance is enforced from the contract.
+          sensitivity: pii
         - name: segment
           type: STRING
           required: true

@@ -43,6 +43,34 @@ npx -y @modelcontextprotocol/inspector --cli --transport stdio \
 You should see four tools advertised: `describe`, `sample`, `query`
 (predeclared semantic), and `query_sql` (only with `--allow-sql`).
 
+## 4. See governance in action (the point)
+
+`email` is marked `sensitivity: pii` in the contract, so the gateway
+redacts its **values** on every result while keeping the column
+visible. Call `sample`:
+
+```bash
+npx -y @modelcontextprotocol/inspector --cli --transport stdio \
+  --method tools/call --tool-name sample --tool-arg limit=2 \
+  -- fluid mcp output-port serve examples/mcp-output-port/contract.fluid.yaml
+```
+
+```jsonc
+{
+  "columns": ["customer_id", "email", "segment", "signup_date", "lifetime_value_usd"],
+  "rows": [
+    {"customer_id": "C-0001", "email": "[REDACTED-PII]", "segment": "enterprise", ...},
+    {"customer_id": "C-0002", "email": "[REDACTED-PII]", "segment": "smb", ...}
+  ]
+}
+```
+
+The agent learns the field exists but never sees a real address — and
+the same masking applies to `query` / `query_sql` results, so it can't
+be aliased away (`SELECT email AS x` is rejected at compile time). No
+flag, no proxy, no code: governance comes from the contract. This is
+the whole value proposition in one call.
+
 ## Wire to Claude Code
 
 Drop this into `~/.config/claude-code/mcp_servers.json`:
