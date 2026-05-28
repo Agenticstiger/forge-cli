@@ -23,6 +23,7 @@ PR.
 """
 from __future__ import annotations
 
+import importlib.util
 import sys
 from typing import Any, Dict
 
@@ -32,6 +33,27 @@ try:
     _fluid_version = fluid_build.__version__
 except Exception:
     _fluid_version = "unknown"
+
+# Each capability flag is *derived* from whether its backing module is
+# importable in this installation — never asserted as a constant. Mirrors
+# pulumi `about`, which discovers plugins/runtime rather than shipping a
+# static table that drifts from reality. Add a row here when a new
+# capability ships a discoverable module.
+_CAPABILITY_MODULES: Dict[str, str] = {
+    "lineage": "fluid_build.api.lineage",
+    "airflow_dag_gen": "fluid_build.cli._init_dag_helpers",
+    "engine_api": "fluid_build.engine",
+}
+
+
+def _detect_capabilities() -> Dict[str, bool]:
+    detected: Dict[str, bool] = {}
+    for name, module in _CAPABILITY_MODULES.items():
+        try:
+            detected[name] = importlib.util.find_spec(module) is not None
+        except Exception:
+            detected[name] = False
+    return detected
 
 
 def self_describe() -> Dict[str, Any]:
@@ -76,10 +98,6 @@ def self_describe() -> Dict[str, Any]:
         "build_engines": matrix.get("build_engines", []),
         "templates": list(matrix.get("templates", {}).keys()),
         "provider_engine_compatibility": matrix.get("provider_engine_compatibility", {}),
-        "capabilities": {
-            "lineage": True,
-            "airflow_dag_gen": True,
-            "engine_api": True,
-        },
+        "capabilities": _detect_capabilities(),
         "warnings": matrix.get("warnings", []),
     }

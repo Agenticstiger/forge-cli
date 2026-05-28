@@ -18,6 +18,8 @@
 Pattern adapted from `pulumi about -j/--json`.
 Usage: fluid describe --self [--json]
 """
+# ruff: noqa: T201 — this CLI command owns user-facing print() output by design;
+# the canonical migration to console.cprint is tracked separately.
 from __future__ import annotations
 
 import argparse
@@ -48,7 +50,7 @@ def register(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
         "--json",
         dest="as_json",
         action="store_true",
-        help="Output as JSON (default when --self is used)",
+        help="Emit machine-readable JSON instead of the human-readable summary",
     )
     p.set_defaults(cmd=COMMAND, func=run)
     return p
@@ -63,13 +65,16 @@ def run(args: argparse.Namespace, *_extra) -> int:
 
     data = self_describe()
 
-    if args.as_json or args.describe_self:
+    if args.as_json:
         print(json.dumps(data, indent=2))
     else:
-        # Human-readable fallback (never reached today since --self implies JSON,
-        # but kept for future non-JSON sub-modes).
         print(f"FLUID forge-cli {data['fluid_version']}")
-        print(f"Schema: {data['schema_version']}")
+        print(f"Schema:    {data['schema_version']}")
+        print(f"Python:    {data['python_version']}")
         print(f"Providers: {', '.join(data['providers']) or 'none'}")
         print(f"Engines:   {', '.join(data['build_engines']) or 'none'}")
+        enabled = sorted(k for k, v in data["capabilities"].items() if v)
+        print(f"Capabilities: {', '.join(enabled) or 'none'}")
+        for warning in data["warnings"]:
+            print(f"warning: {warning}")
     return 0
