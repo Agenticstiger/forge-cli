@@ -127,6 +127,13 @@ class _ModelUsage:
     # accurate per-call cost), accumulate it here. ``None`` means
     # "no override seen yet — fall back to MODEL_PRICES_USD".
     usd_override: Optional[float] = None
+    # Wave 1 — Anthropic prompt-cache token split. Cache writes are
+    # billed at 1.25x the input rate; cache reads at 0.1x. We carry the
+    # counts separately from ``input_tokens`` so the heuristic price
+    # calc applies the right multipliers; ``usd_override`` still wins
+    # when present (litellm's catalog is the source of truth).
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
 
 @dataclass
@@ -216,6 +223,10 @@ class CostRow:
     output_tokens: int
     calls: int
     usd: Optional[float]  # ``None`` when the model isn't in the price table
+    # Wave 1 — Anthropic prompt-cache token split. Default 0 so older
+    # callers that built CostRow positionally don't break.
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
 
 @dataclass
@@ -304,6 +315,8 @@ class RunCostTracker:
         agent_class: str = "",
         usd_override: Optional[float] = None,
         product_id: str = "",
+        cache_creation_input_tokens: int = 0,
+        cache_read_input_tokens: int = 0,
     ) -> None:
         """Add one provider call's tokens to the running counters.
 
@@ -330,6 +343,8 @@ class RunCostTracker:
         """
         in_tok = int(input_tokens or 0)
         out_tok = int(output_tokens or 0)
+        cache_write_tok = int(cache_creation_input_tokens or 0)
+        cache_read_tok = int(cache_read_input_tokens or 0)
         key = (provider, model)
         with self._lock:
             entry = self._counters.get(key)
@@ -339,6 +354,8 @@ class RunCostTracker:
             entry.input_tokens += in_tok
             entry.output_tokens += out_tok
             entry.calls += 1
+            entry.cache_creation_input_tokens += cache_write_tok
+            entry.cache_read_input_tokens += cache_read_tok
             if usd_override is not None:
                 try:
                     entry.usd_override = (entry.usd_override or 0.0) + float(usd_override)
@@ -553,6 +570,92 @@ class RunCostTracker:
         # The ``usd_override`` path covers the common case (litellm).
         return None
 
+    def persist_to_run_dir(
+        self,
+        run_dir: Path,
+        *,
+        provider: str = "",
+        model: str = "",
+        wall_clock_seconds: float = 0.0,
+    ) -> Path:
+        """Write a ``cost.json`` receipt under ``run_dir`` — always.
+
+        Closes the H22 gap: deterministic runs (no LLM call) previously
+        never wrote a receipt, so ``fluid stats`` reported zero runs for
+        them. We now ALWAYS write a cost.json — when no calls happened
+        the payload carries ``mode="deterministic"`` with zero token /
+        USD counts so downstream tools can distinguish "no LLM" from
+        "LLM call but unknown price".
+
+        The on-disk schema is intentionally a superset of the
+        :class:`fluid_build.cli._preview_panel.CostSnapshot` shape that
+        the preview panel writes when it owns the receipt — same keys
+        (provider / model / *_tokens / total_usd / wall_clock_seconds /
+        unknown_models / cumulative_usd) plus a new ``mode`` field
+        ("deterministic" when total_calls == 0, otherwise the
+        provider-prefixed model id).
+
+        ``run_dir`` is created if missing. The write is atomic — temp
+        file then rename — to keep partial reads safe.
+        """
+        run_dir = Path(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        breakdown = self.breakdown()
+        # Mode: deterministic when nothing was billed; otherwise the
+        # provider/model of the single (or aggregate) row. Format favours
+        # the operator-readable shape over JSON object so ``fluid stats
+        # --by provider`` can still group on the simple ``provider``
+        # field while ``mode`` carries the richer signal.
+        if breakdown.total_calls == 0:
+            mode = "deterministic"
+        elif breakdown.rows:
+            # Multi-row runs (modeler + builder on different models) get
+            # the first row's identity in the legacy provider/model
+            # fields and ``mode="mixed"`` so the operator can dig deeper
+            # via the per-row breakdown in the raw cost.json.
+            if len(breakdown.rows) == 1:
+                row = breakdown.rows[0]
+                mode = f"{row.provider}/{row.model}"
+            else:
+                mode = "mixed"
+        else:
+            mode = "unknown"
+        payload: Dict[str, Any] = {
+            "mode": mode,
+            "provider": str(provider or (breakdown.rows[0].provider if breakdown.rows else "")),
+            "model": str(model or (breakdown.rows[0].model if breakdown.rows else "")),
+            "input_tokens": int(breakdown.total_input_tokens),
+            "output_tokens": int(breakdown.total_output_tokens),
+            "total_tokens": int(breakdown.total_input_tokens + breakdown.total_output_tokens),
+            "total_usd": breakdown.total_usd,
+            "cumulative_usd": breakdown.total_usd,
+            "wall_clock_seconds": float(max(0.0, wall_clock_seconds)),
+            "unknown_models": list(breakdown.unknown_models),
+            "total_calls": int(breakdown.total_calls),
+            "missing_usage_calls": int(breakdown.missing_usage_calls),
+            "rows": [
+                {
+                    "provider": row.provider,
+                    "model": row.model,
+                    "input_tokens": int(row.input_tokens),
+                    "output_tokens": int(row.output_tokens),
+                    "calls": int(row.calls),
+                    "usd": row.usd,
+                    "cache_creation_input_tokens": int(row.cache_creation_input_tokens or 0),
+                    "cache_read_input_tokens": int(row.cache_read_input_tokens or 0),
+                }
+                for row in breakdown.rows
+            ],
+        }
+        cost_path = run_dir / "cost.json"
+        tmp_path = cost_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        tmp_path.replace(cost_path)
+        return cost_path
+
     def breakdown(self) -> CostBreakdown:
         """Materialise the current state as a :class:`CostBreakdown`."""
         with self._lock:
@@ -575,8 +678,17 @@ class RunCostTracker:
             if entry.usd_override is not None:
                 usd: Optional[float] = round(float(entry.usd_override), 6)
             else:
-                usd = _price_for(
-                    entry.provider, entry.model, entry.input_tokens, entry.output_tokens
+                # Wave 1 — apply the Anthropic cache split rate when
+                # cache-write or cache-read tokens are present. For
+                # other providers (or when both counts are zero) this
+                # collapses to the legacy flat-rate input pricing.
+                usd = _price_for_with_cache_split(
+                    provider=entry.provider,
+                    model=entry.model,
+                    input_tokens=entry.input_tokens,
+                    output_tokens=entry.output_tokens,
+                    cache_creation_input_tokens=entry.cache_creation_input_tokens,
+                    cache_read_input_tokens=entry.cache_read_input_tokens,
                 )
             if usd is None:
                 any_unknown = True
@@ -592,6 +704,8 @@ class RunCostTracker:
                     output_tokens=entry.output_tokens,
                     calls=entry.calls,
                     usd=usd,
+                    cache_creation_input_tokens=entry.cache_creation_input_tokens,
+                    cache_read_input_tokens=entry.cache_read_input_tokens,
                 )
             )
             in_total += entry.input_tokens
@@ -903,6 +1017,124 @@ def predict_call_cost(
 # ---------------------------------------------------------------------
 
 
+# Anthropic prompt-cache token-cost multipliers per
+# https://www.anthropic.com/news/prompt-caching — cache writes cost
+# 1.25x the regular input price, cache reads cost 0.1x. These are the
+# only published multipliers and apply uniformly across Anthropic API
+# / Bedrock Claude / Vertex Claude. Other providers don't expose a
+# comparable two-tier write/read split today.
+_ANTHROPIC_CACHE_WRITE_MULTIPLIER = 1.25
+_ANTHROPIC_CACHE_READ_MULTIPLIER = 0.10
+
+
+def _is_anthropic_for_pricing(provider: str, model: str) -> bool:
+    """True when the (provider, model) pair uses Anthropic cache pricing."""
+    p = (provider or "").lower()
+    m = (model or "").lower()
+    if p in ("anthropic", "claude"):
+        return True
+    if "claude" in m:
+        return True
+    # Bedrock / Vertex SKU shapes for Claude models.
+    if p == "bedrock" and ("anthropic" in m or "claude" in m):
+        return True
+    if p in ("vertex_ai", "vertex") and "claude" in m:
+        return True
+    return False
+
+
+def _price_for_with_cache_split(
+    *,
+    provider: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_creation_input_tokens: int,
+    cache_read_input_tokens: int,
+) -> Optional[float]:
+    """Apply Anthropic's cache-write 1.25x / cache-read 0.10x split.
+
+    For non-Anthropic models OR when both cache counts are zero this
+    collapses to the existing ``_price_for`` flat-rate calculation —
+    the heuristic stays backward-compatible with every existing
+    cost-summary snapshot.
+
+    For Anthropic-family models with non-zero cache tokens, we:
+
+    1. Look up the per-1M (input, output) rate via ``_price_for``
+       (passing zero tokens to get just the rate-discovery path) —
+       same litellm-first → embedded-fallback ladder as the flat path.
+    2. Split the input charge into three buckets: plain input @ 1x,
+       cache write @ 1.25x, cache read @ 0.10x.
+    3. Add the output charge unchanged.
+
+    Returns ``None`` when the rate isn't discoverable, mirroring
+    ``_price_for``'s "unknown price" signal so the cost summary
+    surfaces ``$?`` instead of fabricating a number.
+    """
+    cache_write = int(cache_creation_input_tokens or 0)
+    cache_read = int(cache_read_input_tokens or 0)
+    if cache_write == 0 and cache_read == 0:
+        return _price_for(provider, model, input_tokens, output_tokens)
+    if not _is_anthropic_for_pricing(provider, model):
+        return _price_for(provider, model, input_tokens, output_tokens)
+
+    # Discover the per-token rate by querying ``_price_for`` with the
+    # observed plain-input / output counts. We then reverse-engineer
+    # the per-1M (in, out) prices and re-apply with the split. This
+    # one extra call keeps the rate-source ladder (overrides → litellm →
+    # embedded table) consistent for both code paths.
+    in_rate, out_rate = _resolve_per_million_rate(provider, model)
+    if in_rate is None or out_rate is None:
+        return None
+    plain_input_cost = (int(input_tokens) * in_rate) / 1_000_000
+    cache_write_cost = (cache_write * in_rate * _ANTHROPIC_CACHE_WRITE_MULTIPLIER) / 1_000_000
+    cache_read_cost = (cache_read * in_rate * _ANTHROPIC_CACHE_READ_MULTIPLIER) / 1_000_000
+    output_cost = (int(output_tokens) * out_rate) / 1_000_000
+    return plain_input_cost + cache_write_cost + cache_read_cost + output_cost
+
+
+def _resolve_per_million_rate(provider: str, model: str) -> Tuple[Optional[float], Optional[float]]:
+    """Return ``(input_per_1M, output_per_1M)`` USD or ``(None, None)``.
+
+    Same lookup ladder as ``_price_for`` (override → litellm → embedded
+    table) but returns the raw rates instead of multiplying through.
+    Needed because the Anthropic cache split applies different rates
+    to different chunks of the same call — we can't pre-multiply.
+    """
+    # 1. Operator override.
+    overrides = _load_price_overrides().get(model)
+    if overrides is not None:
+        return float(overrides[0]), float(overrides[1])
+    # 2. litellm catalog — query with 1M / 1M tokens so the per-token
+    # cost we get back IS the per-1M rate. Avoids floating-point loss
+    # from inferring a rate from small token counts.
+    try:
+        import litellm  # type: ignore[import-untyped]
+
+        for candidate in (model, f"{provider.lower()}/{model}"):
+            try:
+                in_cost, out_cost = litellm.cost_per_token(
+                    model=candidate,
+                    prompt_tokens=1_000_000,
+                    completion_tokens=1_000_000,
+                )
+                # ``cost_per_token`` returns the total USD for the
+                # supplied counts, not a per-token rate. With 1M tokens
+                # the total USD IS the per-1M rate.
+                if in_cost is not None and out_cost is not None and (in_cost > 0 or out_cost > 0):
+                    return float(in_cost), float(out_cost)
+            except Exception:  # noqa: BLE001
+                continue
+    except ImportError:
+        pass
+    # 3. Embedded fallback table.
+    pricing = MODEL_PRICES_USD.get(model)
+    if pricing is not None:
+        return float(pricing[0]), float(pricing[1])
+    return None, None
+
+
 def _price_for(provider: str, model: str, input_tokens: int, output_tokens: int) -> Optional[float]:
     """Look up the USD cost for one (provider, model, tokens) triple.
 
@@ -1097,6 +1329,26 @@ def format_cost_summary(breakdown: CostBreakdown) -> str:
         f"{breakdown.total_input_tokens:>7,} in  "
         f"{breakdown.total_output_tokens:>7,} out  {total_label:>10}"
     )
+    # Wave 1 — prompt-cache footer. Only emit when at least one row has
+    # cache traffic; keeps the legacy snapshot untouched for runs that
+    # didn't hit the prompt cache (the common case for non-Anthropic
+    # backends today).
+    cache_rows = [
+        row
+        for row in breakdown.rows
+        if (row.cache_creation_input_tokens or 0) or (row.cache_read_input_tokens or 0)
+    ]
+    if cache_rows:
+        lines.append("")
+        lines.append("  Prompt cache (Anthropic split: write 1.25x, read 0.10x)")
+        lines.append("  " + "─" * 63)
+        for row in cache_rows:
+            lines.append(
+                f"    {row.provider:>10} / {row.model:<30}  "
+                f"{row.cache_creation_input_tokens:>7,} write  "
+                f"{row.cache_read_input_tokens:>7,} read"
+            )
+
     if breakdown.unknown_models:
         lines.append("")
         lines.append(
@@ -1186,6 +1438,52 @@ def print_cost_summary(*, quiet: bool = False) -> None:
     cprint(format_cost_summary(breakdown))
 
 
+def record_call_from_cumulative_usage(
+    *,
+    provider: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    stage: str = "",
+    agent_class: str = "",
+    usd_override: Optional[float] = None,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+) -> None:
+    """Bridge helper: feed the process-wide tracker from a delta snapshot.
+
+    Closes the H1 gap. ``call_llm`` / ``call_llm_streaming`` go through
+    ``LiteLLMProvider.invoke_blocking`` which updates
+    :data:`fluid_build.cli.forge_copilot_llm_providers._cumulative_usage`
+    (a module dict) but never invoked :meth:`RunCostTracker.record_call`.
+    The runtime's main authoring loop calls ``call_llm`` directly (not
+    through ``BaseStageAgent._call_once`` which is where the staged
+    pipeline's record_call lives), so the tracker stayed empty and the
+    preview panel reported ``$0 / 0 tokens`` even when the underlying
+    Gemini call had spent 8k+ real tokens.
+
+    Callers compute the per-call delta from ``_cumulative_usage``
+    (snapshot before, snapshot after) and pass it here. This module
+    owns the canonical ``record_call`` semantics (cost ceiling,
+    per-agent attribution, prompt-cache split) so the bridge is a thin
+    pass-through — no policy lives here, only the kwarg shape.
+
+    Zero-token calls are explicitly recorded so the missing-usage
+    counter increments (matching how the staged pipeline behaves).
+    """
+    _RUN_TRACKER.record_call(
+        provider=provider,
+        model=model,
+        input_tokens=int(input_tokens or 0),
+        output_tokens=int(output_tokens or 0),
+        stage=stage,
+        agent_class=agent_class,
+        usd_override=usd_override,
+        cache_creation_input_tokens=int(cache_creation_input_tokens or 0),
+        cache_read_input_tokens=int(cache_read_input_tokens or 0),
+    )
+
+
 __all__ = [
     "MODEL_PRICES_USD",
     "RunCostTracker",
@@ -1195,4 +1493,5 @@ __all__ = [
     "reset_run_tracker",
     "format_cost_summary",
     "print_cost_summary",
+    "record_call_from_cumulative_usage",
 ]

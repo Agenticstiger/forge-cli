@@ -1,0 +1,14 @@
+{
+  "axes": {
+    "correctness": 3,
+    "completeness": 2,
+    "security": 1,
+    "governance": 1,
+    "performance": 1,
+    "documentation": 1
+  },
+  "total": 9,
+  "tolerance_per_axis": 2,
+  "tolerance_total": 5,
+  "rationale": "Event stream with device_ip + user_id untagged; no retention, no partition on event_ts."
+}

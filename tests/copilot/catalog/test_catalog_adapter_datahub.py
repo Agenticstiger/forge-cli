@@ -64,6 +64,7 @@ def _stub_datahub_module() -> tuple[ModuleType, ModuleType]:
     schema_classes.OwnershipClass = MagicMock(name="OwnershipClass")
     schema_classes.GlobalTagsClass = MagicMock(name="GlobalTagsClass")
     schema_classes.UpstreamLineageClass = MagicMock(name="UpstreamLineageClass")
+    schema_classes.GlossaryTermInfoClass = MagicMock(name="GlossaryTermInfoClass")
     metadata.schema_classes = schema_classes
     datahub.metadata = metadata
     return datahub, client_mod
@@ -180,13 +181,13 @@ class TestListTables:
     def test_list_tables_uses_search_filter(self, datahub_stub):
         graph_instance = MagicMock()
         datahub_stub.return_value = graph_instance
-        graph_instance.search.return_value = [
-            SimpleNamespace(
-                urn="urn:li:dataset:(urn:li:dataPlatform:snowflake,db.schema.orders,PROD)"
-            ),
-            SimpleNamespace(
-                urn="urn:li:dataset:(urn:li:dataPlatform:snowflake,db.schema.customers,PROD)"
-            ),
+        # ``get_urns_by_filter`` returns an Iterable[str] (the
+        # modern acryl-datahub API). The adapter no longer relies
+        # on ``graph.search(...)``, which was removed from the
+        # SDK in the 1.x line.
+        graph_instance.get_urns_by_filter.return_value = [
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,db.schema.orders,PROD)",
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,db.schema.customers,PROD)",
         ]
 
         adapter = _make_adapter()
@@ -195,25 +196,22 @@ class TestListTables:
         # FQN preserves the URN for downstream consumers (the URN
         # is the canonical DataHub identity).
         assert all(t.fqn.startswith("urn:li:dataset:") for t in tables)
-        # ``search`` was called with a query that scopes by
-        # container — confirms the adapter respects scope filters.
-        call_args = graph_instance.search.call_args
-        assert call_args is not None
-        query_arg = call_args.kwargs.get("query") or call_args.args[0]
-        assert "db" in query_arg or "schema" in query_arg
+        # The structured-filter call carries the scope through as
+        # ``platform`` + ``platform_instance`` filters — confirms
+        # the adapter respects scope axes the modern SDK exposes.
+        call_kwargs = graph_instance.get_urns_by_filter.call_args.kwargs
+        assert call_kwargs.get("entity_types") == ["dataset"]
+        assert call_kwargs.get("platform") == "db"
+        assert call_kwargs.get("platform_instance") == "schema"
 
     def test_list_tables_filters_by_explicit_table_list(self, datahub_stub):
         """When ``scope.tables`` is set, only those tables are
         returned even if DataHub's search hits more."""
         graph_instance = MagicMock()
         datahub_stub.return_value = graph_instance
-        graph_instance.search.return_value = [
-            SimpleNamespace(
-                urn="urn:li:dataset:(urn:li:dataPlatform:snowflake,db.schema.orders,PROD)"
-            ),
-            SimpleNamespace(
-                urn="urn:li:dataset:(urn:li:dataPlatform:snowflake,db.schema.customers,PROD)"
-            ),
+        graph_instance.get_urns_by_filter.return_value = [
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,db.schema.orders,PROD)",
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,db.schema.customers,PROD)",
         ]
         tables = _make_adapter().list_tables(
             CatalogScope(database="db", schema_name="schema", tables=["orders"])
@@ -226,7 +224,7 @@ class TestErrorTranslation:
     def test_unauthorized_becomes_permission_error(self, datahub_stub):
         graph_instance = MagicMock()
         datahub_stub.return_value = graph_instance
-        graph_instance.search.side_effect = Exception("401 Unauthorized: token invalid")
+        graph_instance.get_urns_by_filter.side_effect = Exception("401 Unauthorized: token invalid")
 
         adapter = _make_adapter()
         with pytest.raises(CatalogPermissionError) as exc_info:
@@ -237,7 +235,7 @@ class TestErrorTranslation:
     def test_not_found_becomes_connection_error(self, datahub_stub):
         graph_instance = MagicMock()
         datahub_stub.return_value = graph_instance
-        graph_instance.search.side_effect = Exception("404 Not Found")
+        graph_instance.get_urns_by_filter.side_effect = Exception("404 Not Found")
 
         adapter = _make_adapter()
         with pytest.raises(CatalogConnectionError):
@@ -260,3 +258,63 @@ class TestURNNormalisation:
         assert result.startswith("urn:li:dataset:")
         assert "snowflake" in result
         assert "analytics.orders" in result
+
+
+class TestSdkApiSurface:
+    """Pin the DataHub SDK methods this adapter relies on.
+
+    Regression guard against the v1.5 mistake where the adapter
+    called ``graph.search(...)`` — a method that does not exist on
+    ``acryl-datahub`` 1.0+ (the version pinned in this repo). The
+    SDK exposes ``get_urns_by_filter`` as the modern structured-
+    filter search API and ``get_aspect`` for the per-entity aspect
+    fetch.
+    """
+
+    def test_list_tables_calls_get_urns_by_filter_not_search(self, datahub_stub):
+        graph_instance = MagicMock()
+        datahub_stub.return_value = graph_instance
+        graph_instance.get_urns_by_filter.return_value = []
+
+        _make_adapter().list_tables(CatalogScope(database="snowflake"))
+
+        # Modern API was hit; legacy ``search`` was NOT.
+        graph_instance.get_urns_by_filter.assert_called_once()
+        assert not graph_instance.search.called
+
+    def test_list_glossary_terms_calls_get_urns_by_filter_not_search(self, datahub_stub):
+        graph_instance = MagicMock()
+        datahub_stub.return_value = graph_instance
+        graph_instance.get_urns_by_filter.return_value = []
+
+        _make_adapter().list_glossary_terms(CatalogScope())
+
+        # ``get_urns_by_filter`` is called with the glossaryTerm
+        # entity-type filter. The legacy ``search`` call shape is
+        # not used.
+        graph_instance.get_urns_by_filter.assert_called_once()
+        kwargs = graph_instance.get_urns_by_filter.call_args.kwargs
+        assert kwargs.get("entity_types") == ["glossaryTerm"]
+        assert not graph_instance.search.called
+
+    def test_list_glossary_terms_fetches_definition_via_aspect(self, datahub_stub):
+        """Each glossary URN's term + definition come from
+        ``get_aspect(entity_urn=..., aspect=GlossaryTermInfoClass)``,
+        not from the URN string itself. Confirms the adapter calls
+        the right SDK helper to populate non-empty ``definition``
+        bodies in the result."""
+        graph_instance = MagicMock()
+        datahub_stub.return_value = graph_instance
+        graph_instance.get_urns_by_filter.return_value = [
+            "urn:li:glossaryTerm:business.customer-segment",
+        ]
+        info = SimpleNamespace(name="Customer Segment", definition="A grouping of customers.")
+        graph_instance.get_aspect.return_value = info
+
+        terms = _make_adapter().list_glossary_terms(CatalogScope())
+
+        assert len(terms) == 1
+        assert terms[0].term == "Customer Segment"
+        assert terms[0].definition == "A grouping of customers."
+        # get_aspect was called for the glossary term URN.
+        graph_instance.get_aspect.assert_called_once()

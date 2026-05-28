@@ -196,6 +196,7 @@ class LogicalAgent:
         catalog_summary = _aggregate_catalog_summary(
             adapter_name=adapter.name,
             catalog_tables=full_catalog_tables,
+            scope=scope,
         )
         # Merge — the modeler already populated ``source_kind`` /
         # ``table_count`` so we extend rather than replace.
@@ -238,7 +239,38 @@ def _translate_catalog_table(catalog_table: Any) -> TableDefinition:
     in :attr:`ColumnDefinition.qualifiers` so future modeler-prompt
     enhancements (Sprint D) can pick them up without a fresh
     translation pass.
+
+    RETEST-6 fix — name-based PII pre-classifier runs here so that
+    catalog-driven forges (Snowflake / BigQuery / DataHub / Glue —
+    every adapter funnels through this single helper per RETEST-9)
+    pick up the same ``pii-<class>`` / ``sensitivity`` / ``semanticType``
+    signal the JDBC + AI-enrichment paths already carry. Without this
+    wiring, columns like ``EMAIL`` in the ``sat_individual_details``
+    Snowflake sample landed with zero PII metadata even though the
+    classifier was available (RETEST-6: 0/309 columns tagged).
+
+    The classifier output is stashed into ``qualifiers`` (parallel
+    to ``catalog_sensitivity_tags`` / ``catalog_classifications`` —
+    the existing pattern for catalog-derived signal that flows
+    through the modeler into the v0.7.3 contract). Kill-switch:
+    ``FLUID_COPILOT_PII_CLASSIFIER=0`` — same env var the JDBC and
+    enrichment paths honour. Idempotent: if the catalog already
+    pre-classified the column (``catalog_sensitivity_tags`` set to
+    ``pii``/``phi`` or ``pii_tags`` already present in qualifiers),
+    we skip the column to avoid double-tagging.
     """
+    # Lazy import — keeps the ``classifier_enabled`` env check
+    # cheap and avoids pulling the regex table when this helper is
+    # imported by tools that never call it.
+    from fluid_build.copilot.pii import (
+        PII_SENSITIVITY_MAP,
+        classifier_enabled,
+        classify_column,
+    )
+
+    pii_enabled = classifier_enabled()
+    sens_priority = {"phi": 3, "restricted": 2, "pii": 1}
+
     columns = []
     for cat_col in catalog_table.columns:
         qualifiers = dict(cat_col.catalog_specific or {})
@@ -259,6 +291,36 @@ def _translate_catalog_table(catalog_table: Any) -> TableDefinition:
             qualifiers["catalog_partition_key"] = True
         if cat_col.clustering_key:
             qualifiers["catalog_clustering_key"] = True
+
+        # RETEST-6 — name-based PII pre-classifier. Mirror the
+        # JDBC integration's tag/sensitivity/semanticType triplet
+        # but stash on qualifiers so the modeler + contract emitter
+        # can pick it up (the v0.7.3 column dict doesn't exist yet
+        # at this layer — that's the modeler's output).
+        if pii_enabled and "pii_tags" not in qualifiers:
+            # Idempotent — skip when the catalog already declared
+            # PII / PHI via the typed ``sensitivity_tags`` field.
+            # The existing catalog signal is authoritative; we
+            # only fill gaps the catalog left.
+            existing_sens = qualifiers.get("catalog_sensitivity_tags") or []
+            already_classified = any(str(s).lower() in {"pii", "phi"} for s in existing_sens)
+            if not already_classified:
+                classes = classify_column(cat_col.name or "")
+                if classes:
+                    # Tags — kebab-case ``pii-<class>``, matches
+                    # the JDBC + apply_pii_tags shape.
+                    qualifiers["pii_tags"] = [f"pii-{c}".replace("_", "-") for c in classes]
+                    # Strongest sensitivity wins. phi > restricted > pii.
+                    candidate_levels = sorted(
+                        (PII_SENSITIVITY_MAP[c] for c in classes),
+                        key=lambda s: sens_priority.get(s, 0),
+                        reverse=True,
+                    )
+                    qualifiers["pii_sensitivity"] = candidate_levels[0]
+                    # Semantic type — first alphabetic class
+                    # (classify_column already returns sorted).
+                    qualifiers["pii_semantic_type"] = classes[0]
+
         columns.append(
             ColumnDefinition(
                 name=cat_col.name,
@@ -346,6 +408,7 @@ def _aggregate_catalog_summary(
     *,
     adapter_name: str,
     catalog_tables: list,
+    scope: Any = None,
 ) -> dict:
     """Aggregate :class:`CatalogTable` list into a flat summary dict.
 
@@ -434,6 +497,45 @@ def _aggregate_catalog_summary(
         "source_kind": "catalog",
         "source_catalog_name": adapter_name,
     }
+
+    # H7 fix (Snowflake e2e finding 06-snowflake-e2e.md): when the
+    # source is a warehouse catalog, surface the (database, schema,
+    # catalog) triple AND a per-table FQN/name index on the summary
+    # so :func:`build_contract_from_logical` can emit
+    # ``binding.platform: snowflake`` with proper
+    # ``database`` / ``schema`` / ``table`` location fields instead
+    # of the previous ``local/parquet/runtime/X.parquet`` default
+    # (which is a worst-case interop failure for a Snowflake source).
+    if scope is not None:
+        if getattr(scope, "database", None):
+            summary["source_database"] = scope.database
+        if getattr(scope, "schema_name", None):
+            summary["source_schema"] = scope.schema_name
+        if getattr(scope, "catalog", None):
+            summary["source_catalog"] = scope.catalog
+
+    # Per-table binding hints keyed by table NAME (bare, case-folded).
+    # The contract emitter looks these up when emitting one expose
+    # per DV2 hub / link / sat. ``database`` and ``schema_name`` may
+    # vary across tables for cross-schema scopes (e.g. an explicit
+    # ``--tables DB1.SCH1.T1,DB2.SCH2.T2``), so we record per-table
+    # rather than assuming the scope's defaults.
+    table_bindings: dict[str, dict] = {}
+    for t in catalog_tables:
+        bare = (t.name or "").strip().lower()
+        if not bare:
+            continue
+        entry: dict = {}
+        if t.database:
+            entry["database"] = t.database
+        if getattr(t, "schema_name", None):
+            entry["schema"] = t.schema_name
+        if t.name:
+            entry["table"] = t.name
+        if entry:
+            table_bindings[bare] = entry
+    if table_bindings:
+        summary["source_table_bindings"] = table_bindings
 
     # Owner: tag-based wins; fall back to non-system raw owner;
     # else leave unset so the contract emitter uses its default.

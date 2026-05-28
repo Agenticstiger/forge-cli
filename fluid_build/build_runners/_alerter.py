@@ -37,15 +37,15 @@ allow-list env var and rejection becomes default-deny.
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
 import os
-import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
+
+from fluid_build._net import _hostname_is_private
 
 from ._acquisition_common import utc_now_iso
 
@@ -61,46 +61,6 @@ class WebhookSsrfError(ValueError):
 
 _ALLOWED_SCHEMES = ("http", "https")
 _ALLOWLIST_ENV = "FLUID_WEBHOOK_HOST_ALLOWLIST"
-
-
-def _hostname_is_private(hostname: str) -> bool:
-    """Return True when ``hostname`` resolves to a non-public IP.
-
-    Considers loopback, private, link-local, and unspecified IPv4/IPv6
-    ranges (this catches AWS/GCP metadata at 169.254.169.254 and
-    on-host services). DNS resolution errors fall back to refusing the
-    request (better to fail-closed than fan-out to unknowns).
-
-    .. note::
-
-        This is the canonical SSRF post-DNS-resolution gate for the
-        whole codebase. It is deliberately re-used by the federation
-        digest fetchers (:mod:`fluid_build.forge.federation`), the
-        OpenLineage HTTP emitter (:mod:`fluid_build.build_runners._lineage`),
-        and the Command Center client/reporter rather than each call
-        site re-deriving its own private-range list. When extending the
-        blocked set, extend it *here* so every consumer benefits.
-    """
-    try:
-        addresses = socket.getaddrinfo(hostname, None)
-    except socket.gaierror:
-        # Unresolvable host — treat as private to avoid blind retries.
-        return True
-    for entry in addresses:
-        ip_str = entry[4][0]
-        try:
-            ip = ipaddress.ip_address(ip_str)
-        except ValueError:
-            return True
-        if (
-            ip.is_loopback
-            or ip.is_private
-            or ip.is_link_local
-            or ip.is_unspecified
-            or ip.is_reserved
-        ):
-            return True
-    return False
 
 
 def _host_on_allowlist(hostname: str) -> bool:

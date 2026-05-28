@@ -26,11 +26,17 @@ from fluid_build.build_runners._catalog import (
 )
 from fluid_build.build_runners.catalog_registrars import (
     DataHubRegistrar,
-    GlueCatalogRegistrar,
     OpenMetadataRegistrar,
-    SnowflakeHorizonRegistrar,
-    UnityCatalogRegistrar,
 )
+
+# ``GlueCatalogRegistrar`` and ``SnowflakeHorizonRegistrar`` were retired on
+# this branch — the catalog metadata they used to push (table description,
+# column comments, fluid_layer / fluid_product_type / forge.pii.<col>
+# parameters, Horizon markdown comment) is now emitted directly into the
+# corresponding tofu resources (``aws_glue_catalog_table`` /
+# ``snowflake_table``) by the IaC plugins. See
+# ``tests/iac/test_iac_aws.py`` / ``test_iac_snowflake.py`` for the
+# replacement pin tests.
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -69,6 +75,20 @@ def _contract_with_columns(
 
 class TestDataHubRegistrar:
     def test_register_success(self, datahub_mock):
+        """A successful registration writes:
+
+        * a ``DatasetSnapshot`` (legacy ``/entities?action=ingest``) for
+          the expose's physical asset — captured by ``mock.entities``;
+        * one or more MCPs (``/aspects?action=ingestProposal``) for the
+          DataProduct itself (and a Domain when the contract has one) —
+          captured by ``mock.proposals``.
+
+        The returned URN is the **DataProduct** URN, not the dataset
+        URN, because a FLUID contract is fundamentally a data product
+        — that's what an operator searches for in the UI. The dataset
+        URN is preserved in ``result.metadata['dataset_urn']`` for
+        callers that still need it.
+        """
         registrar = DataHubRegistrar(base_url="https://datahub.test")
         contract = _contract_with_columns(
             columns=[
@@ -78,10 +98,20 @@ class TestDataHubRegistrar:
         )
         result = registrar.register("bronze.x", "orders", contract, {"email": ["email"]})
         assert result.succeeded
-        assert "snowflake" in result.urn
-        assert datahub_mock.entities, "DataHub mock recorded ingestion"
+        assert result.urn == "urn:li:dataProduct:bronze.x"
+        assert "snowflake" in result.metadata["dataset_urn"]
+        assert datahub_mock.entities, "DataHub mock recorded dataset snapshot"
+        assert datahub_mock.proposals_for(
+            "dataProduct"
+        ), "DataHub mock recorded DataProduct MCP proposal"
 
     def test_classifications_become_glossary_terms(self, datahub_mock):
+        """``classifications`` map column → list of glossary-term labels.
+        Each label is emitted as a ``GlossaryTermAssociation`` record
+        with a ``urn:li:glossaryTerm:<label>`` URN — that's the shape
+        the real DataHub GMS accepts (live integration test pins this;
+        the old assertion on a bare-string list silently passed because
+        the mock never validated against the GMS schema)."""
         registrar = DataHubRegistrar(base_url="https://datahub.test")
         contract = _contract_with_columns(
             columns=[{"name": "email", "type": "STRING"}, {"name": "phone", "type": "STRING"}]
@@ -100,8 +130,11 @@ class TestDataHubRegistrar:
         fields = schema_aspect["com.linkedin.schema.SchemaMetadata"]["fields"]
         email_field = next(f for f in fields if f["fieldPath"] == "email")
         phone_field = next(f for f in fields if f["fieldPath"] == "phone")
-        assert "email" in email_field["glossaryTerms"]
-        assert "pii" in phone_field["glossaryTerms"]
+        email_urns = {t["urn"] for t in email_field["glossaryTerms"]["terms"]}
+        phone_urns = {t["urn"] for t in phone_field["glossaryTerms"]["terms"]}
+        assert "urn:li:glossaryTerm:email" in email_urns
+        assert "urn:li:glossaryTerm:phone" in phone_urns
+        assert "urn:li:glossaryTerm:pii" in phone_urns
 
     def test_register_failure_on_network_error(self, monkeypatch):
         registrar = DataHubRegistrar(base_url="http://no-such-host.invalid:9")
@@ -110,23 +143,16 @@ class TestDataHubRegistrar:
         assert not result.succeeded
         assert result.error is not None
 
-    def test_unregister_success(self, datahub_mock, monkeypatch):
-        # Add a custom delete handler.
-        import httpx
-        import respx
-
-        with respx.mock(base_url="https://datahub.test", assert_all_called=False) as router:
-            calls = []
-
-            def delete_handler(request):
-                calls.append(request)
-                return httpx.Response(200, json={})
-
-            router.post("/entities?action=delete").mock(side_effect=delete_handler)
-            registrar = DataHubRegistrar(base_url="https://datahub.test")
-            result = registrar.unregister("bronze.x", "orders")
-            assert result.succeeded
-            assert calls
+    def test_unregister_soft_deletes_dataset_and_dataproduct(self, datahub_mock):
+        """``unregister`` mirrors ``register``: it soft-deletes both the
+        DataProduct and its dataset asset so the UI no longer surfaces
+        either. The DataHub mock's ``deletes`` lane records every
+        delete URN so the test asserts on both shapes."""
+        registrar = DataHubRegistrar(base_url="https://datahub.test")
+        result = registrar.unregister("bronze.x", "orders")
+        assert result.succeeded
+        assert "urn:li:dataProduct:bronze.x" in datahub_mock.deletes
+        assert any("urn:li:dataset:" in u and "bronze.x.orders" in u for u in datahub_mock.deletes)
 
 
 # ── OpenMetadata ────────────────────────────────────────────────────────
@@ -165,146 +191,25 @@ class TestOpenMetadataRegistrar:
         assert "bronze.x.orders" in openmetadata_mock.deletions[0]
 
 
-# ── Unity Catalog ───────────────────────────────────────────────────────
-
-
-class TestUnityCatalogRegistrar:
-    def test_register_success(self, unity_mock):
-        registrar = UnityCatalogRegistrar(
-            base_url="https://databricks.test",
-            workspace_token="t",
-            catalog_name="forge",
-            schema_name="bronze",
-        )
-        result = registrar.register(
-            "bronze.x",
-            "orders",
-            _contract_with_columns(columns=[{"name": "id", "type": "bigint"}]),
-            {},
-        )
-        assert result.succeeded
-        assert "unity://" in result.urn
-        body = unity_mock.tables[0]
-        assert body["catalog_name"] == "forge"
-        assert body["schema_name"] == "bronze"
-        assert body["name"] == "orders"
-
-    def test_table_type_is_managed_delta(self, unity_mock):
-        registrar = UnityCatalogRegistrar(base_url="https://databricks.test")
-        registrar.register("bronze.x", "orders", _contract_with_columns(columns=[]), {})
-        body = unity_mock.tables[0]
-        assert body["table_type"] == "MANAGED"
-        assert body["data_source_format"] == "DELTA"
-
-    def test_unregister(self, unity_mock):
-        registrar = UnityCatalogRegistrar(base_url="https://databricks.test")
-        result = registrar.unregister("bronze.x", "orders")
-        assert result.succeeded
-
-
-# ── AWS Glue ────────────────────────────────────────────────────────────
-
-
-class TestGlueRegistrar:
-    def test_register_success(self, glue_mock):
-        registrar = GlueCatalogRegistrar(
-            region="us-east-1",
-            database_name="forge_bronze",
-            base_url_override="https://glue.us-east-1.amazonaws.com",
-        )
-        result = registrar.register(
-            "bronze.x",
-            "orders",
-            _contract_with_columns(columns=[{"name": "id", "type": "int"}]),
-            {},
-        )
-        assert result.succeeded
-        assert glue_mock.tables
-        body = glue_mock.tables[0]
-        assert body["DatabaseName"] == "forge_bronze"
-        assert body["TableInput"]["Name"] == "orders"
-
-    def test_pii_classifications_become_table_parameters(self, glue_mock):
-        registrar = GlueCatalogRegistrar(base_url_override="https://glue.us-east-1.amazonaws.com")
-        registrar.register(
-            "bronze.x",
-            "orders",
-            _contract_with_columns(columns=[{"name": "email", "type": "string"}]),
-            {"email": ["email", "pii"]},
-        )
-        params = glue_mock.tables[0]["TableInput"]["Parameters"]
-        assert "forge.pii.email" in params
-
-    def test_unregister(self, glue_mock):
-        registrar = GlueCatalogRegistrar(base_url_override="https://glue.us-east-1.amazonaws.com")
-        result = registrar.unregister("bronze.x", "orders")
-        assert result.succeeded
-        assert glue_mock.deletions
-
-    def test_no_boto3_in_module(self):
-        """Glue registrar must not import boto3 — sticks to plain HTTP."""
-        import re
-        from pathlib import Path
-
-        import fluid_build.build_runners.catalog_registrars.glue as mod
-
-        src = Path(mod.__file__).read_text()
-        # Real imports look like `import boto3` or `from boto3.X import ...`.
-        for pattern in (r"^\s*import\s+boto3\b", r"^\s*from\s+boto3(\.|\s)"):
-            assert (
-                re.search(pattern, src, flags=re.MULTILINE) is None
-            ), f"boto3 import leaked: {pattern}"
-
-
-# ── Snowflake Horizon ───────────────────────────────────────────────────
-
-
-class TestSnowflakeHorizonRegistrar:
-    def test_register_success(self, snowflake_horizon_mock):
-        registrar = SnowflakeHorizonRegistrar(
-            account_url="https://acme.snowflakecomputing.com",
-            database="FORGE",
-            schema="BRONZE",
-        )
-        result = registrar.register(
-            "bronze.x",
-            "orders",
-            _contract_with_columns(columns=[{"name": "id", "type": "varchar"}]),
-            {},
-        )
-        assert result.succeeded
-        assert "snowflake://FORGE.BRONZE.ORDERS" == result.urn
-        body = snowflake_horizon_mock.tables[0]
-        assert body["name"] == "ORDERS"
-
-    def test_columns_uppercased(self, snowflake_horizon_mock):
-        registrar = SnowflakeHorizonRegistrar(account_url="https://acme.snowflakecomputing.com")
-        registrar.register(
-            "bronze.x",
-            "orders",
-            _contract_with_columns(columns=[{"name": "email", "type": "varchar"}]),
-            {"email": ["email"]},
-        )
-        col = snowflake_horizon_mock.tables[0]["columns"][0]
-        assert col["name"] == "EMAIL"
-        assert col["datatype"] == "VARCHAR"
-
-    def test_classifications_become_tags(self, snowflake_horizon_mock):
-        registrar = SnowflakeHorizonRegistrar(account_url="https://acme.snowflakecomputing.com")
-        registrar.register(
-            "bronze.x",
-            "orders",
-            _contract_with_columns(columns=[{"name": "email", "type": "varchar"}]),
-            {"email": ["pii", "email"]},
-        )
-        col = snowflake_horizon_mock.tables[0]["columns"][0]
-        assert "pii" in col["tags"]
-        assert "email" in col["tags"]
-
-    def test_unregister(self, snowflake_horizon_mock):
-        registrar = SnowflakeHorizonRegistrar(account_url="https://acme.snowflakecomputing.com")
-        result = registrar.unregister("bronze.x", "orders")
-        assert result.succeeded
+# ── AWS Glue + Snowflake Horizon — retired ─────────────────────────────
+#
+# The boto3-driven Glue registrar and the HTTP-driven Snowflake Horizon
+# registrar were both retired in favour of the IaC plugins:
+#
+#   * aws_glue_catalog_table now carries description / column comments /
+#     fluid_layer + fluid_product_type + forge.pii.<col> parameters
+#     directly (see fluid_build/iac/providers/aws.py::_emit_glue,
+#     pinned by tests/iac/test_iac_aws.py).
+#
+#   * snowflake_table now carries the Horizon markdown comment + per-
+#     column comments + governance.snowflake.tagAssociations[] becomes
+#     snowflake_tag_association resources (see
+#     fluid_build/iac/providers/snowflake.py, pinned by
+#     tests/iac/test_iac_snowflake.py).
+#
+# One source of truth (the contract), one tofu state, drift detection
+# for free — the registrars were strictly redundant for IaC-managed
+# tables and had write-once-on-create semantics for everything else.
 
 
 # ── Dispatcher integration via _catalog.register_all ───────────────────
@@ -340,6 +245,109 @@ class TestRegisterAllDispatcher:
         assert outcome.results == []
 
 
+# ── build_registrar factory + publish-path auto-wiring ────────────────────
+
+
+class TestBuildRegistrarFactory:
+    """``build_registrar`` resolves built-in registrars from env config."""
+
+    def test_unconfigured_target_returns_none(self, monkeypatch):
+        from fluid_build.build_runners.catalog_registrars import build_registrar
+
+        for var in ("FLUID_CATALOG_DATAHUB_URL", "DATAHUB_GMS_URL"):
+            monkeypatch.delenv(var, raising=False)
+        assert build_registrar("datahub") is None
+
+    def test_unknown_target_returns_none(self):
+        from fluid_build.build_runners.catalog_registrars import build_registrar
+
+        assert build_registrar("nonexistent-catalog") is None
+
+    def test_datahub_built_from_fluid_env(self, monkeypatch):
+        from fluid_build.build_runners.catalog_registrars import build_registrar
+
+        monkeypatch.setenv("FLUID_CATALOG_DATAHUB_URL", "https://dh.example")
+        monkeypatch.setenv("FLUID_CATALOG_DATAHUB_TOKEN", "tok")
+        reg = build_registrar("datahub")
+        assert isinstance(reg, DataHubRegistrar)
+        assert reg.base_url == "https://dh.example"
+        assert reg.api_token == "tok"
+
+    def test_datahub_honours_native_env(self, monkeypatch):
+        from fluid_build.build_runners.catalog_registrars import build_registrar
+
+        monkeypatch.delenv("FLUID_CATALOG_DATAHUB_URL", raising=False)
+        monkeypatch.setenv("DATAHUB_GMS_URL", "https://gms.example")
+        reg = build_registrar("datahub")
+        assert isinstance(reg, DataHubRegistrar)
+        assert reg.base_url == "https://gms.example"
+
+    def test_retired_glue_target_returns_none(self, monkeypatch):
+        """``build_registrar('glue')`` returns None on this branch — the
+        Glue catalog registrar was retired; ``aws_glue_catalog_table``
+        carries the table description / parameters / per-column comments
+        directly via the IaC plugin. Existing contracts listing ``glue``
+        under ``properties.catalog.register`` get a clean "not configured"
+        result from the orchestrator instead of a stale push that fights
+        IaC state."""
+        from fluid_build.build_runners.catalog_registrars import build_registrar
+
+        for var in ("FLUID_CATALOG_GLUE_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-west-2")
+        assert build_registrar("glue") is None
+
+    def test_retired_snowflake_horizon_target_returns_none(self, monkeypatch):
+        """Same as Glue: the Snowflake Horizon registrar was retired in
+        favour of the snowflake_table comment + tag-association emit."""
+        from fluid_build.build_runners.catalog_registrars import build_registrar
+
+        monkeypatch.setenv("FLUID_CATALOG_SNOWFLAKE_URL", "https://acme.snowflakecomputing.com")
+        assert build_registrar("snowflake_horizon") is None
+
+    # The OSS Unity Catalog publish-side registrar was removed on main —
+    # its strict v0.4+ table-create validation made round-tripping the
+    # canonical payload too fragile. The Databricks-hosted UC path stays
+    # addressable via the upstream SDK. No ``build_registrar('unity')``
+    # test pins because there is nothing to wire.
+
+    def test_register_all_resolves_builtin_when_unregistered(self, datahub_mock, monkeypatch):
+        """A planned target with env config dispatches end-to-end without an
+        explicit register_registrar() — proves the publish-path wiring."""
+        from fluid_build.build_runners import _catalog as orch
+        from fluid_build.cli._acquisition_stage_ext import _ensure_builtin_registrars
+
+        orch._REGISTRY.pop("datahub", None)
+        monkeypatch.setenv("FLUID_CATALOG_DATAHUB_URL", "https://datahub.test")
+        try:
+            _ensure_builtin_registrars(["datahub"])
+            assert isinstance(orch.get_registrar("datahub"), DataHubRegistrar)
+            outcome = register_all(
+                CatalogPlan(targets=["datahub"]),
+                "bronze.x",
+                "orders",
+                _contract_with_columns(columns=[{"name": "id", "type": "string"}]),
+                {},
+            )
+            assert all(r.succeeded for r in outcome.results), outcome.results
+        finally:
+            orch._REGISTRY.pop("datahub", None)
+
+    def test_explicit_registration_wins_over_builtin(self, monkeypatch):
+        """An explicitly-registered registrar is not replaced by the built-in."""
+        from fluid_build.build_runners import _catalog as orch
+        from fluid_build.cli._acquisition_stage_ext import _ensure_builtin_registrars
+
+        sentinel = DataHubRegistrar(base_url="https://explicit.test")
+        monkeypatch.setenv("FLUID_CATALOG_DATAHUB_URL", "https://builtin.test")
+        register_registrar("datahub", sentinel)
+        try:
+            _ensure_builtin_registrars(["datahub"])
+            assert orch.get_registrar("datahub") is sentinel
+        finally:
+            orch._REGISTRY.pop("datahub", None)
+
+
 # ── Cross-target: every registrar produces a ``RegistrationResult`` ────
 
 
@@ -349,9 +357,6 @@ class TestProtocolConformance:
         [
             lambda: DataHubRegistrar(base_url="https://datahub.test"),
             lambda: OpenMetadataRegistrar(base_url="https://openmetadata.test"),
-            lambda: UnityCatalogRegistrar(base_url="https://databricks.test"),
-            lambda: GlueCatalogRegistrar(base_url_override="https://glue.us-east-1.amazonaws.com"),
-            lambda: SnowflakeHorizonRegistrar(account_url="https://acme.snowflakecomputing.com"),
         ],
     )
     def test_register_returns_registration_result(
@@ -359,9 +364,6 @@ class TestProtocolConformance:
         registrar_factory,
         datahub_mock,
         openmetadata_mock,
-        unity_mock,
-        glue_mock,
-        snowflake_horizon_mock,
     ):
         registrar: CatalogRegistrar = registrar_factory()
         result = registrar.register(

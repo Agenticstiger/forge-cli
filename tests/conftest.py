@@ -23,6 +23,27 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 
 
+# ── Session-level self-heal: scrub poisoned personal-memory ───────────
+#
+# A prior bug let a ``MagicMock`` repr leak into
+# ``~/.fluid/personal-memory.json``; it then re-rendered in every
+# subsequent forge run's streaming preview.  This session-level fixture
+# strips poisoned values once per pytest invocation so contributor
+# laptops self-heal without anyone having to think about it.  Idempotent
+# (no-op when the file is clean or absent).
+@pytest.fixture(scope="session", autouse=True)
+def _self_heal_personal_memory():
+    try:
+        from fluid_build.cli.forge_copilot_personal_memory import (
+            _sanitize_existing_personal_memory,
+        )
+
+        _sanitize_existing_personal_memory()
+    except Exception:  # pragma: no cover — defensive, never fail tests
+        pass
+    yield
+
+
 @pytest.fixture
 def mock_logger():
     """Provide a mock logger for testing."""
@@ -158,6 +179,57 @@ def _disable_copilot_self_eval(monkeypatch):
     monkeypatch.setenv("FLUID_COPILOT_SELF_EVAL", "0")
 
 
+def _noop_assert_safe_url(url, *, allow_private=False):  # noqa: ARG001
+    """Replacement for safe_http.assert_safe_url used in unit tests.
+
+    Returns a sentinel ``(hostname, pinned_ip)`` so callers that unpack
+    the tuple keep working without doing a real DNS lookup. Synthetic
+    test hostnames like ``airbyte.test`` / ``databricks.test`` /
+    ``kafka-connect.test`` are NOT in any DNS, so the real function
+    would raise UnsafeURLError on every test that constructs a
+    safe_httpx_client.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    return parsed.hostname or "test", "127.0.0.1"
+
+
+def _noop_pin_hook_factory(*, allow_private: bool = False):  # noqa: ARG001
+    def _hook(request) -> None:  # noqa: ARG001
+        return None
+
+    return _hook
+
+
+@pytest.fixture(autouse=True)
+def _disable_ssrf_guard_for_unit_tests(request):
+    """Replace the SSRF guard primitives with no-ops for the unit-test
+    suite so respx-mocked synthetic hostnames work without real DNS.
+
+    The guard itself is tested explicitly in ``tests/util/test_safe_http.py``
+    — we DON'T noop there. Detection by path so the policy stays local
+    to one file even if new tests land for the guard later.
+    """
+    fspath = str(getattr(request.node, "fspath", "") or "")
+    if "tests/util/test_safe_http.py" in fspath:
+        # The SSRF guard's own tests need the real implementation.
+        yield
+        return
+
+    with (
+        patch(
+            "fluid_build.util.safe_http.assert_safe_url",
+            side_effect=_noop_assert_safe_url,
+        ),
+        patch(
+            "fluid_build.util.safe_http._make_request_pin_hook",
+            side_effect=_noop_pin_hook_factory,
+        ),
+    ):
+        yield
+
+
 # ── Source-aligned acquisition test infrastructure (Slice A) ────────────
 #
 # Re-export the shared fixtures from tests/_infrastructure/ so individual
@@ -173,7 +245,6 @@ try:  # pragma: no cover — exercised at collection time
         marquez_mock,
         openmetadata_mock,
         snowflake_horizon_mock,
-        unity_mock,
     )
 except ImportError:
     pass
@@ -186,6 +257,18 @@ try:  # pragma: no cover
         postgres_container,
         redpanda_container,
         seeded_postgres,
+    )
+except ImportError:
+    pass
+
+# Keyless emulator fixtures (moto / fakesnow) for the `emulated`-marked
+# provider integration tests. Optional dependency: the `test-emulators`
+# extra. Absent it, the import is skipped and the emulator tests skip.
+try:  # pragma: no cover — exercised at collection time
+    from tests._infrastructure.emulator_fixtures import (  # noqa: F401
+        bigquery_emulator_client,
+        fakesnow_patch,
+        moto_glue_client,
     )
 except ImportError:
     pass

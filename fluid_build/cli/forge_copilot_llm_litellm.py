@@ -110,6 +110,10 @@ _DEFAULT_MODEL_BY_PROVIDER: Dict[str, str] = {
     "vertex_ai": "gemini-2.5-flash",
     "mistral": "mistral-large-latest",
     "cohere": "command-r-plus",
+    # GitHub Models hosts the OpenAI family (plus Llama / Mistral /
+    # DeepSeek). gpt-4o-mini is a small, cheap default that sits well
+    # within the GitHub Models free-tier rate limits.
+    "github": "gpt-4o-mini",
 }
 
 
@@ -129,6 +133,9 @@ _LITELLM_PREFIX_BY_PROVIDER: Dict[str, str] = {
     "cohere": "cohere",
     # Ollama uses ``ollama/<model>`` with api_base; treated specially below.
     "ollama": "ollama",
+    # GitHub Models — litellm routes ``github/<model>`` to the GitHub
+    # Models inference API, authenticating with GITHUB_API_KEY.
+    "github": "github",
 }
 
 
@@ -144,6 +151,24 @@ def _litellm_model_for(provider_name: str, model: str) -> str:
         return f"{override}/{model}"
     prefix = _LITELLM_PREFIX_BY_PROVIDER.get(provider_name.lower(), provider_name.lower())
     return f"{prefix}/{model}"
+
+
+def _is_anthropic_model(model_id: str) -> bool:
+    """True when *model_id* targets an Anthropic Claude model.
+
+    Anthropic prompt caching (and litellm's
+    ``cache_control_injection_points`` auto-injection) only applies to
+    Claude on the Anthropic / Bedrock / Vertex backends. Detection
+    matches the bare model id (``claude-...``), the ``anthropic/``
+    litellm prefix, and the Bedrock / Vertex Anthropic SKU shapes
+    (``anthropic.claude-...`` / ``claude-...@...``).
+    """
+    if not model_id:
+        return False
+    lower = model_id.lower()
+    if lower.startswith("anthropic/") or lower.startswith("anthropic."):
+        return True
+    return "claude" in lower
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +213,9 @@ class LiteLLMProvider(LlmProvider):
         usual ``httpx.post`` path runs, so the "headers" return is
         cosmetic for telemetry only.
         """
+        model_id = _litellm_model_for(self.name, config.model)
         payload: Dict[str, Any] = {
-            "model": _litellm_model_for(self.name, config.model),
+            "model": model_id,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -207,6 +233,7 @@ class LiteLLMProvider(LlmProvider):
             payload["api_base"] = config.endpoint or os.environ.get(
                 "OLLAMA_HOST", "http://localhost:11434"
             )
+        _maybe_inject_cache_control(payload, model_id)
         return ({}, payload)
 
     def extract_text(self, response_json: Dict[str, Any]) -> str:
@@ -225,15 +252,30 @@ class LiteLLMProvider(LlmProvider):
         ``usage.completion_tokens`` — even providers that natively use
         a different field name (Gemini's ``promptTokenCount``,
         Anthropic's ``input_tokens``) get normalised on the way out.
+
+        Anthropic prompt-caching adds two top-level fields on the usage
+        object (per litellm GH issue #15056 and the prompt-caching docs):
+
+        * ``cache_creation_input_tokens`` — tokens written into the
+          ephemeral cache on THIS call (billed at 1.25x input).
+        * ``cache_read_input_tokens`` — tokens served from a previous
+          cache write (billed at 0.1x input).
+
+        We surface both in the canonical dict so cost.py can apply the
+        split rate when ``usd_override`` isn't available.
         """
         usage = (response_json or {}).get("usage") or {}
         prompt = _coerce_nonnegative_int(usage.get("prompt_tokens"))
         completion = _coerce_nonnegative_int(usage.get("completion_tokens"))
         total = _coerce_nonnegative_int(usage.get("total_tokens")) or (prompt + completion)
+        cache_creation = _coerce_nonnegative_int(usage.get("cache_creation_input_tokens"))
+        cache_read = _coerce_nonnegative_int(usage.get("cache_read_input_tokens"))
         return {
             "input_tokens": prompt,
             "output_tokens": completion,
             "total_tokens": total,
+            "cache_creation_input_tokens": cache_creation,
+            "cache_read_input_tokens": cache_read,
         }
 
     def extract_prompt_cache(self, response_json: Dict[str, Any]) -> Dict[str, Any]:
@@ -334,10 +376,21 @@ class LiteLLMProvider(LlmProvider):
     def build_streaming_request(
         self, config: LlmConfig, system_prompt: str, user_prompt: str
     ) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
-        """Return a sentinel URL so ``call_llm_streaming`` routes here."""
+        """Return a sentinel URL so ``call_llm_streaming`` routes here.
+
+        Sets ``stream_options={"include_usage": True}`` so OpenAI / Gemini
+        (which only emit usage on the final chunk when explicitly asked)
+        surface token counts to ``invoke_streaming``. Without this the
+        terminal chunk's ``usage`` block is ``None`` and the
+        ``RunCostTracker`` records nothing — the headline H1 bug. Anthropic
+        / Bedrock include usage on every chunk regardless, so the option
+        is a no-op for them. litellm passes the kwarg straight through
+        to the underlying provider without translation.
+        """
         _, payload = self.build_request(config, system_prompt, user_prompt)
         payload = dict(payload)
         payload["stream"] = True
+        payload.setdefault("stream_options", {"include_usage": True})
         return ("litellm://internal", {}, payload)
 
     def iter_stream_chunks(self, response: Any) -> Iterator[str]:
@@ -354,8 +407,9 @@ class LiteLLMProvider(LlmProvider):
     ) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
         """Build a tool-use request; litellm normalises tools to OpenAI shape."""
         full_messages = [{"role": "system", "content": system_prompt}, *messages]
+        model_id = _litellm_model_for(self.name, config.model)
         payload: Dict[str, Any] = {
-            "model": _litellm_model_for(self.name, config.model),
+            "model": model_id,
             "messages": full_messages,
             "tools": tools,
             "tool_choice": "auto",
@@ -368,6 +422,7 @@ class LiteLLMProvider(LlmProvider):
             payload["api_base"] = config.endpoint or os.environ.get(
                 "OLLAMA_HOST", "http://localhost:11434"
             )
+        _maybe_inject_cache_control(payload, model_id)
         return ("litellm://internal", {}, payload)
 
     def extract_tool_calls(self, response_json: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -474,12 +529,16 @@ class LiteLLMProvider(LlmProvider):
           staged pipeline's optional ``usd_override`` recording;
         * feeds prompt-cache metrics through the canonical recorder.
         """
+        # H1 — clear per-call thread-local USD + cache token state at
+        # the start so the bridge in ``call_llm`` doesn't attribute the
+        # PREVIOUS call's stash to this one.
+        _reset_thread_local_cost_state()
         litellm = _get_litellm()
         _, payload = self.build_request(config, system_prompt, user_prompt)
         if extra_payload:
             payload.update(extra_payload)
         try:
-            response = litellm.completion(**payload)
+            response = _completion_via_router_or_direct(litellm, payload)
         except Exception as exc:  # noqa: BLE001 — translated to typed error
             raise CopilotGenerationError(
                 "copilot_litellm_request_failed",
@@ -495,6 +554,15 @@ class LiteLLMProvider(LlmProvider):
         _cumulative_usage["input_tokens"] += usage.get("input_tokens", 0)
         _cumulative_usage["output_tokens"] += usage.get("output_tokens", 0)
         _cumulative_usage["total_tokens"] += usage.get("total_tokens", 0)
+        # Stash cache-token counts on the thread-local so the staged
+        # pipeline can hand them to RunCostTracker.record_call alongside
+        # the usd_override. Anthropic prompt caching is the load-bearing
+        # case — provider-neutral so the same plumbing covers Vertex
+        # Claude / Bedrock Claude with zero per-backend wiring.
+        _stash_cache_tokens(
+            cache_creation=int(usage.get("cache_creation_input_tokens", 0) or 0),
+            cache_read=int(usage.get("cache_read_input_tokens", 0) or 0),
+        )
         _record_prompt_cache_from_response(self, response_json)
         _record_completion_cost(litellm, response)
         return self.extract_text(response_json)
@@ -518,12 +586,14 @@ class LiteLLMProvider(LlmProvider):
         ``_streaming_usage_state`` via ``_record_streaming_usage`` so
         ``consume_streaming_usage()`` returns the dict afterwards.
         """
+        # H1 — clear per-call thread-local state (see invoke_blocking).
+        _reset_thread_local_cost_state()
         litellm = _get_litellm()
         _, _, payload = self.build_streaming_request(config, system_prompt, user_prompt)
         if extra_payload:
             payload.update(extra_payload)
         try:
-            stream = litellm.completion(**payload)
+            stream = _completion_via_router_or_direct(litellm, payload)
         except Exception as exc:  # noqa: BLE001
             raise CopilotGenerationError(
                 "copilot_litellm_streaming_failed",
@@ -561,15 +631,23 @@ class LiteLLMProvider(LlmProvider):
         if usage_dict:
             prompt = _coerce_nonnegative_int(usage_dict.get("prompt_tokens"))
             completion = _coerce_nonnegative_int(usage_dict.get("completion_tokens"))
-            cached = _coerce_nonnegative_int(
+            # Prefer Anthropic-shape top-level cache_read_input_tokens
+            # when present; fall through to OpenAI-shape
+            # prompt_tokens_details.cached_tokens for non-Anthropic
+            # streaming providers. Same for cache writes.
+            cache_read = _coerce_nonnegative_int(
+                usage_dict.get("cache_read_input_tokens")
+            ) or _coerce_nonnegative_int(
                 (usage_dict.get("prompt_tokens_details") or {}).get("cached_tokens")
             )
+            cache_write = _coerce_nonnegative_int(usage_dict.get("cache_creation_input_tokens"))
             _record_streaming_usage(
                 input_tokens=prompt,
                 output_tokens=completion,
-                cache_read_tokens=cached,
-                cache_write_tokens=0,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_write,
             )
+            _stash_cache_tokens(cache_creation=cache_write, cache_read=cache_read)
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +724,95 @@ def get_last_litellm_cost_usd() -> Optional[float]:
     return getattr(_thread_local, "last_cost_usd", None)
 
 
+def _stash_cache_tokens(*, cache_creation: int, cache_read: int) -> None:
+    """Park per-call cache token counts on the thread-local.
+
+    Read by the staged-pipeline call site (``BaseStageAgent._call_once``)
+    so the cache-write 1.25x and cache-read 0.1x prices apply in the
+    Cost summary even when ``usd_override`` isn't supplied (e.g. for
+    self-hosted Bedrock + Vertex Claude where the litellm catalog
+    sometimes doesn't price the SKU).
+    """
+    _thread_local.last_cache_creation = int(cache_creation or 0)
+    _thread_local.last_cache_read = int(cache_read or 0)
+
+
+def get_last_cache_tokens() -> Dict[str, int]:
+    """Read the most-recent cache (creation, read) counts.
+
+    Returns zeros when nothing has been recorded yet on this thread —
+    callers can pass the returned dict's values to ``record_call``
+    unconditionally without first checking whether caching applied.
+    """
+    return {
+        "cache_creation_input_tokens": int(getattr(_thread_local, "last_cache_creation", 0) or 0),
+        "cache_read_input_tokens": int(getattr(_thread_local, "last_cache_read", 0) or 0),
+    }
+
+
+def _reset_thread_local_cost_state() -> None:
+    """Wipe the per-call USD + cache-token thread-local slots.
+
+    Called at the start of every ``invoke_blocking`` / ``invoke_streaming``
+    so a follow-up call on the same thread doesn't inherit the prior
+    call's stash. Without this, the H1 bridge could attribute the
+    previous call's USD / cache tokens to the next one (especially
+    visible when an LLM provider doesn't expose ``completion_cost`` on
+    the response and the prior call's value lingers).
+    """
+    _thread_local.last_cost_usd = None
+    _thread_local.last_cache_creation = 0
+    _thread_local.last_cache_read = 0
+
+
+# ---------------------------------------------------------------------------
+# Router dispatch + cache-control auto-injection
+# ---------------------------------------------------------------------------
+
+
+def _completion_via_router_or_direct(litellm: Any, payload: Dict[str, Any]) -> Any:
+    """Route through the Router singleton when applicable, else direct.
+
+    A 5xx on the primary deployment would otherwise kill the in-flight
+    run. The Router has the cooldown_time / num_retries / fallbacks
+    machinery already; we just need to call it instead of
+    ``litellm.completion``. Same kwargs shape, same response shape.
+    """
+    model_id = payload.get("model", "")
+    # Lazy import to keep cold-start path off the Router code; tests
+    # patch ``forge_llm_router.get_router`` to inject behaviour.
+    from fluid_build.cli import forge_llm_router
+
+    router = forge_llm_router.get_router(model_id)
+    if router is not None:
+        return router.completion(**payload)
+    return litellm.completion(**payload)
+
+
+# litellm's auto-inject parameter shape per
+# https://docs.litellm.ai/docs/tutorials/prompt_caching — each entry
+# names a message position via location/role/index. We target the
+# single system message at index 0 (standard fluid-side prompt shape).
+_CACHE_CONTROL_INJECTION_SYSTEM: List[Dict[str, Any]] = [
+    {"location": "message", "role": "system", "index": 0},
+]
+
+
+def _maybe_inject_cache_control(payload: Dict[str, Any], model_id: str) -> None:
+    """Add ``cache_control_injection_points`` for Anthropic models only.
+
+    No-op for OpenAI / Gemini / Groq / Cohere etc — their providers
+    either don't support cache_control or use a different mechanism.
+    Injecting the param against a non-Anthropic backend would either
+    be silently dropped (best case) or raise (worst case).
+    """
+    if not _is_anthropic_model(model_id):
+        return
+    # Don't clobber a caller-supplied value — the agent layer may have
+    # already set explicit injection points (multi-turn caching, etc).
+    payload.setdefault("cache_control_injection_points", _CACHE_CONTROL_INJECTION_SYSTEM)
+
+
 _PROVIDER_CACHE: Dict[str, LiteLLMProvider] = {}
 
 
@@ -659,6 +826,7 @@ def get_litellm_provider(name: str) -> LiteLLMProvider:
 
 __all__ = [
     "LiteLLMProvider",
+    "get_last_cache_tokens",
     "get_last_litellm_cost_usd",
     "get_litellm_provider",
 ]

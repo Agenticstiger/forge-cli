@@ -212,7 +212,9 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
     gen_tbl.add_row("  generate transformation", "dbt, SQL, Spark artifacts")
     gen_tbl.add_row("  generate schedule", "Airflow, Dagster, Prefect DAGs")
     gen_tbl.add_row("  generate ci", "GitHub Actions, GitLab CI pipelines")
-    gen_tbl.add_row("  generate standard", "OPDS, ODCS, ODPS, ODPS-Bitol")
+    gen_tbl.add_row(
+        "  generate standard", "Bitol ODPS v1.0.0 (default), ODCS, LF/ODPI v4.1 (opt-in)"
+    )
     console.print(gen_tbl)
     console.print()
 
@@ -225,6 +227,7 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
             ("publish", "Publish to enterprise data catalogs"),
             ("market", "Browse & discover data products  [dim]--blueprints[/dim]"),
             ("import", "Import existing dbt/Terraform/SQL projects"),
+            ("mcp", "Serve forge tools over Model Context Protocol  [dim]serve[/dim]"),
         ],
     )
 
@@ -424,6 +427,23 @@ def print_forge_help() -> None:
         ],
     )
 
+    _group_table(
+        "Resume",
+        [
+            ("--resume [RUN_ID]", "Resume an interrupted run (bare = most-recent)"),
+            ("--no-resume", "Always start fresh, ignore any paused runs"),
+            (
+                "--from-stage STAGE",
+                "Time-travel to a specific stage (requires --resume)",
+            ),
+            (
+                "--fork RUN_ID",
+                "Branch a new run from a checkpoint (requires --from-stage)",
+            ),
+            ("--or-fail", "Exit 1 if no resumable run exists"),
+        ],
+    )
+
     # Examples
     console.print("  [bold bright_green]Examples[/bold bright_green]")
     examples = [
@@ -444,6 +464,17 @@ def print_forge_help() -> None:
     ]
     for cmd, desc in examples:
         console.print(f"    [bright_cyan]{cmd}[/bright_cyan]  [dim]{desc}[/dim]")
+    console.print()
+
+    # H9 — kill-switch discoverability pointer. Pre-fix, none of the 8
+    # runtime toggles (FLUID_FORGE_NO_PICKER, FLUID_COPILOT_JUDGE, ...)
+    # were findable in --help / README / AGENTS.md; only CLAUDE.md
+    # documented them.
+    console.print(
+        "  [dim]Tip:[/dim] [bright_cyan]fluid doctor --env[/bright_cyan] "
+        "[dim]lists runtime kill switches (FLUID_FORGE_NO_PICKER, "
+        "FLUID_COPILOT_JUDGE, …) and their current values.[/dim]"
+    )
     console.print()
 
     return True
@@ -483,7 +514,9 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
             "  fluid forge --provider snowflake                  Target a specific cloud\n"
             "  fluid forge --llm-provider gemini                 Use a specific LLM\n"
             "  fluid forge --reset-memory                        Clear project memory\n"
-            "  fluid forge --non-interactive --context ctx.json  CI usage"
+            "  fluid forge --non-interactive --context ctx.json  CI usage\n"
+            "  Tip: `fluid doctor --env` lists runtime kill switches\n"
+            "       (FLUID_FORGE_NO_PICKER, FLUID_COPILOT_JUDGE, …)."
         ),
     ),
     "demo": (
@@ -556,7 +589,9 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
         ),
     ),
     "export-opds": (
-        "Export a FLUID contract to OPDS (Open Data Product Specification) JSON.",
+        "[deprecated alias] Export a FLUID contract to LF/ODPI ODPS v4.1 JSON. "
+        "Prefer `fluid generate standard --format odps-v4.1` for new scripts. "
+        "(For Bitol ODPS v1.0.0 — the center-stage default — use `--format odps`.)",
         (
             "  fluid export-opds contract.fluid.yaml\n"
             "  fluid export-opds contract.fluid.yaml --out my-product.opds.json\n"

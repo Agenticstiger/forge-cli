@@ -82,6 +82,76 @@ DEFAULT_CONFIG = {
 }
 
 
+def _set_auth_field(catalog_config: Dict[str, Any], field: str, value: str) -> None:
+    """Set ``catalog_config['auth'][field] = value``, creating the dict if absent."""
+    if "auth" not in catalog_config:
+        catalog_config["auth"] = {}
+    catalog_config["auth"][field] = value
+
+
+def _first_env(*names: str) -> Optional[str]:
+    """Return the first non-empty environment variable from *names* (or None)."""
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v
+    return None
+
+
+def _apply_catalog_env_overrides(catalog_name: str, catalog_config: Dict[str, Any]) -> None:
+    """Apply per-catalog environment-variable overrides in place.
+
+    Two paths:
+
+    1. Native async providers (``fluid-command-center``,
+       ``datamesh-manager``) — their env vars target nested ``auth.*``
+       config keys and toggle provider-specific behaviour (ODCS / ODPS
+       selection, provider hints). Hard-coded here because their
+       config shape isn't shared with the plug-in backends.
+
+    2. Plug-in catalog backends declared via
+       :func:`~fluid_build.api.catalog_backend.register_catalog_backend`
+       — every accepted env var is declared in the backend spec next
+       to the registrar. We delegate to
+       :func:`~fluid_build.api.catalog_backend.apply_env_overrides`
+       so adding a new backend never requires editing this function.
+    """
+    if catalog_name in ("fluid-command-center", "fluid_cc"):
+        endpoint = _first_env("FLUID_CC_ENDPOINT", "FLUID_CATALOG_FLUID_CC_URL")
+        if endpoint:
+            catalog_config["endpoint"] = endpoint
+        api_key = _first_env("FLUID_API_KEY", "FLUID_CATALOG_FLUID_CC_TOKEN")
+        if api_key:
+            _set_auth_field(catalog_config, "api_key", api_key)
+        return
+
+    if catalog_name in ("datamesh-manager", "entropy-data", "dmm"):
+        endpoint = _first_env("DMM_API_URL", "FLUID_CATALOG_DMM_URL")
+        if endpoint:
+            catalog_config["endpoint"] = endpoint
+        api_key = _first_env("DMM_API_KEY", "FLUID_CATALOG_DMM_TOKEN")
+        if api_key:
+            _set_auth_field(catalog_config, "api_key", api_key)
+        dps = os.environ.get("DMM_DATA_PRODUCT_SPECIFICATION")
+        if dps:
+            catalog_config["data_product_specification"] = dps
+        provider_hint = os.environ.get("DMM_PROVIDER_HINT")
+        if provider_hint:
+            catalog_config["provider_hint"] = provider_hint
+        return
+
+    # Plug-in backend — declarative spec owns the env-var mapping.
+    try:
+        # Importing the registrar package triggers register_catalog_backend
+        # side effects; without this the spec lookup misses for callers
+        # that talk to config_manager before any provider is instantiated.
+        import fluid_build.build_runners.catalog_registrars  # noqa: F401
+        from fluid_build.api.catalog_backend import apply_env_overrides
+    except Exception:  # pragma: no cover — defensive against import-time failure
+        return
+    apply_env_overrides(catalog_name, catalog_config)
+
+
 class FluidConfig:
     """
     Hierarchical configuration manager for FLUID CLI.
@@ -344,37 +414,7 @@ class FluidConfig:
 
         if catalog_name:
             catalog_config = copy.deepcopy(catalogs.get(catalog_name, {}))
-
-            # Apply environment variable overrides
-            if catalog_name == "fluid-command-center":
-                endpoint = os.environ.get("FLUID_CC_ENDPOINT")
-                if endpoint:
-                    catalog_config["endpoint"] = endpoint
-
-                api_key = os.environ.get("FLUID_API_KEY")
-                if api_key:
-                    if "auth" not in catalog_config:
-                        catalog_config["auth"] = {}
-                    catalog_config["auth"]["api_key"] = api_key
-            elif catalog_name == "datamesh-manager":
-                endpoint = os.environ.get("DMM_API_URL")
-                if endpoint:
-                    catalog_config["endpoint"] = endpoint
-
-                api_key = os.environ.get("DMM_API_KEY")
-                if api_key:
-                    if "auth" not in catalog_config:
-                        catalog_config["auth"] = {}
-                    catalog_config["auth"]["api_key"] = api_key
-
-                data_product_specification = os.environ.get("DMM_DATA_PRODUCT_SPECIFICATION")
-                if data_product_specification:
-                    catalog_config["data_product_specification"] = data_product_specification
-
-                provider_hint = os.environ.get("DMM_PROVIDER_HINT")
-                if provider_hint:
-                    catalog_config["provider_hint"] = provider_hint
-
+            _apply_catalog_env_overrides(catalog_name, catalog_config)
             return self._resolve_env_placeholders(catalog_config)
 
         return self._resolve_env_placeholders(copy.deepcopy(catalogs))

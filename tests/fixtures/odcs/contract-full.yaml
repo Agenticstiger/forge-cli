@@ -1,0 +1,102 @@
+# Comprehensive ODCS v3.1.0 fixture — populates every section the Phase 1
+# lossless round-trip needs to preserve. Used by tests/test_odcs_roundtrip.py.
+version: "1.0.0"
+apiVersion: v3.1.0
+kind: DataContract
+id: data-product.orders
+status: active
+name: orders
+domain: commerce
+tenant: acme
+description:
+  purpose: "Order data for downstream fulfilment"
+  limitations: "PII columns require approval before consumption"
+  usage: "Consume via the analytics warehouse only"
+tags:
+  - orders
+  - production
+team:
+  name: commerce-team
+  description: "Owners of the commerce domain data"
+  members:
+    - username: alice@acme.com
+      name: Alice
+      role: data-owner
+      dateIn: "2024-01-01"
+    - username: bob@acme.com
+      name: Bob
+      role: steward
+schema:
+  - name: orders
+    logicalType: object
+    physicalType: table
+    physicalName: orders_v1
+    description: "One row per order"
+    tags:
+      - core
+    properties:
+      - name: order_id
+        logicalType: string
+        physicalType: STRING
+        required: true
+        primaryKey: true
+        description: "Unique order identifier"
+        tags:
+          - id
+        quality:
+          - type: library
+            metric: duplicateValues
+            mustBe: 0
+            dimension: uniqueness
+          - type: library
+            metric: nullValues
+            mustBe: 0
+            dimension: completeness
+      - name: customer_id
+        logicalType: string
+        physicalType: STRING
+        required: true
+        description: "Foreign key to customers"
+      - name: amount
+        logicalType: number
+        physicalType: NUMERIC
+        required: true
+        description: "Order amount in dollars"
+        quality:
+          - type: library
+            metric: nullValues
+            mustBe: 0
+            dimension: completeness
+    relationships:
+      - type: foreignKey
+        from: customer_id
+        to: customers.id
+    quality:
+      - type: library
+        metric: rowCount
+        mustBeGreaterThan: 0
+        dimension: completeness
+servers:
+  - server: bq-prod
+    type: bigquery
+    project: acme-prod
+    dataset: orders
+slaProperties:
+  - property: availability
+    value: 0.99
+  - property: interval
+    value: "PT5M"
+  - property: retention
+    value: "365"
+    unit: d
+support:
+  - channel: ops-orders
+    url: https://slack.acme.com/ops
+    tool: slack
+price:
+  priceAmount: 100.0
+  priceCurrency: USD
+  priceUnit: GB
+customProperties:
+  - property: owner-cost-center
+    value: CC-42

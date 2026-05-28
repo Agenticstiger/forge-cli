@@ -263,6 +263,23 @@ def _semantic_inventory(logical: LogicalDraft) -> list[str]:
             lines.append(
                 f"- `{dataset.name}`: source `{dataset.source or '-'}`, grain/primary key `{grain}`, fields `{_csv(fields[:12])}`."
             )
+            # UX-9 fix: when the source catalog provided a
+            # ``Description`` / ``COMMENT`` for the table, surface
+            # it under the dataset line. Indented one level so the
+            # markdown renders as a sub-bullet (description belongs
+            # to the dataset). Skipped when no description is set
+            # so undocumented sources stay clean.
+            if dataset.description:
+                lines.append(f"  - Description: {dataset.description}")
+            # And the per-field descriptions — only when at least
+            # one field carries one (otherwise this is just noise).
+            described = [
+                (field.name, field.description) for field in dataset.fields if field.description
+            ]
+            if described:
+                lines.append("  - Field descriptions:")
+                for name, desc in described:
+                    lines.append(f"    - `{name}`: {desc}")
         lines.append("")
 
     dimensions: list[str] = []

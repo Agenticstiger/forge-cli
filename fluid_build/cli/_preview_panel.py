@@ -164,6 +164,28 @@ class ReceiptDecision:
 
 
 @dataclass
+class QualitySnapshot:
+    """Predicted-quality view rendered in the panel.
+
+    Populated from the runtime's ``provenance`` block (judge_score +
+    judge_axes + enrichment_applied). Surfacing this BEFORE the write
+    closes the feedback loop: the user can iterate on a low-scoring
+    contract rather than discovering the score post-hoc in
+    ``.fluid/agents/<run-id>/judge.json``.
+    """
+
+    total: Optional[int] = None  # 0..30
+    axes: Dict[str, int] = field(default_factory=dict)  # axis → 0..5
+    model: str = ""
+    enrichment_applied: bool = False
+    critique_applied: bool = False
+
+    @property
+    def has_data(self) -> bool:
+        return self.total is not None or bool(self.axes)
+
+
+@dataclass
 class PreviewPanel:
     """All data the pre-write preview needs to render.
 
@@ -177,6 +199,7 @@ class PreviewPanel:
     target_dir: Path
     files: List[PendingFile] = field(default_factory=list)
     cost: CostSnapshot = field(default_factory=CostSnapshot.empty)
+    quality: QualitySnapshot = field(default_factory=QualitySnapshot)
     decisions: List[ReceiptDecision] = field(default_factory=list)
     assumptions: List[str] = field(default_factory=list)
     tools_called: List[str] = field(default_factory=list)
@@ -416,6 +439,12 @@ def render(panel: PreviewPanel, *, console: Optional[Any] = None) -> None:
 
     Uses ``rich`` when available; falls back to plain text otherwise so
     the function is safe to call in CI/quiet environments.
+
+    When the panel carries resume metadata (``extra["resume"]`` —
+    populated by the runtime when this is a resumed run), the title
+    surface includes the resume context and the cost line splits into
+    "cached + this session = total" so the user can see exactly how
+    much of the prior spend they're re-using.
     """
     try:
         from rich.console import Console
@@ -443,14 +472,15 @@ def render(panel: PreviewPanel, *, console: Optional[Any] = None) -> None:
     cost_line = _format_cost_line(panel.cost)
     provider_line = _format_provider_line(panel.cost)
 
+    title = _build_panel_title(panel)
     out.print(
         RichPanel(
             table,
-            title=f"[bold]Preview · run {panel.run_id}[/bold]",
+            title=title,
             border_style="cyan",
         )
     )
-    out.print(f"[bold]Cost:[/bold] {cost_line}")
+    out.print(f"[bold]Cost:[/bold] {_format_resume_cost_line(panel, cost_line)}")
     if provider_line:
         out.print(f"[dim]Provider:[/dim] {provider_line}")
     if panel.cost.unknown_models:
@@ -458,6 +488,8 @@ def render(panel: PreviewPanel, *, console: Optional[Any] = None) -> None:
             "[yellow]One or more models are not in the price catalog; the dollar "
             "figure above is an estimate.[/yellow]"
         )
+    if panel.quality.has_data:
+        _render_quality_block(out, panel.quality)
     out.print(f"[dim]Artifacts:[/dim] {panel.run_dir}/  (reasoning.md, transcript.json, cost.json)")
     if panel.assumptions:
         out.print("[dim]Assumptions:[/dim]")
@@ -465,19 +497,129 @@ def render(panel: PreviewPanel, *, console: Optional[Any] = None) -> None:
             out.print(f"  · {a}")
 
 
+def _render_quality_block(out: Any, quality: "QualitySnapshot") -> None:
+    """Render the predicted-quality block (judge axes + enrichment).
+
+    Shape:
+        Predicted quality: 24/30  ✨ enrichment applied  ✓ critique applied
+          correctness   4/5   completeness  4/5   security     3/5
+          governance    4/5   performance   4/5   documentation 5/5
+    """
+    header_parts: List[str] = []
+    if quality.total is not None:
+        max_total = (len(quality.axes) or 6) * 5
+        score_color = _score_color(quality.total, max_total)
+        header_parts.append(f"[{score_color}]{quality.total}/{max_total}[/{score_color}]")
+    badges: List[str] = []
+    if quality.enrichment_applied:
+        badges.append("[green]✨ enrichment applied[/green]")
+    if quality.critique_applied:
+        badges.append("[cyan]✓ critique applied[/cyan]")
+    header = "  ".join(header_parts + badges)
+    if header:
+        out.print(f"[bold]Predicted quality:[/bold] {header}")
+    if quality.axes:
+        # Two-column grid: axis → score/5. Rendered in 3 columns of 2
+        # pairs each so a 6-axis judge fits on one terminal width.
+        axis_lines: List[str] = []
+        items = list(quality.axes.items())
+        for i in range(0, len(items), 3):
+            chunk = items[i : i + 3]
+            axis_lines.append("  ".join(f"  {name:<14}{score}/5" for name, score in chunk))
+        for line in axis_lines:
+            out.print(f"[dim]{line}[/dim]")
+
+
+def _score_color(score: Any, max_total: int) -> str:
+    # Defensive: ``score`` is meant to be an int from the runtime's
+    # provenance block but the upstream populator may pass anything
+    # the dataclass accepted (Optional[int]). Anything not numerically
+    # comparable (e.g. a MagicMock leaked from a mocked provider in a
+    # test) falls back to a neutral colour instead of raising.
+    if not isinstance(score, (int, float)) or not isinstance(max_total, int) or max_total <= 0:
+        return "white"
+    ratio = score / max_total
+    if ratio >= 0.80:
+        return "green"
+    if ratio >= 0.50:
+        return "yellow"
+    return "red"
+
+
+def _resume_info(panel: PreviewPanel) -> Optional[Mapping[str, Any]]:
+    """Return the resume metadata block on ``panel`` (or None).
+
+    Resume coordinators publish into ``panel.extra["resume"]`` rather
+    than carrying a new dataclass field — keeps the dataclass shape
+    backward-compatible while letting the runtime stitch resume
+    context into the panel.
+    """
+    info = (panel.extra or {}).get("resume")
+    if isinstance(info, Mapping):
+        return info
+    return None
+
+
+def _build_panel_title(panel: PreviewPanel) -> str:
+    """Build the panel header — adds resume context when applicable."""
+    info = _resume_info(panel)
+    if not info:
+        return f"[bold]Preview · run {panel.run_id}[/bold]"
+    from_stage = info.get("from_stage") or info.get("resumed_from_stage")
+    if from_stage:
+        return f"[bold]Preview · run {panel.run_id} " f"(resumed from stage {from_stage})[/bold]"
+    return f"[bold]Preview · run {panel.run_id} (resumed)[/bold]"
+
+
+def _format_resume_cost_line(panel: PreviewPanel, base_line: str) -> str:
+    """Augment the cost line with cached + this-session breakdown on resume."""
+    info = _resume_info(panel)
+    if not info:
+        return base_line
+    cached_usd = info.get("cached_usd")
+    if not isinstance(cached_usd, (int, float)):
+        return base_line
+    this_usd = panel.cost.total_usd or 0.0
+    total = float(cached_usd) + float(this_usd)
+    return f"${cached_usd:.4f} cached + ${this_usd:.4f} this session = " f"${total:.4f} total"
+
+
 def _render_plain(panel: PreviewPanel) -> None:
-    print(f"\n=== Preview · run {panel.run_id} ===")
+    info = _resume_info(panel)
+    if info:
+        from_stage = info.get("from_stage") or info.get("resumed_from_stage")
+        header = f"=== Preview · run {panel.run_id}"
+        if from_stage:
+            header += f" (resumed from stage {from_stage})"
+        else:
+            header += " (resumed)"
+        header += " ==="
+        print(f"\n{header}")
+    else:
+        print(f"\n=== Preview · run {panel.run_id} ===")
     print("Would write the following:")
     for f in panel.files:
         print(f"  {f.relpath}    ({_format_size(f.size_bytes)})")
     if not panel.files:
         print("  (no files queued)")
-    print(f"Cost: {_format_cost_line(panel.cost)}")
+    print(f"Cost: {_format_resume_cost_line(panel, _format_cost_line(panel.cost))}")
     provider_line = _format_provider_line(panel.cost)
     if provider_line:
         print(f"Provider: {provider_line}")
     if panel.cost.unknown_models:
         print("Note: one or more models are not in the price catalog; figure is an estimate.")
+    if panel.quality.has_data:
+        max_total = (len(panel.quality.axes) or 6) * 5
+        badges = []
+        if panel.quality.enrichment_applied:
+            badges.append("enrichment applied")
+        if panel.quality.critique_applied:
+            badges.append("critique applied")
+        suffix = f"  ({', '.join(badges)})" if badges else ""
+        if panel.quality.total is not None:
+            print(f"Predicted quality: {panel.quality.total}/{max_total}{suffix}")
+        for axis, score in panel.quality.axes.items():
+            print(f"  {axis:<14}{score}/5")
     print(f"Artifacts: {panel.run_dir}/  (reasoning.md, transcript.json, cost.json)")
     if panel.assumptions:
         print("Assumptions:")

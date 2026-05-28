@@ -15,8 +15,8 @@
 """AWS provider package — comprehensive AWS data-platform support.
 
 Surfaces:
-* :class:`AwsProvider` — plan / apply / restore_ddl / cleanup_backups
-  for S3 / Glue / Athena / Lambda / EventBridge / Redshift.
+* :class:`AwsProvider` — plan / restore_ddl / cleanup_backups for
+  S3 / Glue / Athena / Lambda / EventBridge / Redshift.
 * :class:`RedshiftProvider` — owns Redshift's rollback DDL (DROP +
   CTAS) which is incompatible with the rest of AWS's S3 prefix-copy
   semantics; registered under the ``"redshift"`` provider name.
@@ -27,38 +27,14 @@ into :class:`AwsProvider` and its ``plan`` method was redundant with
 the planner module's 6-phase scaffold.
 """
 
+from fluid_build.providers import register_provider
+
 from .provider import AwsProvider
 from .redshift_provider import RedshiftProvider
-
-try:
-    from .types import (
-        AWSProviderOptions,
-        CostOptimizationConfig,
-        MonitoringConfig,
-        SecurityConfig,
-        ServiceConfig,
-    )
-
-    _types_available = True
-except ImportError:
-    _types_available = False
-
-from fluid_build.providers import register_provider
 
 register_provider("aws", AwsProvider)
 # Redshift dispatches by its own name so the rollback writer can route
 # DROP+CTAS DDL emission to a class with the right semantics.
 register_provider("redshift", RedshiftProvider)
 
-if _types_available:
-    __all__ = [
-        "AwsProvider",
-        "RedshiftProvider",
-        "AWSProviderOptions",
-        "ServiceConfig",
-        "SecurityConfig",
-        "MonitoringConfig",
-        "CostOptimizationConfig",
-    ]
-else:
-    __all__ = ["AwsProvider", "RedshiftProvider"]
+__all__ = ["AwsProvider", "RedshiftProvider"]

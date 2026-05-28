@@ -28,7 +28,7 @@ Every contract is delivered through an 11-stage pipeline. Each stage is a hard g
 |---|---|---|
 | 1 | `fluid bundle contract.fluid.yaml --format tgz` | Deterministic tgz + `MANIFEST.json` (SHA-256 merkle root). Root of trust for every downstream stage. |
 | 2 | `fluid validate <bundle.tgz>` | Extension-routed: schema (JSON-Schema) + sqlglot (embedded SQL) + openapi-spec-validator (OpenAPI ports). |
-| 3 | `fluid generate artifacts <bundle.tgz>` | Fanout: ODCS + ODPS-Bitol + OPDS + schedule DAGs + policy bindings. Writes a unified MANIFEST. |
+| 3 | `fluid generate artifacts <bundle.tgz>` | Fanout: ODCS + **Bitol ODPS v1.0.0 (default)** + LF/ODPI ODPS v4.1 (opt-in) + schedule DAGs + policy bindings. Writes a unified MANIFEST. (`--emit opds` accepted as a deprecated letter-swap alias of `--emit odps`.) |
 | 4 | `fluid validate-artifacts dist/artifacts/` | Re-verifies SHA-256 + per-format schema validators. OPA `conftest` integration for policy tests. |
 | 5 | `fluid diff --exit-on-drift --env <env>` | Compares live warehouse schema against contract. Hard gate — no plan against an unknown baseline. |
 | 6 | `fluid plan --out runtime/plan.json --html` | Emits `bundleDigest` + `planDigest` cryptographic binding fields. `fluid apply` verifies both before any DDL. |
@@ -126,7 +126,8 @@ forge-cli/
 |------|-------|
 | CLI entrypoint | `fluid_build/cli/__init__.py` → `main()` |
 | Command implementations | `fluid_build/cli/*.py` (one per 11-stage step, plus supporting commands) |
-| Provider plugins | `fluid_build/providers/{local,gcp,aws,snowflake,odps,odcs}/` |
+| Provider plugins (planning) | `fluid_build/providers/{local,gcp,aws,snowflake,odps,odcs}/` — `plan()` emits abstract actions |
+| **IaC emitter (apply)** | `fluid_build/iac/` — modular OpenTofu plugin registry. `cli/_apply_opentofu_engine.py` compiles the contract to `main.tf.json` and shells `tofu` for cloud providers. `cli/generate_iac.py` is `fluid generate iac` for review-only emit. One plugin per cloud at `iac/providers/{aws,gcp,snowflake}.py` (dbt-adapter pattern). |
 | Path-B schedulers | `fluid_build/providers/aws/plan/schedule.py` (EventBridge/MWAA/Lambda/Step-Functions via stage 6 `SchedulePlanner`) |
 | Contract schemas | `fluid_build/schemas/*.json` (0.7.2 is latest; `SchemaManager.latest_bundled_version()` is the dynamic lookup) |
 | Policy engine | `fluid_build/policy/` (compiler, agent_policy, sovereignty, guardrails) |
@@ -138,7 +139,7 @@ forge-cli/
 | Forge (AI creation) | `fluid_build/forge/` (templates, generators, extensions) |
 | Log redaction (global) | `fluid_build/observability/secret_redactor.py` — `SecretRedactingFilter` wired into Python logging |
 | SQL safety helpers | `fluid_build/providers/_sql_safety.py` — `validate_ident`, `quote_string_literal` (required for every DDL f-string) |
-| Test suite | `tests/` — mirrors `fluid_build/` structure |
+| Test suite | `tests/` — mirrors `fluid_build/` structure; IaC tier 1/2/3 lives at `tests/iac/` |
 | Smoke scripts | `scripts/smoke_phase_6b.py` + `scripts/smoke_a1.py` — operator / contributor validation against real Snowflake |
 
 ### Development Commands
@@ -177,10 +178,20 @@ new extra installed). `uv` is dev-time only — not a runtime dep.
 - **Changing what `fluid plan` emits**: `plan.json` must carry both `planDigest` and `bundleDigest` (re-run `inject_digests` after any mutation to the dict). Actions must carry BOTH `op` and `action_type` fields — apply.py's provider dispatcher reads `op`, display/viz reads `action_type`. Dropping either silently breaks the pipeline.
 - **Generating a new CI system template**: extend `fluid_build/forge/core/pipeline_templates.py`. The 11-stage sequence + the `--install-mode {pypi,dev-source}` semantics must be preserved across systems. Jenkins is the reference implementation; GitHub Actions / GitLab / Azure / Bitbucket / CircleCI / Tekton port from it.
 - **Adding a new Path-B scheduler**: extend `fluid_build/providers/<provider>/plan/schedule.py` with a `SchedulePlanner`-compatible interface. Stage 6 `fluid plan` invokes it; stage 7 apply executes the resulting actions alongside DDL.
-- **Adding a new publish target**: register in `fluid_build/cli/publish.py` + `fluid_build/cli/market.py`. `--target` is repeatable; the target name is matched case-insensitively against the registry. Use the `NAME:endpoint` override shape for per-target URL customization.
+- **Adding a new publish target / catalog backend**: drop a new module under `fluid_build/build_runners/catalog_registrars/<name>.py` that defines a `CatalogRegistrar` (the sync HTTP-level shape — see `datahub.py` as the reference) and ends with a `register_catalog_backend(CatalogBackendSpec(...))` call. The spec declares the canonical name, optional aliases, the registrar factory, and a flat `env_vars` mapping (config key → tuple of accepted env vars). That single file makes the backend visible on both publish surfaces — `fluid publish --target <name>` and contract `properties.catalog.register: [<name>]` — and applies the env-var overrides via `config_manager._apply_catalog_env_overrides`. No edits to `providers/catalogs/__init__.py`, `_catalog.py`, or `publish.py` are required. The two legacy native async providers (`fluid-command-center`, `datamesh-manager`) keep custom config shapes and live as hand-wired `BaseCatalogProvider` subclasses under `providers/catalogs/`; new backends should prefer the registrar shape unless they truly need the async-native surface.
 - **Adding a copilot tool that takes a path**: accept `workspace_root: Optional[Path]` as a kwarg from `dispatch_tool_call`; confine the LLM-supplied path with `resolved.relative_to(workspace_root)` and apply a suffix allow-list + size cap. Reference implementation: `cli/forge_copilot_tools.py::_dispatch_read_sample_schema`.
 - **Emitting new SQL DDL**: identifiers must go through `fluid_build/providers/_sql_safety.py::validate_ident`; string literals through `quote_string_literal`. Inline `.replace("'", "''")` is considered a regression — it diverges from the central helper.
 - **Adding a secret pattern to logs**: extend `fluid_build/providers/snowflake/util/logging.py::SENSITIVE_PATTERNS`/`SENSITIVE_KEYS` AND mirror the addition into `fluid_build/observability/secret_redactor.py` to keep the two redactor layers symmetric.
+
+### Adding an integration test
+
+Integration tests run in **three stages**, auto-discovered by **pytest marker** — adding a test is just dropping a file with the right marker; no workflow edit is needed.
+
+- **Stage 1 — community (keyless, light).** Every PR, including forks. Drop `tests/providers/test_<x>_emulated*.py`, set `pytestmark = [pytest.mark.integration, pytest.mark.emulated]`, and request an in-process fixture from `tests/_infrastructure/emulator_fixtures.py`: `moto_glue_client` (AWS) or `fakesnow_patch` (Snowflake). `ci.yml`'s `emulated-integration` job runs `pytest -m emulated`. Locally: `pip install -e ".[dev,local,test-emulators]"` then `pytest -m emulated`.
+- **Stage 2 — admin (heavy emulated).** Docker-based emulators. Set `pytestmark = [pytest.mark.integration, pytest.mark.emulated_heavy]` and use `bigquery_emulator_client` (GCP) or the LocalStack endpoint (`FLUID_LOCALSTACK_ENDPOINT`). `integration-emulated-heavy.yml` runs `pytest -m emulated_heavy`, gated by the `ci:integration-emulated` label + the `integration-emulated` environment's approval. Locally: `pip install -e ".[dev,test-emulators-heavy]"` (Docker required).
+- **Stage 3 — admin (live).** Real credentials. Drop `tests/providers/test_<x>_live*.py`, mark it `integration` plus the provider marker (`aws` / `gcp` / `snowflake`) — or `live_llm` for an LLM test — and `skipif` on the credential env vars (mirror `tests/providers/test_aws_live_happy_path.py`). Runs post-merge in `integration.yml` and, when armed, in `integration-live.yml` (label `ci:integration-live` + the `integration-live` environment).
+
+Stages 2 and 3 are admin-gated (maintainer label + required-reviewer approval) and use **separate environments**, so approving an emulated run never exposes the live credentials. Never give `ci.yml` cloud secrets — fork-PR safety depends on it staying secret-free.
 
 ### Code Conventions
 

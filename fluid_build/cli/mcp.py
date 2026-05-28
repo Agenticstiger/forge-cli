@@ -45,11 +45,12 @@ import logging
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import SamplingMessage, TextContent
+from pydantic import BaseModel, ConfigDict, Field
 
 from fluid_build.copilot.store.audit_trail import write_audit_event
 from fluid_build.copilot.store.factory import resolve_store
@@ -176,7 +177,7 @@ class ToolCapability:
 #   passing through.
 # ---------------------------------------------------------------------
 
-_SOURCE_ENUM = [
+_CATALOG_SOURCE_LIST = (
     "snowflake",
     "unity",
     "bigquery",
@@ -184,68 +185,239 @@ _SOURCE_ENUM = [
     "glue",
     "datahub",
     "datamesh_manager",
-]
+)
+# JDBC-introspectable databases. The catalog tools (list_source_tables /
+# inspect_source_table / list_source_lineage / list_source_glossary) do NOT
+# accept these — JDBC is a one-shot synthesis path only. ``forge_from_source``
+# is the only tool that dispatches to JDBC (via ``_run_from_jdbc_source``).
+_JDBC_SOURCE_LIST = (
+    "postgres",
+    "postgresql",
+    "mysql",
+    "sqlite",
+)
+_SOURCE_ENUM = list(_CATALOG_SOURCE_LIST)
+_FORGE_FROM_SOURCE_ENUM = list(_CATALOG_SOURCE_LIST + _JDBC_SOURCE_LIST)
 _TECHNIQUE_ENUM = ["data_vault_2", "dimensional"]
+
+_CREDENTIALS_DESCRIPTION = (
+    "Credential lookup envelope. Pass ONLY the credential_id; "
+    "the server never accepts raw secrets over the MCP wire. "
+    "credential_id maps to a row in ~/.fluid/sources.yaml that "
+    "was set up via `fluid ai setup --source <catalog> --name <credential-id>`."
+)
+_CREDENTIAL_ID_DESCRIPTION = (
+    "Saved credential name from ~/.fluid/sources.yaml — same value "
+    "you pass to `fluid forge data-model from-source --credential-id`."
+)
 
 _CREDENTIALS_PROP = {
     "type": "object",
-    "description": (
-        "Credential lookup envelope. Pass ONLY the credential_id; "
-        "the server never accepts raw secrets over the MCP wire. "
-        "credential_id maps to a row in ~/.fluid/sources.yaml that "
-        "was set up via `fluid ai setup --source <catalog> --name <credential-id>`."
-    ),
+    "description": _CREDENTIALS_DESCRIPTION,
     "properties": {
         "credential_id": {
             "type": "string",
-            "description": (
-                "Saved credential name from ~/.fluid/sources.yaml — same value "
-                "you pass to `fluid forge data-model from-source --credential-id`."
-            ),
+            "description": _CREDENTIAL_ID_DESCRIPTION,
         },
     },
     "required": ["credential_id"],
     "additionalProperties": True,  # operators can pass adapter-specific keys
 }
 
+_SCOPE_DESCRIPTION = (
+    "Catalog scope — the database/schema/catalog identifier the "
+    "adapter should read from. Field names are catalog-specific: "
+    "Snowflake / BigQuery / DataHub use database+schema; "
+    "Unity uses catalog+schema; Glue uses database; "
+    "DMM uses domain (passed via the database field)."
+)
+_SCOPE_SCHEMA_ALIAS_DESCRIPTION = "Alias for 'schema' on adapters that prefer it."
+_SCOPE_CATALOG_DESCRIPTION = (
+    "Top-level catalog name (Unity / Dataplex entry-group / DataHub platform)."
+)
+_SCOPE_TABLES_DESCRIPTION = (
+    "Optional explicit table-name list; if omitted, every table in scope is enumerated."
+)
+
 _SCOPE_PROP = {
     "type": "object",
-    "description": (
-        "Catalog scope — the database/schema/catalog identifier the "
-        "adapter should read from. Field names are catalog-specific: "
-        "Snowflake / BigQuery / DataHub use database+schema; "
-        "Unity uses catalog+schema; Glue uses database; "
-        "DMM uses domain (passed via the database field)."
-    ),
+    "description": _SCOPE_DESCRIPTION,
     "properties": {
         "database": {"type": "string"},
         "schema": {"type": "string"},
         "schema_name": {
             "type": "string",
-            "description": "Alias for 'schema' on adapters that prefer it.",
+            "description": _SCOPE_SCHEMA_ALIAS_DESCRIPTION,
         },
         "catalog": {
             "type": "string",
-            "description": "Top-level catalog name (Unity / Dataplex entry-group / DataHub platform).",
+            "description": _SCOPE_CATALOG_DESCRIPTION,
         },
         "tables": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "Optional explicit table-name list; if omitted, every table in scope is enumerated.",
+            "description": _SCOPE_TABLES_DESCRIPTION,
         },
     },
     "additionalProperties": False,
 }
 
+_FQN_DESCRIPTION = (
+    "Fully-qualified table name in the catalog's native form. "
+    "Snowflake: DB.SCHEMA.TABLE. Unity: catalog.schema.table. "
+    "BigQuery: project.dataset.table. Glue: database.table. "
+    "DataHub: urn:li:dataset:(...) or shortform snowflake.db.table."
+)
 _FQN_REQ = {
     "type": "string",
-    "description": (
-        "Fully-qualified table name in the catalog's native form. "
-        "Snowflake: DB.SCHEMA.TABLE. Unity: catalog.schema.table. "
-        "BigQuery: project.dataset.table. Glue: database.table. "
-        "DataHub: urn:li:dataset:(...) or shortform snowflake.db.table."
-    ),
+    "description": _FQN_DESCRIPTION,
 }
+
+
+# ---------------------------------------------------------------------
+# Pydantic envelope models — single source of truth for tool argument
+# schemas advertised to MCP clients.
+#
+# Why these exist: FastMCP derives ``inputSchema`` for ``tools/list``
+# from the Python function signature via
+# ``mcp.server.fastmcp.utilities.func_metadata``. Plain ``dict`` /
+# bare ``str`` parameter types produce ``{type: "string"}`` / a bare
+# ``{type: "object"}`` — descriptions + enums never reach the client,
+# breaking Claude Code / Cursor / IDE autocomplete.
+#
+# Migrating to ``Annotated[T, Field(description=...)]`` + per-envelope
+# Pydantic ``BaseModel`` keeps the curated descriptions and enums in
+# the wire schema. Pattern borrowed from the official
+# ``mcp-server-fetch`` reference (Anthropic's official Python MCP
+# server uses ``BaseModel`` + ``Annotated`` for tool argument shapes:
+# https://github.com/modelcontextprotocol/servers/tree/main/src/fetch)
+# and the FastMCP docs:
+# https://gofastmcp.com/servers/tools#parameter-documentation
+#
+# The legacy ``TOOL_CAPABILITIES[*].input_schema`` registry below
+# remains as the canonical description-source-of-truth — every
+# description string here is also exposed as a module-level constant
+# reused by the legacy registry, so the two surfaces never drift.
+# ``tests/cli/test_mcp_judge_enrich_tools.py`` pins both.
+# ---------------------------------------------------------------------
+
+
+class CredentialsArg(BaseModel):
+    """Credential lookup envelope for source-catalog tools.
+
+    The MCP server NEVER accepts raw secrets over the LLM-facing wire —
+    only a ``credential_id`` pointing at a saved entry in the OS
+    keyring + ``~/.fluid/sources.yaml``. A trusted in-process CLI
+    harness can opt-in via ``fluid mcp serve --allow-inline-credentials``.
+    """
+
+    # ``extra = "allow"`` because operators can pass adapter-specific keys
+    # (e.g. ``inline`` when --allow-inline-credentials is on). This mirrors
+    # ``_CREDENTIALS_PROP["additionalProperties"] = True`` in the legacy
+    # registry.
+    model_config = ConfigDict(extra="allow")
+
+    credential_id: Optional[str] = Field(
+        default=None,
+        description=_CREDENTIAL_ID_DESCRIPTION,
+    )
+
+
+class ScopeArg(BaseModel):
+    """Catalog scope envelope — database / schema / catalog identifier."""
+
+    # Curated registry pins ``additionalProperties: false``; ``extra='forbid'``
+    # on the BaseModel produces the same in the emitted JSON Schema.
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    database: Optional[str] = Field(default=None)
+    # ``schema`` is a Pydantic-reserved attribute, so we expose it via the
+    # alias and use ``schema_name`` internally. Pydantic emits the property
+    # under the alias when ``by_alias=True`` is set (FastMCP does — see
+    # ``Tool.from_function`` -> ``model_json_schema(by_alias=True)``).
+    schema_name: Optional[str] = Field(
+        default=None,
+        alias="schema",
+    )
+    catalog: Optional[str] = Field(
+        default=None,
+        description=_SCOPE_CATALOG_DESCRIPTION,
+    )
+    tables: Optional[List[str]] = Field(
+        default=None,
+        description=_SCOPE_TABLES_DESCRIPTION,
+    )
+
+
+# ---------------------------------------------------------------------
+# Per-tool argument descriptions — module-level constants so the legacy
+# ``TOOL_CAPABILITIES[*].input_schema`` registry and the FastMCP-derived
+# ``Annotated[T, Field(description=...)]`` signatures stay symmetric.
+# ``test_mcp_judge_enrich_tools.py::test_curated_registry_matches_signatures``
+# pins them.
+# ---------------------------------------------------------------------
+
+_PATH_LOGICAL_DESCRIPTION = "Path to the .model.json logical sidecar file."
+_PATH_LOGICAL_SHORT_DESCRIPTION = "Path to the .model.json sidecar."
+_ENTITY_DESCRIPTION = "Conceptual entity id to update."
+_UPDATES_DESCRIPTION = 'Field updates to apply (e.g. {"name": "Customer", "description": "..."}).'
+_RELATIONSHIP_DESCRIPTION = (
+    "Conceptual relationship payload — must validate as "
+    "ConceptualRelationship (name, source, target, cardinality)."
+)
+_REGEN_CONTRACT_OUT_DESCRIPTION = (
+    "Output path for the regenerated Fluid contract. Defaults to " "<path>.fluid.yaml when omitted."
+)
+_REGEN_ENGINE_DESCRIPTION = "Build engine for the emitted contract (default: dbt)."
+_VALIDATE_LOGICAL_PATH_DESCRIPTION = "Optional path to a .model.json sidecar to validate."
+_VALIDATE_CONTRACT_PATH_DESCRIPTION = "Optional path to a Fluid contract to validate."
+_DIFF_OLD_DESCRIPTION = "Path to the older .model.json sidecar."
+_DIFF_NEW_DESCRIPTION = "Path to the newer .model.json sidecar."
+_SEMANTIC_QUERY_DESCRIPTION = "Free-text query to search past forged models against."
+_SEMANTIC_MODE_DESCRIPTION = "Retrieval mode. 'hybrid' is best when the VectorBackend is enabled."
+_SEMANTIC_LIMIT_DESCRIPTION = "Maximum number of records to return."
+_ADAPTER_DISPATCH_DESCRIPTION = "Catalog adapter to dispatch against."
+_ALLOW_METADATA_SERVICE_DESCRIPTION = (
+    "Allow the credential resolver to fall back to cloud-metadata-service "
+    "auth (instance profile, workload identity). Off by default."
+)
+_TECHNIQUE_DESCRIPTION = "Modeling technique: Data Vault 2.0 or Dimensional (Kimball)."
+_NAME_DESCRIPTION = "Logical-model name. Defaults to the schema name."
+_ENGINE_FORGE_DESCRIPTION = "Build engine for the emitted Fluid contract."
+_OUTPUT_PATH_DESCRIPTION = (
+    "Destination path for the Fluid contract. Must resolve "
+    "under one of the server's --writable-paths roots."
+)
+_LOGICAL_PATH_OUT_DESCRIPTION = (
+    "Optional explicit path for the .model.json sidecar; " "defaults to <output_path>.model.json."
+)
+_FORGE_FROM_SOURCE_URI_DESCRIPTION = (
+    "JDBC URI for postgres/postgresql/mysql/sqlite sources. "
+    "Carries credentials inline (no credential_id needed). "
+    "Example: postgresql://user:pass@host:5432/db. "
+    "Ignored for catalog sources (snowflake/unity/bigquery/dataplex/glue/datahub/datamesh_manager)."
+)
+_FORGE_RUN_MODE_DESCRIPTION = "Forge run mode (see tool description)."
+_FORGE_RUN_TARGET_DIR_DESCRIPTION = (
+    "Workspace-relative directory for the produced "
+    "contract.fluid.yaml. Must lie under one of the "
+    "server's --writable-paths roots."
+)
+_FORGE_RUN_PRODUCT_TYPE_DESCRIPTION = "Data Mesh product type or medallion layer."
+_FORGE_RUN_PROMPT_DESCRIPTION = (
+    "For mode='diag': the prompt to send to the IDE's LLM. " "Ignored in other modes."
+)
+_FORGE_RUN_FROM_PRODUCTS_DESCRIPTION = (
+    "For mode='ai': upstream product ids or paths to "
+    "compose this product from. Repeatable. Ignored "
+    "in other modes."
+)
+_SCORE_CONTRACT_PATH_DESCRIPTION = "Path to a contract.fluid.yaml file."
+_SCORE_INLINE_DESCRIPTION = "Inline contract dict (alternative to contract_path)."
+_SCORE_INCLUDE_ARTIFACTS_DESCRIPTION = (
+    "If true, run enrichment first and feed artifacts to the judge."
+)
+
 
 TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
     "read_logical_model": ToolCapability(
@@ -525,11 +697,16 @@ TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
         name="forge_from_source",
         description=(
             "Forge a logical data-model + Fluid contract from a metadata-source "
-            "catalog scope. Reads tables / lineage / glossary, runs the staged "
-            "pipeline (Logical → Builder → Readme → Transformation → Validator), "
-            "and writes the contract + .model.json sidecar. Requires "
-            "credentials.credential_id and an output_path that resolves under "
-            "--writable-paths."
+            "catalog scope OR a JDBC-introspectable database. Catalog sources "
+            "(snowflake/unity/bigquery/dataplex/glue/datahub/datamesh_manager) "
+            "read tables / lineage / glossary, run the staged pipeline (Logical "
+            "→ Builder → Readme → Transformation → Validator), and write the "
+            "contract + .model.json sidecar — they require "
+            "credentials.credential_id and a scope. JDBC sources "
+            "(postgres/postgresql/mysql/sqlite) use duckdb-extension "
+            "introspection — they require ``uri`` (URI carries credentials "
+            "inline). Both branches write to output_path which must resolve "
+            "under --writable-paths."
         ),
         mutates_files=True,
         file_path_args=("output_path", "logical_path"),
@@ -537,41 +714,48 @@ TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
         input_schema={
             "type": "object",
             "properties": {
-                "source": {"type": "string", "enum": _SOURCE_ENUM},
+                "source": {"type": "string", "enum": _FORGE_FROM_SOURCE_ENUM},
                 "credentials": _CREDENTIALS_PROP,
                 "scope": _SCOPE_PROP,
+                "uri": {
+                    "type": "string",
+                    "description": _FORGE_FROM_SOURCE_URI_DESCRIPTION,
+                },
                 "technique": {
                     "type": "string",
                     "enum": _TECHNIQUE_ENUM,
                     "default": "data_vault_2",
-                    "description": "Modeling technique: Data Vault 2.0 or Dimensional (Kimball).",
+                    "description": _TECHNIQUE_DESCRIPTION,
                 },
                 "name": {
                     "type": "string",
-                    "description": "Logical-model name. Defaults to the schema name.",
+                    "description": _NAME_DESCRIPTION,
                 },
                 "engine": {
                     "type": "string",
                     "default": "dbt",
-                    "description": "Build engine for the emitted Fluid contract.",
+                    "description": _ENGINE_FORGE_DESCRIPTION,
                 },
                 "output_path": {
                     "type": "string",
-                    "description": (
-                        "Destination path for the Fluid contract. Must resolve "
-                        "under one of the server's --writable-paths roots."
-                    ),
+                    "description": _OUTPUT_PATH_DESCRIPTION,
                 },
                 "logical_path": {
                     "type": "string",
-                    "description": (
-                        "Optional explicit path for the .model.json sidecar; "
-                        "defaults to <output_path>.model.json."
-                    ),
+                    "description": _LOGICAL_PATH_OUT_DESCRIPTION,
                 },
-                "allow_metadata_service": {"type": "boolean", "default": False},
+                "allow_metadata_service": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": _ALLOW_METADATA_SERVICE_DESCRIPTION,
+                },
             },
-            "required": ["source", "credentials", "scope", "output_path"],
+            # Catalog sources need credentials + scope; JDBC sources need
+            # ``uri``. The Python dispatcher (``_call_tool``) does the
+            # source-specific required-field check post-decode. Listing only
+            # ``source`` + ``output_path`` here keeps both shapes valid at
+            # the JSON Schema layer while preserving useful client autocomplete.
+            "required": ["source", "output_path"],
             "additionalProperties": False,
         },
     ),
@@ -631,6 +815,68 @@ TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
                 },
             },
             "required": ["mode"],
+            "additionalProperties": False,
+        },
+    ),
+    "score_contract_quality": ToolCapability(
+        name="score_contract_quality",
+        description=(
+            "Run the out-of-loop LLM-as-judge on a finalised data-product "
+            "contract and return a 6-axis scorecard (correctness, "
+            "completeness, security, governance, performance, "
+            "documentation; each 0..5; total 0..30). Read-only — does NOT "
+            "modify the contract on disk. Pass either ``contract_path`` "
+            "or ``contract`` (inline dict). Set ``include_artifacts=true`` "
+            "to also run the deterministic enrichment pass first so the "
+            "judge sees recommended dbt tests / freshness / clustering "
+            "and credits those axes accordingly."
+        ),
+        read_path_args=("contract_path",),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "contract_path": {
+                    "type": "string",
+                    "description": "Path to a contract.fluid.yaml file.",
+                },
+                "contract": {
+                    "type": "object",
+                    "description": "Inline contract dict (alternative to contract_path).",
+                    "additionalProperties": True,
+                },
+                "include_artifacts": {
+                    "type": "boolean",
+                    "description": "If true, run enrichment first and feed artifacts to the judge.",
+                    "default": False,
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+    "enrich_contract_suggestions": ToolCapability(
+        name="enrich_contract_suggestions",
+        description=(
+            "Run the post-synthesis deterministic enrichment pass over a "
+            "contract and return suggested additions (dbt tests, freshness "
+            "block, physical layout). Read-only — does NOT modify the "
+            "contract on disk. Equivalent to what ``fluid forge`` runs "
+            "automatically after synthesis. Useful for command_center "
+            "previews + 'what would enrichment add?' answers."
+        ),
+        read_path_args=("contract_path",),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "contract_path": {
+                    "type": "string",
+                    "description": "Path to a contract.fluid.yaml file.",
+                },
+                "contract": {
+                    "type": "object",
+                    "description": "Inline contract dict (alternative to contract_path).",
+                    "additionalProperties": True,
+                },
+            },
             "additionalProperties": False,
         },
     ),
@@ -1101,20 +1347,74 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
 # delegates the actual work to :func:`_call_tool` (sync, threaded) or, for
 # ``forge_run``, talks to ``ctx.session.create_message`` directly.
 #
-# Why explicit signatures: FastMCP derives JSON-Schema from the Python
-# function signature. Generic ``**kwargs`` would advertise an empty schema
-# and break editor autocomplete in Claude Code / Cursor / Kiro.
+# Why explicit signatures with ``Annotated[T, Field(description=...)]``:
+# FastMCP derives ``inputSchema`` from the Python function signature via
+# ``mcp.server.fastmcp.utilities.func_metadata``. Annotated metadata
+# (including Pydantic ``Field`` descriptions, ``Literal`` enums, and
+# ``BaseModel`` nested envelopes) flows through verbatim into the
+# emitted JSON Schema — so MCP clients (Claude Code / Cursor / Kiro)
+# see the curated descriptions + enum values for autocomplete.
+#
+# Pattern borrowed from ``mcp-server-fetch`` (the official reference
+# Python MCP server uses ``BaseModel`` + ``Annotated`` for argument
+# shapes) and the FastMCP docs (gofastmcp.com/servers/tools). The
+# legacy ``TOOL_CAPABILITIES[*].input_schema`` registry remains the
+# canonical permission-gate source and pins description-symmetry
+# via ``tests/cli/test_mcp_judge_enrich_tools.py``.
 # ----------------------------------------------------------------------
 
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["read_logical_model"].description)
-async def read_logical_model(path: str) -> Dict[str, Any]:
+async def read_logical_model(
+    path: Annotated[str, Field(description=_PATH_LOGICAL_DESCRIPTION)],
+) -> Dict[str, Any]:
     return await _dispatch_sync_tool("read_logical_model", {"path": path})
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["score_contract_quality"].description)
+async def score_contract_quality(
+    contract_path: Annotated[
+        Optional[str], Field(description=_SCORE_CONTRACT_PATH_DESCRIPTION)
+    ] = None,
+    contract: Annotated[
+        Optional[Dict[str, Any]], Field(description=_SCORE_INLINE_DESCRIPTION)
+    ] = None,
+    include_artifacts: Annotated[
+        bool, Field(description=_SCORE_INCLUDE_ARTIFACTS_DESCRIPTION)
+    ] = False,
+) -> Dict[str, Any]:
+    """Run the 6-axis LLM-as-judge over a contract. Read-only."""
+    args: Dict[str, Any] = {"include_artifacts": include_artifacts}
+    if contract_path:
+        args["contract_path"] = contract_path
+    if contract is not None:
+        args["contract"] = contract
+    return await _dispatch_sync_tool("score_contract_quality", args)
+
+
+@_mcp_app.tool(description=TOOL_CAPABILITIES["enrich_contract_suggestions"].description)
+async def enrich_contract_suggestions(
+    contract_path: Annotated[
+        Optional[str], Field(description=_SCORE_CONTRACT_PATH_DESCRIPTION)
+    ] = None,
+    contract: Annotated[
+        Optional[Dict[str, Any]], Field(description=_SCORE_INLINE_DESCRIPTION)
+    ] = None,
+) -> Dict[str, Any]:
+    """Run the deterministic enrichment pass and return suggestions. Read-only."""
+    args: Dict[str, Any] = {}
+    if contract_path:
+        args["contract_path"] = contract_path
+    if contract is not None:
+        args["contract"] = contract
+    return await _dispatch_sync_tool("enrich_contract_suggestions", args)
 
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["update_entity"].description)
 async def update_entity(
-    path: str, entity: str, updates: Optional[Dict[str, Any]] = None
+    path: Annotated[str, Field(description=_PATH_LOGICAL_SHORT_DESCRIPTION)],
+    entity: Annotated[str, Field(description=_ENTITY_DESCRIPTION)],
+    updates: Annotated[Optional[Dict[str, Any]], Field(description=_UPDATES_DESCRIPTION)] = None,
 ) -> Dict[str, Any]:
     return await _dispatch_sync_tool(
         "update_entity", {"path": path, "entity": entity, "updates": updates or {}}
@@ -1122,7 +1422,10 @@ async def update_entity(
 
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["add_relationship"].description)
-async def add_relationship(path: str, relationship: Dict[str, Any]) -> Dict[str, Any]:
+async def add_relationship(
+    path: Annotated[str, Field(description=_PATH_LOGICAL_SHORT_DESCRIPTION)],
+    relationship: Annotated[Dict[str, Any], Field(description=_RELATIONSHIP_DESCRIPTION)],
+) -> Dict[str, Any]:
     return await _dispatch_sync_tool(
         "add_relationship", {"path": path, "relationship": relationship}
     )
@@ -1130,7 +1433,11 @@ async def add_relationship(path: str, relationship: Dict[str, Any]) -> Dict[str,
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["regenerate_physical"].description)
 async def regenerate_physical(
-    path: str, contract_path: Optional[str] = None, engine: str = "dbt"
+    path: Annotated[str, Field(description=_PATH_LOGICAL_DESCRIPTION)],
+    contract_path: Annotated[
+        Optional[str], Field(description=_REGEN_CONTRACT_OUT_DESCRIPTION)
+    ] = None,
+    engine: Annotated[str, Field(description=_REGEN_ENGINE_DESCRIPTION)] = "dbt",
 ) -> Dict[str, Any]:
     args = {"path": path, "engine": engine}
     if contract_path:
@@ -1140,7 +1447,12 @@ async def regenerate_physical(
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["validate_contract"].description)
 async def validate_contract(
-    logical_path: Optional[str] = None, contract_path: Optional[str] = None
+    logical_path: Annotated[
+        Optional[str], Field(description=_VALIDATE_LOGICAL_PATH_DESCRIPTION)
+    ] = None,
+    contract_path: Annotated[
+        Optional[str], Field(description=_VALIDATE_CONTRACT_PATH_DESCRIPTION)
+    ] = None,
 ) -> Dict[str, Any]:
     args: Dict[str, Any] = {}
     if logical_path:
@@ -1151,15 +1463,26 @@ async def validate_contract(
 
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["diff_models"].description)
-async def diff_models(old: str, new: str) -> Dict[str, Any]:
+async def diff_models(
+    old: Annotated[str, Field(description=_DIFF_OLD_DESCRIPTION)],
+    new: Annotated[str, Field(description=_DIFF_NEW_DESCRIPTION)],
+) -> Dict[str, Any]:
     return await _dispatch_sync_tool("diff_models", {"old": old, "new": new})
 
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["search_semantic_memory"].description)
 async def search_semantic_memory(
-    query: str, namespace: Optional[str] = None, limit: Optional[int] = 5
+    query: Annotated[str, Field(description=_SEMANTIC_QUERY_DESCRIPTION)],
+    mode: Annotated[
+        Optional[Literal["exact", "keyword", "vector", "hybrid"]],
+        Field(description=_SEMANTIC_MODE_DESCRIPTION),
+    ] = "hybrid",
+    limit: Annotated[
+        Optional[int], Field(description=_SEMANTIC_LIMIT_DESCRIPTION, ge=1, le=50)
+    ] = 5,
+    namespace: Optional[str] = None,
 ) -> Dict[str, Any]:
-    args: Dict[str, Any] = {"query": query, "limit": limit or 5}
+    args: Dict[str, Any] = {"query": query, "limit": limit or 5, "mode": mode or "hybrid"}
     if namespace:
         args["namespace"] = namespace
     return await _dispatch_sync_tool("search_semantic_memory", args)
@@ -1172,17 +1495,24 @@ async def list_source_adapters() -> Dict[str, Any]:
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_tables"].description)
 async def list_source_tables(
-    source: str,
-    credentials: Dict[str, Any],
-    scope: Dict[str, Any],
-    allow_metadata_service: bool = False,
+    source: Annotated[
+        Literal[
+            "snowflake", "unity", "bigquery", "dataplex", "glue", "datahub", "datamesh_manager"
+        ],
+        Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
+    ],
+    credentials: Annotated[CredentialsArg, Field(description=_CREDENTIALS_DESCRIPTION)],
+    scope: Annotated[ScopeArg, Field(description=_SCOPE_DESCRIPTION)],
+    allow_metadata_service: Annotated[
+        bool, Field(description=_ALLOW_METADATA_SERVICE_DESCRIPTION)
+    ] = False,
 ) -> Dict[str, Any]:
     return await _dispatch_sync_tool(
         "list_source_tables",
         {
             "source": source,
-            "credentials": credentials,
-            "scope": scope,
+            "credentials": _dump_envelope(credentials),
+            "scope": _dump_envelope(scope),
             "allow_metadata_service": allow_metadata_service,
         },
     )
@@ -1190,16 +1520,23 @@ async def list_source_tables(
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["inspect_source_table"].description)
 async def inspect_source_table(
-    source: str,
-    credentials: Dict[str, Any],
-    fqn: str,
-    allow_metadata_service: bool = False,
+    source: Annotated[
+        Literal[
+            "snowflake", "unity", "bigquery", "dataplex", "glue", "datahub", "datamesh_manager"
+        ],
+        Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
+    ],
+    credentials: Annotated[CredentialsArg, Field(description=_CREDENTIALS_DESCRIPTION)],
+    fqn: Annotated[str, Field(description=_FQN_DESCRIPTION)],
+    allow_metadata_service: Annotated[
+        bool, Field(description=_ALLOW_METADATA_SERVICE_DESCRIPTION)
+    ] = False,
 ) -> Dict[str, Any]:
     return await _dispatch_sync_tool(
         "inspect_source_table",
         {
             "source": source,
-            "credentials": credentials,
+            "credentials": _dump_envelope(credentials),
             "fqn": fqn,
             "allow_metadata_service": allow_metadata_service,
         },
@@ -1208,18 +1545,28 @@ async def inspect_source_table(
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_lineage"].description)
 async def list_source_lineage(
-    source: str,
-    credentials: Dict[str, Any],
-    fqn: str,
-    direction: str = "both",
-    depth: int = 3,
-    allow_metadata_service: bool = False,
+    source: Annotated[
+        Literal[
+            "snowflake", "unity", "bigquery", "dataplex", "glue", "datahub", "datamesh_manager"
+        ],
+        Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
+    ],
+    credentials: Annotated[CredentialsArg, Field(description=_CREDENTIALS_DESCRIPTION)],
+    fqn: Annotated[str, Field(description=_FQN_DESCRIPTION)],
+    direction: Annotated[
+        Literal["both", "upstream", "downstream"],
+        Field(description="Lineage direction to traverse."),
+    ] = "both",
+    depth: Annotated[int, Field(description="Maximum lineage hops to walk.", ge=1, le=20)] = 3,
+    allow_metadata_service: Annotated[
+        bool, Field(description=_ALLOW_METADATA_SERVICE_DESCRIPTION)
+    ] = False,
 ) -> Dict[str, Any]:
     return await _dispatch_sync_tool(
         "list_source_lineage",
         {
             "source": source,
-            "credentials": credentials,
+            "credentials": _dump_envelope(credentials),
             "fqn": fqn,
             "direction": direction,
             "depth": depth,
@@ -1230,18 +1577,30 @@ async def list_source_lineage(
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_glossary"].description)
 async def list_source_glossary(
-    source: str,
-    credentials: Dict[str, Any],
-    query: Optional[str] = None,
-    limit: int = 50,
-    allow_metadata_service: bool = False,
+    source: Annotated[
+        Literal[
+            "snowflake", "unity", "bigquery", "dataplex", "glue", "datahub", "datamesh_manager"
+        ],
+        Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
+    ],
+    credentials: Annotated[CredentialsArg, Field(description=_CREDENTIALS_DESCRIPTION)],
+    scope: Annotated[Optional[ScopeArg], Field(description=_SCOPE_DESCRIPTION)] = None,
+    query: Annotated[Optional[str], Field(description="Free-text glossary search query.")] = None,
+    limit: Annotated[
+        int, Field(description="Maximum number of glossary terms.", ge=1, le=500)
+    ] = 50,
+    allow_metadata_service: Annotated[
+        bool, Field(description=_ALLOW_METADATA_SERVICE_DESCRIPTION)
+    ] = False,
 ) -> Dict[str, Any]:
     args: Dict[str, Any] = {
         "source": source,
-        "credentials": credentials,
+        "credentials": _dump_envelope(credentials),
         "limit": limit,
         "allow_metadata_service": allow_metadata_service,
     }
+    if scope is not None:
+        args["scope"] = _dump_envelope(scope)
     if query:
         args["query"] = query
     return await _dispatch_sync_tool("list_source_glossary", args)
@@ -1249,30 +1608,72 @@ async def list_source_glossary(
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["forge_from_source"].description)
 async def forge_from_source(
-    source: str,
-    credentials: Dict[str, Any],
-    scope: Dict[str, Any],
-    output_path: str,
-    name: Optional[str] = None,
-    technique: str = "data_vault_2",
-    engine: str = "dbt",
-    logical_path: Optional[str] = None,
-    allow_metadata_service: bool = False,
+    source: Annotated[
+        Literal[
+            "snowflake",
+            "unity",
+            "bigquery",
+            "dataplex",
+            "glue",
+            "datahub",
+            "datamesh_manager",
+            "postgres",
+            "postgresql",
+            "mysql",
+            "sqlite",
+        ],
+        Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
+    ],
+    output_path: Annotated[str, Field(description=_OUTPUT_PATH_DESCRIPTION)],
+    credentials: Annotated[
+        Optional[CredentialsArg], Field(description=_CREDENTIALS_DESCRIPTION)
+    ] = None,
+    scope: Annotated[Optional[ScopeArg], Field(description=_SCOPE_DESCRIPTION)] = None,
+    uri: Annotated[Optional[str], Field(description=_FORGE_FROM_SOURCE_URI_DESCRIPTION)] = None,
+    name: Annotated[Optional[str], Field(description=_NAME_DESCRIPTION)] = None,
+    technique: Annotated[
+        Literal["data_vault_2", "dimensional"],
+        Field(description=_TECHNIQUE_DESCRIPTION),
+    ] = "data_vault_2",
+    engine: Annotated[str, Field(description=_ENGINE_FORGE_DESCRIPTION)] = "dbt",
+    logical_path: Annotated[Optional[str], Field(description=_LOGICAL_PATH_OUT_DESCRIPTION)] = None,
+    allow_metadata_service: Annotated[
+        bool, Field(description=_ALLOW_METADATA_SERVICE_DESCRIPTION)
+    ] = False,
 ) -> Dict[str, Any]:
     args: Dict[str, Any] = {
         "source": source,
-        "credentials": credentials,
-        "scope": scope,
         "output_path": output_path,
         "technique": technique,
         "engine": engine,
         "allow_metadata_service": allow_metadata_service,
     }
+    if credentials is not None:
+        args["credentials"] = _dump_envelope(credentials)
+    if scope is not None:
+        args["scope"] = _dump_envelope(scope)
+    if uri:
+        args["uri"] = uri
     if name:
         args["name"] = name
     if logical_path:
         args["logical_path"] = logical_path
     return await _dispatch_sync_tool("forge_from_source", args)
+
+
+def _dump_envelope(env: Optional[BaseModel]) -> Dict[str, Any]:
+    """Serialise an envelope back to a plain dict for ``_dispatch_sync_tool``.
+
+    FastMCP validates incoming JSON against the Pydantic models and passes
+    typed instances into the tool body. Permission gating + the legacy
+    ``_call_tool`` dispatch still speak plain dicts, so we round-trip here.
+    ``by_alias=True`` preserves the wire-shape (``schema`` not
+    ``schema_name``) so the existing ``_scope_from_args`` flat-fallback
+    keeps working.
+    """
+    if env is None:
+        return {}
+    return env.model_dump(mode="json", by_alias=True, exclude_none=False)
 
 
 @_mcp_app.tool(description=TOOL_CAPABILITIES["forge_run"].description)
@@ -1638,6 +2039,17 @@ def _call_tool(
     if name == "forge_from_source":
         if read_only:
             raise RuntimeError("Server is running in read-only mode")
+
+        # JDBC sources route through a separate code path that doesn't
+        # need a credential resolver — the URI carries everything. This
+        # mirrors ``cli/forge_data_model.py::run_from_source_command``
+        # which forks ``--source <jdbc>`` early to ``_run_from_jdbc_source``.
+        # MCP gets the same one-shot synthesis (no separate connect step).
+        jdbc_kinds = {"postgres", "postgresql", "mysql", "sqlite"}
+        source_value = str(arguments.get("source") or "").lower().strip()
+        if source_value in jdbc_kinds:
+            return _dispatch_forge_from_jdbc_source(arguments)
+
         # forge_from_source is the V1.5 marquee tool: enumerate the
         # catalog scope, pull per-table metadata, run the staged
         # Logical pipeline, then write a Fluid contract plus .model.json
@@ -1728,7 +2140,71 @@ def _call_tool(
     # can call ``ctx.session.create_message`` for the sampling round-trip.
     # Any caller that lands here with name='forge_run' is a bug.
 
+    if name == "score_contract_quality":
+        return _dispatch_score_contract_quality(arguments)
+    if name == "enrich_contract_suggestions":
+        return _dispatch_enrich_contract_suggestions(arguments)
     raise RuntimeError(f"Unknown tool {name}")
+
+
+def _resolve_contract_argument(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept either ``contract_path`` (filesystem) or ``contract`` (inline dict).
+
+    Path takes precedence when both supplied. The path read is what the
+    capability's ``read_path_args`` policy gates on; inline dicts come
+    straight from the MCP caller (command_center / IDE) without
+    filesystem confinement.
+    """
+    path_arg = arguments.get("contract_path")
+    inline = arguments.get("contract")
+    if path_arg:
+        text = Path(path_arg).read_text(encoding="utf-8")
+        loaded = yaml.safe_load(text) or {}
+        if not isinstance(loaded, dict):
+            raise RuntimeError(f"Contract at {path_arg!r} did not parse to a dict")
+        return loaded
+    if inline is not None:
+        if not isinstance(inline, dict):
+            raise RuntimeError("'contract' argument must be a dict")
+        return inline
+    raise RuntimeError("Pass either 'contract_path' or 'contract'")
+
+
+def _dispatch_score_contract_quality(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """MCP shim around :class:`JudgeAgent`. Read-only — no contract writes."""
+    from fluid_build.copilot.agents.judge_agent import JudgeAgent
+
+    contract = _resolve_contract_argument(arguments)
+    build_artifacts: Optional[Dict[str, Any]] = None
+    if bool(arguments.get("include_artifacts")):
+        from fluid_build.copilot.enrichment import enrich_contract as _enrich
+
+        try:
+            build_artifacts = _enrich(contract)
+        except Exception:  # noqa: BLE001 — judging without artifacts is still valid
+            build_artifacts = None
+    result = JudgeAgent().judge(contract, build_artifacts=build_artifacts)
+    return {
+        "total": result.total,
+        "axes": {axis: score.score for axis, score in result.axes.items()},
+        "axis_reasoning": {axis: score.reasoning for axis, score in result.axes.items()},
+        "axis_suggestions": {axis: list(score.suggestions) for axis, score in result.axes.items()},
+        "model": result.model,
+        "critique_applied": bool(getattr(result, "critique_applied", False)),
+        "max_total": len(result.axes) * 5,
+    }
+
+
+def _dispatch_enrich_contract_suggestions(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """MCP shim around :func:`enrich_contract`. Read-only — returns
+    suggestions; does not apply them to the contract on disk."""
+    from fluid_build.copilot.enrichment import enrich_contract as _enrich
+
+    contract = _resolve_contract_argument(arguments)
+    artifacts = _enrich(contract)
+    if artifacts is None:
+        return {"enabled": False, "artifacts": None}
+    return {"enabled": True, "artifacts": artifacts}
 
 
 # ---------------------------------------------------------------------
@@ -1737,8 +2213,8 @@ def _call_tool(
 
 
 def _list_source_adapters() -> List[Dict[str, Any]]:
-    """Enumerate the source-catalog adapters this build of forge-cli
-    can dispatch to.
+    """Enumerate the source-catalog + JDBC adapters this build of
+    forge-cli can dispatch to.
 
     The list is static — it reflects what code is shipped, not what
     the operator has configured. To list configured *credentials*
@@ -1747,26 +2223,37 @@ def _list_source_adapters() -> List[Dict[str, Any]]:
     deliberately inventory-only: it tells the LLM which catalog
     types are reachable, not which specific credentials are saved.
 
-    Every adapter listed here is implemented in
-    ``fluid_build.copilot.catalog.<name>`` and follows the 9
-    patterns documented in ``catalog._patterns``. Future adapters
-    (Apache Atlas, Alation, Microsoft Purview, …) get added here
-    when they land — and inherit the same patterns automatically.
+    Catalog adapters (kind=catalog) are implemented in
+    ``fluid_build.copilot.catalog.<name>`` and follow the 9 patterns
+    in ``catalog._patterns``. JDBC adapters (kind=jdbc) route through
+    :mod:`fluid_build.cli._forge_data_model_jdbc` — duckdb-extension
+    introspection over a ``--uri`` payload.
+
+    Future adapters (Apache Atlas, Alation, Microsoft Purview, …) get
+    added here when they land — and inherit the same patterns
+    automatically.
     """
-    return [
-        {"name": "snowflake", "status": "available"},
-        {"name": "unity", "status": "available"},
-        {"name": "bigquery", "status": "available"},
-        {"name": "dataplex", "status": "available"},
-        {"name": "glue", "status": "available"},
-        {"name": "datahub", "status": "available"},
-        {"name": "datamesh_manager", "status": "available"},
+    catalog_entries = [
+        {"name": name, "status": "available", "kind": "catalog"} for name in _CATALOG_SOURCE_LIST
     ]
+    jdbc_entries = [
+        {"name": name, "status": "available", "kind": "jdbc"} for name in _JDBC_SOURCE_LIST
+    ]
+    return catalog_entries + jdbc_entries
 
 
 # Single source of truth for catalog dispatch. Every adapter
 # implements ``CatalogAdapter.from_resolver`` so we just need the
 # class reference here. New adapters land by adding one entry.
+#
+# JDBC sources (postgres / postgresql / mysql / sqlite) are NOT in this
+# table — they route through ``_dispatch_forge_from_jdbc_source`` which
+# uses duckdb-extension introspection rather than a credential-resolver
+# adapter. ``_build_source_adapter`` only handles catalog sources;
+# ``forge_from_source`` short-circuits to the JDBC path before calling
+# it. The catalog-only tools (list_source_tables, inspect_source_table,
+# list_source_lineage, list_source_glossary) reject JDBC sources via
+# the ``Literal[...]`` enum on their Annotated signatures.
 _SOURCE_ADAPTERS: Dict[str, str] = {
     "snowflake": "fluid_build.copilot.catalog.snowflake:SnowflakeCatalogAdapter",
     "unity": "fluid_build.copilot.catalog.unity:UnityCatalogAdapter",
@@ -1778,6 +2265,82 @@ _SOURCE_ADAPTERS: Dict[str, str] = {
         "fluid_build.copilot.catalog.datamesh_manager:DataMeshManagerCatalogAdapter"
     ),
 }
+
+
+def _dispatch_forge_from_jdbc_source(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """MCP shim around :func:`_run_from_jdbc_source` (the CLI's JDBC path).
+
+    JDBC sources (postgres / postgresql / mysql / sqlite) carry credentials
+    inline in a ``--uri`` payload, so they bypass the credential resolver
+    entirely. This shim builds a minimal argparse-Namespace shaped like the
+    ``fluid forge data-model from-source`` parser produces, dispatches to
+    the shared duckdb-attach helper, and re-reads the produced contract so
+    the MCP caller gets the same dict shape catalog sources return.
+
+    Audit event: ``mcp_forge_from_jdbc_source`` is written (no credentials —
+    URI password is masked; only the source kind + output path land in the
+    forensic trail).
+    """
+    import argparse as _argparse
+
+    from fluid_build.cli._forge_data_model_jdbc import _run_from_jdbc_source
+
+    source = str(arguments.get("source") or "").lower().strip()
+    uri = arguments.get("uri")
+    output_path = arguments.get("output_path")
+    if not uri:
+        raise RuntimeError(
+            f"forge_from_source --source {source!r} requires 'uri'. "
+            "Example: postgresql://user:pass@host:5432/db"
+        )
+    if not output_path:
+        raise RuntimeError("forge_from_source requires 'output_path'")
+
+    # The JDBC helper consumes ``args.source``, ``args.uri``, ``args.output``,
+    # ``args.name``, ``args.schema_name``, ``args.tables``. Build an
+    # argparse Namespace with exactly those attributes — leaving the rest
+    # absent is fine since the helper uses ``getattr(args, ..., None)``.
+    scope = arguments.get("scope") or {}
+    if not isinstance(scope, dict):
+        scope = {}
+    namespace = _argparse.Namespace(
+        source=source,
+        uri=str(uri),
+        output=str(output_path),
+        name=arguments.get("name"),
+        schema_name=scope.get("schema") or scope.get("schema_name"),
+        tables=scope.get("tables") or None,
+    )
+    jdbc_logger = logging.getLogger("fluid.mcp.forge_from_jdbc_source")
+    rc = _run_from_jdbc_source(namespace, jdbc_logger)
+    if rc != 0:
+        raise RuntimeError(
+            f"forge_from_source: JDBC introspection failed for source={source!r} "
+            f"(exit_code={rc}). See server logs."
+        )
+
+    # Re-read the emitted contract so the MCP caller gets a structured
+    # response (mirroring the catalog branch's shape).
+    contract_path = Path(str(output_path))
+    contract_text = contract_path.read_text(encoding="utf-8")
+    contract_data = yaml.safe_load(contract_text) or {}
+
+    write_audit_event(
+        "mcp_forge_from_jdbc_source",
+        payload={
+            "source": source,
+            "output_path": str(contract_path),
+            # Deliberately NOT logging the URI — passwords can be embedded.
+        },
+    )
+
+    return {
+        "kind": "jdbc",
+        "source": source,
+        "contract_path": str(contract_path),
+        "contract_exists": contract_path.is_file(),
+        "table_count": len(contract_data.get("exposes") or []),
+    }
 
 
 def _import_adapter_class(dotted_path: str) -> Any:

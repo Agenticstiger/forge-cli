@@ -12,15 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit coverage for ``fluid_build.copilot.models`` — the LLM model registry.
+"""Unit coverage for ``fluid_build.copilot.models``.
 
-The registry is the single source of truth for per-provider / per-role
-default models and for the deprecated-model -> replacement hint surfaced
-in error messages. ``default_model_for`` / ``_provider_prefix_for`` /
-``all_supported_models`` are pure (dict lookups + env override), so they
-are pinned directly; ``deprecation_hint`` orchestrates the litellm-backed
-helpers and is exercised via stubbed helper boundaries so the assertions
-stay deterministic regardless of litellm's shifting ``model_cost`` table.
+The registry is now a thin role -> tier shim over ``cli/llm_models.json``
+(see :mod:`tests.copilot.test_models_catalog_driven` for the
+catalog-driven behaviour pins). This file covers the litellm-backed
+``deprecation_hint`` orchestration plus the static helpers
+(``_provider_prefix_for`` / ``_is_deprecated_in_litellm`` /
+``_suggest_replacement_via_litellm``) that don't read the catalog.
+
+The previous ``TestDefaultModelFor`` / ``TestAllSupportedModels``
+classes that asserted hardcoded model names (e.g. ``"claude-haiku-4"``)
+moved to ``test_models_catalog_driven.py`` with synthetic patched
+catalogs, because hardcoding the bundled catalog's current contents
+made the suite brittle to the weekly auto-update workflow.
 """
 
 from __future__ import annotations
@@ -32,7 +37,6 @@ from fluid_build.copilot.models import (
     _is_deprecated_in_litellm,
     _provider_prefix_for,
     _suggest_replacement_via_litellm,
-    all_supported_models,
     default_model_for,
     deprecation_hint,
 )
@@ -60,44 +64,6 @@ class TestProviderPrefixFor:
     @pytest.mark.parametrize("model", ["llama3.1:70b", "gemma4", "mistral-large"])
     def test_unrecognised_model_yields_empty_prefix(self, model: str) -> None:
         assert _provider_prefix_for(model) == ""
-
-
-class TestDefaultModelFor:
-    """``default_model_for`` — registry lookup, alias, fallback, env override."""
-
-    def test_registry_hit_returns_canonical_model(self) -> None:
-        assert default_model_for("openai", "default") == "gpt-4.1-mini"
-        assert default_model_for("anthropic", "deep") == "claude-opus-4"
-        assert default_model_for("gemini", "fast") == "gemini-2.5-flash"
-
-    def test_claude_alias_resolves_like_anthropic(self) -> None:
-        assert default_model_for("claude", "fast") == "claude-haiku-4"
-
-    def test_role_defaults_to_default(self) -> None:
-        assert default_model_for("ollama") == "gemma4"
-
-    def test_unknown_provider_returns_fallback(self) -> None:
-        assert default_model_for("cohere", "default") is None
-        assert default_model_for("cohere", "default", fallback="gpt-4.1") == "gpt-4.1"
-
-    def test_env_var_overrides_registry(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("FLUID_LLM_DEFAULT_MODEL_OPENAI_DEFAULT", "gpt-pinned-by-ci")
-        assert default_model_for("openai", "default") == "gpt-pinned-by-ci"
-
-
-class TestAllSupportedModels:
-    """``all_supported_models`` — registry snapshot, defensively copied."""
-
-    def test_snapshot_lists_every_provider(self) -> None:
-        snap = all_supported_models()
-        assert {"openai", "anthropic", "claude", "gemini", "ollama"} <= set(snap)
-        assert snap["openai"]["deep"] == "gpt-4.1"
-
-    def test_snapshot_is_a_copy(self) -> None:
-        snap = all_supported_models()
-        snap["openai"]["default"] = "mutated"
-        # Mutating the snapshot must not bleed into the live registry.
-        assert default_model_for("openai", "default") == "gpt-4.1-mini"
 
 
 class TestDeprecationHint:

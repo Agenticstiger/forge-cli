@@ -28,8 +28,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 import yaml
 
@@ -461,28 +459,38 @@ class FluidSchemaManager:
         return None
 
     def _fetch_schema(self, version: SchemaVersion) -> Optional[Dict[str, Any]]:
-        """Fetch schema from remote repository."""
+        """Fetch schema from remote repository.
+
+        SSRF-guarded — schema_url is normally a hardcoded
+        raw.githubusercontent.com URL (gated by the strict version
+        regex in SchemaVersion.parse), but SchemaVersion accepts an
+        explicit override too. Routing through ``safe_http.fetch_bytes``
+        closes the gap if a future code path lets a contract supply
+        ``schema_url`` directly, and bounds the request by
+        ``self.timeout`` so an unreachable host fails fast instead of
+        blocking the CLI for minutes.
+        """
         if not version.schema_url:
             return None
 
+        from fluid_build.util.safe_http import UnsafeURLError, fetch_bytes
+
         try:
             self.logger.info(f"Fetching schema from {version.schema_url}")
-            req = Request(version.schema_url)
-            req.add_header("User-Agent", "FLUID-Build-Tool/1.0")
-
-            with urlopen(req, timeout=self.timeout) as response:
-                if response.status == 200:
-                    content = response.read().decode("utf-8")
-                    schema = json.loads(content)
-                    self.logger.debug(f"Successfully fetched schema for v{version}")
-                    return schema
-                else:
-                    self.logger.warning(f"HTTP {response.status} fetching schema for v{version}")
-
-        except HTTPError as e:
-            self.logger.warning(f"HTTP error fetching schema for v{version}: {e}")
-        except URLError as e:
-            self.logger.warning(f"URL error fetching schema for v{version}: {e}")
+            status, _headers, body = fetch_bytes(
+                version.schema_url,
+                timeout=self.timeout,
+                headers={"User-Agent": "FLUID-Build-Tool/1.0"},
+            )
+            if status != 200:
+                self.logger.warning(f"HTTP {status} fetching schema for v{version}")
+                return None
+            content = body.decode("utf-8")
+            schema = json.loads(content)
+            self.logger.debug(f"Successfully fetched schema for v{version}")
+            return schema
+        except UnsafeURLError as e:
+            self.logger.warning(f"Refusing schema URL for v{version}: {e}")
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             self.logger.warning(f"Invalid schema content for v{version}: {e}")
         except Exception as e:

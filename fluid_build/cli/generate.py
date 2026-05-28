@@ -18,7 +18,9 @@ Subcommands:
     fluid generate transformation         Generate transformation artifacts (dbt, SQL, ...)
     fluid generate schedule               Generate schedule artifacts (Airflow, Dagster, Prefect)
     fluid generate ci                     Generate CI/CD pipelines (GitHub Actions, GitLab CI)
-    fluid generate standard               Export to data product standards (OPDS, ODCS, ODPS, ODPS-Bitol)
+    fluid generate standard               Export to data product standards
+                                          (Bitol ODPS v1.0.0 = default; ODCS; LF/ODPI v4.1
+                                          opt-in via ``--format odps-v4.1``)
 """
 
 from __future__ import annotations
@@ -46,8 +48,12 @@ def register(subparsers: argparse._SubParsersAction):
           dbt                    Alias for transformation when generating dbt projects
           schedule               Generate schedule/orchestration artifacts (Airflow, Dagster, Prefect)
           ci                     Generate CI/CD pipelines (GitHub Actions, GitLab CI)
-          standard               Export to data product standards (OPDS, ODCS, ODPS, ODPS-Bitol)
-          artifacts              Stage-3 fanout: bundle → ODPS, ODCS, OPDS, schedule, policies
+          standard               Export to data product standards
+                                 (Bitol ODPS v1.0.0 = default ``--format odps``;
+                                 ODCS; LF/ODPI v4.1 opt-in ``--format odps-v4.1``)
+          iac                    Compile a contract to an OpenTofu .tf.json module
+          artifacts              Stage-3 fanout: bundle → ODCS, Bitol ODPS,
+                                 LF/ODPI ODPS v4.1, schedule, policies
 
         When called without a subcommand, shows available subcommands.
         """,
@@ -62,8 +68,11 @@ Examples:
   # Generate CI/CD pipeline
   fluid generate ci --system github
 
-  # Export to industry standard
-  fluid generate standard contract.fluid.yaml --format opds
+  # Export to Bitol ODPS (the center-stage, default export)
+  fluid generate standard contract.fluid.yaml --format odps
+
+  # Export to LF/ODPI ODPS v4.1 (opt-in)
+  fluid generate standard contract.fluid.yaml --format odps-v4.1
 
   # List available engines/schedulers/formats
   fluid generate transformation --list
@@ -80,6 +89,7 @@ Examples:
         generate_artifacts,
         generate_ci,
         generate_dbt_tests,
+        generate_iac,
         generate_schedule,
         generate_speed_transformation,
         generate_standard,
@@ -91,6 +101,7 @@ Examples:
     generate_standard.register_subcommand(sub)
     generate_artifacts.register_subcommand(sub)
     generate_dbt_tests.register_subcommand(sub)
+    generate_iac.register_subcommand(sub)
 
     # Default handler (backward compat: no subcommand → transformation)
     p.set_defaults(cmd=COMMAND, func=run)
@@ -128,6 +139,11 @@ def run(args: Any, logger: logging.Logger) -> int:
 
         return generate_standard.run(args, logger)
 
+    if sub == "iac":
+        from . import generate_iac
+
+        return generate_iac.run(args, logger)
+
     if sub == "artifacts":
         from . import generate_artifacts
 
@@ -147,13 +163,20 @@ def run(args: Any, logger: logging.Logger) -> int:
         cprint("  transformation         Generate transformation artifacts (dbt, SQL, etc.)")
         cprint("  schedule               Generate schedule artifacts (Airflow, Dagster, Prefect)")
         cprint("  ci                     Generate CI/CD pipelines (GitHub Actions, GitLab CI)")
-        cprint("  standard               Export to standards (OPDS, ODCS, ODPS, ODPS-Bitol)")
+        cprint(
+            "  standard               Export to standards (Bitol ODPS v1.0.0 = default; "
+            "ODCS; LF/ODPI v4.1 opt-in via --format odps-v4.1)"
+        )
+        cprint("  iac                    Compile a contract to an OpenTofu .tf.json module")
         cprint("")
         cprint("Examples:")
         cprint("  fluid generate transformation")
         cprint("  fluid generate schedule")
         cprint("  fluid generate ci --system github")
-        cprint("  fluid generate standard contract.fluid.yaml --format opds")
+        cprint("  fluid generate standard contract.fluid.yaml --format odps          # Bitol ODPS")
+        cprint(
+            "  fluid generate standard contract.fluid.yaml --format odps-v4.1     # LF/ODPI v4.1"
+        )
         return 0
 
     cprint(f"Unknown subcommand: {sub}")

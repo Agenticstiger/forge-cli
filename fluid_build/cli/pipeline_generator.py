@@ -278,6 +278,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--interactive", action="store_true", help="Interactive mode for configuration"
     )
+    # Wire the dispatcher — without this, `fluid generate-pipeline` errors
+    # with "No command function found". Pinned by
+    # tests/cli/test_subcommand_dispatch_smoke.py.
+    parser.set_defaults(func=run)
 
 
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
@@ -508,5 +512,5 @@ def _show_next_steps(provider: str, output_dir: Path):
     cprint("  • fluid apply --plan plan.json")
     cprint("  • fluid test --coverage")
     cprint("  • fluid viz-plan --output pipeline-viz.html")
-    cprint("  • fluid export-opds --output opds-catalog.json")
-    cprint("  • fluid marketplace publish --catalog opds-catalog.json")
+    cprint("  • fluid generate standard --format odps-v4.1 --out odps-catalog.json")
+    cprint("  • fluid marketplace publish --catalog odps-catalog.json")

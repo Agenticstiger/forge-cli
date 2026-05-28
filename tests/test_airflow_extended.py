@@ -123,8 +123,11 @@ class TestGenerateHelperFunctions:
 
     def test_provider_action_dispatch(self):
         code = _generate_helper_functions()
-        # Should dispatch to concrete modules, not just log
-        assert "handler" in code or "getattr" in code
+        # Provider-action tasks are retired — forge-cli compiles the
+        # contract to OpenTofu and runs `tofu`; the generated helper
+        # fails loud with migration guidance rather than doing CRUD.
+        assert "is retired" in code
+        assert "raise RuntimeError" in code
 
 
 # ── TaskFlow API generator ─────────────────────────────────────────

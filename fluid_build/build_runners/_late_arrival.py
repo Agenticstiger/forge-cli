@@ -56,13 +56,11 @@ manual review.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 LOG = logging.getLogger("fluid.build_runners.late_arrival")
 
@@ -214,35 +212,6 @@ def classify_arrival(
     )
 
 
-def side_output_record(
-    *,
-    payload: Any,
-    classification: ArrivalClassification,
-    event_time: datetime,
-    current_watermark: datetime,
-    allowed_lateness: Optional[timedelta],
-) -> Dict[str, Any]:
-    """Build the side-output row for a late event.
-
-    Used by the runners to construct the ``__late_events`` table
-    write. The ``payload`` is preserved verbatim so downstream
-    consumers can replay the original message; ``_late_arrival_metadata``
-    carries the lateness diagnostics.
-    """
-    return {
-        "_late_arrival_metadata": {
-            "event_time": event_time.isoformat(),
-            "watermark_at_arrival": current_watermark.isoformat(),
-            "lateness_seconds": classification.lateness_seconds,
-            "allowed_lateness_seconds": (
-                allowed_lateness.total_seconds() if allowed_lateness else None
-            ),
-            "reason": classification.reason,
-        },
-        "payload": payload,
-    }
-
-
 def side_output_table_name(target_table: str) -> str:
     """Canonical side-output table name for ``target_table``.
 
@@ -251,31 +220,6 @@ def side_output_table_name(target_table: str) -> str:
     hunting through provider-specific naming.
     """
     return f"{target_table}__late_events"
-
-
-def write_late_event_to_disk(
-    *,
-    workspace_root: Path,
-    product_id: str,
-    target_table: str,
-    record: Dict[str, Any],
-) -> None:
-    """Append one late-event row to a JSONL file under
-    ``.fluid/<product>/runtime/late-events/<target>.jsonl``.
-
-    Used by runners that don't have a managed side-output sink yet
-    (e.g. the local-only path) so late events still land somewhere
-    the operator can inspect. Production runners override with a
-    real sink (Kafka topic, Iceberg table, etc.).
-    """
-    out_dir = workspace_root / ".fluid" / product_id / "runtime" / "late-events"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{target_table}.jsonl"
-    try:
-        with out_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, default=str) + "\n")
-    except OSError as exc:  # pragma: no cover — defensive
-        LOG.warning("late_event_write_failed: path=%s error=%s", out_path, exc)
 
 
 def extract_late_arrival_policy(
@@ -478,8 +422,6 @@ __all__ = [
     "classify_arrival",
     "extract_late_arrival_policy",
     "parse_iso_duration",
-    "side_output_record",
     "side_output_table_name",
     "split_late_events_in_duckdb",
-    "write_late_event_to_disk",
 ]

@@ -19,7 +19,7 @@ artifacts plus a unified MANIFEST.json hashed over every output file.
 Dispatches to existing emitters (``generate standard``, ``policy-compile``,
 ``generate schedule``) without duplicating their logic.
 
-Output layout (default emit set — opds/odps opt-in pending emitter fix)::
+Output layout (default emit set — LF/ODPI ODPS v4.1 opt-in pending emitter fix)::
 
     <out>/
     ├── MANIFEST.json                       # SHA-256 per file + merkle root
@@ -32,9 +32,15 @@ Output layout (default emit set — opds/odps opt-in pending emitter fix)::
 
 Opt-in emitters (broken shape — see trello-verify-odps-linux-foundation)::
 
-    <out>/opds/<product>.opds.json          # should be OPDS v4.1 but emits
-                                            # a homebrew {specVersion: "1.0", ...}
+    <out>/opds/<product>.opds.json          # should be ODPS v4.1 (LF/ODPI) but
+                                            # emits a homebrew {specVersion: "1.0", ...}
                                             # shape that does NOT conform
+
+Note on terminology: this codebase historically used the letter-swap "OPDS"
+to refer to the Linux Foundation's Open Data Product Specification, whose
+canonical acronym is ODPS. The subdir name ``opds/`` and the emit key
+``opds`` are kept for back-compat; new code should use the canonical
+``odps`` key, with ``opds`` as a deprecated alias.
 
 dbt is NOT emitted here. Per plan decision D4, dbt project files are
 execution artifacts, not catalog artifacts — they stay in the product's
@@ -51,9 +57,9 @@ bindings file when the contract declares no access policy.
 
 Upstream versions verified 2026-04-22:
 
-- ODCS v3.1.0: bitol-io/open-data-contract-standard
-- ODPS-Bitol v1.0.0: bitol-io/open-data-product-standard
-- OPDS v4.1: Open-Data-Product-Initiative/v4.1 (emitter needs fix)
+- ODCS v3.1.0:               bitol-io/open-data-contract-standard
+- ODPS-Bitol v1.0.0:         bitol-io/open-data-product-standard
+- ODPS v4.1 (LF/ODPI):       Open-Data-Product-Initiative/v4.1 (emitter needs fix)
 """
 
 from __future__ import annotations
@@ -93,15 +99,17 @@ EMIT_KEYS: Tuple[str, ...] = (
 #
 # - odcs         → bitol-io/open-data-contract-standard v3.1.0 — conformant ✅
 # - odps-bitol   → bitol-io/open-data-product-standard v1.0.0 — conformant ✅
-# - opds         → Open-Data-Product-Initiative/v4.1 — our emitter produces a
-#                  homebrew shape ({specVersion: "1.0", ...}) that does NOT
-#                  match OPDS v4.1's expected shape ({schema, version, product}).
-#                  Opt-in only until fixed (see trello-verify-odps-linux-foundation).
-# - odps         → alias of the broken OPDS emitter, same reason.
+# - odps         → Open-Data-Product-Initiative/v4.1 (LF ODPS v4.1) — our
+#                  emitter produces a homebrew shape ({specVersion: "1.0", ...})
+#                  that does NOT match ODPS v4.1's expected shape
+#                  ({schema, version, product}). Opt-in only until fixed
+#                  (see trello-verify-odps-linux-foundation).
+# - opds         → deprecated letter-swap alias of ``odps`` — same broken
+#                  emitter, kept only for back-compat with pre-2026-05 callers.
 # - schedule     → DAG/flow files; shape is scheduler-specific not schema-pinned
 # - policies     → compiled IAM bindings; shape is internal
 #
-# Users can explicitly opt in to broken emitters via --emit opds,odps,...
+# Users can explicitly opt in to broken emitters via --emit odps,opds,...
 # while upstream alignment work is in flight.
 DEFAULT_EMIT: Tuple[str, ...] = (
     "odps-bitol",
@@ -316,6 +324,25 @@ def parse_emit_set(
             key=unknown[0],
         )
 
+    # Deprecation note for the letter-swap alias. ``opds`` is still routed to
+    # its own subdir / emitter (different on-disk path than ``odps``), so we
+    # don't auto-rewrite — just nudge the operator toward the canonical key.
+    if "opds" in requested:
+        logger.warning(
+            "deprecated_emit_key",
+            extra={
+                "alias": "opds",
+                "canonical": "odps",
+                "note": (
+                    "--emit opds is a deprecated letter-swap alias of --emit odps; "
+                    "both target the Linux Foundation / ODPI ODPS v4.1 spec. The "
+                    "two keys still route to different on-disk subdirectories "
+                    "(opds/ vs odps/) for back-compat — pass --emit odps for the "
+                    "canonical layout."
+                ),
+            },
+        )
+
     # Auto-skip for reference-only.
     if reference_only:
         dropped = [k for k in requested if k in REFERENCE_ONLY_SKIP]
@@ -380,19 +407,37 @@ def _emit_odps(contract_path: Path, out_dir: Path, logger: logging.Logger) -> Li
 
 
 def _emit_odps_bitol(contract_path: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:
-    """Bypass ``generate_standard._export_odps_bitol`` — it calls a wrong method
-    name (``provider.export()``) and AttributeErrors at runtime. Call the
-    provider's real ``render()`` method directly. TODO: file a separate fix
-    for ``_export_odps_bitol`` so other call sites stop hitting the bug."""
-    from fluid_build.providers.odps_standard import OdpsStandardProvider
+    """Emit a complete Bitol ODPS v1.0.0 bundle: 1 product + N sibling ODCS.
+
+    Uses ``BitolOdpsProvider.render(out_dir=...)`` directly so the bundle
+    is self-contained inside ``odps-bitol/`` — every ``contractId`` in the
+    product file resolves to a sibling ``<contractId>.odcs.yaml`` in the
+    same directory. This means ``--emit odps-bitol`` alone produces a
+    usable Bitol bundle; you no longer need ``--emit odps-bitol,odcs``
+    just to avoid dangling ``contractId`` references.
+
+    ``_emit_odcs`` still emits per-port ODCS to ``odcs/`` for the
+    catalog-fanout consumer that prefers one-format-per-subdir layout.
+    """
+    from fluid_build.providers.odps_standard import BitolOdpsProvider
 
     contract = _load_contract(contract_path)
-    slug = _slug_from_contract(contract)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{slug}.odps-bitol.yaml"
-    provider = OdpsStandardProvider()
-    provider.render(contract, out=out, fmt="yaml")
-    return [out]
+
+    provider = BitolOdpsProvider()
+    bundle = provider.render(contract, out_dir=out_dir, fmt="yaml")
+
+    written: List[Path] = []
+    product = bundle.get("product") or {}
+    product_id = product.get("id") or product.get("name") or "product"
+    product_path = out_dir / f"{product_id}.odps.yaml"
+    if product_path.exists():
+        written.append(product_path)
+    for contract_id in bundle.get("contracts") or {}:
+        sibling = out_dir / f"{contract_id}.odcs.yaml"
+        if sibling.exists():
+            written.append(sibling)
+    return written
 
 
 def _emit_odcs(contract_path: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:

@@ -17,12 +17,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 from ..base import Store, StoreRecord, utc_now
 from ..namespaces import normalize_namespace
+
+_log = logging.getLogger(__name__)
 
 
 def _redact_dsn(dsn: str) -> str:
@@ -93,14 +96,33 @@ class PostgresBackend(Store):
             )
         self.conn.commit()
 
+    # ------------------------------------------------------------------
+    # Per-operation guards
+    # ------------------------------------------------------------------
+    # Each public method is wrapped so a transient connection drop (DB
+    # restart, network blip, etc.) degrades to the documented
+    # store-miss shape (``None`` / ``[]`` / ``0``) instead of
+    # surfacing a raw ``psycopg.OperationalError`` mid-forge. The
+    # constructor is hardened by ``factory._safe_store_init``; these
+    # guards keep an already-resolved backend honest across the run.
     def get(self, ns: str, key: str) -> Optional[StoreRecord]:
-        with self.conn.cursor() as cur:
-            cur.execute(
-                "select namespace, key, value_blob, metadata, created_at, expires_at, fluid_version from fluid_store where namespace = %s and key = %s",
-                (ns, key),
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "select namespace, key, value_blob, metadata, created_at, expires_at, fluid_version from fluid_store where namespace = %s and key = %s",
+                    (ns, key),
+                )
+                row = cur.fetchone()
+            return self._row_to_record(row)
+        except Exception as exc:  # noqa: BLE001 - degrade to miss
+            _log.debug(
+                "PostgresBackend.get(%r, %r) failed (%s: %s); returning None",
+                ns,
+                key,
+                type(exc).__name__,
+                exc,
             )
-            row = cur.fetchone()
-        return self._row_to_record(row)
+            return None
 
     def put(
         self,
@@ -123,84 +145,133 @@ class PostgresBackend(Store):
             expires_at=expires_at,
             fluid_version=fluid_version,
         )
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                insert into fluid_store(namespace, key, value_blob, metadata, created_at, expires_at, fluid_version)
-                values (%s, %s, %s, %s, %s, %s, %s)
-                on conflict(namespace, key) do update set
-                    value_blob = excluded.value_blob,
-                    metadata = excluded.metadata,
-                    created_at = excluded.created_at,
-                    expires_at = excluded.expires_at,
-                    fluid_version = excluded.fluid_version
-                """,
-                (
-                    ns,
-                    key,
-                    json.dumps(value, default=str),
-                    json.dumps(metadata or {}, default=str),
-                    created_at,
-                    expires_at,
-                    fluid_version,
-                ),
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into fluid_store(namespace, key, value_blob, metadata, created_at, expires_at, fluid_version)
+                    values (%s, %s, %s, %s, %s, %s, %s)
+                    on conflict(namespace, key) do update set
+                        value_blob = excluded.value_blob,
+                        metadata = excluded.metadata,
+                        created_at = excluded.created_at,
+                        expires_at = excluded.expires_at,
+                        fluid_version = excluded.fluid_version
+                    """,
+                    (
+                        ns,
+                        key,
+                        json.dumps(value, default=str),
+                        json.dumps(metadata or {}, default=str),
+                        created_at,
+                        expires_at,
+                        fluid_version,
+                    ),
+                )
+            self.conn.commit()
+        except Exception as exc:  # noqa: BLE001 - degrade
+            _log.debug(
+                "PostgresBackend.put(%r, %r) failed (%s: %s); " "returning unpersisted record",
+                ns,
+                key,
+                type(exc).__name__,
+                exc,
             )
-        self.conn.commit()
+            # Rollback the failed transaction so the connection is
+            # usable for subsequent operations; ignore secondary
+            # errors during rollback.
+            try:
+                self.conn.rollback()
+            except Exception:  # pragma: no cover - defensive
+                pass
         return record
 
     def query(
         self, ns: str, *, filter: Optional[Dict[str, Any]] = None, limit: int = 10
     ) -> List[StoreRecord]:
         normalized = normalize_namespace(ns)
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                select namespace, key, value_blob, metadata, created_at, expires_at, fluid_version
-                from fluid_store
-                where namespace = %s or namespace like %s
-                order by created_at desc
-                limit %s
-                """,
-                (normalized, f"{normalized}/%", limit),
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select namespace, key, value_blob, metadata, created_at, expires_at, fluid_version
+                    from fluid_store
+                    where namespace = %s or namespace like %s
+                    order by created_at desc
+                    limit %s
+                    """,
+                    (normalized, f"{normalized}/%", limit),
+                )
+                rows = cur.fetchall()
+            return [record for row in rows if (record := self._row_to_record(row)) is not None]
+        except Exception as exc:  # noqa: BLE001 - degrade
+            _log.debug(
+                "PostgresBackend.query(%r) failed (%s: %s); returning empty list",
+                ns,
+                type(exc).__name__,
+                exc,
             )
-            rows = cur.fetchall()
-        return [record for row in rows if (record := self._row_to_record(row)) is not None]
+            return []
 
     def search(
         self, ns: str, query: str, *, mode: str = "exact", limit: int = 10
     ) -> List[StoreRecord]:
-        if mode == "exact":
-            record = self.get(ns, query)
-            return [record] if record else []
-        needle = (query or "").lower()
-        matches: List[StoreRecord] = []
-        for record in self.query(ns, limit=1000):
-            haystack = json.dumps(record.value, default=str).lower()
-            if needle in haystack:
-                matches.append(record)
-            if len(matches) >= limit:
-                break
-        return matches
+        try:
+            if mode == "exact":
+                record = self.get(ns, query)
+                return [record] if record else []
+            needle = (query or "").lower()
+            matches: List[StoreRecord] = []
+            for record in self.query(ns, limit=1000):
+                haystack = json.dumps(record.value, default=str).lower()
+                if needle in haystack:
+                    matches.append(record)
+                if len(matches) >= limit:
+                    break
+            return matches
+        except Exception as exc:  # noqa: BLE001 - degrade
+            _log.debug(
+                "PostgresBackend.search(%r, %r, mode=%r) failed (%s: %s); " "returning empty list",
+                ns,
+                query,
+                mode,
+                type(exc).__name__,
+                exc,
+            )
+            return []
 
     def clear(self, ns: Optional[str] = None) -> int:
-        with self.conn.cursor() as cur:
-            if ns is None:
-                cur.execute("select count(*) from fluid_store")
-                count = cur.fetchone()[0]
-                cur.execute("delete from fluid_store")
-            else:
-                normalized = normalize_namespace(ns)
-                cur.execute(
-                    "select count(*) from fluid_store where namespace = %s or namespace like %s",
-                    (normalized, f"{normalized}/%"),
-                )
-                count = cur.fetchone()[0]
-                cur.execute(
-                    "delete from fluid_store where namespace = %s or namespace like %s",
-                    (normalized, f"{normalized}/%"),
-                )
-        self.conn.commit()
-        return int(count)
+        try:
+            with self.conn.cursor() as cur:
+                if ns is None:
+                    cur.execute("select count(*) from fluid_store")
+                    count = cur.fetchone()[0]
+                    cur.execute("delete from fluid_store")
+                else:
+                    normalized = normalize_namespace(ns)
+                    cur.execute(
+                        "select count(*) from fluid_store where namespace = %s or namespace like %s",
+                        (normalized, f"{normalized}/%"),
+                    )
+                    count = cur.fetchone()[0]
+                    cur.execute(
+                        "delete from fluid_store where namespace = %s or namespace like %s",
+                        (normalized, f"{normalized}/%"),
+                    )
+            self.conn.commit()
+            return int(count)
+        except Exception as exc:  # noqa: BLE001 - degrade
+            _log.debug(
+                "PostgresBackend.clear(%r) failed (%s: %s); returning 0",
+                ns,
+                type(exc).__name__,
+                exc,
+            )
+            try:
+                self.conn.rollback()
+            except Exception:  # pragma: no cover - defensive
+                pass
+            return 0
 
     def _row_to_record(self, row: Any) -> Optional[StoreRecord]:
         if row is None:

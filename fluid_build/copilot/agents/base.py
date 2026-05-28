@@ -491,41 +491,50 @@ class BaseStageAgent:
                     call_llm,
                     call_llm_streaming,
                     consume_streaming_usage,
+                    suppress_call_llm_cost_recording,
                 )
 
-                if streaming_enabled:
-                    from fluid_build.copilot.streaming import (
-                        NullStreamHandler,
-                        StreamingCall,
-                    )
+                # H1 bridge — ``call_llm`` now feeds the RunCostTracker
+                # directly so the runtime's main authoring loop (which
+                # calls ``call_llm`` outside the staged pipeline) is no
+                # longer invisible to ``fluid stats`` / the preview
+                # panel. The staged pipeline owns its own attribution-rich
+                # ``record_call`` further down (with stage + agent_class),
+                # so suppress the bridge here to avoid double-counting.
+                with suppress_call_llm_cost_recording():
+                    if streaming_enabled:
+                        from fluid_build.copilot.streaming import (
+                            NullStreamHandler,
+                            StreamingCall,
+                        )
 
-                    handler = cm.get("stream_handler") or NullStreamHandler()
-                    with StreamingCall(
-                        call_llm_streaming(
+                        handler = cm.get("stream_handler") or NullStreamHandler()
+                        with StreamingCall(
+                            call_llm_streaming(
+                                provider,
+                                config,
+                                system_prompt,
+                                user_prompt,
+                                extra_payload=extra_payload,
+                            ),
+                            handler,
+                        ) as call:
+                            for _chunk in call:
+                                pass
+                        raw = call.full_text
+                        streamed_usage = consume_streaming_usage()
+                        raw_response = streamed_usage if streamed_usage else {}
+                        parsed = safe_json_parse(raw)
+                    else:
+                        raw = call_llm(
                             provider,
                             config,
                             system_prompt,
                             user_prompt,
                             extra_payload=extra_payload,
-                        ),
-                        handler,
-                    ) as call:
-                        for _chunk in call:
-                            pass
-                    raw = call.full_text
-                    streamed_usage = consume_streaming_usage()
-                    raw_response = streamed_usage if streamed_usage else {}
-                    parsed = safe_json_parse(raw)
-                else:
-                    raw = call_llm(
-                        provider,
-                        config,
-                        system_prompt,
-                        user_prompt,
-                        extra_payload=extra_payload,
-                    )
-                    raw_response = {}
-                    parsed = safe_json_parse(raw)
+                        )
+                        raw_response = {}
+                        parsed = safe_json_parse(raw)
             except (httpx.HTTPError, httpx.HTTPStatusError) as exc:
                 raise classify_provider_error(exc, provider=provider.name) from exc
             try:
@@ -570,6 +579,35 @@ class BaseStageAgent:
             # name so the cost summary's per-agent table tells
             # operators WHICH agent drove the cost (not just which
             # model was billed).
+            #
+            # Wave 1 — also pull litellm's per-call USD cost AND the
+            # Anthropic prompt-cache token counts from the litellm
+            # adapter's thread-locals so the run summary reflects the
+            # accurate price + the cache-write/read split. Both are
+            # no-ops on non-litellm code paths (the getattr defaults
+            # to None / zeros) so this stays backward-compatible.
+            usd_override: Optional[float] = None
+            cache_creation = 0
+            cache_read = 0
+            try:
+                from fluid_build.cli.forge_copilot_llm_litellm import (
+                    get_last_cache_tokens,
+                    get_last_litellm_cost_usd,
+                )
+
+                usd_override = get_last_litellm_cost_usd()
+                cache_tokens = get_last_cache_tokens()
+                cache_creation = int(cache_tokens.get("cache_creation_input_tokens", 0) or 0)
+                cache_read = int(cache_tokens.get("cache_read_input_tokens", 0) or 0)
+            except Exception:  # pragma: no cover — defensive
+                pass
+            # Fall back to the canonical usage shape's cache fields when
+            # the thread-local path didn't fire (e.g. streaming path
+            # populated ``usage`` directly with cache_*_tokens via
+            # ``_record_streaming_usage``).
+            if not (cache_creation or cache_read):
+                cache_creation = int(usage.get("cache_creation_input_tokens", 0) or 0)
+                cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
             get_run_tracker().record_call(
                 provider=provider.name,
                 model=config.model,
@@ -577,6 +615,9 @@ class BaseStageAgent:
                 output_tokens=int(usage.get("output_tokens", 0) or 0),
                 stage=self.stage,
                 agent_class=type(self).__name__,
+                usd_override=usd_override,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
             )
         # Sprint #6 — enforce the cost ceiling (if any). Runs
         # AFTER the call's tokens are recorded so the running

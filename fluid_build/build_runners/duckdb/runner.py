@@ -31,7 +31,6 @@ when it detects an acquisition build with ``engine: duckdb``.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import time
 from dataclasses import dataclass
@@ -40,7 +39,6 @@ from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from fluid_build.api.runner import (
     RunContext,
-    Runner,
     RunnerCapability,
     RunPlan,
     RunResult,
@@ -51,7 +49,6 @@ from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.api.source import AcquisitionMode
 from fluid_build.providers._sql_safety import (
     build_libpq_dsn,
-    libpq_escape,
     quote_string_literal,
     validate_ident,
 )
@@ -59,7 +56,6 @@ from fluid_build.providers._sql_safety import (
 from .._acquisition_common import (
     enforce_schema_policy_or_raise,
     finalize_run_result,
-    generate_run_id,
     resolve_connection_secrets,
     utc_now_iso,
     write_run_record,
@@ -1213,32 +1209,14 @@ def execute_duckdb_build(
     state_root: Optional[Path] = None,
 ) -> int:
     """Glue function called by build_runners.base. Returns exit code."""
-    from fluid_build.api.runner import RunContext
-    from fluid_build.api.source import SinkSpec, SourceSpec
-    from fluid_build.build_runners._state import FileStateStore
+    from fluid_build.api.hooks import HookChain
 
-    from .._acquisition_common import get_acquisition_build_props
-    from ..base import _resolve_env_placeholders
+    from .._acquisition_common import (
+        build_acquisition_run_context,
+        get_acquisition_build_props,
+    )
 
     props = get_acquisition_build_props(build)
-    source_dict = props.get("source")
-    if not source_dict:
-        LOG.error("acquisition build missing properties.source")
-        return 1
-
-    # Resolve {{ env.NAME }} placeholders in connection (host, port, etc.) so
-    # the runner sees real values, not templates. Mirrors how the dbt and
-    # python runners already handle env interpolation via build_runners.base.
-    source_dict = _resolve_env_placeholders(source_dict)
-    source = SourceSpec.from_dict(source_dict)
-    sink = SinkSpec.from_dict(props.get("sink"))
-    workdir = str(contract_dir)
-    state_root = state_root or (contract_dir / ".fluid")
-    store = FileStateStore(state_root)
-
-    from fluid_build.api.hooks import HookChain
-    from fluid_build.build_runners._cost import InMemoryCostTracker
-    from fluid_build.build_runners._lineage import NullLineageEmitter
 
     # Build the per-build HookChain from ``properties.preLand`` —
     # contracts declare pre-landing hooks that run on each batch
@@ -1284,20 +1262,17 @@ def execute_duckdb_build(
             # taint-flow false positive.
             LOG.debug("unknown_preLand_hook (skipped — see contract.preLand)")
 
-    ctx = RunContext(
-        run_id=generate_run_id(),
-        product_id=contract.get("id", "unknown"),
-        build_id=build.get("id", "unknown"),
-        contract=contract,
-        source=source,
-        sink=sink,
-        state_store=store,
-        hook_chain=HookChain(hooks=hooks),
-        lineage=NullLineageEmitter(),
-        cost_tracker=InMemoryCostTracker(),
-        workdir=workdir,
+    ctx = build_acquisition_run_context(
+        build,
+        contract,
+        contract_dir,
         sample_rows=sample_rows,
+        state_root=state_root,
+        hook_chain=HookChain(hooks=hooks),
     )
+    if ctx is None:
+        return 1
+    store = ctx.state_store
 
     runner = DuckdbRunner()
     if dry_run:

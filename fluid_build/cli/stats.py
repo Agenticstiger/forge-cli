@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,9 +56,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "--by",
-        choices=["provider", "type", "engine", "run"],
+        choices=["provider", "type", "engine", "run", "mode"],
         default=None,
-        help="Group results by this dimension.",
+        help=(
+            "Group results by this dimension. ``mode`` separates "
+            "``deterministic`` runs from ``llm`` runs."
+        ),
     )
     p.add_argument(
         "--root",
@@ -70,14 +74,56 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Emit machine-readable JSON instead of a table.",
     )
+    p.add_argument(
+        "--judge",
+        dest="judge",
+        action="store_true",
+        help=(
+            "Aggregate judge.json receipts (out-of-loop LLM-as-judge scores) "
+            "instead of cost.json. Not combinable with --by — group manually "
+            "from the --json output instead."
+        ),
+    )
+    # Wire the dispatcher — `ProductionCLI._execute_command` looks up
+    # `args.func`. Without this, `fluid stats` errors with "No command
+    # function found" instead of running. Pinned by
+    # tests/cli/test_subcommand_dispatch_smoke.py.
+    p.set_defaults(func=run)
 
 
 def run(args, logger: logging.Logger) -> int:
     """Execute ``fluid stats``."""
     root = Path(args.root or Path.cwd()).resolve()
-    cutoff = _parse_since(args.since)
-    runs = list(_collect_runs(root, cutoff=cutoff))
+    try:
+        cutoff = _parse_since(args.since)
+    except ValueError as exc:
+        # H21: malformed --since gets a clean argparse-style error and
+        # non-zero exit instead of silently no-filtering.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
+    if getattr(args, "judge", False):
+        # H20: reject ``--judge --by X`` rather than silently dropping
+        # ``--by``. Grouping judge axes is a separate (non-trivial) UX
+        # surface; until then, document the rejection and point at the
+        # ``--json`` escape hatch.
+        if getattr(args, "by", None):
+            print(
+                f"error: --judge --by {args.by} is not yet supported. "
+                "Group manually from the --json output (each run carries "
+                "axes + total + run_id).",
+                file=sys.stderr,
+            )
+            return 2
+        judge_runs = list(_collect_judge_runs(root, cutoff=cutoff))
+        summary = _summarise_judge(judge_runs)
+        if args.emit_json:
+            print(json.dumps(summary, indent=2, sort_keys=True))
+            return 0
+        _render_judge_table(summary, runs_count=len(judge_runs))
+        return 0
+
+    runs = list(_collect_runs(root, cutoff=cutoff))
     summary = _summarise(runs, group_by=args.by)
     if args.emit_json:
         print(json.dumps(summary, indent=2, sort_keys=True))
@@ -106,6 +152,20 @@ def _collect_runs(root: Path, *, cutoff: Optional[datetime]) -> Iterable[Dict[st
             continue
         receipt = _load_receipt(run_dir)
         contract = _load_contract_for_run(run_dir)
+        # H22 — surface ``mode`` so deterministic runs (no LLM call)
+        # are distinguishable from LLM runs in ``fluid stats --by mode``
+        # output. Older cost.json files (preview-panel-authored) don't
+        # carry ``mode`` — default to ``"llm"`` when tokens were spent,
+        # otherwise ``"deterministic"`` so the dimension is always
+        # populated even for receipts predating this field.
+        mode_value = data.get("mode")
+        if not mode_value:
+            mode_value = (
+                "deterministic"
+                if int(data.get("total_tokens", 0) or 0) == 0
+                and int(data.get("total_calls", 0) or 0) == 0
+                else "llm"
+            )
         yield {
             "run_id": run_id,
             "timestamp": ts.isoformat() if ts else "",
@@ -120,6 +180,7 @@ def _collect_runs(root: Path, *, cutoff: Optional[datetime]) -> Iterable[Dict[st
             "layer": (contract or {}).get("metadata", {}).get("layer", ""),
             "engine": (contract or {}).get("builds", [{}])[0].get("engine", ""),
             "files_count": len((receipt or {}).get("files_written", []) or []),
+            "mode": mode_value,
         }
 
 
@@ -134,26 +195,45 @@ def _parse_run_timestamp(run_id: str) -> Optional[datetime]:
 
 
 def _parse_since(spec: Optional[str]) -> Optional[datetime]:
-    """Parse a since-spec like ``30d`` / ``24h`` / ``2026-04-01``."""
+    """Parse a since-spec like ``30d`` / ``24h`` / ``2026-04-01``.
+
+    H21: malformed input raises :class:`ValueError` with a one-line
+    example so the user gets immediate feedback instead of silently
+    seeing every run unfiltered.  Empty / ``None`` legitimately means
+    "no cutoff" — those still return ``None``.  Mirrors the pattern in
+    :mod:`fluid_build.cli.memory_cmd` for ``--older-than``.
+    """
     if not spec:
         return None
+    raw = spec
     spec = spec.strip().lower()
+    if not spec:
+        return None
     now = datetime.now(timezone.utc)
     if spec.endswith("d"):
         try:
             return now - _delta_days(int(spec[:-1]))
-        except ValueError:
-            return None
+        except ValueError as exc:
+            raise ValueError(
+                f"--since must look like '30d', '24h', or an ISO date "
+                f"(e.g. 2026-04-01); got {raw!r}"
+            ) from exc
     if spec.endswith("h"):
         try:
             return now - _delta_hours(int(spec[:-1]))
-        except ValueError:
-            return None
+        except ValueError as exc:
+            raise ValueError(
+                f"--since must look like '30d', '24h', or an ISO date "
+                f"(e.g. 2026-04-01); got {raw!r}"
+            ) from exc
     try:
         dt = datetime.fromisoformat(spec)
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
+    except ValueError as exc:
+        raise ValueError(
+            f"--since must look like '30d', '24h', or an ISO date "
+            f"(e.g. 2026-04-01); got {raw!r}"
+        ) from exc
 
 
 def _delta_days(n: int):
@@ -240,6 +320,7 @@ def _dim_key(group_by: str) -> str:
         "type": "product_type",
         "engine": "engine",
         "run": "run_id",
+        "mode": "mode",
     }.get(group_by, group_by)
 
 
@@ -284,6 +365,98 @@ def _render_table(summary: Dict[str, Any], *, group_by: Optional[str], runs_coun
                     f"tokens={bucket['total_tokens']}  "
                     f"usd=${bucket['total_usd']:.4f}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Judge aggregation — parallel surface that walks judge.json receipts.
+# Out-of-loop LLM-as-judge scores live at ``.fluid/agents/<run-id>/judge.json``
+# (see :mod:`fluid_build.copilot.agents.judge_agent`).
+# ---------------------------------------------------------------------------
+
+
+def _collect_judge_runs(root: Path, *, cutoff: Optional[datetime]) -> Iterable[Dict[str, Any]]:
+    """Yield one record per ``judge.json`` found under ``.fluid/agents/``."""
+    for judge_path in root.rglob(".fluid/agents/*/judge.json"):
+        try:
+            data = json.loads(judge_path.read_text(encoding="utf-8") or "{}")
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("stats_skip_unreadable_judge: %s — %s", judge_path, exc)
+            continue
+        run_dir = judge_path.parent
+        run_id = run_dir.name
+        ts = _parse_run_timestamp(run_id)
+        if cutoff and ts and ts < cutoff:
+            continue
+        axes = data.get("axes") or {}
+        # Axes can be either a flat ``{axis: int}`` or a structured
+        # ``{axis: {score, reasoning, suggestions}}``. Normalise to flat.
+        flat_axes: Dict[str, int] = {}
+        for axis, payload in axes.items():
+            if isinstance(payload, dict):
+                flat_axes[axis] = int(payload.get("score", 0) or 0)
+            else:
+                try:
+                    flat_axes[axis] = int(payload or 0)
+                except (TypeError, ValueError):
+                    flat_axes[axis] = 0
+        yield {
+            "run_id": run_id,
+            "timestamp": ts.isoformat() if ts else "",
+            "total": int(data.get("total", sum(flat_axes.values())) or 0),
+            "model": data.get("model", ""),
+            "axes": flat_axes,
+        }
+
+
+def _summarise_judge(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Roll up judge scores: average per axis, average total, count."""
+    if not runs:
+        return {"runs_count": 0, "axes": {}, "average_total": 0.0}
+    axes_sum: Dict[str, int] = defaultdict(int)
+    axes_count: Dict[str, int] = defaultdict(int)
+    total_sum = 0
+    for r in runs:
+        total_sum += r["total"]
+        for axis, score in r["axes"].items():
+            axes_sum[axis] += score
+            axes_count[axis] += 1
+    axes_avg = {
+        axis: round(axes_sum[axis] / axes_count[axis], 2) if axes_count[axis] else 0.0
+        for axis in axes_sum
+    }
+    return {
+        "runs_count": len(runs),
+        "average_total": round(total_sum / len(runs), 2),
+        "axes": axes_avg,
+        "latest_run": runs[-1] if runs else None,
+    }
+
+
+def _render_judge_table(summary: Dict[str, Any], *, runs_count: int) -> None:
+    try:
+        from rich.console import Console
+        from rich.table import Table
+
+        out = Console()
+        out.print(
+            f"[bold]fluid stats --judge[/bold] — {runs_count} run"
+            f"{'s' if runs_count != 1 else ''} · "
+            f"avg total {summary['average_total']:.2f}/30"
+        )
+        if summary.get("axes"):
+            t = Table()
+            t.add_column("Axis")
+            t.add_column("Average (0..5)", justify="right")
+            for axis in sorted(summary["axes"]):
+                t.add_row(axis, f"{summary['axes'][axis]:.2f}")
+            out.print(t)
+    except Exception:  # noqa: BLE001
+        print(
+            f"fluid stats --judge — {runs_count} runs · "
+            f"avg total {summary['average_total']:.2f}/30"
+        )
+        for axis in sorted(summary.get("axes", {})):
+            print(f"  {axis:<16}  {summary['axes'][axis]:.2f}")
 
 
 __all__ = ["COMMAND", "register", "run"]

@@ -48,7 +48,7 @@ jobs:
       # security review (CODEOWNERS gate on .github/workflows/*).
       - name: Check for pull_request_target trigger outside allowlist
         run: |
-          allowlist='/(actionlint|docs-reminder|welcome|labeler)\.yml:'
+          allowlist='/(actionlint|docs-reminder|welcome|labeler|integration-label-guard)\.yml:'
           violations=$(grep -rEn '^[[:space:]]*pull_request_target[[:space:]]*:' .github/workflows/ \
             | grep -Ev "$allowlist" || true)
           if [ -n "$violations" ]; then
@@ -74,3 +74,27 @@ jobs:
             fi
             echo "integration.yml triggers OK."
           fi
+
+      # Sanity check: the admin lanes run heavier / credentialed work
+      # against PR code, so each MUST be bound to its environment (the
+      # required-reviewer gate). An edit that drops the `environment:`
+      # line would silently un-gate the lane.
+      - name: Check admin lanes are environment-gated
+        run: |
+          fail=0
+          check() {
+            file=".github/workflows/$1"
+            env="$2"
+            [ -f "$file" ] || return 0
+            if grep -Eq "^[[:space:]]*environment:[[:space:]]*${env}[[:space:]]*$" "$file"; then
+              echo "${file} is environment-gated (${env}) OK."
+            else
+              echo "::error::${file} must declare 'environment: ${env}'."
+              echo "::error::That environment's required-reviewer rule keeps"
+              echo "::error::credentials away from un-reviewed PR code."
+              fail=1
+            fi
+          }
+          check integration-live.yml integration-live
+          check integration-emulated-heavy.yml integration-emulated
+          [ "$fail" -eq 0 ]

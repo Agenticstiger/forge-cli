@@ -256,14 +256,14 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         {"name": "Run Tests", "run": commands["test"]},
                         {
                             "name": "Generate Artifacts",
-                            "run": f"{commands['visualize']} && {commands['publish_opds']}",
+                            "run": f"{commands['visualize']} && {commands['publish_odps']}",
                         },
                         {
                             "name": "Upload Artifacts",
                             "uses": _pin_action("actions/upload-artifact@v4"),
                             "with": {
                                 "name": "fluid-artifacts",
-                                "path": "plan.json\npipeline-viz.html\ndependency-graph.png\nopds-catalog.json\ntest-results/",
+                                "path": "plan.json\npipeline-viz.html\ndependency-graph.png\nodps-catalog.json\ntest-results/",
                             },
                         },
                     ],
@@ -497,7 +497,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                 },
                 {
                     "name": "Publish to Marketplace",
-                    "run": f"{commands['publish_opds']} && {commands['marketplace_publish']}",
+                    "run": f"{commands['publish_odps']} && {commands['marketplace_publish']}",
                     "if": f"'{env}' == 'prod' && {str(config.enable_marketplace_publishing).lower()}",
                 },
             ]

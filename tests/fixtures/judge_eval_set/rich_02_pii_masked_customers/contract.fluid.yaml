@@ -1,0 +1,113 @@
+fluidVersion: "0.7.3"
+kind: DataProduct
+id: rich.customers_v3
+name: Customer Master
+description: |
+  Aggregate Silver/ADP customer master derived from CRM, billing, and
+  app-event sources. Every PII column is classified and masked under
+  GDPR Article 4(5). Owner is the data-protection officer's queue.
+domain: crm
+
+metadata:
+  layer: Silver
+  productType: ADP
+  owner:
+    team: customer-data-platform
+    email: cdp-team@example.com
+    dpoContact: dpo@example.com
+  classification: restricted
+  refreshCadence: daily
+  sla:
+    freshness: "P1D"
+    availability: "99.5%"
+  gdprApplicable: true
+
+retention:
+  runState: P30D
+  runLogs: P90D
+  lineage: P365D
+  data: P1095D
+
+consumes:
+  - id: bronze.crm_customers
+  - id: bronze.app_events
+
+exposes:
+  - exposeId: customer_master
+    name: dim_customers
+    kind: table
+    binding:
+      platform: snowflake
+      format: table
+      location:
+        database: ANALYTICS_PROD
+        schema: CRM
+        table: DIM_CUSTOMERS
+      clustering:
+        - customer_id
+    contract:
+      schema:
+        - name: customer_id
+          type: STRING
+          primaryKey: true
+          nullable: false
+          classification: pii_indirect
+          masking:
+            algorithm: tokenize
+            scope: external_only
+          description: "Stable surrogate key. Tokenized when exported externally."
+        - name: email
+          type: STRING
+          nullable: true
+          classification: pii
+          masking:
+            algorithm: partial_mask
+            pattern: "user***@***.com"
+          description: "Primary contact email; partially masked for analyst role."
+        - name: phone
+          type: STRING
+          nullable: true
+          classification: pii
+          masking:
+            algorithm: partial_mask
+            pattern: "***-***-NNNN"
+          description: "E.164 phone number; last-4 visible for service-desk reconciliation."
+        - name: full_name
+          type: STRING
+          nullable: true
+          classification: pii
+          masking:
+            algorithm: hash_sha256
+            scope: non_owner_role
+          description: "Combined first+last legal name; hashed outside owner role."
+        - name: country_code
+          type: STRING
+          nullable: false
+          enum: ["US", "GB", "DE", "FR", "JP", "AU", "CA", "BR"]
+          description: "Primary residence country (ISO-3166-1 alpha-2)."
+        - name: signup_date
+          type: DATE
+          nullable: false
+          description: "Account creation date."
+        - name: tier
+          type: STRING
+          nullable: false
+          enum: ["free", "pro", "business", "enterprise"]
+          description: "Current subscription tier."
+        - name: lifetime_value_cents
+          type: INT64
+          nullable: false
+          min: 0
+          description: "Lifetime customer value in cents (90-day rolling)."
+        - name: is_active
+          type: BOOLEAN
+          nullable: false
+          description: "Has logged in within the last 365 days."
+        - name: consent_marketing
+          type: BOOLEAN
+          nullable: false
+          description: "GDPR Article 7 marketing-communications consent flag."
+        - name: updated_at
+          type: TIMESTAMP
+          nullable: false
+          description: "Last source-record update."

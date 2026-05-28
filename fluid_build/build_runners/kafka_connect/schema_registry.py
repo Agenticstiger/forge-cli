@@ -44,9 +44,17 @@ class SchemaRegistryClient:
     """
 
     def __init__(self, base_url: str, *, timeout_seconds: float = 10.0):
-        import httpx
+        # SSRF guard — schema-registry URL is operator-supplied via
+        # contract.fluid.yaml. allow_private=True for typical
+        # cluster-internal registries; the hook still validates scheme
+        # + DNS-pins the connection.
+        from fluid_build.util.safe_http import safe_httpx_client
 
-        self._client = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout_seconds)
+        self._client = safe_httpx_client(
+            base_url=base_url,
+            timeout=timeout_seconds,
+            allow_private=True,
+        )
 
     def close(self) -> None:
         self._client.close()

@@ -81,6 +81,226 @@ def _business_keys_for_table(table: TableDefinition) -> List[str]:
     return [f"{_slug(table.name)}_id"]
 
 
+# ── H2: Dimensional classification helpers ─────────────────────────────
+#
+# Borrow-before-build receipts:
+# - Kimball Group / dbt blog "Building a Kimball dimensional model with
+#   dbt" — fact tables carry many FKs + numeric measures, dimensions have
+#   single PK + descriptive attrs + no outgoing FKs.
+#   (https://docs.getdbt.com/blog/kimball-dimensional-model,
+#    https://github.com/Data-Engineer-Camp/dbt-dimensional-modelling)
+# - Kimball "Calendar Date Dimension" — every date column on a fact
+#   table should reference a calendar dim_date.
+#   (https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/calendar-date-dimension/)
+# - Kimball Design Tip #95 / forum thread on "Order Header/Line Item"
+#   — the line-item table is the fact (lowest grain), not the header.
+#   (https://www.kimballgroup.com/2007/10/design-tip-95-patterns-to-avoid-when-modeling-headerline-item-transactions/)
+#
+# Reuse strategy: adapt-the-pattern. We don't bring in a dbt-utils
+# dependency for a pure heuristic — but we mirror its rules exactly:
+# * Fact: has FKs to other tables AND has numeric non-key columns
+# * Dimension: pointed-AT by other tables' FKs OR has descriptive
+#   attributes + a single PK
+# * Measures: numeric NON-PK, NON-FK columns only — never IDs.
+# * Dates: any date/timestamp column on a fact → emit a shared
+#   ``dim_date`` and tag the column as a degenerate timestamp FK.
+
+
+_NUMERIC_TYPE_TOKENS = ("INT", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE", "REAL")
+_DATE_TYPE_TOKENS = ("DATE", "TIMESTAMP", "DATETIME", "TIME")
+_ID_NAME_SUFFIXES = ("_id", "_key", "_sk", "_fk")
+_ID_EXACT_NAMES = frozenset({"id", "key", "uuid", "guid"})
+
+
+def _is_id_column(column_name: str) -> bool:
+    """True when the column name pattern indicates it's an identifier.
+
+    Adapted from dbt-utils / dbt-dimensional-modelling tutorial:
+    "IDs that end in _id, _key, _sk, _fk, or are exactly 'id', 'key',
+    'uuid', 'guid' are never measures."
+    """
+    lower = column_name.strip().lower()
+    if lower in _ID_EXACT_NAMES:
+        return True
+    return lower.endswith(_ID_NAME_SUFFIXES)
+
+
+def _is_numeric_type(logical_type: str) -> bool:
+    upper = logical_type.upper()
+    return any(token in upper for token in _NUMERIC_TYPE_TOKENS)
+
+
+def _is_date_type(logical_type: str) -> bool:
+    upper = logical_type.upper()
+    return any(token in upper for token in _DATE_TYPE_TOKENS)
+
+
+def _infer_foreign_keys(table: TableDefinition, all_table_names: Sequence[str]) -> List[str]:
+    """Infer FK columns by name pattern + cross-reference with siblings.
+
+    Without explicit FOREIGN KEY parsing (the DDL parser today only
+    extracts PRIMARY KEYs), we approximate FKs by:
+    1. Column name ends in ``_id`` AND its stem matches another table
+       name (e.g. ``customer_id`` ↔ ``customers``).
+    2. Column name ends in ``_id`` AND is not the table's own PK.
+       (Heuristic: ``order_items.order_id`` is an FK even when there's
+       no explicit ``orders`` sibling visible to this batch.)
+
+    This is the same shape dbt-utils' ``generate_surrogate_key`` helper
+    leans on for FK columns, just at parser-time rather than at SQL
+    compile time.
+    """
+    pk_set = {key.lower() for key in table.primary_keys}
+    sibling_stems = {_slug(other).lower() for other in all_table_names if other != table.name}
+    fks: List[str] = []
+    for column in table.columns:
+        name_lower = column.name.lower()
+        if not _is_id_column(column.name):
+            continue
+        if name_lower in pk_set:
+            # The table's own PK is not an FK (degenerate dim, not FK).
+            continue
+        # Strip trailing _id/_key/_sk/_fk → match against sibling names.
+        stem = name_lower
+        for suffix in _ID_NAME_SUFFIXES:
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        # Stem matches a sibling table name (with/without trailing 's').
+        if stem in sibling_stems or f"{stem}s" in sibling_stems:
+            fks.append(column.name)
+            continue
+        # Even without a sibling match, an `_id` column that isn't
+        # the PK is most likely an FK (the table points-TO something
+        # not in this DDL batch).
+        fks.append(column.name)
+    return fks
+
+
+def _classify_fact_or_dim(
+    table: TableDefinition,
+    all_table_names: Sequence[str],
+    referenced_by: Dict[str, int],
+) -> str:
+    """Return ``"fact"`` or ``"dim"`` for a single table.
+
+    Rules (Kimball / dbt-dimensional-modelling):
+    * If the table is REFERENCED-AT by ≥1 other table's FK → it's a
+      dimension (a thing being described).
+    * If the table CARRIES ≥1 FK AND has ≥1 numeric non-key column → fact
+      (it records measurements about other things).
+    * If the table carries ≥1 FK but has no numeric measures → fact
+      with degenerate measures (still a fact — events without amounts,
+      e.g. clickstream, are common).
+    * Else → dimension (a reference table with descriptive attrs).
+    """
+    ref_count = referenced_by.get(table.name, 0)
+    fks = _infer_foreign_keys(table, all_table_names)
+    has_outgoing_fks = bool(fks)
+    # Tables pointed-at by other FKs are dimensions even if they
+    # themselves carry FKs (rare: snowflake-schema sub-dimension).
+    # We bias toward fact when the table is at the leaf (no inbound
+    # references) AND has outgoing FKs.
+    if has_outgoing_fks and ref_count == 0:
+        return "fact"
+    if ref_count >= 1:
+        return "dim"
+    if has_outgoing_fks:
+        return "fact"
+    return "dim"
+
+
+def _build_referenced_by_counts(tables: Sequence[TableDefinition]) -> Dict[str, int]:
+    """Count how many sibling tables reference each table by name pattern.
+
+    Mirrors the name-pattern inference in ``_infer_foreign_keys`` but
+    flipped: for every table T, count how many other tables have a
+    column matching T's name (with/without trailing 's') + ``_id``.
+    """
+    names = [t.name for t in tables]
+    name_stems_to_table: Dict[str, str] = {}
+    for name in names:
+        stem = _slug(name).lower()
+        name_stems_to_table[stem] = name
+        # Also map without trailing 's' so ``customers`` and ``customer``
+        # both catch ``customer_id``.
+        if stem.endswith("s"):
+            name_stems_to_table[stem[:-1]] = name
+
+    counts: Dict[str, int] = {name: 0 for name in names}
+    for table in tables:
+        pk_set = {key.lower() for key in table.primary_keys}
+        for column in table.columns:
+            name_lower = column.name.lower()
+            if not _is_id_column(column.name) or name_lower in pk_set:
+                continue
+            stem = name_lower
+            for suffix in _ID_NAME_SUFFIXES:
+                if stem.endswith(suffix):
+                    stem = stem[: -len(suffix)]
+                    break
+            referenced = name_stems_to_table.get(stem)
+            if referenced is not None and referenced != table.name:
+                counts[referenced] = counts.get(referenced, 0) + 1
+    return counts
+
+
+def _extract_measure_columns(table: TableDefinition) -> List[Any]:
+    """Return numeric NON-key columns from a fact table.
+
+    The bug we're fixing (UX audit H2): the previous heuristic listed
+    every numeric column as a measure, including ``id`` (PK) and
+    ``customer_id`` (FK). dbt-dimensional-modelling explicitly excludes
+    these — IDs are never measures, only revenue/quantity/price-style
+    columns are.
+    """
+    return [
+        column
+        for column in table.columns
+        if _is_numeric_type(column.logical_type) and not _is_id_column(column.name)
+    ]
+
+
+def _extract_date_columns(table: TableDefinition) -> List[Any]:
+    """Return date/timestamp columns from a fact table.
+
+    Used to drive ``dim_date`` extraction: every fact-table date column
+    should reference a shared calendar dimension, per Kimball.
+    """
+    return [column for column in table.columns if _is_date_type(column.logical_type)]
+
+
+def _build_dim_date() -> Any:
+    """Build a canonical ``dim_date`` (calendar) dimension.
+
+    Borrows the standard Kimball calendar attribute set (year / quarter /
+    month / day / day_of_week / is_weekend / fiscal_period) — the same
+    columns dbt-date and dbt-utils' ``date_spine`` produce. Surrogate
+    key is ``date_sk`` (YYYYMMDD pattern, standard in Kimball).
+    """
+    from fluid_build.copilot.schemas.data_model import DimensionTable, FieldDefinition
+
+    return DimensionTable(
+        name="dim_date",
+        description=(
+            "Calendar dimension (Kimball). Attached to fact-table date "
+            "columns for time-based slicing."
+        ),
+        surrogate_key="date_sk",
+        natural_keys=["date_day"],
+        attributes=[
+            FieldDefinition(name="date_day", data_type="DATE"),
+            FieldDefinition(name="year", data_type="INT"),
+            FieldDefinition(name="quarter", data_type="INT"),
+            FieldDefinition(name="month", data_type="INT"),
+            FieldDefinition(name="day", data_type="INT"),
+            FieldDefinition(name="day_of_week", data_type="INT"),
+            FieldDefinition(name="is_weekend", data_type="BOOLEAN"),
+            FieldDefinition(name="fiscal_period", data_type="STRING", nullable=True),
+        ],
+    )
+
+
 def _merge_dv2_skeleton(emitted: DV2Model, skeleton: DV2Model) -> DV2Model:
     repaired = emitted.model_copy(deep=True)
     existing_hubs = {hub.hub_table_name for hub in repaired.hubs}

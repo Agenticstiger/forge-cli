@@ -261,28 +261,30 @@ def _build_checks() -> List[DoctorCheck]:
             ),
         ),
         DoctorCheck(
-            "module:unity_registrar",
+            "module:datamesh_manager_registrar",
             DoctorScope.CATALOG,
             lambda: _check_python_module(
-                "fluid_build.build_runners.catalog_registrars.unity", DoctorScope.CATALOG
-            ),
-        ),
-        DoctorCheck(
-            "module:glue_registrar",
-            DoctorScope.CATALOG,
-            lambda: _check_python_module(
-                "fluid_build.build_runners.catalog_registrars.glue", DoctorScope.CATALOG
-            ),
-        ),
-        DoctorCheck(
-            "module:snowflake_horizon_registrar",
-            DoctorScope.CATALOG,
-            lambda: _check_python_module(
-                "fluid_build.build_runners.catalog_registrars.snowflake_horizon",
+                "fluid_build.build_runners.catalog_registrars.datamesh_manager",
                 DoctorScope.CATALOG,
             ),
         ),
     ]
+    # Unity Catalog publish registrar dropped in
+    # ``feat(catalog): drop Unity Catalog publish registrar`` — the OSS
+    # v0.4 server doesn't fit the canonical-payload promise (MANAGED
+    # disabled, EXTERNAL URI required, no UPSERT primitive). Doctor
+    # used to import-check ``catalog_registrars.unity``; with the
+    # module gone that check would now WARN forever. Removed from the
+    # registry so ``doctor --scope catalog`` returns all-OK.
+    #
+    # Glue + Snowflake Horizon publish registrars dropped in
+    # ``feat(iac): OpenTofu autogenerator`` — their boto3/HTTP push
+    # was folded into the IaC emit
+    # (``iac/providers/aws.py::_emit_glue`` +
+    # ``iac/providers/snowflake.py::_build_horizon_table_comment``).
+    # The corresponding ``module:glue_registrar`` and
+    # ``module:snowflake_horizon_registrar`` doctor checks were
+    # removed alongside the registrar modules so this scope stays all-OK.
 
 
 def run_doctor(scope: DoctorScope) -> DoctorReport:

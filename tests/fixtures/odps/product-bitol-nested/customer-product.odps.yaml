@@ -1,0 +1,17 @@
+# Nested layout: product at root, ODCS contracts in contracts/ subdir.
+# Exercises the resolver's candidate-path probing across {<base>, contracts/}.
+apiVersion: v1.0.0
+kind: DataProduct
+id: nested.customer.product
+name: Nested Customer Product
+version: 1.0.0
+status: draft
+domain: customer
+team:
+  members:
+    - name: data-platform
+      email: data-platform@example.com
+outputPorts:
+  - name: customers
+    version: 1.0.0
+    contractId: nested.customer.product.customers

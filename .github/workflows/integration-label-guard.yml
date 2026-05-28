@@ -1,0 +1,48 @@
+# Re-vouch hygiene for the admin-gated integration lanes.
+#
+# When a PR carrying `ci:integration-live` or `ci:integration-emulated`
+# receives a new push, this strips that label so a maintainer must
+# deliberately re-apply it after reviewing the new commits — the
+# GitHub-native equivalent of Prow invalidating `/ok-to-test` on every push.
+#
+# Uses `pull_request_target` (NOT `pull_request`) because a fork PR's
+# `pull_request` GITHUB_TOKEN is read-only and cannot remove a label. This
+# is safe: NO pull-request code is checked out or executed — the job only
+# calls the GitHub labels API. Audited into the actionlint.yml allowlist.
+name: Integration label guard
+
+on:
+  pull_request_target:
+    types: [synchronize]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  strip-label:
+    name: Strip integration gate labels on new commits
+    runs-on: ubuntu-latest
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'ci:integration-live') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:integration-emulated')
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        with:
+          script: |
+            for (const name of ['ci:integration-live', 'ci:integration-emulated']) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  name,
+                });
+                core.notice(
+                  `Stripped ${name} after a new push — a maintainer must ` +
+                  're-apply it to re-run that gated integration lane.'
+                );
+              } catch (err) {
+                // 404 = label already absent (race with a manual removal). Fine.
+                if (err.status !== 404) throw err;
+              }
+            }

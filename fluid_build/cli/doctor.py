@@ -59,6 +59,193 @@ EXTENDED_DIAG_SCRIPT = Path("scripts/diagnose.sh")
 EXTENDED_DIAG_README = Path("scripts/README.md")
 
 
+# H9 — curated kill-switch catalog surfaced via ``fluid doctor --env``.
+#
+# Borrow-before-build:
+# - ``aws configure list`` → table of NAME / VALUE / TYPE / LOCATION
+#   (https://docs.aws.amazon.com/cli/latest/reference/configure/list.html)
+# - ``gcloud config list`` → table of property / value
+# - ``gh config list`` → property / value list of CLI-recognised settings
+# - ``terraform env`` (now ``terraform workspace``) → curated set of
+#   env-var knobs documented in
+#   https://developer.hashicorp.com/terraform/cli/config/environment-variables
+#
+# Pattern adopted: one row per recognised FLUID_* runtime knob, columns
+# = name / current value / default behavior / one-line description. The
+# value column reads from ``os.environ`` at call time. Unset values
+# render as ``(unset)`` so the user can tell at a glance which knobs are
+# active in the current shell.
+#
+# Listed knobs are the operator-facing kill switches (UX audit H9
+# called out 8 originally; we ship a small superset for cost caps /
+# backend selectors that are commonly asked about).
+#
+# Entry shape: ``(env_var, default_behavior, description)``.
+ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
+    # — Forge UX kill switches (the 8 UX audit H9 explicitly called out) —
+    (
+        "FLUID_FORGE_NO_PICKER",
+        "picker shown on TTY",
+        "Skip the 5-mode picker on bare `fluid forge`",
+    ),
+    (
+        "FLUID_FORGE_NO_PREVIEW",
+        "pre-write preview shown",
+        "Suppress the pre-write preview panel + confirm prompt",
+    ),
+    (
+        "FLUID_FORGE_NO_WELCOME",
+        "welcome scan rendered",
+        "Suppress the welcome scan panel",
+    ),
+    (
+        "FLUID_FORGE_NO_STREAMING_PREVIEW",
+        "streaming preview on",
+        "Disable the live contract-growth panel during the interview",
+    ),
+    (
+        "FLUID_COPILOT_JUDGE",
+        "judge stage runs (=1)",
+        "Set =0 to skip the post-forge LLM judge stage",
+    ),
+    (
+        "FLUID_COPILOT_ENRICHMENT",
+        "enrichment stage runs (=1)",
+        "Set =0 to skip the post-forge LLM enrichment stage",
+    ),
+    (
+        "FLUID_JUDGE_SELF_CRITIQUE",
+        "judge self-critique on (=1)",
+        "Set =0 to disable the judge's self-critique pass",
+    ),
+    (
+        "FLUID_COPILOT_CHECKPOINT",
+        "checkpointing on (file store)",
+        "Set =0 to route checkpoints to the null store (no on-disk receipts)",
+    ),
+    # — High-traffic operational knobs surfaced for the same reason —
+    (
+        "FLUID_LLM_BACKEND",
+        "native per-provider backends",
+        "Set to `litellm` to route every LLM call through the unified backend",
+    ),
+    (
+        "FLUID_COST_LIMIT_USD",
+        "no global cap",
+        "Per-run global LLM cost ceiling (USD)",
+    ),
+    (
+        "FLUID_COST_LIMIT_USD_PER_RUN",
+        "no per-run cap",
+        "Per-run cost ceiling shown in the progress prefix (USD)",
+    ),
+    (
+        "FLUID_COST_LIMIT_USD_PER_PRODUCT",
+        "no per-product cap",
+        "Per-product cost ceiling, enforced inside the agent coordinator (USD)",
+    ),
+    (
+        "FLUID_INTERVIEW_LEGACY",
+        "world-class interview",
+        "Set =1 to revert to the legacy bootstrap interview",
+    ),
+    (
+        "FLUID_RUN_ID",
+        "auto-generated per run",
+        "Pre-seed or override the cross-stage run-id",
+    ),
+    (
+        "FLUID_TOFU_TIMEOUT_SECONDS",
+        "1800s default",
+        "Per-`tofu` invocation wall-clock cap",
+    ),
+]
+
+
+def _resolve_env_state(name: str) -> Tuple[str, str]:
+    """Return ``(value, source)`` for a kill switch.
+
+    ``source`` is ``"env"`` when the operator set the value, ``"default"``
+    when the variable is absent (in which case ``value`` is rendered as
+    ``(unset)``). Mirrors the LOCATION column from ``aws configure list``.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return ("(unset)", "default")
+    if raw == "":
+        return ('""', "env")
+    return (raw, "env")
+
+
+def _run_env_listing(args, logger: logging.Logger) -> int:
+    """Render the kill-switch catalog as a table or JSON.
+
+    Output shape borrows from ``aws configure list``: NAME / VALUE /
+    SOURCE / DESCRIPTION. Adds a DEFAULT column because FLUID's knobs
+    are mostly boolean toggles where the "off" behavior is the more
+    important piece of information to convey.
+    """
+    import json
+    import sys
+
+    rows: List[Dict[str, str]] = []
+    for env_var, default_behavior, description in ENV_KILL_SWITCHES:
+        value, source = _resolve_env_state(env_var)
+        rows.append(
+            {
+                "name": env_var,
+                "value": value,
+                "source": source,
+                "default": default_behavior,
+                "description": description,
+            }
+        )
+
+    if getattr(args, "json", False):
+        json.dump({"env": rows}, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
+    if RICH_AVAILABLE:
+        console = Console()
+        table = Table(
+            title="FLUID runtime kill switches",
+            show_header=True,
+            header_style="bold cyan",
+        )
+        table.add_column("Env var", style="cyan", no_wrap=True)
+        table.add_column("Current value", style="white")
+        table.add_column("Source", style="dim")
+        table.add_column("Default behavior", style="green")
+        table.add_column("Description")
+        for row in rows:
+            value_style = "yellow" if row["source"] == "env" else "dim"
+            table.add_row(
+                row["name"],
+                f"[{value_style}]{row['value']}[/{value_style}]",
+                row["source"],
+                row["default"],
+                row["description"],
+            )
+        console.print(table)
+        console.print(
+            "[dim]Tip: source values are 'env' when the operator set them, "
+            "'default' when unset.[/dim]"
+        )
+        return 0
+
+    # Plain-text fallback.
+    cprint("FLUID runtime kill switches")
+    cprint("=" * 60)
+    for row in rows:
+        cprint(f"  {row['name']}")
+        cprint(f"    value:       {row['value']} ({row['source']})")
+        cprint(f"    default:     {row['default']}")
+        cprint(f"    description: {row['description']}")
+        cprint()
+    return 0
+
+
 @dataclass
 class DoctorSummary:
     status: str
@@ -138,6 +325,9 @@ Automatically checks:
 Optional workspace diagnostics can be run with --extended
 (or the legacy alias --comprehensive) when scripts/diagnose.sh
 is available in the current checkout.
+
+Use --env to see the recognised FLUID_* runtime kill switches
+and their current values.
         """.strip(),
     )
     p.add_argument(
@@ -169,7 +359,24 @@ is available in the current checkout.
     p.add_argument(
         "--json",
         action="store_true",
-        help="Emit results as JSON (only when --scope is set)",
+        help=(
+            "Emit results as JSON. With --scope/--env the matching surface "
+            "is serialised; otherwise emits the store-backend section "
+            "(MEMORY-E2E-A finding #55)."
+        ),
+    )
+    # H9 — list every recognised FLUID_* env-var kill switch with its
+    # current value + default + one-line description. Borrows the table
+    # shape from ``aws configure list`` (NAME / VALUE / TYPE / LOCATION):
+    # see https://docs.aws.amazon.com/cli/latest/reference/configure/list.html
+    # and ``gcloud config list`` / ``gh config list`` for the same idea.
+    # The previous gap (UX audit finding H9): every kill switch was
+    # documented only in CLAUDE.md and source docstrings, never on the
+    # CLI itself.
+    p.add_argument(
+        "--env",
+        action="store_true",
+        help="List recognised FLUID_* runtime kill switches with current values + defaults",
     )
     p.set_defaults(cmd=COMMAND, func=run)
 
@@ -181,7 +388,12 @@ def run(args, logger: logging.Logger) -> int:
     Automatically checks both base infrastructure and 0.7.1 features.
     When ``--scope`` is set, dispatches to the acquisition-stack scoped
     checks in cli/ops/doctor.py instead.
+    When ``--env`` is set, dispatches to the kill-switch catalog
+    listing.
     """
+    if getattr(args, "env", False):
+        return _run_env_listing(args, logger)
+
     scope_arg = getattr(args, "scope", None)
     if scope_arg:
         return _run_scoped(args, logger, scope_arg)
@@ -193,10 +405,33 @@ def run(args, logger: logging.Logger) -> int:
     # Always check 0.7.1 feature availability (non-intrusive)
     feature_checks_ok, feature_checks = _check_fluid_features()
     copilot_readiness = _check_copilot_readiness()
+    # MEMORY-E2E-A finding #55: surface the active memory-store backend
+    # so operators can tell at a glance which one is wired (file /
+    # sqlite / postgres / vector). Inspection is read-only, swallows
+    # backend resolution errors, and never costs the happy path more
+    # than a few ms.
+    store_backend_status = _inspect_store_backend()
 
     # If features-only mode, just show features and exit
     if getattr(args, "features_only", False):
         _print_feature_checks(feature_checks, verbose)
+        return 0 if feature_checks_ok else 1
+
+    # --json on the default path emits the structured payload (currently
+    # just the store backend section — the rest of the default output is
+    # narrative and stays human-readable). Mirrors the --env / --scope
+    # JSON contracts so machine consumers have ONE shape per surface.
+    if getattr(args, "json", False):
+        import json as _json
+        import sys as _sys
+
+        _json.dump(
+            {"store_backend": store_backend_status},
+            _sys.stdout,
+            indent=2,
+            default=str,
+        )
+        _sys.stdout.write("\n")
         return 0 if feature_checks_ok else 1
 
     resolved_script = _resolve_extended_diagnostic_script()
@@ -208,6 +443,7 @@ def run(args, logger: logging.Logger) -> int:
         extended_requested=extended_requested,
     )
     _print_copilot_readiness(copilot_readiness, verbose)
+    _print_store_backend_status(store_backend_status, verbose)
 
     # Show feature checks first
     if verbose or not feature_checks_ok:
@@ -566,15 +802,16 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
         )
 
     try:
-        from fluid_build.providers.aws.actions import glue, iam, s3  # noqa: F401
+        from fluid_build.iac import get_iac_plugin
 
+        aws_iac_ready = get_iac_plugin("aws") is not None
         checks.append(
             {
                 "check": "AWS Provider Actions",
                 "category": "providers",
-                "status": "✅ Available",
+                "status": "✅ Available" if aws_iac_ready else "⚠️  Not available",
                 "ok": True,
-                "details": "S3, Glue, IAM actions (service-level dispatch)",
+                "details": "AWS provisioning via the OpenTofu engine (contract → .tf.json → tofu)",
             }
         )
     except Exception:
@@ -782,4 +1019,202 @@ def _print_copilot_readiness(readiness: LlmReadinessCheck, verbose: bool = False
         cprint(f"Message:  {message_text}")
         for suggestion in getattr(error, "suggestions", None) or []:
             cprint(f"  • {suggestion}")
+    cprint()
+
+
+# ---------------------------------------------------------------------
+# Store backend inspection (MEMORY-E2E-A finding #55)
+# ---------------------------------------------------------------------
+#
+# Until this slice, ``fluid doctor`` told operators about kill switches
+# and Copilot readiness but stayed silent on which memory-store backend
+# was actually wired. Operators exporting ``FLUID_STORE_BACKEND=postgres``
+# had no easy way to confirm the DSN parsed, the schema initialised,
+# and the writes would land where they expected. The inspector below
+# resolves the active backend exactly once, probes connectivity in a
+# bounded, non-blocking way, and renders a compact "Store Backend"
+# section alongside the existing Copilot Readiness panel.
+#
+# Read-only by construction — every backend variant either skips the
+# probe entirely or wraps it in try/except so a malformed DSN doesn't
+# crash ``fluid doctor``.
+
+
+def _inspect_store_backend() -> Dict[str, str]:
+    """Return a dict describing the active store backend.
+
+    Keys are stable so the ``--json`` shape is documented and the
+    ``_print_store_backend_status`` renderer can rely on them.
+    Connection probes are bounded (2 s for Postgres) and any failure
+    flows back as ``ok=False`` with a ``status`` message — never an
+    exception.
+    """
+    backend_raw = os.environ.get("FLUID_STORE_BACKEND")
+    backend = (backend_raw or "file").strip().lower() or "file"
+
+    info: Dict[str, str] = {
+        "env": backend_raw if backend_raw is not None else "(unset)",
+        "backend": backend,
+        # Resolved fields filled in by the per-backend branches below.
+        "class": "",
+        "location": "",
+        "status": "",
+        "schema_version": "",
+        "ok": "true",
+    }
+
+    if backend in {"null", "none", "0", "disabled"}:
+        info["class"] = "NullBackend"
+        info["location"] = "(no persistence)"
+        info["status"] = "active (no-op backend)"
+        return info
+
+    if backend == "file":
+        path = Path(
+            os.environ.get("FLUID_STORE_ROOT") or (Path.home() / ".fluid" / "store")
+        ).expanduser()
+        info["class"] = "FileBackend"
+        info["location"] = str(path)
+        if path.exists() and path.is_dir() and os.access(path, os.R_OK | os.W_OK):
+            info["status"] = "ready (path readable + writable)"
+        elif path.exists():
+            info["status"] = "path exists but not readable+writable"
+            info["ok"] = "false"
+        else:
+            info["status"] = "path missing (will auto-create on first write)"
+        return info
+
+    if backend == "sqlite":
+        path = Path(
+            os.environ.get("FLUID_STORE_PATH")
+            or (Path.home() / ".fluid" / "store" / "store.sqlite3")
+        ).expanduser()
+        info["class"] = "SqliteBackend"
+        info["location"] = str(path)
+        if not path.exists():
+            info["status"] = "file missing (will auto-create on first write)"
+            return info
+        if not os.access(path, os.R_OK):
+            info["status"] = "file present but not readable"
+            info["ok"] = "false"
+            return info
+        # Read-only probe via PRAGMA user_version. We open with a
+        # dedicated short-lived connection so we don't disturb whatever
+        # state the main runtime may hold.
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(str(path), timeout=2.0)
+            try:
+                cur = conn.execute("PRAGMA user_version")
+                row = cur.fetchone()
+                info["schema_version"] = str(row[0]) if row else "0"
+                info["status"] = "reachable (sqlite3 PRAGMA user_version probe ok)"
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001
+            info["status"] = f"probe failed: {exc.__class__.__name__}"
+            info["ok"] = "false"
+        return info
+
+    if backend == "postgres":
+        dsn = (os.environ.get("FLUID_STORE_DSN") or "").strip()
+        info["class"] = "PostgresBackend"
+        if not dsn:
+            info["location"] = "(FLUID_STORE_DSN unset)"
+            info["status"] = "DSN missing — PostgresBackend cannot connect"
+            info["ok"] = "false"
+            return info
+        # Use the same redactor the backend uses so the displayed DSN
+        # never leaks the password.
+        try:
+            from fluid_build.copilot.store.backends.postgres import _redact_dsn
+
+            info["location"] = _redact_dsn(dsn)
+        except Exception:  # noqa: BLE001
+            info["location"] = "postgresql://***"
+        try:
+            import psycopg  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001
+            info["status"] = f"psycopg not installed: {exc.__class__.__name__}"
+            info["ok"] = "false"
+            return info
+        # Ping with a hard wall-clock cap so a hung Postgres doesn't
+        # hang ``fluid doctor``. ``connect_timeout`` is documented at
+        # https://www.postgresql.org/docs/current/libpq-connect.html
+        # and is honoured by libpq/psycopg.
+        try:
+            conn = psycopg.connect(dsn, connect_timeout=2)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("select 1")
+                    cur.fetchone()
+                    # Schema version probe: read SERVER_VERSION_NUM as a
+                    # proxy (the storage layer doesn't carry its own
+                    # versioned migration table yet — auto-CREATE TABLE
+                    # IF NOT EXISTS handles evolution today).
+                    cur.execute("show server_version_num")
+                    row = cur.fetchone()
+                    if row:
+                        info["schema_version"] = f"pg server={row[0]}"
+                info["status"] = "reachable (select 1 round-trip ok)"
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001
+            info["status"] = f"connect failed: {exc.__class__.__name__}"
+            info["ok"] = "false"
+        return info
+
+    if backend == "vector":
+        backing = (os.environ.get("FLUID_STORE_VECTOR_BACKING") or "file").strip().lower()
+        info["class"] = "VectorBackend"
+        info["location"] = f"backing={backing or 'file'}"
+        info["status"] = "wraps backing store"
+        return info
+
+    # Unknown backend selector — ``resolve_store`` would raise; surface
+    # the message instead of crashing the doctor output.
+    info["class"] = "(unknown)"
+    info["location"] = ""
+    info["status"] = f"unrecognised FLUID_STORE_BACKEND={backend!r}"
+    info["ok"] = "false"
+    return info
+
+
+def _print_store_backend_status(info: Dict[str, str], verbose: bool = False) -> None:
+    """Render the inspected store-backend dict.
+
+    Mirrors the Copilot Readiness panel's layout so the two sections
+    share the same visual rhythm. The ``info["ok"]`` string is the
+    canonical pass/fail signal — anything other than ``"true"`` lights
+    the warning icon.
+    """
+    ok_flag = info.get("ok", "true") == "true"
+    status_icon = "✅ Active" if ok_flag else "⚠️  Action needed"
+
+    if RICH_AVAILABLE:
+        console = Console()
+        table = Table(title="📦 Memory Store Backend", show_header=True)
+        table.add_column("Item", style="cyan", width=18)
+        table.add_column("Value", style="white")
+        table.add_row("Status", status_icon)
+        table.add_row("FLUID_STORE_BACKEND", info.get("env", "(unset)"))
+        table.add_row("Backend class", info.get("class", ""))
+        table.add_row("Location", info.get("location", ""))
+        if info.get("schema_version"):
+            table.add_row("Schema version", info["schema_version"])
+        table.add_row("Probe", info.get("status", ""))
+        console.print(table)
+        return
+
+    cprint("\n" + "=" * 60)
+    cprint("Memory Store Backend")
+    cprint("=" * 60)
+    cprint(f"Status:               {status_icon}")
+    cprint(f"FLUID_STORE_BACKEND:  {info.get('env', '(unset)')}")
+    cprint(f"Backend class:        {info.get('class', '')}")
+    cprint(f"Location:             {info.get('location', '')}")
+    if info.get("schema_version"):
+        cprint(f"Schema version:       {info['schema_version']}")
+    cprint(f"Probe:                {info.get('status', '')}")
     cprint()

@@ -1,0 +1,14 @@
+{
+  "axes": {
+    "correctness": 5,
+    "completeness": 5,
+    "security": 5,
+    "governance": 5,
+    "performance": 4,
+    "documentation": 5
+  },
+  "total": 29,
+  "tolerance_per_axis": 1,
+  "tolerance_total": 4,
+  "rationale": "GDPR-grade: PK + enums + DPO contact + SLA + retention + masked PII + per-column docs."
+}

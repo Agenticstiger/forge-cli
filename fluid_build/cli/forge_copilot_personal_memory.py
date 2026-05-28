@@ -66,6 +66,7 @@ from __future__ import annotations
 __all__ = [
     "load_personal_memory",
     "save_personal_memory",
+    "_sanitize_existing_personal_memory",
 ]
 
 import json
@@ -78,6 +79,15 @@ from fluid_build.cli.artifact_envelope import build_envelope
 from fluid_build.cli.artifact_paths import user_personal_memory_path
 
 LOG = logging.getLogger("fluid.cli.forge.personal_memory")
+
+# Token signatures of test-double ``repr()`` strings that should never
+# land in user-global personal memory.  A prior bug let a MagicMock's
+# ``__repr__`` slip into ``~/.fluid/personal-memory.json`` (showing up
+# in every subsequent streaming preview).  These tokens drive three
+# defensive layers: (1) sanitise on load, (2) refuse to persist, and
+# (3) a one-shot module-level cleanup helper invoked from conftest at
+# session start so contributor laptops self-heal.
+_POISON_TOKENS: tuple[str, ...] = ("<MagicMock", "<Mock ", "<NonCallableMagicMock")
 
 
 #: Resolved lazily so tests can override ``FLUID_HOME`` after import.
@@ -105,6 +115,11 @@ def load_personal_memory() -> Optional[Dict[str, Any]]:
 
     Returns ``None`` if no memory file exists or the file is
     unparseable.
+
+    Defensive: values that look like a test-double ``repr()`` (e.g.
+    ``<MagicMock name=… id=…>``) are silently dropped on read.  See
+    ``_POISON_TOKENS`` for the watch-list and ``save_personal_memory``
+    for the symmetric write-time guard.
     """
     path = _MEMORY_FILE
     try:
@@ -116,6 +131,7 @@ def load_personal_memory() -> Optional[Dict[str, Any]]:
     except (json.JSONDecodeError, OSError):
         return None
 
+    raw = _strip_poisoned_values(raw)
     return _flatten_for_callers(raw)
 
 
@@ -125,7 +141,16 @@ def save_personal_memory(context: Dict[str, Any], console: Any = None) -> bool:
     Merges new preferences into existing memory (never clobbers
     unrelated fields).  Shows a hint on first save telling the user
     where the file is.
+
+    Raises ``ValueError`` if any value in *context* looks like a
+    test-double ``repr()`` (see ``_POISON_TOKENS``) — failing loudly is
+    better than silently writing garbage into user-global state.  The
+    typical trigger is a test that forgot to ``configure_mock`` a
+    return value and let the resulting ``MagicMock`` flow through to
+    the writer.
     """
+    _reject_poisoned_context(context)
+
     path = _MEMORY_FILE
 
     existing_raw = _read_existing_raw(path)
@@ -266,3 +291,106 @@ def _flatten_for_callers(raw: Dict[str, Any]) -> Dict[str, Any]:
             flat["recent_use_cases"] = list(history.get("recent_use_cases") or [])
 
     return flat
+
+
+# ---------------------------------------------------------------------------
+# Poison-token defence (see _POISON_TOKENS)
+# ---------------------------------------------------------------------------
+
+
+def _is_poisoned_value(value: Any) -> bool:
+    """Return True iff *value* looks like a test-double ``repr()`` string."""
+    if isinstance(value, str):
+        return any(token in value for token in _POISON_TOKENS)
+    return False
+
+
+def _strip_poisoned_values(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of *raw* with poisoned scalar values dropped.
+
+    Walks the v1 ``preferences`` and ``history`` sub-dicts (and any
+    lists inside ``history``) — anywhere a string value matches a
+    poison token, the key is omitted from the returned dict.  The
+    on-disk file is *not* rewritten; that is the job of
+    :func:`_sanitize_existing_personal_memory`.
+    """
+    cleaned: Dict[str, Any] = {}
+    for top_key, top_val in raw.items():
+        if top_key in {"preferences", "history"} and isinstance(top_val, dict):
+            inner: Dict[str, Any] = {}
+            for k, v in top_val.items():
+                if isinstance(v, list):
+                    pruned = [item for item in v if not _is_poisoned_value(item)]
+                    inner[k] = pruned
+                elif _is_poisoned_value(v):
+                    LOG.warning(
+                        "Dropping poisoned %s.%s from personal memory: %r",
+                        top_key,
+                        k,
+                        v,
+                    )
+                    continue
+                else:
+                    inner[k] = v
+            cleaned[top_key] = inner
+        elif _is_poisoned_value(top_val):
+            LOG.warning("Dropping poisoned top-level %s from personal memory", top_key)
+            continue
+        else:
+            cleaned[top_key] = top_val
+    return cleaned
+
+
+def _reject_poisoned_context(context: Dict[str, Any]) -> None:
+    """Raise ``ValueError`` if *context* carries a poisoned value.
+
+    Caller-side bug: a test forgot to ``configure_mock`` a return value
+    and let the resulting ``MagicMock`` flow through to the writer.
+    Failing loudly here keeps the on-disk file pristine.
+    """
+    if not isinstance(context, dict):
+        return
+    poisoned_keys = [k for k, v in context.items() if _is_poisoned_value(v)]
+    if poisoned_keys:
+        raise ValueError(
+            "Refusing to persist personal memory: test-double repr() detected in "
+            f"context keys: {poisoned_keys!r}. The caller likely passed a "
+            "MagicMock attribute by accident (see _POISON_TOKENS)."
+        )
+
+
+def _sanitize_existing_personal_memory(path: Optional[Path] = None) -> bool:
+    """One-shot cleanup: rewrite ``~/.fluid/personal-memory.json`` with poison removed.
+
+    Idempotent — if no poisoned values are present, the file is left
+    untouched.  Returns ``True`` iff the file was rewritten.
+
+    Called from ``tests/conftest.py`` at session start so contributor
+    laptops self-heal from any prior test that leaked a MagicMock into
+    user-global state.  Safe to call when the file does not exist.
+    """
+    target = path if path is not None else _MEMORY_FILE
+    try:
+        if not target.exists():
+            return False
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+
+    cleaned = _strip_poisoned_values(raw)
+    if cleaned == raw:
+        return False
+
+    try:
+        target.write_text(
+            json.dumps(cleaned, indent=2, sort_keys=False) + "\n",
+            encoding="utf-8",
+        )
+        target.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        LOG.info("Sanitised poisoned values from %s", target)
+        return True
+    except OSError as exc:  # pragma: no cover — defensive
+        LOG.debug("Could not rewrite sanitised personal memory: %s", exc)
+        return False

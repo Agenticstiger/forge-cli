@@ -66,6 +66,51 @@ INTERVIEW_MAX_QUESTIONS_PER_ROUND = 2
 INTERVIEW_TRANSCRIPT_WINDOW = 6
 KNOWN_SCHEDULER_ENGINES = ("airflow", "dagster", "prefect")
 
+
+def normalize_interview_value(field_name: str, value: Any) -> Any:
+    """Late-bound shim for ``forge_copilot_interview.normalize_interview_value``.
+
+    The helper lives in the host module (``forge_copilot_interview``) to
+    keep its dependencies (``LIST_LIKE_FIELDS``, ``SCALAR_FIELDS``, alias
+    tables) co-located.  Importing it at module top would create a
+    circular import — the host imports ``_interview_ask_helpers`` near
+    the end of its module body so the helpers can be re-exported.  This
+    indirection resolves the function at call time via
+    ``fluid_build.cli.forge_copilot_interview`` so test patches on the
+    host module's namespace continue to flow through to call sites here.
+    """
+
+    from fluid_build.cli import forge_copilot_interview as _host_module
+
+    return _host_module.normalize_interview_value(field_name, value)
+
+
+def __getattr__(name: str) -> Any:
+    """Late-bind module-level constants from the host module.
+
+    Same rationale as :func:`normalize_interview_value`: the host module
+    (``forge_copilot_interview``) defines several alias tables
+    (``_DATA_VAULT_2_ALIASES``, ``_DIMENSIONAL_ALIASES``, …) that
+    helpers reference. Importing them at module top hits the circular
+    import. ``__getattr__`` on the module resolves missing names lazily
+    by routing through the host so the helpers can keep using bare
+    constant names without import surgery.
+
+    RETEST-1 surfaced `NameError: _DATA_VAULT_2_ALIASES` at line 971;
+    same family as the earlier `normalize_interview_value` miss. This
+    shim catches every host-defined constant in one pass so future
+    extracted references don't surface as a third NameError later.
+    """
+    if name.startswith("_") and name.endswith("_ALIASES"):
+        from fluid_build.cli import forge_copilot_interview as _host_module
+
+        try:
+            return getattr(_host_module, name)
+        except AttributeError:
+            pass
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 # Slice UX-I: the set of context slots that together are sufficient for
 # the generation LLM to produce a defensible contract WITHOUT a
 # clarification round.  When every slot in this tuple is already

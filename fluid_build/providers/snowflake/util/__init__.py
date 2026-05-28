@@ -61,10 +61,8 @@ def map_type(fluid_type: str) -> str:
 def create_table_ddl(table_spec) -> str:
     """Render a ``CREATE TABLE`` DDL from a TableSpec dataclass.
 
-    Used by the legacy-style imperative planner; the 11-stage pipeline's
-    stage-7 apply routes through ``_ensure_table`` instead. Identifiers
-    are quoted via :func:`names.quote_identifier`, which doubles embedded
-    double quotes (the old ``backtick`` helper did not).
+    Identifiers are quoted via :func:`names.quote_identifier`, which
+    doubles embedded double quotes.
     """
     cols = []
     for c in table_spec.columns:

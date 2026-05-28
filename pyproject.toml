@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Agentics Transformation Pty Ltd" }]
-keywords = ["data products", "FLUID", "opds", "gitops", "gcp", "snowflake", "duckdb", "composer", "dbt", "dataform"]
+keywords = ["data products", "FLUID", "odps", "odcs", "gitops", "gcp", "snowflake", "duckdb", "composer", "dbt", "dataform"]
 
 # Optional but useful for PyPI/pipx users and internal catalogs
 classifiers = [
@@ -99,6 +99,21 @@ dependencies = [
   # custom-SQL / task-body / view-body surfaces. Borrowed-not-built per
   # /borrow-before-build: https://github.com/tobymao/sqlglot
   "sqlglot>=25.0",
+  # Bitol-vendor-listed Python library for ODCS v3.1.0. Provides typed
+  # Pydantic v2 models + ``from_file()`` / ``to_yaml()`` for lossless
+  # ODCS YAML I/O. Maintained by the ``datacontract`` org (same folks
+  # who ship ``datacontract-cli``).
+  #
+  # Borrowed-not-built per /borrow-before-build:
+  #   PyPI:    https://pypi.org/project/open-data-contract-standard/
+  #   GitHub:  https://github.com/datacontract/open-data-contract-standard-python
+  #   Listed:  https://github.com/bitol-io/open-data-contract-standard/blob/main/vendors.md
+  #
+  # Powers fluid_build.providers.odcs.io for ODCS file I/O. Mapper-based
+  # FLUID ↔ ODCS conversion stays on plain dicts so the pass-through
+  # buckets that preserve unmodeled fields keep their round-trip
+  # fidelity contract.
+  "open-data-contract-standard>=3.1.2",
   # Optional UX nicety on Windows; no-op elsewhere
   "colorama>=0.4.6; platform_system == 'Windows'",
 ]
@@ -107,6 +122,26 @@ dependencies = [
 # Provider SDK (install once published)
 sdk = [
   "fluid-provider-sdk>=0.1.0",
+]
+
+# Stricter ODCS validation via vowl (MIT, GovTech Data Practice).
+# Bitol vendor-listed validation engine that aggregates ALL violations
+# (no first-error-only), runs format checks (uuid/email/ipv4/...),
+# auto-derives SQL data checks from contract metadata, and can run
+# them against real data sources via Ibis.
+#
+# Today we use vowl's *spec-parsing* side only — when this extra is
+# installed and ``ODCS_VOWL_VALIDATE=true`` (or ``fluid odcs validate
+# --vowl``), ``OdcsProvider.render`` runs a vowl second pass to catch
+# semantic issues jsonschema doesn't surface (stricter format
+# validation, unevaluated-properties enforcement, etc.).
+#
+# Borrowed-not-built per /borrow-before-build:
+#   PyPI:    https://pypi.org/project/vowl/
+#   GitHub:  https://github.com/govtech-data-practice/vowl
+#   Listed:  https://github.com/bitol-io/open-data-contract-standard/blob/main/vendors.md
+odcs-strict = [
+  "vowl>=0.0.2",
 ]
 
 # Local provider (DuckDB)
@@ -135,8 +170,14 @@ gcp = [
 # Snowflake provider
 snowflake = [
   "snowflake-connector-python>=4.4",
-  "snowflake-snowpark-python>=1.15 ; python_version >= '3.10'",
   "dbt-snowflake>=1.7 ; python_version >= '3.10'",
+]
+
+# AWS provider (S3 / Glue / Athena). boto3 is lazy-imported by the
+# provider; this extra is the explicit install target so `.[aws]` actually
+# pulls the SDK — the integration workflows install `.[dev,aws]`.
+aws = [
+  "boto3>=1.34",
 ]
 
 # Visualizations (plan graph, HTML)
@@ -144,9 +185,19 @@ viz = [
   "graphviz>=0.20",
 ]
 
-# OPDS export (spec conversion)
-opds = [
+# ODPS / OPDS export (spec conversion). Two distinct standards both
+# abbreviated ODPS: Bitol Open Data Product Standard v1.0.0 and the LF/ODPI
+# Open Data Product Specification v4.1. Both are covered by this extra.
+odps = [
   "ruamel.yaml>=0.18",
+]
+
+# Back-compat alias — earlier docs / install scripts used ``[opds]`` for the
+# letter-swap of ODPS. Kept as an empty alias that depends on ``[odps]`` so
+# existing ``pip install "data-product-forge[opds]"`` invocations keep
+# working through the rename.
+opds = [
+  "data-product-forge[odps]",
 ]
 
 # Optional TUI extras
@@ -236,11 +287,10 @@ keyring = []
 catalogs = [
   "data-product-forge[snowflake]",
   "data-product-forge[gcp]",  # bigquery + dataplex
+  "data-product-forge[aws]",  # glue catalog via boto3
   "data-product-forge[databricks]",
   "data-product-forge[datahub]",
   "data-product-forge[keyring]",
-  # AWS Glue uses boto3 which is already lazy-imported by the
-  # existing AWS provider — no new top-level extra needed.
 ]
 
 # Docs toolchain (optional; if you’ll publish docs)
@@ -257,16 +307,55 @@ dev = [
   "pytest-randomly>=3.15",       # Randomize test order to catch hidden deps
   "respx>=0.21",                 # HTTPX request mocking — used by acquisition test matrix
   "hypothesis>=6.100",           # Property-based testing — used by tests/property/
+  "deepdiff>=7.0",               # Structural diff — used by OdcsProvider.roundtrip_check
   "mypy>=1.10",
   "ruff>=0.5",
   "types-PyYAML>=6.0.12",
   "black==26.3.1",
   "requests>=2.32.5",
+  # Architecture linter — declarative TOML contracts (under
+  # ``[tool.importlinter]`` below) enforced by the ``lint-imports`` CLI.
+  # Borrowed-not-built per /borrow-before-build (seddonym/import-linter,
+  # BSD-2, used by Google langextract / MLRun / Open edX). Pins the
+  # invariant that ``fluid_build.observability`` must not depend on
+  # ``fluid_build.build_runners`` (the cycle root that previously broke
+  # ``cli/__init__.py`` at import time) and that the tier-0
+  # ``fluid_build._net`` leaf module stays free of fluid_build upstreams.
+  "import-linter>=2.0",
+]
+
+# Light (in-process) integration-test emulators — Stage 1. moto mocks the
+# AWS APIs in-process (and pulls boto3); fakesnow patches
+# snowflake-connector-python over an embedded DuckDB. Installed by the
+# ci.yml `emulated-integration` job so Stage-1 provider integration tests
+# run on every PR — including from forks — with zero cloud credentials.
+test-emulators = [
+  # `server` pulls Flask so `ThreadedMotoServer` can back the OpenTofu
+  # autogenerator e2e — `tofu`, a Go binary, needs a real HTTP endpoint
+  # and cannot use moto's in-process `mock_aws`.
+  "moto[glue,server]>=5",
+  "fakesnow>=0.9",
+]
+
+# Heavy (Docker-based) integration-test emulators — Stage 2. These
+# clients drive the GCP emulators (BigQuery / GCS / Pub/Sub) and
+# LocalStack respectively, all via real HTTP endpoints.
+#
+# google-auth is pulled in transitively but listed explicitly so the
+# iac-tests.yml Stage 2 install (which uses just this extra) gets
+# ``AnonymousCredentials`` for the emulator clients without going
+# through the heavier full ``[gcp]`` extra.
+test-emulators-heavy = [
+  "google-auth>=2.29",
+  "google-cloud-bigquery>=3.20",
+  "google-cloud-storage>=2.16",
+  "google-cloud-pubsub>=2.38",
+  "boto3>=1.34",
 ]
 
 # One-shot install for contributors
 all = [
-  "data-product-forge[local,gcp,snowflake,viz,opds,tui,copilot,vector,postgres,docs,dev]"
+  "data-product-forge[local,aws,gcp,snowflake,viz,odps,tui,copilot,vector,postgres,docs,dev]"
 ]
 
 [project.scripts]
@@ -306,6 +395,12 @@ include = ["fluid_build*"]
 # Ensure non-.py assets ship in wheels (schemas, templates, static HTML, etc.)
 [tool.setuptools.package-data]
 fluid_build = [
+  # PEP 561 marker — tells consumers' type checkers (mypy, pyright) to
+  # honour the inline type annotations in this package. Without this,
+  # downstream code that imports ``fluid_build.engine`` sees the careful
+  # ``Optional[Path]`` / ``ClassVar[str]`` / typed-result annotations as
+  # ``Any`` regardless of how strict the consumer's mypy config is.
+  "py.typed",
   "build-manifest.yaml",
   "features.yaml",
   # ``cli/llm_models.json`` is the provider/tier catalog that
@@ -417,7 +512,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short --strict-markers --disable-warnings"
+addopts = "-v --tb=short --strict-markers --disable-warnings -m 'not live_llm and not live_judge'"
 markers = [
     "unit: Unit tests (fast, no I/O)",
     "integration: Integration tests (may need network/files)",
@@ -431,7 +526,11 @@ markers = [
     "policy: Tests for policy validators",
     "runtime: Tests for runtime generators",
     "live_llm: Tests that call a real LLM (cost ~$0.0001/run; require an API key in env)",
+    "live_judge: Opt-in tests that call the real JudgeAgent against an LLM (cost ~$0.001/run; require an API key in env)",
     "redteam: Deterministic adversarial tests for the agentic layer (zero-token, no LLM)",
+    "emulated: Stage-1 keyless integration tests backed by in-process emulators (moto, fakesnow); run on every PR via ci.yml",
+    "emulated_heavy: Stage-2 Docker-based emulated integration tests (bigquery-emulator, LocalStack); admin-gated via integration-emulated-heavy.yml",
+    "live_postgres: Opt-in tests that require a real Postgres reachable on localhost:55432/tpch (see tests/fixtures/sandboxes/from-source-postgres/); skipped when the sandbox is unreachable",
 ]
 
 [tool.coverage.run]
@@ -449,3 +548,53 @@ exclude_lines = [
     "raise NotImplementedError",
     "\\.\\.\\.",
 ]
+
+# ── import-linter contracts ────────────────────────────────────────────
+#
+# Run locally:  ``.venv/bin/lint-imports``  (exit 0 = pass, 1 = violation)
+#
+# These contracts close the gap that surfaced when ``cli/__init__.py``
+# import-time blew up with a cycle through ``observability →
+# build_runners → cli``.  The structural fix landed (the canonical SSRF
+# gate ``_hostname_is_private`` moved out of ``build_runners._alerter``
+# into the tier-0 ``fluid_build._net`` leaf module), and these contracts
+# stop the cycle from being re-introduced by a future drive-by edit.
+[tool.importlinter]
+root_package = "fluid_build"
+# Skip cycle-graph construction for any module that fails to import
+# under the linter's analysis venv (e.g. a provider whose heavy SDK
+# isn't pinned in the dev extra). Contract violations still surface;
+# only unrelated dependency import errors are tolerated.
+include_external_packages = false
+
+[[tool.importlinter.contracts]]
+name = "observability must not depend on build_runners"
+type = "forbidden"
+source_modules = ["fluid_build.observability"]
+forbidden_modules = ["fluid_build.build_runners"]
+# Direct, indirect, and any-descendant imports all count. The
+# canonical SSRF gate now lives in ``fluid_build._net``; there should
+# be zero edges from observability into build_runners after the
+# 2026-05 hardening.
+allow_indirect_imports = false
+as_packages = true
+
+[[tool.importlinter.contracts]]
+name = "fluid_build._net is tier-0 (no fluid_build upstreams)"
+type = "forbidden"
+source_modules = ["fluid_build._net"]
+forbidden_modules = [
+  "fluid_build.cli",
+  "fluid_build.observability",
+  "fluid_build.build_runners",
+  "fluid_build.forge",
+  "fluid_build.providers",
+  "fluid_build.copilot",
+  "fluid_build.api",
+  "fluid_build.credentials",
+]
+# ``_net`` is the tier-0 cross-cutting primitive module (stdlib-only
+# SSRF gate today). Any upward edge here would re-create the cycle
+# class this contract exists to prevent.
+allow_indirect_imports = false
+as_packages = true

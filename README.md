@@ -73,6 +73,8 @@ plan → apply → policy-apply → verify → publish → schedule-sync
 
 You rarely run all 11 by hand; `fluid generate ci` emits a parameterized CI pipeline (Jenkins, GitHub Actions, GitLab CI, Azure DevOps, Bitbucket, CircleCI, Tekton) that runs every stage in order with cryptographic binding between stages 6 and 7 — apply refuses to proceed if the plan has been tampered with since it was computed. See [AGENTS.md](AGENTS.md#the-11-stage-pipeline) for the full stage lifecycle and [the apply mode matrix](AGENTS.md#apply-mode-matrix) (`dry-run`, `create-only`, `amend`, `amend-and-build`, `replace`, `replace-and-build`).
 
+**Under the hood (cloud providers): OpenTofu autogen.** `fluid apply` compiles the contract to a deterministic OpenTofu `main.tf.json` and delegates apply / state / drift / idempotency to the `tofu` binary — battle-tested infrastructure code instead of hand-rolled per-cloud apply. The emitter is modular: one `IacProviderPlugin` per cloud (`fluid_build/iac/providers/{aws,gcp,snowflake}.py`, dbt-adapter pattern). Preview the emitted module before applying with `fluid generate iac <contract>`. See [AUTOGEN_SPIKE.md](AUTOGEN_SPIKE.md) for the architecture and [HONESTLY_TESTED.md](HONESTLY_TESTED.md) for the coverage matrix (unit / emulator / live cloud).
+
 ---
 
 ## 🤯 Why We Built This
@@ -144,6 +146,27 @@ fluid generate speed-transformation customer_orders.fluid.yaml -o ./dbt_customer
 Three guarantees that hold across every catalog: **read-only metadata access** (no `SELECT *` against any data table), **per-call credentials** (the MCP server never holds your secrets), and **full audit trail** (every catalog read writes a redacted event under `~/.fluid/store/audit/`).
 
 The same flow is exposed via the MCP `forge_from_source` tool — Claude Code, Cursor, and any MCP client can drive a catalog forge from inside the editor. See the [catalogs walkthrough](https://agenticstiger.github.io/forge_docs/cli/catalogs/) for per-catalog privilege grants and end-to-end demos.
+
+### Which ODPS? — Bitol center stage, LF/ODPI in the back pocket
+
+This codebase treats **Bitol Open Data Product Standard v1.0.0 as the
+default, center-stage ODPS**. The Linux Foundation / ODPI Open Data Product
+Specification v4.1 is supported as a secondary, opt-in target for catalogs
+that require it. Both standards share the three-letter ODPS acronym but are
+different specs published by different organisations.
+
+| Standard | Role | What it is | Spec | CLI selector | `--format` |
+|---|---|---|---|---|---|
+| **Bitol ODPS v1.0.0** | **default** | Open Data Product **Standard**. Bidirectional; product wrapper that references ODCS contracts by `contractId`. | [bitol-io/open-data-product-standard](https://github.com/bitol-io/open-data-product-standard) | `fluid odps --spec bitol-1.0.0` *(default)* | `--format odps` *(default)* / `--format odps-bitol` |
+| **LF/ODPI ODPS v4.1** | opt-in | Open Data Product **Specification**. Hosted by the Linux Foundation / Open Data Product **Initiative** (ODPI). Export-only; single JSON document. | [Open-Data-Product-Initiative/v4.1](https://github.com/Open-Data-Product-Initiative/v4.1) | `fluid odps --spec odps-4.1` | `--format odps-v4.1` |
+
+Bitol ODPS export emits **1 ODPS doc + N sibling `<contractId>.odcs.yaml`** files — the canonical Bitol fragments layout. Import reverses it: a single ODPS file, a directory bundle, or a lone ODCS file all converge on one validated FLUID contract. `fluid forge --seed-from <path>` accepts the same three input shapes as a structural seed for AI authoring.
+
+Back-compat aliases (all emit a WARNING pointing at the canonical form):
+- `fluid opds` — letter-swap of `fluid odps`
+- `--spec odpi-4.1` and `--version 4.1` — historical labels for the LF/ODPI v4.1 spec
+- `--format opds` — historical default of `--format odps-v4.1` (LF/ODPI v4.1 JSON; **does NOT** map to the Bitol-default `--format odps`)
+- `fluid export-opds` — equivalent to `fluid generate standard --format odps-v4.1`
 
 ### From dev to CI — `fluid generate ci`
 

@@ -5,54 +5,30 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""Back-compat shim for ``fluid_build.cli.export_opds``.
+
+The canonical module path is now ``fluid_build.cli.export_odps``. This shim
+re-exports every public symbol from the new module and emits a
+:class:`DeprecationWarning` on import so existing scripts and tests keep
+resolving while we migrate. The CLI subcommand name ``export-opds`` is
+still registered (as a deprecated alias) by the canonical module.
+"""
 
 from __future__ import annotations
 
-import argparse
-import logging
-import os
+import warnings as _warnings
 
-from ._common import CLIError, load_contract_with_overlay, write_json
-from ._logging import info
+_warnings.warn(
+    "fluid_build.cli.export_opds is deprecated; import "
+    "fluid_build.cli.export_odps instead (OPDS is a letter-swap of the "
+    "canonical ODPS acronym).",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
-COMMAND = "export-opds"
-
-
-def register(subparsers: argparse._SubParsersAction):
-    p = subparsers.add_parser(COMMAND, help="Export FLUID → OPDS JSON")
-    p.add_argument("contract", help="contract.fluid.yaml")
-    p.add_argument("--env", help="overlay env")
-    p.add_argument("--out", default="runtime/exports/product.opds.json", help="Output path")
-    p.set_defaults(cmd=COMMAND, func=run)
-
-
-def run(args, logger: logging.Logger) -> int:
-    try:
-        c = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
-        try:
-            from fluid_build.providers.odps.odps import OdpsProvider
-
-            export = OdpsProvider.to_odps(c)
-        except Exception:
-            export = {
-                "specVersion": "1.0",
-                "id": c.get("id"),
-                "title": c.get("name"),
-                "owner": c.get("metadata", {}).get("owner", {}),
-                "domain": c.get("domain"),
-                "exposes": c.get("exposes", []),
-            }
-        os.makedirs(os.path.dirname(args.out), exist_ok=True)
-        write_json(args.out, export)
-        info(logger, "export_opds_ok", out=args.out)
-        return 0
-    except CLIError:
-        raise
-    except Exception as e:
-        raise CLIError(1, "export_opds_failed", {"error": str(e)})
+from fluid_build.cli.export_odps import *  # noqa: F401,F403,E402
+from fluid_build.cli.export_odps import (  # noqa: F401,E402
+    COMMAND,
+    register,
+    run,
+)

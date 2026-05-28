@@ -1,0 +1,74 @@
+version: "3.8"
+
+# GCP Stage-2 emulator suite — spin up locally to run the
+# ``tests/iac/test_iac_gcp_emulator_e2e.py`` tier without any GCP project
+# or credentials. CI integration jobs run the same compose before
+# invoking pytest.
+#
+# Usage:
+#   docker compose -f tests/iac/_gcp_emulator/docker-compose.yml up -d
+#   export FLUID_IAC_LIVE_GCP_EMULATOR=1
+#   export PUBSUB_EMULATOR_HOST=localhost:8085
+#   .venv/bin/python -m pytest tests/iac/test_iac_gcp_emulator_e2e.py -v
+#   docker compose -f tests/iac/_gcp_emulator/docker-compose.yml down
+#
+# Borrowed-OSS receipts (per the borrow-before-build trail in this
+# branch's history):
+#   - bigquery     → goccy/bigquery-emulator (ghcr.io/goccy/bigquery-emulator)
+#   - storage      → fsouza/fake-gcs-server  (fsouza/fake-gcs-server)
+#   - pubsub       → google/cloud-sdk gcloud beta emulators pubsub start
+
+services:
+  bigquery-emulator:
+    image: ghcr.io/goccy/bigquery-emulator:latest
+    container_name: fluid-bigquery-emulator
+    command:
+      - --project=fluid-emulator
+      # Default datasets — empty so per-test create operations have
+      # something to chain against.
+      - --port=9050
+      - --grpc-port=9060
+    ports:
+      - "9050:9050"
+      - "9060:9060"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9050/discovery/v1/apis/bigquery/v2/rest"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  fake-gcs-server:
+    image: fsouza/fake-gcs-server:latest
+    container_name: fluid-fake-gcs-server
+    # ``-scheme http`` lets clients talk plain HTTP — no need for a
+    # custom CA in test pods. ``-public-host`` makes the signed-URL
+    # path match what google-cloud-storage expects locally.
+    command:
+      - -scheme=http
+      - -port=4443
+      - -public-host=localhost:4443
+    ports:
+      - "4443:4443"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4443/storage/v1/b || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  pubsub-emulator:
+    image: google/cloud-sdk:latest
+    container_name: fluid-pubsub-emulator
+    command:
+      - /bin/bash
+      - -c
+      - |
+        gcloud beta emulators pubsub start \
+          --host-port=0.0.0.0:8085 \
+          --project=fluid-emulator
+    ports:
+      - "8085:8085"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8085 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

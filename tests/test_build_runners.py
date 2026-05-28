@@ -730,6 +730,129 @@ class TestGeneratedDbtProfile:
         assert output["catalog"] == "main"
         assert output["schema"] == "analytics"
 
+    # ----- dbt-athena ------------------------------------------------------
+
+    def test_athena_profile_emits_canonical_shape(self, monkeypatch):
+        # Iceberg materialization is per-model config, not profile config —
+        # the profile carries the staging/data paths and the Glue catalog
+        # schema (the mesh interface name).
+        for var in ("AWS_PROFILE", "ATHENA_S3_STAGING_DIR", "ATHENA_S3_DATA_DIR"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        build = {
+            "execution": {
+                "runtime": {
+                    "platform": "athena",
+                    "resources": {
+                        "s3_staging_dir": "s3://mesh-lake/athena-staging/",
+                        "s3_data_dir": "s3://mesh-lake/iceberg/silver_events/",
+                        "schema": "silver_events",
+                    },
+                }
+            },
+            "properties": {},
+        }
+        profile = _build_generated_dbt_profile(build, {"profile": "silver_events"})
+        output = profile["silver_events"]["outputs"]["dev"]
+        assert output["type"] == "athena"
+        assert output["s3_staging_dir"] == "s3://mesh-lake/athena-staging/"
+        assert output["s3_data_dir"] == "s3://mesh-lake/iceberg/silver_events/"
+        assert output["region_name"] == "us-east-1"
+        assert output["database"] == "awsdatacatalog"  # canonical Athena default
+        assert output["schema"] == "silver_events"
+
+    def test_athena_picks_up_aws_profile_when_set(self, monkeypatch):
+        monkeypatch.setenv("AWS_PROFILE", "fluid-mesh")
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        build = {
+            "execution": {
+                "runtime": {
+                    "platform": "athena",
+                    "resources": {
+                        "s3_staging_dir": "s3://b/staging/",
+                        "schema": "s",
+                    },
+                }
+            },
+            "properties": {},
+        }
+        output = _build_generated_dbt_profile(build, {"profile": "p"})["p"]["outputs"]["dev"]
+        assert output["aws_profile_name"] == "fluid-mesh"
+
+    def test_athena_falls_back_to_env_for_staging_dir(self, monkeypatch):
+        # Operator-set ``ATHENA_S3_STAGING_DIR`` is the canonical override.
+        monkeypatch.delenv("S3_STAGING_DIR", raising=False)
+        monkeypatch.setenv("ATHENA_S3_STAGING_DIR", "s3://fallback/staging/")
+        monkeypatch.setenv("AWS_REGION", "eu-west-1")
+        build = {
+            "execution": {"runtime": {"platform": "athena", "resources": {"schema": "s"}}},
+            "properties": {},
+        }
+        output = _build_generated_dbt_profile(build, {"profile": "p"})["p"]["outputs"]["dev"]
+        assert output["s3_staging_dir"] == "s3://fallback/staging/"
+
+    # ----- dbt-glue --------------------------------------------------------
+
+    def test_glue_profile_emits_canonical_shape(self, monkeypatch):
+        monkeypatch.delenv("AWS_PROFILE", raising=False)
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        build = {
+            "execution": {
+                "runtime": {
+                    "platform": "glue",
+                    "resources": {
+                        "role_arn": "arn:aws:iam::1:role/GlueInteractive",
+                        "schema": "silver_events",
+                        "workers": 8,
+                        "worker_type": "G.2X",
+                    },
+                }
+            },
+            "properties": {},
+        }
+        output = _build_generated_dbt_profile(build, {"profile": "p"})["p"]["outputs"]["dev"]
+        assert output["type"] == "glue"
+        assert output["role_arn"] == "arn:aws:iam::1:role/GlueInteractive"
+        assert output["region"] == "us-east-1"
+        assert output["workers"] == 8
+        assert output["worker_type"] == "G.2X"
+        assert output["schema"] == "silver_events"
+
+    def test_glue_session_timeout_defaults_to_240_not_20(self, monkeypatch):
+        # The upstream dbt-glue sample uses 20s, which is too low for cold
+        # interactive sessions — the canonical first-pass default is 240s.
+        monkeypatch.delenv("AWS_PROFILE", raising=False)
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        build = {
+            "execution": {
+                "runtime": {
+                    "platform": "glue",
+                    "resources": {"role_arn": "arn:aws:iam::1:role/r", "schema": "s"},
+                }
+            },
+            "properties": {},
+        }
+        output = _build_generated_dbt_profile(build, {"profile": "p"})["p"]["outputs"]["dev"]
+        assert output["session_provisioning_timeout_in_seconds"] == 240
+
+    def test_glue_explicit_timeout_overrides_default(self, monkeypatch):
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        build = {
+            "execution": {
+                "runtime": {
+                    "platform": "glue",
+                    "resources": {
+                        "role_arn": "arn:aws:iam::1:role/r",
+                        "schema": "s",
+                        "session_provisioning_timeout_in_seconds": 480,
+                    },
+                }
+            },
+            "properties": {},
+        }
+        output = _build_generated_dbt_profile(build, {"profile": "p"})["p"]["outputs"]["dev"]
+        assert output["session_provisioning_timeout_in_seconds"] == 480
+
 
 class TestCollectDbtContainerEnv:
     """Env forwarding into the dbt container must cover each adapter's conventions."""

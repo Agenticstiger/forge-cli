@@ -111,6 +111,49 @@ class TestCheckFluidFeatures:
         # The details string lists the bundled v0.7.x schemas.
         assert "0.7.3" in schema_check["details"]
 
+    # ---- AWS provider check is now IaC-engine-backed --------------------
+    # The branch ``feat/opentofu-iac-autogen`` retired the native AWS
+    # action modules; ``_check_fluid_features`` was rewritten to probe
+    # the IaC plugin registry instead. These tests pin the behaviour so
+    # a future refactor does not silently regress the doctor surface
+    # back to importing the deleted ``providers.aws.actions`` modules.
+
+    def test_aws_check_uses_opentofu_engine_wording(self):
+        """The AWS provider check description names the OpenTofu engine
+        — confirms the doctor doesn't still claim 'service-level dispatch'
+        (the retired action-module phrase)."""
+        from fluid_build.cli.doctor import _check_fluid_features
+
+        _all_ok, checks = _check_fluid_features()
+        aws_check = next(c for c in checks if c["check"] == "AWS Provider Actions")
+        assert "OpenTofu" in aws_check["details"]
+
+    def test_aws_check_available_when_iac_plugin_registered(self):
+        """When the AWS IaC plugin is registered (the default state),
+        the check reports Available."""
+        from fluid_build.cli.doctor import _check_fluid_features
+        from fluid_build.iac import get_iac_plugin
+
+        # Sanity: the AWS plugin is registered on package import.
+        assert get_iac_plugin("aws") is not None
+
+        _all_ok, checks = _check_fluid_features()
+        aws_check = next(c for c in checks if c["check"] == "AWS Provider Actions")
+        assert aws_check["status"] == "✅ Available"
+
+    def test_aws_check_not_available_when_iac_plugin_missing(self):
+        """When the AWS plugin lookup returns ``None`` (e.g. a future
+        refactor unregisters it), the check flips to ``⚠️  Not available``
+        without raising."""
+        from fluid_build.cli.doctor import _check_fluid_features
+
+        with patch("fluid_build.iac.get_iac_plugin", return_value=None):
+            _all_ok, checks = _check_fluid_features()
+        aws_check = next(c for c in checks if c["check"] == "AWS Provider Actions")
+        assert aws_check["status"] == "⚠️  Not available"
+        # The check is still ``ok`` — AWS is optional.
+        assert aws_check["ok"] is True
+
 
 class TestRun:
     @patch("fluid_build.cli.doctor._check_fluid_features")
@@ -123,6 +166,8 @@ class TestRun:
         args.features_only = True
         args.verbose = False
         args.scope = None  # default to legacy doctor flow (no scoped checks)
+        args.env = False  # not exercising the kill-switch catalog listing
+        args.json = False  # not exercising the structured JSON path
         logger = MagicMock()
 
         result = run(args, logger)
@@ -139,6 +184,8 @@ class TestRun:
         args.features_only = True
         args.verbose = False
         args.scope = None  # default to legacy doctor flow (no scoped checks)
+        args.env = False  # not exercising the kill-switch catalog listing
+        args.json = False  # not exercising the structured JSON path
         logger = MagicMock()
 
         result = run(args, logger)
@@ -175,6 +222,8 @@ class TestRun:
         args.verbose = False
         args.extended = False
         args.scope = None  # default to legacy doctor flow (no scoped checks)
+        args.env = False  # not exercising the kill-switch catalog listing
+        args.json = False  # not exercising the structured JSON path
         args.out_dir = "/tmp/diag"
         logger = MagicMock()
 
@@ -211,6 +260,8 @@ class TestRun:
         args.verbose = False
         args.extended = False
         args.scope = None  # default to legacy doctor flow (no scoped checks)
+        args.env = False  # not exercising the kill-switch catalog listing
+        args.json = False  # not exercising the structured JSON path
         args.out_dir = "/tmp/diag"
         logger = MagicMock()
 
@@ -246,6 +297,8 @@ class TestRun:
         args.verbose = False
         args.extended = True
         args.scope = None  # default to legacy doctor flow
+        args.env = False  # not exercising the kill-switch catalog listing
+        args.json = False  # not exercising the structured JSON path
         args.out_dir = "/tmp/diag"
 
         with pytest.raises(CLIError) as exc:

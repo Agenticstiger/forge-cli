@@ -1,0 +1,43 @@
+fluidVersion: "0.7.3"
+kind: DataProduct
+id: medium.claims_v1
+name: insurance_claims
+domain: insurance
+
+metadata:
+  layer: Silver
+  productType: ADP
+  owner:
+    team: claims-engineering
+    email: claims-eng@example.com
+  refreshCadence: hourly
+  classification: confidential
+
+retention:
+  runState: P30D
+  runLogs: P180D
+
+exposes:
+  - name: claims
+    schema:
+      - name: claim_id
+        type: STRING
+        primaryKey: true
+      - name: policy_number
+        type: STRING
+      - name: claimant_name
+        type: STRING
+      - name: claim_amount
+        type: NUMBER
+        nullable: false
+      - name: claim_type
+        type: STRING
+        enum: ["auto", "home", "health", "life"]
+      - name: filed_date
+        type: DATE
+        nullable: false
+      - name: status
+        type: STRING
+        enum: ["filed", "under_review", "approved", "denied", "paid"]
+      - name: adjuster_id
+        type: STRING

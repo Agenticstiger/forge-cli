@@ -277,9 +277,17 @@ class TestQualityCostCatalog:
     def test_catalog_register_validates(
         self, manager: FluidSchemaManager, minimal_acquisition_contract: Dict[str, Any]
     ):
+        # ``glue`` + ``snowflake_horizon`` were dropped from the
+        # ``acquisitionCatalog.register`` enum on the OpenTofu-autogen
+        # branch — those catalog backends are now absorbed by the IaC
+        # plugin emit (see fluid_build/iac/providers/{aws,snowflake}.py),
+        # so a contract that still requested them via the registrar
+        # surface would be misleading. Test with two retained values
+        # (``datahub`` + ``datamesh_manager``) to keep the validation
+        # contract honest.
         contract = copy.deepcopy(minimal_acquisition_contract)
         contract["builds"][0]["properties"]["catalog"] = {
-            "register": ["datahub", "snowflake_horizon"],
+            "register": ["datahub", "datamesh_manager"],
             "documentation": "auto",
         }
         result = _validate(manager, contract)

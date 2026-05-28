@@ -1,0 +1,186 @@
+# Stage 2 — admin-gated heavy emulated integration tests.
+#
+# Docker-based emulators that are too heavy for the keyless community lane
+# (ci.yml `emulated-integration`, Stage 1):
+#   • bigquery-emulator (GCP) — keyless, but a Docker container;
+#   • LocalStack (AWS S3 + Glue) — needs a LOCALSTACK_AUTH_TOKEN, Docker.
+#
+# Admin-gated the same way as the live lane (Stage 3): a maintainer applies
+# the `ci:integration-emulated` label and the job pauses for the
+# `integration-emulated` environment's required reviewer. integration-label-
+# guard.yml strips the label on each new push so the vouch must be renewed.
+#
+# `integration-emulated` is a SEPARATE environment from `integration-live`
+# — it holds only LOCALSTACK_AUTH_TOKEN, so approving an emulated run can
+# never expose the real cloud/LLM credentials.
+#
+# The LocalStack half is skip-clean: with no LOCALSTACK_AUTH_TOKEN the
+# bigquery-emulator test still runs and the LocalStack test skips.
+name: Integration (emulated heavy, admin-gated)
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-emulated-heavy-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  emulated-heavy:
+    name: Heavy emulated integration (bigquery-emulator + LocalStack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'ci:integration-emulated')
+    environment: integration-emulated
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install with heavy-emulator extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,test-emulators-heavy]"
+
+      # Skip-clean: a secret cannot gate a job-level `if:`. With no token
+      # the LocalStack steps skip and only bigquery-emulator runs.
+      - name: Check for the LocalStack auth token
+        id: gate
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+        run: |
+          if [ -n "$LOCALSTACK_AUTH_TOKEN" ]; then
+            echo "localstack=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "localstack=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::LOCALSTACK_AUTH_TOKEN not configured — running bigquery-emulator only; LocalStack tests will skip."
+          fi
+
+      - name: Start LocalStack
+        if: steps.gate.outputs.localstack == 'true'
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+        run: |
+          # Pin to an exact LocalStack version when arming this lane —
+          # the repo convention is fully-pinned container images.
+          docker run -d --name fluid-localstack -p 4566:4566 \
+            -e LOCALSTACK_AUTH_TOKEN="$LOCALSTACK_AUTH_TOKEN" \
+            localstack/localstack:stable
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:4566/_localstack/health >/dev/null 2>&1; then
+              echo "LocalStack ready after ~$((i * 2))s"; break
+            fi
+            sleep 2
+          done
+
+      - name: Run heavy emulated integration tests
+        timeout-minutes: 15
+        env:
+          FLUID_LOCALSTACK_ENDPOINT: http://localhost:4566
+        run: python -m pytest -v -m emulated_heavy
+
+      - name: Stop LocalStack
+        if: always() && steps.gate.outputs.localstack == 'true'
+        run: docker rm -f fluid-localstack || true
+
+  # ────────────────────────────────────────────────────────────────────
+  # DataHub Quickstart lane — exercises the canonical DataHubRegistrar
+  # against a real DataHub OSS GMS booted via the project's Docker
+  # Quickstart. Same admin-gate as the bigquery / LocalStack lane.
+  #
+  # Why a separate job (not folded into emulated-heavy above):
+  #   - DataHub Quickstart is its own multi-container stack (GMS,
+  #     frontend, MySQL, Kafka, Elasticsearch) — running it alongside
+  #     LocalStack on one runner peaks at ~12 GB RAM, which exceeds
+  #     `ubuntu-latest`'s 7 GB limit.
+  #   - Quickstart pull + boot is ~3-4 min on a cold runner; isolating
+  #     it lets the bigquery-emulator job finish independently and
+  #     keeps the failure surface attributable.
+  #
+  # Secret-less. The `datahub` CLI exposes a self-contained Quickstart
+  # via `docker compose` against pinned tags; no DataHub Cloud token
+  # is involved. Tests run via the `tests/integration/test_catalog_datahub_live.py`
+  # + `tests/integration/test_catalog_datahub_lineage_e2e.py` matrix
+  # (gated on `DATAHUB_GMS_URL` being set — skip-clean if the boot
+  # times out).
+  datahub-integration:
+    name: DataHub Quickstart integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'ci:integration-emulated')
+    environment: integration-emulated
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install fluid-build + acryl-datahub CLI
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          # acryl-datahub provides the `datahub docker quickstart` helper
+          # which stands up the GMS + frontend + storage + Kafka stack.
+          # Pin to a specific minor — the docker-compose shape evolves
+          # version to version and we want repeatable boots.
+          python -m pip install "acryl-datahub==1.5.0.6"
+
+      - name: Start DataHub Quickstart
+        id: quickstart
+        env:
+          # Quickstart resolves the version tag from the CLI itself; pin
+          # via env so we control which docker images get pulled. Matches
+          # the lab's local Quickstart pin so behaviour is identical.
+          DATAHUB_VERSION: v1.5.0.6
+        run: |
+          # `--quickstart-compose-file` defaults to the embedded
+          # docker-compose-without-neo4j.yml, which has the smaller
+          # footprint (no Neo4j) — sufficient for our catalog tests.
+          datahub docker quickstart --version "$DATAHUB_VERSION" --no-pull-images || true
+          # Wait for GMS REST on :8080 — that's the endpoint
+          # ``safe_httpx_client`` connects to via DATAHUB_GMS_URL.
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:8080/config >/dev/null 2>&1; then
+              echo "DataHub GMS ready after ~$((i * 4))s"
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            sleep 4
+          done
+          if ! curl -sf http://localhost:8080/config >/dev/null 2>&1; then
+            echo "::warning::DataHub GMS did not come up in 6 minutes — skipping tests"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run DataHub integration tests
+        if: steps.quickstart.outputs.ready == 'true'
+        timeout-minutes: 15
+        env:
+          DATAHUB_GMS_URL: http://localhost:8080
+        run: |
+          python -m pytest -v \
+            tests/integration/test_catalog_datahub_live.py \
+            tests/integration/test_catalog_datahub_lineage_e2e.py
+
+      - name: Collect DataHub logs on failure
+        if: failure()
+        run: |
+          datahub docker check || true
+          docker compose -p datahub logs --tail=200 || true
+
+      - name: Tear down DataHub Quickstart
+        if: always()
+        run: |
+          datahub docker nuke --keep-data 2>&1 | tail -5 || true

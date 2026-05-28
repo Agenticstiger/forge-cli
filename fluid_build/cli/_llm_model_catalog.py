@@ -156,6 +156,41 @@ def get_catalog_routing_model(provider_name: str, strong_model: str = "") -> Opt
     return _default_routing_model(provider_name, strong_model or "")
 
 
+def get_explicit_catalog_tier(provider_name: str, tier: str) -> Optional[str]:
+    """Return the catalog's ``tier`` model ONLY when explicitly defined.
+
+    ``get_catalog_tier_model(provider, tier)`` silently falls back to
+    the provider's flagship/default when ``tier`` is not configured.
+    That's the wrong contract for "cheap-tier" ladders — we want a
+    clear "yes this tier is set" signal, not a silent escalation to
+    the most-expensive model.
+
+    Checks both the catalog ``tiers`` section and the provider entry
+    for an explicit key. Returns None when the tier isn't actually
+    configured anywhere (so the caller can fall through to the next
+    rung of its own ladder).
+
+    Pinned by ``tests/copilot/agents/test_judge_cheap_tier_default.py``
+    (the live-test discovery that surfaced the silent-flagship-fallback
+    bug — JudgeAgent was using gemini-2.5-pro instead of gemini-2.5-flash
+    because ``get_catalog_tier_model("gemini","judge")`` silently
+    escalated to flagship when no "judge" tier existed).
+    """
+    try:
+        catalog = _resolve_load_model_catalog()()
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    if not isinstance(catalog, dict):
+        return None
+    tier_entry = catalog.get("tiers", {}).get(provider_name, {})
+    if tier in tier_entry and tier_entry[tier]:
+        return str(tier_entry[tier])
+    entry = catalog.get("providers", {}).get(provider_name, {})
+    if tier in entry and entry[tier]:
+        return str(entry[tier])
+    return None
+
+
 def get_catalog_tier_model(provider_name: str, tier: str = "flagship") -> Optional[str]:
     """Return the model for a given tier.
 

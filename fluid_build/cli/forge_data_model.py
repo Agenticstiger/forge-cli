@@ -312,6 +312,12 @@ def run_from_ddl_command(args: Any, logger: logging.Logger) -> int:
     ddl_texts = [Path(path).read_text(encoding="utf-8") for path in args.ddl]
     name = output_path.stem.replace(".fluid", "") or Path(args.ddl[0]).stem
     technique = _normalize_technique(args.technique) or "data_vault_2"
+    # H2 — surface the offline/heuristic banner BEFORE the run so the
+    # user knows quality will be lower than the --require-llm path.
+    _print_heuristic_only_banner(session=session, technique=technique, args=args, logger=logger)
+    import time as _time
+
+    _started_at = _time.time()
     try:
         result = run_from_ddl(
             session,
@@ -327,6 +333,14 @@ def run_from_ddl_command(args: Any, logger: logging.Logger) -> int:
     except AgentExecutionError as exc:
         cprint(f"[red]from-ddl failed:[/red] {exc}")
         return 1
+    # H22 — always write a per-run cost.json so deterministic runs are
+    # visible to ``fluid stats``.
+    _persist_run_cost_receipt(
+        session=session,
+        output_path=output_path,
+        wall_clock_seconds=_time.time() - _started_at,
+        logger=logger,
+    )
     logical = result.coordinator.logical
     contract = _finalize_contract(
         logical=logical,
@@ -334,6 +348,12 @@ def run_from_ddl_command(args: Any, logger: logging.Logger) -> int:
         engine=args.engine,
         contract=result.coordinator.contract,
     )
+    # H2 — stamp a warning into the contract when the dimensional
+    # heuristic ran without an LLM, so the contract itself records
+    # the caveat (validation is schema-only and cannot catch
+    # structural mis-classification).
+    if session.llm_config is None and not session.require_llm:
+        _stamp_heuristic_warning_on_contract(contract, technique=technique)
     return _write_or_report(
         args,
         logger,
@@ -399,6 +419,11 @@ def run_from_intent_command(args: Any, logger: logging.Logger) -> int:
     technique = technique or "data_vault_2"
     args.selected_modeling_technique = technique
     args.intent_source_path = str(intent_file)
+    # H2 — banner before run (dimensional heuristic only, no LLM).
+    _print_heuristic_only_banner(session=session, technique=technique, args=args, logger=logger)
+    import time as _time
+
+    _started_at = _time.time()
     try:
         result = run_from_intent(
             session,
@@ -409,6 +434,14 @@ def run_from_intent_command(args: Any, logger: logging.Logger) -> int:
     except AgentExecutionError as exc:
         cprint(f"[red]from-intent failed:[/red] {exc}")
         return 1
+    # H22 — always write a per-run cost.json so deterministic runs are
+    # visible to ``fluid stats``.
+    _persist_run_cost_receipt(
+        session=session,
+        output_path=output_path,
+        wall_clock_seconds=_time.time() - _started_at,
+        logger=logger,
+    )
     logical = result.coordinator.logical
     contract = _finalize_contract(
         logical=logical,
@@ -416,6 +449,9 @@ def run_from_intent_command(args: Any, logger: logging.Logger) -> int:
         engine=args.engine,
         contract=result.coordinator.contract,
     )
+    # H2 — heuristic warning on the contract itself.
+    if session.llm_config is None and not session.require_llm:
+        _stamp_heuristic_warning_on_contract(contract, technique=technique)
     return _write_or_report(
         args,
         logger,
@@ -554,6 +590,9 @@ def run_from_source_command(args: Any, logger: logging.Logger) -> int:
                 # forge — log and continue.
                 logger.debug("fluid.copilot.catalog.industry_autodetect.failed: %s", exc)
 
+    import time as _time
+
+    _started_at = _time.time()
     try:
         result = run_from_catalog(
             session,
@@ -575,6 +614,17 @@ def run_from_source_command(args: Any, logger: logging.Logger) -> int:
                 cprint(f"  • {s}")
         return 1
 
+    # H22 — persist cost.json under .fluid/agents/<run-id>/ even for
+    # deterministic (no-LLM) runs so the run is visible to
+    # ``fluid stats``. Best-effort: a write failure here MUST NOT
+    # poison an otherwise-successful forge.
+    _persist_run_cost_receipt(
+        session=session,
+        output_path=output_path,
+        wall_clock_seconds=_time.time() - _started_at,
+        logger=logger,
+    )
+
     logical = result.coordinator.logical
     contract = _finalize_contract(
         logical=logical,
@@ -594,6 +644,52 @@ def run_from_source_command(args: Any, logger: logging.Logger) -> int:
         ),
         industry_pack=session.industry_pack,
     )
+
+
+def _persist_run_cost_receipt(
+    *,
+    session: Any,
+    output_path: Path,
+    wall_clock_seconds: float,
+    logger: logging.Logger,
+) -> None:
+    """Write a per-run ``cost.json`` under ``.fluid/agents/<run-id>/``.
+
+    Closes the H22 gap: the from-source / data-model pipeline was
+    skipping cost.json entirely when the run was deterministic (no
+    LLM call), so ``fluid stats`` reported "0 runs" even though the
+    coordinator's manifest plainly recorded a completed forge.
+
+    Idempotent: ``RunCostTracker.persist_to_run_dir`` always writes a
+    receipt (including ``mode="deterministic"`` + zero counts for runs
+    that never invoked the LLM). The run-id comes from the staged
+    coordinator's session stamp; when unavailable we mint a synthetic
+    one so the cost-tracker still has somewhere to land.
+
+    Best-effort: any exception is swallowed at DEBUG. The forge has
+    already succeeded by the time we get here; a receipt write
+    failure must not turn that into an error.
+    """
+    try:
+        run_id = getattr(session, "run_id", "") or ""
+        if not run_id:
+            from fluid_build.copilot.agents._coordinator_helpers import (
+                new_run_id as _mint,
+            )
+
+            run_id = _mint()
+        workspace_root = (
+            getattr(session, "workspace_root", None) or output_path.parent or Path.cwd()
+        )
+        run_dir = Path(workspace_root) / ".fluid" / "agents" / run_id
+        from fluid_build.copilot.cost import get_run_tracker
+
+        get_run_tracker().persist_to_run_dir(
+            run_dir,
+            wall_clock_seconds=wall_clock_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001 — never block on a receipt write
+        logger.debug("cost_receipt_persist_failed: %s", exc)
 
 
 # JDBC-source path (postgres / mysql / sqlite via duckdb-extension
@@ -886,6 +982,67 @@ def _normalize_technique(value: Optional[str]) -> Optional[str]:
     if normalized == "dimensional":
         return normalized
     return value
+
+
+def _print_heuristic_only_banner(
+    *, session: StageSession, technique: str, args: Any, logger: logging.Logger
+) -> bool:
+    """Emit a single-line banner when the dimensional heuristic is about to run.
+
+    UX audit H2 finding: the default heuristic-only path silently
+    produces structurally-wrong dimensional models (IDs as measures,
+    line-item facts classified as dims, no dim_date). The DV2
+    heuristic is solid — only the dimensional path needs the warning.
+
+    Returns ``True`` when the banner was emitted (so callers can also
+    stamp ``metadata.warnings`` on the contract).
+    """
+    # Strict-LLM and "LLM configured" runs need no banner — they get
+    # real LLM review.
+    if session.llm_config is not None or session.require_llm:
+        return False
+    # Only the dimensional path is affected by H2. DV2 heuristic is solid.
+    if technique != "dimensional":
+        return False
+    # Silence in non-interactive / deterministic / CI usage so the
+    # banner doesn't pollute byte-stable receipts.
+    if getattr(args, "deterministic", False) or getattr(args, "quiet", False):
+        return False
+    cprint(
+        "[yellow]note:[/yellow] running offline (no LLM). "
+        "Dimensional classification is heuristic-only — for "
+        "higher-fidelity fact/dim split, add [bright_cyan]--require-llm[/bright_cyan] "
+        "or set [bright_cyan]FLUID_LLM_PROVIDER=...[/bright_cyan]."
+    )
+    return True
+
+
+def _stamp_heuristic_warning_on_contract(contract: dict, *, technique: str) -> None:
+    """Stamp a heuristic-only warning into the contract labels.
+
+    The audit (H2) flagged that ``Validation passed (score=9)`` was
+    misleading: validation is schema-only — it cannot catch
+    structurally-wrong classification (line-item table marked as a
+    dim, IDs marked as measures). We surface this honestly in the
+    contract so downstream consumers see the caveat.
+
+    Uses ``labels.heuristicWarning`` (and ``labels.qualityCaveat``) —
+    not ``metadata.warnings``, because the v0.7.x metadata schema is
+    ``additionalProperties: false`` and would reject an unknown
+    ``warnings`` key.
+    """
+    if technique != "dimensional":
+        return
+    labels = contract.setdefault("labels", {})
+    if not isinstance(labels, dict):
+        return
+    labels["heuristicMode"] = "dimensional"
+    labels["heuristicWarning"] = (
+        "dimensional classification is heuristic-only; review fact/dim "
+        "split, measures (no SUM(id) shapes), and dim_date coverage "
+        "before production use. Add --require-llm for LLM-assisted "
+        "review."
+    )
 
 
 def _finalize_contract(

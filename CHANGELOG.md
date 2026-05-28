@@ -329,6 +329,398 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `mcp.shared.memory` test fixtures we depend on. Tested against
   mcp 1.27.x.
 
+## [0.8.4] - 2026-05-26
+
+### Added (DMM CLI surface + lineage UX)
+- **`fluid dmm wipe`** — multi-pass FK-aware mass delete of every DataProduct
+  in the tenant. Supersedes the ad-hoc helper scripts everyone was writing.
+  `--yes` to skip confirmation; `--max-passes <n>` to bound retry attempts.
+- **`fluid dmm list-contracts` / `get-contract` / `delete-contract`** —
+  parity with the DataProduct surface for the long-overlooked DataContracts
+  side of the DMM API.
+- **`fluid dmm delete` enriched error** — on DMM's `422 Cannot delete
+  because data product is in use` lock, the CLI now enumerates the
+  consumer products holding the FK and prints them in the error so the
+  operator knows what to delete first.
+- **`fluid dmm publish` access-agreement visibility** — output now shows
+  the count + approval status of Access agreements created from
+  `consumes[]`. When any are left `pending` the CLI prints a yellow hint
+  pointing at `--auto-approve-access` / `DMM_AUTO_APPROVE_ACCESS=true`.
+  This closes the most common "I published but the DMM lineage graph is
+  empty" footgun: DMM only renders lineage from APPROVED agreements.
+- **`fluid dmm publish --auto-approve-access` / `--no-auto-approve-access`** —
+  explicit flags overriding the env var, with help text that explains
+  the lineage-rendering implications.
+
+### Fixed (DMM + emitter bugs)
+- **`OdpsStandardProvider.render()` no longer drops duplicate-exposeId
+  consumes.** Previously, two `consumes[]` entries sharing an `exposeId`
+  (e.g. both upstream products expose `data_analytics_platform`) collapsed
+  to ONE InputPort via name-keyed dedup; the second was silently dropped.
+  Now dedup is keyed by `(name, contract_id)` and collisions are
+  disambiguated by tail-of-productId prefix (`b2__data_analytics_platform`),
+  so every consume produces its own InputPort. Pinned by
+  `tests/test_odps_cli_spec.py::TestInputPortDuplicateExposeIdHandling`.
+- **`_publish_access_agreements` pre-flight upstream check.** Previously,
+  if a `consumes[].productId` pointed at a product that didn't exist in
+  DMM, the access PUT returned a generic `404` mid-publish. Now the
+  publisher lists existing products first and surfaces a structured
+  `missing_upstream_product` warning per skipped agreement, naming the
+  upstream that needs publishing first.
+- **`fluid dmm list --format json`** — Rich console line-wrapping injected
+  literal newlines into JSON string values, breaking `json.loads()` for
+  pipe consumers. Now bypasses Rich for `--format json` and writes
+  directly to stdout.
+- **`generator: "fluid-forge-opds-provider"` payload literal** in the LF
+  v4.1 wrapper renamed to `fluid-forge-odps-provider` for naming
+  consistency with the canonical spec acronym. Wire-visible field;
+  downstream consumers that keyed on the old string should accept both.
+
+### Removed (dead code)
+- `_generate_uuid_from_id` + `_CANONICAL_UUID_NAMESPACE` +
+  `_LEGACY_UUID_NAMESPACE` + the `FLUID_LEGACY_UUID_NAMESPACE` env var
+  escape hatch (added in Phase 8.2 as a thoughtful migration path) —
+  **deleted**: zero callers in the codebase, no production path depends on
+  it. If a future caller needs deterministic UUIDs from a product id, the
+  helper is a 3-liner; re-introduce it with explicit wiring at that time.
+
+### Changed (BEHAVIOR — read carefully)
+- **`fluid generate standard` defaults reordered: Bitol ODPS v1.0.0 is now
+  the center-stage `--format odps`.** Previously `--format odps` routed to
+  the LF/ODPI v4.1 emitter (which itself silently fell back to a
+  5-field degenerate placeholder because the underlying `cli.opds.run`
+  symbol didn't exist). The fix:
+  - `--format odps` → emits **Bitol Open Data Product Standard v1.0.0**
+    (bare product YAML via `BitolOdpsProvider().render()`).
+  - `--format odps-bitol` → explicit alias of `--format odps` (kept for
+    callers that want disambiguation in CI logs).
+  - `--format odps-v4.1` (NEW) → emits **LF/ODPI Open Data Product
+    Specification v4.1** (bare JSON via `OdpsProvider().render()` with
+    the `artifacts:` wrapper unwrapped).
+  - `--format opds` → deprecated letter-swap alias of `--format odps-v4.1`
+    (NOT `--format odps`) — emits a WARNING + the LF/ODPI v4.1 JSON.
+    Reasoning: in this codebase `--format opds` has always *meant* the
+    LF/ODPI export (the historical default of that flag), so back-compat
+    callers keep getting the spec they actually consume.
+  - `fluid export-opds` → also fixed; now emits a real LF/ODPI v4.1 JSON
+    (was: same degenerate fallback). Logs a DEPRECATION warning pointing at
+    `fluid generate standard --format odps-v4.1`.
+  - All previously-emitted degenerate shapes (`{specVersion: "4.1", id,
+    name, domain, owner}` and `{specVersion: "1.0", id, title, owner,
+    domain, exposes[]}`) are GONE — every path now produces a real spec
+    doc.
+- **`fluid generate standard --list` output reordered Bitol-first**
+  (`odps` → `odps-bitol` → `odcs` → `odps-v4.1` → `opds`). The README
+  "Which ODPS?" section, AGENTS.md pipeline row, and the rich help
+  formatter table are all reordered to lead with Bitol.
+
+### Changed
+- **ODPS / OPDS naming alignment with upstream specifications.** Resolved a
+  long-standing letter-swap that treated the canonical acronym **ODPS**
+  (Open Data Product Specification — Linux Foundation / ODPI v4.1) and the
+  letter-swap **OPDS** as if they were separate standards in user-facing
+  help text and emit-set listings. Two distinct standards do share the
+  ODPS acronym (Bitol's *Standard* v1.0.0 and the LF *Specification* v4.1)
+  and both are now disambiguated by full name everywhere the names appear.
+  - `fluid odps` is the canonical subcommand; `fluid opds` remains as a
+    documented deprecated alias.
+  - `--spec odps-4.1` is the canonical id for the LF/ODPI spec;
+    `--spec odpi-4.1` (which swapped the *spec* name for the *org* name) is
+    accepted with a WARNING that points at the correct id.
+  - `--format opds`, `--emit opds`, and the `OPDS_*` env vars
+    (`OPDS_VERSION`, `OPDS_INCLUDE_BUILD_INFO`, `OPDS_INCLUDE_EXECUTION_DETAILS`,
+    `OPDS_TARGET_PLATFORM`, `OPDS_VALIDATE_OUTPUT`) are accepted with a
+    one-time WARNING that names the canonical ODPS form.
+  - `pyproject.toml`: added `[odps]` extra as the canonical name; `[opds]`
+    is kept as a back-compat empty alias that depends on `[odps]`. The
+    `[all]` umbrella now references `[odps]`.
+  - Internals: `SPEC_ODPS_4_1` / `ODPS_4_1_*_URL` are the canonical names
+    in `fluid_build.cli.opds`; `SPEC_ODPI_4_1` / `ODPI_4_1_*_URL` remain
+    as module-level back-compat aliases.
+  - The `OdpsProvider.name` property and the deterministic UUID namespace
+    string (`"fluid-forge-opds"`) are intentionally **unchanged** to
+    preserve wire-format keys and deterministic IDs across releases.
+  - Test coverage: every existing OPDS test (`tests/test_opds_*`,
+    `tests/test_contract_compatibility_matrix.py`,
+    `tests/forge/test_artifact_fanout.py`,
+    `tests/test_pipeline_templates_branches.py`,
+    `tests/test_forge_seed_import_matrix.py`,
+    `tests/test_forge_copilot_seed.py`,
+    `tests/cli/test_subcommand_dispatch_smoke.py`) re-runs green after the
+    rename + back-compat aliases.
+## [0.8.3] — 2026-05-25
+
+First stable release on the `0.8.x` line after `v0.8.0`. Folds five
+post-`v0.8.0` PRs — ODCS / Bitol ODPS bidirectional provider with
+SSRF-hardened HTTP (#136), CLI dispatch + smoke hardening (#137),
+unified catalog registry with world-class DataHub + Data Mesh Manager
+lineage (#138), tier-0 import-hygiene SSRF gate with `import-linter`
+contracts (#139), and the OpenTofu autogenerator that recasts
+`fluid apply` for cloud providers as a contract compiler (#140) — and
+ships the previously-pre-released `v0.8.3rc1` plugin extension points
++ v0.7.3 acquisition-pattern engine as stable. `pip install
+data-product-forge` resolves to this line by default. Stacks on the
+beta-tier v0.7.3 acquisition runners and the EngineRuntime registry
+released in [0.8.2] below — no schema break vs `v0.8.0`.
+
+### Added
+
+- **OpenTofu autogenerator — `fluid apply` becomes a contract compiler
+  for cloud providers** (#140). New `fluid_build/iac/` module: modular
+  `IacProviderPlugin` per cloud (dbt-adapter pattern), built-in plugins
+  for **AWS / GCP / Snowflake**. The cloud providers compile the
+  contract to a deterministic OpenTofu `main.tf.json` and delegate
+  apply / state / drift / idempotency to the `tofu` binary; `local`
+  keeps its native apply. New CLI surface: `fluid generate iac
+  <contract>` (review-only emit) and `fluid apply` auto-routes cloud
+  providers through `iac.cutover.resolve_engine`. The plan-binding
+  integrity gate from the native engine is replicated at
+  `_apply_opentofu_engine.py::_verify_plan_binding_for_opentofu`. The
+  brownfield `tofu import` path is wired for all three plugins via
+  `discover_imports`. Architecture doc at `AUTOGEN_SPIKE.md`;
+  three-tier coverage matrix at `HONESTLY_TESTED.md`.
+
+- **Tier-0 SSRF gate + import-linter architecture contracts** (#139).
+  The canonical post-DNS-resolution SSRF check
+  (`_hostname_is_private` — RFC1918 + link-local 169.254.0.0/16 +
+  loopback + reserved + IPv4-mapped IPv6 unwrap, fails closed on DNS
+  errors) moved to the new `fluid_build/_net.py` tier-0 leaf so
+  `observability/reporter.py` can use it without importing
+  `build_runners` (closes the cycle that previously broke
+  `cli/__init__.py` import). Two declarative `[tool.importlinter]`
+  contracts in `pyproject.toml` gate the architecture in CI:
+  (1) `observability ↛ build_runners`, (2) `_net` is tier-0 (no
+  `fluid_build.*` upstreams). Wired into the pre-commit hook and a
+  new `import-hygiene` CI job. Four subprocess-isolated regression
+  tests in `tests/observability/test_import_hygiene.py`.
+
+- **Unified catalog registry + world-class DataHub + DMM lineage**
+  (#138). One registry (`fluid_build/build_runners/catalog_registrars/
+  __init__.py::build_registrar`) instantiates every backend from a
+  uniform `CatalogPublicationPayload`. DataHub emits canonical MCPs
+  with full schema + ownership + tags + descriptions; Data Mesh
+  Manager emits proper `SourceSystem` lineage links rather than the
+  prior flat dataset list. The retired Glue + Snowflake Horizon
+  publish registrars folded their metadata-enrichment into the IaC
+  emit (PR #140) — single source of truth, full drift detection,
+  zero out-of-band registrar writes.
+
+- **ODCS + Bitol ODPS bidirectional provider + `fluid forge --seed-from`
+  pre-processor** (#136). `BitolOdpsProvider` (registered as
+  `odps_bitol`, alias `odps-standard`) emits the canonical Bitol
+  fragments layout (1 ODPS doc + N sibling `<contractId>.odcs.yaml`
+  files) and the linking invariant `port.contractId == odcs.id` is
+  asserted in tests. `ContractResolver` resolves port `contractId`
+  references through local probes + opt-in http(s) fetch with the
+  full SSRF guard (see Security). `fluid opds import` accepts three
+  entry shapes — single ODPS, directory bundle, lone ODCS — and
+  `fluid opds export --spec bitol-1.0.0|odpi-4.1` dispatches between
+  the two output specs. `fluid forge --seed-from <path>` accepts an
+  ODCS contract, Bitol ODPS product, or a directory bundle as
+  structural seed for the copilot. The ODCS provider was modularised
+  under `providers/odcs/` with paired `to_fluid()` / `to_odcs()`
+  mappers and per-level `odcs_passthrough` buckets for lossless
+  round-trip; `roundtrip_check()` returns a structured diff used by
+  tests and the forge ground-truth guard.
+
+- **Plugin extension points** — three entry-point groups discovered
+  via `importlib.metadata.entry_points()` (graduated from
+  `v0.8.3rc1`):
+  - `fluid_build.commands` — register `fluid <name>` subcommands at
+    CLI bootstrap (`cli/bootstrap.py`).
+  - `fluid_build.extension_validators` — validate `contract.extensions`
+    sub-keys during `fluid validate`. Errors fold into the
+    `ValidationResult` namespaced under `extensions.<ep-name>`.
+  - `fluid_build.apply_hooks` — apply-time invariants during
+    `fluid apply`. Plugins receive `copy.deepcopy(contract)` and
+    cannot mutate the live reference.
+  All three trap exceptions, pre-redact them via `redact_secret_text`,
+  and report them as errors — they cannot crash the CLI. Companion
+  packages `data-product-forge-sdk==0.9.0` (Beta) and
+  `data-product-forge-custom-scaffold==0.1.0` (Beta) plug in via
+  these hooks.
+
+- **`--force-pattern-drift` flag on `fluid apply`** — override gate
+  for the scaffold-pattern drift detector when an intentional
+  re-scaffold needs to bypass it (graduated from `v0.8.3rc1`).
+
+- **`contract.extensions` schema field** in `fluid-schema-0.7.3.json`
+  — optional top-level object with `additionalProperties: true`,
+  validated per-sub-key by extension-validator plugins.
+
+- **`fluid stats` aggregator** with `--by provider/type/engine`,
+  `--since <spec>`, and `--json` over `.fluid/agents/*/cost.json`
+  (cross-run cost telemetry, useful for budget tracking).
+
+### Security
+
+- **`fluid_build.util.safe_http` — shared SSRF guard for every HTTP
+  fetch** (#136). One factory (`safe_httpx_client`) routes all
+  outbound http(s) calls through: scheme allowlist + private /
+  loopback / link-local / CGNAT / 6to4 / NAT64 / ORCHIDv2 / IPv6-SR /
+  RFC-TEST-NET filter + IPv4-mapped IPv6 unwrap (closes a Python
+  3.10/3.11 bypass — stdlib `is_private` only recurses into
+  IPv4-mapped in 3.12+) + reject-all on mixed-public+private DNS +
+  connection-layer DNS pin (via httpx's `sni_hostname` extension) +
+  `follow_redirects=False` default + streaming body cap (10 MiB).
+  Migrated seven fetch surfaces in one pass: `ContractResolver`,
+  `KafkaConnectRestClient` + its schema-registry client, the Airbyte
+  REST client, all five catalog registrars (Glue / DataHub /
+  OpenMetadata / Unity / Snowflake Horizon / DataMesh Manager), the
+  Databricks auth-provider's API check, and the schema-manager remote
+  fetcher. Borrow-before-build receipts (CIDR list from
+  `requests-hardened` BSD-3; httpx DNS-pin from the maintainer-blessed
+  `sni_hostname` extension docs) are in
+  `fluid_build/util/safe_http.py`'s module header.
+
+- **Plan-binding gate replicated in the OpenTofu engine** (#140).
+  `_apply_opentofu_engine.py::_verify_plan_binding_for_opentofu`
+  mirrors the native engine's stage-7 `bundleDigest` + `planDigest`
+  verification — a tampered `plan.json` is rejected before any
+  `tofu apply` for every cut-over cloud (AWS / GCP / Snowflake).
+  `--no-verify-plan-binding` is the emergency escape hatch and logs
+  at WARNING.
+
+- **Operational hardening on the OpenTofu engine** (#140): per-tofu
+  subprocess timeout (default 1800s, override via
+  `FLUID_TOFU_TIMEOUT_SECONDS`); `require_tofu_version()` floor at
+  1.6.0 (catches the silent `terraform`-on-PATH-as-`tofu` mixup);
+  `--allow-data-loss` override now emits a WARNING log + a structured
+  `opentofu_destructive_gate_override` event for CI log-scrapers.
+
+- **Apply hooks receive `copy.deepcopy(contract)`** rather than the
+  live reference (graduated from `v0.8.3rc1`). A buggy or malicious
+  hook cannot mutate the contract the rest of apply or other hooks
+  consume.
+
+- **Plugin exception text and plugin-supplied error strings are
+  pre-scrubbed with `redact_secret_text`** before reaching logs or
+  the errors list (graduated from `v0.8.3rc1`). The
+  `SecretRedactingFilter` only scrubs args bound to `password=%s`-style
+  template tokens; plugin exceptions are free-form text that can
+  carry credential-shaped substrings anywhere. Applied uniformly
+  across `cli/apply.py`, `cli/validate.py`, `cli/bootstrap.py`.
+
+- **`bootstrap.py` imports `redact_secret_text` at module top**
+  rather than nested inside an except branch — closes a
+  defense-in-depth gap surfaced by security review.
+
+### Changed
+
+- **BREAKING (caller API) — `allow_remote` defaults to `False`
+  across CLI + library** (#136). `fluid opds import` and
+  `fluid forge --seed-from` no longer fetch http(s) `contractId`
+  references unless `--allow-remote` / `--seed-allow-remote` is
+  passed explicitly. Python callers of
+  `BitolOdpsProvider().import_contract(...)`,
+  `BitolOdpsProvider().import_directory(...)`, `ContractResolver(...)`,
+  and `forge_copilot_seed.load_seed(...)` must now pass
+  `allow_remote=True` for the previous behaviour. `--no-remote` and
+  `--seed-no-remote` remain as hidden no-op aliases.
+
+- **CLI dispatch wired on `stats` and `generate-pipeline` subcommands**
+  (#137). Both subparsers now carry `set_defaults(func=run)` so
+  `fluid stats` and `fluid generate-pipeline` dispatch to the
+  implementation instead of falling through to the
+  no-subcommand-selected help guide. Pinned by a smoke test that
+  parses every registered subparser and asserts the `func` attribute
+  is set.
+
+- **Catalog registrar retirement — Glue + Snowflake Horizon** (#140).
+  `fluid_build/build_runners/catalog_registrars/{glue,snowflake_horizon}.py`
+  (~514 LOC of boto3/HTTP push) deleted; the catalog metadata they
+  used to write at publish time (table descriptions, per-column
+  comments, FLUID classification tags, contract YAML) is folded into
+  the IaC emit (`iac/providers/aws.py::_emit_glue` for Glue +
+  `iac/providers/snowflake.py::_build_horizon_table_comment` for
+  Horizon). One source of truth, full drift detection by `tofu plan`,
+  no out-of-band registrar writes that fight IaC state. The
+  `acquisitionCatalog.register` schema enum drops `glue` and
+  `snowflake_horizon` accordingly; `datahub`, `openmetadata`, and
+  `datamesh_manager` registrars remain (the first two have community
+  Terraform providers we may adopt later; DMM has no provider).
+
+- **ODCS schema validation default-on with warn-on-fail** (#136).
+  Vendored ODCS v3.1.0 JSON Schema runs on every export by default
+  (`ODCS_VALIDATE=true`); failures warn rather than raise. Hard fail
+  via `ODCS_VALIDATE_STRICT=true` or by calling `validate_contract()`.
+
+- **ODCS type table is now exhaustive against the FLUID 0.7.3 column-type
+  enum** (79 types) (#136). Drift guard in
+  `tests/providers/test_odcs_type_mapping.py` fails CI if a new FLUID
+  schema type is missing from `_FLUID_TYPE_TO_ODCS_LOGICAL`.
+
+- **Bitol ODPS input ports — three-source merge** (#136).
+  `ports.py::to_odps()` walks `consumes[]` (FLUID 0.7.2 canonical),
+  `builds[]` (SDP source streams), and `expects[]` (FLUID 0.7.1
+  legacy) — de-duped by name. Uses upstream's
+  `util.contract.consumes_to_canonical_ports` +
+  `builds_to_canonical_input_ports` for the normalisation.
+
+### Test coverage
+
+- **40+ new IaC test files at `tests/iac/`** (#140) — three-tier
+  ladder: Stage 1 unit + `tofu validate` (creds-free, every PR),
+  Stage 2 Docker emulators (LocalStack for AWS + goccy/bigquery-emulator
+  + fsouza/fake-gcs-server + gcloud pubsub for GCP, every PR), and
+  Stage 3 real-cloud OIDC keyless (nightly + manual; ~30 tests on
+  real AWS, ~19 on real GCP, ~40 on real Snowflake). New
+  `.github/workflows/iac-tests.yml` runs the ladder; the existing
+  `ci.yml` Stage 2 path skips LocalStack cleanly when the optional
+  `LOCALSTACK_AUTH_TOKEN` secret isn't configured.
+
+- **16 unit tests for the brownfield `discover_imports` shape**
+  across AWS + GCP + Snowflake plugins, with documented hashicorp/{aws,
+  google,snowflake} import-id formats; plus live brownfield tests for
+  AWS + GCP (pre-create resources out-of-band, run apply, verify
+  adoption).
+
+- **4 subprocess-isolated import-hygiene regression tests** at
+  `tests/observability/test_import_hygiene.py` (#139) — including the
+  original failing import path, sys.modules introspection after
+  `observability` load, and assertions that `fluid_build._net` does
+  not pull any other `fluid_build.*` module.
+
+- **`tests/test_cli_plugin_hooks.py`** — 19 tests pinning every
+  behaviour on the plugin trust surface (graduated from
+  `v0.8.3rc1`).
+
+### Upstream issues filed / resolved
+
+- [snowflakedb/terraform-provider-snowflake#4775](https://github.com/snowflakedb/terraform-provider-snowflake/issues/4775)
+  — filed 2026-05-25, **resolved upstream same day** by maintainer
+  @sfc-gh-kwasilewski. The `snowflake_tag_masking_policy_association`
+  resource was deprecated in v0.99.0 and removed in v1.0.0; the
+  binding moved INTO `snowflake_tag.masking_policies` (set of
+  fully-qualified names). Trello card created for implementing
+  this in the Snowflake IaC plugin.
+- [goccy/bigquery-emulator#484](https://github.com/goccy/bigquery-emulator/issues/484)
+  — filed 2026-05-25. `tofu apply` via the hashicorp/google provider
+  crashes on dataset read-back ("Plugin did not respond"). Pinned as
+  an xfailed test until upstream resolves.
+- Two LocalStack Pro quirks (Lambda V2 docker-in-docker socket
+  reachability + LF DataLakeAdmin GrantPermissions auth) — drafts at
+  `docs/upstream-issues/localstack-*.md`. The public LocalStack repo
+  was archived 2026-03-23 and the Pro repo is private; the drafts
+  point operators at LocalStack's support portal and Slack.
+
+### Notes
+
+- Companion plugin ecosystem packages on PyPI:
+  - `data-product-forge-sdk` (0.9.0, Beta) — reference ABCs +
+    conformance harnesses for the three entry-point groups.
+  - `data-product-forge-custom-scaffold` (0.1.0, Beta) — reference
+    `CustomScaffold` engine; Jinja+YAML or Python-plugin bundles.
+- All six ingestion engines (`duckdb`, `airbyte`, `meltano`, `dlt`,
+  `kafka-connect`, `debezium`) remain GA — no schema break vs
+  `v0.8.0`. The v0.7.3 acquisition-pattern engine documented in
+  [0.8.2] graduates to stable in this line.
+- Cloud-provider apply paths now route through the OpenTofu engine
+  by default. Operationally this means: install `tofu` (≥ 1.6.0)
+  alongside `data-product-forge`; otherwise `fluid apply` against
+  AWS / GCP / Snowflake fails fast with a clear error. The `local`
+  provider is unaffected.
+
 ## [0.8.3rc1] — 2026-05-12
 
 Pre-release candidate of the first stable line after `v0.8.0`. Stacks the

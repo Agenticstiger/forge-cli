@@ -193,13 +193,20 @@ def in_memory_exporter(monkeypatch):
     actual spans emitted. Uses opentelemetry-sdk's
     ``InMemorySpanExporter`` test helper.
 
-    Resets the tracer-provider state before and after so tests are
-    isolated — OTEL's ``set_tracer_provider`` is sticky otherwise.
+    Bypasses OTel's global :func:`trace.set_tracer_provider` entirely
+    because that call is gated by a module-level ``_TRACER_PROVIDER_SET_ONCE``
+    in ``opentelemetry.trace`` — once any test sets a provider, the
+    second test's fixture would log ``Overriding of current
+    TracerProvider is not allowed`` and silently no-op, detaching the
+    exporter from the actual provider the module reads from. Instead
+    we build a local provider, grab a tracer off it directly, and pin
+    that tracer into the module's ``_tracer`` slot — ``_get_tracer``
+    returns it as-is when non-None, and ``monkeypatch`` rolls back
+    cleanly at fixture teardown.
     """
     if not tracing._OTEL_AVAILABLE:
         pytest.skip("opentelemetry-sdk not installed in this env")
 
-    from opentelemetry import trace
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -207,15 +214,14 @@ def in_memory_exporter(monkeypatch):
     )
 
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
-    # Install fresh tracer provider with in-memory exporter.
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    # The module's lazy init would create its own provider; pre-set
-    # one that the module will pick up via trace.get_tracer_provider.
-    trace.set_tracer_provider(provider)
-    # Reset module cache so _get_tracer re-uses our provider.
-    monkeypatch.setattr(tracing, "_tracer", None)
+    tracer = provider.get_tracer("fluid_build")
+    # Pin both fields the module checks before lazy-initialising. Setting
+    # ``_tracer`` directly bypasses ``_get_tracer``'s otel-init branch so
+    # the global provider stays untouched for the next test's fixture.
+    monkeypatch.setattr(tracing, "_tracer", tracer)
     monkeypatch.setattr(tracing, "_tracer_provider_initialised", True)
     yield exporter
 

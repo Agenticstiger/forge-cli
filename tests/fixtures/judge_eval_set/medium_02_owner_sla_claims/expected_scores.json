@@ -1,0 +1,14 @@
+{
+  "axes": {
+    "correctness": 4,
+    "completeness": 3,
+    "security": 3,
+    "governance": 4,
+    "performance": 2,
+    "documentation": 2
+  },
+  "total": 18,
+  "tolerance_per_axis": 2,
+  "tolerance_total": 6,
+  "rationale": "Owner + retention + classification; missing SLA terms, column-level PII masks, partitioning."
+}

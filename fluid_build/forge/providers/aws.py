@@ -61,7 +61,7 @@ class AWSProvider(InfrastructureProvider):
         return len(errors) == 0, errors
 
     def get_required_tools(self) -> List[str]:
-        return ["aws", "terraform"]
+        return ["aws", "tofu"]
 
     def get_environment_variables(self) -> List[str]:
         return ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"]

@@ -1,0 +1,288 @@
+name: iac-tests
+
+# Three-stage test ladder for the IaC autogenerator (see
+# HONESTLY_TESTED.md for the full coverage matrix):
+#
+#   * Stage 1 — unit + tofu validate. No creds, runs on every PR + push.
+#   * Stage 2 — docker emulators (LocalStack for AWS,
+#     goccy/bigquery-emulator + fsouza/fake-gcs-server + gcloud pubsub
+#     for GCP). Runs on every PR + push.
+#   * Stage 3 — real AWS + real GCP via OIDC keyless. Runs nightly + on
+#     manual workflow_dispatch. Skipped on forks (no secrets).
+#
+# OIDC patterns borrowed from aws-actions/configure-aws-credentials@v4
+# and google-github-actions/auth@v2 — both are the recommended keyless
+# (Workload Identity Federation) entry points for their respective
+# clouds. No long-lived secrets stored anywhere.
+
+on:
+  pull_request:
+    paths:
+      - "fluid_build/iac/**"
+      - "fluid_build/cli/_apply_opentofu_engine.py"
+      - "fluid_build/build_runners/dbt/**"
+      - "tests/iac/**"
+      - ".github/workflows/iac-tests.yml"
+  push:
+    branches: [main]
+  schedule:
+    # 03:00 UTC every day — Stage 3 nightly. Sandbox accounts are
+    # tagged ``managed_by=fluid`` so leaked test resources are
+    # observable + sweepable.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Which stage to run"
+        required: true
+        default: "stage1-2"
+        type: choice
+        options:
+          - stage1-2
+          - stage3-aws
+          - stage3-gcp
+          - stage3-all
+
+permissions:
+  contents: read
+  # Required for OIDC keyless auth to AWS + GCP.
+  id-token: write
+
+jobs:
+  # -------------------------------------------------------------------
+  # Stage 1 — unit emit + tofu validate. Fast, no creds.
+  # -------------------------------------------------------------------
+  stage1-unit:
+    name: "Stage 1 — unit + tofu validate"
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: 1.12.0
+
+      - name: Install Python deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -e '.[dev]'
+
+      - name: Stage 1 — unit (pure-function emit)
+        run: .venv/bin/python -m pytest -m "unit and not slow" -q
+
+      - name: Stage 1 — tofu validate (creds-free)
+        run: .venv/bin/python -m pytest tests/iac/test_iac_tofu_validate.py -q
+
+  # -------------------------------------------------------------------
+  # Stage 2 — docker emulators. PR + push.
+  # -------------------------------------------------------------------
+  stage2-emulator:
+    name: "Stage 2 — docker emulators"
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    # LocalStack and GCP emulators are started as step-level docker
+    # commands AFTER checkout (rather than via the job-level
+    # ``services:`` block) so that:
+    #   1. LocalStack can be skipped cleanly when the optional
+    #      ``LOCALSTACK_AUTH_TOKEN`` secret isn't set — the modern
+    #      ``localstack/localstack:latest`` image now requires a token
+    #      at startup even for community features (LocalStack 2026.x).
+    #      Without the token the service container fails before
+    #      ``actions/checkout`` runs, cascading every downstream step.
+    #   2. The GCP emulators (BigQuery + GCS + Pub/Sub) are
+    #      token-free and always start, so the GCP half of Stage 2
+    #      runs on every PR regardless of LocalStack availability.
+    env:
+      HAS_LOCALSTACK_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: 1.12.0
+
+      - name: Install Python deps
+        # The ``test-emulators-heavy`` extra ships the GCP + AWS SDK
+        # clients the Stage 2 tests use to talk to the BigQuery / GCS /
+        # Pub/Sub emulators and LocalStack (``google-auth``,
+        # ``google-cloud-bigquery``, ``google-cloud-storage``,
+        # ``google-cloud-pubsub``, ``boto3``). Installing the full
+        # ``[gcp]`` extra here would needlessly pull dbt-bigquery and
+        # google-cloud-dataplex; the emulator tier only needs the SDK
+        # clients themselves.
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -e '.[dev,test-emulators-heavy]'
+
+      - name: Start LocalStack (when token is configured)
+        if: env.HAS_LOCALSTACK_TOKEN == 'true'
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+        run: |
+          docker run -d --name localstack \
+            -p 4566:4566 \
+            -e LOCALSTACK_AUTH_TOKEN="$LOCALSTACK_AUTH_TOKEN" \
+            -e SERVICES="s3,glue,iam,kinesis,lambda,stepfunctions,athena,events,scheduler,sns,sqs,secretsmanager,cloudwatch" \
+            localstack/localstack:latest
+          # Health-check — wait up to 60 s for the gateway to respond.
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:4566/_localstack/health > /dev/null && break
+            sleep 2
+          done
+
+      - name: Start GCP emulators
+        run: |
+          docker compose -f tests/iac/_gcp_emulator/docker-compose.yml up -d
+          # Health-check loops — the BQ emulator can take ~15s to be ready.
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9050/discovery/v1/apis/bigquery/v2/rest > /dev/null && break
+            sleep 2
+          done
+
+      - name: Stage 2 — AWS LocalStack
+        if: env.HAS_LOCALSTACK_TOKEN == 'true'
+        env:
+          FLUID_IAC_LIVE_LOCALSTACK: "1"
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+        run: .venv/bin/python -m pytest tests/iac/test_iac_aws_localstack_e2e.py -q --no-header
+
+      - name: Stage 2 — AWS LocalStack (skipped — no token)
+        if: env.HAS_LOCALSTACK_TOKEN != 'true'
+        run: |
+          echo "::notice::Skipping LocalStack tests — set the LOCALSTACK_AUTH_TOKEN repo secret to enable them."
+          echo "LocalStack 2026.x requires an auth token even for community features; see"
+          echo "https://docs.localstack.cloud/getting-started/auth-token/ for free-tier setup."
+
+      - name: Stage 2 — GCP emulator
+        env:
+          FLUID_IAC_LIVE_GCP_EMULATOR: "1"
+          PUBSUB_EMULATOR_HOST: "localhost:8085"
+          FLUID_GCP_BIGQUERY_EMULATOR: "http://localhost:9050"
+          FLUID_GCP_STORAGE_EMULATOR: "http://localhost:4443"
+        run: .venv/bin/python -m pytest tests/iac/test_iac_gcp_emulator_e2e.py -q --no-header
+
+      - name: Stop LocalStack
+        if: always() && env.HAS_LOCALSTACK_TOKEN == 'true'
+        run: docker rm -f localstack || true
+
+      - name: Stop GCP emulators
+        if: always() && hashFiles('tests/iac/_gcp_emulator/docker-compose.yml') != ''
+        run: docker compose -f tests/iac/_gcp_emulator/docker-compose.yml down
+
+  # -------------------------------------------------------------------
+  # Stage 3 AWS — real cloud, OIDC keyless. Nightly + manual.
+  # -------------------------------------------------------------------
+  stage3-aws:
+    name: "Stage 3 — real AWS"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (inputs.stage == 'stage3-aws' || inputs.stage == 'stage3-all'))
+    env:
+      AWS_REGION: eu-west-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: 1.12.0
+
+      - name: Install Python deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -e '.[dev]'
+          .venv/bin/pip install --quiet dbt-athena-community dbt-redshift
+
+      # Keyless OIDC: GitHub Actions mints a short-lived token that
+      # AWS STS exchanges for credentials via an IAM role's trust
+      # policy. No long-lived secrets in the repo.
+      - name: Assume AWS role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN }}
+          aws-region: eu-west-1
+
+      - name: Stage 3 AWS — full suite
+        env:
+          FLUID_IAC_LIVE_AWS: "1"
+          FLUID_AWS_LAMBDA_ROLE_ARN: ${{ vars.FLUID_AWS_LAMBDA_ROLE_ARN }}
+          FLUID_AWS_SFN_ROLE_ARN: ${{ vars.FLUID_AWS_SFN_ROLE_ARN }}
+          FLUID_AWS_GLUE_ROLE_ARN: ${{ vars.FLUID_AWS_GLUE_ROLE_ARN }}
+          FLUID_AWS_SPECTRUM_ROLE_ARN: ${{ vars.FLUID_AWS_SPECTRUM_ROLE_ARN }}
+        run: |
+          .venv/bin/python -m pytest tests/iac/test_iac_aws_real_*.py \
+            -v --tb=short --no-header -p no:cacheprovider
+
+  # -------------------------------------------------------------------
+  # Stage 3 GCP — real cloud, OIDC keyless via WIF. Nightly + manual.
+  # -------------------------------------------------------------------
+  stage3-gcp:
+    name: "Stage 3 — real GCP"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (inputs.stage == 'stage3-gcp' || inputs.stage == 'stage3-all'))
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: 1.12.0
+
+      - name: Install Python deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -e '.[dev]'
+          .venv/bin/pip install --quiet dbt-bigquery
+
+      # Workload Identity Federation: GitHub Actions OIDC token →
+      # GCP-side WIF provider → impersonates the test service account.
+      # Same security model as the local dev path (no SA-key files
+      # ever exist on disk).
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_TEST_SA }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Stage 3 GCP — full suite
+        env:
+          FLUID_IAC_LIVE_GCP: "1"
+          FLUID_GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          FLUID_GCP_TEST_SA: ${{ vars.GCP_TEST_SA }}
+          FLUID_GCP_REGION: ${{ vars.GCP_REGION }}
+        run: |
+          .venv/bin/python -m pytest tests/iac/test_iac_gcp_real_*.py \
+            -v --tb=short --no-header -p no:cacheprovider

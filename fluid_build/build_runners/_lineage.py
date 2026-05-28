@@ -25,12 +25,11 @@ from dataclasses import asdict, dataclass, field
 from typing import List, Optional
 from urllib.parse import urlparse
 
-from fluid_build.api.lineage import LineageEmitter, RunEvent
-
 # Reuse the canonical SSRF post-DNS-resolution gate (RFC1918,
 # link-local 169.254.0.0/16 — AWS/GCP metadata — loopback, reserved;
 # fails closed on DNS errors).
-from ._alerter import _hostname_is_private
+from fluid_build._net import _hostname_is_private
+from fluid_build.api.lineage import LineageEmitter, RunEvent
 
 LOG = logging.getLogger("fluid.acquire.lineage")
 

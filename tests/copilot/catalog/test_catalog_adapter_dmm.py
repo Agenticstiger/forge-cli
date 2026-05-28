@@ -207,3 +207,88 @@ class TestPerCallClientLifecycle:
         # Context manager's __exit__ was called → connection
         # closed. Pattern 3 satisfied.
         cm.__exit__.assert_called()
+
+
+class TestDmmApiPaths:
+    """Pin the DMM REST paths against the vendor's published surface.
+
+    Regression guard against the v1.5 mistake where the adapter
+    called ``/api/data-products`` (with hyphen) — a 404 against every
+    real DMM instance. The publisher side at
+    ``providers/datamesh_manager`` uses ``/api/dataproducts`` and
+    ``/api/datacontracts``; the read-side adapter must match.
+    """
+
+    def test_list_tables_calls_dataproducts_without_hyphen(self):
+        cm, client = _stub_httpx_client(_stub_httpx_response(200, {"dataProducts": []}))
+        with patch("httpx.Client", return_value=cm):
+            _make_adapter().list_tables(CatalogScope())
+        # client.request is called positionally as (method, url, ...)
+        args = client.request.call_args.args
+        assert args[0] == "GET"
+        # Path is /api/dataproducts — not /api/data-products.
+        assert args[1].endswith("/api/dataproducts")
+        assert "/api/data-products" not in args[1]
+
+    def test_get_table_calls_dataproducts_then_datacontracts(self):
+        # First call: product fetch; second call: contract fetch.
+        cm, client = _stub_httpx_client(
+            [
+                _stub_httpx_response(200, {"name": "p", "outputPorts": []}),
+                _stub_httpx_response(200, {"id": "p", "schema": []}),
+            ]
+        )
+        with patch("httpx.Client", return_value=cm):
+            _make_adapter().get_table("commerce.orders")
+
+        product_call = client.request.call_args_list[0]
+        contract_call = client.request.call_args_list[1]
+        # Product fetch hits /api/dataproducts/{fqn}.
+        assert product_call.args[1].endswith("/api/dataproducts/commerce.orders")
+        # Contract fetch hits /api/datacontracts/{fqn} — the canonical
+        # DMM contract path, NOT a /contract sub-resource on the
+        # product.
+        assert contract_call.args[1].endswith("/api/datacontracts/commerce.orders")
+        assert "/api/data-products" not in product_call.args[1]
+        assert "/api/data-products" not in contract_call.args[1]
+
+    def test_get_lineage_calls_dataproducts_lineage(self):
+        cm, client = _stub_httpx_client(
+            _stub_httpx_response(200, {"upstream": [], "downstream": []})
+        )
+        with patch("httpx.Client", return_value=cm):
+            _make_adapter().get_lineage("commerce.orders")
+        url = client.request.call_args.args[1]
+        assert url.endswith("/api/dataproducts/commerce.orders/lineage")
+        assert "/api/data-products" not in url
+
+    def test_list_glossary_terms_returns_empty_without_calling_dmm(self):
+        """DMM has no glossary endpoint. The adapter MUST NOT hit the
+        network (the v1.5 mistake was to call ``/api/glossary``,
+        which always 404s); it should return ``[]`` synchronously."""
+        cm, client = _stub_httpx_client(_stub_httpx_response(404))
+        with patch("httpx.Client", return_value=cm):
+            terms = _make_adapter().list_glossary_terms(CatalogScope())
+        assert terms == []
+        # No HTTP call was made — adapter knew DMM has no glossary
+        # endpoint and short-circuited.
+        client.request.assert_not_called()
+
+    def test_translation_suggestion_points_at_correct_url(self):
+        """When DMM 404s, the error suggestion must reference the
+        right URL — not the v1.5 ``/api/data-products`` typo that
+        sent operators down the wrong rabbit hole."""
+        cm, _ = _stub_httpx_client(_stub_httpx_response(404))
+        with patch("httpx.Client", return_value=cm):
+            adapter = _make_adapter()
+            with pytest.raises(CatalogConnectionError) as exc_info:
+                adapter.list_tables(CatalogScope())
+        joined = " ".join(exc_info.value.suggestions or [])
+        # The connection-level suggestion (always emitted when the
+        # error isn't recognised as a permission failure) hints
+        # ``/api/dataproducts`` as the smoke-test URL. The 404-path
+        # ``target`` references the request URL, which is also the
+        # correct ``/api/dataproducts`` path. Either way, the wrong
+        # ``/api/data-products`` string must not appear.
+        assert "/api/data-products" not in joined
+        assert "/api/data-products" not in exc_info.value.message

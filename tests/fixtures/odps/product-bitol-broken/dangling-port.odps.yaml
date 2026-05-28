@@ -1,0 +1,12 @@
+# Broken: outputPort points at a contractId that has no corresponding ODCS file
+# in the same directory. Used to exercise ContractNotFound.
+apiVersion: v1.0.0
+kind: DataProduct
+id: broken.dangling-port
+name: broken-product
+version: "1.0.0"
+status: draft
+outputPorts:
+  - name: missing_table
+    version: "1.0.0"
+    contractId: broken.dangling-port.missing_table

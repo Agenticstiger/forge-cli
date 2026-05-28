@@ -145,45 +145,35 @@ class DataHubCatalogAdapter(CatalogAdapter):
     def list_tables(self, scope: CatalogScope) -> List[CatalogTable]:
         """Search DataHub for datasets matching the scope.
 
-        Uses DataHub's search API filtered by platform + container
-        (database + schema) to narrow results."""
+        Uses DataHub's structured-filter search API
+        (:meth:`DataHubGraph.get_urns_by_filter`) to narrow by
+        platform + container. The legacy ``graph.search(...)`` method
+        does not exist on ``acryl-datahub`` 1.0+; ``get_urns_by_filter``
+        is the modern equivalent and returns an iterable of URN
+        strings directly (no entity-vs-dict unpacking needed)."""
         graph = self._emitter()
-        # DataHub's search uses URN filters. Build a query that
-        # narrows by platform / container if the scope provides
-        # them; otherwise broad search.
-        query_parts: List[str] = []
+
+        # Build keyword args for the structured-filter call. The
+        # adapter maps ``scope.database`` to DataHub's ``platform``
+        # filter (the cross-catalog "which system is this from?"
+        # axis) — Snowflake / BigQuery / Glue / DataHub itself all
+        # show up as distinct platforms in the DataHub model.
+        filter_kwargs: Dict[str, Any] = {"entity_types": ["dataset"]}
         if scope.database:
-            query_parts.append(f"container:{scope.database}")
+            filter_kwargs["platform"] = scope.database
         if scope.schema_name:
-            query_parts.append(f"container:{scope.schema_name}")
-        query_parts.append("entity_type:dataset")
-        query = " AND ".join(query_parts) or "*"
+            # ``schema_name`` maps to DataHub's platform-instance
+            # axis (intra-platform sub-grouping such as a Snowflake
+            # database name or a BigQuery project).
+            filter_kwargs["platform_instance"] = scope.schema_name
 
         try:
-            results = list(
-                graph.search(
-                    query=query,
-                    entity_types=["dataset"],
-                    skip=0,
-                    count=200,
-                )
-            )
+            urns = list(graph.get_urns_by_filter(**filter_kwargs))
         except Exception as exc:
             raise self._translate_query_error(exc, scope=scope) from exc
 
         out: List[CatalogTable] = []
-        for entity in results:
-            # DataHub SDK returns entities as SDK objects (with
-            # ``.urn`` attribute) on most paths and dicts on others;
-            # support both shapes. Parenthesise the conditional to
-            # avoid Python's operator-precedence trap where
-            # ``a or b if cond else None`` parses as
-            # ``(a or b) if cond else None`` and discards the attr
-            # path entirely when ``entity`` isn't a dict.
-            if isinstance(entity, dict):
-                urn = entity.get("urn")
-            else:
-                urn = getattr(entity, "urn", None)
+        for urn in urns:
             if not urn:
                 continue
             name = _extract_dataset_name(urn)
@@ -285,17 +275,15 @@ class DataHubCatalogAdapter(CatalogAdapter):
         """List DataHub glossary terms.
 
         DataHub has a first-class business glossary; this maps each
-        :class:`GlossaryTerm` directly."""
+        :class:`GlossaryTerm` directly. We discover the term URNs
+        via :meth:`DataHubGraph.get_urns_by_filter` (the modern
+        replacement for the long-removed ``graph.search``) and
+        fetch each term's ``GlossaryTermInfoClass`` aspect to read
+        the definition body.
+        """
         graph = self._emitter()
         try:
-            results = list(
-                graph.search(
-                    query="*",
-                    entity_types=["glossaryTerm"],
-                    skip=0,
-                    count=500,
-                )
-            )
+            urns = list(graph.get_urns_by_filter(entity_types=["glossaryTerm"]))
         except Exception as exc:
             _log.debug(
                 "fluid.copilot.catalog.datahub.glossary.skipped: %s",
@@ -303,18 +291,44 @@ class DataHubCatalogAdapter(CatalogAdapter):
             )
             return []
 
+        # Lazy-import the aspect class so module load still works
+        # without the optional ``[datahub]`` extra installed.
+        try:
+            from datahub.metadata.schema_classes import GlossaryTermInfoClass  # type: ignore
+        except ImportError:
+            GlossaryTermInfoClass = None  # type: ignore[assignment]
+
         out: List[GlossaryTerm] = []
-        for entity in results:
-            urn = getattr(entity, "urn", None) or (
-                entity.get("urn") if isinstance(entity, dict) else None
-            )
+        for urn in urns:
             if not urn:
                 continue
+            # ``name`` falls back to the last URN segment when no
+            # aspect is available — keeps the surface populated
+            # even on DataHub instances that hide the glossary
+            # aspect behind a permission boundary.
             name = urn.rsplit(",", 1)[-1].split(":")[-1]
+            definition = ""
+            if GlossaryTermInfoClass is not None:
+                try:
+                    info = graph.get_aspect(entity_urn=urn, aspect=GlossaryTermInfoClass)
+                except Exception as exc:  # pragma: no cover - defensive
+                    _log.debug(
+                        "fluid.copilot.catalog.datahub.glossary.aspect.skipped: " "%s — %s",
+                        urn,
+                        exc,
+                    )
+                    info = None
+                if info is not None:
+                    # ``GlossaryTermInfoClass`` carries ``name`` and
+                    # ``definition`` directly per acryl-datahub's
+                    # aspect schema; prefer the aspect's name over
+                    # the URN-derived suffix when present.
+                    name = getattr(info, "name", None) or name
+                    definition = getattr(info, "definition", "") or ""
             out.append(
                 GlossaryTerm(
                     term=name,
-                    definition=getattr(entity, "description", "") or "",
+                    definition=definition,
                     catalog_specific={"datahub_urn": urn},
                 )
             )

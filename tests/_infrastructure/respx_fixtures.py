@@ -14,7 +14,6 @@ Each fixture wraps the canonical REST shape of one external service:
 - Kafka Connect REST (`/connectors`, `/connectors/<name>/status`)
 - DataHub GMS (`/entities`)
 - OpenMetadata (`/api/v1/services`, `/tables`)
-- Unity Catalog REST (`/api/2.1/unity-catalog/...`)
 - AWS Glue Catalog (boto3 stub via responses or moto)
 - Snowflake Horizon (HTTP RPC)
 - Marquez (OpenLineage receiver)
@@ -80,14 +79,6 @@ def marquez_mock() -> Iterator["MarquezMockServer"]:
 def openmetadata_mock() -> Iterator["OpenMetadataMockServer"]:
     server = OpenMetadataMockServer()
     with respx.mock(base_url="https://openmetadata.test", assert_all_called=False) as router:
-        server.attach(router)
-        yield server
-
-
-@pytest.fixture
-def unity_mock() -> Iterator["UnityMockServer"]:
-    server = UnityMockServer()
-    with respx.mock(base_url="https://databricks.test", assert_all_called=False) as router:
         server.attach(router)
         yield server
 
@@ -323,14 +314,32 @@ class KafkaConnectMockServer:
 
 
 class DataHubMockServer:
-    """Captures DataHub GMS entity registrations."""
+    """Captures DataHub GMS entity registrations.
+
+    Three lanes:
+
+    - ``entities`` — legacy Snapshot envelopes posted to
+      ``/entities?action=ingest`` (Dataset and similar).
+    - ``proposals`` — MetadataChangeProposals posted to
+      ``/aspects?action=ingestProposal`` (DataProduct, Domain, and
+      anything DataHub only exposes via the MCP API).
+    - ``deletes`` — soft-delete URNs posted to
+      ``/entities?action=delete``.
+
+    Tests that historically asserted ``len(entities) == N`` keep
+    working — the new lanes only capture the new endpoints.
+    """
 
     def __init__(self) -> None:
         self.entities: List[Dict[str, Any]] = []
+        self.proposals: List[Dict[str, Any]] = []
+        self.deletes: List[str] = []
         self.calls: List[str] = []
 
     def attach(self, router: "respx.Router") -> None:
         router.post("/entities?action=ingest").mock(side_effect=self._ingest)
+        router.post("/aspects?action=ingestProposal").mock(side_effect=self._ingest_proposal)
+        router.post("/entities?action=delete").mock(side_effect=self._delete)
 
     def _ingest(self, request: Any) -> Any:
         import httpx
@@ -339,6 +348,40 @@ class DataHubMockServer:
         body = json.loads(request.content)
         self.entities.append(body)
         return httpx.Response(200, json={"value": "ok"})
+
+    def _ingest_proposal(self, request: Any) -> Any:
+        import httpx
+
+        self.calls.append("ingestProposal")
+        body = json.loads(request.content)
+        # The aspect payload is JSON-string-wrapped inside the MCP envelope
+        # (DataHub's GenericAspect shape). Materialise it back to a dict so
+        # tests don't have to double-parse to assert on aspect content.
+        proposal = body.get("proposal") or {}
+        aspect_str = (proposal.get("aspect") or {}).get("value")
+        if isinstance(aspect_str, str):
+            try:
+                proposal = {**proposal, "_aspect_value": json.loads(aspect_str)}
+            except Exception:  # noqa: BLE001 — best-effort, leave raw
+                pass
+        self.proposals.append(proposal)
+        return httpx.Response(200, json={"value": "ok"})
+
+    def _delete(self, request: Any) -> Any:
+        import httpx
+
+        self.calls.append("delete")
+        body = json.loads(request.content)
+        urn = body.get("urn")
+        if urn:
+            self.deletes.append(urn)
+        return httpx.Response(200, json={"value": "ok"})
+
+    # Convenience accessors for tests asserting on the new lanes.
+    def proposals_for(self, entity_type: str) -> List[Dict[str, Any]]:
+        """Return MCP proposals matching ``entity_type`` (``dataProduct``,
+        ``domain``, …)."""
+        return [p for p in self.proposals if p.get("entityType") == entity_type]
 
 
 class MarquezMockServer:
@@ -386,37 +429,6 @@ class OpenMetadataMockServer:
         self.calls.append("delete_table")
         name = request.url.path.rsplit("/", 1)[-1]
         self.deletions.append(name)
-        return httpx.Response(200)
-
-
-class UnityMockServer:
-    """Captures Unity Catalog table CRUD."""
-
-    def __init__(self) -> None:
-        self.tables: List[Dict[str, Any]] = []
-        self.deletions: List[str] = []
-        self.calls: List[str] = []
-
-    def attach(self, router: "respx.Router") -> None:
-        router.post("/api/2.1/unity-catalog/tables").mock(side_effect=self._post)
-        router.delete(
-            host="databricks.test", path__regex=r"^/api/2\.1/unity-catalog/tables/.+$"
-        ).mock(side_effect=self._delete)
-
-    def _post(self, request: Any) -> Any:
-        import httpx
-
-        self.calls.append("post_table")
-        body = json.loads(request.content)
-        self.tables.append(body)
-        return httpx.Response(200, json={**body, "table_id": f"uc-{len(self.tables)}"})
-
-    def _delete(self, request: Any) -> Any:
-        import httpx
-
-        self.calls.append("delete_table")
-        full_name = request.url.path.split("/", 5)[-1]
-        self.deletions.append(full_name)
         return httpx.Response(200)
 
 

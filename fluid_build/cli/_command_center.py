@@ -31,7 +31,7 @@ import yaml
 # Reuse the canonical SSRF post-DNS-resolution gate (RFC1918,
 # link-local 169.254.0.0/16 — AWS/GCP metadata — loopback, reserved;
 # fails closed on DNS errors) rather than re-deriving a range list.
-from fluid_build.build_runners._alerter import _hostname_is_private
+from fluid_build._net import _hostname_is_private
 
 try:
     import requests

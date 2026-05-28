@@ -369,6 +369,39 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     parser.add_argument(
+        "--seed-from",
+        dest="seed_from",
+        help=(
+            "[experimental — pre-processor only] Structural seed for the LLM. "
+            "Accepts a Bitol ODPS file (*.odps.yaml), a directory containing "
+            "the ODPS doc + sibling ODCS files (or only ODCS files), or a "
+            "lone ODCS file (*.odcs.yaml). The schema/quality/qos from the "
+            "seed are treated as ground truth; the LLM fills in builds, "
+            "execution, and governance. Today the seed pre-processor "
+            "(fluid_build.cli.forge_copilot_seed.load_seed) is callable as "
+            "a library; the copilot runtime hand-off + ground-truth diff "
+            "guard wiring is on a follow-up commit."
+        ),
+    )
+    parser.add_argument(
+        "--seed-allow-remote",
+        dest="seed_allow_remote",
+        action="store_true",
+        help=(
+            "[experimental] When --seed-from has http(s) contractId "
+            "references, allow http(s) fetch. Default is OFF (since "
+            "the May 2026 SSRF hardening); the fetcher rejects "
+            "internal/private IPs and pins the validated IP, but "
+            "still only enable when you trust the upstream catalog."
+        ),
+    )
+    parser.add_argument(
+        "--seed-no-remote",
+        dest="seed_no_remote",
+        action="store_true",
+        help=argparse.SUPPRESS,  # deprecated — default is already remote-off
+    )
+    parser.add_argument(
         "--yes",
         "-y",
         action="store_true",
@@ -478,6 +511,23 @@ def register(subparsers: argparse._SubParsersAction):
             "key still pastes back into the terminal (preview)."
         ),
     )
+    # Gap 5 — apply post-synthesis enrichment artifacts back into the
+    # contract (dbt tests, freshness, physical layout). Conservative
+    # merge: never overwrites user-set fields. OFF by default; the
+    # confirmation prompt is bypassed with --yes.
+    parser.add_argument(
+        "--apply-enrichment",
+        dest="apply_enrichment",
+        action="store_true",
+        default=False,
+        help=(
+            "Land the post-synthesis enrichment artifacts (dbt tests, "
+            "freshness, physical layout) back into the contract itself. "
+            "Shows a unified diff and prompts before writing; pair with "
+            "--yes to bypass the prompt. Default OFF: behavior is "
+            "unchanged without this flag."
+        ),
+    )
 
     # --- Discovery ---
     parser.add_argument(
@@ -526,6 +576,14 @@ def register(subparsers: argparse._SubParsersAction):
         "--reset-memory",
         action="store_true",
         help="Delete the copilot memory file and exit",
+    )
+    parser.add_argument(
+        "--memory-json",
+        action="store_true",
+        help=(
+            "When combined with --show-memory, emit the layered memory dump "
+            "as machine-readable JSON instead of a Rich panel."
+        ),
     )
 
     # --- CI/CD auto-scaffolding (post-generation hook) ---
@@ -624,12 +682,198 @@ def register(subparsers: argparse._SubParsersAction):
         default=False,
         help="Force flat single-file layout (skip automatic fragment splitting).",
     )
+
+    # --- Resume / time-travel flags (resumability) ---
+    # Default: a bare `fluid forge` auto-detects an incomplete run in
+    # the cwd and prompts (default = continue). --resume <id> jumps to
+    # a specific run; --resume (bare) takes the most recent.
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="__RESUME_BARE__",
+        default=None,
+        metavar="RUN_ID",
+        help=(
+            "Resume an interrupted forge run. With no argument, picks the "
+            "most-recent paused run in this workspace. Pass a run-id (or "
+            "unambiguous prefix) to jump to a specific one. See "
+            "'fluid agents list' for paused runs."
+        ),
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the auto-detect-and-prompt for paused runs. Always start "
+            "fresh, even when a paused run exists in this directory."
+        ),
+    )
+    parser.add_argument(
+        "--from-stage",
+        dest="from_stage",
+        default=None,
+        metavar="STAGE",
+        help=(
+            "Time-travel to a specific stage (requires --resume). Stages: "
+            "logical, contract_forge, builder, readme, transformation, "
+            "validator, enrichment, judge."
+        ),
+    )
+    parser.add_argument(
+        "--fork",
+        dest="fork",
+        default=None,
+        metavar="RUN_ID",
+        help=(
+            "Like --resume but assigns a new run id and copies stages up "
+            "to --from-stage. Requires --from-stage."
+        ),
+    )
+    parser.add_argument(
+        "--or-fail",
+        dest="or_fail",
+        action="store_true",
+        default=False,
+        help=(
+            "Require --resume to find a resumable run; exit 1 if none "
+            "exists. Useful for scripts that should fail-fast rather "
+            "than start fresh."
+        ),
+    )
+
     parser.set_defaults(func=run)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class _ResumeFlagError(Exception):
+    """Raised by ``_resolve_resume_args`` on incompatible flag combinations.
+
+    Carries an ``exit_code`` so the dispatcher can return the right
+    POSIX code without sniffing the exception message. Defaults to 2
+    (usage error per ``argparse`` convention); the ``--or-fail`` policy
+    violation overrides to 1 (per spec).
+    """
+
+    def __init__(self, message: str, *, exit_code: int = 2) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def _resolve_resume_args(
+    args: Any,
+    *,
+    workspace_root: Path,
+    console: Optional[Any] = None,
+) -> None:
+    """Validate resume/fork/from-stage flags and resolve the run-id.
+
+    Mutates ``args``:
+      * sets ``args._resume_run_id`` to the resolved run-id (or None)
+      * normalises ``args.resume`` (None for absent, "" for bare,
+        "<id>" for explicit)
+      * sets ``args._resume_explicit`` (True when --resume appeared)
+
+    Raises :class:`_ResumeFlagError` on invalid combinations:
+      * --fork without --from-stage (exit 2)
+      * --from-stage with an unknown stage name (Did-you-mean) (exit 2)
+      * --resume <id> with an unknown id (exit 2)
+      * --or-fail without a resumable run (exit 1 — policy violation,
+        not a usage error)
+    """
+    from fluid_build.cli._forge_resume import (
+        ResumeError,
+        maybe_prompt_resume,
+        validate_from_stage,
+    )
+
+    # Defensive type-guards — tests that build args via MagicMock have
+    # every attribute auto-attr'd to a Mock instance. argparse always
+    # passes None / str / bool for these flags; coerce non-conforming
+    # values to None/False so the validator never sees a Mock object.
+    # Mirrors the same guard pattern in ``_forge_resume.py``.
+    def _str_or_none(value: Any) -> Optional[str]:
+        return value if isinstance(value, str) else None
+
+    def _bool_or_false(value: Any) -> bool:
+        return bool(value) if isinstance(value, bool) else False
+
+    resume_raw = _str_or_none(getattr(args, "resume", None))
+    # Argparse stores "__RESUME_BARE__" when the flag appeared without a
+    # value; None when it didn't appear; "<id>" when explicit.
+    if resume_raw == "__RESUME_BARE__":
+        args.resume = None
+        args._resume_explicit = True
+    elif resume_raw is None:
+        args.resume = None
+        args._resume_explicit = False
+    else:
+        args.resume = resume_raw
+        args._resume_explicit = True
+    # Coerce the other resume-shaped flags too — test fixtures auto-attr
+    # them to MagicMock truthies; the policy checks below treat any
+    # truthy as "flag set", which corrupts the no-flags path.
+    args.no_resume = _bool_or_false(getattr(args, "no_resume", False))
+    args.or_fail = _bool_or_false(getattr(args, "or_fail", False))
+
+    # --fork requires --from-stage
+    fork_target = getattr(args, "fork", None)
+    from_stage = getattr(args, "from_stage", None)
+    # Defensive type-guard — tests that build args via MagicMock have
+    # ``from_stage`` auto-attr'd to a Mock instance, which then crashes
+    # deep in ``validate_from_stage``'s ``.lower()`` call. argparse
+    # always passes ``None`` or ``str``; coerce anything else to
+    # ``None`` so the validator never sees a non-string.
+    if from_stage is not None and not isinstance(from_stage, str):
+        from_stage = None
+    if isinstance(fork_target, str) and not fork_target.strip():
+        fork_target = None
+    elif fork_target is not None and not isinstance(fork_target, str):
+        fork_target = None
+    if fork_target and not from_stage:
+        raise _ResumeFlagError(
+            "--fork requires --from-stage (which stage of the source run to fork from)"
+        )
+    # --from-stage requires --resume or --fork
+    if from_stage and not (args._resume_explicit or fork_target):
+        raise _ResumeFlagError("--from-stage requires --resume <run-id> or --fork <run-id>")
+    if from_stage:
+        ok, msg = validate_from_stage(from_stage)
+        if not ok:
+            raise _ResumeFlagError(msg)
+
+    # Resolve the run-id.
+    try:
+        run_id = maybe_prompt_resume(args, workspace_root=workspace_root)
+    except ResumeError as exc:
+        # ``--or-fail`` policy violation (no resumable run in cwd) →
+        # exit 1 per spec; usage errors (typo'd id, ambiguous prefix,
+        # --no-resume + --or-fail) → exit 2 (argparse convention).
+        # We distinguish by message prefix so the dispatcher reports
+        # the right POSIX code without sniffing exception types.
+        msg = str(exc)
+        is_policy_violation = (
+            getattr(args, "or_fail", False)
+            and "No resumable run found" in msg
+            and "not found" not in msg  # disambiguates "Run X not found"
+        )
+        if is_policy_violation:
+            raise _ResumeFlagError(msg, exit_code=1) from exc
+        raise _ResumeFlagError(msg) from exc
+
+    args._resume_run_id = run_id
+    if run_id and console:
+        try:
+            console.print(
+                f"\n[bold cyan]↻ Resuming run {run_id}[/bold cyan]"
+                + (f" from stage [bold]{from_stage}[/bold]" if from_stage else "")
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def get_target_directory(args, default_name: str = "my-fluid-project") -> Path:
@@ -1070,8 +1314,48 @@ def run(args, logger: logging.Logger) -> int:
         _emit_agent_jsonl("forge.done", run_id=run_id, exit_code=int(rc or 0))
 
 
+#: Per-process flag for the personal-memory sanitiser.  See
+#: ``_sanitize_personal_memory_once`` for the rationale — issue #51 fix.
+_PERSONAL_MEMORY_SANITISED: bool = False
+
+
+def _sanitize_personal_memory_once() -> None:
+    """Run the personal-memory poison sanitiser exactly once per process.
+
+    Issue #51 fix: ``_sanitize_existing_personal_memory`` (the on-disk
+    cleanup helper introduced by P1a) was previously only invoked from
+    ``tests/conftest.py``.  A real engineer whose ``~/.fluid/personal-memory.json``
+    got poisoned by an earlier test run (or by hand) never had the
+    file rewritten — the in-memory ``_strip_poisoned_values`` cleared
+    the values for the current run but the next run would re-read the
+    same poison.
+
+    Calling the sanitiser once per process at the entry to ``fluid
+    forge`` closes that gap.  The helper is idempotent and safe when
+    the file is absent (documented in the helper's docstring).  Best
+    effort: any error is logged at DEBUG and never blocks the run.
+
+    The module-level flag avoids repeating the disk read on subsequent
+    in-process invocations (notably the test suite, where ``_run_main``
+    is called many times per session).
+    """
+    global _PERSONAL_MEMORY_SANITISED
+    if _PERSONAL_MEMORY_SANITISED:
+        return
+    _PERSONAL_MEMORY_SANITISED = True
+    try:
+        from fluid_build.cli.forge_copilot_personal_memory import (
+            _sanitize_existing_personal_memory,
+        )
+
+        _sanitize_existing_personal_memory()
+    except Exception as exc:  # noqa: BLE001 — best effort, never blocks the run
+        LOG.debug("personal_memory_sanitise_failed: %s", exc)
+
+
 def _run_main(args, logger: logging.Logger) -> int:
     """Main entry point for ``fluid forge``."""
+    _sanitize_personal_memory_once()
     console = Console() if RICH_AVAILABLE else None
     try:
         if getattr(args, "forge_subcommand", None) == "data-model":
@@ -1111,6 +1395,28 @@ def _run_main(args, logger: logging.Logger) -> int:
         scan_root = Path.cwd()
         before_snapshot = snapshot_workspace(scan_root)
         reset_token_usage()
+
+        # --- Resume detection + flag validation (Phase R1) ---
+        # Validate flag combinations and surface a resume prompt before
+        # any other work. The resolved run-id (or None) lands on
+        # ``args._resume_run_id`` so downstream coordinators can pick
+        # it up from one canonical place.
+        try:
+            _resolve_resume_args(args, workspace_root=scan_root, console=console)
+        except _ResumeFlagError as exc:
+            if console:
+                console.print(f"[red]{exc}[/red]")
+            else:
+                console_error(str(exc))
+            return exc.exit_code
+
+        # --- Startup prune-hint (non-blocking, once per run) ---
+        try:
+            from fluid_build.cli._forge_resume import maybe_print_prune_hint
+
+            maybe_print_prune_hint(scan_root)
+        except Exception:  # noqa: BLE001 — never block on the hint
+            LOG.debug("prune_hint_failed", exc_info=True)
 
         # --- Top-level flag aliases ---
         # ``--no-llm`` and ``--deterministic`` were added at the

@@ -265,19 +265,54 @@ class PublishResult:
     error: Optional[str] = None
 
 
-def publish_acquisition(contract: Dict[str, Any], workdir: Path) -> List[PublishResult]:
-    """Register each acquisition expose with the catalogs declared in
-    ``properties.catalog.register``.
+def _ensure_builtin_registrars(targets: List[str]) -> None:
+    """Register a built-in, env-configured registrar for any planned target
+    that has none.
 
-    Reuses the existing ``_catalog.register_all`` orchestrator so this
-    stays consistent with the per-build runner's auto-registration on
-    first apply (no double-register — registrars are idempotent).
+    Explicit registrations (a custom registrar, or a test's fake) are left
+    untouched — ``get_registrar`` is checked first, so they take precedence
+    over the built-ins. Targets with no environment config resolve to no
+    registrar; the dispatcher then records a clear "not configured" result.
     """
+    from fluid_build.build_runners import _catalog as orch
+    from fluid_build.build_runners.catalog_registrars import build_registrar
+
+    for target in targets:
+        if orch.get_registrar(target) is not None:
+            continue
+        registrar = build_registrar(target)
+        if registrar is not None:
+            orch.register_registrar(target, registrar)
+
+
+def publish_acquisition(contract: Dict[str, Any], workdir: Path) -> List[PublishResult]:
+    """Register every acquisition build's catalog targets exactly once.
+
+    Builds a :class:`~fluid_build.api.catalog_publication.CatalogPublicationPayload`
+    *once per build* and threads it through every catalog target in the
+    plan via :func:`register_all_payload`. That centralises the
+    expensive bits (parsing the contract, rendering ODPS, rendering
+    one ODCS per expose, computing lineage) so they happen exactly
+    once regardless of how many catalogs the contract publishes to.
+
+    Per-target configs are resolved from ``FluidConfig`` (env vars +
+    ``catalogs.<target>`` blocks) and threaded through so backends
+    declared only in ``providers/catalogs/CATALOG_PROVIDERS`` (the CLI
+    ``--target`` registry) work here automatically — keeping the two
+    surfaces from drifting. As a fallback for backends that haven't
+    migrated to the unified config path, :func:`_ensure_builtin_registrars`
+    pre-wires env-configured registrars into the legacy ``_catalog``
+    dispatcher so a target declared in the contract still resolves.
+    """
+    from fluid_build.api.catalog_publication import CatalogPublicationPayload
     from fluid_build.build_runners import _catalog as catalog_orchestrator
+
+    target_configs = _collect_target_configs(contract)
 
     results: List[PublishResult] = []
     product_id = contract.get("id", "")
     classifications = _classifications_from_run_records(contract, workdir)
+    payload = CatalogPublicationPayload.from_contract(contract, classifications)
 
     for build in acquisition_builds(contract):
         plan = catalog_orchestrator.CatalogPlan.from_dict(
@@ -285,15 +320,22 @@ def publish_acquisition(contract: Dict[str, Any], workdir: Path) -> List[Publish
         )
         if not plan.targets:
             continue
-        for expose_id in build.get("outputs", []):
-            outcome = catalog_orchestrator.register_all(
-                plan,
-                product_id=product_id,
-                expose_id=expose_id,
-                contract=contract,
-                classifications=classifications,
-            )
-            for r in outcome.results:
+        _ensure_builtin_registrars(plan.targets)
+        outcome = catalog_orchestrator.register_all_payload(
+            plan,
+            payload,
+            target_configs=target_configs,
+        )
+        # The canonical path produces one ``RegistrationResult`` per
+        # target. We project back to the ``PublishResult`` shape (per
+        # product+expose+target) by emitting one entry per output the
+        # build declared — every entry shares the target outcome since
+        # the registrar's ``register_payload`` publishes the whole
+        # product atomically. ``expose_id`` is the build's declared
+        # output (preserved for CLI display).
+        outputs = list(build.get("outputs") or []) or [a.asset_id for a in payload.assets]
+        for r in outcome.results:
+            for expose_id in outputs:
                 results.append(
                     PublishResult(
                         product_id=product_id,
@@ -305,6 +347,38 @@ def publish_acquisition(contract: Dict[str, Any], workdir: Path) -> List[Publish
                     )
                 )
     return results
+
+
+def _collect_target_configs(contract: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Resolve per-target catalog configs for every target named in any
+    acquisition build's ``properties.catalog.register``.
+
+    Reading via ``FluidConfig`` picks up both the YAML config blocks
+    and the env-var overrides applied in ``get_catalog_config``. Best-
+    effort: a failed lookup degrades to an empty dict so the registrar
+    factory falls back to its defaults.
+    """
+    targets: List[str] = []
+    for build in acquisition_builds(contract):
+        for t in (build.get("properties", {}).get("catalog", {}) or {}).get("register", []) or []:
+            if t not in targets:
+                targets.append(t)
+    if not targets:
+        return {}
+    try:
+        from fluid_build.config_manager import FluidConfig
+
+        cfg = FluidConfig()
+    except Exception:  # noqa: BLE001
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for t in targets:
+        try:
+            resolved = cfg.get_catalog_config(t) or {}
+        except Exception:  # noqa: BLE001
+            resolved = {}
+        out[t] = resolved
+    return out
 
 
 def _classifications_from_run_records(
