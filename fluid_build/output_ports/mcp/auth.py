@@ -31,8 +31,10 @@ Three pluggable schemes that the gateway selects via
   standard pattern — works with Auth0, Okta, Keycloak, AWS Cognito,
   Google IAP, Azure AD.
 
-* ``spiffe`` — verify a SPIFFE SVID JWT against a configured trust
-  bundle using the canonical
+* ``spiffe`` (**EXPERIMENTAL** — emits a one-shot startup warning;
+  not yet under support guarantees, kept until a real
+  workload-identity deployment exercises it) — verify a SPIFFE SVID
+  JWT against a configured trust bundle using the canonical
   `py-spiffe <https://github.com/HewlettPackard/py-spiffe>`_
   ``JwtSvid.parse_and_validate`` API. The issuer is a SPIFFE
   authority (``spiffe://<trust-domain>``); the ``sub`` claim is a
@@ -71,6 +73,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 _log = logging.getLogger("fluid.output_port.mcp.auth")
+
+# One-shot (process-global) guard so the "spiffe mode is experimental"
+# notice fires exactly once at startup, not on every from_env() call.
+_WARNED_SPIFFE_EXPERIMENTAL = False
 
 
 @dataclass(frozen=True)
@@ -183,6 +189,17 @@ class AuthValidator:
                     parsed[claim.strip()] = attr.strip()
                 kwargs["jwt_claim_mappings"] = parsed
         elif mode == "spiffe":
+            global _WARNED_SPIFFE_EXPERIMENTAL
+            if not _WARNED_SPIFFE_EXPERIMENTAL:
+                _WARNED_SPIFFE_EXPERIMENTAL = True
+                _log.warning(
+                    "output_port_auth_spiffe_experimental: FLUID_MCP_AUTH_MODE=spiffe "
+                    "is EXPERIMENTAL and not yet covered by the gateway's support "
+                    "guarantees. For production today prefer shared-token (or front "
+                    "the gateway with an mTLS / OIDC reverse proxy). SPIFFE is kept "
+                    "behind this notice until a real workload-identity deployment "
+                    "exercises it end-to-end."
+                )
             kwargs.update(
                 spiffe_trust_domain=os.environ.get("FLUID_MCP_SPIFFE_TRUST_DOMAIN"),
                 spiffe_jwks_url=os.environ.get("FLUID_MCP_SPIFFE_JWKS_URL"),

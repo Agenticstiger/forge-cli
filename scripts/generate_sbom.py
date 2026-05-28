@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""Generate a CycloneDX 1.5 SBOM from the current Python env.
+"""Generate a CycloneDX 1.5 SBOM from the current Python env. (EXPERIMENTAL)
+
+EXPERIMENTAL — this is a developer / supply-chain convenience, not yet
+part of the supported release surface or CI. It's kept behind this
+notice until a real operator workflow consumes the SBOM; until then it
+carries no stability guarantee and may change or be removed.
+
 
 Walks ``pip list --format=json``, queries PyPI for license + project
 URL on each package, and writes a CycloneDX-conformant JSON document
 operators can ship to enterprise security teams or import into
 tools like Dependency-Track.
 
-Cost: zero extra deps. Uses ``httpx`` (already a forge-cli dep) for
-PyPI metadata fetches; CycloneDX JSON is hand-emitted because the
-spec is small enough that adding ``cyclonedx-bom`` for it would be
-the kind of borrow-vs-build tradeoff our /borrow-before-build skill
-deliberately rejects when the schema fits in 50 lines.
+Borrow-before-build: the CycloneDX document is built with the official
+`cyclonedx-python-lib <https://github.com/CycloneDX/cyclonedx-python-lib>`_
+(``Bom`` / ``Component`` model + ``make_outputter``) rather than
+hand-emitting the JSON. An earlier version hand-rolled the JSON "because
+the schema fits in 50 lines"; that rationale doesn't hold — the library
+is already present in the venv (transitive), gives **schema-validated**
+output, and tracks future CycloneDX spec versions for free, so the
+hand-roll was a maintenance liability with no upside. Package metadata
+fetches still use ``httpx`` (a core forge-cli dep).
 
 Usage:
   .venv/bin/python scripts/generate_sbom.py --out sbom.cyclonedx.json
@@ -35,19 +45,35 @@ import argparse
 import json
 import subprocess
 import sys
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
 try:
     import httpx
-except ImportError:
-    print("ERROR: httpx not installed. Run inside the project venv.", file=sys.stderr)
+    from cyclonedx.model import ExternalReference, ExternalReferenceType, XsUri
+    from cyclonedx.model.bom import Bom
+    from cyclonedx.model.component import Component, ComponentType
+    from cyclonedx.model.license import DisjunctiveLicense
+    from cyclonedx.output import make_outputter
+    from cyclonedx.schema import OutputFormat, SchemaVersion
+    from packageurl import PackageURL
+except ImportError as exc:
+    print(
+        f"ERROR: missing dependency ({exc.name}). Run inside the project venv "
+        "with the dev extra: pip install -e '.[dev]'",
+        file=sys.stderr,
+    )
     sys.exit(2)
 
 
 PYPI_URL = "https://pypi.org/pypi/{name}/{version}/json"
+
+# Map our internal external-reference kinds → CycloneDX enum members.
+_EXT_REF_TYPES = {
+    "homepage": ExternalReferenceType.WEBSITE,
+    "documentation": ExternalReferenceType.DOCUMENTATION,
+    "vcs": ExternalReferenceType.VCS,
+}
 
 
 def list_packages() -> List[Dict[str, str]]:
@@ -84,6 +110,36 @@ def license_field(info: Dict[str, Any]) -> str:
     return "NOASSERTION"
 
 
+def _build_component(name: str, version: str, info: Dict[str, Any]) -> "tuple[Component, str]":
+    """Build a CycloneDX library Component from PyPI metadata.
+
+    Returns ``(component, resolved_license_string)`` — the license
+    string is returned alongside for the progress log line."""
+    lic = license_field(info)
+    component = Component(
+        name=name,
+        version=version,
+        type=ComponentType.LIBRARY,
+        purl=PackageURL(type="pypi", name=name, version=version),
+        bom_ref=f"pkg:pypi/{name}@{version}",
+        # ``DisjunctiveLicense(name=...)`` is the named-license path
+        # (not SPDX-id-validated), safe for PyPI's inconsistent strings
+        # incl. the ``NOASSERTION`` sentinel.
+        licenses=[DisjunctiveLicense(name=lic)],
+    )
+    for kind, enum_type in _EXT_REF_TYPES.items():
+        url = (
+            info.get("home_page")
+            if kind == "homepage"
+            else (info.get("project_urls") or {}).get(
+                "Documentation" if kind == "documentation" else "Source"
+            )
+        )
+        if url:
+            component.external_references.add(ExternalReference(type=enum_type, url=XsUri(url)))
+    return component, lic
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, help="Output CycloneDX JSON path")
@@ -95,67 +151,35 @@ def main() -> int:
     parser.add_argument("--component-version", default="0.7.4", help="Top-level component version")
     args = parser.parse_args()
 
+    print(
+        "[EXPERIMENTAL] generate_sbom.py is a developer convenience and is NOT "
+        "yet a supported, CI-gated artifact."
+    )
     packages = list_packages()
     print(f"resolved {len(packages)} packages from `pip list`")
 
-    components: List[Dict[str, Any]] = []
+    # ``Bom()`` auto-assigns the serialNumber (urn:uuid) + metadata
+    # timestamp; we only set the described component + the component list.
+    bom = Bom()
+    bom.metadata.component = Component(
+        name=args.component_name,
+        version=args.component_version,
+        type=ComponentType.APPLICATION,
+        bom_ref=f"pkg:pypi/{args.component_name}@{args.component_version}",
+    )
+
     with httpx.Client() as client:
         for pkg in packages:
             name = pkg["name"]
             version = pkg["version"]
             info = fetch_pypi_metadata(client, name, version)
-            licenses = []
-            lic = license_field(info)
-            if lic and lic != "NOASSERTION":
-                licenses.append({"license": {"name": lic}})
-            else:
-                licenses.append({"license": {"name": "NOASSERTION"}})
-            external_refs = []
-            for kind, url in [
-                ("homepage", info.get("home_page")),
-                ("documentation", (info.get("project_urls") or {}).get("Documentation")),
-                ("vcs", (info.get("project_urls") or {}).get("Source")),
-            ]:
-                if url:
-                    external_refs.append({"type": kind, "url": url})
-            component = {
-                "type": "library",
-                "bom-ref": f"pkg:pypi/{name}@{version}",
-                "name": name,
-                "version": version,
-                "purl": f"pkg:pypi/{name}@{version}",
-                "licenses": licenses,
-            }
-            if external_refs:
-                component["externalReferences"] = external_refs
-            components.append(component)
+            component, lic = _build_component(name, version, info)
+            bom.components.add(component)
             print(f"  {name}=={version}  ({lic})")
 
-    bom = {
-        "bomFormat": "CycloneDX",
-        "specVersion": "1.5",
-        "serialNumber": f"urn:uuid:{uuid.uuid4()}",
-        "version": 1,
-        "metadata": {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "tools": [
-                {
-                    "vendor": "Agentics Transformation Ltd",
-                    "name": "scripts/generate_sbom.py",
-                    "version": "0.1.0",
-                }
-            ],
-            "component": {
-                "type": "application",
-                "bom-ref": f"pkg:pypi/{args.component_name}@{args.component_version}",
-                "name": args.component_name,
-                "version": args.component_version,
-            },
-        },
-        "components": components,
-    }
-    Path(args.out).write_text(json.dumps(bom, indent=2), encoding="utf-8")
-    print(f"\nwrote {args.out} ({len(components)} components)")
+    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_5)
+    Path(args.out).write_text(outputter.output_as_string(indent=2), encoding="utf-8")
+    print(f"\nwrote {args.out} ({len(bom.components)} components)")
     return 0
 
 
