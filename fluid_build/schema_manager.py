@@ -349,6 +349,12 @@ class FluidSchemaManager:
             return cls.BUNDLED_VERSIONS[-1]
         return "0.7.3"
 
+    @classmethod
+    def latest_schema_path(cls) -> "Path":
+        """Return the absolute Path to the newest bundled schema JSON file."""
+        version = cls.latest_bundled_version()
+        return Path(__file__).parent / "schemas" / f"fluid-schema-{version}.json"
+
     def __init__(
         self,
         cache_dir: Optional[Path] = None,
