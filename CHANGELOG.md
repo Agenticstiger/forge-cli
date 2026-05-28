@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-05-28
+
+### Added (agentic world-class uplift — #155)
+- **LiteLLM Router with cross-cloud fallback** — opt-in fallback chain
+  (`anthropic→bedrock→vertex`) via `FLUID_LLM_FALLBACK_CHAIN`, auto-injected
+  Anthropic `cache_control` points, and 3-token cost tracking (1.25× creation /
+  0.10× read multipliers) persisted to `cost.json`.
+- **JudgeAgent + CI judge-gate** — 6-axis CoT rubric (correctness, completeness,
+  security, governance, performance, documentation) with a toggleable Self-Refine
+  self-critique pass, a 10-contract eval set, and a snapshot regression gate.
+- **Wave 2 enrichment** — deterministic `dbt_test_generator`, `freshness_emitter`,
+  and `physical_layout` (Snowflake/BQ/Athena/Redshift) tools, surfaced via
+  `fluid forge --apply-enrichment` with diff preview that never overwrites a
+  user-set field.
+- **Pause/resume + `fluid agents` namespace** — LangGraph-shape
+  `BaseCheckpointSaver` (JSON-only file backend, no pickle); Ctrl-C writes a
+  `.paused` marker that the next `fluid forge` auto-detects, plus
+  `fluid agents list/show/prune` with safe-by-default archiving.
+- **15-class PII classifier** wired into both catalog and JDBC intake paths
+  (pattern borrowed from Presidio / piicatcher / GCP DLP / AWS Glue).
+- **Catalog-driven model registry + 3-tier memory** — static model tables
+  retired in favour of `cli/llm_models.json` (weekly-refreshed); personal/team/project
+  memory with a documented precedence ladder (`fluid forge --show-memory`);
+  `fluid doctor --env` enumerates the `FLUID_*` kill switches.
+
+### Added (CC alignment — describe surface — #156)
+- **`FluidSchemaManager.latest_schema_path()`** — returns the absolute path to the
+  newest bundled schema JSON without hardcoding a filename.
+- **`fluid_build.describe.self_describe()`** — flat, JSON-serializable snapshot of
+  the installed environment (version, schema, providers, build engines, templates,
+  capability flags), importable in-process by the CC backend. Capability flags are
+  derived from importable backing modules (à la `pulumi about`), never hardcoded.
+- **`fluid describe --self [--json]`** — human-readable summary by default, JSON
+  with `--json`.
+
+### Fixed
+- JDBC PK/FK/CHECK extraction routed through `postgres_query()` / `mysql_query()`
+  pass-throughs (DuckDB's `information_schema` union drops FK rows).
+- Snowflake DDL honours `osi.datasets[].fields[].data_type` with parameterised
+  `NUMBER(p,s)`; DV2 emits one expose per hub/link/sat.
+- Catalog adapter paths corrected (DMM `/api/dataproducts`; DataHub
+  `graph.get_urns_by_filter`) with description preservation at the
+  `_translate_catalog_table` chokepoint.
+
 ## [0.8.4] - 2026-05-26
 
 ### Added (DMM CLI surface + lineage UX)
