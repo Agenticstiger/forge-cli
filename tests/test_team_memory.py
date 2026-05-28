@@ -214,6 +214,90 @@ class TestScaffoldTeamMemory:
         assert "conventions" in parsed
 
 
+class TestAutoScaffoldOnFirstForge:
+    """Issue #49 fix: ``fluid forge`` in a fresh workspace auto-scaffolds
+    ``.fluid/team-memory.yaml`` so engineers who never call ``fluid init``
+    still discover team memory.
+
+    Mirrors the ``git init`` pattern: re-running is safe / idempotent,
+    only fills in missing template files."""
+
+    def test_scaffold_helper_creates_file_when_absent(self, tmp_path, monkeypatch):
+        """When ``.fluid/team-memory.yaml`` is absent, the helper writes
+        the template and returns the new path."""
+        import fluid_build.cli.forge_modes as fm
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("FLUID_FORGE_NO_TEAM_MEMORY_SCAFFOLD", raising=False)
+
+        path = fm._maybe_scaffold_team_memory_on_first_forge(console=None)
+        assert path is not None
+        assert path.exists()
+        assert path.name == "team-memory.yaml"
+        assert "conventions:" in path.read_text()
+
+    def test_scaffold_helper_is_idempotent_when_file_exists(self, tmp_path, monkeypatch):
+        """When the file already exists, the helper returns its path
+        unchanged and does NOT overwrite — mirrors git init's
+        ``running git init in an existing repository is safe`` rule."""
+        import fluid_build.cli.forge_modes as fm
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("FLUID_FORGE_NO_TEAM_MEMORY_SCAFFOLD", raising=False)
+        (tmp_path / ".fluid").mkdir()
+        existing = tmp_path / ".fluid" / "team-memory.yaml"
+        existing.write_text("custom: preserved\n")
+
+        path = fm._maybe_scaffold_team_memory_on_first_forge(console=None)
+        assert path == existing
+        # Content unchanged.
+        assert existing.read_text() == "custom: preserved\n"
+
+    def test_scaffold_helper_emits_console_hint_on_first_scaffold(self, tmp_path, monkeypatch):
+        """The one-line hint must include the file path so a curious
+        engineer can ``cat`` it and learn the format."""
+        import fluid_build.cli.forge_modes as fm
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("FLUID_FORGE_NO_TEAM_MEMORY_SCAFFOLD", raising=False)
+
+        from unittest.mock import MagicMock
+
+        console = MagicMock()
+        path = fm._maybe_scaffold_team_memory_on_first_forge(console=console)
+        assert path is not None
+        console.print.assert_called_once()
+        printed = console.print.call_args.args[0]
+        assert "Scaffolded" in printed
+        assert "team-memory.yaml" in printed
+
+    def test_scaffold_helper_no_hint_when_file_already_exists(self, tmp_path, monkeypatch):
+        """Idempotent: re-invocation must be silent (no spam on every run)."""
+        import fluid_build.cli.forge_modes as fm
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("FLUID_FORGE_NO_TEAM_MEMORY_SCAFFOLD", raising=False)
+        (tmp_path / ".fluid").mkdir()
+        (tmp_path / ".fluid" / "team-memory.yaml").write_text("conventions: {}\n")
+
+        from unittest.mock import MagicMock
+
+        console = MagicMock()
+        fm._maybe_scaffold_team_memory_on_first_forge(console=console)
+        console.print.assert_not_called()
+
+    def test_scaffold_helper_skipped_when_env_var_set(self, tmp_path, monkeypatch):
+        """``FLUID_FORGE_NO_TEAM_MEMORY_SCAFFOLD=1`` opts out entirely."""
+        import fluid_build.cli.forge_modes as fm
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("FLUID_FORGE_NO_TEAM_MEMORY_SCAFFOLD", "1")
+
+        path = fm._maybe_scaffold_team_memory_on_first_forge(console=None)
+        assert path is None
+        assert not (tmp_path / ".fluid" / "team-memory.yaml").exists()
+
+
 class TestTeamMemoryInPrompt:
     """Team memory appears in the user prompt payload."""
 

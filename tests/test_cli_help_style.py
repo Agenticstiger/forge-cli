@@ -73,6 +73,7 @@ _VERBS = (
     "config",
     "generate",
     "contract",
+    "mcp",
 )
 
 
@@ -108,6 +109,7 @@ _NO_EXAMPLES_REQUIRED = frozenset(
         "split",  # opens an interactive picker
         "generate",  # noun group; examples live on subcommands
         "contract",  # noun group; examples live on subcommands
+        "mcp",  # MCP server group (mcp serve); examples live on subcommands
     }
 )
 

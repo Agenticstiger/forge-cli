@@ -585,6 +585,9 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     _try_register(sp, "ide", "ide")
     _try_register(sp, "workspace", "workspace")
     _try_register(sp, "stats", "stats")
+    # ``fluid agents`` — manage forge agent runs (list / show / prune).
+    # New in the resumability landing; mirrors ``stats`` registration.
+    _try_register(sp, "agents_cmd", "agents")
 
     # ────────────────────────────────────────────────────────────────────
     # External CLI plugins — discovered via Python entry-points.

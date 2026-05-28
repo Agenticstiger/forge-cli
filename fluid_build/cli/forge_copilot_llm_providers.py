@@ -1053,6 +1053,119 @@ def reset_token_usage() -> None:
     _cumulative_prompt_cache.update({"read_tokens": 0, "total_tokens": 0})
 
 
+_cost_tracker_suppress = threading.local()
+
+
+def suppress_call_llm_cost_recording() -> "_SuppressionToken":
+    """Suppress ``call_llm`` / ``call_llm_streaming`` cost recording
+    on the current thread for the duration of the returned context.
+
+    The staged pipeline (``BaseStageAgent._call_once``) already records
+    the per-call usage with the rich per-(stage, agent_class) attribution
+    that the cost summary's "Per-agent attribution" panel surfaces. When
+    that pipeline calls ``call_llm`` internally, the new H1 bridge would
+    double-count unless suppressed.
+
+    Callers use this as a context manager::
+
+        with suppress_call_llm_cost_recording():
+            raw = call_llm(provider, config, sys, usr)
+            # ... record_call(...) here with full attribution
+
+    Outside the context the bridge runs normally so the runtime's
+    direct ``call_llm`` users (forge_copilot_runtime, the legacy
+    interview path, judge_agent) continue to feed the tracker.
+    """
+    return _SuppressionToken()
+
+
+class _SuppressionToken:
+    """Thread-local on/off switch for the call_llm cost bridge."""
+
+    def __enter__(self) -> "_SuppressionToken":
+        depth = int(getattr(_cost_tracker_suppress, "depth", 0) or 0)
+        _cost_tracker_suppress.depth = depth + 1
+        return self
+
+    def __exit__(self, *exc) -> None:
+        depth = int(getattr(_cost_tracker_suppress, "depth", 0) or 0)
+        _cost_tracker_suppress.depth = max(0, depth - 1)
+
+
+def _record_call_in_run_tracker(
+    provider: LlmProvider,
+    config: LlmConfig,
+    *,
+    before: Mapping[str, int],
+) -> None:
+    """Snapshot the per-call usage delta and feed the RunCostTracker.
+
+    Closes the H1 gap: ``call_llm`` updates ``_cumulative_usage`` (this
+    module's module-level dict) but historically never invoked the
+    ``RunCostTracker``. The tracker is what the preview panel reads to
+    write ``cost.json``, what ``fluid stats`` aggregates, and what the
+    cost ceiling (``FLUID_COST_LIMIT_USD_PER_RUN``) checks against. The
+    runtime's main authoring loop in ``forge_copilot_runtime.py`` calls
+    ``call_llm`` directly (not through ``BaseStageAgent._call_once``
+    which is where the staged pipeline's record_call lives), so the
+    tracker stayed empty and the user saw ``$0 / 0 tokens`` even when
+    the LLM had spent thousands of tokens.
+
+    Implementation: ``invoke_blocking`` increments ``_cumulative_usage``
+    in-place; we read the dict before and after to compute the per-call
+    delta. The per-call litellm USD and Anthropic cache-token counts
+    sit on a thread-local in ``forge_copilot_llm_litellm`` so we pull
+    them through the same bridge.
+
+    Fail-safe: any exception is swallowed (logged at DEBUG). A failure
+    here must never bubble up and break a user-facing run.
+
+    Suppression: when the staged pipeline (``BaseStageAgent._call_once``)
+    is on the call stack it wraps the ``call_llm`` invocation in
+    :func:`suppress_call_llm_cost_recording` so the rich per-agent
+    attribution it produces wins over the bridge's bare delta.
+    """
+    if int(getattr(_cost_tracker_suppress, "depth", 0) or 0) > 0:
+        return
+    try:
+        delta_in = max(0, _cumulative_usage["input_tokens"] - int(before.get("input_tokens", 0)))
+        delta_out = max(0, _cumulative_usage["output_tokens"] - int(before.get("output_tokens", 0)))
+        # Pull the litellm-supplied USD + cache tokens off the thread
+        # locals if available; non-litellm providers (MCP sampling) yield
+        # None/zero which still drives a correct call into record_call.
+        usd_override: Optional[float] = None
+        cache_creation = 0
+        cache_read = 0
+        try:
+            from fluid_build.cli.forge_copilot_llm_litellm import (
+                get_last_cache_tokens,
+                get_last_litellm_cost_usd,
+            )
+
+            usd_override = get_last_litellm_cost_usd()
+            ct = get_last_cache_tokens()
+            cache_creation = int(ct.get("cache_creation_input_tokens", 0) or 0)
+            cache_read = int(ct.get("cache_read_input_tokens", 0) or 0)
+        except Exception:  # pragma: no cover — defensive
+            pass
+
+        from fluid_build.copilot.cost import record_call_from_cumulative_usage
+
+        record_call_from_cumulative_usage(
+            provider=str(getattr(provider, "name", "") or getattr(config, "provider", "")),
+            model=str(getattr(config, "model", "")),
+            input_tokens=delta_in,
+            output_tokens=delta_out,
+            usd_override=usd_override,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
+        )
+    except Exception:  # pragma: no cover — never let cost wiring break the run
+        import logging as _logging
+
+        _logging.getLogger(__name__).debug("record_call_in_run_tracker_failed", exc_info=True)
+
+
 def call_llm(
     provider: LlmProvider,
     config: LlmConfig,
@@ -1073,17 +1186,31 @@ def call_llm(
     response_format directive the agent layer injects. Plumbing it
     through here keeps the litellm path honest about the schema
     constraint the caller cares about.
+
+    Cost wiring (H1 fix): we snapshot ``_cumulative_usage`` before the
+    call and after, then feed the delta into the process-wide
+    ``RunCostTracker`` via ``_record_call_in_run_tracker``. Without
+    this bridge, the runtime's main authoring loop (which calls
+    ``call_llm`` directly, not through ``BaseStageAgent._call_once``)
+    leaves the tracker empty even when thousands of tokens flowed
+    through it.
     """
-    if extra_payload:
-        # Forward only when the provider supports the kwarg — older
-        # base-class subclasses ignore it; LiteLLMProvider honours it.
-        try:
-            return provider.invoke_blocking(  # type: ignore[call-arg]
-                config, system_prompt, user_prompt, extra_payload=extra_payload
-            )
-        except TypeError:
-            pass
-    return provider.invoke_blocking(config, system_prompt, user_prompt)
+    before = dict(_cumulative_usage)
+    try:
+        if extra_payload:
+            # Forward only when the provider supports the kwarg — older
+            # base-class subclasses ignore it; LiteLLMProvider honours it.
+            try:
+                text = provider.invoke_blocking(  # type: ignore[call-arg]
+                    config, system_prompt, user_prompt, extra_payload=extra_payload
+                )
+            except TypeError:
+                text = provider.invoke_blocking(config, system_prompt, user_prompt)
+        else:
+            text = provider.invoke_blocking(config, system_prompt, user_prompt)
+        return text
+    finally:
+        _record_call_in_run_tracker(provider, config, before=before)
 
 
 def call_llm_streaming(
@@ -1111,16 +1238,52 @@ def call_llm_streaming(
 
     ``extra_payload`` carries structured-output / JSON-schema
     response_format directives — same purpose as in :func:`call_llm`.
+
+    Cost wiring (H1 fix): same as :func:`call_llm` — snapshot the
+    cumulative usage dict before yielding, then feed the delta into
+    the ``RunCostTracker`` once the iterator drains. The streaming
+    provider's ``invoke_streaming`` is responsible for updating
+    ``_cumulative_usage`` via ``_record_streaming_usage`` once it sees
+    the closing-chunk usage block — both code paths land in the same
+    place by the time the iterator is exhausted.
     """
-    if extra_payload:
+    before = dict(_cumulative_usage)
+    try:
+        if extra_payload:
+            try:
+                yield from provider.invoke_streaming(  # type: ignore[call-arg]
+                    config, system_prompt, user_prompt, extra_payload=extra_payload
+                )
+                return
+            except TypeError:
+                pass
+        yield from provider.invoke_streaming(config, system_prompt, user_prompt)
+    finally:
+        # Streaming providers feed ``_cumulative_usage`` via the
+        # ``_record_streaming_usage`` -> consume_streaming_usage path
+        # OR directly inside ``invoke_streaming`` once the closing
+        # chunk arrives. Either way, by the time the iterator drains
+        # the delta against ``before`` reflects the call's tokens.
+        # The streaming usage state also lives on a thread-local —
+        # peek it WITHOUT popping so the existing
+        # ``consume_streaming_usage()`` reader (BaseStageAgent) still
+        # gets the same shape it has always seen.
         try:
-            yield from provider.invoke_streaming(  # type: ignore[call-arg]
-                config, system_prompt, user_prompt, extra_payload=extra_payload
-            )
-            return
-        except TypeError:
+            streamed = getattr(_streaming_usage_state, "usage", None)
+            if streamed and (
+                _cumulative_usage["input_tokens"] == int(before.get("input_tokens", 0))
+                and _cumulative_usage["output_tokens"] == int(before.get("output_tokens", 0))
+            ):
+                # The streaming invoke_streaming kept the cache-side
+                # bookkeeping but didn't increment _cumulative_usage
+                # (older provider implementations). Backfill so the
+                # delta-bridge picks up the tokens.
+                _cumulative_usage["input_tokens"] += int(streamed.get("input_tokens", 0) or 0)
+                _cumulative_usage["output_tokens"] += int(streamed.get("output_tokens", 0) or 0)
+                _cumulative_usage["total_tokens"] += int(streamed.get("total_tokens", 0) or 0)
+        except Exception:  # pragma: no cover — defensive
             pass
-    yield from provider.invoke_streaming(config, system_prompt, user_prompt)
+        _record_call_in_run_tracker(provider, config, before=before)
 
 
 # ---------------------------------------------------------------------------

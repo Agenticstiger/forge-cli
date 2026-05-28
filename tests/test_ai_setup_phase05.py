@@ -286,6 +286,83 @@ def test_slash_command_unknown_reports(console):
     assert any("Unknown command" in line for line in console.lines)
 
 
+# ---------------------------------------------------------------------------
+# H24 — Unknown slash commands print did-you-mean + re-prompt
+# (i.e. the typo never leaks through as the user's answer to the next
+# interview question). UX-finding 01 caught `:bogus` getting captured
+# as the user's answer; the fix is in maybe_handle_slash_command.
+# ---------------------------------------------------------------------------
+
+
+def test_slash_command_typo_suggests_close_match(console):
+    """`:hlp` → did-you-mean `:help`."""
+    from fluid_build.cli._interview_slash_commands import maybe_handle_slash_command
+
+    handled = maybe_handle_slash_command(":hlp", console=console)
+    assert handled  # it WAS a slash command — just a typo
+    full = "\n".join(console.lines)
+    assert "Unknown command" in full
+    assert "Did you mean" in full
+    assert ":help" in full  # the closest match is suggested
+
+
+def test_slash_command_typo_suggests_close_match_ai_setup(console):
+    """`:ai-setupx` → did-you-mean `:ai-setup`."""
+    from fluid_build.cli._interview_slash_commands import maybe_handle_slash_command
+
+    maybe_handle_slash_command(":ai-setupx", console=console)
+    full = "\n".join(console.lines)
+    assert "Did you mean" in full
+    assert ":ai-setup" in full
+
+
+def test_slash_command_no_close_match_omits_suggestion(console):
+    """`:zzzzzz` is far from every known command; no did-you-mean is
+    rendered (just the plain 'Unknown command' message).
+    """
+    from fluid_build.cli._interview_slash_commands import maybe_handle_slash_command
+
+    maybe_handle_slash_command(":zzzzzz", console=console)
+    full = "\n".join(console.lines)
+    assert "Unknown command" in full
+    assert "Did you mean" not in full
+
+
+def test_unknown_slash_command_is_treated_as_handled(console):
+    """The dialog layer relies on this return value to re-prompt;
+    if the unknown command leaked through as an answer (returning False)
+    the user's typo (`:bogus`) would become their answer to the
+    current interview question. H24 keeps the answer-injection bug
+    pinned: any input starting with `:` is *always* handled, even when
+    unknown.
+    """
+    from fluid_build.cli._interview_slash_commands import maybe_handle_slash_command
+
+    assert maybe_handle_slash_command(":bogus", console=console) is True
+    assert maybe_handle_slash_command(":another-typo", console=console) is True
+
+
+def test_ask_friendly_text_reprompts_on_unknown_slash_command(console):
+    """End-to-end: a `:bogus` followed by a real answer returns the
+    real answer (not the typo). This is the production path —
+    `ask_friendly_text` loops on slash commands."""
+    from unittest import mock
+
+    from fluid_build.cli.forge_dialogs import ask_friendly_text
+
+    answers = iter([":bogus", "real answer"])
+
+    with mock.patch(
+        "fluid_build.cli.forge_dialogs._read_free_text",
+        side_effect=lambda *_a, **_kw: next(answers),
+    ):
+        result = ask_friendly_text(console, "What's your name?", required=True)
+
+    assert result == "real answer"
+    full = "\n".join(console.lines)
+    assert "Unknown command" in full  # the typo was rejected
+
+
 def test_slash_command_help_lists_commands(console):
     from fluid_build.cli._interview_slash_commands import maybe_handle_slash_command
 

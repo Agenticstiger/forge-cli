@@ -23,6 +23,27 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 
 
+# ── Session-level self-heal: scrub poisoned personal-memory ───────────
+#
+# A prior bug let a ``MagicMock`` repr leak into
+# ``~/.fluid/personal-memory.json``; it then re-rendered in every
+# subsequent forge run's streaming preview.  This session-level fixture
+# strips poisoned values once per pytest invocation so contributor
+# laptops self-heal without anyone having to think about it.  Idempotent
+# (no-op when the file is clean or absent).
+@pytest.fixture(scope="session", autouse=True)
+def _self_heal_personal_memory():
+    try:
+        from fluid_build.cli.forge_copilot_personal_memory import (
+            _sanitize_existing_personal_memory,
+        )
+
+        _sanitize_existing_personal_memory()
+    except Exception:  # pragma: no cover — defensive, never fail tests
+        pass
+    yield
+
+
 @pytest.fixture
 def mock_logger():
     """Provide a mock logger for testing."""

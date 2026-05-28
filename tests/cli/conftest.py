@@ -165,3 +165,44 @@ def test_environment():
     # Restore original environment
     os.environ.clear()
     os.environ.update(original_env)
+
+
+# ---------------------------------------------------------------------------
+# Pollution-hardening for resume / agents / signal tests.
+# The resume code paths carry process-wide state (env-var-driven behaviour,
+# the prune-hint singleton at fluid_build.cli._forge_resume._PRUNE_HINT_PRINTED,
+# and the default checkpoint saver singleton at
+# fluid_build.copilot.checkpoint.get_default_saver). When pytest-randomly
+# reorders tests, leftover state from any earlier test in the broader suite
+# can leak into these tests. This autouse fixture defensively resets
+# everything before every CLI test runs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_cli_process_state(monkeypatch):
+    """Reset process-wide state that resume / agents / signal tests rely on."""
+    for var in (
+        "FLUID_FORGE_AUTO_RESUME",
+        "FLUID_FORGE_NO_PRUNE_HINT",
+        "FLUID_COPILOT_CHECKPOINT",
+        "FLUID_COPILOT_JUDGE",
+        "FLUID_COPILOT_ENRICHMENT",
+        "FLUID_JUDGE_SELF_CRITIQUE",
+        "FLUID_LLM_PROVIDER",
+        "FLUID_LLM_MODEL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    try:
+        from fluid_build.cli._forge_resume import _reset_prune_hint_flag
+
+        _reset_prune_hint_flag()
+    except ImportError:
+        pass
+    try:
+        from fluid_build.copilot.checkpoint import reset_default_saver
+
+        reset_default_saver()
+    except ImportError:
+        pass
+    yield

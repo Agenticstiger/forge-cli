@@ -583,6 +583,75 @@ def _self_eval_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def _judge_enabled() -> bool:
+    """Kill-switch for the out-of-loop LLM-as-judge pass."""
+    value = os.environ.get("FLUID_COPILOT_JUDGE", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _judge_contract(
+    contract: Dict[str, Any],
+    logger: Optional[logging.Logger] = None,
+    *,
+    build_artifacts: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Run the JudgeAgent and return a flat dict of scores (fail-open).
+
+    Returns ``{"score": int, "axes": {axis: int, ...}, "model": str}`` or
+    ``None`` when the judge is disabled or fails. The judge writes its
+    own ``judge.json`` receipt to ``.fluid/agents/<run_id>/`` — this
+    helper returns the in-process summary so callers can fold scores
+    into the provenance block.
+
+    ``build_artifacts`` — when supplied (the post-synthesis enrichment
+    pass), the judge prompt includes the deterministic-tool outputs so
+    it can credit security / performance / governance axes for fields
+    the enrichment fills in.
+    """
+    if not _judge_enabled():
+        return None
+    try:
+        from fluid_build.copilot.agents.judge_agent import JudgeAgent
+
+        result = JudgeAgent().judge(contract, build_artifacts=build_artifacts)
+        if logger:
+            logger.info("Judge score: %s/30 (%s)", result.total, result.model)
+        return {
+            "score": result.total,
+            "axes": {axis: score.score for axis, score in result.axes.items()},
+            "model": result.model,
+        }
+    except Exception as exc:  # noqa: BLE001 — fail-open
+        if logger:
+            logger.debug("Judge pass failed (skipping): %s", exc)
+        return None
+
+
+def _enrich_contract(
+    contract: Dict[str, Any],
+    logger: Optional[logging.Logger] = None,
+) -> Optional[Dict[str, Any]]:
+    """Run the post-synthesis deterministic enrichment pass (fail-open).
+
+    Delegates to :func:`fluid_build.copilot.enrichment.enrich_contract`,
+    which executes the three Wave 2 tools (dbt tests, freshness,
+    physical layout) and writes artifacts to
+    ``.fluid/agents/<run_id>/enrichment/``. Returns the in-process dict
+    so the caller can pass it to :func:`_judge_contract` as
+    ``build_artifacts``.
+
+    Returns ``None`` when enrichment is disabled or fails.
+    """
+    try:
+        from fluid_build.copilot.enrichment import enrich_contract
+
+        return enrich_contract(contract, logger=logger)
+    except Exception as exc:  # noqa: BLE001 — fail-open
+        if logger:
+            logger.debug("Enrichment pass failed (skipping): %s", exc)
+        return None
+
+
 def _self_evaluate_contract(
     llm_config: "LlmConfig",
     context: Mapping[str, Any],
@@ -947,6 +1016,13 @@ def generate_copilot_artifacts(
                     )
                     continue
 
+            enrichment_artifacts = _enrich_contract(normalized["contract"], logger=logger)
+            judge_result = _judge_contract(
+                normalized["contract"],
+                logger=logger,
+                build_artifacts=enrichment_artifacts,
+            )
+
             provenance = {
                 "llm_provider": llm_config.provider,
                 "llm_model": llm_config.model,
@@ -958,6 +1034,13 @@ def generate_copilot_artifacts(
                 ).hexdigest()[:16],
                 "attempt": attempt_index,
                 "self_eval_score": eval_result.get("score") if eval_result else None,
+                "judge_score": judge_result.get("score") if judge_result else None,
+                "judge_axes": judge_result.get("axes") if judge_result else None,
+                "judge_model": judge_result.get("model") if judge_result else None,
+                "enrichment_applied": enrichment_artifacts is not None,
+                # Gap 5 — stash the artifact dict so the apply pass in
+                # _template_mode can find it without re-running the tools.
+                "enrichment_artifacts": enrichment_artifacts,
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             }
             return CopilotGenerationResult(
@@ -1164,6 +1247,68 @@ def _generate_staged_copilot_artifacts(
         team_memory=team_memory,
         discovery_report=discovery_report,
     )
+    # Pause/resume wiring (S3) — stamp the resume id from context onto
+    # the session BEFORE the coordinator runs. Without this the
+    # coordinator's ``_resolve_run_id`` mints a fresh id and the
+    # ``skip_if_done`` blocks never find the cached stages from a
+    # prior run. ``context["_resume_run_id"]`` is set in
+    # ``forge_modes.run_ai_copilot_mode`` (either the explicit --resume
+    # id or the freshly-minted id for this run); see also S2.
+    _resume_id = context.get("_resume_run_id") if isinstance(context, Mapping) else None
+    if _resume_id:
+        try:
+            session.run_id = str(_resume_id)
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+
+        # If the run is actually resuming (cache has stages), surface
+        # the trust-building "Stage N/8: <name> ← cached, saved $X"
+        # summary now so the user sees what's about to be skipped
+        # BEFORE the staged work starts. Uses the shared
+        # ``StageProgressFormatter`` so the rendering matches the
+        # ``fluid agents show`` post-hoc view.
+        try:
+            from fluid_build.copilot.checkpoint import (
+                STAGE_NAMES as _STAGE_NAMES,
+            )
+            from fluid_build.copilot.checkpoint import (
+                get_default_saver as _get_saver,
+            )
+            from fluid_build.copilot.checkpoint_progress import (
+                StageProgressFormatter as _Formatter,
+            )
+
+            _saver = _get_saver(workspace_root=Path.cwd())
+            _existing = _saver.list_stages(str(_resume_id))
+            if _existing:
+                _fmt = _Formatter(use_rich=False)
+                _total = len(_STAGE_NAMES)
+                _lines = [
+                    _fmt.render_resume_header(
+                        str(_resume_id),
+                        f"{len(_existing)} of {_total} cached",
+                    )
+                ]
+                for _idx, _rec in enumerate(_existing, start=1):
+                    _lines.append(
+                        _fmt.render_stage_line(
+                            _rec.stage,
+                            "cached",
+                            index=_idx,
+                            total=_total,
+                            saved_usd=float(_rec.cost_usd or 0.0),
+                        )
+                    )
+                _msg = "\n".join(_lines)
+                # Emit through the logger so tests can capture it and
+                # the rich-render path picks it up via the standard
+                # forge UI handler.
+                if logger:
+                    logger.info("resume_progress:\n%s", _msg)
+        except Exception as _resume_ui_exc:  # noqa: BLE001 — UI is best-effort
+            if logger:
+                logger.debug("resume_progress_render_failed: %s", _resume_ui_exc)
+
     coordinator = StageCoordinator()
     staged_engine = _resolve_staged_engine(
         context,
@@ -1268,6 +1413,54 @@ def _generate_staged_copilot_artifacts(
     )
 
 
+# Module-scoped guard so the "backend set but coordinator off" warning
+# fires exactly once per process — repeated calls to
+# ``_should_use_staged_copilot`` (every retry attempt, every interview
+# refresh) must not spam the operator.
+_STAGED_COPILOT_BACKEND_WARNING_EMITTED = False
+
+
+def _reset_staged_copilot_warning() -> None:
+    """Test-only: reset the once-per-process backend-warning latch."""
+    global _STAGED_COPILOT_BACKEND_WARNING_EMITTED
+    _STAGED_COPILOT_BACKEND_WARNING_EMITTED = False
+
+
+def _maybe_warn_inactive_staged_coordinator() -> None:
+    """Warn once when a non-file store backend is configured but the
+    staged coordinator is inactive.
+
+    Symptom this guards against (MEMORY-E2E-A finding #53): operators
+    export ``FLUID_STORE_BACKEND=postgres`` (or sqlite/vector) but the
+    default forge flow stays on the legacy ``CopilotEngine`` codepath,
+    so the staged ``StageCoordinator`` checkpoints never fire and the
+    configured backend silently does nothing. We prefer the warning
+    path over auto-flipping a default — the staged coordinator is a
+    behavioural change, not a transparent swap.
+    """
+    global _STAGED_COPILOT_BACKEND_WARNING_EMITTED
+    if _STAGED_COPILOT_BACKEND_WARNING_EMITTED:
+        return
+    backend_raw = os.environ.get("FLUID_STORE_BACKEND")
+    if not backend_raw:
+        return
+    backend = backend_raw.strip().lower()
+    # ``file`` is the default; ``null``/``none``/``0``/``disabled`` all
+    # map to the no-op backend in ``resolve_store`` — no point warning
+    # about either since neither persists anything anyway.
+    if backend in {"", "file", "null", "none", "0", "disabled"}:
+        return
+    _STAGED_COPILOT_BACKEND_WARNING_EMITTED = True
+    message = (
+        "Store backend %r configured but staged coordinator is inactive "
+        "(only DDL/intent/data-model-driven flows trigger it). Set "
+        "FLUID_FORGE_STAGED_COPILOT=1 to activate, OR use a DDL/intent/source "
+        "input that triggers it automatically. Episodic / semantic / audit "
+        "writers will not fire and the backend will receive no traffic."
+    )
+    LOG.warning(message, backend)
+
+
 def _should_use_staged_copilot(
     context: Mapping[str, Any],
     discovery_report: DiscoveryReport,
@@ -1282,7 +1475,13 @@ def _should_use_staged_copilot(
     ):
         if context.get(key):
             return True
-    return bool(discovery_report.user_data_models)
+    if discovery_report.user_data_models:
+        return True
+    # Stayed legacy AND a non-file backend is configured — flag the
+    # silent-no-op trap (finding #53). Only emit when the staged path
+    # would NOT have fired, so we don't double-up on the active path.
+    _maybe_warn_inactive_staged_coordinator()
+    return False
 
 
 def _resolve_staged_engine(

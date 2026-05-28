@@ -183,6 +183,36 @@ class TestListTables:
         kwargs = glue_client.get_tables.call_args_list[0].kwargs
         assert kwargs["DatabaseName"] == "my_db"
 
+    def test_list_tables_carries_table_description(self, boto3_stub):
+        """Glue's ``GetTables`` response carries ``Description`` per
+        table. The UX-9 audit observed this metadata being silently
+        dropped end-to-end, so we pin it here at the adapter
+        boundary: the ``Description`` field MUST land on
+        ``CatalogTable.description`` so downstream stages
+        (logical_agent → modeler → contract emit) can carry it
+        verbatim into the generated contract / model docs."""
+        session_instance = MagicMock()
+        boto3_stub.return_value = session_instance
+        glue_client = MagicMock()
+        session_instance.client.return_value = glue_client
+        glue_client.get_tables.return_value = {
+            "TableList": [
+                {
+                    "Name": "orders",
+                    "Description": "Customer orders table",
+                    "Owner": "data-eng",
+                    "Parameters": {},
+                    "UpdateTime": None,
+                },
+            ],
+        }
+
+        tables = _make_adapter().list_tables(CatalogScope(database="my_db"))
+
+        assert len(tables) == 1
+        # Description must propagate verbatim to CatalogTable.description.
+        assert tables[0].description == "Customer orders table"
+
     def test_paginated_list_walks_next_token(self, boto3_stub):
         """When Glue returns a NextToken, the adapter must follow
         it until exhaustion. Otherwise large catalogs silently
@@ -225,6 +255,77 @@ class TestListTables:
         with pytest.raises(CatalogConfigError) as exc_info:
             adapter.list_tables(CatalogScope())
         assert "database" in exc_info.value.message.lower()
+
+
+class TestGetTable:
+    """Pin the Glue → CatalogTable metadata bridge.
+
+    UX-9 audit (catalog descriptions silently dropped end-to-end)
+    motivated this test class. The Glue ``GetTable`` response
+    carries table-level ``Description`` AND per-column ``Comment``
+    fields. Both MUST flow into the resulting :class:`CatalogTable`
+    so downstream stages (logical_agent → modeler → contract emit)
+    can carry them into the generated artifacts.
+    """
+
+    def test_get_table_carries_description_and_column_comments(self, boto3_stub):
+        session_instance = MagicMock()
+        boto3_stub.return_value = session_instance
+        glue_client = MagicMock()
+        # lakeformation calls go to a different client; soft-fail
+        # path returns {} so the test focuses on Glue-only metadata.
+        session_instance.client.return_value = glue_client
+        glue_client.get_table.return_value = {
+            "Table": {
+                "Name": "orders",
+                "Description": "Customer orders table",
+                "Owner": "data-eng",
+                "Parameters": {},
+                "UpdateTime": None,
+                "StorageDescriptor": {
+                    "Columns": [
+                        {
+                            "Name": "order_id",
+                            "Type": "string",
+                            "Comment": "primary key",
+                        },
+                        {
+                            "Name": "amount_usd",
+                            "Type": "double",
+                            "Comment": "Total in USD",
+                        },
+                        {
+                            "Name": "status",
+                            "Type": "string",
+                            # No Comment — pins the None passthrough.
+                        },
+                    ]
+                },
+                "PartitionKeys": [],
+            }
+        }
+
+        # lakeformation soft-fails (no LF configured in this fake env);
+        # the adapter should keep going and still return descriptions.
+        # Stub the LF client lookup to raise so safe_metadata_call
+        # exercises the fallback path.
+        session_instance.client.side_effect = lambda svc: (
+            glue_client if svc == "glue" else (_ for _ in ()).throw(Exception("no LF"))
+        )
+
+        adapter = _make_adapter()
+        table = adapter.get_table("my_db.orders")
+
+        # Table-level Description propagates.
+        assert table.description == "Customer orders table"
+
+        # Per-column Comment propagates to CatalogColumn.description.
+        col_descs = {c.name: c.description for c in table.columns}
+        assert col_descs["order_id"] == "primary key"
+        assert col_descs["amount_usd"] == "Total in USD"
+        # Missing Comment surfaces as None — not the literal string
+        # "None" or an empty string artefact.
+        assert col_descs["status"] is None
 
 
 class TestErrorTranslation:

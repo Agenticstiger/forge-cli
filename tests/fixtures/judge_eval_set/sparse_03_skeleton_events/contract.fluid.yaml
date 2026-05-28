@@ -1,0 +1,23 @@
+fluidVersion: "0.7.3"
+kind: DataProduct
+id: sparse.events_skeleton
+name: events
+domain: analytics
+
+exposes:
+  - name: events
+    schema:
+      - name: event_id
+        type: STRING
+      - name: user_id
+        type: STRING
+      - name: event_type
+        type: STRING
+      - name: event_ts
+        type: TIMESTAMP
+      - name: payload
+        type: STRING
+      - name: source
+        type: STRING
+      - name: device_ip
+        type: STRING

@@ -61,6 +61,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 # reach the moved class bodies. We resolve via ``_auth.RICH_AVAILABLE``
 # at call time so every patch flows through.
 from fluid_build.cli import auth as _auth  # noqa: E402
+from fluid_build.cli._common import CLIError  # noqa: E402,F401
 from fluid_build.cli.auth import (  # noqa: E402,F401
     AuthProvider,
     AuthResult,

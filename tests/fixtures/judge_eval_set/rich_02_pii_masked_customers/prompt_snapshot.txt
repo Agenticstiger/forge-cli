@@ -1,0 +1,184 @@
+===== SYSTEM PROMPT =====
+
+You are a senior data-platform reviewer judging a finalised data-product contract against a 6-axis quality rubric.
+
+For EACH of these six axes, score the contract from 0 to 5:
+  0 = missing / not present
+  1 = severely deficient
+  2 = below acceptable threshold
+  3 = acceptable / minimum viable
+  4 = good
+  5 = excellent / production-ready
+
+Axes (with definitions):
+- correctness: Does the contract's declared schema (column names, types, nullability) match the sample data and the upstream sources? Are data types reasonable for the values shown?
+- completeness: Are the required contract fields populated — owner, SLAs, descriptions, retention, refresh cadence? Anything missing that would block a downstream consumer from using this?
+- security: Are PII / sensitive columns tagged with a classification? Is masking applied where appropriate (e.g. for emails, SSNs, tokens)? Are there obvious leakage paths in exposes[]?
+- governance: Is the data product owned (team or person, contactable)? Are access policies declared? Is retention specified? Is the lineage clear (consumes[]) when this product depends on others?
+- performance: Are clustering / partition keys / indexes sensible for the product type (SDP/ADP/CDP) and the query patterns implied by exposes[]? Are large tables partitioned at all?
+- documentation: Are README and per-column descriptions present and non-trivial? Could a new analyst use this contract without asking the owner what each column means?
+
+RULES OF THE JUDGEMENT:
+1. For each axis, write your reasoning BEFORE assigning the score. Chain-of-thought reasoning improves correlation with human reviewers.
+2. Reasoning should be 1-2 sentences citing specific contract fields, not generic praise or criticism.
+3. Provide actionable suggestions when the score is below 5; emit an empty suggestions list when the axis is already excellent.
+4. Score every axis. Do not skip any. Do not invent extra axes.
+5. Respond with strict JSON only — no markdown narration outside the JSON block. Top-level keys MUST be exactly 'axes' (object keyed by the six axis names above).
+
+Example response (abbreviated to 3 axes for illustration; you must score all 6):
+
+```json
+{
+  "axes": {
+    "correctness": {
+      "score": 4,
+      "reasoning": "Schema columns match the sample data; one numeric column is typed as STRING which is conservative but inefficient.",
+      "suggestions": ["Type 'amount_cents' as INT64 instead of STRING."]
+    },
+    "completeness": {
+      "score": 3,
+      "reasoning": "Owner and SLA are set, but column descriptions are missing for 4/12 columns.",
+      "suggestions": ["Add descriptions for: customer_id, created_at, status, tier."]
+    },
+    "security": {
+      "score": 5,
+      "reasoning": "All PII columns tagged; email is masked in exposes[]; no obvious leakage.",
+      "suggestions": []
+    }
+  }
+}
+```
+
+===== USER PROMPT =====
+
+Judge this contract:
+
+```yaml
+fluidVersion: 0.7.3
+kind: DataProduct
+id: rich.customers_v3
+name: Customer Master
+description: 'Aggregate Silver/ADP customer master derived from CRM, billing, and
+
+  app-event sources. Every PII column is classified and masked under
+
+  GDPR Article 4(5). Owner is the data-protection officer''s queue.
+
+  '
+domain: crm
+metadata:
+  layer: Silver
+  productType: ADP
+  owner:
+    team: customer-data-platform
+    email: cdp-team@example.com
+    dpoContact: dpo@example.com
+  classification: restricted
+  refreshCadence: daily
+  sla:
+    freshness: P1D
+    availability: 99.5%
+  gdprApplicable: true
+retention:
+  runState: P30D
+  runLogs: P90D
+  lineage: P365D
+  data: P1095D
+consumes:
+- id: bronze.crm_customers
+- id: bronze.app_events
+exposes:
+- exposeId: customer_master
+  name: dim_customers
+  kind: table
+  binding:
+    platform: snowflake
+    format: table
+    location:
+      database: ANALYTICS_PROD
+      schema: CRM
+      table: DIM_CUSTOMERS
+    clustering:
+    - customer_id
+  contract:
+    schema:
+    - name: customer_id
+      type: STRING
+      primaryKey: true
+      nullable: false
+      classification: pii_indirect
+      masking:
+        algorithm: tokenize
+        scope: external_only
+      description: Stable surrogate key. Tokenized when exported externally.
+    - name: email
+      type: STRING
+      nullable: true
+      classification: pii
+      masking:
+        algorithm: partial_mask
+        pattern: user***@***.com
+      description: Primary contact email; partially masked for analyst role.
+    - name: phone
+      type: STRING
+      nullable: true
+      classification: pii
+      masking:
+        algorithm: partial_mask
+        pattern: '***-***-NNNN'
+      description: E.164 phone number; last-4 visible for service-desk reconciliation.
+    - name: full_name
+      type: STRING
+      nullable: true
+      classification: pii
+      masking:
+        algorithm: hash_sha256
+        scope: non_owner_role
+      description: Combined first+last legal name; hashed outside owner role.
+    - name: country_code
+      type: STRING
+      nullable: false
+      enum:
+      - US
+      - GB
+      - DE
+      - FR
+      - JP
+      - AU
+      - CA
+      - BR
+      description: Primary residence country (ISO-3166-1 alpha-2).
+    - name: signup_date
+      type: DATE
+      nullable: false
+      description: Account creation date.
+    - name: tier
+      type: STRING
+      nullable: false
+      enum:
+      - free
+      - pro
+      - business
+      - enterprise
+      description: Current subscription tier.
+    - name: lifetime_value_cents
+      type: INT64
+      nullable: false
+      min: 0
+      description: Lifetime customer value in cents (90-day rolling).
+    - name: is_active
+      type: BOOLEAN
+      nullable: false
+      description: Has logged in within the last 365 days.
+    - name: consent_marketing
+      type: BOOLEAN
+      nullable: false
+      description: GDPR Article 7 marketing-communications consent flag.
+    - name: updated_at
+      type: TIMESTAMP
+      nullable: false
+      description: Last source-record update.
+
+```
+
+Return the full 6-axis JSON scorecard now.

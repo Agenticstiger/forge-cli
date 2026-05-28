@@ -1,0 +1,14 @@
+{
+  "axes": {
+    "correctness": 4,
+    "completeness": 3,
+    "security": 2,
+    "governance": 4,
+    "performance": 2,
+    "documentation": 3
+  },
+  "total": 18,
+  "tolerance_per_axis": 2,
+  "tolerance_total": 5,
+  "rationale": "PK/FK markers + owner + enums; missing SLA, PII tags on account_id, clustering on filed_date."
+}

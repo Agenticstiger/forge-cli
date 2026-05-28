@@ -1,0 +1,101 @@
+# Judge regression gate — protects against silent drift in the
+# out-of-loop LLM-as-judge scores.
+#
+# Two layers:
+#
+# 1. **Default cheap path (every PR + push to main):** Run the golden
+#    snapshot tests in tests/copilot/agents/test_judge_golden_set.py
+#    and the prompt frozen-string tests in
+#    test_judge_prompt_snapshots.py. NO LLM CALLS — these mock the
+#    provider to return a deterministic response and assert the
+#    parser/persistence/prompt-builder round-trip stays stable.
+#    Catches any drift to AXES, rubric template, _build_prompt
+#    structure, or the JudgeResult shape.
+#
+# 2. **Opt-in expensive path (workflow_dispatch only):** Run the
+#    live-judge test (marked `live_judge`) against actual LLM
+#    inference using the GitHub Models token. Asserts judge scores
+#    stay within tolerance of pinned expected scores per contract.
+#    Promote to required-check status once it has proven stable.
+name: Judge gate
+
+on:
+  pull_request:
+    paths:
+      - "fluid_build/copilot/agents/judge_agent.py"
+      - "fluid_build/copilot/enrichment.py"
+      - "fluid_build/copilot/tools/**"
+      - "tests/copilot/agents/test_judge_**"
+      - "tests/fixtures/judge_eval_set/**"
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_live_judge:
+        description: "Also run the opt-in live-judge tests (consumes GitHub Models quota)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  judge-snapshots:
+    name: Judge snapshot tests (no LLM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install forge-cli
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run judge snapshot + A/B tests
+        run: |
+          python -m pytest \
+            tests/copilot/agents/test_judge_agent.py \
+            tests/copilot/agents/test_judge_artifacts.py \
+            tests/copilot/agents/test_judge_golden_set.py \
+            tests/copilot/agents/test_judge_prompt_snapshots.py \
+            tests/copilot/agents/test_judge_ab_enriched_vs_baseline.py \
+            tests/copilot/test_enrichment.py \
+            tests/test_judge_runtime_integration.py \
+            -v --tb=short
+
+  judge-live:
+    # Opt-in only — run via workflow_dispatch with run_live_judge=true.
+    # Forks can't call GitHub Models so we also skip fork PRs.
+    name: Judge live test (real LLM)
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.run_live_judge == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install forge-cli
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run live judge tests against GitHub Models
+        env:
+          FLUID_LLM_PROVIDER: github
+          FLUID_LLM_MODEL: gpt-4o-mini
+          GITHUB_API_KEY: ${{ github.token }}
+        run: |
+          python -m pytest \
+            tests/copilot/agents/test_judge_live.py \
+            -m live_judge -v --tb=short

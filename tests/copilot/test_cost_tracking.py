@@ -949,3 +949,179 @@ class TestCatalogFetchSurfacing:
         tracker.record_catalog_fetch("snowflake", 1500)
         reset_run_tracker()
         assert get_run_tracker().breakdown().catalog_fetch_ms == {}
+
+
+# ---------------------------------------------------------------------
+# H22 — RunCostTracker.persist_to_run_dir always writes a cost.json
+# ---------------------------------------------------------------------
+
+
+class TestPersistToRunDir:
+    """``persist_to_run_dir`` always writes a receipt, even for
+    deterministic runs that never invoked the LLM.
+
+    Pre-fix the from-source (deterministic) path silently skipped
+    cost.json, so ``fluid stats`` reported "0 runs" even when the
+    coordinator's manifest clearly recorded a completed forge. The
+    receipt now ALWAYS lands, carrying ``mode=deterministic`` +
+    zero counts when nothing was billed.
+    """
+
+    def setup_method(self) -> None:
+        reset_run_tracker()
+
+    def teardown_method(self) -> None:
+        reset_run_tracker()
+
+    def test_deterministic_run_writes_cost_json(self, tmp_path):
+        run_dir = tmp_path / ".fluid" / "agents" / "20260527-000000-deadbe"
+        path = get_run_tracker().persist_to_run_dir(run_dir)
+        assert path == run_dir / "cost.json"
+        assert path.is_file()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        # Must be flagged as deterministic so downstream tools can
+        # distinguish "no LLM" from "LLM ran but unknown price".
+        assert data["mode"] == "deterministic"
+        assert data["total_calls"] == 0
+        assert data["input_tokens"] == 0
+        assert data["output_tokens"] == 0
+        # ``total_usd`` is None (unknown) — not 0.0 — when no calls fired.
+        assert data["total_usd"] is None
+
+    def test_persist_creates_parent_directories(self, tmp_path):
+        """Missing ``.fluid/agents/<run-id>`` is created on the fly."""
+        nested = tmp_path / "deep" / "nested" / "dir"
+        assert not nested.exists()
+        get_run_tracker().persist_to_run_dir(nested)
+        assert (nested / "cost.json").is_file()
+
+    def test_persist_with_calls_records_real_mode_and_tokens(self, tmp_path):
+        tracker = get_run_tracker()
+        tracker.record_call(
+            provider="gemini",
+            model="gemini-2.5-flash",
+            input_tokens=100,
+            output_tokens=50,
+            usd_override=0.0042,
+        )
+        run_dir = tmp_path / ".fluid" / "agents" / "20260527-000001-deadbe"
+        path = tracker.persist_to_run_dir(run_dir, wall_clock_seconds=2.5)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["mode"] == "gemini/gemini-2.5-flash"
+        assert data["provider"] == "gemini"
+        assert data["model"] == "gemini-2.5-flash"
+        assert data["input_tokens"] == 100
+        assert data["output_tokens"] == 50
+        assert data["total_tokens"] == 150
+        assert data["total_usd"] == pytest.approx(0.0042)
+        assert data["wall_clock_seconds"] == pytest.approx(2.5)
+        # The rich per-row breakdown is also persisted so consumers can
+        # drill into multi-model runs.
+        assert len(data["rows"]) == 1
+        assert data["rows"][0]["model"] == "gemini-2.5-flash"
+
+    def test_persist_multi_row_run_emits_mixed_mode(self, tmp_path):
+        tracker = get_run_tracker()
+        tracker.record_call(
+            provider="anthropic",
+            model="claude-haiku-4-5",
+            input_tokens=200,
+            output_tokens=100,
+        )
+        tracker.record_call(
+            provider="gemini",
+            model="gemini-2.5-flash",
+            input_tokens=100,
+            output_tokens=50,
+        )
+        run_dir = tmp_path / ".fluid" / "agents" / "20260527-000002-deadbe"
+        path = tracker.persist_to_run_dir(run_dir)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["mode"] == "mixed"
+        assert data["total_calls"] == 2
+        assert len(data["rows"]) == 2
+
+    def test_persist_atomic_write_no_partial_file(self, tmp_path, monkeypatch):
+        """A mid-write crash mustn't leave a half-written cost.json
+        (atomic rename: temp file → final path)."""
+        run_dir = tmp_path / ".fluid" / "agents" / "20260527-000003-deadbe"
+        path = get_run_tracker().persist_to_run_dir(run_dir)
+        # After a successful write the temp file is gone and only the
+        # canonical name is left.
+        assert path.is_file()
+        leftovers = list(run_dir.glob("cost*.tmp"))
+        assert leftovers == []
+
+
+# ---------------------------------------------------------------------
+# H1 — record_call_from_cumulative_usage bridge helper
+# ---------------------------------------------------------------------
+
+
+class TestRecordCallFromCumulativeUsage:
+    """The bridge helper feeds the process-wide ``RunCostTracker`` from
+    the bare ``call_llm`` path. Without it, the runtime's main
+    authoring loop (which calls ``call_llm`` directly) leaves the
+    tracker empty and the user sees ``$0 / 0 tokens`` in cost.json
+    even when thousands of tokens flowed through.
+
+    Pin: the helper must produce an identical row to a direct
+    ``record_call`` so the cost summary, ceiling check, and per-product
+    attribution all behave the same regardless of which entry point
+    drove the recording.
+    """
+
+    def setup_method(self) -> None:
+        reset_run_tracker()
+
+    def teardown_method(self) -> None:
+        reset_run_tracker()
+
+    def test_bridge_produces_row_matching_record_call(self):
+        from fluid_build.copilot.cost import record_call_from_cumulative_usage
+
+        record_call_from_cumulative_usage(
+            provider="gemini",
+            model="gemini-2.5-flash",
+            input_tokens=14,
+            output_tokens=22,
+            usd_override=0.0123,
+        )
+        bd = get_run_tracker().breakdown()
+        assert bd.total_calls == 1
+        assert bd.total_input_tokens == 14
+        assert bd.total_output_tokens == 22
+        assert bd.rows[0].provider == "gemini"
+        assert bd.rows[0].model == "gemini-2.5-flash"
+        # ``total_usd`` rounds to 4 decimal places (sub-cent precision).
+        assert bd.total_usd == pytest.approx(0.0123)
+
+    def test_bridge_propagates_anthropic_cache_split(self):
+        """Anthropic prompt-cache tokens flow through verbatim."""
+        from fluid_build.copilot.cost import record_call_from_cumulative_usage
+
+        record_call_from_cumulative_usage(
+            provider="anthropic",
+            model="claude-haiku-4-5",
+            input_tokens=100,
+            output_tokens=50,
+            cache_creation_input_tokens=500,
+            cache_read_input_tokens=300,
+        )
+        bd = get_run_tracker().breakdown()
+        assert bd.rows[0].cache_creation_input_tokens == 500
+        assert bd.rows[0].cache_read_input_tokens == 300
+
+    def test_bridge_zero_call_is_recorded(self):
+        """A 0/0 paid-provider call still increments missing_usage_calls
+        so the cost summary can show "N calls had no usage data"."""
+        from fluid_build.copilot.cost import record_call_from_cumulative_usage
+
+        record_call_from_cumulative_usage(
+            provider="openai",
+            model="gpt-4.1-mini",
+            input_tokens=0,
+            output_tokens=0,
+        )
+        bd = get_run_tracker().breakdown()
+        assert bd.missing_usage_calls == 1

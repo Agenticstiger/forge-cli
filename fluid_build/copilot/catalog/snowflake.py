@@ -69,6 +69,75 @@ def _quote_ident(value: str, *, kind: str) -> str:
     return validate_and_quote_identifier(value, kind=f"Snowflake {kind}")
 
 
+# Snowflake DATA_TYPE values for the numeric family. Snowflake
+# normalises DECIMAL / DEC / NUMERIC / INT* / INTEGER / BIGINT /
+# SMALLINT / TINYINT / BYTEINT to ``NUMBER`` in INFORMATION_SCHEMA,
+# but we accept the full superset defensively so non-canonical
+# accounts (or external tables surfacing native dialect names)
+# still round-trip cleanly. We never compose precision/scale onto
+# non-numeric types — TEXT / VARCHAR / CHAR / TIMESTAMP_TZ etc.
+# carry their own size/precision semantics through DATA_TYPE
+# verbatim and adding ``(p,s)`` to them would emit invalid DDL.
+_NUMERIC_DATA_TYPES = frozenset(
+    {
+        "NUMBER",
+        "DECIMAL",
+        "DEC",
+        "NUMERIC",
+    }
+)
+
+
+def _compose_data_type_with_precision_scale(
+    data_type: Optional[str],
+    numeric_precision: Optional[int],
+    numeric_scale: Optional[int],
+) -> str:
+    """Round-trip NUMBER precision/scale into the ``data_type`` string.
+
+    H3-followup (RETEST-6 finding): the upstream H3 fix wired the
+    DDL emitter to honour ``data_type`` instead of hard-coding
+    ``STRING`` — but the Snowflake catalog adapter discarded
+    NUMERIC_PRECISION / NUMERIC_SCALE at the SELECT layer, so every
+    NUMBER column emitted as bare ``NUMBER`` (no precision / scale)
+    even though Snowflake had the right answer in
+    INFORMATION_SCHEMA.COLUMNS.
+
+    This helper composes the parameterised form
+    (``NUMBER(15,2)`` / ``NUMBER(10,0)``) so the OSI sidecar carries
+    the correct logical type and the DDL emitter emits valid
+    Snowflake DDL on round-trip. Mirrors the JDBC introspect
+    pattern at ``_jdbc_introspect._map_jdbc_type_to_logical``
+    (H18 — P2b's fix for the same family of bug).
+
+    Composition rules:
+
+    * Only NUMBER-family types (NUMBER / DECIMAL / DEC / NUMERIC)
+      get parameterisation. TEXT / TIMESTAMP_TZ / VARCHAR / etc.
+      pass through untouched — Snowflake's information_schema
+      doesn't populate NUMERIC_PRECISION for them in any case,
+      but the defensive type-family check keeps the helper safe
+      against future schema changes.
+    * Both precision AND scale present  → ``NUMBER(p,s)``
+    * Precision only (no scale)         → ``NUMBER(p)``
+    * Neither present                   → bare ``NUMBER`` (the
+      pre-fix shape; Snowflake treats this as ``NUMBER(38,0)``).
+    * ``data_type`` ``None`` / empty    → ``STRING`` fallback
+      (consistent with the rest of the catalog → emitter chain;
+      keeps DDL parseable even on degenerate metadata rows).
+    """
+    if not data_type:
+        return "STRING"
+    upper = data_type.upper()
+    if upper not in _NUMERIC_DATA_TYPES:
+        return data_type
+    if numeric_precision is not None and numeric_scale is not None:
+        return f"{data_type}({numeric_precision},{numeric_scale})"
+    if numeric_precision is not None:
+        return f"{data_type}({numeric_precision})"
+    return data_type
+
+
 from fluid_build.copilot.catalog.base import (
     CatalogAdapter,
     CatalogConfigError,
@@ -328,9 +397,21 @@ class SnowflakeCatalogAdapter(CatalogAdapter):
                 comment, owner, last_altered = header
 
                 # Columns
+                #
+                # H3-followup (RETEST-6): NUMBER columns were emitting as
+                # bare ``NUMBER`` without precision / scale (e.g.
+                # ``AMOUNT_CHF NUMBER`` instead of ``AMOUNT_CHF
+                # NUMBER(15,2)``). Snowflake's INFORMATION_SCHEMA.COLUMNS
+                # already exposes NUMERIC_PRECISION / NUMERIC_SCALE for
+                # NUMBER/DECIMAL/NUMERIC; we fetch them here and compose
+                # them into the returned ``data_type`` string via
+                # :func:`_compose_data_type_with_precision_scale` so the
+                # downstream OSI sidecar + DDL emitter round-trip the
+                # parameterised type without further changes.
                 columns_sql = """
                     SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE,
-                           COMMENT, ORDINAL_POSITION
+                           COMMENT, ORDINAL_POSITION,
+                           NUMERIC_PRECISION, NUMERIC_SCALE
                       FROM {database}.INFORMATION_SCHEMA.COLUMNS
                      WHERE TABLE_SCHEMA  = %s
                        AND TABLE_NAME    = %s
@@ -378,7 +459,9 @@ class SnowflakeCatalogAdapter(CatalogAdapter):
         columns = [
             CatalogColumn(
                 name=col_name,
-                data_type=data_type,
+                data_type=_compose_data_type_with_precision_scale(
+                    data_type, numeric_precision, numeric_scale
+                ),
                 nullable=(is_nullable == "YES"),
                 description=col_comment,
                 primary_key=col_name in pk_columns,
@@ -388,7 +471,15 @@ class SnowflakeCatalogAdapter(CatalogAdapter):
                 # round-trip that's expensive on large schemas; the
                 # umbrella tag list is sufficient for v1.5 Sprint A.
             )
-            for (col_name, data_type, is_nullable, col_comment, _ord) in column_rows
+            for (
+                col_name,
+                data_type,
+                is_nullable,
+                col_comment,
+                _ord,
+                numeric_precision,
+                numeric_scale,
+            ) in column_rows
         ]
 
         return CatalogTable(

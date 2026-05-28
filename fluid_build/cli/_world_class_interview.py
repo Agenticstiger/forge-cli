@@ -359,7 +359,20 @@ class InterviewProgress:
 
 
 def _format_progress(p: InterviewProgress) -> str:
-    parts = [f"Q{p.asked + 1}/{p.total}"]
+    """Render the prompt prefix ``[Q N/M · ~$X budget left]``.
+
+    ``p.asked`` is the 1-indexed position of the question we're about
+    to ask (i.e. the caller pre-increments ``progress.asked`` before
+    calling).  H23 fix: the previous renderer added a second ``+1``
+    which made the first question read ``Q2/2`` instead of ``Q1/2``.
+    """
+    # Defend against under/over-flow rendering so a mis-sized counter
+    # never embarrasses the user (e.g. ``Q3/2`` from the old off-by-one).
+    if p.total > 0:
+        position = max(1, min(p.asked, p.total))
+    else:
+        position = max(1, p.asked)
+    parts = [f"Q{position}/{p.total}"]
     if p.cap_usd > 0:
         remaining = max(0.0, p.cap_usd - p.cumulative_usd)
         parts.append(f"~${remaining:.2f} budget left")
@@ -529,6 +542,11 @@ def run_world_class_bootstrap(
         _get_tel = None  # type: ignore[assignment]
 
     for q in open_questions:
+        # H23: ``progress.asked`` after this increment is the 1-indexed
+        # position of the question we're about to ask (Q1, Q2, ...).
+        # ``_format_progress`` renders the position verbatim — the
+        # production overflow ux-finding 01 caught (``Q2/2`` on the
+        # first question) was caused by the renderer also adding +1.
         progress.asked += 1
         if _get_tel is not None:
             try:

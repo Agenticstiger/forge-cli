@@ -1,0 +1,39 @@
+fluidVersion: "0.7.3"
+kind: DataProduct
+id: medium.transactions_v1
+name: transactions
+domain: payments
+
+metadata:
+  layer: Silver
+  productType: ADP
+  owner:
+    team: payments-platform
+    email: payments@example.com
+
+exposes:
+  - name: transactions
+    schema:
+      - name: transaction_id
+        type: STRING
+        primaryKey: true
+      - name: account_id
+        type: STRING
+        foreignKey:
+          to: accounts
+          field: account_id
+      - name: amount_cents
+        type: INT64
+        nullable: false
+      - name: currency
+        type: STRING
+        enum: ["USD", "EUR", "GBP", "JPY"]
+      - name: status
+        type: STRING
+        enum: ["pending", "settled", "refunded", "failed"]
+      - name: created_at
+        type: TIMESTAMP
+        nullable: false
+      - name: settled_at
+        type: TIMESTAMP
+        nullable: true

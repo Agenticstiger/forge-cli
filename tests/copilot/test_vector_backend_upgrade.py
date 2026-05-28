@@ -37,6 +37,7 @@ users who have).
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import pytest
 
@@ -178,3 +179,123 @@ def test_hash_embed_is_normalised() -> None:
     v = _hash_embed("customer churn analytics")
     norm_sq = sum(x * x for x in v)
     assert 0.99 < norm_sq < 1.01, f"expected L2-normalised; got norm^2={norm_sq}"
+
+
+# ---------------------------------------------------------------------------
+# Live sqlite-vec wiring (issue #45) — the ``[vector]`` extra must be
+# actually invoked, not just probed as a feature flag.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not is_sqlite_vec_available(), reason="[vector] extra not installed")
+def test_rank_by_embedding_invokes_sqlite_vec(monkeypatch, populated_backing_store) -> None:
+    """The ``_rank_by_embedding`` code path must actually call
+    ``sqlite-vec`` — observe the call by spying on ``sqlite_vec.load``.
+
+    Pre-fix, this was the canonical "dead code on the wire" bug: the
+    [vector] extra installed cleanly, ``is_sqlite_vec_available()``
+    returned True, and yet ``_rank_by_embedding`` was a pure-stdlib
+    blake2b token bag + Python cosine. Without a spy on the actual
+    sqlite-vec entry point we'd never catch a re-regression.
+    """
+    import sqlite_vec  # type: ignore[import-not-found]
+
+    calls: list[Any] = []
+    original_load = sqlite_vec.load
+
+    def spy_load(conn):
+        calls.append(conn)
+        return original_load(conn)
+
+    monkeypatch.setattr(sqlite_vec, "load", spy_load)
+
+    backend = VectorBackend(populated_backing_store, use_embeddings=True)
+    assert backend.use_embeddings is True
+    results = backend.search(
+        "memory/semantic",
+        "retail loyalty point of sale analytics",
+        mode="vector",
+        limit=3,
+    )
+    assert len(results) >= 1
+    assert calls, "sqlite_vec.load must be called by _rank_by_embedding when the extra is installed"
+
+
+@pytest.mark.skipif(not is_sqlite_vec_available(), reason="[vector] extra not installed")
+def test_embedding_ranking_differs_from_difflib_baseline(populated_backing_store) -> None:
+    """When the extra is installed, the embedded ranker must produce a
+    rank order that differs from a pure-difflib baseline on at least
+    one realistic query — otherwise the upgrade is purely cosmetic.
+
+    The test seeds three records with overlapping vocabularies and
+    confirms the embedded ranker picks the token-overlap winner
+    (retail) over the substring winner. With only difflib, the
+    ranker tends to prefer whichever stored doc shares the most
+    *consecutive* characters with the query, which can favour the
+    healthcare-cohort record on adversarial queries.
+    """
+    embedded = VectorBackend(populated_backing_store, use_embeddings=True)
+    difflib_only = VectorBackend(populated_backing_store, use_embeddings=False)
+
+    query = "retail loyalty point of sale analytics"
+    embedded_results = embedded.search("memory/semantic", query, mode="vector", limit=5)
+    difflib_results = difflib_only.search("memory/semantic", query, mode="vector", limit=5)
+
+    # Both rankers should return something for this query.
+    assert embedded_results, "embedded ranker returned no results"
+    assert difflib_results, "difflib ranker returned no results"
+
+    # Embedded ranker stamps a score; difflib path also does (post-fix).
+    assert embedded_results[0].score is not None
+    assert 0.0 <= embedded_results[0].score <= 1.0
+    # Token-overlap winner for the retail query is the retail record.
+    assert embedded_results[0].key == "intent_retail_sales"
+
+
+@pytest.mark.skipif(not is_sqlite_vec_available(), reason="[vector] extra not installed")
+def test_rank_by_embedding_stamps_score_for_min_similarity(populated_backing_store) -> None:
+    """``StoreRecord.score`` must carry the cosine similarity so
+    ``RetrievalConfig.min_similarity`` can actually threshold-filter.
+    Pre-fix, ``VectorBackend.search`` returned records without scores
+    so ``retrieval.py:163`` read 0.0 and filtered everything out."""
+    backend = VectorBackend(populated_backing_store, use_embeddings=True)
+    results = backend.search("memory/semantic", "retail loyalty", mode="vector", limit=5)
+    assert results, "expected at least one result for the seeded retail intent"
+    for r in results:
+        assert r.score is not None, "every embedded-ranker hit must carry a similarity score"
+        assert 0.0 <= r.score <= 1.0, f"expected cosine similarity in [0,1], got {r.score}"
+
+
+def test_min_similarity_threshold_actually_filters(populated_backing_store) -> None:
+    """End-to-end: with ``min_similarity > 0`` the retrieval helper
+    must filter low-scoring records out (and keep high-scoring ones).
+    This pins the wire-up from ``VectorBackend.search`` →
+    ``StoreRecord.score`` → ``RetrievalConfig.min_similarity`` so the
+    docstring at ``retrieval.py:71-75`` stops being false."""
+    from fluid_build.copilot.retrieval import (
+        RetrievalConfig,
+        retrieve_similar_models,
+    )
+    from fluid_build.copilot.scratchpad import Scratchpad
+
+    backend = VectorBackend(populated_backing_store, use_embeddings=is_sqlite_vec_available())
+    scratchpad = Scratchpad()
+    # A threshold of 0.0 returns everything (or whatever the ranker
+    # scored > 0); a threshold of 0.999 filters out essentially
+    # everything since two short documents rarely match perfectly.
+    permissive = retrieve_similar_models(
+        "retail loyalty point of sale",
+        store=backend,
+        scratchpad=scratchpad,
+        config=RetrievalConfig(min_similarity=0.0, mode="vector"),
+    )
+    strict = retrieve_similar_models(
+        "retail loyalty point of sale",
+        store=backend,
+        scratchpad=Scratchpad(),
+        config=RetrievalConfig(min_similarity=0.999, mode="vector"),
+    )
+    assert permissive, "min_similarity=0.0 must return at least one result"
+    assert len(strict) < len(
+        permissive
+    ), "min_similarity=0.999 must filter at least one result the permissive path returned"

@@ -86,8 +86,14 @@ _MAX_SCHEMA_REPAIR_ATTEMPTS = 1
 from fluid_build.copilot.agents._modeler_helpers import (  # noqa: E402,F401
     _annotate_logical_from_tables,
     _append_unique,
+    _build_dim_date,
+    _build_referenced_by_counts,
     _business_keys_for_table,
+    _classify_fact_or_dim,
     _ensure_tool_registry,
+    _extract_date_columns,
+    _extract_measure_columns,
+    _infer_foreign_keys,
     _inject_operator_corrections,
     _inject_scratchpad_signals,
     _merge_dimensional_skeleton,
@@ -267,27 +273,40 @@ class ModelerAgent(BaseStageAgent):
             name=name, tables=tables, technique=technique
         )
         prior_context = self._retrieve_prior_similar_models(session, query=semantic_query)
+        # UX-9 fix: surface the catalog-sourced ``table.comment`` /
+        # ``column.comment`` to the LLM so it can echo them through
+        # to ``OSIDataset.description`` / ``OSIField.description``.
+        # Without this, the LLM never sees the descriptions and
+        # only the heuristic path could preserve them. Empty
+        # comments are omitted so prompts forged from undocumented
+        # DDL stay compact.
+        table_entries: List[Dict[str, Any]] = []
+        for table in tables:
+            cols: List[Dict[str, Any]] = []
+            for column in table.columns:
+                col_entry: Dict[str, Any] = {
+                    "name": column.name,
+                    "logical_type": column.logical_type,
+                    "nullable": column.nullable,
+                    "primary_key": column.primary_key,
+                }
+                if column.comment:
+                    col_entry["description"] = column.comment
+                cols.append(col_entry)
+            table_entry: Dict[str, Any] = {
+                "name": table.name,
+                "primary_keys": table.primary_keys,
+                "columns": cols,
+            }
+            if table.comment:
+                table_entry["description"] = table.comment
+            table_entries.append(table_entry)
         user_prompt_payload: Dict[str, Any] = {
             "name": name,
             "technique": technique,
             "source_type": source_type,
             "schema_constraints": self._logical_schema_constraints(technique),
-            "tables": [
-                {
-                    "name": table.name,
-                    "primary_keys": table.primary_keys,
-                    "columns": [
-                        {
-                            "name": column.name,
-                            "logical_type": column.logical_type,
-                            "nullable": column.nullable,
-                            "primary_key": column.primary_key,
-                        }
-                        for column in table.columns
-                    ],
-                }
-                for table in tables
-            ],
+            "tables": table_entries,
         }
         if prior_context:
             user_prompt_payload["prior_similar_models"] = prior_context
@@ -595,9 +614,20 @@ class ModelerAgent(BaseStageAgent):
                 RetrievalConfig,
                 retrieve_similar_models,
             )
-            from fluid_build.copilot.store.backends.vector import VectorBackend
+            from fluid_build.copilot.store.backends.vector import (
+                VectorBackend,
+                is_sqlite_vec_available,
+            )
 
-            ranker = store if isinstance(store, VectorBackend) else VectorBackend(store)
+            # When the user installed the ``[vector]`` extra, light up
+            # the sqlite-vec embedding path so retrieval ranks by
+            # cosine similarity instead of stdlib difflib. The
+            # VectorBackend constructor guards against the extra being
+            # missing, so this stays a no-op for users who didn't.
+            if isinstance(store, VectorBackend):
+                ranker = store
+            else:
+                ranker = VectorBackend(store, use_embeddings=is_sqlite_vec_available())
             results = retrieve_similar_models(
                 query,
                 store=ranker,
@@ -1178,9 +1208,17 @@ class ModelerAgent(BaseStageAgent):
         for table in tables:
             fields = []
             for column in table.columns:
+                # UX-9 fix: ``column.comment`` carries the catalog
+                # column ``Comment`` / ``COMMENT`` (Glue, Snowflake,
+                # BQ, …) populated by ``_translate_catalog_table``
+                # from ``CatalogColumn.description``. Drop-on-
+                # translate to ``OSIField`` was the original UX-9
+                # SEV-1 — forward it now so the contract emitter
+                # can carry it through to ``exposes[].contract.schema``.
                 fields.append(
                     OSIField(
                         name=column.name,
+                        description=column.comment,
                         data_type=column.logical_type,
                         expression=OSIExpression(
                             dialects=[
@@ -1196,6 +1234,7 @@ class ModelerAgent(BaseStageAgent):
                 OSIDataset(
                     name=table.name,
                     source=table.name,
+                    description=table.comment,
                     primary_key=list(table.primary_keys),
                     fields=fields,
                 )
@@ -1292,13 +1331,24 @@ class ModelerAgent(BaseStageAgent):
         satellites = []
         for table in tables:
             keys = _business_keys_for_table(table)
+            # UX-9 fix: when the source catalog carries a table
+            # description, prefer it over the generic
+            # "Hub derived from source table …" stub so the
+            # business-facing blurb survives. Per-column comments
+            # cannot be preserved on a DV2 satellite (``attributes``
+            # is List[str] by spec) — they still flow through the
+            # OSI dataset, which is what the contract emitter
+            # reads. Hub description is the natural slot.
+            hub_description = (
+                table.comment if table.comment else f"Hub derived from source table {table.name}."
+            )
             hubs.append(
                 HubDefinition(
                     entity_name=table.name,
                     hub_table_name=f"hub_{_slug(table.name)}",
                     business_key_columns=keys,
                     mapped_source_tables=[table.name],
-                    description=f"Hub derived from source table {table.name}.",
+                    description=hub_description,
                 )
             )
             non_key_columns = [column.name for column in table.columns if column.name not in keys]
@@ -1377,42 +1427,119 @@ class ModelerAgent(BaseStageAgent):
     def _dimensional_from_tables(
         self, *, name: str, tables: Sequence[TableDefinition]
     ) -> DimensionalModel:
+        """Heuristic Kimball star-schema classifier.
+
+        Fixed in UX audit H2. Previously the classifier:
+
+        * Picked the table with the most columns as the fact (wrong —
+          ``orders`` typically has more columns than ``order_items``
+          but ``order_items`` is the line-item fact per Kimball Design
+          Tip #95).
+        * Listed every numeric column as a measure (wrong — ``id`` and
+          ``customer_id`` are IDs, not measures; ``SUM(id)`` is
+          nonsense).
+        * Never extracted ``dim_date`` from fact-table date columns
+          (wrong — Kimball requires every fact-table date column to
+          reference a calendar dimension).
+
+        New rules (see ``_modeler_helpers._classify_fact_or_dim`` for the
+        full receipts block):
+
+        * Tables referenced-AT by other tables' ``_id`` columns →
+          dimension (regardless of column count).
+        * Tables that carry FKs and have no inbound references → fact.
+        * Measures = numeric NON-key columns only.
+        * Date columns on a fact → emit a shared ``dim_date`` and tag
+          the original column as a degenerate timestamp dimension.
+        """
         if not tables:
             return DimensionalModel(grain_statement=f"Facts at the {name} grain.")
-        fact_table = max(tables, key=lambda table: len(table.columns))
-        dimensions = [table for table in tables if table.name != fact_table.name]
-        fact = FactTable(
-            name=f"fact_{_slug(fact_table.name)}",
-            grain_statement=f"One row per {_slug(fact_table.name)} event.",
-            measures=[
-                FieldDefinition(name=column.name, data_type=column.logical_type)
-                for column in fact_table.columns
-                if any(
-                    token in column.logical_type.upper()
-                    for token in ("INT", "DECIMAL", "NUMERIC", "FLOAT")
+
+        all_table_names = [t.name for t in tables]
+        referenced_by = _build_referenced_by_counts(tables)
+
+        # Partition: facts vs dimensions.
+        fact_tables = [
+            t for t in tables if _classify_fact_or_dim(t, all_table_names, referenced_by) == "fact"
+        ]
+        dim_tables = [
+            t for t in tables if _classify_fact_or_dim(t, all_table_names, referenced_by) == "dim"
+        ]
+
+        # Edge case: if no FK relationships found, fall back to the
+        # single-table = single-fact rule (the "lone source table"
+        # path that the old code handled implicitly). Pick the
+        # widest table as the fact and treat the rest as dims.
+        if not fact_tables and not dim_tables:
+            fact_tables = [max(tables, key=lambda t: len(t.columns))]
+        elif not fact_tables:
+            # Only "dim" tables — promote the most-columns one to fact
+            # so the model is non-degenerate.
+            promoted = max(dim_tables, key=lambda t: len(t.columns))
+            fact_tables = [promoted]
+            dim_tables = [t for t in dim_tables if t.name != promoted.name]
+
+        # Build facts.
+        facts: List[FactTable] = []
+        for fact_table in fact_tables:
+            measures = [
+                FieldDefinition(
+                    name=column.name,
+                    data_type=column.logical_type,
+                    description=column.comment,
                 )
-            ],
-            foreign_keys=[
-                column.name for column in fact_table.columns if column.name.endswith("_id")
-            ],
-        )
+                for column in _extract_measure_columns(fact_table)
+            ]
+            fk_columns = _infer_foreign_keys(fact_table, all_table_names)
+            # Date columns become degenerate timestamp dims pointing at
+            # dim_date — surface them in foreign_keys so the emitter
+            # treats them as joins, not as measures.
+            date_cols = _extract_date_columns(fact_table)
+            facts.append(
+                FactTable(
+                    name=f"fact_{_slug(fact_table.name)}",
+                    grain_statement=f"One row per {_slug(fact_table.name)} event.",
+                    description=fact_table.comment,
+                    measures=measures,
+                    foreign_keys=fk_columns + [col.name for col in date_cols],
+                    degenerate_dimensions=[col.name for col in date_cols],
+                )
+            )
+
+        # Build dimensions.
         dims = [
             DimensionTable(
                 name=f"dim_{_slug(table.name)}",
+                description=table.comment,
                 attributes=[
-                    FieldDefinition(name=column.name, data_type=column.logical_type)
+                    FieldDefinition(
+                        name=column.name,
+                        data_type=column.logical_type,
+                        description=column.comment,
+                    )
                     for column in table.columns
                 ],
                 surrogate_key=f"{_slug(table.name)}_sk",
                 natural_keys=list(table.primary_keys),
             )
-            for table in dimensions
+            for table in dim_tables
         ]
+
+        # Add shared dim_date when ANY table (fact or dim) carries a
+        # date column. Kimball treats dim_date as a conformed
+        # dimension that every other table's date columns reference —
+        # so we scan everything, not just facts. (Common pattern: the
+        # event timestamp lives on the order header dim, the line-item
+        # fact denormalises it; either way dim_date must exist.)
+        any_date_columns_seen = any(_extract_date_columns(t) for t in tables)
+        if any_date_columns_seen and not any(d.name == "dim_date" for d in dims):
+            dims.append(_build_dim_date())
+
         return DimensionalModel(
-            facts=[fact],
+            facts=facts,
             dimensions=dims,
             conformed_dimensions=[dimension.name for dimension in dims],
-            grain_statement=fact.grain_statement,
+            grain_statement=facts[0].grain_statement if facts else "",
         )
 
     def _dimensional_from_intent(self, intent: BusinessIntent) -> DimensionalModel:

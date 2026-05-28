@@ -29,7 +29,15 @@ def utc_now() -> datetime:
 
 @dataclass
 class StoreRecord:
-    """A value persisted in a namespaced store."""
+    """A value persisted in a namespaced store.
+
+    ``score`` is populated only by ranking backends (``VectorBackend``)
+    on ``search()`` results — it carries the cosine similarity in
+    ``[0.0, 1.0]`` so downstream consumers (e.g.
+    ``RetrievalConfig.min_similarity``) can apply a threshold filter.
+    ``None`` everywhere else preserves the v1.0 contract of put/get
+    round-tripping a plain record without a score field.
+    """
 
     namespace: str
     key: str
@@ -38,6 +46,7 @@ class StoreRecord:
     created_at: datetime = field(default_factory=utc_now)
     expires_at: Optional[datetime] = None
     fluid_version: Optional[str] = None
+    score: Optional[float] = None
 
     @property
     def expired(self) -> bool:

@@ -1,0 +1,19 @@
+fluidVersion: "0.7.3"
+kind: DataProduct
+id: sparse.orders_minimal
+name: orders
+domain: commerce
+
+exposes:
+  - name: orders
+    schema:
+      - name: id
+        type: STRING
+      - name: customer_id
+        type: STRING
+      - name: amount
+        type: NUMBER
+      - name: created_at
+        type: TIMESTAMP
+      - name: status
+        type: STRING

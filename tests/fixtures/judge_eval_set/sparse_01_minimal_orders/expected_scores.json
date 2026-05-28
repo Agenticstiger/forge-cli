@@ -1,0 +1,14 @@
+{
+  "axes": {
+    "correctness": 3,
+    "completeness": 2,
+    "security": 1,
+    "governance": 1,
+    "performance": 1,
+    "documentation": 1
+  },
+  "total": 9,
+  "tolerance_per_axis": 2,
+  "tolerance_total": 5,
+  "rationale": "Minimal {name, type} columns only — no owner, no SLA, no PII tags, no descriptions."
+}

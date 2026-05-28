@@ -41,16 +41,52 @@ This module:
 * Compares the resolved capabilities against the requirements of the
   current run and emits a single, structured warning when something
   important is missing.
+
+Catalog source of truth
+-----------------------
+
+The catalog is built from two tiers, in order:
+
+1. **Family overlay** (``_FAMILY_OVERLAY``) — hand-curated entries
+   keyed on the model *family* prefix (``claude-3-5-sonnet``,
+   ``claude-3``, ``gemma``, ``phi`` …). This is the only place the
+   rich, non-catalogued fields live: ``prompt_caching``,
+   ``extended_thinking``, ``notes``.
+2. **JSON-derived entries** — every model id under
+   ``fluid_build/cli/llm_models.json::providers.<p>.models[]`` is
+   reflected into the catalog with its ``capabilities`` dict (tool
+   use, structured output, streaming). ``prompt_caching`` /
+   ``extended_thinking`` are filled in from
+   ``_PROVIDER_FIELD_DEFAULTS`` because the JSON catalog doesn't
+   carry those fields *yet* — see the docstring on
+   ``_PROVIDER_FIELD_DEFAULTS`` for a TODO link back to the catalog
+   refresh script.
+
+Borrows the JSON-driven "static capability lookup" pattern from
+`BerriAI/litellm
+<https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json>`_
+and OpenRouter's `/api/v1/models` endpoint — both expose
+``supports_function_calling`` / ``supports_response_schema`` /
+``supports_vision`` as boolean flags on each model id. Adapted (not
+copied) because the litellm registry is 1.4MB and keyed by model-id
+only, whereas this module needs family-prefix matching and a small
+overlay for the fields that aren't yet in our weekly refresh.
+
+The merge means: when ``scripts/update_model_catalog.py`` adds a new
+model id to ``llm_models.json``, it shows up here automatically —
+no edit to this file needed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "CAPABILITY_CATALOG",
     "ProviderCapabilities",
+    "_build_capability_catalog",
+    "_reset_capability_cache",
     "assess_capabilities",
     "format_degradation_warnings",
     "required_capabilities_for",
@@ -84,15 +120,48 @@ class ProviderCapabilities:
 
 
 # ---------------------------------------------------------------------------
-# Catalog
+# Per-provider defaults for fields the JSON catalog doesn't carry.
 #
-# Entries are matched by (provider, model_prefix) with longest-prefix
-# winning. Keep them sorted from most-specific to least-specific within
-# a provider so a quick read shows the override hierarchy.
+# ``llm_models.json::providers.<p>.models[].capabilities`` only carries
+# the three flags the weekly refresh script populates today:
+# ``tool_use``, ``structured_output``, ``streaming``.
+#
+# ``ProviderCapabilities`` has two more fields that affect behaviour:
+# ``prompt_caching`` (Anthropic-only today) and ``extended_thinking``
+# (Anthropic Opus / OpenAI o-series). Until the weekly refresh script
+# learns about them, this overlay reflects "what's true for *every*
+# model in the provider that the catalog itself hasn't disproved".
+#
+# TODO(catalog-refresh): teach ``scripts/update_model_catalog.py`` to
+# emit ``prompt_caching`` and ``extended_thinking`` directly so this
+# overlay can shrink to per-family overrides only.
 # ---------------------------------------------------------------------------
 
+_PROVIDER_FIELD_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "anthropic": {"prompt_caching": True, "extended_thinking": False},
+    "openai": {"prompt_caching": False, "extended_thinking": False},
+    "gemini": {"prompt_caching": False, "extended_thinking": False},
+    "ollama": {"prompt_caching": False, "extended_thinking": False},
+}
 
-CAPABILITY_CATALOG: Tuple[ProviderCapabilities, ...] = (
+
+# ---------------------------------------------------------------------------
+# Family overlay
+#
+# Hand-curated, family-prefix entries that:
+#
+# * Carry the rich fields ``prompt_caching`` / ``extended_thinking`` /
+#   ``notes`` that the JSON catalog doesn't have.
+# * Cover the family prefixes consumers depend on (``claude-3``,
+#   ``gemma``, ``phi``, ``qwen`` …) even when no exact model-id with
+#   that prefix is in the JSON catalog yet.
+#
+# Sorted most-specific → least-specific within a provider so a quick
+# read shows the override hierarchy. ``assess_capabilities`` does the
+# actual longest-prefix match.
+# ---------------------------------------------------------------------------
+
+_FAMILY_OVERLAY: Tuple[ProviderCapabilities, ...] = (
     # ---- Anthropic ----
     ProviderCapabilities(
         provider="anthropic",
@@ -419,18 +488,258 @@ _FALLBACK_CAPABILITIES = ProviderCapabilities(
 )
 
 
+# ---------------------------------------------------------------------------
+# Catalog build (overlay + JSON-derived entries)
+# ---------------------------------------------------------------------------
+
+# Module-scope cache. Tests can null it via ``_reset_capability_cache``.
+_CAPABILITY_CATALOG_CACHE: Optional[Tuple[ProviderCapabilities, ...]] = None
+
+
+def _reset_capability_cache() -> None:
+    """Force the next ``CAPABILITY_CATALOG`` / ``assess_capabilities``
+    call to rebuild from scratch.
+
+    Tests use this after patching ``_resolve_load_model_catalog`` so
+    the freshly mocked JSON catalog is reflected in the build output.
+    """
+    global _CAPABILITY_CATALOG_CACHE  # noqa: PLW0603
+    _CAPABILITY_CATALOG_CACHE = None
+
+
+def _build_capability_catalog() -> Tuple[ProviderCapabilities, ...]:
+    """Build the full capability catalog by merging the family overlay
+    with JSON-catalog-derived per-model entries.
+
+    Algorithm:
+
+    1. Start with :data:`_FAMILY_OVERLAY` — this is authoritative for
+       every prefix it covers (carries ``prompt_caching`` /
+       ``extended_thinking`` / ``notes``).
+    2. For every model id under
+       ``llm_models.json::providers.<p>.models[]``, append a derived
+       :class:`ProviderCapabilities` *unless* the family overlay
+       already covers the same (provider, prefix) — preventing the
+       weekly refresh from clobbering hand-curated entries.
+
+    The overlay-first resolution in :func:`assess_capabilities` means
+    JSON-derived entries only get reached for model ids whose family
+    isn't covered by the overlay (e.g. a future ``claude-sonnet-5-0``
+    that the weekly refresh adds before anyone updates the overlay).
+    The derived entries also serve as a registration manifest — when
+    consumers iterate ``CAPABILITY_CATALOG`` looking for "every
+    known model id", they see the JSON ids too.
+
+    Falls back to the overlay alone when the JSON catalog can't be
+    loaded (e.g. import-time failure in a stripped install).
+    """
+    entries: List[ProviderCapabilities] = list(_FAMILY_OVERLAY)
+
+    catalog = _safe_load_json_catalog()
+    if not catalog:
+        return tuple(entries)
+
+    # (provider, model_prefix) pairs already populated by the overlay.
+    overlay_keys = {(c.provider, c.model_prefix) for c in _FAMILY_OVERLAY}
+
+    providers = catalog.get("providers") or {}
+    if not isinstance(providers, Mapping):
+        return tuple(entries)
+
+    for provider_name, provider_entry in providers.items():
+        if not isinstance(provider_entry, Mapping):
+            continue
+        models = provider_entry.get("models") or []
+        if not isinstance(models, list):
+            continue
+        defaults = _PROVIDER_FIELD_DEFAULTS.get(provider_name, {})
+        for model in models:
+            if not isinstance(model, Mapping):
+                continue
+            model_id = model.get("id")
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            key = (provider_name, model_id)
+            if key in overlay_keys:
+                # Overlay already speaks for this exact (provider,
+                # model_id) — don't append a duplicate.
+                continue
+            caps_dict = model.get("capabilities") or {}
+            if not isinstance(caps_dict, Mapping):
+                caps_dict = {}
+            entries.append(
+                ProviderCapabilities(
+                    provider=provider_name,
+                    model_prefix=model_id,
+                    tool_use=bool(caps_dict.get("tool_use", False)),
+                    structured_output=bool(caps_dict.get("structured_output", False)),
+                    streaming=bool(caps_dict.get("streaming", True)),
+                    prompt_caching=bool(defaults.get("prompt_caching", False)),
+                    extended_thinking=bool(
+                        _extended_thinking_default(provider_name, model_id, defaults)
+                    ),
+                )
+            )
+
+    return tuple(entries)
+
+
+def _overlay_keys() -> frozenset:
+    """Set of ``(provider, model_prefix)`` pairs that originate in the
+    hand-curated family overlay (not the JSON catalog).
+
+    Used by :func:`assess_capabilities` to give overlay entries
+    priority over JSON-derived entries when both match — this
+    preserves the "family-prefix attribution" semantics that
+    downstream consumers rely on (e.g. tests pinning
+    ``caps.model_prefix == 'claude-haiku-4-5'`` for
+    ``'claude-haiku-4-5-20251001'``).
+    """
+    return frozenset((c.provider, c.model_prefix) for c in _FAMILY_OVERLAY)
+
+
+def _extended_thinking_default(
+    provider: str, model_id: str, provider_defaults: Mapping[str, Any]
+) -> bool:
+    """Pick a sensible ``extended_thinking`` default for a JSON-catalog
+    entry that doesn't carry that field.
+
+    Family rules — these mirror the family overlay so the JSON-derived
+    entries for the same family stay consistent:
+
+    * Anthropic ``claude-opus-4-*`` / ``claude-sonnet-4-7*`` → True.
+    * OpenAI ``o1`` / ``o3`` / ``o4`` → True.
+    * Otherwise: provider default (currently False everywhere).
+    """
+    if provider == "anthropic":
+        if model_id.startswith("claude-opus-4-") or model_id.startswith("claude-sonnet-4-7"):
+            return True
+    elif provider == "openai":
+        if model_id.startswith(("o1", "o3", "o4")):
+            return True
+    return bool(provider_defaults.get("extended_thinking", False))
+
+
+def _safe_load_json_catalog() -> Optional[Dict[str, Any]]:
+    """Load the JSON model catalog via the canonical resolver.
+
+    Returns ``None`` on any failure (the build then falls back to the
+    overlay alone — strictly worse than the merged catalog but never
+    raises out of import).
+    """
+    try:
+        from fluid_build.cli._llm_model_catalog import _resolve_load_model_catalog
+    except Exception:  # pragma: no cover — defensive against import order
+        return None
+    try:
+        loader = _resolve_load_model_catalog()
+        data = loader()
+    except Exception:  # noqa: BLE001 — defensive
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _ensure_catalog() -> Tuple[ProviderCapabilities, ...]:
+    """Return the cached catalog, building it on first call."""
+    global _CAPABILITY_CATALOG_CACHE  # noqa: PLW0603
+    if _CAPABILITY_CATALOG_CACHE is None:
+        _CAPABILITY_CATALOG_CACHE = _build_capability_catalog()
+    return _CAPABILITY_CATALOG_CACHE
+
+
+class _CapabilityCatalogProxy(tuple):  # type: ignore[type-arg]
+    """Tuple-shaped lazy proxy for the capability catalog.
+
+    Backward-compat shim: every existing call site does either
+    ``for entry in CAPABILITY_CATALOG`` or ``len(CAPABILITY_CATALOG)``
+    or ``CAPABILITY_CATALOG[i]`` — all of which work on this subclass
+    because we delegate ``__iter__`` / ``__len__`` / ``__getitem__``
+    to the freshly rebuilt tuple. The class itself is a tuple, so
+    ``isinstance(CAPABILITY_CATALOG, tuple)`` is True for callers that
+    inspect it.
+
+    The proxy stays empty internally — every access funnels through
+    :func:`_ensure_catalog`, which honours
+    :func:`_reset_capability_cache` between calls.
+    """
+
+    def __new__(cls):
+        return super().__new__(cls)
+
+    def __iter__(self):
+        return iter(_ensure_catalog())
+
+    def __len__(self) -> int:  # type: ignore[override]
+        return len(_ensure_catalog())
+
+    def __getitem__(self, index):  # type: ignore[override]
+        return _ensure_catalog()[index]
+
+    def __contains__(self, item) -> bool:  # type: ignore[override]
+        return item in _ensure_catalog()
+
+    def __repr__(self) -> str:  # pragma: no cover — debug aid only
+        return f"CAPABILITY_CATALOG({len(_ensure_catalog())} entries, lazy)"
+
+    def __eq__(self, other) -> bool:  # type: ignore[override]
+        if isinstance(other, _CapabilityCatalogProxy):
+            return tuple(self) == tuple(other)
+        return tuple(self) == other
+
+    def __hash__(self) -> int:  # type: ignore[override]
+        return hash(tuple(self))
+
+
+# Backward-compat: ``CAPABILITY_CATALOG`` is still importable as a
+# tuple-shaped object. Iteration / indexing / ``len`` work as before
+# but the contents are now built lazily from the family overlay +
+# JSON catalog merge.
+CAPABILITY_CATALOG: Tuple[ProviderCapabilities, ...] = _CapabilityCatalogProxy()  # type: ignore[assignment]
+
+
 def assess_capabilities(provider: str, model: str) -> ProviderCapabilities:
     """Resolve the catalog entry for ``(provider, model)``.
 
-    Picks the longest matching ``model_prefix`` within the requested
-    provider so more-specific entries override less-specific ones.
-    Returns ``_FALLBACK_CAPABILITIES`` when no entry matches — so the
-    caller still gets a typed object back instead of having to handle
-    ``None``.
+    Two-tier longest-prefix resolution:
+
+    1. Try the **family overlay** first — longest-prefix match within
+       the hand-curated entries. Preserves family-level attribution
+       (so ``claude-haiku-4-5-20251001`` resolves to the
+       ``claude-haiku-4-5`` family, not the JSON-derived per-id
+       entry).
+    2. Only when the overlay doesn't match for this ``(provider,
+       model)`` pair do we fall through to JSON-derived entries —
+       which exist precisely for "new model id in a family the
+       overlay hasn't been updated for yet".
+
+    Returns ``_FALLBACK_CAPABILITIES`` when neither tier matches —
+    callers always get a typed object back instead of having to
+    handle ``None``.
     """
-    candidates = [c for c in CAPABILITY_CATALOG if c.provider == provider]
-    candidates.sort(key=lambda c: len(c.model_prefix), reverse=True)
-    for cand in candidates:
+    all_entries = _ensure_catalog()
+    overlay_keys = _overlay_keys()
+
+    # Tier 1: overlay only.
+    overlay_candidates = [
+        c
+        for c in all_entries
+        if c.provider == provider and (c.provider, c.model_prefix) in overlay_keys
+    ]
+    overlay_candidates.sort(key=lambda c: len(c.model_prefix), reverse=True)
+    for cand in overlay_candidates:
+        if model.startswith(cand.model_prefix):
+            return cand
+
+    # Tier 2: JSON-derived fallback (only reached when no overlay match).
+    derived_candidates = [
+        c
+        for c in all_entries
+        if c.provider == provider and (c.provider, c.model_prefix) not in overlay_keys
+    ]
+    derived_candidates.sort(key=lambda c: len(c.model_prefix), reverse=True)
+    for cand in derived_candidates:
         if model.startswith(cand.model_prefix):
             return cand
     return _FALLBACK_CAPABILITIES

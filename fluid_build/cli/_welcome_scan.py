@@ -148,20 +148,53 @@ def _probe_workspace(start: Path) -> Dict[str, Any]:
         return {}
 
 
+def _provider_hint_from_env_var(var: str) -> str:
+    """Map an AI-credential env-var name to a canonical provider name."""
+    if "OPENAI" in var:
+        return "openai"
+    if "ANTHROPIC" in var or "CLAUDE" in var:
+        return "anthropic"
+    if "GEMINI" in var or "GOOGLE" in var:
+        return "gemini"
+    return ""
+
+
 def _probe_ai_credentials() -> Dict[str, Any]:
-    """Detect any configured AI provider via env vars."""
+    """Detect the configured AI provider.
+
+    Authoritative-signal-first ladder (mirrors
+    ``check_llm_readiness``'s ordering so the welcome panel never
+    disagrees with the rest of the run):
+
+    1. ``FLUID_LLM_PROVIDER`` env var — explicit selector.
+    2. Saved ``~/.fluid/ai_config.json`` — the user's persisted choice.
+    3. AI-credential env-var presence (``OPENAI_API_KEY`` etc.) — last
+       resort, otherwise a stray ``OPENAI_API_KEY`` in the shell
+       silently overrides a Gemini run.
+    """
+    # 1. Explicit selector wins.
+    explicit = (os.environ.get("FLUID_LLM_PROVIDER") or "").strip().lower()
+    if explicit:
+        return {"ai_configured": True, "ai_provider_hint": explicit}
+
+    # 2. Persisted choice (``fluid ai setup``).
+    try:
+        from fluid_build.cli.ai_setup import _load_ai_config
+
+        saved = _load_ai_config() or {}
+        provider = (saved.get("provider") or "").strip().lower()
+        if provider:
+            return {"ai_configured": True, "ai_provider_hint": provider}
+    except Exception as exc:  # noqa: BLE001 — best-effort, never blocks the scan
+        LOG.debug("welcome_scan_ai_config_failed: %s", exc)
+
+    # 3. Env-var inference.
     for var in _AI_ENV:
         if os.environ.get(var):
-            hint = (
-                "openai"
-                if "OPENAI" in var
-                else (
-                    "anthropic"
-                    if "ANTHROPIC" in var or "CLAUDE" in var
-                    else "gemini" if "GEMINI" in var or "GOOGLE" in var else ""
-                )
-            )
-            return {"ai_configured": True, "ai_provider_hint": hint}
+            return {
+                "ai_configured": True,
+                "ai_provider_hint": _provider_hint_from_env_var(var),
+            }
     return {"ai_configured": False}
 
 
