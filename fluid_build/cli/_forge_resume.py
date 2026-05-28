@@ -88,11 +88,30 @@ class ResumeError(RuntimeError):
 
 
 def _is_interactive(input_fn: Optional[Callable[[str], str]] = None) -> bool:
-    """True when we have a TTY to talk to."""
+    """True when we have a TTY to talk to.
+
+    Belt-and-suspenders detection:
+
+    1. Explicit ``input_fn`` injected (test override) → True.
+    2. ``$PYTEST_CURRENT_TEST`` set (pytest captures stdin and raises
+       ``OSError`` on ``input()``) → False.
+    3. ``$CI`` set (most CI runners) → False.
+    4. Either stdin OR stdout is non-TTY → False (pytest's capfd
+       replaces stdout/stderr with non-TTY pipes even when ``isatty``
+       on ``sys.stdin`` lies; checking both stops the false-positive).
+    """
     if input_fn is not None:
         return True
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    if os.environ.get("CI"):
+        return False
     try:
-        return sys.stdin.isatty()
+        if not sys.stdin.isatty():
+            return False
+        if not sys.stdout.isatty():
+            return False
+        return True
     except Exception:  # noqa: BLE001
         return False
 

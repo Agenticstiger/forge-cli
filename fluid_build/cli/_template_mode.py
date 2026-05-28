@@ -643,16 +643,31 @@ def _create_project_minimal(
             try:
                 from fluid_build.cli._preview_panel import QualitySnapshot
 
+                # Defensive: ``_prov`` is a Mapping in production but may
+                # arrive as a MagicMock from tests that mock
+                # ``generate_project_artifacts``. Validate types BEFORE
+                # they leak into QualitySnapshot (the render path is a
+                # hot read of float comparisons).
                 _prov = getattr(generation_result, "provenance", None) or {}
-                _judge_axes = _prov.get("judge_axes") or {}
-                _judge_total = _prov.get("judge_score")
+                if not isinstance(_prov, Mapping):
+                    _prov = {}
+                _judge_axes_raw = _prov.get("judge_axes")
+                _judge_axes = _judge_axes_raw if isinstance(_judge_axes_raw, Mapping) else {}
+                _judge_total_raw = _prov.get("judge_score")
+                _judge_total = (
+                    _judge_total_raw if isinstance(_judge_total_raw, (int, float)) else None
+                )
                 if _judge_total is not None or _judge_axes:
+                    _judge_model_raw = _prov.get("judge_model")
+                    _judge_model = _judge_model_raw if isinstance(_judge_model_raw, str) else ""
                     _preview_panel.quality = QualitySnapshot(
                         total=_judge_total,
-                        axes={k: int(v) for k, v in _judge_axes.items() if v is not None},
-                        model=str(_prov.get("judge_model") or ""),
-                        enrichment_applied=bool(_prov.get("enrichment_applied")),
-                        critique_applied=bool(_prov.get("judge_critique_applied")),
+                        axes={
+                            k: int(v) for k, v in _judge_axes.items() if isinstance(v, (int, float))
+                        },
+                        model=_judge_model,
+                        enrichment_applied=_prov.get("enrichment_applied") is True,
+                        critique_applied=_prov.get("judge_critique_applied") is True,
                     )
             except Exception:  # noqa: BLE001 — preview must never crash the run
                 logger.debug("preview_panel_quality_populate_failed", exc_info=True)

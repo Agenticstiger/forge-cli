@@ -530,8 +530,15 @@ def _render_quality_block(out: Any, quality: "QualitySnapshot") -> None:
             out.print(f"[dim]{line}[/dim]")
 
 
-def _score_color(score: int, max_total: int) -> str:
-    ratio = score / max_total if max_total else 0
+def _score_color(score: Any, max_total: int) -> str:
+    # Defensive: ``score`` is meant to be an int from the runtime's
+    # provenance block but the upstream populator may pass anything
+    # the dataclass accepted (Optional[int]). Anything not numerically
+    # comparable (e.g. a MagicMock leaked from a mocked provider in a
+    # test) falls back to a neutral colour instead of raising.
+    if not isinstance(score, (int, float)) or not isinstance(max_total, int) or max_total <= 0:
+        return "white"
+    ratio = score / max_total
     if ratio >= 0.80:
         return "green"
     if ratio >= 0.50:
