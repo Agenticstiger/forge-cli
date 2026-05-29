@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-05-30
+
+### Fixed
+
+- **0.7.4 schema was not actually backward-compatible with 0.7.3 (shipped in
+  0.8.6).** The MCP "schema minimize" refactor that introduced
+  `fluid-schema-0.7.4.json` dropped fields that 0.7.4 still advertised as fully
+  backward-compatible with 0.7.3, so any 0.7.3 contract using them failed 0.7.4
+  validation. Restored: top-level and per-binding `governance` (AWS Lake
+  Formation admins, LF-tag definitions, principal grants, row/column filters);
+  the `snowflake_view`, `redshift_table`, `redshift_serverless`, and
+  `redshift_external_schema` binding formats; the `athena`, `glue`, and
+  `redshift` runtime platforms; `datamesh_manager` catalog registration; and the
+  `opentofu` deployment target. 0.7.4 is now a strict superset of 0.7.3 again —
+  every genuine 0.7.4 addition (`expose.mcp`, the `postgres` platform, and the
+  `postgres_table` / `athena_table` / `glue_table` formats) is retained. (#162)
+- **Stale `0.7.3` version fallbacks no longer freeze the default schema.** Three
+  degenerate "schema-discovery-came-up-empty" fallbacks (`cli/validate.py`,
+  `cli/version_cmd.py`, `forge/core/validation.py`) plus four hardcoded defaults
+  in `cli/plan.py` still pointed at `0.7.3`. They now derive from
+  `FluidSchemaManager.latest_bundled_version()` (or include `0.7.4`), so the
+  bundled-schema default tracks the newest version instead of drifting each
+  release. (#163)
+
+### Changed
+
+- **README polish + version sync.** Single Install section, refreshed table of
+  contents, CLI-completeness pass, current version numbers, and removal of the
+  legacy `opds` spelling from the backward-compatibility note. (#160, #161)
+
 ## [0.8.6] - 2026-05-29
 
 ### Fixed
