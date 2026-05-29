@@ -6,7 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Tests for the cryptographic auth strategies — shared-token,
-JWT bearer, SPIFFE SVID, mTLS-from-proxy. Uses real JWT signing
+JWT bearer, mTLS-from-proxy. Uses real JWT signing
 roundtrip (PyJWT + cryptography, both already in venv) so the
 contract isn't just mocked — the validator actually verifies a
 freshly-issued token end-to-end.
@@ -263,119 +263,6 @@ def test_jwt_custom_claim_mapping():
     assert attrs["principal"] == "alice"
     assert attrs["model"] == "claude-haiku"
     assert attrs["region"] == "us-east"
-
-
-# ---------------------------------------------------------------------
-# SPIFFE mode — py-spiffe JwtSvid.parse_and_validate (canonical impl)
-# ---------------------------------------------------------------------
-
-# All SPIFFE tests need py-spiffe installed (``pip install
-# fluid-build[spiffe]`` extra). Auto-skip if absent so the rest of
-# the auth suite still runs in a minimal venv.
-spiffe_pkg = pytest.importorskip("spiffe")
-
-
-def _build_spiffe_validator_with_fake_bundle(jwk: Dict[str, Any]):
-    """Build a SPIFFE validator and stub ``_cached_spiffe_bundle`` to
-    return a real py-spiffe ``JwtBundle`` constructed from ``jwk``.
-    Avoids the httpx round-trip while keeping the ``parse_and_validate``
-    code path fully exercised."""
-    from spiffe import JwtBundle, TrustDomain
-
-    public_key = serialization.load_pem_public_key(
-        pyjwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk)).public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-    )
-    bundle = JwtBundle(TrustDomain("acme.example"), {"test-key-1": public_key})
-    v = AuthValidator(
-        mode="spiffe",
-        spiffe_trust_domain="spiffe://acme.example",
-        spiffe_jwks_url="https://acme.example/jwks",
-        spiffe_audience="fluid-mcp",
-    )
-    v._cached_spiffe_bundle = lambda: bundle
-    return v
-
-
-def test_spiffe_validates_svid_with_trust_domain_subject():
-    private_pem, jwk = _generate_keypair()
-    v = _build_spiffe_validator_with_fake_bundle(jwk)
-    now = int(time.time())
-    token = _make_token(
-        private_pem,
-        {
-            "iss": "spiffe://acme.example",
-            "aud": "fluid-mcp",
-            "iat": now,
-            "exp": now + 300,
-            "sub": "spiffe://acme.example/workload/api-gateway",
-            "model": "claude-haiku",
-        },
-    )
-    decision = v.validate({"Authorization": f"Bearer {token}"})
-    assert decision.allowed is True, decision.deny_reason
-    assert decision.identity_kind == "spiffe"
-    assert dict(decision.caller_attributes)["sub"] == "spiffe://acme.example/workload/api-gateway"
-
-
-def test_spiffe_rejects_sub_outside_trust_domain():
-    """Defense-in-depth: even a signature-valid SVID is rejected if
-    its ``sub`` claims membership of a trust domain other than the
-    configured one. py-spiffe's ``parse_and_validate`` does not
-    enforce this — the gateway adds the check after."""
-    private_pem, jwk = _generate_keypair()
-    v = _build_spiffe_validator_with_fake_bundle(jwk)
-    now = int(time.time())
-    token = _make_token(
-        private_pem,
-        {
-            "iss": "spiffe://acme.example",
-            "aud": "fluid-mcp",
-            "iat": now,
-            "exp": now + 300,
-            "sub": "spiffe://attacker.example/workload/x",
-        },
-    )
-    decision = v.validate({"Authorization": f"Bearer {token}"})
-    assert decision.allowed is False
-    assert "spiffe-sub-not-under-trust-domain" in (decision.deny_reason or "")
-
-
-def test_spiffe_rejects_wrong_audience():
-    """py-spiffe enforces ``aud`` strictly per the SPIFFE JWT-SVID
-    spec — a token whose ``aud`` doesn't match the configured
-    ``FLUID_MCP_SPIFFE_AUDIENCE`` is rejected."""
-    private_pem, jwk = _generate_keypair()
-    v = _build_spiffe_validator_with_fake_bundle(jwk)
-    now = int(time.time())
-    token = _make_token(
-        private_pem,
-        {
-            "iss": "spiffe://acme.example",
-            "aud": "some-other-service",  # not "fluid-mcp"
-            "iat": now,
-            "exp": now + 300,
-            "sub": "spiffe://acme.example/workload/api-gateway",
-        },
-    )
-    decision = v.validate({"Authorization": f"Bearer {token}"})
-    assert decision.allowed is False
-
-
-def test_spiffe_is_disabled_without_audience_config():
-    """Audience is required in py-spiffe-backed SPIFFE mode — if the
-    operator hasn't set ``FLUID_MCP_SPIFFE_AUDIENCE``, ``is_enabled``
-    returns False so the gateway warns loud at startup instead of
-    silently weakening to no-audience-check."""
-    v = AuthValidator(
-        mode="spiffe",
-        spiffe_trust_domain="spiffe://acme.example",
-        spiffe_jwks_url="https://acme.example/jwks",
-        spiffe_audience=None,
-    )
-    assert v.is_enabled() is False
 
 
 # ---------------------------------------------------------------------

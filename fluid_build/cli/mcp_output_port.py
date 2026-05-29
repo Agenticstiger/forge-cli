@@ -433,7 +433,7 @@ def _run_serve(args, logger: logging.Logger) -> int:
     # initialize handshake's clientInfo. A malicious or buggy client
     # can lie. Surface this loudly at startup so operators don't
     # mistake the gateway for cryptographic identity. P3 will land
-    # OAuth/SPIFFE/mTLS via the MCP session-auth borrow target.
+    # OAuth/mTLS via the MCP session-auth borrow target.
     if (
         policy.allowed_models is not None
         or policy.denied_models
@@ -443,7 +443,7 @@ def _run_serve(args, logger: logging.Logger) -> int:
         sys.stderr.write(
             "⚠️  fluid mcp output-port: caller model_id is self-attested via "
             "MCP clientInfo. Do not expose this gateway over an untrusted "
-            "network until P3 (OAuth/SPIFFE/mTLS identity) ships. See "
+            "network until P3 (OAuth/mTLS identity) ships. See "
             "https://github.com/Agenticstiger/forge-docs#agent-policy.\n"
         )
         sys.stderr.flush()

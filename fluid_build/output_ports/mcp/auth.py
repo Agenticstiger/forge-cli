@@ -14,8 +14,8 @@
 
 """Cryptographic identity for the Fluid MCP output port.
 
-Three pluggable schemes that the gateway selects via
-``FLUID_MCP_AUTH_MODE``:
+Two pluggable schemes that the gateway selects via
+``FLUID_MCP_AUTH_MODE`` (plus ``none`` to opt out):
 
 * ``shared-token`` (default historical behaviour) — symmetric
   bearer token compared with ``hmac.compare_digest``. One secret,
@@ -31,19 +31,6 @@ Three pluggable schemes that the gateway selects via
   standard pattern — works with Auth0, Okta, Keycloak, AWS Cognito,
   Google IAP, Azure AD.
 
-* ``spiffe`` (**EXPERIMENTAL** — emits a one-shot startup warning;
-  not yet under support guarantees, kept until a real
-  workload-identity deployment exercises it) — verify a SPIFFE SVID
-  JWT against a configured trust bundle using the canonical
-  `py-spiffe <https://github.com/HewlettPackard/py-spiffe>`_
-  ``JwtSvid.parse_and_validate`` API. The issuer is a SPIFFE
-  authority (``spiffe://<trust-domain>``); the ``sub`` claim is a
-  SPIFFE ID URI; the ``aud`` claim is required and matched against
-  ``FLUID_MCP_SPIFFE_AUDIENCE``. Pairs with workload-identity
-  systems (SPIRE, Tornjak) so the gateway gets the calling
-  workload's cryptographic identity, not a human-issued bearer
-  token. Requires ``pip install fluid-build[spiffe]``.
-
 mTLS (client-cert-bound identity) is best handled by the reverse
 proxy in front of the gateway — see
 ``examples/mcp-output-port-docker/proxy/`` for templates. This module
@@ -58,25 +45,16 @@ Borrowed-not-built per /borrow-before-build:
   (already in venv).
 * `cryptography <https://cryptography.io>`_ for JWKS key parsing
   (already in venv).
-* `httpx <https://www.python-httpx.org>`_ for JWKS fetch (forge-cli
-  core dep).
 """
 
 from __future__ import annotations
 
 import hmac
 import json
-import logging
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
-
-_log = logging.getLogger("fluid.output_port.mcp.auth")
-
-# One-shot (process-global) guard so the "spiffe mode is experimental"
-# notice fires exactly once at startup, not on every from_env() call.
-_WARNED_SPIFFE_EXPERIMENTAL = False
 
 
 @dataclass(frozen=True)
@@ -95,13 +73,14 @@ class AuthDecision:
     caller_attributes: Mapping[str, Any] = field(default_factory=dict)
     deny_reason: Optional[str] = None
     identity_kind: str = "none"
-    """``shared-token`` / ``jwt`` / ``spiffe`` / ``mtls`` / ``none`` —
+    """``shared-token`` / ``jwt`` / ``mtls`` / ``none`` —
     surfaced on the audit event so operators can see WHICH layer
     authenticated each call."""
 
 
 class AuthValidator:
-    """Strategy pattern for the four auth modes the gateway supports.
+    """Strategy pattern for the auth modes the gateway supports
+    (``shared-token`` / ``jwt`` / ``none``).
 
     Resolved once at gateway start from ``FLUID_MCP_AUTH_MODE`` and
     related env vars; subsequent ``validate(request_headers)`` calls
@@ -119,15 +98,12 @@ class AuthValidator:
         jwt_jwks_url: Optional[str] = None,
         jwt_algorithms: Sequence[str] = ("RS256", "ES256", "EdDSA"),
         jwt_claim_mappings: Optional[Mapping[str, str]] = None,
-        spiffe_trust_domain: Optional[str] = None,
-        spiffe_jwks_url: Optional[str] = None,
-        spiffe_audience: Optional[str] = None,
         jwks_cache_ttl_seconds: float = 600.0,
     ) -> None:
-        if mode not in {"shared-token", "jwt", "spiffe", "none"}:
+        if mode not in {"shared-token", "jwt", "none"}:
             raise ValueError(
                 f"unknown FLUID_MCP_AUTH_MODE={mode!r}; expected one of "
-                "shared-token / jwt / spiffe / none"
+                "shared-token / jwt / none"
             )
         self.mode = mode
         self.shared_token = shared_token
@@ -148,12 +124,8 @@ class AuthValidator:
                 "tenant_id": "tenant_id",
             }
         )
-        self.spiffe_trust_domain = spiffe_trust_domain
-        self.spiffe_jwks_url = spiffe_jwks_url
-        self.spiffe_audience = spiffe_audience
         self.jwks_cache_ttl_seconds = jwks_cache_ttl_seconds
         self._jwks_cache: Dict[str, Tuple[float, Any]] = {}
-        self._spiffe_bundle_cache: Dict[str, Tuple[float, Any]] = {}
 
     @classmethod
     def from_env(cls) -> "AuthValidator":
@@ -161,7 +133,7 @@ class AuthValidator:
 
         Defaults to the historical ``shared-token`` mode using
         ``FLUID_MCP_AUTH_TOKEN`` so existing deployments keep
-        working. Operators upgrade to JWT / SPIFFE by setting
+        working. Operators upgrade to JWT by setting
         ``FLUID_MCP_AUTH_MODE=jwt`` and the related issuer / JWKS
         env vars.
         """
@@ -188,23 +160,6 @@ class AuthValidator:
                     claim, attr = pair.split("=", 1)
                     parsed[claim.strip()] = attr.strip()
                 kwargs["jwt_claim_mappings"] = parsed
-        elif mode == "spiffe":
-            global _WARNED_SPIFFE_EXPERIMENTAL
-            if not _WARNED_SPIFFE_EXPERIMENTAL:
-                _WARNED_SPIFFE_EXPERIMENTAL = True
-                _log.warning(
-                    "output_port_auth_spiffe_experimental: FLUID_MCP_AUTH_MODE=spiffe "
-                    "is EXPERIMENTAL and not yet covered by the gateway's support "
-                    "guarantees. For production today prefer shared-token (or front "
-                    "the gateway with an mTLS / OIDC reverse proxy). SPIFFE is kept "
-                    "behind this notice until a real workload-identity deployment "
-                    "exercises it end-to-end."
-                )
-            kwargs.update(
-                spiffe_trust_domain=os.environ.get("FLUID_MCP_SPIFFE_TRUST_DOMAIN"),
-                spiffe_jwks_url=os.environ.get("FLUID_MCP_SPIFFE_JWKS_URL"),
-                spiffe_audience=os.environ.get("FLUID_MCP_SPIFFE_AUDIENCE"),
-            )
         return cls(**kwargs)
 
     # ------------------------------------------------------------------
@@ -215,9 +170,9 @@ class AuthValidator:
         """True when the validator has enough config to enforce auth.
 
         ``shared-token`` requires ``FLUID_MCP_AUTH_TOKEN``; JWT
-        requires issuer + audience + JWKS URL; SPIFFE requires the
-        trust-domain + JWKS URL. Missing config means the gateway
-        runs WITHOUT auth — surfaced as a loud startup warning.
+        requires issuer + audience + JWKS URL. Missing config means
+        the gateway runs WITHOUT auth — surfaced as a loud startup
+        warning.
         """
         if self.mode == "none":
             return False
@@ -225,8 +180,6 @@ class AuthValidator:
             return bool(self.shared_token)
         if self.mode == "jwt":
             return bool(self.jwt_issuer and self.jwt_audience and self.jwt_jwks_url)
-        if self.mode == "spiffe":
-            return bool(self.spiffe_trust_domain and self.spiffe_jwks_url and self.spiffe_audience)
         return False
 
     def validate(self, headers: Mapping[str, str]) -> AuthDecision:
@@ -246,8 +199,6 @@ class AuthValidator:
             return self._validate_shared_token(headers)
         if self.mode == "jwt":
             return self._validate_jwt(headers)
-        if self.mode == "spiffe":
-            return self._validate_spiffe(headers)
         return AuthDecision(allowed=False, deny_reason="unknown-auth-mode")
 
     # ------------------------------------------------------------------
@@ -341,101 +292,6 @@ class AuthValidator:
         client = PyJWKClient(jwks_url, cache_keys=True, lifespan=int(self.jwks_cache_ttl_seconds))
         self._jwks_cache[jwks_url] = (now, client)
         return client
-
-    # ------------------------------------------------------------------
-    # SPIFFE — JWT-SVID validation via py-spiffe (canonical impl)
-    # ------------------------------------------------------------------
-
-    def _validate_spiffe(self, headers: Mapping[str, str]) -> AuthDecision:
-        try:
-            from spiffe import JwtSvid  # type: ignore[import-not-found]
-        except ImportError:
-            return AuthDecision(
-                allowed=False,
-                deny_reason="spiffe-package-not-installed; install fluid-build[spiffe]",
-                identity_kind="spiffe",
-            )
-
-        token = _bearer_token(headers)
-        if not token:
-            return AuthDecision(
-                allowed=False,
-                deny_reason="missing-bearer-token",
-                identity_kind="spiffe",
-            )
-
-        try:
-            jwt_bundle = self._cached_spiffe_bundle()
-            jwt_svid = JwtSvid.parse_and_validate(
-                token,
-                jwt_bundle,
-                audience={self.spiffe_audience or ""},
-            )
-        except Exception as exc:  # noqa: BLE001
-            return AuthDecision(
-                allowed=False,
-                deny_reason=f"{type(exc).__name__}: {exc}",
-                identity_kind="spiffe",
-            )
-
-        # Defense-in-depth: ``parse_and_validate`` checks signature +
-        # audience but does NOT match the SVID's trust domain against
-        # the bundle's. Reject SVIDs whose ``sub`` claims membership
-        # of a trust domain other than the operator-configured one,
-        # even if the signing key was somehow shared across domains.
-        configured_domain = self.spiffe_trust_domain or ""
-        if not str(jwt_svid.spiffe_id).startswith(f"{configured_domain}/"):
-            return AuthDecision(
-                allowed=False,
-                deny_reason="spiffe-sub-not-under-trust-domain",
-                identity_kind="spiffe",
-            )
-
-        # Map configured claims → caller_attributes. py-spiffe's
-        # JwtSvid only exposes ``spiffe_id`` / ``audience`` / ``expiry``
-        # / ``token`` publicly — there's no public ``claims`` accessor
-        # — so re-decode the token with PyJWT without re-verifying the
-        # signature (parse_and_validate already verified above) to
-        # surface custom claims (model, tenant_id, etc.) into the same
-        # rowFilter placeholder map the JWT mode populates.
-        import jwt as pyjwt  # type: ignore[import-not-found]
-
-        claims = pyjwt.decode(jwt_svid.token, options={"verify_signature": False})
-        attrs: Dict[str, Any] = {}
-        for claim_name, attr_name in self.jwt_claim_mappings.items():
-            if claim_name in claims:
-                attrs[attr_name] = claims[claim_name]
-        # Always carry the SPIFFE ID under ``sub`` for audit
-        # attribution. ``jwt_svid.spiffe_id`` is a parsed SpiffeId;
-        # str() returns the canonical ``spiffe://`` URI.
-        attrs.setdefault("sub", str(jwt_svid.spiffe_id))
-        return AuthDecision(allowed=True, caller_attributes=attrs, identity_kind="spiffe")
-
-    def _cached_spiffe_bundle(self):
-        """TTL-cached py-spiffe ``JwtBundle`` parsed from the
-        configured JWKS endpoint. Mirrors the
-        ``_cached_jwks_client`` pattern so the discovery endpoint
-        isn't hit on every request. Bundle keys are immutable for
-        the cache lifetime; re-fetch on TTL expiry handles SPIRE
-        authority rotation."""
-        import httpx  # forge-cli core dep
-        from spiffe import JwtBundle, TrustDomain  # type: ignore[import-not-found]
-
-        cached = self._spiffe_bundle_cache.get(self.spiffe_jwks_url or "")
-        now = time.monotonic()
-        if cached is not None and now - cached[0] < self.jwks_cache_ttl_seconds:
-            return cached[1]
-        response = httpx.get(self.spiffe_jwks_url or "", timeout=5.0)
-        response.raise_for_status()
-        # ``TrustDomain`` expects the bare authority name, no
-        # ``spiffe://`` prefix — strip if the operator configured the
-        # URI form (both shapes are accepted in env var input).
-        domain_name = self.spiffe_trust_domain or ""
-        if domain_name.startswith("spiffe://"):
-            domain_name = domain_name[len("spiffe://") :]
-        bundle = JwtBundle.parse(TrustDomain(domain_name), response.content)
-        self._spiffe_bundle_cache[self.spiffe_jwks_url or ""] = (now, bundle)
-        return bundle
 
 
 def _bearer_token(headers: Mapping[str, str]) -> Optional[str]:

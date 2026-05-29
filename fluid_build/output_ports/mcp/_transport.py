@@ -84,7 +84,7 @@ async def run_http_async(
     from .auth import AuthValidator, extract_mtls_identity
 
     # Resolve the auth strategy from FLUID_MCP_AUTH_MODE
-    # (shared-token / jwt / spiffe / none). When the validator
+    # (shared-token / jwt / none). When the validator
     # is unconfigured (mode=none, or shared-token without
     # FLUID_MCP_AUTH_TOKEN), the gateway runs unauthenticated
     # and surfaces a loud warning.
@@ -92,7 +92,7 @@ async def run_http_async(
     if not auth_validator.is_enabled():
         srv.state.logger.warning(
             "output_port_http_no_auth_configured: gateway is unauthenticated. "
-            "Set FLUID_MCP_AUTH_MODE=jwt|spiffe|shared-token + matching "
+            "Set FLUID_MCP_AUTH_MODE=jwt|shared-token + matching "
             "config OR front with mTLS/OAuth proxy before exposing to an "
             "untrusted network."
         )
