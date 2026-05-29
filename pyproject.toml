@@ -93,14 +93,12 @@ dependencies = [
   #   docs:  https://modelcontextprotocol.github.io/python-sdk/
   #   repo:  https://github.com/modelcontextprotocol/python-sdk
   "mcp>=1.20,<2.0",
-  # MCP output-port rate limiter — sliding-window + optional Redis fleet
-  # backend. Borrowed-not-built per /borrow-before-build
-  # (vutran1710/PyrateLimiter, MIT): its RedisBucket uses the same
-  # sorted-set sliding window we'd otherwise hand-roll, and InMemoryBucket
-  # covers the single-instance case. We wrap it with a fail-open →
-  # in-process degrade on Redis outage (the one behaviour the lib leaves
-  # to the caller).
-  "pyrate-limiter>=3,<5",
+  # (The MCP output-port rate limiter is an in-process monotonic-clock
+  # deque sliding window in SessionState.check_rate_limit — no dependency.
+  # PyrateLimiter was dropped: its Limiter spins a background "leaker"
+  # thread per instance, which leaked unboundedly with a per-session
+  # SessionState. Reintroduce a backend here only if a multi-replica
+  # deployment needs shared limits.)
   # Borrowed SQL parser (MIT) used by fluid_build.providers._sql_safety to
   # AST-classify statement bodies for the Snowflake action surfaces, so a
   # contract cannot smuggle account-level / multi-statement SQL through the
@@ -295,6 +293,7 @@ dev = [
   "pytest-asyncio>=0.23",        # For async test support
   "pytest-randomly>=3.15",       # Randomize test order to catch hidden deps
   "pytest-timeout>=2.3",         # Bound any hung test (e.g. a deadlocked async session) so CI fails fast with a stack dump, not a silent job-kill
+  "pytest-xdist>=3.5",           # Parallelize the unit suite (-n auto) → CI test matrix under ~10 min; also isolates per-worker so a leaked-thread test can't OOM the whole run
   "respx>=0.21",                 # HTTPX request mocking — used by acquisition test matrix
   "hypothesis>=6.100",           # Property-based testing — used by tests/property/
   "deepdiff>=7.0",               # Structural diff — used by OdcsProvider.roundtrip_check

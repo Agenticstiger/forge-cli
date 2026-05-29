@@ -190,13 +190,14 @@ class SessionState:
     # events; stable across the gateway lifetime). Mirrors the same
     # contract every other forge-cli CLI stage already honours.
     run_id: str = field(default="")
-    # Sliding-window rate limit (PyrateLimiter-backed). When
-    # ``rate_limit_calls`` is 0 the gate is disabled.
+    # Sliding-window rate limit. When ``rate_limit_calls`` is 0 the gate
+    # is disabled.
     rate_limit_calls: int = DEFAULT_RATE_LIMIT_CALLS
     rate_limit_window_seconds: float = DEFAULT_RATE_LIMIT_WINDOW_SECONDS
-    # Lazily-built in-process PyrateLimiter (per-SessionState
-    # ``InMemoryBucket``). See :meth:`check_rate_limit`.
-    _rate_limiter: Optional[Any] = None
+    # Monotonic-clock timestamps of recent calls (the sliding window).
+    # See :meth:`check_rate_limit`. Typed ``Any`` to keep the dataclass
+    # default trivial; the real runtime type is ``deque[float]``.
+    _rate_window: Optional[Any] = None
     # In-flight tool-call count INCLUDING calls queued behind the
     # concurrency semaphore; used by graceful-shutdown to drain so
     # nothing is dropped on SIGTERM.
@@ -263,36 +264,37 @@ class SessionState:
         ``(allowed, deny_reason)``. ``rate_limit_calls=0`` disables
         the gate.
 
-        Borrow-before-build (vutran1710/PyrateLimiter, MIT): the window
-        is a PyrateLimiter ``InMemoryBucket`` (sorted-set sliding
-        window). In-process / single-replica — a Redis fleet backend
-        was removed as speculative (no multi-replica deployment yet).
+        In-process single-replica sliding window over a monotonic-clock
+        deque: O(1) amortised, no background thread, no dependency.
+
+        (Previously this used PyrateLimiter's ``Limiter(InMemoryBucket)``.
+        That spins up a background "leaker" thread per ``Limiter``
+        instance; with a fresh ``SessionState`` per session those threads
+        leaked without bound, and across a long-lived process the thread
+        stacks exhaust virtual address space. A plain deque is the right
+        tool for an in-process window — it removes the thread *and* the
+        dependency. A Redis fleet backend was already dropped as
+        speculative; if a multi-replica deployment ever needs shared
+        limits, reintroduce a backend behind this same method.)
         """
         if self.rate_limit_calls <= 0:
             return True, None
-        acquired = bool(self._inprocess_rate_limiter().try_acquire("call", blocking=False))
-        if not acquired:
+        if self._rate_window is None:
+            from collections import deque
+
+            self._rate_window = deque()
+        now = time.monotonic()
+        cutoff = now - self.rate_limit_window_seconds
+        window = self._rate_window
+        while window and window[0] <= cutoff:
+            window.popleft()
+        if len(window) >= self.rate_limit_calls:
             return False, (
                 f"rate-limit-exceeded ({self.rate_limit_calls} calls per "
                 f"{self.rate_limit_window_seconds}s)"
             )
+        window.append(now)
         return True, None
-
-    def _make_rate(self):
-        """Build the PyrateLimiter ``Rate`` from the configured window
-        (interval is milliseconds in PyrateLimiter)."""
-        from pyrate_limiter import Rate
-
-        return Rate(self.rate_limit_calls, int(self.rate_limit_window_seconds * 1000))
-
-    def _inprocess_rate_limiter(self):
-        """Lazily build + cache the in-process limiter (per-SessionState
-        ``InMemoryBucket``)."""
-        if self._rate_limiter is None:
-            from pyrate_limiter import InMemoryBucket, Limiter
-
-            self._rate_limiter = Limiter(InMemoryBucket([self._make_rate()]))
-        return self._rate_limiter
 
     def check_token_budget(self, estimated_tokens: int) -> tuple[bool, Optional[str]]:
         """Per-day token-budget check against
