@@ -1,0 +1,50 @@
+fluidVersion: "0.7.3"
+kind: DataProduct
+id: gold.customer.profiles_mcp_v1
+name: Customer Profiles (with MCP overrides)
+metadata:
+  layer: Gold
+  owner:
+    team: customer-analytics
+    email: customer@example.com
+  businessContext:
+    domain: Customer Experience
+exposes:
+  - exposeId: customer_profiles
+    title: Customer Profiles (MCP-enabled)
+    kind: table
+    contract:
+      schema:
+        - name: customer_id
+          type: STRING
+          required: true
+        - name: email
+          type: STRING
+          sensitivity: pii
+    binding:
+      platform: snowflake
+      format: snowflake_table
+      location:
+        database: ANALYTICS_PROD
+        schema: CUSTOMER
+        table: PROFILES
+    semantics:
+      name: customer_profiles
+      measures:
+        - name: customer_count
+          agg: count_distinct
+          expr: customer_id
+      dimensions:
+        - name: signup_date
+          type: time
+    mcp:
+      sampling:
+        maxRows: 50
+        redactPII: true
+      classification:
+        dataClass: confidential
+      allowFreeFormSql: false
+      auth:
+        mode: oidc
+        issuer: "https://auth.example.com/realms/data"
+        audience: "mcp.customer.profiles"

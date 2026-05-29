@@ -13,10 +13,29 @@
 # limitations under the License.
 
 """
-FLUID 0.7.1 AgentPolicy Validator
+FLUID AgentPolicy Validator + runtime helpers.
 
-Validates AI/LLM usage policies in data product contracts.
-Ensures model access, use cases, and retention policies are enforceable.
+Validates AI/LLM usage policies in data product contracts. Ensures
+model access, use cases, and retention policies are internally
+consistent.
+
+The two helpers :func:`is_model_allowed` and :func:`is_use_case_allowed`
+were dead code in earlier versions of forge-cli — the agentPolicy
+schema declared a contract but no production caller enforced it. As
+of v0.7.4 they are load-bearing: the Fluid MCP gateway
+(:mod:`fluid_build.output_ports.mcp`) calls both on every
+``tools/call`` request and refuses the read when either denies. See
+:class:`fluid_build.output_ports.mcp.policy.OutputPortPolicy` for the
+runtime call site.
+
+Validator additions in v0.7.4:
+
+* :meth:`AgentPolicyValidator._validate_agent_port` warns when an
+  expose carries an ``mcp`` block (i.e. opts in to the MCP
+  gateway) but its ``policy.agentPolicy`` declares neither
+  ``allowedModels`` nor ``deniedModels`` — without one or the other
+  the runtime gate is open, which silently defeats the user's
+  intent to "gate which LLMs can read which fields".
 """
 
 from dataclasses import dataclass
@@ -120,6 +139,11 @@ class AgentPolicyValidator:
 
             # Validate reasoning constraints
             self._validate_reasoning_constraints(agent_policy, expose_id, violations)
+
+            # Validate mcp/agentPolicy coupling (NEW in v0.7.4) — warn when
+            # the expose opts into the MCP gateway but agentPolicy
+            # declares no model gate.
+            self._validate_agent_port(expose, agent_policy, expose_id, violations)
 
         # All agentPolicy violations are errors or warnings, not blockers by default
         has_errors = any(v.severity == "error" for v in violations)
@@ -277,6 +301,49 @@ class AgentPolicyValidator:
                     expose_id=expose_id,
                     policy_field="canReason",
                     suggestion="Remove 'reasoning' from allowedUseCases or set canReason=true",
+                )
+            )
+
+    def _validate_agent_port(
+        self,
+        expose: Dict[str, Any],
+        agent_policy: Dict[str, Any],
+        expose_id: str,
+        violations: List[AgentPolicyViolation],
+    ) -> None:
+        """Warn when an expose opts into the MCP gateway but
+        agentPolicy declares no model-level gate.
+
+        An ``expose.mcp`` block opts the expose into runtime enforcement
+        at
+        :class:`fluid_build.output_ports.mcp.policy.OutputPortPolicy`.
+        Without ``allowedModels`` or ``deniedModels`` the gate is
+        permissive — the operator's intent to govern who reads the
+        data is silently defeated. Surface that as a warning so the
+        contract author sees it before the data product ships.
+        """
+        opts_into_mcp = bool(expose.get("mcp"))
+        if not opts_into_mcp:
+            return
+        has_model_gate = bool(agent_policy.get("allowedModels") or agent_policy.get("deniedModels"))
+        if not has_model_gate:
+            violations.append(
+                AgentPolicyViolation(
+                    severity="warning",
+                    message=(
+                        "Expose opts into the MCP gateway (`mcp` block) but "
+                        "agentPolicy declares neither allowedModels nor "
+                        "deniedModels. The runtime gate will accept any "
+                        "model; the contract's intent to govern downstream "
+                        "LLM access is silently lost."
+                    ),
+                    expose_id=expose_id,
+                    policy_field="mcp/agentPolicy",
+                    suggestion=(
+                        "Add agentPolicy.allowedModels (e.g. "
+                        "['claude-haiku', 'gpt-4o-mini']) or "
+                        "agentPolicy.deniedModels to the expose."
+                    ),
                 )
             )
 

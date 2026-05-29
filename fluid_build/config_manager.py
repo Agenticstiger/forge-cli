@@ -174,8 +174,15 @@ class FluidConfig:
         self._load_env_vars()
 
     def _load_defaults(self) -> None:
-        """Load default configuration."""
-        self._config = DEFAULT_CONFIG.copy()
+        """Load default configuration.
+
+        Deep-copy, not ``.copy()``: a shallow copy shares the nested dicts
+        (``logging``, etc.) with the module-level ``DEFAULT_CONFIG``, so a
+        later ``set("logging.level", ...)`` or config-file merge would
+        mutate the process-wide defaults in place — corrupting every other
+        ConfigManager (and leaking across tests, which is how xdist surfaced
+        ``test_defaults_loaded`` seeing a polluted ``DEBUG``)."""
+        self._config = copy.deepcopy(DEFAULT_CONFIG)
         LOGGER.debug("Loaded default configuration")
 
     def _load_system_config(self) -> None:

@@ -30,6 +30,7 @@ import queue
 import threading
 import time
 import traceback
+import weakref
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -106,6 +107,19 @@ class HealthCheck:
     tags: Dict[str, str] = field(default_factory=dict)
 
 
+# Registry of every live MonitoringSystem so its background worker
+# threads can be stopped deterministically. Each instance starts FOUR
+# daemon workers in __init__ that loop until shutdown(). Production uses
+# the get_monitor() singleton (one instance, process-lifetime), but any
+# code — notably tests — that constructs instances directly and drops
+# them without shutdown() would otherwise leak 4 threads apiece; across a
+# long test run that compounds into thousands of threads (~8MB of virtual
+# stack each), exhausting address space until the OS OOM-kills the
+# process. The WeakSet holds no strong reference, so a shut-down + dropped
+# instance is garbage-collected normally.
+_LIVE_MONITORS: "weakref.WeakSet[MonitoringSystem]" = weakref.WeakSet()
+
+
 class MonitoringSystem:
     """Central monitoring and observability system"""
 
@@ -124,7 +138,16 @@ class MonitoringSystem:
 
         # Background workers
         self._running = True
+        # Set by shutdown() so interval-sleeping workers (aggregator,
+        # health checks) wake at once instead of sleeping out their full
+        # 30-60s interval — a shut-down instance must not linger as a live
+        # thread long enough to accumulate across a fast test run.
+        self._stop_event = threading.Event()
         self._start_background_workers()
+        # Track this instance so its 4 daemon workers can be stopped
+        # deterministically (see _shutdown_all_monitors; the test harness
+        # drains these per-test to stop cross-test thread accumulation).
+        _LIVE_MONITORS.add(self)
 
         # Alert rules
         self.alert_rules: List[Callable[[List[Metric]], Optional[Alert]]] = []
@@ -240,8 +263,10 @@ class MonitoringSystem:
                             if aggregated:
                                 self.aggregated_metrics[interval][metric_name] = aggregated
 
-                # Sleep for 30 seconds before next aggregation
-                time.sleep(30)
+                # Wait up to 30s before the next aggregation, but wake
+                # immediately when shutdown() sets the stop event.
+                if self._stop_event.wait(30):
+                    break
 
             except Exception as e:
                 self._log_error(f"Error aggregating metrics: {e}")
@@ -536,7 +561,11 @@ class MonitoringSystem:
         # Schedule periodic checks (could be improved with proper scheduler)
         def periodic_check():
             while self._running:
-                time.sleep(60)  # Run every minute
+                # Wake immediately on shutdown instead of sleeping the
+                # full minute (a shut-down check must not linger as a
+                # live thread).
+                if self._stop_event.wait(60):
+                    break
                 run_check()
 
         thread = threading.Thread(target=periodic_check, name=f"health_check_{name}", daemon=True)
@@ -867,8 +896,20 @@ class MonitoringSystem:
         return html
 
     def shutdown(self):
-        """Shutdown monitoring system"""
+        """Stop the background worker threads. Idempotent.
+
+        The workers poll ``self._running`` (queue ``get`` with a 1s
+        timeout / short interval sleeps), so they exit within ~1s of this
+        call instead of running for the life of the process."""
         self._running = False
+        self._stop_event.set()
+        _LIVE_MONITORS.discard(self)
+
+    def __enter__(self) -> "MonitoringSystem":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.shutdown()
 
 
 # Global monitoring instance
@@ -883,6 +924,25 @@ def get_monitor(project_name: str = "fluid-forge") -> MonitoringSystem:
         _global_monitor = MonitoringSystem(project_name)
 
     return _global_monitor
+
+
+def _shutdown_all_monitors() -> None:
+    """Stop the background workers of every live MonitoringSystem and
+    reset the global singleton.
+
+    Intended for the test harness — an autouse fixture calls this after
+    each test so the per-instance daemon workers don't accumulate across
+    a long run. Left unchecked they pile into thousands of threads,
+    exhausting virtual address space (~8MB stack each) until the OS
+    OOM-kills the process; that is what silently hung the 3.13/3.14 CI
+    jobs. A cheap no-op in normal single-instance operation."""
+    global _global_monitor
+    for monitor in list(_LIVE_MONITORS):
+        try:
+            monitor.shutdown()
+        except Exception:  # noqa: BLE001 — best-effort teardown
+            pass
+    _global_monitor = None
 
 
 # Convenience functions for global monitoring

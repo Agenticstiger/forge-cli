@@ -179,6 +179,98 @@ def _disable_copilot_self_eval(monkeypatch):
     monkeypatch.setenv("FLUID_COPILOT_SELF_EVAL", "0")
 
 
+@pytest.fixture(autouse=True)
+def _stop_leaked_monitoring_threads():
+    """Drain every MonitoringSystem's background worker threads after each
+    test.
+
+    ``fluid_build.forge.core.monitoring.MonitoringSystem`` starts FOUR
+    daemon workers (metric/log/alert processors + aggregator) in its
+    ``__init__`` and only stops them on an explicit ``shutdown()``. Tests
+    that construct instances directly — and never shut them down — leak
+    4 threads each. Across the full suite that compounds into thousands of
+    threads, each reserving ~8MB of virtual stack, which exhausts virtual
+    address space and gets the process OOM-killed on Linux (this is what
+    silently hung the 3.13/3.14 CI jobs at ~95% — low RSS, ~11GB VSZ,
+    SIGKILL). Draining per-test keeps the live-thread count flat. Only
+    acts when monitoring was actually imported during the test, so it
+    costs nothing for the vast majority that never touch it.
+    """
+    import sys
+
+    yield
+    module = sys.modules.get("fluid_build.forge.core.monitoring")
+    if module is not None:
+        try:
+            module._shutdown_all_monitors()
+        except Exception:  # pragma: no cover — never fail teardown
+            pass
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_keyring():
+    """Swap the OS keyring for a fresh in-memory backend in EVERY test.
+
+    A unit test must never touch the real system keyring, for two
+    reasons that bit us in CI:
+
+    * **It can BLOCK INDEFINITELY.** On macOS the real backend's
+      ``SecItemCopyMatching`` hangs on a locked/headless keychain — it
+      *blocks*, it does not raise, so the ``try/except KeyringError`` in
+      ``KeyringCredentialStore.get_credential`` cannot save us. Several
+      code paths probe the keyring for a saved LLM key
+      (``resolve_llm_config`` → ``_infer_provider_from_keyring``), so any
+      test that exercises the copilot/judge stack could wedge. This is
+      exactly what silently hung the 3.13/3.14 CI jobs for ~10 min until
+      the runner cancelled them — and only intermittently, because
+      ``pytest-randomly`` has to order such a test *before* any test that
+      sets a provider env var (which would short-circuit the probe).
+    * **It is non-deterministic.** A key saved on the contributor's real
+      keychain would leak into ``_infer_provider_from_keyring`` and
+      change behaviour between machines.
+
+    A *fresh* in-memory backend per test makes keyring reads instant,
+    credential-free, and isolated — no cross-test leakage. We use
+    keyring's documented extension point (``set_keyring`` + a
+    ``KeyringBackend`` subclass), the same isolation pattern keyring's
+    own test suite and downstream tools (twine, poetry) use. Tests that
+    patch ``...keyring_store.keyring`` directly are unaffected (they
+    replace a different reference); tests that genuinely save+load a key
+    get a working in-memory round-trip.
+    """
+    try:
+        import keyring
+        from keyring.backend import KeyringBackend
+    except Exception:  # pragma: no cover — keyring not installed: nothing to block on
+        yield
+        return
+
+    class _InMemoryKeyring(KeyringBackend):
+        # ``priority`` is keyring's required backend-ranking attribute;
+        # irrelevant here since we install this backend explicitly.
+        priority = 1  # type: ignore[assignment]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._store: dict = {}
+
+        def get_password(self, service, username):
+            return self._store.get((service, username))
+
+        def set_password(self, service, username, password):
+            self._store[(service, username)] = password
+
+        def delete_password(self, service, username):
+            self._store.pop((service, username), None)
+
+    previous = keyring.get_keyring()
+    keyring.set_keyring(_InMemoryKeyring())
+    try:
+        yield
+    finally:
+        keyring.set_keyring(previous)
+
+
 def _noop_assert_safe_url(url, *, allow_private=False):  # noqa: ARG001
     """Replacement for safe_http.assert_safe_url used in unit tests.
 

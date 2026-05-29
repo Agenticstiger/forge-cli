@@ -50,8 +50,8 @@
 <sub>policy-compile emits real BigQuery/Snowflake/AWS bindings.</sub>
 </td>
 <td width="25%" align="center">
-<strong>Agentic governance, declarative.</strong><br>
-<sub>agentPolicy gates which LLMs can read which fields.</sub>
+<strong>Agentic governance, enforced.</strong><br>
+<sub>agentPolicy gates which LLMs can read which fields, via the Fluid MCP output port (<code>fluid mcp output-port serve</code>).</sub>
 </td>
 </tr>
 </table>
@@ -530,6 +530,31 @@ Migration from pre-v1.0: [`docs/MIGRATION.md`](docs/MIGRATION.md).
 fluid policy-compile contract.fluid.yaml   # Translate policies → native IAM
 fluid contract-tests contract.fluid.yaml   # Run assertion suites
 ```
+
+### MCP output port (NEW in v0.7.4)
+
+Turn any FLUID expose into an agent-consumable MCP server with the
+contract's `agentPolicy` enforced at every read.
+
+```bash
+# stdio (default — for Claude Desktop / Cursor / MCP Inspector)
+fluid mcp output-port serve contract.fluid.yaml
+
+# HTTP / SSE for network deployments (front with mTLS proxy)
+FLUID_MCP_AUTH_TOKEN=$(openssl rand -hex 32) \
+  fluid mcp output-port serve contract.fluid.yaml \
+  --transport http --host 0.0.0.0 --port 8765
+
+# CLI overrides for ops / incident response
+fluid mcp output-port serve contract.fluid.yaml \
+  --allow-models claude-haiku-4-5-20251001 \
+  --deny-use-cases training,fine_tuning
+```
+
+Drivers in-tree: DuckDB · Postgres · Snowflake · BigQuery · AWS Athena.
+See [`examples/mcp-output-port-docker/`](examples/mcp-output-port-docker/)
+for a one-command Postgres demo + the [`proxy/`](examples/mcp-output-port-docker/proxy/)
+templates (Caddy / nginx) for production mTLS.
 
 ### Visualization
 

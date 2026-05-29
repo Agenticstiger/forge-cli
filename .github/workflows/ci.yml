@@ -69,6 +69,19 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # The keyless suite runs in ~8–12 min; 25 bounds a true hang (a
+    # leaked server loop / deadlocked async session) to minutes instead
+    # of GitHub's 6-hour default. A hung job that burns 6h of runner time
+    # before anyone notices is how the 3.13/3.14 deadlock stayed costly.
+    timeout-minutes: 25
+    env:
+      # Cap glibc malloc arenas. On Linux glibc creates up to one ~64MB
+      # virtual arena PER THREAD; a thread-heavy run balloons VIRTUAL
+      # memory into multi-GB and gets OOM-killed at low RSS. Capping to 2
+      # keeps virtual memory flat regardless of thread count — a standard
+      # containerized-Python setting, and a backstop behind the real
+      # thread-leak fixes + xdist per-worker isolation.
+      MALLOC_ARENA_MAX: "2"
     strategy:
       fail-fast: false
       matrix:
@@ -90,6 +103,8 @@ jobs:
         if: matrix.python-version != '3.12'
         run: |
           python -m pytest \
+            -n auto --dist loadscope \
+            --ignore=tests/perf \
             --junitxml=junit.xml \
             -q
 
@@ -98,11 +113,24 @@ jobs:
         if: matrix.python-version == '3.12'
         run: |
           python -m pytest \
+            -n auto --dist loadscope \
+            --ignore=tests/perf \
             --cov=fluid_build \
             --cov-report=xml:coverage.xml \
             --cov-report=term-missing \
             --junitxml=junit.xml \
             -q
+
+      # ── Perf budgets (serial — must NOT run under xdist) ────────
+      # Wall-clock budgets (e.g. `fluid --help` < 2s) are meaningless
+      # under `-n auto`: N workers contend for CPU and inflate subprocess
+      # timings past budget (3.10 saw 2.275s vs the 2.0s gate). Run the
+      # perf suite serially in its own step so the gate stays accurate
+      # and reliable — this is how it passed before the suite went
+      # parallel. ``tests/perf`` is excluded from the parallel run above
+      # via ``--ignore=tests/perf``.
+      - name: Perf budgets (serial)
+        run: python -m pytest tests/perf -q -p no:randomly
 
       # ── Coverage Gates (Python 3.12 only) ───────────────────────
       # NOTE: core gate is intentionally set to 70% right now. The original

@@ -45,12 +45,121 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 _log = logging.getLogger(__name__)
+
+# Process-local monotonic counter that disambiguates audit events
+# emitted within the same wall-clock second. Without this, the
+# previous ``%Y%m%dT%H%M%SZ`` filename pattern silently overwrote
+# concurrent decisions — disqualifying for an enterprise audit
+# trail where a single lost deny event can mean a missed
+# compliance signal. The counter is paired with a short uuid hex
+# so multiple worker processes (e.g. an MCP gateway fleet sharing
+# a network audit volume) cannot collide either.
+_AUDIT_SEQ_LOCK = threading.Lock()
+_AUDIT_SEQ = 0
+_AUDIT_PROC_TAG = uuid.uuid4().hex[:6]
+
+
+def _next_audit_suffix() -> str:
+    """Return a short, monotonically-increasing suffix safe for audit
+    filenames. Uses microsecond precision (process-local) plus a
+    monotonic counter (thread-safe) plus a per-process random tag
+    so concurrent writes never overwrite each other."""
+    global _AUDIT_SEQ
+    with _AUDIT_SEQ_LOCK:
+        _AUDIT_SEQ += 1
+        seq = _AUDIT_SEQ
+    micros = datetime.now(timezone.utc).strftime("%f")
+    pid = os.getpid()
+    return f"{micros}-{pid}-{_AUDIT_PROC_TAG}-{seq:06d}"
+
+
+def rotate_audit_directory(
+    *,
+    root: Optional[Path] = None,
+    max_age_days: Optional[float] = None,
+    max_total_bytes: Optional[int] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, int]:
+    """Best-effort cleanup of an audit directory.
+
+    Removes audit files older than ``max_age_days`` AND, if the
+    directory exceeds ``max_total_bytes``, removes the OLDEST files
+    until the size budget is met. Both knobs are independent — pass
+    ``None`` to either to disable that policy.
+
+    Defaults come from env so operators can wire the gateway boot
+    hook without any code changes:
+      * ``FLUID_AUDIT_MAX_AGE_DAYS`` (default 30)
+      * ``FLUID_AUDIT_MAX_TOTAL_MB`` (default 256)
+
+    Returns a counter dict ``{"removed_age": N, "removed_size": N,
+    "kept": N, "total_bytes_after": B}`` for logging / smoke
+    assertions. Never raises — audit cleanup must not block the
+    gateway. Failures land on the debug log.
+    """
+    log = logger or _log
+    base = (root or (Path.home() / ".fluid" / "store" / "audit")).expanduser()
+    if not base.exists():
+        return {"removed_age": 0, "removed_size": 0, "kept": 0, "total_bytes_after": 0}
+
+    if max_age_days is None:
+        max_age_days = float(os.environ.get("FLUID_AUDIT_MAX_AGE_DAYS", "30"))
+    if max_total_bytes is None:
+        max_total_bytes = int(
+            float(os.environ.get("FLUID_AUDIT_MAX_TOTAL_MB", "256")) * 1024 * 1024
+        )
+
+    counters = {"removed_age": 0, "removed_size": 0, "kept": 0}
+    files: List[Tuple[float, int, Path]] = []
+    cutoff_seconds = (
+        (datetime.now(timezone.utc).timestamp() - max_age_days * 86400.0)
+        if max_age_days and max_age_days > 0
+        else None
+    )
+
+    try:
+        for path in base.glob("*.json"):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            if cutoff_seconds is not None and stat.st_mtime < cutoff_seconds:
+                try:
+                    path.unlink()
+                    counters["removed_age"] += 1
+                    continue
+                except OSError as exc:
+                    log.debug("audit_rotate_age_unlink_failed: %s", exc)
+            files.append((stat.st_mtime, stat.st_size, path))
+
+        # Size cap: only invoked if the surviving set still exceeds
+        # the budget. Sort oldest-first and pop until we fit.
+        if max_total_bytes is not None and max_total_bytes > 0:
+            total = sum(size for _, size, _ in files)
+            if total > max_total_bytes:
+                files.sort(key=lambda entry: entry[0])
+                while files and total > max_total_bytes:
+                    _, size, path = files.pop(0)
+                    try:
+                        path.unlink()
+                        counters["removed_size"] += 1
+                        total -= size
+                    except OSError as exc:
+                        log.debug("audit_rotate_size_unlink_failed: %s", exc)
+
+        counters["kept"] = len(files)
+        counters["total_bytes_after"] = sum(size for _, size, _ in files)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("audit_rotate_failed: %s", exc)
+    return counters
 
 
 # Namespace name used when audit events round-trip through the Store
@@ -133,27 +242,80 @@ def write_audit_event(
 ) -> Path:
     base = (root or (Path.home() / ".fluid" / "store" / "audit")).expanduser()
     base.mkdir(parents=True, exist_ok=True)
-    when = datetime.now(timezone.utc)
-    timestamp = when.strftime("%Y%m%dT%H%M%SZ")
-    path = base / f"{timestamp}_{event}.json"
+    now = datetime.now(timezone.utc)
+    timestamp = now.strftime("%Y%m%dT%H%M%SZ")
+    suffix = _next_audit_suffix()
+    path = base / f"{timestamp}_{suffix}_{event}.json"
     document = {
         "event": event,
-        "timestamp_utc": when.isoformat(),
+        "timestamp_utc": now.isoformat(),
         "payload": payload,
     }
-    # File write is the canonical fallback (always lands somewhere) +
-    # the source of truth for ``AuditReportGenerator``'s on-disk walker.
-    path.write_text(json.dumps(document, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    # Atomic write: stage to a sibling temp file then rename so a
+    # crash mid-write can't leave a half-written audit document.
+    # Same-directory rename is atomic on POSIX filesystems. This is the
+    # canonical sink + the source of truth for ``AuditReportGenerator``'s
+    # on-disk walker.
+    tmp_path = path.with_suffix(path.suffix + ".part")
+    tmp_path.write_text(
+        json.dumps(document, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
     # MEMORY-E2E-A finding #54: dual-write through the configured Store
     # so Postgres/Sqlite/Vector backends actually see audit traffic.
-    # File write is canonical; the Store mirror is best-effort. When
-    # an explicit ``root`` is passed (tests, sandboxed callers) we
-    # honour the existing isolation contract by skipping the Store
-    # hop — the test is asking "write a file here", not "fan out to
-    # the user's global Store".
+    # File write (above) is canonical; the Store mirror is best-effort.
+    # When an explicit ``root`` is passed (tests, sandboxed callers) we
+    # honour the existing isolation contract by skipping the Store hop —
+    # the test is asking "write a file here", not "fan out to the user's
+    # global Store".
     if root is None:
-        _route_to_store(event, document, when)
+        _route_to_store(event, document, now)
+    # Multi-instance HA: optional webhook forward to a SIEM /
+    # central audit-log aggregator so every gateway replica's
+    # decisions land in one queryable place. Best-effort,
+    # fire-and-forget; webhook failures NEVER block the
+    # local-disk write above. Operators set
+    # ``FLUID_MCP_AUDIT_WEBHOOK_URL`` and (optionally)
+    # ``FLUID_MCP_AUDIT_WEBHOOK_HEADER_AUTH`` for a shared bearer.
+    _maybe_forward_to_webhook(document)
     return path
+
+
+def _maybe_forward_to_webhook(document: Dict[str, Any]) -> None:
+    """Background-thread POST to the configured audit webhook.
+
+    Spawned per-event with ``threading.Thread(daemon=True)`` so the
+    main dispatch path is never blocked on network I/O. Failures are
+    logged at debug — the local-disk audit copy is the source of
+    truth, the webhook is best-effort fan-out for operators who
+    aggregate across replicas (Splunk HEC / Datadog / Elastic /
+    Loki).
+    """
+    url = os.environ.get("FLUID_MCP_AUDIT_WEBHOOK_URL")
+    if not url:
+        return
+    auth_header = os.environ.get("FLUID_MCP_AUDIT_WEBHOOK_HEADER_AUTH")
+    timeout = float(os.environ.get("FLUID_MCP_AUDIT_WEBHOOK_TIMEOUT_SECONDS", "5.0"))
+
+    def _post() -> None:
+        try:
+            import httpx  # core forge-cli dep
+
+            headers = {"content-type": "application/json"}
+            if auth_header:
+                headers["authorization"] = auth_header
+            httpx.post(
+                url,
+                json=document,
+                headers=headers,
+                timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("audit_webhook_forward_failed: %s", exc)
+
+    thread = threading.Thread(target=_post, daemon=True)
+    thread.start()
 
 
 # ---------------------------------------------------------------------

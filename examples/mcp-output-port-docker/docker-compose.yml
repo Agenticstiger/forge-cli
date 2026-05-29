@@ -1,0 +1,40 @@
+# Local Docker setup for `fluid mcp output-port` end-to-end tests
+# against a real Postgres engine. Pairs with run_e2e.py to spin up
+# Postgres, seed it with a small telco customer table, run the MCP
+# gateway in-process, drive it with a real LLM (litellm + OpenAI or
+# Anthropic), and verify the agentPolicy gate works against actual
+# Postgres rows. DuckDB is exercised separately by the e2e script
+# without Docker (file-only).
+#
+# Default credentials are deliberately weak — this compose file is
+# intended for local laptop validation, NOT production. Override via
+# .env or shell-export when wiring into CI.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: forge-mcp-postgres
+    environment:
+      POSTGRES_USER: forge_mcp_test
+      POSTGRES_PASSWORD: forge_mcp_test_pwd
+      POSTGRES_DB: forge_mcp_demo
+    ports:
+      - "55432:5432"
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/01_seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forge_mcp_test -d forge_mcp_demo"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  # MinIO is staged here for a future Athena/Iceberg local play but
+  # not used by the Phase-1 e2e — keeping it commented documents the
+  # intended next step without forcing the dep on every laptop run.
+  # minio:
+  #   image: minio/minio:latest
+  #   command: server /data --console-address ":9001"
+  #   ports: ["9000:9000", "9001:9001"]
+  #   environment:
+  #     MINIO_ROOT_USER: forge
+  #     MINIO_ROOT_PASSWORD: forge_minio_pwd

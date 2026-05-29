@@ -23,7 +23,17 @@ import sqlglot
 from sqlglot import exp
 
 _SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_SAFE_EXPR_CHARS = re.compile(r"^[A-Za-z0-9_\s().,<>=!'+\-*/%|&\":\[\]]+$")
+# Identifier-quote characters for every supported dialect belong in the
+# safe set: ``"`` (ANSI / Snowflake), ``[`` ``]`` (T-SQL), and ``` ` ```
+# (BigQuery / MySQL). The backtick was the missing one — BigQuery table
+# references with a hyphenated project id (`` `my-proj.ds.tbl` ``) MUST
+# be backtick-quoted, and the MCP output-port query compiler
+# allowlist-checks the driver-built ``table_reference`` as a
+# defence-in-depth step, so a backtick-quoted reference would otherwise
+# be rejected and the ``query`` tool fails on BigQuery. A backtick can't
+# open a statement or a comment, so the ``;`` / ``--`` / ``/* */`` and
+# blocked-keyword guards below still hold.
+_SAFE_EXPR_CHARS = re.compile(r"^[A-Za-z0-9_\s().,<>=!'+\-*/%|&\"`:\[\]]+$")
 _BLOCKED_EXPR_TOKENS = re.compile(
     r"(?i)\b("
     r"alter|call|copy|create|delete|drop|execute|grant|insert|merge|put|remove|"

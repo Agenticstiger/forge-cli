@@ -1,0 +1,71 @@
+fluidVersion: "0.7.4"
+kind: DataProduct
+id: silver.telco.customer_segments_pg_demo
+name: Telco Customer Segments (Postgres demo)
+description: |
+  Local Postgres-bound contract used by examples/mcp-output-port-docker
+  to validate the Fluid MCP output port end-to-end against a real
+  Postgres engine in Docker. Demonstrates the v0.7.4 capabilities:
+  expose.mcp declaration, agentPolicy runtime enforcement
+  (allowedModels + allowedUseCases + token caps), row-level PII/PHI
+  redaction via sensitivity markers, and the new HTTP/SSE transport.
+domain: telco
+metadata:
+  layer: Silver
+  owner:
+    team: telco-data-platform
+    email: data-platform@example.com
+exposes:
+  - exposeId: customer_segments
+    title: Customer Segments (Postgres)
+    kind: table
+    version: "1.0.0"
+    contract:
+      schema:
+        - name: customer_id
+          type: STRING
+          required: true
+          sensitivity: cleartext
+        - name: segment
+          type: STRING
+          required: true
+        - name: signup_date
+          type: DATE
+        - name: lifetime_value_usd
+          type: FLOAT64
+        - name: contact_email
+          type: STRING
+          # NEW in v0.7.4: column stays VISIBLE in the schema (so the
+          # agent knows the field exists and can write COUNT/DISTINCT
+          # aggregates) but VALUES are redacted to [REDACTED-PII]
+          # before the row leaves the gateway.
+          sensitivity: pii
+        - name: medical_note
+          type: STRING
+          sensitivity: phi
+    binding:
+      platform: postgres
+      format: postgres_table
+      location:
+        database: forge_mcp_demo
+        schema: telco_demo
+        table: customer_segments
+    mcp:
+      sampling:
+        maxRows: 10
+    policy:
+      agentPolicy:
+        allowedModels:
+          - gpt-4o-mini
+          - claude-haiku-4-5-20251001
+        allowedUseCases:
+          - analysis
+          - qa
+          - summarization
+        deniedUseCases:
+          - training
+          - fine_tuning
+        maxTokensPerRequest: 4096
+        maxTokensPerDay: 50000
+        canStore: false
+        auditRequired: true

@@ -1,0 +1,9 @@
+customer_id,email,segment,signup_date,lifetime_value_usd
+C-0001,ada@enterprise.example,enterprise,2024-01-15,12500.00
+C-0002,bo@smb.example,smb,2024-02-10,4500.00
+C-0003,cy@consumer.example,consumer,2024-03-05,890.50
+C-0004,di@enterprise.example,enterprise,2024-04-20,18200.75
+C-0005,em@consumer.example,consumer,2024-05-11,1200.00
+C-0006,fp@smb.example,smb,2024-06-02,2300.00
+C-0007,gh@enterprise.example,enterprise,2024-07-19,28400.00
+C-0008,ix@consumer.example,consumer,2024-08-08,560.25

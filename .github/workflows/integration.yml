@@ -284,13 +284,283 @@ jobs:
         run: python scripts/cleanup_aws_test_artifacts.py
 
   # ──────────────────────────────────────────────────────────────
+  # MCP output-port docker e2e — Postgres in container, real LLM,
+  # full gateway path including PII redaction, agentPolicy gates,
+  # and audit trail. No external creds beyond LLM API key.
+  # ──────────────────────────────────────────────────────────────
+  mcp-output-port-postgres-e2e:
+    name: MCP output-port Postgres e2e (Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      contains(fromJSON('["all", "mcp"]'), inputs.providers) ||
+      contains(inputs.providers, 'mcp')
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: forge_mcp_test
+          POSTGRES_PASSWORD: forge_mcp_test_pwd
+          POSTGRES_DB: forge_mcp_demo
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U forge_mcp_test -d forge_mcp_demo"
+          --health-interval 1s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with local + postgres + dev extras
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,local]" psycopg
+
+      - name: Apply seed.sql to dockerized Postgres
+        env:
+          PGPASSWORD: forge_mcp_test_pwd
+        run: |
+          # GitHub Actions services don't auto-mount initdb hooks the way
+          # docker-compose does — apply the seed via psql instead.
+          sudo apt-get update -y && sudo apt-get install -y postgresql-client
+          psql -h 127.0.0.1 -p 55432 -U forge_mcp_test -d forge_mcp_demo \
+            -f examples/mcp-output-port-docker/seed.sql
+
+      - name: Run docker e2e against the live Postgres + LLM
+        timeout-minutes: 6
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POSTGRES_HOST: 127.0.0.1
+          POSTGRES_PORT: "55432"
+          POSTGRES_USER: forge_mcp_test
+          POSTGRES_PASSWORD: forge_mcp_test_pwd
+          FLUID_COST_LIMIT_USD_PER_RUN: "0.20"
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::No LLM API key (set ANTHROPIC_API_KEY or OPENAI_API_KEY)"
+            exit 1
+          fi
+          python examples/mcp-output-port-docker/run_e2e.py
+
+  # ──────────────────────────────────────────────────────────────
+  # MCP output-port Snowflake e2e — runs the same gateway path
+  # against a real Snowflake account + a real LLM. Lab credentials
+  # come from secrets; the test binds to INFORMATION_SCHEMA.TABLES
+  # so the gate is proven without depending on a seeded TELCO_*
+  # table being present.
+  # ──────────────────────────────────────────────────────────────
+  mcp-output-port-snowflake-e2e:
+    name: MCP output-port Snowflake e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      contains(fromJSON('["all", "mcp"]'), inputs.providers) ||
+      contains(inputs.providers, 'mcp')
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with snowflake + dev extras
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,snowflake]"
+
+      - name: Verify Snowflake + LLM secrets are wired
+        run: |
+          for var in SNOWFLAKE_ACCOUNT SNOWFLAKE_USER SNOWFLAKE_PASSWORD SNOWFLAKE_WAREHOUSE SNOWFLAKE_DATABASE SNOWFLAKE_FLUID_SCHEMA SNOWFLAKE_ROLE; do
+            value="${!var}"
+            if [ -z "$value" ]; then
+              echo "::error::$var is empty — Snowflake e2e cannot run"; exit 1
+            fi
+            echo "$var: ${value:0:4}***"
+          done
+          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::No LLM API key set"; exit 1
+          fi
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_FLUID_SCHEMA: ${{ secrets.SNOWFLAKE_FLUID_SCHEMA }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Run Snowflake e2e
+        timeout-minutes: 8
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_FLUID_SCHEMA: ${{ secrets.SNOWFLAKE_FLUID_SCHEMA }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FLUID_COST_LIMIT_USD_PER_RUN: "0.20"
+        # The validation script lives under /tmp on a developer
+        # laptop; CI checks out into $GITHUB_WORKSPACE so we vendor
+        # an in-tree copy via scripts/ci/run_snowflake_mcp_e2e.py
+        # (added in this PR).
+        run: |
+          python scripts/ci/run_snowflake_mcp_e2e.py
+
+  # ──────────────────────────────────────────────────────────────
+  # MCP output-port live LLM tests — exercises the gateway end-to-end
+  # against a real model (Anthropic Haiku 4.5 preferred, OpenAI
+  # gpt-4o-mini fallback). Validates the agentPolicy enforcement
+  # contract from the LLM side: deny envelopes are received and
+  # handled by a real model without loops or escapes. Cost-capped
+  # at $0.20/run via FLUID_COST_LIMIT_USD_PER_RUN; typical full
+  # run is ~$0.08 on Haiku.
+  # ──────────────────────────────────────────────────────────────
+  mcp-output-port-live-llm:
+    name: MCP output-port live LLM
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      contains(fromJSON('["all", "mcp"]'), inputs.providers) ||
+      contains(inputs.providers, 'mcp')
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install with local + test extras
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,local]"
+
+      - name: Verify at least one LLM API key is wired
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::No LLM API key in env (set ANTHROPIC_API_KEY or OPENAI_API_KEY)"
+            exit 1
+          fi
+          if [ -n "$ANTHROPIC_API_KEY" ]; then echo "Anthropic key present (preferred)"; fi
+          if [ -n "$OPENAI_API_KEY" ]; then echo "OpenAI key present (fallback)"; fi
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Run live LLM gateway tests
+        timeout-minutes: 6
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FLUID_COST_LIMIT_USD_PER_RUN: "0.20"
+        run: |
+          python -m pytest tests/integration/test_mcp_output_port_live_llm.py \
+            -v -m integration
+
+  # ──────────────────────────────────────────────────────────────
+  # Multi-language MCP-client conformance — proves the gateway is
+  # spec-compatible with the TypeScript / Go / Rust MCP SDKs, not
+  # just the Python SDK that ships with forge-cli. Each step
+  # installs the SDK + language toolchain, spawns the gateway,
+  # and runs the same allow + deny scenario the Python integration
+  # tests exercise. Per-step Docker layer caches keep the recurring
+  # cost to ~2 minutes per language per nightly run.
+  # ──────────────────────────────────────────────────────────────
+  multi-lang-mcp-conformance:
+    name: Multi-language MCP client conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      contains(fromJSON('["all", "mcp"]'), inputs.providers) ||
+      contains(inputs.providers, 'mcp')
+    steps:
+      - uses: actions/checkout@v5
+
+      # 1. Install fluid-cli + provision the demo contract.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install forge-cli
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,local]"
+
+      # 2. TypeScript SDK
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install MCP TypeScript SDK
+        run: |
+          npm install --no-save \
+            @modelcontextprotocol/sdk \
+            ts-node \
+            typescript
+      - name: TS conformance
+        run: |
+          node --loader ts-node/esm scripts/conformance/conformance_test.ts \
+            examples/mcp-output-port-docker/contract.fluid.yaml
+
+      # 3. Go SDK
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Go conformance
+        run: |
+          mkdir -p /tmp/mcp-go-conformance
+          cp scripts/conformance/conformance_test.go /tmp/mcp-go-conformance/main.go
+          cd /tmp/mcp-go-conformance
+          go mod init mcpconformance
+          go mod tidy
+          go run main.go "$GITHUB_WORKSPACE/examples/mcp-output-port-docker/contract.fluid.yaml"
+
+      # 4. Rust SDK
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust conformance
+        run: |
+          mkdir -p /tmp/mcp-rust-conformance/src
+          cp scripts/conformance/conformance_test.rs /tmp/mcp-rust-conformance/src/main.rs
+          cd /tmp/mcp-rust-conformance
+          cat > Cargo.toml <<'EOF'
+          [package]
+          name = "mcp-conformance"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          rmcp = { version = "0.4", features = ["client", "transport-child-process"] }
+          tokio = { version = "1", features = ["full"] }
+          anyhow = "1"
+          serde_json = "1"
+          EOF
+          cargo run --release -- "$GITHUB_WORKSPACE/examples/mcp-output-port-docker/contract.fluid.yaml"
+
+  # ──────────────────────────────────────────────────────────────
   # Cron-only: file an issue when the nightly run fails so external
   # API drift gets noticed. Runs only when integration jobs failed AND
   # the trigger was the nightly schedule.
   # ──────────────────────────────────────────────────────────────
   notify-on-cron-failure:
     name: File issue on nightly failure
-    needs: [snowflake-integration, bigquery-integration, aws-integration]
+    needs:
+      - snowflake-integration
+      - bigquery-integration
+      - aws-integration
+      - mcp-output-port-live-llm
+      - mcp-output-port-postgres-e2e
+      - mcp-output-port-snowflake-e2e
+      - multi-lang-mcp-conformance
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     steps:

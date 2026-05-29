@@ -7,6 +7,316 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-05-29
+
+### Fixed
+
+- **Daemon-thread leak that OOM-hung CI on Python 3.13/3.14.**
+  `forge.core.monitoring.MonitoringSystem` started four background daemon
+  workers (metric / log / alert processors + aggregator) per instance and
+  only stopped them on an explicit `shutdown()`. Code that constructed
+  instances and dropped them (notably the test suite) leaked threads
+  without bound; across a long run the per-thread virtual stacks exhausted
+  address space and the OS OOM-killed the process. Workers now stop
+  promptly via a `threading.Event`, live instances are tracked in a
+  `WeakSet`, `shutdown()`/context-manager support is added, and a per-test
+  fixture drains them.
+- **`ConfigManager` could corrupt process-wide defaults.** `_load_defaults`
+  shallow-copied the module-level `DEFAULT_CONFIG`, sharing its nested
+  dicts — so a later `set("logging.level", ...)` or config-file merge
+  mutated the shared defaults in place, affecting every other
+  `ConfigManager` in the process. Now deep-copies the defaults.
+- **MCP gateway rate limiter no longer leaks a background thread.**
+  Replaced PyrateLimiter's `Limiter` (which spins a per-instance "leaker"
+  thread) with an in-process monotonic-clock deque sliding window —
+  functionally identical for the single-replica gateway, with no thread
+  and no dependency. Drops the `pyrate-limiter` dependency.
+
+### Added (closes the final 5 honest gaps from the prior audit)
+
+- **JWT bearer + mTLS gateway-native identity**
+  (`fluid_build/output_ports/mcp/auth.py`). New `AuthValidator`
+  strategy with modes: `shared-token` (existing v0.7.4 default),
+  `jwt` (RS256/ES256/EdDSA against an issuer's JWKS endpoint,
+  validates iss/aud/exp/sig), `none` (operator opts out, gateway
+  warns loud at startup). Maps configured JWT claims into
+  `caller_attributes` so `policy.rowFilters` `${caller.<attr>}`
+  placeholders resolve cryptographically rather than via
+  self-attestation. Mirrors `X-Client-CN` + `X-Client-Fingerprint`
+  proxy-forwarded mTLS metadata for combined identity attribution.
+  Real RSA signing roundtrip + wrong-key rejection in the test suite.
+
+- **BigQuery row-access policy compiler** (real impl, replaces the
+  earlier stub). Emits `CREATE OR REPLACE ROW ACCESS POLICY ON
+  <table> GRANT TO (<service_accounts>) FILTER USING (<predicate>)`
+  with caller.user → SESSION_USER() mapping and
+  `agentPolicy.allowedModels` → `serviceAccount:fluid-mcp-<MODEL>@<project>`
+  GRANT clauses.
+
+- **AWS Lake Formation compiler** (real impl, replaces the earlier
+  stub). Emits a runnable boto3 Python script with
+  `lakeformation.create_data_cells_filter` + `grant_permissions`
+  calls bound to per-LLM IAM roles
+  (`arn:aws:iam::<ACCOUNT>:role/fluid-mcp-<MODEL>`). Operators paste
+  into CDK/Terraform or run directly.
+
+- **Audit webhook forwarder** for multi-instance HA. Set
+  `FLUID_MCP_AUDIT_WEBHOOK_URL` (and optionally
+  `FLUID_MCP_AUDIT_WEBHOOK_HEADER_AUTH`) and every audit event is
+  POST-ed on a daemon thread to a SIEM aggregator (Splunk HEC,
+  Datadog, Elastic, Loki). Best-effort: webhook failures NEVER
+  block the local-disk write — local copy is the source of truth.
+
+- **Multi-language MCP-client conformance** harnesses + CI matrix.
+  `scripts/conformance/conformance_test.{ts,go,rs}` exercise the
+  same 3-step contract (initialize → tools/list → call with allow +
+  deny) via the official TypeScript SDK
+  (`@modelcontextprotocol/sdk`), the community Go SDK
+  (`mark3labs/mcp-go`), and the community Rust SDK (`rmcp`). New
+  `multi-lang-mcp-conformance` job in `integration.yml` runs all
+  three on every nightly + workflow-dispatch trigger.
+
+- **Provider-selection regression tests**
+  (`tests/output_ports/test_provider_resolution.py`). Pins the
+  `_resolve_provider()` contract: when both `ANTHROPIC_API_KEY` and
+  `OPENAI_API_KEY` are set, the live-LLM tests prefer Anthropic
+  Haiku 4.5 (the Anthropic preference is now a regression-tested
+  invariant, not just a docstring).
+
+### Added (final gap-closing pass — production-grade defence in depth)
+
+- **PostgreSQL driver** — psycopg v3, read-only sessions,
+  per-statement timeout via `SET LOCAL`, `:p_<idx>` →
+  `%(p_<idx>)s` parameter rewrite. Live e2e via the dockerized
+  setup in `examples/mcp-output-port-docker/`.
+- **AWS Athena driver** — boto3 default credential chain,
+  `StartQueryExecution` → poll → page-through with
+  `ExecutionParameters`. Mocked unit tests; live AWS validation
+  deferred to a follow-up.
+- **Out-of-tree driver registration tested** — `register_driver()`
+  contract pinned by 3 new tests so a future refactor can't
+  silently break customers' private wheels.
+- **HTTP / SSE transport with optional bearer-token auth.** Set
+  `FLUID_MCP_AUTH_TOKEN` and the gateway returns 401 on every
+  unauthenticated request BEFORE the SSE handshake. Pair with the
+  Caddy / nginx mTLS templates in
+  `examples/mcp-output-port-docker/proxy/` for production
+  defence-in-depth.
+- **Per-tenant row-level security** via `policy.rowFilters[]`. Each
+  filter compiles to a parameterised `WHERE` clause bound to MCP
+  `clientInfo` extra fields (`${caller.tenant_id}` etc.). Missing
+  caller attributes raise `RowFilterIdentityMissing` (fail-closed
+  deny — the gateway never serves rows under undefined identity).
+- **Cloud-IAM compiler** (`fluid_build.output_ports.iam_compiler`).
+  Emits Snowflake row-access policies + Postgres `CREATE POLICY`
+  statements that honour the same `agentPolicy` + `rowFilters`
+  contract — defence-in-depth so bypass-the-gateway scenarios
+  (analyst querying the warehouse directly) are also gated.
+  BigQuery + AWS Lake Formation targets emit clear `-- TODO`
+  stubs with explicit warnings.
+- **EngineDriver.close() hoisted to base class** — every driver
+  now has a uniform close path. Walks `_connection` / `_client`
+  attributes for cleanup; idempotent.
+- **Backpressure tracking split into `_in_flight` (drain count) +
+  `_actively_dispatching` (concurrency cap)** — the unit test
+  caught a real bug where the previous instrumentation conflated
+  the two. Operators sizing connection pools now have a clean
+  metric.
+- **CI integration jobs** for Postgres docker e2e + Snowflake
+  live e2e. `mcp-output-port-postgres-e2e` and
+  `mcp-output-port-snowflake-e2e` join `mcp-output-port-live-llm`
+  on the integration workflow's nightly + workflow-dispatch
+  triggers.
+- **Hash-pinned lockfile recipe** — generated via
+  `uv pip compile pyproject.toml --generate-hashes -o
+  requirements.lock.hashed.txt` (uv is the canonical pip-tools
+  replacement; ~100× faster than the previous custom script). The
+  earlier `scripts/generate_hashed_lockfile.py` placeholder was
+  removed in this release per /borrow-before-build (uv covers the
+  full surface and is dev-time only — no runtime cost).
+
+### Changed (security)
+
+- **Reverse-proxy templates** for production HTTP deployments —
+  Caddy + nginx with mTLS + bearer token + SSE buffering.
+
+### Added (enterprise-grade hardening — closes the v0.7.4 gap list)
+
+- **PostgreSQL driver** (`fluid_build/output_ports/mcp/drivers/postgres.py`).
+  Mirrors the Snowflake / BigQuery shape; binds on
+  `platform=postgres`, `format∈{postgres_table, table}`. Read-only
+  sessions enforced at connect time; per-statement timeout via
+  `SET LOCAL statement_timeout`. Borrowed-not-built: `psycopg` v3
+  (parameter-binding native, SQL-injection-safe identifier
+  quoting). Exercised end-to-end against a dockerized Postgres in
+  the new `examples/mcp-output-port-docker/`.
+
+- **AWS Athena driver** (`fluid_build/output_ports/mcp/drivers/athena.py`).
+  Binds on `platform=aws`, `format∈{athena_table, glue_table}`.
+  Uses the boto3 default credential chain (env / `~/.aws/credentials`
+  / IAM role / OIDC) — no long-lived keys baked in. Polls
+  `GetQueryExecution` with configurable timeout, pages through
+  `GetQueryResults`, parameterised queries via `ExecutionParameters`.
+
+- **Row-level PII / PHI redaction** at the driver boundary. Columns
+  marked `sensitivity: pii`, `sensitivity: phi`, or
+  `sensitivity: sensitive` in `expose.contract.schema` keep their
+  KEY visible (so the agent knows the field exists and can write
+  `COUNT(DISTINCT)` aggregates) but VALUES are replaced with
+  `[REDACTED-PII]` before the row leaves the gateway. Distinct from
+  `columnRestrictions`, which drops the column wholesale.
+
+- **Audit-log rotation**
+  (`audit_trail.rotate_audit_directory`). Bounded by
+  `FLUID_AUDIT_MAX_AGE_DAYS` (default 30) AND
+  `FLUID_AUDIT_MAX_TOTAL_MB` (default 256). Runs automatically on
+  gateway startup; oldest files dropped first when over budget.
+  Replaces unbounded growth of `~/.fluid/store/audit/`.
+
+- **Backpressure** via `asyncio.Semaphore`. Bounds concurrent tool
+  calls to `FLUID_MCP_MAX_CONCURRENCY` (default 8) so a runaway
+  agent can't saturate the engine connection pool.
+
+- **Circuit breaker** on the driver layer. Trips after
+  `FLUID_MCP_CIRCUIT_THRESHOLD` (default 5) failures within
+  `FLUID_MCP_CIRCUIT_WINDOW_SECONDS` (default 60); open for
+  `FLUID_MCP_CIRCUIT_COOLDOWN_SECONDS` (default 30). Returns a
+  `CircuitOpen` envelope fast instead of pinning event-loop slots
+  on a downstream Snowflake / BigQuery / Postgres outage.
+
+- **Token-budget enforcement** for `agentPolicy.maxTokensPerDay`
+  and `agentPolicy.maxTokensPerRequest`. Per-day counter rolls on a
+  sliding 24-hour window; per-request cap evaluated against the
+  serialised response payload. Cap denials emit a typed
+  `TokenBudgetExceeded` envelope and an audit event with
+  `policySource: "token-budget"`.
+
+- **`canStore` advisory + retention startup warning.** When the
+  contract sets `agentPolicy.canStore=false` or
+  `retentionPolicy.requireDeletion=true`, the gateway surfaces a
+  loud stderr notice at startup explaining the gateway honours the
+  hint advisorily but cannot prevent the receiving model from
+  storing data once it crosses the wire (cloud-IAM ephemeral
+  credentials are the only true guarantee).
+
+- **HTTP / SSE transport** option:
+  `fluid mcp output-port serve --transport http --host H --port N`.
+  Borrows `mcp.server.sse.SseServerTransport` + Starlette + uvicorn
+  (transitive deps of `mcp[cli]`). No built-in HTTP auth —
+  documented loud at startup; pair with mTLS / OAuth proxy until
+  the auth phase ships.
+
+- **Local Docker e2e harness**
+  (`examples/mcp-output-port-docker/`). One-command
+  `docker compose up -d` brings up Postgres seeded with a small
+  telco customer table. `run_e2e.py` drives the gateway with a
+  real LLM (litellm + OpenAI / Anthropic) across 4 scenarios:
+  Postgres allow + PII redaction, Postgres deny by model, Postgres
+  deny by use-case, DuckDB allow on the same gate (proves
+  engine-agnostic enforcement). Total LLM cost per run ~$0.0001.
+
+- **Throughput + latency benchmark**
+  (`scripts/mcp_output_port_bench.py`). Drives the gateway via the
+  SDK in-memory transport (zero LLM cost). Recorded baseline on
+  laptop: **1080 calls/s, p50=6.7 ms, p95=7.5 ms, p99=34 ms** at
+  500 calls / 8 concurrency against the local DuckDB driver.
+
+- **Reproducible-build lockfile** (`requirements.lock.txt`). Pins
+  the resolved transitive closure of every dep so a fresh install
+  on CI / a contributor laptop / a container build resolves to
+  the exact versions the maintainers tested.
+
+### Added (v0.7.4 base — from prior turns)
+
+- **FLUID schema v0.7.4 — Runtime agentPolicy Enforcement at the MCP gateway.**
+  Closes the legitimacy gap where `agentPolicy` was declarative metadata
+  only. Adds the `expose.mcp` block: its presence declares an expose
+  agent-consumable over MCP (sampling caps + classification) and opts it
+  into the gateway. Backward-compatible with v0.7.3: existing contracts
+  validate unchanged.
+
+- **`fluid mcp output-port serve` runtime enforcement of `agentPolicy`.**
+  When an expose carries an `expose.mcp` block,
+  the gateway loads `policy.agentPolicy.allowedModels` / `deniedModels`
+  and `allowedUseCases` / `deniedUseCases` and enforces them on every
+  `tools/call`. Caller `model_id` and `useCase` come from the MCP
+  `clientInfo` handshake. Built on Anthropic's official
+  [`mcp` Python SDK](https://github.com/modelcontextprotocol/python-sdk)
+  (`>=1.20,<2.0`); the prior custom JSON-RPC dispatcher and stdio
+  transport are deleted. Driver registry (DuckDB / Snowflake / BigQuery)
+  and audit-trail integration are reused unchanged.
+
+- **CLI overrides for ops/incident response.** New `--allow-models`,
+  `--deny-models`, `--allow-use-cases`, `--deny-use-cases` flags on
+  `fluid mcp output-port serve`. CLI values replace the contract values
+  entirely (not merged); the audit event records `policySource: "cli"`
+  vs `"contract"` so an audit reader can distinguish ops overrides from
+  declared policy.
+
+- **Sliding-window rate limit on the gateway.** Defaults to 60 calls per
+  60 seconds per session; tune with `FLUID_MCP_RATE_LIMIT` and
+  `FLUID_MCP_RATE_WINDOW_SECONDS`. Set `FLUID_MCP_RATE_LIMIT=0` to
+  disable. Rate-limit denials emit a `RateLimitExceeded` envelope AND an
+  audit event with `policySource: "rate-limit"`.
+
+- **OTel + run_id correlation on every tool call.** Each `tools/call` is
+  wrapped in a `fluid.mcp.call_tool` span carrying `fluid.run_id`,
+  `fluid.tool`, `fluid.expose_id`, `fluid.model_id`, `fluid.use_case`,
+  `fluid.policy_source`, `fluid.decision`, and `fluid.reason`. Spans are
+  no-op when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset.
+
+- **Graceful shutdown.** SIGTERM / SIGINT install handlers that drain
+  in-flight tool calls (up to 5 s) before tearing down driver
+  connections. Cloud SDK connections (snowflake-connector-python,
+  google-cloud-bigquery, duckdb) are closed explicitly.
+
+- **`FLUID_AUDIT_ROOT`** env var redirects every gateway audit event to
+  a custom root (e.g. a SIEM-forwarded volume). Unset → default to
+  `~/.fluid/store/audit/`.
+
+### Changed
+
+- **`write_audit_event` no longer collides on burst writes.** The audit
+  writer was previously second-precision and overwrote concurrent
+  decisions on disk — disqualifying for an enterprise audit trail. Now
+  uses `<timestamp>_<microseconds>-<pid>-<tag>-<seq>_<event>.json` with
+  atomic rename so no two writes can clash even at thousands of events
+  per second. Stress-tested with 400 concurrent writes across 8 threads
+  (zero collisions).
+
+- **Audit-event payload carries `runId` + `policySource`** in addition
+  to the previous fields. Consumers that read `~/.fluid/store/audit/`
+  get a consistent correlation token across all forge-cli stages and
+  can distinguish CLI-override decisions from contract-driven ones.
+
+- **Argument-summary in audit events is now redacted** through
+  `fluid_build.observability.secret_redactor` (closes a side-channel
+  where caller-supplied filter literals matching JWT / Stripe / GitHub /
+  bearer / `k=v` shapes landed raw in audit JSON).
+
+- **Tool-error envelopes no longer leak engine binding info to the
+  wire**: the calling LLM gets a generic "see audit trail" message
+  while the full annotated error (database / schema / table hints)
+  lands on the operator log + audit event only.
+
+- **Self-attestation startup banner**: when an `agentPolicy` model or
+  use-case gate is configured, the CLI now writes a clear warning to
+  stderr that caller `model_id` is self-attested via MCP `clientInfo`
+  and that the gateway must not be exposed over an untrusted network
+  until the OAuth/mTLS phase ships.
+
+- **Multi-expose `find_expose` error** lists agent-eligible exposes
+  separately so operators don't have to grep the contract to figure out
+  which `--expose-id` choices the gateway can serve.
+
+### Notes
+
+- The MCP gateway integrates with `litellm` (already a core dep) for
+  the live-LLM regression tests; no new test deps were added.
+- `mcp` Python SDK pin is `>=1.20,<2.0` to bracket the `lifespan` API
+  and `mcp.shared.memory` test fixtures we depend on. Tested against
+  mcp 1.27.x.
+
 ## [0.8.5] - 2026-05-28
 
 ### Added (agentic world-class uplift — #155)

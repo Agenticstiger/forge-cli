@@ -212,11 +212,12 @@ class TestFluidSchemaManager:
         assert "0.7.1" in mgr.BUNDLED_VERSIONS
         assert "0.7.2" in mgr.BUNDLED_VERSIONS
         assert "0.7.3" in mgr.BUNDLED_VERSIONS
+        assert "0.7.4" in mgr.BUNDLED_VERSIONS
         assert "0.5.7" not in mgr.BUNDLED_VERSIONS
         assert "0.4.0" not in mgr.BUNDLED_VERSIONS
 
     def test_latest_bundled_version(self):
-        assert FluidSchemaManager.latest_bundled_version() == "0.7.3"
+        assert FluidSchemaManager.latest_bundled_version() == "0.7.4"
 
     def test_detect_version_from_contract(self):
         mgr = FluidSchemaManager()
