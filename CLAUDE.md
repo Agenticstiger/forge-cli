@@ -323,6 +323,7 @@ docker-in-docker, Lake Formation DataLakeAdmin → GrantPermissions).
 ## Commit / PR etiquette
 
 - Conventional-commits style (`feat(scope):`, `fix(scope):`, `chore(ci):`, `security: …`). See the git log for the in-use shape.
+- **Commit incrementally, never in one big drop.** Land each logical unit (one fix, one refactor, one feature) as its own green, reviewable commit the moment it passes its checks — do not batch many unrelated concerns into a mega-commit.
 - `main` is protected. All changes go via PR. CI (`.github/workflows/ci.yml`) must be green before merge.
 - `ci.yml` triggers on `push: branches:[main]` and `pull_request:`. GitHub's rule that `GITHUB_TOKEN` merges don't trigger downstream workflows can leave a merge commit without a CI run — trigger it manually with `gh workflow run ci.yml --ref main` (`workflow_dispatch` was added for exactly this reason in PR #27).
 - Never add `Co-Authored-By: Claude …` trailers to commits (repo-wide preference).
