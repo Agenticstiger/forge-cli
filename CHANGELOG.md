@@ -9,19 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added (closes the final 5 honest gaps from the prior audit)
 
-- **JWT bearer + SPIFFE/mTLS gateway-native identity**
+- **JWT bearer + mTLS gateway-native identity**
   (`fluid_build/output_ports/mcp/auth.py`). New `AuthValidator`
-  strategy with four modes: `shared-token` (existing v0.7.4
-  default), `jwt` (RS256/ES256/EdDSA against an issuer's JWKS
-  endpoint, validates iss/aud/exp/sig), `spiffe` (SVID JWT against
-  a configured trust-domain), `none` (operator opts out, gateway
+  strategy with modes: `shared-token` (existing v0.7.4 default),
+  `jwt` (RS256/ES256/EdDSA against an issuer's JWKS endpoint,
+  validates iss/aud/exp/sig), `none` (operator opts out, gateway
   warns loud at startup). Maps configured JWT claims into
   `caller_attributes` so `policy.rowFilters` `${caller.<attr>}`
   placeholders resolve cryptographically rather than via
   self-attestation. Mirrors `X-Client-CN` + `X-Client-Fingerprint`
   proxy-forwarded mTLS metadata for combined identity attribution.
-  17 regression tests including real RSA signing roundtrip + wrong-key
-  rejection + SPIFFE trust-domain enforcement.
+  Real RSA signing roundtrip + wrong-key rejection in the test suite.
 
 - **BigQuery row-access policy compiler** (real impl, replaces the
   earlier stub). Emits `CREATE OR REPLACE ROW ACCESS POLICY ON
@@ -43,14 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   POST-ed on a daemon thread to a SIEM aggregator (Splunk HEC,
   Datadog, Elastic, Loki). Best-effort: webhook failures NEVER
   block the local-disk write — local copy is the source of truth.
-
-- **Redis-backed circuit breaker** for multi-instance HA. Set
-  `FLUID_MCP_CIRCUIT_BACKEND=redis` and a downstream warehouse
-  outage trips the breaker for every gateway replica
-  simultaneously, preventing the thundering-herd retry storm that
-  would otherwise hit the recovering warehouse from N
-  independently-healing local breakers. Falls back to in-process
-  on Redis outage (fail-open documented loud).
 
 - **Multi-language MCP-client conformance** harnesses + CI matrix.
   `scripts/conformance/conformance_test.{ts,go,rs}` exercise the
@@ -107,12 +97,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caught a real bug where the previous instrumentation conflated
   the two. Operators sizing connection pools now have a clean
   metric.
-- **Redis-backed rate-limit option** for multi-instance HA. Set
-  `FLUID_MCP_RATE_LIMIT_BACKEND=redis` +
-  `FLUID_MCP_RATE_LIMIT_REDIS_URL`; the sliding window becomes
-  fleet-wide via Redis sorted sets. Falls back to in-process on
-  Redis outage (fail-open is documented loud — failing closed on
-  a Redis hiccup would block every gateway worldwide).
 - **CI integration jobs** for Postgres docker e2e + Snowflake
   live e2e. `mcp-output-port-postgres-e2e` and
   `mcp-output-port-snowflake-e2e` join `mcp-output-port-live-llm`
@@ -128,25 +112,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed (security)
 
-- **SPIFFE SVID validation now routes through the canonical
-  `py-spiffe` library** (`spiffe>=0.2.9`,
-  https://github.com/HewlettPackard/py-spiffe) via
-  `JwtSvid.parse_and_validate` instead of the prior open-coded
-  PyJWT path. Strictness gains: the SPIFFE JWT-SVID spec's required
-  `aud` claim is now enforced (operators set
-  `FLUID_MCP_SPIFFE_AUDIENCE`); the per-spec algorithm allow-list
-  is enforced; the SPIFFE ID structure is validated through the
-  spec-compliant `SpiffeId` parser. The defense-in-depth
-  trust-domain match (reject SVIDs claiming a domain other than
-  the configured one) is preserved on top of py-spiffe. Operators
-  using `FLUID_MCP_AUTH_MODE=spiffe` must now `pip install
-  fluid-build[spiffe]` and configure `FLUID_MCP_SPIFFE_AUDIENCE`;
-  startup `is_enabled()` returns False (gateway warns loud) when
-  audience is missing. Borrowed-not-built per /borrow-before-build
-  retrospective audit.
-- **SBOM generator** (`scripts/generate_sbom.py`). Emits CycloneDX
-  1.5 JSON from `pip list` + PyPI metadata. Validated against
-  the spec; 191 components on the current venv.
 - **Reverse-proxy templates** for production HTTP deployments —
   Caddy + nginx with mTLS + bearer token + SSE buffering.
 
@@ -315,7 +280,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use-case gate is configured, the CLI now writes a clear warning to
   stderr that caller `model_id` is self-attested via MCP `clientInfo`
   and that the gateway must not be exposed over an untrusted network
-  until the OAuth/SPIFFE/mTLS phase ships.
+  until the OAuth/mTLS phase ships.
 
 - **Multi-expose `find_expose` error** lists agent-eligible exposes
   separately so operators don't have to grep the contract to figure out
