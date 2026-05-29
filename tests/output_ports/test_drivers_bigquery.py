@@ -174,6 +174,10 @@ class TestBigQueryDriverMocked:
     def test_execute_rewrites_named_placeholders(self):
         """Compiler emits ``:p_0``; BigQuery expects ``@p_0``. The driver
         MUST rewrite before binding."""
+        # execute() imports google.cloud.bigquery for real (QueryJobConfig /
+        # ScalarQueryParameter); skip when the optional [gcp] extra isn't
+        # installed (base CI) rather than fail. DuckDB-module convention.
+        pytest.importorskip("google.cloud.bigquery")
         driver = BigQueryDriver(expose=_make_expose(), contract={})
         driver._client = _fake_client(columns=["CUSTOMER_ID"], rows=[{"CUSTOMER_ID": "C0001"}])
         sql_named = (
@@ -190,12 +194,14 @@ class TestBigQueryDriverMocked:
         assert result.rows == ({"CUSTOMER_ID": "C0001"},)
 
     def test_execute_blocks_injection_marker_at_driver(self):
+        pytest.importorskip("google.cloud.bigquery")
         driver = BigQueryDriver(expose=_make_expose(), contract={})
         driver._client = _fake_client(columns=[], rows=[])
         with pytest.raises(ValueError):
             driver.execute(sql="SELECT 1; DROP TABLE x", params=())
 
     def test_health_check_reports_ok(self):
+        pytest.importorskip("google.cloud.bigquery")
         driver = BigQueryDriver(expose=_make_expose(), contract={})
         driver._client = _fake_client(columns=["f0_"], rows=[{"f0_": 1}])
         result = driver.health_check()
@@ -204,6 +210,7 @@ class TestBigQueryDriverMocked:
         assert "latency_ms" in result
 
     def test_health_check_reports_unavailable_on_error(self):
+        pytest.importorskip("google.cloud.bigquery")
         from unittest.mock import MagicMock
 
         driver = BigQueryDriver(expose=_make_expose(), contract={})
@@ -246,7 +253,10 @@ class TestBigQueryDriverMocked:
            tool on BigQuery even after the wiring was fixed.
 
         Runs the REAL compiler + handler; only the BigQuery client is a
-        fake, so no network/auth happens and it runs in CI."""
+        fake. Still needs the google.cloud.bigquery lib importable (the
+        driver builds QueryJobConfig); skip when the optional [gcp] extra
+        is absent (base CI)."""
+        pytest.importorskip("google.cloud.bigquery")
         import logging
 
         from fluid_build.output_ports.mcp import _handlers

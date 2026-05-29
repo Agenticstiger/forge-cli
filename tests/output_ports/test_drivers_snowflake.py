@@ -191,6 +191,10 @@ class TestSnowflakeDriverMocked:
             )
 
     def test_health_check_reports_ok(self):
+        # health_check() imports snowflake.connector for real (the optional
+        # [snowflake] extra); skip when it isn't installed (base CI) rather
+        # than fail. Same convention as the DuckDB module's importorskip.
+        pytest.importorskip("snowflake.connector")
         driver = SnowflakeDriver(expose=_make_expose(), contract={})
         connection, cursor = self._patch_connection(driver)
         cursor.fetchall.return_value = [(1,)]
@@ -200,6 +204,7 @@ class TestSnowflakeDriverMocked:
         assert "latency_ms" in result
 
     def test_health_check_reports_unavailable_on_error(self):
+        pytest.importorskip("snowflake.connector")
         driver = SnowflakeDriver(expose=_make_expose(), contract={})
         connection, cursor = self._patch_connection(driver)
         cursor.execute.side_effect = RuntimeError("network unreachable")
