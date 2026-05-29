@@ -30,7 +30,7 @@ from fluid_build.cli.validate import (
     _validate_version_constraints,
     run,
 )
-from fluid_build.schema_manager import SchemaVersion, ValidationResult
+from fluid_build.schema_manager import FluidSchemaManager, SchemaVersion, ValidationResult
 
 logger = logging.getLogger("test_validate_ext")
 
@@ -193,13 +193,13 @@ class TestFindLatestCompatibleVersion:
         assert version is not None
 
     def test_fallback_when_no_versions(self):
-        """When no versions are available, fall back to the canonical
-        v0.7.3 (the latest bundled schema)."""
+        """When no versions are available, fall back to the latest bundled
+        schema (tracked dynamically, not a hardcoded number)."""
         sm = _make_schema_manager()
         sm.list_available_versions.return_value = []
         args = _make_args(min_version=None, max_version=None)
         version = _find_latest_compatible_version(args, sm)
-        assert str(version) == "0.7.3"
+        assert str(version) == FluidSchemaManager.latest_bundled_version()
 
 
 # ---------------------------------------------------------------------------

@@ -515,7 +515,10 @@ def _find_latest_compatible_version(args, schema_manager: FluidSchemaManager) ->
     if versions:
         return versions[-1]
 
-    return SchemaVersion.parse("0.7.3")
+    # Degenerate case: no schema versions discoverable at all (e.g. an empty
+    # schemas dir). Fall back to the latest bundled schema rather than a
+    # hardcoded number that goes stale every release.
+    return SchemaVersion.parse(FluidSchemaManager.latest_bundled_version())
 
 
 def _find_previous_compatible_version(
