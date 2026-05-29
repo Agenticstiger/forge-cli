@@ -54,6 +54,7 @@ from fluid_build.output_ports.mcp import _handlers, resolve_expose_paths
 from fluid_build.output_ports.mcp.policy import OutputPortPolicy
 from fluid_build.output_ports.mcp.query_compiler import QueryValidationError
 from fluid_build.output_ports.mcp.server import SessionState
+from fluid_build.schema_manager import validate_contract_file
 
 _EXAMPLE = (
     Path(__file__).resolve().parents[2] / "examples" / "mcp-output-port" / "contract.fluid.yaml"
@@ -75,6 +76,17 @@ def _example_state() -> SessionState:
 
 def test_example_contract_file_exists():
     assert _EXAMPLE.is_file(), f"shipped quickstart contract missing: {_EXAMPLE}"
+
+
+def test_example_contract_passes_fluid_validate():
+    """The shipped quickstart must pass the REAL ``fluid validate`` — schema
+    validation against its DECLARED ``fluidVersion`` — not just build a
+    SessionState. The handler tests below bypass validation entirely, so a
+    version/field mismatch (e.g. declaring 0.7.3 while using the 0.7.4
+    ``expose.mcp`` block) would sail past them yet fail a real adopter at
+    ``fluid validate``. This assertion closes that gap."""
+    result = validate_contract_file(str(_EXAMPLE))
+    assert result.is_valid, f"quickstart fails `fluid validate`: {result.errors}"
 
 
 def test_golden_path_describe_exposes_schema():

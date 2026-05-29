@@ -1,4 +1,4 @@
-fluidVersion: "0.7.3"
+fluidVersion: "0.7.4"
 kind: DataProduct
 id: silver.demo.customer_segments_v1
 name: Customer Segments (MCP demo)
