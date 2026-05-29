@@ -47,7 +47,10 @@ except ImportError:
     RICH_AVAILABLE = False
 
 COMMAND = "version"
-FALLBACK_SPEC_VERSION = "0.7.3"
+# Last-resort fallback for the displayed "latest spec" when no bundled schema
+# is discoverable. Derived from the schema manager so it tracks the newest
+# bundled version instead of going stale every release.
+FALLBACK_SPEC_VERSION = FluidSchemaManager.latest_bundled_version()
 
 
 def register(subparsers: argparse._SubParsersAction):

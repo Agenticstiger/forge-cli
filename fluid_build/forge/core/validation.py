@@ -256,8 +256,9 @@ class ProjectValidator:
                 known_versions = set(FluidSchemaManager.BUNDLED_VERSIONS)
             except Exception:  # noqa: BLE001
                 # Defensive fallback when the schema manager is unavailable;
-                # the canonical 0.7.x line is the supported set.
-                known_versions = {"0.7.1", "0.7.2", "0.7.3"}
+                # the canonical 0.7.x line is the supported set. Keep this in
+                # lockstep with the bundled schemas in fluid_build/schemas/.
+                known_versions = {"0.7.1", "0.7.2", "0.7.3", "0.7.4"}
             if declared_version not in known_versions:
                 self.issues.append(
                     ValidationIssue(

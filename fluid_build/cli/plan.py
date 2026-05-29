@@ -284,7 +284,7 @@ def run(args, logger: logging.Logger) -> int:
 
         # Load contract with environment overlay
         contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
-        fluid_version = contract.get("fluidVersion", "0.7.3")
+        fluid_version = contract.get("fluidVersion", _default_fluid_version())
 
         # --- Pre-plan contract gate ---------------------------------------
         # ``fluid plan`` used to plan ANY contract — including a pre-0.7
@@ -657,7 +657,7 @@ def _should_use_provider_actions(contract: Dict[str, Any], logger: logging.Logge
         return True
 
     # Check version and parser availability
-    version = contract.get("fluidVersion", "0.7.3")
+    version = contract.get("fluidVersion", _default_fluid_version())
     if _parse_semver(version) >= (0, 7, 0) and PROVIDER_ACTIONS_AVAILABLE:
         return True
 
@@ -861,14 +861,14 @@ def _plan_legacy(contract: Dict[str, Any], args, logger: logging.Logger) -> Dict
     actions = run_post_plan(provider, actions, logger)
 
     return {
-        "format_version": "0.7.3",
+        "format_version": contract.get("fluidVersion", _default_fluid_version()),
         "generated_at": time.time(),
         # Embed full contract (see rationale in _plan_with_provider_actions).
         "contract": contract,
         "contract_metadata": {
             "id": contract.get("id"),
             "name": contract.get("name") or contract.get("metadata", {}).get("name") or "Unknown",
-            "version": contract.get("fluidVersion", "0.7.3"),
+            "version": contract.get("fluidVersion", _default_fluid_version()),
             # See ``source_path`` rationale in _plan_with_provider_actions.
             "source_path": (
                 str(Path(args.contract).resolve()) if getattr(args, "contract", None) else None
