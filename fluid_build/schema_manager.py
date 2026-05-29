@@ -69,7 +69,7 @@ def _discover_bundled_versions() -> List[str]:
                 versions.add(match.group(1))
 
     if not versions:
-        versions.update(["0.7.1", "0.7.2", "0.7.3"])
+        versions.update(["0.7.1", "0.7.2", "0.7.3", "0.7.4"])
 
     return sorted(versions, key=_schema_version_sort_key)
 
@@ -347,7 +347,7 @@ class FluidSchemaManager:
         """Return the newest bundled FLUID schema version."""
         if cls.BUNDLED_VERSIONS:
             return cls.BUNDLED_VERSIONS[-1]
-        return "0.7.3"
+        return "0.7.4"
 
     @classmethod
     def latest_schema_path(cls) -> "Path":
@@ -399,10 +399,10 @@ class FluidSchemaManager:
         # Fallback: ensure we have at least one 0.7.x schema with a
         # minimal definition if none were loaded from disk.
         if not self._bundled_schemas:
-            self._bundled_schemas["0.7.3"] = {
+            self._bundled_schemas["0.7.4"] = {
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "description": "FLUID v0.7.3 Contract Schema (minimal fallback)",
+                "description": "FLUID v0.7.4 Contract Schema (minimal fallback)",
             }
 
     def detect_version(self, contract: Dict[str, Any]) -> Optional[SchemaVersion]:
