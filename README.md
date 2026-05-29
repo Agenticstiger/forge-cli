@@ -33,6 +33,10 @@
 
 ---
 
+> 🚀 **Latest: [`v0.8.6`](CHANGELOG.md)** on PyPI · contract schema **`fluidVersion 0.7.4`** · 📖 **[Full documentation →](https://agenticstiger.github.io/forge_docs/)**
+
+**Jump to:** [Why FLUID Forge?](#why-fluid-forge) · [What is FLUID?](#-what-is-fluid) · [Why We Built This](#-why-we-built-this) · [60 Seconds to Magic](#-60-seconds-to-magic) · [Installation](#installation) · [Contract Anatomy](#-anatomy-of-a-fluid-contract) · [Providers](#-providers--bring-your-own-cloud) · [CLI Reference](#-cli-command-reference) · [Templates](#-templates) · [Contributing](#-contributing)
+
 ## Why FLUID Forge?
 
 <table>
@@ -149,24 +153,27 @@ The same flow is exposed via the MCP `forge_from_source` tool — Claude Code, C
 
 ### Which ODPS? — Bitol center stage, LF/ODPI in the back pocket
 
-This codebase treats **Bitol Open Data Product Standard v1.0.0 as the
-default, center-stage ODPS**. The Linux Foundation / ODPI Open Data Product
-Specification v4.1 is supported as a secondary, opt-in target for catalogs
-that require it. Both standards share the three-letter ODPS acronym but are
-different specs published by different organisations.
+Two different specs share the **ODPS** acronym. FLUID treats **Bitol Open Data Product Standard v1.0.0** as the default, center-stage target; the Linux Foundation / ODPI Open Data Product Specification v4.1 is a secondary, opt-in export for catalogs that require it.
 
 | Standard | Role | What it is | Spec | CLI selector | `--format` |
 |---|---|---|---|---|---|
 | **Bitol ODPS v1.0.0** | **default** | Open Data Product **Standard**. Bidirectional; product wrapper that references ODCS contracts by `contractId`. | [bitol-io/open-data-product-standard](https://github.com/bitol-io/open-data-product-standard) | `fluid odps --spec bitol-1.0.0` *(default)* | `--format odps` *(default)* / `--format odps-bitol` |
 | **LF/ODPI ODPS v4.1** | opt-in | Open Data Product **Specification**. Hosted by the Linux Foundation / Open Data Product **Initiative** (ODPI). Export-only; single JSON document. | [Open-Data-Product-Initiative/v4.1](https://github.com/Open-Data-Product-Initiative/v4.1) | `fluid odps --spec odps-4.1` | `--format odps-v4.1` |
 
-Bitol ODPS export emits **1 ODPS doc + N sibling `<contractId>.odcs.yaml`** files — the canonical Bitol fragments layout. Import reverses it: a single ODPS file, a directory bundle, or a lone ODCS file all converge on one validated FLUID contract. `fluid forge --seed-from <path>` accepts the same three input shapes as a structural seed for AI authoring.
+Bitol export emits **1 ODPS doc + N sibling `<contractId>.odcs.yaml`** fragments; import reverses it — a single ODPS file, a directory bundle, or a lone ODCS file all converge on one validated FLUID contract (and `fluid forge --seed-from <path>` accepts the same three shapes as an AI-authoring seed).
 
-Back-compat aliases (all emit a WARNING pointing at the canonical form):
+<details>
+<summary>Back-compat aliases</summary>
+
+All emit a WARNING pointing at the canonical form:
 - `fluid opds` — letter-swap of `fluid odps`
 - `--spec odpi-4.1` and `--version 4.1` — historical labels for the LF/ODPI v4.1 spec
 - `--format opds` — historical default of `--format odps-v4.1` (LF/ODPI v4.1 JSON; **does NOT** map to the Bitol-default `--format odps`)
 - `fluid export-opds` — equivalent to `fluid generate standard --format odps-v4.1`
+
+</details>
+
+→ [full ODPS guide](https://agenticstiger.github.io/forge_docs/cli/odps.html)
 
 ### From dev to CI — `fluid generate ci`
 
@@ -194,7 +201,30 @@ Generated Jenkinsfiles install `fluid` via `pip install data-product-forge` at b
 
 ---
 
-## 🖥️ First-Time Setup from Source
+## Installation
+
+FLUID Forge is modular — install only what you need. **Requires Python 3.10+.**
+
+```bash
+pip install data-product-forge                # Minimal — CLI + Local/DuckDB provider
+pip install "data-product-forge[gcp]"         # + Google Cloud (BigQuery, GCS, Composer)
+pip install "data-product-forge[aws]"         # + AWS (S3, Glue, Athena, Redshift)
+pip install "data-product-forge[snowflake]"   # + Snowflake
+pip install "data-product-forge[all]"         # Everything (all providers + dev tools)
+```
+
+> 💡 **Tip:** We recommend [pipx](https://pipx.pypa.io/) for an isolated global install:
+> `pipx install "data-product-forge[all]"`
+
+Verify, then scaffold your first product:
+
+```bash
+fluid --version
+fluid init demo --template hello-world
+```
+
+<details>
+<summary><strong>Install from source (for contributors)</strong></summary>
 
 Choose your platform below for step-by-step instructions.
 
@@ -370,26 +400,18 @@ fluid validate examples\01-hello-world\contract.fluid.yaml
 
 </details>
 
+> Adding a provider to a source checkout? Use the editable form, e.g. `pip install -e ".[gcp]"` / `".[snowflake]"` / `".[all]"`.
+
+</details>
+
 ---
-
-### Installing additional providers
-
-Once the base install is working, add cloud providers as needed:
-
-```bash
-pip install -e ".[gcp]"         # + Google Cloud (BigQuery, GCS, Composer)
-pip install -e ".[snowflake]"   # + Snowflake
-pip install -e ".[all]"         # Everything (all providers + dev tools)
-```
-
-
 
 ## 🧬 Anatomy of a FLUID Contract
 
 Everything starts with `contract.fluid.yaml` — the **single source of truth** for your data product's entire lifecycle.
 
 ```yaml
-fluidVersion: "0.7.2"
+fluidVersion: "0.7.4"
 kind: DataProduct
 id: example.customer_360
 name: Customer 360
@@ -397,7 +419,7 @@ domain: analytics
 
 metadata:
   layer: Gold              # medallion vocabulary
-  productType: CDP         # Data Mesh vocabulary (NEW in v0.7.3) — Bronze↔SDP, Silver↔ADP, Gold↔CDP
+  productType: CDP         # Data Mesh vocabulary — Bronze↔SDP, Silver↔ADP, Gold↔CDP
   owner:
     team: data-platform
     email: platform@example.com
@@ -457,23 +479,6 @@ Providers are the bridge between your declarative contract and your target execu
 
 ---
 
-## 🛠️ Installation
-
-FLUID Forge is modular. Install only what you need.
-
-```bash
-pip install data-product-forge                # Minimal — CLI + Local/DuckDB provider
-pip install "data-product-forge[gcp]"         # + Google Cloud
-pip install "data-product-forge[aws]"         # + AWS
-pip install "data-product-forge[snowflake]"   # + Snowflake
-pip install "data-product-forge[all]"         # Everything
-```
-
-> 💡 **Tip:** We recommend [pipx](https://pipx.pypa.io/) for an isolated global install:
-> `pipx install "data-product-forge[all]"`
-
----
-
 ## 💻 CLI Command Reference
 
 FLUID Forge is designed to feel as natural as `git` or `terraform`.
@@ -486,6 +491,7 @@ fluid validate contract.fluid.yaml   # Validate schema, dependencies, syntax
 fluid plan contract.fluid.yaml       # Generate a deterministic execution plan
 fluid apply contract.fluid.yaml      # Execute the plan against your target provider
 fluid verify contract.fluid.yaml     # Post-deployment data quality & compliance checks
+fluid ship contract.fluid.yaml       # One-shot macro: validate → bundle → plan → apply
 ```
 
 ### AI & Code Generation
@@ -494,6 +500,9 @@ fluid verify contract.fluid.yaml     # Post-deployment data quality & compliance
 fluid forge                                  # 🤖 Interactive, AI-powered project creation
 fluid generate-airflow contract.fluid.yaml   # Compile contract → native Airflow DAG
 fluid generate-pipeline contract.fluid.yaml  # Scaffold transformation code
+fluid generate iac contract.fluid.yaml       # Emit a deterministic OpenTofu main.tf.json
+fluid stats                                  # Aggregate LLM cost across forge runs
+fluid agents list                            # List / show / prune forge runs (.fluid/agents/)
 ```
 
 ### Staged Forge Pipeline (v1.0)
@@ -531,7 +540,7 @@ fluid policy-compile contract.fluid.yaml   # Translate policies → native IAM
 fluid contract-tests contract.fluid.yaml   # Run assertion suites
 ```
 
-### MCP output port (NEW in v0.7.4)
+### MCP output port — serve data products to AI agents
 
 Turn any FLUID expose into an agent-consumable MCP server with the
 contract's `agentPolicy` enforced at every read.
@@ -561,6 +570,12 @@ templates (Caddy / nginx) for production mTLS.
 ```bash
 fluid graph contract.fluid.yaml   # Graphviz DAG of internal lineage
 fluid docs contract.fluid.yaml    # Auto-generate documentation from contract
+```
+
+### Diagnostics
+
+```bash
+fluid doctor   # Environment diagnostics — Python, providers, CLIs, creds
 ```
 
 ---
