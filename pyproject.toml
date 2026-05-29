@@ -330,13 +330,6 @@ dev = [
   # ``cli/__init__.py`` at import time) and that the tier-0
   # ``fluid_build._net`` leaf module stays free of fluid_build upstreams.
   "import-linter>=2.0",
-  # SBOM generation — ``scripts/generate_sbom.py`` builds a CycloneDX
-  # 1.5 document via the official model library rather than hand-emitting
-  # JSON (borrow-before-build; CycloneDX/cyclonedx-python-lib, Apache-2.0).
-  # Already present transitively via pip-audit/cyclonedx-bom; declared
-  # explicitly because the script now imports it directly.
-  "cyclonedx-python-lib>=8",
-  "packageurl-python>=0.11",
 ]
 
 # Light (in-process) integration-test emulators — Stage 1. moto mocks the
