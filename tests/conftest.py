@@ -180,6 +180,34 @@ def _disable_copilot_self_eval(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _stop_leaked_monitoring_threads():
+    """Drain every MonitoringSystem's background worker threads after each
+    test.
+
+    ``fluid_build.forge.core.monitoring.MonitoringSystem`` starts FOUR
+    daemon workers (metric/log/alert processors + aggregator) in its
+    ``__init__`` and only stops them on an explicit ``shutdown()``. Tests
+    that construct instances directly — and never shut them down — leak
+    4 threads each. Across the full suite that compounds into thousands of
+    threads, each reserving ~8MB of virtual stack, which exhausts virtual
+    address space and gets the process OOM-killed on Linux (this is what
+    silently hung the 3.13/3.14 CI jobs at ~95% — low RSS, ~11GB VSZ,
+    SIGKILL). Draining per-test keeps the live-thread count flat. Only
+    acts when monitoring was actually imported during the test, so it
+    costs nothing for the vast majority that never touch it.
+    """
+    import sys
+
+    yield
+    module = sys.modules.get("fluid_build.forge.core.monitoring")
+    if module is not None:
+        try:
+            module._shutdown_all_monitors()
+        except Exception:  # pragma: no cover — never fail teardown
+            pass
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_keyring():
     """Swap the OS keyring for a fresh in-memory backend in EVERY test.
 
