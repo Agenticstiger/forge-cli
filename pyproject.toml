@@ -294,6 +294,7 @@ dev = [
   "pytest-cov>=4.1",
   "pytest-asyncio>=0.23",        # For async test support
   "pytest-randomly>=3.15",       # Randomize test order to catch hidden deps
+  "pytest-timeout>=2.3",         # Bound any hung test (e.g. a deadlocked async session) so CI fails fast with a stack dump, not a silent job-kill
   "respx>=0.21",                 # HTTPX request mocking — used by acquisition test matrix
   "hypothesis>=6.100",           # Property-based testing — used by tests/property/
   "deepdiff>=7.0",               # Structural diff — used by OdcsProvider.roundtrip_check
@@ -502,6 +503,15 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short --strict-markers --disable-warnings -m 'not live_llm and not live_judge'"
+# Backstop: bound any single test at 10 min (pytest-timeout, thread
+# method). If a test ever DEADLOCKS in isolation it then FAILS FAST with
+# a thread-stack dump of exactly where it's stuck, instead of silently
+# consuming the CI job until the runner cancels it (which is how the
+# 3.13/3.14 hang stayed undiagnosed for ~10 min). No normal test — the
+# keyless suite runs in minutes total — comes near 10 min, so this is a
+# pure safety net; the gated live/heavy provider suites keep ample room.
+timeout = 600
+timeout_method = "thread"
 markers = [
     "unit: Unit tests (fast, no I/O)",
     "integration: Integration tests (may need network/files)",

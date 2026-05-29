@@ -69,6 +69,11 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # The keyless suite runs in ~8–12 min; 25 bounds a true hang (a
+    # leaked server loop / deadlocked async session) to minutes instead
+    # of GitHub's 6-hour default. A hung job that burns 6h of runner time
+    # before anyone notices is how the 3.13/3.14 deadlock stayed costly.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
