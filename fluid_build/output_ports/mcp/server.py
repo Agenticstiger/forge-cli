@@ -946,10 +946,11 @@ class OutputPortMcpServer:
         See :func:`_transport.run_http_async`."""
         return await _transport.run_http_async(self, host=host, port=port)
 
-    def stop_http(self) -> None:
+    def stop_http(self, *, force: bool = False) -> None:
         """Signal a running HTTP/SSE transport to shut down.
-        See :func:`_transport.stop_http`."""
-        _transport.stop_http(self)
+        Pass ``force=True`` for an immediate stop that does not wait for
+        lingering connections to drain. See :func:`_transport.stop_http`."""
+        _transport.stop_http(self, force=force)
 
     async def run_async(self) -> None:
         """Run on the SDK stdio transport until the client disconnects

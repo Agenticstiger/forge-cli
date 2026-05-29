@@ -401,15 +401,30 @@ def _running_sse_server(server: OutputPortMcpServer, port: int):
     try:
         yield
     finally:
-        # CLEANLY stop uvicorn — ``stop_http()`` flips ``should_exit``
-        # so serve() unwinds, then we join the thread. Relying on
-        # ``daemon=True`` alone leaked a spinning uvicorn event loop
-        # for the remainder of a full ``pytest tests/`` run, starving
-        # every later test of CPU (a ~4-min suite ballooned past
-        # 20 min). Joining with a timeout keeps the test bounded even
-        # if uvicorn is wedged.
-        server.stop_http()
-        thread.join(timeout=5.0)
+        # HARD-stop uvicorn. ``should_exit`` alone only breaks the accept
+        # loop; uvicorn's shutdown() then WAITS for any half-open SSE
+        # stream to drain. On Python 3.13/3.14 that wait outran the old
+        # join(timeout=5.0): the join silently gave up, the test "passed",
+        # and a LIVE uvicorn thread leaked into the rest of the run —
+        # spinning an event loop that starved every later async test until
+        # the CI job was cancelled (~10 min). That was the 3.13/3.14 hang.
+        # ``force=True`` sets uvicorn's force_exit so serve() returns at
+        # once instead of waiting on the connection.
+        server.stop_http(force=True)
+        # Generous join: force_exit returns serve() near-instantly once the
+        # client has disconnected (the real flow — every test closes its
+        # session/stream before this finally runs), but a heavily-loaded CI
+        # runner may take a few seconds to fully unwind. 15s covers that
+        # without false-tripping the assert below.
+        thread.join(timeout=15.0)
+        # Never SILENTLY leak. If the thread is somehow still alive, fail
+        # loudly HERE — a local, diagnosable failure on THIS test — rather
+        # than poisoning the whole suite with a starving background loop
+        # (and the job-level timeout-minutes / per-test pytest-timeout are
+        # the last-resort backstops if it ever does).
+        assert (
+            not thread.is_alive()
+        ), "SSE server thread did not stop after force-stop — would leak a uvicorn loop"
 
 
 @pytest.mark.asyncio

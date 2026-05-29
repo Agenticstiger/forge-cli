@@ -190,16 +190,29 @@ async def run_http_async(
         srv._uvicorn_server = None
 
 
-def stop_http(srv: "OutputPortMcpServer") -> None:
+def stop_http(srv: "OutputPortMcpServer", *, force: bool = False) -> None:
     """Signal a running HTTP/SSE transport to shut down.
 
     Sets uvicorn's ``should_exit`` flag so the ``serve()`` loop
     returns at its next iteration. Safe to call from any thread
     (the flag is a plain bool uvicorn polls). No-op when the
-    gateway isn't running in HTTP mode."""
+    gateway isn't running in HTTP mode.
+
+    When ``force`` is True, ALSO set uvicorn's ``force_exit``. By
+    itself ``should_exit`` only breaks the accept loop — uvicorn's
+    ``shutdown()`` then WAITS for any still-open connection to drain
+    (a half-open MCP-SSE stream whose server-side handler hasn't
+    noticed the client went away can hold this open for a long time).
+    ``force_exit`` makes ``serve()`` return immediately by cancelling
+    those connections instead of waiting. Graceful (``force=False``)
+    is the right default for a production stop so in-flight tool calls
+    finish; a hard stop is what a test harness — or any "shut down
+    NOW" caller — needs so it never leaks a spinning server loop."""
     server = getattr(srv, "_uvicorn_server", None)
     if server is not None:
         server.should_exit = True
+        if force:
+            server.force_exit = True
 
 
 async def run_async(srv: "OutputPortMcpServer") -> None:
