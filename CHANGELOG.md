@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-05-29
+
+### Fixed
+
+- **Daemon-thread leak that OOM-hung CI on Python 3.13/3.14.**
+  `forge.core.monitoring.MonitoringSystem` started four background daemon
+  workers (metric / log / alert processors + aggregator) per instance and
+  only stopped them on an explicit `shutdown()`. Code that constructed
+  instances and dropped them (notably the test suite) leaked threads
+  without bound; across a long run the per-thread virtual stacks exhausted
+  address space and the OS OOM-killed the process. Workers now stop
+  promptly via a `threading.Event`, live instances are tracked in a
+  `WeakSet`, `shutdown()`/context-manager support is added, and a per-test
+  fixture drains them.
+- **`ConfigManager` could corrupt process-wide defaults.** `_load_defaults`
+  shallow-copied the module-level `DEFAULT_CONFIG`, sharing its nested
+  dicts — so a later `set("logging.level", ...)` or config-file merge
+  mutated the shared defaults in place, affecting every other
+  `ConfigManager` in the process. Now deep-copies the defaults.
+- **MCP gateway rate limiter no longer leaks a background thread.**
+  Replaced PyrateLimiter's `Limiter` (which spins a per-instance "leaker"
+  thread) with an in-process monotonic-clock deque sliding window —
+  functionally identical for the single-replica gateway, with no thread
+  and no dependency. Drops the `pyrate-limiter` dependency.
+
 ### Added (closes the final 5 honest gaps from the prior audit)
 
 - **JWT bearer + mTLS gateway-native identity**
