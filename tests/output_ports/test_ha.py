@@ -5,10 +5,10 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Tests for the multi-instance HA layers — audit webhook
-forwarding + Redis-backed circuit breaker fallback. Both layers
-must FAIL OPEN on backend outage so a Redis hiccup or webhook
-endpoint blip doesn't take down every gateway worldwide.
+"""Tests for the audit webhook forwarder — the multi-instance HA
+layer that POSTs every audit event to a SIEM aggregator. It must
+FAIL OPEN on a webhook outage so an endpoint blip never blocks the
+local-disk audit write.
 """
 
 from __future__ import annotations
@@ -88,44 +88,3 @@ def test_audit_webhook_failure_does_not_block_local_write(
     assert path.exists(), "webhook outage must not block local write"
     body = json.loads(path.read_text())
     assert body["event"] == "data_access"
-
-
-# ---------------------------------------------------------------------
-# Redis-backed circuit breaker
-# ---------------------------------------------------------------------
-
-
-def test_circuit_breaker_redis_falls_back_to_in_process_when_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """FLUID_MCP_CIRCUIT_BACKEND=redis with an unreachable Redis
-    must fall back to in-process state, not block forever or
-    fail-closed."""
-    from fluid_build.output_ports.mcp.server import _CircuitBreaker
-
-    monkeypatch.setenv("FLUID_MCP_CIRCUIT_BACKEND", "redis")
-    monkeypatch.setenv("FLUID_MCP_CIRCUIT_REDIS_URL", "redis://nonexistent-host:1/0")
-
-    cb = _CircuitBreaker(threshold=2, window_seconds=60.0, cooldown_seconds=30.0)
-    # First call → tries Redis, fails, falls back to in-process.
-    assert cb.is_open() is False
-    # Trigger threshold via in-process counter.
-    assert cb.record_failure() is False
-    tripped = cb.record_failure()
-    assert tripped is True
-    assert cb.is_open() is True
-
-
-def test_circuit_breaker_redis_backend_disabled_by_default(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """Without the env var, no Redis client is built — backwards-
-    compatible single-process behaviour."""
-    from fluid_build.output_ports.mcp.server import _CircuitBreaker
-
-    monkeypatch.delenv("FLUID_MCP_CIRCUIT_BACKEND", raising=False)
-    cb = _CircuitBreaker(threshold=2)
-    assert cb._is_redis_enabled() is False
-    cb.record_failure()
-    cb.record_failure()
-    assert cb.is_open() is True

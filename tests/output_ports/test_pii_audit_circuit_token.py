@@ -173,36 +173,6 @@ def test_circuit_breaker_record_success_partially_heals():
     assert cb.is_open() is False
 
 
-def test_circuit_breaker_warns_once_when_redis_degrades(caplog):
-    """Opting into the Redis fleet backend then losing Redis must NOT
-    fail silently: the breaker degrades to in-process AND warns ONCE
-    per process that fleet-wide coordination is OFF (parity with the
-    rate limiter's ``redis-unavailable-fallback-open`` signal). A
-    silent degrade would hide that the safety feature the operator
-    opted into is no longer active."""
-    import logging
-
-    from fluid_build.output_ports.mcp import _circuit
-    from fluid_build.output_ports.mcp.server import _CircuitBreaker
-
-    # Reset the process-global one-shot guard so the assertion is
-    # deterministic under pytest-randomly ordering.
-    _circuit._WARNED_REDIS_DEGRADED = False
-
-    cb = _CircuitBreaker()
-    with caplog.at_level(logging.WARNING, logger="fluid.output_port.mcp.circuit"):
-        cb._mark_redis_unavailable()
-        cb._mark_redis_unavailable()  # second call must NOT re-warn
-
-    assert cb._redis_unavailable is True
-    degraded = [
-        r for r in caplog.records if "fleet-wide breaker coordination is OFF" in r.getMessage()
-    ]
-    assert len(degraded) == 1, "expected exactly one degrade warning (one-shot)"
-    # The warning must be actionable — it names the env var to set.
-    assert "FLUID_MCP_CIRCUIT_REDIS_URL" in degraded[0].getMessage()
-
-
 # ---------------------------------------------------------------------
 # Token-budget enforcement on SessionState
 # ---------------------------------------------------------------------

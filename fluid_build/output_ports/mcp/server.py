@@ -133,10 +133,6 @@ DEFAULT_QUERY_TIMEOUT_SECONDS = 60.0
 DEFAULT_RATE_LIMIT_CALLS = int(os.environ.get("FLUID_MCP_RATE_LIMIT", "60"))
 DEFAULT_RATE_LIMIT_WINDOW_SECONDS = float(os.environ.get("FLUID_MCP_RATE_WINDOW_SECONDS", "60"))
 
-# One-shot guard so the "redis rate-limit backend is experimental"
-# notice fires once per process, the first time it's actually selected.
-_WARNED_RATE_REDIS_EXPERIMENTAL = False
-
 # Backpressure: max concurrent in-flight tool calls per gateway
 # process. Prevents a runaway agent from saturating the engine
 # connection pool. Set 0 to disable.
@@ -198,12 +194,9 @@ class SessionState:
     # ``rate_limit_calls`` is 0 the gate is disabled.
     rate_limit_calls: int = DEFAULT_RATE_LIMIT_CALLS
     rate_limit_window_seconds: float = DEFAULT_RATE_LIMIT_WINDOW_SECONDS
-    # Lazily-built PyrateLimiter instances — in-process (single
-    # instance) + optional Redis fleet backend — plus the fail-open
-    # degrade flag. See :meth:`check_rate_limit`.
+    # Lazily-built in-process PyrateLimiter (per-SessionState
+    # ``InMemoryBucket``). See :meth:`check_rate_limit`.
     _rate_limiter: Optional[Any] = None
-    _redis_rate_limiter: Optional[Any] = None
-    _rate_redis_unavailable: bool = False
     # In-flight tool-call count INCLUDING calls queued behind the
     # concurrency semaphore; used by graceful-shutdown to drain so
     # nothing is dropped on SIGTERM.
@@ -271,34 +264,17 @@ class SessionState:
         the gate.
 
         Borrow-before-build (vutran1710/PyrateLimiter, MIT): the window
-        is a PyrateLimiter ``InMemoryBucket`` for the single-instance
-        default, or a ``RedisBucket`` (same sorted-set sliding window)
-        when ``FLUID_MCP_RATE_LIMIT_BACKEND=redis`` so a fleet of
-        gateway replicas shares one budget. The one behaviour the
-        library leaves to the caller is the **fail-open → in-process
-        degrade**: if Redis is unreachable we warn once and fall back to
-        the in-process limiter (dropping all traffic on a Redis outage
-        is worse than a transient fleet-wide-budget gap).
+        is a PyrateLimiter ``InMemoryBucket`` (sorted-set sliding
+        window). In-process / single-replica — a Redis fleet backend
+        was removed as speculative (no multi-replica deployment yet).
         """
         if self.rate_limit_calls <= 0:
             return True, None
-        limiter, label = self._resolve_rate_limiter()
-        try:
-            acquired = bool(limiter.try_acquire("call", blocking=False))
-        except Exception as exc:  # noqa: BLE001 — Redis hiccup mid-acquire → degrade
-            self.logger.warning(
-                "rate_limit_acquire_failed (%s backend); degrading to in-process: %s",
-                label,
-                exc,
-            )
-            self._rate_redis_unavailable = True
-            acquired = bool(self._inprocess_rate_limiter().try_acquire("call", blocking=False))
-            label = "memory"
+        acquired = bool(self._inprocess_rate_limiter().try_acquire("call", blocking=False))
         if not acquired:
-            fleet = ", fleet-wide via Redis" if label == "redis" else ""
             return False, (
                 f"rate-limit-exceeded ({self.rate_limit_calls} calls per "
-                f"{self.rate_limit_window_seconds}s{fleet})"
+                f"{self.rate_limit_window_seconds}s)"
             )
         return True, None
 
@@ -317,65 +293,6 @@ class SessionState:
 
             self._rate_limiter = Limiter(InMemoryBucket([self._make_rate()]))
         return self._rate_limiter
-
-    def _resolve_rate_limiter(self) -> "tuple[Any, str]":
-        """Return ``(limiter, backend_label)``.
-
-        Redis-backed (fleet-wide, shared across replicas via a
-        ``RedisBucket`` keyed ``fluid:mcp:rate:{contract}:{expose}``)
-        when ``FLUID_MCP_RATE_LIMIT_BACKEND=redis`` and Redis is
-        reachable; otherwise the in-process limiter. A Redis failure
-        flips ``_rate_redis_unavailable`` and degrades to in-process
-        with a one-shot warning (fail-open — see ``check_rate_limit``).
-        """
-        backend = os.environ.get("FLUID_MCP_RATE_LIMIT_BACKEND", "memory").lower()
-        if backend != "redis" or self._rate_redis_unavailable:
-            return self._inprocess_rate_limiter(), "memory"
-        global _WARNED_RATE_REDIS_EXPERIMENTAL
-        if not _WARNED_RATE_REDIS_EXPERIMENTAL:
-            _WARNED_RATE_REDIS_EXPERIMENTAL = True
-            self.logger.warning(
-                "mcp_rate_limit_redis_experimental: FLUID_MCP_RATE_LIMIT_BACKEND=redis "
-                "(fleet-wide shared rate limit) is EXPERIMENTAL and not yet under "
-                "support guarantees. The default in-process limiter covers "
-                "single-replica deployments; enable Redis only once you run multiple "
-                "gateway replicas that must share one budget."
-            )
-        if self._redis_rate_limiter is not None:
-            return self._redis_rate_limiter, "redis"
-        try:
-            import redis  # type: ignore[import-not-found]
-            from pyrate_limiter import Limiter, RedisBucket
-
-            url = os.environ.get("FLUID_MCP_RATE_LIMIT_REDIS_URL", "redis://127.0.0.1:6379/0")
-            client = getattr(self, "_redis_client", None)
-            if client is None:
-                client = redis.Redis.from_url(url, socket_timeout=2.0)
-                client.ping()
-                self._redis_client = client
-            contract_id = self.contract.get("id") or "default"
-            expose_id = self.expose.get("exposeId") or "default"
-            bucket_key = f"fluid:mcp:rate:{contract_id}:{expose_id}"
-            self._redis_rate_limiter = Limiter(
-                RedisBucket.init([self._make_rate()], client, bucket_key)
-            )
-            return self._redis_rate_limiter, "redis"
-        except ImportError:
-            self.logger.warning(
-                "FLUID_MCP_RATE_LIMIT_BACKEND=redis but redis-py not installed; "
-                "using in-process rate limit. Install with: pip install redis"
-            )
-            self._rate_redis_unavailable = True
-            return self._inprocess_rate_limiter(), "memory"
-        except Exception as exc:  # noqa: BLE001
-            self.logger.warning(
-                "redis_rate_limit_unavailable (%s) — fleet-wide rate limit OFF, "
-                "degrading to in-process. Point FLUID_MCP_RATE_LIMIT_REDIS_URL at "
-                "a reachable Redis to restore it.",
-                exc,
-            )
-            self._rate_redis_unavailable = True
-            return self._inprocess_rate_limiter(), "memory"
 
     def check_token_budget(self, estimated_tokens: int) -> tuple[bool, Optional[str]]:
         """Per-day token-budget check against
