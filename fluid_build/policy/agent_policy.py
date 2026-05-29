@@ -31,7 +31,7 @@ runtime call site.
 Validator additions in v0.7.4:
 
 * :meth:`AgentPolicyValidator._validate_agent_port` warns when an
-  expose carries ``agentPort.kind=mcp`` (i.e. opts in to the MCP
+  expose carries an ``mcp`` block (i.e. opts in to the MCP
   gateway) but its ``policy.agentPolicy`` declares neither
   ``allowedModels`` nor ``deniedModels`` — without one or the other
   the runtime gate is open, which silently defeats the user's
@@ -140,7 +140,7 @@ class AgentPolicyValidator:
             # Validate reasoning constraints
             self._validate_reasoning_constraints(agent_policy, expose_id, violations)
 
-            # Validate agentPort coupling (NEW in v0.7.4) — warn when
+            # Validate mcp/agentPolicy coupling (NEW in v0.7.4) — warn when
             # the expose opts into the MCP gateway but agentPolicy
             # declares no model gate.
             self._validate_agent_port(expose, agent_policy, expose_id, violations)
@@ -314,19 +314,15 @@ class AgentPolicyValidator:
         """Warn when an expose opts into the MCP gateway but
         agentPolicy declares no model-level gate.
 
-        ``agentPort.kind=mcp`` (or the legacy ``mcp`` block) opts the
-        expose into runtime enforcement at
+        An ``expose.mcp`` block opts the expose into runtime enforcement
+        at
         :class:`fluid_build.output_ports.mcp.policy.OutputPortPolicy`.
         Without ``allowedModels`` or ``deniedModels`` the gate is
         permissive — the operator's intent to govern who reads the
         data is silently defeated. Surface that as a warning so the
         contract author sees it before the data product ships.
         """
-        agent_port = expose.get("agentPort") or {}
-        legacy_mcp = expose.get("mcp")
-        opts_into_mcp = (isinstance(agent_port, dict) and agent_port.get("kind") == "mcp") or bool(
-            legacy_mcp
-        )
+        opts_into_mcp = bool(expose.get("mcp"))
         if not opts_into_mcp:
             return
         has_model_gate = bool(agent_policy.get("allowedModels") or agent_policy.get("deniedModels"))
@@ -335,14 +331,14 @@ class AgentPolicyValidator:
                 AgentPolicyViolation(
                     severity="warning",
                     message=(
-                        "Expose opts into the MCP gateway (agentPort.kind=mcp "
-                        "or legacy `mcp` block) but agentPolicy declares "
-                        "neither allowedModels nor deniedModels. The runtime "
-                        "gate will accept any model; the contract's intent "
-                        "to govern downstream LLM access is silently lost."
+                        "Expose opts into the MCP gateway (`mcp` block) but "
+                        "agentPolicy declares neither allowedModels nor "
+                        "deniedModels. The runtime gate will accept any "
+                        "model; the contract's intent to govern downstream "
+                        "LLM access is silently lost."
                     ),
                     expose_id=expose_id,
-                    policy_field="agentPort/agentPolicy",
+                    policy_field="mcp/agentPolicy",
                     suggestion=(
                         "Add agentPolicy.allowedModels (e.g. "
                         "['claude-haiku', 'gpt-4o-mini']) or "

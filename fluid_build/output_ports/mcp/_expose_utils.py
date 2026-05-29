@@ -35,8 +35,8 @@ def find_expose(contract: Mapping[str, Any], expose_id: Optional[str]) -> Mappin
     exposes and no id is given, a ``ValueError`` lists them so the
     operator can pick.
 
-    The error message is agentPort-aware: when more than one expose
-    carries an ``agentPort.kind=mcp`` (or legacy ``mcp``) block, the
+    The error message is mcp-aware: when more than one expose
+    carries an ``mcp`` block, the
     eligible candidates are listed separately so the operator
     immediately sees which ``--expose-id`` choices the gateway can
     actually serve.
@@ -54,11 +54,7 @@ def find_expose(contract: Mapping[str, Any], expose_id: Optional[str]) -> Mappin
         candidate = expose.get("exposeId")
         if isinstance(candidate, str):
             available.append(candidate)
-            agent_port = expose.get("agentPort") or {}
-            has_agent_port = (
-                isinstance(agent_port, dict) and agent_port.get("kind") == "mcp"
-            ) or bool(expose.get("mcp"))
-            if has_agent_port:
+            if bool(expose.get("mcp")):
                 agent_eligible.append(candidate)
             if expose_id is not None and candidate == expose_id:
                 return expose
@@ -69,16 +65,12 @@ def find_expose(contract: Mapping[str, Any], expose_id: Optional[str]) -> Mappin
         if not matches:
             raise ValueError("Contract has no exposes")
         if agent_eligible:
-            eligible_hint = (
-                f" Agent-eligible exposes (carry agentPort.kind=mcp or "
-                f"legacy mcp block): {agent_eligible}."
-            )
+            eligible_hint = f" Agent-eligible exposes (carry an `mcp` block): {agent_eligible}."
         else:
             eligible_hint = (
-                " None of these exposes carry agentPort.kind=mcp; the "
+                " None of these exposes carry an `mcp` block; the "
                 "gateway will refuse to serve a non-eligible expose. "
-                "Add an `agentPort: { kind: mcp }` block to the expose "
-                "you want to serve."
+                "Add an `mcp:` block to the expose you want to serve."
             )
         raise ValueError(
             f"Contract has {len(matches)} exposes; pass --expose-id to "
@@ -145,7 +137,6 @@ def list_exposes(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "tableReference": table_reference,
                 "hasSemantics": bool(expose.get("semantics")),
                 "hasMcpOverrides": bool(expose.get("mcp")),
-                "hasAgentPort": bool(expose.get("agentPort")),
             }
         )
     return out

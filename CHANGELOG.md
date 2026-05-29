@@ -203,17 +203,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added (v0.7.4 base — from prior turns)
 
-- **FLUID schema v0.7.4 — Agent Port + Runtime agentPolicy Enforcement.**
+- **FLUID schema v0.7.4 — Runtime agentPolicy Enforcement at the MCP gateway.**
   Closes the legitimacy gap where `agentPolicy` was declarative metadata
-  only. Adds a first-class `expose.agentPort` block (today only
-  `kind: mcp` is implemented; `kind: a2a` and `kind: iatp` are reserved
-  for future versions and the gateway fails-loud at startup if set).
-  Backward-compatible with v0.7.3: existing contracts validate unchanged
-  AND the legacy `expose.mcp` block is accepted as an implicit
-  `agentPort.kind=mcp`.
+  only. Adds the `expose.mcp` block: its presence declares an expose
+  agent-consumable over MCP (sampling caps + classification) and opts it
+  into the gateway. Backward-compatible with v0.7.3: existing contracts
+  validate unchanged.
 
 - **`fluid mcp output-port serve` runtime enforcement of `agentPolicy`.**
-  When an expose carries `agentPort.kind=mcp` (or the legacy `mcp` block),
+  When an expose carries an `expose.mcp` block,
   the gateway loads `policy.agentPolicy.allowedModels` / `deniedModels`
   and `allowedUseCases` / `deniedUseCases` and enforces them on every
   `tools/call`. Caller `model_id` and `useCase` come from the MCP

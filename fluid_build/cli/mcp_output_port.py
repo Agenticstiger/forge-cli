@@ -355,20 +355,6 @@ def _run_serve(args, logger: logging.Logger) -> int:
             f"(only expose in contract).\n"
         )
         sys.stderr.flush()
-    # Fail-loud guard for unsupported agentPort kinds. The schema
-    # accepts ``a2a`` and ``iatp`` as reserved values for future
-    # versions, but the gateway only implements ``mcp`` today. A
-    # contract that opts into an unimplemented kind would silently
-    # serve the MCP surface, defeating the operator's intent.
-    agent_port = expose.get("agentPort") or {}
-    port_kind = agent_port.get("kind") if isinstance(agent_port, dict) else None
-    if port_kind and port_kind != "mcp":
-        raise CLIError(
-            f"expose.agentPort.kind={port_kind!r} is reserved but not yet "
-            "implemented by `fluid mcp output-port serve`. Only `kind: mcp` "
-            "is supported in this release. Remove the agentPort block or "
-            "set kind=mcp explicitly."
-        )
     policy = _build_policy(args, contract_path=contract_path, expose=expose)
     # Boot-time auditRequired enforcement. The contract can declare
     # ``policy.agentPolicy.auditRequired: true``; the gateway always
@@ -462,7 +448,6 @@ def _run_serve(args, logger: logging.Logger) -> int:
             "maxSampleRows": policy.max_sample_rows,
             "policySource": policy.policy_source,
             "auditRequired": audit_required,
-            "agentPortKind": port_kind or "implicit-mcp",
         },
     )
     transport = getattr(args, "transport", "stdio")

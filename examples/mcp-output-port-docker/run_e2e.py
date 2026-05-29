@@ -113,7 +113,7 @@ def _build_duckdb_contract() -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 {"name": "medical_note", "type": "STRING", "sensitivity": "phi"},
             ]
         },
-        "agentPort": {"kind": "mcp", "transport": "stdio", "tools": ["sample"]},
+        "mcp": {"sampling": {"maxRows": 5}},
         "policy": {
             "agentPolicy": {
                 "allowedModels": [LLM_BARE],

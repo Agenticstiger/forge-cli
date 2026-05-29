@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://open-data-protocol.github.io/fluid/schema/fluid-schema-0.7.4.json",
-  "title": "FLUID 0.7.4 — Agent Port + Runtime agentPolicy Enforcement",
-  "description": "FLUID Data Product contract (v0.7.4). Agent Port + Runtime agentPolicy Enforcement Release.\n\n🔥 NEW in v0.7.4:\n• agentPort — First-class declaration that an expose is agent-consumable via a named port kind. Today only `kind: mcp` is implemented; `kind: a2a` and `kind: iatp` are reserved for future versions. Aliases the legacy `expose.mcp` block.\n• Runtime agentPolicy enforcement — When `agentPort.kind=mcp` is present, `policy.agentPolicy.allowedModels` / `deniedModels` and `allowedUseCases` / `deniedUseCases` are enforced at the Fluid MCP gateway (`fluid mcp output-port serve`) on every read. Closes the legitimacy gap where these fields were previously declarative metadata only.\n• Backward compatible with v0.7.3 — All v0.7.3 contracts remain valid; the new `agentPort` field is additive and optional. Existing `expose.mcp` blocks are accepted as an implicit `agentPort.kind=mcp`.\n\n📋 Inherited from v0.7.3 (Source-Aligned Acquisition):\n• Acquisition build pattern — First-class support for source-aligned data products that ingest external systems (Salesforce, Postgres, Kafka, files) into the mesh.\n• Six ingestion engines — duckdb (zero-infra files/JDBC), airbyte (350+ SaaS connectors), meltano (600+ Singer taps), dlt (Python-native), kafka-connect (streaming), debezium (CDC).\n• Three deployment modes — embedded (in-process), bring-your-own (existing server), managed (Forge provisions via Helm/Compose/OpenTofu).\n• Capability-based negotiation — Runners declare {full_refresh, incremental_append, incremental_dedup, cdc, streaming, schema_discovery, dlp_scan, exactly_once}; contract asks validated against declarations.\n• Schema evolution semantics — schemaPolicy ∈ {strict, discover_and_freeze, evolve_safe, evolve_all} with concrete per-change behavior.\n• Delivery guarantees — at_most_once | at_least_once | exactly_once with idempotency keys and DLQ semantics.\n• Source supply-chain security — Cosign image signature verification + SLSA provenance required in production.\n• Top-level retention block — runState, runLogs, lineage, dlq durations.\n• Extended sovereignty.dataResidency — region pinning + prohibitTransferTo for runtime enforcement.\n\n📋 Inherited from v0.7.2 (Semantic Layer):\n• Semantic model definitions — Optional `semantics` block on each expose for entities, measures, dimensions, and metrics.\n• Agent-consumable business logic — Eliminates semantic hallucination by providing machine-readable metric definitions.\n• Industry-aligned primitives — Compatible with dbt MetricFlow, Snowflake Semantic Views, and OSI-aligned formats.\n\n📋 Inherited from v0.7.1 (Provider-First Orchestration + Agentic Governance):\n• Agentic governance — AI/LLM usage policies (agentPolicy) declare which models can consume data and for what purposes (runtime enforcement added in v0.7.4 — see above).\n• Sovereignty constraints — Top-level jurisdiction and data residency requirements for compliance enforcement.\n• Orchestration philosophy — Pragmatic engine enumeration (v0.7.x) with path to capability-based abstraction (v0.8.0+).\n• Provider actions as first-class tasks — Direct invocation of provider actions (aws.s3.ensure_bucket, sf.table.ensure) without wrapper operators.\n• Unified task type taxonomy — provider_action, fluid_*, bash, python, sensor.\n• Data product references in datasets — Link trigger datasets to actual `exposes[]` with strong typing and auto-URI generation.\n• Task output → expose mapping — Formal `produces[]` declaration for automatic dataset registration and lineage.\n• Cross-provider workflow patterns — Native support for multi-cloud pipelines with XCom data passing.\n• Cost tracking — Track actual vs estimated costs with budget enforcement.\n\n🎯 Design Philosophy:\n• Provider actions = orchestration primitives.\n• Contracts drive both infrastructure and workflows.\n• Strong typing and validation.\n• Natural multi-cloud/multi-provider patterns.\n• Minimal abstraction layers.\n• Agentic governance: data owners control AI/LLM usage boundaries.\n• Sovereignty-first: jurisdiction constraints enforced at contract level.\n\n⚙️ Orchestration Philosophy (v0.7.x):\n• Pragmatic approach: enumerate known engines (airflow, dagster, prefect) for immediate adoption.\n• Trade-off: implementation-specific vs pure abstraction — favouring real-world deployment patterns.\n• Future path: v0.8.0+ will evolve toward a capability-based orchestration model.\n• Escape hatch: `custom` engine allows experimentation without schema changes.",
+  "title": "FLUID 0.7.4 — Runtime agentPolicy Enforcement at the MCP Gateway",
+  "description": "FLUID Data Product contract (v0.7.4). Runtime agentPolicy Enforcement Release.\n\n🔥 NEW in v0.7.4:\n• MCP output-port gateway — An `expose.mcp` block declares an expose as agent-consumable over MCP (sampling caps + classification); its presence opts the expose into `fluid mcp output-port serve`.\n• Runtime agentPolicy enforcement — When an `expose.mcp` block is present, `policy.agentPolicy.allowedModels` / `deniedModels` and `allowedUseCases` / `deniedUseCases` are enforced at the Fluid MCP gateway on every read. Closes the legitimacy gap where these fields were previously declarative metadata only.\n• Backward compatible with v0.7.3 — All v0.7.3 contracts remain valid; the new `expose.mcp` block is additive and optional.\n\n📋 Inherited from v0.7.3 (Source-Aligned Acquisition):\n• Acquisition build pattern — First-class support for source-aligned data products that ingest external systems (Salesforce, Postgres, Kafka, files) into the mesh.\n• Six ingestion engines — duckdb (zero-infra files/JDBC), airbyte (350+ SaaS connectors), meltano (600+ Singer taps), dlt (Python-native), kafka-connect (streaming), debezium (CDC).\n• Three deployment modes — embedded (in-process), bring-your-own (existing server), managed (Forge provisions via Helm/Compose/OpenTofu).\n• Capability-based negotiation — Runners declare {full_refresh, incremental_append, incremental_dedup, cdc, streaming, schema_discovery, dlp_scan, exactly_once}; contract asks validated against declarations.\n• Schema evolution semantics — schemaPolicy ∈ {strict, discover_and_freeze, evolve_safe, evolve_all} with concrete per-change behavior.\n• Delivery guarantees — at_most_once | at_least_once | exactly_once with idempotency keys and DLQ semantics.\n• Source supply-chain security — Cosign image signature verification + SLSA provenance required in production.\n• Top-level retention block — runState, runLogs, lineage, dlq durations.\n• Extended sovereignty.dataResidency — region pinning + prohibitTransferTo for runtime enforcement.\n\n📋 Inherited from v0.7.2 (Semantic Layer):\n• Semantic model definitions — Optional `semantics` block on each expose for entities, measures, dimensions, and metrics.\n• Agent-consumable business logic — Eliminates semantic hallucination by providing machine-readable metric definitions.\n• Industry-aligned primitives — Compatible with dbt MetricFlow, Snowflake Semantic Views, and OSI-aligned formats.\n\n📋 Inherited from v0.7.1 (Provider-First Orchestration + Agentic Governance):\n• Agentic governance — AI/LLM usage policies (agentPolicy) declare which models can consume data and for what purposes (runtime enforcement added in v0.7.4 — see above).\n• Sovereignty constraints — Top-level jurisdiction and data residency requirements for compliance enforcement.\n• Orchestration philosophy — Pragmatic engine enumeration (v0.7.x) with path to capability-based abstraction (v0.8.0+).\n• Provider actions as first-class tasks — Direct invocation of provider actions (aws.s3.ensure_bucket, sf.table.ensure) without wrapper operators.\n• Unified task type taxonomy — provider_action, fluid_*, bash, python, sensor.\n• Data product references in datasets — Link trigger datasets to actual `exposes[]` with strong typing and auto-URI generation.\n• Task output → expose mapping — Formal `produces[]` declaration for automatic dataset registration and lineage.\n• Cross-provider workflow patterns — Native support for multi-cloud pipelines with XCom data passing.\n• Cost tracking — Track actual vs estimated costs with budget enforcement.\n\n🎯 Design Philosophy:\n• Provider actions = orchestration primitives.\n• Contracts drive both infrastructure and workflows.\n• Strong typing and validation.\n• Natural multi-cloud/multi-provider patterns.\n• Minimal abstraction layers.\n• Agentic governance: data owners control AI/LLM usage boundaries.\n• Sovereignty-first: jurisdiction constraints enforced at contract level.\n\n⚙️ Orchestration Philosophy (v0.7.x):\n• Pragmatic approach: enumerate known engines (airflow, dagster, prefect) for immediate adoption.\n• Trade-off: implementation-specific vs pure abstraction — favouring real-world deployment patterns.\n• Future path: v0.8.0+ will evolve toward a capability-based orchestration model.\n• Escape hatch: `custom` engine allows experimentation without schema changes.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -103,7 +103,7 @@
         "0.7.3",
         "0.7.4"
       ],
-      "description": "Contract schema version. Accepts '0.7.3' (source-aligned data products + acquisition pattern + ingestion engines) or '0.7.4' (adds agentPort + runtime agentPolicy enforcement at the MCP gateway). 0.7.4 is fully backward-compatible with 0.7.3 — every 0.7.3 contract validates as 0.7.4 unchanged.",
+      "description": "Contract schema version. Accepts '0.7.3' (source-aligned data products + acquisition pattern + ingestion engines) or '0.7.4' (adds the MCP output-port gateway + runtime agentPolicy enforcement). 0.7.4 is fully backward-compatible with 0.7.3 — every 0.7.3 contract validates as 0.7.4 unchanged.",
       "examples": [
         "0.7.4",
         "0.7.3"
@@ -640,11 +640,7 @@
         },
         "mcp": {
           "$ref": "#/$defs/exposeMcp",
-          "description": "NEW in v0.7.4 (alias of agentPort.kind=mcp): Per-expose overrides for the consumer-side MCP output-port server (`fluid mcp output-port serve`). Use `agentPort` for the forward-looking shape; `mcp` is kept as the operational alias so existing contracts continue to work."
-        },
-        "agentPort": {
-          "$ref": "#/$defs/agentPort",
-          "description": "NEW in v0.7.4: Declares this expose as agent-consumable via a named port kind (mcp today; a2a / iatp reserved for future versions). The presence of agentPort.kind=mcp opts the expose into the Fluid MCP gateway, where `policy.agentPolicy.allowedModels` / `allowedUseCases` are enforced at every read. Backward-compatible: when absent, the legacy `mcp` block (if any) is treated as an implicit agentPort.kind=mcp; when both are present they are merged with `agentPort` winning on conflicts."
+          "description": "NEW in v0.7.4: Declares this expose as agent-consumable over MCP, with per-expose overrides for the consumer-side output-port server (`fluid mcp output-port serve`). Its presence opts the expose into the Fluid MCP gateway, where `policy.agentPolicy.allowedModels` / `allowedUseCases` are enforced at every read."
         }
       }
     },
@@ -5182,63 +5178,10 @@
         }
       ]
     },
-    "agentPort": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "NEW in v0.7.4: Declares this expose as agent-consumable via a named port kind. Today only `kind: mcp` is implemented; `kind: a2a` and `kind: iatp` are reserved for future versions and produce a validator warning until a runtime ships. The presence of `agentPort.kind=mcp` opts the expose into the Fluid MCP gateway, where `policy.agentPolicy.allowedModels` / `allowedUseCases` are enforced at every read.",
-      "required": [
-        "kind"
-      ],
-      "properties": {
-        "kind": {
-          "type": "string",
-          "enum": [
-            "mcp",
-            "a2a",
-            "iatp"
-          ],
-          "description": "Port kind. `mcp` is enforced at runtime today; others are reserved."
-        },
-        "transport": {
-          "type": "string",
-          "enum": [
-            "stdio",
-            "http"
-          ],
-          "description": "MCP transport. `stdio` is the default for desktop tool integrations; `http` is reserved for future streamable-HTTP support."
-        },
-        "tools": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "enum": [
-              "describe",
-              "sample",
-              "query",
-              "query_sql"
-            ]
-          },
-          "uniqueItems": true,
-          "description": "Allowlist of MCP tools the gateway advertises. Defaults to [`describe`, `sample`, `query`] (read-only). `query_sql` is gated and must be explicitly listed."
-        },
-        "maxRowsPerRead": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Hard cap for any read tool's row count. Mirrors `mcp.sampling.maxRows`."
-        },
-        "enforce": {
-          "type": "string",
-          "enum": [
-            "agentPolicy"
-          ],
-          "description": "Which policy block governs this port. Default and only value today is `agentPolicy`."
-        }
-      }
-    },
     "exposeMcp": {
       "type": "object",
       "additionalProperties": false,
-      "description": "NEW in v0.7.4 (alias of agentPort.kind=mcp): Per-expose MCP-server overrides. Existing 0.7.3 contracts using the `mcp` block continue to validate; new contracts should prefer `agentPort` for forward-compat with `kind: a2a | iatp`.",
+      "description": "NEW in v0.7.4: Per-expose overrides for the MCP output-port server — sampling caps + classification. The presence of this (non-empty) block opts the expose into the Fluid MCP gateway, where policy.agentPolicy is enforced at every read.",
       "properties": {
         "sampling": {
           "type": "object",

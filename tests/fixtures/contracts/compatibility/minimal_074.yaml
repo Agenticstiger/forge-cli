@@ -2,7 +2,7 @@ fluidVersion: "0.7.4"
 kind: DataProduct
 id: compat.ops.pipeline_health_074
 name: Pipeline Health Compatibility 0.7.4
-description: Operational health fixture used to protect FLUID 0.7.4 compatibility (adds the agentPort + runtime agentPolicy enforcement surface; the underlying transformation path is identical to 0.7.3 so the 0.7.3 baseline carries forward).
+description: Operational health fixture used to protect FLUID 0.7.4 compatibility (adds the MCP output-port + runtime agentPolicy enforcement surface; the underlying transformation path is identical to 0.7.3 so the 0.7.3 baseline carries forward).
 domain: ops
 metadata:
   layer: Gold
@@ -42,16 +42,11 @@ exposes:
         - name: event_ts
           type: timestamp
           required: true
-    # NEW in v0.7.4 — agentPort + agentPolicy demonstrating the
+    # NEW in v0.7.4 — the `mcp` block + agentPolicy demonstrating the
     # runtime enforcement gate that ships with the MCP output port.
-    agentPort:
-      kind: mcp
-      transport: stdio
-      tools:
-        - describe
-        - sample
-        - query
-      maxRowsPerRead: 100
+    mcp:
+      sampling:
+        maxRows: 100
     policy:
       agentPolicy:
         allowedModels:
