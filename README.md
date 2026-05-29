@@ -166,10 +166,7 @@ Bitol export emits **1 ODPS doc + N sibling `<contractId>.odcs.yaml`** fragments
 <summary>Back-compat aliases</summary>
 
 All emit a WARNING pointing at the canonical form:
-- `fluid opds` — letter-swap of `fluid odps`
 - `--spec odpi-4.1` and `--version 4.1` — historical labels for the LF/ODPI v4.1 spec
-- `--format opds` — historical default of `--format odps-v4.1` (LF/ODPI v4.1 JSON; **does NOT** map to the Bitol-default `--format odps`)
-- `fluid export-opds` — equivalent to `fluid generate standard --format odps-v4.1`
 
 </details>
 
