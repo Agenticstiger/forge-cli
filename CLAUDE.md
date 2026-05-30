@@ -65,12 +65,16 @@ The `feat/source-aligned-acquisition` branch lands SDP/ADP/CDP as a Data
 Mesh-aligned classification that runs alongside the medallion
 `metadata.layer`. **Bronze↔SDP, Silver↔ADP, Gold↔CDP** — either-or-both
 is accepted; when both are set the validator enforces consistency.
-Cross-check is duplicated inline at three sites (no helper module — the
-user explicitly rejected one): `schema.py::_check_metadata`,
-`schema_manager.py::_validate_with_jsonschema`, and
-`cli/contract_validation.py::_validate_metadata`. If the mapping ever
-changes, update all three in lockstep, plus the discover emitter at
-`cli/discover/emitter.py`. Templates / importers / fixtures all populate
+The cross-check is centralized in
+`forge/product_types.py::normalize_metadata_in_place` (raises
+`ProductTypeError` on an inconsistent layer/productType pair), invoked from
+`cli/validate.py` and `cli/contract.py`; the schema validators
+`schema_manager.py::_validate_with_jsonschema` and
+`cli/contract_validation.py::_validate_metadata` validate the metadata at
+their boundaries. (A former inline `schema.py::_check_metadata` site has been
+removed — `schema.py` no longer exists; the logic was consolidated into the
+helper.) If the mapping ever changes, update the helper plus the discover
+emitter at `cli/discover/emitter.py` (which populates both fields). Templates / importers / fixtures all populate
 both fields; provider tag emitters (AWS / GCP / Snowflake / forge)
 propagate both into cloud labels as `fluid_layer` + `fluid_product_type`
 (distinct keys, same canonical value). The marketplace surfaces both as
@@ -90,7 +94,7 @@ The `feat/cli-pipeline-and-publish-hardening` branch (15 commits) landed the **1
 - **CI template generation got install-mode.** `fluid generate ci --system jenkins --install-mode {pypi,dev-source}`. The generated Jenkinsfile carries ONE mode's logic — no runtime branching in the file. `pypi` (default, production) exposes 4 build-time Jenkins parameters (`FLUID_PACKAGE_SPEC`, `FLUID_PIP_INDEX_URL`, `FLUID_PIP_EXTRA_INDEX_URL`, `FLUID_ALLOW_PRERELEASE`). `dev-source` (lab) uses `PYTHONPATH=/forge-cli-src` and fails LOUD if the mount is missing.
 - **The Jenkins template is the reference 11-stage implementation.** `forge/core/pipeline_templates.py::JenkinsTemplate.generate()` ships the full parameterized template. The other 6 CI systems (GitHub Actions, GitLab, Azure DevOps, Bitbucket, CircleCI, Tekton) are scheduled for Phase 7-rest to port from it.
 - **Smoke scripts live in `scripts/`.** `scripts/smoke_phase_6b.py` validates plan-binding + data-loss-gate against a real .venv.fluid-dev venv. `scripts/smoke_a1.py` validates the A1 variant with the new `--mode` / `--target` flags. Both auto-discover env from the launchpad; both are safe (every apply runs `--dry-run`).
-- **Known gap — `unknown_action_op` (Phase 6F, deferred).** The Snowflake provider's dispatcher doesn't yet recognize the 0.7.1 high-level abstract ops (`provisionDataset`, `scheduleTask`). Stage 7 apply logs `{"event": "unknown_action_op", ...}` and no-ops instead of emitting native DDL. Pipeline reports SUCCESS but accomplishes nothing. Fix involves a translator layer in `providers/snowflake/` that maps abstract → native ops. Pre-existing, not a regression.
+- **RESOLVED (was: `unknown_action_op`, Phase 6F).** The gap where the Snowflake dispatcher silently no-op'd the 0.7.1 abstract ops (`provisionDataset`, `scheduleTask`) and logged `{"event": "unknown_action_op", ...}` has been **retired by the OpenTofu cutover** (see the 2026-05-25 section): cloud `apply` routes through the OpenTofu emitter, and `unknown_action_op` is no longer emitted anywhere in `fluid_build/`. Kept here for history.
 
 ## Recent architectural changes worth knowing (2026-04-30, world-class forge UX)
 
@@ -148,8 +152,9 @@ streaming runners. Headline items:
   - GCP adds `bq.update_table_schema`, `iam.grant_role`, `iam.revoke_role`,
     `iam.set_policy`. Dispatcher accepts `ps.publish` (alias for
     `publish_message`) and `bq.execute_sql`.
-  - Pin file: `tests/providers/test_abstract_op_dispatch.py` — every
-    abstract handler must route to a recognised native op.
+  - Pin file: `tests/providers/test_abstract_op_dispatch.py` *(since removed —
+    this per-provider abstract-op dispatch was superseded by the OpenTofu
+    cutover; see the 2026-05-25 section)*.
   - **Critical bug fix in passing**: `aws/provider.py` had a malformed
     method body — Athena dispatcher fell through into orphaned Redshift
     code with no proper method header. Now `_execute_redshift_action`
@@ -239,7 +244,7 @@ streaming runners. Headline items:
   patches.
 
 Test files pinning the above (this session):
-`tests/providers/test_abstract_op_dispatch.py`,
+`tests/providers/test_abstract_op_dispatch.py` *(since removed — see note above)*,
 `tests/observability/test_run_id_decorator_integration.py`,
 `tests/build_runners/test_replay_state_integration.py`,
 `tests/build_runners/test_late_arrival_runner_integration.py`,

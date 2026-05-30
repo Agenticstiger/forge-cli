@@ -55,11 +55,12 @@ The data model is **declarative**:
         auth:
           mode: oidc
 
-This is a SKELETON — the stubs raise ``NotImplementedError`` for
-the actual fetch/auth paths. The schema + dispatcher + cache layer
-are real and tested. Wiring in a concrete fetcher (gitpython for
-``git_registry``, a REST client for ``catalog`` / ``http_registry``)
-is a follow-up PR per integration.
+The ``git_registry`` / ``catalog`` / ``http_registry`` fetch backends are
+implemented (``_fetch_digest_via_git`` — gitpython with a shell-out
+fallback; ``_fetch_digest_via_catalog`` / ``_fetch_digest_via_http`` — REST
+clients) and tested, alongside the schema + dispatcher + cache layer.
+``NotImplementedError`` is now raised only for an unrecognised ``kind`` or
+when a live fetch returns no digest (endpoint unreachable / wrong path).
 """
 
 from __future__ import annotations
