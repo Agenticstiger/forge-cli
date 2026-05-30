@@ -392,6 +392,7 @@ from fluid_build.cli._market_render import (  # noqa: E402,F401
     format_detailed_output,
     format_json_output,
     format_table_output,
+    render_no_catalog_onboarding,
 )
 
 
@@ -560,7 +561,9 @@ async def run_market_discovery(args, logger: logging.Logger) -> int:
         await engine.initialize_connectors(catalog_types)
 
         if not engine.connectors:
-            logger.error("❌ No catalog connectors available. Check your configuration.")
+            render_no_catalog_onboarding(
+                catalog_types or config.get("catalogs", []), engine.console
+            )
             return 1
 
         # Handle specific product lookup

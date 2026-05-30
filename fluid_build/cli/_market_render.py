@@ -68,6 +68,61 @@ def cprint(*args: Any, **kwargs: Any) -> None:
     _market.cprint(*args, **kwargs)
 
 
+def _format_usage(usage_stats: Optional[dict]) -> str:
+    """Summarize trust/usage signals (popularity, usage counts) for display."""
+    if not usage_stats:
+        return "N/A"
+    parts = []
+    for key in ("popularity", "usageCount", "queryCount", "views", "trust", "trustScore"):
+        if key in usage_stats and usage_stats[key] not in (None, ""):
+            parts.append(f"{key}={usage_stats[key]}")
+    if not parts:  # unknown shape — show a compact slice rather than nothing
+        parts = [f"{k}={v}" for k, v in list(usage_stats.items())[:3]]
+    return ", ".join(parts) if parts else "N/A"
+
+
+def render_no_catalog_onboarding(
+    configured: Optional[List[str]] = None, console: Optional["Console"] = None
+) -> None:
+    """Actionable first-run guidance when ``fluid market`` has no usable catalog.
+
+    Replaces a dead-end ``❌ No catalog connectors available`` error with
+    onboarding: how to configure a catalog (MCP works with any catalog that
+    exposes an MCP server; auth is env-sourced). When catalogs *were* configured
+    but none connected, it also explains they are either on the roadmap or
+    failed to connect (per-catalog detail is logged above).
+    """
+    configured = configured or []
+    lines: List[str] = []
+    if configured:
+        lines += [
+            f"Configured catalogs are unavailable: {', '.join(configured)}.",
+            "They are either on the roadmap (not yet implemented) or failed to "
+            "connect — see the per-catalog detail logged above.",
+            "",
+        ]
+    lines += [
+        "To discover real data products, configure a catalog in ~/.fluid/market.yaml:",
+        "",
+        "  1. Starter config:   fluid market --config-template > ~/.fluid/market.yaml",
+        "  2. List catalogs:     fluid market --list-catalogs",
+        "  3. Recommended — works with ANY catalog that exposes an MCP server",
+        "     (DataHub, OpenMetadata, Data Mesh Manager): add 'mcp' to the catalogs list.",
+        "     Auth is environment-sourced; secrets never live in the config file.",
+        "",
+        "  Then re-run:   fluid market --search '<term>'",
+    ]
+    title = "🏪 No data catalog is available for discovery"
+    if console and _rich_available():
+        from rich.panel import Panel
+
+        console.print(Panel("\n".join(lines), title=title, border_style="yellow"))
+    else:
+        cprint(f"\n{title}\n")
+        for line in lines:
+            cprint(line)
+
+
 def format_table_output(
     products: "List[DataProductMetadata]", console: Optional["Console"] = None
 ) -> None:
@@ -147,6 +202,8 @@ def format_detailed_output(
 • Status: {product.status.value}
 • Version: {product.version}
 • Quality Score: {product.quality_score if product.quality_score else "N/A"}
+• Product Type: {product.product_type or "—"}
+• Trust / Usage: {_format_usage(product.usage_stats)}
 
 [bold blue]Timestamps:[/bold blue]
 • Created: {product.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")}
@@ -175,6 +232,8 @@ def format_detailed_output(
         cprint(f"Status: {product.status.value}")
         cprint(f"Version: {product.version}")
         cprint(f"Quality Score: {product.quality_score if product.quality_score else 'N/A'}")
+        cprint(f"Product Type: {product.product_type or '—'}")
+        cprint(f"Trust / Usage: {_format_usage(product.usage_stats)}")
         cprint(f"Tags: {', '.join(product.tags) if product.tags else 'None'}")
         cprint(f"Source: {product.catalog_source}")
 
@@ -199,6 +258,8 @@ def format_json_output(products: "List[DataProductMetadata]") -> str:
             "documentation_url": product.documentation_url,
             "api_endpoint": product.api_endpoint,
             "quality_score": product.quality_score,
+            "product_type": product.product_type,
+            "usage_stats": product.usage_stats,
             "catalog_source": product.catalog_source,
             "catalog_type": product.catalog_type,
         }
@@ -211,4 +272,5 @@ __all__ = [
     "format_detailed_output",
     "format_json_output",
     "format_table_output",
+    "render_no_catalog_onboarding",
 ]
