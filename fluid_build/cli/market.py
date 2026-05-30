@@ -535,6 +535,21 @@ def register(subparsers: argparse._SubParsersAction):
         action="store_true",
         help="Instantiate a blueprint (requires --blueprint-id)",
     )
+    blueprint_group.add_argument(
+        "--params",
+        help="Blueprint parameters as a JSON string or a path to a JSON file "
+        "(used with --instantiate)",
+    )
+    blueprint_group.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Fill blueprint parameters via an interactive wizard (used with --instantiate)",
+    )
+    blueprint_group.add_argument(
+        "--show-template",
+        action="store_true",
+        help="Show a blueprint's Jinja2 contract template (used with --blueprint-id)",
+    )
 
     p.set_defaults(cmd=COMMAND, func=run)
 
