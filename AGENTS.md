@@ -430,8 +430,8 @@ fluid plan contract.fluid.yaml --out plan.json
 fluid apply contract.fluid.yaml --out apply.json
 
 # Graph output for dependency analysis
-fluid graph contract.fluid.yaml --format dot
-fluid graph contract.fluid.yaml --format json
+fluid viz-graph contract.fluid.yaml --format dot
+fluid viz-graph contract.fluid.yaml --format json
 
 # Policy reports
 fluid policy-check contract.fluid.yaml --out policy-report.json
