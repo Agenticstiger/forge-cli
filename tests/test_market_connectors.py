@@ -914,7 +914,12 @@ class TestRunExtended:
 
 
 class TestMarketDiscoveryEngineInitializeConnectors:
-    def test_collibra_connector_initialized(self):
+    def test_collibra_is_roadmap_skipped(self):
+        # Collibra ships only illustrative/demo metadata today, so even with
+        # full credentials the engine must SKIP it rather than register a
+        # connector that would surface fabricated products through
+        # ``fluid market``. Flip this back to an "in engine.connectors"
+        # assertion once a real discovery integration lands.
         config = {
             "catalogs": ["collibra"],
             "collibra": {
@@ -928,9 +933,11 @@ class TestMarketDiscoveryEngineInitializeConnectors:
         logger = logging.getLogger("test")
         engine = MarketDiscoveryEngine(config, logger)
         _run(engine.initialize_connectors(["collibra"]))
-        assert "collibra" in engine.connectors
+        assert "collibra" not in engine.connectors
 
-    def test_alation_connector_initialized(self):
+    def test_alation_is_roadmap_skipped(self):
+        # Alation is a demo-only connector today; the engine must skip it
+        # rather than surface fabricated products. See the collibra case above.
         config = {
             "catalogs": ["alation"],
             "alation": {
@@ -943,9 +950,11 @@ class TestMarketDiscoveryEngineInitializeConnectors:
         logger = logging.getLogger("test")
         engine = MarketDiscoveryEngine(config, logger)
         _run(engine.initialize_connectors(["alation"]))
-        assert "alation" in engine.connectors
+        assert "alation" not in engine.connectors
 
-    def test_apache_atlas_initialized_with_credentials(self):
+    def test_apache_atlas_is_roadmap_skipped(self):
+        # Apache Atlas is a demo-only connector today; even with valid
+        # credentials the engine must skip it rather than emit fake products.
         config = {
             "catalogs": ["apache_atlas"],
             "apache_atlas": {
@@ -959,7 +968,7 @@ class TestMarketDiscoveryEngineInitializeConnectors:
         logger = logging.getLogger("test")
         engine = MarketDiscoveryEngine(config, logger)
         _run(engine.initialize_connectors(["apache_atlas"]))
-        assert "apache_atlas" in engine.connectors
+        assert "apache_atlas" not in engine.connectors
 
     def test_health_checker_initialized_with_connectors(self):
         config = _base_config()
