@@ -72,7 +72,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
@@ -290,6 +290,55 @@ def _parse_dt(value: Any) -> datetime:
         except ValueError:
             pass
     return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _is_empty(value: Any) -> bool:
+    """True for the "unknown"/sentinel values ``_row_to_metadata`` emits for an
+    absent field — None, empty string/list/dict, or the epoch timestamp."""
+    if value is None or value == "" or value == [] or value == {}:
+        return True
+    if isinstance(value, datetime) and value == _EPOCH:
+        return True
+    return False
+
+
+def _merge_product_metadata(
+    base: Optional[DataProductMetadata], overlay: Optional[DataProductMetadata]
+) -> Optional[DataProductMetadata]:
+    """Make ``--detailed`` a SUPERSET of the listing, never a subset.
+
+    ``base`` is the shallow search row (authoritative for the trust/quality/layer/
+    tags/usage/version fields the listing surfaces); ``overlay`` is the rich
+    per-product detail entity, which is frequently *sparser* on those fields (it
+    carries description + ownership but not quality/tags/layer). So we keep
+    ``base`` and apply ``overlay`` only where it genuinely adds:
+
+    * ``description`` / ``owner`` — the detail entity's reason to exist — win when
+      present (the listing's summary is the fallback);
+    * every other field is **gap-filled** only where ``base`` left it empty, so a
+      sparse detail entity can never clobber a value the listing already had.
+    """
+    if base is None:
+        return overlay
+    if overlay is None:
+        return base
+
+    updates: Dict[str, Any] = {}
+    # The detail entity's raison d'être: a richer description + resolved owner.
+    for name in ("description", "owner"):
+        oval = getattr(overlay, name)
+        if not _is_empty(oval) and oval != getattr(base, name):
+            updates[name] = oval
+    # Everything else: fill only the gaps the shallow row left — never overwrite.
+    for f in fields(base):
+        if f.name in updates:
+            continue
+        if _is_empty(getattr(base, f.name)) and not _is_empty(getattr(overlay, f.name)):
+            updates[f.name] = getattr(overlay, f.name)
+    return replace(base, **updates) if updates else base
 
 
 def _parse_layer(value: Any) -> DataProductLayer:
@@ -536,19 +585,25 @@ class McpCatalogConnector(BaseCatalogConnector):
         """
         async with self._open_session() as session:
             available = {t.name for t in (await session.list_tools()).tools}
-            product: Optional[DataProductMetadata] = None
 
-            # Phase 1 — rich entity detail.
+            # Phase 0 — the shallow search row carries the trust fields (quality,
+            # layer, tags, usage, version) the listing surfaces. Keep it as the
+            # base so `--detailed` is a SUPERSET of the listing, never a subset.
+            shallow = await self._search_match(session, product_id, available)
+
+            # Phase 1 — the rich entity detail (description, owners, …), which is
+            # often sparser than the search row on the trust fields.
+            detail: Optional[DataProductMetadata] = None
             if self.profile.detail_tool and self.profile.detail_tool in available:
                 entity = await self._fetch_object(
                     session, self.profile.detail_tool, {self.profile.detail_id_arg: product_id}
                 )
                 if entity:
-                    product = self._row_to_metadata(entity)
+                    detail = self._row_to_metadata(entity)
 
-            # Fallback — shallow search + match by id (within this session).
-            if product is None:
-                product = await self._search_match(session, product_id, available)
+            # Merge: shallow base + detail's genuine additions (see helper). When
+            # only one source resolves, that one is used as-is.
+            product = _merge_product_metadata(shallow, detail)
             if product is None:
                 return None
 
