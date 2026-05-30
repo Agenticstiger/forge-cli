@@ -316,7 +316,16 @@ def get_api_url(logger: Optional[logging.Logger] = None) -> str:
     console.print("\n  4. Specify custom API URL:")
     console.print("     [cyan]export FLUID_API_URL=https://your-custom-url[/cyan]")
 
-    raise CLIError("No blueprint marketplace available. See options above.")
+    raise CLIError(
+        1,
+        "no_blueprint_marketplace",
+        {
+            "message": (
+                "No blueprint marketplace available — configure Command Center, "
+                "FLUID_PUBLIC_REGISTRY, or local blueprints (see the options above)."
+            )
+        },
+    )
 
 
 def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
@@ -639,7 +648,7 @@ def interactive_parameter_wizard(parameters: list) -> Dict[str, Any]:
             result[name] = value
         elif required:
             console.print(f"[red]❌ Required parameter '{name}' cannot be empty[/red]")
-            raise CLIError(f"Required parameter '{name}' not provided")
+            raise CLIError(2, "missing_blueprint_parameter", {"parameter": name})
 
     return result
 
