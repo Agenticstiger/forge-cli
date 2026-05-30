@@ -68,6 +68,23 @@ def cprint(*args: Any, **kwargs: Any) -> None:
     _market.cprint(*args, **kwargs)
 
 
+def _schema_summary(schema_fields: "List[dict]", limit: int = 15) -> str:
+    """Compact, human-readable listing of a data asset's columns."""
+    if not schema_fields:
+        return "(no column schema retrieved)"
+    lines = []
+    for f in schema_fields[:limit]:
+        ftype = f.get("type") or "?"
+        fdesc = f.get("description") or ""
+        line = f"  • {f.get('name')} ({ftype})"
+        if fdesc:
+            line += f" — {fdesc}"
+        lines.append(line)
+    if len(schema_fields) > limit:
+        lines.append(f"  … and {len(schema_fields) - limit} more")
+    return "\n".join(lines)
+
+
 def format_table_output(
     products: "List[DataProductMetadata]", console: Optional["Console"] = None
 ) -> None:
@@ -159,6 +176,9 @@ def format_detailed_output(
 • Documentation: {product.documentation_url or "Not available"}
 • API Endpoint: {product.api_endpoint or "Not available"}
 
+[bold cyan]Columns ({len(product.schema_fields)}):[/bold cyan]
+{_schema_summary(product.schema_fields)}
+
 [bold dim]Source:[/bold dim] {product.catalog_source} ({product.catalog_type})
         """
 
@@ -176,6 +196,9 @@ def format_detailed_output(
         cprint(f"Version: {product.version}")
         cprint(f"Quality Score: {product.quality_score if product.quality_score else 'N/A'}")
         cprint(f"Tags: {', '.join(product.tags) if product.tags else 'None'}")
+        if product.schema_fields:
+            cprint(f"Columns ({len(product.schema_fields)}):")
+            cprint(_schema_summary(product.schema_fields))
         cprint(f"Source: {product.catalog_source}")
 
 
@@ -199,6 +222,7 @@ def format_json_output(products: "List[DataProductMetadata]") -> str:
             "documentation_url": product.documentation_url,
             "api_endpoint": product.api_endpoint,
             "quality_score": product.quality_score,
+            "schema_fields": product.schema_fields,
             "catalog_source": product.catalog_source,
             "catalog_type": product.catalog_type,
         }

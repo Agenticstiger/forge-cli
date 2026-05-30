@@ -139,6 +139,21 @@ class CatalogProfile:
     status_keys: Tuple[str, ...] = ("status", "lifecycle", "lifecycleStatus", "state")
     created_keys: Tuple[str, ...] = ("created_at", "createdAt", "created", "creationDate")
     updated_keys: Tuple[str, ...] = ("updated_at", "updatedAt", "updated", "lastModified")
+    # --- Enrichment: per-product detail lookup (the world-class "all metadata"
+    #     path). Listing stays shallow/fast; the detail path fetches the rich
+    #     entity + its column schema. Left unset → no enrichment (graceful). ---
+    detail_tool: Optional[str] = None  # returns a rich entity for one id
+    detail_id_arg: str = "urns"
+    schema_tool: Optional[str] = None  # returns the asset's column/field schema
+    schema_id_arg: str = "urn"
+    schema_field_name_keys: Tuple[str, ...] = ("fieldPath", "name", "path", "column")
+    schema_field_type_keys: Tuple[str, ...] = (
+        "nativeDataType",
+        "type",
+        "dataType",
+        "dataTypeDisplay",
+    )
+    schema_field_desc_keys: Tuple[str, ...] = ("description", "doc")
 
 
 # Tuned profiles for the three catalogs fluid already integrates, plus a
@@ -147,6 +162,12 @@ PROFILES: Dict[str, CatalogProfile] = {
     "datahub": CatalogProfile(
         name="datahub",
         search_tools=("search", "search_entities", "get_entities", "get_dataset"),
+        # Verified live against mcp-server-datahub: get_entities(urns=…) returns
+        # the rich entity; list_schema_fields(urn=…) returns column schema.
+        detail_tool="get_entities",
+        detail_id_arg="urns",
+        schema_tool="list_schema_fields",
+        schema_id_arg="urn",
     ),
     "openmetadata": CatalogProfile(
         name="openmetadata",
@@ -209,6 +230,31 @@ def _as_tags(value: Any) -> List[str]:
                 out.append(s)
         return out
     return [_as_str(value)]
+
+
+def _extract_owner(value: Any) -> str:
+    """Owner display string, handling the deep ``ownership.owners[].owner``
+    envelope catalogs use (DataHub: ``{"owners":[{"owner":{...}}]}``) as well as
+    plain strings / lists. Falls back to :func:`_as_str` for simple shapes.
+    """
+    if isinstance(value, dict) and isinstance(value.get("owners"), list):
+        names: List[str] = []
+        for entry in value["owners"]:
+            owner = entry.get("owner", entry) if isinstance(entry, dict) else entry
+            if isinstance(owner, dict):
+                name = (
+                    _get_path(owner, "properties.displayName")
+                    or owner.get("name")
+                    or _get_path(owner, "properties.email")
+                    or owner.get("urn")
+                )
+            else:
+                name = owner
+            name = _as_str(name)
+            if name and name not in names:
+                names.append(name)
+        return ", ".join(names)
+    return _as_str(value)
 
 
 def _parse_dt(value: Any) -> datetime:
@@ -470,6 +516,114 @@ class McpCatalogConnector(BaseCatalogConnector):
             "source": f"mcp:{self.profile.name}",
         }
 
+    async def _get_data_product_impl(self, product_id: str) -> Optional[DataProductMetadata]:
+        """Two-phase detail retrieval — the "all metadata" path.
+
+        Listing (:meth:`_search_data_products_impl`) stays shallow + fast; this
+        per-product lookup fetches the RICH entity (description, owners, tags,
+        quality, …) via the profile's ``detail_tool`` and the underlying data
+        asset's column/field schema via ``schema_tool`` — falling back to the
+        shallow search result when no detail tool is configured/available.
+        """
+        async with self._open_session() as session:
+            available = {t.name for t in (await session.list_tools()).tools}
+            product: Optional[DataProductMetadata] = None
+
+            # Phase 1 — rich entity detail.
+            if self.profile.detail_tool and self.profile.detail_tool in available:
+                entity = await self._fetch_object(
+                    session, self.profile.detail_tool, {self.profile.detail_id_arg: product_id}
+                )
+                if entity:
+                    product = self._row_to_metadata(entity)
+
+            # Fallback — shallow search + match by id (within this session).
+            if product is None:
+                product = await self._search_match(session, product_id, available)
+            if product is None:
+                return None
+
+            # Phase 2 — column/field schema of the underlying data asset.
+            if self.profile.schema_tool and self.profile.schema_tool in available:
+                product.schema_fields = await self._fetch_schema_fields(session, product_id)
+            return product
+
+    async def _search_match(
+        self, session: Any, product_id: str, available: set
+    ) -> Optional[DataProductMetadata]:
+        tool = self._search_tool
+        if tool is None or tool not in available:
+            resolved = self._resolve_search_tool(list((await session.list_tools()).tools))
+            if resolved is None:
+                return None
+            tool = resolved.name
+        result = await session.call_tool(tool, self._build_search_args(SearchFilters(limit=200)))
+        for row in self._extract_rows(result):
+            mapped = self._row_to_metadata(row)
+            if mapped.id == product_id:
+                return mapped
+        return None
+
+    async def _fetch_object(
+        self, session: Any, tool_name: str, args: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Call a tool that returns a single entity object; unwrap the common
+        ``{"result": {…}}`` / ``{"entity": {…}}`` envelopes."""
+        result = await session.call_tool(tool_name, args)
+        if getattr(result, "isError", False):
+            return None
+        payload = self._result_payload(result)
+        if isinstance(payload, dict):
+            for key in ("result", "entity", "data"):
+                inner = payload.get(key)
+                if isinstance(inner, dict):
+                    return inner
+            return payload
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return payload[0]
+        return None
+
+    async def _fetch_schema_fields(self, session: Any, product_id: str) -> List[Dict[str, Any]]:
+        """Retrieve the data asset's column/field schema via ``schema_tool``."""
+        obj = await self._fetch_object(
+            session, self.profile.schema_tool, {self.profile.schema_id_arg: product_id}
+        )
+        if not isinstance(obj, dict):
+            return []
+        raw_fields = obj.get("fields") or obj.get("schemaFields") or obj.get("columns") or []
+        p = self.profile
+        out: List[Dict[str, Any]] = []
+        for field_obj in raw_fields:
+            if not isinstance(field_obj, dict):
+                continue
+            name = _as_str(_first(field_obj, p.schema_field_name_keys))
+            if not name:
+                continue
+            entry: Dict[str, Any] = {
+                "name": name,
+                "type": _as_str(_first(field_obj, p.schema_field_type_keys)),
+                "description": _as_str(_first(field_obj, p.schema_field_desc_keys)),
+            }
+            if "nullable" in field_obj:
+                entry["nullable"] = field_obj["nullable"]
+            out.append(entry)
+        return out
+
+    @staticmethod
+    def _result_payload(result: Any) -> Any:
+        """Best-effort JSON payload from a CallToolResult (structured or text)."""
+        structured = getattr(result, "structuredContent", None)
+        if structured not in (None, {}):
+            return structured
+        for block in getattr(result, "content", None) or []:
+            text = getattr(block, "text", None)
+            if text:
+                try:
+                    return json.loads(text)
+                except (ValueError, TypeError):
+                    continue
+        return None
+
     # ------------------------------------------------------------------ #
     # Tool resolution + result mapping                                   #
     # ------------------------------------------------------------------ #
@@ -581,7 +735,7 @@ class McpCatalogConnector(BaseCatalogConnector):
             name=name,
             description=_as_str(_first(row, p.desc_keys)),
             domain=_as_str(_first(row, p.domain_keys)),
-            owner=_as_str(_first(row, p.owner_keys)),
+            owner=_extract_owner(_first(row, p.owner_keys)),
             layer=_parse_layer(_first(row, p.layer_keys)),
             status=_parse_status(_first(row, p.status_keys)),
             version=_as_str(_first(row, p.version_keys)) or "1.0.0",
