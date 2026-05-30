@@ -39,6 +39,7 @@ from mcp.types import Implementation
 from fluid_build.cli.market import DataProductLayer, DataProductStatus, SearchFilters
 from fluid_build.cli.market_catalogs.mcp_catalog import (
     McpCatalogConnector,
+    _extract_owner,
     _get_path,
     _normalize_quality,
     _parse_layer,
@@ -400,6 +401,96 @@ def test_secret_never_appears_in_logs(caplog):
         assert _run(c.connect()) is True
     blob = " ".join(r.getMessage() for r in caplog.records)
     assert "super-secret-token" not in blob
+
+
+# --------------------------------------------------------------------------- #
+# Two-phase enrichment (detail retrieval — "all metadata")                    #
+# --------------------------------------------------------------------------- #
+# Shapes mirror what was captured live from mcp-server-datahub:
+#   get_entities(urns=…)     -> {"result": {entity}}
+#   list_schema_fields(urn=…) -> {"fields": [{fieldPath, nativeDataType, ...}]}
+_ENTITY = {
+    "urn": "urn:li:dataset:x",
+    "name": "orders",
+    "properties": {"description": "daily orders by region"},
+    "ownership": {"owners": [{"owner": {"properties": {"displayName": "Jane Doe"}}}]},
+}
+_FIELDS = [
+    {
+        "fieldPath": "id",
+        "nativeDataType": "bigint",
+        "description": "primary key",
+        "nullable": False,
+    },
+    {"fieldPath": "amount", "nativeDataType": "double", "description": "order total"},
+]
+_SEARCH_HIT = {
+    "searchResults": [{"entity": {"urn": "urn:li:dataset:x", "properties": {"name": "orders"}}}]
+}
+
+
+def _make_enriching_server() -> Server:
+    """In-memory server exposing search + get_entities + list_schema_fields."""
+    server: Server = Server("fake-catalog-enrich")
+
+    @server.list_tools()
+    async def _list_tools():
+        def tool(name):
+            return mcp_types.Tool(
+                name=name,
+                description=name,
+                inputSchema={"type": "object", "properties": {"query": {"type": "string"}}},
+            )
+
+        return [tool("search"), tool("get_entities"), tool("list_schema_fields")]
+
+    @server.call_tool()
+    async def _call_tool(name, arguments):
+        if name == "search":
+            payload = _SEARCH_HIT
+        elif name == "get_entities":
+            payload = {"result": _ENTITY}
+        elif name == "list_schema_fields":
+            payload = {"fields": _FIELDS, "totalFields": len(_FIELDS)}
+        else:
+            raise ValueError(f"unknown tool: {name}")
+        return [mcp_types.TextContent(type="text", text=json.dumps(payload))]
+
+    return server
+
+
+def test_get_data_product_enriches_with_detail_and_schema():
+    c = _connector(profile="datahub")
+    _wire(c, _make_enriching_server())
+    assert _run(c.connect()) is True
+    d = _run(c.get_data_product("urn:li:dataset:x"))
+    assert d is not None
+    # Phase 1: rich entity detail.
+    assert d.description == "daily orders by region"
+    assert d.owner == "Jane Doe"  # deep ownership.owners[].owner.properties.displayName
+    # Phase 2: the data asset's column schema.
+    assert [f["name"] for f in d.schema_fields] == ["id", "amount"]
+    assert d.schema_fields[0]["type"] == "bigint"
+    assert d.schema_fields[0]["description"] == "primary key"
+    assert d.schema_fields[0]["nullable"] is False
+
+
+def test_get_data_product_falls_back_to_shallow_without_detail_tool():
+    # auto profile has no detail_tool → falls back to shallow search match.
+    c = _connector(profile="auto")
+    _wire(c, _make_catalog_server(_ROWS))
+    assert _run(c.connect()) is True
+    d = _run(c.get_data_product("urn:li:dataset:finance.revenue"))
+    assert d is not None
+    assert d.name == "Revenue"
+    assert d.schema_fields == []  # no schema tool → no enrichment
+
+
+def test_extract_owner_handles_nested_ownership():
+    assert _extract_owner("team-a") == "team-a"
+    assert _extract_owner({"owners": [{"owner": {"properties": {"displayName": "A"}}}]}) == "A"
+    assert _extract_owner({"owners": [{"owner": {"name": "B"}}, {"owner": {"urn": "C"}}]}) == "B, C"
+    assert _extract_owner(["x", "y"]) == "x, y"
 
 
 # --------------------------------------------------------------------------- #

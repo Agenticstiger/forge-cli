@@ -140,6 +140,11 @@ class DataProductMetadata:
     # marketplace facet so teams that prefer the Data Mesh terminology
     # can filter without having to mentally translate.
     product_type: Optional[str] = None
+    # Column/field-level schema of the underlying data asset, populated by the
+    # detail/enrichment path (e.g. the MCP connector's ``list_schema_fields``
+    # call). Each entry: ``{"name", "type", "description", "nullable"}``. Empty
+    # for the shallow listing path — enrichment is a per-product detail lookup.
+    schema_fields: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
