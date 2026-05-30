@@ -215,8 +215,23 @@ def run(args, logger: logging.Logger) -> int:
             logger.error("Marketplace action required. Use --help for available actions.")
             return 1
 
-        # Get API URL from config or environment (with fallback)
-        api_url = get_api_url(logger=logger)
+        # Bundled blueprints ship in the package and need no registry. Resolve
+        # the registry URL only as far as the action actually needs it:
+        #   • search       — always list bundled; merge the registry when it is
+        #                     reachable, so a missing marketplace is non-fatal.
+        #   • bundled id    — served entirely offline; skip the registry probe.
+        #   • registry id   — require a reachable registry (original behaviour).
+        from fluid_build.cli._market_bundled_blueprints import is_bundled
+
+        action = args.marketplace_action
+        bp_id = getattr(args, "blueprint_id", None)
+
+        if action == "search":
+            api_url = get_api_url(logger=logger, required=False)
+        elif bp_id and is_bundled(bp_id):
+            api_url = None
+        else:
+            api_url = get_api_url(logger=logger, required=True)
 
         if args.marketplace_action == "search":
             return search_blueprints(args, logger, api_url)
@@ -239,7 +254,7 @@ def run(args, logger: logging.Logger) -> int:
         return 1
 
 
-def get_api_url(logger: Optional[logging.Logger] = None) -> str:
+def get_api_url(logger: Optional[logging.Logger] = None, *, required: bool = True) -> Optional[str]:
     """
     Get API URL with intelligent fallback.
 
@@ -250,12 +265,17 @@ def get_api_url(logger: Optional[logging.Logger] = None) -> str:
 
     Args:
         logger: Optional logger for diagnostic messages
+        required: When True (default), raise ``CLIError`` and print the
+            "options to fix" guidance if no registry source is available.
+            When False, return ``None`` quietly — used when the caller can
+            still serve bundled blueprints without a registry.
 
     Returns:
-        API URL for blueprint marketplace
+        API URL for the blueprint marketplace, or ``None`` when no source is
+        available and ``required`` is False.
 
     Raises:
-        CLIError: If no blueprint source is available
+        CLIError: If no blueprint source is available and ``required`` is True.
     """
     if logger is None:
         logger = logging.getLogger(__name__)
@@ -301,7 +321,12 @@ def get_api_url(logger: Optional[logging.Logger] = None) -> str:
                 console.print(f"[yellow]⚠️  Using fallback registry: {fallback_url}[/yellow]")
                 return fallback_url
 
-    # No sources available
+    # No sources available. When the caller can fall back to bundled
+    # blueprints, stay quiet and let it decide what to show.
+    if not required:
+        logger.debug("No registry source available; caller will fall back to bundled blueprints.")
+        return None
+
     console.print("[red]❌ No blueprint marketplace available[/red]")
     console.print("\n[bold]Options to fix:[/bold]")
     console.print("  1. Start Command Center locally:")
@@ -328,9 +353,35 @@ def get_api_url(logger: Optional[logging.Logger] = None) -> str:
     )
 
 
+def _bundled_blueprints_matching(args) -> list:
+    """Bundled blueprints filtered by the same query/category/maturity facets."""
+    from fluid_build.cli._market_bundled_blueprints import list_bundled_blueprints
+
+    bundled = list_bundled_blueprints()
+    if args.query:
+        q = args.query.lower()
+        bundled = [
+            b
+            for b in bundled
+            if q in b["id"].lower()
+            or q in b.get("name", "").lower()
+            or q in b.get("description", "").lower()
+            or any(q in t.lower() for t in b.get("tags", []))
+        ]
+    if args.category:
+        bundled = [b for b in bundled if b.get("category") == args.category]
+    if args.maturity:
+        bundled = [b for b in bundled if b.get("labels", {}).get("maturity") == args.maturity]
+    return bundled
+
+
 def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
-    """Search marketplace blueprints."""
+    """Search marketplace blueprints (bundled + registry)."""
     console.print("[cyan]🔍 Searching marketplace blueprints...[/cyan]\n")
+
+    # Bundled blueprints ship in the package, so discovery works offline and is
+    # never empty out of the box — they are listed alongside any registry hits.
+    bundled = _bundled_blueprints_matching(args)
 
     # Build query parameters
     params = {
@@ -350,167 +401,202 @@ def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
     if args.state:
         params["state"] = args.state
 
-    try:
-        response = _marketplace_get(api_url, logger, params=params)
-        response.raise_for_status()
-        data = response.json()
-
-        blueprints = data.get("items", [])
-        total = data.get("total", 0)
-
-        if not blueprints:
-            console.print("[yellow]No blueprints found matching your criteria.[/yellow]")
-            return 0
-
-        # Create results table
-        table = Table(title=f"Blueprint Marketplace ({total} results)")
-        table.add_column("ID", style="cyan", no_wrap=True)
-        table.add_column("Name", style="bold")
-        table.add_column("Category", style="green")
-        table.add_column("Maturity", style="yellow")
-        table.add_column("Downloads", justify="right", style="magenta")
-        table.add_column("Version", justify="center")
-
-        for bp in blueprints:
-            # Extract maturity from labels if available
-            maturity = bp.get("labels", {}).get("maturity", "N/A")
-
-            table.add_row(
-                bp["id"],
-                bp["name"][:40] + "..." if len(bp["name"]) > 40 else bp["name"],
-                bp.get("category", "N/A"),
-                maturity,
-                str(bp.get("download_count", 0)),
-                bp.get("version", "N/A"),
+    registry: list = []
+    registry_total = 0
+    if api_url:
+        try:
+            response = _marketplace_get(api_url, logger, params=params)
+            response.raise_for_status()
+            data = response.json()
+            registry = data.get("items", [])
+            registry_total = data.get("total", len(registry))
+        except requests.exceptions.RequestException as e:
+            message = _format_marketplace_error(e)
+            # A bundled-only result is still useful; only hard-fail when there
+            # is nothing at all to show.
+            if not bundled:
+                console.print(f"[red]❌ {message}[/red]")
+                logger.error("Failed to search blueprints: %s", message, exc_info=True)
+                return 1
+            console.print(
+                f"[dim]Registry unavailable ({message}); showing bundled blueprints only.[/dim]\n"
             )
+            logger.info(
+                "Marketplace registry unavailable; showing %d bundled blueprint(s).", len(bundled)
+            )
+    elif bundled:
+        console.print(
+            "[dim]No registry configured; showing bundled blueprints. "
+            "Set FLUID_API_URL or FLUID_PUBLIC_REGISTRY for more.[/dim]\n"
+        )
 
-        console.print(table)
-        console.print("\n[dim]💡 Use 'fluid market --blueprint-id <id>' to see details[/dim]")
-
+    blueprints = bundled + registry
+    if not blueprints:
+        console.print("[yellow]No blueprints found matching your criteria.[/yellow]")
         return 0
 
-    except requests.exceptions.RequestException as e:
-        message = _format_marketplace_error(e)
-        console.print(f"[red]❌ {message}[/red]")
-        logger.error("Failed to search blueprints: %s", message, exc_info=True)
-        return 1
+    # Create results table
+    title = f"Blueprint Marketplace ({len(bundled)} bundled + {registry_total} registry)"
+    table = Table(title=title)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Name", style="bold")
+    table.add_column("Category", style="green")
+    table.add_column("Maturity", style="yellow")
+    table.add_column("Source", style="blue")
+    table.add_column("Version", justify="center")
+
+    for bp in blueprints:
+        # Extract maturity from labels if available
+        maturity = bp.get("labels", {}).get("maturity", "N/A")
+        source = "bundled" if bp.get("source") == "bundled" else "registry"
+
+        table.add_row(
+            bp["id"],
+            bp["name"][:40] + "..." if len(bp["name"]) > 40 else bp["name"],
+            bp.get("category", "N/A"),
+            maturity,
+            source,
+            bp.get("version", "N/A"),
+        )
+
+    console.print(table)
+    console.print("\n[dim]💡 Use 'fluid market --blueprint-id <id>' to see details[/dim]")
+
+    return 0
 
 
 def show_blueprint_info(args, logger: logging.Logger, api_url: str) -> int:
     """Show detailed blueprint information."""
     console.print(f"[cyan]ℹ️  Fetching blueprint: {args.blueprint_id}...[/cyan]\n")
 
-    params = {}
-    if args.version:
-        params["version"] = args.version
+    from fluid_build.cli._market_bundled_blueprints import get_bundled_blueprint, is_bundled
 
-    try:
-        response = _marketplace_get(f"{api_url}/{args.blueprint_id}", logger, params=params)
-        response.raise_for_status()
-        bp = response.json()
+    if is_bundled(args.blueprint_id):
+        # Bundled blueprint — no registry round-trip; it has the same dict shape.
+        bp = get_bundled_blueprint(args.blueprint_id)
+    else:
+        params = {}
+        if getattr(args, "version", None):
+            params["version"] = args.version
+        try:
+            response = _marketplace_get(f"{api_url}/{args.blueprint_id}", logger, params=params)
+            response.raise_for_status()
+            bp = response.json()
+        except requests.exceptions.RequestException as e:
+            message = _format_marketplace_error(e)
+            console.print(f"[red]❌ {message}[/red]")
+            logger.error("Failed to get blueprint info: %s", message, exc_info=True)
+            return 1
 
-        # Display blueprint header
-        console.print(
-            Panel(
-                f"[bold cyan]{bp['name']}[/bold cyan]\n"
-                f"[dim]{bp.get('description', 'No description available')}[/dim]",
-                title=f"📦 {bp['id']} v{bp['version']}",
-            )
+    # Display blueprint header
+    console.print(
+        Panel(
+            f"[bold cyan]{bp['name']}[/bold cyan]\n"
+            f"[dim]{bp.get('description', 'No description available')}[/dim]",
+            title=f"📦 {bp['id']} v{bp['version']}",
+        )
+    )
+
+    # Metadata table
+    metadata_table = Table(show_header=False, box=None, padding=(0, 2))
+    metadata_table.add_column("Field", style="cyan")
+    metadata_table.add_column("Value")
+
+    # Extract metadata from correct fields
+    maturity = bp.get("labels", {}).get("maturity", "N/A")
+    author_name = bp.get("author", {}).get("name", bp.get("author_name", "N/A"))
+    org = bp.get("author", {}).get("organization", bp.get("organization", "N/A"))
+    license_info = bp.get("labels", {}).get("license", bp.get("license", "N/A"))
+
+    metadata_table.add_row("Category", bp.get("category", "N/A"))
+    metadata_table.add_row("Maturity", maturity)
+    metadata_table.add_row("Source", "bundled" if bp.get("source") == "bundled" else "registry")
+    metadata_table.add_row("State", bp.get("state", "N/A"))
+    metadata_table.add_row("Author", author_name)
+    metadata_table.add_row("Organization", org)
+    metadata_table.add_row("License", license_info)
+    metadata_table.add_row("Downloads", str(bp.get("download_count", 0)))
+    metadata_table.add_row("Usage Count", str(bp.get("usage_count", 0)))
+
+    # Success rate comes as decimal 0.0-1.0
+    success_rate = bp.get("success_rate")
+    if success_rate is not None:
+        # If it's > 1, it's already a percentage
+        if success_rate > 1:
+            metadata_table.add_row("Success Rate", f"{success_rate:.1f}%")
+        else:
+            metadata_table.add_row("Success Rate", f"{success_rate:.1%}")
+
+    console.print(metadata_table)
+    console.print()
+
+    # Parameters table
+    params_table = Table(title="Parameters")
+    params_table.add_column("Name", style="cyan")
+    params_table.add_column("Type", style="green")
+    params_table.add_column("Required", justify="center")
+    params_table.add_column("Description")
+
+    # Parameters are in spec.parameters for BlueprintDetail
+    param_list = bp.get("spec", {}).get("parameters", bp.get("parameters", []))
+    for param in param_list:
+        params_table.add_row(
+            param["name"],
+            param["type"],
+            "✓" if param.get("required") else "",
+            (
+                param.get("description", "")[:50] + "..."
+                if len(param.get("description", "")) > 50
+                else param.get("description", "")
+            ),
         )
 
-        # Metadata table
-        metadata_table = Table(show_header=False, box=None, padding=(0, 2))
-        metadata_table.add_column("Field", style="cyan")
-        metadata_table.add_column("Value")
+    console.print(params_table)
+    console.print()
 
-        # Extract metadata from correct fields
-        maturity = bp.get("labels", {}).get("maturity", "N/A")
-        author_name = bp.get("author", {}).get("name", bp.get("author_name", "N/A"))
-        org = bp.get("author", {}).get("organization", bp.get("organization", "N/A"))
-        license_info = bp.get("labels", {}).get("license", bp.get("license", "N/A"))
+    # Tags and labels
+    if bp.get("tags"):
+        console.print(f"[bold]Tags:[/bold] {', '.join(bp['tags'])}")
 
-        metadata_table.add_row("Category", bp.get("category", "N/A"))
-        metadata_table.add_row("Maturity", maturity)
-        metadata_table.add_row("State", bp.get("state", "N/A"))
-        metadata_table.add_row("Author", author_name)
-        metadata_table.add_row("Organization", org)
-        metadata_table.add_row("License", license_info)
-        metadata_table.add_row("Downloads", str(bp.get("download_count", 0)))
-        metadata_table.add_row("Usage Count", str(bp.get("usage_count", 0)))
+    # Show template if requested
+    if getattr(args, "show_template", False):
+        console.print("\n[bold]Contract Template:[/bold]")
+        syntax = Syntax(bp["contract_template"], "jinja2", theme="monokai", line_numbers=True)
+        console.print(syntax)
 
-        # Success rate comes as decimal 0.0-1.0
-        success_rate = bp.get("success_rate")
-        if success_rate is not None:
-            # If it's > 1, it's already a percentage
-            if success_rate > 1:
-                metadata_table.add_row("Success Rate", f"{success_rate:.1f}%")
-            else:
-                metadata_table.add_row("Success Rate", f"{success_rate:.1%}")
+    console.print(
+        f"\n[dim]💡 Use 'fluid market --blueprint-id {args.blueprint_id}' to generate a contract[/dim]"
+    )
 
-        console.print(metadata_table)
-        console.print()
-
-        # Parameters table
-        params_table = Table(title="Parameters")
-        params_table.add_column("Name", style="cyan")
-        params_table.add_column("Type", style="green")
-        params_table.add_column("Required", justify="center")
-        params_table.add_column("Description")
-
-        # Parameters are in spec.parameters for BlueprintDetail
-        params = bp.get("spec", {}).get("parameters", bp.get("parameters", []))
-        for param in params:
-            params_table.add_row(
-                param["name"],
-                param["type"],
-                "✓" if param.get("required") else "",
-                (
-                    param.get("description", "")[:50] + "..."
-                    if len(param.get("description", "")) > 50
-                    else param.get("description", "")
-                ),
-            )
-
-        console.print(params_table)
-        console.print()
-
-        # Tags and labels
-        if bp.get("tags"):
-            console.print(f"[bold]Tags:[/bold] {', '.join(bp['tags'])}")
-
-        # Show template if requested
-        if args.show_template:
-            console.print("\n[bold]Contract Template:[/bold]")
-            syntax = Syntax(bp["contract_template"], "jinja2", theme="monokai", line_numbers=True)
-            console.print(syntax)
-
-        console.print(
-            f"\n[dim]💡 Use 'fluid market --blueprint-id {args.blueprint_id}' to generate a contract[/dim]"
-        )
-
-        return 0
-
-    except requests.exceptions.RequestException as e:
-        message = _format_marketplace_error(e)
-        console.print(f"[red]❌ {message}[/red]")
-        logger.error("Failed to get blueprint info: %s", message, exc_info=True)
-        return 1
+    return 0
 
 
 def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
     """Instantiate blueprint to generate FLUID contract."""
+    from fluid_build.cli._market_bundled_blueprints import (
+        get_bundled_blueprint,
+        is_bundled,
+        render_bundled_contract,
+    )
+
     console.print(f"[cyan]⚙️  Instantiating blueprint: {args.blueprint_id}...[/cyan]\n")
 
-    # Get blueprint info first
-    try:
-        response = _marketplace_get(f"{api_url}/{args.blueprint_id}", logger)
-        response.raise_for_status()
-        bp = response.json()
-    except requests.exceptions.RequestException as e:
-        message = _format_marketplace_error(e)
-        console.print(f"[red]❌ Failed to fetch blueprint: {message}[/red]")
-        logger.error("Failed to fetch blueprint: %s", message, exc_info=True)
-        return 1
+    bundled_bp = get_bundled_blueprint(args.blueprint_id) if is_bundled(args.blueprint_id) else None
+
+    # Get blueprint info first (bundled blueprints carry the same dict shape and
+    # need no registry round-trip).
+    if bundled_bp is not None:
+        bp = bundled_bp
+    else:
+        try:
+            response = _marketplace_get(f"{api_url}/{args.blueprint_id}", logger)
+            response.raise_for_status()
+            bp = response.json()
+        except requests.exceptions.RequestException as e:
+            message = _format_marketplace_error(e)
+            console.print(f"[red]❌ Failed to fetch blueprint: {message}[/red]")
+            logger.error("Failed to fetch blueprint: %s", message, exc_info=True)
+            return 1
 
     # Get parameters
     parameters = {}
@@ -527,58 +613,68 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
         console.print(
             Panel(f"[bold]Parameter Wizard[/bold]\nFill in parameters for {bp['name']}", title="🧙")
         )
-        params = bp.get("spec", {}).get("parameters", bp.get("parameters", []))
-        parameters = interactive_parameter_wizard(params)
+        param_list = bp.get("spec", {}).get("parameters", bp.get("parameters", []))
+        parameters = interactive_parameter_wizard(param_list)
     else:
         console.print("[yellow]⚠️  No parameters provided. Use --params or --interactive.[/yellow]")
         return 1
 
-    # Instantiate blueprint (matches BlueprintInstantiateRequest model)
-    payload = {
-        "instance_name": bp.get("id", "instance") + "-" + str(int(time.time())),
-        "parameters": parameters,
-        "user_context": {},
-        "deployment_context": {},
-    }
+    # Render the contract. Bundled blueprints render client-side with a
+    # sandboxed Jinja2 environment; registry blueprints are rendered
+    # server-side via POST /{id}/instantiate.
+    if bundled_bp is not None:
+        try:
+            contract = render_bundled_contract(bundled_bp, parameters)
+        except ValueError as e:
+            console.print(f"[red]❌ {e}[/red]")
+            logger.error("Bundled blueprint render failed: %s", e)
+            return 1
+        cost_estimate = "N/A (rendered locally)"
+    else:
+        # Instantiate blueprint (matches BlueprintInstantiateRequest model)
+        payload = {
+            "instance_name": bp.get("id", "instance") + "-" + str(int(time.time())),
+            "parameters": parameters,
+            "user_context": {},
+            "deployment_context": {},
+        }
+        try:
+            response = _marketplace_post(
+                f"{api_url}/{args.blueprint_id}/instantiate", logger, json=payload
+            )
+            response.raise_for_status()
+            result = response.json()
+            contract = result["contract"]
+            cost_estimate = result.get("cost_estimate", "N/A")
+        except requests.exceptions.RequestException as e:
+            message = _format_marketplace_error(e)
+            console.print(f"[red]❌ Failed to instantiate blueprint: {message}[/red]")
+            logger.error("Blueprint instantiation failed: %s", message, exc_info=True)
+            return 1
 
-    try:
-        response = _marketplace_post(
-            f"{api_url}/{args.blueprint_id}/instantiate", logger, json=payload
-        )
-        response.raise_for_status()
-        result = response.json()
+    console.print("[green]✅ Contract generated successfully![/green]\n")
 
-        contract = result["contract"]
+    # Show generated contract
+    console.print(Panel("Generated FLUID Contract", style="green"))
+    syntax = Syntax(json.dumps(contract, indent=2), "json", theme="monokai", line_numbers=True)
+    console.print(syntax)
 
-        console.print("[green]✅ Contract generated successfully![/green]\n")
+    # Save to file if requested
+    if args.output:
+        output_path = Path(args.output)
+        with open(output_path, "w") as f:
+            json.dump(contract, f, indent=2)
+        console.print(f"\n[green]💾 Saved to: {output_path}[/green]")
 
-        # Show generated contract
-        console.print(Panel("Generated FLUID Contract", style="green"))
-        syntax = Syntax(json.dumps(contract, indent=2), "json", theme="monokai", line_numbers=True)
-        console.print(syntax)
+    # Submit if requested
+    if getattr(args, "submit", False):
+        if Confirm.ask("\n[bold]Submit contract to FLUID?[/bold]"):
+            console.print("[yellow]🚀 Submitting contract... (not implemented yet)[/yellow]")
+            # TODO: Implement contract submission
 
-        # Save to file if requested
-        if args.output:
-            output_path = Path(args.output)
-            with open(output_path, "w") as f:
-                json.dump(contract, f, indent=2)
-            console.print(f"\n[green]💾 Saved to: {output_path}[/green]")
+    console.print(f"\n[dim]Cost estimate: {cost_estimate}[/dim]")
 
-        # Submit if requested
-        if args.submit:
-            if Confirm.ask("\n[bold]Submit contract to FLUID?[/bold]"):
-                console.print("[yellow]🚀 Submitting contract... (not implemented yet)[/yellow]")
-                # TODO: Implement contract submission
-
-        console.print(f"\n[dim]Cost estimate: {result.get('cost_estimate', 'N/A')}[/dim]")
-
-        return 0
-
-    except requests.exceptions.RequestException as e:
-        message = _format_marketplace_error(e)
-        console.print(f"[red]❌ Failed to instantiate blueprint: {message}[/red]")
-        logger.error("Blueprint instantiation failed: %s", message, exc_info=True)
-        return 1
+    return 0
 
 
 def interactive_parameter_wizard(parameters: list) -> Dict[str, Any]:
