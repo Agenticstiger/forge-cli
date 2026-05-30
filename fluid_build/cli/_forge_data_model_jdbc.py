@@ -27,10 +27,16 @@ existing call sites and test patches keep resolving.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fluid_build.cli.console import cprint
+from fluid_build.util.contract import slugify_identifier
+
+# Canonical FLUID contract-id pattern (lowercased form — ``product_id`` is
+# lowercased before the check). Mirrors the JSON-schema id constraint.
+_FLUID_ID_RE = re.compile(r"^[a-z0-9_][a-z0-9_.-]*[a-z0-9_]$|^[a-z0-9_]$")
 
 
 def _run_from_jdbc_source(args: Any, logger: logging.Logger) -> int:
@@ -93,12 +99,25 @@ def _run_from_jdbc_source(args: Any, logger: logging.Logger) -> int:
     # metadata (with owner), exposes (with exposeId, kind, binding,
     # contract.schema using "type" only). The operator can then refine
     # via ``fluid forge --refine``.
-    product_id = (args.name or db.database).lower().replace(" ", "_")
+    # ``db.database`` is a real database name for postgres/mysql but a FILE
+    # PATH for sqlite (ATTACH takes a path) — the raw path contains ``/`` and
+    # ``.`` and is not a valid FLUID id, so the whole emitted contract was
+    # rejected by the validator. Use the sqlite file *stem* as the base name.
+    if not args.name and db.source_kind == "sqlite":
+        base_name = Path(db.database).stem or "sqlite_db"
+    else:
+        base_name = args.name or db.database
+    # Preserve the historical id shape (lowercase, spaces→underscores) for the
+    # common case; only fall back to the shared slugifier when the base still
+    # carries characters the FLUID id pattern rejects, so the id is ALWAYS valid.
+    product_id = base_name.lower().replace(" ", "_")
+    if not _FLUID_ID_RE.match(product_id):
+        product_id = slugify_identifier(base_name, fallback="source_model")
     contract: Dict[str, Any] = {
         "fluidVersion": "0.7.3",
         "kind": "DataProduct",
         "id": product_id,
-        "name": args.name or db.database,
+        "name": base_name,
         "description": (f"Forged from {args.source}. {len(db.tables)} tables enumerated."),
         "metadata": {
             "layer": "Bronze",
