@@ -189,6 +189,41 @@ class TestRunFromJdbcSource:
         rc = _run_from_jdbc_source(args, logging.getLogger("test"))
         assert rc == 2
 
+    def test_sqlite_without_name_derives_valid_id_from_file_stem(
+        self, sqlite_db: Path, tmp_path: Path
+    ):
+        """Regression: with no ``--name``, the sqlite FILE PATH must not leak
+        into the contract id. db.database is a path for sqlite (ATTACH takes a
+        path), so the raw value ``/.../fixtures.sqlite`` previously became the
+        id and the whole contract was rejected by the validator. It must now
+        become the sanitized file stem and the contract must validate."""
+        import logging
+        import re as _re
+
+        from fluid_build.cli.forge_data_model import _run_from_jdbc_source
+
+        out = tmp_path / "out.fluid.yaml"
+        args = SimpleNamespace(
+            source="sqlite",
+            uri=f"sqlite:///{sqlite_db}",
+            schema_name=None,
+            tables=None,
+            name=None,  # the bug only triggers WITHOUT an explicit --name
+            output=str(out),
+        )
+        rc = _run_from_jdbc_source(args, logging.getLogger("test"))
+        assert rc == 0, "emitted contract must pass in-process id validation"
+
+        import yaml as _yaml
+
+        contract = _yaml.safe_load(out.read_text())
+        # The fixture file is ``fixtures.sqlite`` → id is its stem, path-free,
+        # and matches the FLUID identifier pattern.
+        assert contract["id"] == "fixtures"
+        assert "/" not in contract["id"]
+        assert str(sqlite_db) not in contract["id"]
+        assert _re.match(r"^[a-z0-9_][a-z0-9_.-]*[a-z0-9_]$|^[a-z0-9_]$", contract["id"])
+
 
 class TestJdbcTypeMapping:
     def test_integer_types(self):
