@@ -971,11 +971,23 @@ class TestMarketDiscoveryEngineInitializeConnectors:
         assert "apache_atlas" not in engine.connectors
 
     def test_health_checker_initialized_with_connectors(self):
+        # A connector must actually register for the engine to spin up a health
+        # checker. Every *bundled* demo connector (datahub included) is now
+        # roadmap-skipped, so patch the non-skipped command_center connector with
+        # a stub that connects — exercising the real init → register → health path.
         config = _base_config()
+        config["catalogs"] = ["fluid_command_center"]
         logger = logging.getLogger("test")
         engine = MarketDiscoveryEngine(config, logger)
-        # datahub connects with defaults (gdc is now roadmap-skipped).
-        _run(engine.initialize_connectors(["datahub"]))
+
+        stub = MagicMock()
+        stub.connect = AsyncMock(return_value=True)
+        with patch(
+            "fluid_build.cli.market_catalogs.command_center.CommandCenterConnector",
+            MagicMock(return_value=stub),
+        ):
+            _run(engine.initialize_connectors(["fluid_command_center"]))
+        assert "fluid_command_center" in engine.connectors
         assert engine.health_checker is not None
 
     def test_health_checker_not_initialized_without_connectors(self):

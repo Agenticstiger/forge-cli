@@ -14,14 +14,15 @@
 
 """Engine guard: roadmap catalogs are skipped, never served as demo data.
 
-The proprietary catalog connectors (Collibra, Alation, Azure Purview, Apache
-Atlas, Confluent Schema Registry) still ship illustrative *mock* metadata
-rather than performing a real catalog query. Until a real discovery
-integration lands, :class:`MarketDiscoveryEngine` must skip them entirely so
-``fluid market`` never surfaces fabricated data products as if they were live
-catalog results. These tests pin that behaviour for all five — including the
-two (azure_purview, confluent_schema_registry) that had no engine-path test
-before — and assert the skip is announced honestly in the logs.
+The bundled per-catalog connectors (Collibra, Alation, Azure Purview, Apache
+Atlas, Confluent Schema Registry, the AWS/GCP/custom-REST demos, and DataHub)
+ship illustrative *mock* metadata rather than performing a real catalog query.
+Real discovery for every one of them flows through the generic ``mcp``
+connector pointed at the catalog's MCP server, so :class:`MarketDiscoveryEngine`
+must skip the bundled connectors entirely — otherwise ``fluid market`` would
+surface fabricated data products as if they were live catalog results. These
+tests pin that behaviour for all of them and assert the skip is announced
+honestly in the logs.
 """
 
 from __future__ import annotations
@@ -51,6 +52,9 @@ _ROADMAP_CATALOG_NAMES = [
     "aws_glue_data_catalog",
     "google_cloud_data_catalog",
     "custom_rest_api",
+    # DataHub's bundled connector returned one demo product; real discovery is
+    # the mcp connector pointed at mcp-server-datahub.
+    "datahub",
 ]
 
 # Per-catalog configs that WOULD let each connector's ``_connect_impl`` return
@@ -66,6 +70,7 @@ _CREDS = {
     "aws_glue_data_catalog": {"region": "us-east-1"},
     "google_cloud_data_catalog": {"project_id": "test"},
     "custom_rest_api": {"base_url": "http://api.example.com"},
+    "datahub": {"server_url": "http://x"},
 }
 
 _BASE = {"defaults": {"timeout_seconds": 30}, "cache": {"enabled": False}}
