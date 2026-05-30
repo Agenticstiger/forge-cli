@@ -1172,6 +1172,7 @@ def handle_list_catalogs(config: Dict[str, Any], logger: logging.Logger) -> int:
         "collibra": "Collibra",
         "alation": "Alation",
         "custom_rest_api": "Custom REST API",
+        "mcp": "MCP server (DataHub / OpenMetadata / Data Mesh Manager / any MCP catalog)",
     }
 
     configured_catalogs = config.get("catalogs", [])
@@ -1225,6 +1226,36 @@ confluent_schema_registry:
   url: "http://localhost:8081"
   # api_key: "your-api-key"  # Optional
   # api_secret: "your-api-secret"  # Optional
+
+# MCP-based discovery — speak Model Context Protocol to any catalog that
+# exposes an MCP server (DataHub, OpenMetadata, Data Mesh Manager, ...).
+# Catalogs are normally REMOTE/hosted, so the default below connects to a
+# hosted MCP endpoint. Add "mcp" to the catalogs list above to enable it.
+mcp:
+  profile: openmetadata       # datahub | openmetadata | datamesh_manager | auto
+
+  # --- Remote MCP endpoint (default; OpenMetadata exposes one at /mcp) ---
+  transport: streamable_http
+  url: "https://openmetadata.your-company.com/mcp"
+  token_env: "OPENMETADATA_JWT"   # bearer token (Personal Access Token) from this env var
+
+  # --- DataHub: run the official server locally, pointed at your REMOTE
+  #     DataHub GMS (the server process is local; the catalog is not) ---
+  # profile: datahub
+  # transport: stdio
+  # command: uvx
+  # args: ["mcp-server-datahub"]
+  # env:
+  #   DATAHUB_GMS_URL: "https://your-company.acryl.io/gms"   # your hosted DataHub
+  #   DATAHUB_GMS_TOKEN: "${DATAHUB_GMS_TOKEN}"
+
+  # --- Data Mesh Manager (SaaS): run dataproduct-mcp against the hosted API ---
+  # profile: datamesh_manager
+  # transport: stdio
+  # command: uvx
+  # args: ["dataproduct-mcp"]
+  # env:
+  #   DATAMESH_MANAGER_API_KEY: "${DATAMESH_MANAGER_API_KEY}"
 
 # Default search settings
 defaults:

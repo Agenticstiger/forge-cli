@@ -160,6 +160,7 @@ class MarketDiscoveryEngine:
         from fluid_build.cli.market_catalogs.google_data_catalog import (
             GoogleCloudDataCatalogConnector,
         )
+        from fluid_build.cli.market_catalogs.mcp_catalog import McpCatalogConnector
         from fluid_build.cli.market_catalogs.rest_api import CustomRestApiConnector
 
         connector_classes = {
@@ -173,6 +174,7 @@ class MarketDiscoveryEngine:
             "alation": AlationConnector,
             "custom_rest_api": CustomRestApiConnector,
             "fluid_command_center": CommandCenterConnector,
+            "mcp": McpCatalogConnector,
         }
 
         for catalog_type in catalog_types:
