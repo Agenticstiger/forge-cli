@@ -69,7 +69,22 @@ SENSITIVE_PATTERNS = [
     # value terminator set (stop at whitespace / ``;`` / ``&`` / ``,``).
     # Quantifiers are upper-bounded to prevent catastrophic backtracking.
     re.compile(
-        r"(?i)\b(?P<key>api[_-]?key|password|secret|token|passphrase)"
+        # Key alternation + optional env-var prefix mirror the global
+        # ``SecretRedactingFilter._ASSIGNMENT_RE`` so the two layers stay
+        # symmetric (CLAUDE.md invariant): a bare ``client_secret=…`` /
+        # ``oauth_token=…`` / ``MY_API_KEY=…`` is redacted here too, not only
+        # by the always-on global filter.
+        # Intentionally EXCLUDED from this alternation:
+        #   * ``aws_secret_access_key`` — handled by the dedicated env-var
+        #     pattern below;
+        #   * ``private_key`` — covered by the ``"private_key":`` JSON pattern,
+        #     the SENSITIVE_KEYS dict-key check, and the PEM-block pattern.
+        #     Including it HERE would run before the PEM-block pattern and
+        #     corrupt a ``private_key=<multiline PEM>`` header, leaking the body.
+        r"(?i)\b(?P<key>(?:[A-Za-z0-9_]{,128}_)?(?:"
+        r"api[_-]?key|authorization|client_secret|"
+        r"oauth[_-]?token|password|secret|token|passphrase"
+        r"))"
         r"(?P<sep>\s{,8}[:=]\s{,8})"
         r"(?P<value>[^\s;&,]{,256})"
     ),
@@ -152,6 +167,10 @@ SENSITIVE_KEYS = {
     "conn_str",
     "bearer",
     "jwt",
+    # Mirror the global SecretRedactingFilter key set (CLAUDE.md symmetry
+    # invariant) — these were present globally but missing from this twin.
+    "auth_token",
+    "session_token",
 }
 
 

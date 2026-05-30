@@ -108,6 +108,12 @@ class TestSnowflakeAssignmentKeyNamePreserved:
             ("secret=topsecretvalue", "secret=[REDACTED]"),
             ("token=abc.def.ghi", "token=[REDACTED]"),
             ("passphrase=letmein", "passphrase=[REDACTED]"),
+            # Newly symmetric with the global layer (key alternation widened):
+            ("client_secret=topsecret123", "client_secret=[REDACTED]"),
+            ("oauth_token=abc.def.ghi", "oauth_token=[REDACTED]"),
+            ("authorization=Bearerabc123", "authorization=[REDACTED]"),
+            # Env-var prefix (``MY_…``) now matches, mirroring the global regex:
+            ("MY_API_KEY=zzz999", "MY_API_KEY=[REDACTED]"),
         ],
     )
     def test_assignment_keeps_key_name(self, line: str, expected: str) -> None:
@@ -130,6 +136,20 @@ class TestSnowflakeAssignmentKeyNamePreserved:
         assert out != "[REDACTED]"
         assert out == "password=[REDACTED]"
 
+    def test_private_key_pem_adjacent_not_corrupted(self) -> None:
+        # Regression guard: ``private_key`` must stay OUT of the bare-assignment
+        # alternation. If it were in, the assignment regex would run before the
+        # PEM-block pattern, mangle the ``-----BEGIN…-----`` header, and the
+        # base64 body would leak. The PEM-block pattern must win here.
+        pem = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEvQIBADBODYMUSTVANISH0123456789\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        out = redact_string(f"private_key={pem}")
+        assert "MIIEvQIBADBODYMUSTVANISH0123456789" not in out
+        assert "MIIEvQIBAD" not in out
+
 
 class TestSnowflakeRedactDict:
     """``redact_dict`` redacts newly covered sensitive key names."""
@@ -144,6 +164,9 @@ class TestSnowflakeRedactDict:
             "aws_access_key",
             "aws_secret_key",
             "azure_sas_token",
+            # Newly mirrored from the global key set:
+            "auth_token",
+            "session_token",
         ],
     )
     def test_sensitive_key_redacted(self, key: str) -> None:
