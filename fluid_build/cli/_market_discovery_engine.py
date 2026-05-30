@@ -41,19 +41,26 @@ from typing import Any, Dict, List, Optional
 # dishonest UX this guard exists to prevent. An entry graduates out of
 # this set the moment its connector performs a real lookup.
 #
-# Scope note: DataHub / OpenMetadata / datamesh-manager are tracked
-# separately for a real-integration pass and are intentionally NOT listed
-# here. The remaining demo connectors (aws_glue_data_catalog /
-# google_cloud_data_catalog / custom_rest_api) are pending a follow-up
-# classification (real vs. roadmap) and are likewise left untouched here
-# to keep this change narrowly scoped.
+# Real discovery is delivered through the generic ``mcp`` connector
+# (``market_catalogs/mcp_catalog.py``), which speaks Model Context Protocol
+# to any catalog that exposes an MCP server (DataHub, OpenMetadata, Data
+# Mesh Manager, and increasingly AWS/GCP) — so the demo-only per-catalog
+# connectors below are skipped rather than reimplemented bespoke. Point the
+# ``mcp`` connector at the relevant catalog's MCP server to discover them
+# for real.
 _ROADMAP_CATALOGS: frozenset[str] = frozenset(
     {
+        # Proprietary demo connectors (no fabricated data — see above).
         "azure_purview",
         "apache_atlas",
         "confluent_schema_registry",
         "collibra",
         "alation",
+        # Cloud / generic demo connectors — real discovery flows through the
+        # ``mcp`` connector instead of a bespoke client for each.
+        "aws_glue_data_catalog",
+        "google_cloud_data_catalog",
+        "custom_rest_api",
     }
 )
 

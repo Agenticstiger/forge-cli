@@ -35,16 +35,22 @@ from fluid_build.cli.market import MarketDiscoveryEngine
 
 LOG = logging.getLogger("test.market.roadmap")
 
-# The five proprietary demo-only catalogs. Hardcoded here (rather than derived
-# from the engine's private set) so this list independently *pins* the
+# The demo-only catalogs the engine must skip. Hardcoded here (rather than
+# derived from the engine's private set) so this list independently *pins* the
 # expectation: the equality test below fails loudly if the engine's
-# ``_ROADMAP_CATALOGS`` ever drifts from this set.
+# ``_ROADMAP_CATALOGS`` ever drifts from this set. Real discovery for these
+# catalogs flows through the generic ``mcp`` connector instead.
 _ROADMAP_CATALOG_NAMES = [
+    # Proprietary demo connectors.
     "alation",
     "apache_atlas",
     "azure_purview",
     "collibra",
     "confluent_schema_registry",
+    # Cloud / generic demo connectors (real discovery is via the mcp connector).
+    "aws_glue_data_catalog",
+    "google_cloud_data_catalog",
+    "custom_rest_api",
 ]
 
 # Per-catalog configs that WOULD let each connector's ``_connect_impl`` return
@@ -57,12 +63,15 @@ _CREDS = {
     "confluent_schema_registry": {"url": "http://x"},
     "collibra": {"base_url": "http://x", "username": "u", "password": "p"},
     "alation": {"base_url": "http://x", "api_token": "t"},
+    "aws_glue_data_catalog": {"region": "us-east-1"},
+    "google_cloud_data_catalog": {"project_id": "test"},
+    "custom_rest_api": {"base_url": "http://api.example.com"},
 }
 
 _BASE = {"defaults": {"timeout_seconds": 30}, "cache": {"enabled": False}}
 
 
-def test_roadmap_set_is_exactly_the_five_proprietary_connectors():
+def test_roadmap_set_matches_pinned_demo_connectors():
     # Lazy import: reaching into ``_market_discovery_engine`` at module scope
     # before ``market`` is imported trips a circular import. By call time the
     # host module (imported at top) has fully initialised the engine module.
