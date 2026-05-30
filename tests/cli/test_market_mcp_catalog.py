@@ -534,6 +534,79 @@ def test_get_data_product_falls_back_to_shallow_without_detail_tool():
     assert d.schema_fields == []  # no schema tool → no enrichment
 
 
+def _make_superset_server() -> Server:
+    """search returns a RICH row (trust fields); get_entities returns a SPARSE
+    entity (description/owner only). The merged detail must keep the rich trust
+    fields AND gain the enriched description/owner — i.e. `--detailed` ⊇ listing.
+    """
+    rich_row = {
+        "urn": "urn:li:dataset:finance.revenue",
+        "name": "Revenue",
+        "description": "short summary",
+        "domain": "finance",
+        "owners": [{"name": "fin-team"}],
+        "tags": ["gold", "kpi"],
+        "qualityScore": 95,
+        "layer": "gold",
+        "version": "2.1.0",
+        "popularity": 42,
+    }
+    sparse_entity = {
+        "urn": "urn:li:dataset:finance.revenue",
+        "name": "Revenue",
+        "properties": {"description": "Daily revenue by region (enriched)"},
+        "ownership": {"owners": [{"owner": {"properties": {"displayName": "Finance Team"}}}]},
+    }
+    server: Server = Server("fake-catalog-superset")
+
+    @server.list_tools()
+    async def _list_tools():
+        def tool(name):
+            return mcp_types.Tool(
+                name=name,
+                description=name,
+                inputSchema={"type": "object", "properties": {"query": {"type": "string"}}},
+            )
+
+        return [tool("search"), tool("get_entities"), tool("list_schema_fields")]
+
+    @server.call_tool()
+    async def _call_tool(name, arguments):
+        if name == "search":
+            payload = [rich_row]
+        elif name == "get_entities":
+            payload = {"result": sparse_entity}
+        elif name == "list_schema_fields":
+            payload = {"fields": _FIELDS}
+        else:
+            raise ValueError(f"unknown tool: {name}")
+        return [mcp_types.TextContent(type="text", text=json.dumps(payload))]
+
+    return server
+
+
+def test_get_data_product_detail_is_superset_of_listing():
+    # Regression: enrichment must MERGE (not REPLACE) — the detail entity is
+    # sparser than the search row on trust, so a naive replace would drop
+    # quality/layer/tags/version/usage that the listing showed.
+    c = _connector(profile="datahub")
+    _wire(c, _make_superset_server())
+    assert _run(c.connect()) is True
+    d = _run(c.get_data_product("urn:li:dataset:finance.revenue"))
+    assert d is not None
+    # Detail's reason to exist — enriched description + resolved owner — wins.
+    assert d.description == "Daily revenue by region (enriched)"
+    assert d.owner == "Finance Team"
+    # Trust fields from the shallow listing are KEPT, not dropped.
+    assert d.quality_score == pytest.approx(0.95)
+    assert d.layer is DataProductLayer.GOLD
+    assert d.version == "2.1.0"
+    assert d.tags == ["gold", "kpi"]
+    assert d.usage_stats.get("popularity") == 42
+    # And the column schema is attached (from the shared _FIELDS fixture).
+    assert [f["name"] for f in d.schema_fields] == ["id", "amount"]
+
+
 def test_extract_owner_handles_nested_ownership():
     assert _extract_owner("team-a") == "team-a"
     assert _extract_owner({"owners": [{"owner": {"properties": {"displayName": "A"}}}]}) == "A"
