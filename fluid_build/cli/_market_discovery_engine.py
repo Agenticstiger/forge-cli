@@ -33,6 +33,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Discovery catalogs whose connectors still ship illustrative/demo
+# metadata rather than performing a real catalog query. Until a real
+# discovery integration lands for each, the engine SKIPS them entirely
+# instead of surfacing fabricated data products through ``fluid market``
+# — serving demo rows as if they were live catalog results is exactly the
+# dishonest UX this guard exists to prevent. An entry graduates out of
+# this set the moment its connector performs a real lookup.
+#
+# Scope note: DataHub / OpenMetadata / datamesh-manager are tracked
+# separately for a real-integration pass and are intentionally NOT listed
+# here. The remaining demo connectors (aws_glue_data_catalog /
+# google_cloud_data_catalog / custom_rest_api) are pending a follow-up
+# classification (real vs. roadmap) and are likewise left untouched here
+# to keep this change narrowly scoped.
+_ROADMAP_CATALOGS: frozenset[str] = frozenset(
+    {
+        "azure_purview",
+        "apache_atlas",
+        "confluent_schema_registry",
+        "collibra",
+        "alation",
+    }
+)
+
 
 def _market_module():
     from fluid_build.cli import market as _m
@@ -152,6 +176,12 @@ class MarketDiscoveryEngine:
         }
 
         for catalog_type in catalog_types:
+            if catalog_type in _ROADMAP_CATALOGS:
+                self.logger.info(
+                    f"⏭️  '{catalog_type}' discovery is on the roadmap — not yet "
+                    "implemented; skipping (no demo data served)."
+                )
+                continue
             if catalog_type in connector_classes:
                 catalog_config = self.config.get(catalog_type, {})
                 connector = connector_classes[catalog_type](catalog_config, self.logger)
