@@ -548,7 +548,9 @@ class TestContractValidator:
 
         with (
             patch("fluid_build.cli.contract_validation.SNOWFLAKE_VALIDATION_AVAILABLE", True),
-            patch("fluid_build.cli.contract_validation.SnowflakeValidationProvider") as MockSFP,
+            patch(
+                "fluid_build.providers.snowflake_validation.SnowflakeValidationProvider"
+            ) as MockSFP,
         ):
             mock_sfp = MockSFP.return_value
             mock_sfp.validate_connection.return_value = True

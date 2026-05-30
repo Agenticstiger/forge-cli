@@ -30,6 +30,7 @@ and validates that they match what's declared in the FLUID contract.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import logging
 import time
@@ -57,37 +58,26 @@ from ..providers.validation_provider import ValidationProvider
 from ..schema_manager import FluidSchemaManager
 from ._common import load_contract_with_overlay
 
-try:
-    from ..providers.bigquery_validation import BigQueryValidationProvider
 
-    BIGQUERY_AVAILABLE = True
-except ImportError:
-    BigQueryValidationProvider = None  # type: ignore[assignment,misc]
-    BIGQUERY_AVAILABLE = False
+# Validation providers pull heavy cloud SDKs at import time
+# (google-cloud-bigquery drags in pandas; snowflake-connector; boto3).
+# Importing them at module load made every ``fluid --help`` import ~2.5k
+# modules and take ~0.85s. Detect availability cheaply from distribution
+# metadata (no package import) and import the provider class lazily at the
+# point of use. The ``*_AVAILABLE`` flags stay module-level so they remain
+# patchable in tests and back-compatible.
+def _dist_installed(dist_name: str) -> bool:
+    try:
+        importlib.metadata.version(dist_name)
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
 
-try:
-    from ..providers.snowflake_validation import SnowflakeValidationProvider
 
-    SNOWFLAKE_VALIDATION_AVAILABLE = True
-except ImportError:
-    SnowflakeValidationProvider = None  # type: ignore[assignment,misc]
-    SNOWFLAKE_VALIDATION_AVAILABLE = False
-
-try:
-    from ..providers.aws_validation import AWSValidationProvider
-
-    AWS_VALIDATION_AVAILABLE = True
-except ImportError:
-    AWSValidationProvider = None  # type: ignore[assignment,misc]
-    AWS_VALIDATION_AVAILABLE = False
-
-try:
-    from ..providers.local_validation import LocalValidationProvider
-
-    LOCAL_VALIDATION_AVAILABLE = True
-except ImportError:
-    LocalValidationProvider = None  # type: ignore[assignment,misc]
-    LOCAL_VALIDATION_AVAILABLE = False
+BIGQUERY_AVAILABLE = _dist_installed("google-cloud-bigquery")
+SNOWFLAKE_VALIDATION_AVAILABLE = _dist_installed("snowflake-connector-python")
+AWS_VALIDATION_AVAILABLE = _dist_installed("boto3")
+LOCAL_VALIDATION_AVAILABLE = _dist_installed("duckdb")
 
 LOG = logging.getLogger("fluid.cli.contract_validation")
 COMMAND = "contract-validation"
@@ -425,6 +415,8 @@ class ContractValidator:
             # --server can override the GCP project
             if self.server:
                 provider_config["project_id"] = self.server
+            from ..providers.bigquery_validation import BigQueryValidationProvider
+
             self.validation_provider = BigQueryValidationProvider(provider_config)
         elif self.provider_name == "snowflake":
             if not SNOWFLAKE_VALIDATION_AVAILABLE:
@@ -438,6 +430,8 @@ class ContractValidator:
                 return
             # Build Snowflake config from contract bindings + CLI overrides
             sf_config = self._build_snowflake_config()
+            from ..providers.snowflake_validation import SnowflakeValidationProvider
+
             self.validation_provider = SnowflakeValidationProvider(sf_config)
         elif self.provider_name == "aws":
             if not AWS_VALIDATION_AVAILABLE:
@@ -450,6 +444,8 @@ class ContractValidator:
                 )
                 return
             aws_config = {"region": self.region or "us-east-1"}
+            from ..providers.aws_validation import AWSValidationProvider
+
             self.validation_provider = AWSValidationProvider(aws_config)
         elif self.provider_name == "local":
             if not LOCAL_VALIDATION_AVAILABLE:
@@ -462,6 +458,8 @@ class ContractValidator:
                 )
                 return
             base_dir = str(self.contract_path.parent) if self.contract_path else "."
+            from ..providers.local_validation import LocalValidationProvider
+
             self.validation_provider = LocalValidationProvider({"base_dir": base_dir})
         elif self.provider_name in ["databricks", "azure"]:
             self.report.add_issue(

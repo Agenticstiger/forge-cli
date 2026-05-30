@@ -393,7 +393,7 @@ class TestDetectAndValidateProviderExt(unittest.TestCase):
 
         with patch("fluid_build.cli.contract_validation.LOCAL_VALIDATION_AVAILABLE", True):
             with patch(
-                "fluid_build.cli.contract_validation.LocalValidationProvider",
+                "fluid_build.providers.local_validation.LocalValidationProvider",
                 return_value=mock_provider,
             ):
                 v._detect_and_validate_provider()
@@ -410,7 +410,7 @@ class TestDetectAndValidateProviderExt(unittest.TestCase):
 
         with patch("fluid_build.cli.contract_validation.LOCAL_VALIDATION_AVAILABLE", True):
             with patch(
-                "fluid_build.cli.contract_validation.LocalValidationProvider",
+                "fluid_build.providers.local_validation.LocalValidationProvider",
                 return_value=mock_provider,
             ):
                 v._detect_and_validate_provider()
