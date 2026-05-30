@@ -1628,6 +1628,44 @@ class TestRun:
             result = run(args, logger)
         assert result == 0
 
+    def test_dbt_engine_on_inline_sql_warns_not_silently_ignored(self, tmp_path):
+        """A build that declares ``engine: dbt`` but carries inline SQL runs via
+        the local DuckDB engine — the dispatch must WARN that the dbt engine is
+        not honoured rather than silently ignoring it."""
+        contract_file = tmp_path / "contract.yaml"
+        contract_file.touch()
+        build = {
+            "id": "hello",
+            "pattern": "embedded-logic",
+            "engine": "dbt",
+            "properties": {"sql": "SELECT 1 AS x"},
+        }
+        args = self._args(contract=str(contract_file))
+        logger = logging.getLogger("test")
+
+        with (
+            patch(
+                "fluid_build.build_runners.base.load_contract_with_overlay",
+                return_value={"id": "t", "builds": [build]},
+            ),
+            patch(
+                "fluid_build.build_runners.base._execute_embedded_sql_build",
+                return_value=0,
+            ) as mock_exec,
+            patch("fluid_build.build_runners.base.cprint") as mock_cprint,
+            patch("fluid_build.build_runners.base.success"),
+            patch("fluid_build.build_runners.base.console_error"),
+        ):
+            result = run(args, logger)
+
+        # Still executed via the embedded-SQL / DuckDB path…
+        assert result == 0
+        mock_exec.assert_called_once()
+        # …and the dispatch warned that engine: dbt is not honoured.
+        printed = " ".join(str(c.args[0]) for c in mock_cprint.call_args_list if c.args)
+        assert "engine 'dbt'" in printed
+        assert "not dbt" in printed
+
     def test_all_builds_succeed_returns_zero(self, tmp_path):
         contract_file = tmp_path / "contract.yaml"
         contract_file.touch()

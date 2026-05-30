@@ -474,6 +474,18 @@ def run_builds_from_args(
             continue
 
         if is_embedded_sql_build(build):
+            # An inline-SQL build that ALSO declares a dbt(-adapter) engine
+            # still runs via the local DuckDB engine below — NOT dbt. Surface
+            # that explicitly so ``engine: dbt`` is never silently ignored.
+            if is_dbt_build(build):
+                cprint(
+                    f"\n⚠️  Build '{build_id}' sets engine "
+                    f"'{build.get('engine')}' but carries inline SQL "
+                    f"('properties.sql'); running it via the local DuckDB "
+                    f"engine, not dbt. To run dbt, point the build at a dbt "
+                    f"project (repository + dbt_project.yml) instead of inline "
+                    f"SQL."
+                )
             # Bug A4-A fix: embedded-SQL builds (engine: sql / pattern:
             # embedded-logic + properties.sql) carry their SQL inline and do
             # NOT have an external Python script.  They are executed via the
