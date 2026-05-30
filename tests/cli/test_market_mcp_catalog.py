@@ -387,7 +387,9 @@ def test_subprocess_env_inherits_and_layers(monkeypatch):
     )
     env = c._subprocess_env()
     assert env["PATH"] == "/usr/bin"  # inherited from os.environ
-    assert env["DATAMESH_MANAGER_HOST"].endswith("datamesh-manager.com")  # literal config
+    # Full-equality (not endswith) so this stays a clean assertion and doesn't
+    # trip CodeQL's url-substring-sanitization pattern.
+    assert env["DATAMESH_MANAGER_HOST"] == "https://app.datamesh-manager.com"  # literal config
     assert env["DATAMESH_MANAGER_API_KEY"] == "dmm_live_secret"  # env_from rename
 
 
