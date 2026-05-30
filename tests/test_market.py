@@ -1364,6 +1364,42 @@ class TestHandleProductDetails:
         result = _asyncio.run(handle_product_details(engine, "nonexistent", args, logger))
         assert result == 1
 
+    def test_product_found_json_emits_parseable_json(self):
+        # --format json must emit parseable JSON, not the Rich detail panel, so
+        # `fluid market --product-id … --detailed --format json | jq` works.
+        config = _base_engine_config()
+        logger = logging.getLogger("test")
+        engine = MarketDiscoveryEngine(config, logger)
+        engine.console = None
+
+        mock_connector = _MagicMock()
+        mock_connector.get_data_product = _AsyncMock(return_value=_make_test_product(id="tp1"))
+        engine.connectors = {"gcp": mock_connector}
+
+        args = _make_test_args(format="json")
+        with _patch("fluid_build.cli.market.cprint") as mock_cprint:
+            result = _asyncio.run(handle_product_details(engine, "tp1", args, logger))
+        assert result == 0
+        mock_cprint.assert_called_once()
+        emitted = _json.loads(mock_cprint.call_args.args[0])
+        assert isinstance(emitted, list) and emitted[0]["id"] == "tp1"
+
+    def test_product_not_found_json_emits_empty_array(self):
+        config = _base_engine_config()
+        logger = logging.getLogger("test")
+        engine = MarketDiscoveryEngine(config, logger)
+        engine.console = None
+
+        mock_connector = _MagicMock()
+        mock_connector.get_data_product = _AsyncMock(return_value=None)
+        engine.connectors = {"gcp": mock_connector}
+
+        args = _make_test_args(format="json")
+        with _patch("fluid_build.cli.market.cprint") as mock_cprint:
+            result = _asyncio.run(handle_product_details(engine, "missing", args, logger))
+        assert result == 1
+        assert _json.loads(mock_cprint.call_args.args[0]) == []
+
 
 # ---------------------------------------------------------------------------
 # generate_output
@@ -1377,6 +1413,17 @@ class TestGenerateOutput:
         with _patch("fluid_build.cli.market.cprint"):
             result = generate_output([], args, None, logger)
         assert result == 0
+
+    def test_no_products_json_emits_valid_empty_array(self):
+        # Empty JSON result must be a valid document (`[]`), not the human
+        # "no products found" prose, so stdout stays machine-parseable.
+        args = _make_test_args(format="json")
+        logger = logging.getLogger("test")
+        with _patch("fluid_build.cli.market.cprint") as mock_cprint:
+            result = generate_output([], args, None, logger)
+        assert result == 0
+        mock_cprint.assert_called_once()
+        assert _json.loads(mock_cprint.call_args.args[0]) == []
 
     def test_table_format(self):
         products = [_make_test_product()]

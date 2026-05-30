@@ -563,6 +563,13 @@ async def run_market_discovery(args, logger: logging.Logger) -> int:
         # Initialize discovery engine
         engine = MarketDiscoveryEngine(config, logger)
 
+        # In JSON mode stdout is reserved for the JSON document, so keep all
+        # progress / status / onboarding chatter off it. Nulling the engine
+        # console routes its Rich search-progress to the stderr logger instead.
+        json_mode = getattr(args, "format", None) == "json"
+        if json_mode:
+            engine.console = None
+
         # Handle special operations first
         if args.list_catalogs:
             return handle_list_catalogs(config, logger)
@@ -581,9 +588,14 @@ async def run_market_discovery(args, logger: logging.Logger) -> int:
         await engine.initialize_connectors(catalog_types)
 
         if not engine.connectors:
-            render_no_catalog_onboarding(
-                catalog_types or config.get("catalogs", []), engine.console
-            )
+            if json_mode:
+                # Machine consumers get a valid empty result on stdout; the
+                # human onboarding guidance would only corrupt the JSON.
+                cprint(format_json_output([]))
+            else:
+                render_no_catalog_onboarding(
+                    catalog_types or config.get("catalogs", []), engine.console
+                )
             return 1
 
         # Handle specific product lookup
@@ -835,6 +847,22 @@ def generate_output(
     products: List[DataProductMetadata], args, console: Optional[Console], logger: logging.Logger
 ) -> int:
     """Generate and output results"""
+    # JSON mode emits a valid document even when empty (``[]``) — handled before
+    # the human "no products" message so stdout stays machine-parseable.
+    if args.format == "json":
+        output_content = format_json_output(products)
+        if args.output:
+            try:
+                with open(args.output, "w") as f:
+                    f.write(output_content)
+                logger.info(f"📄 Results written to {args.output}")
+            except Exception as e:
+                logger.error(f"Failed to write output file: {e}")
+                return 1
+        else:
+            cprint(output_content)
+        return 0
+
     if not products:
         if console and RICH_AVAILABLE:
             console.print("[yellow]No data products found matching your criteria.[/yellow]")
@@ -843,9 +871,7 @@ def generate_output(
         return 0
 
     # Generate output based on format
-    if args.format == "json":
-        output_content = format_json_output(products)
-    elif args.format == "detailed":
+    if args.format == "detailed":
         if console and RICH_AVAILABLE:
             for product in products:
                 format_detailed_output(product, console)
@@ -856,20 +882,6 @@ def generate_output(
     else:  # table format
         format_table_output(products, console)
         return 0
-
-    # Handle file output
-    if args.output:
-        try:
-            with open(args.output, "w") as f:
-                f.write(output_content)
-            logger.info(f"📄 Results written to {args.output}")
-        except Exception as e:
-            logger.error(f"Failed to write output file: {e}")
-            return 1
-    else:
-        cprint(output_content)
-
-    return 0
 
 
 async def handle_health_check(engine: MarketDiscoveryEngine, args, logger: logging.Logger) -> int:
@@ -1331,14 +1343,23 @@ async def handle_product_details(
     engine: MarketDiscoveryEngine, product_id: str, args, logger: logging.Logger
 ) -> int:
     """Handle product detail lookup"""
+    json_mode = getattr(args, "format", None) == "json"
     try:
         # Search for the product across all catalogs
         for catalog_name, connector in engine.connectors.items():
             product = await connector.get_data_product(product_id)
             if product:
-                format_detailed_output(product, engine.console)
+                if json_mode:
+                    # Honour --format json: emit the product as a single-element
+                    # JSON array (same shape/serialiser as the listing view) so
+                    # `--product-id … --detailed --format json` is parseable.
+                    cprint(format_json_output([product]))
+                else:
+                    format_detailed_output(product, engine.console)
                 return 0
 
+        if json_mode:
+            cprint(format_json_output([]))
         logger.error(f"Product '{product_id}' not found in any connected catalogs")
         return 1
     except Exception as e:
