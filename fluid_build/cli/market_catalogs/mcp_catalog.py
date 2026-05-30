@@ -162,8 +162,10 @@ PROFILES: Dict[str, CatalogProfile] = {
     "datahub": CatalogProfile(
         name="datahub",
         search_tools=("search", "search_entities", "get_entities", "get_dataset"),
-        # Verified live against mcp-server-datahub: get_entities(urns=…) returns
-        # the rich entity; list_schema_fields(urn=…) returns column schema.
+        # Verified live against mcp-server-datahub: the search tool's result-limit
+        # arg is ``num_results`` (not ``limit``); get_entities(urns=…) returns the
+        # rich entity; list_schema_fields(urn=…) returns column schema.
+        limit_arg="num_results",
         detail_tool="get_entities",
         detail_id_arg="urns",
         schema_tool="list_schema_fields",
@@ -171,7 +173,14 @@ PROFILES: Dict[str, CatalogProfile] = {
     ),
     "openmetadata": CatalogProfile(
         name="openmetadata",
+        # Verified live against OpenMetadata 1.12's built-in MCP server: the
+        # search tool is ``search_metadata`` (results under "results", each with
+        # fullyQualifiedName / name / description / owners), and its result-limit
+        # arg is ``size`` (not ``limit``). Detail enrichment via
+        # ``get_entity_details(entityType, fqn)`` is a 2-arg shape left for a
+        # follow-up; OM's search result is already rich (description + owners).
         search_tools=("search_metadata", "search"),
+        limit_arg="size",
     ),
     "datamesh_manager": CatalogProfile(
         name="datamesh_manager",

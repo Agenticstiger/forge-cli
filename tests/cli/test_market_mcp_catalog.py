@@ -269,6 +269,54 @@ def test_search_parses_datahub_searchresults_envelope():
     assert any("commerce.sdp.orders" in p.id for p in products)
 
 
+# OpenMetadata's `search_metadata` shape, captured live from OM 1.12's built-in
+# MCP server: rows under "results", each with fullyQualifiedName / name /
+# description / owners (a list of {name, displayName}).
+_OM_SHAPE = {
+    "totalFound": 1,
+    "results": [
+        {
+            "entityType": "table",
+            "fullyQualifiedName": "svc.db.schema.dim_address",
+            "name": "dim_address",
+            "displayName": "Address Dimension",
+            "description": "address dimension table",
+            "owners": [{"name": "data-team", "displayName": "Data Team"}],
+        }
+    ],
+}
+
+
+def test_openmetadata_search_metadata_shape_maps():
+    c = _connector(profile="openmetadata")
+    _wire(c, _make_wrapping_server(_OM_SHAPE, tool_name="search_metadata"))
+    assert _run(c.connect()) is True
+    assert c._search_tool == "search_metadata"
+    products = _run(c.search_data_products(SearchFilters()))
+    assert len(products) == 1
+    p = products[0]
+    assert p.id == "svc.db.schema.dim_address"  # fullyQualifiedName
+    assert p.name == "dim_address"
+    assert p.description == "address dimension table"
+    assert p.owner == "data-team"  # owners[].name
+    assert p.catalog_source == "MCP (openmetadata)"
+
+
+def test_limit_arg_is_per_catalog():
+    # Verified live: OpenMetadata's search-limit param is `size`, DataHub's is
+    # `num_results` — NOT `limit`. _build_search_args keeps only schema-declared
+    # args, so the per-profile limit_arg must match the server's real param.
+    om = _connector(profile="openmetadata")
+    om._search_tool_schema = {"properties": {"query": {}, "size": {}}}
+    om_args = om._build_search_args(SearchFilters(limit=7))
+    assert om_args.get("size") == 7 and "limit" not in om_args
+
+    dh = _connector(profile="datahub")
+    dh._search_tool_schema = {"properties": {"query": {}, "num_results": {}}}
+    dh_args = dh._build_search_args(SearchFilters(limit=7))
+    assert dh_args.get("num_results") == 7 and "limit" not in dh_args
+
+
 # --------------------------------------------------------------------------- #
 # Pure mapping helpers                                                         #
 # --------------------------------------------------------------------------- #
