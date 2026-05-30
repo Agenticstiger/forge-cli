@@ -628,6 +628,166 @@ def _verify_plan_digests(
         )
 
 
+def _render_apply_result(
+    *,
+    success: bool,
+    no_outputs: bool,
+    result: dict,
+    output_count: int,
+    start_time: float,
+    logger: logging.Logger,
+) -> None:
+    """Render the simple-mode apply result — Rich panels when available, else logs.
+
+    Pure presentation extracted verbatim from ``run``: it only reads the
+    already-computed ``result`` and prints/logs, so it can affect *what is
+    displayed*, never the deployment itself.
+    """
+    # Show results
+    if RICH_AVAILABLE:
+        console = Console()
+        if success and not no_outputs:
+            # Success panel
+            console.print("\n[green]✅ Data product deployed successfully[/green]")
+
+            # Summary table
+            summary_table = Table(show_header=False, box=None)
+            summary_table.add_column("Metric", style="cyan")
+            summary_table.add_column("Value", style="white")
+
+            if "applied" in result:
+                summary_table.add_row("Actions Applied", str(result["applied"]))
+
+            total_time = time.time() - start_time
+            summary_table.add_row("Duration", f"{total_time:.2f}s")
+
+            if output_count > 0:
+                summary_table.add_row("Files Generated", str(output_count))
+
+            console.print(summary_table)
+
+            # Show output files
+            if "results" in result:
+                for r in result["results"]:
+                    if r.get("status") == "ok" and "written" in r:
+                        for path in r["written"]:
+                            console.print(f"  📁 [cyan]{path}[/cyan]")
+        elif no_outputs:
+            # Honest "ran but did nothing useful" panel.
+            console.print("\n[yellow]⚠️  Apply ran but produced no output files.[/yellow]")
+            if "applied" in result:
+                console.print(f"  [dim]Actions applied: {result['applied']}[/dim]")
+            console.print(
+                "  [dim]This usually means the contract uses an "
+                "engine the active provider doesn't yet materialise "
+                "(e.g. dlt acquisition on the local provider). "
+                "Try a different provider with `--provider <name>` "
+                "or fix the contract's engine choice.[/dim]"
+            )
+        else:
+            error_msg = result.get("error", "Unknown error")
+            console.print(f"\n[red]❌ Deployment failed: {error_msg}[/red]")
+
+            # Show individual action errors
+            if "results" in result:
+                console.print("\n[bold]Action Errors:[/bold]")
+                for i, r in enumerate(result["results"]):
+                    if r.get("status") == "error":
+                        console.print(
+                            f"  {i + 1}. [red]✗[/red] {r.get('op', 'unknown')}: {r.get('error', 'no details')}"
+                        )
+    else:
+        if success and not no_outputs:
+            logger.info("✅ Data product deployed successfully")
+            if "applied" in result:
+                logger.info(f"Applied {result['applied']} action(s)")
+        elif no_outputs:
+            logger.warning("⚠️  Apply ran but produced no output files.")
+            if "applied" in result:
+                logger.info(f"Actions applied: {result['applied']}")
+        else:
+            error_msg = result.get("error", "Unknown error")
+            logger.error(f"❌ Deployment failed: {error_msg}")
+
+
+def _write_apply_report(
+    *,
+    args,
+    contract: dict,
+    result: dict,
+    success: bool,
+    execution_id: str,
+    total_time: float,
+    logger: logging.Logger,
+) -> None:
+    """Write the simple-mode HTML/JSON execution report when ``--report`` is set.
+
+    Extracted verbatim from ``run``; self-contained and already wrapped in its
+    own try/except, so a report-write failure never fails the apply.
+    """
+    # Generate report if requested (simple mode)
+    if hasattr(args, "report") and args.report:
+        try:
+            report_path = Path(args.report)
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+
+            report_format = getattr(args, "report_format", "html")
+            contract_name = contract.get("name") or contract.get("id") or "Unknown"
+            applied_count = result.get("applied", 0)
+            failed_count = result.get("failed", 0)
+
+            if report_format == "html":
+                html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>FLUID Apply Report</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 40px; }}
+        .header {{ background: #1f2937; color: white; padding: 20px; border-radius: 8px; }}
+        .metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }}
+        .metric {{ background: #f8fafc; padding: 15px; border-radius: 8px; border-left: 4px solid #3b82f6; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>FLUID Apply Report</h1>
+        <p>Contract: {contract_name}</p>
+        <p>Execution ID: {execution_id}</p>
+        <p>Status: {"Success" if success else "Failed"}</p>
+    </div>
+    <div class="metrics">
+        <div class="metric"><h3>Actions Applied</h3><p>{applied_count}</p></div>
+        <div class="metric"><h3>Failed</h3><p>{failed_count}</p></div>
+        <div class="metric"><h3>Duration</h3><p>{total_time:.2f}s</p></div>
+        <div class="metric"><h3>Mode</h3><p>Simple</p></div>
+    </div>
+</body>
+</html>"""
+                with open(report_path, "w") as f:
+                    f.write(html_content)
+            elif report_format == "json":
+                import json as json_mod
+
+                with open(report_path, "w") as f:
+                    json_mod.dump(
+                        {
+                            "execution_id": execution_id,
+                            "contract": contract_name,
+                            "success": success,
+                            "applied": applied_count,
+                            "failed": failed_count,
+                            "duration_seconds": round(total_time, 2),
+                            "mode": "simple",
+                        },
+                        f,
+                        indent=2,
+                    )
+
+            logger.info(f"📄 Execution report generated: {report_path}")
+        except Exception as e:
+            logger.warning(f"Failed to generate report: {e}")
+
+
 @_traced_stage("apply")
 def run(args, logger: logging.Logger) -> int:
     """
@@ -1267,71 +1427,15 @@ def run(args, logger: logging.Logger) -> int:
             )
             no_outputs = success and output_count == 0 and applied_count == 0
 
-            # Show results
-            if RICH_AVAILABLE:
-                console = Console()
-                if success and not no_outputs:
-                    # Success panel
-                    console.print("\n[green]✅ Data product deployed successfully[/green]")
-
-                    # Summary table
-                    summary_table = Table(show_header=False, box=None)
-                    summary_table.add_column("Metric", style="cyan")
-                    summary_table.add_column("Value", style="white")
-
-                    if "applied" in result:
-                        summary_table.add_row("Actions Applied", str(result["applied"]))
-
-                    total_time = time.time() - start_time
-                    summary_table.add_row("Duration", f"{total_time:.2f}s")
-
-                    if output_count > 0:
-                        summary_table.add_row("Files Generated", str(output_count))
-
-                    console.print(summary_table)
-
-                    # Show output files
-                    if "results" in result:
-                        for r in result["results"]:
-                            if r.get("status") == "ok" and "written" in r:
-                                for path in r["written"]:
-                                    console.print(f"  📁 [cyan]{path}[/cyan]")
-                elif no_outputs:
-                    # Honest "ran but did nothing useful" panel.
-                    console.print("\n[yellow]⚠️  Apply ran but produced no output files.[/yellow]")
-                    if "applied" in result:
-                        console.print(f"  [dim]Actions applied: {result['applied']}[/dim]")
-                    console.print(
-                        "  [dim]This usually means the contract uses an "
-                        "engine the active provider doesn't yet materialise "
-                        "(e.g. dlt acquisition on the local provider). "
-                        "Try a different provider with `--provider <name>` "
-                        "or fix the contract's engine choice.[/dim]"
-                    )
-                else:
-                    error_msg = result.get("error", "Unknown error")
-                    console.print(f"\n[red]❌ Deployment failed: {error_msg}[/red]")
-
-                    # Show individual action errors
-                    if "results" in result:
-                        console.print("\n[bold]Action Errors:[/bold]")
-                        for i, r in enumerate(result["results"]):
-                            if r.get("status") == "error":
-                                console.print(
-                                    f"  {i + 1}. [red]✗[/red] {r.get('op', 'unknown')}: {r.get('error', 'no details')}"
-                                )
-            else:
-                if success and not no_outputs:
-                    logger.info("✅ Data product deployed successfully")
-                    if "applied" in result:
-                        logger.info(f"Applied {result['applied']} action(s)")
-                elif no_outputs:
-                    logger.warning("⚠️  Apply ran but produced no output files.")
-                    if "applied" in result:
-                        logger.info(f"Actions applied: {result['applied']}")
-                else:
-                    error_msg = result.get("error", "Unknown error")
-                    logger.error(f"❌ Deployment failed: {error_msg}")
+            # Show results (Rich panel / plain log) — extracted helper.
+            _render_apply_result(
+                success=success,
+                no_outputs=no_outputs,
+                result=result,
+                output_count=output_count,
+                start_time=start_time,
+                logger=logger,
+            )
 
             total_time = time.time() - start_time
             # Drop the always-green "Execution completed" footer when the
@@ -1345,67 +1449,16 @@ def run(args, logger: logging.Logger) -> int:
             log_metric(logger, "apply_duration", total_time, unit="seconds")
             log_metric(logger, "actions_executed", result.get("applied", 0), unit="count")
 
-            # Generate report if requested (simple mode)
-            if hasattr(args, "report") and args.report:
-                try:
-                    report_path = Path(args.report)
-                    report_path.parent.mkdir(parents=True, exist_ok=True)
-
-                    report_format = getattr(args, "report_format", "html")
-                    contract_name = contract.get("name") or contract.get("id") or "Unknown"
-                    applied_count = result.get("applied", 0)
-                    failed_count = result.get("failed", 0)
-
-                    if report_format == "html":
-                        html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <title>FLUID Apply Report</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 40px; }}
-        .header {{ background: #1f2937; color: white; padding: 20px; border-radius: 8px; }}
-        .metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }}
-        .metric {{ background: #f8fafc; padding: 15px; border-radius: 8px; border-left: 4px solid #3b82f6; }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>FLUID Apply Report</h1>
-        <p>Contract: {contract_name}</p>
-        <p>Execution ID: {execution_id}</p>
-        <p>Status: {"Success" if success else "Failed"}</p>
-    </div>
-    <div class="metrics">
-        <div class="metric"><h3>Actions Applied</h3><p>{applied_count}</p></div>
-        <div class="metric"><h3>Failed</h3><p>{failed_count}</p></div>
-        <div class="metric"><h3>Duration</h3><p>{total_time:.2f}s</p></div>
-        <div class="metric"><h3>Mode</h3><p>Simple</p></div>
-    </div>
-</body>
-</html>"""
-                        with open(report_path, "w") as f:
-                            f.write(html_content)
-                    elif report_format == "json":
-                        import json as json_mod
-
-                        with open(report_path, "w") as f:
-                            json_mod.dump(
-                                {
-                                    "execution_id": execution_id,
-                                    "contract": contract_name,
-                                    "success": success,
-                                    "applied": applied_count,
-                                    "failed": failed_count,
-                                    "duration_seconds": round(total_time, 2),
-                                    "mode": "simple",
-                                },
-                                f,
-                                indent=2,
-                            )
-
-                    logger.info(f"📄 Execution report generated: {report_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to generate report: {e}")
+            # Generate report if requested (simple mode) — extracted helper.
+            _write_apply_report(
+                args=args,
+                contract=contract,
+                result=result,
+                success=success,
+                execution_id=execution_id,
+                total_time=total_time,
+                logger=logger,
+            )
 
             if success:
                 log_operation_success(
