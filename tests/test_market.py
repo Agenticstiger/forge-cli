@@ -983,9 +983,12 @@ class TestMetricsCollector:
 
 
 def _base_engine_config():
-    # datahub's connector connects with defaults and returns a product, so it's
-    # the engine-behavior fixture now that google_cloud_data_catalog (a demo
-    # connector) is roadmap-skipped. Real discovery for these is via ``mcp``.
+    # A valid engine config. ``datahub`` is just a placeholder catalog name here:
+    # every bundled demo connector (datahub included) is now roadmap-skipped by
+    # ``initialize_connectors`` so no fabricated data reaches real users, and real
+    # discovery is via ``mcp``. Engine-behaviour tests that need a *working*
+    # connector inject one directly (see ``_engine_with_injected_connector``) —
+    # the same pattern the stats/details tests already use.
     return {
         "catalogs": ["datahub"],
         "datahub": {"server_url": "http://localhost:8080"},
@@ -994,13 +997,38 @@ def _base_engine_config():
     }
 
 
+def _engine_with_injected_connector(products=None, *, cache=False):
+    """An engine with one working connector injected directly into ``.connectors``.
+
+    ``initialize_connectors`` roadmap-skips every bundled demo connector, so no
+    in-tree connector auto-registers. Search / cache / aggregation tests inject a
+    mock connector straight in (mirroring the stats/details tests) to exercise the
+    engine's dispatch path against a connector that returns products.
+    """
+    config = _base_engine_config()
+    if cache:
+        config["cache"] = {"enabled": True, "ttl_minutes": 15, "max_entries": 100}
+    engine = MarketDiscoveryEngine(config, logging.getLogger("test"))
+    connector = _MagicMock()
+    connector.catalog_type = "datahub"
+    connector.search_data_products = _AsyncMock(
+        return_value=products if products is not None else [_make_test_product()]
+    )
+    engine.connectors = {"datahub": connector}
+    return engine
+
+
 class TestMarketDiscoveryEngine:
-    def test_initialize_connectors_success(self):
+    def test_initialize_connectors_roadmap_skips_demo_catalog(self):
+        # datahub is a bundled demo connector — initialize_connectors must skip
+        # it (never surface fabricated products), so nothing registers. Real
+        # DataHub discovery is the ``mcp`` connector pointed at its MCP server.
         config = _base_engine_config()
         logger = logging.getLogger("test")
         engine = MarketDiscoveryEngine(config, logger)
         _asyncio.run(engine.initialize_connectors(["datahub"]))
-        assert "datahub" in engine.connectors
+        assert "datahub" not in engine.connectors
+        assert engine.connectors == {}
 
     def test_initialize_connectors_unknown_type(self):
         config = _base_engine_config()
@@ -1009,7 +1037,10 @@ class TestMarketDiscoveryEngine:
         _asyncio.run(engine.initialize_connectors(["unknown_catalog_type"]))
         assert len(engine.connectors) == 0
 
-    def test_initialize_multiple_connector_types(self):
+    def test_initialize_multiple_roadmap_types_all_skipped(self):
+        # All six of these are bundled demo connectors → every one is
+        # roadmap-skipped, so the engine handles a multi-catalog config without
+        # registering (or fabricating) anything. Real discovery is via ``mcp``.
         config = {
             "catalogs": [
                 "google_cloud_data_catalog",
@@ -1031,27 +1062,16 @@ class TestMarketDiscoveryEngine:
         logger = logging.getLogger("test")
         engine = MarketDiscoveryEngine(config, logger)
         _asyncio.run(engine.initialize_connectors())
-        assert len(engine.connectors) >= 1
+        assert engine.connectors == {}
 
     def test_search_all_catalogs_no_cache(self):
-        config = _base_engine_config()
-        logger = logging.getLogger("test")
-        engine = MarketDiscoveryEngine(config, logger)
-        _asyncio.run(engine.initialize_connectors(["datahub"]))
+        engine = _engine_with_injected_connector()
         results = _asyncio.run(engine.search_all_catalogs(SearchFilters()))
         assert "datahub" in results
         assert len(results["datahub"]) >= 1
 
     def test_search_all_catalogs_with_cache(self):
-        config = {
-            "catalogs": ["datahub"],
-            "datahub": {"server_url": "http://localhost:8080"},
-            "defaults": {"timeout_seconds": 30},
-            "cache": {"enabled": True, "ttl_minutes": 15, "max_entries": 100},
-        }
-        logger = logging.getLogger("test")
-        engine = MarketDiscoveryEngine(config, logger)
-        _asyncio.run(engine.initialize_connectors(["datahub"]))
+        engine = _engine_with_injected_connector(cache=True)
         results1 = _asyncio.run(engine.search_all_catalogs(SearchFilters()))
         results2 = _asyncio.run(engine.search_all_catalogs(SearchFilters()))
         assert len(results1) == len(results2)

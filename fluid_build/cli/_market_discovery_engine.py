@@ -61,6 +61,12 @@ _ROADMAP_CATALOGS: frozenset[str] = frozenset(
         "aws_glue_data_catalog",
         "google_cloud_data_catalog",
         "custom_rest_api",
+        # DataHub's bespoke connector only ever returned one illustrative demo
+        # product (it never queried a real server). Real DataHub discovery is
+        # the ``mcp`` connector pointed at ``mcp-server-datahub`` (live-verified),
+        # so the demo connector is skipped here like its siblings — no fabricated
+        # data reaches ``fluid market``.
+        "datahub",
     }
 )
 
@@ -187,8 +193,10 @@ class MarketDiscoveryEngine:
         for catalog_type in catalog_types:
             if catalog_type in _ROADMAP_CATALOGS:
                 self.logger.info(
-                    f"⏭️  '{catalog_type}' discovery is on the roadmap — not yet "
-                    "implemented; skipping (no demo data served)."
+                    f"⏭️  '{catalog_type}' discovery is on the roadmap — its bundled "
+                    "connector served demo data only, so it is skipped (no fabricated "
+                    "data). For real discovery, configure the 'mcp' catalog pointed at "
+                    f"{catalog_type}'s MCP server."
                 )
                 continue
             if catalog_type in connector_classes:
