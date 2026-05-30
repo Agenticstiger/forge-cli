@@ -167,14 +167,18 @@ class TestGetApiUrl:
     @patch("fluid_build.cli.marketplace.get_command_center_client")
     @patch("fluid_build.cli.marketplace.console", MagicMock())
     def test_no_sources_raises(self, mock_cc, logger):
-        """All sources exhausted raises CLIError (or TypeError from bad CLIError call)"""
+        """All sources exhausted → a clean CLIError. Previously this raised
+        TypeError because CLIError was constructed with a single positional
+        (missing the required ``event`` arg), crashing the default no-registry
+        path on a fresh install."""
         os.environ.pop("FLUID_API_URL", None)
         cc_instance = MagicMock()
         cc_instance.get_marketplace_url.return_value = None
         cc_instance.url = None
         mock_cc.return_value = cc_instance
-        with pytest.raises((CLIError, TypeError)):
+        with pytest.raises(CLIError) as exc_info:
             get_api_url(logger)
+        assert exc_info.value.event == "no_blueprint_marketplace"
 
     @patch.dict(
         os.environ,
