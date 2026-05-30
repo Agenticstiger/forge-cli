@@ -97,3 +97,37 @@ class TestPolicyApplyEmptyBindings:
         rc = policy_apply.run(_make_args(bindings_file), logger)
         assert rc == 0
         assert called["value"] is False
+
+
+class TestPolicyApplyNoApplierProvider:
+    """When the resolved provider has no ``apply_policy`` (AWS / Snowflake /
+    local), policy-apply is a no-op — but it must SAY so visibly rather than
+    exiting 0 silently as if the GRANT/IAM bindings had been enforced."""
+
+    pytestmark = pytest.mark.unit
+
+    def test_no_applier_warns_visibly_and_returns_zero(self, tmp_path, logger, monkeypatch, capsys):
+        from fluid_build.cli import policy_apply
+
+        bindings_file = tmp_path / "bindings.json"
+        bindings_file.write_text(
+            json.dumps(
+                {
+                    "provider": "aws",
+                    "bindings": [
+                        {"provider": "aws", "principal": "role:analyst", "permissions": ["read"]}
+                    ],
+                }
+            )
+        )
+
+        class _NoApplierProvider:  # deliberately has no ``apply_policy``
+            pass
+
+        monkeypatch.setattr(policy_apply, "build_provider", lambda *a, **k: _NoApplierProvider())
+        rc = policy_apply.run(_make_args(bindings_file, mode="enforce"), logger)
+        assert rc == 0
+        # Flatten Rich line-wrapping before asserting on the message.
+        flat = " ".join(capsys.readouterr().out.split()).lower()
+        assert "no policy bindings were enforced" in flat
+        assert "stage 7" in flat

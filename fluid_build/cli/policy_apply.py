@@ -23,6 +23,7 @@ import traceback
 from ..observability.tracing import traced_stage as _traced_stage
 from ._common import CLIError, build_provider
 from ._logging import info
+from .console import cprint
 
 COMMAND = "policy-apply"
 
@@ -119,6 +120,19 @@ def run(args, logger: logging.Logger) -> int:
             res = provider.apply_policy(data, mode=args.mode)
         else:
             res = {"status": "noop", "note": "provider has no policy applier"}
+            # Make the no-op visible: otherwise the operator sees exit 0 and
+            # assumes the GRANT/IAM bindings were enforced. For cloud providers
+            # the policies are emitted + applied during `fluid apply` (stage 7),
+            # so a standalone `policy-apply` is genuinely a no-op here — say so
+            # rather than exiting silently green.
+            cprint(
+                f"\n⚠️  No policy bindings were enforced — the "
+                f"'{provider_name or 'configured'}' provider has no standalone "
+                f"policy applier. For cloud providers, IAM/GRANT, masking and "
+                f"row-access policies are emitted and applied during "
+                f"`fluid apply` (stage 7), so `fluid policy-apply` is a no-op "
+                f"for this provider."
+            )
         info(logger, "policy_apply_result", **res)
 
         # ── Acquisition pattern: register retention + alert + cost policies ─
