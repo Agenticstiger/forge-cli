@@ -983,9 +983,12 @@ class TestMetricsCollector:
 
 
 def _base_engine_config():
+    # datahub's connector connects with defaults and returns a product, so it's
+    # the engine-behavior fixture now that google_cloud_data_catalog (a demo
+    # connector) is roadmap-skipped. Real discovery for these is via ``mcp``.
     return {
-        "catalogs": ["google_cloud_data_catalog"],
-        "google_cloud_data_catalog": {"project_id": "test"},
+        "catalogs": ["datahub"],
+        "datahub": {"server_url": "http://localhost:8080"},
         "defaults": {"timeout_seconds": 30},
         "cache": {"enabled": False},
     }
@@ -996,8 +999,8 @@ class TestMarketDiscoveryEngine:
         config = _base_engine_config()
         logger = logging.getLogger("test")
         engine = MarketDiscoveryEngine(config, logger)
-        _asyncio.run(engine.initialize_connectors(["google_cloud_data_catalog"]))
-        assert "google_cloud_data_catalog" in engine.connectors
+        _asyncio.run(engine.initialize_connectors(["datahub"]))
+        assert "datahub" in engine.connectors
 
     def test_initialize_connectors_unknown_type(self):
         config = _base_engine_config()
@@ -1034,21 +1037,21 @@ class TestMarketDiscoveryEngine:
         config = _base_engine_config()
         logger = logging.getLogger("test")
         engine = MarketDiscoveryEngine(config, logger)
-        _asyncio.run(engine.initialize_connectors(["google_cloud_data_catalog"]))
+        _asyncio.run(engine.initialize_connectors(["datahub"]))
         results = _asyncio.run(engine.search_all_catalogs(SearchFilters()))
-        assert "google_cloud_data_catalog" in results
-        assert len(results["google_cloud_data_catalog"]) >= 1
+        assert "datahub" in results
+        assert len(results["datahub"]) >= 1
 
     def test_search_all_catalogs_with_cache(self):
         config = {
-            "catalogs": ["google_cloud_data_catalog"],
-            "google_cloud_data_catalog": {"project_id": "test"},
+            "catalogs": ["datahub"],
+            "datahub": {"server_url": "http://localhost:8080"},
             "defaults": {"timeout_seconds": 30},
             "cache": {"enabled": True, "ttl_minutes": 15, "max_entries": 100},
         }
         logger = logging.getLogger("test")
         engine = MarketDiscoveryEngine(config, logger)
-        _asyncio.run(engine.initialize_connectors(["google_cloud_data_catalog"]))
+        _asyncio.run(engine.initialize_connectors(["datahub"]))
         results1 = _asyncio.run(engine.search_all_catalogs(SearchFilters()))
         results2 = _asyncio.run(engine.search_all_catalogs(SearchFilters()))
         assert len(results1) == len(results2)

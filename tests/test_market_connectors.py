@@ -974,7 +974,8 @@ class TestMarketDiscoveryEngineInitializeConnectors:
         config = _base_config()
         logger = logging.getLogger("test")
         engine = MarketDiscoveryEngine(config, logger)
-        _run(engine.initialize_connectors(["google_cloud_data_catalog"]))
+        # datahub connects with defaults (gdc is now roadmap-skipped).
+        _run(engine.initialize_connectors(["datahub"]))
         assert engine.health_checker is not None
 
     def test_health_checker_not_initialized_without_connectors(self):
