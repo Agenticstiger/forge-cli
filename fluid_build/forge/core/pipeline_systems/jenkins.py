@@ -636,7 +636,7 @@ pipeline {{
             }}
             steps {{
                 sh '''{CD}set -eu
-                    set -- runtime/plan.json --mode "$APPLY_MODE" --env "${{FLUID_ENV:-dev}}" --yes --report runtime/apply-report.html
+                    set -- runtime/plan.json --mode "$APPLY_MODE" --env "${{FLUID_ENV:-dev}}" --yes --ensure-opentofu --report runtime/apply-report.html
                     if [ -n "${{APPLY_BUILD_ID_VAL:-}}" ]; then set -- "$@" --build "$APPLY_BUILD_ID_VAL"; fi
                     if [ "${{ALLOW_DATA_LOSS:-false}}" = "true" ]; then set -- "$@" --allow-data-loss; fi
                     if [ "${{NO_VERIFY_DIGEST:-false}}" = "true" ]; then set -- "$@" --no-verify-plan-binding --no-verify-federation; fi

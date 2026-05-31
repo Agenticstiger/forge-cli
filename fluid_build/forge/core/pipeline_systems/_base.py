@@ -329,11 +329,16 @@ class BasePipelineTemplate:
             "plan": "fluid plan ${CONTRACT:-contract.fluid.yaml} --out runtime/plan.json",
             # --build is required for dbt hybrid-reference builds; the
             # inline conditional keeps the template useful for both shapes.
+            # --ensure-opentofu lets a cloud apply provision a pinned,
+            # SHA-256-verified `tofu` (no root/gpg) on a fresh runner; it is
+            # idempotent (skips when tofu is present) and a no-op for
+            # native/local applies that never touch the OpenTofu engine.
             "apply": (
                 'if [ -n "$BUILD_ID" ]; then '
-                "fluid apply ${CONTRACT:-contract.fluid.yaml} --build $BUILD_ID --yes; "
+                "fluid apply ${CONTRACT:-contract.fluid.yaml} --build $BUILD_ID "
+                "--ensure-opentofu --yes; "
                 "else "
-                "fluid apply runtime/plan.json --yes; "
+                "fluid apply runtime/plan.json --ensure-opentofu --yes; "
                 "fi"
             ),
             # 11-stage pipeline stage 8 — enforce policy bindings against the
@@ -821,8 +826,12 @@ class BasePipelineTemplate:
                 # narrowly-scoped flags at the CLI).
                 command=(
                     "set -eu; "
+                    # --ensure-opentofu provisions a pinned, SHA-256-verified
+                    # `tofu` (no root/gpg) when a cloud apply needs it; it is
+                    # idempotent (skips when tofu is present) and a no-op for
+                    # native/local applies that never touch the OpenTofu engine.
                     'set -- runtime/plan.json --mode "${APPLY_MODE:-amend}" '
-                    '--env "${FLUID_ENV:-dev}" --yes '
+                    '--env "${FLUID_ENV:-dev}" --yes --ensure-opentofu '
                     "--report runtime/apply-report.html; "
                     'if [ -n "${APPLY_BUILD_ID:-}" ]; then '
                     'set -- "$@" --build "$APPLY_BUILD_ID"; fi; '

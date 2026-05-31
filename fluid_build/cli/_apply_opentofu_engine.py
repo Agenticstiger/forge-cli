@@ -58,15 +58,28 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
             {"error": f"no OpenTofu plugin for provider {provider!r}"},
         )
     if runner.tofu_path() is None:
-        raise CLIError(
-            1,
-            "opentofu_engine_no_tofu",
-            {
-                "error": "the `tofu` binary is required to provision cloud "
-                "infrastructure — install it from "
-                "https://opentofu.org/docs/intro/install/"
-            },
-        )
+        # `tofu` isn't on PATH. When the operator opted in (--ensure-opentofu,
+        # which `fluid generate ci` bakes into the apply stage), provision a
+        # pinned, SHA-256-verified build with no root/gpg needed; otherwise
+        # fail loud and point at the flag.
+        if getattr(args, "ensure_opentofu", False):
+            from fluid_build.iac.opentofu_install import OpenTofuInstallError, ensure_opentofu
+
+            try:
+                ensure_opentofu(logger=logger)
+            except OpenTofuInstallError as exc:
+                raise CLIError(1, "opentofu_engine_install_failed", {"error": str(exc)})
+        if runner.tofu_path() is None:
+            raise CLIError(
+                1,
+                "opentofu_engine_no_tofu",
+                {
+                    "error": "the `tofu` binary is required to provision cloud "
+                    "infrastructure — re-run with `--ensure-opentofu` to auto-"
+                    "provision a pinned, verified build, or install it from "
+                    "https://opentofu.org/docs/intro/install/"
+                },
+            )
     # Fail loud if `tofu` is older than the supported floor — a stale
     # binary would otherwise be discovered only mid-apply, after partial
     # state has been mutated. See ``runner.require_tofu_version`` for the
