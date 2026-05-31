@@ -286,6 +286,19 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
 
+    execution_group_tofu = mode_group
+    execution_group_tofu.add_argument(
+        "--ensure-opentofu",
+        action="store_true",
+        default=False,
+        help=(
+            "If the `tofu` binary is missing, provision a pinned, SHA-256-"
+            "verified OpenTofu build (no root / gpg needed) before the cloud "
+            "apply. `fluid generate ci` bakes this into the apply stage so "
+            "generated pipelines work on any runner."
+        ),
+    )
+
     # Execution control
     execution_group = p.add_argument_group("Execution Control")
     execution_group.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
