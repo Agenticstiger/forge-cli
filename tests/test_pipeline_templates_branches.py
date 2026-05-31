@@ -627,8 +627,15 @@ class TestJenkinsTemplateHardening:
         # Fail-loud check is required — no silent fallback to PyPI.
         assert "install-mode=dev-source but /forge-cli-src" in content
         assert "exit 2" in content
-        # Uninstall the shadowing installed version so PYTHONPATH wins.
-        assert "pip uninstall -y data-product-forge" in content
+        # Must NOT uninstall data-product-forge: `fluid` is that package's
+        # console_scripts entry point, so uninstalling deletes the command
+        # and stage 0 dies with `fluid: not found` (PYTHONPATH supplies the
+        # module, not the executable). Keep the console script; PYTHONPATH
+        # prepend already shadows its modules with the bind mount.
+        assert "pip uninstall -y data-product-forge" not in content
+        # Sanity-check the import resolves from the bind mount (clear early
+        # failure if PYTHONPATH / the mount is wrong).
+        assert 'python -c "import fluid_build"' in content
         # PYTHONPATH = /forge-cli-src at the pipeline environment level
         # means every sh step inherits it and imports resolve to the
         # bind mount live — no pip install, no wheel cache, no stale
