@@ -206,13 +206,19 @@ ERROR: This Jenkinsfile has install-mode=dev-source but /forge-cli-src
 EOM
                         exit 2
                       fi
-                      # Wipe any stale data-product-forge install from
-                      # site-packages so its modules don't shadow the
-                      # bind mount. PYTHONPATH-prepending normally wins
-                      # over site-packages, but a leftover egg-info or
-                      # namespace package fragment can confuse imports.
-                      pip uninstall -y data-product-forge 2>/dev/null || true
-                      echo "install-mode=dev-source — fluid imports will resolve from /forge-cli-src via PYTHONPATH"'''"""
+                      # Do NOT `pip uninstall data-product-forge` here: the
+                      # package's ``fluid`` entry-point IS the command on PATH,
+                      # and PYTHONPATH=/forge-cli-src (prepended, exported in the
+                      # environment {} block) already wins over site-packages for
+                      # every ``import fluid_build`` — so the bind-mounted checkout
+                      # shadows the installed modules while the console script
+                      # keeps ``fluid`` callable. A prior version uninstalled it
+                      # "to avoid shadowing", which removed the ``fluid`` command
+                      # itself and broke stage 0 with ``fluid: not found``. Mirror
+                      # the non-Jenkins runners' dev-source setup (_render_install_setup)
+                      # which keeps the console script and only overrides via PYTHONPATH.
+                      python -c "import fluid_build" || (echo 'FATAL: fluid_build import failed; check /forge-cli-src bind mount' >&2 && exit 3)
+                      echo "install-mode=dev-source — fluid command via the installed console script; imports resolve from /forge-cli-src via PYTHONPATH"'''"""
         else:
             # Defensive: unknown install_mode. Caller passed something
             # we don't support — raise NOW (at generate time) rather
