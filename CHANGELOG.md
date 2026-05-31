@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-05-31
+
+### Added
+
+- **On-demand OpenTofu provisioner — `fluid apply --ensure-opentofu`.** A cloud
+  apply shells out to `tofu` via the OpenTofu engine; the official standalone
+  installer needs root (`/usr/local/bin`) and gpg/cosign, which a non-root CI
+  runner (e.g. a locked-down Jenkins agent) can't provide. When `--ensure-opentofu`
+  is set and `tofu` is missing, FLUID downloads a pinned, **SHA-256-verified**
+  OpenTofu release and installs it using only the Python standard library — **no
+  root, gpg, cosign, curl, or unzip** — extracting only the `tofu` entry (no
+  zip-slip) and prepending it to the process `PATH`. Idempotent (a usable `tofu`
+  at/above the engine floor wins untouched); override the pin with
+  `FLUID_OPENTOFU_VERSION`. `fluid generate ci` bakes the flag into the apply
+  stage of all seven CI runners. (#187)
+- **`fluid market` real catalog discovery over MCP** — DataHub, OpenMetadata,
+  and Data Mesh Manager, replacing the previous demo data. (#172)
+- **`fluid market` metadata enrichment** — two-phase fetch of full product
+  detail plus data-asset column schema; `--detailed` is now a true superset of
+  the listing rather than a replacement. (#175, #183)
+- **`fluid market` onboarding + trust/usage surfacing** — actionable next steps
+  and trust/usage signals in the listing. (#173)
+- **`fluid market --blueprints` works offline** via bundled blueprints. (#181)
+
+### Changed
+
+- `fluid market` no longer serves fabricated demo data for roadmap-only catalog
+  connectors (datahub / glue / data-catalog / rest); they are skipped with a
+  clear roadmap note. (#171, #174, #182)
+- `fluid market --format json` emits clean, machine-parseable output. (#184)
+- Faster CLI startup — validation providers are lazy-loaded. (#167)
+- Internal: the two simple-mode reporting blocks were extracted out of
+  `cli/apply.py::run()`. (#185)
+
+### Fixed
+
+- **generate-ci dev-source Jenkins bootstrap left `fluid` uncallable.** It ran
+  `pip uninstall -y data-product-forge` — deleting the `fluid` console script
+  (the package's `console_scripts` entry point) — then invoked `fluid` relying
+  only on `PYTHONPATH`, so stage 0 died with `fluid: not found`. It now keeps the
+  installed console script (a `PYTHONPATH` prepend already shadows its modules
+  with the bind-mounted checkout) and adds an `import fluid_build` sanity check. (#187)
+- **generate-ci stage-8 policy-apply emitted an empty `--mode`.** The Jenkins
+  stage read `${POLICY_APPLY_MODE}` as a raw shell env var; on the first build
+  after a Jenkinsfile change the param isn't injected yet, so it expanded to
+  `--mode ` and `fluid policy-apply` rejected the empty choice. Now defaults to
+  `enforce` (the param's own default). (#187)
+- `fluid forge --from-source` sanitizes the contract id derived from a sqlite
+  file path. (#166)
+- build-runners now warn when an inline-SQL build declares `engine: dbt`
+  (previously silently ignored). (#168)
+- `fluid policy-apply` surfaces a no-op message when a provider has no policy
+  applier instead of appearing to succeed silently. (#169)
+- `fluid market` per-catalog MCP search-limit param corrected (OpenMetadata
+  `size`, DataHub `num_results`). (#180)
+- `fluid market` / marketplace raises a proper `CLIError` instead of crashing
+  with a `TypeError`. (#170)
+
+### Removed
+
+- Dead module `fluid_build/validation.py` (test-only, never wired in). (#178)
+- Dead SQL-allowlist helpers — `parse_and_allowlist_sql` and the type/language
+  validators. (#179)
+
+### Security
+
+- Re-symmetrized the Snowflake provider-local secret redactor with the global
+  logging filter so new secret shapes are masked in both layers. (#176)
+
 ## [0.8.7] - 2026-05-30
 
 ### Fixed
@@ -1217,7 +1286,8 @@ Also the first release published from the `Agenticstiger/forge-cli` repository v
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.8...HEAD
+[0.8.8]: https://github.com/Agenticstiger/forge-cli/compare/v0.8.7...v0.8.8
 [0.8.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.7.10...v0.8.0
 [0.7.11]: https://github.com/Agenticstiger/forge-cli/compare/v0.7.10...v0.7.11
 [0.7.10]: https://github.com/Agenticstiger/forge-cli/compare/v0.7.9...v0.7.10
