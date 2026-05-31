@@ -76,3 +76,20 @@ def test_pypi_mode_unaffected():
     jf = _jenkinsfile("pypi")
     assert "pip install" in jf
     assert "data-product-forge" in jf
+
+
+def test_stage8_policy_apply_mode_has_a_shell_default():
+    """Stage 8 must not emit a bare `--mode "$POLICY_APPLY_MODE"`.
+
+    The param is read as a raw shell env var; on the first build after a
+    Jenkinsfile change (or any trigger that doesn't pass it) the param isn't
+    injected, so a bare reference yields `--mode ` (empty) and
+    `fluid policy-apply` rejects it (`invalid choice: ''`). A `:-enforce`
+    shell default — matching the param's own default — keeps it valid.
+    """
+    jf = _jenkinsfile("dev-source")
+    assert '--mode "${POLICY_APPLY_MODE}"' not in jf, (
+        "stage 8 emits a bare ${POLICY_APPLY_MODE} — an unset param becomes "
+        "`--mode ` and policy-apply rejects the empty choice."
+    )
+    assert '"${POLICY_APPLY_MODE:-enforce}"' in jf
