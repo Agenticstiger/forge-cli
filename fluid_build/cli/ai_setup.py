@@ -38,6 +38,7 @@ __all__ = [
 import json as _json
 import logging
 import os
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -708,6 +709,25 @@ def _make_cloud_config(
     )
 
 
+def _make_coding_agent_config(pname: str, model: Optional[str] = None) -> LlmConfig:
+    """Build a keyless ``LlmConfig`` for a coding-agent provider.
+
+    No API key is attached: Claude Code uses the user's subscription, and
+    codex/cursor/kiro validate their own key *inside the provider* at call
+    time. The provider is resolved from the registry (where the four
+    coding-agent rows were added in Part B).
+    """
+    provider = BUILTIN_LLM_PROVIDERS[pname]
+    env = dict(os.environ)
+    resolved_model = model or provider.default_model
+    return LlmConfig(
+        provider=provider.name,
+        model=resolved_model,
+        endpoint=provider.default_endpoint(resolved_model, env),
+        api_key=None,
+    )
+
+
 def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
     """Compact inline setup triggered when forge starts without a configured provider.
 
@@ -733,6 +753,14 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
         model = saved.get("model")
         provider = BUILTIN_LLM_PROVIDERS.get(pname)
         if provider:
+            from fluid_build.cli.forge_copilot_coding_agent import is_coding_agent
+
+            if is_coding_agent(pname):
+                config = _make_coding_agent_config(pname, model=model)
+                if console and RICH_AVAILABLE:
+                    console.print(f"[dim]Using {pname} (no API key needed).[/dim]")
+                LOG.info("Inline AI setup: loaded coding agent %s from saved config", pname)
+                return config
             if pname == "ollama":
                 ollama_host = _sanitize_ollama_host(
                     saved.get("ollama_host", "http://localhost:11434")
@@ -802,6 +830,34 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
             # Non-interactive (CI) — auto-select Ollama silently.
             LOG.info("Inline AI setup: auto-selected local Ollama (non-interactive)")
             return _make_ollama_config()
+
+    # 4.5. Keyless local coding agent (Claude Code) — offer before the
+    #      API-key prompt. Only Claude Code is truly keyless (subscription);
+    #      codex/cursor/kiro need their own key, so they stay explicit-flag.
+    if shutil.which("claude"):
+        if sys.stdin.isatty() and console and RICH_AVAILABLE:
+            use_agent = ask_confirmation(
+                console,
+                "Use your local Claude Code (no API key needed)?",
+                default=True,
+                preview=(
+                    "Claude Code authors the contract using your existing Claude\n"
+                    "subscription — no API key, no separate billing for forge.\n"
+                    "forge still validates and repairs whatever it produces."
+                ),
+                title="Keyless Authoring Available",
+                border_style="green",
+            )
+            if use_agent:
+                config = _make_coding_agent_config("claude-code")
+                _save_ai_config("claude-code", config.model)
+                console.print("[dim]Using Claude Code (your subscription — no API key).[/dim]")
+                LOG.info("Inline AI setup: user confirmed local Claude Code")
+                return config
+            # User declined — fall through to the API-key prompt.
+        else:
+            LOG.info("Inline AI setup: auto-selected local Claude Code (non-interactive)")
+            return _make_coding_agent_config("claude-code")
 
     # 5. Nothing found — prompt user (only if stdin is interactive).
     if not sys.stdin.isatty():

@@ -159,6 +159,27 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "1800s default",
         "Per-`tofu` invocation wall-clock cap",
     ),
+    # — Keyless coding-agent providers (claude-code / codex / cursor / kiro) —
+    (
+        "FLUID_FORGE_AGENT",
+        "no agent preselected",
+        "Select a keyless coding-agent provider (claude-code/codex/cursor/kiro)",
+    ),
+    (
+        "FLUID_FORGE_AGENT_MODE",
+        "envelope",
+        "Coding-agent drive mode: `envelope` (default) or `agentic`",
+    ),
+    (
+        "FLUID_FORGE_AGENT_TIMEOUT_SECONDS",
+        "LLM timeout (120s)",
+        "Per-agent-CLI invocation wall-clock cap",
+    ),
+    (
+        "FLUID_FORGE_AGENT_CWD",
+        "scratch tempdir",
+        "Working dir for the agent CLI (default avoids loading project CLAUDE.md/AGENTS.md)",
+    ),
 ]
 
 
