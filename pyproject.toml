@@ -125,9 +125,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Provider SDK (install once published)
+# Plugin SDK — for authors building scaffolds / validators / providers /
+# catalog adapters against `fluid_sdk` (renamed from the old provider-only
+# `fluid-provider-sdk`). Not on the CLI's runtime path; extension discovery
+# uses importlib.metadata directly (see fluid_build/extension_schemas.py).
 sdk = [
-  "fluid-provider-sdk>=0.1.0",
+  "data-product-forge-sdk>=0.9,<1",
 ]
 
 # Stricter ODCS validation via vowl (MIT, GovTech Data Practice).

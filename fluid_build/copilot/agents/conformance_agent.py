@@ -248,7 +248,20 @@ class ConformanceAgent:
         # field name predates the agent — kept for backwards
         # compat). Coerce here so the conformance report's
         # ``ValidationFinding`` shape stays clean.
-        return list(report.issues)
+        findings = list(report.issues)
+        # Pre-emit extension validation: run any plugin-registered
+        # ``contract.extensions.<key>`` validators through the SAME path
+        # ``fluid validate`` uses, but BEFORE the contract is written. Error
+        # findings flow into the report's error count, so the existing repair
+        # loop can fix a malformed extension block instead of silently emitting
+        # it. (The core schema treats ``extensions`` as additionalProperties:
+        # true, so without this a bad block would pass the pre-emit gate.)
+        if isinstance(contract, dict):
+            from fluid_build.extension_schemas import run_extension_validators
+
+            for err in run_extension_validators(contract):
+                findings.append(ValidationFinding(message=err, severity="error"))
+        return findings
 
     def _lint_osi(
         self,

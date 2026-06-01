@@ -70,6 +70,10 @@ from fluid_build.copilot.schemas.stage_outputs import (
     ConceptualRelationship,
     LogicalDraft,
 )
+from fluid_build.extension_schemas import (
+    build_extension_prompt_fragment,
+    iter_extension_schemas,
+)
 from fluid_build.forge_datamodel.from_ddl.parser import TableDefinition
 
 _MAX_SCHEMA_REPAIR_ATTEMPTS = 1
@@ -342,6 +346,15 @@ class ModelerAgent(BaseStageAgent):
             payload=user_prompt_payload,
             target_stages=("logical", "modeler"),
         )
+        # Ground the model on installed contract-extension schemas so it can
+        # natively propose a valid extensions.<key> block (placed under
+        # source_summary.proposed_extensions). No-op — the prompt is unchanged —
+        # when no extension-schema plugins are installed.
+        _ext_fragment = build_extension_prompt_fragment(
+            iter_extension_schemas(getattr(session, "fluid_version", None))
+        )
+        if _ext_fragment:
+            fragments.append(_ext_fragment)
         user_prompt = json.dumps(user_prompt_payload, indent=2)
         result = self._call_logical_with_schema_repair(
             session,
@@ -396,6 +409,13 @@ class ModelerAgent(BaseStageAgent):
             payload=intent_payload,
             target_stages=("logical", "modeler"),
         )
+        # Ground the model on installed contract-extension schemas (same as the
+        # tables path); no-op when no extension-schema plugins are installed.
+        _ext_fragment = build_extension_prompt_fragment(
+            iter_extension_schemas(getattr(session, "fluid_version", None))
+        )
+        if _ext_fragment:
+            fragments.append(_ext_fragment)
         result = self._call_logical_with_schema_repair(
             session,
             system_prompt="\n".join(fragments),
