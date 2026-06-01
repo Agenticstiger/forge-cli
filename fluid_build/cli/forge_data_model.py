@@ -153,8 +153,19 @@ def _add_common_generation_args(
     )
     parser.add_argument(
         "--llm-provider",
-        choices=["openai", "anthropic", "claude", "gemini", "ollama"],
-        help="Optional LLM provider override for the staged modeler",
+        choices=[
+            "openai",
+            "anthropic",
+            "claude",
+            "gemini",
+            "ollama",
+            "mcp-sampling",
+            "claude-code",
+            "codex",
+            "cursor",
+            "kiro",
+        ],
+        help="Optional LLM provider override for the staged modeler (incl. keyless agents)",
     )
     parser.add_argument("--llm-model", help="Optional LLM model override for the staged modeler")
     parser.add_argument("--llm-endpoint", help="Optional LLM endpoint override")

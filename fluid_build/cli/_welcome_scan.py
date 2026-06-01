@@ -84,6 +84,17 @@ _AI_ENV = (
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
 )
+# AI coding-agent CLIs forge can delegate to, mapped binary -> canonical
+# provider name. Detected on PATH so the welcome panel can offer keyless
+# authoring even with no API key configured. Claude Code is keyless via the
+# user's subscription; the others reuse their own key (validated inside the
+# provider at call time). Order encodes keyless preference (claude-code first).
+_CODING_AGENT_BINARIES = (
+    ("claude", "claude-code"),
+    ("codex", "codex"),
+    ("cursor-agent", "cursor"),
+    ("kiro-cli", "kiro"),
+)
 
 
 @dataclass
@@ -103,6 +114,7 @@ class WelcomeFindings:
     ai_configured: bool = False
     ai_provider_hint: str = ""
     installed_clis: List[str] = field(default_factory=list)
+    coding_agents_available: List[str] = field(default_factory=list)
     sample_data_candidates: List[str] = field(default_factory=list)
     cloud_credentials: List[str] = field(default_factory=list)
     return_user: bool = False
@@ -112,6 +124,16 @@ class WelcomeFindings:
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def suggested_keyless_provider(self) -> str:
+        """Best keyless LLM provider given what was detected, else "".
+
+        Returns the most key-free coding agent on PATH — Claude Code first
+        because it's the only *truly* keyless one (subscription OAuth); the
+        others reuse their own key but still spare the user forge's separate
+        key setup. ``_CODING_AGENT_BINARIES`` order encodes the preference.
+        """
+        return self.coding_agents_available[0] if self.coding_agents_available else ""
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +227,21 @@ def _probe_clis() -> Dict[str, Any]:
         if shutil.which(binary):
             found.append(binary)
     return {"installed_clis": found}
+
+
+def _probe_coding_agents() -> Dict[str, Any]:
+    """Find AI coding-agent CLIs on PATH (claude/codex/cursor-agent/kiro).
+
+    These enable keyless authoring without an LLM API key — Claude Code via
+    the user's subscription, the others by reusing the agent's own key. We
+    report canonical provider names (e.g. ``claude-code``) so the welcome
+    panel can suggest ``--llm-provider <name>`` directly.
+    """
+    found: List[str] = []
+    for binary, canonical in _CODING_AGENT_BINARIES:
+        if shutil.which(binary):
+            found.append(canonical)
+    return {"coding_agents_available": found}
 
 
 def _probe_sample_data(start: Path) -> Dict[str, Any]:
@@ -316,6 +353,7 @@ def run_welcome_scan(*, start: Optional[Path] = None) -> WelcomeFindings:
         "workspace": (_probe_workspace, (target,)),
         "ai": (_probe_ai_credentials, ()),
         "clis": (_probe_clis, ()),
+        "coding_agents": (_probe_coding_agents, ()),
         "samples": (_probe_sample_data, (target,)),
         "cloud": (_probe_cloud_creds, ()),
         "return_user": (_probe_return_user, ()),
@@ -375,15 +413,23 @@ def render_welcome(findings: WelcomeFindings, *, console: Optional[Any] = None) 
             else ""
         ),
     )
-    table.add_row(
-        "AI:",
-        (
-            "[green]✓ configured[/green]"
-            + (f" ({findings.ai_provider_hint})" if findings.ai_provider_hint else "")
-            if findings.ai_configured
-            else "[yellow]not configured — run `fluid ai setup`[/yellow]"
-        ),
-    )
+    if findings.ai_configured:
+        ai_status = "[green]✓ configured[/green]" + (
+            f" ({findings.ai_provider_hint})" if findings.ai_provider_hint else ""
+        )
+    elif findings.coding_agents_available:
+        ai_status = "[yellow]no API key set — keyless coding agent available ↓[/yellow]"
+    else:
+        ai_status = "[yellow]not configured — run `fluid ai setup`[/yellow]"
+    table.add_row("AI:", ai_status)
+    if findings.coding_agents_available:
+        agents = ", ".join(findings.coding_agents_available)
+        suggested = findings.suggested_keyless_provider()
+        table.add_row(
+            "Keyless:",
+            f"[green]✓ {agents}[/green] — no API key needed, "
+            f"e.g. [bold]--llm-provider {suggested}[/bold]",
+        )
     if findings.installed_clis:
         table.add_row("CLIs:", ", ".join(findings.installed_clis[:6]))
     if findings.cloud_credentials:
@@ -418,7 +464,19 @@ def _render_welcome_plain(findings: WelcomeFindings) -> None:
         if findings.existing_products:
             line += f"  · {findings.existing_products} existing products"
         print(line)
-    print(f"  AI: {'configured' if findings.ai_configured else 'not configured'}")
+    if findings.ai_configured:
+        hint = f" ({findings.ai_provider_hint})" if findings.ai_provider_hint else ""
+        print(f"  AI: configured{hint}")
+    elif findings.coding_agents_available:
+        print("  AI: no API key set — keyless coding agent available below")
+    else:
+        print("  AI: not configured")
+    if findings.coding_agents_available:
+        suggested = findings.suggested_keyless_provider()
+        print(
+            f"  Keyless: {', '.join(findings.coding_agents_available)} "
+            f"— no API key needed (--llm-provider {suggested})"
+        )
     if findings.installed_clis:
         print(f"  CLIs: {', '.join(findings.installed_clis[:6])}")
     if findings.cloud_credentials:

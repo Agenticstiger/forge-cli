@@ -306,6 +306,11 @@ class LlmConfig:
     model_source: str = "catalog"
     model_resolution_notes: List[str] = field(default_factory=list)
     tier_models: Dict[str, str] = field(default_factory=dict)
+    # Drive mode for coding-agent providers: "envelope" (agent returns the
+    # response JSON on stdout — the default) or "agentic" (agent writes
+    # contract.fluid.yaml into the workspace with its own tools). Ignored by
+    # every other provider.
+    agent_mode: str = "envelope"
 
     def for_routing(self) -> "LlmConfig":
         """Return a shallow copy configured for the routing model.
@@ -561,6 +566,17 @@ def get_llm_provider(name: str) -> LlmProvider:
     normalized = (name or "").strip().lower()
     if normalized in ("mcp-sampling", "mcp_sampling"):
         return MCPSamplingProvider()
+    # Coding-agent providers (claude-code/codex/cursor/kiro) shell out to a
+    # local agent CLI — keyless for Claude Code, key-reusing for the rest.
+    # Resolved BEFORE the litellm delegation so their hyphenated names aren't
+    # collapsed by ``normalize_llm_provider_name`` (claude-code -> anthropic).
+    from fluid_build.cli.forge_copilot_coding_agent import (
+        get_coding_agent_provider,
+        is_coding_agent,
+    )
+
+    if is_coding_agent(normalized):
+        return get_coding_agent_provider(normalized)
     from fluid_build.cli.forge_copilot_llm_litellm import get_litellm_provider
 
     return get_litellm_provider(normalize_llm_provider_name(normalized))
@@ -762,12 +778,28 @@ def has_llm_api_key(
     return bool(_resolve_api_key(provider.name, env))
 
 
+# Providers that never require an LLM API key — the call is paid for
+# elsewhere, so the api-key gate below must skip them. ``ollama`` runs a
+# local server; ``mcp-sampling`` routes the call back through the MCP client
+# (the IDE) via ``sampling/createMessage`` so the IDE's own LLM answers and
+# forge never sees a key. Part B's coding-agent providers
+# (claude-code/codex/cursor/kiro) are appended here too — they shell out to an
+# installed agent CLI, and any per-agent key (CODEX_API_KEY, CURSOR_API_KEY,
+# KIRO_API_KEY) is validated *inside* the provider at call time, not at this
+# resolve-time gate. ``provider.name`` is always canonical (hyphen form); the
+# underscore alias is included defensively.
+_KEYLESS_PROVIDERS: frozenset = frozenset(
+    {"ollama", "mcp-sampling", "mcp_sampling", "claude-code", "codex", "cursor", "kiro"}
+)
+
+
 def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -> LlmConfig:
     """Resolve provider, model, endpoint, and API key from flags and env vars."""
     env = dict(environ or os.environ)
     provider_name = (
         getattr(args, "llm_provider", None)
         or env.get("FLUID_LLM_PROVIDER")
+        or env.get("FLUID_FORGE_AGENT")
         or _infer_provider_from_env(env)
         or "gemini"
     )
@@ -797,7 +829,7 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
         )
 
     api_key = _resolve_api_key(provider.name, env)
-    if provider.name != "ollama" and not api_key:
+    if provider.name not in _KEYLESS_PROVIDERS and not api_key:
         raise CopilotGenerationError(
             "copilot_missing_llm_api_key",
             f"No API key was configured for the {provider.name} copilot adapter.",
@@ -805,6 +837,8 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
                 "Set FLUID_LLM_API_KEY or the provider-specific API key environment variable",
                 "Examples: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY",
                 "For local models, use --llm-provider ollama and optionally --llm-endpoint",
+                "For keyless authoring: run forge from your IDE (mcp-sampling), or use a "
+                "local coding agent (e.g. --llm-provider claude-code)",
             ],
         )
 
@@ -928,6 +962,13 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
                         context={"provider": provider.name, "model": candidate, "role": role},
                     )
 
+    agent_mode = (
+        str(getattr(args, "forge_agent_mode", None) or env.get("FLUID_FORGE_AGENT_MODE") or "")
+        .strip()
+        .lower()
+    )
+    if agent_mode not in ("envelope", "agentic"):
+        agent_mode = "envelope"
     return LlmConfig(
         provider=provider.name,
         model=model,
@@ -939,6 +980,7 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
         model_source=model_source,
         model_resolution_notes=model_notes,
         tier_models=tier_models,
+        agent_mode=agent_mode,
     )
 
 
@@ -1143,6 +1185,17 @@ def _record_call_in_run_tracker(
             )
 
             usd_override = get_last_litellm_cost_usd()
+            if usd_override is None:
+                # Coding-agent providers (Claude Code) report cost on their own
+                # thread-local; litellm never ran for them, so fall back to it.
+                try:
+                    from fluid_build.cli.forge_copilot_coding_agent import (
+                        get_last_agent_cost_usd,
+                    )
+
+                    usd_override = get_last_agent_cost_usd()
+                except Exception:  # pragma: no cover — defensive
+                    pass
             ct = get_last_cache_tokens()
             cache_creation = int(ct.get("cache_creation_input_tokens", 0) or 0)
             cache_read = int(ct.get("cache_read_input_tokens", 0) or 0)
@@ -1769,6 +1822,18 @@ class OllamaProvider(
 # ---------------------------------------------------------------------------
 
 
+def _coding_agent_provider(name: str) -> "LlmProvider":
+    """Lazy factory bridge for the coding-agent registry rows.
+
+    Imported lazily so the registry doesn't pull in
+    ``forge_copilot_coding_agent`` (which imports back from this module) at
+    module-load time.
+    """
+    from fluid_build.cli.forge_copilot_coding_agent import get_coding_agent_provider
+
+    return get_coding_agent_provider(name)
+
+
 class _LazyBuiltinProviders(dict):
     """Lazy registry for built-in LLM providers.
 
@@ -1790,6 +1855,11 @@ class _LazyBuiltinProviders(dict):
         "claude": lambda: AnthropicProvider(),
         "gemini": lambda: GeminiProvider(),
         "ollama": lambda: OllamaProvider(),
+        # Coding-agent providers — shell out to a local agent CLI (Part B).
+        "claude-code": lambda: _coding_agent_provider("claude-code"),
+        "codex": lambda: _coding_agent_provider("codex"),
+        "cursor": lambda: _coding_agent_provider("cursor"),
+        "kiro": lambda: _coding_agent_provider("kiro"),
     }
 
     def __init__(self):

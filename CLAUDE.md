@@ -320,6 +320,66 @@ Drafted upstream issues for known external gaps live in
 association removal; two LocalStack Pro quirks: Lambda in
 docker-in-docker, Lake Formation DataLakeAdmin → GrantPermissions).
 
+## Recent architectural changes worth knowing (2026-06-01, keyless coding-agent authoring)
+
+`fluid forge` can now author **without an LLM API key of its own** by reusing an
+AI coding agent the user already has. Two complementary topologies, both on the
+existing `LlmProvider` seam (no new backend switch — selection is by provider name):
+
+- **In-IDE (MCP sampling, already existed; this branch fixed two bugs).**
+  `MCPSamplingProvider` routes the LLM call back to the host IDE via
+  `sampling/createMessage`. It was reachable only through the `forge_run` MCP
+  tool, but was broken keyless: (1) `--llm-provider mcp-sampling` was rejected by
+  the `forge` / `forge data-model` argparse `choices` allowlist, and (2)
+  `resolve_llm_config` raised `copilot_missing_llm_api_key` for it. Both fixed —
+  `mcp-sampling` is now in `choices` and in `_KEYLESS_PROVIDERS`
+  (`forge_copilot_llm_providers.py`). Pin: `tests/test_mcp_sampling_keyless.py`.
+
+- **Standalone terminal (new — headless shell-out).** New module
+  `cli/forge_copilot_coding_agent.py`: one parametrized `CodingAgentProvider`
+  driven by an `AgentSpec` table for `claude-code` / `codex` / `cursor` / `kiro`.
+  `invoke_blocking` shells out to the agent's headless CLI (`claude -p`,
+  `codex exec`, `cursor-agent -p`, `kiro-cli chat --no-interactive`) and returns
+  the response **envelope string** — the runtime's `extract_json_object` +
+  validate + repair loop is unchanged. **The only subprocess seam is
+  `_run_agent`** (list argv, never `shell=True`); tests monkeypatch it — no real
+  CLI in CI. Schema-constrained output via `--json-schema` (Claude) /
+  `--output-schema` (Codex); cursor/kiro fall back to the self-healing JSON-parse
+  loop, and agent stdout is ANSI-stripped (`_ANSI_RE`) before extraction (kiro-cli
+  decorates its output). **Auth is each CLI's own job — a stored interactive
+  login (`claude`, `cursor-agent login`, `kiro-cli login`) OR the key env; we do
+  NOT pre-block on a missing key** (verified live: a current `kiro-cli login` runs
+  headless keyless with no `KIRO_API_KEY`; an *expired* token is what makes
+  kiro-cli open a browser). All four are in `_KEYLESS_PROVIDERS` so the generic
+  resolve-time api-key gate (which only knows the standard cloud keys) doesn't
+  reject them; only Claude Code is *truly zero-setup* keyless (subscription OAuth,
+  never `--bare`). Claude's `total_cost_usd` feeds `usd_override` via a
+  thread-local; the others surface as `$?` (honest, never a misleading `$0`).
+  NB: the **Kiro IDE** (`/Applications/Kiro.app`) is NOT the `kiro-cli` product —
+  the IDE's `code chat` is GUI-bound; the IDE's keyless route is MCP sampling.
+  Pins: `tests/test_coding_agent_provider.py`, `tests/test_coding_agent_resolve.py`.
+
+- **Detection + "offer, don't force" UX.** `_welcome_scan._probe_coding_agents`
+  detects installed agent CLIs and the panel surfaces "Keyless: … (no API key)".
+  `ai_setup.run_ai_setup_inline` loads a saved coding-agent keyless and auto-offers
+  Claude Code (step 4.5, mirroring the Ollama branch). Pins:
+  `tests/test_welcome_scan_coding_agents.py`, `tests/test_coding_agent_ai_setup.py`.
+
+- **Drive modes.** Default is **envelope** (agent returns the contract JSON).
+  `--forge-agent-mode agentic` / `FLUID_FORGE_AGENT_MODE=agentic` selects the
+  opt-in **agentic** mode (agent writes `contract.fluid.yaml` into the workspace) —
+  the `LlmConfig.agent_mode` plumbing is wired; the full agentic read+validate loop
+  is the remaining follow-up.
+
+Key env vars: `FLUID_FORGE_AGENT` (select agent), `FLUID_FORGE_AGENT_MODE`
+(envelope|agentic), `FLUID_FORGE_AGENT_TIMEOUT_SECONDS`, `FLUID_FORGE_AGENT_CWD`
+(default = scratch tempdir, so the agent doesn't auto-load the project's
+CLAUDE.md/AGENTS.md). All four are in the `fluid doctor` env dump. ACP (Agent
+Client Protocol) is the noted v2 transport — `_run_agent` is the only seam it
+would replace; when building it, **depend on the official `agent-client-protocol`
+PyPI SDK** (Pydantic models + async base classes + stdio JSON-RPC) rather than
+hand-rolling the protocol.
+
 ## Working style
 
 - **Goal-driven execution.** For non-trivial tasks, state success criteria before implementing and loop until verified. Transform imperatives into tests: "add redactor coverage" → "new pattern is masked by a test assertion"; "fix the bug" → "reproducing test passes first, then fix makes it green".
