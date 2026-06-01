@@ -318,10 +318,36 @@ def register(subparsers: argparse._SubParsersAction):
     # --- LLM flags ---
     parser.add_argument(
         "--llm-provider",
-        choices=["openai", "anthropic", "claude", "gemini", "ollama"],
-        help="LLM provider for copilot",
+        choices=[
+            "openai",
+            "anthropic",
+            "claude",
+            "gemini",
+            "ollama",
+            # Keyless: route the LLM through the IDE (mcp-sampling) or a local
+            # coding-agent CLI instead of an API key of forge's own.
+            "mcp-sampling",
+            "claude-code",
+            "codex",
+            "cursor",
+            "kiro",
+        ],
+        help=(
+            "LLM provider for copilot. Keyless options: mcp-sampling (in-IDE), "
+            "claude-code / codex / cursor / kiro (local agent CLI)."
+        ),
     )
     parser.add_argument("--llm-model", help="Model identifier for copilot")
+    parser.add_argument(
+        "--forge-agent-mode",
+        dest="forge_agent_mode",
+        choices=["envelope", "agentic"],
+        help=(
+            "Drive mode for coding-agent providers (claude-code/codex/cursor/kiro): "
+            "'envelope' (agent returns the contract JSON on stdout; default) or "
+            "'agentic' (agent writes contract.fluid.yaml into the workspace)."
+        ),
+    )
     parser.add_argument(
         "--llm-routing-model",
         help="Fast/cheap model for interview clarification and AI self-evaluation",

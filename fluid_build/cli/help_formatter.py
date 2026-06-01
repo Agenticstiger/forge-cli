@@ -398,8 +398,13 @@ def print_forge_help() -> None:
     _group_table(
         "AI Config",
         [
-            ("--llm-provider NAME", "LLM provider (openai, anthropic, claude, gemini, ollama)"),
+            (
+                "--llm-provider NAME",
+                "openai/anthropic/gemini/ollama, or keyless: mcp-sampling (in-IDE), "
+                "claude-code / codex / cursor / kiro (local agent CLI)",
+            ),
             ("--llm-model NAME", "Model identifier"),
+            ("--forge-agent-mode MODE", "Coding-agent drive mode: envelope (default) or agentic"),
             ("--llm-routing-model NAME", "Fast model for interview and AI self-checks"),
             ("--llm-endpoint URL", "HTTP endpoint override"),
             ("--tiered", "Use provider-local deep/fast model tiers"),
