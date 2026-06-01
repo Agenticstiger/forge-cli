@@ -780,39 +780,15 @@ def _run_extension_validators(
     Plugin exceptions are caught and reported as a single error so a
     buggy plugin can't crash ``fluid validate`` itself.
     """
-    extensions = contract.get("extensions") if isinstance(contract, dict) else None
-    if not isinstance(extensions, dict):
-        return  # no extensions block — nothing to validate
-    from fluid_build.observability.secret_redactor import redact_secret_text
+    # Shared return-based core (also used by the copilot's pre-emit conformance
+    # pass). It performs the importlib.metadata walk, per-plugin isolation, and
+    # ``redact_secret_text`` pre-redaction; we just fold each error into the
+    # ValidationResult so output formatting / exit code / strict mode are
+    # unchanged.
+    from fluid_build.extension_schemas import run_extension_validators
 
-    try:
-        import importlib.metadata as _md
-
-        try:
-            eps = _md.entry_points(group="fluid_build.extension_validators")
-        except TypeError:
-            # Python < 3.10
-            eps = _md.entry_points().get("fluid_build.extension_validators", [])
-    except Exception as e:
-        logger.warning("Extension validator discovery failed: %s", redact_secret_text(str(e)))
-        return
-
-    for ep in eps:
-        plugin_errors: List[str] = []
-        try:
-            validator = ep.load()
-            validator(extensions, plugin_errors)
-        except Exception as e:
-            # Pre-redact plugin exception text: free-form strings can carry
-            # credential-shaped substrings the SecretRedactingFilter won't
-            # scrub through its placeholder-based scanning. See
-            # ``apply.py::_run_apply_hooks`` for the symmetric treatment.
-            validation_result.add_error(
-                redact_secret_text(f"extensions: validator {ep.name!r} raised: {e}")
-            )
-            continue
-        for msg in plugin_errors:
-            validation_result.add_error(redact_secret_text(f"extensions.{ep.name}: {msg}"))
+    for err in run_extension_validators(contract, logger):
+        validation_result.add_error(err)
 
 
 def _output_results(result: ValidationResult, args, logger: logging.Logger) -> int:

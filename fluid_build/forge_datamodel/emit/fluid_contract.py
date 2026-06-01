@@ -717,6 +717,25 @@ def _build_dv2_exposes(
     return exposes
 
 
+def _assemble_extensions(logical: LogicalDraft) -> Dict[str, Any]:
+    """Promote schema-valid LLM-proposed ``contract.extensions.<key>`` blocks.
+
+    Proposals live in the free-form
+    ``logical.source_summary['proposed_extensions']`` map (populated when the
+    modeler is grounded on installed extension schemas via the extension-schema
+    prompt fragment). Only blocks whose key has an installed schema AND that
+    validate against it are kept. Returns ``{}`` when there are no proposals or
+    no matching installed schema — so contracts generated without extension
+    plugins are byte-identical to before.
+    """
+    from fluid_build.extension_schemas import assemble_proposed_extensions
+
+    proposed = (logical.source_summary or {}).get("proposed_extensions")
+    return assemble_proposed_extensions(
+        proposed, fluid_version=FluidSchemaManager.latest_bundled_version()
+    )
+
+
 def build_contract_from_logical(
     logical: LogicalDraft,
     *,
@@ -888,7 +907,7 @@ def build_contract_from_logical(
                 expose["description"] = first_dataset.description
         exposes = [expose]
 
-    return {
+    contract: Dict[str, Any] = {
         "fluidVersion": FluidSchemaManager.latest_bundled_version(),
         "kind": "DataProduct",
         "id": f"generated.{slug}",
@@ -900,3 +919,10 @@ def build_contract_from_logical(
         "builds": [_default_build(build_engine, slug)],
         "exposes": exposes,
     }
+    # Promote any LLM-proposed, schema-valid contract.extensions.<key> blocks
+    # (grounded via the extension-schema prompt fragment). Added only when
+    # non-empty, so contracts with no extensions are byte-identical to before.
+    extensions = _assemble_extensions(logical)
+    if extensions:
+        contract["extensions"] = extensions
+    return contract
