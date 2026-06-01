@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Native copilot support for ANY `contract.extensions.<key>` block.** A new
+  `fluid_build.extension_schemas` entry-point group lets a plugin advertise the
+  JSON-Schema for its extension sub-key (provider
+  `get_extension_schema(fluid_version=None) -> dict`). The `fluid forge` copilot
+  now (a) grounds the modeler on every installed extension schema so it can
+  natively propose a valid block, and (b) schema-gates + validates the proposed
+  block before emit. Adding a new extension needs **zero** changes here — the
+  group is the entire contract. See `fluid_build/extension_schemas.py`.
+
+### Fixed
+
+- **Pre-emit extension validation.** The copilot's conformance pass now runs
+  registered `fluid_build.extension_validators` (the same plugins `fluid
+  validate` uses) before writing the contract, so a malformed
+  `extensions.<key>` block surfaces as an error-severity finding and enters the
+  repair loop instead of being emitted silently (the core schema treats
+  `extensions` as `additionalProperties: true`).
+- Updated the `sdk` optional extra from the retired `fluid-provider-sdk` to
+  `data-product-forge-sdk>=0.9,<1` (`fluid_sdk`).
+
 ## [0.8.8] - 2026-05-31
 
 ### Added
