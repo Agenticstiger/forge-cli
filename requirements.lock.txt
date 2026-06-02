@@ -1880,9 +1880,9 @@ tqdm==4.67.3 \
     # via
     #   huggingface-hub
     #   openai
-typer==0.25.1 \
-    --hash=sha256:75caa44ed46a03fb2dab8808753ffacdbfea88495e74c85a28c5eefcf5f39c89 \
-    --hash=sha256:9616eb8853a09ffeabab1698952f33c6f29ffdbceb4eaeecf571880e8d7664cc
+typer==0.26.6 \
+    --hash=sha256:49f96d9ee5730cef607bbe155042f40b41fa4c0d0dec04990d580837493805be \
+    --hash=sha256:cdbc160fe7e795b835fb6016419494a521a67bfb86b9476a1ccd0e7727d3ae5b
     # via huggingface-hub
 typing-extensions==4.15.0 \
     --hash=sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466 \
