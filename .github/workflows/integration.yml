@@ -311,8 +311,8 @@ jobs:
           --health-timeout 3s
           --health-retries 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
@@ -364,8 +364,8 @@ jobs:
       contains(fromJSON('["all", "mcp"]'), inputs.providers) ||
       contains(inputs.providers, 'mcp')
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
@@ -435,8 +435,8 @@ jobs:
       contains(fromJSON('["all", "mcp"]'), inputs.providers) ||
       contains(inputs.providers, 'mcp')
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
@@ -485,10 +485,10 @@ jobs:
       contains(fromJSON('["all", "mcp"]'), inputs.providers) ||
       contains(inputs.providers, 'mcp')
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
 
       # 1. Install fluid-cli + provision the demo contract.
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
@@ -498,7 +498,7 @@ jobs:
           pip install -e ".[dev,local]"
 
       # 2. TypeScript SDK
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: "20"
       - name: Install MCP TypeScript SDK
@@ -513,7 +513,7 @@ jobs:
             examples/mcp-output-port-docker/contract.fluid.yaml
 
       # 3. Go SDK
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
         with:
           go-version: "1.22"
       - name: Go conformance
@@ -526,7 +526,7 @@ jobs:
           go run main.go "$GITHUB_WORKSPACE/examples/mcp-output-port-docker/contract.fluid.yaml"
 
       # 4. Rust SDK
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
       - name: Rust conformance
         run: |
           mkdir -p /tmp/mcp-rust-conformance/src
