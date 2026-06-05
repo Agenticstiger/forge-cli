@@ -418,17 +418,29 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install project + scanners
+      - name: Install project + pip-audit
         run: |
           pip install --upgrade pip
           pip install -e ".[dev]"
-          pip install bandit pip-audit "semgrep==1.163.0"
-      - name: Bandit security scan
-        run: bandit -r fluid_build/ -c pyproject.toml --severity-level medium -q
+          pip install pip-audit
       - name: pip-audit dependency CVE scan
         # Fails the build on any known-vulnerable dependency. Keeps the
         # litellm / jinja2 / h11 / cryptography CVE floors honest over time.
+        #
+        # ORDER MATTERS — this audits the project's REAL resolved closure
+        # BEFORE bandit/semgrep are installed. semgrep==1.163.0 pins
+        # mcp==1.23.3, which caps pyjwt at 2.12.1 — below pyjwt's own CVE
+        # floor (PYSEC-2026-175/177/178/179, fixed in 2.13.0). Installing the
+        # SAST scanners into the same env therefore drags a known-vulnerable
+        # pyjwt we don't even ship into the audited set and turns this gate
+        # permanently red. The project alone resolves pyjwt>=2.13.0, so
+        # auditing first keeps the gate honest. Do NOT fold the scanner
+        # install back into the step above.
         run: pip-audit --desc
+      - name: Install SAST scanners
+        run: pip install bandit "semgrep==1.163.0"
+      - name: Bandit security scan
+        run: bandit -r fluid_build/ -c pyproject.toml --severity-level medium -q
       # Semgrep custom rules — forge-cli repo-specific invariants from
       # CLAUDE.md (deleted-module imports, SQL-safety helper bypass,
       # copilot workspace_root confinement). Generic SAST is CodeQL's job.
