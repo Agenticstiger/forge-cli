@@ -29,6 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated the `sdk` optional extra from the retired `fluid-provider-sdk` to
   `data-product-forge-sdk>=0.9,<1` (`fluid_sdk`).
 
+### Removed
+
+- **Unused root `requirements.txt` / `requirements.lock.txt`.** Neither was
+  referenced by CI, the Dockerfiles (which install from `pyproject.toml`),
+  packaging (`MANIFEST.in`), or any install step — `pyproject.toml` is the
+  single source of truth, and the canonical hash-pinned lockfile is generated
+  on demand (`uv pip compile pyproject.toml --generate-hashes -o
+  requirements.lock.hashed.txt`; see AGENTS.md). The stale committed files only
+  produced Dependabot churn and false-looking alerts (e.g. `starlette<=1.0.0`,
+  `pyjwt==2.12.1`) against versions the real resolved closure never installs.
+  Removing them clears those alerts; Dependabot continues to track
+  `pyproject.toml`.
+
 ## [0.8.8] - 2026-05-31
 
 ### Added

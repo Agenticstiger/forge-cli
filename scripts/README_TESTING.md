@@ -463,7 +463,7 @@ jobs:
           python-version: '3.10'
       
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -e ".[dev]"
       
       - name: Run CLI tests (dry-run)
         run: ./scripts/run_cli_tests.sh --quick --dry-run

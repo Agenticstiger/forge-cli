@@ -239,9 +239,8 @@ python3 -m venv .venv
 source .venv/bin/activate  # Linux/Mac
 # .venv\Scripts\Activate.ps1  # Windows
 
-# Install dependencies
-pip install -r requirements.txt
-pip install -e .
+# Install dependencies (pyproject.toml is the single source of truth)
+pip install -e ".[dev]"
 ```
 
 ## 🚨 Troubleshooting
