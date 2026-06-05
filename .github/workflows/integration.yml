@@ -81,7 +81,7 @@ jobs:
       contains(fromJSON('["all", "snowflake"]'), inputs.providers) ||
       contains(inputs.providers, 'snowflake')
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
@@ -162,7 +162,7 @@ jobs:
       contains(fromJSON('["all", "bigquery"]'), inputs.providers) ||
       contains(inputs.providers, 'bigquery')
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
@@ -229,7 +229,7 @@ jobs:
       contains(fromJSON('["all", "aws"]'), inputs.providers) ||
       contains(inputs.providers, 'aws')
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
@@ -311,17 +311,44 @@ jobs:
           --health-timeout 3s
           --health-retries 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
+
+      # Skip-clean gate: when neither LLM key is configured, the e2e
+      # ends green (skipped) rather than failing - same pattern as the
+      # 3 sibling integration jobs above (snowflake-integration /
+      # bigquery-integration / aws-integration). Without this gate the
+      # nightly notify-on-failure job auto-files a "Nightly integration
+      # failure" issue every night at 04:00 UTC, drowning out real
+      # regressions. Issue #205 and the four preceding #165/#186/#190
+      # /#194 reports were all this same "no LLM key in the cron env"
+      # false positive.
+      - name: Check LLM API key
+        id: gate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$OPENAI_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            [ -n "$ANTHROPIC_API_KEY" ] && echo "Anthropic key present (preferred)"
+            [ -n "$OPENAI_API_KEY" ] && echo "OpenAI key present (fallback)"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No LLM API key in env (set ANTHROPIC_API_KEY or OPENAI_API_KEY) - skipping MCP output-port Postgres e2e."
+          fi
+
       - name: Install with local + postgres + dev extras
+        if: steps.gate.outputs.enabled == 'true'
         run: |
           pip install --upgrade pip
           pip install -e ".[dev,local]" psycopg
 
       - name: Apply seed.sql to dockerized Postgres
+        if: steps.gate.outputs.enabled == 'true'
         env:
           PGPASSWORD: forge_mcp_test_pwd
         run: |
@@ -332,6 +359,7 @@ jobs:
             -f examples/mcp-output-port-docker/seed.sql
 
       - name: Run docker e2e against the live Postgres + LLM
+        if: steps.gate.outputs.enabled == 'true'
         timeout-minutes: 6
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -342,10 +370,6 @@ jobs:
           POSTGRES_PASSWORD: forge_mcp_test_pwd
           FLUID_COST_LIMIT_USD_PER_RUN: "0.20"
         run: |
-          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
-            echo "::error::No LLM API key (set ANTHROPIC_API_KEY or OPENAI_API_KEY)"
-            exit 1
-          fi
           python examples/mcp-output-port-docker/run_e2e.py
 
   # ──────────────────────────────────────────────────────────────
@@ -364,28 +388,26 @@ jobs:
       contains(fromJSON('["all", "mcp"]'), inputs.providers) ||
       contains(inputs.providers, 'mcp')
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install with snowflake + dev extras
-        run: |
-          pip install --upgrade pip
-          pip install -e ".[dev,snowflake]"
-
-      - name: Verify Snowflake + LLM secrets are wired
-        run: |
-          for var in SNOWFLAKE_ACCOUNT SNOWFLAKE_USER SNOWFLAKE_PASSWORD SNOWFLAKE_WAREHOUSE SNOWFLAKE_DATABASE SNOWFLAKE_FLUID_SCHEMA SNOWFLAKE_ROLE; do
-            value="${!var}"
-            if [ -z "$value" ]; then
-              echo "::error::$var is empty — Snowflake e2e cannot run"; exit 1
-            fi
-            echo "$var: ${value:0:4}***"
-          done
-          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
-            echo "::error::No LLM API key set"; exit 1
-          fi
+      # Skip-clean gate: emits `enabled=true` only when ALL of the
+      # Snowflake creds AND at least one LLM API key are configured.
+      # Mirrors the snowflake-integration / bigquery-integration /
+      # aws-integration jobs' gate pattern. Without this the nightly
+      # notify-on-failure job auto-files a "Nightly integration failure"
+      # issue every night at 04:00 UTC. Issue #205 (and the four
+      # preceding #165/#186/#190/#194) were all this same regression.
+      #
+      # MUST run before the install step below: that step's
+      # `if: steps.gate.outputs.enabled == 'true'` reads this step's
+      # output, so a gated step placed ahead of the gate would evaluate to
+      # an empty string and skip unconditionally (deps never install, then
+      # the e2e crashes when creds ARE present).
+      - name: Check Snowflake + LLM secrets
+        id: gate
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
@@ -396,8 +418,36 @@ jobs:
           SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          missing=""
+          for var in SNOWFLAKE_ACCOUNT SNOWFLAKE_USER SNOWFLAKE_PASSWORD SNOWFLAKE_WAREHOUSE SNOWFLAKE_DATABASE SNOWFLAKE_FLUID_SCHEMA SNOWFLAKE_ROLE; do
+            value="${!var}"
+            if [ -z "$value" ]; then
+              missing="$missing $var"
+            else
+              echo "$var: ${value:0:4}***"
+            fi
+          done
+          if [ -n "$missing" ] || { [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; }; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            if [ -n "$missing" ]; then
+              echo "::notice::Snowflake secrets not configured (missing:$missing) - skipping Snowflake MCP e2e."
+            fi
+            if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
+              echo "::notice::No LLM API key in env (set ANTHROPIC_API_KEY or OPENAI_API_KEY) - skipping Snowflake MCP e2e."
+            fi
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install with snowflake + dev extras
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,snowflake]"
 
       - name: Run Snowflake e2e
+        if: steps.gate.outputs.enabled == 'true'
         timeout-minutes: 8
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
@@ -435,8 +485,8 @@ jobs:
       contains(fromJSON('["all", "mcp"]'), inputs.providers) ||
       contains(inputs.providers, 'mcp')
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.12"
           cache: pip
@@ -484,39 +534,107 @@ jobs:
       github.event_name != 'workflow_dispatch' ||
       contains(fromJSON('["all", "mcp"]'), inputs.providers) ||
       contains(inputs.providers, 'mcp')
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: forge_mcp_test
+          POSTGRES_PASSWORD: forge_mcp_test_pwd
+          POSTGRES_DB: forge_mcp_demo
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+        ports:
+          - 55432:5432
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      # Skip-clean gate: the conformance test needs a running Postgres
+      # (the sample tool queries the DB) AND an LLM key for model-filter
+      # enforcement. Without either the gateway crashes — same skip-clean
+      # pattern as the sibling MCP jobs. Issue #205 and the four preceding
+      # #165/#186/#190/#194 were all this same false-positive root cause.
+      - name: Check Postgres + LLM key
+        id: gate
+        env:
+          PGPASSWORD: forge_mcp_test_pwd
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if ! pg_isready -h 127.0.0.1 -p 55432 -U forge_mcp_test 2>/dev/null; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Postgres not reachable at 127.0.0.1:55432 — skipping multi-lang MCP conformance."
+            exit 0
+          fi
+          if ! psql -h 127.0.0.1 -p 55432 -U forge_mcp_test -d forge_mcp_demo -c "SELECT 1" > /dev/null 2>&1; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Postgres not seeded (forge_mcp_demo DB not accessible) — skipping multi-lang MCP conformance."
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       # 1. Install fluid-cli + provision the demo contract.
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        if: steps.gate.outputs.enabled == 'true'
         with:
           python-version: "3.12"
           cache: pip
       - name: Install forge-cli
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POSTGRES_HOST: 127.0.0.1
+          POSTGRES_PORT: "55432"
+          POSTGRES_USER: forge_mcp_test
+          POSTGRES_PASSWORD: forge_mcp_test_pwd
         run: |
           pip install --upgrade pip
           pip install -e ".[dev,local]"
+          psql -h 127.0.0.1 -p 55432 -U forge_mcp_test -d forge_mcp_demo \
+            -f examples/mcp-output-port-docker/seed.sql 2>/dev/null || true
 
       # 2. TypeScript SDK
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        if: steps.gate.outputs.enabled == 'true'
         with:
           node-version: "20"
       - name: Install MCP TypeScript SDK
+        if: steps.gate.outputs.enabled == 'true'
         run: |
           npm install --no-save \
             @modelcontextprotocol/sdk \
             ts-node \
             typescript
       - name: TS conformance
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POSTGRES_HOST: 127.0.0.1
+          POSTGRES_PORT: "55432"
+          POSTGRES_USER: forge_mcp_test
+          POSTGRES_PASSWORD: forge_mcp_test_pwd
         run: |
           node --loader ts-node/esm scripts/conformance/conformance_test.ts \
             examples/mcp-output-port-docker/contract.fluid.yaml
 
       # 3. Go SDK
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5.6.0
+        if: steps.gate.outputs.enabled == 'true'
         with:
           go-version: "1.22"
       - name: Go conformance
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POSTGRES_HOST: 127.0.0.1
+          POSTGRES_PORT: "55432"
+          POSTGRES_USER: forge_mcp_test
+          POSTGRES_PASSWORD: forge_mcp_test_pwd
         run: |
           mkdir -p /tmp/mcp-go-conformance
           cp scripts/conformance/conformance_test.go /tmp/mcp-go-conformance/main.go
@@ -526,8 +644,17 @@ jobs:
           go run main.go "$GITHUB_WORKSPACE/examples/mcp-output-port-docker/contract.fluid.yaml"
 
       # 4. Rust SDK
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        if: steps.gate.outputs.enabled == 'true'
       - name: Rust conformance
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POSTGRES_HOST: 127.0.0.1
+          POSTGRES_PORT: "55432"
+          POSTGRES_USER: forge_mcp_test
+          POSTGRES_PASSWORD: forge_mcp_test_pwd
         run: |
           mkdir -p /tmp/mcp-rust-conformance/src
           cp scripts/conformance/conformance_test.rs /tmp/mcp-rust-conformance/src/main.rs
