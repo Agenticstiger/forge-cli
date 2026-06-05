@@ -599,8 +599,6 @@ def test_enum_string_aliases_acceptedvalues_camel_and_snake():
             ]
         }
         cols = _cols(contract)
-        accepted = [
-            t for t in cols["s"]["tests"] if isinstance(t, dict) and "accepted_values" in t
-        ]
+        accepted = [t for t in cols["s"]["tests"] if isinstance(t, dict) and "accepted_values" in t]
         assert accepted, f"{key} did not produce an accepted_values test"
         assert accepted[0]["accepted_values"]["values"] == ["a", "b"]
