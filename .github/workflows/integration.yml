@@ -393,12 +393,6 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install with snowflake + dev extras
-        if: steps.gate.outputs.enabled == 'true'
-        run: |
-          pip install --upgrade pip
-          pip install -e ".[dev,snowflake]"
-
       # Skip-clean gate: emits `enabled=true` only when ALL of the
       # Snowflake creds AND at least one LLM API key are configured.
       # Mirrors the snowflake-integration / bigquery-integration /
@@ -406,6 +400,12 @@ jobs:
       # notify-on-failure job auto-files a "Nightly integration failure"
       # issue every night at 04:00 UTC. Issue #205 (and the four
       # preceding #165/#186/#190/#194) were all this same regression.
+      #
+      # MUST run before the install step below: that step's
+      # `if: steps.gate.outputs.enabled == 'true'` reads this step's
+      # output, so a gated step placed ahead of the gate would evaluate to
+      # an empty string and skip unconditionally (deps never install, then
+      # the e2e crashes when creds ARE present).
       - name: Check Snowflake + LLM secrets
         id: gate
         env:
@@ -439,6 +439,12 @@ jobs:
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Install with snowflake + dev extras
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,snowflake]"
 
       - name: Run Snowflake e2e
         if: steps.gate.outputs.enabled == 'true'
