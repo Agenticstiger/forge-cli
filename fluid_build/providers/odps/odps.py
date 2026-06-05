@@ -466,6 +466,22 @@ class OdpsProvider(BaseProvider):
                 processing_errors.append(error_info)
                 self.logger.error("Failed to process contract", extra=error_info)
 
+        # Fail loudly when NOTHING could be mapped. The pre-2026-06 behaviour
+        # collected the swallowed exceptions, built a payload whose
+        # ``artifacts`` was an empty list, and let the CLI write the literal
+        # string ``[]`` to disk while exiting 0 — a silent corruption that
+        # looked like success. A render that produced zero artifacts is a hard
+        # failure: re-raise the real reason(s) so the caller gets a non-zero
+        # exit and an actionable message instead of garbage output.
+        if not opds_artifacts:
+            detail = "; ".join(
+                f"{e['contract_id']}: {e['error_type']}: {e['error']}" for e in processing_errors
+            )
+            raise ProviderError(
+                "ODPS v4.1 export produced no document — "
+                f"all {len(contracts)} contract(s) failed to map. {detail}".strip()
+            )
+
         # Build final payload
         payload = self._build_opds_payload(opds_artifacts, processing_errors)
 
@@ -573,8 +589,26 @@ class OdpsProvider(BaseProvider):
         # Remove None values for cleaner output
         return {k: v for k, v in opds_artifact.items() if v is not None}
 
+    @staticmethod
+    def _coerce_owner(owner: Any) -> Dict[str, Any]:
+        """Normalise a contract ``metadata.owner`` to a dict.
+
+        FLUID contracts in the wild declare ``owner`` either as a structured
+        mapping (``{team, email, ...}``) or as a bare string (the team / person
+        name). The extractors below index it with ``.get()``; a bare-string
+        owner therefore used to raise ``AttributeError`` deep inside
+        ``_contract_to_opds`` — which the render loop swallowed into an empty
+        ``[]`` document. Coercing here keeps both shapes working.
+        """
+        if isinstance(owner, Mapping):
+            return dict(owner)
+        if isinstance(owner, str) and owner.strip():
+            return {"team": owner.strip()}
+        return {}
+
     def _extract_owner_info(self, owner: Mapping[str, Any]) -> Dict[str, Any]:
         """Extract and format owner information."""
+        owner = self._coerce_owner(owner)
         return {
             "name": owner.get("team", owner.get("name")),
             "email": owner.get("email"),
@@ -1014,6 +1048,7 @@ class OdpsProvider(BaseProvider):
 
     def _extract_data_holder_info(self, owner: Mapping[str, Any]) -> Dict[str, Any]:
         """Extract DataHolder information for OPDS v4.1."""
+        owner = self._coerce_owner(owner)
         return {
             "legalName": owner.get("organization", owner.get("org", owner.get("team", ""))),
             "contactName": owner.get("name", ""),

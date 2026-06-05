@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 
 from fluid_build.cli.console import cprint
 from fluid_build.iac import IAC_PLUGINS, assemble_tofu_document, get_iac_plugin, render_tofu_json
@@ -165,31 +166,171 @@ def _validate_with_tofu(out_dir: str) -> None:
     cprint("OpenTofu validation passed.")
 
 
+# Cloud aliases → canonical IaC plugin name. The contract surface uses a few
+# interchangeable spellings (``binding.provider: aws`` vs ``binding.platform:
+# aws``; ``google``/``bigquery`` for GCP; ``duckdb`` for the in-process local
+# runner). Normalising here means a contract authored with any documented
+# spelling auto-detects, instead of only the single ``exposes[].binding.platform``
+# token the pre-2026-06 resolver inspected.
+_PROVIDER_ALIASES = {
+    "aws": "aws",
+    "s3": "aws",
+    "glue": "aws",
+    "athena": "aws",
+    "redshift": "aws",
+    "gcp": "gcp",
+    "google": "gcp",
+    "gcs": "gcp",
+    "bigquery": "gcp",
+    "snowflake": "snowflake",
+    # ``local`` (and its DuckDB engine) is a recognised target but has no
+    # OpenTofu plugin — it runs in-process. Detected so we can emit an
+    # actionable error rather than the misleading "no supported cloud".
+    "local": "local",
+    "duckdb": "local",
+}
+
+# An unambiguous AWS region (``us-east-1``, ``eu-west-2`` …) is a last-resort
+# detection hint — GCP regions (``us-central1``) and the dash-suffixed AWS form
+# are distinguishable by the trailing ``-<n>``.
+_AWS_REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
+
+
+def _canonical_cloud(token: object) -> str:
+    """Map a raw contract platform/provider token to a canonical cloud name.
+
+    Returns the canonical name (``aws``/``gcp``/``snowflake``/``local``) or
+    ``""`` when the token is empty or unrecognised.
+    """
+    if not isinstance(token, str):
+        return ""
+    return _PROVIDER_ALIASES.get(token.strip().lower().replace("-", "_"), "")
+
+
+def _detect_clouds(contract) -> list[str]:
+    """Collect every canonical cloud declared anywhere in the contract.
+
+    Inspects, in the order the spec documents them:
+
+    * ``exposes[].binding.provider`` / ``exposes[].binding.platform``
+    * top-level ``binding.provider`` / ``binding.platform`` (Snowflake- and
+      single-binding contracts that declare the cloud once at the root)
+    * ``builds[].provider`` and ``builds[].execution.runtime.platform``
+
+    Falls back to an unambiguous AWS region (``binding.region`` /
+    ``binding.location.region``) only when no platform/provider token was
+    found, so a region never overrides an explicit binding. Order-preserving
+    and de-duplicated.
+    """
+    found: list[str] = []
+
+    def _add(token: object) -> None:
+        cloud = _canonical_cloud(token)
+        if cloud and cloud not in found:
+            found.append(cloud)
+
+    # exposes[] data-plane bindings (most specific).
+    for exposure in contract.get("exposes") or []:
+        binding = exposure.get("binding") or {}
+        if isinstance(binding, dict):
+            _add(binding.get("platform"))
+            _add(binding.get("provider"))
+
+    # Top-level binding — Snowflake-style + contracts that declare the cloud
+    # once at the root via either ``platform`` or ``provider``.
+    top_binding = contract.get("binding")
+    if isinstance(top_binding, dict):
+        _add(top_binding.get("platform"))
+        _add(top_binding.get("provider"))
+
+    # builds[].provider and builds[].execution.runtime.platform.
+    for build in contract.get("builds") or []:
+        if not isinstance(build, dict):
+            continue
+        _add(build.get("provider"))
+        runtime = (build.get("execution") or {}).get("runtime") or {}
+        if isinstance(runtime, dict):
+            _add(runtime.get("platform"))
+
+    # Region fallback — only consulted when nothing stronger was declared.
+    if not found:
+        for region in _candidate_regions(contract):
+            if _AWS_REGION_RE.match(region.strip().lower()):
+                found.append("aws")
+                break
+
+    return found
+
+
+def _candidate_regions(contract) -> list[str]:
+    """Region strings declared on the top-level / expose bindings."""
+    regions: list[str] = []
+
+    def _collect(binding: object) -> None:
+        if not isinstance(binding, dict):
+            return
+        for value in (binding.get("region"), (binding.get("location") or {}).get("region")):
+            if isinstance(value, str) and value:
+                regions.append(value)
+
+    _collect(contract.get("binding"))
+    for exposure in contract.get("exposes") or []:
+        _collect(exposure.get("binding") or {})
+    return regions
+
+
 def _resolve_provider(contract, requested: str) -> str:
-    """Return the IaC plugin name for the contract, or raise ``CLIError``."""
+    """Return the IaC plugin name for the contract, or raise ``CLIError``.
+
+    With an explicit ``--provider`` the request is honoured verbatim. With
+    ``auto`` (the default) the cloud is detected from the contract's binding
+    declarations — ``binding.provider``/``binding.platform`` (top-level or per
+    expose), ``builds[].provider``, or an unambiguous region — so the common
+    ``binding.provider: aws`` shape resolves instead of erroring.
+    """
     if requested and requested != "auto":
         return requested
 
-    found = []
-    for exposure in contract.get("exposes") or []:
-        platform = str((exposure.get("binding") or {}).get("platform") or "").lower()
-        if platform in IAC_PLUGINS and platform not in found:
-            found.append(platform)
-
-    if len(found) == 1:
-        return found[0]
+    found = _detect_clouds(contract)
     supported = "/".join(sorted(IAC_PLUGINS))
+
     if not found:
         raise CLIError(
             1,
             "generate_iac_no_provider",
-            {"error": f"could not detect a supported cloud — pass --provider ({supported})"},
+            {
+                "error": (
+                    "could not detect a target cloud from the contract — declare "
+                    "`binding.provider` (or `binding.platform`) as one of "
+                    f"{supported}, or pass --provider ({supported})"
+                )
+            },
         )
-    raise CLIError(
-        1,
-        "generate_iac_ambiguous_provider",
-        {"error": f"contract spans multiple clouds {found} — pass --provider explicitly"},
-    )
+
+    if len(found) > 1:
+        raise CLIError(
+            1,
+            "generate_iac_ambiguous_provider",
+            {"error": f"contract spans multiple clouds {found} — pass --provider explicitly"},
+        )
+
+    cloud = found[0]
+    if cloud not in IAC_PLUGINS:
+        # ``local``/DuckDB is a real, detected target but runs in-process — it
+        # has no OpenTofu module to emit. Say so explicitly instead of the
+        # misleading "no supported cloud".
+        raise CLIError(
+            1,
+            "generate_iac_local_target",
+            {
+                "error": (
+                    f"contract targets `{cloud}`, which runs in-process and has no "
+                    f"infrastructure to provision — `generate iac` supports {supported}. "
+                    "Run it with `fluid apply` (local engine) instead."
+                )
+            },
+        )
+    return cloud
 
 
 def native_actions(contract, logger: logging.Logger) -> list:
