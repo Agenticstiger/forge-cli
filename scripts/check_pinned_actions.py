@@ -129,7 +129,11 @@ def scan_workflows_for_unpinned() -> list[tuple[str, int, str]]:
         return findings
 
     for path in sorted(WORKFLOWS_DIR.glob("*.yml")) + sorted(WORKFLOWS_DIR.glob("*.yaml")):
-        text = path.read_text()
+        # Force UTF-8: Windows defaults to the active code page (cp1252)
+        # which rejects the non-Latin1 chars maintainers sometimes add to
+        # commit messages / step names. The files are committed as UTF-8
+        # on every platform.
+        text = path.read_text(encoding="utf-8")
         for match in WORKFLOW_USES_RE.finditer(text):
             action = match.group("action")
             ref = match.group("ref")
