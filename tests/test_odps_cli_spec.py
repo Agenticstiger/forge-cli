@@ -299,6 +299,132 @@ class TestGenerateStandardFormatRouting:
         ), f"expected deprecated_format_alias event; got {[r.message for r in caplog.records]!r}"
 
 
+class TestOdpsV41NeverEmitsGarbage:
+    """Regression: ``--format odps-v4.1`` must never write the literal ``[]``.
+
+    The pre-2026-06 ``OdpsProvider.render`` caught any mapping exception,
+    logged "Failed to process contract", left ``artifacts`` an empty list, and
+    let the CLI write the string ``[]`` to disk while exiting 0 — silent
+    corruption that looked like success. A common trigger was a bare-string
+    ``metadata.owner`` (the extractors indexed it with ``.get()``).
+    """
+
+    @staticmethod
+    def _string_owner_contract() -> dict:
+        """A normal contract whose ``metadata.owner`` is a bare string."""
+        return {
+            "fluidVersion": "0.7.3",
+            "kind": "DataProduct",
+            "id": "demo.string_owner_v1",
+            "name": "String Owner Product",
+            "domain": "demo",
+            "description": "owner declared as a bare string, not a mapping",
+            "metadata": {
+                "status": "production",
+                "owner": "platform-team",
+                "tags": ["demo"],
+            },
+            "exposes": [
+                {
+                    "exposeId": "p1",
+                    "kind": "table",
+                    "description": "primary output",
+                    "binding": {
+                        "platform": "snowflake",
+                        "format": "snowflake_table",
+                        "location": {"database": "D", "schema": "S", "table": "T"},
+                    },
+                    "contract": {"schema": [{"name": "id", "type": "string"}]},
+                }
+            ],
+        }
+
+    def _write(self, tmp_path: Path, contract: dict) -> Path:
+        import json as _json
+
+        cpath = tmp_path / "contract.fluid.yaml"
+        cpath.write_text(_json.dumps(contract))  # JSON is valid YAML
+        return cpath
+
+    def test_string_owner_exports_valid_non_empty_doc(self, tmp_path: Path) -> None:
+        """A bare-string owner now maps cleanly instead of collapsing to []."""
+        import json as _json
+        from argparse import Namespace
+
+        from fluid_build.cli.generate_standard import _export_format
+        from fluid_build.providers.odps.validator import validate_opds_structure
+
+        contract = self._write(tmp_path, self._string_owner_contract())
+        out = tmp_path / "product.json"
+        rc = _export_format("odps-v4.1", str(contract), Namespace(env=None, out=str(out)), LOG)
+        assert rc == 0
+        doc = _json.loads(out.read_text())
+
+        # The headline assertion: NOT the literal empty-array garbage.
+        assert doc != [], "export wrote the literal '[]' — the swallowed-exception bug is back"
+        assert isinstance(doc, dict)
+        assert doc.get("version") == "4.1"
+        assert "product" in doc
+        # The string owner became the DataHolder legalName.
+        assert doc["product"]["dataHolder"]["legalName"] == "platform-team"
+        # And the whole thing still validates against the vendored LF schema.
+        result = validate_opds_structure(doc, version="4.1", use_full_schema=True)
+        assert result.get("valid") is True, result.get("errors")
+
+    def test_render_coerces_string_owner_directly(self) -> None:
+        from fluid_build.providers.odps.odps import OdpsProvider
+
+        provider = OdpsProvider()
+        provider.validate_output = False
+        artifact = provider._contract_to_opds(self._string_owner_contract())
+        assert artifact["product"]["dataHolder"]["legalName"] == "platform-team"
+        assert artifact["product"]["_legacy"]["dataProductOwner"]["name"] == "platform-team"
+
+    def test_total_failure_raises_instead_of_writing_empty_array(self, tmp_path: Path) -> None:
+        """When EVERY contract fails to map, render raises — no garbage on disk."""
+        from unittest.mock import patch
+
+        from fluid_build.providers.base import ProviderError
+        from fluid_build.providers.odps.odps import OdpsProvider
+
+        out = tmp_path / "must-not-exist.json"
+        provider = OdpsProvider()
+        with patch.object(
+            OdpsProvider, "_contract_to_opds", side_effect=ValueError("synthetic unmappable")
+        ):
+            with pytest.raises(ProviderError) as exc:
+                provider.render({"id": "x.y", "name": "Y"}, out=str(out))
+        # The real reason is surfaced, not swallowed.
+        assert "synthetic unmappable" in str(exc.value)
+        assert "no document" in str(exc.value).lower()
+        # Crucially: nothing was written.
+        assert not out.exists(), "a failed export must not leave a '[]' file behind"
+
+    def test_cli_total_failure_is_nonzero_and_writes_nothing(self, tmp_path: Path) -> None:
+        import logging as _logging
+        from argparse import Namespace
+        from unittest.mock import patch
+
+        from fluid_build.cli import generate_standard
+        from fluid_build.cli._common import CLIError
+        from fluid_build.providers.odps.odps import OdpsProvider
+
+        contract = self._write(tmp_path, self._string_owner_contract())
+        out = tmp_path / "must-not-exist.json"
+        args = Namespace(
+            standard_format="odps-v4.1",
+            contract=str(contract),
+            out=str(out),
+            env=None,
+            list_formats=False,
+        )
+        with patch.object(OdpsProvider, "_contract_to_opds", side_effect=ValueError("synthetic")):
+            with pytest.raises(CLIError) as exc:
+                generate_standard.run(args, _logging.getLogger("t"))
+        assert exc.value.exit_code != 0
+        assert not out.exists()
+
+
 class TestSupportedFormatsOrdering:
     """The SUPPORTED_FORMATS list and --list output must lead Bitol-first."""
 
