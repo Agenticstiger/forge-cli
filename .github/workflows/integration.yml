@@ -568,8 +568,7 @@ jobs:
             echo "::notice::Postgres not reachable at 127.0.0.1:55432 — skipping multi-lang MCP conformance."
             exit 0
           fi
-          psql -h 127.0.0.1 -p 55432 -U forge_mcp_test -d forge_mcp_demo -c "SELECT 1" > /dev/null 2>&1
-          if [ $? -ne 0 ]; then
+          if ! psql -h 127.0.0.1 -p 55432 -U forge_mcp_test -d forge_mcp_demo -c "SELECT 1" > /dev/null 2>&1; then
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "::notice::Postgres not seeded (forge_mcp_demo DB not accessible) — skipping multi-lang MCP conformance."
             exit 0
