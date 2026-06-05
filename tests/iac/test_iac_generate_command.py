@@ -29,6 +29,11 @@ class TestResolveProvider:
     def test_explicit_provider_wins(self):
         assert generate_iac._resolve_provider({}, "snowflake") == "snowflake"
 
+    def test_explicit_provider_wins_over_contract_binding(self):
+        # An explicit --provider overrides whatever the contract declares.
+        contract = {"binding": {"provider": "aws"}}
+        assert generate_iac._resolve_provider(contract, "snowflake") == "snowflake"
+
     def test_auto_detects_single_platform(self):
         contract = {"exposes": [{"binding": {"platform": "gcp"}}]}
         assert generate_iac._resolve_provider(contract, "auto") == "gcp"
@@ -46,6 +51,72 @@ class TestResolveProvider:
         }
         with pytest.raises(CLIError):
             generate_iac._resolve_provider(contract, "auto")
+
+    # ── auto-detection from every documented binding location ──────────
+    # Pre-2026-06 the resolver only read ``exposes[].binding.platform``, so a
+    # contract that declared its cloud via the top-level ``binding.provider``
+    # (the common single-binding shape) 422'd with "no supported cloud".
+
+    def test_auto_detects_top_level_binding_provider(self):
+        # The headline bug: `binding.provider: aws` must resolve to aws.
+        contract = {"binding": {"provider": "aws", "region": "us-east-1"}}
+        assert generate_iac._resolve_provider(contract, "auto") == "aws"
+
+    def test_auto_detects_top_level_binding_platform(self):
+        # Snowflake-style: cloud declared once at the root via `platform`.
+        contract = {"binding": {"platform": "snowflake"}}
+        assert generate_iac._resolve_provider(contract, "auto") == "snowflake"
+
+    def test_auto_detects_expose_binding_provider(self):
+        contract = {"exposes": [{"binding": {"provider": "gcp"}}]}
+        assert generate_iac._resolve_provider(contract, "auto") == "gcp"
+
+    def test_auto_detects_builds_provider(self):
+        contract = {"builds": [{"provider": "aws"}]}
+        assert generate_iac._resolve_provider(contract, "auto") == "aws"
+
+    def test_auto_detects_builds_runtime_platform(self):
+        contract = {"builds": [{"execution": {"runtime": {"platform": "gcp"}}}]}
+        assert generate_iac._resolve_provider(contract, "auto") == "gcp"
+
+    @pytest.mark.parametrize(
+        "alias,expected",
+        [
+            ("google", "gcp"),
+            ("bigquery", "gcp"),
+            ("s3", "aws"),
+            ("glue", "aws"),
+            ("athena", "aws"),
+        ],
+    )
+    def test_auto_normalises_provider_aliases(self, alias, expected):
+        contract = {"binding": {"provider": alias}}
+        assert generate_iac._resolve_provider(contract, "auto") == expected
+
+    def test_auto_infers_aws_from_region_only(self):
+        # Region is a last-resort hint when no platform/provider is declared.
+        contract = {"binding": {"location": {"region": "eu-west-2"}}}
+        assert generate_iac._resolve_provider(contract, "auto") == "aws"
+
+    def test_region_never_overrides_explicit_binding(self):
+        # A GCP binding wins even when an AWS-shaped region is also present.
+        contract = {"binding": {"provider": "gcp", "region": "us-east-1"}}
+        assert generate_iac._resolve_provider(contract, "auto") == "gcp"
+
+    def test_local_target_raises_actionable_error(self):
+        # `local`/DuckDB is detected (not "unknown cloud") but has no IaC
+        # plugin — the error must name `local` and point at `fluid apply`.
+        contract = {"exposes": [{"binding": {"platform": "local"}}]}
+        with pytest.raises(CLIError) as exc:
+            generate_iac._resolve_provider(contract, "auto")
+        assert exc.value.event == "generate_iac_local_target"
+        assert "local" in exc.value.context["error"]
+
+    def test_duckdb_alias_resolves_to_local_target_error(self):
+        contract = {"builds": [{"provider": "duckdb"}]}
+        with pytest.raises(CLIError) as exc:
+            generate_iac._resolve_provider(contract, "auto")
+        assert exc.value.event == "generate_iac_local_target"
 
 
 class TestGenerateIacRun:

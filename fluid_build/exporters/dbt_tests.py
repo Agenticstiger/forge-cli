@@ -16,10 +16,27 @@
 
 Reads the FLUID v0.7.x contract shape:
 
-* ``exposes[].contract.schema[]``  — tabular columns (``{name, type, ...}``)
+* ``exposes[].contract.schema[]``  — tabular columns (``{name, type, ...}``),
+  including any *field-level constraints* declared inline on a column
+  (``required`` / ``unique`` / ``enum`` / ``minimum`` / ``maximum``)
 * ``exposes[].contract.dq.rules[]`` — data-quality rules (``dqRule``)
 * ``exposes[].binding.location.table`` — the physical table the dbt model
   binds to (falls back to ``exposeId``)
+
+Two test sources feed each column and are merged (deduped): the ``dq.rules[]``
+block AND the column's own inline constraints. The inline-constraint mapping is:
+
+==================== =================================================
+column constraint    dbt test
+==================== =================================================
+``required: true``   ``not_null``
+``unique`` / key     ``unique`` (``primaryKey`` / ``pk`` / ``identifier``
+                     / ``labels.constraint: primary_key`` also count)
+``enum`` /           ``accepted_values`` with the declared value list
+``acceptedValues``
+``minimum`` /        ``dbt_utils.accepted_range`` (inclusive bounds)
+``maximum``
+==================== =================================================
 
 Each ``dqRule`` carries a ``type`` from the v0.7.3 enum
 (``completeness | uniqueness | valid_values | accuracy | freshness |
@@ -209,8 +226,21 @@ def _columns_with_tests(
 ) -> list[dict[str, Any]]:
     """Build the dbt ``columns:`` block, attaching per-column tests.
 
-    Reads ``contract.schema[]`` (v0.7.x) — an array of ``{name, type}``
-    column objects.
+    Reads ``contract.schema[]`` (v0.7.x) — an array of column objects
+    (``{name, type, ...}``). Two test sources are merged per column:
+
+    1. ``tests_by_column`` — tests derived from ``contract.dq.rules[]``
+       (the data-quality block).
+    2. The column's own *field-level constraints* — ``required`` → ``not_null``,
+       a declared key (``unique`` / ``primaryKey`` / ``pk`` / ``identifier``) →
+       ``unique``, ``enum`` / ``acceptedValues`` → ``accepted_values``, and
+       ``minimum`` / ``maximum`` → ``dbt_utils.accepted_range``.
+
+    Without (2) a contract that expressed its quality intent inline on the
+    schema (the common case) produced a dbt model with column names but **zero
+    executable tests**. Both sources are deduped so a column declared
+    ``required: true`` *and* covered by a ``completeness`` dq rule gets a single
+    ``not_null``.
     """
     contract = expose.get("contract")
     cols_in: Sequence[Any] = []
@@ -232,7 +262,10 @@ def _columns_with_tests(
         desc = col.get("description") or col.get("businessName")
         if desc:
             col_block["description"] = desc
-        col_tests = tests_by_column.get(name)
+        col_tests = _merge_tests(
+            list(tests_by_column.get(name) or []),
+            _constraint_tests_for_column(col),
+        )
         if col_tests:
             col_block["tests"] = col_tests
         out.append(col_block)
@@ -246,6 +279,139 @@ def _columns_with_tests(
         out.append({"name": col_name, "tests": col_tests})
 
     return out
+
+
+# ── Field-level constraint → dbt test mapping ─────────────────────────
+#
+# Mirrors the canonical FLUID column-constraint key recognition already used
+# by ``copilot.enrichment._map_fluid_column_to_wave2`` so the dbt artifact and
+# the rest of the codebase agree on which keys mean what. The dbt test names
+# follow the dbt ecosystem conventions confirmed against the docs:
+#   - not_null / unique / accepted_values — dbt built-in generic tests
+#     (https://docs.getdbt.com/reference/resource-properties/data-tests)
+#   - dbt_utils.accepted_range — numeric range test
+#     (https://github.com/dbt-labs/dbt-utils)
+# Tests are emitted under the ``tests:`` key (not ``data_tests:``) to stay
+# consistent with the dq-rules path above and ``engines/dbt`` — ``tests`` is
+# still valid in current dbt (the 1.8+ rename concerns test *arguments*, not
+# the property name).
+
+# Truthy markers a column may carry to declare it a uniqueness key. ``labels``
+# is a free-form string map in v0.7.x; ``labels.unique: "true"`` and
+# ``labels.constraint: "primary_key"`` are an in-the-wild convention (see
+# examples/bitcoin-price-api-declarative-part-c).
+_PK_KEYS = ("primary", "primaryKey", "primary_key", "pk", "isPrimary")
+_ENUM_KEYS = ("enum", "acceptedValues", "accepted_values")
+
+
+def _is_truthy(value: Any) -> bool:
+    """Loose truthiness for YAML/JSON booleans-as-strings (``"true"``/``True``)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
+def _column_is_key(col: Mapping[str, Any]) -> bool:
+    """True when the column is declared a uniqueness key / primary key."""
+    if _is_truthy(col.get("unique")):
+        return True
+    if any(_is_truthy(col.get(k)) for k in _PK_KEYS):
+        return True
+    if str(col.get("semanticType") or "").strip().lower() in ("identifier", "primary_key"):
+        return True
+    labels = col.get("labels")
+    if isinstance(labels, Mapping):
+        if _is_truthy(labels.get("unique")):
+            return True
+        if str(labels.get("constraint") or "").strip().lower() in ("primary_key", "unique"):
+            return True
+    return False
+
+
+def _column_enum_values(col: Mapping[str, Any]) -> list[Any]:
+    """Return the accepted-value list declared on a column, if any."""
+    for key in _ENUM_KEYS:
+        raw = col.get(key)
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+            vals = [v for v in raw if v is not None]
+            if vals:
+                return vals
+    return []
+
+
+def _column_range(col: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the ``{min_value, max_value}`` declared on a column, if any.
+
+    Accepts both ``minimum``/``maximum`` (JSON-Schema spelling) and the
+    ``min``/``max`` aliases the copilot mapper recognises.
+    """
+    out: dict[str, Any] = {}
+    minimum = col.get("minimum", col.get("min"))
+    maximum = col.get("maximum", col.get("max"))
+    if isinstance(minimum, (int, float)) and not isinstance(minimum, bool):
+        out["min_value"] = minimum
+    if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
+        out["max_value"] = maximum
+    return out
+
+
+def _constraint_tests_for_column(col: Mapping[str, Any]) -> list[Any]:
+    """Translate one schema column's field-level constraints to dbt tests."""
+    tests: list[Any] = []
+
+    # required → not_null
+    if _is_truthy(col.get("required")):
+        tests.append("not_null")
+
+    # declared key → unique
+    if _column_is_key(col):
+        tests.append("unique")
+
+    # enum / acceptedValues → accepted_values
+    values = _column_enum_values(col)
+    if values:
+        tests.append({"accepted_values": {"values": values}})
+
+    # minimum / maximum → dbt_utils.accepted_range (inclusive bounds)
+    bounds = _column_range(col)
+    if bounds:
+        bounds["inclusive"] = True
+        tests.append({"dbt_utils.accepted_range": bounds})
+
+    return tests
+
+
+def _test_identity(test: Any) -> Any:
+    """A hashable identity for a dbt test entry, for de-duplication.
+
+    String tests (``not_null``) identify by their name; dict tests
+    (``{accepted_values: ...}``) identify by their single test-name key so two
+    sources can't emit the same generic test twice for one column.
+    """
+    if isinstance(test, str):
+        return test
+    if isinstance(test, Mapping) and len(test) == 1:
+        return next(iter(test))
+    return repr(test)
+
+
+def _merge_tests(primary: list[Any], extra: list[Any]) -> list[Any]:
+    """Concatenate two test lists, dropping duplicates by test identity.
+
+    ``primary`` (dq-rule-derived) wins on collision so an explicitly-tuned dq
+    rule isn't clobbered by the generic constraint-derived form.
+    """
+    merged: list[Any] = []
+    taken: set[Any] = set()
+    for test in (*primary, *extra):
+        identity = _test_identity(test)
+        if identity in taken:
+            continue
+        taken.add(identity)
+        merged.append(test)
+    return merged
 
 
 def _convert_column_rule(rule: Mapping[str, Any], column: str) -> Any | None:
