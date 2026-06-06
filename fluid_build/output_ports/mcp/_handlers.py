@@ -144,6 +144,9 @@ def tool_query(state: "SessionState", arguments: Mapping[str, Any]) -> Dict[str,
         dimensions=args.get("dimensions"),
         filters=args.get("filters"),
         limit=_resolve_limit(args.get("limit"), cap=state.policy.max_sample_rows),
+        # Enforce policy.rowFilters[] on the query tool (was bypassed — only
+        # sample applied them); merged into the compiled WHERE.
+        caller_attributes=state.caller_attributes,
         table_reference=descriptor.table_reference,
     )
     result = driver.query(compiled=compiled, timeout_seconds=state.query_timeout_seconds)
@@ -172,6 +175,11 @@ def tool_query_sql(state: "SessionState", arguments: Mapping[str, Any]) -> Dict[
         table_reference=descriptor.table_reference,
         limit=_resolve_limit(args.get("limit"), cap=state.policy.max_sample_rows),
         restricted_columns=restricted,
+        # Enforce policy.rowFilters[] on the free-form query_sql tool too (was
+        # bypassed). Can't merge a WHERE into arbitrary SQL, so the compiler
+        # wraps it: SELECT * FROM (<caller_sql>) WHERE <rowfilter> LIMIT n.
+        expose=state.expose,
+        caller_attributes=state.caller_attributes,
     )
     result = driver.query(compiled=compiled, timeout_seconds=state.query_timeout_seconds)
     return _serialize_query_result(state.expose, compiled, result)

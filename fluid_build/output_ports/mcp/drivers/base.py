@@ -43,37 +43,14 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..query_compiler import CompiledQuery
 
-
-class RowFilterIdentityMissing(RuntimeError):
-    """Raised when a ``rowFilters[]`` entry references a caller
-    attribute that is not present (fail-closed deny so the gateway
-    never serves rows under an undefined identity)."""
-
-
-_CALLER_PLACEHOLDER = re.compile(r"\$\{caller\.([A-Za-z_][A-Za-z0-9_]*)\}")
-
-
-def _resolve_caller_placeholder(value: Any, caller_attributes: Mapping[str, Any]) -> Any:
-    """Replace ``${caller.<attr>}`` tokens in ``value`` with values
-    from ``caller_attributes``. Lists / tuples recurse; scalars
-    that aren't strings pass through unchanged. Raises
-    :class:`RowFilterIdentityMissing` when an attribute is absent
-    so a misconfigured contract can never accidentally widen access.
-    """
-    if isinstance(value, str):
-        match = _CALLER_PLACEHOLDER.fullmatch(value)
-        if match is None:
-            return value
-        attr = match.group(1)
-        if attr not in caller_attributes:
-            raise RowFilterIdentityMissing(
-                f"rowFilter references caller.{attr} but caller_attributes "
-                f"only carry: {sorted(caller_attributes)}"
-            )
-        return caller_attributes[attr]
-    if isinstance(value, (list, tuple)):
-        return [_resolve_caller_placeholder(v, caller_attributes) for v in value]
-    return value
+# Row-level-security primitives live in query_compiler (the lower layer that
+# also compiles the semantic ``query`` / free-form ``query_sql`` WHERE) so a
+# single offset-aware builder enforces ``policy.rowFilters[]`` on EVERY read
+# path — ``sample`` here, plus ``query`` / ``query_sql`` at compile time.
+# Imported (and thus re-exported from this module) so ``sample`` and existing
+# ``from ...drivers.base import RowFilterIdentityMissing`` call sites are
+# unchanged.
+from ..query_compiler import RowFilterIdentityMissing, compile_row_filter_clauses
 
 
 class UnsupportedBindingError(RuntimeError):
@@ -406,37 +383,11 @@ class EngineDriver(ABC):
         the WHERE clause to its FROM and binds the params in its
         normal placeholder rewrite.
         """
-        policy = expose.get("policy") or {}
-        filters = policy.get("rowFilters") or []
-        if not filters:
-            return "", []
-        clauses: list[str] = []
-        params: list[Any] = []
-        for entry in filters:
-            if not isinstance(entry, Mapping):
-                continue
-            column_raw = entry.get("column")
-            if not isinstance(column_raw, str) or not column_raw:
-                continue
-            from fluid_build.providers._sql_safety import validate_ident
-
-            column = validate_ident(column_raw)
-            if "equals" in entry:
-                value = _resolve_caller_placeholder(entry["equals"], caller_attributes)
-                clauses.append(f'"{column}" = :p_{len(params)}')
-                params.append(value)
-            elif "in" in entry:
-                raw_list = _resolve_caller_placeholder(entry["in"], caller_attributes)
-                if not isinstance(raw_list, (list, tuple)) or not raw_list:
-                    raise RowFilterIdentityMissing(
-                        f"row filter on column={column!r} expects a non-empty "
-                        "list (got empty / non-list value); fail-closed deny."
-                    )
-                placeholders = ", ".join(f":p_{len(params) + i}" for i in range(len(raw_list)))
-                clauses.append(f'"{column}" IN ({placeholders})')
-                params.extend(raw_list)
-            else:
-                continue  # unknown operator — silently skip
+        # Delegates to the shared, offset-aware builder in query_compiler so
+        # sample / query / query_sql all enforce identical row filters. sample
+        # builds its own ``SELECT * FROM <table>`` so it owns placeholder index
+        # 0 (offset=0) and just needs the leading WHERE.
+        clauses, params = compile_row_filter_clauses(expose, caller_attributes, offset=0)
         if not clauses:
             return "", []
         return " WHERE " + " AND ".join(clauses), params

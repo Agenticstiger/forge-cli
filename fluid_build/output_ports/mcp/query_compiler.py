@@ -99,6 +99,88 @@ class QueryValidationError(ValueError):
     """
 
 
+class RowFilterIdentityMissing(RuntimeError):
+    """Raised when a ``rowFilters[]`` entry references a caller attribute
+    that is not present (fail-closed deny so the gateway never serves rows
+    under an undefined identity)."""
+
+
+_CALLER_PLACEHOLDER = re.compile(r"\$\{caller\.([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _resolve_caller_placeholder(value: Any, caller_attributes: Mapping[str, Any]) -> Any:
+    """Replace ``${caller.<attr>}`` tokens in ``value`` with values from
+    ``caller_attributes``. Lists / tuples recurse; non-string scalars pass
+    through. Raises :class:`RowFilterIdentityMissing` when an attribute is
+    absent so a misconfigured contract can never accidentally widen access."""
+    if isinstance(value, str):
+        match = _CALLER_PLACEHOLDER.fullmatch(value)
+        if match is None:
+            return value
+        attr = match.group(1)
+        if attr not in caller_attributes:
+            raise RowFilterIdentityMissing(
+                f"rowFilter references caller.{attr} but caller_attributes "
+                f"only carry: {sorted(caller_attributes)}"
+            )
+        return caller_attributes[attr]
+    if isinstance(value, (list, tuple)):
+        return [_resolve_caller_placeholder(v, caller_attributes) for v in value]
+    return value
+
+
+def compile_row_filter_clauses(
+    expose: Mapping[str, Any],
+    caller_attributes: Mapping[str, Any],
+    *,
+    offset: int = 0,
+) -> Tuple[List[str], List[Any]]:
+    """Compile ``expose.policy.rowFilters[]`` into AND-able WHERE clauses +
+    bound params, with placeholders ``:p_{offset}``, ``:p_{offset+1}``, …
+
+    Centralises row-level security so EVERY read path enforces it: ``sample``
+    (via :meth:`...drivers.base.EngineDriver.compile_row_filter_predicate`,
+    ``offset=0``), the semantic ``query`` (merged into its WHERE at
+    ``offset=len(existing_params)``), and the free-form ``query_sql`` wrapper.
+    The ``offset`` is what lets these merge into a statement that already has
+    ``:p_<n>`` placeholders without colliding.
+
+    Fail-closed: a ``${caller.<attr>}`` referencing a missing attribute, or an
+    ``in:`` filter resolving to an empty/non-list value, raises
+    :class:`RowFilterIdentityMissing` — the gateway prefers no rows to wrong
+    rows. Column identifiers route through ``validate_ident``; filter values are
+    always bound parameters, never interpolated.
+    """
+    policy = expose.get("policy") or {}
+    filters = policy.get("rowFilters") or []
+    clauses: List[str] = []
+    params: List[Any] = []
+    for entry in filters:
+        if not isinstance(entry, Mapping):
+            continue
+        column_raw = entry.get("column")
+        if not isinstance(column_raw, str) or not column_raw:
+            continue
+        column = validate_ident(column_raw)
+        if "equals" in entry:
+            value = _resolve_caller_placeholder(entry["equals"], caller_attributes)
+            clauses.append(f'"{column}" = :p_{offset + len(params)}')
+            params.append(value)
+        elif "in" in entry:
+            raw_list = _resolve_caller_placeholder(entry["in"], caller_attributes)
+            if not isinstance(raw_list, (list, tuple)) or not raw_list:
+                raise RowFilterIdentityMissing(
+                    f"row filter on column={column!r} expects a non-empty "
+                    "list (got empty / non-list value); fail-closed deny."
+                )
+            placeholders = ", ".join(f":p_{offset + len(params) + i}" for i in range(len(raw_list)))
+            clauses.append(f'"{column}" IN ({placeholders})')
+            params.extend(raw_list)
+        else:
+            continue  # unknown operator — silently skip
+    return clauses, params
+
+
 @dataclass(frozen=True)
 class CompiledQuery:
     """The result of compiling a semantic ``query`` payload.
@@ -322,6 +404,7 @@ def compile_semantic_query(
     dimensions: Optional[List[str]] = None,
     filters: Optional[Mapping[str, Any]] = None,
     limit: Optional[int] = None,
+    caller_attributes: Optional[Mapping[str, Any]] = None,
     table_reference: str,
 ) -> CompiledQuery:
     """Compile one ``query`` payload into a :class:`CompiledQuery`.
@@ -408,6 +491,18 @@ def compile_semantic_query(
         where_clauses.append(f"{dimension_expr} = :p_{placeholder_index}")
         params.append(filter_value)
 
+    # Row-level security: merge policy.rowFilters[] into the WHERE so the
+    # semantic ``query`` tool enforces the SAME tenant isolation as ``sample``.
+    # Previously query() executed the compiled statement with no row filter, so
+    # a multi-tenant rowFilter (e.g. tenant_id = ${caller.tenant_id}) was
+    # silently bypassed on the query/query_sql tools. Placeholders continue from
+    # the filter params (offset) so they never collide.
+    rf_clauses, rf_params = compile_row_filter_clauses(
+        expose, caller_attributes or {}, offset=len(params)
+    )
+    where_clauses.extend(rf_clauses)
+    params.extend(rf_params)
+
     if not isinstance(limit, int) or limit < 1 or limit > 1_000_000:
         raise QueryValidationError("limit must be an integer in [1, 1_000_000]")
 
@@ -493,6 +588,8 @@ def compile_free_form_sql(
     table_reference: str,
     limit: int,
     restricted_columns: Iterable[str] = (),
+    expose: Optional[Mapping[str, Any]] = None,
+    caller_attributes: Optional[Mapping[str, Any]] = None,
 ) -> CompiledQuery:
     """Compile a caller-supplied SQL ``query_sql`` payload.
 
@@ -512,12 +609,20 @@ def compile_free_form_sql(
       defends against the alias bypass — ``SELECT email AS not_email``
       would otherwise sneak masked values past the result-set masking
       step in :class:`fluid_build.output_ports.mcp.drivers.base.EngineDriver`.
-    * ``FROM`` references are not rewritten in MVP — the caller is
-      expected to reference the bound table by its fully-qualified
-      name from the contract, and the cert script confirms this works
-      end-to-end. Phase-2 adds an AST-level rewrite so consumers can
-      reference the expose by exposeId rather than the underlying
-      binding.
+      This is column-level deny only; row-level security is the next bullet.
+    * **Row-level security.** When ``expose.policy.rowFilters[]`` is declared
+      (and ``expose`` / ``caller_attributes`` are passed), the caller SQL is
+      wrapped as ``SELECT * FROM (<caller_sql>) WHERE <rowfilter> LIMIT n`` so
+      the SAME tenant isolation that ``sample`` / ``query`` apply also holds
+      here — there is no longer a free-form bypass. The rowFilter columns must
+      be visible in the caller's projection; if absent the engine errors
+      (fail-closed). A missing ``${caller.*}`` attribute raises
+      :class:`RowFilterIdentityMissing` before any SQL runs.
+    * ``FROM`` references are NOT rewritten — the caller must reference the
+      bound table by its fully-qualified name from the contract (the RLS
+      wrapper only adds an outer ``SELECT * FROM (...)``; it does not rewrite
+      the caller's ``FROM``). Phase-2 may add an AST-level rewrite so consumers
+      can reference the expose by exposeId rather than the underlying binding.
     """
     if not isinstance(sql, str):
         raise QueryValidationError("sql must be a string")
@@ -560,5 +665,23 @@ def compile_free_form_sql(
                     f"rules as the sample / query tools — aliasing the "
                     f"column does not bypass them."
                 )
+    # Row-level security: a WHERE cannot be merged into arbitrary caller SQL,
+    # so when the contract declares policy.rowFilters[] we wrap the statement as
+    # a subquery and apply the filter on the outside. This enforces the SAME
+    # tenant isolation as sample/query — previously query_sql executed the
+    # caller SQL with NO row filter, leaking every tenant's rows. The rowFilter
+    # columns must be visible in the caller's projection (use SELECT * or include
+    # them); if absent the engine errors — fail-closed, never an unfiltered
+    # result. The inner LIMIT (if any) is harmless inside the subquery; the outer
+    # LIMIT is the enforced cap.
+    rf_clauses, rf_params = compile_row_filter_clauses(
+        expose or {}, caller_attributes or {}, offset=0
+    )
+    if rf_clauses:
+        rf_where = " AND ".join(rf_clauses)
+        final_sql = (
+            f"SELECT * FROM (\n{candidate}\n) AS _fluid_rls\n" f"WHERE {rf_where}\nLIMIT {limit}"
+        )
+        return CompiledQuery(sql=final_sql, params=rf_params, columns=[])
     final_sql = f"{candidate}\nLIMIT {limit}"
     return CompiledQuery(sql=final_sql, params=[], columns=[])
