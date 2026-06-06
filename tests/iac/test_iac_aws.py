@@ -454,22 +454,35 @@ class TestAwsRedshiftExternalSchema:
         loc.update(overrides)
         return _redshift_external_schema_exposure(**loc)
 
-    def test_emits_null_resource_with_create_external_schema_sql(self):
-        res = _aws().emit(_contract([self._ext()]))
+    # The command is a CONSTANT template — every untrusted value is passed via
+    # the subprocess ``environment`` (data), never spliced into the shell argv.
+    _STATIC_CMD = (
+        "aws redshift-data execute-statement "
+        '--workgroup-name "$FLUID_REDSHIFT_WORKGROUP" '
+        '--database "$FLUID_REDSHIFT_DATABASE" '
+        '--sql "$FLUID_REDSHIFT_SQL"'
+    )
+
+    def _emit(self, **overrides):
+        res = _aws().emit(_contract([self._ext(**overrides)]))
         assert "null_resource" in res
         body = next(iter(res["null_resource"].values()))
-        cmd = body["provisioner"][0]["local-exec"]["command"]
-        assert "aws redshift-data execute-statement" in cmd
-        assert "--workgroup-name fluid_mesh_wg" in cmd
-        assert "--database fluid" in cmd
-        assert "CREATE EXTERNAL SCHEMA IF NOT EXISTS ext_silver" in cmd
-        assert "FROM DATA CATALOG" in cmd
-        assert "DATABASE 'silver_events'" in cmd
-        assert "IAM_ROLE 'arn:aws:iam::1:role/RedshiftSpectrum'" in cmd
+        return body, body["provisioner"][0]["local-exec"]
+
+    def test_emits_static_command_with_values_in_environment(self):
+        body, le = self._emit()
+        assert le["command"] == self._STATIC_CMD
+        env = le["environment"]
+        assert env["FLUID_REDSHIFT_WORKGROUP"] == "fluid_mesh_wg"
+        assert env["FLUID_REDSHIFT_DATABASE"] == "fluid"
+        sql = env["FLUID_REDSHIFT_SQL"]
+        assert "CREATE EXTERNAL SCHEMA IF NOT EXISTS ext_silver" in sql
+        assert "FROM DATA CATALOG" in sql
+        assert "DATABASE 'silver_events'" in sql
+        assert "IAM_ROLE 'arn:aws:iam::1:role/RedshiftSpectrum'" in sql
 
     def test_triggers_carry_inputs_for_re_exec_on_change(self):
-        res = _aws().emit(_contract([self._ext()]))
-        body = next(iter(res["null_resource"].values()))
+        body, _ = self._emit()
         triggers = body["triggers"]
         assert triggers["schema"] == "ext_silver"
         assert triggers["workgroup"] == "fluid_mesh_wg"
@@ -477,15 +490,13 @@ class TestAwsRedshiftExternalSchema:
         assert triggers["iam_role"] == "arn:aws:iam::1:role/RedshiftSpectrum"
 
     def test_region_clause_included_when_supplied(self):
-        res = _aws().emit(_contract([self._ext(region="us-west-2")]))
-        cmd = next(iter(res["null_resource"].values()))["provisioner"][0]["local-exec"]["command"]
-        assert "REGION 'us-west-2'" in cmd
+        _, le = self._emit(region="us-west-2")
+        assert "REGION 'us-west-2'" in le["environment"]["FLUID_REDSHIFT_SQL"]
 
     def test_region_clause_omitted_when_absent(self):
         # No region → no REGION clause (workgroup-local Glue catalog).
-        res = _aws().emit(_contract([self._ext()]))
-        cmd = next(iter(res["null_resource"].values()))["provisioner"][0]["local-exec"]["command"]
-        assert "REGION " not in cmd
+        _, le = self._emit()
+        assert "REGION " not in le["environment"]["FLUID_REDSHIFT_SQL"]
 
     def test_missing_required_inputs_emits_nothing(self):
         for missing in ("workgroup", "external_schema", "glue_database", "iam_role_arn"):
@@ -497,6 +508,37 @@ class TestAwsRedshiftExternalSchema:
             }
             loc.pop(missing)
             assert _aws().emit(_contract([_redshift_external_schema_exposure(**loc)])) == {}
+
+    # --- injection regression: the CRITICAL local-exec shell-RCE + SQLi ------
+
+    def test_shell_metacharacters_in_inputs_cannot_inject_into_command(self):
+        # workgroup / database / region carry shell metacharacters; they must
+        # reach the subprocess ONLY as inert env data, never the executed argv.
+        body, le = self._emit(
+            workgroup="wg; touch /tmp/PWNED",
+            database="db`touch /tmp/PWNED`",
+            region="us-east-1$(touch /tmp/PWNED)",
+        )
+        assert le["command"] == self._STATIC_CMD  # constant regardless of input
+        assert "touch /tmp/PWNED" not in le["command"]
+        assert le["environment"]["FLUID_REDSHIFT_WORKGROUP"] == "wg; touch /tmp/PWNED"
+        assert le["environment"]["FLUID_REDSHIFT_DATABASE"] == "db`touch /tmp/PWNED`"
+
+    def test_malicious_external_schema_identifier_is_rejected(self):
+        # external_schema is a SQL IDENTIFIER — a quote/semicolon/space must
+        # fail closed (validate_ident raises) and never reach the emitted SQL.
+        for bad in ("ext'; DROP TABLE x; --", "ext schema", 'ext"x', "ext;`$("):
+            with pytest.raises(ValueError):
+                _aws().emit(_contract([self._ext(external_schema=bad)]))
+
+    def test_sql_string_literals_are_escaped(self):
+        # glue_database / iam_role / region are SQL string literals — an embedded
+        # single quote is doubled (quote_string_literal), never breaks out.
+        _, le = self._emit(glue_database="ev'il", iam_role_arn="arn'x", region="r'1")
+        sql = le["environment"]["FLUID_REDSHIFT_SQL"]
+        assert "DATABASE 'ev''il'" in sql
+        assert "IAM_ROLE 'arn''x'" in sql
+        assert "REGION 'r''1'" in sql
 
 
 class TestAwsRedshiftDependencyWiring:
