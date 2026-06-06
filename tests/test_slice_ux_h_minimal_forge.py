@@ -508,3 +508,93 @@ class TestEnginePipelineShim:
                 f"legacy _generate_pipeline_files must never raise, "
                 f"but got {type(exc).__name__}: {exc}"
             )
+
+
+# ---------------------------------------------------------------------------
+# SECURITY — additional_files write loop must confine writes to target_dir
+# ---------------------------------------------------------------------------
+
+
+def _generation_result_with_files(additional_files: Dict[str, str]) -> Any:
+    """A ``CopilotGenerationResult`` carrying a caller-supplied
+    ``additional_files`` map (the surface the LLM/staged path populates)."""
+    from fluid_build.cli.forge_copilot_runtime import CopilotGenerationResult
+
+    base = _fake_generation_result()
+    return CopilotGenerationResult(
+        suggestions=base.suggestions,
+        contract=base.contract,
+        readme_markdown=base.readme_markdown,
+        additional_files=dict(additional_files),
+        discovery_report=base.discovery_report,
+        attempt_reports=base.attempt_reports,
+        scaffold_decision=base.scaffold_decision,
+        project_memory=base.project_memory,
+        provenance=base.provenance,
+        ai_run_plan=base.ai_run_plan,
+    )
+
+
+class TestAdditionalFilesPathConfinement:
+    """The minimal path's write loop materialises ``additional_files``
+    (engine skeletons + LLM-proposed files). LLM output is UNTRUSTED, so
+    a path that escapes ``target_dir`` (prompt-injection →
+    arbitrary-file-write) must be skipped + warned, never written."""
+
+    def test_traversal_entry_does_not_write_outside_target_dir(self, tmp_path: Path, caplog):
+        # target_dir is a subdir so the sentinel can resolve to a sibling
+        # *inside* tmp_path — proving escape happened without polluting the
+        # real filesystem if the guard regressed.
+        target_dir = tmp_path / "project"
+        target_dir.mkdir()
+        sentinel_rel = "../../../../tmp/pwned.sql"
+        sentinel_abs = (target_dir / sentinel_rel).resolve()
+        assert not sentinel_abs.exists()
+
+        fake = _make_fake_copilot()
+        fake.generate_project_artifacts.return_value = _generation_result_with_files(
+            {sentinel_rel: "SELECT 'pwned'"}
+        )
+        args = _build_args(target_dir)
+        logger = logging.getLogger("test_slice_ux_h.path_confinement")
+
+        with caplog.at_level(logging.WARNING):
+            with patch("fluid_build.cli.forge.CopilotAgent", return_value=fake):
+                from fluid_build.cli.forge import run_ai_copilot_mode
+
+                rc = run_ai_copilot_mode(args, logger)
+
+        assert rc == 0
+        # The escaping file must NOT have been written anywhere.
+        assert (
+            not sentinel_abs.exists()
+        ), f"path-traversal payload escaped target_dir and wrote to {sentinel_abs}"
+        # And a WARNING must have been emitted for the skip.
+        assert any(
+            "additional_file_outside_target_dir_skipped" in rec.getMessage()
+            for rec in caplog.records
+        ), "skipping an escaping additional_file must log a WARNING"
+
+    def test_normal_entry_still_writes_under_target_dir(self, tmp_path: Path):
+        """Positive control: a benign relative path still materialises
+        under ``target_dir`` (the guard must not block legitimate files)."""
+        target_dir = tmp_path / "project"
+        target_dir.mkdir()
+        benign_rel = "dbt_project/models/silver/dim_customer.sql"
+
+        fake = _make_fake_copilot()
+        fake.generate_project_artifacts.return_value = _generation_result_with_files(
+            {benign_rel: "SELECT 1 AS id"}
+        )
+        args = _build_args(target_dir)
+        logger = logging.getLogger("test_slice_ux_h.benign_write")
+
+        with patch("fluid_build.cli.forge.CopilotAgent", return_value=fake):
+            from fluid_build.cli.forge import run_ai_copilot_mode
+
+            rc = run_ai_copilot_mode(args, logger)
+
+        assert rc == 0
+        written = target_dir / benign_rel
+        assert written.is_file(), "a benign additional_file must still be written under target_dir"
+        assert written.read_text() == "SELECT 1 AS id"

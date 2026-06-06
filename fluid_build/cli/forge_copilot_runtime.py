@@ -1359,6 +1359,15 @@ def _generate_staged_copilot_artifacts(
     readme_markdown = physical.readme.readme_markdown if physical.readme else ""
     additional_files = dict(physical.additional_files or {})
     additional_files.update(_transform_plan_to_files(physical.transform_plan, technique=technique))
+    # SECURITY: the staged path's additional_files derive from LLM-chosen
+    # table names (hub/satellite/link/fact/dim) that become physical file
+    # paths. The standard AI path runs every model-proposed file map
+    # through ``sanitize_additional_files``; the staged path previously did
+    # not, leaving a prompt-injection → arbitrary-file-write hole (a name
+    # like ``../../../../tmp/pwned`` escaped target_dir). Mirror the
+    # standard path here so absolute / parent-traversal / unsafe-extension
+    # entries are dropped before they reach the write loop.
+    additional_files = sanitize_additional_files(additional_files)
     suggestions = {
         "recommended_template": scaffold_decision.template,
         "recommended_provider": scaffold_decision.provider,

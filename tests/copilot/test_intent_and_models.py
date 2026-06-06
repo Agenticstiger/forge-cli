@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from fluid_build.copilot.schemas.data_model import DV2Model, HubDefinition
+import pytest
+from pydantic import ValidationError
+
+from fluid_build.copilot.schemas.data_model import (
+    BridgeDefinition,
+    DimensionTable,
+    DV2Model,
+    FactTable,
+    HubDefinition,
+    LinkDefinition,
+    PitDefinition,
+    SatelliteDefinition,
+)
 from fluid_build.copilot.schemas.intent import BusinessIntent, DataProduct, Grain
 from fluid_build.copilot.schemas.osi import OSIAIContext, OSISemanticModel
 from fluid_build.copilot.schemas.stage_outputs import ConceptualDraft, LogicalDraft
@@ -75,3 +87,89 @@ def test_logical_draft_normalizes_nullable_llm_metadata():
     assert draft.source_summary == {}
     assert draft.conceptual is not None
     assert draft.conceptual.ai_context.synonyms == []
+
+
+# ---------------------------------------------------------------------------
+# SECURITY — table-name fields must reject path-traversal payloads
+# ---------------------------------------------------------------------------
+#
+# These LLM-chosen names flow verbatim into physical file paths
+# (``models/<layer>/<name>.sql``) on the staged authoring path. LLM output
+# is UNTRUSTED, so a name with a path separator or ``..`` is a
+# prompt-injection → arbitrary-file-write vector. The schema validator is
+# the innermost of three defense layers.
+
+
+_MALICIOUS_NAMES = [
+    "../../../../tmp/pwned",
+    "..",
+    "foo/../bar",
+    "sub/dir/name",
+    "back\\slash",
+    "/abs/path",
+]
+
+
+@pytest.mark.parametrize("bad", _MALICIOUS_NAMES)
+def test_hub_table_name_rejects_traversal(bad):
+    with pytest.raises(ValidationError):
+        HubDefinition(entity_name="customer", hub_table_name=bad)
+
+
+@pytest.mark.parametrize("bad", _MALICIOUS_NAMES)
+def test_link_table_name_rejects_traversal(bad):
+    with pytest.raises(ValidationError):
+        LinkDefinition(link_name="cust_order", link_table_name=bad)
+
+
+@pytest.mark.parametrize("bad", _MALICIOUS_NAMES)
+def test_satellite_table_name_rejects_traversal(bad):
+    with pytest.raises(ValidationError):
+        SatelliteDefinition(
+            entity_name="customer", satellite_table_name=bad, parent_hub="hub_customer"
+        )
+
+
+@pytest.mark.parametrize("bad", _MALICIOUS_NAMES)
+def test_pit_table_name_rejects_traversal(bad):
+    with pytest.raises(ValidationError):
+        PitDefinition(pit_table_name=bad, parent_hub="hub_customer")
+
+
+@pytest.mark.parametrize("bad", _MALICIOUS_NAMES)
+def test_bridge_table_name_rejects_traversal(bad):
+    with pytest.raises(ValidationError):
+        BridgeDefinition(bridge_table_name=bad)
+
+
+@pytest.mark.parametrize("bad", _MALICIOUS_NAMES)
+def test_fact_table_name_rejects_traversal(bad):
+    with pytest.raises(ValidationError):
+        FactTable(name=bad, grain_statement="one row per order line")
+
+
+@pytest.mark.parametrize("bad", _MALICIOUS_NAMES)
+def test_dimension_table_name_rejects_traversal(bad):
+    with pytest.raises(ValidationError):
+        DimensionTable(name=bad)
+
+
+def test_table_names_accept_benign_values():
+    """Positive control: legitimate names must still validate."""
+    assert HubDefinition(entity_name="customer", hub_table_name="hub_customer").hub_table_name == (
+        "hub_customer"
+    )
+    assert FactTable(name="fct_orders", grain_statement="one row per order").name == "fct_orders"
+    assert DimensionTable(name="dim_customer").name == "dim_customer"
+    # The DV2 container composing the validated leaf models still builds.
+    model = DV2Model(
+        hubs=[HubDefinition(entity_name="customer", hub_table_name="hub_customer")],
+        satellites=[
+            SatelliteDefinition(
+                entity_name="customer",
+                satellite_table_name="sat_customer",
+                parent_hub="hub_customer",
+            )
+        ],
+    )
+    assert model.hubs[0].hub_table_name == "hub_customer"

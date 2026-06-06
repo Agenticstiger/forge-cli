@@ -18,7 +18,30 @@ from __future__ import annotations
 
 from typing import Any, List, Literal, Optional, Tuple
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+def _reject_path_traversal(value: str) -> str:
+    """Reject LLM-chosen table names that could escape the output dir.
+
+    These names flow verbatim into physical file paths
+    (``dbt_project/models/<layer>/<name>.sql``) by the staged authoring
+    path. LLM output is UNTRUSTED, so a name containing a path separator
+    or a parent-dir token is a prompt-injection → arbitrary-file-write
+    vector. Reject at the schema boundary so the bad value never reaches
+    the write loop. Defense-in-depth: the write loop additionally
+    confines every path to ``target_dir`` and ``sanitize_additional_files``
+    filters the file map.
+    """
+    if not isinstance(value, str):
+        return value
+    if "/" in value or "\\" in value or ".." in value:
+        raise ValueError(
+            "table name must not contain path separators ('/', '\\\\') or '..' "
+            f"(got {value!r}) — this would escape the project output directory"
+        )
+    return value
+
 
 TechniqueLiteral = Literal["data_vault_2", "dimensional"]
 
@@ -76,6 +99,8 @@ class HubDefinition(BaseModel):
     mapped_source_tables: List[str] = Field(default_factory=list)
     description: Optional[str] = None
 
+    _no_traversal = field_validator("hub_table_name")(_reject_path_traversal)
+
 
 class JoinKeyDetail(BaseModel):
     table1: str
@@ -102,6 +127,8 @@ class LinkDefinition(BaseModel):
     join_keys: List[JoinKeyDetail] = Field(default_factory=list)
     relationships: List[EntityRelationship] = Field(default_factory=list)
 
+    _no_traversal = field_validator("link_table_name")(_reject_path_traversal)
+
 
 class SatelliteDefinition(BaseModel):
     entity_name: str
@@ -111,17 +138,23 @@ class SatelliteDefinition(BaseModel):
     mapped_source_tables: List[str] = Field(default_factory=list)
     change_tracking: Literal["type1", "type2", "append_only"] = "type2"
 
+    _no_traversal = field_validator("satellite_table_name")(_reject_path_traversal)
+
 
 class PitDefinition(BaseModel):
     pit_table_name: str
     parent_hub: str
     satellites: List[str] = Field(default_factory=list)
 
+    _no_traversal = field_validator("pit_table_name")(_reject_path_traversal)
+
 
 class BridgeDefinition(BaseModel):
     bridge_table_name: str
     source_links: List[str] = Field(default_factory=list)
     description: Optional[str] = None
+
+    _no_traversal = field_validator("bridge_table_name")(_reject_path_traversal)
 
 
 class DV2Model(BaseModel):
@@ -149,6 +182,8 @@ class FactTable(BaseModel):
     degenerate_dimensions: List[str] = Field(default_factory=list)
     description: Optional[str] = None
 
+    _no_traversal = field_validator("name")(_reject_path_traversal)
+
 
 class DimensionTable(BaseModel):
     name: str
@@ -157,6 +192,8 @@ class DimensionTable(BaseModel):
     natural_keys: List[str] = Field(default_factory=list)
     slowly_changing_type: Optional[Literal["type1", "type2", "type3", "type6"]] = None
     description: Optional[str] = None
+
+    _no_traversal = field_validator("name")(_reject_path_traversal)
 
 
 class DimensionalModel(BaseModel):
