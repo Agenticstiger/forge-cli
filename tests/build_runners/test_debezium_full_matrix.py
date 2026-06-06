@@ -28,6 +28,7 @@ from fluid_build.build_runners.debezium.runner import (
     build_connector_config,
     execute_debezium_build,
     resolve_debezium_class,
+    resolve_server_binary,
     resolve_snapshot_mode,
 )
 
@@ -524,6 +525,154 @@ class TestFailureModes:
 
 
 # ── Dispatcher integration ─────────────────────────────────────────────
+
+
+# ── server_binary validation (arbitrary-binary-exec guard) ─────────────
+
+
+class TestResolveServerBinary:
+    """``properties.debezium.server_binary`` becomes argv[0] of a subprocess,
+    so an unvalidated value is an arbitrary-binary-execution vector. The
+    resolver validates it the way the meltano runner validates its tap/target
+    binaries and dbt validates ``DBT_EXECUTABLE``: a bare name must resolve on
+    PATH; an explicit path must be an existing executable file."""
+
+    def test_none_falls_back_to_path_lookup(self, monkeypatch):
+        import fluid_build.build_runners.debezium.runner as mod
+
+        monkeypatch.setattr(mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+        assert resolve_server_binary(None) == "/usr/bin/debezium-server"
+
+    def test_bare_name_on_path_is_accepted(self, monkeypatch):
+        import fluid_build.build_runners.debezium.runner as mod
+
+        monkeypatch.setattr(
+            mod.shutil, "which", lambda name: "/opt/dbz/bin/run.sh" if name == "run.sh" else None
+        )
+        assert resolve_server_binary("run.sh") == "/opt/dbz/bin/run.sh"
+
+    def test_bare_name_not_on_path_is_rejected(self, monkeypatch):
+        import fluid_build.build_runners.debezium.runner as mod
+
+        monkeypatch.setattr(mod.shutil, "which", lambda name: None)
+        assert resolve_server_binary("definitely-not-installed") is None
+
+    def test_explicit_path_to_nonexistent_file_is_rejected(self, tmp_path):
+        # An absolute path that does not exist (or is not executable) must be
+        # rejected — this is the core arbitrary-binary vector (e.g. /tmp/evil).
+        assert resolve_server_binary(str(tmp_path / "evil")) is None
+
+    def test_explicit_path_to_existing_executable_is_accepted(self, tmp_path):
+        import os
+        import stat
+
+        binpath = tmp_path / "debezium-server"
+        binpath.write_text("#!/bin/sh\nexit 0\n")
+        binpath.chmod(binpath.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR)
+        assert resolve_server_binary(str(binpath)) == str(binpath)
+        assert os.access(binpath, os.X_OK)
+
+    def test_explicit_path_to_directory_is_rejected(self, tmp_path):
+        # A directory next to a real path must not be returned (would EACCES
+        # at exec time); is_file() rejects it.
+        d = tmp_path / "server_dir"
+        d.mkdir()
+        assert resolve_server_binary(str(d)) is None
+
+    def test_shell_metacharacter_value_is_rejected(self, monkeypatch):
+        # Defense-in-depth: even though argv (not shell) is used, a value like
+        # "x; rm -rf /" has no path separator, so it routes to PATH lookup and
+        # is rejected when shutil.which finds nothing.
+        import fluid_build.build_runners.debezium.runner as mod
+
+        monkeypatch.setattr(mod.shutil, "which", lambda name: None)
+        assert resolve_server_binary("x; rm -rf /") is None
+
+
+class TestEmbeddedBinaryNotExecuted:
+    """Integration: a malicious ``server_binary`` must be rejected BEFORE any
+    subprocess is spawned (fail-closed)."""
+
+    def _embedded_contract(self, server_binary: str) -> Dict[str, Any]:
+        return _base_contract(
+            source={
+                "kind": "postgres",
+                "connection": {
+                    "host": "db",
+                    "port": 5432,
+                    "database": "mydb",
+                    "user": "u",
+                    "password": "p",
+                },
+                "mode": "cdc",
+                "streams": ["public.orders"],
+            },
+            dbz_props={
+                "deployment": {"mode": "embedded"},
+                "server_binary": server_binary,
+                "server": {"sink": {"type": "iceberg", "config": {}}},
+            },
+        )
+
+    def test_malicious_binary_never_spawns_subprocess(self, tmp_path: Path, monkeypatch):
+        import fluid_build.build_runners.debezium.runner as mod
+
+        def _boom(*_a, **_k):
+            raise AssertionError(
+                "subprocess.run was reached with an unvalidated server_binary "
+                "(arbitrary-binary-execution regression)"
+            )
+
+        monkeypatch.setattr(mod.subprocess, "run", _boom)
+        # An absolute path that does not exist — the classic /tmp/evil vector.
+        contract = self._embedded_contract(str(tmp_path / "evil"))
+        rc = execute_debezium_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+        assert rc != 0  # fail-closed
+        # Config was still generated (generation precedes the binary gate).
+        config_path = (
+            tmp_path / ".fluid" / "debezium" / contract["id"] / "ingest" / "application.properties"
+        )
+        assert config_path.exists()
+
+    def test_injection_string_binary_never_spawns_subprocess(self, tmp_path: Path, monkeypatch):
+        import fluid_build.build_runners.debezium.runner as mod
+
+        def _boom(*_a, **_k):
+            raise AssertionError("subprocess.run reached with injection-string binary")
+
+        monkeypatch.setattr(mod.subprocess, "run", _boom)
+        monkeypatch.setattr(mod.shutil, "which", lambda name: None)
+        contract = self._embedded_contract("x; touch /tmp/pwned")
+        rc = execute_debezium_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+        assert rc != 0
+
+    def test_valid_binary_is_executed(self, tmp_path: Path, monkeypatch):
+        """Positive path: a normal binary name that resolves on PATH reaches
+        subprocess.run (proves the guard does not break legitimate use)."""
+        import subprocess as real_subprocess
+
+        import fluid_build.build_runners.debezium.runner as mod
+
+        fake_bin = tmp_path / "debezium-server"
+        fake_bin.write_text("#!/bin/sh\nexit 0\n")
+        import stat as _stat
+
+        fake_bin.chmod(fake_bin.stat().st_mode | _stat.S_IXUSR | _stat.S_IRUSR)
+
+        spawned = {}
+
+        def _fake_run(cmd, *_a, **_k):
+            spawned["cmd"] = cmd
+            # Mimic the long-running server hitting the timeout (the runner's
+            # expected "binary booted" success path).
+            raise real_subprocess.TimeoutExpired(cmd, 1)
+
+        monkeypatch.setattr(mod.subprocess, "run", _fake_run)
+        contract = self._embedded_contract(str(fake_bin))
+        rc = execute_debezium_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+        assert rc == 0  # TimeoutExpired → _success_embedded
+        assert spawned["cmd"][0] == str(fake_bin)
+        assert spawned["cmd"][1:3] == ["--config", spawned["cmd"][2]]
 
 
 class TestDispatcher:

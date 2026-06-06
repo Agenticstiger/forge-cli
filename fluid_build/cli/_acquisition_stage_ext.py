@@ -38,22 +38,34 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# The identifier grammar + validator are hoisted into the neutral
+# ``build_runners._ids`` leaf so the runtime chokepoint
+# (``build_runners.base.run_builds_from_args``) can share the EXACT same
+# guard without a ``build_runners`` → ``cli`` reverse edge. ``cli`` →
+# ``build_runners`` is an existing allowed edge. We re-export the symbols
+# under their historical names (``_validate_identifier``, ``_IDENT_RE``,
+# ``IdentifierViolation``) so existing call sites and tests that import
+# them from this module keep resolving the same single class identity.
+from fluid_build.build_runners._ids import (
+    _IDENT_RE,
+    IdentifierViolation,
+)
+from fluid_build.build_runners._ids import (
+    validate_identifier as _validate_identifier,
+)
+
 LOG = logging.getLogger("fluid.acquire.stage_ext")
 
 
-# ── Identifier + cron validation (Sec-Fix 9 + 10) ────────────────────────
+# ── Cron validation (Sec-Fix 9 + 10) ─────────────────────────────────────
 
 
 # ``contract.id`` and ``build.id`` show up in:
 # * filesystem paths under .fluid/artifacts/<id>/ and .fluid/policies/<id>/
 # * inline f-string interpolation into Airflow / Dagster / Prefect Python
 # * cron entries
+# They are validated via :func:`_validate_identifier` (hoisted above).
 #
-# A permissive regex here is the same as ``validate_ident`` in
-# ``providers/_sql_safety``: alphanumerics + dots + dashes + underscores,
-# starting with a letter or underscore, capped at a sane length to avoid
-# DOS-via-filename attacks.
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]{0,127}$")
 # Cron must be 5 (standard) or 6 (with seconds) whitespace-separated
 # fields, each made of digits, ``*``, ``/``, ``,``, ``-``, ``?``, ``L``,
 # ``W``, ``#``. We deliberately exclude any character that could survive
@@ -61,19 +73,11 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]{0,127}$")
 _CRON_FIELD_RE = re.compile(r"^[0-9*/,\-?LW#]+$")
 
 
-class IdentifierViolation(ValueError):
-    """Raised when a contract identifier or cron expression fails validation."""
-
-
-def _validate_identifier(value: str, *, kind: str) -> str:
-    if not isinstance(value, str) or not _IDENT_RE.match(value):
-        raise IdentifierViolation(
-            f"{kind} {value!r} is not a valid identifier "
-            "(must match ^[A-Za-z_][A-Za-z0-9_.\\-]{0,127}$). This guard "
-            "blocks template-injection / path-traversal attacks via "
-            "attacker-controlled contract metadata."
-        )
-    return value
+__all__ = [  # re-exported identifier symbols + this module's public surface
+    "IdentifierViolation",
+    "_IDENT_RE",
+    "_validate_identifier",
+]
 
 
 def _validate_cron(value: str) -> str:

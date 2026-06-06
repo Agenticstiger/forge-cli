@@ -55,6 +55,7 @@ from fluid_build.build_runners.dbt.runner import (
     _collect_dbt_container_env,
     _configured_dbt_command_prefix,
     _dbt_command_supports_adapter,
+    _normalize_selectors,
     _render_command_for_log,
     build_dbt_command,
     execute_dbt_build,
@@ -415,6 +416,113 @@ class TestBuildDbtCommand:
 
         vars_index = cmd.index("--vars")
         assert json.loads(cmd[vars_index + 1]) == {"database": "TELCO_LAB"}
+
+
+class TestNormalizeSelectors:
+    """``--select`` values are spread as standalone argv elements, so a value
+    starting with ``-`` (e.g. ``--full-refresh``, ``--target``) would be parsed
+    by dbt as a flag — an argument-injection vector. ``_normalize_selectors``
+    drops flag-like values, matching the existing ``--target`` (allowlist) and
+    ``--vars`` (json.dumps) guards in the same module. Fail-closed."""
+
+    def test_normal_string_selector_passes(self):
+        assert _normalize_selectors("mart_orders") == ["mart_orders"]
+
+    def test_normal_node_selectors_pass(self):
+        # Standard dbt selector syntax (graph operators, tag:, path:) is kept.
+        assert _normalize_selectors(["+mart_orders+", "tag:nightly", "staging.stg_x"]) == [
+            "+mart_orders+",
+            "tag:nightly",
+            "staging.stg_x",
+        ]
+
+    def test_full_refresh_flag_value_is_dropped(self):
+        assert _normalize_selectors("--full-refresh") == []
+
+    def test_target_flag_value_is_dropped(self):
+        assert _normalize_selectors("--target") == []
+
+    def test_short_flag_value_is_dropped(self):
+        assert _normalize_selectors("-x") == []
+
+    def test_flaglike_with_leading_space_is_dropped(self):
+        assert _normalize_selectors("  --full-refresh") == []
+
+    def test_mixed_list_keeps_only_safe_selectors(self):
+        assert _normalize_selectors(["mart_orders", "--full-refresh", "tag:x", "-y"]) == [
+            "mart_orders",
+            "tag:x",
+        ]
+
+    def test_none_and_empty_yield_empty(self):
+        assert _normalize_selectors(None) == []
+        assert _normalize_selectors([]) == []
+        assert _normalize_selectors(["", "  "]) == []
+
+
+class TestBuildDbtCommandSelectorInjection:
+    """End-to-end through ``build_dbt_command``: a flag-like ``select`` value
+    must never reach the dbt argv."""
+
+    def _make_project(self, tmp_path):
+        project_dir = tmp_path / "dbt_project"
+        project_dir.mkdir()
+        (project_dir / "dbt_project.yml").write_text("name: sample\nprofile: telco\n")
+        return project_dir
+
+    def test_flaglike_select_not_in_command(self, tmp_path):
+        project_dir = self._make_project(tmp_path)
+        build = {
+            "id": "b1",
+            "engine": "dbt",
+            "outputs": ["one", "two"],
+            "properties": {"select": "--full-refresh"},
+        }
+        with patch(
+            "fluid_build.build_runners.dbt.runner._resolve_dbt_executable",
+            return_value="/opt/homebrew/bin/dbt",
+        ):
+            cmd = build_dbt_command(build, project_dir, profiles_dir=Path("/tmp/dbt-profiles"))
+        # The injected flag must not appear anywhere, and because it was the
+        # ONLY selector, no --select is emitted at all.
+        assert "--full-refresh" not in cmd
+        assert "--select" not in cmd
+
+    def test_legit_select_reaches_command(self, tmp_path):
+        project_dir = self._make_project(tmp_path)
+        build = {
+            "id": "b1",
+            "engine": "dbt",
+            "outputs": ["one", "two"],
+            "properties": {"select": "mart_orders"},
+        }
+        with patch(
+            "fluid_build.build_runners.dbt.runner._resolve_dbt_executable",
+            return_value="/opt/homebrew/bin/dbt",
+        ):
+            cmd = build_dbt_command(build, project_dir, profiles_dir=Path("/tmp/dbt-profiles"))
+        assert "--select" in cmd
+        assert "mart_orders" in cmd
+
+    def test_mixed_select_list_strips_only_flaglike(self, tmp_path):
+        project_dir = self._make_project(tmp_path)
+        build = {
+            "id": "b1",
+            "engine": "dbt",
+            "outputs": ["one", "two"],
+            "properties": {"select": ["mart_orders", "--target", "tag:nightly"]},
+        }
+        with patch(
+            "fluid_build.build_runners.dbt.runner._resolve_dbt_executable",
+            return_value="/opt/homebrew/bin/dbt",
+        ):
+            cmd = build_dbt_command(build, project_dir, profiles_dir=Path("/tmp/dbt-profiles"))
+        sel_index = cmd.index("--select")
+        # Only the legit selectors follow --select; the injected --target is gone.
+        following = cmd[sel_index + 1 :]
+        assert "mart_orders" in following
+        assert "tag:nightly" in following
+        assert "--target" not in following
 
 
 class TestResolveDbtExecutable:

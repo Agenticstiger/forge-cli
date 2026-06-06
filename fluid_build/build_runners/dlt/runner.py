@@ -51,6 +51,7 @@ from .._acquisition_common import (
     utc_now_iso,
     write_run_record_and_finalize,
 )
+from .._path_safety import confine_to_workspace
 
 LOG = logging.getLogger("fluid.acquire.dlt")
 
@@ -178,15 +179,40 @@ def _make_custom_source(module_path: str, contract_dir: Path) -> Any:
 
     Searches the module for the first attribute that is a dlt source factory
     (``@dlt.source``-decorated function), or a top-level callable named ``source``.
-    """
-    abs_path = (contract_dir / module_path).resolve()
-    try:
-        from fluid_build.build_runners._path_safety import safe_join
 
-        safe_join(str(contract_dir), module_path)
-    except Exception:
-        # Path safety is advisory; the import below will also fail on bad paths.
-        pass
+    ``module_path`` is operator-controlled contract input
+    (``builds[].properties.dlt.source_module``). Before the module is
+    ``exec_module``'d — which runs arbitrary code at import time — the
+    resolved path is confined to the contract's workspace via
+    :func:`confine_to_workspace`. A path that escapes the workspace
+    (``../../../../tmp/evil.py``) or an absolute path raises ``ValueError``
+    and is **never** executed. This mirrors the python / dbt runners, which
+    treat an out-of-workspace path as fail-closed.
+    """
+    # Reject absolute paths outright — they can name a file anywhere on the
+    # host regardless of the workspace boundary. ``Path("/etc/x").is_absolute()``
+    # catches POSIX; ``ntpath`` semantics (drive letters / UNC) are caught by
+    # the same check on Windows.
+    if Path(module_path).is_absolute():
+        raise ValueError(
+            f"dlt custom source module path must be relative to the contract "
+            f"directory; refusing absolute path: {module_path!r}"
+        )
+
+    abs_path = (contract_dir / module_path).resolve()
+
+    # Fail CLOSED: confine the resolved module path to the contract's
+    # workspace before any import/exec. ``confine_to_workspace`` returns
+    # ``None`` when the path escapes the workspace (after symlink
+    # resolution); we refuse to load it.
+    confined = confine_to_workspace(
+        abs_path, contract_dir, build_id="dlt", kind="source_module", logger=LOG
+    )
+    if confined is None:
+        raise ValueError(
+            f"dlt custom source module escapes the contract workspace and "
+            f"will not be loaded: {module_path!r}"
+        )
 
     if not abs_path.exists():
         raise FileNotFoundError(f"dlt custom source module not found: {abs_path}")
