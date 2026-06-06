@@ -37,6 +37,7 @@ from fluid_build.build_runners.duckdb.runner import (
 from fluid_build.build_runners.hooks.tokenize_pii import (
     _TOKEN_HEX_LEN,
     TokenizePiiHook,
+    _resolve_default_key,
 )
 from fluid_build.build_runners.meltano.runner import (
     _resolve_tap_binary,
@@ -326,6 +327,50 @@ class TestPiiTokenization:
         # Token SHOULD equal the HMAC under the same key.
         expected = hmac.new(b"key1", b"alice@x.com", hashlib.sha256).hexdigest()[:32]
         assert token == expected
+
+    # ── Keyless fallback is ephemeral + random (not PID-derived) ──────
+    #
+    # Regression guard for the credential-at-rest finding: the no-key
+    # fallback used to be ``sha256("fluid-pid-<pid>")`` whose keyspace was
+    # the PID space (< 2**22), trivially brute-forceable. It must now be a
+    # cryptographically-random per-resolution 256-bit key.
+
+    def test_keyless_default_key_is_random_per_call(self, monkeypatch):
+        # No configured key → each resolution returns a *different* key,
+        # so tokens are unlinkable across runs (no stable secret to attack).
+        monkeypatch.delenv("FLUID_PII_TOKENIZATION_KEY", raising=False)
+        k1 = _resolve_default_key()
+        k2 = _resolve_default_key()
+        assert k1 != k2, "keyless fallback regressed to a deterministic key"
+
+    def test_keyless_default_key_is_256_bits(self, monkeypatch):
+        # 32 bytes = 256 bits of entropy from secrets.token_bytes(32).
+        monkeypatch.delenv("FLUID_PII_TOKENIZATION_KEY", raising=False)
+        assert len(_resolve_default_key()) == 32
+
+    def test_keyless_default_key_is_not_pid_derived(self, monkeypatch):
+        # Explicitly pin that the old PID-seed construction is gone: the
+        # returned key must not equal sha256("fluid-pid-<pid>").
+        import os
+
+        monkeypatch.delenv("FLUID_PII_TOKENIZATION_KEY", raising=False)
+        legacy = hashlib.sha256(f"fluid-pid-{os.getpid()}".encode("utf-8")).digest()
+        assert _resolve_default_key() != legacy
+
+    def test_configured_env_key_is_used_verbatim(self, monkeypatch):
+        # When the env var IS set, the configured key is used as-is (UTF-8
+        # bytes) — stability across runs is opt-in, not the fallback.
+        monkeypatch.setenv("FLUID_PII_TOKENIZATION_KEY", "configured-key")
+        assert _resolve_default_key() == b"configured-key"
+
+    def test_keyless_tokens_differ_across_hook_instances(self, monkeypatch):
+        # End-to-end: two keyless hook instances tokenize the same value to
+        # DIFFERENT tokens (each captured a fresh random key in __post_init__).
+        monkeypatch.delenv("FLUID_PII_TOKENIZATION_KEY", raising=False)
+        ctx = {"classifications": {"email": ["email"]}}
+        a = TokenizePiiHook().apply([{"email": "alice@x.com"}], ctx).records[0]["email"]
+        b = TokenizePiiHook().apply([{"email": "alice@x.com"}], ctx).records[0]["email"]
+        assert a != b
 
 
 # ── Sec-Fix 8: dlt SQL count query identifier validation ──────────────

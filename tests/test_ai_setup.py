@@ -58,6 +58,60 @@ class TestSaveAndLoadConfig:
             assert not (mode & stat.S_IRGRP)  # no group read
             assert not (mode & stat.S_IROTH)  # no other read
 
+    def test_save_creates_config_0o600_atomically_not_chmodded_after(self, tmp_path):
+        """F2 regression: the api_key-bearing ``ai_config.json`` must be
+        *created* 0o600, never opened at the umask default and chmod'd after
+        (the create-then-chmod TOCTOU window). We spy on ``os.open`` to assert
+        the create mode is 0o600, and that no post-write ``Path.chmod`` narrows
+        the file.
+        """
+        import os
+
+        from fluid_build.cli.ai_setup import _save_ai_config
+
+        config_file = tmp_path / "ai_config.json"
+        # Parent dir pre-created 0o755 — a leaked 0o644 file would be readable.
+        config_file.parent.chmod(0o755)
+
+        real_os_open = os.open
+        create_modes: list[int] = []
+
+        def _spy_open(path, flags, mode=0o777, *args, **kwargs):
+            p = os.fspath(path)
+            if (flags & os.O_CREAT) and str(tmp_path) in p and "ai_config.json" in p:
+                create_modes.append(mode)
+            return real_os_open(path, flags, mode, *args, **kwargs)
+
+        chmod_calls: list[int] = []
+        real_path_chmod = type(config_file).chmod
+
+        def _spy_chmod(self, mode, *args, **kwargs):
+            if "ai_config.json" in str(self):
+                chmod_calls.append(mode)
+            return real_path_chmod(self, mode, *args, **kwargs)
+
+        with (
+            patch("fluid_build.cli.ai_setup._CONFIG_FILE", config_file),
+            patch("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path),
+            patch("fluid_build.cli.ai_setup._save_key_to_keyring", return_value=False),
+            patch.dict("os.environ", {"FLUID_ALLOW_PLAINTEXT_AI_SECRETS": "1"}, clear=True),
+            patch.object(os, "open", _spy_open),
+            patch.object(type(config_file), "chmod", _spy_chmod),
+        ):
+            # api_key forced down the plaintext branch so the file carries it.
+            assert _save_ai_config("openai", "gpt-4o", api_key="sk-secret")
+
+        final_mode = config_file.stat().st_mode
+        assert stat.S_IMODE(final_mode) == 0o600, oct(stat.S_IMODE(final_mode))
+        assert oct(final_mode)[-3:] == "600"
+        assert not (final_mode & stat.S_IRGRP)
+        assert not (final_mode & stat.S_IROTH)
+        assert create_modes, "ai_config.json was never created via os.open"
+        assert all(
+            stat.S_IMODE(m) == 0o600 for m in create_modes
+        ), f"created wider than 0o600: {[oct(m) for m in create_modes]}"
+        assert not chmod_calls, f"post-write chmod (TOCTOU): {[oct(m) for m in chmod_calls]}"
+
     def test_save_plaintext_key_requires_explicit_opt_in(self, tmp_path):
         from fluid_build.cli.ai_setup import _load_ai_config, _save_ai_config
 
