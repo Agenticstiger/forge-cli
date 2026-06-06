@@ -123,16 +123,16 @@ async def test_i1_allowed_model_can_sample_data(
     )
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
 
-    # Inject the model_id directly into the bound session so this
-    # in-memory test doesn't have to thread custom clientInfo through
-    # the SDK's Implementation type. The production path uses
-    # _bind_caller_identity_from_context() to pull this from the
-    # client's initialize handshake.
-    server.state.model_id = "claude-haiku-4-5-20251001"
-
+    # Declare the model via the real ``clientInfo`` at initialize —
+    # identity is resolved PER REQUEST from the SDK's request_context
+    # (``_resolve_request_identity``), never cached on the shared
+    # SessionState. (Caching bled the first HTTP/SSE client's identity
+    # onto every later client; see test_identity_isolation.py.)
     async with create_connected_server_and_client_session(
         server.server,
-        client_info=Implementation(name="test-client", version="0.1.0"),
+        client_info=Implementation(
+            name="test-client", version="0.1.0", model="claude-haiku-4-5-20251001"
+        ),
     ) as client:
         result = await client.call_tool("sample", {"limit": 3})
 
@@ -166,11 +166,12 @@ async def test_i2_denied_model_gets_typed_deny_envelope(
         audit_root=audit_root,
     )
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
-    server.state.model_id = "claude-3-opus"  # NOT in allowlist
 
     async with create_connected_server_and_client_session(
         server.server,
-        client_info=Implementation(name="test-client", version="0.1.0"),
+        client_info=Implementation(
+            name="test-client", version="0.1.0", model="claude-3-opus"  # NOT in allowlist
+        ),
     ) as client:
         result = await client.call_tool("sample", {"limit": 3})
 
@@ -204,12 +205,13 @@ async def test_i3_multiple_calls_each_audited(
         audit_root=audit_root,
     )
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
-    server.state.model_id = "claude-haiku-4-5-20251001"
 
     payloads: list[Dict[str, Any]] = []
     async with create_connected_server_and_client_session(
         server.server,
-        client_info=Implementation(name="test-client", version="0.1.0"),
+        client_info=Implementation(
+            name="test-client", version="0.1.0", model="claude-haiku-4-5-20251001"
+        ),
     ) as client:
         for tool, args in [
             ("describe", {}),
@@ -290,13 +292,15 @@ async def test_i5_identity_binding_via_real_clientinfo(
 ) -> None:
     """Regression test for the production identity-extraction path.
 
-    All previous integration tests inject ``server.state.model_id``
-    directly. This one drives the SDK with a real
-    ``Implementation(model=..., useCase=...)`` ``clientInfo`` and
-    verifies ``_bind_caller_identity_from_context`` extracts both
-    fields correctly. Catches any future SDK shape change that
-    would silently break the binding (failing closed = production
-    outage).
+    Drives the SDK with a real ``Implementation(model=..., useCase=...)``
+    ``clientInfo`` and verifies ``_resolve_request_identity`` extracts
+    both fields PER REQUEST from the SDK's request_context. Catches any
+    future SDK shape change that would silently break the resolution
+    (failing closed = production outage).
+
+    Critically also asserts identity is NEVER written back onto the
+    shared SessionState — that write-back is the cross-client
+    identity-bleed this fix removed (see test_identity_isolation.py).
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     audit_root = tmp_path / ".fluid" / "store" / "audit"
@@ -309,8 +313,8 @@ async def test_i5_identity_binding_via_real_clientinfo(
         audit_root=audit_root,
     )
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
-    # Deliberately leave server.state.model_id and use_case unset so
-    # the binding has to come from clientInfo at first tools/call.
+    # Identity is never cached on the shared SessionState — it stays
+    # unset before AND after the call; resolution is per-request.
     assert server.state.model_id is None
     assert server.state.use_case is None
 
@@ -327,9 +331,10 @@ async def test_i5_identity_binding_via_real_clientinfo(
 
     payload = json.loads(result.content[0].text)
     assert payload.get("error") is None, f"expected allow after identity binding, got: {payload}"
-    # Production binding succeeded — both fields landed.
-    assert server.state.model_id == "claude-haiku-4-5-20251001"
-    assert server.state.use_case == "analysis"
+    # Per-request resolution succeeded — but NOTHING was cached on the
+    # shared SessionState (the bleed this fix closed).
+    assert server.state.model_id is None, "identity must NOT be cached on shared state"
+    assert server.state.use_case is None, "identity must NOT be cached on shared state"
 
     audit = _audit_files(audit_root)
     assert audit, "allow must be audited"

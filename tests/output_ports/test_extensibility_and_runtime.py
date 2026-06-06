@@ -276,12 +276,11 @@ async def test_rate_limit_denies_after_threshold_under_real_dispatch(
         rate_limit_calls=3,
         rate_limit_window_seconds=60.0,
     )
-    server.state.model_id = "burst-driver"
 
     payloads: list[Dict[str, Any]] = []
     async with create_connected_server_and_client_session(
         server.server,
-        client_info=Implementation(name="burst-test", version="1.0.0"),
+        client_info=Implementation(name="burst-test", version="1.0.0", model="burst-driver"),
     ) as client:
         for _ in range(4):
             result = await client.call_tool("sample", {"limit": 1})
@@ -568,11 +567,13 @@ async def test_query_validation_error_surfaces_message_to_caller(
     server = OutputPortMcpServer(
         contract=contract, expose=expose, policy=policy, rate_limit_calls=0
     )
-    server.state.model_id = "test-agent"
-
+    # Declare the model via real ``clientInfo`` — identity is resolved
+    # PER REQUEST from the SDK's request_context, never cached on the
+    # shared SessionState (the cross-client bleed this fix removed; see
+    # test_identity_isolation.py).
     async with create_connected_server_and_client_session(
         server.server,
-        client_info=Implementation(name="validation-test", version="1.0.0"),
+        client_info=Implementation(name="validation-test", version="1.0.0", model="test-agent"),
     ) as client:
         result = await client.call_tool("query", {"measure": "no_such_measure", "limit": 5})
     payload = json.loads(result.content[0].text)
@@ -599,7 +600,6 @@ async def test_engine_error_stays_sanitised_at_the_wire(
     server = OutputPortMcpServer(
         contract=contract, expose=expose, policy=policy, rate_limit_calls=0
     )
-    server.state.model_id = "test-agent"
 
     secret = "database=topsecret_db table=topsecret_tbl"
 
@@ -610,9 +610,12 @@ async def test_engine_error_stays_sanitised_at_the_wire(
     # genuine (non-validation) engine error carrying binding info.
     server.state.get_driver().execute = _boom
 
+    # Declare the model via real ``clientInfo`` — identity is resolved
+    # PER REQUEST from the SDK's request_context, never cached on the
+    # shared SessionState (see test_identity_isolation.py).
     async with create_connected_server_and_client_session(
         server.server,
-        client_info=Implementation(name="engine-error-test", version="1.0.0"),
+        client_info=Implementation(name="engine-error-test", version="1.0.0", model="test-agent"),
     ) as client:
         result = await client.call_tool("query", {"measure": "customer_count", "limit": 5})
     payload = json.loads(result.content[0].text)

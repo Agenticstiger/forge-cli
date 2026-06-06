@@ -143,14 +143,21 @@ async def _running_gateway(
         cli_denied_use_cases=cli_denied_use_cases,
     )
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
+
+    # Declare identity via the real ``clientInfo`` at initialize — it is
+    # resolved PER REQUEST from the SDK's request_context
+    # (``_resolve_request_identity``), never cached on the shared
+    # SessionState (the cross-client identity bleed this fix removed; see
+    # tests/output_ports/test_identity_isolation.py).
+    client_info_kwargs: Dict[str, Any] = {"name": "fluid-live-llm-test", "version": "0.1.0"}
     if bound_model_id is not None:
-        server.state.model_id = bound_model_id
+        client_info_kwargs["model"] = bound_model_id
     if bound_use_case is not None:
-        server.state.use_case = bound_use_case
+        client_info_kwargs["useCase"] = bound_use_case
 
     async with create_connected_server_and_client_session(
         server.server,
-        client_info=Implementation(name="fluid-live-llm-test", version="0.1.0"),
+        client_info=Implementation(**client_info_kwargs),
     ) as client:
         yield client
 

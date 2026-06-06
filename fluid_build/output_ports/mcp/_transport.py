@@ -96,9 +96,6 @@ async def run_http_async(
             "config OR front with mTLS/OAuth proxy before exposing to an "
             "untrusted network."
         )
-    # Snapshot for the per-request middleware closure + the
-    # per-call attribute merger inside the SSE handler.
-    state = srv.state
 
     class _AuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
@@ -132,24 +129,18 @@ async def run_http_async(
     sse = SseServerTransport(messages_path)
 
     async def handle_sse(request):
-        # Cryptographic caller_attributes from the authn layer
-        # win over any self-attested clientInfo.* extras the
-        # session is about to bind. We snapshot them here so
-        # the lifespan-bound SessionState picks them up before
-        # the first tools/call arrives.
-        crypto_attrs = request.scope.get("fluid_auth_attrs") or {}
-        if crypto_attrs:
-            state.caller_attributes = {
-                **state.caller_attributes,
-                **crypto_attrs,
-            }
-            # Promote sub → model_id / use_case if those claims
-            # were in the JWT mapping but the SDK clientInfo
-            # didn't carry them. Cryptographic identity wins.
-            if "model" in crypto_attrs and not state.model_id:
-                state.model_id = str(crypto_attrs["model"])
-            if "use_case" in crypto_attrs and not state.use_case:
-                state.use_case = str(crypto_attrs["use_case"])
+        # NOTE: deliberately NO per-connection write of identity onto
+        # the shared SessionState here. One gateway process serves many
+        # concurrent SSE clients over ONE SessionState, so stamping the
+        # connecting client's caller_attributes / model_id / use_case
+        # onto it bled the FIRST client's identity onto every later
+        # client (wrong agentPolicy principal + wrong tenant rowFilter).
+        # The _AuthMiddleware already stashes the verified cryptographic
+        # attrs at ``request.scope["fluid_auth_attrs"]`` PER REQUEST; the
+        # dispatcher resolves them fresh per tools/call via
+        # ``OutputPortMcpServer._resolve_request_identity`` (which reads
+        # request_context.request.scope — for SSE the POST /messages/
+        # Request — and lets crypto win over self-attested clientInfo).
         async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
             await srv.server.run(
                 streams[0],
