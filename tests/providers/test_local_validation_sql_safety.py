@@ -122,7 +122,7 @@ class TestGetResourceSchemaInjection:
     def test_normal_table_introspects_successfully(self, tmp_path):
         """Positive path: a legitimate schema/table introspects against a real
         DuckDB file (proves the guard does not break normal use)."""
-        import duckdb
+        duckdb = pytest.importorskip("duckdb")
 
         db_path = tmp_path / "data.duckdb"
         con = duckdb.connect(str(db_path))
@@ -172,7 +172,7 @@ class TestRunQualityChecksInjection:
 
     def test_normal_table_runs_quality_checks(self, tmp_path):
         """Positive path: a legitimate identifier runs a real DQ rule."""
-        import duckdb
+        duckdb = pytest.importorskip("duckdb")
 
         db_path = tmp_path / "data.duckdb"
         con = duckdb.connect(str(db_path))
