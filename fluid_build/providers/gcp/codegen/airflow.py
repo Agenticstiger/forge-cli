@@ -26,6 +26,7 @@ from fluid_build.providers.common.codegen_utils import (
     convert_schedule_to_airflow,
     generate_file_header,
     generate_task_dependencies_code,
+    py_str_literal,
     sanitize_identifier,
 )
 
@@ -134,6 +135,15 @@ def _generate_dag_definition(
     # Convert cron to Airflow schedule
     airflow_schedule = convert_schedule_to_airflow(schedule)
 
+    # All contract-derived values are emitted as repr()-escaped literals so a
+    # malicious name/timezone/schedule/id cannot break out and inject code that
+    # Airflow would run at DAG-parse time. dag_id is an identifier (no quotes).
+    dag_id_lit = py_str_literal(sanitize_identifier(contract_id))
+    contract_name_lit = py_str_literal(contract_name)
+    airflow_schedule_lit = py_str_literal(airflow_schedule)
+    timezone_lit = py_str_literal(timezone)
+    tags = ["fluid", "auto-generated", "gcp", contract_id]
+
     return f"""# Default DAG arguments
 default_args = {{
     'owner': 'fluid-forge',
@@ -147,13 +157,13 @@ default_args = {{
 
 # DAG definition
 dag = DAG(
-    dag_id='{sanitize_identifier(contract_id)}',
+    dag_id={dag_id_lit},
     default_args=default_args,
-    description='{contract_name}',
-    schedule_interval='{airflow_schedule}',
-    start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo('{timezone}')),
+    description={contract_name_lit},
+    schedule_interval={airflow_schedule_lit},
+    start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo({timezone_lit})),
     catchup=False,
-    tags=['fluid', 'auto-generated', 'gcp', '{contract_id}'],
+    tags={tags!r},
 )"""
 
 
@@ -202,27 +212,31 @@ def _generate_bigquery_task(
 ) -> str:
     """Generate BigQuery task code."""
     task_id = task.get("taskId")
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    project_lit = py_str_literal(project)
+    region_lit = py_str_literal(region)
 
     if operation == "create_dataset":
-        dataset_id = params.get("dataset_id", "unknown_dataset")
-        location = params.get("location", region)
-        return f"""{task_id} = BigQueryCreateEmptyDatasetOperator(
-    task_id='{task_id}',
-    dataset_id='{dataset_id}',
-    project_id='{project}',
-    location='{location}',
+        dataset_lit = py_str_literal(params.get("dataset_id", "unknown_dataset"))
+        location_lit = py_str_literal(params.get("location", region))
+        return f"""{var} = BigQueryCreateEmptyDatasetOperator(
+    task_id={task_id_lit},
+    dataset_id={dataset_lit},
+    project_id={project_lit},
+    location={location_lit},
     dag=dag,
 )"""
 
     elif operation == "create_table":
-        dataset_id = params.get("dataset_id", "unknown_dataset")
-        table_id = params.get("table_id", "unknown_table")
+        dataset_lit = py_str_literal(params.get("dataset_id", "unknown_dataset"))
+        table_lit = py_str_literal(params.get("table_id", "unknown_table"))
         schema_fields = params.get("schema", [])
-        return f"""{task_id} = BigQueryCreateEmptyTableOperator(
-    task_id='{task_id}',
-    dataset_id='{dataset_id}',
-    table_id='{table_id}',
-    project_id='{project}',
+        return f"""{var} = BigQueryCreateEmptyTableOperator(
+    task_id={task_id_lit},
+    dataset_id={dataset_lit},
+    table_id={table_lit},
+    project_id={project_lit},
     schema_fields={schema_fields!r},
     dag=dag,
 )"""
@@ -246,11 +260,11 @@ def _generate_bigquery_task(
                 "tableId": destination_table,
             }
 
-        return f"""{task_id} = BigQueryInsertJobOperator(
-    task_id='{task_id}',
+        return f"""{var} = BigQueryInsertJobOperator(
+    task_id={task_id_lit},
     configuration={config!r},
-    project_id='{project}',
-    location='{region}',
+    project_id={project_lit},
+    location={region_lit},
     dag=dag,
 )"""
 
@@ -263,18 +277,21 @@ def _generate_gcs_task(
 ) -> str:
     """Generate Cloud Storage task code."""
     task_id = task.get("taskId")
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    project_lit = py_str_literal(project)
 
     if operation == "create_bucket" or operation == "ensure_bucket":
-        bucket_name = params.get("bucket", "unknown-bucket")
-        location = params.get("location", region)
-        storage_class = params.get("storage_class", "STANDARD")
+        bucket_lit = py_str_literal(params.get("bucket", "unknown-bucket"))
+        location_lit = py_str_literal(params.get("location", region))
+        storage_lit = py_str_literal(params.get("storage_class", "STANDARD"))
 
-        return f"""{task_id} = GCSCreateBucketOperator(
-    task_id='{task_id}',
-    bucket_name='{bucket_name}',
-    project_id='{project}',
-    storage_class='{storage_class}',
-    location='{location}',
+        return f"""{var} = GCSCreateBucketOperator(
+    task_id={task_id_lit},
+    bucket_name={bucket_lit},
+    project_id={project_lit},
+    storage_class={storage_lit},
+    location={location_lit},
     dag=dag,
 )"""
 
@@ -287,24 +304,27 @@ def _generate_pubsub_task(
 ) -> str:
     """Generate Pub/Sub task code."""
     task_id = task.get("taskId")
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    project_lit = py_str_literal(project)
 
     if operation == "create_topic":
-        topic_name = params.get("topic", "unknown-topic")
-        return f"""{task_id} = PubSubCreateTopicOperator(
-    task_id='{task_id}',
-    topic='{topic_name}',
-    project_id='{project}',
+        topic_lit = py_str_literal(params.get("topic", "unknown-topic"))
+        return f"""{var} = PubSubCreateTopicOperator(
+    task_id={task_id_lit},
+    topic={topic_lit},
+    project_id={project_lit},
     dag=dag,
 )"""
 
     elif operation == "create_subscription":
-        topic_name = params.get("topic", "unknown-topic")
-        subscription_name = params.get("subscription", "unknown-sub")
-        return f"""{task_id} = PubSubCreateSubscriptionOperator(
-    task_id='{task_id}',
-    topic='{topic_name}',
-    subscription='{subscription_name}',
-    project_id='{project}',
+        topic_lit = py_str_literal(params.get("topic", "unknown-topic"))
+        subscription_lit = py_str_literal(params.get("subscription", "unknown-sub"))
+        return f"""{var} = PubSubCreateSubscriptionOperator(
+    task_id={task_id_lit},
+    topic={topic_lit},
+    subscription={subscription_lit},
+    project_id={project_lit},
     dag=dag,
 )"""
 
@@ -317,19 +337,23 @@ def _generate_dataflow_task(
 ) -> str:
     """Generate Dataflow task code."""
     task_id = task.get("taskId")
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    project_lit = py_str_literal(project)
+    region_lit = py_str_literal(region)
 
     if operation == "run_template":
-        template = params.get("template", "")
-        job_name = params.get("job_name", task_id)
+        template_lit = py_str_literal(params.get("template", ""))
+        job_name_lit = py_str_literal(params.get("job_name", task_id))
         parameters = params.get("parameters", {})
 
-        return f"""{task_id} = DataflowTemplatedJobStartOperator(
-    task_id='{task_id}',
-    job_name='{job_name}',
-    template='{template}',
+        return f"""{var} = DataflowTemplatedJobStartOperator(
+    task_id={task_id_lit},
+    job_name={job_name_lit},
+    template={template_lit},
     parameters={parameters!r},
-    project_id='{project}',
-    location='{region}',
+    project_id={project_lit},
+    location={region_lit},
     dag=dag,
 )"""
 
@@ -338,13 +362,30 @@ def _generate_dataflow_task(
 
 
 def _generate_python_task(task: Dict[str, Any], project: str, region: str) -> str:
-    """Generate generic Python task."""
+    """Generate generic Python task.
+
+    The action + params are emitted via ``repr``/``json.dumps`` and
+    concatenated (never f-string-interpolated inside a quoted literal) so a
+    contract value containing quotes/newlines cannot break out of the lambda
+    body — mirrors ``schedulers/airflow``'s ``_generate_generic_task``.
+    """
+    import json
+
     task_id = task.get("taskId")
     action = task.get("action")
     params = task.get("params", {})
 
-    return f"""{task_id} = PythonOperator(
-    task_id='{task_id}',
-    python_callable=lambda: logger.info('Action: {action}, Params: {params!r}'),
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    action_lit = py_str_literal(action)
+    # json.dumps -> double-quoted JSON; repr() wraps it as a safe single-line
+    # literal embedded via string concatenation.
+    params_json = repr(json.dumps(params, sort_keys=True, default=str))
+
+    return f"""{var} = PythonOperator(
+    task_id={task_id_lit},
+    python_callable=lambda: logger.info(
+        'Action: ' + {action_lit} + ', Params: ' + {params_json}
+    ),
     dag=dag,
 )"""

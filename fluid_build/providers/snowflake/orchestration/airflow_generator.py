@@ -26,6 +26,7 @@ Converts FLUID provider action tasks into Airflow operators:
 from typing import Any, Dict, List, Optional
 
 from ..._sql_safety import quote_string_literal
+from ...common.codegen_utils import py_str_literal, sanitize_identifier
 from ..registry import SnowflakeActionRegistry
 from .common import OrchestrationConfig, OrchestrationEngine, extract_dependencies, sanitize_task_id
 
@@ -95,19 +96,36 @@ def _build_config_from_contract(
 
 
 def _generate_dag_header(config: OrchestrationConfig) -> str:
-    """Generate DAG header with imports and configuration."""
+    """Generate DAG header with imports and configuration.
+
+    Every contract/config-derived value (description, owner, email,
+    schedule, dag_id, tags) is emitted as a ``repr()``-escaped literal via
+    ``py_str_literal`` / ``!r`` rather than wrapped in hand-written quotes,
+    so a malicious value containing a single/double/triple quote or a
+    newline cannot break out of its literal and inject a top-level statement
+    that Airflow would execute when it parses the generated DAG. The module
+    docstring is likewise emitted as a single ``repr()``-escaped string
+    literal (a bare string expression at module top is a valid docstring).
+    """
     owner = config.default_args.get("owner", "fluid")
     email = config.default_args.get("email", [""])[0] if config.default_args.get("email") else ""
     retries = config.default_args.get("retries", 3)
-    description = config.description
+    description = config.description or ""
 
-    return f'''"""
-{description}
+    docstring_text = (
+        f"{description}\n\n"
+        "Generated from FLUID 0.7.1 contract.\n"
+        "Provider: Snowflake\n"
+        "Engine: Airflow"
+    )
+    docstring_lit = py_str_literal(docstring_text)
+    owner_lit = py_str_literal(owner)
+    email_lit = py_str_literal(email)
+    description_lit = py_str_literal(description)
+    dag_id_lit = py_str_literal(sanitize_identifier(config.dag_id))
+    schedule_lit = py_str_literal(config.schedule)
 
-Generated from FLUID 0.7.1 contract.
-Provider: Snowflake
-Engine: Airflow
-"""
+    return f"""{docstring_lit}
 
 from datetime import datetime, timedelta
 from airflow import DAG
@@ -118,27 +136,27 @@ from airflow.sensors.external_task import ExternalTaskSensor
 
 # DAG default arguments
 default_args = {{
-    'owner': '{owner}',
+    'owner': {owner_lit},
     'depends_on_past': False,
-    'email': ['{email}'],
+    'email': [{email_lit}],
     'email_on_failure': True,
     'email_on_retry': False,
-    'retries': {retries},
+    'retries': {retries!r},
     'retry_delay': timedelta(minutes=5),
 }}
 
 # DAG definition
 dag = DAG(
-    dag_id='{config.dag_id}',
+    dag_id={dag_id_lit},
     default_args=default_args,
-    description="{description}",
-    schedule_interval='{config.schedule}',
+    description={description_lit},
+    schedule_interval={schedule_lit},
     start_date=datetime(2025, 1, 1),
     catchup=False,
-    tags={config.tags},
+    tags={config.tags!r},
 )
 
-'''
+"""
 
 
 def _generate_task_definitions(tasks: List[Dict[str, Any]], config: OrchestrationConfig) -> str:
@@ -159,7 +177,12 @@ def _generate_task_definitions(tasks: List[Dict[str, Any]], config: Orchestratio
         elif task_type == "sensor":
             code += _generate_sensor_task(task, task_id)
         else:
-            code += f"# TODO: Unsupported task type '{task_type}' for task '{task_name}'\n\n"
+            # repr both values so a newline in type/name can't escape the
+            # leading ``#`` and turn the remainder into executable code.
+            code += (
+                f"# TODO: Unsupported task type {py_str_literal(task_type)} "
+                f"for task {py_str_literal(task_name)}\n\n"
+            )
 
     return code
 
@@ -175,7 +198,12 @@ def _generate_provider_action_task(
     # Validate action exists
     action_def = SnowflakeActionRegistry.get(action)
     if not action_def:
-        return f"# ERROR: Unknown action '{action}' for task '{task_id}'\n\n"
+        # Route both values through repr so a newline in action/task_id can't
+        # escape the leading ``#`` and turn the rest of the line into code.
+        return (
+            f"# ERROR: Unknown action {py_str_literal(action)} "
+            f"for task {py_str_literal(task_id)}\n\n"
+        )
 
     # Generate SQL based on action type
     if action == "sf.table.ensure":
@@ -191,33 +219,46 @@ def _generate_provider_action_task(
     else:
         sql = f"-- TODO: Generate SQL for {action}"
 
-    # The SQL body is interpolated into a triple-double-quoted operator
-    # argument in the generated DAG. A literal triple-double-quote run in
-    # the SQL would close that string early and emit broken Python, so
-    # rewrite each run to its backslash-escaped form: a valid in-string
-    # representation Python does not treat as a string terminator. The SQL
-    # is preserved verbatim when the generated DAG executes.
-    sql_clean = sql.replace('"""', '\\"\\"\\"')
+    # The SQL body is emitted as a single ``repr()``-escaped literal via
+    # py_str_literal: repr picks a safe quote style and escapes embedded
+    # quotes, triple-quotes, newlines and backslashes, so the SQL cannot
+    # terminate the literal and inject a top-level statement that Airflow
+    # would run at DAG-parse time. The LHS is a Python variable name, so it
+    # routes through sanitize_identifier to match the dependency wiring.
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    conn_lit = py_str_literal(config.snowflake_conn_id)
+    sql_lit = py_str_literal(sql)
 
-    return f'''{task_id} = SnowflakeOperator(
-    task_id='{task_id}',
-    snowflake_conn_id='{config.snowflake_conn_id}',
-    sql="""
-{sql_clean}
-    """,
+    return f"""{var} = SnowflakeOperator(
+    task_id={task_id_lit},
+    snowflake_conn_id={conn_lit},
+    sql={sql_lit},
     dag=dag,
 )
 
-'''
+"""
 
 
 def _generate_python_task(task: Dict[str, Any], task_id: str) -> str:
-    """Generate PythonOperator."""
+    """Generate PythonOperator.
+
+    ``python_callable`` is emitted as a *bare* Python name (a reference to a
+    callable), so the contract-supplied ``callable`` is routed through
+    ``sanitize_identifier`` -- otherwise a value like ``os.system(...) or x``
+    would be interpolated as a top-level expression and executed at parse
+    time. The LHS variable name uses the same helper so it matches the
+    dependency wiring; ``task_id`` is emitted as a ``repr()``-escaped literal.
+    """
     callable_name = task.get("callable", task_id + "_func")
 
-    return f"""{task_id} = PythonOperator(
-    task_id='{task_id}',
-    python_callable={callable_name},
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    callable_ident = sanitize_identifier(callable_name)
+
+    return f"""{var} = PythonOperator(
+    task_id={task_id_lit},
+    python_callable={callable_ident},
     dag=dag,
 )
 
@@ -225,12 +266,23 @@ def _generate_python_task(task: Dict[str, Any], task_id: str) -> str:
 
 
 def _generate_bash_task(task: Dict[str, Any], task_id: str) -> str:
-    """Generate BashOperator."""
+    """Generate BashOperator.
+
+    ``bash_command`` is the highest-risk sink in this file: a single ``'`` in
+    the contract-supplied command would close the hand-written ``'...'`` and
+    inject Python that Airflow runs at DAG-parse time (and the value is then
+    handed to a shell at run time). It is emitted as a ``repr()``-escaped
+    literal via ``py_str_literal`` so neither break-out is possible.
+    """
     command = task.get("command", "echo 'No command specified'")
 
-    return f"""{task_id} = BashOperator(
-    task_id='{task_id}',
-    bash_command='{command}',
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    command_lit = py_str_literal(command)
+
+    return f"""{var} = BashOperator(
+    task_id={task_id_lit},
+    bash_command={command_lit},
     dag=dag,
 )
 
@@ -238,14 +290,25 @@ def _generate_bash_task(task: Dict[str, Any], task_id: str) -> str:
 
 
 def _generate_sensor_task(task: Dict[str, Any], task_id: str) -> str:
-    """Generate Sensor."""
+    """Generate Sensor.
+
+    The external DAG/task ids are contract-derived string kwargs, emitted as
+    ``repr()``-escaped literals via ``py_str_literal`` so an embedded quote or
+    newline cannot break out of the literal. The LHS routes through
+    ``sanitize_identifier`` to match the dependency wiring.
+    """
     external_dag_id = task.get("external_dag_id", "")
     external_task_id = task.get("external_task_id", "")
 
-    return f"""{task_id} = ExternalTaskSensor(
-    task_id='{task_id}',
-    external_dag_id='{external_dag_id}',
-    external_task_id='{external_task_id}',
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    external_dag_id_lit = py_str_literal(external_dag_id)
+    external_task_id_lit = py_str_literal(external_task_id)
+
+    return f"""{var} = ExternalTaskSensor(
+    task_id={task_id_lit},
+    external_dag_id={external_dag_id_lit},
+    external_task_id={external_task_id_lit},
     dag=dag,
 )
 
@@ -260,7 +323,14 @@ def _generate_task_dependencies(dependencies: List) -> str:
     code = "# Task dependencies\n\n"
 
     for dep in dependencies:
-        code += f"{dep.upstream_task} >> {dep.downstream_task}\n"
+        # These are bare Python variable names (``upstream >> downstream``), so
+        # both sides route through sanitize_identifier to match the identifiers
+        # the task generators emit -- otherwise an untrusted task name could
+        # inject code as a bare identifier, or a non-identifier name would
+        # produce a SyntaxError / dangle against the wrong variable.
+        upstream = sanitize_identifier(dep.upstream_task)
+        downstream = sanitize_identifier(dep.downstream_task)
+        code += f"{upstream} >> {downstream}\n"
 
     return code + "\n"
 
