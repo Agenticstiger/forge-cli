@@ -83,7 +83,8 @@ import yaml
 # (169.254.0.0/16 — AWS/GCP metadata), loopback, unspecified, and
 # reserved ranges (and fails closed on DNS errors).
 from fluid_build._net import _hostname_is_private
-from fluid_build.util.safe_yaml import load_yaml_safe
+from fluid_build.util.safe_http import MAX_REMOTE_BYTES
+from fluid_build.util.safe_yaml import MAX_YAML_BYTES, load_yaml_safe
 
 LOG = logging.getLogger("fluid.forge.federation")
 
@@ -623,36 +624,70 @@ def _federation_http_get(
             follow_redirects=False,
             verify=True,
         ) as client:
-            resp = client.get(current, headers=dict(headers))
-            # Genuine-redirect path: follow a small, bounded number of
-            # hops, re-checking the host gate before each one. This is
-            # the SSRF-safe manual-redirect pattern — never let httpx
-            # chase a 30x to an internal address on its own.
-            hops = 0
-            while resp.is_redirect and hops < _FEDERATION_MAX_REDIRECTS:
-                location = resp.headers.get("location")
-                if not location:
-                    break
-                next_url = str(httpx.URL(current).join(location))
-                try:
-                    current = _guard_federation_url(next_url, workspace_id=workspace.id)
-                except FederationSsrfError as exc:
-                    LOG.warning(
-                        "federation_http_fetch_ssrf_blocked_on_redirect: " "workspace=%s err=%s",
-                        workspace.id,
-                        exc,
-                    )
-                    return None
-                resp = client.get(current, headers=dict(headers))
-                hops += 1
-            if resp.is_redirect:
-                LOG.warning(
-                    "federation_http_fetch_too_many_redirects: workspace=%s host=%s",
-                    workspace.id,
-                    host,
-                )
+            # SECURITY (unbounded-read OOM): a malicious or misconfigured
+            # federation endpoint could return a multi-GB body and OOM the
+            # stage-7 digest gate of ``fluid apply``. ``client.get`` buffers
+            # the WHOLE body eagerly, so we must stream and cap — mirroring
+            # the streamed per-chunk ceiling in ``safe_http.fetch_bytes``
+            # (shared :data:`MAX_REMOTE_BYTES`). Redirects are detected from
+            # the response status WITHOUT consuming the body, so the SSRF-
+            # safe manual-redirect re-validation below stays intact.
+            def _stream_capped() -> Optional[httpx.Response]:
+                """GET ``current`` with a streamed body cap; re-validate each
+                redirect hop's Location host before following it. Returns the
+                final (non-redirect) response, or ``None`` on too-many-hops /
+                SSRF-blocked redirect / oversized body."""
+                nonlocal current
+                hops = 0
+                while True:
+                    with client.stream("GET", current, headers=dict(headers)) as resp:
+                        if resp.is_redirect:
+                            location = resp.headers.get("location")
+                            if not location or hops >= _FEDERATION_MAX_REDIRECTS:
+                                LOG.warning(
+                                    "federation_http_fetch_too_many_redirects: "
+                                    "workspace=%s host=%s",
+                                    workspace.id,
+                                    host,
+                                )
+                                return None
+                            next_url = str(httpx.URL(current).join(location))
+                            try:
+                                current = _guard_federation_url(next_url, workspace_id=workspace.id)
+                            except FederationSsrfError as exc:
+                                LOG.warning(
+                                    "federation_http_fetch_ssrf_blocked_on_redirect: "
+                                    "workspace=%s err=%s",
+                                    workspace.id,
+                                    exc,
+                                )
+                                return None
+                            hops += 1
+                            continue
+                        resp.raise_for_status()
+                        chunks = []
+                        total = 0
+                        for chunk in resp.iter_bytes():
+                            total += len(chunk)
+                            if total > MAX_REMOTE_BYTES:
+                                LOG.warning(
+                                    "federation_http_fetch_body_too_large: "
+                                    "workspace=%s host=%s cap=%s",
+                                    workspace.id,
+                                    host,
+                                    MAX_REMOTE_BYTES,
+                                )
+                                return None
+                            chunks.append(chunk)
+                        # Hydrate ``resp._content`` from the capped read so
+                        # ``.json()`` / ``.text`` work after the stream closes
+                        # (httpx reads ``.text``/``.json`` off ``_content``).
+                        resp._content = b"".join(chunks)
+                        return resp
+
+            resp = _stream_capped()
+            if resp is None:
                 return None
-            resp.raise_for_status()
             if expect_json:
                 return resp.json()
             return resp.text
@@ -977,6 +1012,20 @@ def _read_first_existing_contract(
             continue
         if resolved.is_file():
             try:
+                # SECURITY (unbounded-read OOM): stat-before-read so a
+                # hostile contract pulled from a federated git repo can't
+                # exhaust memory before ``load_yaml_safe``'s post-hoc cap
+                # ever runs. Mirrors the stat-before-read pattern in
+                # ``forge_copilot_runtime._confine_to_workspace`` and reuses
+                # the same :data:`MAX_YAML_BYTES` ceiling as ``load_yaml_safe``.
+                if resolved.stat().st_size > MAX_YAML_BYTES:
+                    LOG.warning(
+                        "federation_git_contract_too_large: path=%s size=%s cap=%s",
+                        path,
+                        resolved.stat().st_size,
+                        MAX_YAML_BYTES,
+                    )
+                    return None
                 return resolved.read_text(encoding="utf-8")
             except OSError as exc:  # pragma: no cover
                 LOG.warning(

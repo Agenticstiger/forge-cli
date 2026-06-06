@@ -433,8 +433,19 @@ class ProjectValidator:
         """Validate YAML file syntax"""
 
         try:
-            with open(file_path) as f:
-                yaml.safe_load(f)
+            # SECURITY (billion-laughs DoS): this validates EVERY ``*.yaml``
+            # found by walking the project tree (``rglob("*.yaml")``) — files
+            # the user did not explicitly name. Route through ``load_yaml_safe``
+            # (50-alias + 5 MiB caps) so a hostile anchor-expansion payload
+            # dropped into the tree can't OOM the validator. Falls back to the
+            # bare loader only when PyYAML itself is unavailable.
+            text = file_path.read_text(encoding="utf-8")
+            try:
+                from fluid_build.util.safe_yaml import load_yaml_safe
+
+                load_yaml_safe(text)
+            except ImportError:  # pragma: no cover — PyYAML-missing fallback
+                yaml.safe_load(text)
         except Exception as e:
             self.issues.append(
                 ValidationIssue(

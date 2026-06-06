@@ -46,6 +46,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import yaml
 
+from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
+
 __all__ = [
     "IGNORED_DIRS",
     "CONTRACT_FILENAMES",
@@ -162,8 +164,16 @@ def discover_upstream_products(
     for root in roots:
         for contract_path in _iter_contracts(root, max_depth=max_depth):
             try:
-                data = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
-            except (OSError, yaml.YAMLError) as exc:
+                # SECURITY (billion-laughs / oversized-YAML DoS): these
+                # contracts are DISCOVERED by walking the workspace (+ pulled
+                # mesh repos via FLUID_UPSTREAM_CONTRACTS) — the user did NOT
+                # explicitly name them, so a hostile upstream contract must
+                # not be able to OOM generation of a different product. Route
+                # through ``load_yaml_safe`` (50-alias + 5 MiB caps) instead
+                # of bare ``yaml.safe_load``. Tolerant-by-design: a rejected
+                # file is skipped, never fatal (same as a YAML syntax error).
+                data = load_yaml_safe(contract_path.read_text(encoding="utf-8"))
+            except (OSError, yaml.YAMLError, UnsafeYamlError) as exc:
                 _logger.debug("upstream: skipping %s (%s)", contract_path, exc)
                 continue
             if not isinstance(data, Mapping):
