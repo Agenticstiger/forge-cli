@@ -26,8 +26,22 @@ from __future__ import annotations
 
 import pytest
 
-from fluid_build.providers import bigquery_validation as bq
 from fluid_build.providers import snowflake_validation as sf
+
+# bigquery_validation eagerly imports google.cloud.bigquery at module load, which
+# is absent in the minimal unit-test env (the GCP SDK is a provider extra). Guard
+# it so collection doesn't error there; the BigQuery cases skip when the SDK is
+# missing (they run locally + in GCP-enabled jobs), while the Snowflake + helper
+# cases — which exercise the same per-part validate+quote fix — run everywhere.
+try:
+    from fluid_build.providers import bigquery_validation as bq
+
+    _HAVE_BQ = True
+except ImportError:  # pragma: no cover - depends on whether the GCP extra is installed
+    bq = None  # type: ignore[assignment]
+    _HAVE_BQ = False
+
+_needs_bq = pytest.mark.skipif(not _HAVE_BQ, reason="google.cloud.bigquery not installed")
 
 # A backtick-bearing table that, under the old whole-string single-backtick
 # quoting, broke out of `...` and appended a UNION-based exfil subquery.
@@ -88,6 +102,7 @@ def _resource_with_bq_table(table: str, *, project=None, dataset="ds") -> dict:
     return {"binding": {"location": {"properties": props}}}
 
 
+@_needs_bq
 class TestBigQueryQualityInjection:
     def test_malicious_table_runs_no_query_and_reports_issue(self):
         client = _ExplodingBQClient()
@@ -149,6 +164,7 @@ class TestBigQueryQualityInjection:
         assert "FROM `my-proj-123`.`ds`.`tbl`" in client.queries[0]
 
 
+@_needs_bq
 class TestBuildBqTableRef:
     def test_hyphenated_project(self):
         assert bq._build_bq_table_ref("my-proj-123.ds.tbl", None) == "`my-proj-123`.`ds`.`tbl`"
