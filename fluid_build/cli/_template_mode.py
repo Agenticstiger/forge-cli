@@ -580,6 +580,7 @@ def _create_project_minimal(
             confirm,
             new_run_id,
             render_completion,
+            render_refine_diff,
         )
 
         _preview_enabled = not bool(os.environ.get("FLUID_FORGE_NO_PREVIEW"))
@@ -709,6 +710,23 @@ def _create_project_minimal(
                 logger=logger,
             )
             _preview_panel.persist_artifacts()
+
+            # Refine mode: show what this regeneration CHANGED vs the
+            # existing contract before overwriting it. Reuses the
+            # ``fluid diff --baseline`` engine (compare_contracts +
+            # render_text) — no new differ. The existing contract was
+            # loaded into context by forge_modes.run_ai_copilot_mode
+            # (--refine path). Advisory only: never blocks the prompt.
+            _refine_baseline = context.get("refine_existing_contract")
+            if isinstance(_refine_baseline, Mapping) and _refine_baseline:
+                try:
+                    render_refine_diff(
+                        _refine_baseline,
+                        root_contract if use_fragments else contract,
+                        console=console,
+                    )
+                except Exception:  # noqa: BLE001 — diff is advisory
+                    logger.debug("preview_panel_refine_diff_failed", exc_info=True)
 
             if not confirm(_preview_panel, auto_yes=bool(options.get("auto_yes", False))):
                 _preview_panel.cleanup_run_dir()
