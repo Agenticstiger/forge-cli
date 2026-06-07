@@ -434,7 +434,18 @@ class EngineDriver(ABC):
             dialect=descriptor.dialect,
         )
         sql = f"SELECT * FROM {descriptor.table_reference}{where_clause} LIMIT {limit}"
-        result = self.execute(sql=sql, params=tuple(where_params))
+        # The row-filter WHERE carries portable ``:p_<index>`` placeholders; render
+        # them to the driver's native form BEFORE execute (the ``query`` path renders
+        # via CompiledQuery, but ``sample`` built the SQL by hand and previously
+        # skipped this — so sample+rowFilters raised a parser error on every real
+        # engine, e.g. DuckDB ``syntax error at ":"``). A no-rowFilters sample has no
+        # placeholders, so this is a no-op there.
+        from ..query_compiler import CompiledQuery
+
+        rendered = CompiledQuery(sql=sql, params=list(where_params)).render_sql_for_dialect(
+            descriptor.dialect
+        )
+        result = self.execute(sql=rendered, params=tuple(where_params))
         visible_columns, rows = self.project(result.rows, columns=result.columns)
         truncated = len(rows) >= limit
         return SampleResult(columns=visible_columns, rows=rows, truncated=truncated)
