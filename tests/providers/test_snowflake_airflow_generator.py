@@ -106,6 +106,268 @@ class TestAirflowGeneratorQuoteSafety:
         assert sql in _operator_sql_arg(code)
 
 
+# ---------------------------------------------------------------------------
+# FIX 1/2 — DDL identifier + type allowlisting at the SQL-content boundary
+#
+# The generated SnowflakeOperator runs this SQL at DAG *runtime*, so the
+# Python-layer ``py_str_literal`` wrapping is not enough: a malicious
+# identifier / column type must be rejected at generation time and never
+# reach the emitted SQL string.
+# ---------------------------------------------------------------------------
+
+from fluid_build.providers._sql_safety import (  # noqa: E402
+    SqlTypeError,
+    validate_sql_type_name,
+)
+from fluid_build.providers.snowflake.codegen import airflow as codegen_airflow  # noqa: E402
+
+
+class TestSqlTypeNameAllowlist:
+    """``validate_sql_type_name`` accepts real column types, rejects injection."""
+
+    @pytest.mark.parametrize(
+        "type_name",
+        ["INT", "VARCHAR(255)", "NUMBER(18,4)", "TIMESTAMP_NTZ", "TIMESTAMP WITHOUT TIME ZONE"],
+    )
+    def test_accepts_legitimate_types(self, type_name: str) -> None:
+        assert validate_sql_type_name(type_name) == type_name.strip()
+
+    @pytest.mark.parametrize(
+        "type_name",
+        [
+            'INT"); DROP TABLE x; --',  # quote + statement terminator + comment
+            "INT; DROP TABLE x",  # statement terminator
+            "INT) , evil VARCHAR(1)) --",  # comment sequence
+            "INT /* c */",  # block comment
+            'VARCHAR(10)"',  # bare identifier quote
+            "INT-1",  # hyphen excluded
+            "",  # empty
+            None,  # non-str
+        ],
+    )
+    def test_rejects_injection(self, type_name) -> None:
+        with pytest.raises(SqlTypeError):
+            validate_sql_type_name(type_name)
+
+
+def _codegen_create_table_dag(table: str, columns: list) -> str:
+    """One-task DAG via the ``codegen/airflow`` create_table operation path."""
+    contract = {
+        "id": "t.dag",
+        "orchestration": {
+            "tasks": [
+                {
+                    "taskId": "make_tbl",
+                    "type": "provider_action",
+                    "action": "snowflake.table.create_table",
+                    "params": {
+                        "database": "ANALYTICS",
+                        "schema": "PUBLIC",
+                        "table": table,
+                        "columns": columns,
+                    },
+                }
+            ]
+        },
+    }
+    return codegen_airflow.generate_airflow_dag(contract, account="acct", database="ANALYTICS")
+
+
+class TestCodegenCreateTableDDLSafety:
+    """``codegen/airflow.py`` create_table: identifiers + types are validated."""
+
+    def test_malicious_table_name_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            _codegen_create_table_dag('orders"); DROP TABLE x; --', [])
+
+    @pytest.mark.parametrize("bad_type", ['INT"); DROP TABLE x; --', "INT; SELECT 1", "INT)--"])
+    def test_malicious_column_type_rejected(self, bad_type: str) -> None:
+        with pytest.raises(ValueError):
+            _codegen_create_table_dag("orders", [{"name": "id", "type": bad_type}])
+
+    def test_malicious_column_name_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            _codegen_create_table_dag(
+                "orders", [{"name": 'id" INT); DROP TABLE x; --', "type": "INT"}]
+            )
+
+    def test_normal_create_table_emits_validated_identifiers(self) -> None:
+        code = _codegen_create_table_dag(
+            "orders", [{"name": "id", "type": "INT"}, {"name": "amount", "type": "NUMBER(18,4)"}]
+        )
+        compile(code, "<dag>", "exec")
+        sql = _operator_sql_arg(code)
+        assert "CREATE TABLE IF NOT EXISTS ANALYTICS.PUBLIC.orders" in sql
+        assert "id INT" in sql
+        assert "amount NUMBER(18,4)" in sql
+        # No injection payload survived anywhere in the generated source.
+        assert "DROP TABLE" not in code
+
+
+def _generator_table_dag(params: dict) -> str:
+    """One-task DAG via ``orchestration/airflow_generator`` sf.table.ensure path."""
+    contract = {"id": "t.dag"}
+    orchestration = {
+        "tasks": [
+            {"name": "ensure_tbl", "type": "provider_action", "action": "sf.table.ensure", **params}
+        ]
+    }
+    return airflow_generator.generate_airflow_dag(contract, orchestration)
+
+
+class TestGeneratorCreateTableDDLSafety:
+    """``orchestration/airflow_generator.py`` create-table DDL is validated."""
+
+    def test_malicious_table_name_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            _generator_table_dag(
+                {"parameters": {"database": "db", "schema": "s", "table": 'x" ; DROP TABLE y --'}}
+            )
+
+    @pytest.mark.parametrize("bad_type", ['INT"); DROP TABLE x; --', "INT; SELECT 1"])
+    def test_malicious_column_type_rejected(self, bad_type: str) -> None:
+        with pytest.raises(ValueError):
+            _generator_table_dag(
+                {
+                    "parameters": {
+                        "database": "db",
+                        "schema": "s",
+                        "table": "t",
+                        "columns": [{"name": "c", "type": bad_type}],
+                    }
+                }
+            )
+
+    def test_normal_create_table_emits_quoted_validated_identifiers(self) -> None:
+        code = _generator_table_dag(
+            {
+                "parameters": {
+                    "database": "db",
+                    "schema": "s",
+                    "table": "orders",
+                    "columns": [
+                        {"name": "id", "type": "INT"},
+                        {"name": "amount", "type": "NUMBER(18,4)"},
+                    ],
+                }
+            }
+        )
+        compile(code, "<dag>", "exec")
+        sql = _operator_sql_arg(code)
+        assert 'CREATE TABLE IF NOT EXISTS "db"."s"."orders"' in sql
+        assert '"id" INT' in sql
+        assert '"amount" NUMBER(18,4)' in sql
+        assert "DROP TABLE" not in code
+
+
+# ---------------------------------------------------------------------------
+# FIX 3 — task var name in the DEFINITION must match the DEPENDENCY wiring
+# even when taskId is missing (codegen/airflow.py).
+# ---------------------------------------------------------------------------
+
+
+def _assignment_targets(code: str) -> set:
+    """Top-level ``<name> = ...`` assignment target identifiers in ``code``."""
+    targets = set()
+    for node in ast.walk(ast.parse(code)):
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    targets.add(tgt.id)
+    return targets
+
+
+class TestCodegenMissingTaskIdConsistency:
+    """A python task with NO taskId: def var == wiring var, never ``>> None``."""
+
+    def test_missing_taskid_def_and_wiring_agree(self) -> None:
+        contract = {
+            "id": "dep.dag",
+            "orchestration": {
+                "tasks": [
+                    {
+                        "taskId": "upstream",
+                        "type": "provider_action",
+                        "action": "snowflake.table.query",
+                        "params": {"sql": "SELECT 1"},
+                    },
+                    {
+                        # No taskId -> must normalise to ``unnamed_task`` in BOTH
+                        # the operator definition and the ``>>`` wiring. The
+                        # ``python`` service routes to PythonOperator; the task
+                        # must be type=provider_action to survive the generator's
+                        # ``provider_action`` filter.
+                        "type": "provider_action",
+                        "action": "snowflake.python.run",
+                        "params": {"x": 1},
+                        "dependsOn": ["upstream"],
+                    },
+                ]
+            },
+        }
+        code = codegen_airflow.generate_airflow_dag(contract, account="a", database="d")
+        compile(code, "<dag>", "exec")
+        # The downstream variable used in the ``>>`` edge must be one that is
+        # actually defined — and specifically not the literal ``None``.
+        assert "unnamed_task = PythonOperator(" in code
+        assert ">> None" not in code
+        assert "upstream >> unnamed_task" in code
+        # Every name referenced on either side of a ``>>`` edge is a defined var.
+        defined = _assignment_targets(code)
+        assert "unnamed_task" in defined
+        assert "None" not in defined
+
+
+# ---------------------------------------------------------------------------
+# FIX 4 — a contract param that parses to a date/datetime must not crash
+# DAG generation (json.dumps default=str), in BOTH snowflake generators.
+# ---------------------------------------------------------------------------
+
+
+class TestPythonTaskDateParamSerialises:
+    """``json.dumps(..., default=str)`` so a date param doesn't raise."""
+
+    def test_codegen_python_task_with_date_param(self) -> None:
+        import datetime
+
+        contract = {
+            "id": "d.dag",
+            "orchestration": {
+                "tasks": [
+                    {
+                        "taskId": "py",
+                        "type": "provider_action",
+                        "action": "snowflake.python.run",
+                        "params": {"as_of": datetime.date(2024, 1, 1)},
+                    }
+                ]
+            },
+        }
+        # Must not raise TypeError: "Object of type date is not JSON serializable".
+        code = codegen_airflow.generate_airflow_dag(contract, account="a", database="d")
+        compile(code, "<dag>", "exec")
+        assert "2024-01-01" in code
+
+    def test_generator_python_task_with_datetime_param(self) -> None:
+        import datetime
+
+        contract = {"id": "d.dag"}
+        orchestration = {
+            "tasks": [
+                {
+                    "name": "py",
+                    "type": "python",
+                    "callable": "my_func",
+                    "parameters": {"as_of": datetime.datetime(2024, 1, 1, 12, 0, 0)},
+                }
+            ]
+        }
+        # ``airflow_generator``'s python task doesn't serialise params into the
+        # body, but exercise the path end-to-end to prove a date param is inert.
+        code = airflow_generator.generate_airflow_dag(contract, orchestration)
+        compile(code, "<dag>", "exec")
+
+
 # Code-injection payload: closes a single-quoted literal, runs an os.system,
 # comments out the trailing quote. The marker file path is asserted-absent.
 _PWN = 'import os; os.system("touch /tmp/PWNED")'

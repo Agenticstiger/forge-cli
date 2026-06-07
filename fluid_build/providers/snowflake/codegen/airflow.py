@@ -27,6 +27,7 @@ Supports:
 from datetime import datetime
 from typing import Any, Dict, List
 
+from fluid_build.providers._sql_safety import validate_ident, validate_sql_type_name
 from fluid_build.providers.common.codegen_utils import py_str_literal, sanitize_identifier
 
 
@@ -203,7 +204,6 @@ def _generate_task_definitions(
 
 def _generate_single_task(task: Dict[str, Any], account: str, database: str, warehouse: str) -> str:
     """Generate code for a single task."""
-    task.get("taskId")
     action = task.get("action", "")
     params = task.get("params", {})
 
@@ -225,26 +225,38 @@ def _generate_single_task(task: Dict[str, Any], account: str, database: str, war
 def _generate_snowflake_sql_task(
     task: Dict[str, Any], operation: str, params: Dict[str, Any], database: str, warehouse: str
 ) -> str:
-    """Generate Snowflake SQL task code."""
-    task_id = task.get("taskId")
+    """Generate Snowflake SQL task code.
+
+    SQL-injection safety: ``create_database`` / ``create_schema`` /
+    ``create_table`` build DDL that the generated ``SnowflakeOperator`` runs at
+    DAG *runtime*, so ``py_str_literal`` (which only neutralises the Python
+    layer) is not enough on its own. Every IDENTIFIER (database / schema /
+    table / column name) is routed through ``validate_ident`` and every column
+    TYPE through ``validate_sql_type_name`` so a contract-supplied value
+    containing ``"`` / ``;`` / ``)`` / a comment sequence is rejected
+    (``ValueError``) and never reaches the emitted SQL.
+    """
+    task_id = task.get("taskId") or "unnamed_task"
 
     if operation == "create_database":
-        db_name = params.get("database", "UNKNOWN_DB")
+        db_name = validate_ident(params.get("database", "UNKNOWN_DB"))
         sql = f"CREATE DATABASE IF NOT EXISTS {db_name}"
 
     elif operation == "create_schema":
-        schema_name = params.get("schema", "UNKNOWN_SCHEMA")
-        db_name = params.get("database", database)
+        schema_name = validate_ident(params.get("schema", "UNKNOWN_SCHEMA"))
+        db_name = validate_ident(params.get("database", database))
         sql = f"CREATE SCHEMA IF NOT EXISTS {db_name}.{schema_name}"
 
     elif operation == "create_table":
-        table_name = params.get("table", "UNKNOWN_TABLE")
-        schema_name = params.get("schema", "PUBLIC")
-        db_name = params.get("database", database)
+        table_name = validate_ident(params.get("table", "UNKNOWN_TABLE"))
+        schema_name = validate_ident(params.get("schema", "PUBLIC"))
+        db_name = validate_ident(params.get("database", database))
         columns = params.get("columns", [])
 
         if columns:
-            cols_def = ", ".join([f"{c['name']} {c['type']}" for c in columns])
+            cols_def = ", ".join(
+                f"{validate_ident(c['name'])} {validate_sql_type_name(c['type'])}" for c in columns
+            )
             sql = f"CREATE TABLE IF NOT EXISTS {db_name}.{schema_name}.{table_name} ({cols_def})"
         else:
             sql = f"CREATE TABLE IF NOT EXISTS {db_name}.{schema_name}.{table_name} (id INTEGER, created_at TIMESTAMP_NTZ)"
@@ -295,7 +307,10 @@ def _generate_python_task(task: Dict[str, Any], account: str, database: str) -> 
     var = sanitize_identifier(task_id)
     task_id_lit = py_str_literal(task_id)
     action_lit = py_str_literal(action)
-    params_json_lit = repr(json.dumps(params, sort_keys=True))
+    # ``default=str`` so a contract param that YAML-parses to a date/datetime
+    # (or any non-JSON-native value) serialises instead of raising TypeError
+    # at DAG-generation time — matches the gcp sibling generator.
+    params_json_lit = repr(json.dumps(params, sort_keys=True, default=str))
 
     return f"""{var} = PythonOperator(
     task_id={task_id_lit},
@@ -314,7 +329,13 @@ def _generate_task_dependencies(tasks: List[Dict[str, Any]]) -> str:
     dep_code = "# Task dependencies\n"
 
     for task in tasks:
-        task_id = task.get("taskId")
+        # Normalise the missing-taskId fallback to ``unnamed_task`` so this
+        # matches what the task *definition* emitters use (both the SQL-task and
+        # python-task generators do ``task.get("taskId") or "unnamed_task"``).
+        # Without this the definition was ``unnamed_task = Operator(...)`` while
+        # the wiring referenced ``None`` (``sanitize_identifier(None) == "None"``)
+        # — the edge dangled against a variable that was never defined.
+        task_id = task.get("taskId") or "unnamed_task"
         depends_on = task.get("dependsOn", [])
 
         if depends_on:

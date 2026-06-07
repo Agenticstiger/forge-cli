@@ -25,7 +25,7 @@ Converts FLUID provider action tasks into Airflow operators:
 
 from typing import Any, Dict, List, Optional
 
-from ..._sql_safety import quote_string_literal
+from ..._sql_safety import quote_string_literal, validate_ident, validate_sql_type_name
 from ...common.codegen_utils import py_str_literal, sanitize_identifier
 from ..registry import SnowflakeActionRegistry
 from .common import OrchestrationConfig, OrchestrationEngine, extract_dependencies, sanitize_task_id
@@ -336,10 +336,20 @@ def _generate_task_dependencies(dependencies: List) -> str:
 
 
 def _generate_create_table_sql(params: Dict[str, Any]) -> str:
-    """Generate CREATE TABLE SQL."""
-    database = params.get("database", "")
-    schema = params.get("schema", "PUBLIC")
-    table = params.get("table", "")
+    """Generate CREATE TABLE SQL.
+
+    SQL-injection safety: this SQL is executed by the generated
+    ``SnowflakeOperator`` at DAG *runtime*, so every IDENTIFIER (database /
+    schema / table / column / cluster-by column) is routed through
+    ``validate_ident`` before the existing double-quote wrapping, and every
+    column TYPE through ``validate_sql_type_name``. A contract-supplied value
+    containing ``"`` / ``;`` / ``)`` / a comment sequence is rejected
+    (``ValueError``) instead of breaking out of the quoted identifier. The
+    ``COMMENT`` is a string literal and stays on ``quote_string_literal``.
+    """
+    database = validate_ident(params.get("database", ""))
+    schema = validate_ident(params.get("schema", "PUBLIC"))
+    table = validate_ident(params.get("table", ""))
     columns = params.get("columns", [])
     cluster_by = params.get("cluster_by", [])
     comment = params.get("comment", "")
@@ -348,8 +358,8 @@ def _generate_create_table_sql(params: Dict[str, Any]) -> str:
 
     col_defs = []
     for col in columns:
-        col_name = col.get("name", "")
-        col_type = col.get("type", "VARCHAR")
+        col_name = validate_ident(col.get("name", ""))
+        col_type = validate_sql_type_name(col.get("type", "VARCHAR"))
         nullable = "" if col.get("nullable", True) else " NOT NULL"
         col_defs.append(f'  "{col_name}" {col_type}{nullable}')
 
@@ -357,7 +367,7 @@ def _generate_create_table_sql(params: Dict[str, Any]) -> str:
     sql += "\n)"
 
     if cluster_by:
-        cols = ", ".join(f'"{c}"' for c in cluster_by)
+        cols = ", ".join(f'"{validate_ident(c)}"' for c in cluster_by)
         sql += f"\nCLUSTER BY ({cols})"
 
     if comment:
@@ -369,8 +379,13 @@ def _generate_create_table_sql(params: Dict[str, Any]) -> str:
 
 
 def _generate_create_database_sql(params: Dict[str, Any]) -> str:
-    """Generate CREATE DATABASE SQL."""
-    database = params.get("database", "")
+    """Generate CREATE DATABASE SQL.
+
+    The ``database`` identifier is routed through ``validate_ident`` (inside the
+    existing double-quote wrapping) before reaching runtime-executed DDL; the
+    ``COMMENT`` stays a ``quote_string_literal`` string literal.
+    """
+    database = validate_ident(params.get("database", ""))
     comment = params.get("comment", "")
     transient = params.get("transient", False)
 
@@ -385,9 +400,15 @@ def _generate_create_database_sql(params: Dict[str, Any]) -> str:
 
 
 def _generate_create_schema_sql(params: Dict[str, Any]) -> str:
-    """Generate CREATE SCHEMA SQL."""
-    database = params.get("database", "")
-    schema = params.get("schema", "")
+    """Generate CREATE SCHEMA SQL.
+
+    The ``database`` / ``schema`` identifiers are routed through
+    ``validate_ident`` (inside the existing double-quote wrapping) before
+    reaching runtime-executed DDL; the ``COMMENT`` stays a
+    ``quote_string_literal`` string literal.
+    """
+    database = validate_ident(params.get("database", ""))
+    schema = validate_ident(params.get("schema", ""))
     comment = params.get("comment", "")
     transient = params.get("transient", False)
 
