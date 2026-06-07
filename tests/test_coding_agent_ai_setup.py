@@ -70,6 +70,89 @@ def test_inline_setup_auto_selects_claude_code_when_only_agent(monkeypatch):
     assert cfg.api_key is None
 
 
+def _stub_console():
+    import types as _t
+
+    printed = []
+    return (
+        _t.SimpleNamespace(print=lambda *a, **k: printed.append(" ".join(str(x) for x in a))),
+        printed,
+    )
+
+
+def test_offer_import_env_key_skips_non_tty(monkeypatch):
+    # Non-interactive: never persist (CI safety).
+    monkeypatch.setattr(ai_setup.sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
+    called = {"save": False}
+    monkeypatch.setattr(
+        ai_setup, "_save_ai_config", lambda *a, **k: called.__setitem__("save", True) or True
+    )
+    console, _ = _stub_console()
+    ai_setup._offer_import_env_api_key(console, "openai", "sk-live-xxx", "OPENAI_API_KEY")
+    assert called["save"] is False
+
+
+def test_offer_import_env_key_persists_on_yes(monkeypatch):
+    monkeypatch.setattr(ai_setup.sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(ai_setup, "RICH_AVAILABLE", True, raising=False)
+    monkeypatch.setattr(ai_setup, "_load_ai_config", lambda: None)
+    monkeypatch.setattr(ai_setup, "ask_confirmation", lambda *a, **k: True)
+    saved = {}
+    monkeypatch.setattr(
+        ai_setup,
+        "_save_ai_config",
+        lambda provider, model, *, api_key=None, **k: saved.update(
+            provider=provider, api_key=api_key
+        )
+        or True,
+    )
+    console, _ = _stub_console()
+    ai_setup._offer_import_env_api_key(console, "openai", "sk-live-abc", "OPENAI_API_KEY")
+    assert saved == {"provider": "openai", "api_key": "sk-live-abc"}
+
+
+def test_offer_import_env_key_declined_does_not_persist(monkeypatch):
+    monkeypatch.setattr(ai_setup.sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(ai_setup, "RICH_AVAILABLE", True, raising=False)
+    monkeypatch.setattr(ai_setup, "_load_ai_config", lambda: None)
+    monkeypatch.setattr(ai_setup, "ask_confirmation", lambda *a, **k: False)
+    called = {"save": False}
+    monkeypatch.setattr(
+        ai_setup, "_save_ai_config", lambda *a, **k: called.__setitem__("save", True) or True
+    )
+    console, _ = _stub_console()
+    ai_setup._offer_import_env_api_key(console, "openai", "sk-live-abc", "OPENAI_API_KEY")
+    assert called["save"] is False
+
+
+def test_offer_import_env_key_skips_when_already_configured(monkeypatch):
+    monkeypatch.setattr(ai_setup.sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(ai_setup, "RICH_AVAILABLE", True, raising=False)
+    monkeypatch.setattr(ai_setup, "_load_ai_config", lambda: {"provider": "openai"})
+    called = {"asked": False}
+    monkeypatch.setattr(
+        ai_setup, "ask_confirmation", lambda *a, **k: called.__setitem__("asked", True) or True
+    )
+    console, _ = _stub_console()
+    ai_setup._offer_import_env_api_key(console, "openai", "sk-live-abc", "OPENAI_API_KEY")
+    assert called["asked"] is False
+
+
+def test_offer_import_env_key_skips_on_shape_mismatch(monkeypatch):
+    # An Anthropic-shaped key (sk-ant-) sitting in OPENAI_API_KEY must not be
+    # persisted as openai.
+    monkeypatch.setattr(ai_setup.sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(ai_setup, "RICH_AVAILABLE", True, raising=False)
+    monkeypatch.setattr(ai_setup, "_load_ai_config", lambda: None)
+    called = {"asked": False}
+    monkeypatch.setattr(
+        ai_setup, "ask_confirmation", lambda *a, **k: called.__setitem__("asked", True) or True
+    )
+    console, _ = _stub_console()
+    ai_setup._offer_import_env_api_key(console, "openai", "sk-ant-xxxxxxxx", "OPENAI_API_KEY")
+    assert called["asked"] is False
+
+
 def test_inline_setup_no_agent_no_key_returns_none(monkeypatch):
     # Nothing available + non-interactive -> None (existing behavior preserved).
     monkeypatch.setattr(ai_setup, "_ai_setup_skipped", False, raising=False)
