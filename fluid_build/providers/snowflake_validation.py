@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from fluid_build.providers._sql_safety import validate_ident
 from fluid_build.providers.quality_engine import (
     execute_quality_checks,
     quality_results_to_issues,
@@ -36,6 +37,21 @@ from fluid_build.providers.validation_provider import (
     ValidationProvider,
     ValidationResult,
 )
+
+
+def _build_sf_table_ref(fqn: tuple) -> str:
+    """Build a per-part double-quoted ``"DB"."SCHEMA"."TABLE"`` reference.
+
+    Each of the three identifier parts is validated independently via
+    :func:`validate_ident` and quoted on its own — so a double-quote
+    smuggled into any single part can never break out of its quote pair.
+    Raises ``ValueError`` (fail-closed) on any invalid part.
+    """
+    database, schema, table = fqn
+    return (
+        f'"{validate_ident(database)}".' f'"{validate_ident(schema)}".' f'"{validate_ident(table)}"'
+    )
+
 
 try:
     from fluid_build.providers.snowflake.connection import SnowflakeConnection
@@ -134,6 +150,19 @@ class SnowflakeValidationProvider(ValidationProvider):
                 return None
 
             db, sch, tbl = fqn
+            # Validate every identifier BEFORE it reaches SQL. ``db`` is
+            # interpolated unquoted into ``FROM {db}.INFORMATION_SCHEMA.*`` and
+            # all three parts are quoted into the row-count query, so an
+            # unvalidated value (e.g. a backtick/quote-bearing table from an
+            # unconstrained binding) could inject. validate_ident raises on a
+            # malicious identifier; fail closed (no schema, no query executed).
+            try:
+                db = validate_ident(db)
+                sch = validate_ident(sch)
+                tbl = validate_ident(tbl)
+            except ValueError:
+                LOG.warning("snowflake_get_resource_schema_invalid_identifier")
+                return None
 
             with self._connect() as conn:
                 # Query column metadata
@@ -356,7 +385,24 @@ class SnowflakeValidationProvider(ValidationProvider):
                     path="contract.dq.rules",
                 )
             ]
-        table_ref = '"{}"."{}"."{}"'.format(*fqn)
+        # Validate + per-part double-quote the FQN before it reaches SQL.
+        # ``_build_sf_table_ref`` fails closed on a malicious
+        # database/schema/table so no query is ever issued against an
+        # unsafe reference.
+        try:
+            table_ref = _build_sf_table_ref(fqn)
+        except ValueError:
+            return [
+                ValidationIssue(
+                    severity="error",
+                    category="quality",
+                    message=(
+                        "Cannot run quality checks: table reference failed "
+                        "identifier validation (refusing to execute query)"
+                    ),
+                    path="exposes[].binding.location",
+                )
+            ]
         with self._connect() as conn:
             results = execute_quality_checks(
                 rules=rules,

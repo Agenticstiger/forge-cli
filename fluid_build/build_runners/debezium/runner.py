@@ -22,6 +22,7 @@ Two execution modes:
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -87,6 +88,54 @@ def resolve_snapshot_mode(mode: Optional[str]) -> str:
     raise ValueError(
         f"debezium: invalid snapshot.mode '{mode}'; expected one of {sorted(SUPPORTED_SNAPSHOT_MODES)}"
     )
+
+
+def resolve_server_binary(server_binary: Optional[str]) -> Optional[str]:
+    """Resolve the Debezium Server executable, validating any contract override.
+
+    ``properties.debezium.server_binary`` is a contract-controlled field that
+    becomes ``argv[0]`` of a subprocess, so a hostile value would be an
+    arbitrary-binary-execution vector. We validate it the same way the
+    meltano runner validates its tap/target binaries and ``dbt``'s
+    ``_resolve_dbt_executable`` validates ``DBT_EXECUTABLE``:
+
+    * **Bare program name** (no path separator) — must resolve on ``PATH``
+      via :func:`shutil.which`. This is the preferred / production shape and
+      confines the binary to the operator-controlled ``PATH``.
+    * **Explicit path** (contains a path separator, or starts with ``.``/``~``)
+      — must point at an existing, executable file (``is_file()`` rejects a
+      directory; ``os.X_OK`` rejects a non-executable).
+
+    Anything that resolves to neither is rejected (warn-log + ``None``) so the
+    caller fails closed rather than ``exec``-ing an unverifiable program. When
+    no override is set we fall back to ``debezium-server`` on ``PATH``.
+    """
+    if not server_binary:
+        return shutil.which("debezium-server")
+    candidate = str(server_binary)
+    if (
+        os.path.sep in candidate
+        or (os.path.altsep and os.path.altsep in candidate)
+        or candidate.startswith((".", "~"))
+    ):
+        # Explicit path form — must be an existing, executable file.
+        resolved = Path(candidate).expanduser()
+        if resolved.is_file() and os.access(resolved, os.X_OK):
+            return str(resolved)
+        LOG.warning(
+            "debezium.server_binary.rejected reason=path-not-an-executable-file value=%r",
+            candidate,
+        )
+        return None
+    # Bare program name — must resolve on PATH.
+    found = shutil.which(candidate)
+    if found:
+        return found
+    LOG.warning(
+        "debezium.server_binary.rejected reason=not-on-path value=%r",
+        candidate,
+    )
+    return None
 
 
 # ── Connector config builder ───────────────────────────────────────────
@@ -420,17 +469,20 @@ def _execute_debezium_server(
         lines.append(f"debezium.sink.{sink_type}.{k}={v}")
     config_path.write_text("\n".join(lines), encoding="utf-8")
 
-    binary = dbz_props.get("server_binary") or shutil.which("debezium-server")
+    # Validate any contract-supplied ``server_binary`` before it becomes
+    # ``argv[0]`` (arbitrary-binary-execution guard). A value with a path
+    # separator must resolve to an existing executable file; a bare name must
+    # resolve on PATH. An unverifiable value yields ``None`` → fail closed.
+    binary = resolve_server_binary(dbz_props.get("server_binary"))
     if binary is None:
-        # Config is generated; without the binary we can't run it. We still
-        # report success when only generation was requested via dry_run, and
-        # treat absence of the binary as a non-fatal "config-only" outcome.
+        # Config is generated; without a verified binary we can't run it.
         return _failed(
             ctx,
             started_at,
             t_start,
-            "debezium-server binary not found on PATH; install or set "
-            "properties.debezium.server_binary",
+            "debezium-server binary not found / rejected; install it on PATH, "
+            "or set properties.debezium.server_binary to a valid executable "
+            "(bare name on PATH, or an absolute path to an executable file)",
         )
 
     try:

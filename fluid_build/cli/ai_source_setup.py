@@ -70,6 +70,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from fluid_build.credentials.encrypted_store import _atomic_write_bytes
+
 _log = logging.getLogger(__name__)
 
 
@@ -484,12 +486,12 @@ def _redact_console_message(message: str) -> str:
 def _save_yaml_entry(saved_name: str, source: str, config: Dict[str, Any]) -> None:
     """Write the non-sensitive entry to ``~/.fluid/sources.yaml``.
 
-    Mode 600 on first creation; merges into the existing
-    ``sources:`` mapping so re-running the wizard for a different
-    source name doesn't clobber other entries.
+    The file is created atomically with mode 0o600 from the start
+    (no create-then-chmod window in which the secrets-bearing file
+    is briefly world-readable under the process umask). Merges into
+    the existing ``sources:`` mapping so re-running the wizard for a
+    different source name doesn't clobber other entries.
     """
-    import stat
-
     import yaml  # type: ignore
 
     SOURCES_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -509,11 +511,11 @@ def _save_yaml_entry(saved_name: str, source: str, config: Dict[str, Any]) -> No
         "source_type": source,
         "config": config,
     }
-    SOURCES_PATH.write_text(
-        yaml.safe_dump(existing, sort_keys=False),
-        encoding="utf-8",
+    _atomic_write_bytes(
+        SOURCES_PATH,
+        yaml.safe_dump(existing, sort_keys=False).encode("utf-8"),
+        mode=0o600,
     )
-    SOURCES_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
 def _save_keyring_entry(saved_name: str, secret_fields: Dict[str, str]) -> bool:
@@ -550,10 +552,15 @@ def _allow_plaintext_source_secrets() -> bool:
 
 def _save_yaml_secrets_fallback(saved_name: str, secret_fields: Dict[str, str]) -> None:
     """When keyring is unavailable, write secrets into the YAML
-    under a ``secrets`` key in the saved entry. Mode 600 on the
-    file is the only protection — the operator was warned."""
-    import stat
+    under a ``secrets`` key in the saved entry.
 
+    Mode 600 on the file is the only protection — the operator was
+    warned. The write is atomic and the file is created 0o600 from
+    the start (via ``_atomic_write_bytes``): the previous
+    ``write_text`` then ``chmod`` sequence left the secret bytes on
+    disk at the umask default (commonly 0o644) until the chmod
+    landed, and the ``~/.fluid`` 0o700 mitigation does not hold when
+    that directory is pre-created 0o755."""
     import yaml  # type: ignore
 
     if not SOURCES_PATH.is_file():
@@ -571,11 +578,11 @@ def _save_yaml_secrets_fallback(saved_name: str, secret_fields: Dict[str, str]) 
     if not isinstance(entry, dict):
         return
     entry["secrets"] = secret_fields
-    SOURCES_PATH.write_text(
-        yaml.safe_dump(data, sort_keys=False),
-        encoding="utf-8",
+    _atomic_write_bytes(
+        SOURCES_PATH,
+        yaml.safe_dump(data, sort_keys=False).encode("utf-8"),
+        mode=0o600,
     )
-    SOURCES_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
 __all__ = [

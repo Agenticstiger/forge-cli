@@ -75,20 +75,53 @@ class FileStateStore(StateStore):
         self.root.mkdir(parents=True, exist_ok=True)
 
     # ── path helpers ─────────────────────────────────────────────────────
+    def _confine(self, candidate: Path) -> Path:
+        """Assert ``candidate`` stays inside the state-store root after resolution.
+
+        Belt-and-suspenders defence in depth: the runtime chokepoint
+        (``build_runners.base.run_builds_from_args``) already validates
+        ``contract.id`` / ``build.id`` against the shared identifier
+        grammar before any path is created, so neither ``product_id`` nor
+        ``build_id`` can carry ``..`` / a separator by the time they reach
+        here. This guard is the second wall: if a future caller ever
+        constructs a ``FileStateStore`` path from an unvalidated component
+        (``product_id``, ``build_id``, ``stream``, ``run_id``), an escape
+        is rejected here instead of writing outside the workspace.
+        """
+        root_resolved = self.root.resolve()
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(root_resolved)
+        except ValueError as exc:
+            from fluid_build.build_runners._ids import IdentifierViolation
+
+            raise IdentifierViolation(
+                f"state path {resolved} escapes the state-store root {root_resolved}"
+            ) from exc
+        return resolved
+
     def _build_dir(self, product_id: str, build_id: str) -> Path:
-        return self.root / "runs" / product_id / build_id
+        return self._confine(self.root / "runs" / product_id / build_id)
 
     def _cursor_path(self, product_id: str, build_id: str, stream: str) -> Path:
-        return self._build_dir(product_id, build_id) / "cursors" / f"{stream}.json"
+        return self._confine(self._build_dir(product_id, build_id) / "cursors" / f"{stream}.json")
 
     def _watermark_path(self, product_id: str, build_id: str, stream: str) -> Path:
-        return self._build_dir(product_id, build_id) / "watermarks" / f"{stream}.json"
+        return self._confine(
+            self._build_dir(product_id, build_id) / "watermarks" / f"{stream}.json"
+        )
 
     def _run_record_path(self, product_id: str, build_id: str, run_id: str) -> Path:
-        return self._build_dir(product_id, build_id) / "runs" / f"{run_id}.json"
+        return self._confine(self._build_dir(product_id, build_id) / "runs" / f"{run_id}.json")
 
     def _lock_path(self, scope: str, resource_id: str) -> Path:
-        return self.root / "locks" / f"{scope}__{resource_id}.lock"
+        # SECURITY (path traversal): ``scope`` / ``resource_id`` are
+        # interpolated into the lock filename, so a value with a path
+        # separator or ``..`` would escape the workspace. Route through the
+        # same ``_confine`` backstop as every sibling helper
+        # (``_build_dir`` / ``_cursor_path`` / ``_watermark_path`` /
+        # ``_run_record_path``) so an unvalidated component is rejected here.
+        return self._confine(self.root / "locks" / f"{scope}__{resource_id}.lock")
 
     # ── cursor / watermark ───────────────────────────────────────────────
     def get_cursor(self, product_id: str, build_id: str, stream: str) -> Optional[Cursor]:

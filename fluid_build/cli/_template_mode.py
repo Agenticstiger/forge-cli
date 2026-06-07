@@ -621,7 +621,21 @@ def _create_project_minimal(
                 _preview_panel.add_file(rel_path, content)
             for rel_path, content in (schedule_files or {}).items():
                 _preview_panel.add_file(rel_path, content)
+            _preview_target_root = target_dir.resolve()
             for rel_path, content in (generation_result.additional_files or {}).items():
+                # SECURITY: mirror the write-loop confinement (below) on the
+                # preview consumer so an LLM-chosen path that escapes
+                # target_dir is never surfaced as a legitimate pending file
+                # (and never materialised). See the write loop for the full
+                # rationale (prompt-injection → arbitrary-file-write).
+                try:
+                    (target_dir / rel_path).resolve().relative_to(_preview_target_root)
+                except ValueError:
+                    logger.warning(
+                        "additional_file_outside_target_dir_skipped",
+                        extra={"rel_path": rel_path},
+                    )
+                    continue
                 _preview_panel.add_file(rel_path, content)
 
             _llm_provider_name = (getattr(generation_result, "provenance", None) or {}).get(
@@ -752,8 +766,24 @@ def _create_project_minimal(
         if llm_files:
             additional_files.update(llm_files)
         if additional_files:
+            _target_root = target_dir.resolve()
             for rel_path, content in additional_files.items():
                 fpath = target_dir / rel_path
+                # SECURITY: confine every write to target_dir. ``rel_path``
+                # can originate from LLM-chosen table names (staged path)
+                # that flow into ``models/<layer>/<name>.sql``; an entry
+                # like ``../../../../tmp/pwned.sql`` would otherwise escape
+                # the project dir (prompt-injection → arbitrary-file-write).
+                # Skip + warn rather than write outside the sandbox.
+                try:
+                    dest = fpath.resolve()
+                    dest.relative_to(_target_root)
+                except ValueError:
+                    logger.warning(
+                        "additional_file_outside_target_dir_skipped",
+                        extra={"rel_path": rel_path},
+                    )
+                    continue
                 fpath.parent.mkdir(parents=True, exist_ok=True)
                 fpath.write_text(content, encoding="utf-8")
 

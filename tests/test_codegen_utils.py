@@ -14,6 +14,8 @@
 
 """Tests for providers/common/codegen_utils.py — shared codegen helpers."""
 
+import keyword
+
 import pytest
 
 from fluid_build.providers.common.codegen_utils import (
@@ -21,6 +23,7 @@ from fluid_build.providers.common.codegen_utils import (
     convert_schedule_to_airflow,
     convert_schedule_to_cron,
     detect_circular_dependencies,
+    escape_for_docstring,
     escape_sql_for_python,
     generate_file_header,
     generate_task_dependencies_code,
@@ -46,6 +49,21 @@ class TestSanitizeIdentifier:
     def test_purely_numeric(self):
         # Leading digits stripped, leaving empty → 'unnamed'
         assert sanitize_identifier("999") == "unnamed"
+
+    def test_python_keyword_gets_suffix(self):
+        # A taskId of ``class`` would otherwise emit ``class = Operator(...)``
+        # → SyntaxError in the generated DAG. The result must be a valid,
+        # NON-keyword Python identifier.
+        result = sanitize_identifier("class")
+        assert keyword.iskeyword(result) is False
+        assert result.isidentifier() is True
+        assert result == "class_"
+
+    @pytest.mark.parametrize("kw", ["import", "def", "return", "for", "if", "None", "lambda"])
+    def test_all_keywords_become_legal_identifiers(self, kw):
+        result = sanitize_identifier(kw)
+        assert keyword.iskeyword(result) is False
+        assert result.isidentifier() is True
 
 
 # ── convert_schedule_to_cron ─────────────────────────────────────────
@@ -120,6 +138,36 @@ class TestEscapeSqlForPython:
 
     def test_plain(self):
         assert escape_sql_for_python("SELECT 1") == "SELECT 1"
+
+
+# ── escape_for_docstring ─────────────────────────────────────────────
+class TestEscapeForDocstring:
+    def test_plain(self):
+        assert escape_for_docstring("My Pipeline") == "My Pipeline"
+
+    def test_double_quotes_escaped(self):
+        assert escape_for_docstring('has "quote"') == 'has \\"quote\\"'
+
+    def test_backslash_escaped_before_quote(self):
+        # Backslash must be doubled first so an escaped quote is not undone.
+        assert escape_for_docstring('a\\"b') == 'a\\\\\\"b'
+
+    def test_triple_quote_cannot_terminate(self):
+        result = escape_for_docstring('x"""y')
+        assert '"""' not in result
+
+    def test_newline_preserved(self):
+        # Newlines are legal inside a triple-quoted docstring; keep them.
+        assert escape_for_docstring("line\nbreak") == "line\nbreak"
+
+    def test_none_becomes_empty_string(self):
+        # A null contract field renders blank, not the literal text "None"
+        # (matches py_str_literal's None handling). This is the single
+        # source of truth the snowflake provider's header builder reuses.
+        assert escape_for_docstring(None) == ""
+
+    def test_non_string_coerced(self):
+        assert escape_for_docstring(123) == "123"
 
 
 # ── generate_task_dependencies_code ──────────────────────────────────

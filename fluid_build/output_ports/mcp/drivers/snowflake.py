@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -55,6 +56,12 @@ from .base import (
     get_binding,
     guard_against_injection_markers,
 )
+
+# Rewrite ``:p_<index>`` (compiler form) → ``%(p_<index>)s`` (Snowflake DB-API
+# pyformat). Word-boundary anchored so ``:p_1`` is not rewritten inside
+# ``:p_10`` — a per-index ``str.replace`` loop corrupts placeholders ≥11
+# (``:p_10`` → ``%(p_1)s0``). Mirrors the postgres / athena driver pattern.
+_PARAM_REWRITE = re.compile(r":p_(\d+)\b")
 
 
 class SnowflakeDriver(EngineDriver):
@@ -131,9 +138,7 @@ class SnowflakeDriver(EngineDriver):
         timeout_seconds: Optional[float] = None,
     ) -> QueryResult:
         connection = self._get_connection()
-        rendered = sql
-        for index in range(len(params)):
-            rendered = rendered.replace(f":p_{index}", f"%(p_{index})s")
+        rendered = _PARAM_REWRITE.sub(r"%(p_\1)s", sql)
         guard_against_injection_markers(rendered)
         bound = {f"p_{index}": value for index, value in enumerate(params)}
         cursor = connection.cursor()

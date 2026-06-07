@@ -23,6 +23,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import yaml
 
+from ...providers._sql_safety import quote_string_literal, validate_ident
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref
 from ..versions import required_providers
@@ -890,22 +891,36 @@ def _emit_redshift_external_schema(
         return
     database = loc.get("database") or "fluid"
     region = loc.get("region") or ""
-    # The v2 Redshift Spectrum CREATE EXTERNAL SCHEMA syntax. ``REGION`` is
-    # required only when the Glue catalog is in a different region than the
-    # workgroup, but emitting it when supplied is always safe.
-    region_clause = f" REGION '{region}'" if region else ""
+
+    # --- Injection defenses (two independent layers) -------------------------
+    # This binding values are attacker-influenced contract content
+    # (binding.location.*) and `fluid apply`/`fluid generate iac` do NOT
+    # JSON-schema-validate them first, so both layers are load-bearing:
+    #
+    # 1. SQL layer — the schema is an identifier (validate_ident, fail-closed on
+    #    a malicious name); glue_database/iam_role/region are string literals
+    #    (quote_string_literal doubles embedded quotes). This prevents a value
+    #    like ``glue_database = "x' UNION ..."`` from breaking out of the
+    #    CREATE EXTERNAL SCHEMA SQL run against Redshift under the IAM role.
+    # 2. Shell layer — the command runs through ``local-exec`` (i.e. /bin/sh).
+    #    Every untrusted value is passed via the subprocess ``environment``
+    #    (data, never spliced into the command string) and referenced as a
+    #    double-quoted ``"$VAR"``, so the shell cannot re-parse metacharacters
+    #    (``;`` ``$(`` `` ` `` etc.). The command string is therefore STATIC.
+    schema_ident = validate_ident(external_schema)
     sql = (
-        f"CREATE EXTERNAL SCHEMA IF NOT EXISTS {external_schema} "
+        f"CREATE EXTERNAL SCHEMA IF NOT EXISTS {schema_ident} "
         f"FROM DATA CATALOG "
-        f"DATABASE '{glue_database}' "
-        f"IAM_ROLE '{iam_role_arn}'"
-        f"{region_clause};"
+        f"DATABASE {quote_string_literal(glue_database)} "
+        f"IAM_ROLE {quote_string_literal(iam_role_arn)}"
+        + (f" REGION {quote_string_literal(region)}" if region else "")
+        + ";"
     )
     cmd = (
         "aws redshift-data execute-statement "
-        f"--workgroup-name {workgroup} "
-        f"--database {database} "
-        f'--sql "{sql}"'
+        '--workgroup-name "$FLUID_REDSHIFT_WORKGROUP" '
+        '--database "$FLUID_REDSHIFT_DATABASE" '
+        '--sql "$FLUID_REDSHIFT_SQL"'
     )
     res_key = safe_ident(f"{cid}_redshift_ext_{workgroup}_{external_schema}")
     resources.setdefault("null_resource", {}).setdefault(
@@ -922,7 +937,20 @@ def _emit_redshift_external_schema(
                 "iam_role": iam_role_arn,
                 "region": region,
             },
-            "provisioner": [{"local-exec": {"command": cmd}}],
+            "provisioner": [
+                {
+                    "local-exec": {
+                        "command": cmd,
+                        # Untrusted values reach the subprocess as env vars
+                        # (data), keeping `command` a constant string.
+                        "environment": {
+                            "FLUID_REDSHIFT_WORKGROUP": workgroup,
+                            "FLUID_REDSHIFT_DATABASE": database,
+                            "FLUID_REDSHIFT_SQL": sql,
+                        },
+                    }
+                }
+            ],
         },
     )
 

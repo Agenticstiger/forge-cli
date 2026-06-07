@@ -164,11 +164,15 @@ _QUERY_SQL_SCHEMA: Dict[str, Any] = {
         "sql": {
             "type": "string",
             "description": (
-                "SELECT statement against the bound expose. Server "
-                "rewrites the table reference to the contract's binding "
-                "location and runs sql_safety.validate_sql_expression_allowlist "
-                "on the body. Refused unless the server was started "
-                "with --allow-sql."
+                "SELECT statement against the bound expose. Reference the table "
+                "by the fully-qualified name shown in describe.binding."
+                "tableReference (the server does NOT rewrite the FROM clause). "
+                "The server runs sql_safety.validate_sql_expression_allowlist on "
+                "the body, rejects references to restricted/PII columns, and — "
+                "when the contract declares row filters — wraps the statement to "
+                "enforce them (so include any row-filter column in the "
+                "projection). Refused unless the server was started with "
+                "--allow-sql."
             ),
         },
         "limit": _LIMIT_PROP,

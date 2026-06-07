@@ -19,6 +19,7 @@ Common functions for DAG/pipeline generation to reduce code duplication
 and ensure consistent behavior across AWS, GCP, and Snowflake providers.
 """
 
+import keyword
 import re
 from datetime import datetime
 from typing import Any, Dict, List
@@ -28,8 +29,13 @@ def sanitize_identifier(name: str) -> str:
     """
     Sanitize a name to be a valid Python identifier.
 
-    Converts to lowercase, replaces non-alphanumeric with underscores,
-    and removes leading digits.
+    Replaces non-alphanumeric characters with underscores and removes
+    leading digits. Used for every place a (potentially untrusted)
+    contract value becomes a *Python variable name* in generated source —
+    a hyphen/quote/newline in a ``taskId`` would otherwise produce a
+    ``SyntaxError`` at best and arbitrary code at worst. The mapping is
+    deterministic so a task definition (``<id> = Operator(...)``) and the
+    dependency wiring (``<id> >> <other>``) resolve to the same variable.
 
     Args:
         name: Original name
@@ -38,7 +44,7 @@ def sanitize_identifier(name: str) -> str:
         Valid Python identifier
     """
     # Replace non-alphanumeric with underscores
-    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", str(name))
 
     # Remove leading digits
     sanitized = re.sub(r"^[0-9]+", "", sanitized)
@@ -47,7 +53,47 @@ def sanitize_identifier(name: str) -> str:
     if not sanitized:
         sanitized = "unnamed"
 
+    # A sanitised value can land on a Python keyword (a taskId of ``class``
+    # / ``import`` would emit ``class = PythonOperator(...)`` → SyntaxError in
+    # the generated DAG). Suffix an underscore so the result is always a
+    # *non-keyword* legal identifier (``class`` → ``class_``).
+    if keyword.iskeyword(sanitized):
+        sanitized += "_"
+
+    # NOTE: this mapping is intentionally not injective — two distinct raw
+    # ids (``a-b`` and ``a.b``) collapse to the same identifier. The
+    # upstream duplicate-taskId validator (codegen_utils.validate_contract_for_export
+    # / the schedulers' dup-id checks) already rejects duplicate *raw* ids,
+    # so a collision here cannot silently merge two declared tasks.
     return sanitized
+
+
+def py_str_literal(value: Any) -> str:
+    """Return a safe Python **string-literal** for ``value`` for embedding
+    into generated source code.
+
+    Every value that originates from a (potentially untrusted)
+    ``contract.fluid.yaml`` and gets interpolated into generated Python —
+    DAG files, pipeline scripts, operator kwargs — MUST route through here
+    instead of being wrapped in hand-written quotes (``'{value}'`` /
+    ``\"\"\"{value}\"\"\"``).
+
+    ``repr()`` of a ``str`` is a fully-escaped Python literal: it picks a
+    safe quote style and escapes embedded quotes, triple-quotes, newlines
+    and backslashes, so a contract value such as
+    ``SELECT 1\"\"\"\\nimport os; os.system('…')\\nx=\"\"\"`` cannot break
+    out of the literal and inject a top-level statement that Airflow would
+    execute when it parses the generated DAG. ``None`` becomes an empty
+    string; non-strings are coerced with ``str()`` so a malicious non-string
+    value can't slip a raw object repr into the source.
+
+    Borrowed-not-built (/borrow-before-build): ``repr()`` is the canonical
+    stdlib primitive for emitting a Python literal (``ast.unparse`` is for
+    whole-tree codegen, overkill here). This centralises the pattern already
+    used by ``schedulers/airflow``'s generic-task path — the same way SQL
+    string literals are centralised through ``providers/_sql_safety.py``.
+    """
+    return repr("" if value is None else str(value))
 
 
 def convert_schedule_to_cron(schedule: str) -> str:
@@ -111,6 +157,26 @@ def convert_schedule_to_airflow(schedule: str) -> str:
     return "@daily"
 
 
+def escape_for_docstring(value: Any) -> str:
+    """Escape ``value`` for safe embedding inside a generated triple-quoted
+    Python docstring (``\"\"\"...\"\"\"``).
+
+    Escapes backslashes then double-quotes so the value can neither form a
+    closing ``\"\"\"`` delimiter nor leave a trailing line-continuation
+    backslash. Without this, a contract ``name`` containing ``\"\"\"`` followed
+    by a newline and ``import os; …`` would close the generated file's header
+    docstring and inject a top-level statement that Airflow runs at DAG-parse
+    time. Newlines are left intact (legal inside a triple-quoted string).
+
+    ``None`` becomes an empty string (a null contract field renders as
+    blank rather than the literal text ``None``) — matching ``py_str_literal``'s
+    ``None`` handling so the two codegen escapers behave consistently. This is
+    the single source of truth shared by every provider's DAG-header builder
+    (the snowflake provider's former local copy delegated here).
+    """
+    return ("" if value is None else str(value)).replace("\\", "\\\\").replace('"', '\\"')
+
+
 def generate_file_header(contract_id: str, contract_name: str, provider: str, **kwargs: Any) -> str:
     """
     Generate standardized file header with metadata.
@@ -124,11 +190,13 @@ def generate_file_header(contract_id: str, contract_name: str, provider: str, **
     Returns:
         Multi-line docstring header
     """
+    # Contract-derived values are escaped so they cannot terminate the
+    # surrounding ``\"\"\"`` docstring and inject code (see escape_for_docstring).
     lines = [
-        f"FLUID Generated Pipeline: {contract_name}",
+        f"FLUID Generated Pipeline: {escape_for_docstring(contract_name)}",
         "",
-        f"Contract ID: {contract_id}",
-        f"Provider: {provider.upper()}",
+        f"Contract ID: {escape_for_docstring(contract_id)}",
+        f"Provider: {escape_for_docstring(provider.upper())}",
     ]
 
     # Add any additional metadata
@@ -136,7 +204,7 @@ def generate_file_header(contract_id: str, contract_name: str, provider: str, **
         if value:
             # Format key for display
             display_key = key.replace("_", " ").title()
-            lines.append(f"{display_key}: {value}")
+            lines.append(f"{escape_for_docstring(display_key)}: {escape_for_docstring(value)}")
 
     lines.extend(
         [
@@ -196,11 +264,17 @@ def generate_task_dependencies_code(tasks: List[Dict[str, Any]], syntax: str = "
             continue
 
         if syntax == "airflow":
-            # Airflow: upstream >> downstream
-            if len(depends_on) == 1:
-                dep_code += f"{depends_on[0]} >> {task_id}\n"
+            # Airflow: upstream >> downstream. These are Python *variable
+            # names*, so they must be sanitised to match the identifiers the
+            # task generators emit (``sanitize_identifier(taskId) = Operator``)
+            # — otherwise an untrusted taskId / dependsOn entry could inject
+            # code as a bare identifier, and a non-identifier id would dangle.
+            safe_task = sanitize_identifier(task_id)
+            safe_deps = [sanitize_identifier(dep) for dep in depends_on]
+            if len(safe_deps) == 1:
+                dep_code += f"{safe_deps[0]} >> {safe_task}\n"
             else:
-                dep_code += f"[{', '.join(depends_on)}] >> {task_id}\n"
+                dep_code += f"[{', '.join(safe_deps)}] >> {safe_task}\n"
 
         elif syntax == "dagster":
             # Dagster: handled via op() ins parameter

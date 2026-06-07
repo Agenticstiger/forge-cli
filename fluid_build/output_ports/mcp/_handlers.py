@@ -35,7 +35,7 @@ standing up a full server. ``SessionState`` is imported only under
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Mapping
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional
 
 from ._expose_utils import _jsonable
 from .query_compiler import compile_free_form_sql, compile_semantic_query
@@ -82,7 +82,12 @@ def tool_describe(state: "SessionState") -> Dict[str, Any]:
     }
 
 
-def tool_sample(state: "SessionState", arguments: Mapping[str, Any]) -> Dict[str, Any]:
+def tool_sample(
+    state: "SessionState",
+    arguments: Mapping[str, Any],
+    *,
+    caller_attributes: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     driver = state.get_driver()
     requested = arguments.get("limit", 10)
     try:
@@ -93,10 +98,14 @@ def tool_sample(state: "SessionState", arguments: Mapping[str, Any]) -> Dict[str
     effective = min(max(limit, 1), cap)
     # Pass caller_attributes so any policy.rowFilters[] in the
     # contract resolve their ${caller.*} placeholders against
-    # the bound MCP clientInfo. Drivers that don't override
-    # sample() use the base impl, which compiles the filter
-    # into a parameterised WHERE clause.
-    result = driver.sample(limit=effective, caller_attributes=state.caller_attributes)
+    # THIS request's caller identity. The kwarg is the per-request
+    # identity threaded down from the dispatcher; it falls back to
+    # ``state.caller_attributes`` only for legacy callers that don't
+    # pass it (back-compat for existing tests + stdio). Drivers that
+    # don't override sample() use the base impl, which compiles the
+    # filter into a parameterised WHERE clause.
+    attrs = caller_attributes if caller_attributes is not None else state.caller_attributes
+    result = driver.sample(limit=effective, caller_attributes=attrs)
     return {
         "exposeId": state.expose.get("exposeId"),
         "columns": list(result.columns),
@@ -128,10 +137,16 @@ def _resolve_limit(requested: Any, *, cap: int) -> int:
     return min(max(value, 1), cap)
 
 
-def tool_query(state: "SessionState", arguments: Mapping[str, Any]) -> Dict[str, Any]:
+def tool_query(
+    state: "SessionState",
+    arguments: Mapping[str, Any],
+    *,
+    caller_attributes: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     driver = state.get_driver()
     descriptor = driver.descriptor()
     args = dict(arguments)
+    attrs = caller_attributes if caller_attributes is not None else state.caller_attributes
     # compile_semantic_query takes the individual semantic fields +
     # a driver-built ``table_reference`` — NOT an ``arguments`` dict or
     # a ``descriptor``. (Calling it with those was a long-standing bug
@@ -144,16 +159,31 @@ def tool_query(state: "SessionState", arguments: Mapping[str, Any]) -> Dict[str,
         dimensions=args.get("dimensions"),
         filters=args.get("filters"),
         limit=_resolve_limit(args.get("limit"), cap=state.policy.max_sample_rows),
+        # Enforce policy.rowFilters[] on the query tool (was bypassed — only
+        # sample applied them); merged into the compiled WHERE. ``attrs`` is
+        # this request's caller identity (falls back to state for legacy
+        # callers that don't pass the kwarg).
+        caller_attributes=attrs,
         table_reference=descriptor.table_reference,
+        # Pass the engine dialect so a merged rowFilter column is quoted for
+        # THIS engine — backticks on BigQuery (ANSI double-quotes there read
+        # as a string literal → predicate always false → zero rows).
+        dialect=descriptor.dialect,
     )
     result = driver.query(compiled=compiled, timeout_seconds=state.query_timeout_seconds)
     return _serialize_query_result(state.expose, compiled, result)
 
 
-def tool_query_sql(state: "SessionState", arguments: Mapping[str, Any]) -> Dict[str, Any]:
+def tool_query_sql(
+    state: "SessionState",
+    arguments: Mapping[str, Any],
+    *,
+    caller_attributes: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     driver = state.get_driver()
     descriptor = driver.descriptor()
     args = dict(arguments)
+    attrs = caller_attributes if caller_attributes is not None else state.caller_attributes
     # Block free-form SQL from referencing EITHER a column-restricted
     # OR a PII-marked column. Both are masked/redacted by the driver's
     # row-level ``project()``, but that step matches by output column
@@ -172,6 +202,15 @@ def tool_query_sql(state: "SessionState", arguments: Mapping[str, Any]) -> Dict[
         table_reference=descriptor.table_reference,
         limit=_resolve_limit(args.get("limit"), cap=state.policy.max_sample_rows),
         restricted_columns=restricted,
+        # Enforce policy.rowFilters[] on the free-form query_sql tool. RLS
+        # can't be safely applied to arbitrary caller SQL (a spoofable filter
+        # column in the caller's projection), so the compiler FAILS CLOSED:
+        # when the expose declares rowFilters it raises QueryValidationError
+        # steering the caller to the semantic ``query`` tool instead of
+        # wrapping. ``attrs`` is this request's caller identity (falls back to
+        # state for legacy callers that don't pass the kwarg).
+        expose=state.expose,
+        caller_attributes=attrs,
     )
     result = driver.query(compiled=compiled, timeout_seconds=state.query_timeout_seconds)
     return _serialize_query_result(state.expose, compiled, result)

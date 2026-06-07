@@ -31,6 +31,7 @@ import hashlib
 import hmac
 import logging
 import os
+import secrets
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -53,24 +54,38 @@ def _resolve_default_key() -> bytes:
 
     A missing key is a configuration error in production but, since this
     hook may run in dev / CI without a vault, we fall back to a *warning*
-    + a process-stable derived key tied to the Python process id. This
-    keeps determinism within a single run while making cross-run rainbow
-    tables ineffective. Production callers must set ``FLUID_PII_TOKENIZATION_KEY``.
+    + an **ephemeral, cryptographically-random** key
+    (``secrets.token_bytes(32)``). The key lives only for the lifetime of
+    this ``_resolve_default_key()`` call, so tokens are deterministic
+    within a single hook instance (the key is captured once in
+    ``__post_init__``) but **unlinkable across runs** — there is no
+    stable secret to derive a rainbow table against.
+
+    This deliberately replaces the previous PID-derived fallback
+    (``sha256("fluid-pid-<pid>")``): the keyspace was the PID space
+    (typically < 2**22 on Linux / macOS), which is trivially
+    brute-forceable, and — contrary to the old docstring — no
+    process-start-time was ever mixed in, so it was NOT a rainbow-table
+    defence.
+
+    The fallback is intentionally **not** stable across runs. Callers
+    that need cross-run stable tokens (joins / dedup against previously
+    tokenized data) MUST set ``FLUID_PII_TOKENIZATION_KEY`` (or pass
+    ``hmac_key=...``); do not rely on the fallback for stability.
     """
     raw = os.environ.get(_TOKEN_KEY_ENV)
     if raw:
         return raw.encode("utf-8")
-    # Process-stable but unique-per-run fallback: derive from PID + process
-    # start time. Any test or single-run job stays deterministic; a fresh
-    # process gets a fresh key, defeating rainbow tables.
+    # Ephemeral, cryptographically-random per-resolution fallback. A fresh
+    # call gets a fresh 256-bit key, so tokens cannot be linked across runs
+    # and there is no low-entropy secret to brute-force.
     LOG.warning(
-        "tokenize_pii: %s not set; using a per-process derived key. "
-        "Set this env var (or pass hmac_key=...) to make tokens stable across runs "
-        "for joins / dedup.",
+        "tokenize_pii: %s not set; using an ephemeral random key. "
+        "Tokens will NOT be stable across runs — set this env var (or pass "
+        "hmac_key=...) to make tokens stable for joins / dedup.",
         _TOKEN_KEY_ENV,
     )
-    seed = f"fluid-pid-{os.getpid()}".encode("utf-8")
-    return hashlib.sha256(seed).digest()
+    return secrets.token_bytes(32)
 
 
 @dataclass

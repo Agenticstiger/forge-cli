@@ -22,6 +22,16 @@ from typing import Any, Dict, List
 
 from fluid_build.api.hooks import HookResult
 
+# A ``regex`` gate's ``pattern`` comes from the (attacker-influenceable)
+# contract, and Python's ``re`` has no match timeout — an adversarial pattern
+# applied to a large value can backtrack catastrophically (ReDoS). Bound both
+# the pattern and the scanned value so the match cost stays linear-ish. (This
+# hook is currently latent — not wired into a live chain — but if a live path
+# is added it should prefer a linear-time engine, as the DuckDB path's
+# ``regexp_matches`` already does.)
+_MAX_REGEX_PATTERN = 1024
+_MAX_REGEX_INPUT = 65536
+
 
 @dataclass
 class QualityGateHook:
@@ -68,7 +78,15 @@ def _check(record: Dict[str, Any], gate: Dict[str, Any]) -> bool:
         v = record.get(col)
         if v is None:
             return True
-        return bool(re.match(pat, str(v)))
+        sval = str(v)
+        # ReDoS guard: reject oversized pattern/value rather than feed an
+        # unbounded backtracking match (see the module-level note).
+        if len(pat) > _MAX_REGEX_PATTERN or len(sval) > _MAX_REGEX_INPUT:
+            return False
+        try:
+            return bool(re.match(pat, sval))
+        except re.error:
+            return False
     if rule == "range":
         col = gate.get("column")
         v = record.get(col)

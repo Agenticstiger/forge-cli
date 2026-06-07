@@ -65,11 +65,13 @@ pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 ANTHROPIC_MODEL = "anthropic/claude-haiku-4-5-20251001"
 OPENAI_MODEL = "openai/gpt-4o-mini"
+GEMINI_MODEL = "gemini/gemini-2.5-flash"
 
 # What the gateway expects in agentPolicy.allowedModels — the bare
 # model name without the litellm provider prefix.
 ANTHROPIC_BARE = "claude-haiku-4-5-20251001"
 OPENAI_BARE = "gpt-4o-mini"
+GEMINI_BARE = "gemini-2.5-flash"
 
 # Cost cap per scenario (dollars). Asserts below the per-run cap so
 # a runaway loop can't burn money.
@@ -86,7 +88,9 @@ def _resolve_provider() -> Tuple[str, str]:
         return ANTHROPIC_MODEL, ANTHROPIC_BARE
     if os.environ.get("OPENAI_API_KEY"):
         return OPENAI_MODEL, OPENAI_BARE
-    pytest.skip("no LLM API key in env; set ANTHROPIC_API_KEY or OPENAI_API_KEY")
+    if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+        return GEMINI_MODEL, GEMINI_BARE
+    pytest.skip("no LLM API key in env; set ANTHROPIC_API_KEY, OPENAI_API_KEY or GEMINI_API_KEY")
 
 
 def _enforce_cost_cap(response_obj: Any) -> float:
@@ -143,14 +147,21 @@ async def _running_gateway(
         cli_denied_use_cases=cli_denied_use_cases,
     )
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
+
+    # Declare identity via the real ``clientInfo`` at initialize — it is
+    # resolved PER REQUEST from the SDK's request_context
+    # (``_resolve_request_identity``), never cached on the shared
+    # SessionState (the cross-client identity bleed this fix removed; see
+    # tests/output_ports/test_identity_isolation.py).
+    client_info_kwargs: Dict[str, Any] = {"name": "fluid-live-llm-test", "version": "0.1.0"}
     if bound_model_id is not None:
-        server.state.model_id = bound_model_id
+        client_info_kwargs["model"] = bound_model_id
     if bound_use_case is not None:
-        server.state.use_case = bound_use_case
+        client_info_kwargs["useCase"] = bound_use_case
 
     async with create_connected_server_and_client_session(
         server.server,
-        client_info=Implementation(name="fluid-live-llm-test", version="0.1.0"),
+        client_info=Implementation(**client_info_kwargs),
     ) as client:
         yield client
 

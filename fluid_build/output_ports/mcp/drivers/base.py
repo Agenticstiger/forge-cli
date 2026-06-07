@@ -43,37 +43,14 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..query_compiler import CompiledQuery
 
-
-class RowFilterIdentityMissing(RuntimeError):
-    """Raised when a ``rowFilters[]`` entry references a caller
-    attribute that is not present (fail-closed deny so the gateway
-    never serves rows under an undefined identity)."""
-
-
-_CALLER_PLACEHOLDER = re.compile(r"\$\{caller\.([A-Za-z_][A-Za-z0-9_]*)\}")
-
-
-def _resolve_caller_placeholder(value: Any, caller_attributes: Mapping[str, Any]) -> Any:
-    """Replace ``${caller.<attr>}`` tokens in ``value`` with values
-    from ``caller_attributes``. Lists / tuples recurse; scalars
-    that aren't strings pass through unchanged. Raises
-    :class:`RowFilterIdentityMissing` when an attribute is absent
-    so a misconfigured contract can never accidentally widen access.
-    """
-    if isinstance(value, str):
-        match = _CALLER_PLACEHOLDER.fullmatch(value)
-        if match is None:
-            return value
-        attr = match.group(1)
-        if attr not in caller_attributes:
-            raise RowFilterIdentityMissing(
-                f"rowFilter references caller.{attr} but caller_attributes "
-                f"only carry: {sorted(caller_attributes)}"
-            )
-        return caller_attributes[attr]
-    if isinstance(value, (list, tuple)):
-        return [_resolve_caller_placeholder(v, caller_attributes) for v in value]
-    return value
+# Row-level-security primitives live in query_compiler (the lower layer that
+# also compiles the semantic ``query`` / free-form ``query_sql`` WHERE) so a
+# single offset-aware builder enforces ``policy.rowFilters[]`` on EVERY read
+# path — ``sample`` here, plus ``query`` / ``query_sql`` at compile time.
+# Imported (and thus re-exported from this module) so ``sample`` and existing
+# ``from ...drivers.base import RowFilterIdentityMissing`` call sites are
+# unchanged.
+from ..query_compiler import RowFilterIdentityMissing, compile_row_filter_clauses
 
 
 class UnsupportedBindingError(RuntimeError):
@@ -377,6 +354,7 @@ class EngineDriver(ABC):
         expose: Mapping[str, Any],
         *,
         caller_attributes: Mapping[str, Any],
+        dialect: Optional[str] = None,
     ) -> tuple[str, list[Any]]:
         """Compile ``expose.policy.rowFilters[]`` into a parameterised
         SQL ``WHERE`` predicate the driver appends to ``sample`` /
@@ -401,42 +379,27 @@ class EngineDriver(ABC):
         deny by raising ``RowFilterIdentityMissing``: the gateway
         prefers no rows to wrong rows.
 
+        ``dialect`` is the driver's dialect token
+        (``descriptor().dialect``); it selects the identifier-quoting
+        style for the filter column (backticks on BigQuery, ANSI
+        double-quotes elsewhere). BigQuery reads ANSI double-quotes as
+        a STRING LITERAL, so without this the predicate compiles to
+        ``WHERE 'tenant_id' = <val>`` — always false → a row-filtered
+        BigQuery ``sample`` returns ZERO rows. ``None`` keeps the ANSI
+        form for back-compat.
+
         Returns ``("WHERE <pred>", [param, ...])`` (empty string +
         empty list when no filters configured). The driver appends
         the WHERE clause to its FROM and binds the params in its
         normal placeholder rewrite.
         """
-        policy = expose.get("policy") or {}
-        filters = policy.get("rowFilters") or []
-        if not filters:
-            return "", []
-        clauses: list[str] = []
-        params: list[Any] = []
-        for entry in filters:
-            if not isinstance(entry, Mapping):
-                continue
-            column_raw = entry.get("column")
-            if not isinstance(column_raw, str) or not column_raw:
-                continue
-            from fluid_build.providers._sql_safety import validate_ident
-
-            column = validate_ident(column_raw)
-            if "equals" in entry:
-                value = _resolve_caller_placeholder(entry["equals"], caller_attributes)
-                clauses.append(f'"{column}" = :p_{len(params)}')
-                params.append(value)
-            elif "in" in entry:
-                raw_list = _resolve_caller_placeholder(entry["in"], caller_attributes)
-                if not isinstance(raw_list, (list, tuple)) or not raw_list:
-                    raise RowFilterIdentityMissing(
-                        f"row filter on column={column!r} expects a non-empty "
-                        "list (got empty / non-list value); fail-closed deny."
-                    )
-                placeholders = ", ".join(f":p_{len(params) + i}" for i in range(len(raw_list)))
-                clauses.append(f'"{column}" IN ({placeholders})')
-                params.extend(raw_list)
-            else:
-                continue  # unknown operator — silently skip
+        # Delegates to the shared, offset-aware builder in query_compiler so
+        # sample / query / query_sql all enforce identical row filters. sample
+        # builds its own ``SELECT * FROM <table>`` so it owns placeholder index
+        # 0 (offset=0) and just needs the leading WHERE.
+        clauses, params = compile_row_filter_clauses(
+            expose, caller_attributes, offset=0, dialect=dialect
+        )
         if not clauses:
             return "", []
         return " WHERE " + " AND ".join(clauses), params
@@ -466,10 +429,23 @@ class EngineDriver(ABC):
             raise ValueError("limit must be an integer in [1, 1_000_000]")
         descriptor = self.descriptor()
         where_clause, where_params = self.compile_row_filter_predicate(
-            self.expose, caller_attributes=caller_attributes or {}
+            self.expose,
+            caller_attributes=caller_attributes or {},
+            dialect=descriptor.dialect,
         )
         sql = f"SELECT * FROM {descriptor.table_reference}{where_clause} LIMIT {limit}"
-        result = self.execute(sql=sql, params=tuple(where_params))
+        # The row-filter WHERE carries portable ``:p_<index>`` placeholders; render
+        # them to the driver's native form BEFORE execute (the ``query`` path renders
+        # via CompiledQuery, but ``sample`` built the SQL by hand and previously
+        # skipped this — so sample+rowFilters raised a parser error on every real
+        # engine, e.g. DuckDB ``syntax error at ":"``). A no-rowFilters sample has no
+        # placeholders, so this is a no-op there.
+        from ..query_compiler import CompiledQuery
+
+        rendered = CompiledQuery(sql=sql, params=list(where_params)).render_sql_for_dialect(
+            descriptor.dialect
+        )
+        result = self.execute(sql=rendered, params=tuple(where_params))
         visible_columns, rows = self.project(result.rows, columns=result.columns)
         truncated = len(rows) >= limit
         return SampleResult(columns=visible_columns, rows=rows, truncated=truncated)

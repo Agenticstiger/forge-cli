@@ -23,11 +23,10 @@ JSON, and DuckDB tables).
 from __future__ import annotations
 
 import logging
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fluid_build.providers._sql_safety import quote_string_literal
+from fluid_build.providers._sql_safety import quote_string_literal, validate_ident
 from fluid_build.providers.quality_engine import (
     execute_quality_checks,
     quality_results_to_issues,
@@ -43,15 +42,21 @@ from fluid_build.providers.validation_provider import (
 
 LOG = logging.getLogger("fluid.providers.local_validation")
 
-# Regex for safe SQL identifiers
-_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+def _build_duckdb_table_ref(schema_name: str, table_name: str) -> str:
+    """Build a quoted ``"schema"."table"`` reference for a DuckDB-native table.
 
-def _validate_ident(name: str) -> str:
-    """Validate a SQL identifier to prevent injection."""
-    if not _SAFE_IDENT.match(name):
-        raise ValueError(f"Invalid SQL identifier: {name!r}")
-    return name
+    Both identifiers are routed through the central
+    :func:`~fluid_build.providers._sql_safety.validate_ident` allowlist
+    (alphanumeric + underscore, must start with a letter/underscore) so a
+    contract cannot smuggle SQL through ``binding.location.{schema,table}``.
+    A malicious value such as a double-quote-bearing table name (which would
+    otherwise close the identifier quote and let ``ATTACH``/``COPY ... TO``
+    statements run) raises :class:`ValueError` before any query is built —
+    fail-closed, mirroring the parquet/csv branches that route the file path
+    through :func:`quote_string_literal`.
+    """
+    return f'"{validate_ident(schema_name)}"."{validate_ident(table_name)}"'
 
 
 class LocalValidationProvider(ValidationProvider):
@@ -147,9 +152,11 @@ class LocalValidationProvider(ValidationProvider):
                     if not table_name:
                         LOG.warning("DuckDB binding: no table specified in location")
                         return None
+                    # Validate identifiers BEFORE opening the on-disk DB so a
+                    # malicious schema/table never reaches a query (fail-closed).
+                    table_ref = _build_duckdb_table_ref(schema_name, table_name)
                     conn.close()
                     conn = duckdb.connect(abs_path, read_only=True)
-                    table_ref = f'"{schema_name}"."{table_name}"'
                     describe_sql = f"DESCRIBE SELECT * FROM {table_ref}"
                     rows = conn.execute(describe_sql).fetchall()
                     fields: List[FieldSchema] = []
@@ -161,6 +168,7 @@ class LocalValidationProvider(ValidationProvider):
                     conn.close()
                     return ResourceSchema(
                         resource_type=ResourceType.TABLE,
+                        fully_qualified_name=table_ref,
                         fields=fields,
                         row_count=row_count,
                         size_bytes=size_bytes,
@@ -391,8 +399,26 @@ class LocalValidationProvider(ValidationProvider):
                         path="contract.dq.rules",
                     )
                 ]
+            # Validate identifiers BEFORE opening the on-disk DB so a malicious
+            # schema/table never reaches a query (fail-closed, mirroring the
+            # parquet/csv branches that route the path through
+            # ``quote_string_literal``).
+            try:
+                table_ref = _build_duckdb_table_ref(schema_name, table_name)
+            except ValueError as exc:
+                LOG.warning("local_validation.invalid_duckdb_identifier err=%s", exc)
+                return [
+                    ValidationIssue(
+                        severity="error",
+                        category="quality",
+                        message=(
+                            "DuckDB binding has an invalid location.schema/location.table "
+                            "identifier — refusing to run quality checks"
+                        ),
+                        path="exposes[].binding.location",
+                    )
+                ]
             conn = duckdb.connect(abs_path, read_only=True)
-            table_ref = f'"{schema_name}"."{table_name}"'
             try:
 
                 def _exec(sql):

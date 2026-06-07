@@ -19,11 +19,13 @@ Implements the ValidationProvider interface for validating FLUID contracts
 against actual BigQuery resources.
 """
 
+import re
 from typing import Any, Dict, List, Optional
 
 from google.api_core import exceptions as google_exceptions
 from google.cloud import bigquery
 
+from fluid_build.providers._sql_safety import validate_ident
 from fluid_build.providers.quality_engine import (
     execute_quality_checks,
     quality_results_to_issues,
@@ -36,6 +38,49 @@ from fluid_build.providers.validation_provider import (
     ValidationProvider,
     ValidationResult,
 )
+
+# GCP project ids allow hyphens (which ``validate_ident`` rejects), so they
+# need a dedicated allowlist: 6–30 chars, lowercase-or-mixed letter start,
+# letters/digits/hyphens in the middle, and a letter/digit terminator.
+# See https://cloud.google.com/resource-manager/docs/creating-managing-projects.
+_BQ_PROJECT_ID = re.compile(r"^[A-Za-z][A-Za-z0-9-]{4,28}[A-Za-z0-9]$")
+
+
+def _quote_bq_project(project: str) -> str:
+    """Validate a BigQuery project id and return it backtick-quoted.
+
+    Raises ``ValueError`` (fail-closed) on anything outside the GCP
+    project-id allowlist so a malicious ``project`` can never reach SQL.
+    """
+    if not isinstance(project, str) or not _BQ_PROJECT_ID.match(project):
+        raise ValueError(f"Invalid BigQuery project id: {project!r}")
+    return f"`{project}`"
+
+
+def _build_bq_table_ref(fqn: str, default_project: Optional[str]) -> str:
+    """Build a per-part backtick-quoted ``project.dataset.table`` reference.
+
+    The FQN is split on ``.`` and each component is validated independently
+    (project via :data:`_BQ_PROJECT_ID`, dataset/table via
+    :func:`validate_ident`) then quoted individually — ```project`.`dataset`.`table```
+    — so a backtick smuggled into any single part can never break out of its
+    own quote pair. Raises ``ValueError`` (fail-closed) on a malformed FQN.
+    """
+    parts = fqn.split(".")
+    if len(parts) == 2:
+        if default_project is None:
+            raise ValueError(f"Cannot resolve project for BigQuery table reference: {fqn!r}")
+        project, dataset, table = default_project, parts[0], parts[1]
+    elif len(parts) == 3:
+        project, dataset, table = parts[0], parts[1], parts[2]
+    else:
+        raise ValueError(f"Invalid BigQuery table reference: {fqn!r}")
+
+    return (
+        f"{_quote_bq_project(project)}."
+        f"`{validate_ident(dataset)}`."
+        f"`{validate_ident(table)}`"
+    )
 
 
 class BigQueryValidationProvider(ValidationProvider):
@@ -329,8 +374,23 @@ class BigQueryValidationProvider(ValidationProvider):
                     path="contract.dq.rules",
                 )
             ]
-        # BigQuery FQN uses backtick quoting: `project.dataset.table`
-        table_ref = f"`{fqn}`"
+        # Validate + per-part backtick-quote the FQN before it reaches SQL.
+        # ``_build_bq_table_ref`` fails closed on a malicious project/dataset/
+        # table so no query is ever issued against an unsafe reference.
+        try:
+            table_ref = _build_bq_table_ref(fqn, self.project_id)
+        except ValueError:
+            return [
+                ValidationIssue(
+                    severity="error",
+                    category="quality",
+                    message=(
+                        "Cannot run quality checks: table reference failed "
+                        "identifier validation (refusing to execute query)"
+                    ),
+                    path="exposes[].binding.resource",
+                )
+            ]
 
         def _exec(sql):
             rows = self.client.query(sql).result()

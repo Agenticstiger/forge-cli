@@ -433,6 +433,32 @@ def run_builds_from_args(
         LOG.warning("No builds defined in contract")
         return 0
 
+    # ── Identifier guard (fail CLOSED) ───────────────────────────────────
+    # This is the single runtime chokepoint for ``fluid apply --mode
+    # amend-and-build``, which loads a contract WITHOUT jsonschema
+    # validation. ``contract['id']`` and each ``build['id']`` flow into
+    # ``RunContext.product_id`` / ``build_id`` (``_acquisition_common``)
+    # and then into ``FileStateStore._build_dir`` (``_state``), which
+    # joins them as ``<root>/runs/<product_id>/<build_id>`` with
+    # ``parents=True`` and (historically) no sanitisation — so an
+    # ``id`` like ``../../../../tmp/escape`` would write JSON OUTSIDE the
+    # workspace. Validate every id here, BEFORE any runner runs and BEFORE
+    # any state-store path is created, so a malicious contract is rejected
+    # rather than traversing the filesystem. The parallel pipeline
+    # (``cli/_acquisition_stage_ext``) already validates the same fields;
+    # this closes the one-sided-guard gap on the runtime path.
+    from ._ids import validate_identifier
+
+    # Only non-empty ids are checked: an absent/empty id cannot traverse
+    # (``_build_dir`` falls back to a safe "product" default and
+    # ``FileStateStore._confine()`` is the backstop), while a non-empty id
+    # like ``../../../../tmp/escape`` is rejected here before any path is made.
+    if contract.get("id"):
+        validate_identifier(contract["id"], kind="contract.id")
+    for _b in builds:
+        if _b.get("id"):
+            validate_identifier(_b["id"], kind="build.id")
+
     # Filter builds if specific ID requested
     if args.build_id:
         builds = [b for b in builds if b.get("id") == args.build_id]

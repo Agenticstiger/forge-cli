@@ -103,7 +103,6 @@ def _save_ai_config(
     on disk.
     """
     import json
-    import stat
 
     # Resolve ``_save_key_to_keyring`` via the canonical
     # ``cli.ai_setup`` namespace so test patches on
@@ -111,6 +110,7 @@ def _save_ai_config(
     # to this caller (matches the pattern used in
     # ``_init_interactive_helpers`` etc.).
     from fluid_build.cli import ai_setup as _as
+    from fluid_build.credentials.encrypted_store import _atomic_write_bytes
 
     save_key_fn = getattr(_as, "_save_key_to_keyring", _save_key_to_keyring)
 
@@ -130,9 +130,16 @@ def _save_ai_config(
             data["endpoint"] = endpoint
         if ollama_host:
             data["ollama_host"] = ollama_host
-        _config_file().write_text(json.dumps(data, indent=2), encoding="utf-8")
-        # Owner-only read/write — protect the API key
-        _config_file().chmod(stat.S_IRUSR | stat.S_IWUSR)
+        # Owner-only read/write from the start — the previous
+        # ``write_text`` then ``chmod`` left the (potentially
+        # api_key-bearing) JSON on disk at the umask default until the
+        # chmod landed. ``_atomic_write_bytes`` opens the file 0o600,
+        # so there is no world-readable window.
+        _atomic_write_bytes(
+            _config_file(),
+            json.dumps(data, indent=2).encode("utf-8"),
+            mode=0o600,
+        )
         LOG.debug("Saved AI config to %s (mode 600)", _config_file())
         return True
     except OSError as exc:

@@ -274,12 +274,72 @@ class SecretManager:
         """
         Get secret from local file.
 
-        Expects file at: ~/.fluid/secrets/<secret_name>
+        Expects file at: ``~/.fluid/secrets/<secret_name>``
+
+        SECURITY (path traversal / arbitrary-file-read): ``secret_name``
+        is attacker-influenced — it arrives from a contract ``secretRef``
+        of the form ``file://<identifier>`` (see
+        ``build_runners/_acquisition_common.py::resolve_secret_ref``). A
+        naive ``secrets_dir / secret_name`` is unsafe because pathlib
+        DISCARDS the left operand when the right is absolute
+        (``Path("/a") / "/etc/passwd" == Path("/etc/passwd")``), and a
+        relative ``../../x`` walks out of the secrets dir. We therefore:
+
+        1. Reject names that are absolute or contain ``..`` / any path
+           separator BEFORE joining (cheap, fails fast on the obvious
+           payloads — including the pathlib absolute-RHS footgun).
+        2. Resolve the candidate and re-confirm it stays under the
+           resolved secrets dir via ``relative_to`` (defence in depth
+           against symlinks / normalisation surprises).
+
+        Fails CLOSED: any escape raises ``ConfigurationError`` rather
+        than reading the out-of-bounds file. A genuinely-missing
+        in-bounds secret still returns ``None``.
         """
-        from pathlib import Path
+        from pathlib import Path, PurePosixPath
 
         secrets_dir = Path.home() / ".fluid" / "secrets"
-        secret_file = secrets_dir / secret_name
+
+        # (1) Pre-join rejection. ``os.sep``/``os.altsep`` cover the
+        # platform separators; we also explicitly reject ``/`` and ``\``
+        # so a Windows-style payload is caught on POSIX and vice-versa.
+        # ``PurePosixPath(secret_name).is_absolute()`` catches a leading
+        # ``/``; ``os.path.isabs`` catches a drive-letter form on Windows.
+        name = secret_name or ""
+        bad_separators = {"/", "\\", os.sep}
+        if os.altsep:
+            bad_separators.add(os.altsep)
+        if (
+            not name
+            or name in (".", "..")
+            or ".." in name.replace("\\", "/").split("/")
+            or any(sep in name for sep in bad_separators)
+            or os.path.isabs(name)
+            or PurePosixPath(name).is_absolute()
+        ):
+            raise ConfigurationError(
+                "Invalid secret name for file-backed secret store",
+                context={"source": self.config.source.value},
+                suggestions=[
+                    "Secret names must be a single path component with no "
+                    "'/', '\\', or '..' and must not be absolute",
+                ],
+            )
+
+        base = secrets_dir.resolve()
+        secret_file = (secrets_dir / name).resolve()
+
+        # (2) Post-resolve confinement. Fail closed on any escape.
+        try:
+            secret_file.relative_to(base)
+        except ValueError as exc:
+            raise ConfigurationError(
+                "Refusing to read secret outside the secrets directory",
+                context={"source": self.config.source.value},
+                suggestions=[
+                    "Secret names must resolve to a file under ~/.fluid/secrets",
+                ],
+            ) from exc
 
         if not secret_file.exists():
             return None

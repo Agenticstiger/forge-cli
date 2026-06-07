@@ -29,6 +29,18 @@ import pytest
 # os.environ is visible to module-level helpers.
 LIVE_LLM_MODULE = "tests.integration.test_mcp_output_port_live_llm"
 
+# Every provider key _resolve_provider() consults. Cleared before each test so
+# resolution is deterministic regardless of the developer's ambient env (a real
+# GEMINI_API_KEY / GOOGLE_API_KEY in the shell otherwise leaks into the
+# no-keys / single-provider cases).
+_PROVIDER_KEYS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+
+
+@pytest.fixture(autouse=True)
+def _clear_provider_keys(monkeypatch: pytest.MonkeyPatch):
+    for key in _PROVIDER_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
 
 def _fresh_module():
     if LIVE_LLM_MODULE in sys.modules:
@@ -57,11 +69,20 @@ def test_openai_fallback_when_only_openai_key_present(monkeypatch: pytest.Monkey
     assert bare == "gpt-4o-mini"
 
 
+def test_gemini_fallback_when_only_gemini_key_present(monkeypatch: pytest.MonkeyPatch):
+    """Gemini is the third provider (after Anthropic + OpenAI) — set when the
+    project's ai_config uses gemini-2.5-flash and only GEMINI_API_KEY is present."""
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-fake-for-test")
+    mod = _fresh_module()
+    model, bare = mod._resolve_provider()
+    assert model == "gemini/gemini-2.5-flash"
+    assert bare == "gemini-2.5-flash"
+
+
 def test_skip_when_no_keys_present(monkeypatch: pytest.MonkeyPatch):
     """Production CI without any LLM secrets must SKIP, not FAIL.
-    pytest.skip raises pytest.skip.Exception under the hood."""
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    pytest.skip raises pytest.skip.Exception under the hood. The autouse
+    fixture has cleared every provider key (incl. GEMINI/GOOGLE)."""
     mod = _fresh_module()
     with pytest.raises(pytest.skip.Exception):
         mod._resolve_provider()

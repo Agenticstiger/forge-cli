@@ -280,12 +280,18 @@ def _validate_against_schema(
         ]
 
     # Parse YAML or JSON depending on extension.
+    # SECURITY (billion-laughs DoS): generated/vendored artifacts are
+    # untrusted content — route YAML through ``load_yaml_safe`` (50-alias +
+    # 5 MiB caps) instead of bare ``yaml.safe_load`` so a hostile anchor-
+    # expansion payload can't OOM the artifact validator.
+    from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
+
     try:
         if artifact_path.endswith(".json"):
             doc = json.loads(content.decode("utf-8"))
         else:
-            doc = yaml.safe_load(content)
-    except (yaml.YAMLError, json.JSONDecodeError) as exc:
+            doc = load_yaml_safe(content)
+    except (yaml.YAMLError, json.JSONDecodeError, UnsafeYamlError) as exc:
         return [
             ValidationIssue(
                 file=artifact_path,

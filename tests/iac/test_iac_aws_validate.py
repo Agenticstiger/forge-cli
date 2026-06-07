@@ -218,16 +218,21 @@ def test_redshift_serverless_contract_validates(tofu_binary, tofu_env, tmp_path)
 
 def test_redshift_external_schema_contract_validates(tofu_binary, tofu_env, tmp_path):
     """The ``null_resource`` bridge compiles to a module the ``hashicorp/null``
-    provider accepts; the embedded ``CREATE EXTERNAL SCHEMA`` SQL is a string."""
+    provider accepts. The ``CREATE EXTERNAL SCHEMA`` SQL and the workgroup /
+    database are passed via the local-exec ``environment`` (data, never spliced
+    into the shell command) — see the injection fix in
+    ``_emit_redshift_external_schema``; the ``command`` itself is a static
+    template referencing ``"$FLUID_REDSHIFT_*"`` env vars."""
     text = build_module(_plugin(), _REDSHIFT_EXTERNAL_SCHEMA_CONTRACT)
     (tmp_path / "main.tf.json").write_text(text, encoding="utf-8")
     _init_and_validate(tmp_path, tofu_env)
 
     resources = json.loads(text)["resource"]
     assert "null_resource" in resources
-    cmd = next(iter(resources["null_resource"].values()))["provisioner"][0]["local-exec"]["command"]
-    assert "CREATE EXTERNAL SCHEMA" in cmd
-    assert "FROM DATA CATALOG" in cmd
+    local_exec = next(iter(resources["null_resource"].values()))["provisioner"][0]["local-exec"]
+    sql = local_exec["environment"]["FLUID_REDSHIFT_SQL"]
+    assert "CREATE EXTERNAL SCHEMA" in sql
+    assert "FROM DATA CATALOG" in sql
 
 
 def test_mesh_dual_port_contract_validates(tofu_binary, tofu_env, tmp_path):

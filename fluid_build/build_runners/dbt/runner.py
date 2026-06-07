@@ -210,14 +210,51 @@ def _configured_dbt_command_prefix() -> Optional[List[str]]:
     return parts
 
 
+def _is_flaglike_selector(value: str) -> bool:
+    """True when a selector value would be parsed by dbt as its own flag.
+
+    A ``--select`` value is spread as a standalone argv element, so a value
+    like ``--full-refresh`` or ``--target`` (or the short ``-x`` form) would
+    be consumed by dbt's own arg parser as a flag rather than treated as a
+    node selector — an argument-injection vector. We treat any value whose
+    first non-space character is ``-`` as flag-like and drop it.
+    """
+    return value.strip().startswith("-")
+
+
 def _normalize_selectors(raw: Any) -> List[str]:
+    """Normalize ``properties.select`` / ``properties.models`` into a clean
+    list of dbt node selectors.
+
+    Flag-like values (those starting with ``-``) are dropped with a warning so
+    a contract cannot inject dbt flags (e.g. ``--full-refresh``, ``--target``)
+    through a selector field. This mirrors the existing guards in
+    :func:`build_dbt_command`: ``--target`` is allowlisted against the
+    profile's real targets and ``--vars`` is neutralized via ``json.dumps``;
+    ``--select`` was the asymmetry. Fail-closed: the malicious token never
+    reaches the subprocess argv.
+    """
     if raw is None:
-        return []
-    if isinstance(raw, str):
-        return [raw]
-    if isinstance(raw, list):
-        return [str(item) for item in raw if str(item).strip()]
-    return [str(raw)]
+        items: List[str] = []
+    elif isinstance(raw, str):
+        items = [raw]
+    elif isinstance(raw, list):
+        items = [str(item) for item in raw if str(item).strip()]
+    else:
+        items = [str(raw)]
+
+    cleaned: List[str] = []
+    for item in items:
+        if _is_flaglike_selector(item):
+            LOG.warning(
+                "dbt.selector.rejected reason=flag-like-value value=%r "
+                "(a --select value starting with '-' would be parsed by dbt "
+                "as a flag; dropping it)",
+                item,
+            )
+            continue
+        cleaned.append(item)
+    return cleaned
 
 
 def _infer_dbt_adapter(build: Dict[str, Any]) -> Optional[str]:

@@ -41,6 +41,7 @@ maintained protocol implementation.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -434,14 +435,16 @@ class OutputPortMcpServer:
         async def _call_tool(
             name: str, arguments: Dict[str, Any]
         ) -> List[TextContent | EmbeddedResource]:
-            # Identity binding — the SDK lowlevel Server doesn't
-            # provide an initialize hook on the public surface in
-            # all SDK versions, so we read clientInfo lazily on the
-            # first tool call. The MCP protocol guarantees
-            # initialize precedes any tools/call, so the SDK has
-            # already received clientInfo by the time we get here;
-            # we resolve it via the request context.
-            self._bind_caller_identity_from_context(server)
+            # Identity binding — resolved FRESH per request from the
+            # SDK's request_ctx (NOT cached on the shared SessionState).
+            # On HTTP/SSE one process serves many concurrent clients
+            # over one SessionState; caching the first client's identity
+            # bled it onto every later client (wrong agentPolicy
+            # principal + wrong tenant rowFilter). The MCP protocol
+            # guarantees initialize precedes any tools/call, so the SDK
+            # has already received this client's clientInfo + auth attrs
+            # by the time we get here.
+            model_id, use_case, caller_attributes = self._resolve_request_identity(server)
 
             # Open an OTel span around the full tool-call path so
             # operators can correlate gateway traffic with the rest
@@ -460,8 +463,8 @@ class OutputPortMcpServer:
                         "fluid.run_id": self.state.run_id,
                         "fluid.tool": name,
                         "fluid.expose_id": self.state.expose.get("exposeId"),
-                        "fluid.model_id": self.state.model_id or "<unbound>",
-                        "fluid.use_case": self.state.use_case or "<unset>",
+                        "fluid.model_id": model_id or "<unbound>",
+                        "fluid.use_case": use_case or "<unset>",
                         "fluid.policy_source": self.state.policy.policy_source,
                     },
                 )
@@ -474,8 +477,8 @@ class OutputPortMcpServer:
                     decision_payload = {
                         "tool": name,
                         "exposeId": self.state.expose.get("exposeId"),
-                        "modelId": self.state.model_id,
-                        "useCase": self.state.use_case,
+                        "modelId": model_id,
+                        "useCase": use_case,
                         "decision": "deny",
                         "reason": rl_reason,
                         "policySource": "rate-limit",
@@ -504,7 +507,10 @@ class OutputPortMcpServer:
                     ]
 
                 decision_payload, allowed, reason = self._evaluate_policy(
-                    tool_name=name, arguments=arguments
+                    tool_name=name,
+                    arguments=arguments,
+                    model_id=model_id,
+                    use_case=use_case,
                 )
                 self._write_audit(decision_payload)
                 _set_span_attrs(
@@ -541,8 +547,8 @@ class OutputPortMcpServer:
                         {
                             "tool": name,
                             "exposeId": self.state.expose.get("exposeId"),
-                            "modelId": self.state.model_id,
-                            "useCase": self.state.use_case,
+                            "modelId": model_id,
+                            "useCase": use_case,
                             "decision": "deny",
                             "reason": "circuit-open",
                             "policySource": "circuit-breaker",
@@ -580,8 +586,8 @@ class OutputPortMcpServer:
                         {
                             "tool": name,
                             "exposeId": self.state.expose.get("exposeId"),
-                            "modelId": self.state.model_id,
-                            "useCase": self.state.use_case,
+                            "modelId": model_id,
+                            "useCase": use_case,
                             "decision": "deny",
                             "reason": tok_reason,
                             "policySource": "token-budget",
@@ -623,7 +629,9 @@ class OutputPortMcpServer:
                         async with semaphore:
                             self.state._actively_dispatching += 1
                             try:
-                                response = await self._dispatch_allowed_tool(name, arguments)
+                                response = await self._dispatch_allowed_tool(
+                                    name, arguments, caller_attributes=caller_attributes
+                                )
                             finally:
                                 self.state._actively_dispatching = max(
                                     0, self.state._actively_dispatching - 1
@@ -631,7 +639,9 @@ class OutputPortMcpServer:
                     else:
                         self.state._actively_dispatching += 1
                         try:
-                            response = await self._dispatch_allowed_tool(name, arguments)
+                            response = await self._dispatch_allowed_tool(
+                                name, arguments, caller_attributes=caller_attributes
+                            )
                         finally:
                             self.state._actively_dispatching = max(
                                 0, self.state._actively_dispatching - 1
@@ -652,8 +662,8 @@ class OutputPortMcpServer:
                             {
                                 "tool": name,
                                 "exposeId": self.state.expose.get("exposeId"),
-                                "modelId": self.state.model_id,
-                                "useCase": self.state.use_case,
+                                "modelId": model_id,
+                                "useCase": use_case,
                                 "decision": "deny",
                                 "reason": (
                                     f"per-request-token-cap-exceeded "
@@ -700,80 +710,89 @@ class OutputPortMcpServer:
     # Identity binding (E3)
     # ------------------------------------------------------------------
 
-    def _bind_caller_identity_from_context(self, server: Server) -> None:
-        """Read ``clientInfo.model`` / ``clientInfo.useCase`` from the
-        SDK's session-info if present, store on SessionState.
-
-        The SDK exposes the initialize-time clientInfo via the
-        per-request context object on the active session. We poke
-        through the documented surface; if the SDK ever drops it,
-        the gate falls back to ``None`` (which the policy treats as
-        ``missing-model-identity``, fail-closed).
+    def _resolve_request_identity(
+        self, server: Server
+    ) -> tuple[Optional[str], Optional[str], Dict[str, Any]]:
+        """Resolve the CALLING client's identity for THIS request — never
+        cached on the shared SessionState. On HTTP/SSE one process serves many
+        concurrent clients over one SessionState, so caching bled the first
+        client's identity onto every later client. The SDK isolates identity
+        per request via request_ctx, so read it fresh: self-attested clientInfo
+        from request_context.session.client_params, and cryptographic
+        fluid_auth_attrs (JWT/mTLS, verified by the transport auth middleware)
+        from request_context.request.scope — crypto WINS over self-attestation.
+        Returns (model_id, use_case, caller_attributes); any failure -> (None,
+        None, {}) so the policy fail-closes on missing identity.
         """
-        if self.state.model_id is not None:
-            return  # already bound this session
+        model_id: Optional[str] = None
+        use_case: Optional[str] = None
+        attrs: Dict[str, Any] = {}
         try:
-            session = server.request_context.session
+            ctx = server.request_context
+        except Exception:  # noqa: BLE001 - no active request context
+            return None, None, {}
+        try:
+            session = getattr(ctx, "session", None)
             client_info = getattr(session, "client_params", None)
             client_info = getattr(client_info, "clientInfo", None) if client_info else None
-            if client_info is None:
-                return
-            # MCP clientInfo carries name + version; we extend the
-            # convention to include model + useCase. Anthropic's SDK
-            # accepts arbitrary extra fields on clientInfo.
-            extra = getattr(client_info, "model_extra", None) or {}
-            if "model" in extra:
-                self.state.model_id = str(extra["model"])
-            elif hasattr(client_info, "model"):
-                self.state.model_id = str(client_info.model)
-            if "useCase" in extra:
-                self.state.use_case = str(extra["useCase"])
-            elif hasattr(client_info, "useCase"):
-                self.state.use_case = str(client_info.useCase)
-            # Capture every extra field on clientInfo so contract
-            # ``rowFilters`` can resolve ``${caller.<attr>}``
-            # placeholders. We strip the well-known fields the SDK
-            # already validates (name/version/model/useCase) so the
-            # caller_attributes dict only carries authority context.
-            attrs: Dict[str, Any] = {}
-            for key, value in extra.items():
-                if key in {"name", "version", "title", "websiteUrl", "icons"}:
-                    continue
-                attrs[key] = value
-            # Convenience aliases for the most common row-filter
-            # placeholders so contracts can write `${caller.model}`
-            # or `${caller.use_case}` without quoting the camelCase.
-            if self.state.model_id is not None:
-                attrs.setdefault("model", self.state.model_id)
-            if self.state.use_case is not None:
-                attrs.setdefault("use_case", self.state.use_case)
-                attrs.setdefault("useCase", self.state.use_case)
-            self.state.caller_attributes = attrs
-            self.state.logger.info(
-                "output_port_session_bound",
-                extra={
-                    "model_id": self.state.model_id,
-                    "use_case": self.state.use_case,
-                    "caller_attribute_keys": sorted(attrs.keys()),
-                },
-            )
+            if client_info is not None:
+                extra = getattr(client_info, "model_extra", None) or {}
+                if "model" in extra:
+                    model_id = str(extra["model"])
+                elif hasattr(client_info, "model"):
+                    model_id = str(client_info.model)
+                if "useCase" in extra:
+                    use_case = str(extra["useCase"])
+                elif hasattr(client_info, "useCase"):
+                    use_case = str(client_info.useCase)
+                for key, value in extra.items():
+                    if key in {"name", "version", "title", "websiteUrl", "icons"}:
+                        continue
+                    attrs[key] = value
         except Exception as exc:  # noqa: BLE001
-            # Identity binding must never crash the dispatcher;
-            # missing identity is just a fail-closed gate.
-            self.state.logger.debug("output_port_identity_bind_failed: %s", exc)
+            self.state.logger.debug("output_port_identity_clientinfo_failed: %s", exc)
+        try:
+            request = getattr(ctx, "request", None)
+            scope = getattr(request, "scope", None)
+            crypto = (scope or {}).get("fluid_auth_attrs") or {}
+            if crypto:
+                attrs.update(crypto)
+                if "model" in crypto:
+                    model_id = str(crypto["model"])
+                if "use_case" in crypto:
+                    use_case = str(crypto["use_case"])
+        except Exception as exc:  # noqa: BLE001
+            self.state.logger.debug("output_port_identity_crypto_failed: %s", exc)
+        if model_id is not None:
+            attrs.setdefault("model", model_id)
+        if use_case is not None:
+            attrs.setdefault("use_case", use_case)
+            attrs.setdefault("useCase", use_case)
+        return model_id, use_case, attrs
 
     # ------------------------------------------------------------------
     # Policy evaluation (E2 wired)
     # ------------------------------------------------------------------
 
     def _evaluate_policy(
-        self, *, tool_name: str, arguments: Mapping[str, Any]
+        self,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        model_id: Optional[str],
+        use_case: Optional[str],
     ) -> tuple[Dict[str, Any], bool, Optional[str]]:
-        """Evaluate the policy gate and produce the audit payload."""
+        """Evaluate the policy gate and produce the audit payload.
+
+        ``model_id`` / ``use_case`` are the CALLING client's identity
+        resolved per-request by :meth:`_resolve_request_identity` — not
+        read from the shared SessionState, which would gate every
+        concurrent HTTP/SSE client under the first client's identity.
+        """
         allowed, reason = self.state.policy.check_tool_call(
             tool=tool_name,
-            model_id=self.state.model_id,
-            use_case=self.state.use_case,
+            model_id=model_id,
+            use_case=use_case,
         )
         payload = {
             "tool": tool_name,
@@ -783,8 +802,8 @@ class OutputPortMcpServer:
                 if self.state.policy.contract_path is not None
                 else None
             ),
-            "modelId": self.state.model_id,
-            "useCase": self.state.use_case,
+            "modelId": model_id,
+            "useCase": use_case,
             "decision": "allow" if allowed else "deny",
             "reason": reason,
             "policySource": self.state.policy.policy_source,
@@ -810,9 +829,16 @@ class OutputPortMcpServer:
     # ------------------------------------------------------------------
 
     async def _dispatch_allowed_tool(
-        self, name: str, arguments: Dict[str, Any]
+        self, name: str, arguments: Dict[str, Any], *, caller_attributes: Dict[str, Any]
     ) -> List[TextContent]:
         """Dispatch a tool that has cleared the policy gate.
+
+        ``caller_attributes`` is the CALLING client's per-request
+        identity (resolved by :meth:`_resolve_request_identity`),
+        threaded explicitly into the data-tool handlers so each
+        concurrent HTTP/SSE client's ``${caller.*}`` rowFilters resolve
+        against ITS OWN identity — not whatever happens to be cached on
+        the shared SessionState.
 
         Each handler is sync today — driver SDKs (snowflake-connector,
         google-cloud-bigquery, duckdb) are blocking. We run them in
@@ -845,11 +871,30 @@ class OutputPortMcpServer:
             if name == "describe":
                 payload = await loop.run_in_executor(None, self._tool_describe)
             elif name == "sample":
-                payload = await loop.run_in_executor(None, self._tool_sample, arguments)
+                # functools.partial threads the per-request
+                # caller_attributes kwarg through run_in_executor (which
+                # only forwards positional args), so the row filter
+                # resolves against THIS client's identity.
+                payload = await loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        self._tool_sample, arguments, caller_attributes=caller_attributes
+                    ),
+                )
             elif name == "query":
-                payload = await loop.run_in_executor(None, self._tool_query, arguments)
+                payload = await loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        self._tool_query, arguments, caller_attributes=caller_attributes
+                    ),
+                )
             elif name == "query_sql":
-                payload = await loop.run_in_executor(None, self._tool_query_sql, arguments)
+                payload = await loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        self._tool_query_sql, arguments, caller_attributes=caller_attributes
+                    ),
+                )
             else:
                 payload = {
                     "error": "UnknownTool",
@@ -887,8 +932,8 @@ class OutputPortMcpServer:
                     {
                         "tool": name,
                         "exposeId": self.state.expose.get("exposeId"),
-                        "modelId": self.state.model_id,
-                        "useCase": self.state.use_case,
+                        "modelId": caller_attributes.get("model"),
+                        "useCase": caller_attributes.get("use_case"),
                         "decision": "tool_error",
                         "reason": type(exc).__name__,
                         "policySource": self.state.policy.policy_source,
@@ -924,14 +969,20 @@ class OutputPortMcpServer:
     def _tool_describe(self) -> Dict[str, Any]:
         return _handlers.tool_describe(self.state)
 
-    def _tool_sample(self, arguments: Mapping[str, Any]) -> Dict[str, Any]:
-        return _handlers.tool_sample(self.state, arguments)
+    def _tool_sample(
+        self, arguments: Mapping[str, Any], *, caller_attributes: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        return _handlers.tool_sample(self.state, arguments, caller_attributes=caller_attributes)
 
-    def _tool_query(self, arguments: Mapping[str, Any]) -> Dict[str, Any]:
-        return _handlers.tool_query(self.state, arguments)
+    def _tool_query(
+        self, arguments: Mapping[str, Any], *, caller_attributes: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        return _handlers.tool_query(self.state, arguments, caller_attributes=caller_attributes)
 
-    def _tool_query_sql(self, arguments: Mapping[str, Any]) -> Dict[str, Any]:
-        return _handlers.tool_query_sql(self.state, arguments)
+    def _tool_query_sql(
+        self, arguments: Mapping[str, Any], *, caller_attributes: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        return _handlers.tool_query_sql(self.state, arguments, caller_attributes=caller_attributes)
 
     # ------------------------------------------------------------------
     # Lifecycle

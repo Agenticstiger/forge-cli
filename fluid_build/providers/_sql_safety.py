@@ -63,6 +63,17 @@ def quote_string_literal(value: str) -> str:
 # ``quote_string_literal``).
 _SQL_TYPE_PARAM_PAYLOAD = re.compile(r"^[0-9]+(\s*,\s*[0-9]+)?$")
 
+# A *whole* column-type token (not just the ``(...)`` payload) such as
+# ``INT`` / ``VARCHAR(255)`` / ``NUMBER(18,4)`` / ``TIMESTAMP_NTZ`` /
+# ``TIMESTAMP WITHOUT TIME ZONE``. ``validate_ident`` rejects parens and
+# spaces, so a parameterised / multi-word type needs this conservative
+# allowlist instead: letters, digits, underscores, spaces, parens, commas
+# and apostrophes (a few dialects spell types like ``INTERVAL 'day'``). The
+# set deliberately excludes ``;`` ``"`` ``-`` ``*`` ``/`` ``=`` so a type
+# token cannot carry a statement terminator, an identifier-quote, or a
+# comment sequence into the surrounding ``CREATE TABLE`` DDL.
+_SQL_TYPE_NAME = re.compile(r"^[A-Za-z0-9_ ()',]+$")
+
 
 class SqlTypeError(ValueError):
     """Raised when a SQL type name or language fails its allowlist.
@@ -70,6 +81,31 @@ class SqlTypeError(ValueError):
     Subclasses :class:`ValueError` so existing ``except ValueError`` handlers
     around the SQL-safety helpers continue to catch it.
     """
+
+
+def validate_sql_type_name(type_name: str) -> str:
+    """Validate a whole SQL column-type token and return it unchanged.
+
+    For DDL emitters that interpolate a contract-supplied column ``type``
+    (e.g. ``VARCHAR(255)``) directly into ``CREATE TABLE`` SQL. ``validate_ident``
+    is too strict for parameterised / multi-word types (it forbids parens and
+    spaces), so this applies the conservative type allowlist
+    ``^[A-Za-z0-9_ ()',]+$`` and additionally fails closed on comment
+    sequences (``--`` / ``/*`` / ``*/``) — defence-in-depth mirroring
+    :func:`validate_sql_expression_allowlist`. Raises :class:`SqlTypeError`
+    (a ``ValueError`` subclass) on anything outside the allowlist so callers
+    that already catch ``ValueError`` keep working.
+    """
+    if not isinstance(type_name, str):
+        raise SqlTypeError(f"Invalid SQL type name: {type_name!r}")
+    candidate = type_name.strip()
+    if not candidate:
+        raise SqlTypeError("Invalid SQL type name: empty")
+    if any(token in candidate for token in ("--", "/*", "*/")):
+        raise SqlTypeError(f"Invalid SQL type name: {type_name!r}")
+    if not _SQL_TYPE_NAME.match(candidate):
+        raise SqlTypeError(f"Invalid SQL type name: {type_name!r}")
+    return candidate
 
 
 def validate_sql_type_param_payload(payload: str) -> str:

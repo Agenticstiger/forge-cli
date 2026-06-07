@@ -27,6 +27,13 @@ Supports:
 from datetime import datetime
 from typing import Any, Dict, List
 
+from fluid_build.providers._sql_safety import validate_ident, validate_sql_type_name
+from fluid_build.providers.common.codegen_utils import (
+    escape_for_docstring,
+    py_str_literal,
+    sanitize_identifier,
+)
+
 
 def generate_airflow_dag(
     contract: Dict[str, Any], account: str, database: str, warehouse: str = "COMPUTE_WH"
@@ -85,7 +92,21 @@ def _generate_dag_header(
     database: str,
     warehouse: str,
 ) -> str:
-    """Generate DAG file header with metadata."""
+    """Generate DAG file header with metadata.
+
+    The header is a ``\"\"\"``-delimited docstring in the generated file. Every
+    interpolated, contract-derived value is escaped via the shared
+    ``escape_for_docstring`` so a value containing ``\"\"\"`` (or a trailing
+    ``"``) cannot terminate the docstring and turn following text into a
+    top-level statement that Airflow would execute at DAG-parse time.
+    """
+    contract_name = escape_for_docstring(contract_name)
+    contract_id = escape_for_docstring(contract_id)
+    schedule = escape_for_docstring(schedule)
+    timezone = escape_for_docstring(timezone)
+    account = escape_for_docstring(account)
+    database = escape_for_docstring(database)
+    warehouse = escape_for_docstring(warehouse)
     return f'''"""
 FLUID Generated DAG: {contract_name}
 
@@ -121,6 +142,16 @@ def _generate_dag_definition(
     """Generate DAG definition with default arguments."""
     airflow_schedule = _convert_schedule(schedule)
 
+    # All contract-derived values are emitted as repr()-escaped literals
+    # (py_str_literal) so a malicious name/timezone/schedule/id cannot break
+    # out of its string and inject code that Airflow runs at DAG-parse time.
+    # dag_id is sanitised to a bare identifier first, then literal-quoted.
+    dag_id_lit = py_str_literal(_sanitize_dag_id(contract_id))
+    description_lit = py_str_literal(contract_name)
+    schedule_lit = py_str_literal(airflow_schedule)
+    timezone_lit = py_str_literal(timezone)
+    tags = ["fluid", "auto-generated", "snowflake", contract_id]
+
     return f"""# Default DAG arguments
 default_args = {{
     'owner': 'fluid-forge',
@@ -134,13 +165,13 @@ default_args = {{
 
 # DAG definition
 dag = DAG(
-    dag_id='{_sanitize_dag_id(contract_id)}',
+    dag_id={dag_id_lit},
     default_args=default_args,
-    description='{contract_name}',
-    schedule_interval='{airflow_schedule}',
-    start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo('{timezone}')),
+    description={description_lit},
+    schedule_interval={schedule_lit},
+    start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo({timezone_lit})),
     catchup=False,
-    tags=['fluid', 'auto-generated', 'snowflake', '{contract_id}'],
+    tags={tags!r},
 )
 
 # Snowflake connection ID (configure in Airflow UI or via env vars)
@@ -162,7 +193,6 @@ def _generate_task_definitions(
 
 def _generate_single_task(task: Dict[str, Any], account: str, database: str, warehouse: str) -> str:
     """Generate code for a single task."""
-    task.get("taskId")
     action = task.get("action", "")
     params = task.get("params", {})
 
@@ -184,26 +214,38 @@ def _generate_single_task(task: Dict[str, Any], account: str, database: str, war
 def _generate_snowflake_sql_task(
     task: Dict[str, Any], operation: str, params: Dict[str, Any], database: str, warehouse: str
 ) -> str:
-    """Generate Snowflake SQL task code."""
-    task_id = task.get("taskId")
+    """Generate Snowflake SQL task code.
+
+    SQL-injection safety: ``create_database`` / ``create_schema`` /
+    ``create_table`` build DDL that the generated ``SnowflakeOperator`` runs at
+    DAG *runtime*, so ``py_str_literal`` (which only neutralises the Python
+    layer) is not enough on its own. Every IDENTIFIER (database / schema /
+    table / column name) is routed through ``validate_ident`` and every column
+    TYPE through ``validate_sql_type_name`` so a contract-supplied value
+    containing ``"`` / ``;`` / ``)`` / a comment sequence is rejected
+    (``ValueError``) and never reaches the emitted SQL.
+    """
+    task_id = task.get("taskId") or "unnamed_task"
 
     if operation == "create_database":
-        db_name = params.get("database", "UNKNOWN_DB")
+        db_name = validate_ident(params.get("database", "UNKNOWN_DB"))
         sql = f"CREATE DATABASE IF NOT EXISTS {db_name}"
 
     elif operation == "create_schema":
-        schema_name = params.get("schema", "UNKNOWN_SCHEMA")
-        db_name = params.get("database", database)
+        schema_name = validate_ident(params.get("schema", "UNKNOWN_SCHEMA"))
+        db_name = validate_ident(params.get("database", database))
         sql = f"CREATE SCHEMA IF NOT EXISTS {db_name}.{schema_name}"
 
     elif operation == "create_table":
-        table_name = params.get("table", "UNKNOWN_TABLE")
-        schema_name = params.get("schema", "PUBLIC")
-        db_name = params.get("database", database)
+        table_name = validate_ident(params.get("table", "UNKNOWN_TABLE"))
+        schema_name = validate_ident(params.get("schema", "PUBLIC"))
+        db_name = validate_ident(params.get("database", database))
         columns = params.get("columns", [])
 
         if columns:
-            cols_def = ", ".join([f"{c['name']} {c['type']}" for c in columns])
+            cols_def = ", ".join(
+                f"{validate_ident(c['name'])} {validate_sql_type_name(c['type'])}" for c in columns
+            )
             sql = f"CREATE TABLE IF NOT EXISTS {db_name}.{schema_name}.{table_name} ({cols_def})"
         else:
             sql = f"CREATE TABLE IF NOT EXISTS {db_name}.{schema_name}.{table_name} (id INTEGER, created_at TIMESTAMP_NTZ)"
@@ -214,30 +256,56 @@ def _generate_snowflake_sql_task(
     else:
         sql = f"SELECT 'Operation: {operation}' AS result"
 
-    # Clean SQL for Python string
-    sql_clean = sql.replace("'''", '"""')
+    # repr() (via py_str_literal) escapes embedded quotes / triple-quotes /
+    # newlines, so a contract-supplied sql value cannot terminate the literal
+    # and inject a top-level statement that Airflow would execute at DAG-parse
+    # time. The LHS variable name is sanitised to a legal Python identifier so
+    # an untrusted taskId can't inject a bare statement either.
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    sql_lit = py_str_literal(sql)
+    warehouse_lit = py_str_literal(warehouse)
+    database_lit = py_str_literal(database)
 
-    return f'''{task_id} = SnowflakeOperator(
-    task_id='{task_id}',
+    return f"""{var} = SnowflakeOperator(
+    task_id={task_id_lit},
     snowflake_conn_id=SNOWFLAKE_CONN_ID,
-    sql="""
-{sql_clean}
-    """,
-    warehouse='{warehouse}',
-    database='{database}',
+    sql={sql_lit},
+    warehouse={warehouse_lit},
+    database={database_lit},
     dag=dag,
-)'''
+)"""
 
 
 def _generate_python_task(task: Dict[str, Any], account: str, database: str) -> str:
-    """Generate generic Python task."""
-    task_id = task.get("taskId")
-    action = task.get("action")
+    """Generate generic Python task.
+
+    Quote safety: interpolating ``{params!r}`` inside a single-quoted string
+    literal is unsafe — ``repr({'k': 'v'})`` contains single quotes that
+    terminate the outer literal (SyntaxError at best, code injection at worst).
+    Instead serialise params via ``json.dumps`` (double-quoted JSON) and emit
+    every interpolated value through ``py_str_literal`` / ``sanitize_identifier``
+    so untrusted contract content cannot inject code at DAG-parse time.
+    """
+    import json
+
+    task_id = task.get("taskId") or "unnamed_task"
+    action = task.get("action") or ""
     params = task.get("params", {})
 
-    return f"""{task_id} = PythonOperator(
-    task_id='{task_id}',
-    python_callable=lambda: logger.info('Action: {action}, Params: {params!r}'),
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    action_lit = py_str_literal(action)
+    # ``default=str`` so a contract param that YAML-parses to a date/datetime
+    # (or any non-JSON-native value) serialises instead of raising TypeError
+    # at DAG-generation time — matches the gcp sibling generator.
+    params_json_lit = repr(json.dumps(params, sort_keys=True, default=str))
+
+    return f"""{var} = PythonOperator(
+    task_id={task_id_lit},
+    python_callable=lambda: logger.info(
+        'Action: ' + {action_lit} + ', Params: ' + {params_json_lit}
+    ),
     dag=dag,
 )"""
 
@@ -250,14 +318,27 @@ def _generate_task_dependencies(tasks: List[Dict[str, Any]]) -> str:
     dep_code = "# Task dependencies\n"
 
     for task in tasks:
-        task_id = task.get("taskId")
+        # Normalise the missing-taskId fallback to ``unnamed_task`` so this
+        # matches what the task *definition* emitters use (both the SQL-task and
+        # python-task generators do ``task.get("taskId") or "unnamed_task"``).
+        # Without this the definition was ``unnamed_task = Operator(...)`` while
+        # the wiring referenced ``None`` (``sanitize_identifier(None) == "None"``)
+        # — the edge dangled against a variable that was never defined.
+        task_id = task.get("taskId") or "unnamed_task"
         depends_on = task.get("dependsOn", [])
 
         if depends_on:
-            if len(depends_on) == 1:
-                dep_code += f"{depends_on[0]} >> {task_id}\n"
+            # These are Python *variable names*, so both sides must be
+            # sanitised to match the identifiers the task generators emit
+            # (sanitize_identifier(taskId) = Operator(...)) — otherwise an
+            # untrusted taskId / dependsOn entry could inject code as a bare
+            # identifier, and a non-identifier id would dangle and fail to parse.
+            safe_task = sanitize_identifier(task_id)
+            safe_deps = [sanitize_identifier(dep) for dep in depends_on]
+            if len(safe_deps) == 1:
+                dep_code += f"{safe_deps[0]} >> {safe_task}\n"
             else:
-                dep_code += f"[{', '.join(depends_on)}] >> {task_id}\n"
+                dep_code += f"[{', '.join(safe_deps)}] >> {safe_task}\n"
 
     return dep_code.rstrip()
 

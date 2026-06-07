@@ -28,6 +28,7 @@ from fluid_build.providers.common.codegen_utils import (
     convert_schedule_to_airflow,
     generate_file_header,
     generate_task_dependencies_code,
+    py_str_literal,
     sanitize_identifier,
 )
 from fluid_build.schedulers.base import ScheduleEngine, ScheduleGenerationResult, ScheduleIntent
@@ -194,6 +195,9 @@ def _generate_dag_definition(
         tags.append(provider.lower())
     tags.append(contract_id)
 
+    # All contract-derived values are emitted as repr()-escaped literals so a
+    # malicious name/timezone/schedule cannot break out and inject code that
+    # Airflow would run at DAG-parse time. dag_id is an identifier (no quotes).
     return f"""# Default DAG arguments
 default_args = {{
     'owner': 'fluid-forge',
@@ -207,11 +211,11 @@ default_args = {{
 
 # DAG definition
 dag = DAG(
-    dag_id='{sanitize_identifier(contract_id)}',
+    dag_id={py_str_literal(sanitize_identifier(contract_id))},
     default_args=default_args,
-    description='{contract_name}',
-    schedule_interval='{airflow_schedule}',
-    start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo('{timezone}')),
+    description={py_str_literal(contract_name)},
+    schedule_interval={py_str_literal(airflow_schedule)},
+    start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo({py_str_literal(timezone)})),
     catchup=False,
     tags={tags!r},
 )"""
@@ -241,12 +245,23 @@ def _generate_task_definitions(
 
 
 def _generate_gcp_task(task: Dict[str, Any], config: Dict[str, Any]) -> str:
-    """Generate a GCP-specific Airflow task."""
+    """Generate a GCP-specific Airflow task.
+
+    Every contract/config-derived value is emitted via ``sanitize_identifier``
+    (the LHS variable name) or ``py_str_literal`` (string kwargs) so untrusted
+    contract content cannot inject code into the generated DAG. Dict configs go
+    out via ``!r`` (repr of a dict is itself a safe, fully-escaped literal).
+    """
     task_id = task.get("taskId")
     action = task.get("action", "")
     params = task.get("params", {})
     project = config.get("project", "my-project")
     region = config.get("region", "us-central1")
+
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    project_lit = py_str_literal(project)
+    region_lit = py_str_literal(region)
 
     action_parts = action.split(".")
     if len(action_parts) >= 3:
@@ -255,33 +270,33 @@ def _generate_gcp_task(task: Dict[str, Any], config: Dict[str, Any]) -> str:
 
         if service == "bigquery":
             if operation == "create_dataset":
-                dataset_id = params.get("dataset_id", "unknown_dataset")
-                location = params.get("location", region)
-                return f"""{task_id} = BigQueryCreateEmptyDatasetOperator(
-    task_id='{task_id}',
-    dataset_id='{dataset_id}',
-    project_id='{project}',
-    location='{location}',
+                dataset_lit = py_str_literal(params.get("dataset_id", "unknown_dataset"))
+                location_lit = py_str_literal(params.get("location", region))
+                return f"""{var} = BigQueryCreateEmptyDatasetOperator(
+    task_id={task_id_lit},
+    dataset_id={dataset_lit},
+    project_id={project_lit},
+    location={location_lit},
     dag=dag,
 )"""
             elif operation in ("query", "run_query"):
                 query_sql = params.get("query", "SELECT 1")
                 bq_config = {"query": {"query": query_sql, "useLegacySql": False}}
-                return f"""{task_id} = BigQueryInsertJobOperator(
-    task_id='{task_id}',
+                return f"""{var} = BigQueryInsertJobOperator(
+    task_id={task_id_lit},
     configuration={bq_config!r},
-    project_id='{project}',
-    location='{region}',
+    project_id={project_lit},
+    location={region_lit},
     dag=dag,
 )"""
         elif service in ("gcs", "storage"):
             if operation in ("create_bucket", "ensure_bucket"):
-                bucket_name = params.get("bucket", "unknown-bucket")
-                return f"""{task_id} = GCSCreateBucketOperator(
-    task_id='{task_id}',
-    bucket_name='{bucket_name}',
-    project_id='{project}',
-    location='{region}',
+                bucket_lit = py_str_literal(params.get("bucket", "unknown-bucket"))
+                return f"""{var} = GCSCreateBucketOperator(
+    task_id={task_id_lit},
+    bucket_name={bucket_lit},
+    project_id={project_lit},
+    location={region_lit},
     dag=dag,
 )"""
 
@@ -295,38 +310,42 @@ def _generate_aws_task(task: Dict[str, Any], config: Dict[str, Any]) -> str:
     params = task.get("params", {})
     region = config.get("region", "us-east-1")
 
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    region_lit = py_str_literal(region)
+
     action_parts = action.split(".")
     if len(action_parts) >= 3:
         service = action_parts[1]
         operation = action_parts[2]
 
         if service == "glue":
-            job_name = params.get("job_name", task_id)
-            return f"""{task_id} = GlueJobOperator(
-    task_id='{task_id}',
-    job_name='{job_name}',
-    region_name='{region}',
+            job_name_lit = py_str_literal(params.get("job_name", task_id))
+            return f"""{var} = GlueJobOperator(
+    task_id={task_id_lit},
+    job_name={job_name_lit},
+    region_name={region_lit},
     script_args={params.get("script_args", {})!r},
     dag=dag,
 )"""
         elif service == "s3":
             if operation in ("create_bucket", "ensure_bucket"):
-                bucket_name = params.get("bucket", "unknown-bucket")
-                return f"""{task_id} = S3CreateBucketOperator(
-    task_id='{task_id}',
-    bucket_name='{bucket_name}',
-    region_name='{region}',
+                bucket_lit = py_str_literal(params.get("bucket", "unknown-bucket"))
+                return f"""{var} = S3CreateBucketOperator(
+    task_id={task_id_lit},
+    bucket_name={bucket_lit},
+    region_name={region_lit},
     dag=dag,
 )"""
         elif service == "athena":
-            query = params.get("query", "SELECT 1")
-            database = params.get("database", "default")
-            output = params.get("output_location", "s3://results/")
-            return f"""{task_id} = AthenaOperator(
-    task_id='{task_id}',
-    query='{query}',
-    database='{database}',
-    output_location='{output}',
+            query_lit = py_str_literal(params.get("query", "SELECT 1"))
+            database_lit = py_str_literal(params.get("database", "default"))
+            output_lit = py_str_literal(params.get("output_location", "s3://results/"))
+            return f"""{var} = AthenaOperator(
+    task_id={task_id_lit},
+    query={query_lit},
+    database={database_lit},
+    output_location={output_lit},
     dag=dag,
 )"""
 
@@ -340,25 +359,31 @@ def _generate_snowflake_task(task: Dict[str, Any], config: Dict[str, Any]) -> st
     params = task.get("params", {})
     conn_id = config.get("connection_id", "snowflake_default")
 
+    var = sanitize_identifier(task_id)
+    task_id_lit = py_str_literal(task_id)
+    conn_lit = py_str_literal(conn_id)
+
     action_parts = action.split(".")
     if len(action_parts) >= 3:
         operation = action_parts[2]
 
         if operation in ("query", "run_query", "execute_sql"):
-            sql = params.get("sql", params.get("query", "SELECT 1"))
-            return f"""{task_id} = SnowflakeOperator(
-    task_id='{task_id}',
-    sql=\"\"\"{sql}\"\"\",
-    snowflake_conn_id='{conn_id}',
+            # repr() escapes embedded quotes / triple-quotes / newlines, so SQL
+            # cannot terminate the literal and inject a top-level statement.
+            sql_lit = py_str_literal(params.get("sql", params.get("query", "SELECT 1")))
+            return f"""{var} = SnowflakeOperator(
+    task_id={task_id_lit},
+    sql={sql_lit},
+    snowflake_conn_id={conn_lit},
     dag=dag,
 )"""
 
     # Fallback: wrap action in SnowflakeOperator SQL call
-    sql = params.get("sql", f"-- TODO: implement {action}")
-    return f"""{task_id} = SnowflakeOperator(
-    task_id='{task_id}',
-    sql=\"\"\"{sql}\"\"\",
-    snowflake_conn_id='{conn_id}',
+    sql_lit = py_str_literal(params.get("sql", f"-- TODO: implement {action}"))
+    return f"""{var} = SnowflakeOperator(
+    task_id={task_id_lit},
+    sql={sql_lit},
+    snowflake_conn_id={conn_lit},
     dag=dag,
 )"""
 
@@ -396,11 +421,12 @@ def _generate_generic_task(task: Dict[str, Any]) -> str:
     # the outer single-quoted f-string payload via repr().
     params_json = repr(json.dumps(params, sort_keys=True))
 
-    # The Python identifier in ``<task_id> = PythonOperator(...)`` must
-    # be a legal Python name; we emit it literally as returned by the
-    # caller (who is responsible for pre-validation). Fall back to a
-    # safe placeholder when the task_id isn't a legal identifier.
-    py_id = task_id if task_id.isidentifier() else "unnamed_task"
+    # The Python identifier in ``<id> = PythonOperator(...)`` must be a legal
+    # Python name AND must match the identifier the dependency wiring emits, so
+    # route it through the shared ``sanitize_identifier`` (deterministic — the
+    # same task_id maps to the same variable in both the definition and the
+    # ``a >> b`` wiring).
+    py_id = sanitize_identifier(task_id)
 
     return f"""{py_id} = PythonOperator(
     task_id={task_id_literal},
