@@ -947,16 +947,35 @@ def _create_project_minimal(
             # operators correlate user-visible UX (questions_asked,
             # inferences_used, time_to_first_panel) with cost/repair
             # metrics so future UX iterations are evidence-based.
+            #
+            # Privacy gate: the ux.* user-behavior attrs are emitted only
+            # when the user has explicitly opted in (default OFF). The
+            # fluid.* operational attrs above are non-PII run metrics and
+            # stay; only the behavior signal is consent-gated. DO_NOT_TRACK
+            # / FLUID_TELEMETRY=0 force this off — see _telemetry_consent.
             try:
-                from fluid_build.cli._ux_telemetry import get_telemetry
+                from fluid_build.cli._telemetry_consent import telemetry_enabled
 
-                attrs.update(get_telemetry().to_span_attributes())
+                if telemetry_enabled():
+                    from fluid_build.cli._ux_telemetry import get_telemetry
+
+                    attrs.update(get_telemetry().to_span_attributes())
             except Exception:  # noqa: BLE001
                 pass
             with traced_span("forge.invocation", attributes=attrs):
                 pass
         except Exception:  # noqa: BLE001 — telemetry must never block forge
             logger.debug("forge_invocation_span_failed", exc_info=True)
+
+        # One-time, non-interactive-safe telemetry consent prompt. No-ops
+        # on non-TTY / DO_NOT_TRACK / FLUID_TELEMETRY-set / already-asked.
+        # Default stays OFF — this only records an explicit user choice.
+        try:
+            from fluid_build.cli._telemetry_consent import maybe_prompt_for_consent
+
+            maybe_prompt_for_consent()
+        except Exception:  # noqa: BLE001
+            pass
 
         # Bump usage counter so future runs detect the return user.
         try:
