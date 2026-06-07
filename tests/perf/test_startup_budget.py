@@ -45,6 +45,31 @@ _BUILD_PARSER_PROBE = (
 )
 
 
+def _clean_env():
+    """Minimal, controlled environment for the probe subprocess.
+
+    A full-suite run leaves env vars behind (an earlier test may set FLUID_*,
+    PYTHONPATH, etc.); an inherited subprocess env would otherwise perturb the
+    module count and make this gate flaky. Pass only a safe allowlist plus
+    PYTHONNOUSERSITE so the cold-start measurement is deterministic regardless
+    of what ran before.
+    """
+    allow = (
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TMPDIR",
+        "SYSTEMROOT",
+        "USERPROFILE",
+        "PATHEXT",
+    )
+    env = {k: os.environ[k] for k in allow if k in os.environ}
+    env["PYTHONNOUSERSITE"] = "1"
+    return env
+
+
 def _probe():
     """Return (module_count, set_of_forbidden_loaded) from a cold subprocess."""
     out = subprocess.run(
@@ -52,6 +77,7 @@ def _probe():
         capture_output=True,
         text=True,
         check=True,
+        env=_clean_env(),
     ).stdout.splitlines()
     count = int(out[0])
     loaded = set(filter(None, (out[1] if len(out) > 1 else "").split(",")))
@@ -90,6 +116,7 @@ def test_help_cold_wall_time_backstop():
             [sys.executable, "-m", "fluid_build.cli", "--help"],
             capture_output=True,
             check=True,
+            env=_clean_env(),
         )
         samples.append(time.perf_counter() - t0)
     median = statistics.median(samples)
