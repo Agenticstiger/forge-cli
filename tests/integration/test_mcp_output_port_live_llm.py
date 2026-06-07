@@ -65,11 +65,13 @@ pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 ANTHROPIC_MODEL = "anthropic/claude-haiku-4-5-20251001"
 OPENAI_MODEL = "openai/gpt-4o-mini"
+GEMINI_MODEL = "gemini/gemini-2.5-flash"
 
 # What the gateway expects in agentPolicy.allowedModels — the bare
 # model name without the litellm provider prefix.
 ANTHROPIC_BARE = "claude-haiku-4-5-20251001"
 OPENAI_BARE = "gpt-4o-mini"
+GEMINI_BARE = "gemini-2.5-flash"
 
 # Cost cap per scenario (dollars). Asserts below the per-run cap so
 # a runaway loop can't burn money.
@@ -86,7 +88,9 @@ def _resolve_provider() -> Tuple[str, str]:
         return ANTHROPIC_MODEL, ANTHROPIC_BARE
     if os.environ.get("OPENAI_API_KEY"):
         return OPENAI_MODEL, OPENAI_BARE
-    pytest.skip("no LLM API key in env; set ANTHROPIC_API_KEY or OPENAI_API_KEY")
+    if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+        return GEMINI_MODEL, GEMINI_BARE
+    pytest.skip("no LLM API key in env; set ANTHROPIC_API_KEY, OPENAI_API_KEY or GEMINI_API_KEY")
 
 
 def _enforce_cost_cap(response_obj: Any) -> float:
