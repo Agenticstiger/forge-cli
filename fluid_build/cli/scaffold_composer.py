@@ -21,20 +21,11 @@ import re
 import shlex
 
 from ..providers.common.codegen_utils import py_str_literal, sanitize_identifier
+from ._acquisition_stage_ext import _validate_cron as _validate_cron_grammar
 from ._common import CLIError, load_contract_with_overlay
 from ._logging import info
 
 COMMAND = "scaffold-composer"
-
-# A cron expression is the 5 (or 6, with seconds/year) standard fields.
-# We allow only the cron grammar's character set — digits, the wildcards
-# ``* / , -`` and field-separating whitespace. This rejects anything that
-# could be smuggled through the ``cron`` contract field into the generated
-# Python source (the value lands inside a string literal which Airflow
-# imports at DAG-parse time). Belt-and-suspenders with ``py_str_literal``
-# below — a malformed cron is rejected outright rather than silently
-# emitted as an inert-but-wrong schedule.
-_CRON_FIELD_CHARS = re.compile(r"^[0-9*/,\-]+$")
 
 
 def register(subparsers: argparse._SubParsersAction):
@@ -76,20 +67,27 @@ with DAG(
 def _validate_cron(raw: object) -> str:
     """Validate an untrusted ``cron`` contract value against the cron grammar.
 
-    Allowlist: 5 or 6 whitespace-separated fields, each drawn only from
-    ``[0-9*/,\\-]``. Anything else (extra fields, shell metacharacters,
-    newlines, quotes) is rejected. This is the *primary* guard — the
-    value also passes through :func:`py_str_literal` before it reaches the
+    Delegates the grammar check to the canonical
+    :func:`fluid_build.cli._acquisition_stage_ext._validate_cron` so the
+    scaffold and the schedule-sync stage share ONE cron allowlist. That
+    shared allowlist correctly accepts the Quartz tokens ``? L W #`` (the
+    old scaffold-local ``[0-9*/,-]`` regex wrongly rejected them) while
+    still rejecting shell metacharacters, newlines and quotes. The value
+    also passes through :func:`py_str_literal` before it reaches the
     generated source, so even a future grammar gap can't break out of the
     string literal and inject a top-level statement Airflow would execute.
+
+    Two thin adaptations preserve this caller's historical contract:
+
+    * a ``None``/missing value defaults to the daily ``0 2 * * *`` cron
+      (the shared validator requires a ``str``), and a non-string value is
+      coerced with ``str()`` before validation;
+    * the shared validator raises :class:`IdentifierViolation`, a
+      ``ValueError`` subclass, so existing ``except Exception`` handling in
+      :func:`run` and ``pytest.raises(ValueError)`` callers both still fire.
     """
-    cron = str(raw if raw is not None else "0 2 * * *").strip()
-    fields = cron.split()
-    if len(fields) not in (5, 6) or not all(_CRON_FIELD_CHARS.fullmatch(f) for f in fields):
-        raise ValueError(
-            f"invalid cron expression {cron!r}: expected 5 or 6 fields drawn from [0-9*/,-]"
-        )
-    return cron
+    cron = str(raw if raw is not None else "0 2 * * *")
+    return _validate_cron_grammar(cron)
 
 
 # A generated DAG's ``bash_command`` is executed by a shell at run time.

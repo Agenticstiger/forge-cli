@@ -167,8 +167,14 @@ def escape_for_docstring(value: Any) -> str:
     by a newline and ``import os; …`` would close the generated file's header
     docstring and inject a top-level statement that Airflow runs at DAG-parse
     time. Newlines are left intact (legal inside a triple-quoted string).
+
+    ``None`` becomes an empty string (a null contract field renders as
+    blank rather than the literal text ``None``) — matching ``py_str_literal``'s
+    ``None`` handling so the two codegen escapers behave consistently. This is
+    the single source of truth shared by every provider's DAG-header builder
+    (the snowflake provider's former local copy delegated here).
     """
-    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return ("" if value is None else str(value)).replace("\\", "\\\\").replace('"', '\\"')
 
 
 def generate_file_header(contract_id: str, contract_name: str, provider: str, **kwargs: Any) -> str:
