@@ -210,6 +210,42 @@ def test_state_store_confines_unvalidated_component(tmp_path: Path) -> None:
         store._build_dir("../../../../tmp/escape", "build")
 
 
+def test_lock_path_confines_traversal_resource_id(tmp_path: Path) -> None:
+    """``_lock_path`` was the only path helper not wrapped in ``_confine``;
+    a ``resource_id`` with enough ``../`` to climb out of the state-store
+    root must now be rejected, exactly like the sibling helpers.
+    """
+    store = FileStateStore(tmp_path / "ws" / ".fluid")
+    with pytest.raises(IdentifierViolation, match="escapes the state-store root"):
+        store._lock_path("acq", "../../../../tmp/escape")
+    # A traversal smuggled through the ``scope`` component is rejected too.
+    with pytest.raises(IdentifierViolation, match="escapes the state-store root"):
+        store._lock_path("../../../../tmp/escape", "orders")
+
+
+def test_lock_path_allows_normal_resource_id(tmp_path: Path) -> None:
+    """Positive control: a normal scope/resource_id still resolves to a lock
+    file strictly inside the state-store root (no false-positive rejection)."""
+    root = tmp_path / "ws" / ".fluid"
+    store = FileStateStore(root)
+    p = store._lock_path("acquisition", "orders.bronze")
+    assert p.name == "acquisition__orders.bronze.lock"
+    # Resolved path stays under the (resolved) state-store root.
+    assert p.is_relative_to(root.resolve())
+
+
+def test_acquire_lock_rejects_traversal_resource_id(tmp_path: Path) -> None:
+    """End-to-end: ``acquire_lock`` (which calls ``_lock_path``) refuses a
+    traversal ``resource_id`` before creating any lock file outside root."""
+    store = FileStateStore(tmp_path / "ws" / ".fluid")
+    sentinel = tmp_path / "lock_escape"
+    assert not sentinel.exists()
+    with pytest.raises(IdentifierViolation, match="escapes the state-store root"):
+        with store.acquire_lock("acq", "../../../../" + sentinel.name):
+            pass  # pragma: no cover — must never enter the body
+    assert not (sentinel.with_suffix(".lock")).exists()
+
+
 def test_shared_validator_accepts_normal_and_rejects_bad() -> None:
     """Unit-pin the hoisted validator's grammar at its new home."""
     assert validate_identifier("orders.bronze", kind="contract.id") == "orders.bronze"

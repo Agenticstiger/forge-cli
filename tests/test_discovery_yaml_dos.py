@@ -77,6 +77,95 @@ class TestUpstreamDiscoveryDoS:
         assert "good.v1" in idx
 
 
+# ─────────── read-before-cap (stat-before-read) OOM gap (FIX 2) ──────────
+#
+# ``load_yaml_safe``'s byte cap only fires AFTER the whole file is in memory,
+# so a multi-GB file would already have OOM'd the process. Both loaders now
+# stat the file FIRST and skip/reject oversized ones BEFORE ``read_text`` —
+# the cap is meaningless against a huge file otherwise.
+
+
+class TestUpstreamDiscoveryStatBeforeRead:
+    def test_oversized_file_not_read_into_memory(self, tmp_path, monkeypatch):
+        """An oversized discovered contract is rejected by the stat gate
+        WITHOUT ``read_text`` ever being called (no read-before-cap OOM)."""
+        from fluid_build.util import upstream_discovery as ud
+        from fluid_build.util.safe_yaml import MAX_YAML_BYTES
+
+        monkeypatch.delenv("FLUID_UPSTREAM_CONTRACTS", raising=False)
+        huge = _write(tmp_path / "huge", "id: huge.v1\n")
+        good = _write(tmp_path / "good", "id: good.v1\nexposes: []\n")
+
+        real_stat = Path.stat
+
+        def fake_stat(self, *a, **k):
+            st = real_stat(self, *a, **k)
+            if self == huge:
+                # Pretend the file is 1 byte over the cap without writing GBs.
+                return os.stat_result(
+                    (st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid)
+                    + (MAX_YAML_BYTES + 1,)
+                    + (st.st_atime, st.st_mtime, st.st_ctime)
+                )
+            return st
+
+        # If ``read_text`` is ever called on the oversized file, fail loud:
+        # that is the read-before-cap OOM bug this fix closes.
+        real_read_text = Path.read_text
+
+        def guarded_read_text(self, *a, **k):
+            if self == huge:
+                raise AssertionError(
+                    "read_text called on oversized file — stat-before-read gate missed it"
+                )
+            return real_read_text(self, *a, **k)
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+        monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+        idx = ud.discover_upstream_products(tmp_path)
+        assert "huge.v1" not in idx  # oversized file skipped
+        assert "good.v1" in idx  # benign file still read+indexed
+
+
+class TestValidationYamlFileStatBeforeRead:
+    def test_oversized_yaml_not_read_into_memory(self, tmp_path, monkeypatch):
+        """``_validate_yaml_file`` rejects an oversized YAML via the stat
+        gate (an ERROR issue) WITHOUT ``read_text`` ever being called."""
+        from fluid_build.forge.core.validation import ProjectValidator, ValidationLevel
+        from fluid_build.util.safe_yaml import MAX_YAML_BYTES
+
+        target = _write(tmp_path, "a: 1\n", name="huge.yaml")
+        v = ProjectValidator(str(tmp_path))
+
+        real_stat = Path.stat
+
+        def fake_stat(self, *a, **k):
+            st = real_stat(self, *a, **k)
+            if self == target:
+                return os.stat_result(
+                    (st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid)
+                    + (MAX_YAML_BYTES + 1,)
+                    + (st.st_atime, st.st_mtime, st.st_ctime)
+                )
+            return st
+
+        real_read_text = Path.read_text
+
+        def guarded_read_text(self, *a, **k):
+            if self == target:
+                raise AssertionError(
+                    "read_text called on oversized file — stat-before-read gate missed it"
+                )
+            return real_read_text(self, *a, **k)
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+        monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+        v._validate_yaml_file(target)
+        assert any(i.level == ValidationLevel.ERROR for i in v.issues)
+
+
 # ──────────────── sibling reader: tree-scan validator ───────────────────
 
 

@@ -30,6 +30,7 @@ asserted here, with positive controls.
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 from types import SimpleNamespace
@@ -37,7 +38,14 @@ from types import SimpleNamespace
 import pytest
 
 from fluid_build.cli._common import CLIError
-from fluid_build.cli.scaffold_composer import _validate_cron, run
+from fluid_build.cli.scaffold_composer import (
+    DAG_TMPL,
+    _build_pipeline_bash_commands,
+    _validate_contract_path,
+    _validate_cron,
+    run,
+)
+from fluid_build.providers.common.codegen_utils import py_str_literal
 
 LOG = logging.getLogger("test.scaffold_composer")
 
@@ -157,4 +165,141 @@ class TestScaffoldComposerRun:
         assert rc == 0
         written = list(out_dir.glob("*.py"))[0]
         assert written.name == "my_product_v1.py"
-        assert 'dag_id="my_product_v1"' in written.read_text()
+        text = written.read_text()
+        # dag_id is now emitted as a py_str_literal (repr → single quotes).
+        assert "dag_id='my_product_v1'" in text or 'dag_id="my_product_v1"' in text
+
+
+# ─────────────────── contract-path injection (FIX 1) ───────────────────
+
+# The contract path was previously interpolated RAW into both a generated
+# BashOperator ``bash_command`` (shell-executed at run time) and a Python
+# string literal (executed by Airflow at DAG-parse time). A double-quote or
+# shell metacharacter could break the Python literal or inject into the shell.
+
+_DANGEROUS_CALLS = {"system", "popen", "exec", "eval", "__import__", "spawn", "Popen"}
+_DANGEROUS_MODULES = {"os", "subprocess", "sys", "shutil", "socket"}
+
+
+def _assert_inert(code: str) -> None:
+    """Assert ``code`` parses AND injects no executable construct at module
+    scope (no os.system/exec/eval call, no import of os/subprocess/…)."""
+    tree = ast.parse(code)  # raises SyntaxError if a payload broke out
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name in _DANGEROUS_CALLS:
+                offenders.append(f"call:{name}")
+        if isinstance(node, ast.Import):
+            offenders.extend(
+                f"import:{a.name}" for a in node.names if a.name.split(".")[0] in _DANGEROUS_MODULES
+            )
+        if (
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").split(".")[0] in _DANGEROUS_MODULES
+        ):
+            offenders.append(f"from:{node.module}")
+    assert not offenders, f"contract-path injection: generated DAG executes {offenders}\n{code}"
+
+
+class TestContractPathInjection:
+    # ── front-door validator rejects hostile shapes ──────────────────────
+    @pytest.mark.parametrize(
+        "evil",
+        [
+            'a"b.yaml',  # double-quote (Python-literal break-out vector)
+            "a;rm -rf /.yaml",  # shell command separator
+            "$(touch /tmp/pwned).yaml",  # command substitution
+            "`whoami`.yaml",  # backtick substitution
+            "a|b.yaml",  # pipe
+            "a&b.yaml",  # background/and
+            "contract.yaml\nimport os",  # newline injection
+            "-rf.yaml",  # leading-dash option-injection
+            "a b.yaml",  # whitespace
+            "a${HOME}.yaml",  # variable expansion
+        ],
+    )
+    def test_validator_rejects_metacharacters(self, evil):
+        with pytest.raises(ValueError):
+            _validate_contract_path(evil)
+
+    @pytest.mark.parametrize(
+        "good",
+        [
+            "contract.fluid.yaml",
+            "runtime/contracts/orders.fluid.yaml",
+            "./relative/path-with_chars.v1.yaml",
+            "/abs/path/to/contract.fluid.yaml",
+            "team@host:contract.yaml",
+        ],
+    )
+    def test_validator_accepts_clean_paths(self, good):
+        assert _validate_contract_path(good) == good
+
+    # ── codegen layer is inert even if the validator is bypassed ─────────
+    @pytest.mark.parametrize(
+        "payload,marker",
+        [
+            ('c.yaml"\nimport os\nos.system("touch /tmp/PWNED")\nx="', "touch /tmp/PWNED"),
+            ("c.yaml; rm -rf /", "rm -rf /"),
+            ("c.yaml$(touch /tmp/PWNED)", "touch /tmp/PWNED"),
+            ("c.yaml`whoami`", "whoami"),
+            ("c.yaml\nexec('evil')\n", "exec("),
+        ],
+    )
+    def test_codegen_layer_renders_payload_inert(self, payload, marker):
+        """Defence-in-depth: feed a hostile path DIRECTLY to the command
+        builder (bypassing the front-door validator) and prove the
+        ``shlex.quote`` + ``py_str_literal`` layering keeps it inert — the
+        generated DAG ast.parse-es and the payload survives only as data."""
+        validate_cmd, plan_cmd, apply_cmd = _build_pipeline_bash_commands(payload, "gcp")
+        # Each bash_command literal eval-rounds-trips to a plain string —
+        # i.e. it is a single inert expression, never an executable statement.
+        for lit in (validate_cmd, plan_cmd, apply_cmd):
+            assert isinstance(ast.literal_eval(lit), str)
+        src = DAG_TMPL.format(
+            dag_id=py_str_literal("d"),
+            cron=py_str_literal("0 2 * * *"),
+            validate_cmd=validate_cmd,
+            plan_cmd=plan_cmd,
+            apply_cmd=apply_cmd,
+        )
+        _assert_inert(src)
+        # The payload survives only as inert shell-quoted data inside the
+        # command string — it is NOT promoted to a top-level Python/shell
+        # token (``_assert_inert`` above proves the Python-AST side; the
+        # marker presence here proves the bytes weren't silently dropped).
+        runtime_command = ast.literal_eval(validate_cmd)
+        assert marker in runtime_command
+        # And it lives inside a single shell-quoted argument, not as a bare
+        # command separator: the marker is wrapped in shell quoting.
+        assert "'" in runtime_command or '"' in runtime_command
+
+    def test_e2e_hostile_filename_rejected_no_dag_written(self, tmp_path):
+        """End-to-end: a contract that LOADS fine but lives at a path with a
+        shell metacharacter is rejected by ``run`` — no DAG is emitted."""
+        # A filename a POSIX FS accepts but the validator must reject.
+        evil_dir = tmp_path / "evil;rm"
+        evil_dir.mkdir()
+        contract = _write_contract(evil_dir, contract_id="p.v1", cron="0 2 * * *")
+        assert ";" in contract  # the path carries the metacharacter
+        out_dir = tmp_path / "dags"
+        with pytest.raises(CLIError) as ei:
+            _run(tmp_path, contract, out_dir)
+        assert ei.value.event == "scaffold_composer_failed"
+        assert not list(out_dir.glob("*.py")) if out_dir.exists() else True
+
+    def test_e2e_clean_relative_path_emits_quoted_command(self, tmp_path, monkeypatch):
+        """Positive control: a clean relative contract path is emitted as a
+        shell-quoted token inside a ``bash_command`` py_str_literal."""
+        monkeypatch.chdir(tmp_path)
+        _write_contract(tmp_path, contract_id="orders.v1", cron="0 2 * * *")
+        out_dir = tmp_path / "dags"
+        args = SimpleNamespace(contract="contract.fluid.yaml", env=None, out_dir=str(out_dir))
+        rc = run(args, LOG)
+        assert rc == 0
+        text = list(out_dir.glob("*.py"))[0].read_text()
+        _assert_inert(text)
+        # The path appears inside a validate bash_command as a single token.
+        assert "validate contract.fluid.yaml" in text

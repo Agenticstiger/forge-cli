@@ -19,6 +19,7 @@ Common functions for DAG/pipeline generation to reduce code duplication
 and ensure consistent behavior across AWS, GCP, and Snowflake providers.
 """
 
+import keyword
 import re
 from datetime import datetime
 from typing import Any, Dict, List
@@ -52,6 +53,18 @@ def sanitize_identifier(name: str) -> str:
     if not sanitized:
         sanitized = "unnamed"
 
+    # A sanitised value can land on a Python keyword (a taskId of ``class``
+    # / ``import`` would emit ``class = PythonOperator(...)`` → SyntaxError in
+    # the generated DAG). Suffix an underscore so the result is always a
+    # *non-keyword* legal identifier (``class`` → ``class_``).
+    if keyword.iskeyword(sanitized):
+        sanitized += "_"
+
+    # NOTE: this mapping is intentionally not injective — two distinct raw
+    # ids (``a-b`` and ``a.b``) collapse to the same identifier. The
+    # upstream duplicate-taskId validator (codegen_utils.validate_contract_for_export
+    # / the schedulers' dup-id checks) already rejects duplicate *raw* ids,
+    # so a collision here cannot silently merge two declared tasks.
     return sanitized
 
 

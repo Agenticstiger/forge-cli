@@ -433,18 +433,40 @@ class ProjectValidator:
         """Validate YAML file syntax"""
 
         try:
-            # SECURITY (billion-laughs DoS): this validates EVERY ``*.yaml``
-            # found by walking the project tree (``rglob("*.yaml")``) — files
-            # the user did not explicitly name. Route through ``load_yaml_safe``
-            # (50-alias + 5 MiB caps) so a hostile anchor-expansion payload
-            # dropped into the tree can't OOM the validator. Falls back to the
-            # bare loader only when PyYAML itself is unavailable.
-            text = file_path.read_text(encoding="utf-8")
+            # SECURITY (billion-laughs / oversized-YAML DoS): this validates
+            # EVERY ``*.yaml`` found by walking the project tree
+            # (``rglob("*.yaml")``) — files the user did not explicitly name.
+            #
+            # stat-before-read: ``load_yaml_safe``'s byte cap only fires AFTER
+            # the whole file is in memory, so a multi-GB file would OOM the
+            # validator before the cap ever ran. Stat FIRST and reject
+            # oversized files as a validation issue — mirrors the
+            # stat-before-read in ``forge/federation.py`` and reuses the same
+            # :data:`MAX_YAML_BYTES` ceiling. ``load_yaml_safe`` (50-alias +
+            # 5 MiB caps) remains the parse path (defence in depth). Falls
+            # back to the bare loader only when PyYAML itself is unavailable.
             try:
-                from fluid_build.util.safe_yaml import load_yaml_safe
-
-                load_yaml_safe(text)
+                from fluid_build.util.safe_yaml import MAX_YAML_BYTES, load_yaml_safe
             except ImportError:  # pragma: no cover — PyYAML-missing fallback
+                MAX_YAML_BYTES = 5 * 1024 * 1024
+                load_yaml_safe = None
+            if file_path.stat().st_size > MAX_YAML_BYTES:
+                self.issues.append(
+                    ValidationIssue(
+                        level=ValidationLevel.ERROR,
+                        message=(
+                            f"YAML file too large to validate safely "
+                            f"({file_path.stat().st_size} bytes > {MAX_YAML_BYTES}-byte cap)"
+                        ),
+                        file_path=str(file_path.relative_to(self.project_path)),
+                        suggestion="Split or remove the oversized YAML file",
+                    )
+                )
+                return
+            text = file_path.read_text(encoding="utf-8")
+            if load_yaml_safe is not None:
+                load_yaml_safe(text)
+            else:  # pragma: no cover — PyYAML-missing fallback
                 yaml.safe_load(text)
         except Exception as e:
             self.issues.append(

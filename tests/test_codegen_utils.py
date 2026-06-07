@@ -14,6 +14,8 @@
 
 """Tests for providers/common/codegen_utils.py — shared codegen helpers."""
 
+import keyword
+
 import pytest
 
 from fluid_build.providers.common.codegen_utils import (
@@ -46,6 +48,21 @@ class TestSanitizeIdentifier:
     def test_purely_numeric(self):
         # Leading digits stripped, leaving empty → 'unnamed'
         assert sanitize_identifier("999") == "unnamed"
+
+    def test_python_keyword_gets_suffix(self):
+        # A taskId of ``class`` would otherwise emit ``class = Operator(...)``
+        # → SyntaxError in the generated DAG. The result must be a valid,
+        # NON-keyword Python identifier.
+        result = sanitize_identifier("class")
+        assert keyword.iskeyword(result) is False
+        assert result.isidentifier() is True
+        assert result == "class_"
+
+    @pytest.mark.parametrize("kw", ["import", "def", "return", "for", "if", "None", "lambda"])
+    def test_all_keywords_become_legal_identifiers(self, kw):
+        result = sanitize_identifier(kw)
+        assert keyword.iskeyword(result) is False
+        assert result.isidentifier() is True
 
 
 # ── convert_schedule_to_cron ─────────────────────────────────────────

@@ -46,7 +46,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import yaml
 
-from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
+from fluid_build.util.safe_yaml import MAX_YAML_BYTES, UnsafeYamlError, load_yaml_safe
 
 __all__ = [
     "IGNORED_DIRS",
@@ -168,10 +168,23 @@ def discover_upstream_products(
                 # contracts are DISCOVERED by walking the workspace (+ pulled
                 # mesh repos via FLUID_UPSTREAM_CONTRACTS) — the user did NOT
                 # explicitly name them, so a hostile upstream contract must
-                # not be able to OOM generation of a different product. Route
-                # through ``load_yaml_safe`` (50-alias + 5 MiB caps) instead
-                # of bare ``yaml.safe_load``. Tolerant-by-design: a rejected
-                # file is skipped, never fatal (same as a YAML syntax error).
+                # not be able to OOM generation of a different product.
+                #
+                # stat-before-read: ``load_yaml_safe``'s byte cap only fires
+                # AFTER the whole file is in memory, so a multi-GB file would
+                # already have OOM'd us before the cap ran. Stat the file
+                # FIRST and skip oversized ones — mirrors the stat-before-read
+                # in ``forge/federation.py::_read_first_existing_contract`` and
+                # reuses the same :data:`MAX_YAML_BYTES` ceiling. ``load_yaml_safe``
+                # remains the parse path (defence in depth: alias-bomb + cap).
+                if contract_path.stat().st_size > MAX_YAML_BYTES:
+                    _logger.debug(
+                        "upstream: skipping %s (%s bytes > %s cap)",
+                        contract_path,
+                        contract_path.stat().st_size,
+                        MAX_YAML_BYTES,
+                    )
+                    continue
                 data = load_yaml_safe(contract_path.read_text(encoding="utf-8"))
             except (OSError, yaml.YAMLError, UnsafeYamlError) as exc:
                 _logger.debug("upstream: skipping %s (%s)", contract_path, exc)

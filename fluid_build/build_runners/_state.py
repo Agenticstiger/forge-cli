@@ -115,7 +115,13 @@ class FileStateStore(StateStore):
         return self._confine(self._build_dir(product_id, build_id) / "runs" / f"{run_id}.json")
 
     def _lock_path(self, scope: str, resource_id: str) -> Path:
-        return self.root / "locks" / f"{scope}__{resource_id}.lock"
+        # SECURITY (path traversal): ``scope`` / ``resource_id`` are
+        # interpolated into the lock filename, so a value with a path
+        # separator or ``..`` would escape the workspace. Route through the
+        # same ``_confine`` backstop as every sibling helper
+        # (``_build_dir`` / ``_cursor_path`` / ``_watermark_path`` /
+        # ``_run_record_path``) so an unvalidated component is rejected here.
+        return self._confine(self.root / "locks" / f"{scope}__{resource_id}.lock")
 
     # ── cursor / watermark ───────────────────────────────────────────────
     def get_cursor(self, product_id: str, build_id: str, stream: str) -> Optional[Cursor]:
