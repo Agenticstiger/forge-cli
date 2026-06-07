@@ -87,7 +87,7 @@ def test_resolve_apply_engine_is_opentofu_for_snowflake(tmp_path):
 def test_native_snowflake_apply_is_retired():
     """The native Snowflake apply path raises instead of silently doing
     nothing — a contract is never reported 'applied' without provisioning."""
-    from fluid_build.providers.snowflake.provider_enhanced import SnowflakeProviderEnhanced
+    from fluid_build.providers.snowflake.provider import SnowflakeProviderEnhanced
 
     provider = SnowflakeProviderEnhanced(account="TESTACCT", database="TESTDB", schema="PUBLIC")
     with pytest.raises(ProviderError, match="retired"):

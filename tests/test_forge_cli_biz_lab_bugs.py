@@ -314,8 +314,7 @@ class TestFederationEndpointSchemeAllowList:
         manifest_path = tmp_path / "federation" / "upstreams.yaml"
         manifest_path.parent.mkdir(parents=True)
         manifest_path.write_text(
-            textwrap.dedent(
-                """\
+            textwrap.dedent("""\
                 workspaces:
                   - id: evil
                     kind: git_registry
@@ -323,8 +322,7 @@ class TestFederationEndpointSchemeAllowList:
                   - id: ok
                     kind: git_registry
                     endpoint: "https://github.com/org/repo.git"
-                """
-            ),
+                """),
             encoding="utf-8",
         )
 
@@ -370,7 +368,7 @@ class TestSnowflakeRollbackCleanupValidatesIdentifiers:
         # The provider is initialised lazily in the rollback path; here
         # we instantiate with placeholder creds and exercise the
         # synchronous DDL emitters which don't touch the network.
-        from fluid_build.providers.snowflake.provider_enhanced import (
+        from fluid_build.providers.snowflake.provider import (
             SnowflakeProviderEnhanced,
         )
 

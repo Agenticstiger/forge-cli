@@ -339,7 +339,7 @@ class TestProviderInfo:
         assert "bigquery" in info.supported_platforms
 
     def test_snowflake_provider_info(self):
-        from fluid_build.providers.snowflake.provider_enhanced import SnowflakeProviderEnhanced
+        from fluid_build.providers.snowflake.provider import SnowflakeProviderEnhanced
 
         info = SnowflakeProviderEnhanced.get_provider_info()
         assert info.name == "snowflake"

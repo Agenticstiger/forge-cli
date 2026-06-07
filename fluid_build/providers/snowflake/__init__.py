@@ -32,8 +32,8 @@ Discovery compatibility:
 from typing import Callable, Dict
 
 # Import enhanced provider as production implementation
-# Legacy provider.py has been deprecated in favor of provider_enhanced.py
-from .provider_enhanced import SnowflakeProviderEnhanced as SnowflakeProvider  # noqa: F401
+# The enhanced provider is now the canonical implementation in provider.py.
+from .provider import SnowflakeProviderEnhanced as SnowflakeProvider  # noqa: F401
 
 
 def auto_register(register: Callable[[str, object], None]) -> None:
