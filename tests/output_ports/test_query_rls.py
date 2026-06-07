@@ -22,11 +22,15 @@ BYPASSED on ``tool_query`` / ``tool_query_sql`` — a caller received every
 tenant's rows. These tests pin:
 
 1. the row filter merged into the semantic ``query`` WHERE (offset placeholders);
-2. the row filter wrapping free-form ``query_sql``;
+2. free-form ``query_sql`` REJECTED (fail-closed) when the expose declares
+   ``policy.rowFilters[]`` — RLS cannot be safely enforced on arbitrary caller
+   SQL (a spoofable filter column in the caller's projection), so the compiler
+   raises :class:`QueryValidationError` instead of wrapping;
 3. fail-closed (:class:`RowFilterIdentityMissing`) on the query path when a
    referenced caller attribute is absent;
 4. the handler wiring actually passes ``caller_attributes`` / ``expose`` through
-   (so the compiled SQL the driver executes carries the filter + bound params).
+   (so the compiled SQL the driver executes carries the filter + bound params,
+   and the ``query_sql`` handler surfaces the rejection).
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ import pytest
 
 from fluid_build.output_ports.mcp._handlers import tool_query, tool_query_sql
 from fluid_build.output_ports.mcp.query_compiler import (
+    QueryValidationError,
     RowFilterIdentityMissing,
     compile_free_form_sql,
     compile_semantic_query,
@@ -124,18 +129,32 @@ class TestSemanticQueryRowFilter:
 
 
 class TestFreeFormQueryRowFilter:
-    def test_row_filter_wraps_caller_sql(self):
-        compiled = compile_free_form_sql(
-            sql="SELECT id, tenant_id FROM db.t",
-            table_reference="db.t",
-            limit=50,
-            expose=TENANT_EXPOSE,
-            caller_attributes={"tenant_id": "acme"},
-        )
-        assert "SELECT * FROM (" in compiled.sql
-        assert '"tenant_id" = :p_0' in compiled.sql
-        assert compiled.sql.rstrip().endswith("LIMIT 50")
-        assert compiled.params == ["acme"]
+    def test_rejects_when_rowfilters_declared(self):
+        # FAIL CLOSED: RLS cannot be enforced on arbitrary caller SQL (the
+        # caller controls the subquery projection, so it can spoof the filter
+        # column → cross-tenant read). The compiler must REJECT rather than
+        # wrap. The message steers the caller to the semantic ``query`` tool.
+        with pytest.raises(QueryValidationError, match="row filter"):
+            compile_free_form_sql(
+                sql="SELECT id, tenant_id FROM db.t",
+                table_reference="db.t",
+                limit=50,
+                expose=TENANT_EXPOSE,
+                caller_attributes={"tenant_id": "acme"},
+            )
+
+    def test_rejection_blocks_projection_spoof(self):
+        # The concrete RLS-bypass the rejection closes: a caller-controlled
+        # projection that fabricates the tenant_id column. This must NOT
+        # compile (previously it wrapped into a cross-tenant read).
+        with pytest.raises(QueryValidationError, match="row filter"):
+            compile_free_form_sql(
+                sql="SELECT 'acme' AS tenant_id, secret FROM other_tenant_table",
+                table_reference="db.t",
+                limit=50,
+                expose=TENANT_EXPOSE,
+                caller_attributes={"tenant_id": "acme"},
+            )
 
     def test_no_wrap_when_no_rowfilters(self):
         compiled = compile_free_form_sql(
@@ -144,9 +163,25 @@ class TestFreeFormQueryRowFilter:
             limit=50,
         )
         assert "SELECT * FROM (" not in compiled.sql
+        assert compiled.sql.rstrip().endswith("LIMIT 50")
         assert compiled.params == []
 
+    def test_no_double_limit_when_caller_already_limited(self):
+        # FIX: the server-side LIMIT must not be appended a second time when
+        # the caller's SQL already ends in ``LIMIT <n>`` (two trailing LIMITs
+        # is a syntax error on most engines).
+        compiled = compile_free_form_sql(
+            sql="SELECT id FROM db.t LIMIT 5",
+            table_reference="db.t",
+            limit=50,
+        )
+        # Exactly one LIMIT, and it's the caller's.
+        assert compiled.sql.count("LIMIT") == 1
+        assert compiled.sql.rstrip().endswith("LIMIT 5")
+
     def test_fail_closed_when_caller_attribute_missing(self):
+        # Missing ${caller.*} attribute fails closed via RowFilterIdentityMissing
+        # — raised while resolving the placeholder, BEFORE the rejection check.
         with pytest.raises(RowFilterIdentityMissing, match="tenant_id"):
             compile_free_form_sql(
                 sql="SELECT id FROM db.t",
@@ -203,14 +238,15 @@ class TestHandlerWiring:
         assert '"tenant_id" = :p_0' in driver.captured.sql
         assert "acme" in driver.captured.params
 
-    def test_tool_query_sql_executes_wrapped_rowfiltered_sql(self):
+    def test_tool_query_sql_rejected_when_rowfilters_declared(self):
+        # FAIL CLOSED at the handler: a free-form query_sql call against an
+        # RLS-protected expose raises QueryValidationError and never reaches
+        # the driver (no SQL executed).
         driver = _CapturingDriver()
         state = _fake_state(TENANT_EXPOSE, {"tenant_id": "acme"}, driver)
-        tool_query_sql(state, {"sql": "SELECT id, tenant_id FROM db.t", "limit": 10})
-        assert driver.captured is not None
-        assert "SELECT * FROM (" in driver.captured.sql
-        assert '"tenant_id" = :p_0' in driver.captured.sql
-        assert "acme" in driver.captured.params
+        with pytest.raises(QueryValidationError, match="row filter"):
+            tool_query_sql(state, {"sql": "SELECT id, tenant_id FROM db.t", "limit": 10})
+        assert driver.captured is None
 
     def test_tool_query_fail_closed_never_executes(self):
         driver = _CapturingDriver()

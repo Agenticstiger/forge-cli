@@ -107,6 +107,13 @@ class RowFilterIdentityMissing(RuntimeError):
 
 _CALLER_PLACEHOLDER = re.compile(r"\$\{caller\.([A-Za-z_][A-Za-z0-9_]*)\}")
 
+# Matches a single ``:p_<index>`` named placeholder, capturing the index.
+# Word-boundary anchored so ``:p_1`` never matches inside ``:p_10`` — the
+# substring-collision bug a per-index ``str.replace`` loop has at ≥11 params.
+# Shared by :meth:`CompiledQuery.render_sql_for_dialect`; the postgres /
+# athena drivers compile the identical pattern for their own rewrites.
+_PARAM_PLACEHOLDER_RE = re.compile(r":p_(\d+)\b")
+
 
 def _resolve_caller_placeholder(value: Any, caller_attributes: Mapping[str, Any]) -> Any:
     """Replace ``${caller.<attr>}`` tokens in ``value`` with values from
@@ -129,11 +136,29 @@ def _resolve_caller_placeholder(value: Any, caller_attributes: Mapping[str, Any]
     return value
 
 
+def _quote_filter_identifier(column: str, dialect: Optional[str]) -> str:
+    """Quote a (already ``validate_ident``-checked) row-filter column for the
+    target ``dialect``.
+
+    BigQuery's standard SQL reads ANSI double-quotes as a STRING LITERAL, so
+    ``WHERE "tenant_id" = @p_0`` compiles to ``WHERE 'tenant_id' = <val>`` —
+    always false → an RLS-protected BigQuery expose returns ZERO rows. BigQuery
+    quotes identifiers with backticks instead. Every other dialect we target
+    (duckdb / snowflake / postgres / athena) treats double-quotes as an
+    identifier quote, so the default (``dialect is None`` or anything non-BQ)
+    keeps the ANSI form for back-compat.
+    """
+    if dialect == "bigquery":
+        return f"`{column}`"
+    return f'"{column}"'
+
+
 def compile_row_filter_clauses(
     expose: Mapping[str, Any],
     caller_attributes: Mapping[str, Any],
     *,
     offset: int = 0,
+    dialect: Optional[str] = None,
 ) -> Tuple[List[str], List[Any]]:
     """Compile ``expose.policy.rowFilters[]`` into AND-able WHERE clauses +
     bound params, with placeholders ``:p_{offset}``, ``:p_{offset+1}``, …
@@ -141,9 +166,16 @@ def compile_row_filter_clauses(
     Centralises row-level security so EVERY read path enforces it: ``sample``
     (via :meth:`...drivers.base.EngineDriver.compile_row_filter_predicate`,
     ``offset=0``), the semantic ``query`` (merged into its WHERE at
-    ``offset=len(existing_params)``), and the free-form ``query_sql`` wrapper.
+    ``offset=len(existing_params)``), and the free-form ``query_sql`` path
+    (which now rejects rather than wraps — see :func:`compile_free_form_sql`).
     The ``offset`` is what lets these merge into a statement that already has
     ``:p_<n>`` placeholders without colliding.
+
+    ``dialect`` selects the identifier-quoting style for the filter column:
+    backticks for ``"bigquery"`` (BQ reads ANSI double-quotes as a string
+    literal, which silently turns the predicate always-false → zero rows),
+    ANSI double-quotes for every other dialect. ``None`` (default) keeps the
+    ANSI form for back-compat with callers that don't know their dialect.
 
     Fail-closed: a ``${caller.<attr>}`` referencing a missing attribute, or an
     ``in:`` filter resolving to an empty/non-list value, raises
@@ -161,10 +193,10 @@ def compile_row_filter_clauses(
         column_raw = entry.get("column")
         if not isinstance(column_raw, str) or not column_raw:
             continue
-        column = validate_ident(column_raw)
+        column = _quote_filter_identifier(validate_ident(column_raw), dialect)
         if "equals" in entry:
             value = _resolve_caller_placeholder(entry["equals"], caller_attributes)
-            clauses.append(f'"{column}" = :p_{offset + len(params)}')
+            clauses.append(f"{column} = :p_{offset + len(params)}")
             params.append(value)
         elif "in" in entry:
             raw_list = _resolve_caller_placeholder(entry["in"], caller_attributes)
@@ -174,7 +206,7 @@ def compile_row_filter_clauses(
                     "list (got empty / non-list value); fail-closed deny."
                 )
             placeholders = ", ".join(f":p_{offset + len(params) + i}" for i in range(len(raw_list)))
-            clauses.append(f'"{column}" IN ({placeholders})')
+            clauses.append(f"{column} IN ({placeholders})")
             params.extend(raw_list)
         else:
             continue  # unknown operator — silently skip
@@ -219,19 +251,24 @@ class CompiledQuery:
         Unknown dialects fall back to the unrewritten ``:p_<index>``
         form so a future driver that prefers PEP-249 named style still
         receives something usable.
+
+        The rewrite uses a word-boundary regex (``:p_(\\d+)\\b``) rather
+        than a per-index ``str.replace`` loop. A naive loop corrupts the
+        SQL once there are ≥11 params: ``:p_1`` is a prefix of ``:p_10``,
+        so replacing ``:p_1`` first turns ``:p_10`` into e.g.
+        ``%(p_1)s0``. The single regex pass matches each placeholder
+        exactly once and is the same approach the postgres / athena
+        drivers already use.
         """
         if dialect == "duckdb":
-            out = self.sql
-            for index in range(len(self.params)):
-                out = out.replace(f":p_{index}", f"$p_{index}")
-            return out
+            return _PARAM_PLACEHOLDER_RE.sub(r"$p_\1", self.sql)
         if dialect == "bigquery":
+            # The bare-prefix replace is collision-safe here: ``@p_`` is a
+            # 1:1 substitution of the ``:p_`` prefix, so ``:p_10`` → ``@p_10``
+            # correctly (unlike the index-suffix forms the other dialects use).
             return self.sql.replace(":p_", "@p_")
         if dialect == "snowflake":
-            out = self.sql
-            for index in range(len(self.params)):
-                out = out.replace(f":p_{index}", f"%(p_{index})s")
-            return out
+            return _PARAM_PLACEHOLDER_RE.sub(r"%(p_\1)s", self.sql)
         return self.sql
 
 
@@ -406,6 +443,7 @@ def compile_semantic_query(
     limit: Optional[int] = None,
     caller_attributes: Optional[Mapping[str, Any]] = None,
     table_reference: str,
+    dialect: Optional[str] = None,
 ) -> CompiledQuery:
     """Compile one ``query`` payload into a :class:`CompiledQuery`.
 
@@ -423,6 +461,12 @@ def compile_semantic_query(
     ``[1, 1_000_000]``. We deliberately don't accept ``None`` for
     "no limit" — every consumer-side query gets a hard cap so a curious
     agent can't run a full-table scan by accident.
+
+    ``dialect`` is the driver's dialect token (``descriptor().dialect``);
+    it only selects the identifier-quoting style for any merged
+    ``policy.rowFilters[]`` column (backticks on BigQuery, ANSI
+    double-quotes elsewhere — see :func:`compile_row_filter_clauses`).
+    ``None`` keeps the ANSI form.
     """
     if (metric is None) == (measure is None):
         raise QueryValidationError("Exactly one of 'metric' or 'measure' must be provided")
@@ -498,7 +542,7 @@ def compile_semantic_query(
     # silently bypassed on the query/query_sql tools. Placeholders continue from
     # the filter params (offset) so they never collide.
     rf_clauses, rf_params = compile_row_filter_clauses(
-        expose, caller_attributes or {}, offset=len(params)
+        expose, caller_attributes or {}, offset=len(params), dialect=dialect
     )
     where_clauses.extend(rf_clauses)
     params.extend(rf_params)
@@ -582,6 +626,14 @@ def _strip_string_literals(sql: str) -> str:
     return _STRING_LITERAL_RE.sub(" ", sql)
 
 
+# A caller statement that already ends in ``LIMIT <n>`` (case-insensitive,
+# trailing whitespace tolerated). Used so the server-side ``LIMIT`` is not
+# appended a second time — two trailing LIMITs is a syntax error on most
+# engines. Only a bare integer literal counts as "already limited"; a
+# ``LIMIT`` with an expression / placeholder is left for the caller to own.
+_TRAILING_LIMIT_RE = re.compile(r"(?is)\blimit\s+\d+\s*$")
+
+
 def compile_free_form_sql(
     *,
     sql: str,
@@ -601,28 +653,38 @@ def compile_free_form_sql(
     * The reserved-word allowlist
       (:func:`fluid_build.providers._sql_safety.validate_sql_expression_allowlist`)
       blocks every DDL/DML token in the SQL body.
-    * Server-side ``LIMIT`` is appended unconditionally — even if the
-      user already supplied one. Two limits is harmless; missing one
-      is dangerous.
+    * Server-side ``LIMIT`` is appended — but only when the caller's
+      statement doesn't already end in one. Appending a second
+      ``LIMIT`` is a syntax error on most engines, so we detect a
+      trailing ``LIMIT <n>`` (case-insensitive) and leave it; a
+      statement with no limit always gets the server cap.
     * Any identifier reference (case-insensitive, word-bounded) to a
       column listed in ``restricted_columns`` is rejected. This
       defends against the alias bypass — ``SELECT email AS not_email``
       would otherwise sneak masked values past the result-set masking
       step in :class:`fluid_build.output_ports.mcp.drivers.base.EngineDriver`.
       This is column-level deny only; row-level security is the next bullet.
-    * **Row-level security.** When ``expose.policy.rowFilters[]`` is declared
-      (and ``expose`` / ``caller_attributes`` are passed), the caller SQL is
-      wrapped as ``SELECT * FROM (<caller_sql>) WHERE <rowfilter> LIMIT n`` so
-      the SAME tenant isolation that ``sample`` / ``query`` apply also holds
-      here — there is no longer a free-form bypass. The rowFilter columns must
-      be visible in the caller's projection; if absent the engine errors
-      (fail-closed). A missing ``${caller.*}`` attribute raises
-      :class:`RowFilterIdentityMissing` before any SQL runs.
+    * **Row-level security — FAIL CLOSED.** When
+      ``expose.policy.rowFilters[]`` is declared (i.e.
+      :func:`compile_row_filter_clauses` returns a non-empty clause
+      list), free-form ``query_sql`` is REJECTED with a
+      :class:`QueryValidationError`. RLS cannot be safely enforced on
+      arbitrary caller SQL: wrapping it as
+      ``SELECT * FROM (<caller_sql>) WHERE <rowfilter>`` is bypassable —
+      the caller controls the subquery's projection, so
+      ``SELECT 't1' AS tenant_id, secret FROM other`` spoofs the filter
+      column and reads across tenants. (It also trips every driver's
+      ``guard_against_injection_markers`` body-SELECT check, so the
+      wrap erred anyway.) Callers that need row-filtered access on an
+      RLS-protected expose must use the semantic ``query`` tool, where
+      the WHERE is merged into a compiler-controlled statement. A
+      missing ``${caller.*}`` attribute still raises
+      :class:`RowFilterIdentityMissing` (fail-closed) before the
+      rejection check completes.
     * ``FROM`` references are NOT rewritten — the caller must reference the
-      bound table by its fully-qualified name from the contract (the RLS
-      wrapper only adds an outer ``SELECT * FROM (...)``; it does not rewrite
-      the caller's ``FROM``). Phase-2 may add an AST-level rewrite so consumers
-      can reference the expose by exposeId rather than the underlying binding.
+      bound table by its fully-qualified name from the contract. Phase-2 may
+      add an AST-level rewrite so consumers can reference the expose by
+      exposeId rather than the underlying binding.
     """
     if not isinstance(sql, str):
         raise QueryValidationError("sql must be a string")
@@ -665,23 +727,33 @@ def compile_free_form_sql(
                     f"rules as the sample / query tools — aliasing the "
                     f"column does not bypass them."
                 )
-    # Row-level security: a WHERE cannot be merged into arbitrary caller SQL,
-    # so when the contract declares policy.rowFilters[] we wrap the statement as
-    # a subquery and apply the filter on the outside. This enforces the SAME
-    # tenant isolation as sample/query — previously query_sql executed the
-    # caller SQL with NO row filter, leaking every tenant's rows. The rowFilter
-    # columns must be visible in the caller's projection (use SELECT * or include
-    # them); if absent the engine errors — fail-closed, never an unfiltered
-    # result. The inner LIMIT (if any) is harmless inside the subquery; the outer
-    # LIMIT is the enforced cap.
-    rf_clauses, rf_params = compile_row_filter_clauses(
+    # Row-level security: FAIL CLOSED. RLS cannot be safely enforced on
+    # arbitrary caller SQL. The old wrapper —
+    #   SELECT * FROM (<caller_sql>) AS _fluid_rls WHERE <rowfilter> LIMIT n
+    # was bypassable two ways: (a) the caller controls the subquery's
+    # projection, so `SELECT 't1' AS tenant_id, secret FROM other` spoofs the
+    # filter column → cross-tenant read; (b) the inner SELECT trips every
+    # driver's guard_against_injection_markers body-keyword check, so it erred
+    # anyway. When the expose declares policy.rowFilters[], reject the
+    # free-form path outright and steer the caller to the semantic `query`
+    # tool, where the WHERE is merged into a compiler-controlled statement.
+    # (compile_row_filter_clauses still resolves ${caller.*} first, so a
+    # missing attribute fails closed via RowFilterIdentityMissing before we
+    # reach the rejection.)
+    rf_clauses, _rf_params = compile_row_filter_clauses(
         expose or {}, caller_attributes or {}, offset=0
     )
     if rf_clauses:
-        rf_where = " AND ".join(rf_clauses)
-        final_sql = (
-            f"SELECT * FROM (\n{candidate}\n) AS _fluid_rls\n" f"WHERE {rf_where}\nLIMIT {limit}"
+        raise QueryValidationError(
+            "Free-form query_sql is not permitted on an expose that declares "
+            "row filters (policy.rowFilters): row-level security cannot be "
+            "enforced on arbitrary SQL — use the semantic 'query' tool instead."
         )
-        return CompiledQuery(sql=final_sql, params=rf_params, columns=[])
-    final_sql = f"{candidate}\nLIMIT {limit}"
+    # No row filters: append the server-side cap, but only when the caller
+    # didn't already supply a trailing ``LIMIT <n>`` (a second one is a syntax
+    # error on most engines).
+    if _TRAILING_LIMIT_RE.search(candidate):
+        final_sql = candidate
+    else:
+        final_sql = f"{candidate}\nLIMIT {limit}"
     return CompiledQuery(sql=final_sql, params=[], columns=[])

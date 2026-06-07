@@ -354,6 +354,7 @@ class EngineDriver(ABC):
         expose: Mapping[str, Any],
         *,
         caller_attributes: Mapping[str, Any],
+        dialect: Optional[str] = None,
     ) -> tuple[str, list[Any]]:
         """Compile ``expose.policy.rowFilters[]`` into a parameterised
         SQL ``WHERE`` predicate the driver appends to ``sample`` /
@@ -378,6 +379,15 @@ class EngineDriver(ABC):
         deny by raising ``RowFilterIdentityMissing``: the gateway
         prefers no rows to wrong rows.
 
+        ``dialect`` is the driver's dialect token
+        (``descriptor().dialect``); it selects the identifier-quoting
+        style for the filter column (backticks on BigQuery, ANSI
+        double-quotes elsewhere). BigQuery reads ANSI double-quotes as
+        a STRING LITERAL, so without this the predicate compiles to
+        ``WHERE 'tenant_id' = <val>`` — always false → a row-filtered
+        BigQuery ``sample`` returns ZERO rows. ``None`` keeps the ANSI
+        form for back-compat.
+
         Returns ``("WHERE <pred>", [param, ...])`` (empty string +
         empty list when no filters configured). The driver appends
         the WHERE clause to its FROM and binds the params in its
@@ -387,7 +397,9 @@ class EngineDriver(ABC):
         # sample / query / query_sql all enforce identical row filters. sample
         # builds its own ``SELECT * FROM <table>`` so it owns placeholder index
         # 0 (offset=0) and just needs the leading WHERE.
-        clauses, params = compile_row_filter_clauses(expose, caller_attributes, offset=0)
+        clauses, params = compile_row_filter_clauses(
+            expose, caller_attributes, offset=0, dialect=dialect
+        )
         if not clauses:
             return "", []
         return " WHERE " + " AND ".join(clauses), params
@@ -417,7 +429,9 @@ class EngineDriver(ABC):
             raise ValueError("limit must be an integer in [1, 1_000_000]")
         descriptor = self.descriptor()
         where_clause, where_params = self.compile_row_filter_predicate(
-            self.expose, caller_attributes=caller_attributes or {}
+            self.expose,
+            caller_attributes=caller_attributes or {},
+            dialect=descriptor.dialect,
         )
         sql = f"SELECT * FROM {descriptor.table_reference}{where_clause} LIMIT {limit}"
         result = self.execute(sql=sql, params=tuple(where_params))

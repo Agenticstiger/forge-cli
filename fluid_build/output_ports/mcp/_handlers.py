@@ -165,6 +165,10 @@ def tool_query(
         # callers that don't pass the kwarg).
         caller_attributes=attrs,
         table_reference=descriptor.table_reference,
+        # Pass the engine dialect so a merged rowFilter column is quoted for
+        # THIS engine — backticks on BigQuery (ANSI double-quotes there read
+        # as a string literal → predicate always false → zero rows).
+        dialect=descriptor.dialect,
     )
     result = driver.query(compiled=compiled, timeout_seconds=state.query_timeout_seconds)
     return _serialize_query_result(state.expose, compiled, result)
@@ -198,11 +202,13 @@ def tool_query_sql(
         table_reference=descriptor.table_reference,
         limit=_resolve_limit(args.get("limit"), cap=state.policy.max_sample_rows),
         restricted_columns=restricted,
-        # Enforce policy.rowFilters[] on the free-form query_sql tool too (was
-        # bypassed). Can't merge a WHERE into arbitrary SQL, so the compiler
-        # wraps it: SELECT * FROM (<caller_sql>) WHERE <rowfilter> LIMIT n.
-        # ``attrs`` is this request's caller identity (falls back to state
-        # for legacy callers that don't pass the kwarg).
+        # Enforce policy.rowFilters[] on the free-form query_sql tool. RLS
+        # can't be safely applied to arbitrary caller SQL (a spoofable filter
+        # column in the caller's projection), so the compiler FAILS CLOSED:
+        # when the expose declares rowFilters it raises QueryValidationError
+        # steering the caller to the semantic ``query`` tool instead of
+        # wrapping. ``attrs`` is this request's caller identity (falls back to
+        # state for legacy callers that don't pass the kwarg).
         expose=state.expose,
         caller_attributes=attrs,
     )
