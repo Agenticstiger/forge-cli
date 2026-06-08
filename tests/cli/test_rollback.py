@@ -288,14 +288,39 @@ class TestRestoreSnowflake:
         with pytest.raises(CLIError, match="rollback_snowflake_missing_database"):
             rollback._restore_snowflake(snap, dry_run=False)
 
-    def test_missing_ddl_array_raises(self):
-        """A snapshot without ``ddl[]`` is malformed (or written by a
-        pre-T3 build). Reject loudly rather than emitting a
-        database-level CLONE that could overwrite unrelated tables."""
+    def test_missing_ddl_is_ignored_and_reconstructed(self):
+        """SECURITY: the baked ddl[] is no longer trusted. A snapshot without
+        it still restores, because the CLONE is reconstructed from the
+        validated location identifiers."""
         snap = _snap()
         snap.pop("ddl")
-        with pytest.raises(CLIError, match="rollback_snowflake_missing_ddl"):
-            rollback._restore_snowflake(snap, dry_run=False)
+        result = rollback._restore_snowflake(snap, dry_run=True)
+        assert result["status"] == "dry_run"
+        assert "CREATE OR REPLACE TABLE" in result["ddl"]
+        assert "CLONE" in result["ddl"]
+
+    def test_malicious_ddl_is_not_executed(self):
+        """SECURITY (regression for the verbatim-ddl[]-replay finding): a
+        tampered ddl[] with a benign location must NOT execute the attacker's
+        SQL — only the safe CLONE rebuilt from validated identifiers runs."""
+        snap = _snap()
+        snap["ddl"] = ["DROP DATABASE production", "CREATE USER pwn"]
+        mock_provider_cls = MagicMock()
+        mock_instance = MagicMock()
+        mock_instance.account = "test_account"
+        mock_instance._execute_sql_action.return_value = {"status": "ok"}
+        mock_provider_cls.return_value = mock_instance
+        with patch(
+            "fluid_build.providers.snowflake.SnowflakeProvider",
+            mock_provider_cls,
+        ):
+            result = rollback._restore_snowflake(snap, dry_run=False)
+        assert result["status"] == "restored"
+        executed = [c.args[0]["sql"] for c in mock_instance._execute_sql_action.call_args_list]
+        assert len(executed) == 1
+        assert executed[0].startswith("CREATE OR REPLACE TABLE")
+        assert "CLONE" in executed[0]
+        assert all("DROP" not in s and "CREATE USER" not in s for s in executed)
 
     def test_live_restore_invokes_provider(self):
         """Non-dry-run path constructs a SnowflakeProvider and runs
@@ -536,11 +561,46 @@ class TestRestoreBigQuery:
         with pytest.raises(CLIError, match="rollback_bigquery_missing_location"):
             rollback._restore_bigquery(snap, dry_run=False)
 
-    def test_missing_ddl_array_raises(self):
+    def test_missing_ddl_is_ignored_and_reconstructed(self):
+        """SECURITY: the baked ddl[] is no longer trusted. A snapshot without
+        it still restores, because the CTAS is reconstructed from the
+        validated location identifiers."""
         snap = _bq_snap()
         snap.pop("ddl")
-        with pytest.raises(CLIError, match="rollback_bigquery_missing_ddl"):
-            rollback._restore_bigquery(snap, dry_run=False)
+        result = rollback._restore_bigquery(snap, dry_run=True)
+        assert result["status"] == "dry_run"
+        assert "CREATE OR REPLACE TABLE" in result["ddl"]
+        assert "AS SELECT * FROM" in result["ddl"]
+
+    def test_malicious_ddl_is_not_executed(self):
+        """SECURITY (regression for the verbatim-ddl[]-replay finding): a
+        tampered ddl[] with a benign location must NOT execute the attacker's
+        SQL — only the safe CTAS rebuilt from validated identifiers runs."""
+        snap = _bq_snap()
+        snap["ddl"] = [
+            "DROP TABLE `myproj.prod.billing`",
+            "DELETE FROM `myproj.prod.users`",
+        ]
+        mock_bq = MagicMock()
+        mock_client = MagicMock()
+        mock_bq.Client.return_value = mock_client
+        google_cloud_mod = MagicMock()
+        google_cloud_mod.bigquery = mock_bq
+        with patch.dict(
+            sys.modules,
+            {
+                "google": MagicMock(),
+                "google.cloud": google_cloud_mod,
+                "google.cloud.bigquery": mock_bq,
+            },
+        ):
+            result = rollback._restore_bigquery(snap, dry_run=False)
+        assert result["status"] == "restored"
+        executed = [c.args[0] for c in mock_client.query.call_args_list]
+        assert len(executed) == 1
+        assert executed[0].startswith("CREATE OR REPLACE TABLE")
+        assert "AS SELECT * FROM" in executed[0]
+        assert all("DROP" not in s and "DELETE" not in s for s in executed)
 
     def test_invalid_identifier_refused(self):
         """The state file is attacker-authorable; a tampered dataset with
@@ -572,7 +632,10 @@ class TestRestoreBigQuery:
         assert result["status"] == "restored"
         assert result["provider"] == "bigquery"
         mock_bq.Client.assert_called_once_with(project="myproj")
-        assert mock_client.query.call_count == len(snap["ddl"])
+        assert mock_client.query.call_count == 1
+        executed = mock_client.query.call_args_list[0].args[0]
+        assert executed.startswith("CREATE OR REPLACE TABLE")
+        assert "AS SELECT * FROM" in executed
 
     def test_provider_unavailable_raises(self):
         """If google-cloud-bigquery isn't importable, surface a typed
