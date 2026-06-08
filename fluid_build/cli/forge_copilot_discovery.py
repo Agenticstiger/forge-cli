@@ -37,7 +37,7 @@ from fluid_build.cli.forge_copilot_schema_inference import (
     extract_provider_hints,
     summarize_sample_file,
 )
-from fluid_build.config import RUN_STATE_DIR
+from fluid_build.config_defaults import RUN_STATE_DIR
 from fluid_build.util.contract import get_builds
 
 LOG = logging.getLogger("fluid.cli.forge_copilot.discovery")

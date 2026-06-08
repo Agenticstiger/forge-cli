@@ -13,15 +13,18 @@
 # limitations under the License.
 
 """
-Configuration Management for FLUID CLI
+Runtime hierarchical configuration for FLUID CLI.
 
-Provides hierarchical configuration loading from multiple sources:
-1. Default configuration (built-in)
-2. System-wide configuration (/etc/fluid/config.yaml or C:\\ProgramData\\fluid\\config.yaml)
-3. User configuration (~/.fluidrc.yaml, ~/.fluid/config.yaml, or ~/.config/fluid/config.yaml)
-4. Project configuration (.fluidrc.yaml or fluid.config.yaml in current directory)
-5. Environment variables (FLUID_*)
-6. Command-line arguments (highest priority)
+Loads configuration from multiple sources with decreasing priority:
+  1. Defaults (built-in DEFAULT_CONFIG)
+  2. System config (/etc/fluid/config.yaml or C:\\ProgramData\\fluid\\config.yaml)
+  3. User config (~/.fluidrc.yaml, ~/.fluid/config.yaml, ~/.config/fluid/config.yaml)
+  4. Project config (.fluidrc.yaml, fluid.config.yaml in CWD)
+  5. Environment variables (FLUID_*)
+  6. CLI arguments (highest priority)
+
+For compile-time static defaults (RUN_STATE_DIR, DEFAULT_REGION, etc.),
+use ``fluid_build.config_defaults`` instead — NOT this module.
 """
 
 from __future__ import annotations
