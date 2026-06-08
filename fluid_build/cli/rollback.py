@@ -365,6 +365,8 @@ def _restore_snowflake(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, 
     raw_backup_name = snapshot.get("backup_name")
     location = snapshot.get("location", {})
     raw_database = location.get("database") or snapshot.get("database")
+    raw_schema = location.get("schema") or "PUBLIC"
+    raw_table = location.get("table")
     if not raw_database:
         raise CLIError(
             2,
@@ -386,8 +388,21 @@ def _restore_snowflake(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, 
                 "hint": ("snapshot record is missing backup_name — state file is malformed."),
             },
         )
+    if not raw_table:
+        raise CLIError(
+            2,
+            "rollback_snowflake_missing_location",
+            {
+                "hint": (
+                    "snapshot record is missing location.table — the snapshot "
+                    "writer should set this. File a bug if you see this."
+                ),
+            },
+        )
     try:
         database = validate_ident(raw_database)
+        schema = validate_ident(str(raw_schema))
+        table = validate_ident(str(raw_table))
         backup_name = validate_ident(raw_backup_name)
     except ValueError as exc:
         # Raise as a CLIError with a diagnostic event slug so CI log
@@ -409,28 +424,17 @@ def _restore_snowflake(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, 
             },
         ) from exc
 
-    # The rollback writer always records table-level CLONE DDL
-    # in ``snapshot.ddl[]``. A snapshot without that field is
-    # malformed (or written by a pre-T3 build that's no longer
-    # supported); reject it loudly rather than silently emitting a
-    # database-level CLONE that could overwrite unrelated tables.
-    snapshot_ddl_list = snapshot.get("ddl") if isinstance(snapshot.get("ddl"), list) else []
-    if not snapshot_ddl_list:
-        raise CLIError(
-            2,
-            "rollback_snowflake_missing_ddl",
-            {
-                "backup_name": backup_name,
-                "database": database,
-                "hint": (
-                    "snapshot is missing the ``ddl`` array. "
-                    "Re-snapshot via ``fluid apply --mode replace`` and "
-                    "retry, or restore manually with the Snowflake "
-                    "Time Travel CLI."
-                ),
-            },
-        )
-    ddl_statements = [str(s).rstrip(";") + ";" for s in snapshot_ddl_list if s]
+    # SECURITY: reconstruct the table-level CLONE from the VALIDATED
+    # identifiers instead of replaying snapshot["ddl"] verbatim. The state
+    # file is attacker-authorable, so a tampered ddl[] with a benign location
+    # could otherwise smuggle arbitrary DDL (e.g. "DROP DATABASE production")
+    # past the identifier checks. We ONLY ever run the single, structurally-
+    # safe CLONE built from db/schema/table/backup that passed validate_ident;
+    # the baked ddl[] is never executed. Mirrors SnowflakeProvider.restore_ddl.
+    ddl_statements = [
+        f"CREATE OR REPLACE TABLE {database}.{schema}.{table} "
+        f"CLONE {database}.{schema}.{backup_name};"
+    ]
     ddl = "\n".join(ddl_statements)
     cprint(
         "[rollback] snowflake CLONE plan:\n    " + "\n    ".join(ddl_statements),
@@ -494,28 +498,136 @@ def _restore_snowflake(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, 
 
 
 def _restore_bigquery(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, Any]:
-    """BigQuery rollback — not yet implemented.
+    """Restore a BigQuery product via CTAS, reconstructed from validated IDs.
 
-    Follow-up work sketch (for whoever picks this up):
-    - Read backup-dataset name from ``snapshot["backup_name"]``.
-    - For each table in the backup dataset, run ``bq cp --force
-      <backup>.<table> <live>.<table>``.
-    - Wrap in a script that short-circuits on first failure; partial
-      restores are worse than no restore.
+    BigQuery has no zero-copy CLONE for arbitrary backups, so the restore is
+    ``CREATE OR REPLACE TABLE <orig> AS SELECT * FROM <backup>`` (atomic, so
+    the live table is never left half-restored).
+
+    SECURITY: the on-disk state file (``.fluid/rollback-state.json``) is
+    attacker-authorable — the module docstring invites operators to commit it
+    as an audit trail, so it is reviewed as a data blob, not byte-audited SQL.
+    The baked ``snapshot["ddl"]`` is therefore NEVER executed: the statement
+    is REBUILT here from ``location`` components that each pass
+    ``_validated_bq_fqn``, so a tampered ddl[] (e.g. ``DROP TABLE prod``)
+    cannot smuggle arbitrary DDL past a benign-looking location. Mirrors the
+    apply-time writer ``GcpProvider.restore_ddl``. Returns the usual
+    ``{status, provider, ddl, ...}`` contract.
     """
-    raise CLIError(
-        2,
-        "rollback_bigquery_not_implemented",
-        {
-            "snapshot": snapshot.get("backup_name"),
-            "hint": (
-                "BigQuery rollback is not yet wired. Workaround: "
-                "``bq cp --force <backup_dataset>.<table> "
-                "<live_dataset>.<table>`` per table. Track under the "
-                "follow-up issue for this feature."
-            ),
-        },
+    from fluid_build.providers.gcp.plan.planner import _validated_bq_fqn
+
+    location = snapshot.get("location") or {}
+    raw_project = location.get("database") or snapshot.get("database")
+    raw_dataset = location.get("schema")
+    raw_table = location.get("table")
+    raw_backup = location.get("backup_table") or snapshot.get("backup_name")
+    if not raw_project:
+        raise CLIError(
+            2,
+            "rollback_bigquery_missing_project",
+            {
+                "snapshot": raw_backup,
+                "hint": (
+                    "snapshot record is missing location.database (the GCP "
+                    "project) — the snapshot writer should set this. File "
+                    "a bug if you see this."
+                ),
+            },
+        )
+    if not (raw_dataset and raw_table and raw_backup):
+        raise CLIError(
+            2,
+            "rollback_bigquery_missing_location",
+            {
+                "snapshot": raw_backup,
+                "hint": (
+                    "snapshot record is missing location.schema / table / "
+                    "backup_table — the snapshot writer should set these. "
+                    "File a bug if you see this."
+                ),
+            },
+        )
+    # SECURITY: reconstruct the restore DDL from the VALIDATED identifiers
+    # instead of replaying snapshot["ddl"] verbatim. The state file is
+    # attacker-authorable, so a tampered ddl[] with a benign location could
+    # otherwise execute arbitrary SQL (DROP/DELETE/GRANT) under the operator's
+    # credentials. We ONLY ever run the single, structurally-safe
+    # ``CREATE OR REPLACE TABLE <orig> AS SELECT * FROM <backup>`` built from
+    # FQNs that passed _validated_bq_fqn; the baked ddl[] is never executed.
+    try:
+        orig_fqn = _validated_bq_fqn(raw_project, raw_dataset, raw_table)
+        backup_fqn = _validated_bq_fqn(raw_project, raw_dataset, raw_backup)
+    except ValueError as exc:
+        raise CLIError(
+            2,
+            "rollback_bigquery_invalid_identifier",
+            {
+                "error": str(exc),
+                "hint": (
+                    "state-file project/dataset/table values must be valid "
+                    "BigQuery identifiers. A value containing spaces, "
+                    "semicolons, quotes, or shell metacharacters indicates "
+                    "a corrupt or attacker-crafted state file."
+                ),
+            },
+        ) from exc
+
+    ddl_statements = [f"CREATE OR REPLACE TABLE {orig_fqn} AS SELECT * FROM {backup_fqn}"]
+    ddl = ddl_statements[0] + ";"
+    cprint(
+        "[rollback] bigquery CTAS restore plan:\n    "
+        + "\n    ".join(stmt + ";" for stmt in ddl_statements),
+        markup=False,
     )
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "provider": "bigquery",
+            "ddl": ddl,
+            "project": raw_project,
+            "backup_name": raw_backup,
+        }
+    # Execute via the BigQuery client. Imported lazily so non-BigQuery
+    # rollbacks don't pay the google-cloud-bigquery import cost (mirrors
+    # the lazy SnowflakeProvider import in _restore_snowflake and the
+    # client usage in GcpProvider.cleanup_backups).
+    try:
+        from google.cloud import bigquery  # type: ignore
+    except ImportError as exc:
+        raise CLIError(
+            2,
+            "rollback_bigquery_provider_unavailable",
+            {
+                "error": str(exc),
+                "hint": (
+                    "google-cloud-bigquery is not installed. Install it "
+                    "(``pip install google-cloud-bigquery``) or run the "
+                    "restore manually with ``bq``."
+                ),
+            },
+        ) from exc
+
+    client = bigquery.Client(project=raw_project)
+    last_result: Any = None
+    for stmt in ddl_statements:
+        try:
+            job = client.query(stmt)
+            last_result = job.result()  # blocks until the statement completes
+        except Exception as exc:  # pragma: no cover - defensive
+            raise CLIError(
+                2,
+                "rollback_bigquery_execute_failed",
+                {"error": str(exc), "ddl": stmt},
+            ) from exc
+
+    return {
+        "status": "restored",
+        "provider": "bigquery",
+        "ddl": ddl,
+        "project": raw_project,
+        "backup_name": raw_backup,
+        "provider_result": {"status": "ok", "statements": len(ddl_statements)},
+    }
 
 
 def _restore_redshift(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, Any]:
@@ -544,7 +656,21 @@ def _restore_redshift(snapshot: Dict[str, Any], *, dry_run: bool) -> Dict[str, A
 
 _RESTORE_DISPATCH = {
     "snowflake": _restore_snowflake,
+    # BigQuery snapshots are written with provider="bigquery" by synthetic
+    # callers, but a REAL ``fluid apply`` records provider=GcpProvider.name
+    # == "gcp" (apply.py writes ``getattr(provider, "name", ...)``). Alias
+    # "gcp" to the BigQuery restorer so the live apply->rollback round trip
+    # actually reaches it instead of failing with rollback_unknown_provider.
+    "gcp": _restore_bigquery,
     "bigquery": _restore_bigquery,
+    # NOTE: Redshift is NOT aliased from "aws" on purpose. A real Redshift
+    # apply plans through AwsProvider (provider name "aws") and the snapshot
+    # writer bakes its DDL via AwsProvider.restore_ddl -> [] (S3 prefix-copy,
+    # non-DDL). Routing "aws" here would only surface rollback_redshift_
+    # missing_ddl because the transactional BEGIN/DROP/CTAS/COMMIT is never
+    # baked into a real "aws" snapshot. Redshift rollback needs the writer/
+    # planner to record provider="redshift" + the transactional ddl first
+    # (follow-up); only then add the alias.
     "redshift": _restore_redshift,
 }
 

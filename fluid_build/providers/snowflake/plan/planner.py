@@ -110,7 +110,7 @@ class SnowflakePlanner(BasePlanner):
     lot of helper utilities and are referenced from tests) but the
     public entry point is now this class. ``plan_actions`` below is
     kept as a back-compat shim so existing callers
-    (``provider.plan()`` in ``provider_enhanced.py``) don't have to
+    (``provider.plan()`` in ``provider.py``) don't have to
     change at the same time.
     """
 

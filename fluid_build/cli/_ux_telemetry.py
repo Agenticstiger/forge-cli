@@ -142,7 +142,19 @@ def emit_telemetry_to_active_span() -> None:
     Best-effort — never blocks the run on a missing tracer or a
     misbehaving exporter. Idempotent: calling twice writes the
     most-recent values.
+
+    Privacy gate: no-ops unless the user has explicitly opted in to
+    telemetry (default OFF). ``DO_NOT_TRACK`` and ``FLUID_TELEMETRY=0``
+    force this off regardless of any persisted choice — see
+    :mod:`fluid_build.cli._telemetry_consent`.
     """
+    try:
+        from fluid_build.cli._telemetry_consent import telemetry_enabled
+
+        if not telemetry_enabled():
+            return
+    except Exception:  # noqa: BLE001 — fail closed (no emit) on gate error
+        return
     try:
         from opentelemetry import trace as _otel_trace
     except Exception:  # noqa: BLE001

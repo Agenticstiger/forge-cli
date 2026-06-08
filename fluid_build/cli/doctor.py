@@ -180,6 +180,17 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "scratch tempdir",
         "Working dir for the agent CLI (default avoids loading project CLAUDE.md/AGENTS.md)",
     ),
+    # — Telemetry consent (opt-in, default OFF) —
+    (
+        "FLUID_TELEMETRY",
+        "OFF (opt-in via ~/.fluid/config.yaml telemetry.enabled)",
+        "Set =1 to enable anonymous UX telemetry, =0 to force off (overrides config)",
+    ),
+    (
+        "DO_NOT_TRACK",
+        "unset (telemetry OFF by default anyway)",
+        "Universal kill switch — when set, all telemetry is disabled (wins over everything)",
+    ),
 ]
 
 
@@ -196,6 +207,31 @@ def _resolve_env_state(name: str) -> Tuple[str, str]:
     if raw == "":
         return ('""', "env")
     return (raw, "env")
+
+
+def _telemetry_state_line() -> str:
+    """One-line resolved telemetry state for the --env footer.
+
+    Shows the *effective* decision after applying the full precedence
+    ladder (DO_NOT_TRACK > FLUID_TELEMETRY > persisted config > default),
+    which a per-env-var table can't convey on its own.
+    """
+    try:
+        from fluid_build.cli._telemetry_consent import describe_state
+
+        st = describe_state()
+        effective = "ON" if st["enabled"] else "OFF"
+        if st["do_not_track"]:
+            why = "DO_NOT_TRACK set"
+        elif st["env_override"] is not None:
+            why = f"FLUID_TELEMETRY={st['env_override']!r}"
+        elif st["persisted"] is not None:
+            why = f"~/.fluid/config.yaml telemetry.enabled={st['persisted']}"
+        else:
+            why = "default (opt-in, not yet enabled)"
+        return f"Telemetry: {effective} — {why}"
+    except Exception:  # noqa: BLE001
+        return "Telemetry: OFF — default (gate unavailable)"
 
 
 def _run_env_listing(args, logger: logging.Logger) -> int:
@@ -223,7 +259,13 @@ def _run_env_listing(args, logger: logging.Logger) -> int:
         )
 
     if getattr(args, "json", False):
-        json.dump({"env": rows}, sys.stdout, indent=2)
+        try:
+            from fluid_build.cli._telemetry_consent import describe_state
+
+            telemetry_state = describe_state()
+        except Exception:  # noqa: BLE001
+            telemetry_state = {"enabled": False, "default": False}
+        json.dump({"env": rows, "telemetry": telemetry_state}, sys.stdout, indent=2)
         sys.stdout.write("\n")
         return 0
 
@@ -253,6 +295,7 @@ def _run_env_listing(args, logger: logging.Logger) -> int:
             "[dim]Tip: source values are 'env' when the operator set them, "
             "'default' when unset.[/dim]"
         )
+        console.print(f"[bold]{_telemetry_state_line()}[/bold]")
         return 0
 
     # Plain-text fallback.
@@ -264,6 +307,7 @@ def _run_env_listing(args, logger: logging.Logger) -> int:
         cprint(f"    default:     {row['default']}")
         cprint(f"    description: {row['description']}")
         cprint()
+    cprint(_telemetry_state_line())
     return 0
 
 

@@ -169,7 +169,7 @@ class RedshiftProvider(BaseProvider):
         which is documented as PR-reviewable / attacker-authorable —
         every component is routed through ``validate_ident`` before
         being interpolated into the DDL string. Mirrors the defence
-        applied at ``providers/snowflake/provider_enhanced.py::
+        applied at ``providers/snowflake/provider.py::
         cleanup_backups`` and ``cli/rollback.py::_restore_snowflake``.
         Records with invalid identifiers are skipped silently so a
         single tampered entry doesn't poison the whole cleanup pass.

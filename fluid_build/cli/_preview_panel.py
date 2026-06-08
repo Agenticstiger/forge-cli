@@ -688,6 +688,76 @@ def confirm(
 # ---------------------------------------------------------------------------
 
 
+def render_refine_diff(
+    old_contract: Optional[Mapping[str, Any]],
+    new_contract: Optional[Mapping[str, Any]],
+    *,
+    console: Optional[Any] = None,
+) -> bool:
+    """Render a contract-vs-contract diff BEFORE the refine write.
+
+    Reuses the existing version-diff engine
+    (:func:`fluid_build.api.changelog.compare_contracts` +
+    :func:`render_text` — the same classifier behind ``fluid diff
+    --baseline``) rather than re-implementing a differ. Surfaces what a
+    ``fluid forge --refine`` regeneration changed (columns added/removed/
+    modified, metadata churn, breaking-change classification) so the user
+    sees the delta against their existing contract before a single byte
+    is overwritten.
+
+    Returns ``True`` when a diff block was rendered, ``False`` otherwise
+    (no baseline, no changes, or the engine was unavailable). Never
+    raises — preview must not crash the authoring flow.
+    """
+    if not isinstance(old_contract, Mapping) or not isinstance(new_contract, Mapping):
+        return False
+    try:
+        from fluid_build.api.changelog import compare_contracts, render_text
+
+        report = compare_contracts(old_contract, new_contract)
+    except Exception:  # noqa: BLE001 — diff is advisory; never block the write
+        LOG.debug("render_refine_diff: changelog engine unavailable", exc_info=True)
+        return False
+
+    if report.total == 0:
+        # Nothing changed vs the existing contract — say so explicitly so
+        # the user knows the regeneration was a no-op rather than that the
+        # diff failed silently.
+        _line = "[dim]No changes vs the existing contract.[/dim]"
+        if console is not None:
+            try:
+                console.print(_line)
+            except Exception:  # noqa: BLE001
+                print("No changes vs the existing contract.")
+        else:
+            print("No changes vs the existing contract.")
+        return False
+
+    body = render_text(report)
+    title = (
+        f"Changes vs existing contract "
+        f"({len(report.breaking)} breaking · "
+        f"{len(report.non_breaking)} non-breaking · {len(report.info)} info)"
+    )
+    if console is not None:
+        try:
+            from rich.panel import Panel as _RichPanel
+
+            border = "red" if report.has_breaking else "yellow"
+            console.print(_RichPanel(body, title=f"[bold]{title}[/bold]", border_style=border))
+            return True
+        except Exception:  # noqa: BLE001 — fall through to plain text
+            try:
+                console.print(f"\n=== {title} ===")
+                console.print(body)
+                return True
+            except Exception:  # noqa: BLE001
+                pass
+    print(f"\n=== {title} ===")
+    print(body)
+    return True
+
+
 def render_completion(
     panel: PreviewPanel,
     *,
@@ -737,5 +807,6 @@ __all__ = [
     "new_run_id",
     "render",
     "render_completion",
+    "render_refine_diff",
     "run_dir_for",
 ]

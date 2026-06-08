@@ -50,6 +50,26 @@ REQUIRED_KILL_SWITCHES = (
 )
 
 
+class TestTelemetryKillSwitchesListed:
+    def test_telemetry_env_vars_are_in_catalog(self):
+        names = {row[0] for row in doctor.ENV_KILL_SWITCHES}
+        assert "FLUID_TELEMETRY" in names
+        assert "DO_NOT_TRACK" in names
+
+    def test_json_includes_resolved_telemetry_state(self, monkeypatch):
+        for name, _, _ in doctor.ENV_KILL_SWITCHES:
+            monkeypatch.delenv(name, raising=False)
+        args = SimpleNamespace(env=True, json=True)
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            rc = doctor._run_env_listing(args, LOG)
+        assert rc == 0
+        payload = json.loads(buf.getvalue())
+        assert "telemetry" in payload
+        # Default is OFF (privacy-preserving) when nothing is set.
+        assert payload["telemetry"]["enabled"] is False
+
+
 class TestEnvCatalog:
     def test_all_eight_kill_switches_are_listed(self):
         catalog_names = {row[0] for row in doctor.ENV_KILL_SWITCHES}
@@ -63,9 +83,11 @@ class TestEnvCatalog:
         for entry in doctor.ENV_KILL_SWITCHES:
             assert len(entry) == 3, f"expected (name, default, description), got {entry!r}"
             name, default, desc = entry
-            assert isinstance(name, str) and name.startswith(
-                "FLUID_"
-            ), f"env-var name must start with FLUID_: {name!r}"
+            # Almost all knobs are FLUID_* prefixed; the one documented
+            # exception is the cross-tool ``DO_NOT_TRACK`` standard.
+            assert isinstance(name, str) and (
+                name.startswith("FLUID_") or name == "DO_NOT_TRACK"
+            ), f"env-var name must be FLUID_* (or DO_NOT_TRACK): {name!r}"
             assert default, f"every entry needs a non-empty default for {name}"
             assert desc, f"every entry needs a non-empty description for {name}"
 

@@ -857,7 +857,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     # resolution (and the Snowflake identifier allowlist) sees values
     # the user already staged in .env. Matches the apply path, which hits
     # the credential resolver chain with project_root defaulted to Path.cwd()
-    # (see provider_enhanced -> resolve_snowflake_settings fallback). The
+    # (see provider -> resolve_snowflake_settings fallback). The
     # contract file itself lives deeper in the tree (e.g. fluid/contracts/*)
     # so its parent is NOT the project root.
     _hydrate_dotenv_into_environ(Path.cwd(), getattr(args, "env", None))

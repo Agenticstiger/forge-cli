@@ -370,7 +370,7 @@ class TestSnowflakeRollbackCleanupValidatesIdentifiers:
         # The provider is initialised lazily in the rollback path; here
         # we instantiate with placeholder creds and exercise the
         # synchronous DDL emitters which don't touch the network.
-        from fluid_build.providers.snowflake.provider_enhanced import (
+        from fluid_build.providers.snowflake.provider import (
             SnowflakeProviderEnhanced,
         )
 

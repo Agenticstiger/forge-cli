@@ -21,7 +21,7 @@ Bug IDs and what each test covers:
 * A4-3  verify.py: verify_acquisition uses contract parent dir, not cwd
 * A4-4  _acquisition_stage_ext.py: run_state_succeeded is case-insensitive
 * A4-A  build_runners/base.py: embedded-SQL builds don't emit "Script not found"
-* A5-3  provider_enhanced.py: _aggregate_sub_status counts ok/changed correctly
+* A5-3  provider.py: _aggregate_sub_status counts ok/changed correctly
 """
 
 from __future__ import annotations

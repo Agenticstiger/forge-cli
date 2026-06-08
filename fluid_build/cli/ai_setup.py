@@ -728,6 +728,96 @@ def _make_coding_agent_config(pname: str, model: Optional[str] = None) -> LlmCon
     )
 
 
+def _offer_import_env_api_key(
+    console: Any,
+    provider: str,
+    env_key: str,
+    env_var: str,
+) -> None:
+    """Offer to import an LLM API key already present in the environment.
+
+    Many users already export ``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` /
+    ``GEMINI_API_KEY`` (or ``GOOGLE_API_KEY``) for another tool. fluid finds
+    and *uses* that key for the current process (step 2 above) but, until now,
+    forgot it on the next shell. This helper offers to persist that same
+    already-in-memory value into fluid's own keyring so the user never re-enters
+    it.
+
+    Security posture (deliberately conservative):
+
+    * **Env vars only.** We read **only** the value already present in this
+      process's environment — never another CLI's on-disk credential file
+      (``~/.codex/auth.json``, ``~/.config/anthropic/credentials/*``,
+      ``~/.aws/credentials``, ``~/.config/gh/hosts.yml``), never a browser or
+      OS credential store. Those are out of scope on purpose.
+    * **Explicit opt-in.** Nothing is written without an interactive
+      ``ask_confirmation`` yes. Non-TTY (CI / piped) returns immediately and
+      persists nothing.
+    * **No double-write.** If a config already names this provider we skip the
+      offer — the user has already set fluid up.
+    * **Shape cross-check.** If the key's recognisable shape disagrees with the
+      env var's provider we skip silently rather than persist a mismatch.
+    * **Never logs the key.** Only the constant provider name is logged
+      (CodeQL ``py/clear-text-logging-sensitive-data`` — the key is in scope at
+      every LOG site in this frame).
+    """
+    # Non-interactive (CI / piped stdin): use the key, persist nothing.
+    if not (sys.stdin.isatty() and console and RICH_AVAILABLE):
+        return
+    # Already configured for this provider — don't re-offer.
+    try:
+        saved = _load_ai_config() or {}
+        if (saved.get("provider") or "").strip().lower() == provider:
+            return
+    except Exception as exc:  # noqa: BLE001 — best-effort, never blocks setup
+        LOG.debug("import-env-key: could not read existing config: %s", exc)
+        return
+    # Shape cross-check: a key whose recognisable shape disagrees with the
+    # env var's provider is not safe to persist as that provider.
+    detected = detect_provider_from_api_key(env_key)
+    if detected is not None and detected != provider:
+        LOG.debug("import-env-key: shape/provider mismatch, skipping offer")
+        return
+    label = PROVIDER_DISPLAY_NAMES.get(provider, provider)
+    try:
+        accept = ask_confirmation(
+            console,
+            f"Save this {label} key for future fluid runs?",
+            default=True,
+            title="Import API Key",
+            border_style="green",
+            preview=(
+                f"fluid found a {label} key in your environment ({env_var}).\n"
+                "Saving it to fluid's keyring means you won't need to set the\n"
+                "environment variable again next time. The key is stored in your\n"
+                "OS keyring (encrypted), never in plaintext on disk."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — a prompt failure must not break setup
+        LOG.debug("import-env-key: prompt failed: %s", exc)
+        return
+    if not accept:
+        LOG.info("Inline AI setup: user declined importing env key (provider configured)")
+        return
+    # Persist provider/model to ~/.fluid/ai_config.json and the key to the
+    # keyring (plaintext only under the existing FLUID_ALLOW_PLAINTEXT_AI_SECRETS
+    # opt-in). Don't interpolate the key into any log line.
+    provider_obj = BUILTIN_LLM_PROVIDERS.get(provider)
+    if provider_obj is None:
+        # Not a built-in cloud provider (e.g. "github"/GITHUB_API_KEY).
+        # Don't offer to persist a key we'd save with an empty model and
+        # that the cloud-config builder can't construct anyway.
+        return
+    model = provider_obj.default_model
+    saved_ok = _save_ai_config(provider, model, api_key=env_key)
+    if saved_ok:
+        console.print("[dim]Saved to fluid's keyring — no need to set the env var next time.[/dim]")
+        LOG.info("Inline AI setup: imported env key into keyring (provider configured)")
+    else:
+        console.print("[yellow]Could not save the key; it will work this session only.[/yellow]")
+        LOG.info("Inline AI setup: env key import failed (provider configured)")
+
+
 def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
     """Compact inline setup triggered when forge starts without a configured provider.
 
@@ -795,6 +885,11 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
                 label = PROVIDER_DISPLAY_NAMES.get(pname, pname)
                 console.print(f"[dim]Using {label} from environment.[/dim]")
             LOG.info("Inline AI setup: loaded %s from env var", pname)
+            # 2a. Opt-in import: the key is in this shell's environment
+            #     (e.g. exported for another tool). Offer to persist it to
+            #     fluid's own keyring so it survives the next shell — strictly
+            #     opt-in, never in CI, and only the env value we already read.
+            _offer_import_env_api_key(console, pname, env_key, env_var)
             return _make_cloud_config(pname, env_key)
 
     # 3. Explicit OLLAMA_HOST env var.

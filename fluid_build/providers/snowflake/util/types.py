@@ -10,7 +10,7 @@
 
 Single source of truth for FLUID's generic type names → Snowflake DDL types.
 Imported by both the planner (``plan/planner.py``) and the abstract-action
-recovery path in ``provider_enhanced.py``; without this consolidation, the
+recovery path in ``provider.py``; without this consolidation, the
 two paths drifted and `NUMBER` columns silently degraded to `VARCHAR`.
 
 Per /borrow-before-build receipts (search 2026-05):

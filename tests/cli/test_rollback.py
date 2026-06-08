@@ -20,9 +20,10 @@ Covers:
   shape — each raises an actionable CLIError event slug).
 - Snapshot selection (env + product filter, named snapshot, latest-by-
   timestamp).
-- Per-provider restore dispatch (Snowflake happy path; BQ + Redshift
-  raise NotImplementedError-shaped CLIErrors with clear workaround
-  hints).
+- Per-provider restore dispatch (Snowflake + BigQuery happy paths,
+  incl. the provider="gcp" dispatch alias a real apply records;
+  Redshift still raises a typed not-implemented CLIError until its
+  writer bakes transactional restore DDL — see _RESTORE_DISPATCH).
 - Destructive-confirmation gate (--yes required unless --dry-run).
 - Dry-run surface (returns plan without executing).
 
@@ -35,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -286,14 +288,39 @@ class TestRestoreSnowflake:
         with pytest.raises(CLIError, match="rollback_snowflake_missing_database"):
             rollback._restore_snowflake(snap, dry_run=False)
 
-    def test_missing_ddl_array_raises(self):
-        """A snapshot without ``ddl[]`` is malformed (or written by a
-        pre-T3 build). Reject loudly rather than emitting a
-        database-level CLONE that could overwrite unrelated tables."""
+    def test_missing_ddl_is_ignored_and_reconstructed(self):
+        """SECURITY: the baked ddl[] is no longer trusted. A snapshot without
+        it still restores, because the CLONE is reconstructed from the
+        validated location identifiers."""
         snap = _snap()
         snap.pop("ddl")
-        with pytest.raises(CLIError, match="rollback_snowflake_missing_ddl"):
-            rollback._restore_snowflake(snap, dry_run=False)
+        result = rollback._restore_snowflake(snap, dry_run=True)
+        assert result["status"] == "dry_run"
+        assert "CREATE OR REPLACE TABLE" in result["ddl"]
+        assert "CLONE" in result["ddl"]
+
+    def test_malicious_ddl_is_not_executed(self):
+        """SECURITY (regression for the verbatim-ddl[]-replay finding): a
+        tampered ddl[] with a benign location must NOT execute the attacker's
+        SQL — only the safe CLONE rebuilt from validated identifiers runs."""
+        snap = _snap()
+        snap["ddl"] = ["DROP DATABASE production", "CREATE USER pwn"]
+        mock_provider_cls = MagicMock()
+        mock_instance = MagicMock()
+        mock_instance.account = "test_account"
+        mock_instance._execute_sql_action.return_value = {"status": "ok"}
+        mock_provider_cls.return_value = mock_instance
+        with patch(
+            "fluid_build.providers.snowflake.SnowflakeProvider",
+            mock_provider_cls,
+        ):
+            result = rollback._restore_snowflake(snap, dry_run=False)
+        assert result["status"] == "restored"
+        executed = [c.args[0]["sql"] for c in mock_instance._execute_sql_action.call_args_list]
+        assert len(executed) == 1
+        assert executed[0].startswith("CREATE OR REPLACE TABLE")
+        assert "CLONE" in executed[0]
+        assert all("DROP" not in s and "CREATE USER" not in s for s in executed)
 
     def test_live_restore_invokes_provider(self):
         """Non-dry-run path constructs a SnowflakeProvider and runs
@@ -478,14 +505,156 @@ class TestRestoreSnowflakeSqlInjection:
             rollback._restore_snowflake(snap, dry_run=True)
 
 
-class TestRestoreBigQueryRedshift:
-    def test_bigquery_not_implemented_with_actionable_hint(self):
-        """NotImplemented must surface as a CLIError with the
-        workaround command, not a vague ImportError."""
-        with pytest.raises(CLIError, match="rollback_bigquery_not_implemented"):
-            rollback._restore_bigquery(_snap(), dry_run=False)
+def _bq_snap(*, provider="bigquery", backup_name="subscriber360_bak_1", **loc_overrides):
+    """Build a canonical BigQuery rollback snapshot.
 
-    def test_redshift_not_implemented_with_actionable_hint(self):
+    Mirrors what providers/gcp/plan/planner.py emits: location carries the
+    project/dataset/table/backup_table, and ``ddl[]`` is the pre-baked CTAS
+    restore statement (``CREATE OR REPLACE TABLE <orig> AS SELECT * FROM
+    <backup>``). ``provider`` defaults to "bigquery" but a REAL apply records
+    "gcp" (GcpProvider.name) — pass provider="gcp" to exercise the dispatch.
+    """
+    location = {
+        "database": "myproj",
+        "schema": "telco",
+        "table": "subscriber360",
+        "backup_table": backup_name,
+    }
+    location.update(loc_overrides)
+    return {
+        "timestamp": "2026-04-23T10:00:00Z",
+        "env": "dev",
+        "product_id": "silver.telco.subscriber360_v1",
+        "backup_name": backup_name,
+        "provider": provider,
+        "mode": "replace",
+        "location": location,
+        "ddl": [
+            f"CREATE OR REPLACE TABLE `{location['database']}.{location['schema']}."
+            f"{location['table']}` AS SELECT * FROM "
+            f"`{location['database']}.{location['schema']}.{backup_name}`"
+        ],
+    }
+
+
+class TestRestoreBigQuery:
+    def test_dry_run_returns_ddl_without_client(self):
+        """Dry-run returns the baked CTAS DDL and never constructs a client."""
+        result = rollback._restore_bigquery(_bq_snap(), dry_run=True)
+        assert result["status"] == "dry_run"
+        assert result["provider"] == "bigquery"
+        assert "CREATE OR REPLACE TABLE" in result["ddl"]
+        assert _bq_snap()["backup_name"] in result["ddl"]
+
+    def test_missing_project_raises(self):
+        snap = _bq_snap()
+        snap["location"] = {}
+        snap.pop("database", None)
+        with pytest.raises(CLIError, match="rollback_bigquery_missing_project"):
+            rollback._restore_bigquery(snap, dry_run=False)
+
+    def test_missing_location_fields_raises(self):
+        """Project present but dataset/table absent → a distinct, clear slug
+        (not the confusing invalid_identifier path)."""
+        snap = _bq_snap()
+        snap["location"] = {"database": "myproj"}
+        with pytest.raises(CLIError, match="rollback_bigquery_missing_location"):
+            rollback._restore_bigquery(snap, dry_run=False)
+
+    def test_missing_ddl_is_ignored_and_reconstructed(self):
+        """SECURITY: the baked ddl[] is no longer trusted. A snapshot without
+        it still restores, because the CTAS is reconstructed from the
+        validated location identifiers."""
+        snap = _bq_snap()
+        snap.pop("ddl")
+        result = rollback._restore_bigquery(snap, dry_run=True)
+        assert result["status"] == "dry_run"
+        assert "CREATE OR REPLACE TABLE" in result["ddl"]
+        assert "AS SELECT * FROM" in result["ddl"]
+
+    def test_malicious_ddl_is_not_executed(self):
+        """SECURITY (regression for the verbatim-ddl[]-replay finding): a
+        tampered ddl[] with a benign location must NOT execute the attacker's
+        SQL — only the safe CTAS rebuilt from validated identifiers runs."""
+        snap = _bq_snap()
+        snap["ddl"] = [
+            "DROP TABLE `myproj.prod.billing`",
+            "DELETE FROM `myproj.prod.users`",
+        ]
+        mock_bq = MagicMock()
+        mock_client = MagicMock()
+        mock_bq.Client.return_value = mock_client
+        google_cloud_mod = MagicMock()
+        google_cloud_mod.bigquery = mock_bq
+        with patch.dict(
+            sys.modules,
+            {
+                "google": MagicMock(),
+                "google.cloud": google_cloud_mod,
+                "google.cloud.bigquery": mock_bq,
+            },
+        ):
+            result = rollback._restore_bigquery(snap, dry_run=False)
+        assert result["status"] == "restored"
+        executed = [c.args[0] for c in mock_client.query.call_args_list]
+        assert len(executed) == 1
+        assert executed[0].startswith("CREATE OR REPLACE TABLE")
+        assert "AS SELECT * FROM" in executed[0]
+        assert all("DROP" not in s and "DELETE" not in s for s in executed)
+
+    def test_invalid_identifier_refused(self):
+        """The state file is attacker-authorable; a tampered dataset with
+        SQL metacharacters must be refused before any DDL executes."""
+        snap = _bq_snap(schema="ds; DROP TABLE x")
+        with pytest.raises(CLIError, match="rollback_bigquery_invalid_identifier"):
+            rollback._restore_bigquery(snap, dry_run=False)
+
+    def test_live_restore_invokes_client(self):
+        """Non-dry-run constructs bigquery.Client(project=...) and runs each
+        baked statement through it. The SDK is injected via sys.modules so the
+        test is hermetic regardless of whether google-cloud-bigquery is installed.
+        """
+        snap = _bq_snap()
+        mock_bq = MagicMock()
+        mock_client = MagicMock()
+        mock_bq.Client.return_value = mock_client
+        google_cloud_mod = MagicMock()
+        google_cloud_mod.bigquery = mock_bq
+        with patch.dict(
+            sys.modules,
+            {
+                "google": MagicMock(),
+                "google.cloud": google_cloud_mod,
+                "google.cloud.bigquery": mock_bq,
+            },
+        ):
+            result = rollback._restore_bigquery(snap, dry_run=False)
+        assert result["status"] == "restored"
+        assert result["provider"] == "bigquery"
+        mock_bq.Client.assert_called_once_with(project="myproj")
+        assert mock_client.query.call_count == 1
+        executed = mock_client.query.call_args_list[0].args[0]
+        assert executed.startswith("CREATE OR REPLACE TABLE")
+        assert "AS SELECT * FROM" in executed
+
+    def test_provider_unavailable_raises(self):
+        """If google-cloud-bigquery isn't importable, surface a typed
+        provider-unavailable error, not a raw ImportError."""
+        snap = _bq_snap()
+        with patch.dict(sys.modules, {"google.cloud": None, "google.cloud.bigquery": None}):
+            with pytest.raises(CLIError, match="rollback_bigquery_provider_unavailable"):
+                rollback._restore_bigquery(snap, dry_run=False)
+
+
+class TestRestoreRedshiftNotYetWired:
+    def test_redshift_still_not_implemented(self):
+        """Redshift rollback is intentionally NOT wired yet. A real Redshift
+        apply plans through AwsProvider, whose restore_ddl returns [] (S3
+        prefix-copy, non-DDL), so the transactional restore DDL is never baked
+        into a snapshot. The stub raises an honest typed error rather than a
+        false-green no-op. Follow-up: the writer/planner must record
+        provider="redshift" + the transactional ddl, then add the dispatch
+        alias (see the note in _RESTORE_DISPATCH)."""
         with pytest.raises(CLIError, match="rollback_redshift_not_implemented"):
             rollback._restore_redshift(_snap(), dry_run=False)
 
@@ -597,6 +766,21 @@ class TestRunEndToEnd:
         args = _args(state_file=str(p), dry_run=True)
         with pytest.raises(CLIError, match="rollback_unknown_provider"):
             rollback.run(args)
+
+    def test_gcp_provider_routes_to_bigquery(self, tmp_path):
+        """Regression guard for the dispatch gap: a REAL BigQuery apply
+        records provider="gcp" (GcpProvider.name), not "bigquery". The
+        "gcp" alias in _RESTORE_DISPATCH must route it to _restore_bigquery
+        so the live apply->rollback round trip actually works instead of
+        failing with rollback_unknown_provider."""
+        p = tmp_path / "state.json"
+        p.write_text(
+            json.dumps(_state(snapshots=[_bq_snap(provider="gcp")])),
+            encoding="utf-8",
+        )
+        args = _args(state_file=str(p), dry_run=True)
+        rc = rollback.run(args)
+        assert rc == 0
 
 
 # -----------------------------------------------------------------------------

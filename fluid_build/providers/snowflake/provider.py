@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# fluid_build/providers/snowflake/provider_enhanced.py
+# fluid_build/providers/snowflake/provider.py
 """
 Production-grade Snowflake Provider for FLUID Build.
 
