@@ -11,84 +11,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`fluid describe --self` self-description for the Command Center.** A new
-  library-callable `fluid_build.describe.self_describe()` (and `fluid describe
-  --self`) returns a machine-readable description of the installation —
-  `fluid_version`, `schema_version`, `providers`, `build_engines`, `templates`,
-  `capabilities`, and the **full command tree**: every subcommand with its
-  flags (names / dest / required / help / choices / default), introspected from
-  the argparse parser. The Command Center consumes it via
-  `GET /api/v1/forge/capabilities`, so the workbench can render command/flag UI
-  dynamically and never lag the CLI. (#220)
-- **Opt-in usage telemetry (default OFF).** Nothing is emitted unless the user
-  explicitly opts in; honours `FLUID_TELEMETRY=0` and the cross-tool
-  `DO_NOT_TRACK` standard, and the resolved state is surfaced in `fluid doctor`.
-  (#217)
-- **Reuse an LLM API key already in the environment** during `fluid` AI setup
-  — offers to persist a recognized provider key found in the env instead of
-  re-prompting (read-only, explicit confirmation, never logged; built-in
-  providers only). (#217)
-- **Contract diff before writing on refine/regenerate** — the refine/preview
-  flow now shows what changed (reusing the existing changelog differ) before
-  the contract is written. (#217)
-- **Native copilot support for ANY `contract.extensions.<key>` block.** A new
-  `fluid_build.extension_schemas` entry-point group lets a plugin advertise the
-  JSON-Schema for its extension sub-key (provider
-  `get_extension_schema(fluid_version=None) -> dict`). The `fluid forge` copilot
-  now (a) grounds the modeler on every installed extension schema so it can
-  natively propose a valid block, and (b) schema-gates + validates the proposed
-  block before emit. Adding a new extension needs **zero** changes here — the
-  group is the entire contract. See `fluid_build/extension_schemas.py`.
+- **`fluid describe --self` self-description for the Command Center.** Library-
+  callable `fluid_build.describe.self_describe()` now returns `fluid_version`,
+  `schema_version`, `providers`, `build_engines`, `templates`, `capabilities`,
+  and the full **command tree** (every subcommand + its flags), consumed by the
+  backend via `GET /api/v1/forge/capabilities` so the UI can render the CLI
+  surface without lagging it. (#220)
+- **Opt-in usage telemetry, default OFF.** Nothing is emitted unless explicitly
+  opted in; honours `FLUID_TELEMETRY=0` and the `DO_NOT_TRACK` standard, and the
+  resolved state is surfaced in `fluid doctor`. (#217)
+- **Reuse an existing LLM API key during AI setup.** `fluid` AI setup now offers
+  to persist a recognized built-in-provider key already present in the
+  environment (read-only, explicit confirmation, never logged). (#217)
+- **Contract diff before writing on refine/regenerate.** The refine/preview flow
+  now shows what changed (reusing the changelog differ) before the contract is
+  written. (#217)
 
 ### Changed
 
-- Renamed `providers/snowflake/provider_enhanced.py` -> `provider.py` (the
-  canonical `SnowflakeProvider` implementation); class name unchanged,
-  entry-points unaffected. (#217)
-- Added a startup-budget perf gate (`fluid --help` module-count + cold
-  wall-time, in clean subprocesses) to catch CLI startup regressions. (#217)
+- Renamed `providers/snowflake/provider_enhanced.py` → `provider.py` (canonical
+  `SnowflakeProvider`); class name and entry points are unchanged. (#217)
+- Added a startup-budget perf gate (`fluid --help` module-count + cold wall-time
+  in clean subprocesses) to catch CLI-startup regressions. (#217)
 
 ### Fixed
 
-- **BigQuery rollback restore.** `fluid rollback` now restores BigQuery
-  products (previously Snowflake only): it replays the snapshot's
-  `CREATE OR REPLACE TABLE ... AS SELECT` via the BigQuery client, with a `gcp`
-  dispatch alias so a real apply -> rollback round trip actually reaches it.
-  (#217)
-- **CI resilient to transient OpenTofu registry outages.** The IaC tests no
-  longer red the build when `tofu init` cannot reach the provider registry
-  (504 / network); such failures convert to skips, while real `tofu validate`
-  schema errors still fail. (#218)
-- **Pre-emit extension validation.** The copilot's conformance pass now runs
-  registered `fluid_build.extension_validators` (the same plugins `fluid
-  validate` uses) before writing the contract, so a malformed
-  `extensions.<key>` block surfaces as an error-severity finding and enters the
-  repair loop instead of being emitted silently (the core schema treats
-  `extensions` as `additionalProperties: true`).
-- Updated the `sdk` optional extra from the retired `fluid-provider-sdk` to
-  `data-product-forge-sdk>=0.9,<1` (`fluid_sdk`).
+- **BigQuery rollback restore.** `fluid rollback` now restores BigQuery products
+  (previously Snowflake only), replaying the snapshot's
+  `CREATE OR REPLACE TABLE ... AS SELECT` via the BigQuery client with a `gcp`
+  dispatch alias. (#217)
+- **`fluid generate iac --provider auto` detection broadened.** The target cloud
+  is now detected from top-level `binding.{provider,platform}`, `builds[].provider`,
+  and the runtime platform — not just `exposes[].binding.platform` — fixing the
+  common single-binding contract that previously errored as "could not detect a
+  supported cloud" (surfaced as a 422 in the Command Center); `local`/DuckDB now
+  raises an actionable `generate_iac_local_target` error. (#211)
+- **odps export fails loud.** `fluid generate standard --format odps-v4.1` /
+  `fluid odps export` now error instead of silently writing the literal `[]` to
+  disk while exiting 0. (#211)
+- **CI resilient to transient OpenTofu registry outages.** IaC tests convert
+  `tofu init` 504 / network failures to skips while real `tofu validate` schema
+  errors still fail. (#218)
+
+### Security
+
+- **Fixed injection / RCE / RLS findings across the platform.** (#215)
+  - Code-injection (RCE) in generated Airflow DAGs — untrusted contract values are
+    now routed through repr-escaped literals / sanitized identifiers.
+  - Shell-RCE + SQL injection in the Redshift external-schema emit — closed.
+  - Multi-tenant row-level-security **bypass** in the MCP `query` / `query_sql`
+    tools — they now apply `policy.rowFilters[]` and fail closed on missing caller
+    identity.
+  - Path-traversal RCE in the dlt custom-source loader — now fails closed via
+    workspace confinement.
+  - Adds cross-provider AST regression tests.
+- **Rollback no longer executes attacker-authorable DDL.** The Snowflake and
+  BigQuery rollback restorers reconstruct the restore statement from validated
+  identifiers instead of replaying `snapshot.ddl[]` verbatim, so a tampered
+  `.fluid/rollback-state.json` cannot smuggle arbitrary SQL (DROP/DELETE/GRANT). (#217)
+- **Hardened CI Security Scan.** Project dependencies are now audited before the
+  SAST scanners are installed, unbreaking the scan job. (#212)
 
 ### Removed
 
 - **Unused root `requirements.txt` / `requirements.lock.txt`.** Neither was
-  referenced by CI, the Dockerfiles (which install from `pyproject.toml`),
-  packaging (`MANIFEST.in`), or any install step — `pyproject.toml` is the
-  single source of truth, and the canonical hash-pinned lockfile is generated
-  on demand (`uv pip compile pyproject.toml --generate-hashes -o
-  requirements.lock.hashed.txt`; see AGENTS.md). The stale committed files only
-  produced Dependabot churn and false-looking alerts (e.g. `starlette<=1.0.0`,
-  `pyjwt==2.12.1`) against versions the real resolved closure never installs.
-  Removing them clears those alerts; Dependabot continues to track
-  `pyproject.toml`.
+  referenced by CI, the Dockerfiles, packaging, or any install step —
+  `pyproject.toml` is the single source of truth. Removing them clears spurious
+  Dependabot churn and false security alerts. (#213)
 
-### Security
+### Dependencies
 
-- **Rollback no longer executes attacker-authorable DDL.** The Snowflake and
-  BigQuery rollback restorers now reconstruct the restore statement from
-  *validated* identifiers instead of replaying `snapshot.ddl[]` verbatim, so a
-  tampered `.fluid/rollback-state.json` (which the docs invite operators to
-  commit as an audit trail) can no longer smuggle arbitrary SQL
-  (`DROP` / `DELETE` / `GRANT`) past a benign-looking location. (#217)
+- Bumped runtime dependencies: typer 0.25.1→0.26.6 (#197), certifi (#201),
+  openai 2.37.0→2.40.0 (#202), yarl (#203), more-itertools (#204), aiohttp (#207).
+- Bumped CI actions: setup-python (#195), attest-build-provenance (#196),
+  build-push-action (#199), google-github-actions/auth (#200), checkout (#198).
+- CI also gained clean-skip of MCP e2e jobs when secrets are missing (#209) and
+  SHA-pinned dev workflows with a refreshed `PINNED_ACTIONS` list (#206).
+
+## [0.8.9] - 2026-06-01
+
+### Added
+
+- **Keyless contract authoring via local AI coding agents.** `fluid forge` can
+  now author contracts without an LLM API key of its own by reusing an AI coding
+  agent the user already has, across two topologies on the existing `LlmProvider`
+  seam (selection is by provider name — no new backend switch):
+  - **In-IDE (MCP sampling).** `--llm-provider mcp-sampling` is now accepted by
+    the `forge` / `forge data-model` argparse `choices` allowlist and exempted
+    from the api-key gate (added to `_KEYLESS_PROVIDERS`), so `MCPSamplingProvider`
+    routes the LLM call back to the host IDE via `sampling/createMessage` with no
+    key (previously rejected as `copilot_missing_llm_api_key`).
+  - **Standalone terminal (new).** A single parametrized `CodingAgentProvider`
+    (new module `fluid_build/cli/forge_copilot_coding_agent.py`) shells out to each
+    agent's headless CLI — `claude -p`, `codex exec`, `cursor-agent -p`,
+    `kiro-cli chat --no-interactive` — over one list-argv subprocess seam
+    (`_run_agent`, never `shell=True`), with schema-constrained output and
+    ANSI-stripped stdout before envelope extraction. Only Claude Code is truly
+    zero-setup keyless (subscription OAuth); codex / cursor / kiro reuse their own
+    stored login or key.
+  - Adds welcome-scan detection of installed agent CLIs, an auto-offer in
+    `ai_setup.run_ai_setup_inline`, a `--forge-agent-mode {envelope,agentic}`
+    flag, `fluid doctor` reporting, and the `FLUID_FORGE_AGENT`,
+    `FLUID_FORGE_AGENT_MODE`, `FLUID_FORGE_AGENT_TIMEOUT_SECONDS`, and
+    `FLUID_FORGE_AGENT_CWD` env vars. (#189)
+- **Native copilot support for ANY `contract.extensions.<key>` block.** A new
+  `fluid_build.extension_schemas` entry-point group lets a plugin advertise the
+  JSON-Schema for its extension sub-key
+  (`get_extension_schema(fluid_version=None) -> dict`). The `fluid forge` copilot
+  now (a) grounds the modeler on every installed extension schema so it can
+  natively propose a valid block, and (b) schema-gates + validates the proposed
+  block before emit. Adding a new extension needs **zero** forge-cli changes — the
+  entry-point group is the entire contract. See `fluid_build/extension_schemas.py`. (#191)
+
+### Fixed
+
+- **Pre-emit extension validation.** The copilot's conformance pass now runs
+  registered `fluid_build.extension_validators` (the same plugins `fluid validate`
+  uses) before writing the contract, so a malformed `extensions.<key>` block
+  surfaces as an error-severity finding and enters the repair loop instead of
+  being emitted silently (the core schema treats `extensions` as
+  `additionalProperties: true`). (#191)
+
+### Changed
+
+- Updated the `sdk` optional extra from the retired `fluid-provider-sdk` to
+  `data-product-forge-sdk>=0.9,<1` (`fluid_sdk`). (#191)
 
 ## [0.8.8] - 2026-05-31
 
