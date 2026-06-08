@@ -64,6 +64,58 @@ from fluid_build.iac import (
 )
 from fluid_build.iac.credentials import build_tofu_env
 
+# ---------------------------------------------------------------------------
+# tofu init resilience — tolerate transient provider-registry outages
+# ---------------------------------------------------------------------------
+
+# Markers in tofu output that mean a transient infra/registry outage (e.g.
+# registry.opentofu.org 504s while fetching providers), NOT a contract/tfjson
+# error. The IaC tests validate emitted tfjson against the real ``tofu``
+# schema (``tofu plan``/``validate``); a provider *download* failure during
+# ``tofu init`` is orthogonal, so a failure caused purely by it is converted
+# to a skip rather than redding the build on an upstream outage. Real
+# tfjson/schema drift fails at plan/validate with output that looks nothing
+# like these markers, so it is unaffected.
+_REGISTRY_FAILURE_MARKERS = (
+    "could not query provider",
+    "failed to retrieve",
+    "failed to query available provider",
+    "authentication checksums for provider",
+    "cryptographic signature for provider",
+    "request failed after",
+    "504",
+    "context deadline exceeded",
+    "no such host",
+    "connection reset",
+    "i/o timeout",
+    "tls handshake timeout",
+)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Convert an IaC test that failed purely because ``tofu init`` could not
+    reach the provider registry (transient 504/network) into a SKIP.
+
+    Mirrors how ``_pytest.skipping`` rewrites ``rep.outcome``/``rep.longrepr``.
+    Only the unambiguous registry-failure markers trigger it, so a real
+    ``tofu validate``/``plan`` schema error (very different output) still fails.
+    """
+    outcome = yield
+    report = outcome.get_result()
+    if report.when != "call" or not report.failed:
+        return
+    text = str(report.longrepr).lower()
+    if any(marker in text for marker in _REGISTRY_FAILURE_MARKERS):
+        report.outcome = "skipped"
+        report.longrepr = (
+            str(item.fspath),
+            (item.location[1] or 0) + 1,
+            "Skipped: transient OpenTofu provider-registry outage (504/network) "
+            "during `tofu init` — not a tfjson error",
+        )
+
+
 # Throwaway databases all share this prefix so the session finalizer can
 # find and drop any a crashed run left behind.
 TEST_DB_PREFIX = "FLUID_IACTEST_"

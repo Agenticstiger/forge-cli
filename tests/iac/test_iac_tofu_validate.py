@@ -26,6 +26,59 @@ pytestmark = [pytest.mark.integration, pytest.mark.provider]
 
 _TOFU = shutil.which("tofu")
 
+
+# Registry/network failure signatures during ``tofu init`` — these mean a
+# transient infra outage (e.g. registry.opentofu.org 504s while fetching
+# providers), NOT a contract/tfjson error. These tests exist to validate the
+# EMITTED tfjson against the real ``tofu`` schema (only ``tofu validate``
+# exercises that); a provider *download* failure during init is orthogonal, so
+# skip rather than red the build on an upstream registry outage.
+_REGISTRY_FAILURE_MARKERS = (
+    "could not query provider",
+    "failed to retrieve",
+    "failed to query available provider",
+    "authentication checksums for provider",
+    "cryptographic signature for provider",
+    "request failed after",
+    "504",
+    "context deadline exceeded",
+    "no such host",
+    "connection reset",
+    "i/o timeout",
+    "tls handshake timeout",
+)
+
+
+def _tofu_init_or_skip(cwd) -> None:
+    """Run ``tofu init`` (no backend), tolerating transient registry outages.
+
+    Retries once, then ``pytest.skip``s if init keeps failing for a
+    network/registry reason; a non-network init failure is a real error and is
+    asserted as before.
+    """
+    import time
+
+    last = None
+    for attempt in range(2):
+        last = subprocess.run(
+            [_TOFU, "init", "-backend=false", "-input=false", "-no-color"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if last.returncode == 0:
+            return
+        if attempt == 0:
+            time.sleep(2)
+    output = ((last.stderr or "") + (last.stdout or "")).lower()
+    if any(marker in output for marker in _REGISTRY_FAILURE_MARKERS):
+        pytest.skip(
+            "tofu init could not reach the provider registry (transient "
+            f"network/504, not a tfjson error): {(last.stderr or last.stdout)[:200]}"
+        )
+    assert last.returncode == 0, last.stderr or last.stdout
+
+
 # One representative contract per cloud. New plugins add an entry here.
 _SAMPLE_CONTRACTS = {
     "aws": {
@@ -343,13 +396,7 @@ def test_emitted_tfjson_passes_tofu_validate(cloud, tmp_path):
         build_module(plugin, _SAMPLE_CONTRACTS[cloud], actions=_SAMPLE_ACTIONS.get(cloud, ()))
     )
 
-    init = subprocess.run(
-        [_TOFU, "init", "-backend=false", "-input=false", "-no-color"],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-    )
-    assert init.returncode == 0, init.stderr or init.stdout
+    _tofu_init_or_skip(tmp_path)
 
     validate = subprocess.run(
         [_TOFU, "validate", "-no-color"],
@@ -437,13 +484,7 @@ def test_cross_account_emit_passes_tofu_validate(cloud, tmp_path):
 
     (tmp_path / "main.tf.json").write_text(build_module(plugin, _CROSS_ACCOUNT_CONTRACTS[cloud]))
 
-    init = subprocess.run(
-        [_TOFU, "init", "-backend=false", "-input=false", "-no-color"],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-    )
-    assert init.returncode == 0, init.stderr or init.stdout
+    _tofu_init_or_skip(tmp_path)
 
     validate = subprocess.run(
         [_TOFU, "validate", "-no-color"],
