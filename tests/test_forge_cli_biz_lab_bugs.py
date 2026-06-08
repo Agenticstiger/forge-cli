@@ -314,7 +314,8 @@ class TestFederationEndpointSchemeAllowList:
         manifest_path = tmp_path / "federation" / "upstreams.yaml"
         manifest_path.parent.mkdir(parents=True)
         manifest_path.write_text(
-            textwrap.dedent("""\
+            textwrap.dedent(
+                """\
                 workspaces:
                   - id: evil
                     kind: git_registry
@@ -322,7 +323,8 @@ class TestFederationEndpointSchemeAllowList:
                   - id: ok
                     kind: git_registry
                     endpoint: "https://github.com/org/repo.git"
-                """),
+                """
+            ),
             encoding="utf-8",
         )
 
