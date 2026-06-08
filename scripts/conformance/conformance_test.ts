@@ -6,9 +6,9 @@
 // tools/call sample with denied model.
 //
 // Run:
-//   npm install --no-save @modelcontextprotocol/sdk
-//   node --loader ts-node/esm scripts/conformance/conformance_test.ts \
-//     <path-to-contract.fluid.yaml>
+  //   npm install --no-save @modelcontextprotocol/sdk tsx
+  //   npx tsx scripts/conformance/conformance_test.ts \
+  //     <path-to-contract.fluid.yaml>
 //
 // Exit 0 = conformant, non-zero = a wire-shape regression. CI runs
 // this against the docker example contract.
