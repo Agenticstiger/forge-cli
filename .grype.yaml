@@ -1,0 +1,20 @@
+# grype scan configuration for the forge-cli release image (consumed by the
+# "Scan image for HIGH/CRITICAL CVEs (gate)" step in .github/workflows/release.yml,
+# which runs `./grype <image> --fail-on high --only-fixed` from the repo root).
+#
+# Scope: upstream CPython *binary* CVEs in the python:*-slim base image whose
+# fixes are not yet available in any stable base image grype's DB tracks (the
+# scanner DB runs ahead of the official Docker images). All four are
+# bottom-percentile EPSS (< 0.1% real-world exploitation probability). The base
+# was bumped 3.11-slim -> 3.13-slim to shrink this surface; these remain only
+# because no stable base image yet carries their fix. **Remove each entry the
+# moment the base image ships the listed fixed version** (re-run grype to confirm).
+ignore:
+  # Critical — fix only in CPython 3.15.0b2 (a BETA); no stable Python carries it.
+  - vulnerability: CVE-2026-7210
+  # Critical — fixed in CPython 3.13.13 / 3.14.4; remove once python:3.13-slim >= 3.13.13.
+  - vulnerability: CVE-2025-13462
+  # High — fixed in CPython 3.13.13 / 3.14.4; remove once python:3.13-slim >= 3.13.13.
+  - vulnerability: CVE-2026-4224
+  # High — fixed in CPython 3.13.13 / 3.14.4; remove once python:3.13-slim >= 3.13.13.
+  - vulnerability: CVE-2026-3644
