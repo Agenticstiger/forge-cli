@@ -7,8 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.10] - 2026-06-08
+
 ### Added
 
+- **`fluid describe --self` self-description for the Command Center.** A new
+  library-callable `fluid_build.describe.self_describe()` (and `fluid describe
+  --self`) returns a machine-readable description of the installation —
+  `fluid_version`, `schema_version`, `providers`, `build_engines`, `templates`,
+  `capabilities`, and the **full command tree**: every subcommand with its
+  flags (names / dest / required / help / choices / default), introspected from
+  the argparse parser. The Command Center consumes it via
+  `GET /api/v1/forge/capabilities`, so the workbench can render command/flag UI
+  dynamically and never lag the CLI. (#220)
+- **Opt-in usage telemetry (default OFF).** Nothing is emitted unless the user
+  explicitly opts in; honours `FLUID_TELEMETRY=0` and the cross-tool
+  `DO_NOT_TRACK` standard, and the resolved state is surfaced in `fluid doctor`.
+  (#217)
+- **Reuse an LLM API key already in the environment** during `fluid` AI setup
+  — offers to persist a recognized provider key found in the env instead of
+  re-prompting (read-only, explicit confirmation, never logged; built-in
+  providers only). (#217)
+- **Contract diff before writing on refine/regenerate** — the refine/preview
+  flow now shows what changed (reusing the existing changelog differ) before
+  the contract is written. (#217)
 - **Native copilot support for ANY `contract.extensions.<key>` block.** A new
   `fluid_build.extension_schemas` entry-point group lets a plugin advertise the
   JSON-Schema for its extension sub-key (provider
@@ -18,8 +40,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   block before emit. Adding a new extension needs **zero** changes here — the
   group is the entire contract. See `fluid_build/extension_schemas.py`.
 
+### Changed
+
+- Renamed `providers/snowflake/provider_enhanced.py` -> `provider.py` (the
+  canonical `SnowflakeProvider` implementation); class name unchanged,
+  entry-points unaffected. (#217)
+- Added a startup-budget perf gate (`fluid --help` module-count + cold
+  wall-time, in clean subprocesses) to catch CLI startup regressions. (#217)
+
 ### Fixed
 
+- **BigQuery rollback restore.** `fluid rollback` now restores BigQuery
+  products (previously Snowflake only): it replays the snapshot's
+  `CREATE OR REPLACE TABLE ... AS SELECT` via the BigQuery client, with a `gcp`
+  dispatch alias so a real apply -> rollback round trip actually reaches it.
+  (#217)
+- **CI resilient to transient OpenTofu registry outages.** The IaC tests no
+  longer red the build when `tofu init` cannot reach the provider registry
+  (504 / network); such failures convert to skips, while real `tofu validate`
+  schema errors still fail. (#218)
 - **Pre-emit extension validation.** The copilot's conformance pass now runs
   registered `fluid_build.extension_validators` (the same plugins `fluid
   validate` uses) before writing the contract, so a malformed
@@ -41,6 +80,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pyjwt==2.12.1`) against versions the real resolved closure never installs.
   Removing them clears those alerts; Dependabot continues to track
   `pyproject.toml`.
+
+### Security
+
+- **Rollback no longer executes attacker-authorable DDL.** The Snowflake and
+  BigQuery rollback restorers now reconstruct the restore statement from
+  *validated* identifiers instead of replaying `snapshot.ddl[]` verbatim, so a
+  tampered `.fluid/rollback-state.json` (which the docs invite operators to
+  commit as an audit trail) can no longer smuggle arbitrary SQL
+  (`DROP` / `DELETE` / `GRANT`) past a benign-looking location. (#217)
 
 ## [0.8.8] - 2026-05-31
 
