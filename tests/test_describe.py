@@ -37,6 +37,7 @@ _EXPECTED_KEYS = {
     "templates",
     "provider_engine_compatibility",
     "capabilities",
+    "commands",
     "warnings",
 }
 
@@ -58,11 +59,29 @@ def test_self_describe_has_all_keys_with_correct_types() -> None:
     assert isinstance(info["templates"], list)
     assert isinstance(info["provider_engine_compatibility"], dict)
     assert isinstance(info["capabilities"], dict)
+    assert isinstance(info["commands"], dict)
     assert isinstance(info["warnings"], list)
 
 
 def test_self_describe_is_json_serializable() -> None:
     json.dumps(self_describe())  # must not raise
+
+
+def test_command_tree_lists_subcommands_and_flags() -> None:
+    """describe.commands introspects the argparse parser into a command tree
+    so the CC can render command/flag UI dynamically and never lag the CLI."""
+    cmds = self_describe()["commands"]
+    assert cmds.get("error") is None, cmds.get("error")
+    subs = cmds["subcommands"]
+    # core lifecycle commands must be discoverable
+    assert {"validate", "plan", "apply"} <= set(subs), sorted(subs)
+    # each command exposes its options with stable descriptor fields
+    validate_opts = subs["validate"]["options"]
+    assert validate_opts, "validate should expose options"
+    assert {"names", "dest", "positional", "required", "help"} <= set(validate_opts[0])
+    # a known flag is discoverable without hardcoding it in the CC
+    flag_names = {n for o in validate_opts for n in o["names"]}
+    assert "--env" in flag_names, sorted(flag_names)
 
 
 def test_capabilities_are_derived_not_hardcoded() -> None:
