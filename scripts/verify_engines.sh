@@ -2,6 +2,12 @@
 # Engine-matrix verification: exercise each acquisition runner against the
 # live infra spun by scripts/verify_compose.yml, using the ENGINE-NAMESPACED
 # `properties.<engine>` shape the runners actually consume.
+#
+# The verify image runs as non-root (UID 1000). On Linux hosts with a
+# different UID, build the image with
+#   --build-arg UID=$(id -u) --build-arg GID=$(id -g)
+# so the writes below into the bind-mounted /repo/.verify-logs succeed
+# (a root-owned .verify-logs left by an older image also needs a chown).
 set -u
 declare -A RESULT
 fail=0; pass=0
