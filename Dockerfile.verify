@@ -14,6 +14,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl ca-certificates make \
     && rm -rf /var/lib/apt/lists/*
 
+# Non-root runtime user (trivy DS-0002). UID/GID default to 1000 to match
+# the typical first user on Linux hosts, so writes to the bind-mounted
+# /repo keep sane ownership. Linux hosts with a different UID align via
+#   docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) ...
+# (Docker Desktop on macOS/Windows maps mount ownership transparently, so
+# the args are not needed there.) -o tolerates UIDs/GIDs that already
+# exist in the base image — e.g. macOS staff GID 20 == Debian dialout.
+ARG UID=1000
+ARG GID=1000
+RUN groupadd -o -g "${GID}" fluid \
+ && useradd -m -o -u "${UID}" -g "${GID}" fluid
+
 WORKDIR /repo
 
 # Pre-install runtime deps so the editable install is fast.
@@ -46,6 +58,11 @@ RUN python -m venv /opt/singer-venv \
 # Editable install happens at runtime against the bind-mounted /repo,
 # so iteration is "edit on host → re-run" with no rebuild.
 ENV PYTHONPATH=/repo
+
+# All system-level installs are done; drop privileges. /repo is normally
+# shadowed by the bind mount, but chown it so the image also works bare.
+RUN chown -R fluid:fluid /repo
+USER fluid
 
 ENTRYPOINT ["python", "-m", "fluid_build.cli"]
 CMD ["--help"]
