@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`.gitleaks.toml` with triaged allowlists** so full-history `gitleaks
+  detect` scans run clean. All 464 historical candidates were confirmed fake
+  (`trufflehog --only-verified`: 0): the detect-secrets baseline's hashed
+  digests, redaction-test fixtures, and the redactor pattern sources.
+  Requires gitleaks ≥ 8.25.0. (#236)
+
 ## [0.8.10] - 2026-06-08
 
 ### Added
