@@ -490,24 +490,29 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - name: Check LLM API key
+        id: gate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$OPENAI_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            [ -n "$ANTHROPIC_API_KEY" ] && echo "Anthropic key present (preferred)"
+            [ -n "$OPENAI_API_KEY" ] && echo "OpenAI key present (fallback)"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No LLM API key in env (set ANTHROPIC_API_KEY or OPENAI_API_KEY) - skipping MCP output-port live LLM."
+          fi
+
       - name: Install with local + test extras
+        if: steps.gate.outputs.enabled == 'true'
         run: |
           pip install --upgrade pip
           pip install -e ".[dev,local]"
 
-      - name: Verify at least one LLM API key is wired
-        run: |
-          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
-            echo "::error::No LLM API key in env (set ANTHROPIC_API_KEY or OPENAI_API_KEY)"
-            exit 1
-          fi
-          if [ -n "$ANTHROPIC_API_KEY" ]; then echo "Anthropic key present (preferred)"; fi
-          if [ -n "$OPENAI_API_KEY" ]; then echo "OpenAI key present (fallback)"; fi
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
       - name: Run live LLM gateway tests
+        if: steps.gate.outputs.enabled == 'true'
         timeout-minutes: 6
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -601,12 +606,12 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         with:
           node-version: "20"
-      - name: Install MCP TypeScript SDK
+      - name: Install MCP TypeScript SDK + tsx
         if: steps.gate.outputs.enabled == 'true'
         run: |
           npm install --no-save \
             @modelcontextprotocol/sdk \
-            ts-node \
+            tsx \
             typescript
       - name: TS conformance
         if: steps.gate.outputs.enabled == 'true'
@@ -618,7 +623,7 @@ jobs:
           POSTGRES_USER: forge_mcp_test
           POSTGRES_PASSWORD: forge_mcp_test_pwd
         run: |
-          node --loader ts-node/esm scripts/conformance/conformance_test.ts \
+          npx tsx scripts/conformance/conformance_test.ts \
             examples/mcp-output-port-docker/contract.fluid.yaml
 
       # 3. Go SDK

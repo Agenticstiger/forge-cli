@@ -30,6 +30,8 @@ from enum import Enum
 from threading import Lock
 from typing import Any, Callable, Optional
 
+from fluid_build.errors import CircuitBreakerOpenError
+
 
 class CircuitState(Enum):
     """Circuit breaker states."""
@@ -37,17 +39,6 @@ class CircuitState(Enum):
     CLOSED = "closed"  # Normal operation
     OPEN = "open"  # Failing - reject requests
     HALF_OPEN = "half_open"  # Testing recovery
-
-
-class CircuitBreakerOpenError(Exception):
-    """Raised when circuit breaker is open."""
-
-    def __init__(self, service: str, timeout_remaining: float):
-        self.service = service
-        self.timeout_remaining = timeout_remaining
-        super().__init__(
-            f"Circuit breaker is OPEN for {service}. Retry in {timeout_remaining:.1f}s"
-        )
 
 
 @dataclass

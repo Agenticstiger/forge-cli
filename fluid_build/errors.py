@@ -84,6 +84,24 @@ class AuthenticationError(FluidError):
     """Raised on authentication / credential failures."""
 
 
+class CircuitBreakerOpenError(Exception):
+    """Raised when a circuit breaker is open and requests are being rejected.
+
+    Attributes:
+        service: Name of the service whose circuit is open.
+        timeout_remaining: Seconds until the circuit breaker will attempt recovery.
+    """
+
+    def __init__(self, service: str, timeout_remaining: float = 0.0) -> None:
+        self.service = service
+        self.timeout_remaining = timeout_remaining
+        if timeout_remaining > 0:
+            msg = f"Circuit breaker is OPEN for {service}. Retry in {timeout_remaining:.1f}s"
+        else:
+            msg = f"Circuit breaker is open: {service}"
+        super().__init__(msg)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
