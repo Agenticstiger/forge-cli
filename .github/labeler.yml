@@ -28,3 +28,4 @@ security:
           - 'fluid_build/auth.py'
           - 'SECURITY.md'
           - '.secrets.baseline'
+          - '.gitleaks.toml'

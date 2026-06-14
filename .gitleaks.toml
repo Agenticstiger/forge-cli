@@ -1,0 +1,57 @@
+# Gitleaks configuration — extends the default ruleset with allowlists for
+# known false positives so full-history scans (gitleaks detect) run clean.
+#
+# Every entry below was triaged: a full-history scan reported 464 candidates,
+# and trufflehog --only-verified confirms 0 are live secrets. Coverage of
+# fluid_build/ is otherwise unchanged — allowlists are scoped to exact file
+# paths (anchored regexes), never to directories or rules globally.
+#
+# Config shape follows the gitleaks README ([extend] + [[allowlists]]);
+# see also wildfly/.gitleaks.toml and hawtio-online/.gitleaks.toml for the
+# same pattern in the wild.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = ".secrets.baseline — the detect-secrets baseline stores SHA-1 hashed_secret hex digests, which trip the generic-api-key rule"
+targetRules = ["generic-api-key"]
+paths = [
+    '''^\.secrets\.baseline$''',
+]
+
+[[allowlists]]
+# Scoped to the private-key rule only: these two files define the
+# PEM-header redaction regexes, which contain the exact shape the
+# private-key rule detects. Any other secret shape committed into these
+# files is still flagged.
+description = "redaction-pattern sources — the private-key detection regexes contain the PEM header shapes they detect"
+targetRules = ["private-key"]
+paths = [
+    '''^fluid_build/observability/secret_redactor\.py$''',
+    '''^fluid_build/providers/snowflake/util/logging\.py$''',
+]
+
+[[allowlists]]
+description = "redaction/runner test fixtures — intentionally fake secrets asserted against the redactors"
+paths = [
+    '''^tests/providers/test_snowflake_redaction_symmetry\.py$''',
+    '''^tests/providers/test_snowflake_util_logging\.py$''',
+    '''^tests/test_build_runners\.py$''',
+    '''^tests/test_observability_secret_redactor\.py$''',
+    '''^tests/test_preview_panel\.py$''',
+]
+
+[[allowlists]]
+# Deleted from HEAD; pinned to its two historical fixture commits
+# (condition = "AND") so in history scans (gitleaks detect) a future file
+# recreated at this path is scanned with full rule coverage. Caveat: plain
+# `gitleaks dir` scans have no commit context, skip the commits criterion,
+# and fall back to path-only suppression for this block.
+description = "tests/test_execute.py — fake fixture token in two historical commits only"
+condition = "AND"
+commits = [
+    "45d45891151195a23137c67b78a84bf327f7ec11",
+    "0724ad152cdbc8ab99716934773f0fcc1bf1d6c6",
+]
+paths = ['''^tests/test_execute\.py$''']

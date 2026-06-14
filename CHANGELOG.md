@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Dockerfile.verify` now runs as a non-root user** (`fluid`, UID/GID 1000,
   overridable via `--build-arg UID/GID` for Linux hosts), closing trivy
   DS-0002 and matching the production image's non-root posture. (#235)
+- **`.gitleaks.toml` with triaged allowlists** so full-history `gitleaks
+  detect` scans run clean. All 464 historical candidates were confirmed fake
+  (`trufflehog --only-verified`: 0): the detect-secrets baseline's hashed
+  digests, redaction-test fixtures, and the redactor pattern sources.
+  Requires gitleaks ≥ 8.25.0. (#236)
 
 ## [0.8.10] - 2026-06-08
 

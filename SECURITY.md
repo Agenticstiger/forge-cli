@@ -45,6 +45,7 @@ We follow [coordinated disclosure](https://en.wikipedia.org/wiki/Coordinated_vul
 - **Never commit secrets** to your contract files. Use environment variables or a credential resolver.
 - **Keep dependencies updated:** `pip install --upgrade data-product-forge`
 - **Use the built-in secret scanner:** `detect-secrets scan` (see [CONTRIBUTING.md](CONTRIBUTING.md))
+- **Full-history secret scans:** `gitleaks detect` (requires gitleaks ≥ 8.25.0; auto-loads the repo's `.gitleaks.toml`, whose allowlists are triaged false positives only)
 - **Review plans before applying:** Always run `fluid plan` and inspect the output before `fluid apply`.
 
 ## Security Features
