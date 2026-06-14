@@ -7,6 +7,10 @@
 #     docker run --rm --network forge-verify_verify \
 #     -v "$PWD:/repo" -w /repo --entrypoint bash forge-verify \
 #     scripts/verify_engines_airbyte_real.sh
+#
+# The verify image runs as non-root (UID 1000); on Linux hosts with a
+# different UID build it with --build-arg UID=$(id -u) --build-arg GID=$(id -g)
+# so the /repo/.verify-logs writes below succeed.
 set -u
 WORK=/repo/.verify-logs/airbyte-real
 rm -rf "$WORK"; mkdir -p "$WORK"

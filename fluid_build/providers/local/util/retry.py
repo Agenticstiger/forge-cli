@@ -27,6 +27,8 @@ import time
 from functools import wraps
 from typing import Any, Callable, List, Optional, Type
 
+from fluid_build.errors import CircuitBreakerOpenError
+
 
 class RetryableError(Exception):
     """Exception that indicates an operation should be retried."""
@@ -382,7 +384,7 @@ class CircuitBreaker:
             if self._should_attempt_reset():
                 self.state = "half-open"
             else:
-                raise CircuitBreakerOpenError("Circuit breaker is open")
+                raise CircuitBreakerOpenError("local_provider")
 
         try:
             result = func(*args, **kwargs)
@@ -411,9 +413,3 @@ class CircuitBreaker:
 
         if self.failure_count >= self.failure_threshold:
             self.state = "open"
-
-
-class CircuitBreakerOpenError(Exception):
-    """Exception raised when circuit breaker is open."""
-
-    pass
