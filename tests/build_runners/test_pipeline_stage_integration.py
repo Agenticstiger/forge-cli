@@ -322,7 +322,14 @@ class TestSchemaCoversEveryEngine:
     @pytest.mark.parametrize("engine", sorted(ACQUISITION_ENGINES))
     def test_engine_in_schema_enum(self, schema_manager: FluidSchemaManager, engine: str):
         schema = schema_manager.get_schema("0.7.3", offline_only=True)
-        engine_enum = schema["$defs"]["build"]["properties"]["engine"]["enum"]
+        engine_schema = schema["$defs"]["build"]["properties"]["engine"]
+        # ``engine`` is ``anyOf: [{enum: [...]}, {pattern: "^dbt-..."}]`` (issue
+        # #249 relaxed the closed enum to also accept ``dbt-<adapter>``), so the
+        # enumerated values may sit directly on the node or inside an ``anyOf``
+        # branch. Collect them regardless of which shape is present.
+        engine_enum = engine_schema.get("enum") or [
+            value for branch in engine_schema.get("anyOf", []) for value in branch.get("enum", [])
+        ]
         assert engine in engine_enum, f"engine '{engine}' missing from schema enum"
 
 

@@ -2321,22 +2321,29 @@
         },
         "engine": {
           "type": "string",
-          "enum": [
-            "dbt",
-            "sql",
-            "python",
-            "spark",
-            "glue",
-            "custom",
-            "duckdb",
-            "airbyte",
-            "meltano",
-            "dlt",
-            "kafka-connect",
-            "debezium"
+          "anyOf": [
+            {
+              "enum": [
+                "dbt",
+                "sql",
+                "python",
+                "spark",
+                "glue",
+                "custom",
+                "duckdb",
+                "airbyte",
+                "meltano",
+                "dlt",
+                "kafka-connect",
+                "debezium"
+              ]
+            },
+            {
+              "pattern": "^dbt-[a-z0-9]+([_-][a-z0-9]+)*$"
+            }
           ],
           "default": "dbt",
-          "description": "Build/ingestion engine. Transformation engines: dbt, sql, python, spark, glue, custom. Ingestion engines (acquisition pattern only): duckdb (zero-infra files/JDBC), airbyte (350+ SaaS), meltano (Singer 600+ taps), dlt (Python-native), kafka-connect (streaming), debezium (CDC). AWS Glue: glue (Spark ETL jobs managed by Glue)."
+          "description": "Build/ingestion engine. Transformation engines: dbt, sql, python, spark, glue, custom. Adapter-qualified dbt engines (dbt-<adapter>, e.g. dbt-glue, dbt-snowflake, dbt-bigquery) are accepted too and route through the dbt build runner, which derives the adapter from the suffix. Ingestion engines (acquisition pattern only): duckdb (zero-infra files/JDBC), airbyte (350+ SaaS), meltano (Singer 600+ taps), dlt (Python-native), kafka-connect (streaming), debezium (CDC). AWS Glue: glue (Spark ETL jobs managed by Glue)."
         },
         "capabilities": {
           "type": "array",
@@ -2491,6 +2498,38 @@
       "properties": {
         "model": {
           "type": "string"
+        },
+        "target": {
+          "type": "string",
+          "description": "dbt profile target to run against. Forwarded to dbt as `--target <name>` by the build runner (allowlisted against the profile's real targets; falls back to the profile default when the requested target is unavailable)."
+        },
+        "select": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "dbt node selector(s) forwarded to `dbt --select`. Accepts a single selector string or an array of selector strings; the build runner drops flag-like values (those starting with '-')."
+        },
+        "models": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "Legacy alias for `select` (dbt's older `--models` flag). Same string-or-array shape; `select` takes precedence when both are set."
         },
         "vars": {
           "type": "object",
