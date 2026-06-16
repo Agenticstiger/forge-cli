@@ -142,26 +142,15 @@ def register_forge_subcommand(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     _h._add_common_generation_args(from_source)
+    # Source choices come from the shared registry (built-in catalog +
+    # JDBC sources, plus any ``fluid_build.source_adapters`` plugins) so a
+    # pip-installed adapter appears in ``--source`` without editing the CLI.
+    from fluid_build.copilot.catalog.source_registry import list_source_adapters
+
     from_source.add_argument(
         "--source",
         required=True,
-        choices=[
-            "snowflake",
-            "unity",
-            "bigquery",
-            "dataplex",
-            "glue",
-            "datahub",
-            "datamesh_manager",
-            # JDBC-introspectable databases — use the duckdb scanner
-            # (already pulled in by the SDP forge path) to enumerate
-            # tables + types live. Same dispatcher entry, different
-            # connection-uri shape.
-            "postgres",
-            "postgresql",
-            "mysql",
-            "sqlite",
-        ],
+        choices=list_source_adapters(),
         help=(
             "Which metadata-source catalog to read from. Catalogs "
             "(snowflake/unity/bigquery/dataplex/glue/datahub/"
