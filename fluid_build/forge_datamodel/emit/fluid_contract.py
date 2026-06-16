@@ -531,6 +531,57 @@ def _binding_for_artifact(
     return binding
 
 
+def _build_flat_exposes(
+    *,
+    logical: LogicalDraft,
+    summary: Dict[str, Any],
+    contract_slug: str,
+) -> List[Dict[str, Any]]:
+    """Source-aligned (``flat``) emit: one expose per OSI dataset — 1:1 with the
+    source tables, no vault/dimensional reshaping (issue #248). Mirrors the
+    single-expose builder but loops over datasets, so a multi-table source does
+    not collapse into one expose. Degenerates to a single expose when the
+    logical model carries no datasets.
+    """
+    datasets = logical.osi.datasets or []
+    if not datasets:
+        return [
+            {
+                "exposeId": contract_slug,
+                "kind": "table",
+                "version": "1.0.0",
+                "binding": _binding_for_artifact(
+                    logical=logical,
+                    summary=summary,
+                    artifact_slug=contract_slug,
+                    source_tables=None,
+                ),
+                "contract": {"schema": _expose_schema(logical)},
+                "semantics": _fluid_semantics(logical),
+            }
+        ]
+    exposes: List[Dict[str, Any]] = []
+    for dataset in datasets:
+        slug = _slug(dataset.name)
+        expose: Dict[str, Any] = {
+            "exposeId": slug,
+            "kind": "table",
+            "version": "1.0.0",
+            "binding": _binding_for_artifact(
+                logical=logical,
+                summary=summary,
+                artifact_slug=slug,
+                source_tables=[dataset.name],
+            ),
+            "contract": {"schema": _expose_schema(logical, dataset_override=dataset)},
+            "semantics": _fluid_semantics(logical, dataset_override=dataset),
+        }
+        if dataset.description:
+            expose["description"] = dataset.description
+        exposes.append(expose)
+    return exposes
+
+
 def _build_dv2_exposes(
     *,
     logical: LogicalDraft,
@@ -866,6 +917,15 @@ def build_contract_from_logical(
         logical.dv2.hubs or logical.dv2.links or logical.dv2.satellites
     ):
         exposes = _build_dv2_exposes(
+            logical=logical,
+            summary=summary,
+            contract_slug=slug,
+        )
+    elif logical.dv2 is None and logical.dimensional is None:
+        # Source-aligned (``flat``) or a bring-your-own (``custom``) model with
+        # neither vault nor dimensional branch: emit one expose per OSI dataset
+        # (1:1 with the source tables) rather than collapsing to a single expose.
+        exposes = _build_flat_exposes(
             logical=logical,
             summary=summary,
             contract_slug=slug,

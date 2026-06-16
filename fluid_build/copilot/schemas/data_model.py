@@ -43,7 +43,12 @@ def _reject_path_traversal(value: str) -> str:
     return value
 
 
-TechniqueLiteral = Literal["data_vault_2", "dimensional"]
+# ``technique`` is an OPEN string validated against the pluggable registry
+# (``copilot.modeling_techniques``) rather than a closed Literal, so built-in
+# (data_vault_2 / dimensional / flat / custom) AND plugin techniques are accepted
+# on ``LogicalDraft.technique``. The per-technique branch shape is enforced by
+# ``LogicalDraft._validate_technique_shape`` via the registry. See issue #248.
+TechniqueLiteral = str
 
 DimensionalVariant = Literal["star", "snowflake", "galaxy", "flat"]
 """Canonical Kimball flavors forge-cli supports.

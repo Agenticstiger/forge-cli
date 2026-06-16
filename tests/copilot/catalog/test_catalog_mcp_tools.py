@@ -221,14 +221,18 @@ class TestToolRegistryShape:
         ), "forge_from_source must advertise 'uri' for JDBC sources"
 
     def test_forge_from_source_schema_has_technique_enum(self):
-        """``forge_from_source.technique`` must be a closed enum so
-        clients know the only valid values are ``data_vault_2`` and
-        ``dimensional`` — defends against hallucinated free-form
-        techniques like 'star schema' that the dispatch would
-        silently default away."""
+        """``forge_from_source.technique`` must be a closed enum so clients know
+        the valid values — defends against hallucinated free-form techniques
+        like 'star schema' that the dispatch would silently default away.
+
+        Registry-driven (issue #248): the enum is the pluggable modeling-technique
+        registry MINUS ``custom`` (bring-your-own needs a ``--logical-model`` file
+        the MCP wire can't supply). Built-in analytical (data_vault_2 /
+        dimensional) + source-aligned (flat) techniques are present."""
         schema = TOOL_CAPABILITIES["forge_from_source"].input_schema
         technique = schema["properties"]["technique"]
-        assert technique["enum"] == ["data_vault_2", "dimensional"]
+        assert set(technique["enum"]) == {"data_vault_2", "dimensional", "flat"}
+        assert "custom" not in technique["enum"]
         assert "engine" in schema["properties"]
 
 

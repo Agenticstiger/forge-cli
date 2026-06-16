@@ -137,6 +137,20 @@ class FluidContractValidator:
                 findings.append(ValidationFinding(message=err, severity="error"))
             for warning in validation.warnings:
                 findings.append(ValidationFinding(message=warning, severity="warning"))
+            # Source-aligned (``flat``) and bring-your-own (``custom``) products
+            # are intentionally raw / user-authored, so we don't force full BI
+            # semantics (entities/dimensions/measures/metrics) onto every expose
+            # — for branch-less techniques the coverage findings drop to
+            # warnings instead of hard errors. Analytical techniques
+            # (data_vault_2 / dimensional) keep the strict requirement. See #248.
+            strict_semantics = True
+            if logical is not None:
+                from fluid_build.copilot.modeling_techniques import get_modeling_technique
+
+                _spec = get_modeling_technique(getattr(logical, "technique", None))
+                if _spec is not None and (_spec.branch is None or _spec.requires_logical_model):
+                    strict_semantics = False
+
             exposes = contract.get("exposes")
             if not exposes:
                 findings.append(
@@ -168,7 +182,9 @@ class FluidContractValidator:
                             )
                         )
                         continue
-                    findings.extend(_lint_contract_semantics(semantics, field_prefix))
+                    findings.extend(
+                        _lint_contract_semantics(semantics, field_prefix, strict=strict_semantics)
+                    )
 
         errors = [finding for finding in findings if finding.severity == "error"]
         warnings = [finding for finding in findings if finding.severity == "warning"]
@@ -188,6 +204,8 @@ class FluidContractValidator:
 def _lint_contract_semantics(
     semantics: Dict[str, Any],
     field_prefix: str,
+    *,
+    strict: bool = True,
 ) -> List[ValidationFinding]:
     findings: list[ValidationFinding] = []
 
@@ -223,7 +241,7 @@ def _lint_contract_semantics(
                         f"Semantics must include at least one {label} "
                         "so generated contracts are useful to BI and transformation tooling."
                     ),
-                    severity="error",
+                    severity="error" if strict else "warning",
                     field=f"{field_prefix}.{collection}",
                 )
             )
