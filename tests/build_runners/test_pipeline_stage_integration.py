@@ -328,9 +328,7 @@ class TestSchemaCoversEveryEngine:
         # enumerated values may sit directly on the node or inside an ``anyOf``
         # branch. Collect them regardless of which shape is present.
         engine_enum = engine_schema.get("enum") or [
-            value
-            for branch in engine_schema.get("anyOf", [])
-            for value in branch.get("enum", [])
+            value for branch in engine_schema.get("anyOf", []) for value in branch.get("enum", [])
         ]
         assert engine in engine_enum, f"engine '{engine}' missing from schema enum"
 
