@@ -2199,6 +2199,34 @@
           "type": "string",
           "description": "dbt profile target to run against. Forwarded to dbt as `--target <name>` by the build runner (allowlisted against the profile's real targets; falls back to the profile default when the requested target is unavailable)."
         },
+        "select": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "dbt node selector(s) forwarded to `dbt --select`. Accepts a single selector string or an array of selector strings; the build runner drops flag-like values (those starting with '-')."
+        },
+        "models": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "Legacy alias for `select` (dbt's older `--models` flag). Same string-or-array shape; `select` takes precedence when both are set."
+        },
         "vars": {
           "type": "object",
           "additionalProperties": true
