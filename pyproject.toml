@@ -362,6 +362,17 @@ gcp = "fluid_build.providers.gcp:GcpProvider"
 snowflake = "fluid_build.providers.snowflake:SnowflakeProvider"
 odps = "fluid_build.providers.odps:OdpsProvider"
 
+# Metadata source adapters for ``fluid forge data-model from-source`` and the
+# ``forge_from_source`` MCP tool (issue #247) are a discovered plugin group:
+#
+#     [project.entry-points."fluid_build.source_adapters"]
+#     my-catalog = "my_pkg.adapter:MyCatalogAdapter"   # a CatalogAdapter subclass
+#
+# Like the other pure-plugin groups (commands / apply_hooks / extension_*),
+# built-in sources are seeded in code (copilot.catalog.source_registry), so
+# this group is declared by THIRD-PARTY packages only — listing the built-ins
+# here would self-shadow. Plugins merge into ``--source`` choices + dispatch.
+
 [project.urls]
 Homepage = "https://agenticstiger.github.io/forge_docs/"
 Repository = "https://github.com/Agenticstiger/forge-cli"

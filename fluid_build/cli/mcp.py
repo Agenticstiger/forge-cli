@@ -177,27 +177,31 @@ class ToolCapability:
 #   passing through.
 # ---------------------------------------------------------------------
 
-_CATALOG_SOURCE_LIST = (
-    "snowflake",
-    "unity",
-    "bigquery",
-    "dataplex",
-    "glue",
-    "datahub",
-    "datamesh_manager",
-)
+# Source lists derive from the shared registry
+# (``copilot.catalog.source_registry``) — the single source of truth shared
+# with the CLI — so built-in AND plugin (``fluid_build.source_adapters``)
+# sources flow into every MCP surface at once: the curated
+# ``TOOL_CAPABILITIES`` schemas, the dynamic tool-signature enums, and
+# ``list_source_adapters``. Plugins present at import time are included.
+# Discovery is cheap: plugin classes load lazily at dispatch, not here.
+from fluid_build.copilot.catalog import source_registry as _source_registry
+
+_source_registry.discover_source_adapters()
+_CATALOG_SOURCE_LIST = tuple(_source_registry.list_catalog_sources())
 # JDBC-introspectable databases. The catalog tools (list_source_tables /
 # inspect_source_table / list_source_lineage / list_source_glossary) do NOT
 # accept these — JDBC is a one-shot synthesis path only. ``forge_from_source``
 # is the only tool that dispatches to JDBC (via ``_run_from_jdbc_source``).
-_JDBC_SOURCE_LIST = (
-    "postgres",
-    "postgresql",
-    "mysql",
-    "sqlite",
-)
+_JDBC_SOURCE_LIST = tuple(_source_registry.list_jdbc_sources())
 _SOURCE_ENUM = list(_CATALOG_SOURCE_LIST)
-_FORGE_FROM_SOURCE_ENUM = list(_CATALOG_SOURCE_LIST + _JDBC_SOURCE_LIST)
+_FORGE_FROM_SOURCE_ENUM = sorted(set(_CATALOG_SOURCE_LIST) | set(_JDBC_SOURCE_LIST))
+
+# Dynamic Literal aliases for the tool signatures: a registry-driven enum
+# preserves LLM autocomplete (the JSON-Schema ``enum`` still ships) while
+# accepting plugin source names. ``Literal[tuple(...)]`` is evaluated at
+# import; pydantic emits the enum and validates membership (verified).
+_CatalogSourceLiteral = Literal[tuple(_SOURCE_ENUM)]  # type: ignore[valid-type]
+_ForgeSourceLiteral = Literal[tuple(_FORGE_FROM_SOURCE_ENUM)]  # type: ignore[valid-type]
 _TECHNIQUE_ENUM = ["data_vault_2", "dimensional"]
 
 _CREDENTIALS_DESCRIPTION = (
@@ -1496,9 +1500,7 @@ async def list_source_adapters() -> Dict[str, Any]:
 @_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_tables"].description)
 async def list_source_tables(
     source: Annotated[
-        Literal[
-            "snowflake", "unity", "bigquery", "dataplex", "glue", "datahub", "datamesh_manager"
-        ],
+        _CatalogSourceLiteral,
         Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
     ],
     credentials: Annotated[CredentialsArg, Field(description=_CREDENTIALS_DESCRIPTION)],
@@ -1521,9 +1523,7 @@ async def list_source_tables(
 @_mcp_app.tool(description=TOOL_CAPABILITIES["inspect_source_table"].description)
 async def inspect_source_table(
     source: Annotated[
-        Literal[
-            "snowflake", "unity", "bigquery", "dataplex", "glue", "datahub", "datamesh_manager"
-        ],
+        _CatalogSourceLiteral,
         Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
     ],
     credentials: Annotated[CredentialsArg, Field(description=_CREDENTIALS_DESCRIPTION)],
@@ -1546,9 +1546,7 @@ async def inspect_source_table(
 @_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_lineage"].description)
 async def list_source_lineage(
     source: Annotated[
-        Literal[
-            "snowflake", "unity", "bigquery", "dataplex", "glue", "datahub", "datamesh_manager"
-        ],
+        _CatalogSourceLiteral,
         Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
     ],
     credentials: Annotated[CredentialsArg, Field(description=_CREDENTIALS_DESCRIPTION)],
@@ -1578,9 +1576,7 @@ async def list_source_lineage(
 @_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_glossary"].description)
 async def list_source_glossary(
     source: Annotated[
-        Literal[
-            "snowflake", "unity", "bigquery", "dataplex", "glue", "datahub", "datamesh_manager"
-        ],
+        _CatalogSourceLiteral,
         Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
     ],
     credentials: Annotated[CredentialsArg, Field(description=_CREDENTIALS_DESCRIPTION)],
@@ -1609,19 +1605,7 @@ async def list_source_glossary(
 @_mcp_app.tool(description=TOOL_CAPABILITIES["forge_from_source"].description)
 async def forge_from_source(
     source: Annotated[
-        Literal[
-            "snowflake",
-            "unity",
-            "bigquery",
-            "dataplex",
-            "glue",
-            "datahub",
-            "datamesh_manager",
-            "postgres",
-            "postgresql",
-            "mysql",
-            "sqlite",
-        ],
+        _ForgeSourceLiteral,
         Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
     ],
     output_path: Annotated[str, Field(description=_OUTPUT_PATH_DESCRIPTION)],
@@ -2242,29 +2226,12 @@ def _list_source_adapters() -> List[Dict[str, Any]]:
     return catalog_entries + jdbc_entries
 
 
-# Single source of truth for catalog dispatch. Every adapter
-# implements ``CatalogAdapter.from_resolver`` so we just need the
-# class reference here. New adapters land by adding one entry.
-#
-# JDBC sources (postgres / postgresql / mysql / sqlite) are NOT in this
-# table — they route through ``_dispatch_forge_from_jdbc_source`` which
-# uses duckdb-extension introspection rather than a credential-resolver
-# adapter. ``_build_source_adapter`` only handles catalog sources;
-# ``forge_from_source`` short-circuits to the JDBC path before calling
-# it. The catalog-only tools (list_source_tables, inspect_source_table,
-# list_source_lineage, list_source_glossary) reject JDBC sources via
-# the ``Literal[...]`` enum on their Annotated signatures.
-_SOURCE_ADAPTERS: Dict[str, str] = {
-    "snowflake": "fluid_build.copilot.catalog.snowflake:SnowflakeCatalogAdapter",
-    "unity": "fluid_build.copilot.catalog.unity:UnityCatalogAdapter",
-    "bigquery": "fluid_build.copilot.catalog.bigquery:BigQueryCatalogAdapter",
-    "dataplex": "fluid_build.copilot.catalog.dataplex:DataplexCatalogAdapter",
-    "glue": "fluid_build.copilot.catalog.glue:GlueCatalogAdapter",
-    "datahub": "fluid_build.copilot.catalog.datahub:DataHubCatalogAdapter",
-    "datamesh_manager": (
-        "fluid_build.copilot.catalog.datamesh_manager:DataMeshManagerCatalogAdapter"
-    ),
-}
+# Catalog dispatch + the JDBC source set now live in the shared registry
+# ``copilot.catalog.source_registry`` (the single source of truth shared
+# with the CLI, plus ``fluid_build.source_adapters`` plugins).
+# ``_build_source_adapter`` resolves catalog adapter classes through it;
+# ``forge_from_source`` short-circuits JDBC sources to the duckdb scanner
+# (``_dispatch_forge_from_jdbc_source``) before calling it (catalog-only).
 
 
 def _dispatch_forge_from_jdbc_source(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -2343,18 +2310,6 @@ def _dispatch_forge_from_jdbc_source(arguments: Dict[str, Any]) -> Dict[str, Any
     }
 
 
-def _import_adapter_class(dotted_path: str) -> Any:
-    """Resolve ``module.path:ClassName`` into the actual class.
-
-    Lazy import keeps ``fluid --help`` cold-start fast — only the
-    requested adapter's module is imported. Pattern 4 applied at the
-    dispatch layer.
-    """
-    module_path, class_name = dotted_path.split(":", 1)
-    module = __import__(module_path, fromlist=[class_name])
-    return getattr(module, class_name)
-
-
 def _build_source_adapter(
     arguments: Dict[str, Any],
     *,
@@ -2385,8 +2340,9 @@ def _build_source_adapter(
     from fluid_build.copilot.catalog.credentials import CredentialResolver
 
     source = str(arguments.get("source") or "").lower().strip()
+    catalog_sources = _source_registry.list_catalog_sources()
     if not source:
-        supported = ", ".join(sorted(_SOURCE_ADAPTERS))
+        supported = ", ".join(catalog_sources)
         raise RuntimeError(f"Source-catalog tools require 'source' (one of: {supported}).")
     credentials_arg = arguments.get("credentials") or {}
     credential_id = credentials_arg.get("credential_id")
@@ -2410,13 +2366,13 @@ def _build_source_adapter(
             "(or credentials.inline for direct CLI callers when the "
             "server is started with --allow-inline-credentials)."
         )
-    if source not in _SOURCE_ADAPTERS:
-        supported = ", ".join(sorted(_SOURCE_ADAPTERS))
+    if source not in catalog_sources:
+        supported = ", ".join(catalog_sources)
         raise RuntimeError(f"Unknown source-catalog adapter: {source!r}. Supported: {supported}.")
     resolver = CredentialResolver(
         allow_metadata_service=bool(arguments.get("allow_metadata_service", False))
     )
-    adapter_cls = _import_adapter_class(_SOURCE_ADAPTERS[source])
+    adapter_cls = _source_registry.resolve_catalog_adapter_class(source)
     return adapter_cls.from_resolver(
         resolver, credential_id=credential_id, inline_credentials=inline
     )

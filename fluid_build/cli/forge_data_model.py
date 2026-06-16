@@ -510,9 +510,11 @@ def run_from_source_command(args: Any, logger: logging.Logger) -> int:
     the CLI subcommand share one staged-pipeline path.
     """
     # JDBC sources — branch out early to a duckdb-attach helper. The
-    # rest of the function below handles catalog sources.
-    jdbc_sources = {"postgres", "postgresql", "mysql", "sqlite"}
-    if args.source in jdbc_sources:
+    # rest of the function below handles catalog sources. The JDBC set
+    # lives in the shared source registry (single source of truth).
+    from fluid_build.copilot.catalog.source_registry import is_jdbc_source
+
+    if is_jdbc_source(args.source):
         return _run_from_jdbc_source(args, logger)
 
     # Lazy imports keep ``fluid forge --help`` cold-start fast: the
@@ -722,31 +724,17 @@ def _build_catalog_adapter(
     """Construct the right adapter for ``source`` via its
     ``from_resolver`` classmethod.
 
-    Mirrors the dispatch dict in ``cli.mcp._SOURCE_ADAPTERS`` so
-    the CLI and MCP layers stay in sync: adding a new catalog only
-    needs one edit there. We DON'T import that dict directly here
-    because the CLI must work without ``cli.mcp`` (which imports
-    yaml + history + audit_trail + … the catalog dispatch should
-    not pull all of that in).
+    Resolves the class through the shared source registry
+    (``copilot.catalog.source_registry``) — the single source of truth
+    shared with the MCP layer — so built-in AND plugin
+    (``fluid_build.source_adapters``) catalog adapters dispatch
+    identically. The registry module is intentionally lightweight (no
+    ``cli.mcp`` import) so the CLI doesn't pull in yaml + history +
+    audit_trail just to look up an adapter class.
     """
-    dispatch = {
-        "snowflake": "fluid_build.copilot.catalog.snowflake:SnowflakeCatalogAdapter",
-        "unity": "fluid_build.copilot.catalog.unity:UnityCatalogAdapter",
-        "bigquery": "fluid_build.copilot.catalog.bigquery:BigQueryCatalogAdapter",
-        "dataplex": "fluid_build.copilot.catalog.dataplex:DataplexCatalogAdapter",
-        "glue": "fluid_build.copilot.catalog.glue:GlueCatalogAdapter",
-        "datahub": "fluid_build.copilot.catalog.datahub:DataHubCatalogAdapter",
-        "datamesh_manager": (
-            "fluid_build.copilot.catalog.datamesh_manager:DataMeshManagerCatalogAdapter"
-        ),
-    }
-    if source not in dispatch:
-        raise RuntimeError(
-            f"Unknown source-catalog adapter: {source!r}. Supported: {', '.join(sorted(dispatch))}."
-        )
-    module_path, class_name = dispatch[source].split(":", 1)
-    module = __import__(module_path, fromlist=[class_name])
-    cls = getattr(module, class_name)
+    from fluid_build.copilot.catalog.source_registry import resolve_catalog_adapter_class
+
+    cls = resolve_catalog_adapter_class(source)
     return cls.from_resolver(resolver, credential_id=credential_id)
 
 
