@@ -52,7 +52,7 @@ where ``ANCHOR_MODELING`` is a :class:`ModelingTechnique` instance.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 LOG = logging.getLogger("fluid.modeling_techniques")
