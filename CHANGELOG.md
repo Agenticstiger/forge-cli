@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.11] - 2026-06-16
+
+### Added
+
+- **Pluggable metadata source adapters for `fluid forge data-model from-source`.**
+  A new `fluid_build.source_adapters` entry-point group lets a third-party
+  package register a custom `CatalogAdapter` (e.g. an internal/enterprise
+  metadata catalog) that merges into the `--source` choices and dispatch — and
+  the `forge_from_source` MCP tool — without forking the CLI. Built-in catalog +
+  JDBC sources now resolve through one shared registry (the two previously
+  duplicated dispatch tables are gone). (#247)
+- **Pluggable modeling techniques, plus `flat` and `custom`.** A new
+  `fluid_build.modeling_techniques` entry-point group makes
+  `--modeling-technique` extensible. Two new built-ins: **`flat`** (source-aligned
+  1:1 — one expose per source table, no reshaping) for bronze / source-aligned
+  products, and **`custom`** (bring-your-own logical model used verbatim via
+  `--logical-model <path>`, no reshaping). The closed
+  `{data_vault_2, dimensional}` enum is now a registry the modeler and contract
+  emitter read instead of branching on the technique name. (#248)
+
+### Fixed
+
+- **Contract schema now accepts dbt features the build runner already supports.**
+  `build.engine` accepts the whole `dbt-<adapter>` family (`dbt-glue`,
+  `dbt-snowflake`, …) generically, and the hybrid-reference build pattern accepts
+  `properties.target`, `properties.select`, and `properties.models` — all of
+  which the dbt runner already honoured but `fluid validate` rejected. Applied
+  across every bundled schema (0.7.1–0.7.4). (#249)
+- **Nightly live-LLM / TS-conformance gate** no longer false-fails when no LLM
+  API key is wired; duplicate `CircuitBreakerOpenError` definitions consolidated
+  into `fluid_build/errors.py`. (#223)
+- **CI Docker base bumped to `python:3.13-slim`** with grype-ignores for the
+  unfixable CPython CVEs. (#226)
+
 ### Security
 
 - **`Dockerfile.verify` now runs as a non-root user** (`fluid`, UID/GID 1000,
@@ -17,6 +51,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`trufflehog --only-verified`: 0): the detect-secrets baseline's hashed
   digests, redaction-test fixtures, and the redactor pattern sources.
   Requires gitleaks ≥ 8.25.0. (#236)
+
+### Changed
+
+- Dependency / CI-action bumps via Dependabot: black 26.3.1→26.5.1 (#232),
+  `actions/setup-node` (#231), `actions/setup-go` (#243),
+  `actions/github-script` (#244), `github/codeql-action` (#246),
+  `docker/metadata-action` (#230), `docker/login-action` (#227),
+  `docker/setup-buildx-action` (#245),
+  `aws-actions/configure-aws-credentials` (#229),
+  `peter-evans/create-pull-request` (#228),
+  `softprops/action-gh-release` (#242).
 
 ## [0.8.10] - 2026-06-08
 
