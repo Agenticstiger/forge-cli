@@ -368,12 +368,29 @@ class LogicalDraft(StructuredOutputModel):
 
     @model_validator(mode="after")
     def _validate_technique_shape(self) -> "LogicalDraft":
-        if self.technique == "data_vault_2":
+        # Registry-driven (issue #248): each technique declares which branch it
+        # fills. data_vault_2 -> dv2 only; dimensional -> dimensional only; a
+        # source-aligned ``flat`` (or any branch=None technique) -> neither
+        # branch (the OSI semantic model carries the 1:1 shape); ``custom``
+        # (bring-your-own) -> accept whatever shape the user supplied verbatim.
+        from fluid_build.copilot.modeling_techniques import get_modeling_technique
+
+        spec = get_modeling_technique(self.technique)
+        if spec is not None and spec.requires_logical_model:
+            return self  # custom — user-supplied model used verbatim
+        branch = spec.branch if spec is not None else None
+        if branch == "dv2":
             if self.dv2 is None or self.dimensional is not None:
                 raise ValueError("data_vault_2 logical drafts must populate dv2 only")
-        if self.technique == "dimensional":
+        elif branch == "dimensional":
             if self.dimensional is None or self.dv2 is not None:
                 raise ValueError("dimensional logical drafts must populate dimensional only")
+        else:
+            if self.dv2 is not None or self.dimensional is not None:
+                raise ValueError(
+                    f"{self.technique!r} logical drafts must not populate dv2/dimensional "
+                    "(source-aligned techniques carry their shape in osi)"
+                )
         return self
 
 

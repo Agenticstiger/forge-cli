@@ -202,7 +202,19 @@ _FORGE_FROM_SOURCE_ENUM = sorted(set(_CATALOG_SOURCE_LIST) | set(_JDBC_SOURCE_LI
 # import; pydantic emits the enum and validates membership (verified).
 _CatalogSourceLiteral = Literal[tuple(_SOURCE_ENUM)]  # type: ignore[valid-type]
 _ForgeSourceLiteral = Literal[tuple(_FORGE_FROM_SOURCE_ENUM)]  # type: ignore[valid-type]
-_TECHNIQUE_ENUM = ["data_vault_2", "dimensional"]
+# Modeling techniques offered over MCP come from the pluggable registry
+# (issue #248), EXCLUDING ``custom`` — the bring-your-own-model technique needs
+# a ``--logical-model`` file path the MCP wire can't supply. Built-in
+# data_vault_2 / dimensional / flat + any plugin techniques flow through.
+from fluid_build.copilot import modeling_techniques as _modeling_techniques
+
+_modeling_techniques.discover_modeling_techniques()
+_TECHNIQUE_ENUM = [
+    name
+    for name in _modeling_techniques.list_modeling_techniques()
+    if not ((_t := _modeling_techniques.get_modeling_technique(name)) and _t.requires_logical_model)
+]
+_TechniqueLiteral = Literal[tuple(_TECHNIQUE_ENUM)]  # type: ignore[valid-type]
 
 _CREDENTIALS_DESCRIPTION = (
     "Credential lookup envelope. Pass ONLY the credential_id; "
@@ -1616,7 +1628,7 @@ async def forge_from_source(
     uri: Annotated[Optional[str], Field(description=_FORGE_FROM_SOURCE_URI_DESCRIPTION)] = None,
     name: Annotated[Optional[str], Field(description=_NAME_DESCRIPTION)] = None,
     technique: Annotated[
-        Literal["data_vault_2", "dimensional"],
+        _TechniqueLiteral,
         Field(description=_TECHNIQUE_DESCRIPTION),
     ] = "data_vault_2",
     engine: Annotated[str, Field(description=_ENGINE_FORGE_DESCRIPTION)] = "dbt",

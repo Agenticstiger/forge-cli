@@ -150,7 +150,12 @@ class ModelerAgent(BaseStageAgent):
             tables=tables,
             technique=technique,
         )
-        if session.llm_config is not None:
+        from fluid_build.copilot.modeling_techniques import get_modeling_technique
+
+        _spec = get_modeling_technique(technique)
+        # Deterministic techniques (flat / source-aligned) declare no LLM
+        # fragment — they skip the LLM path and build 1:1 heuristically.
+        if session.llm_config is not None and bool(_spec and _spec.uses_llm):
             try:
                 return self._llm_from_tables(
                     session, name=name, tables=tables, technique=technique, source_type=source_type
@@ -224,7 +229,10 @@ class ModelerAgent(BaseStageAgent):
             intent=intent,
             technique=technique,
         )
-        if session.llm_config is not None:
+        from fluid_build.copilot.modeling_techniques import get_modeling_technique
+
+        _spec = get_modeling_technique(technique)
+        if session.llm_config is not None and bool(_spec and _spec.uses_llm):
             try:
                 return self._llm_from_intent(session, intent=intent, technique=technique)
             except Exception as exc:  # noqa: BLE001 — fallback is deliberate
@@ -265,13 +273,15 @@ class ModelerAgent(BaseStageAgent):
         technique: str,
         source_type: Optional[str],
     ) -> LogicalDraft:
+        from fluid_build.copilot.modeling_techniques import get_modeling_technique
+
+        _spec = get_modeling_technique(technique)
+        _fragment = (
+            _spec.llm_fragment if _spec is not None else None
+        ) or "fragments/dimensional.yaml"
         fragments = [
             load_prompt_text("fragments/conceptual.yaml"),
-            load_prompt_text(
-                "fragments/dv2.yaml"
-                if technique == "data_vault_2"
-                else "fragments/dimensional.yaml"
-            ),
+            load_prompt_text(_fragment),
         ]
         semantic_query = self._build_semantic_query_from_tables(
             name=name, tables=tables, technique=technique
@@ -372,13 +382,15 @@ class ModelerAgent(BaseStageAgent):
     def _llm_from_intent(
         self, session: StageSession, *, intent: BusinessIntent, technique: str
     ) -> LogicalDraft:
+        from fluid_build.copilot.modeling_techniques import get_modeling_technique
+
+        _spec = get_modeling_technique(technique)
+        _fragment = (
+            _spec.llm_fragment if _spec is not None else None
+        ) or "fragments/dimensional.yaml"
         fragments = [
             load_prompt_text("fragments/conceptual.yaml"),
-            load_prompt_text(
-                "fragments/dv2.yaml"
-                if technique == "data_vault_2"
-                else "fragments/dimensional.yaml"
-            ),
+            load_prompt_text(_fragment),
         ]
         semantic_query = self._build_semantic_query_from_intent(intent=intent, technique=technique)
         prior_context = self._retrieve_prior_similar_models(session, query=semantic_query)
@@ -1059,30 +1071,46 @@ class ModelerAgent(BaseStageAgent):
         technique: str,
         source_type: Optional[str],
     ) -> LogicalDraft:
+        from fluid_build.copilot.modeling_techniques import get_modeling_technique
+
         relationships = self._relationships_from_tables(tables)
         osi = self._osi_from_tables(
             name=name, tables=tables, relationships=relationships, source_type=source_type
         )
-        if technique == "data_vault_2":
-            dv2 = self._dv2_from_tables(tables, relationships)
+        summary = {"source_kind": "ddl", "table_count": len(tables)}
+        spec = get_modeling_technique(technique)
+        branch = spec.branch if spec is not None else None
+        if branch == "dv2":
             return LogicalDraft(
                 name=name,
                 description=f"Logical DV2 draft for {name}",
                 technique="data_vault_2",
                 conceptual=conceptual,
-                dv2=dv2,
+                dv2=self._dv2_from_tables(tables, relationships),
                 osi=osi,
-                source_summary={"source_kind": "ddl", "table_count": len(tables)},
+                source_summary=summary,
             )
-        dimensional = self._dimensional_from_tables(name=name, tables=tables)
+        if branch == "dimensional":
+            return LogicalDraft(
+                name=name,
+                description=f"Logical dimensional draft for {name}",
+                technique="dimensional",
+                conceptual=conceptual,
+                dimensional=self._dimensional_from_tables(name=name, tables=tables),
+                osi=osi,
+                source_summary=summary,
+            )
+        # Source-aligned ``flat`` (or any branch=None technique): 1:1 — neither
+        # vault nor dimensional reshaping; the OSI model (one dataset per source
+        # table) carries the shape, and the emitter renders one expose per dataset.
+        canonical = spec.name if spec is not None else technique
         return LogicalDraft(
             name=name,
-            description=f"Logical dimensional draft for {name}",
-            technique="dimensional",
+            description=f"Logical {canonical} draft for {name}",
+            technique=canonical,
             conceptual=conceptual,
-            dimensional=dimensional,
             osi=osi,
-            source_summary={"source_kind": "ddl", "table_count": len(tables)},
+            source_summary=summary,
         )
 
     def _conceptual_from_intent(self, intent: BusinessIntent) -> ConceptualDraft:
@@ -1127,27 +1155,41 @@ class ModelerAgent(BaseStageAgent):
         conceptual: ConceptualDraft,
         technique: str,
     ) -> LogicalDraft:
+        from fluid_build.copilot.modeling_techniques import get_modeling_technique
+
         osi = self._osi_from_intent(intent)
-        if technique == "data_vault_2":
-            dv2 = self._dv2_from_intent(intent)
+        summary = {"source_kind": "intent", "metric_count": len(intent.metrics)}
+        spec = get_modeling_technique(technique)
+        branch = spec.branch if spec is not None else None
+        if branch == "dv2":
             return LogicalDraft(
                 name=intent.data_product.name,
                 description=intent.data_product.description,
                 technique="data_vault_2",
                 conceptual=conceptual,
-                dv2=dv2,
+                dv2=self._dv2_from_intent(intent),
                 osi=osi,
-                source_summary={"source_kind": "intent", "metric_count": len(intent.metrics)},
+                source_summary=summary,
             )
-        dimensional = self._dimensional_from_intent(intent)
+        if branch == "dimensional":
+            return LogicalDraft(
+                name=intent.data_product.name,
+                description=intent.data_product.description,
+                technique="dimensional",
+                conceptual=conceptual,
+                dimensional=self._dimensional_from_intent(intent),
+                osi=osi,
+                source_summary=summary,
+            )
+        # Source-aligned ``flat`` (branch=None): neither branch; osi carries it.
+        canonical = spec.name if spec is not None else technique
         return LogicalDraft(
             name=intent.data_product.name,
             description=intent.data_product.description,
-            technique="dimensional",
+            technique=canonical,
             conceptual=conceptual,
-            dimensional=dimensional,
             osi=osi,
-            source_summary={"source_kind": "intent", "metric_count": len(intent.metrics)},
+            source_summary=summary,
         )
 
     def _relationships_from_tables(self, tables: Sequence[TableDefinition]) -> List[Dict[str, str]]:

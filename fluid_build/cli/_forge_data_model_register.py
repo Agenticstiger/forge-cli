@@ -149,7 +149,11 @@ def register_forge_subcommand(subparsers: argparse._SubParsersAction) -> None:
 
     from_source.add_argument(
         "--source",
-        required=True,
+        # Optional so ``--modeling-technique custom --logical-model <path>`` can
+        # forge from a supplied logical model with no source; the handler
+        # validates that a source is present for every non-custom run.
+        required=False,
+        default=None,
         choices=list_source_adapters(),
         help=(
             "Which metadata-source catalog to read from. Catalogs "
@@ -157,7 +161,8 @@ def register_forge_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "datamesh_manager) require credentials configured via "
             "``fluid ai setup --source <catalog> --name <credential-id>``. "
             "JDBC sources (postgres/postgresql/mysql/sqlite) accept a "
-            "``--uri`` directly. See docs/PROVIDERS.md."
+            "``--uri`` directly. Omit with ``--modeling-technique custom``. "
+            "See docs/PROVIDERS.md."
         ),
     )
     from_source.add_argument(

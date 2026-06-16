@@ -88,13 +88,34 @@ def _add_common_generation_args(
     parser: argparse.ArgumentParser, *, output_required: bool = True
 ) -> None:
     _add_quiet_arg(parser)
+    # Choices come from the pluggable technique registry (built-in data_vault_2 /
+    # dimensional / flat / custom + any ``fluid_build.modeling_techniques`` plugins).
+    # ``type`` normalizes aliases (data-vault-2 -> data_vault_2, kimball ->
+    # dimensional) so they're accepted, while ``choices`` shows only the clean
+    # canonical names.
+    from fluid_build.copilot.modeling_techniques import list_modeling_techniques
+
     parser.add_argument(
         "--modeling-technique",
         "--technique",
         dest="technique",
-        choices=["data_vault_2", "data-vault-2", "dimensional"],
+        type=_normalize_technique,
+        choices=list_modeling_techniques(),
         default=None,
-        help="Modeling technique to forge",
+        help=(
+            "Modeling technique: data_vault_2, dimensional, flat (source-aligned "
+            "1:1), custom (bring-your-own logical model via --logical-model), or a "
+            "registered plugin technique. Aliases like data-vault-2 / kimball are accepted."
+        ),
+    )
+    parser.add_argument(
+        "--logical-model",
+        dest="logical_model",
+        default=None,
+        help=(
+            "Path to a logical model (.model.json) used verbatim with "
+            "--modeling-technique custom (no reshaping)."
+        ),
     )
     parser.add_argument("--output", "-o", required=output_required, help="Output contract path")
     parser.add_argument(
@@ -314,6 +335,9 @@ def run_learn_command(args: Any, logger: logging.Logger) -> int:
 
 
 def run_from_ddl_command(args: Any, logger: logging.Logger) -> int:
+    rc = _maybe_run_custom_technique(args, logger)
+    if rc is not None:
+        return rc
     output_path = Path(args.output)
     try:
         session = _build_session(args, workspace_root=output_path.parent, logger=logger)
@@ -380,6 +404,9 @@ def run_from_ddl_command(args: Any, logger: logging.Logger) -> int:
 
 
 def run_from_intent_command(args: Any, logger: logging.Logger) -> int:
+    rc = _maybe_run_custom_technique(args, logger)
+    if rc is not None:
+        return rc
     if getattr(args, "example", None):
         try:
             sys.stdout.write(render_intent_example(str(args.example)))
@@ -509,6 +536,18 @@ def run_from_source_command(args: Any, logger: logging.Logger) -> int:
     ``forge_datamodel.from_catalog.pipeline`` so the MCP tool and
     the CLI subcommand share one staged-pipeline path.
     """
+    # Bring-your-own logical model (issue #248): --modeling-technique custom
+    # + --logical-model short-circuits the source pipeline entirely.
+    rc = _maybe_run_custom_technique(args, logger)
+    if rc is not None:
+        return rc
+    if not getattr(args, "source", None):
+        cprint(
+            "[red]from-source requires --source <catalog|jdbc>[/red] (or "
+            "--modeling-technique custom with --logical-model to forge from a "
+            "supplied logical model instead)."
+        )
+        return 1
     # JDBC sources — branch out early to a duckdb-attach helper. The
     # rest of the function below handles catalog sources. The JDBC set
     # lives in the shared source registry (single source of truth).
@@ -973,14 +1012,61 @@ def _resolve_optional_llm_config(args: Any, logger: logging.Logger):
 
 
 def _normalize_technique(value: Optional[str]) -> Optional[str]:
-    if not value:
+    # Delegate to the pluggable registry so aliases for built-in AND plugin
+    # techniques (e.g. data-vault-2 -> data_vault_2, kimball -> dimensional)
+    # resolve to their canonical name. See issue #248.
+    from fluid_build.copilot.modeling_techniques import normalize_technique
+
+    return normalize_technique(value)
+
+
+def _maybe_run_custom_technique(args: Any, logger: logging.Logger) -> Optional[int]:
+    """Bring-your-own-model path (issue #248).
+
+    When ``--modeling-technique custom`` is selected, load the user-supplied
+    logical model from ``--logical-model`` and emit a contract from it
+    **verbatim** — no modeler, no reshaping. Returns an exit code when it
+    handled the run, or ``None`` to let the caller proceed with normal
+    source-driven modeling.
+
+    Reuses the same ``_finalize_contract`` + ``_write_or_report`` machinery as
+    the source-driven path so the emitted artifacts (contract + sidecar + model
+    doc + validation report) are identical in shape.
+    """
+    if _normalize_technique(getattr(args, "technique", None)) != "custom":
         return None
-    normalized = value.replace("-", "_").strip().lower()
-    if normalized == "data_vault_2":
-        return normalized
-    if normalized == "dimensional":
-        return normalized
-    return value
+    model_path = getattr(args, "logical_model", None)
+    if not model_path:
+        cprint(
+            "[red]--modeling-technique custom requires --logical-model <path>[/red] "
+            "(a .model.json logical model to use verbatim)."
+        )
+        return 1
+    path = Path(model_path)
+    if not path.exists():
+        cprint(f"[red]--logical-model not found:[/red] {path}")
+        return 1
+    try:
+        logical = LogicalDraft.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — surface the validation error cleanly
+        cprint(f"[red]--logical-model is not a valid logical model:[/red] {exc}")
+        return 1
+    engine = getattr(args, "engine", None) or "dbt"
+    output_path = Path(args.output)
+    contract = _finalize_contract(
+        logical=logical,
+        output_path=output_path,
+        engine=engine,
+        contract=build_contract_from_logical(logical, build_engine=engine),
+    )
+    return _write_or_report(
+        args,
+        logger,
+        logical=logical,
+        contract=contract,
+        validation=FluidContractValidator().validate(logical=logical, contract=contract),
+        industry_pack=None,
+    )
 
 
 def _print_heuristic_only_banner(
