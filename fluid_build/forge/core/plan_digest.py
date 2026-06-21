@@ -22,9 +22,10 @@ digest fields emitted into ``plan.json``:
   When the plan is computed against a ``.tgz`` bundle, this pins the exact
   bundle. When the plan is computed against a raw ``.fluid.yaml``, this is
   the empty string (no bundle to pin).
-- ``planDigest``  — SHA-256 over the plan body itself (with the two digest
-  fields masked out), canonicalized via sorted-keys JSON. Catches
-  tampering of the plan file between stages 6 and 7.
+- ``planDigest``  — SHA-256 over the plan body itself (with the derived
+  digest fields and the volatile ``generated_at`` timestamp masked out),
+  canonicalized via sorted-keys JSON. Catches tampering of the plan file
+  between stages 6 and 7, while staying identical across two identical runs.
 
 ``fluid apply`` re-verifies both before any DDL. Mismatch → hard-fail
 with a message pointing at the specific divergence ("bundle swap" vs
@@ -50,10 +51,23 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-# Plan fields excluded from the planDigest hash input. Their values are
-# derived from the hash or derived from the bundle, so including them
-# would create self-referential dependencies.
+# Plan fields excluded from the planDigest hash input.
+#
+# ``bundleDigest`` / ``planDigest`` are *derived* values (``planDigest`` IS
+# the hash) — including them would create a self-referential dependency with
+# no fixed point.
 _DIGEST_FIELDS = ("bundleDigest", "planDigest")
+
+# Volatile metadata fields legitimately differ between two otherwise-identical
+# ``fluid plan`` runs, so hashing them makes ``planDigest`` non-deterministic
+# and breaks the "apply consumes the exact approved plan" guarantee.
+# ``generated_at`` is the wall-clock time the plan was produced
+# (``cli/plan.py`` stamps ``time.time()``); it is audit metadata, not plan
+# content, and is still written to ``plan.json`` — just masked out of the hash.
+_VOLATILE_FIELDS = ("generated_at",)
+
+# Everything masked out of the planDigest input.
+_NON_DIGEST_FIELDS = frozenset(_DIGEST_FIELDS + _VOLATILE_FIELDS)
 
 
 def _nfc_normalise(obj: Any) -> Any:
@@ -95,15 +109,29 @@ def coerce_keys_to_str(obj: Any) -> Any:
 
 
 def compute_plan_digest(plan: Dict[str, Any]) -> str:
-    """SHA-256 over the plan body with the digest fields masked out.
+    """SHA-256 over the plan body, canonicalised so it is byte-stable.
 
-    Deterministic across runs: ``json.dumps(sort_keys=True, separators=...)``.
-    Matches the canonical-JSON form used by Phase-2 bundle MANIFEST so
-    external tools can reproduce the hash with standard utilities.
+    This digest is the plan-binding primitive ``fluid apply`` verifies, so it
+    MUST be identical for two ``fluid plan`` runs over the same contract.
+    Determinism rests on three things:
+
+    - ``json.dumps(sort_keys=True, separators=(",", ":"))`` — key order and
+      whitespace cannot perturb the bytes. Matches the Phase-2 bundle
+      MANIFEST algorithm so operators can reproduce the hash with a single
+      ``jq`` + ``sha256sum`` pipeline.
+    - Unicode NFC normalisation of every string, so composed/decomposed
+      accents canonicalise identically.
+    - Two field classes are masked OUT of the hash input
+      (``_NON_DIGEST_FIELDS``): the *derived* digest fields
+      (``bundleDigest`` / ``planDigest`` — self-referential) and *volatile*
+      metadata (``generated_at`` — a wall-clock timestamp that differs every
+      run). Everything ELSE is part of the hash — including the **order** of
+      ``actions`` — so action order must itself be deterministic upstream
+      (see ``ProviderActionParser.get_execution_order``).
 
     Returns a ``sha256:<hex>`` string (64 hex chars after the prefix).
     """
-    stripped = _nfc_normalise({k: v for k, v in plan.items() if k not in _DIGEST_FIELDS})
+    stripped = _nfc_normalise({k: v for k, v in plan.items() if k not in _NON_DIGEST_FIELDS})
     # Coerce non-str keys to str BEFORE sort_keys serialisation: a contract
     # carrying a YAML magic-word key (on/off/yes/no) parses it as a Python
     # bool, and ``sort_keys=True`` cannot order a mixed bool/str key set.

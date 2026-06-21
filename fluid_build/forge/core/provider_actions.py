@@ -410,13 +410,24 @@ class ProviderActionParser:
                 if dep in in_degree:
                     in_degree[action.action_id] += 1
 
-        # Topological sort by levels
+        # Topological sort by levels.
+        #
+        # Iterate in the stable order actions were parsed (``exposes[]`` then
+        # ``builds[]`` in document order) — NOT in ``set`` iteration order. A
+        # ``set`` of action-id strings iterates in an order that depends on
+        # per-process hash randomisation (PYTHONHASHSEED), so two otherwise-
+        # identical ``fluid plan`` runs emitted the same actions in different
+        # order. That ordering flows into ``planDigest`` (action order is part
+        # of the plan-binding hash by design — see test_actions_reorder_*), so
+        # the digest was non-deterministic across runs. Preserving parse order
+        # keeps the plan body — and its digest — byte-stable.
+        order = [action.action_id for action in actions]
         levels = []
-        remaining = set(action.action_id for action in actions)
+        remaining = set(order)
 
         while remaining:
-            # Find nodes with no dependencies
-            current_level = [action_id for action_id in remaining if in_degree[action_id] == 0]
+            # Nodes with no remaining dependencies, in stable parse order.
+            current_level = [aid for aid in order if aid in remaining and in_degree[aid] == 0]
 
             if not current_level:
                 # Circular dependency detected
