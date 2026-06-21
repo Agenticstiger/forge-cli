@@ -79,10 +79,21 @@ class TestSchemaVersionCoverage:
             result.is_valid
         ), f"Fixture {fixture.name} failed validation for schema {version}: {error_msgs}"
 
-    def test_latest_version_is_highest(self):
-        """latest_bundled_version() returns the numerically highest version."""
+    def test_latest_version_is_highest_stable(self):
+        """latest_bundled_version() returns the highest STABLE (non-preview)
+        version — preview/opt-in versions are bundled + validatable but never
+        the silent default (RFC-streaming-extension §8)."""
         latest = FluidSchemaManager.latest_bundled_version()
-        assert latest == FluidSchemaManager.BUNDLED_VERSIONS[-1]
+        stable = [
+            v
+            for v in FluidSchemaManager.BUNDLED_VERSIONS
+            if v not in FluidSchemaManager.PREVIEW_VERSIONS
+        ]
+        assert latest == stable[-1]
+        # any preview version is bundled (opt-in) yet excluded from the default
+        for preview in FluidSchemaManager.PREVIEW_VERSIONS:
+            assert preview in FluidSchemaManager.BUNDLED_VERSIONS
+            assert latest != preview
 
     def test_copilot_targets_latest_version(self):
         """The copilot prompt helpers must target the latest bundled version."""
