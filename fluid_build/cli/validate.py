@@ -617,6 +617,26 @@ def _validate_contract_for_version(
             if args.verbose:
                 info(logger, f"Metadata consistency check skipped: {exc}")
 
+        # --- Iceberg streaming-sink checks (RFC-streaming-extension §6.8) --
+        # Catch the connector's silent-fail-at-first-record traps at validate
+        # time: a sink with no Iceberg expose, the v1-deferred upsert mode,
+        # dynamic routing without a route field, an incomplete REST catalog, or
+        # an operator warehouse override that diverges from the binding.
+        try:
+            from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
+                validate_iceberg_sink,
+            )
+
+            ice_errors, ice_warnings = validate_iceberg_sink(contract)
+            for msg in ice_errors:
+                validation_result.add_error(msg)
+                validation_result.is_valid = False
+            for msg in ice_warnings:
+                validation_result.add_warning(msg)
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"Iceberg sink check skipped: {exc}")
+
         try:
             from pathlib import Path as _Path
 
