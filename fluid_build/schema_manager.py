@@ -27,7 +27,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, FrozenSet, List, Optional, Union
 
 import yaml
 
@@ -342,9 +342,26 @@ class FluidSchemaManager:
     # Bundled schema versions (embedded in package)
     BUNDLED_VERSIONS = _discover_bundled_versions()
 
+    # Preview / opt-in schema versions: bundled and fully validatable when a
+    # contract explicitly declares ``fluidVersion``, but deliberately EXCLUDED
+    # from ``latest_bundled_version`` so adding one never silently re-defaults
+    # untagged contracts (which would churn plan/bundle digests install-wide —
+    # RFC-streaming-extension §8). Graduate a version by removing it here.
+    #
+    # This mirrors Kubernetes' API-version lifecycle: an *alpha* version is
+    # served (validatable) but disabled-by-default behind a feature gate; it
+    # becomes the default only on promotion to stable/GA. Here PREVIEW_VERSIONS
+    # is the feature gate and removing an entry is the GA promotion.
+    PREVIEW_VERSIONS: FrozenSet[str] = frozenset({"0.7.5"})
+
     @classmethod
     def latest_bundled_version(cls) -> str:
-        """Return the newest bundled FLUID schema version."""
+        """The newest STABLE bundled schema version — the default for untagged
+        contracts. Preview versions (``PREVIEW_VERSIONS``) are opt-in only and
+        excluded here so they never become the silent default."""
+        stable = [v for v in cls.BUNDLED_VERSIONS if v not in cls.PREVIEW_VERSIONS]
+        if stable:
+            return stable[-1]
         if cls.BUNDLED_VERSIONS:
             return cls.BUNDLED_VERSIONS[-1]
         return "0.7.4"

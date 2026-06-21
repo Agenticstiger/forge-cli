@@ -350,6 +350,11 @@ _FIELD_ALIASES = {
         "snowflake-table": "snowflake_table",
         "bigquery-table": "bigquery_table",
         "redshift-table": "redshift_table",
+        # Iceberg streaming-sink target: human-friendly aliases normalize to the
+        # canonical ``iceberg`` enum at load time, so the schema validator only
+        # ever sees ``iceberg`` (RFC-streaming-extension §6.4).
+        "iceberg_table": "iceberg",
+        "iceberg-table": "iceberg",
     },
 }
 
