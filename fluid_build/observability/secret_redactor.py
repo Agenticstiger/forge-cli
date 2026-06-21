@@ -37,6 +37,11 @@ _SENSITIVE_KEY_PARTS = (
     "client_secret",
     "connection_string",
     "credential",
+    # ``sasl.jaas.config`` (incl. the connector's ``iceberg.kafka.sasl.jaas.config``)
+    # carries the SASL password/token inside the value, but the key name has no
+    # other sensitive substring — so the substring matcher misses it without this
+    # part. Wholesale-masks the whole JAAS string (RFC-streaming-extension §6.8).
+    "jaas",
     "jwt",
     "oauth_token",
     "password",
@@ -102,6 +107,16 @@ _ASSIGNMENT_RE = re.compile(
     r"(?P<value>.{,256}?)(?P=quote)"
     r"(?=(?:[\s,;}\]]|$))"
 )
+# ``sasl.jaas.config`` carries the SASL login secret inside the value, often in a
+# field the generic assignment regex does NOT recognize (OAuthBearer
+# ``clientSecret=``, custom ``rawCredentialBlob=``). The dict-key path masks it
+# when it is a mapping key (the ``jaas`` key-part); this matches the WHOLE quoted
+# value on the TEXT path too — e.g. a serialized config / Kafka Connect failure
+# trace — so the two paths stay symmetric (RFC-streaming-extension §6.8).
+# Escaped-quote-safe value class (``\"`` doesn't end the match) + length-bounded.
+_JAAS_CONFIG_RE = re.compile(
+    r'(?i)([\w.]*sasl\.jaas\.config"?\s{,8}[:=]\s{,8}")((?:[^"\\]|\\.){,2048})(")'
+)
 # Matches a single printf-style placeholder. We use this to walk a log message
 # left-to-right so we can map placeholder *positions* to positional args.
 # Group 1 = named placeholder name (``%(name)s``), empty for positional.
@@ -138,6 +153,9 @@ def redact_secret_text(text: str) -> str:
     for provider_re in _PROVIDER_KEY_RES:
         redacted = provider_re.sub(_REDACTED, redacted)
     redacted = _FERNET_TOKEN_RE.sub(_REDACTED, redacted)
+    # Mask the whole sasl.jaas.config value BEFORE the assignment regex (which
+    # would only catch an inner ``password=`` and leave a non-standard secret).
+    redacted = _JAAS_CONFIG_RE.sub(r"\1" + _REDACTED + r"\3", redacted)
     redacted = _ASSIGNMENT_RE.sub(
         lambda match: (
             f"{match.group('key')}{match.group('sep')}{match.group('quote')}"
