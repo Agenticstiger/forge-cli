@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from fluid_build.providers._planner_base import BasePlanner
 
+from ..util import warehouse as _warehouse
 from ..util.logging import format_event
 from ..util.names import normalize_database_name
 
@@ -504,13 +505,10 @@ def _plan_exposures(
                 # Map FLUID schema to Glue schema
                 glue_columns = _map_schema_to_glue(contract_schema)
 
-                # Build S3 location — prefer contract bucket, resolve templates
-                raw_bucket = location.get("bucket")
-                bucket = _resolve_env_templates(raw_bucket) if raw_bucket else None
-                if not bucket or "{{" in bucket:
-                    bucket = f"{account_id}-fluid-data"
-                path = location.get("path", f"{database}/{table}/")
-                s3_location = f"s3://{bucket}/{path}"
+                # Build the warehouse S3 location through the single canonical
+                # writer so the native action and the OpenTofu emitter can never
+                # disagree (RFC-streaming-extension §7).
+                s3_location = _warehouse.get_iceberg_warehouse(location, account_ref=account_id)
 
                 # Check if Iceberg format
                 if is_iceberg_format(binding):

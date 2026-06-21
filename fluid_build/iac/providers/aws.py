@@ -24,9 +24,17 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 import yaml
 
 from ...providers._sql_safety import quote_string_literal, validate_ident
+from ...providers.aws.util import warehouse as _warehouse
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref
 from ..versions import required_providers
+
+# Apply-time AWS account placeholder for the credential-free warehouse fallback.
+# Resolves at ``tofu apply`` so ``main.tf.json`` stays account-agnostic while
+# matching the native planner's ``{account_id}-fluid-data`` bucket. The backing
+# ``data.aws_caller_identity.fluid_lf_caller`` source is emitted by ``emit_data``
+# whenever a bucket-less Glue binding is present.
+_CALLER_ACCOUNT_TOKEN = str(tofu_ref("data.aws_caller_identity.fluid_lf_caller.account_id"))
 
 
 def _resolve_catalog_id() -> str:
@@ -189,7 +197,9 @@ class AwsIacPlugin:
         # the calling AWS account ID as ``catalog_id``. Emit the
         # ``aws_caller_identity`` data source when any LF feature is used
         # so downstream resources can ``tofu_ref`` ``account_id`` off it.
-        if _contract_uses_lakeformation(contract):
+        # ...and when a bucket-less Glue binding falls back to the
+        # ``{account}-fluid-data`` warehouse, whose token references this source.
+        if _contract_uses_lakeformation(contract) or _has_bucketless_glue_binding(contract):
             data.setdefault("aws_caller_identity", {})["fluid_lf_caller"] = {}
         return data
 
@@ -350,9 +360,25 @@ def _emit_glue(
     # parameters again. Mirrors how the Glue Terraform Registry
     # examples model catalog metadata + descriptions in one resource.
     storage: Dict[str, Any] = {"columns": _columns(schema)}
-    bucket = loc.get("bucket")
-    if bucket:
-        storage["location"] = f"s3://{bucket}/{(loc.get('path') or '').lstrip('/')}"
+    # Single canonical warehouse writer (RFC §7): identical derivation to the
+    # native planner.
+    #
+    # SECURITY: contract-derived bucket/path must NEVER reach a raw ``TofuExpr``.
+    # ``TofuExpr`` tells the renderer to leave ``${...}`` un-escaped, so wrapping
+    # contract content would let a malicious binding inject OpenTofu
+    # interpolation (e.g. ``${file("/etc/passwd")}``) into the emitted module —
+    # bypassing ``_escape_tofu_literals``. The ONLY deliberate interpolation here
+    # is the emitter's own account-id fallback token. So: when the bucket is the
+    # emitter fallback, the contract-derived path is explicitly escaped before it
+    # goes inside the TofuExpr; otherwise the whole value is a plain literal that
+    # the renderer escapes at render time. Fallback is decided on the raw input
+    # (``bucket_uses_fallback``), which a contract cannot spoof.
+    bucket, path = _warehouse.normalize_location(loc, account_ref=_CALLER_ACCOUNT_TOKEN)
+    if _warehouse.bucket_uses_fallback(loc):
+        safe_path = path.replace("${", "$${").replace("%{", "%%{")
+        storage["location"] = TofuExpr(f"s3://{bucket}/{safe_path}")
+    else:
+        storage["location"] = f"s3://{bucket}/{path}"
     parameters: Dict[str, str] = {"classification": fmt, "managed_by": "fluid"}
     if "iceberg" in str(fmt).lower():
         # AWS Glue / Athena identify an Iceberg table via this parameter.
@@ -1040,6 +1066,23 @@ def _contract_uses_lakeformation(contract: Mapping[str, Any]) -> bool:
     return False
 
 
+def _has_bucketless_glue_binding(contract: Mapping[str, Any]) -> bool:
+    """True if any AWS Glue-catalog exposure omits ``binding.location.bucket``.
+
+    Such a binding's warehouse falls back to the apply-time
+    ``{aws_caller_identity}-fluid-data`` bucket, so the backing data source must
+    be emitted (see :meth:`AwsIacPlugin.emit_data`)."""
+    for exposure in contract.get("exposes") or []:
+        binding = exposure.get("binding") or {}
+        if binding.get("platform") != "aws":
+            continue
+        loc = binding.get("location") or {}
+        fmt = str(binding.get("format") or "").lower()
+        if fmt in _GLUE_CATALOG_FORMATS and loc.get("table") and not loc.get("bucket"):
+            return True
+    return False
+
+
 def _emit_lf_account_settings(
     resources: Dict[str, Any], contract: Mapping[str, Any], cid: str, tags: Dict[str, str]
 ) -> None:
@@ -1095,8 +1138,16 @@ def _emit_lakeformation(
     bucket = loc.get("bucket")
     path = (loc.get("path") or "").lstrip("/")
 
-    # 1. Register the S3 location with Lake Formation.
+    # 1. Register the S3 location with Lake Formation. Route the (bucket, path)
+    #    through the canonical normalizer so a templated bucket resolves and the
+    #    path strips consistently with the table's warehouse — but keep LF's
+    #    register-the-bucket-root semantics (``default_path=False``: no
+    #    ``{db}/{table}/`` default). The ``and bucket`` guard means the
+    #    account fallback never fires here.
     if gov.get("registerLocation") and bucket:
+        bucket, path = _warehouse.normalize_location(
+            loc, account_ref=_CALLER_ACCOUNT_TOKEN, default_path=False
+        )
         loc_key = safe_ident(f"{cid}_lf_loc_{bucket}_{path or 'root'}")
         s3_uri = f"s3://{bucket}/{path}" if path else f"s3://{bucket}"
         resources.setdefault("aws_lakeformation_resource", {})[loc_key] = {
