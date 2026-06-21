@@ -194,7 +194,7 @@ WHERE created_at >= CURRENT_DATE - INTERVAL 7 DAY
 ORDER BY created_at DESC
 """
 
-        (sql_dir / "sample_query.sql").write_text(sample_query)
+        (sql_dir / "sample_query.sql").write_text(sample_query, encoding="utf-8")
 
         # Sample data transformation
         transforms_dir = project_dir / "sql" / "transforms"
@@ -226,7 +226,7 @@ SELECT
 FROM cleaned_data
 """
 
-        (transforms_dir / "clean_data.sql").write_text(transform_sql)
+        (transforms_dir / "clean_data.sql").write_text(transform_sql, encoding="utf-8")
 
         # Sample test
         test_dir = project_dir / "tests" / "unit"
@@ -262,7 +262,7 @@ GROUP BY value_category
 -- Expect: categories should match business rules
 """
 
-        (test_dir / "test_transformations.sql").write_text(test_sql)
+        (test_dir / "test_transformations.sql").write_text(test_sql, encoding="utf-8")
 
     def _initialize_git_repo(self, project_dir: Path) -> None:
         """Initialize Git repository with basic setup"""
@@ -316,7 +316,7 @@ tmp/
 temp/
 """
 
-            (project_dir / ".gitignore").write_text(gitignore_content)
+            (project_dir / ".gitignore").write_text(gitignore_content, encoding="utf-8")
 
             # Create initial commit
             subprocess.run(["git", "add", "."], cwd=project_dir, check=True, capture_output=True)

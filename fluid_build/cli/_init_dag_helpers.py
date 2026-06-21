@@ -214,7 +214,7 @@ with DAG(
     dag_dir.mkdir(exist_ok=True)
     dag_file = dag_dir / f"{dag_id}_dag.py"
 
-    with open(dag_file, "w") as f:
+    with open(dag_file, "w", encoding="utf-8") as f:
         f.write(dag_content)
 
     logger.info(f"Created basic DAG template: {dag_file}")
@@ -296,7 +296,7 @@ For more information, see: https://fluid.dev/docs/orchestration
 """
 
     readme_path = dag_dir / "README.md"
-    with open(readme_path, "w") as f:
+    with open(readme_path, "w", encoding="utf-8") as f:
         f.write(readme_content)
 
 

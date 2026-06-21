@@ -150,7 +150,7 @@ class IndustryPackCompiler:
         for candidate in [name, *_INDUSTRY_ALIASES.get(name, [])]:
             path = self.skeletons_dir / candidate / f"{technique}.yaml"
             if path.exists():
-                with path.open() as f:
+                with path.open(encoding="utf-8") as f:
                     return yaml.safe_load(f) or {}
         return None
 

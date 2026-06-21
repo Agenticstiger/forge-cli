@@ -276,21 +276,21 @@ class ProjectDeployer:
 
         # Generate Dockerfile
         dockerfile_content = self._generate_dockerfile()
-        (package_path / "Dockerfile").write_text(dockerfile_content)
+        (package_path / "Dockerfile").write_text(dockerfile_content, encoding="utf-8")
 
         # Generate docker-compose.yml
         docker_compose_content = self._generate_docker_compose()
-        (package_path / "docker-compose.yml").write_text(docker_compose_content)
+        (package_path / "docker-compose.yml").write_text(docker_compose_content, encoding="utf-8")
 
         # Generate Kubernetes manifests
         k8s_dir = package_path / "k8s"
         k8s_dir.mkdir(exist_ok=True)
 
         deployment_yaml = self._generate_k8s_deployment()
-        (k8s_dir / "deployment.yaml").write_text(deployment_yaml)
+        (k8s_dir / "deployment.yaml").write_text(deployment_yaml, encoding="utf-8")
 
         service_yaml = self._generate_k8s_service()
-        (k8s_dir / "service.yaml").write_text(service_yaml)
+        (k8s_dir / "service.yaml").write_text(service_yaml, encoding="utf-8")
 
         # Generate CI/CD configuration
         self._generate_cicd_configs(package_path)
@@ -480,15 +480,15 @@ spec:
         github_dir.mkdir(parents=True, exist_ok=True)
 
         github_workflow = self._generate_github_workflow()
-        (github_dir / "deploy.yml").write_text(github_workflow)
+        (github_dir / "deploy.yml").write_text(github_workflow, encoding="utf-8")
 
         # GitLab CI
         gitlab_ci = self._generate_gitlab_ci()
-        (package_path / ".gitlab-ci.yml").write_text(gitlab_ci)
+        (package_path / ".gitlab-ci.yml").write_text(gitlab_ci, encoding="utf-8")
 
         # Azure DevOps
         azure_pipelines = self._generate_azure_pipelines()
-        (package_path / "azure-pipelines.yml").write_text(azure_pipelines)
+        (package_path / "azure-pipelines.yml").write_text(azure_pipelines, encoding="utf-8")
 
     def _generate_github_workflow(self) -> str:
         """Generate GitHub Actions workflow"""
@@ -694,7 +694,7 @@ stages:
         requirements_file = package_path / "requirements.txt"
         if requirements_file.exists():
             # Add any missing deployment dependencies
-            with open(requirements_file) as f:
+            with open(requirements_file, encoding="utf-8") as f:
                 requirements = f.read()
 
             # Add health check dependencies if not present
@@ -703,7 +703,7 @@ stages:
                 if dep not in requirements:
                     requirements += f"\n{dep}>=1.0.0"
 
-            with open(requirements_file, "w") as f:
+            with open(requirements_file, "w", encoding="utf-8") as f:
                 f.write(requirements)
 
     def _deploy_local(
@@ -969,7 +969,7 @@ stages:
         }
 
         record_file = self.deployment_dir / f"{result.deployment_id}.json"
-        with open(record_file, "w") as f:
+        with open(record_file, "w", encoding="utf-8") as f:
             json.dump(record, f, indent=2)
 
     def _get_timestamp(self) -> str:
@@ -985,7 +985,7 @@ stages:
 
         for record_file in self.deployment_dir.glob("*.json"):
             try:
-                with open(record_file) as f:
+                with open(record_file, encoding="utf-8") as f:
                     record = json.load(f)
                 deployments.append(record)
             except Exception:
@@ -1001,7 +1001,7 @@ stages:
 
         record_file = self.deployment_dir / f"{deployment_id}.json"
         if record_file.exists():
-            with open(record_file) as f:
+            with open(record_file, encoding="utf-8") as f:
                 return json.load(f)
         return None
 

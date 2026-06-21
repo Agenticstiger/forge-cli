@@ -84,7 +84,7 @@ def _safe_yaml_load(path: Path, max_bytes: int = _YAML_MAX_BYTES) -> Any:
         raise ValueError(
             f"Refusing to parse {path.name}: {size:,} bytes exceeds {max_bytes:,}-byte cap"
         )
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -238,7 +238,7 @@ class DbtDetector(ProjectDetector):
         """Parse a dbt SQL model file"""
 
         try:
-            content = sql_file.read_text()
+            content = sql_file.read_text(encoding="utf-8")
 
             # Extract model name from file
             model_name = sql_file.stem
@@ -353,7 +353,7 @@ class TerraformDetector(ProjectDetector):
 
         # Parse HCL files (simplified — a real implementation would use an HCL parser).
         for tf_file in tf_files:
-            content = tf_file.read_text()
+            content = tf_file.read_text(encoding="utf-8")
             if 'resource "google_bigquery_dataset"' in content:
                 results["metadata"]["target_platform"] = "gcp"
             elif 'resource "snowflake_database"' in content:
@@ -363,7 +363,7 @@ class TerraformDetector(ProjectDetector):
         # never match JSON syntax.
         for tf_file in tf_json_files:
             try:
-                doc = json.loads(tf_file.read_text())
+                doc = json.loads(tf_file.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 continue
             if not isinstance(doc, dict):
@@ -620,7 +620,7 @@ def _run_directory_scan_import(args: Any, logger: logging.Logger) -> int:
             safe_name = _safe_contract_filename(raw_name, i)
             contract_path = target_path / f"{safe_name}.fluid.yaml"
 
-            with open(contract_path, "w") as f:
+            with open(contract_path, "w", encoding="utf-8") as f:
                 yaml.dump(contract, f, default_flow_style=False, sort_keys=False)
 
             if RICH_AVAILABLE:

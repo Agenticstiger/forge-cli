@@ -362,7 +362,7 @@ class BaseCredentialResolver(ABC):
             if not os.path.exists(config_path):
                 continue
             try:
-                with open(config_path) as f:
+                with open(config_path, encoding="utf-8") as f:
                     config = _yaml.safe_load(f) or {}
                 # Try provider-scoped key first, then global
                 provider_section = config.get(self.provider, {})

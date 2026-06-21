@@ -99,7 +99,7 @@ def load_compiled_skills(workspace_root: Path) -> Optional[Dict[str, Any]]:
 
             from fluid_build.cli.industry_skills import compile_skill
 
-            with raw_path.open() as f:
+            with raw_path.open(encoding="utf-8") as f:
                 merged = yaml.safe_load(f) or {}
             payload = compile_skill(merged)
             LOG.debug(

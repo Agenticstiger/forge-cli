@@ -345,7 +345,7 @@ class SecretManager:
             return None
 
         try:
-            return secret_file.read_text().strip()
+            return secret_file.read_text(encoding="utf-8").strip()
         except Exception as e:
             logger.warning(f"Failed to read secret from file: {e}")
             return None

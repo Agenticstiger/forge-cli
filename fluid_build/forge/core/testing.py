@@ -192,7 +192,7 @@ class TemplateTestSuite:
             contract = template.generate_contract(context)
             contract_path = target_path / "contract.fluid.yaml"
 
-            with open(contract_path, "w") as f:
+            with open(contract_path, "w", encoding="utf-8") as f:
                 yaml.dump(contract, f, default_flow_style=False)
 
             generated_files.append(str(contract_path))
@@ -219,7 +219,7 @@ class TemplateTestSuite:
             elif isinstance(item_content, str):
                 # File with content
                 item_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(item_path, "w") as f:
+                with open(item_path, "w", encoding="utf-8") as f:
                     f.write(item_content)
                 created_files.append(str(item_path))
 
@@ -244,7 +244,7 @@ class TemplateTestSuite:
         # Check Python files are valid syntax
         for py_file in project_path.rglob("*.py"):
             try:
-                with open(py_file) as f:
+                with open(py_file, encoding="utf-8") as f:
                     compile(f.read(), str(py_file), "exec")
             except SyntaxError as e:
                 errors.append(f"Python syntax error in {py_file}: {str(e)}")
@@ -252,7 +252,7 @@ class TemplateTestSuite:
         # Check YAML files are valid
         for yaml_file in project_path.rglob("*.yaml"):
             try:
-                with open(yaml_file) as f:
+                with open(yaml_file, encoding="utf-8") as f:
                     yaml.safe_load(f)
             except yaml.YAMLError as e:
                 errors.append(f"YAML syntax error in {yaml_file}: {str(e)}")
@@ -268,7 +268,7 @@ class TemplateTestSuite:
             return ["FLUID contract file not found"]
 
         try:
-            with open(contract_path) as f:
+            with open(contract_path, encoding="utf-8") as f:
                 contract = yaml.safe_load(f)
 
             # Check required contract fields

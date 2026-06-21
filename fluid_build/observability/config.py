@@ -84,7 +84,7 @@ class CommandCenterConfig:
         config_file = _safe_home_dir() / ".fluid" / "config.yaml"
         if config_file.exists():
             try:
-                with open(config_file) as f:
+                with open(config_file, encoding="utf-8") as f:
                     yaml_config = yaml.safe_load(f) or {}
                     cc_config = yaml_config.get("command_center", {})
 

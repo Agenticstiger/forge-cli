@@ -219,7 +219,7 @@ def write_pipeline_files(
             written.append(file_path)
             continue
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        with file_path.open("w") as f:
+        with file_path.open("w", encoding="utf-8") as f:
             f.write(content)
         success(f"Created: {file_path}")
         written.append(file_path)

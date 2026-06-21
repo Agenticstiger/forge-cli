@@ -135,7 +135,7 @@ class GoogleCloudAuthProvider(AuthProvider):
                 )
                 project = None
                 try:
-                    with open(credentials_path) as _f:
+                    with open(credentials_path, encoding="utf-8") as _f:
                         project = json.load(_f).get("project_id")
                 except Exception:
                     pass
@@ -224,7 +224,7 @@ class GoogleCloudAuthProvider(AuthProvider):
 
         # Quick sanity: must be valid JSON with required fields
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             if "type" not in data:
                 return AuthResult(

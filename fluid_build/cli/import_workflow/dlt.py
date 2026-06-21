@@ -42,7 +42,7 @@ class DltImporter(Importer):
         state_file = path / "state.json"
         state: Dict[str, Any] = {}
         if state_file.exists():
-            with state_file.open() as f:
+            with state_file.open(encoding="utf-8") as f:
                 state = json.load(f)
             report.mapped_one_to_one.append("pipeline.state")
         else:

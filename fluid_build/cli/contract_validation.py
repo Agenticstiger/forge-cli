@@ -1406,7 +1406,7 @@ def output_json_report(report: ValidationReport, output_file: Optional[str] = No
     json_output = json.dumps(report_dict, indent=2)
 
     if output_file:
-        with open(output_file, "w") as f:
+        with open(output_file, "w", encoding="utf-8") as f:
             f.write(json_output)
         success(f"Report saved to: {output_file}")
     else:

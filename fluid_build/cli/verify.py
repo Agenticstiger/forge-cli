@@ -1252,7 +1252,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         }
 
         output_path = Path(args.out)
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
 
         cprint(f"\n📄 Report saved: {output_path}")

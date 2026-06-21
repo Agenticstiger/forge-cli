@@ -212,7 +212,7 @@ class ProjectValidator:
             return  # Already reported in structure validation
 
         try:
-            with open(contract_path) as f:
+            with open(contract_path, encoding="utf-8") as f:
                 contract = yaml.safe_load(f)
 
             # Check FLUID spec compliance
@@ -376,7 +376,7 @@ class ProjectValidator:
         """Validate Python file syntax and quality"""
 
         try:
-            with open(file_path) as f:
+            with open(file_path, encoding="utf-8") as f:
                 content = f.read()
 
             # Check syntax
@@ -482,7 +482,7 @@ class ProjectValidator:
         """Validate JSON file syntax"""
 
         try:
-            with open(file_path) as f:
+            with open(file_path, encoding="utf-8") as f:
                 json.load(f)
         except Exception as e:
             self.issues.append(
@@ -502,7 +502,7 @@ class ProjectValidator:
             return
 
         try:
-            with open(requirements_path) as f:
+            with open(requirements_path, encoding="utf-8") as f:
                 requirements = f.read().strip().splitlines()
 
             # Check for empty requirements
@@ -551,7 +551,7 @@ class ProjectValidator:
             return
 
         try:
-            with open(readme_path) as f:
+            with open(readme_path, encoding="utf-8") as f:
                 content = f.read()
 
             # Check README is not empty

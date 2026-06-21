@@ -33,7 +33,7 @@ class MeltanoImporter(Importer):
         meltano_yml = project_dir / "meltano.yml"
         if not meltano_yml.exists():
             raise FileNotFoundError(meltano_yml)
-        with meltano_yml.open() as f:
+        with meltano_yml.open(encoding="utf-8") as f:
             meltano = yaml.safe_load(f) or {}
 
         report = ImportReport()

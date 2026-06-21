@@ -211,7 +211,7 @@ def import_command(odcs_file: str, output: Optional[str], format: str):
         output_path = Path(output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             if format == "yaml":
                 import yaml
 
@@ -444,7 +444,7 @@ def _run_odcs_import(args):
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         if args.format == "yaml":
             import yaml
 
@@ -559,7 +559,7 @@ def _run_odcs_validate(args):
     if getattr(args, "report", None):
         report_path = Path(args.report)
         report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(json.dumps(report, indent=2, default=str))
+        report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         cprint(f"📄 Report: {report_path}")
 
     return 0 if report["ok"] else 1

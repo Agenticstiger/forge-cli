@@ -284,7 +284,7 @@ class FluidLanguageServer:
     def _is_contract_file(self, file_path: str) -> bool:
         """Check if file is a FLUID contract"""
         try:
-            with open(file_path) as f:
+            with open(file_path, encoding="utf-8") as f:
                 content = f.read()
                 return "meta:" in content or "sources:" in content or "transforms:" in content
         except Exception:
@@ -600,7 +600,7 @@ class IDEIntegration:
                 },
             }
 
-            with open(extension_dir / "package.json", "w") as f:
+            with open(extension_dir / "package.json", "w", encoding="utf-8") as f:
                 json.dump(package_json, f, indent=2)
 
             # Create language configuration
@@ -616,7 +616,7 @@ class IDEIntegration:
                 ],
             }
 
-            with open(extension_dir / "language-configuration.json", "w") as f:
+            with open(extension_dir / "language-configuration.json", "w", encoding="utf-8") as f:
                 json.dump(language_config, f, indent=2)
 
             # Create basic TypeScript extension code
@@ -678,7 +678,7 @@ export function deactivate() {}
             src_dir = extension_dir / "src"
             src_dir.mkdir(exist_ok=True)
 
-            with open(src_dir / "extension.ts", "w") as f:
+            with open(src_dir / "extension.ts", "w", encoding="utf-8") as f:
                 f.write(extension_ts.strip())
 
             # Create tsconfig.json
@@ -695,7 +695,7 @@ export function deactivate() {}
                 "exclude": ["node_modules", ".vscode-test"],
             }
 
-            with open(extension_dir / "tsconfig.json", "w") as f:
+            with open(extension_dir / "tsconfig.json", "w", encoding="utf-8") as f:
                 json.dump(tsconfig, f, indent=2)
 
             if self.console:
@@ -722,7 +722,7 @@ export function deactivate() {}
                 completion_file = Path.home() / ".bash_completion.d" / "fluid"
                 completion_file.parent.mkdir(exist_ok=True)
 
-                with open(completion_file, "w") as f:
+                with open(completion_file, "w", encoding="utf-8") as f:
                     f.write(completion_script)
 
                 if self.console:
@@ -735,7 +735,7 @@ export function deactivate() {}
                 completion_file = Path.home() / ".zsh" / "completions" / "_fluid"
                 completion_file.parent.mkdir(parents=True, exist_ok=True)
 
-                with open(completion_file, "w") as f:
+                with open(completion_file, "w", encoding="utf-8") as f:
                     f.write(completion_script)
 
                 if self.console:
@@ -950,7 +950,7 @@ def handle_language_server(args, ide_integration: IDEIntegration, logger: loggin
 
     elif args.lsp_action == "completions":
         try:
-            with open(args.file) as f:
+            with open(args.file, encoding="utf-8") as f:
                 content = f.read()
 
             completions = ide_integration.language_server.get_completions(
@@ -985,7 +985,7 @@ def handle_file_validation(args, ide_integration: IDEIntegration, logger: loggin
     console = Console()
 
     try:
-        with open(args.file) as f:
+        with open(args.file, encoding="utf-8") as f:
             content = f.read()
 
         diagnostics = ide_integration.language_server.validate_file(args.file, content)

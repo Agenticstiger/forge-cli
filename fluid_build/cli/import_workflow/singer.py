@@ -42,13 +42,13 @@ class SingerImporter(Importer):
         if not tap_cfg_path.exists():
             raise FileNotFoundError(tap_cfg_path)
 
-        with tap_cfg_path.open() as f:
+        with tap_cfg_path.open(encoding="utf-8") as f:
             tap_cfg = json.load(f)
         report = ImportReport()
         report.mapped_one_to_one.append("tap.config")
         target_cfg: Dict[str, Any] = {}
         if target_cfg_path and target_cfg_path.exists():
-            with target_cfg_path.open() as f:
+            with target_cfg_path.open(encoding="utf-8") as f:
                 target_cfg = json.load(f)
             report.mapped_one_to_one.append("target.config")
         elif target_cfg_path:

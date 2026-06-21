@@ -314,7 +314,7 @@ workspace.db
 *.tmp
 *.temp
 """
-                with open(self.workspace_dir / ".gitignore", "w") as f:
+                with open(self.workspace_dir / ".gitignore", "w", encoding="utf-8") as f:
                     f.write(gitignore_content.strip())
 
                 # Initial commit

@@ -136,7 +136,7 @@ def validate_command(odps_file: str):
         click.echo(f"Loading ODPS file: {odps_file}")
 
         file_path = Path(odps_file)
-        with open(file_path) as f:
+        with open(file_path, encoding="utf-8") as f:
             if file_path.suffix in (".yaml", ".yml"):
                 import yaml
 
@@ -304,7 +304,7 @@ def _run_odps_validate(args):
     from pathlib import Path
 
     file_path = Path(args.odps_file)
-    with open(file_path) as f:
+    with open(file_path, encoding="utf-8") as f:
         if file_path.suffix in (".yaml", ".yml"):
             import yaml
 

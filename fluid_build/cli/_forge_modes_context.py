@@ -281,7 +281,7 @@ def _load_industry_skills(ws_root: Any, context: Dict[str, Any], console: Any) -
         if not skills_path.exists():
             return
 
-        with skills_path.open() as f:
+        with skills_path.open(encoding="utf-8") as f:
             skills = yaml.safe_load(f)
         if not skills:
             return

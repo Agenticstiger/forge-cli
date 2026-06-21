@@ -286,7 +286,7 @@ class FluidConfig:
             return
 
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 file_config = yaml.safe_load(f) or {}
 
             self._deep_merge(self._config, file_config)
@@ -487,7 +487,7 @@ class FluidConfig:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
 
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 yaml.dump(self._config, f, default_flow_style=False, sort_keys=False)
 
             LOGGER.info(f"Saved user configuration to {path}")
@@ -623,7 +623,7 @@ output:
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(sample_config)
         LOGGER.info(f"Created sample configuration at {path}")
     except Exception as e:

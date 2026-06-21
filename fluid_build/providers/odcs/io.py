@@ -87,7 +87,7 @@ def write_output(data: Dict[str, Any], path: Union[Path, str], fmt: str) -> None
             )
 
             dc = OpenDataContractStandard.model_validate(data)
-            output_path.write_text(dc.to_yaml())
+            output_path.write_text(dc.to_yaml(), encoding="utf-8")
             return
         except Exception as exc:  # noqa: BLE001 — soft-fail to raw dump
             LOG.debug(
@@ -96,7 +96,7 @@ def write_output(data: Dict[str, Any], path: Union[Path, str], fmt: str) -> None
                 exc,
             )
 
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         if fmt == "yaml":
             import yaml
 
@@ -106,7 +106,7 @@ def write_output(data: Dict[str, Any], path: Union[Path, str], fmt: str) -> None
 
 
 def _raw_load(path: Path) -> Any:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         if path.suffix in (".yaml", ".yml"):
             import yaml
 

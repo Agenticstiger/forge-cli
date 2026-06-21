@@ -345,29 +345,13 @@ jobs:
         # Glob the test files so newly-added test_e2e_local_*.py and
         # test_local_live_*.py files are picked up automatically without
         # editing this workflow.
-        env:
-          # Windows defaults to cp1252 for both stdout/stderr (when
-          # captured to a non-TTY) AND for file I/O via open(). The
-          # fluid CLI uses Unicode in its banner (🌊, ━) and reads the
-          # bundled YAML examples which contain UTF-8 bytes outside
-          # cp1252. Both paths fail on Windows with charmap codec
-          # errors.
-          #
-          # PYTHONUTF8=1 flips Python's default encoding to UTF-8 across
-          # the entire process — stdout, stderr, AND open() — which
-          # covers both failure modes in one knob.
-          # PYTHONIOENCODING=utf-8 is set for belt-and-braces clarity
-          # but is technically subsumed by PYTHONUTF8=1.
-          #
-          # Both are no-ops on Linux/macOS, which already default to
-          # UTF-8.
-          #
-          # The underlying fluid CLI should also handle this itself
-          # (open files with explicit encoding='utf-8'; reconfigure
-          # stdout to utf-8 at boot). Tracked as Trello card xsdOYJ6E.
-          # When that fix lands these env vars can be removed.
-          PYTHONUTF8: "1"
-          PYTHONIOENCODING: utf-8
+        #
+        # No PYTHONUTF8 / PYTHONIOENCODING crutch: the fluid CLI now handles
+        # a non-UTF-8 (Windows cp1252) locale itself — stdout/stderr are
+        # reconfigured to UTF-8 at boot (#263) and every text file I/O passes
+        # encoding="utf-8" (xsdOYJ6E). Running this job WITHOUT the env knobs
+        # is the cross-platform proof that the CLI no longer needs them; a
+        # static gate (tests/test_no_unencoded_text_io.py) keeps it that way.
         run: |
           python -m pytest -v -m "integration and not slow" tests/test_e2e_local.py tests/test_e2e_local_apply.py tests/test_e2e_local_negative.py tests/providers/test_local_live_happy_path.py
       - name: Cleanup local artifacts (defensive)

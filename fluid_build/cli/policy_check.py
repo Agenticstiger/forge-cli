@@ -572,7 +572,7 @@ def output_json(result: PolicyEnforcementResult, output_file: Optional[str] = No
     json_str = json.dumps(output, indent=2)
 
     if output_file:
-        with open(output_file, "w") as f:
+        with open(output_file, "w", encoding="utf-8") as f:
             f.write(json_str)
         success(f"Policy report saved to: {output_file}")
     else:

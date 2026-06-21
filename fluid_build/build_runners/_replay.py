@@ -127,7 +127,7 @@ def find_downstream_products(
     matches: List[Dict[str, Any]] = []
     for path in sorted(workspace_root.rglob("*.fluid.yaml")):
         try:
-            with path.open() as f:
+            with path.open(encoding="utf-8") as f:
                 contract = yaml.safe_load(f) or {}
         except (OSError, yaml.YAMLError) as exc:
             LOG.debug("downstream_walk_skip: path=%s error=%s", path, exc)
@@ -233,7 +233,7 @@ def list_dirty_products(workspace_root: Path) -> List[Dict[str, Any]]:
         if not marker_path.is_file():
             continue
         try:
-            with marker_path.open() as f:
+            with marker_path.open(encoding="utf-8") as f:
                 marker = json.load(f)
         except (OSError, json.JSONDecodeError) as exc:
             LOG.debug("dirty_marker_read_skip: path=%s error=%s", marker_path, exc)

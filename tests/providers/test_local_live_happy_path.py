@@ -55,11 +55,8 @@ def _fluid(*args: str, cwd: Path, timeout: int = 60) -> subprocess.CompletedProc
     where the default locale is cp1252 and the fluid banner uses chars
     outside that codepage."""
     env = os.environ.copy()
-    # See tests/test_e2e_local._fluid for rationale. PYTHONUTF8=1 and
-    # PYTHONIOENCODING=utf-8 are no-ops on Linux/macOS; required on
-    # Windows until Trello card xsdOYJ6E is resolved.
-    env.setdefault("PYTHONUTF8", "1")
-    env.setdefault("PYTHONIOENCODING", "utf-8")
+    # No PYTHONUTF8 crutch: the CLI self-handles cp1252 (see
+    # tests/test_e2e_local._fluid) — #263 + xsdOYJ6E.
     return subprocess.run(
         [sys.executable, "-m", "fluid_build.cli", *args],
         cwd=cwd,

@@ -776,12 +776,12 @@ def _write_apply_report(
     </div>
 </body>
 </html>"""
-                with open(report_path, "w") as f:
+                with open(report_path, "w", encoding="utf-8") as f:
                     f.write(html_content)
             elif report_format == "json":
                 import json as json_mod
 
-                with open(report_path, "w") as f:
+                with open(report_path, "w", encoding="utf-8") as f:
                     json_mod.dump(
                         {
                             "execution_id": execution_id,

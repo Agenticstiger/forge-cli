@@ -496,7 +496,7 @@ class FluidOrchestrationEngine:
             },
         }
         self.context.state_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.context.state_file, "w") as f:
+        with open(self.context.state_file, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
 
     async def _handle_execution_failure(self, error: Exception):

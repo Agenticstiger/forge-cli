@@ -31,7 +31,7 @@ def load_schema() -> Optional[Dict[str, Any]]:
         LOG.warning("ODPS schema not found: %s", _SCHEMA_PATH)
         return None
     try:
-        with open(_SCHEMA_PATH) as f:
+        with open(_SCHEMA_PATH, encoding="utf-8") as f:
             return json.load(f)
     except Exception as exc:  # pragma: no cover - defensive
         LOG.error("Failed to load ODPS schema: %s", exc)

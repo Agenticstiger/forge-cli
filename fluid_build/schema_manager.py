@@ -246,7 +246,7 @@ class SchemaCache:
         """Load cache index from disk."""
         if self.cache_index_file.exists():
             try:
-                with open(self.cache_index_file) as f:
+                with open(self.cache_index_file, encoding="utf-8") as f:
                     self._cache_index = json.load(f)
             except (json.JSONDecodeError, OSError):
                 self._cache_index = {}
@@ -254,7 +254,7 @@ class SchemaCache:
     def _save_cache_index(self) -> None:
         """Save cache index to disk."""
         try:
-            with open(self.cache_index_file, "w") as f:
+            with open(self.cache_index_file, "w", encoding="utf-8") as f:
                 json.dump(self._cache_index, f, indent=2, default=str)
         except OSError as exc:
             LOG.debug(
@@ -286,7 +286,7 @@ class SchemaCache:
             return None
 
         try:
-            with open(cached_file) as f:
+            with open(cached_file, encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             return None
@@ -298,7 +298,7 @@ class SchemaCache:
         cached_file = self.cache_dir / filename
 
         try:
-            with open(cached_file, "w") as f:
+            with open(cached_file, "w", encoding="utf-8") as f:
                 json.dump(schema, f, indent=2)
 
             self._cache_index[version_key] = {
@@ -404,7 +404,7 @@ class FluidSchemaManager:
 
                 version = version_match.group(1)
 
-                with open(schema_file) as f:
+                with open(schema_file, encoding="utf-8") as f:
                     schema = json.load(f)
 
                 self._bundled_schemas[version] = schema
@@ -737,7 +737,7 @@ def validate_contract_file(
     """
     try:
         # Load contract
-        with open(file_path) as f:
+        with open(file_path, encoding="utf-8") as f:
             if file_path.endswith(".yaml") or file_path.endswith(".yml"):
                 contract = yaml.safe_load(f)
             else:
