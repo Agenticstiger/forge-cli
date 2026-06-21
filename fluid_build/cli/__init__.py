@@ -211,8 +211,44 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
     return p
 
 
+def _force_utf8_streams() -> None:
+    """Ensure stdout/stderr can encode the CLI's Unicode output.
+
+    Windows defaults non-TTY stdout/stderr to cp1252. The help banner and most
+    command output use emoji, box-drawing, and pointer characters that cp1252
+    cannot encode, so the very first ``print()`` raised ``UnicodeEncodeError``
+    ('charmap' codec) before argparse even ran — every ``fluid`` command failed
+    on startup when output was piped/captured (the original Windows-CI crash).
+
+    ``TextIOWrapper.reconfigure`` is the standard fix (PEP 528); ``errors=
+    "replace"`` degrades any stray unencodable char to U+FFFD rather than
+    crashing. Surgical + safe:
+
+    - Only streams that are NOT already UTF-8 are touched, so POSIX (already
+      UTF-8) is a complete no-op — no change to its encoding or errors mode.
+    - Streams a test harness / pipe wrapper swapped in may lack
+      ``reconfigure`` (skipped) or refuse it (caught); the encoding fix must
+      never be what aborts the CLI.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        current = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+        if current.startswith("utf8"):
+            continue  # already UTF-8 — leave its encoding and errors mode alone
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            # Detached buffer / non-reconfigurable stream — not worth crashing over.
+            pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """Enhanced main entry point with production features and comprehensive error handling"""
+    # Must run before ANY output: the banner below is Unicode-heavy and would
+    # crash on a cp1252 console otherwise (xsdOYJ6E).
+    _force_utf8_streams()
     cli = ProductionCLI()
 
     try:
