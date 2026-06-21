@@ -25,7 +25,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Dict, FrozenSet, List, Optional
+from typing import Any, ClassVar, Dict, FrozenSet, List, Mapping, Optional
 
 from fluid_build.api.runner import (
     RunContext,
@@ -87,6 +87,19 @@ def resolve_sink_connector(format_or_platform: str, override: Optional[str] = No
         if k in key:
             return cls
     return SINK_CONNECTOR_CLASS["s3"]  # safe default
+
+
+def _find_iceberg_expose_binding(contract: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The expose ``binding`` carrying the Iceberg-table identity for a sink.
+
+    PR2 uses a simple format=iceberg lookup; the validated build->expose join
+    (build.outputs/exposeId) lands with the plan-time validator (RFC §6.8 #5).
+    """
+    for exposure in contract.get("exposes") or []:
+        binding = exposure.get("binding") or {}
+        if str(binding.get("format") or "").lower() == "iceberg":
+            return binding
+    return None
 
 
 # ── REST client ────────────────────────────────────────────────────────
@@ -270,8 +283,39 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     if late_arrival_policy.get("enabled"):
         base_config.update(late_arrival_policy["connector_config"])
 
-    # Optional sink-side connector (companion).
+    # Optional sink-side connector (companion). When the build targets an
+    # Iceberg sink, derive the iceberg.catalog.*/iceberg.tables.* config instead
+    # of forcing the operator to hand-author it (RFC §6.2). Gated:
+    # ``iceberg_sink_enabled`` defaults OFF when a hand-written
+    # ``sink_connector_config`` is already present, so existing contracts are
+    # byte-for-byte unaffected; when both are set the merge lets operator keys
+    # win (derived first).
     sink_config = kc_props.get("sink_connector_config")
+    iceberg_enabled = kc_props.get("iceberg_sink_enabled", sink_config is None)
+    if iceberg_enabled and str(ctx.sink.format or "").lower() == "iceberg":
+        binding = _find_iceberg_expose_binding(ctx.contract)
+        if binding is not None:
+            from ...providers._iceberg_catalog import resolve_iceberg_catalog
+            from .iceberg_sink import emit_iceberg_sink_config
+
+            resolved = resolve_iceberg_catalog(
+                binding,
+                contract=ctx.contract,
+                sink=ctx.sink,
+                account_ref=ctx.env.get("AWS_ACCOUNT_ID", ""),
+            )
+            sink_topics = kc_props.get("sink_topics") or [
+                str(s) for s in (ctx.source.streams or [ctx.source.kind])
+            ]
+            derived = emit_iceberg_sink_config(
+                resolved,
+                product_id=ctx.product_id,
+                topics=sink_topics,
+                kc_props=kc_props,
+                schema_registry_url=sr_url,
+                delivery_guarantee=(props.get("delivery") or {}).get("guarantee"),
+            )
+            sink_config = {**derived, **(sink_config or {})}
 
     connector_name = kc_props.get("connector_name") or f"forge-{ctx.product_id.replace('.', '-')}"
     client = KafkaConnectRestClient(server_url)
