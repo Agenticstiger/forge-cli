@@ -201,6 +201,42 @@ class KafkaConnectRunner:
         )
 
 
+def _poll_connector_health(
+    client: "KafkaConnectRestClient", name: str, *, timeout: float, interval: float
+) -> "tuple[str, bool, List[str]]":
+    """Poll a connector until terminal; return (connector_state, ok, traces).
+
+    ``ok`` requires the connector RUNNING **and** no task FAILED — a connector
+    can report ``state=RUNNING`` while a task is ``FAILED`` (observed in the
+    spike, RFC §14B; Kafka Connect does not auto-restart failed tasks), so
+    checking only ``connector.state`` reports a broken sink as healthy.
+    ``traces`` carries each failed task's trace for the run record.
+
+    This per-task ``/status`` check mirrors the canonical OSS healthcheck
+    (devshawn/kafka-connect-healthcheck, which flags unhealthy if ANY task is
+    FAILED); done inline against the existing REST client rather than adding a
+    healthcheck sidecar/dependency.
+    """
+    deadline = time.time() + timeout
+    state = "UNKNOWN"
+    traces: List[str] = []
+    while time.time() < deadline:
+        try:
+            status = client.get_status(name)
+            state = (status.get("connector", {}) or {}).get("state", "UNKNOWN")
+            tasks = status.get("tasks") or []
+            traces = [
+                t.get("trace") for t in tasks if t.get("state") == "FAILED" and t.get("trace")
+            ]
+            if state in ("RUNNING", "FAILED", "PAUSED"):
+                ok = state == "RUNNING" and not any(t.get("state") == "FAILED" for t in tasks)
+                return state, ok, traces
+        except Exception as exc:  # noqa: BLE001 — eventual consistency
+            LOG.debug("kafka_connect.status_poll.transient name=%s err=%s", name, exc)
+        time.sleep(interval)
+    return state, state == "RUNNING", traces
+
+
 def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     from .._acquisition_common import begin_acquisition_run
 
@@ -276,9 +312,21 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
     # canonical ``<target>__late_events`` side-output table.
     from .._late_arrival import extract_late_arrival_policy
 
+    # For an Iceberg sink, name the late-events side table after the canonical
+    # fully-qualified table (``<db.table>__late_events``) so it sits beside the
+    # target — GATED to the Iceberg path so non-Iceberg runners keep their
+    # connector-named side table (back-compat). v1 emits these keys as advisory
+    # only; nothing provisions the side table yet (RFC §6.7 / spike §14).
+    late_arrival_target = connector_name_for_topic
+    if str(ctx.sink.format or "").lower() == "iceberg":
+        _ib = _find_iceberg_expose_binding(ctx.contract) or {}
+        _loc = _ib.get("location") or {}
+        if _loc.get("database") and _loc.get("table"):
+            late_arrival_target = f"{_loc['database']}.{_loc['table']}"
+
     late_arrival_policy = extract_late_arrival_policy(
         contract_or_source=ctx.source,
-        target_table=connector_name_for_topic,
+        target_table=late_arrival_target,
     )
     if late_arrival_policy.get("enabled"):
         base_config.update(late_arrival_policy["connector_config"])
@@ -340,18 +388,21 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
         # the connector reports a terminal state or the timeout lapses.
         status_timeout = float(kc_props.get("status_timeout_seconds") or 15.0)
         poll_interval = float(kc_props.get("poll_interval_seconds") or 0.5)
-        deadline = time.time() + status_timeout
-        connector_state = "UNKNOWN"
-        while time.time() < deadline:
-            try:
-                status = client.get_status(connector_name)
-                connector_state = (status.get("connector", {}) or {}).get("state", "UNKNOWN")
-                if connector_state in ("RUNNING", "FAILED", "PAUSED"):
-                    break
-            except Exception as exc:  # noqa: BLE001 — eventual consistency
-                LOG.debug("kafka_connect.status_poll.transient err=%s", exc)
-            time.sleep(poll_interval)
-        ok = connector_state == "RUNNING"
+        connector_state, ok, traces = _poll_connector_health(
+            client, connector_name, timeout=status_timeout, interval=poll_interval
+        )
+        # The Iceberg SINK connector is where catalog/credential errors surface —
+        # poll it too. A source RUNNING + sink task FAILED was reported as success
+        # before this (spike §14B).
+        sink_state: Optional[str] = None
+        if sink_name:
+            sink_state, sink_ok, sink_traces = _poll_connector_health(
+                client, sink_name, timeout=status_timeout, interval=poll_interval
+            )
+            ok = ok and sink_ok
+            traces = traces + sink_traces
+        # Truncate each captured failure trace so the run record stays bounded.
+        failed_task_traces = [str(t)[:1000] for t in traces if t]
 
         stream_results = [
             StreamResult(
@@ -379,6 +430,8 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
                 "connector_class": connector_class,
                 "sink_connector_name": sink_name,
                 "connector_state": connector_state,
+                "sink_connector_state": sink_state,
+                "failed_task_traces": failed_task_traces,
                 "late_arrival_enabled": bool(late_arrival_policy.get("enabled")),
                 "late_arrival_budget_seconds": late_arrival_policy.get("allowed_lateness_seconds"),
                 "late_arrival_side_output_table": late_arrival_policy.get("side_output_table"),
