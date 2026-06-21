@@ -45,12 +45,21 @@ import logging
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.types import SamplingMessage, TextContent
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    # Annotation-only. The MCP server SDK (``mcp.server.fastmcp`` / ``mcp.types``)
+    # is heavy (~87 modules / ~100ms). Importing this module only registers the
+    # ``fluid mcp`` subparser — which happens on every ``fluid`` invocation,
+    # including ``--help`` — so the SDK is imported lazily at serve time (see
+    # ``_forge_tool`` / ``_get_mcp_app``) to keep the hot path light. Runtime
+    # uses (FastMCP instantiation, SamplingMessage/TextContent in forge_run)
+    # import locally where needed.
+    from mcp.server.fastmcp import Context, FastMCP
+    from mcp.types import SamplingMessage, TextContent
 
 from fluid_build.copilot.store.audit_trail import write_audit_event
 from fluid_build.copilot.store.factory import resolve_store
@@ -1276,7 +1285,7 @@ def _render_mcp_guide() -> int:
 # We delegate stdio framing, JSON-RPC routing, tools/list advertisement,
 # initialize handshake, and sampling round-trip to the official
 # ``modelcontextprotocol/python-sdk`` (FastMCP). Each forge tool is registered
-# via ``@_mcp_app.tool()`` and dispatched into a worker thread so blocking
+# via ``@_forge_tool()`` and dispatched into a worker thread so blocking
 # code paths (file I/O, the FluidContractValidator, the forge.run() copilot
 # loop) don't stall the asyncio loop the SDK runs on. Tools that need an LLM
 # (``forge_run`` mode='ai', the diagnostic ``forge_run`` mode='diag') call
@@ -1288,8 +1297,61 @@ def _render_mcp_guide() -> int:
 # ----------------------------------------------------------------------
 
 
-_mcp_app = FastMCP(name="forge-cli-mcp")
+# Lazy MCP SDK loading (Light CLI). Importing this module registers the
+# ``fluid mcp`` subparser, which happens on EVERY ``fluid`` invocation
+# (including ``--help`` and unrelated commands). Instantiating ``FastMCP`` and
+# applying ``@FastMCP.tool`` decorators at import time eagerly pulled in the
+# whole MCP server SDK (~87 modules / ~100ms) off the hot path. Tools are now
+# recorded by ``@_forge_tool`` (no SDK needed) and the FastMCP app is built —
+# importing the SDK — only on first ``fluid mcp serve``. Pinned by
+# tests/perf/test_startup_budget.py.
+_PENDING_TOOLS: List[Tuple[Any, Dict[str, Any]]] = []
+_mcp_app: Optional["FastMCP"] = None
 _current_policy: Optional[McpPolicy] = None
+
+
+def _forge_tool(**tool_kwargs: Any):
+    """Defer FastMCP tool registration so importing this module doesn't load
+    the MCP server SDK.
+
+    Records ``(fn, FastMCP.tool kwargs)``; the real registration happens in
+    :func:`_get_mcp_app` at serve time. Returns ``fn`` unchanged so the tool
+    coroutine stays a plain module-level function (callable directly in tests).
+    """
+
+    def _register(fn):
+        _PENDING_TOOLS.append((fn, tool_kwargs))
+        return fn
+
+    return _register
+
+
+def _get_mcp_app() -> "FastMCP":
+    """Build (once) and return the FastMCP app.
+
+    Imports the MCP server SDK lazily and registers every ``@_forge_tool``
+    tool. Cached on the module global so repeated ``serve`` builds — and the
+    policy-driven ``remove_tool`` pruning in :func:`_build_fastmcp_app` —
+    operate on a single app instance (unchanged from the previous
+    module-level singleton).
+    """
+    global _mcp_app
+    if _mcp_app is None:
+        from mcp.server.fastmcp import Context, FastMCP
+
+        # FastMCP introspects each tool's signature with ``eval_str=True``. The
+        # ``forge_run`` tool annotates its session param ``ctx: Context``, and
+        # under ``from __future__ import annotations`` that annotation is a
+        # string evaluated against THIS module's globals. Bind ``Context`` into
+        # globals here (build time) so the eval resolves — without importing
+        # the SDK at module-load time, which is the whole point of the laziness.
+        globals()["Context"] = Context
+
+        app = FastMCP(name="forge-cli-mcp")
+        for fn, tool_kwargs in _PENDING_TOOLS:
+            app.tool(**tool_kwargs)(fn)
+        _mcp_app = app
+    return _mcp_app
 
 
 def _set_policy(policy: McpPolicy) -> None:
@@ -1315,6 +1377,7 @@ def _build_fastmcp_app(policy: McpPolicy) -> FastMCP:
     (mutating tools under ``--read-only``) are removed from the SDK's tool
     registry so they never appear in ``tools/list``.
     """
+    app = _get_mcp_app()
     for name in list(TOOL_CAPABILITIES.keys()):
         cap = TOOL_CAPABILITIES[name]
         needs_write = cap.mutates_files or bool(cap.writes_namespaces)
@@ -1322,10 +1385,10 @@ def _build_fastmcp_app(policy: McpPolicy) -> FastMCP:
         read_only_blocked = policy.read_only and needs_write
         if denied or read_only_blocked:
             try:
-                _mcp_app.remove_tool(name)
+                app.remove_tool(name)
             except Exception:  # noqa: BLE001
                 pass
-    return _mcp_app
+    return app
 
 
 async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -1358,7 +1421,7 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
 
 
 # ----------------------------------------------------------------------
-# Tool registrations (14 tools — one @_mcp_app.tool() per capability in
+# Tool registrations (14 tools — one @_forge_tool() per capability in
 # TOOL_CAPABILITIES). Each is a thin async wrapper that gates on policy and
 # delegates the actual work to :func:`_call_tool` (sync, threaded) or, for
 # ``forge_run``, talks to ``ctx.session.create_message`` directly.
@@ -1380,14 +1443,14 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
 # ----------------------------------------------------------------------
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["read_logical_model"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["read_logical_model"].description)
 async def read_logical_model(
     path: Annotated[str, Field(description=_PATH_LOGICAL_DESCRIPTION)],
 ) -> Dict[str, Any]:
     return await _dispatch_sync_tool("read_logical_model", {"path": path})
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["score_contract_quality"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["score_contract_quality"].description)
 async def score_contract_quality(
     contract_path: Annotated[
         Optional[str], Field(description=_SCORE_CONTRACT_PATH_DESCRIPTION)
@@ -1408,7 +1471,7 @@ async def score_contract_quality(
     return await _dispatch_sync_tool("score_contract_quality", args)
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["enrich_contract_suggestions"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["enrich_contract_suggestions"].description)
 async def enrich_contract_suggestions(
     contract_path: Annotated[
         Optional[str], Field(description=_SCORE_CONTRACT_PATH_DESCRIPTION)
@@ -1426,7 +1489,7 @@ async def enrich_contract_suggestions(
     return await _dispatch_sync_tool("enrich_contract_suggestions", args)
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["update_entity"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["update_entity"].description)
 async def update_entity(
     path: Annotated[str, Field(description=_PATH_LOGICAL_SHORT_DESCRIPTION)],
     entity: Annotated[str, Field(description=_ENTITY_DESCRIPTION)],
@@ -1437,7 +1500,7 @@ async def update_entity(
     )
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["add_relationship"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["add_relationship"].description)
 async def add_relationship(
     path: Annotated[str, Field(description=_PATH_LOGICAL_SHORT_DESCRIPTION)],
     relationship: Annotated[Dict[str, Any], Field(description=_RELATIONSHIP_DESCRIPTION)],
@@ -1447,7 +1510,7 @@ async def add_relationship(
     )
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["regenerate_physical"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["regenerate_physical"].description)
 async def regenerate_physical(
     path: Annotated[str, Field(description=_PATH_LOGICAL_DESCRIPTION)],
     contract_path: Annotated[
@@ -1461,7 +1524,7 @@ async def regenerate_physical(
     return await _dispatch_sync_tool("regenerate_physical", args)
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["validate_contract"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["validate_contract"].description)
 async def validate_contract(
     logical_path: Annotated[
         Optional[str], Field(description=_VALIDATE_LOGICAL_PATH_DESCRIPTION)
@@ -1478,7 +1541,7 @@ async def validate_contract(
     return await _dispatch_sync_tool("validate_contract", args)
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["diff_models"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["diff_models"].description)
 async def diff_models(
     old: Annotated[str, Field(description=_DIFF_OLD_DESCRIPTION)],
     new: Annotated[str, Field(description=_DIFF_NEW_DESCRIPTION)],
@@ -1486,7 +1549,7 @@ async def diff_models(
     return await _dispatch_sync_tool("diff_models", {"old": old, "new": new})
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["search_semantic_memory"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["search_semantic_memory"].description)
 async def search_semantic_memory(
     query: Annotated[str, Field(description=_SEMANTIC_QUERY_DESCRIPTION)],
     mode: Annotated[
@@ -1504,12 +1567,12 @@ async def search_semantic_memory(
     return await _dispatch_sync_tool("search_semantic_memory", args)
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_adapters"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["list_source_adapters"].description)
 async def list_source_adapters() -> Dict[str, Any]:
     return await _dispatch_sync_tool("list_source_adapters", {})
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_tables"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["list_source_tables"].description)
 async def list_source_tables(
     source: Annotated[
         _CatalogSourceLiteral,
@@ -1532,7 +1595,7 @@ async def list_source_tables(
     )
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["inspect_source_table"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["inspect_source_table"].description)
 async def inspect_source_table(
     source: Annotated[
         _CatalogSourceLiteral,
@@ -1555,7 +1618,7 @@ async def inspect_source_table(
     )
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_lineage"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["list_source_lineage"].description)
 async def list_source_lineage(
     source: Annotated[
         _CatalogSourceLiteral,
@@ -1585,7 +1648,7 @@ async def list_source_lineage(
     )
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["list_source_glossary"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["list_source_glossary"].description)
 async def list_source_glossary(
     source: Annotated[
         _CatalogSourceLiteral,
@@ -1614,7 +1677,7 @@ async def list_source_glossary(
     return await _dispatch_sync_tool("list_source_glossary", args)
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["forge_from_source"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["forge_from_source"].description)
 async def forge_from_source(
     source: Annotated[
         _ForgeSourceLiteral,
@@ -1672,7 +1735,7 @@ def _dump_envelope(env: Optional[BaseModel]) -> Dict[str, Any]:
     return env.model_dump(mode="json", by_alias=True, exclude_none=False)
 
 
-@_mcp_app.tool(description=TOOL_CAPABILITIES["forge_run"].description)
+@_forge_tool(description=TOOL_CAPABILITIES["forge_run"].description)
 async def forge_run(
     mode: str,
     target_dir: Optional[str] = None,
@@ -1733,6 +1796,10 @@ async def forge_run(
                 "FLUID_LLM_BACKEND=litellm + an API key as fallback."
             )
         prompt_text = prompt or "Say 'hello from the IDE'."
+        # Lazy SDK import — keeps ``mcp.types`` off the ``fluid --help`` path
+        # (this tool only runs inside an active ``fluid mcp serve`` session).
+        from mcp.types import SamplingMessage, TextContent
+
         try:
             result = await ctx.session.create_message(
                 messages=[

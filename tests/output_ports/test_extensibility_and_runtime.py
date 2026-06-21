@@ -198,7 +198,10 @@ exposes:
         captured.update(kwargs)
         return 0
 
-    monkeypatch.setattr(cli_module, "run_stdio", _fake_run_stdio)
+    # ``_run_serve`` imports ``run_stdio`` lazily from the package at call time
+    # (Light-CLI: keeps the MCP SDK off the ``fluid --help`` path), so patch the
+    # canonical source rather than a CLI-module re-export.
+    monkeypatch.setattr("fluid_build.output_ports.mcp.run_stdio", _fake_run_stdio)
 
     # Drive the same path the CLI does for `serve`.
     args = type(
