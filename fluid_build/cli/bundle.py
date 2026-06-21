@@ -30,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import sys
@@ -196,7 +197,55 @@ def _has_refs(obj: Any) -> bool:
     return False
 
 
+def _restores_logging_state(fn):
+    """Snapshot + restore the loggers ``run`` may mutate.
+
+    When writing a bundle to stdout (``--out -``), ``run`` redirects
+    stdout-polluting log output to stderr by adding a handler AND setting
+    ``propagate = False`` on the root logger, the caller's logger, and
+    ``fluid.loader`` (see the ``out == "-"`` block below). That mutation is
+    process-global and previously leaked: a single ``fluid bundle … --out -``
+    call left ``root.propagate = False`` (plus an extra stderr handler) in
+    place for the rest of the process, silently breaking log propagation for
+    every later caller in the same interpreter — including pytest's
+    ``caplog``, which captures at the root (the symptom was unrelated tests
+    asserting on captured records flaking by run order). One-shot in a real
+    CLI process, but corrupting under test runners, the ``forge_run`` MCP
+    tool, and any library embedding of the CLI. Snapshotting each affected
+    logger's handlers + ``propagate`` on entry and restoring them on exit
+    keeps the redirect scoped to the single call.
+    """
+
+    @functools.wraps(fn)
+    def _wrapper(args: argparse.Namespace, logger: logging.Logger) -> int:
+        # Mirror run()'s exact (args, logger) signature, not a variadic
+        # form: tests/test_engine.py scans this module's source text for
+        # stage fields, so a ``.get`` lookup on a keyword dict here would be
+        # mis-read as a phantom stage field.
+        affected = [logging.getLogger(), logging.getLogger("fluid.loader")]
+        if isinstance(logger, logging.Logger):
+            affected.append(logger)
+        # De-dupe by identity so a logger that happens to BE root or
+        # fluid.loader isn't snapshotted (and restored) twice.
+        seen: set[int] = set()
+        saved = []
+        for lg in affected:
+            if id(lg) in seen:
+                continue
+            seen.add(id(lg))
+            saved.append((lg, lg.handlers[:], lg.propagate))
+        try:
+            return fn(args, logger)
+        finally:
+            for lg, handlers, propagate in saved:
+                lg.handlers[:] = handlers
+                lg.propagate = propagate
+
+    return _wrapper
+
+
 @traced_stage("bundle")
+@_restores_logging_state
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     # UX hardening pass — accept the bare ``fluid bundle`` invocation
     # when CWD has a ``contract.fluid.yaml``. Mirrors ``fluid validate``'s
