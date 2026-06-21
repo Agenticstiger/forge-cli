@@ -197,6 +197,32 @@ class TestProviderActionParser:
         assert len(levels) == 1
         assert set(levels[0]) == {"x", "y"}
 
+    def test_execution_order_preserves_parse_order_within_level(self):
+        """Dependency-free actions come out in stable PARSE order, not in
+        ``set`` iteration order. Iterating the ``remaining`` set keyed level
+        ordering on per-process string-hash randomisation (PYTHONHASHSEED),
+        which made ``planDigest`` non-deterministic across ``fluid plan``
+        runs. The cross-process guard is the subprocess test in
+        tests/test_e2e_local.py; this pins the in-module contract."""
+        ids = ["m", "a", "z", "b", "y", "c", "x", "d"]
+        actions = [ProviderAction(i, ActionType.PROVISION_DATASET, "gcp", {}) for i in ids]
+        levels = ProviderActionParser().get_execution_order(actions)
+        assert levels == [ids]
+
+    def test_execution_order_within_nonroot_level_follows_parse_order(self):
+        """Order within a non-root level is the PARSE order, not sorted order
+        — proves the fix preserves input order specifically (``b`` is parsed
+        before ``a``, so it stays first), not merely *some* deterministic
+        order."""
+        actions = [
+            ProviderAction("root", ActionType.PROVISION_DATASET, "gcp", {}),
+            ProviderAction("b", ActionType.GRANT_ACCESS, "gcp", {}, depends_on=["root"]),
+            ProviderAction("a", ActionType.REGISTER_SCHEMA, "gcp", {}, depends_on=["root"]),
+        ]
+        levels = ProviderActionParser().get_execution_order(actions)
+        assert levels[0] == ["root"]
+        assert levels[1] == ["b", "a"]
+
 
 class TestHelperFunctions:
     def _actions(self):

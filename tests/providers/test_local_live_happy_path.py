@@ -172,14 +172,10 @@ class TestLocalProviderEndToEnd:
 class TestLocalProviderDeterminism:
     """Two `plan` runs against the same contract produce identical output.
 
-    Currently xfailed — see the parallel test in tests/test_e2e_local.py for
-    the rationale (planDigest non-determinism appears real and needs a
-    separate bug card)."""
+    The planDigest leaks (wall-clock ``generated_at`` in the hash, and
+    PYTHONHASHSEED-dependent action ordering) are fixed; see the parallel
+    test in tests/test_e2e_local.py for the rationale."""
 
-    @pytest.mark.xfail(
-        reason="planDigest non-determinism — track in separate bug card",
-        strict=False,
-    )
     def test_two_plan_runs_produce_identical_artifacts(
         self, hello_world_contract: Path, workspace: Path
     ) -> None:

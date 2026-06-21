@@ -180,17 +180,19 @@ class TestFluidPlanProducesDeterministicArtifact:
         # shape is provider-dependent, but the file must not be empty.
         assert plan_doc, "plan JSON is empty"
 
-    @pytest.mark.xfail(
-        reason=(
-            "plan-binding planDigest appears non-deterministic across runs — "
-            "needs investigation in a separate bug card. CLAUDE.md advertises "
-            "plan-binding as cryptographic; if planDigest legitimately includes "
-            "a timestamp this test should assert structural equality of the "
-            "plan body instead."
-        ),
-        strict=False,
-    )
     def test_plan_is_deterministic_across_two_runs(self, tmp_path: Path) -> None:
+        """Two identical ``fluid plan`` runs emit the same ``planDigest``.
+
+        Plan-binding is advertised as cryptographic: ``fluid apply`` verifies
+        the plan it applies is the one that was approved. That requires the
+        digest to be a stable content hash. The two historical leaks were a
+        wall-clock ``generated_at`` baked into the hash, and action ordering
+        that varied with per-process string-hash randomisation; both are now
+        fixed (see ``compute_plan_digest`` and
+        ``ProviderActionParser.get_execution_order``). Each run is a fresh
+        subprocess, so PYTHONHASHSEED differs between them — this would flap
+        if the ordering regressed.
+        """
         repo_root = Path(__file__).resolve().parent.parent
         src_contract = repo_root / "examples" / "01-hello-world" / "contract.fluid.yaml"
         if not src_contract.exists():
@@ -217,6 +219,12 @@ class TestFluidPlanProducesDeterministicArtifact:
         a_digest = a.get("planDigest") or a.get("plan_digest")
         b_digest = b.get("planDigest") or b.get("plan_digest")
         assert a_digest == b_digest
+        # Action ordering is part of the digest and was the second leak —
+        # pin it directly so a regression names the cause, not just "digests
+        # differ".
+        assert [act["action_id"] for act in a.get("actions", [])] == [
+            act["action_id"] for act in b.get("actions", [])
+        ]
 
 
 class TestFluidHelpReachesEverySubcommand:

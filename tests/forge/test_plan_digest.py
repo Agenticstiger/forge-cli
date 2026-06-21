@@ -160,6 +160,26 @@ class TestComputePlanDigest:
         ]
         assert compute_plan_digest(plan_a) != compute_plan_digest(plan_b)
 
+    def test_masks_generated_at_volatile_field(self) -> None:
+        """``generated_at`` is a wall-clock timestamp stamped per run, so two
+        otherwise-identical plans that differ ONLY in ``generated_at`` must
+        hash the SAME. This is the regression guard for the plan-binding
+        non-determinism bug: ``fluid plan`` run twice over one contract used
+        to emit diverging digests purely because the timestamp differed."""
+        plan_a = {**_minimal_plan(), "generated_at": 1700000000.0}
+        plan_b = {**_minimal_plan(), "generated_at": 1799999999.123456}
+        assert plan_a["generated_at"] != plan_b["generated_at"]
+        assert compute_plan_digest(plan_a) == compute_plan_digest(plan_b)
+
+    def test_generated_at_absent_vs_present_hashes_the_same(self) -> None:
+        """Masking is total: a plan with no ``generated_at`` at all hashes
+        identically to one carrying a timestamp (the field is never part of
+        the digest input)."""
+        with_ts = _minimal_plan()
+        without_ts = {k: v for k, v in with_ts.items() if k != "generated_at"}
+        assert "generated_at" not in without_ts
+        assert compute_plan_digest(with_ts) == compute_plan_digest(without_ts)
+
 
 # ---------------------------------------------------------------------------
 # is_bundle_path
