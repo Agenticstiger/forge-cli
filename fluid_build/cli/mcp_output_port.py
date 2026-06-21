@@ -41,17 +41,19 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
-
-from fluid_build.output_ports.mcp import (
-    OutputPortPolicy,
-    find_expose,
-    list_exposes,
-    resolve_expose_paths,
-    run_stdio,
-)
+from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
 
 from ._common import CLIError, load_contract_with_overlay
+
+if TYPE_CHECKING:
+    # Lazy (Light CLI): importing ``fluid_build.output_ports.mcp`` runs its
+    # package ``__init__``, which eagerly pulls the MCP server SDK (~80
+    # modules). This module only registers the ``fluid mcp output-port``
+    # subparser on import — which happens on every ``fluid`` invocation,
+    # including ``--help`` — so the API is imported INSIDE the handlers
+    # (which only run under ``fluid mcp output-port <cmd>``). Annotation-only
+    # here keeps ``OutputPortPolicy`` resolvable for type-checkers.
+    from fluid_build.output_ports.mcp import OutputPortPolicy
 
 
 def attach_to_mcp_subparsers(sp: argparse._SubParsersAction) -> None:
@@ -343,6 +345,8 @@ def _resolve_contract_path(args) -> Path:
 
 
 def _run_serve(args, logger: logging.Logger) -> int:
+    from fluid_build.output_ports.mcp import find_expose, run_stdio
+
     contract_path = _resolve_contract_path(args)
     contract = load_contract_with_overlay(str(contract_path), args.env, logger)
     expose = find_expose(contract, getattr(args, "expose_id", None) or None)
@@ -472,6 +476,8 @@ def _run_serve(args, logger: logging.Logger) -> int:
 
 
 def _run_list(args, logger: logging.Logger) -> int:
+    from fluid_build.output_ports.mcp import list_exposes
+
     contract_path = _resolve_contract_path(args)
     contract = load_contract_with_overlay(str(contract_path), args.env, logger)
     summaries = list_exposes(contract)
@@ -505,6 +511,8 @@ def _run_list(args, logger: logging.Logger) -> int:
 
 
 def _run_doctor(args, logger: logging.Logger) -> int:
+    from fluid_build.output_ports.mcp import find_expose
+
     contract_path = _resolve_contract_path(args)
     contract = load_contract_with_overlay(str(contract_path), args.env, logger)
     try:
@@ -561,6 +569,8 @@ def _build_doctor_report(
         "semanticsPresent": has_semantics,
         "checks": [],
     }
+    from fluid_build.output_ports.mcp import resolve_expose_paths
+
     expose_for_driver = resolve_expose_paths(expose, contract_dir=contract_path.parent)
     try:
         driver = build_driver(expose=expose_for_driver, contract=contract, logger=logger)
@@ -637,6 +647,9 @@ def _build_policy(args, *, contract_path: Path, expose) -> OutputPortPolicy:
     cli_deny_models = _opt_csv_tuple(getattr(args, "deny_models", None))
     cli_allow_use_cases = _opt_csv_tuple(getattr(args, "allow_use_cases", None))
     cli_deny_use_cases = _opt_csv_tuple(getattr(args, "deny_use_cases", None))
+
+    from fluid_build.output_ports.mcp import OutputPortPolicy
+
     return OutputPortPolicy.from_contract_and_flags(
         expose=expose,
         contract_path=contract_path,

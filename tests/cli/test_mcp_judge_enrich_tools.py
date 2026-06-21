@@ -245,10 +245,10 @@ def _get_advertised_input_schema(tool_name: str) -> dict:
     """
     import asyncio
 
-    from fluid_build.cli.mcp import _mcp_app
+    from fluid_build.cli.mcp import _get_mcp_app
 
     async def _go() -> dict:
-        tools = await _mcp_app.list_tools()
+        tools = await _get_mcp_app().list_tools()
         for tool in tools:
             if tool.name == tool_name:
                 return tool.inputSchema  # type: ignore[no-any-return]
