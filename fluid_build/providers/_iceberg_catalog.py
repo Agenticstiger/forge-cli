@@ -28,17 +28,44 @@ from .aws.util.warehouse import get_iceberg_warehouse
 # in the OSS spike — RFC §14). Bumping the Iceberg runtime may change these.
 GLUE_CATALOG_IMPL = "org.apache.iceberg.aws.glue.GlueCatalog"
 S3_FILE_IO = "org.apache.iceberg.aws.s3.S3FileIO"
+GCS_FILE_IO = "org.apache.iceberg.gcp.gcs.GCSFileIO"
+ADLS_FILE_IO = "org.apache.iceberg.azure.adlsv2.ADLSFileIO"
+
+# Iceberg catalog types the runtime recognizes for ``iceberg.catalog.type``.
+# Anything else (polaris / snowflake-managed / unity — all REST-fronted) maps to
+# ``rest`` so the connector talks to it over the REST protocol.
+_KNOWN_CATALOG_TYPES = frozenset(
+    {"rest", "hive", "hadoop", "jdbc", "nessie", "bigquery", "dynamodb"}
+)
+
+
+def _io_impl_for_warehouse(warehouse: str) -> Optional[str]:
+    """Pick the Iceberg ``FileIO`` from the warehouse URI scheme.
+
+    An object-store warehouse REQUIRES an ``io-impl`` (the connector's #1
+    works-in-REST-demo-fails-on-cloud trap). REST / Nessie / Hive catalogs can
+    front any cloud, so the FileIO follows the WAREHOUSE scheme, not the catalog
+    kind: ``s3://`` -> S3FileIO, ``gs://`` -> GCSFileIO, ``abfss://`` -> ADLSFileIO.
+    """
+    w = (warehouse or "").lower()
+    if w.startswith(("s3://", "s3a://", "s3n://")):
+        return S3_FILE_IO
+    if w.startswith(("gs://", "gcs://")):
+        return GCS_FILE_IO
+    if w.startswith(("abfs://", "abfss://")):
+        return ADLS_FILE_IO
+    return None
 
 
 @dataclass(frozen=True)
 class ResolvedIcebergCatalog:
     """Canonical, provider-neutral Iceberg-table identity for a binding."""
 
-    catalog_type: str  # "glue" | "rest"
-    warehouse: str  # s3://bucket/path (glue) or catalog name/uri-warehouse (rest)
+    catalog_type: str  # "glue" | "rest" | "nessie" | "hive" | ...
+    warehouse: str  # s3://|gs://|abfss:// path (glue/object-store) or catalog name (rest)
     fq_table: str  # "<database>.<table>"
     catalog_impl: Optional[str] = None  # GlueCatalog for glue
-    io_impl: Optional[str] = None  # S3FileIO for object-store warehouses
+    io_impl: Optional[str] = None  # S3 / GCS / ADLS FileIO per warehouse scheme
     region: Optional[str] = None
     uri: Optional[str] = None  # REST catalog endpoint
     id_columns: Tuple[str, ...] = ()  # -> iceberg.tables.default-id-columns
@@ -100,14 +127,18 @@ def resolve_iceberg_catalog(
             partition_by=partition_by,
         )
 
-    # REST catalog (Snowflake Open Catalog / Polaris / Nessie / the spike's
-    # iceberg-rest-fixture). Warehouse is the catalog *name*, not an s3 path.
+    # Non-Glue catalog: REST / Nessie / Hive / Polaris / Snowflake Open Catalog /
+    # Unity (all REST-fronted) over any cloud storage. ``catalog_type`` is the
+    # kind when the runtime recognizes it (nessie / hive / rest / ...), else REST;
+    # the FileIO follows the WAREHOUSE scheme so GCS (gs://) and ADLS (abfss://)
+    # work, not just S3 (RFC §6.3 — PR7's REST + GCP profiles).
+    warehouse = loc.get("warehouse") or loc.get("catalog_warehouse") or ""
     return ResolvedIcebergCatalog(
-        catalog_type="rest",
-        warehouse=loc.get("warehouse") or loc.get("catalog_warehouse") or "",
+        catalog_type=kind if kind in _KNOWN_CATALOG_TYPES else "rest",
+        warehouse=warehouse,
         fq_table=fq_table,
         uri=loc.get("uri") or loc.get("catalogUri"),
-        io_impl=S3_FILE_IO if loc.get("warehouse", "").startswith(("s3://", "s3a://")) else None,
+        io_impl=_io_impl_for_warehouse(warehouse),
         region=loc.get("region"),
         id_columns=id_columns,
         partition_by=partition_by,
