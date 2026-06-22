@@ -99,7 +99,7 @@ class ValidationCache:
 
         # Load and parse cache
         try:
-            data = json.loads(cache_path.read_text())
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
 
             # Reconstruct ResourceSchema
             from fluid_build.providers.validation_provider import FieldSchema, ResourceType
@@ -155,7 +155,7 @@ class ValidationCache:
         }
 
         # Write to cache
-        cache_path.write_text(json.dumps(data, indent=2))
+        cache_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def invalidate(self, resource_fqn: str, provider: str):
         """
@@ -271,7 +271,7 @@ class ValidationResultHistory:
 
         # Append to history file
         try:
-            with self.history_file.open("a") as f:
+            with self.history_file.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
         except Exception as e:
             # Log but don't fail validation if history recording fails
@@ -295,7 +295,7 @@ class ValidationResultHistory:
             return []
 
         # Read last N lines
-        with self.history_file.open("r") as f:
+        with self.history_file.open("r", encoding="utf-8") as f:
             lines = f.readlines()
 
         recent_lines = lines[-limit:] if len(lines) > limit else lines
@@ -320,7 +320,7 @@ class ValidationResultHistory:
 
         # Find relevant validations
         relevant_validations = []
-        with self.history_file.open("r") as f:
+        with self.history_file.open("r", encoding="utf-8") as f:
             for line in f:
                 record = json.loads(line)
                 if record["contract"] == contract_path and record["resource"] == resource_name:

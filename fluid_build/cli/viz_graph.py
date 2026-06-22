@@ -1459,7 +1459,7 @@ def _run_provider_actions_viz(args: argparse.Namespace, logger: logging.Logger) 
             .replace(".dot", ".html")
         )
 
-        with open(html_path, "w") as f:
+        with open(html_path, "w", encoding="utf-8") as f:
             f.write(html_content)
 
         logger.info(f"✅ Provider actions visualization saved to: {html_path}")
@@ -1481,7 +1481,7 @@ def _run_provider_actions_viz(args: argparse.Namespace, logger: logging.Logger) 
                 .replace(".html", ".dot")
             )
 
-            with open(dot_path, "w") as f:
+            with open(dot_path, "w", encoding="utf-8") as f:
                 f.write(dot_content)
 
             logger.info(f"✅ Provider actions DOT saved to: {dot_path}")
@@ -1500,7 +1500,7 @@ def _run_provider_actions_viz(args: argparse.Namespace, logger: logging.Logger) 
                 )
                 logger.info("Falling back to DOT format...")
                 dot_path = str(output_path).replace(".svg", ".dot").replace(".png", ".dot")
-                with open(dot_path, "w") as f:
+                with open(dot_path, "w", encoding="utf-8") as f:
                     f.write(dot_content)
                 logger.info(f"DOT file saved to: {dot_path}")
                 return 1

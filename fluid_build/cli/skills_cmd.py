@@ -106,7 +106,7 @@ def _update(logger: logging.Logger) -> int:
         console = Console()
         import yaml
 
-        with skills_path.open() as f:
+        with skills_path.open(encoding="utf-8") as f:
             data = yaml.safe_load(f)
         ind = data.get("industry", {})
         console.print("[green]Updated .fluid/skills.yaml[/green]")
@@ -138,13 +138,13 @@ def _show(logger: logging.Logger) -> int:
         from rich.syntax import Syntax
 
         console = Console()
-        content = skills_path.read_text()
+        content = skills_path.read_text(encoding="utf-8")
         console.print(Syntax(content, "yaml", theme="monokai", line_numbers=True))
     except ImportError:
         # Rich isn't available — dump the raw YAML so the user at least
         # sees it. Bare ``print`` is the right primitive in this no-Rich
         # fallback. See CODE_REVIEW C-011.
-        print(skills_path.read_text())  # noqa: T201 — no-Rich fallback
+        print(skills_path.read_text(encoding="utf-8"))  # noqa: T201 — no-Rich fallback
 
     return 0
 
@@ -167,7 +167,7 @@ def _compile(logger: logging.Logger) -> int:
         from fluid_build.cli.forge_copilot_skills_cache import write_compiled_skills
         from fluid_build.cli.industry_skills import compile_skill
 
-        with skills_path.open() as f:
+        with skills_path.open(encoding="utf-8") as f:
             merged = yaml.safe_load(f) or {}
 
         compiled = compile_skill(merged)

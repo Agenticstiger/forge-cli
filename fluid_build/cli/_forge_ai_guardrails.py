@@ -281,10 +281,10 @@ def write_suggestion_file(suggestion: Suggestion, path: str | Path) -> Path:
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(suggestion.to_dict(), indent=2, sort_keys=True))
+    p.write_text(json.dumps(suggestion.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
     return p
 
 
 def read_suggestion_file(path: str | Path) -> Suggestion:
     p = Path(path)
-    return Suggestion.from_dict(json.loads(p.read_text()))
+    return Suggestion.from_dict(json.loads(p.read_text(encoding="utf-8")))

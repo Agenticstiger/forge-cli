@@ -289,7 +289,7 @@ def _run_from_jdbc_source(args: Any, logger: logging.Logger) -> int:
 
     import yaml as _yaml
 
-    output_path.write_text(_yaml.safe_dump(contract, sort_keys=False))
+    output_path.write_text(_yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
 
     # Validate the emitted contract in-process before reporting success.
     # A contract that fails schema validation must never exit 0 — the

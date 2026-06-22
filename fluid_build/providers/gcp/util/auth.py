@@ -54,7 +54,7 @@ def get_auth_report(project: Optional[str] = None, region: Optional[str] = None)
             # Try to read key info (without exposing private key)
             if report["key_file_exists"]:
                 try:
-                    with open(sa_key_path) as f:
+                    with open(sa_key_path, encoding="utf-8") as f:
                         key_data = json.load(f)
                     report["service_account_email"] = key_data.get("client_email")
                     report["project_id_from_key"] = key_data.get("project_id")

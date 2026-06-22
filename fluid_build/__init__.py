@@ -109,7 +109,7 @@ def _load_manifest() -> Dict[str, Any]:
     global _MANIFEST
     if _MANIFEST is None:
         if _MANIFEST_PATH.exists():
-            with open(_MANIFEST_PATH) as f:
+            with open(_MANIFEST_PATH, encoding="utf-8") as f:
                 _MANIFEST = yaml.safe_load(f)
         else:
             # Fallback: everything enabled (backwards compatibility)

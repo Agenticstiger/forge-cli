@@ -38,7 +38,7 @@ _SKILLS_DIR = Path(__file__).parent
 def load_tools() -> Dict[str, Any]:
     """Load the shared FLUID tool catalog from ``_tools.yaml``."""
     tools_path = _SKILLS_DIR / "_tools.yaml"
-    with tools_path.open() as f:
+    with tools_path.open(encoding="utf-8") as f:
         data = yaml.safe_load(f)
     return data.get("tools", {})
 
@@ -54,7 +54,7 @@ def load_industry_skills(name: str) -> Dict[str, Any]:
     path = _SKILLS_DIR / f"{name}.yaml"
     if not path.exists():
         raise FileNotFoundError(f"No industry skills file for '{name}' at {path}")
-    with path.open() as f:
+    with path.open(encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -72,7 +72,7 @@ def list_industries() -> List[Dict[str, str]]:
         if path.name.startswith("_"):
             continue
         try:
-            with path.open() as f:
+            with path.open(encoding="utf-8") as f:
                 data = yaml.safe_load(f)
             industry = data.get("industry", {})
             choices.append(
@@ -145,7 +145,7 @@ def generate_skills_file(
         "# All FLUID agents read this file for project context.\n"
         "# Update with: fluid skills update\n"
     )
-    with out_path.open("w") as f:
+    with out_path.open("w", encoding="utf-8") as f:
         f.write(header)
         yaml.dump(skills, f, default_flow_style=False, sort_keys=False)
 
@@ -216,7 +216,7 @@ def refresh_tools_section(skills_path: Path, *, cli_version: Optional[str] = Non
         except ImportError:
             cli_version = "unknown"
 
-    with skills_path.open() as f:
+    with skills_path.open(encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
     data["tools"] = load_tools()
@@ -228,6 +228,6 @@ def refresh_tools_section(skills_path: Path, *, cli_version: Optional[str] = Non
         "# All FLUID agents read this file for project context.\n"
         "# Update with: fluid skills update\n"
     )
-    with skills_path.open("w") as f:
+    with skills_path.open("w", encoding="utf-8") as f:
         f.write(header)
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)

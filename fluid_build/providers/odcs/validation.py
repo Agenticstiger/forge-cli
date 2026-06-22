@@ -29,7 +29,7 @@ def load_schema() -> Optional[Dict[str, Any]]:
         LOG.warning("ODCS schema not found: %s", schema_path)
         return None
     try:
-        with open(schema_path) as f:
+        with open(schema_path, encoding="utf-8") as f:
             return json.load(f)
     except Exception as exc:  # pragma: no cover - defensive
         LOG.error("Failed to load ODCS schema: %s", exc)

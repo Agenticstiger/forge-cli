@@ -212,7 +212,7 @@ class PluginManager:
         """Load a single plugin"""
         # Read plugin metadata
         metadata_file = plugin_path / "plugin.json"
-        with open(metadata_file) as f:
+        with open(metadata_file, encoding="utf-8") as f:
             metadata_dict = json.load(f)
 
         metadata = PluginMetadata(
@@ -280,7 +280,7 @@ class PluginManager:
         """Load plugin configuration"""
         config_file = plugin_path / "config.json"
         if config_file.exists():
-            with open(config_file) as f:
+            with open(config_file, encoding="utf-8") as f:
                 return json.load(f)
         return {}
 
@@ -313,7 +313,7 @@ class PluginManager:
                     self.console.print("[red]Invalid plugin: missing plugin.json[/red]")
                 return False
 
-            with open(metadata_file) as f:
+            with open(metadata_file, encoding="utf-8") as f:
                 metadata_dict = json.load(f)
 
             plugin_name = metadata_dict["name"]
@@ -724,7 +724,7 @@ def handle_create_plugin(args, plugin_manager: PluginManager, logger: logging.Lo
         "permissions": [],
     }
 
-    with open(plugin_path / "plugin.json", "w") as f:
+    with open(plugin_path / "plugin.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
     # Create main.py template
@@ -735,7 +735,7 @@ def handle_create_plugin(args, plugin_manager: PluginManager, logger: logging.Lo
     else:
         template = _get_basic_plugin_template(plugin_name, author, plugin_type)
 
-    with open(plugin_path / "main.py", "w") as f:
+    with open(plugin_path / "main.py", "w", encoding="utf-8") as f:
         f.write(template)
 
     # Create README.md
@@ -762,7 +762,7 @@ This plugin was created using the FLUID plugin template.
 [Add license information here]
 """
 
-    with open(plugin_path / "README.md", "w") as f:
+    with open(plugin_path / "README.md", "w", encoding="utf-8") as f:
         f.write(readme)
 
     console.print(f"[green]✅ Plugin template created at {plugin_path}[/green]")

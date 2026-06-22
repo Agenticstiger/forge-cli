@@ -912,7 +912,7 @@ class ForgeEngine:
 
         import yaml
 
-        with contract_file.open("w") as f:
+        with contract_file.open("w", encoding="utf-8") as f:
             yaml.dump(contract, f, default_flow_style=False, sort_keys=False)
 
     def _build_contract(self, template) -> Dict[str, Any]:
@@ -926,7 +926,7 @@ class ForgeEngine:
         config_file = target_dir / "config" / "provider.json"
         config_file.parent.mkdir(exist_ok=True)
 
-        with config_file.open("w") as f:
+        with config_file.open("w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
 
     def _run_generators(self) -> None:
@@ -1024,7 +1024,7 @@ class ForgeEngine:
                 file_path = target_dir / filename
                 file_path.parent.mkdir(parents=True, exist_ok=True)
 
-                with file_path.open("w") as f:
+                with file_path.open("w", encoding="utf-8") as f:
                     f.write(content)
 
             rprint(f"[green]✅ Generated {len(pipeline_files)} pipeline files[/green]")

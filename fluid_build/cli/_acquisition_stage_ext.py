@@ -140,7 +140,7 @@ def latest_run_record(workdir: Path, product_id: str, build_id: str) -> Optional
     if not candidates:
         return None
     try:
-        return json.loads(candidates[-1].read_text())
+        return json.loads(candidates[-1].read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return None
 
@@ -445,7 +445,9 @@ def schedule_sync_acquisition(
 
         if "airflow" in chosen:
             dag_path = _safe_subpath(artifacts_root, f"{bid}_dag.py")
-            dag_path.write_text(_render_airflow_dag(contract_id, bid, build, schedule))
+            dag_path.write_text(
+                _render_airflow_dag(contract_id, bid, build, schedule), encoding="utf-8"
+            )
             out.append(
                 ScheduleArtifact(
                     product_id=contract_id,
@@ -458,7 +460,7 @@ def schedule_sync_acquisition(
 
         if "dagster" in chosen:
             job_path = _safe_subpath(artifacts_root, f"{bid}_dagster.py")
-            job_path.write_text(_render_dagster_job(contract_id, bid, schedule))
+            job_path.write_text(_render_dagster_job(contract_id, bid, schedule), encoding="utf-8")
             out.append(
                 ScheduleArtifact(
                     product_id=contract_id,
@@ -471,7 +473,9 @@ def schedule_sync_acquisition(
 
         if "prefect" in chosen:
             depl_path = _safe_subpath(artifacts_root, f"{bid}_prefect.py")
-            depl_path.write_text(_render_prefect_deployment(contract_id, bid, schedule))
+            depl_path.write_text(
+                _render_prefect_deployment(contract_id, bid, schedule), encoding="utf-8"
+            )
             out.append(
                 ScheduleArtifact(
                     product_id=contract_id,
@@ -484,7 +488,7 @@ def schedule_sync_acquisition(
 
         if "cron" in chosen:
             cron_path = _safe_subpath(artifacts_root, f"{bid}.cron")
-            cron_path.write_text(_render_cron_entry(contract_id, bid, schedule))
+            cron_path.write_text(_render_cron_entry(contract_id, bid, schedule), encoding="utf-8")
             out.append(
                 ScheduleArtifact(
                     product_id=contract_id,
@@ -643,11 +647,15 @@ def policy_apply_acquisition(contract: Dict[str, Any], workdir: Path) -> List[Po
 
     retention = contract.get("retention")
     if retention:
-        _safe_subpath(policy_root, "retention.json").write_text(json.dumps(retention, indent=2))
+        _safe_subpath(policy_root, "retention.json").write_text(
+            json.dumps(retention, indent=2), encoding="utf-8"
+        )
 
     obs = (contract.get("observability") or {}).get("alert") or {}
     if obs:
-        _safe_subpath(policy_root, "alert_channels.json").write_text(json.dumps(obs, indent=2))
+        _safe_subpath(policy_root, "alert_channels.json").write_text(
+            json.dumps(obs, indent=2), encoding="utf-8"
+        )
 
     for build in acquisition_builds(contract):
         bid = _validate_identifier(build.get("id", ""), kind="build.id")
@@ -658,7 +666,7 @@ def policy_apply_acquisition(contract: Dict[str, Any], workdir: Path) -> List[Po
         classifications = (record or {}).get("facets", {}).get("classifications", {}) or {}
         if classifications:
             _safe_subpath(policy_root, f"{bid}_pii_masking.json").write_text(
-                json.dumps({"masking": classifications}, indent=2)
+                json.dumps({"masking": classifications}, indent=2), encoding="utf-8"
             )
             applied.append(f"pii_masking:{len(classifications)}_columns")
         else:
@@ -667,7 +675,7 @@ def policy_apply_acquisition(contract: Dict[str, Any], workdir: Path) -> List[Po
         cost = build.get("properties", {}).get("cost")
         if cost:
             _safe_subpath(policy_root, f"{bid}_cost_budget.json").write_text(
-                json.dumps(cost, indent=2)
+                json.dumps(cost, indent=2), encoding="utf-8"
             )
             applied.append("cost_budget")
 

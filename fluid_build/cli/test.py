@@ -292,7 +292,7 @@ def _output_rich(report, output_file: Optional[str] = None) -> None:
         _output_plain(report, output_file)
         return
 
-    console = Console(file=open(output_file, "w") if output_file else sys.stdout)
+    console = Console(file=open(output_file, "w", encoding="utf-8") if output_file else sys.stdout)
 
     # ── header panel ──
     passed = report.is_valid()
@@ -534,7 +534,7 @@ def _output_plain(report, output_file: Optional[str] = None) -> None:
 
     text = "\n".join(lines)
     if output_file:
-        with open(output_file, "w") as f:
+        with open(output_file, "w", encoding="utf-8") as f:
             f.write(text)
         cprint(f"Report saved to: {output_file}")
     else:
@@ -578,7 +578,7 @@ def _output_json(report, output_file: Optional[str] = None) -> None:
     }
     text = json.dumps(data, indent=2)
     if output_file:
-        with open(output_file, "w") as f:
+        with open(output_file, "w", encoding="utf-8") as f:
             f.write(text)
         cprint(f"Report saved to: {output_file}")
     else:

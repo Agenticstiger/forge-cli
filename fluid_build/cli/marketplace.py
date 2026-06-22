@@ -604,7 +604,7 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
     if args.params:
         # Load from JSON string or file
         if Path(args.params).is_file():
-            with open(args.params) as f:
+            with open(args.params, encoding="utf-8") as f:
                 parameters = json.load(f)
         else:
             parameters = json.loads(args.params)
@@ -662,7 +662,7 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
     # Save to file if requested
     if args.output:
         output_path = Path(args.output)
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(contract, f, indent=2)
         console.print(f"\n[green]💾 Saved to: {output_path}[/green]")
 

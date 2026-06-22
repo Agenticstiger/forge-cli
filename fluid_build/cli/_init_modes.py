@@ -121,7 +121,7 @@ def demo_mode(args, logger: logging.Logger) -> int:
 
                 contract_path = project_dir / "contract.fluid.yaml"
                 if contract_path.exists():
-                    with open(contract_path) as f:
+                    with open(contract_path, encoding="utf-8") as f:
                         contract = yaml.safe_load(f)
 
                     if _init.should_generate_dag(contract, template):

@@ -137,7 +137,7 @@ def run_template_mode(
         contract = template.generate_contract(context)
         import yaml
 
-        with open(target_dir / "contract.fluid.yaml", "w") as handle:
+        with open(target_dir / "contract.fluid.yaml", "w", encoding="utf-8") as handle:
             yaml.dump(contract, handle, default_flow_style=False, sort_keys=False)
 
         for path_str, content in template.generate_structure(context).items():

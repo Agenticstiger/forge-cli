@@ -111,7 +111,7 @@ def init_samples(output_dir: Optional[str], format: str, datasets: tuple, quiet:
                 else:
                     import json
 
-                    with open(files["customers"]) as f:
+                    with open(files["customers"], encoding="utf-8") as f:
                         if format == "json":
                             customers_data = json.load(f)
                             customer_ids = [c["customer_id"] for c in customers_data]

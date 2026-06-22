@@ -102,7 +102,7 @@ def load_yaml_json(path: Path) -> Any:
     """
     import json as _json
 
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         if path.suffix in (".yaml", ".yml"):
             import yaml as _yaml
 

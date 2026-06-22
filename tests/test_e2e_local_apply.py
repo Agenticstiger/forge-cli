@@ -61,14 +61,9 @@ def _fluid(*args: str, cwd: Path) -> subprocess.CompletedProcess:
 
     ``encoding='utf-8', errors='replace'`` is set on the parent side so
     decoding the captured streams never raises on Windows where the
-    default locale is cp1252. ``PYTHONIOENCODING=utf-8`` is forced on
-    the child for the same reason."""
+    default locale is cp1252. The child no longer needs a PYTHONUTF8
+    crutch — the CLI self-handles cp1252 (#263 + xsdOYJ6E)."""
     env = os.environ.copy()
-    # See test_e2e_local._fluid for the rationale on PYTHONUTF8 +
-    # PYTHONIOENCODING. No-op on Linux/macOS; required on Windows
-    # until Trello card xsdOYJ6E is resolved in the fluid CLI itself.
-    env.setdefault("PYTHONUTF8", "1")
-    env.setdefault("PYTHONIOENCODING", "utf-8")
     return subprocess.run(
         [sys.executable, "-m", "fluid_build.cli", *args],
         cwd=cwd,

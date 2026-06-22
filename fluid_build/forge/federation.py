@@ -309,7 +309,7 @@ def load_federation_manifest(workspace_root: Path) -> FederationManifest:
     if not path.is_file():
         return FederationManifest()
     try:
-        with path.open() as f:
+        with path.open(encoding="utf-8") as f:
             doc = load_yaml_safe(f) or {}
     except (OSError, yaml.YAMLError) as exc:
         LOG.warning("federation_manifest_unreadable: path=%s error=%s", path, exc)
@@ -348,7 +348,7 @@ def _read_cache(path: Path) -> Dict[str, Any]:
     if not path.is_file():
         return {}
     try:
-        with path.open() as f:
+        with path.open(encoding="utf-8") as f:
             return json.load(f) or {}
     except (OSError, json.JSONDecodeError):
         return {}

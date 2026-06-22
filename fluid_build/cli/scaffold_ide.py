@@ -579,7 +579,7 @@ def _emit_claude_code(root: Path, python_bin: str, force: bool) -> list[Path]:
         # Append rather than overwrite — CLAUDE.md may already have project
         # content. Idempotent via the BEGIN/END markers (re-runs append; we
         # detect a pre-existing block and skip).
-        existing = claude_md.read_text()
+        existing = claude_md.read_text(encoding="utf-8")
         if "BEGIN forge-cli scaffold-ide block" in existing:
             LOG.info(
                 "CLAUDE.md already has a scaffold-ide block — skipping. " "Pass --force to replace."
@@ -690,7 +690,7 @@ def _emit_generic(root: Path, python_bin: str, force: bool) -> list[Path]:
     )
     agents_md = root / "AGENTS.md"
     if agents_md.exists() and not force:
-        existing = agents_md.read_text()
+        existing = agents_md.read_text(encoding="utf-8")
         if "BEGIN forge-cli scaffold-ide block" in existing:
             LOG.info(
                 "AGENTS.md already has a scaffold-ide block — skipping. " "Pass --force to replace."

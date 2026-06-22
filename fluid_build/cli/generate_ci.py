@@ -330,7 +330,7 @@ def _contract_is_reference_only(contract_path: str) -> bool:
     try:
         import yaml
 
-        with open(contract_path) as fh:
+        with open(contract_path, encoding="utf-8") as fh:
             contract = yaml.safe_load(fh) or {}
     except (FileNotFoundError, OSError, ImportError):
         return False
@@ -358,7 +358,7 @@ def _extract_engine_context(contract_path: str) -> dict:
     try:
         import yaml
 
-        with open(contract_path) as fh:
+        with open(contract_path, encoding="utf-8") as fh:
             contract = yaml.safe_load(fh) or {}
     except (FileNotFoundError, OSError, ImportError, Exception):
         return {}

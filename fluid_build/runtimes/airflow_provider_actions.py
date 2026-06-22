@@ -98,7 +98,7 @@ class AirflowDAGGenerator:
 
         # Write to file if path provided
         if output_path:
-            with open(output_path, "w") as f:
+            with open(output_path, "w", encoding="utf-8") as f:
                 f.write(dag_code)
             self.logger.info(f"DAG written to {output_path}")
 

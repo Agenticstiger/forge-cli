@@ -172,7 +172,7 @@ def run(args, logger: logging.Logger) -> int:
             output_file = Path(output_path)
             if output_file.exists():
                 file_size = output_file.stat().st_size
-                with open(output_file) as f:
+                with open(output_file, encoding="utf-8") as f:
                     line_count = len(f.readlines())
 
                 info(logger, f"   Contract ID: {contract.get('id', 'unknown')}")

@@ -76,7 +76,7 @@ class ProjectHistoryExtension(Extension):
         """Load project history from file"""
         if self.history_file.exists():
             try:
-                with self.history_file.open("r") as f:
+                with self.history_file.open("r", encoding="utf-8") as f:
                     return json.load(f)
             except (OSError, json.JSONDecodeError):
                 return []
@@ -85,7 +85,7 @@ class ProjectHistoryExtension(Extension):
     def _save_history(self, history: List[Dict[str, Any]]) -> None:
         """Save project history to file"""
         try:
-            with self.history_file.open("w") as f:
+            with self.history_file.open("w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2)
         except OSError:
             pass

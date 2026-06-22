@@ -212,7 +212,7 @@ class DotEnvCredentialStore:
         """
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             f.write(f"# {provider.upper()} Credentials\n")
             f.write("# Copy to .env and fill in your actual values\n")
             f.write("# DO NOT commit .env to Git!\n\n")
@@ -246,7 +246,7 @@ def ensure_gitignore(project_root: Path):
     entries = [".env", ".env.local", ".env.*.local"]
 
     if gitignore.exists():
-        content = gitignore.read_text()
+        content = gitignore.read_text(encoding="utf-8")
         existing_entries = set(line.strip() for line in content.splitlines())
     else:
         content = ""
@@ -255,7 +255,7 @@ def ensure_gitignore(project_root: Path):
     new_entries = [entry for entry in entries if entry not in existing_entries]
 
     if new_entries:
-        with open(gitignore, "a") as f:
+        with open(gitignore, "a", encoding="utf-8") as f:
             f.write("\n# FLUID CLI - Environment files\n")
             for entry in new_entries:
                 f.write(f"{entry}\n")

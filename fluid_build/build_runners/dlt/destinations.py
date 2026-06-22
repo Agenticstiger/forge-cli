@@ -102,7 +102,7 @@ def _expand_bigquery_service_account(fluid_credentials: Dict[str, Any]) -> None:
     try:
         import json
 
-        sa_text = Path(sa_path).expanduser().read_text()
+        sa_text = Path(sa_path).expanduser().read_text(encoding="utf-8")
         sa = json.loads(sa_text)
     except (OSError, json.JSONDecodeError) as exc:
         LOG.debug("BigQuery SA expansion skipped (will let google.auth handle it): %s", exc)

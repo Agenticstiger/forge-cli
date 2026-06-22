@@ -170,10 +170,10 @@ class CopilotLegacyScaffoldMixin:
         with self.console.status("[bold blue]🤖 AI is crafting your project..."):
             target_dir.mkdir(parents=True, exist_ok=True)
             contract = self._generate_intelligent_contract(context, suggestions)
-            with open(target_dir / "contract.fluid.yaml", "w") as handle:
+            with open(target_dir / "contract.fluid.yaml", "w", encoding="utf-8") as handle:
                 handle.write(contract)
             self._generate_supporting_files(target_dir, context, suggestions)
-            with open(target_dir / "README.md", "w") as handle:
+            with open(target_dir / "README.md", "w", encoding="utf-8") as handle:
                 handle.write(self._generate_intelligent_readme(context, suggestions))
         self.console.print(f"[green]✅ AI-generated project created at {target_dir}[/green]")
 
@@ -277,7 +277,7 @@ credentials.json
 .DS_Store
 Thumbs.db
 """
-        with open(target_dir / ".gitignore", "w") as handle:
+        with open(target_dir / ".gitignore", "w", encoding="utf-8") as handle:
             handle.write(gitignore.strip())
 
         makefile = """
@@ -306,7 +306,7 @@ clean:
 \trm -rf runtime/
 \trm -f *.log
 """
-        with open(target_dir / "Makefile", "w") as handle:
+        with open(target_dir / "Makefile", "w", encoding="utf-8") as handle:
             handle.write(makefile)
 
     def _generate_intelligent_readme(

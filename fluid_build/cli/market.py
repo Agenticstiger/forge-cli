@@ -660,7 +660,7 @@ def load_market_config(args, logger: logging.Logger) -> Dict[str, Any]:
     for config_path in config_paths:
         if config_path.exists():
             try:
-                with open(config_path) as f:
+                with open(config_path, encoding="utf-8") as f:
                     file_config = yaml.safe_load(f) or {}
                     _merge_config(config, file_config)
                     logger.debug(f"Loaded configuration from {config_path}")
@@ -853,7 +853,7 @@ def generate_output(
         output_content = format_json_output(products)
         if args.output:
             try:
-                with open(args.output, "w") as f:
+                with open(args.output, "w", encoding="utf-8") as f:
                     f.write(output_content)
                 logger.info(f"📄 Results written to {args.output}")
             except Exception as e:

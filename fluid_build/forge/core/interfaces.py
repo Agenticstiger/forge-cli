@@ -300,7 +300,7 @@ class BaseGenerator(Generator):
         if not template_path.exists():
             raise FileNotFoundError(f"Template not found: {template_path}")
 
-        return template_path.read_text()
+        return template_path.read_text(encoding="utf-8")
 
     def render_template(self, template_content: str, context: Dict[str, Any]) -> str:
         """Render template with context (basic string replacement)"""

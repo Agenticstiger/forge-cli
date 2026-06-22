@@ -295,11 +295,13 @@ def cmd_opds_import(args: argparse.Namespace, logger: logging.Logger) -> int:
         out_path = Path(out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         if fmt == "json":
-            out_path.write_text(json.dumps(fluid, indent=2, ensure_ascii=False))
+            out_path.write_text(json.dumps(fluid, indent=2, ensure_ascii=False), encoding="utf-8")
         else:
             import yaml
 
-            out_path.write_text(yaml.dump(fluid, default_flow_style=False, sort_keys=False))
+            out_path.write_text(
+                yaml.dump(fluid, default_flow_style=False, sort_keys=False), encoding="utf-8"
+            )
         cprint(f"✓ Imported {in_path} → {out_path}")
     else:
         if fmt == "json":
