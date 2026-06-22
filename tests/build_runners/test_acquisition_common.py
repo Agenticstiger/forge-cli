@@ -488,6 +488,46 @@ class TestFileStateStore:
         got = store.read_run_record("p1", "b1", "r1")
         assert got == rec
 
+    def test_run_record_redacts_secrets_in_facets(self, tmp_path: Path):
+        """Regression: run-record facets can carry a Kafka Connect task-failure
+        ``trace`` that embeds connector config — ``database.password``,
+        ``sasl.jaas.config`` (with its inline password), etc. The record is
+        written via ``json.dumps`` and never flows through the logging
+        ``SecretRedactingFilter``, so ``write_run_record`` redacts at this
+        chokepoint before the bytes hit disk. Without it, secrets land in
+        plaintext in ``.fluid/.../runs/<run_id>.json``."""
+        store = FileStateStore(tmp_path)
+        rec = {
+            "run_id": "r1",
+            "state": "failed",
+            "facets": {
+                "engine": "kafka-connect",
+                "connector_name": "orders-sink",
+                "failed_task_traces": [
+                    "org.apache.kafka.connect.errors.ConnectException: auth failed; "
+                    "sasl.jaas.config=org.apache.kafka.common.security.plain."
+                    'PlainLoginModule required username="svc" '
+                    'password="hunter2-SECRET"; database.password=topsecretpw',
+                ],
+            },
+        }
+        store.write_run_record("p1", "b1", rec)
+
+        # Inspect the raw bytes that actually landed on disk, not just the
+        # parsed dict — the leak is a file-write, so the file is the evidence.
+        on_disk_files = list(tmp_path.rglob("r1.json"))
+        assert len(on_disk_files) == 1, on_disk_files
+        on_disk = on_disk_files[0].read_text(encoding="utf-8")
+        assert "hunter2-SECRET" not in on_disk
+        assert "topsecretpw" not in on_disk
+        assert "REDACTED" in on_disk
+
+        # Non-secret structure / fields are preserved.
+        got = store.read_run_record("p1", "b1", "r1")
+        assert got["state"] == "failed"
+        assert got["facets"]["engine"] == "kafka-connect"
+        assert got["facets"]["connector_name"] == "orders-sink"
+
     def test_list_runs_orders_newest_first(self, tmp_path: Path):
         store = FileStateStore(tmp_path)
         for run_id in ("r1", "r2", "r3"):

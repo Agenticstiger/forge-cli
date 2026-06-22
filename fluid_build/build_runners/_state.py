@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, ContextManager, Dict, List, Optional
 
 from fluid_build.api.state import Cursor, RunLock, StateStore, Watermark
+from fluid_build.observability.secret_redactor import redact_value
 
 from ._acquisition_common import utc_now_iso
 
@@ -190,7 +191,18 @@ class FileStateStore(StateStore):
     # ── run record ───────────────────────────────────────────────────────
     def write_run_record(self, product_id: str, build_id: str, run_record: Dict[str, Any]) -> None:
         run_id = run_record["run_id"]
-        _atomic_write_json(self._run_record_path(product_id, build_id, run_id), run_record)
+        # Defence-in-depth: run records carry runner facets (e.g. a Kafka
+        # Connect task-failure ``trace``) that can embed connector config —
+        # database passwords, S3 keys, ``sasl.jaas.config``. This record is
+        # written via ``json.dumps`` and never flows through the logging
+        # ``SecretRedactingFilter``, so redact here — the single chokepoint
+        # every runner's run-record write funnels through — before it lands
+        # on disk. ``redact_value`` recurses through the dict/list/str shape
+        # and is idempotent, so re-redacting an already-clean record is safe.
+        _atomic_write_json(
+            self._run_record_path(product_id, build_id, run_id),
+            redact_value(run_record),
+        )
 
     def read_run_record(
         self, product_id: str, build_id: str, run_id: str
