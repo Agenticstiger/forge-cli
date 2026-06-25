@@ -207,3 +207,34 @@ def test_known_regression_generate_pipeline_dispatches() -> None:
     pipeline_generator.register(sp)
     args = parser.parse_args(["generate-pipeline"])
     assert getattr(args, "func", None) is pipeline_generator.run
+
+
+def test_known_regression_skills_register_wires_func() -> None:
+    """``skills_cmd.register`` must add a ``skills`` parser with ``func`` set."""
+    from fluid_build.cli import skills_cmd
+
+    parser = argparse.ArgumentParser()
+    sp = parser.add_subparsers(dest="cmd")
+    skills_cmd.register(sp)
+    assert "skills" in sp.choices, "skills_cmd.register must add a 'skills' parser"
+    args = parser.parse_args(["skills"])
+    assert getattr(args, "func", None) is skills_cmd.run
+
+
+def test_known_regression_skills_registered_by_bootstrap() -> None:
+    """Direct regression pin: ``fluid skills`` shipped invisible because
+    bootstrap called ``_try_register(sp, "skills", "skills_cmd")`` with the
+    args swapped — it imported a non-existent ``cli.skills`` module, hit
+    ImportError, and silently dropped the command. The correct call is
+    ``_try_register(sp, "skills_cmd", "skills")`` (module name first, profile
+    second). Assert the full bootstrap actually wires ``skills`` into the CLI."""
+    from fluid_build.cli.bootstrap import register_core_commands
+
+    parser = argparse.ArgumentParser(prog="fluid")
+    sp = parser.add_subparsers(dest="cmd")
+    register_core_commands(sp)
+    assert "skills" in sp.choices, (
+        "fluid skills is missing from the CLI parser — verify the "
+        "_try_register(sp, 'skills_cmd', 'skills') call in bootstrap.py "
+        "(module name first, profile name second)."
+    )
