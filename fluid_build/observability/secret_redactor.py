@@ -99,8 +99,9 @@ _PEM_PRIVATE_KEY_RE = re.compile(
 _ASSIGNMENT_RE = re.compile(
     r"(?ix)"
     r"(?P<key>\b(?:[A-Za-z0-9_]{,128}_)?(?:"
-    r"api[_-]?key|authorization|aws_secret_access_key|client_secret|"
-    r"oauth[_-]?token|password|private[_-]?key(?:_passphrase)?|secret|token"
+    r"api[_-]?key|authorization|aws_secret_access_key|secret[_-]access[_-]key|"
+    r"client_secret|oauth[_-]?token|password|private[_-]?key(?:_passphrase)?|"
+    r"session[_-]token|secret|token"
     r")\b)"
     r"(?P<sep>\s{,8}[:=]\s{,8})"
     r"(?P<quote>['\"]?)"
@@ -132,8 +133,9 @@ _PLACEHOLDER_RE = re.compile(
 # linear in the message length.
 _PRECEDING_SENSITIVE_KEY_RE = re.compile(
     r"(?ix)\b(?:[A-Za-z0-9_]*_)?(?:"
-    r"api[_-]?key|authorization|aws_secret_access_key|client_secret|"
-    r"oauth[_-]?token|password|private[_-]?key(?:_passphrase)?|secret|token"
+    r"api[_-]?key|authorization|aws_secret_access_key|secret[_-]access[_-]key|"
+    r"client_secret|oauth[_-]?token|password|private[_-]?key(?:_passphrase)?|"
+    r"session[_-]token|secret|token"
     r")\b\s*[:=]\s*$"
 )
 

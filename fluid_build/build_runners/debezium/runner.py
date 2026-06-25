@@ -430,19 +430,43 @@ def _execute_kafka_connect(
 
 
 def _properties_line(key: str, value: object) -> str:
-    """Render one ``key=value`` line for a Java ``.properties`` file, failing
-    closed on control characters.
+    """Render one ``key=value`` line for a Java ``.properties`` file, escaped per
+    the ``java.util.Properties`` grammar and failing closed on control characters.
 
     The file is line-based, so a newline (or carriage-return / form-feed / NUL)
     smuggled into a contract-derived key or value would inject arbitrary extra
-    Debezium directives. Reject rather than silently write it — the Kafka-Connect
-    twin is immune because it serializes to JSON, but this path writes raw lines.
+    Debezium directives — reject those rather than silently write them (the
+    Kafka-Connect twin is immune because it serializes to JSON). Backslash is
+    ALSO load-bearing: ``Properties.load`` treats ``\\`` as an escape introducer,
+    so a literal backslash in a value (a Windows path, a ``destination-regexp``
+    replacement) must be doubled or it is silently corrupted on read-back; key
+    separators (``=`` / ``:`` / leading whitespace / ``#`` / ``!``) are escaped so
+    a contract-derived key round-trips verbatim.
     """
     text_value = str(value)
     for token in (key, text_value):
         if any(ch in token for ch in "\r\n\f\x00"):
             raise ValueError(f"debezium config entry contains a control character: {token!r}")
-    return f"{key}={text_value}"
+    return f"{_escape_properties_key(key)}={_escape_properties_value(text_value)}"
+
+
+def _escape_properties_key(key: str) -> str:
+    """Escape a Java ``.properties`` KEY: backslash + the key/value separators +
+    comment markers + spaces, so the key is parsed back exactly as written."""
+    out = []
+    for ch in key:
+        out.append("\\" + ch if ch in "\\=: \t#!" else ch)
+    return "".join(out)
+
+
+def _escape_properties_value(value: str) -> str:
+    """Escape a Java ``.properties`` VALUE: double every backslash (an escape
+    introducer on load) and a leading space/tab (``Properties.load`` strips
+    leading whitespace). ``=`` / ``:`` / ``#`` are literal in the value."""
+    escaped = value.replace("\\", "\\\\")
+    if escaped[:1] in (" ", "\t"):
+        escaped = "\\" + escaped
+    return escaped
 
 
 def _execute_debezium_server(
