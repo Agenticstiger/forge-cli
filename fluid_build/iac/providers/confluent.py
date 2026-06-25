@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
+from ...providers.aws.util.warehouse import normalize_location
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
 from ..versions import required_providers
@@ -51,6 +52,19 @@ def _confluent_exposures(
         binding = exposure.get("binding") or {}
         if str(binding.get("platform") or "").lower() == "confluent":
             yield exposure, binding, (binding.get("location") or {})
+
+
+def _topic_name(loc: Mapping[str, Any], exposure: Mapping[str, Any]) -> str:
+    """The Kafka topic the Tableflow output is named for (the ``display_name``
+    and the basis of the OpenTofu resource name): topic > table > exposeId."""
+    return loc.get("topic") or loc.get("table") or exposure.get("exposeId") or "topic"
+
+
+def _resource_name(cid: str, loc: Mapping[str, Any], exposure: Mapping[str, Any]) -> str:
+    """The OpenTofu resource name for an exposure's Tableflow resources. The
+    emitter and ``validate_confluent_binding`` MUST agree so the validator's
+    collision guard reflects what ``emit`` would actually produce."""
+    return safe_ident(f"{cid}_{_topic_name(loc, exposure)}")
 
 
 class ConfluentIacPlugin:
@@ -115,15 +129,19 @@ def _emit_tableflow(
     """
     environment_id = loc.get("environment_id")
     cluster_id = loc.get("kafka_cluster_id")
-    bucket = loc.get("bucket")
     role_arn = loc.get("confluent_role_arn")
-    if not (environment_id and cluster_id and bucket and role_arn):
+    if not (environment_id and cluster_id and loc.get("bucket") and role_arn):
         return
 
+    # Resolve the bucket through the canonical AWS warehouse writer (env templates
+    # resolved) so the Tableflow byob_aws bucket can never diverge from the Glue
+    # table the output publishes into (RFC §7 zero-drift). account_ref feeds only
+    # the absent-bucket fallback, which validate_confluent_binding makes a hard
+    # error — so it never triggers on this emit path.
+    bucket, _ = normalize_location(loc, account_ref="", default_path=False)
     database = loc.get("database")
-    table = loc.get("table") or exposure.get("exposeId")
-    topic = loc.get("topic") or table or "topic"
-    name = safe_ident(f"{cid}_{topic}")
+    topic = _topic_name(loc, exposure)
+    name = _resource_name(cid, loc, exposure)
 
     # 1. Provider (storage) integration — exports external_id + iam_role_arn
     #    (computed, post-apply); two-phase IAM, see the module docstring.
@@ -166,6 +184,8 @@ def validate_confluent_binding(contract: Mapping[str, Any]) -> Tuple[List[str], 
     """
     errors: List[str] = []
     warnings: List[str] = []
+    cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+    names: Dict[str, str] = {}
     for exposure, binding, loc in _confluent_exposures(contract):
         eid = exposure.get("exposeId") or "?"
         fmt = str(binding.get("format") or "").lower()
@@ -190,4 +210,22 @@ def validate_confluent_binding(contract: Mapping[str, Any]) -> Tuple[List[str], 
                 f"expose '{eid}': no binding.location.database — the AWS Glue database must "
                 f"pre-exist and be named as custom_database so Tableflow publishes there"
             )
+        # The Tableflow display_name (the Kafka topic) falls back to the exposeId
+        # when neither topic nor table is set — usually not the real topic name.
+        if not (loc.get("topic") or loc.get("table")):
+            warnings.append(
+                f"expose '{eid}': no binding.location.topic or table — the Tableflow "
+                f"display_name falls back to the exposeId; set topic to the Kafka topic name"
+            )
+        # Two confluent exposes must not resolve to the same OpenTofu resource
+        # name (topics differing only in punctuation normalise to one safe_ident),
+        # which would silently drop one exposure's resources at emit time.
+        rname = _resource_name(cid, loc, exposure)
+        if rname in names and names[rname] != eid:
+            errors.append(
+                f"expose '{eid}': resolves to the same OpenTofu resource name {rname!r} as "
+                f"expose '{names[rname]}' (topics differ only in punctuation); rename one topic"
+            )
+        else:
+            names.setdefault(rname, eid)
     return errors, warnings

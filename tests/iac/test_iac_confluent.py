@@ -146,6 +146,59 @@ def test_zero_drift_bucket_matches_aws_warehouse():
     )
 
 
+def test_zero_drift_env_template_bucket_resolves(monkeypatch):
+    # an {{ env.* }} bucket must resolve to the SAME value the AWS Glue table uses
+    # (the divergent branch the plain-literal test above never exercised).
+    monkeypatch.setenv("LAKE_BUCKET", "resolved-lake")
+    loc = _loc(bucket="{{ env.LAKE_BUCKET }}")
+    res = _emit(_contract(loc))
+    (name,) = list(res["confluent_tableflow_topic"])
+    bucket = res["confluent_tableflow_topic"][name]["byob_aws"]["bucket_name"]
+    assert bucket == "resolved-lake"  # NOT the literal template
+    assert get_iceberg_warehouse(loc, account_ref="acct").startswith("s3://resolved-lake/")
+
+
+# ── provider auto-detect (so `fluid generate iac` with no --provider works) ──
+
+
+def test_confluent_auto_detects_without_explicit_provider():
+    from fluid_build.cli.generate_iac import _canonical_cloud, _detect_clouds
+
+    assert _canonical_cloud("confluent") == "confluent"
+    assert "confluent" in _detect_clouds(_contract())
+
+
+# ── validator hardening: collision guard + display_name warning ─────────────
+
+
+def test_validator_rejects_colliding_resource_names():
+    # two confluent exposes whose topics differ only in punctuation normalise to
+    # the same safe_ident -> emit would silently drop one; the validator blocks it
+    c = _contract(_loc(topic="orders-v1"))
+    c["exposes"].append(
+        {
+            "exposeId": "orders2",
+            "kind": "table",
+            "binding": {
+                "platform": "confluent",
+                "format": "iceberg",
+                "location": _loc(topic="orders_v1"),
+            },
+        }
+    )
+    errors, _ = validate_confluent_binding(c)
+    assert any("same OpenTofu resource name" in e for e in errors)
+
+
+def test_validator_warns_when_no_topic_or_table():
+    loc = _loc()
+    loc.pop("topic")
+    loc.pop("table")
+    errors, warnings = validate_confluent_binding(_contract(loc))
+    assert errors == []  # the exposeId still names the resources; just a warning
+    assert any("display_name falls back" in w for w in warnings)
+
+
 # ── validator (anti-no-op gate, §15 pt3) ────────────────────────────────────
 
 

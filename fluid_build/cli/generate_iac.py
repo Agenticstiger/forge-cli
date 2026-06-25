@@ -183,6 +183,10 @@ _PROVIDER_ALIASES = {
     "gcs": "gcp",
     "bigquery": "gcp",
     "snowflake": "snowflake",
+    # Confluent Cloud Tableflow (managed Kafka->Iceberg) — ``binding.platform:
+    # confluent`` auto-detects to the OpenTofu confluent plugin, matching its
+    # entry in OPENTOFU_DEFAULT_PROVIDERS.
+    "confluent": "confluent",
     # ``local`` (and its DuckDB engine) is a recognised target but has no
     # OpenTofu plugin — it runs in-process. Detected so we can emit an
     # actionable error rather than the misleading "no supported cloud".
