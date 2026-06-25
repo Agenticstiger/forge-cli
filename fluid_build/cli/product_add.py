@@ -12,12 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""``fluid product-add`` — append a source / exposure / dq rule to a contract.
+
+Items are written to their **canonical** homes in the FLUID schema (the
+contract root is closed, ``additionalProperties: false``), so the contract
+still passes ``fluid validate`` afterward:
+
+* ``source``   -> a ``consumes[]`` entry (``{productId, exposeId}``) — an
+  upstream product expose this contract reads.
+* ``exposure`` -> an ``exposes[]`` entry (``{exposeId, kind, binding,
+  contract}``) — a data interface this product publishes.
+* ``dq``       -> a rule under ``exposes[].contract.dq.rules[]``
+  (``{id, type, severity}``) on the targeted expose (``--expose``, else the
+  first expose).
+"""
+
 from __future__ import annotations
 
 import argparse
 import logging
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Tuple
 
 from ._common import CLIError
 from ._io import dump_json
@@ -25,21 +40,89 @@ from ._logging import info
 
 COMMAND = "product-add"
 
+# Closed enums from the bundled FLUID schema ($defs.expose.kind, $defs.dqRule.type).
+_EXPOSE_KINDS = {
+    "table",
+    "view",
+    "api",
+    "file",
+    "stream",
+    "topic",
+    "feature_store",
+    "model",
+    "vector",
+    "graph",
+    "time_series",
+    "other",
+}
+_DQ_TYPES = {
+    "freshness",
+    "completeness",
+    "uniqueness",
+    "valid_values",
+    "accuracy",
+    "schema",
+    "anomaly_detection",
+    "drift_detection",
+}
+_DQ_SEVERITIES = {"info", "warn", "error", "critical"}
+# Sensible default binding.format per platform (binding requires platform/format/location).
+_PLATFORM_FORMAT = {
+    "local": "parquet",
+    "gcp": "bigquery_table",
+    "aws": "s3_file",
+    "azure": "delta_table",
+    "snowflake": "snowflake_table",
+    "databricks": "delta_table",
+    "kafka": "kafka_topic",
+    "confluent": "kafka_topic",
+    "postgres": "native",
+}
+
 
 def register(subparsers: argparse._SubParsersAction):
     p = subparsers.add_parser(
         COMMAND,
-        help="Add source/exposure/dq to an existing contract",
-        description="Append a new source, exposure, or data quality check to an existing FLUID contract.",
+        help="Add a source/exposure/dq rule to an existing contract",
+        description=(
+            "Append a source (consumes[]), exposure (exposes[]), or data-quality "
+            "rule (exposes[].contract.dq.rules[]) to an existing FLUID contract. "
+            "Output stays schema-valid."
+        ),
     )
     p.add_argument("contract", help="contract.fluid.(json|yaml)")
     p.add_argument("what", choices=["source", "exposure", "dq"], help="What to add")
-    p.add_argument("--id", required=True, help="Identifier to add")
-    p.add_argument("--description", help="Description of the item")
     p.add_argument(
-        "--type", help="Type (for sources: table/view/file; for dq: freshness/schema/quality)"
+        "--id",
+        required=True,
+        help=("Identifier: exposeId (exposure), upstream productId (source), " "or rule id (dq)"),
     )
-    p.add_argument("--location", help="Location/path (for sources and exposures)")
+    p.add_argument("--description", help="Description / purpose of the item")
+    p.add_argument(
+        "--type",
+        help=(
+            "exposure: expose kind (table/view/file/stream/topic/...; default table). "
+            "dq: rule type (completeness/freshness/uniqueness/valid_values/accuracy/"
+            "schema/...; default completeness)."
+        ),
+    )
+    p.add_argument(
+        "--location",
+        help="exposure: binding location path. source: upstream exposeId.",
+    )
+    p.add_argument(
+        "--platform",
+        help="exposure: binding platform (local/gcp/aws/snowflake/...; default local)",
+    )
+    p.add_argument(
+        "--expose",
+        help="dq: target exposeId to attach the rule to (default: first expose)",
+    )
+    p.add_argument(
+        "--severity",
+        choices=sorted(_DQ_SEVERITIES),
+        help="dq: rule severity (default warn)",
+    )
     p.set_defaults(cmd=COMMAND, func=run)
 
 
@@ -49,31 +132,19 @@ def run(args, logger: logging.Logger) -> int:
         if not contract_path.exists():
             raise CLIError(2, "contract_not_found", {"path": args.contract})
 
-        # Load contract
         info(logger, "product_add_loading", contract=args.contract)
         from fluid_build.loader import _parse_file
 
         contract = _parse_file(contract_path)
 
-        # Get current values for diff
-        section_key = _get_section_key(args.what)
-        before_count = len(contract.get(section_key, []))
-
-        # Add new item based on type
         if args.what == "source":
-            _add_source(contract, args)
+            added, total = _add_source(contract, args)
         elif args.what == "exposure":
-            _add_exposure(contract, args)
-        elif args.what == "dq":
-            _add_dq_check(contract, args)
+            added, total = _add_exposure(contract, args)
+        else:  # dq
+            added, total = _add_dq_check(contract, args)
 
-        # Deduplicate
-        if section_key in contract:
-            contract[section_key] = _deduplicate(contract[section_key], "id")
-
-        after_count = len(contract.get(section_key, []))
-
-        # Write atomically (use JSON for safety; user can convert to YAML if needed)
+        # Write atomically (JSON for safety; user can convert to YAML if desired).
         output_path = (
             contract_path.with_suffix(".json")
             if contract_path.suffix in (".yaml", ".yml")
@@ -81,17 +152,14 @@ def run(args, logger: logging.Logger) -> int:
         )
         dump_json(str(output_path), contract)
 
-        # Log summary
-        added = after_count - before_count
         info(
             logger,
             "product_add_success",
             what=args.what,
             added=added,
-            total=after_count,
+            total=total,
             output=str(output_path),
         )
-
         if added == 0:
             info(logger, "product_add_duplicate", id=args.id)
 
@@ -103,67 +171,114 @@ def run(args, logger: logging.Logger) -> int:
         raise CLIError(1, "product_add_failed", {"error": str(e)})
 
 
-def _get_section_key(what: str) -> str:
-    """Map 'what' to contract section key."""
-    return {"source": "sources", "exposure": "exposures", "dq": "dataQuality"}[what]
+def _add_source(contract: Dict[str, Any], args) -> Tuple[int, int]:
+    """Add an upstream dependency as a canonical ``consumes[]`` entry."""
+    consumes: List[Dict[str, Any]] = contract.setdefault("consumes", [])
+    before = len(consumes)
 
-
-def _add_source(contract: Dict[str, Any], args) -> None:
-    """Add a source to the contract."""
-    if "sources" not in contract:
-        contract["sources"] = []
-
-    source = {
-        "id": args.id,
-        "type": args.type or "table",
+    consume: Dict[str, Any] = {
+        "productId": args.id,
+        # consumeRef requires exposeId; use --location as the upstream expose,
+        # falling back to the productId when unspecified.
+        "exposeId": args.location or args.id,
     }
-
     if args.description:
-        source["description"] = args.description
-    if args.location:
-        source["location"] = args.location
+        consume["purpose"] = args.description
 
-    contract["sources"].append(source)
+    consumes.append(consume)
+    contract["consumes"] = _deduplicate_by(
+        consumes, lambda c: (c.get("productId"), c.get("exposeId"))
+    )
+    total = len(contract["consumes"])
+    return total - before, total
 
 
-def _add_exposure(contract: Dict[str, Any], args) -> None:
-    """Add an exposure to the contract."""
-    if "exposures" not in contract:
-        contract["exposures"] = []
+def _add_exposure(contract: Dict[str, Any], args) -> Tuple[int, int]:
+    """Add a data interface as a canonical ``exposes[]`` entry."""
+    exposes: List[Dict[str, Any]] = contract.setdefault("exposes", [])
+    before = len(exposes)
 
-    exposure = {
-        "id": args.id,
-        "type": args.type or "dashboard",
+    platform = args.platform or "local"
+    kind = args.type if args.type in _EXPOSE_KINDS else "table"
+    expose: Dict[str, Any] = {
+        "exposeId": args.id,
+        "kind": kind,
+        "binding": {
+            "platform": platform,
+            "format": _PLATFORM_FORMAT.get(platform, "parquet"),
+            "location": {"path": args.location or f"output/{args.id}.parquet"},
+        },
+        # Empty schema is valid across all bundled schema versions; avoid
+        # version-specific optional keys (e.g. schemaPolicy) so the output stays
+        # valid regardless of the target contract's fluidVersion.
+        "contract": {"schema": []},
     }
-
     if args.description:
-        exposure["description"] = args.description
-    if args.location:
-        exposure["url"] = args.location
+        expose["description"] = args.description
 
-    contract["exposures"].append(exposure)
+    exposes.append(expose)
+    contract["exposes"] = _deduplicate(exposes, "exposeId")
+    total = len(contract["exposes"])
+    return total - before, total
 
 
-def _add_dq_check(contract: Dict[str, Any], args) -> None:
-    """Add a data quality check to the contract."""
-    if "dataQuality" not in contract:
-        contract["dataQuality"] = []
+def _add_dq_check(contract: Dict[str, Any], args) -> Tuple[int, int]:
+    """Add a data-quality rule under the target expose's ``contract.dq.rules``."""
+    exposes: List[Dict[str, Any]] = contract.get("exposes", [])
+    if not exposes:
+        raise CLIError(
+            2,
+            "product_add_no_expose",
+            {
+                "hint": (
+                    "dq rules attach to an expose; add an exposure first "
+                    "(`fluid product-add <contract> exposure --id ...`)."
+                )
+            },
+        )
 
-    dq = {
+    if args.expose:
+        target = next((e for e in exposes if e.get("exposeId") == args.expose), None)
+        if target is None:
+            raise CLIError(2, "product_add_expose_not_found", {"expose": args.expose})
+    else:
+        target = exposes[0]
+
+    expose_contract: Dict[str, Any] = target.setdefault("contract", {})
+    rules: List[Dict[str, Any]] = expose_contract.setdefault("dq", {}).setdefault("rules", [])
+    before = len(rules)
+
+    rule: Dict[str, Any] = {
         "id": args.id,
-        "type": args.type or "quality",
+        "type": args.type if args.type in _DQ_TYPES else "completeness",
+        "severity": args.severity or "warn",
     }
-
     if args.description:
-        dq["description"] = args.description
+        rule["description"] = args.description
 
-    contract["dataQuality"].append(dq)
+    rules.append(rule)
+    expose_contract["dq"]["rules"] = _deduplicate(rules, "id")
+    total = len(expose_contract["dq"]["rules"])
+    return total - before, total
 
 
 def _deduplicate(items: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
-    """Deduplicate list of dicts by key, keeping last occurrence."""
-    seen = {}
+    """Deduplicate dicts by a single key, keeping the last occurrence."""
+    seen: Dict[Any, Dict[str, Any]] = {}
+    passthrough: List[Dict[str, Any]] = []
     for item in items:
         if key in item:
             seen[item[key]] = item
+        else:
+            passthrough.append(item)
+    return passthrough + list(seen.values())
+
+
+def _deduplicate_by(
+    items: List[Dict[str, Any]], keyfn: Callable[[Dict[str, Any]], Any]
+) -> List[Dict[str, Any]]:
+    """Deduplicate dicts by a composite key function, keeping the last occurrence."""
+    seen: Dict[Any, Dict[str, Any]] = {}
+    for item in items:
+        seen[keyfn(item)] = item
     return list(seen.values())
