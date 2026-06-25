@@ -20,7 +20,7 @@ never disagree (RFC §6.1 / §7).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .aws.util.warehouse import get_iceberg_warehouse
 
@@ -37,6 +37,21 @@ ADLS_FILE_IO = "org.apache.iceberg.azure.adlsv2.ADLSFileIO"
 _KNOWN_CATALOG_TYPES = frozenset(
     {"rest", "hive", "hadoop", "jdbc", "nessie", "bigquery", "dynamodb"}
 )
+
+
+def find_iceberg_expose_binding(contract: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The expose ``binding`` carrying the Iceberg-table identity for a sink.
+
+    Shared by the Kafka-Connect and Debezium-Server runners so both resolve the
+    SAME table identity (the RFC zero-drift spine). A simple ``format=iceberg``
+    lookup; the validated build->expose join (build.outputs / exposeId) lands
+    with the plan-time validator (RFC §6.8 #5).
+    """
+    for exposure in contract.get("exposes") or []:
+        binding = exposure.get("binding") or {}
+        if str(binding.get("format") or "").lower() == "iceberg":
+            return binding
+    return None
 
 
 def _io_impl_for_warehouse(warehouse: str) -> Optional[str]:
