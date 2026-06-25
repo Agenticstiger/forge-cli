@@ -28,6 +28,10 @@ PROVIDER_PINS: Dict[str, Dict[str, str]] = {
     "google": {"source": "hashicorp/google", "version": "~> 6.0"},
     "aws": {"source": "hashicorp/aws", "version": "~> 5.0"},
     "snowflake": {"source": "snowflakedb/snowflake", "version": "~> 2.0"},
+    # Confluent Cloud — Tableflow (managed Kafka→Iceberg) + Glue catalog /
+    # provider integration. The managed control plane owns compaction +
+    # snapshot-expiry (RFC-streaming-extension §15).
+    "confluent": {"source": "confluentinc/confluent", "version": "~> 2.0"},
     # `archive` zips Lambda source inline (`data.archive_file`) so the AWS
     # emitter ships function code without a separate packaging step.
     "archive": {"source": "hashicorp/archive", "version": "~> 2.0"},

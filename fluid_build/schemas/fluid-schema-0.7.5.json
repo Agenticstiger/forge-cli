@@ -1264,12 +1264,13 @@
             "snowflake",
             "databricks",
             "kafka",
+            "confluent",
             "local",
             "kubernetes",
             "postgres",
             "other"
           ],
-          "description": "Target platform. NEW in v0.7.4: 'postgres' for the MCP output-port PostgreSQL driver (AWS Athena uses platform 'aws')."
+          "description": "Target platform. NEW in v0.7.5: 'confluent' for the Confluent Cloud Tableflow managed Kafka→Iceberg emitter. NEW in v0.7.4: 'postgres' for the MCP output-port PostgreSQL driver (AWS Athena uses platform 'aws')."
         },
         "format": {
           "type": "string",
@@ -1486,6 +1487,18 @@
         "zone": {
           "type": "string",
           "description": "Cloud zone"
+        },
+        "environment_id": {
+          "type": "string",
+          "description": "NEW in v0.7.5: Confluent Cloud environment id (env-xxxxx) for the Tableflow emitter."
+        },
+        "kafka_cluster_id": {
+          "type": "string",
+          "description": "NEW in v0.7.5: Confluent Cloud Kafka cluster id (lkc-xxxxx) the Tableflow topic belongs to."
+        },
+        "confluent_role_arn": {
+          "type": "string",
+          "description": "NEW in v0.7.5: ARN of the pre-created AWS IAM role Confluent Tableflow assumes (byob_aws). Its trust policy is updated post-apply with the provider integration's external_id (two-phase IAM)."
         }
       }
     },

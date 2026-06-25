@@ -160,3 +160,28 @@ def test_override_warehouse_matching_is_clean():
         _contract(kc={"iceberg_catalog_overrides": {"iceberg.catalog.warehouse": "s3://lake/s/o/"}})
     )
     assert not any("diverges" in w for w in warns)
+
+
+# ── managed Confluent Tableflow exposes are not self-managed KC sink targets ──
+
+
+def test_confluent_expose_not_treated_as_kc_sink_target():
+    # a confluent expose is managed Tableflow (the Confluent IaC plugin owns it),
+    # so this validator must NOT claim it and demand REST/Glue catalog fields.
+    binding = {
+        "platform": "confluent",
+        "format": "iceberg",
+        "location": {
+            "environment_id": "env-1",
+            "kafka_cluster_id": "lkc-1",
+            "bucket": "b",
+            "confluent_role_arn": "arn:aws:iam::1:role/x",
+            "database": "d",
+            "table": "t",
+        },
+    }
+    errs = _errs(_contract(binding=binding))
+    # the only expose is confluent -> excluded -> a real iceberg KC sink build
+    # correctly reports "no iceberg expose" rather than a bogus rest-catalog error
+    assert any("no expose with binding.format=iceberg" in e for e in errs)
+    assert not any("rest catalog requires" in e for e in errs)
