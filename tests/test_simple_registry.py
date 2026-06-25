@@ -178,7 +178,7 @@ class TestGenerationContext:
 
 class TestConfigConstants:
     def test_config_values(self):
-        from fluid_build.config import (
+        from fluid_build.config_defaults import (
             DEFAULT_PROVIDER,
             DEFAULT_REGION,
             RUN_STATE_DIR,
