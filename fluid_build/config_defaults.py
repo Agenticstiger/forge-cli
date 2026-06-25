@@ -33,4 +33,3 @@ DEFAULT_PROVIDER = "gcp"  # or 'local'
 
 SUPPORTED_PROVIDERS = {"gcp", "local", "aws", "snowflake", "odps"}
 """Set of known providers. Used by IaC cutover logic and provider dispatch."""
-
