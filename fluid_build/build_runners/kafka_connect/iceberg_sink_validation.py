@@ -41,6 +41,12 @@ def _is_iceberg_binding(exposure: Any) -> bool:
     if not isinstance(exposure, Mapping):
         return False
     binding = exposure.get("binding") or {}
+    # A confluent expose is a MANAGED Tableflow output (the Confluent IaC plugin
+    # + validate_confluent_binding own it), not a self-managed Kafka-Connect sink
+    # target. Excluding it keeps this validator from demanding REST/Glue catalog
+    # fields the managed path doesn't use (RFC §15).
+    if str(binding.get("platform") or "").lower() == "confluent":
+        return False
     return str(binding.get("format") or "").lower() in _ICEBERG_FORMATS
 
 
