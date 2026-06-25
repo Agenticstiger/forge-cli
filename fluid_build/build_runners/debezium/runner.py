@@ -429,6 +429,22 @@ def _execute_kafka_connect(
         client.close()
 
 
+def _properties_line(key: str, value: object) -> str:
+    """Render one ``key=value`` line for a Java ``.properties`` file, failing
+    closed on control characters.
+
+    The file is line-based, so a newline (or carriage-return / form-feed / NUL)
+    smuggled into a contract-derived key or value would inject arbitrary extra
+    Debezium directives. Reject rather than silently write it — the Kafka-Connect
+    twin is immune because it serializes to JSON, but this path writes raw lines.
+    """
+    text_value = str(value)
+    for token in (key, text_value):
+        if any(ch in token for ch in "\r\n\f\x00"):
+            raise ValueError(f"debezium config entry contains a control character: {token!r}")
+    return f"{key}={text_value}"
+
+
 def _execute_debezium_server(
     ctx: RunContext,
     deployment: Dict[str, Any],
@@ -459,15 +475,54 @@ def _execute_debezium_server(
     )
     sink_block = (dbz_props.get("server") or {}).get("sink") or {}
     sink_type = sink_block.get("type", "iceberg")
+    handwritten = dict(sink_block.get("config") or {})
 
-    lines = [f"debezium.source.{k}={v}" for k, v in source_config.items()]
-    lines += [
-        "quarkus.log.console.json=false",
-        f"debezium.sink.type={sink_type}",
-    ]
-    for k, v in sink_block.get("config", {}).items():
-        lines.append(f"debezium.sink.{sink_type}.{k}={v}")
+    # Iceberg sink: derive the bare-key config from the contract's iceberg expose
+    # binding so the embedded server lands in the SAME table the static Glue
+    # table / KC sink resolve to (RFC zero-drift spine). Mirrors the KC gate:
+    # derivation is OFF whenever a hand-written ``config`` block is present, so
+    # those contracts stay byte-for-byte identical (an explicit empty ``config:
+    # {}`` counts as present, matching the KC ``sink_connector_config`` default);
+    # opt back in with ``server.sink.iceberg_sink_enabled: true``. Derived keys
+    # go UNDER the hand-written ones, so an operator key always wins.
+    sink_config = handwritten
+    iceberg_on = sink_block.get("iceberg_sink_enabled", "config" not in sink_block)
+    if sink_type == "iceberg" and iceberg_on:
+        from ...providers._iceberg_catalog import (
+            find_iceberg_expose_binding,
+            resolve_iceberg_catalog,
+        )
+        from .iceberg_sink import emit_debezium_iceberg_sink_config
+
+        binding = find_iceberg_expose_binding(ctx.contract)
+        if binding is not None:
+            resolved = resolve_iceberg_catalog(
+                binding,
+                contract=ctx.contract,
+                sink=ctx.sink,
+                account_ref=ctx.env.get("AWS_ACCOUNT_ID", ""),
+            )
+            sink_config = {**emit_debezium_iceberg_sink_config(resolved), **handwritten}
+
+    # Render the line-based .properties file. Every contract-derived key/value
+    # routes through _properties_line, which fail-closes on control characters so
+    # a newline in a binding value cannot inject extra Debezium directives.
+    try:
+        lines = [_properties_line(f"debezium.source.{k}", v) for k, v in source_config.items()]
+        lines.append("quarkus.log.console.json=false")
+        lines.append(_properties_line("debezium.sink.type", sink_type))
+        for k, v in sink_config.items():
+            lines.append(_properties_line(f"debezium.sink.{sink_type}.{k}", v))
+    except ValueError as exc:
+        return _failed(ctx, started_at, t_start, str(exc))
     config_path.write_text("\n".join(lines), encoding="utf-8")
+    # The file holds the source DB password and any operator-forwarded sink
+    # credentials (s3.secret-access-key / jdbc.password); it inherits the umask
+    # (0o644) otherwise. Force 0o600, mirroring dbt/profiles.py.
+    try:
+        os.chmod(config_path, 0o600)
+    except OSError:
+        pass
 
     # Validate any contract-supplied ``server_binary`` before it becomes
     # ``argv[0]`` (arbitrary-binary-execution guard). A value with a path
