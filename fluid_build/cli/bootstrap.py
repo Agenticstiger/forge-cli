@@ -452,7 +452,7 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     _try_register(sp, "import_cmd", "import")
 
     # 🎯 Industry Skills
-    _try_register(sp, "skills", "skills_cmd")
+    _try_register(sp, "skills_cmd", "skills")
 
     # validate (enhanced → fallback)
     if is_command_enabled("validate"):
