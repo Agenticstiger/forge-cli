@@ -293,3 +293,28 @@ def test_control_char_value_is_rejected_no_injection(tmp_path: Path):
     assert rc != 0
     path = tmp_path / ".fluid" / "debezium" / contract["id"] / "ingest" / "application.properties"
     assert not path.exists() or "debezium.evil=pwned" not in path.read_text()
+
+
+def test_properties_value_escapes_backslash():
+    # Java Properties.load treats `\` as an escape introducer, so a literal
+    # backslash in a value MUST be doubled or it is silently corrupted on read.
+    from fluid_build.build_runners.debezium.runner import (
+        _escape_properties_value,
+        _properties_line,
+    )
+
+    assert _escape_properties_value("C:\\data") == "C:\\\\data"
+    assert _properties_line("k", "a\\b") == "k=a\\\\b"
+    assert _escape_properties_value(" leading") == "\\ leading"  # leading ws escaped
+    assert _escape_properties_value("s3://lake/wh") == "s3://lake/wh"  # ordinary value untouched
+
+
+def test_properties_key_escapes_separators():
+    from fluid_build.build_runners.debezium.runner import _escape_properties_key
+
+    assert _escape_properties_key("a=b") == "a\\=b"
+    assert _escape_properties_key("a:b") == "a\\:b"
+    # an ordinary dotted Debezium key is unchanged
+    assert _escape_properties_key("debezium.sink.iceberg.warehouse") == (
+        "debezium.sink.iceberg.warehouse"
+    )
