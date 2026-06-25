@@ -637,6 +637,24 @@ def _validate_contract_for_version(
             if args.verbose:
                 info(logger, f"Iceberg sink check skipped: {exc}")
 
+        # --- Confluent Tableflow binding checks (RFC-streaming-extension §15) --
+        # A confluent-bound Iceberg expose carries hard Tableflow inputs
+        # (environment_id / kafka_cluster_id / bucket / role ARN) that have no
+        # other home — surface a clean error at validate time (anti-no-op gate)
+        # instead of emitting an incomplete module that fails at apply.
+        try:
+            from fluid_build.iac.providers.confluent import validate_confluent_binding
+
+            cf_errors, cf_warnings = validate_confluent_binding(contract)
+            for msg in cf_errors:
+                validation_result.add_error(msg)
+                validation_result.is_valid = False
+            for msg in cf_warnings:
+                validation_result.add_warning(msg)
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"Confluent binding check skipped: {exc}")
+
         try:
             from pathlib import Path as _Path
 
