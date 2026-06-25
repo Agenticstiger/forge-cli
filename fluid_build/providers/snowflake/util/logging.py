@@ -61,7 +61,9 @@ SENSITIVE_PATTERNS = [
     # prefixed (e.g. ``iceberg.kafka.sasl.jaas.config``), so match the suffix.
     # Escaped-quote-safe value class so an inner ``\"`` doesn't end the match and
     # leak the tail. Symmetric with the global filter's ``jaas`` handling (§6.8).
-    re.compile(r'"[^"]*sasl\.jaas\.config":\s*"(?:[^"\\]|\\.)*"', re.IGNORECASE),
+    # Both prefix and value are length-bounded ({,64}/{,2048}, matching the
+    # global twin) so an adversarial line cannot backtrack super-linearly.
+    re.compile(r'"[^"]{,64}sasl\.jaas\.config":\s*"(?:[^"\\]|\\.){,2048}"', re.IGNORECASE),
     # API keys (new in S-010)
     re.compile(r'"api[_-]?key":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"client_secret":\s*"[^"]*"', re.IGNORECASE),

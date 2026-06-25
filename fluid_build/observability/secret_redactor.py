@@ -114,8 +114,12 @@ _ASSIGNMENT_RE = re.compile(
 # value on the TEXT path too — e.g. a serialized config / Kafka Connect failure
 # trace — so the two paths stay symmetric (RFC-streaming-extension §6.8).
 # Escaped-quote-safe value class (``\"`` doesn't end the match) + length-bounded.
+# The dotted key prefix is upper-bounded ({,64}) like every other quantifier in
+# this module: an UNbounded ``[\w.]*`` backtracks O(n^2) on an adversarial line
+# (a long word-run that never reaches ``sasl.jaas.config``), which trips the
+# anti-ReDoS bound test; a real prefix (``iceberg.kafka.``) is short.
 _JAAS_CONFIG_RE = re.compile(
-    r'(?i)([\w.]*sasl\.jaas\.config"?\s{,8}[:=]\s{,8}")((?:[^"\\]|\\.){,2048})(")'
+    r'(?i)([\w.]{,64}sasl\.jaas\.config"?\s{,8}[:=]\s{,8}")((?:[^"\\]|\\.){,2048})(")'
 )
 # Matches a single printf-style placeholder. We use this to walk a log message
 # left-to-right so we can map placeholder *positions* to positional args.
