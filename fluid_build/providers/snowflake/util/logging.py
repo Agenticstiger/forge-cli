@@ -25,6 +25,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
+from fluid_build.observability.secret_redactor import is_sensitive_key_name
+
 # Patterns for sensitive data that should be redacted
 #
 # SECURITY_REVIEW S-010: extended to cover common token shapes that were
@@ -89,8 +91,8 @@ SENSITIVE_PATTERNS = [
         #     Including it HERE would run before the PEM-block pattern and
         #     corrupt a ``private_key=<multiline PEM>`` header, leaking the body.
         r"(?i)\b(?P<key>(?:[A-Za-z0-9_]{,128}_)?(?:"
-        r"api[_-]?key|authorization|client_secret|"
-        r"oauth[_-]?token|password|secret|token|passphrase"
+        r"api[_-]?key|authorization|secret[_-]access[_-]key|client_secret|"
+        r"oauth[_-]?token|password|session[_-]token|secret|token|passphrase"
         r"))"
         r"(?P<sep>\s{,8}[:=]\s{,8})"
         r"(?P<value>[^\s;&,]{,256})"
@@ -182,6 +184,19 @@ SENSITIVE_KEYS = {
 }
 
 
+def _is_sensitive_dict_key(key: object) -> bool:
+    """True when ``key`` names a credential-bearing field: an exact match against
+    this layer's SENSITIVE_KEYS OR the global single-source-of-truth substring
+    predicate ``is_sensitive_key_name``. Delegating to the canonical predicate
+    keeps the dict-key path symmetric with the global redactor — the two can't
+    drift — and masks dotted / hyphenated keys that arrive with an arbitrary
+    prefix (e.g. ``s3.secret-access-key``, ``jdbc.password``, ``gcs.oauth2.token``
+    forwarded through an Iceberg sink config) without enumerating every prefix."""
+    if not isinstance(key, str):
+        return False
+    return key.lower() in SENSITIVE_KEYS or is_sensitive_key_name(key)
+
+
 def format_event(event: str, **kwargs: Any) -> str:
     """Format log event with key-value pairs."""
     parts = [f"event={event}"]
@@ -249,7 +264,7 @@ def redact_dict(data: Dict[str, Any], max_depth: int = 10) -> Dict[str, Any]:
 
     for key, value in data.items():
         # Check if key indicates sensitive data
-        if isinstance(key, str) and key.lower() in SENSITIVE_KEYS:
+        if _is_sensitive_dict_key(key):
             redacted[key] = "[REDACTED]"
         elif isinstance(value, dict):
             redacted[key] = redact_dict(value, max_depth - 1)

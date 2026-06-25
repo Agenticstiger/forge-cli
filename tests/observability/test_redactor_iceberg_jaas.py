@@ -111,3 +111,93 @@ def test_snowflake_escaped_quote_jaas_value_masked():
         'user=\\"svc\\" rawCredentialBlob=\\"RAW-LEAK-9999\\";"}'
     )
     assert "RAW-LEAK-9999" not in redact_string(line)
+
+
+# ── PR8 follow-up: dotted/hyphenated Iceberg credential keys (s3.secret-access-
+#    key / session-token / gcs.oauth2.token / jdbc.password) — both layers, both
+#    paths. `secret` is followed by `-access-key=`, so the bare-`secret`
+#    assignment branch never reaches the separator without explicit coverage. The
+#    value below matches NO provider-key shape, so it isolates the assignment
+#    regex (an AKIA-prefixed value would be masked incidentally). ────────────────
+
+_SAK = "s3kr3t-val-DEADBEEF"
+
+
+def test_global_text_masks_dotted_secret_access_key():
+    for line in (
+        f"iceberg.catalog.s3.secret-access-key={_SAK}",
+        f"client.secret-access-key={_SAK}",
+        f"debezium.sink.iceberg.s3.secret-access-key={_SAK}",
+    ):
+        assert _SAK not in redact_secret_text(line), line
+
+
+def test_global_text_masks_session_token():
+    assert "SESSION-TOK-1" not in redact_secret_text("s3.session-token=SESSION-TOK-1")
+
+
+def test_global_dict_masks_dotted_credential_keys():
+    out = redact_value(
+        {
+            "s3.secret-access-key": _SAK,
+            "s3.session-token": "tok",
+            "gcs.oauth2.token": "gtok",
+            "jdbc.password": "pw",
+            "warehouse": "s3://lake/db/t/",  # non-secret must survive
+        }
+    )
+    assert out["s3.secret-access-key"] == _REDACTED
+    assert out["s3.session-token"] == _REDACTED
+    assert out["gcs.oauth2.token"] == _REDACTED
+    assert out["jdbc.password"] == _REDACTED
+    assert out["warehouse"] == "s3://lake/db/t/"
+
+
+def test_snowflake_text_masks_dotted_secret_access_key():
+    assert _SAK not in redact_string(f"iceberg.s3.secret-access-key={_SAK}")
+
+
+def test_snowflake_dict_masks_dotted_credential_keys():
+    out = redact_dict(
+        {
+            "s3.secret-access-key": _SAK,
+            "s3.session-token": "tok",
+            "gcs.oauth2.token": "gtok",
+            "jdbc.password": "pw",
+            "warehouse": "s3://lake/db/t/",
+        }
+    )
+    assert out["s3.secret-access-key"] == "[REDACTED]"
+    assert out["s3.session-token"] == "[REDACTED]"
+    assert out["gcs.oauth2.token"] == "[REDACTED]"
+    assert out["jdbc.password"] == "[REDACTED]"
+    assert out["warehouse"] == "s3://lake/db/t/"
+
+
+def test_both_layers_mask_dotted_secret_access_key():
+    # the headline symmetry assertion from the follow-up task
+    key = "debezium.sink.iceberg.s3.secret-access-key"
+    assert _SAK not in str(redact_value({key: _SAK}))  # global dict
+    assert _SAK not in redact_secret_text(f"{key}={_SAK}")  # global text
+    assert _SAK not in str(redact_dict({key: _SAK}))  # snowflake dict
+    assert _SAK not in redact_string(f"{key}={_SAK}")  # snowflake text
+
+
+def test_gcp_and_local_dict_mask_dotted_credential_keys():
+    # the GCP + local provider-local redactors delegate the dict-key substring
+    # decision to the same SSOT predicate, so they mask the dotted keys too.
+    from fluid_build.providers.gcp.util.logging import redact_dict as gcp_redact_dict
+    from fluid_build.providers.local.util.logging import redact_dict as local_redact_dict
+
+    probe = {
+        "s3.secret-access-key": _SAK,
+        "jdbc.password": "pw",
+        "gcs.oauth2.token": "gtok",
+        "warehouse": "s3://lake/db/t/",  # non-secret must survive
+    }
+    for fn in (gcp_redact_dict, local_redact_dict):
+        out = fn(probe)
+        assert out["s3.secret-access-key"] == "[REDACTED]"
+        assert out["jdbc.password"] == "[REDACTED]"
+        assert out["gcs.oauth2.token"] == "[REDACTED]"
+        assert out["warehouse"] == "s3://lake/db/t/"
