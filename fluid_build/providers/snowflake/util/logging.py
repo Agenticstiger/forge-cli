@@ -57,6 +57,13 @@ SENSITIVE_PATTERNS = [
     re.compile(r'"secret":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"token":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"credentials":\s*"[^"]*"', re.IGNORECASE),
+    # SASL JAAS config — value embeds the login password/token. The key can be
+    # prefixed (e.g. ``iceberg.kafka.sasl.jaas.config``), so match the suffix.
+    # Escaped-quote-safe value class so an inner ``\"`` doesn't end the match and
+    # leak the tail. Symmetric with the global filter's ``jaas`` handling (§6.8).
+    # Both prefix and value are length-bounded ({,64}/{,2048}, matching the
+    # global twin) so an adversarial line cannot backtrack super-linearly.
+    re.compile(r'"[^"]{,64}sasl\.jaas\.config":\s*"(?:[^"\\]|\\.){,2048}"', re.IGNORECASE),
     # API keys (new in S-010)
     re.compile(r'"api[_-]?key":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"client_secret":\s*"[^"]*"', re.IGNORECASE),
@@ -150,6 +157,7 @@ SENSITIVE_KEYS = {
     "token",
     "credentials",
     "credential",
+    "sasl.jaas.config",
     "auth",
     "authorization",
     "api_key",
