@@ -92,14 +92,12 @@ def resolve_sink_connector(format_or_platform: str, override: Optional[str] = No
 def _find_iceberg_expose_binding(contract: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """The expose ``binding`` carrying the Iceberg-table identity for a sink.
 
-    PR2 uses a simple format=iceberg lookup; the validated build->expose join
-    (build.outputs/exposeId) lands with the plan-time validator (RFC §6.8 #5).
+    Delegates to the shared resolver helper so the Kafka-Connect and
+    Debezium-Server runners pick the SAME table (RFC zero-drift spine).
     """
-    for exposure in contract.get("exposes") or []:
-        binding = exposure.get("binding") or {}
-        if str(binding.get("format") or "").lower() == "iceberg":
-            return binding
-    return None
+    from ...providers._iceberg_catalog import find_iceberg_expose_binding
+
+    return find_iceberg_expose_binding(contract)
 
 
 # ── REST client ────────────────────────────────────────────────────────
