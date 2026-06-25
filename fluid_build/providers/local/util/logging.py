@@ -23,6 +23,8 @@ consistent event formatting. Adapted from GCP provider.
 import re
 from typing import Any, Dict, List
 
+from fluid_build.observability.secret_redactor import is_sensitive_key_name
+
 # Patterns for sensitive data that should be redacted
 SENSITIVE_PATTERNS = [
     # Service account keys and credentials
@@ -111,8 +113,11 @@ def redact_dict(data: Dict[str, Any], max_depth: int = 10) -> Dict[str, Any]:
     redacted = {}
 
     for key, value in data.items():
-        # Check if key indicates sensitive data
-        if isinstance(key, str) and key.lower() in SENSITIVE_KEYS:
+        # Check if key indicates sensitive data. Delegate the substring decision
+        # to the global single-source-of-truth predicate so dotted/hyphenated
+        # credential keys (e.g. s3.secret-access-key) are masked symmetrically
+        # with every other redaction layer.
+        if isinstance(key, str) and (key.lower() in SENSITIVE_KEYS or is_sensitive_key_name(key)):
             redacted[key] = "[REDACTED]"
         elif isinstance(value, dict):
             redacted[key] = redact_dict(value, max_depth - 1)
