@@ -303,6 +303,12 @@ def run(args, logger: logging.Logger) -> int:
         # had been emitted by the core schema validator.
         _run_extension_validators(contract, validation_result, logger)
 
+        # Run plugin-supplied contract validators (entry-point group
+        # ``fluid_build.validators`` — the fluid_sdk ``Validator`` role). Each
+        # plugin inspects the whole contract and emits findings; error/critical
+        # findings fail validation, warnings surface as warnings.
+        _run_role_validators(contract, validation_result, logger)
+
         # Log metrics
         duration = time.time() - start_time
         log_metric(logger, "validation_duration", duration, unit="seconds")
@@ -827,6 +833,49 @@ def _run_extension_validators(
 
     for err in run_extension_validators(contract, logger):
         validation_result.add_error(err)
+
+
+def _run_role_validators(
+    contract: Dict[str, Any],
+    validation_result: ValidationResult,
+    logger: logging.Logger,
+) -> None:
+    """Invoke plugin-registered ``Validator``-role plugins over the contract.
+
+    External packages register a contract validator via::
+
+        [project.entry-points."fluid_build.validators"]
+        my-rule = "my_pkg.rules:MyValidator"
+
+    where ``MyValidator`` is a :class:`fluid_sdk.Validator`. Its findings are
+    folded into the ``ValidationResult`` so output formatting, exit code, and
+    strict mode treat them like core errors/warnings:
+
+    * ``error`` / ``critical`` findings → :meth:`ValidationResult.add_error`
+      (fail the validation);
+    * ``warn`` findings → :meth:`ValidationResult.add_warning`;
+    * ``info`` findings → debug log only.
+
+    Discovery, the allow/block policy, and per-plugin fail-isolation (a buggy
+    validator yields one typed error, never a crash) live in the unified
+    :mod:`fluid_build.plugin_manager`.
+    """
+    from fluid_build.plugin_manager import collect_validator_findings
+
+    for f in collect_validator_findings(contract, logger):
+        plugin = f.get("plugin", "?")
+        code = f.get("code") or ""
+        path = f.get("path")
+        msg = f"[{plugin}] {code}: {f.get('message', '')}".rstrip()
+        if path:
+            msg += f" (at {path})"
+        severity = f.get("severity", "info")
+        if severity in ("error", "critical"):
+            validation_result.add_error(msg)
+        elif severity == "warn":
+            validation_result.add_warning(msg)
+        else:
+            logger.debug("validator info finding: %s", msg)
 
 
 def _output_results(result: ValidationResult, args, logger: logging.Logger) -> int:
