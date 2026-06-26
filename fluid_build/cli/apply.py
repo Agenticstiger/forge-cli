@@ -142,11 +142,19 @@ def _run_apply_hooks(
         except TypeError:
             eps = _md.entry_points().get("fluid_build.apply_hooks", [])
     except Exception as e:
-        logger.warning("apply hook discovery failed: %s", redact_secret_text(str(e)))
+        logger.warning("apply hook discovery failed: %s", type(e).__name__)
         return 0
+
+    from fluid_build.plugin_manager import is_allowed
 
     errors: List[str] = []
     for ep in eps:
+        # Operator allow/block gate — an apply_hook runs plugin code, so the same
+        # FLUID_PLUGINS_ALLOWLIST/BLOCKLIST policy that governs every other plugin
+        # surface governs it too. Enforced BEFORE ep.load().
+        if not is_allowed(ep.name):
+            logger.debug("apply hook %s skipped by allow/block policy", ep.name)
+            continue
         # Defense-in-depth: each hook gets its own deep copy. A hook can
         # observe the contract freely but cannot poison the data structure
         # the rest of apply or other hooks rely on.

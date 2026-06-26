@@ -55,6 +55,31 @@ ROLE_GROUPS: Dict[str, str] = {
     "iac_provider": "fluid_build.iac_providers",
 }
 
+# CLI-internal entry-point groups that also load + run plugin code. They are not
+# fluid_sdk *roles*, but they ARE operator-governable plugin surfaces, so they are
+# subject to the SAME allow/block policy and surfaced by ``fluid plugins``. Every
+# entry-point group whose plugins the CLI executes belongs in exactly one of
+# ROLE_GROUPS / EXTRA_GROUPS so the allow/block + type-only guarantees are total.
+EXTRA_GROUPS: Dict[str, str] = {
+    "command": "fluid_build.commands",
+    "apply_hook": "fluid_build.apply_hooks",
+    "extension_schema": "fluid_build.extension_schemas",
+    "extension_validator": "fluid_build.extension_validators",
+    "modeling_technique": "fluid_build.modeling_techniques",
+    "source_adapter": "fluid_build.source_adapters",
+}
+
+
+def governed_groups() -> Dict[str, str]:
+    """Return every entry-point group the operator allow/block policy governs.
+
+    ``ROLE_GROUPS`` (the fluid_sdk roles) plus ``EXTRA_GROUPS`` (CLI-internal
+    plugin surfaces). Anything here is gated by :func:`is_allowed` at its walk
+    site and listed by ``fluid plugins``.
+    """
+    return {**ROLE_GROUPS, **EXTRA_GROUPS}
+
+
 _ALLOWLIST_ENV = "FLUID_PLUGINS_ALLOWLIST"
 _BLOCKLIST_ENV = "FLUID_PLUGINS_BLOCKLIST"
 
@@ -119,20 +144,22 @@ def list_plugins(role: Optional[str] = None) -> Dict[str, List[str]]:
 
 
 def installed_plugins(role: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
-    """Return ``{role: [{name, group, allowed}]}`` for ALL installed plugins.
+    """Return ``{group_key: [{name, group, allowed}]}`` for ALL installed plugins.
 
     Unlike :func:`list_plugins` (which filters to the allowed set), this surfaces
-    EVERY installed plugin per role with its allow/block status, for the operator
-    inspection command (``fluid plugins``). Reads entry-point *names* only — it
-    never imports plugin code.
+    EVERY installed plugin in EVERY governed group — the fluid_sdk roles AND the
+    CLI-internal groups (commands / apply_hooks / extension_*) — with its
+    allow/block status, for the operator inspection command (``fluid plugins``).
+    Reads entry-point *names* only — it never imports plugin code.
     """
-    roles = [role] if role else list(ROLE_GROUPS)
+    groups = governed_groups()
+    keys = [role] if role else list(groups)
     out: Dict[str, List[Dict[str, Any]]] = {}
-    for r in roles:
-        group = ROLE_GROUPS.get(r)
+    for k in keys:
+        group = groups.get(k)
         if not group:
             continue
-        out[r] = [
+        out[k] = [
             {"name": ep.name, "group": group, "allowed": is_allowed(ep.name)}
             for ep in sorted(_entry_points(group), key=lambda e: e.name)
         ]
@@ -270,6 +297,8 @@ def dispatch_catalog_adapters(
 
 __all__ = [
     "ROLE_GROUPS",
+    "EXTRA_GROUPS",
+    "governed_groups",
     "is_allowed",
     "iter_plugins",
     "list_plugins",

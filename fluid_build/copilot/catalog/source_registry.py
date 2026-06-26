@@ -129,7 +129,7 @@ def _discover_entrypoints(logger: Optional[logging.Logger]) -> None:
         else:  # Python < 3.10
             eps = all_eps.get(EP_GROUP, [])
     except Exception as exc:  # noqa: BLE001 — discovery itself failed; fail open
-        log.warning("source adapter discovery failed: %s", exc)
+        log.warning("source adapter discovery failed: %s", type(exc).__name__)
         return
 
     for ep in eps:
@@ -231,5 +231,13 @@ def resolve_catalog_adapter_class(name: str) -> Any:
         module_path, class_name = target.split(":", 1)
         module = __import__(module_path, fromlist=[class_name])
         return getattr(module, class_name)
-    # plugin EntryPoint — load lazily
+    # Third-party plugin EntryPoint — gate by the operator allow/block policy
+    # BEFORE the lazy load, so a blocked source adapter's code never executes.
+    from fluid_build.plugin_manager import is_allowed
+
+    if not is_allowed(key):
+        raise RuntimeError(
+            f"Source adapter {name!r} is blocked by the operator allow/block policy "
+            f"(FLUID_PLUGINS_ALLOWLIST / FLUID_PLUGINS_BLOCKLIST)."
+        )
     return target.load()

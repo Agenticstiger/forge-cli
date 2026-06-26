@@ -42,10 +42,11 @@ def test_installed_plugins_reports_allow_block_status(monkeypatch):
     assert by_name["good"]["group"] == "fluid_build.validators"
 
 
-def test_installed_plugins_covers_all_roles(monkeypatch):
+def test_installed_plugins_covers_all_governed_groups(monkeypatch):
     monkeypatch.setattr(PM, "_entry_points", lambda group: [])
     data = PM.installed_plugins()
-    assert set(data) == set(PM.ROLE_GROUPS)
+    # Now covers the SDK roles AND the CLI-internal governed groups.
+    assert set(data) == set(PM.governed_groups())
 
 
 # ── the `fluid plugins` command is wired into the CLI ─────────────────

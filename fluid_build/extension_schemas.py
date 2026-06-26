@@ -72,8 +72,13 @@ def iter_extension_schemas(
         log.warning("Extension schema discovery failed: %s", redact_secret_text(str(e)))
         return {}
 
+    from fluid_build.plugin_manager import is_allowed
+
     schemas: Dict[str, Dict[str, Any]] = {}
     for ep in eps:
+        if not is_allowed(ep.name):
+            log.debug("extension schema provider %r skipped by allow/block policy", ep.name)
+            continue
         try:
             provider = ep.load()
             try:
@@ -127,7 +132,12 @@ def run_extension_validators(
         return []
 
     errors: List[str] = []
+    from fluid_build.plugin_manager import is_allowed
+
     for ep in eps:
+        if not is_allowed(ep.name):
+            log.debug("extension validator %r skipped by allow/block policy", ep.name)
+            continue
         plugin_errors: List[str] = []
         try:
             validator = ep.load()
