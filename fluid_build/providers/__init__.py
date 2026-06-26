@@ -116,8 +116,48 @@ def _add_discovery_error(source: str, modname: str, exc: BaseException) -> None:
 
 # ----------------------------- Public API ---------------------------------- #
 
-# CLI version for protocol compatibility checks
-_CLI_VERSION = "0.7.1"
+# CLI version for plugin↔CLI protocol compatibility checks. Sourced from the
+# installed distribution metadata (never a stale hardcoded constant); the
+# fallback is used only when the package isn't installed as a distribution
+# (e.g. running straight from a source tree without `pip install`).
+_CLI_VERSION_FALLBACK = "0.7.1"
+
+
+def _detect_cli_version() -> str:
+    """Resolve the installed ``data-product-forge`` version (PEP 440)."""
+    try:
+        return importlib.metadata.version("data-product-forge")
+    except Exception:
+        return _CLI_VERSION_FALLBACK
+
+
+_CLI_VERSION = _detect_cli_version()
+
+
+def _strict_compat() -> bool:
+    """True when ``FLUID_PLUGIN_STRICT_COMPAT`` opts into hard-failing on a mismatch."""
+    return os.environ.get("FLUID_PLUGIN_STRICT_COMPAT", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _spec_satisfied(cli_version: str, specifier: Optional[str]) -> Optional[bool]:
+    """Whether ``cli_version`` satisfies a PEP 440 ``specifier``; ``None`` if uncheckable.
+
+    Uses ``packaging`` when available (the precise, canonical check) and returns
+    ``None`` (defer to legacy bounds) when it isn't installed or the specifier
+    is malformed — so a missing optional dependency never blocks a plugin.
+    """
+    if not specifier:
+        return None
+    try:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        # prereleases=True: a dev/rc build of the CLI (e.g. "0.9.1.dev3") still
+        # counts as satisfying ">=0.7" — its own pre-release status must not
+        # disqualify it from a plugin's compatibility window.
+        return SpecifierSet(specifier).contains(Version(cli_version), prereleases=True)
+    except Exception:
+        return None
 
 
 def _parse_version(v: str) -> Tuple[int, ...]:
@@ -137,25 +177,57 @@ def _parse_version(v: str) -> Tuple[int, ...]:
     return tuple(parts)
 
 
-def _check_sdk_compat(name: str, provider: Any, logger: Optional[logging.Logger]) -> None:
-    """Warn if a provider's SDK version requirements don't match the running CLI.
+def _check_sdk_compat(name: str, provider: Any, logger: Optional[logging.Logger]) -> bool:
+    """Return True if ``provider`` is compatible with the running CLI (or unknown).
 
-    This is advisory — the provider is still registered.  Providers declare
-    compatibility via ProviderMetadata.sdk_version (or get_provider_info()).
+    Declare-and-gate (the SDK declares, the CLI gates), honouring two styles:
+
+    * **New SDK** (``data-product-forge-sdk`` / import ``fluid_sdk``): a plugin's
+      ``get_plugin_info().requires_cli`` is a PEP 440 specifier; the running CLI
+      version is checked against it (``packaging.SpecifierSet`` when available).
+    * **Legacy**: ``get_provider_info().sdk_version`` plus ``MIN_CLI_VERSION`` /
+      ``MAX_CLI_VERSION`` read off the provider's own SDK module (or ``fluid_sdk``).
+
+    Advisory by default — an incompatible provider still registers and a
+    ``provider_version_warning`` is logged. ``FLUID_PLUGIN_STRICT_COMPAT=1`` makes
+    :func:`register_provider` reject incompatible plugins instead. Never raises;
+    fails open (returns True) on any internal error so the check can't block a
+    plugin because of its own bug.
     """
     try:
+        # ── New-SDK declaration: PluginMetadata.requires_cli (PEP 440) ──
+        info_fn = getattr(provider, "get_plugin_info", None)
+        if callable(info_fn):
+            try:
+                requires = getattr(info_fn(), "requires_cli", None)
+            except Exception:
+                requires = None
+            sat = _spec_satisfied(_CLI_VERSION, requires)
+            if sat is False:
+                _safe_log(
+                    logger,
+                    logging.WARNING,
+                    "provider_version_warning",
+                    name=name,
+                    cli_version=_CLI_VERSION,
+                    requires_cli=requires,
+                    hint=f"Provider '{name}' requires CLI {requires}",
+                )
+                return False
+            if sat is True:
+                return True
+            # sat is None → specifier absent/uncheckable; fall through to legacy.
+
+        # ── Legacy declaration: ProviderMetadata.sdk_version + MIN/MAX ──
         if not hasattr(provider, "get_provider_info"):
-            return
+            return True
         info = provider.get_provider_info()
         if not info:
-            return
+            return True
         sdk_ver = getattr(info, "sdk_version", None)
         if not sdk_ver or sdk_ver == "0.0.0":
-            return  # no declared version — skip
+            return True  # no declared version — nothing to gate
 
-        # Check MIN_CLI_VERSION / MAX_CLI_VERSION from the SDK package the
-        # provider was built with.  We try the provider's own module first,
-        # then fall back to the global SDK.
         provider_mod = getattr(provider, "__module__", "") or ""
         min_v = max_v = None
         try:
@@ -167,40 +239,40 @@ def _check_sdk_compat(name: str, provider: Any, logger: Optional[logging.Logger]
             pass
         if not min_v:
             try:
-                import fluid_provider_sdk as _sdk
+                import fluid_sdk as _sdk  # the live SDK (was the renamed-away fluid_provider_sdk)
 
                 min_v = getattr(_sdk, "MIN_CLI_VERSION", None)
                 max_v = getattr(_sdk, "MAX_CLI_VERSION", None)
             except ImportError:
-                return
+                return True  # SDK not installed alongside the CLI — can't gate
 
         cli_t = _parse_version(_CLI_VERSION)
-        if min_v:
-            min_t = _parse_version(min_v)
-            if cli_t < min_t:
-                _safe_log(
-                    logger,
-                    logging.WARNING,
-                    "provider_version_warning",
-                    name=name,
-                    cli_version=_CLI_VERSION,
-                    min_cli_version=min_v,
-                    hint=f"Provider '{name}' requires CLI >= {min_v}",
-                )
-        if max_v:
-            max_t = _parse_version(max_v)
-            if cli_t > max_t:
-                _safe_log(
-                    logger,
-                    logging.WARNING,
-                    "provider_version_warning",
-                    name=name,
-                    cli_version=_CLI_VERSION,
-                    max_cli_version=max_v,
-                    hint=f"Provider '{name}' requires CLI <= {max_v}",
-                )
+        compatible = True
+        if min_v and cli_t < _parse_version(min_v):
+            compatible = False
+            _safe_log(
+                logger,
+                logging.WARNING,
+                "provider_version_warning",
+                name=name,
+                cli_version=_CLI_VERSION,
+                min_cli_version=min_v,
+                hint=f"Provider '{name}' requires CLI >= {min_v}",
+            )
+        if max_v and cli_t > _parse_version(max_v):
+            compatible = False
+            _safe_log(
+                logger,
+                logging.WARNING,
+                "provider_version_warning",
+                name=name,
+                cli_version=_CLI_VERSION,
+                max_cli_version=max_v,
+                hint=f"Provider '{name}' requires CLI <= {max_v}",
+            )
+        return compatible
     except Exception:
-        pass  # Version check is advisory — never block registration
+        return True  # fail open — the compat check never blocks on its own bug
 
 
 # Track simple meta for debugging: name -> {module, qualname, source}
@@ -241,6 +313,20 @@ def register_provider(
         )
         return
 
+    # Plugin↔CLI compatibility gate (read-only, outside the lock). Advisory by
+    # default; FLUID_PLUGIN_STRICT_COMPAT=1 rejects an incompatible plugin.
+    compatible = _check_sdk_compat(cname, provider, logger)
+    if not compatible and _strict_compat():
+        _safe_log(
+            logger,
+            logging.ERROR,
+            "provider_compat_rejected",
+            name=cname,
+            source=source,
+            cli_version=_CLI_VERSION,
+        )
+        return
+
     with _LOCK:
         exists = cname in PROVIDERS
         if exists and not override:
@@ -262,9 +348,6 @@ def register_provider(
             provider=f"{mod}:{qual}",
             source=source,
         )
-
-    # Check SDK version compatibility (outside lock — read-only, advisory)
-    _check_sdk_compat(cname, provider, logger)
 
 
 def registry_dump() -> Dict[str, Any]:
