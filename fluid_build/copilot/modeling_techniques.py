@@ -147,7 +147,7 @@ def _discover_entrypoints(logger: Optional[logging.Logger]) -> None:
             else all_eps.get(EP_GROUP, [])
         )
     except Exception as exc:  # noqa: BLE001 — fail open
-        log.warning("modeling-technique discovery failed: %s", exc)
+        log.warning("modeling-technique discovery failed: %s", type(exc).__name__)
         return
 
     for ep in eps:
@@ -159,10 +159,16 @@ def _discover_entrypoints(logger: Optional[logging.Logger]) -> None:
                 "modeling-technique plugin %r shadows a built-in; keeping the built-in", name
             )
             continue
+        from fluid_build.plugin_manager import is_allowed
+
+        if not is_allowed(name):
+            log.debug("modeling-technique plugin %r skipped by allow/block policy", name)
+            continue
         try:
             obj = ep.load()
         except Exception as exc:  # noqa: BLE001 — one broken plugin must not break the CLI
-            log.warning("modeling-technique plugin %r failed to load: %s", name, exc)
+            # Type-only — never interpolate plugin-supplied exception text.
+            log.warning("modeling-technique plugin %r failed to load: %s", name, type(exc).__name__)
             continue
         if not isinstance(obj, ModelingTechnique):
             log.warning(

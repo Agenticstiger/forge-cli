@@ -14,8 +14,9 @@
 
 """Every entry-point group the CLI executes is governed by ONE allow/block policy.
 
-Previously four CLI-internal groups (commands / apply_hooks / extension_schemas /
-extension_validators) bypassed the gate and were invisible to `fluid plugins`.
+Previously six CLI-internal groups (commands / apply_hooks / extension_schemas /
+extension_validators / modeling_techniques / source_adapters) bypassed the gate
+and were invisible to `fluid plugins`.
 """
 
 from __future__ import annotations
@@ -96,3 +97,51 @@ def test_extension_validator_blocked_does_not_run(monkeypatch):
     errors = ES.run_extension_validators({"extensions": {"myext": {}}})
     assert ran["called"] is False  # blocked before load
     assert errors == []
+
+
+# ── source_adapters: lazy load gated by allow/block ───────────────────
+
+
+def test_source_adapter_blocked_before_lazy_load(monkeypatch):
+    import pytest
+
+    from fluid_build.copilot.catalog import source_registry as SR
+
+    class _Target:
+        def load(self):
+            raise AssertionError("must not load a blocked source adapter")
+
+    monkeypatch.setattr(SR, "_ensure_discovered", lambda: None)
+    monkeypatch.setitem(
+        SR._REGISTRY,
+        "mysrc",
+        SR.SourceAdapterSpec(name="mysrc", kind="catalog", target=_Target(), origin="plugin"),
+    )
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "mysrc")
+    monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
+    with pytest.raises(RuntimeError, match="blocked by the operator allow/block"):
+        SR.resolve_catalog_adapter_class("mysrc")
+
+
+# ── modeling_techniques: entry-point load gated by allow/block ────────
+
+
+def test_modeling_technique_blocked_before_load(monkeypatch):
+    import importlib.metadata as _md
+
+    from fluid_build.copilot import modeling_techniques as MT
+
+    loaded = {"called": False}
+
+    def _loader():
+        loaded["called"] = True
+        return MT.ModelingTechnique(name="mytech", description="x", origin="plugin")
+
+    monkeypatch.setattr(
+        _md, "entry_points", lambda **kw: {MT.EP_GROUP: [_FakeEP("mytech", _loader)]}
+    )
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "mytech")
+    monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
+    MT._discover_entrypoints(None)
+    assert "mytech" not in MT._REGISTRY  # blocked → not registered
+    assert loaded["called"] is False  # and never loaded

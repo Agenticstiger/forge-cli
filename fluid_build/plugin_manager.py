@@ -65,6 +65,8 @@ EXTRA_GROUPS: Dict[str, str] = {
     "apply_hook": "fluid_build.apply_hooks",
     "extension_schema": "fluid_build.extension_schemas",
     "extension_validator": "fluid_build.extension_validators",
+    "modeling_technique": "fluid_build.modeling_techniques",
+    "source_adapter": "fluid_build.source_adapters",
 }
 
 
