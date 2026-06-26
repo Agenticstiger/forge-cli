@@ -196,10 +196,63 @@ def collect_validator_findings(
     return findings
 
 
+def has_plugins(group: str) -> bool:
+    """True if any allowed plugin is registered under ``group`` (no load).
+
+    Cheap pre-check that reads entry-point *names* only — it never imports plugin
+    code — so a caller can short-circuit work when nothing is installed.
+    """
+    return any(is_allowed(ep.name) for ep in _entry_points(group))
+
+
+def dispatch_catalog_adapters(
+    contract: Dict[str, Any],
+    *,
+    dry_run: bool = False,
+    logger: Optional[logging.Logger] = None,
+) -> List[Dict[str, Any]]:
+    """Run every installed ``fluid_build.catalog_adapters`` plugin against ``contract``.
+
+    Each plugin is a :class:`fluid_sdk.CatalogAdapter` (role ``"catalog"``): we
+    instantiate it, call ``plan(contract)``, and — unless ``dry_run`` — call
+    ``apply(actions)`` to sync to the catalog. Returns one summary per plugin
+    ``{plugin, planned, applied, failed, ok, error?}``. A plugin that raises is
+    fail-isolated (typed, no exception text leaked) and reported with ``ok=False``.
+    Returns ``[]`` when nothing is installed — the backward-compatible no-op path.
+    """
+    log = logger or logging.getLogger(__name__)
+    summaries: List[Dict[str, Any]] = []
+    for name, obj in iter_plugins(ROLE_GROUPS["catalog"], logger=log):
+        summary: Dict[str, Any] = {
+            "plugin": name,
+            "planned": 0,
+            "applied": 0,
+            "failed": 0,
+            "ok": True,
+        }
+        try:
+            plugin = obj() if isinstance(obj, type) else obj
+            actions = list(plugin.plan(contract) or [])
+            summary["planned"] = len(actions)
+            if not dry_run:
+                result = plugin.apply(actions)
+                summary["applied"] = int(getattr(result, "applied", 0) or 0)
+                summary["failed"] = int(getattr(result, "failed", 0) or 0)
+                summary["ok"] = summary["failed"] == 0
+        except Exception as e:  # noqa: BLE001 - catalog adapter bug, surface typed
+            summary["ok"] = False
+            summary["error"] = type(e).__name__
+            log.warning("catalog adapter %r failed: %s", name, type(e).__name__)
+        summaries.append(summary)
+    return summaries
+
+
 __all__ = [
     "ROLE_GROUPS",
     "is_allowed",
     "iter_plugins",
     "list_plugins",
+    "has_plugins",
     "collect_validator_findings",
+    "dispatch_catalog_adapters",
 ]
