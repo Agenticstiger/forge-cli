@@ -18,8 +18,14 @@ from .importer import ImportBlock
 class IacProviderPlugin(Protocol):
     """One plugin per cloud — the unit of modularity.
 
-    A new cloud plugs in by adding a plugin module under ``iac/providers/``
-    and calling ``register_iac_plugin`` — no edits to the framework core.
+    Two ways to plug in a cloud, both with **no edits to the framework core**:
+
+    * In-tree: add a module under ``iac/providers/`` and ``register_iac_plugin``
+      it in ``iac/__init__.py``.
+    * Out-of-tree (pip-installed): ship an entry-point under
+      ``fluid_build.iac_providers``; ``registry.discover_iac_entrypoints`` (run
+      on import, via the unified plugin manager) registers it automatically.
+
     This mirrors dbt's per-platform adapter pattern (``dbt-bigquery``,
     ``dbt-snowflake``), which scales that way to 40+ adapters.
     """
