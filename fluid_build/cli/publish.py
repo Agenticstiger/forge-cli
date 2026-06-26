@@ -452,6 +452,42 @@ def format_results(
             return "\n".join(output)
 
 
+def _run_catalog_adapters(contract_paths, args, logger: logging.Logger) -> None:
+    """Dispatch installed ``fluid_build.catalog_adapters`` plugins per contract.
+
+    Additive to the configured-catalog publish above: an external
+    :class:`fluid_sdk.CatalogAdapter` plugin (role ``"catalog"``) syncs the
+    contract's metadata to its own catalog. A no-op (zero overhead, no plugin
+    code loaded) when none is installed. ``--dry-run`` plans without applying.
+    Discovery, the allow/block policy, and per-plugin fail-isolation live in the
+    unified :mod:`fluid_build.plugin_manager`.
+    """
+    from fluid_build.plugin_manager import ROLE_GROUPS, dispatch_catalog_adapters, has_plugins
+
+    if not has_plugins(ROLE_GROUPS["catalog"]):
+        return  # backward-compatible no-op: nothing installed
+
+    from fluid_build.loader import load_contract
+
+    dry_run = getattr(args, "dry_run", False)
+    for cp in contract_paths:
+        try:
+            contract = load_contract(str(cp))
+        except Exception as e:  # noqa: BLE001 - skip an unreadable contract, typed
+            logger.warning("catalog-adapter step: could not load %s: %s", cp, type(e).__name__)
+            continue
+        for s in dispatch_catalog_adapters(contract, dry_run=dry_run, logger=logger):
+            verb = "would sync" if dry_run else "synced"
+            status = "" if s.get("ok", True) else f" (FAILED: {s.get('error', 'error')})"
+            logger.info(
+                "🗂️  catalog adapter %s: %s %d action(s)%s",
+                s.get("plugin", "?"),
+                verb,
+                s.get("planned", 0),
+                status,
+            )
+
+
 async def run_async(args, logger: logging.Logger) -> int:
     """Async main execution logic"""
     # Hydrate os.environ from project dotenv files and FLUID_SECRETS_FILE before
@@ -582,6 +618,10 @@ async def run_async(args, logger: logging.Logger) -> int:
                 endpoint_override=endpoint_override,
             )
             results.append(result)
+
+    # Additionally run any installed fluid_sdk CatalogAdapter plugins
+    # (entry-point group ``fluid_build.catalog_adapters``) against each contract.
+    _run_catalog_adapters(contract_paths, args, logger)
 
     # Display results
     output = format_results(results, args.format, console)
