@@ -30,10 +30,25 @@ from fluid_build import providers as P
 
 
 @pytest.fixture(autouse=True)
-def _clean_registry():
-    P.clear_providers()
-    yield
-    P.clear_providers()
+def _isolate_registry():
+    """Snapshot & restore the global registry — never leave it cleared.
+
+    Unlike a ``clear_providers()`` fixture, this restores whatever was registered
+    before the test, so these tests can't widen an empty-registry window for an
+    order-dependent test elsewhere in the (randomly-ordered) suite. Our throwaway
+    provider names ("acme*") don't collide with built-ins, so no pre-clear needed.
+    """
+    saved = dict(P.PROVIDERS)
+    saved_meta = dict(P._REGISTRY_META)
+    saved_done = P._DISCOVERY_DONE
+    try:
+        yield
+    finally:
+        P.PROVIDERS.clear()
+        P.PROVIDERS.update(saved)
+        P._REGISTRY_META.clear()
+        P._REGISTRY_META.update(saved_meta)
+        P._DISCOVERY_DONE = saved_done
 
 
 class _Info:
@@ -84,7 +99,10 @@ def test_spec_satisfied_helper():
 
 
 def test_compatible_plugin_registers():
-    P.register_provider("acmeok", _new_sdk_provider(">=0.1.0"), source="test")
+    # ">=0.0.0" is satisfiable by ANY CLI version (incl. the 0.0.0 / dev fallback a
+    # shallow CI checkout produces from setuptools-scm) — the test must not assume
+    # a particular version magnitude, only that a satisfiable spec registers.
+    P.register_provider("acmeok", _new_sdk_provider(">=0.0.0"), source="test")
     assert "acmeok" in P.list_providers()
 
 
@@ -108,7 +126,8 @@ def test_strict_mode_keeps_compatible():
 
     os.environ["FLUID_PLUGIN_STRICT_COMPAT"] = "1"
     try:
-        P.register_provider("acmestrictok", _new_sdk_provider(">=0.1.0"), source="test")
+        # ">=0.0.0" — satisfiable by any CLI version (see test_compatible_plugin_registers).
+        P.register_provider("acmestrictok", _new_sdk_provider(">=0.0.0"), source="test")
         assert "acmestrictok" in P.list_providers()
     finally:
         os.environ.pop("FLUID_PLUGIN_STRICT_COMPAT", None)
