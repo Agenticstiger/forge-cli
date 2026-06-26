@@ -49,7 +49,6 @@ import pkgutil
 import re
 import sys
 import threading
-import traceback
 import warnings
 from dataclasses import dataclass
 from inspect import isclass
@@ -102,14 +101,16 @@ def _normalize_name(name: str) -> str:
 
 
 def _add_discovery_error(source: str, modname: str, exc: BaseException) -> None:
+    # DISCOVERY_ERRORS is surfaced to users via registry_dump() / `fluid providers
+    # --debug`, so it must NOT carry raw exception text or a full traceback — either
+    # can embed a secret (a credential in a message, a value off the stack). Record
+    # the exception TYPE only; the full, redaction-filtered detail still reaches the
+    # DEBUG logs at each call site.
     DISCOVERY_ERRORS.append(
         {
             "source": source,
             "modname": modname,
-            "error": f"{exc.__class__.__name__}: {exc}",
-            "traceback": "".join(
-                traceback.format_exception(type(exc), exc, exc.__traceback__)
-            ).strip(),
+            "error": exc.__class__.__name__,
         }
     )
 
@@ -481,7 +482,23 @@ def _discover_entrypoints(logger: Optional[logging.Logger]) -> None:
         _safe_log(logger, logging.DEBUG, "entrypoint_discovery_unavailable", error=str(exc))
         return
 
+    # Gate provider entry-points through the unified operator allow/block policy
+    # (FLUID_PLUGINS_ALLOWLIST / FLUID_PLUGINS_BLOCKLIST), so the SAME control that
+    # governs validators / catalog / iac plugins also governs providers — the
+    # highest-stakes role (it emits cloud DDL / IaC). Imported lazily to avoid any
+    # import-time coupling during early provider bootstrap.
+    from fluid_build.plugin_manager import is_allowed
+
     for ep in eps:
+        if not is_allowed(ep.name):
+            _safe_log(
+                logger,
+                logging.DEBUG,
+                "provider_entrypoint_skipped",
+                name=ep.name,
+                reason="allow_block_policy",
+            )
+            continue
         try:
             provider_cls = ep.load()
             register_provider(
@@ -495,8 +512,14 @@ def _discover_entrypoints(logger: Optional[logging.Logger]) -> None:
                 entrypoint=str(ep),
             )
         except Exception as exc:
+            # Type-only — never interpolate the raw exception text (matches the
+            # unified manager's posture and the DISCOVERY_ERRORS redaction above).
             _safe_log(
-                logger, logging.WARNING, "provider_entrypoint_failed", name=ep.name, error=str(exc)
+                logger,
+                logging.WARNING,
+                "provider_entrypoint_failed",
+                name=ep.name,
+                error=type(exc).__name__,
             )
             _add_discovery_error("entrypoint", ep.name, exc)
 
