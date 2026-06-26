@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import error as console_error
-from fluid_build.observability.secret_redactor import redact_secret_text
 
 # Import shared utilities
 from ._common import build_provider, load_contract_with_overlay
@@ -607,11 +606,10 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     # call ``add_parser`` on it. Failures are logged at WARNING level so a
     # broken plugin can never break ``fluid`` itself.
     # ────────────────────────────────────────────────────────────────────
-    # ``redact_secret_text`` is imported at module top, so both the inner
-    # plugin-load path and the outer discovery-failure path are guaranteed
-    # to scrub plugin-supplied exception text before logging — there is no
-    # code path where a credential-shaped substring from ``str(exception)``
-    # reaches the log handler without going through the redactor.
+    # Governance: each command plugin is gated by the operator allow/block
+    # policy (``is_allowed``) BEFORE it is loaded, and load/discovery failures
+    # are logged by exception TYPE only — plugin-supplied exception text never
+    # reaches the log handler, so a credential-shaped substring cannot leak.
     try:
         import importlib.metadata as _md
 
@@ -620,14 +618,16 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
         except TypeError:
             # Python < 3.10 returned a dict of groups, not a kwarg-filtered iter.
             _eps = _md.entry_points().get("fluid_build.commands", [])
+        from fluid_build.plugin_manager import is_allowed
+
         for _ep in _eps:
+            if not is_allowed(_ep.name):
+                LOG.debug("CLI command plugin %s skipped by allow/block policy", _ep.name)
+                continue
             try:
                 _ep.load()(sp)
             except Exception as _e:
-                LOG.warning(
-                    "Failed to load CLI plugin %s: %s",
-                    _ep.name,
-                    redact_secret_text(str(_e)),
-                )
+                # Type-only — never interpolate plugin-supplied exception text.
+                LOG.warning("Failed to load CLI plugin %s: %s", _ep.name, type(_e).__name__)
     except Exception as _e:
-        LOG.warning("CLI plugin discovery failed: %s", redact_secret_text(str(_e)))
+        LOG.warning("CLI plugin discovery failed: %s", type(_e).__name__)
