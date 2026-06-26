@@ -24,7 +24,12 @@ from .base import IacProviderPlugin
 from .cutover import OPENTOFU_DEFAULT_PROVIDERS, default_engine, resolve_engine
 from .importer import ImportBlock
 from .module import assemble_tofu_document, build_module, render_tofu_json
-from .registry import IAC_PLUGINS, get_iac_plugin, register_iac_plugin
+from .registry import (
+    IAC_PLUGINS,
+    discover_iac_entrypoints,
+    get_iac_plugin,
+    register_iac_plugin,
+)
 from .shadow import LogicalResource, ShadowReport, shadow_compare
 from .versions import PROVIDER_PINS, REQUIRED_TOFU_VERSION, required_providers
 
@@ -34,6 +39,7 @@ __all__ = [
     "IAC_PLUGINS",
     "register_iac_plugin",
     "get_iac_plugin",
+    "discover_iac_entrypoints",
     "assemble_tofu_document",
     "build_module",
     "render_tofu_json",
@@ -59,3 +65,8 @@ register_iac_plugin("aws", AwsIacPlugin())
 register_iac_plugin("confluent", ConfluentIacPlugin())
 register_iac_plugin("gcp", GcpIacPlugin())
 register_iac_plugin("snowflake", SnowflakeIacPlugin())
+
+# External clouds (pip-installed) — discovered after the built-ins so a
+# third-party package can add (or deliberately override) a cloud with zero
+# edits to forge-cli core.
+discover_iac_entrypoints()

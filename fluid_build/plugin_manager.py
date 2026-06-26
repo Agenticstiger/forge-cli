@@ -52,6 +52,7 @@ ROLE_GROUPS: Dict[str, str] = {
     "validator": "fluid_build.validators",
     "catalog": "fluid_build.catalog_adapters",
     "custom_scaffold": "fluid_build.custom_scaffolds",
+    "iac_provider": "fluid_build.iac_providers",
 }
 
 _ALLOWLIST_ENV = "FLUID_PLUGINS_ALLOWLIST"
