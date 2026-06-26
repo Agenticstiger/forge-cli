@@ -118,6 +118,27 @@ def list_plugins(role: Optional[str] = None) -> Dict[str, List[str]]:
     return out
 
 
+def installed_plugins(role: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
+    """Return ``{role: [{name, group, allowed}]}`` for ALL installed plugins.
+
+    Unlike :func:`list_plugins` (which filters to the allowed set), this surfaces
+    EVERY installed plugin per role with its allow/block status, for the operator
+    inspection command (``fluid plugins``). Reads entry-point *names* only — it
+    never imports plugin code.
+    """
+    roles = [role] if role else list(ROLE_GROUPS)
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for r in roles:
+        group = ROLE_GROUPS.get(r)
+        if not group:
+            continue
+        out[r] = [
+            {"name": ep.name, "group": group, "allowed": is_allowed(ep.name)}
+            for ep in sorted(_entry_points(group), key=lambda e: e.name)
+        ]
+    return out
+
+
 def _normalize_severity(value: Any) -> str:
     """Map a raw severity onto {info, warn, error, critical} (CLI-local, zero-dep).
 
@@ -252,6 +273,7 @@ __all__ = [
     "is_allowed",
     "iter_plugins",
     "list_plugins",
+    "installed_plugins",
     "has_plugins",
     "collect_validator_findings",
     "dispatch_catalog_adapters",

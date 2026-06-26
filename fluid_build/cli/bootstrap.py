@@ -54,6 +54,7 @@ _STABLE_COMMANDS = frozenset(
         "docs",
         "doctor",
         "providers",
+        "plugins",
         "version",
         "test",
     }
@@ -453,6 +454,9 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
 
     # 🎯 Industry Skills
     _try_register(sp, "skills_cmd", "skills")
+
+    # 🔌 Plugins — inspect installed plugins by role + allow/block status
+    _try_register(sp, "plugins_cmd", "plugins")
 
     # validate (enhanced → fallback)
     if is_command_enabled("validate"):
