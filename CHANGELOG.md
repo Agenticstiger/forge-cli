@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] — 2026-06-27
+
+A polish + internal-quality release on top of 0.10.1. No breaking changes.
+
+### Added
+
+- **`fluid init --blueprint` accepts `--domain` / `--owner-team` /
+  `--owner-email`** and now writes a `.fluid/forge-receipt.json`, reaching parity
+  with the `--blank` and template scaffolds so `fluid status` and drift detection
+  see the same shape. The metadata flags flow through into the rendered
+  contract's `domain` + `metadata.owner`. (#324)
+
+### Changed
+
+- **Error catalog: diagnostic-only entries now carry an actionable next step.**
+  Five high-traffic failures (`generate_ci_failed`, `product_new_failed`,
+  `signing_bundle_not_file`, `schedule_sync_dags_dir_not_directory`,
+  `loader_missing_functions`) now pair the "what's wrong" line with a concrete
+  "what to do"; `missing_contract` shares the scaffold hint with
+  `contract_required`. (#326)
+- **Internal — `fluid forge`'s `run_ai_copilot_mode` decomposed.** The interview,
+  domain-enrichment, and project-creation cores are extracted into named helpers
+  behind a typed `ForgeRunContext` carrier (behaviour-preserving, guarded by the
+  304-test characterization net; 691 → 478 LOC). (#329)
+
+### Fixed
+
+- **Thread-safe, resettable lazy `CopilotAgent` cache.** The lazily-built
+  `CopilotAgent` class is memoised with `functools.lru_cache` (lock-guarded,
+  stable identity, `cache_clear()` reset hook) instead of a hand-rolled module
+  global — removing a double-checked-locking race. (#323)
+
 ## [0.10.1] — 2026-06-27
 
 A bug-fix + security release on top of 0.10.0.
