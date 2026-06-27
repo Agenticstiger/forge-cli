@@ -1,0 +1,4 @@
+name: fluid_dbt_demo
+version: "1.0.0"
+profile: fluid_dbt_demo
+model-paths: ["models"]
