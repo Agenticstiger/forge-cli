@@ -457,6 +457,10 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     # 🔌 Plugins — inspect installed plugins by role + allow/block status
     _try_register(sp, "plugins_cmd", "plugins")
 
+    # 📤 Exporters — list the spec exporters (odps/odcs) — the discoverable home
+    # for spec-export classes that are intentionally NOT in the provider registry
+    _try_register(sp, "exporters_cmd", "exporters")
+
     # validate (enhanced → fallback)
     if is_command_enabled("validate"):
         try:
