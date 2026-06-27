@@ -234,8 +234,34 @@ def _ask_industry(workspace_root: Path) -> Optional[str]:
     return industry_key
 
 
-def _ask_creation_mode() -> str:
-    """Present the creation menu and return the selected mode."""
+def _detect_ai_available() -> bool:
+    """True when an LLM provider is configured (env var / saved config / key).
+
+    Reuses the welcome-scan credential ladder (``FLUID_LLM_PROVIDER`` → saved
+    ``ai_config.json`` → AI-credential env vars) so the menu's Enter-default
+    never disagrees with the rest of the run. Best-effort: any failure resolves
+    to ``False``, which is the safe direction — it defaults the menu to the
+    Quickstart path that always reaches a working project without a key.
+    """
+    try:
+        from fluid_build.cli._welcome_scan import _probe_ai_credentials
+
+        return bool(_probe_ai_credentials().get("ai_configured"))
+    except Exception:  # noqa: BLE001 — never let detection block the menu
+        return False
+
+
+def _ask_creation_mode(ai_available: Optional[bool] = None) -> str:
+    """Present the creation menu and return the selected mode.
+
+    The Enter-key default adapts to context. When **no** LLM provider is
+    configured, it defaults to **Quickstart**, so a freshly-installed user who
+    just presses Enter reaches a working ``customer-360`` project in ~30s with
+    zero setup — the AI path would otherwise dead-end on a missing API key, a
+    bad first impression. When AI *is* configured, the richer 'Let AI design
+    it' path stays the default. ``ai_available`` is probed via
+    :func:`_detect_ai_available` when not supplied (tests inject it).
+    """
     if not _rich_available():
         return "quickstart"
 
@@ -244,6 +270,9 @@ def _ask_creation_mode() -> str:
     Panel = _get_panel()
     if console is None or Prompt is None or Panel is None:
         return "quickstart"
+
+    if ai_available is None:
+        ai_available = _detect_ai_available()
 
     console.print(
         Panel(
@@ -255,12 +284,18 @@ def _ask_creation_mode() -> str:
         )
     )
     console.print("[dim]How would you like to create your first data product?[/dim]\n")
-    console.print(
-        "  [bold]1.[/bold] Quickstart                 [dim](customer-360 example, zero questions, ~30s) ← fastest[/dim]"
-    )
-    console.print(
-        "  [bold]2.[/bold] Let AI design it           [dim](recommended — just answer questions)[/dim]"
-    )
+    if ai_available:
+        quickstart_tag = "(customer-360 example, zero questions, ~30s) ← fastest"
+        ai_tag = "(recommended — just answer questions)"
+        default_choice = "2"
+    else:
+        quickstart_tag = (
+            "(customer-360 example, zero questions, ~30s) ← recommended, no API key needed"
+        )
+        ai_tag = "(needs an API key — run 'fluid ai setup' first)"
+        default_choice = "1"
+    console.print(f"  [bold]1.[/bold] Quickstart                 [dim]{quickstart_tag}[/dim]")
+    console.print(f"  [bold]2.[/bold] Let AI design it           [dim]{ai_tag}[/dim]")
     console.print(
         "  [bold]3.[/bold] Start from a template     [dim](pre-built, customize later)[/dim]"
     )
@@ -271,9 +306,10 @@ def _ask_creation_mode() -> str:
     choice = Prompt.ask(
         "Choose",
         choices=["1", "2", "3", "4"],
-        default="2",
+        default=default_choice,
     )
-    return {"1": "quickstart", "2": "ai", "3": "template", "4": "blank"}.get(choice, "ai")
+    fallback = "ai" if ai_available else "quickstart"
+    return {"1": "quickstart", "2": "ai", "3": "template", "4": "blank"}.get(choice, fallback)
 
 
 def _print_workspace_products(existing: List, ws_name: str) -> None:
