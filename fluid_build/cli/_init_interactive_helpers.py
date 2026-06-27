@@ -235,18 +235,32 @@ def _ask_industry(workspace_root: Path) -> Optional[str]:
 
 
 def _detect_ai_available() -> bool:
-    """True when an LLM provider is configured (env var / saved config / key).
+    """True when the AI-design path will actually work for this user.
 
-    Reuses the welcome-scan credential ladder (``FLUID_LLM_PROVIDER`` → saved
-    ``ai_config.json`` → AI-credential env vars) so the menu's Enter-default
-    never disagrees with the rest of the run. Best-effort: any failure resolves
-    to ``False``, which is the safe direction — it defaults the menu to the
-    Quickstart path that always reaches a working project without a key.
+    Reuses the welcome-scan signals so the menu's Enter-default never disagrees
+    with the rest of the run. Two ways the AI path works:
+
+    1. A configured LLM provider — the credential ladder (``FLUID_LLM_PROVIDER``
+       → saved ``ai_config.json`` → AI-credential env vars).
+    2. A **keyless** coding agent on PATH (``claude-code`` / ``codex`` /
+       ``cursor`` / ``kiro``) — these author with no API key of their own
+       (Claude Code via the user's subscription, the others via the agent's own
+       login). Without this, a keyless user would be wrongly defaulted to
+       Quickstart *and* shown a "needs an API key" label that is false for them.
+
+    Best-effort: any failure resolves to ``False``, the safe direction — it
+    defaults the menu to the Quickstart path that always reaches a working
+    project without a key.
     """
     try:
-        from fluid_build.cli._welcome_scan import _probe_ai_credentials
+        from fluid_build.cli._welcome_scan import (
+            _probe_ai_credentials,
+            _probe_coding_agents,
+        )
 
-        return bool(_probe_ai_credentials().get("ai_configured"))
+        if _probe_ai_credentials().get("ai_configured"):
+            return True
+        return bool(_probe_coding_agents().get("coding_agents_available"))
     except Exception:  # noqa: BLE001 — never let detection block the menu
         return False
 
