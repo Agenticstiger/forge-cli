@@ -86,6 +86,28 @@ _PROVIDER_KEY_RES = (
 # Fernet token — URL-safe base64 starting with the fixed ``gAAAAA`` header
 # emitted by ``cryptography.fernet`` (version byte 0x80 + timestamp).
 _FERNET_TOKEN_RE = re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}")
+# URL userinfo credentials: ``scheme://user:password@host`` (incl. the
+# password-only ``scheme://:password@host`` form used by redis / AMQP / Celery
+# brokers — the username run is zero-or-more). The password is the run between
+# the first ``:`` after the scheme and the ``@`` that ends the authority.
+# Userinfo is constrained to authority characters (no ``/?#`` and no whitespace)
+# so an ``@`` later in a path/query is never mistaken for a userinfo delimiter.
+# Only the password is masked — scheme, user, and host survive (URLs themselves
+# are safe to log). EVERY repeated run is length-bounded so an uncapped log line
+# (the filter scrubs every traceback) cannot drive polynomial backtracking: the
+# scheme body is ``{,40}`` (real URI schemes are short) — bounding THIS is what
+# flattens the cost, since an unbounded ``[A-Za-z0-9+.\-]*`` re-scans a long alnum
+# run from O(n) start positions -> O(n²). The username is ``{,256}``; the password
+# is ``{,4096}`` — generous enough for the long secrets that genuinely live in
+# userinfo (Azure SAS tokens, signed-URL secrets, base64 service credentials); a
+# tighter bound would let those leak. It stays linear because the scheme body (the
+# real multiplier) is already capped. SHARED with the Snowflake-local twin
+# (providers/snowflake/util/logging.py imports this exact object) so the two
+# redaction layers cannot drift — the CLAUDE.md "extend both" invariant, enforced
+# by a single source of truth.
+_URL_USERINFO_RE = re.compile(
+    r"([A-Za-z][A-Za-z0-9+.\-]{0,40}://[^/?#@:\s]{0,256}:)[^/?#@\s]{1,4096}(@)"
+)
 # PEM private-key block (RSA / EC / OPENSSH / DSA / bare PKCS#8 ...).
 # ``[^-]*`` (zero-or-more) so the algorithm word is optional and the bare
 # ``-----BEGIN PRIVATE KEY-----`` PKCS#8 header is covered. ``(?s)`` so
@@ -159,6 +181,11 @@ def redact_secret_text(text: str) -> str:
     for provider_re in _PROVIDER_KEY_RES:
         redacted = provider_re.sub(_REDACTED, redacted)
     redacted = _FERNET_TOKEN_RE.sub(_REDACTED, redacted)
+    # Mask the password in any ``scheme://user:password@host`` URL (scheme/user/
+    # host preserved). Runs before the assignment regex so a credentialed URL is
+    # scrubbed even when its key name isn't credential-shaped (``uri=https://u:p@h``,
+    # ``connection_url=...``).
+    redacted = _URL_USERINFO_RE.sub(r"\1" + _REDACTED + r"\2", redacted)
     # Mask the whole sasl.jaas.config value BEFORE the assignment regex (which
     # would only catch an inner ``password=`` and leave a non-standard secret).
     redacted = _JAAS_CONFIG_RE.sub(r"\1" + _REDACTED + r"\3", redacted)
