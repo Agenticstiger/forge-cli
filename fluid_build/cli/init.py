@@ -195,6 +195,14 @@ def register(subparsers: argparse._SubParsersAction):
         help="📦 Create from specific template (e.g., customer-360, ml-features)",
     )
     mode_group.add_argument(
+        "--blueprint",
+        metavar="ID",
+        help=(
+            "🧩 Create from a bundled marketplace blueprint "
+            "(e.g., fluid.starter, fluid.analytics-daily) — no network/AI key"
+        ),
+    )
+    mode_group.add_argument(
         "--list-templates",
         action="store_true",
         help="List available templates and exit",
@@ -394,6 +402,7 @@ def run(args, logger: logging.Logger) -> int:
         handlers = {
             "ai": _ai_mode,
             "blank": blank_mode,
+            "blueprint": blueprint_mode,
             "template": template_mode,
         }
         handler = handlers.get(mode)
@@ -920,6 +929,8 @@ def detect_mode(args, logger: logging.Logger) -> Optional[str]:
         return "blank"
     if args.template:
         return "template"
+    if getattr(args, "blueprint", None):
+        return "blueprint"
     if getattr(args, "yes", False):
         return "ai"
 
@@ -954,6 +965,10 @@ def detect_mode(args, logger: logging.Logger) -> Optional[str]:
             args.template = _ask_template_name()
             if not args.template:
                 return "template"  # let template_mode handle the empty case
+        if mode == "blueprint" and not getattr(args, "blueprint", None):
+            # Second prompt: which bundled blueprint? (blueprint_mode defaults
+            # to the first when this stays unset.)
+            args.blueprint = _ask_blueprint_name()
         return mode
 
     # --- Existing contract at root (legacy single-product project) ---
@@ -1006,6 +1021,7 @@ from fluid_build.cli._init_dag_helpers import (  # noqa: E402,F401
     should_generate_dag,
 )
 from fluid_build.cli._init_interactive_helpers import (  # noqa: E402,F401
+    _ask_blueprint_name,
     _ask_creation_mode,
     _ask_industry,
     _ask_template_name,
@@ -1025,6 +1041,7 @@ from fluid_build.cli._init_modes import (  # noqa: E402,F401
     _finalise_template_product,
     _should_copy_template_entry,
     blank_mode,
+    blueprint_mode,
     demo_mode,
     template_mode,
 )

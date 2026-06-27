@@ -180,6 +180,49 @@ def _ask_template_name() -> Optional[str]:
         return default_name
 
 
+def _ask_blueprint_name() -> Optional[str]:
+    """Prompt the user to pick a bundled marketplace blueprint.
+
+    Mirrors :func:`_ask_template_name`. Returns the chosen blueprint id (e.g.
+    ``fluid.starter``), defaulting to the first bundled one; ``None`` only when
+    no blueprints ship. Non-rich / no-prompt environments take the default.
+    """
+    from fluid_build.cli._market_bundled_blueprints import list_bundled_blueprints
+
+    blueprints = list_bundled_blueprints()
+    if not blueprints:
+        return None
+    ids = [str(bp.get("id")) for bp in blueprints]
+    default_id = ids[0]
+
+    if not _rich_available():
+        return default_id
+    console = _get_console()
+    Prompt = _get_prompt()
+    if console is None or Prompt is None:
+        return default_id
+
+    console.print()
+    console.print("[dim]Available blueprints:[/dim]")
+    for i, bp in enumerate(blueprints, 1):
+        marker = " [dim](default)[/dim]" if i == 1 else ""
+        console.print(
+            f"  [bold]{i}.[/bold] {bp.get('name', bp.get('id'))} "
+            f"[dim]{bp.get('id')}[/dim]{marker}"
+        )
+    console.print()
+
+    valid = [str(i) for i in range(1, len(ids) + 1)]
+    try:
+        choice = Prompt.ask("Choose blueprint", choices=valid, default="1")
+    except Exception:  # noqa: BLE001 — never crash the init flow over a prompt
+        return default_id
+    try:
+        return ids[int(choice) - 1]
+    except (ValueError, IndexError):
+        return default_id
+
+
 def _ask_industry(workspace_root: Path) -> Optional[str]:
     """Present the industry picker and generate ``.fluid/skills.yaml``."""
     from fluid_build.cli.industry_skills import generate_skills_file, list_industries
@@ -313,17 +356,25 @@ def _ask_creation_mode(ai_available: Optional[bool] = None) -> str:
     console.print(
         "  [bold]3.[/bold] Start from a template     [dim](pre-built, customize later)[/dim]"
     )
+    console.print("  [bold]4.[/bold] Empty contract             [dim](for experienced users)[/dim]")
     console.print(
-        "  [bold]4.[/bold] Empty contract             [dim](for experienced users)[/dim]\n"
+        "  [bold]5.[/bold] Start from a blueprint     "
+        "[dim](bundled marketplace blueprint, no API key)[/dim]\n"
     )
 
     choice = Prompt.ask(
         "Choose",
-        choices=["1", "2", "3", "4"],
+        choices=["1", "2", "3", "4", "5"],
         default=default_choice,
     )
     fallback = "ai" if ai_available else "quickstart"
-    return {"1": "quickstart", "2": "ai", "3": "template", "4": "blank"}.get(choice, fallback)
+    return {
+        "1": "quickstart",
+        "2": "ai",
+        "3": "template",
+        "4": "blank",
+        "5": "blueprint",
+    }.get(choice, fallback)
 
 
 def _print_workspace_products(existing: List, ws_name: str) -> None:
