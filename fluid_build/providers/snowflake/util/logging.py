@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
-from fluid_build.observability.secret_redactor import is_sensitive_key_name
+from fluid_build.observability.secret_redactor import _URL_USERINFO_RE, is_sensitive_key_name
 
 # Patterns for sensitive data that should be redacted
 #
@@ -35,8 +35,11 @@ from fluid_build.observability.secret_redactor import is_sensitive_key_name
 # (``api_key``, ``client_secret`` lowercase, ``aws_access_key_id`` as the
 # actual AWS standard name).
 SENSITIVE_PATTERNS = [
-    # Connection strings (protocol://user:password@host)
-    re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^:]+:)[^@]+(@)", re.IGNORECASE),
+    # Connection strings (protocol://user:password@host). SHARED with the global
+    # SecretRedactingFilter via the imported _URL_USERINFO_RE so the two layers
+    # mask the identical shape and cannot drift (CLAUDE.md "extend both"). The
+    # generic 2-group branch in redact_string() renders it as \1[REDACTED]\2.
+    _URL_USERINFO_RE,
     # Private keys and credentials
     re.compile(r'"private_key":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r'"private_key_id":\s*"[^"]*"', re.IGNORECASE),
