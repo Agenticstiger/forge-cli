@@ -21,8 +21,7 @@ Instead of complex auto-discovery, we use explicit registration.
 
 import logging
 import os
-
-from fluid_build.cli.console import success
+import sys
 
 from .core.registry import (
     get_extension_registry,
@@ -32,6 +31,24 @@ from .core.registry import (
 )
 
 LOG = logging.getLogger("fluid.forge.registration")
+
+
+def _show_or_log(message: str, *, show: bool) -> None:
+    """Emit a built-in-registration summary.
+
+    Diagnostic only — goes to STDERR (when explicitly shown) or the DEBUG log,
+    **never stdout**, so it can't contaminate machine-readable output like
+    ``fluid market --blueprints --format json``. Previously this used
+    ``console.success`` (stdout), which leaked the ``✅ Registered N …`` lines
+    into JSON output whenever ``FLUID_LOG_LEVEL=DEBUG`` was set — an
+    intermittent CI flake (a prior test leaking the env var into the JSON
+    command's subprocess). Regression-guarded by
+    ``tests/test_market_blueprints_json.py``.
+    """
+    if show:
+        sys.stderr.write(f"✅ {message}\n")
+    else:
+        LOG.debug(message)
 
 
 def register_builtin_components():
@@ -72,10 +89,10 @@ def register_builtin_components():
 
         template_registry.register("streaming", StreamingTemplate, source="builtin")
 
-        if show_registration:
-            success(f"Registered {len(template_registry.list_available())} templates")
-        else:
-            LOG.debug(f"Registered {len(template_registry.list_available())} templates")
+        _show_or_log(
+            f"Registered {len(template_registry.list_available())} templates",
+            show=show_registration,
+        )
 
     except Exception as e:
         LOG.error(f"Failed to register templates: {e}")
@@ -97,10 +114,10 @@ def register_builtin_components():
             LOG.warning("Skipping built-in provider '%s' during registration: %s", provider_name, e)
 
     try:
-        if show_registration:
-            success(f"Registered {len(provider_registry.list_available())} providers")
-        else:
-            LOG.debug(f"Registered {len(provider_registry.list_available())} providers")
+        _show_or_log(
+            f"Registered {len(provider_registry.list_available())} providers",
+            show=show_registration,
+        )
     except Exception as e:
         LOG.warning("Unable to summarize registered providers: %s", e)
 
@@ -121,10 +138,10 @@ def register_builtin_components():
 
         extension_registry.register("ai_assistant", AIAssistantExtension, source="builtin")
 
-        if show_registration:
-            success(f"Registered {len(extension_registry.list_available())} extensions")
-        else:
-            LOG.debug(f"Registered {len(extension_registry.list_available())} extensions")
+        _show_or_log(
+            f"Registered {len(extension_registry.list_available())} extensions",
+            show=show_registration,
+        )
 
     except Exception as e:
         LOG.error(f"Failed to register extensions: {e}")
@@ -144,10 +161,10 @@ def register_builtin_components():
 
         generator_registry.register("config", ConfigGenerator, source="builtin")
 
-        if show_registration:
-            success(f"Registered {len(generator_registry.list_available())} generators")
-        else:
-            LOG.debug(f"Registered {len(generator_registry.list_available())} generators")
+        _show_or_log(
+            f"Registered {len(generator_registry.list_available())} generators",
+            show=show_registration,
+        )
 
     except Exception as e:
         LOG.error(f"Failed to register generators: {e}")
