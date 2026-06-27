@@ -373,6 +373,20 @@ def run(args, logger: logging.Logger) -> int:
                     for key, value in e.context.items():
                         cprint(f"   {key}: {value}")
 
+        # Stable slug + catalog-driven guidance (Error-UX card). ``e`` is
+        # auto-enriched at construction, so catalogued events (contract_*,
+        # provider_*, …) surface actionable hints + a docs link on this
+        # bespoke local render path too, not only when an error reaches main().
+        if not args.quiet:
+            slug = getattr(e, "error_slug", None)
+            if slug:
+                cprint(f"   [{slug}]")
+            for suggestion in getattr(e, "suggestions", None) or []:
+                cprint(f"   💡 {suggestion}")
+            docs_url = getattr(e, "docs_url", None)
+            if docs_url:
+                cprint(f"   📖 {docs_url}")
+
         return e.exit_code
     except Exception as e:
         raise CLIError(1, "cli_unhandled_exception", {"error": str(e)})

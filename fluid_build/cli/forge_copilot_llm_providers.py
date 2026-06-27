@@ -268,9 +268,13 @@ class CopilotGenerationError(CLIError):
         payload = {"message": message}
         if context:
             payload.update(context)
+        # super().__init__ sets error_slug + catalog-enriched suggestions/docs_url.
         super().__init__(1, event, payload)
         self.message = message
-        self.suggestions = suggestions or []
+        # Caller suggestions win; otherwise keep the catalog enrichment from the
+        # base __init__ (don't clobber it back to []). docs_url is untouched here
+        # so the catalog's docs link survives.
+        self.suggestions = suggestions or self.suggestions
 
 
 # ---------------------------------------------------------------------------
@@ -834,6 +838,7 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
             "copilot_missing_llm_api_key",
             f"No API key was configured for the {provider.name} copilot adapter.",
             suggestions=[
+                "Run 'fluid ai setup' to configure a provider interactively",
                 "Set FLUID_LLM_API_KEY or the provider-specific API key environment variable",
                 "Examples: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY",
                 "For local models, use --llm-provider ollama and optionally --llm-endpoint",

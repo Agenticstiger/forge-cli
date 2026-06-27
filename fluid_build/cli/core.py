@@ -120,48 +120,29 @@ class FluidCLIError(_BaseCLIError):
         suggestions: Optional[List[str]] = None,
         docs_url: Optional[str] = None,
     ):
-        # Initialize via CLIError base
+        # Initialize via CLIError base (sets error_slug + catalog enrichment).
         super().__init__(exit_code, event, context)
-        # Override with enhanced attributes
+        # Override with enhanced attributes. A caller-supplied value always
+        # wins; an absent one keeps the catalog enrichment from the base
+        # ``__init__`` (do NOT clobber it back to []/None).
         self.message = message or event
-        self.suggestions = suggestions or []
-        self.docs_url = docs_url
+        if suggestions:
+            self.suggestions = suggestions
+        if docs_url:
+            self.docs_url = docs_url
 
-        # Enrich error with helpful information
+        # Backstop: fill any still-blank field from the central catalog.
         self._enrich_error()
 
     def _enrich_error(self) -> None:
-        """Add helpful suggestions based on error type"""
-        common_suggestions = {
-            "contract_not_found": [
-                "Check that the contract file path is correct",
-                "Ensure the file has .yaml, .yml, or .json extension",
-                "Run 'fluid validate --help' for examples",
-            ],
-            "contract_load_failed": [
-                "Verify YAML/JSON syntax is valid",
-                "Check file permissions",
-                "Ensure file encoding is UTF-8",
-            ],
-            "provider_not_specified": [
-                "Set --provider flag: --provider local|gcp|snowflake",
-                "Set FLUID_PROVIDER environment variable",
-                "Run 'fluid providers' to see available providers",
-            ],
-            "provider_not_found": [
-                "Run 'fluid providers' to see available providers",
-                "Check provider name spelling",
-                "Ensure provider dependencies are installed",
-            ],
-            "validation_failed": [
-                "Check contract syntax and required fields",
-                "Run 'fluid validate --verbose' for detailed errors",
-                "Refer to schema documentation",
-            ],
-        }
+        """Fill blank suggestions / docs_url from the central error catalog.
 
-        if self.event in common_suggestions and not self.suggestions:
-            self.suggestions = common_suggestions[self.event]
+        Single source of truth lives in ``cli/_error_catalog.py`` (was a
+        hardcoded dict here). Idempotent and caller-override-safe.
+        """
+        from ._error_catalog import enrich
+
+        self.suggestions, self.docs_url = enrich(self.event, self.suggestions, self.docs_url)
 
     def format_for_user(self, console: Console) -> None:
         """Render this error for the user with Rich formatting.
@@ -171,8 +152,14 @@ class FluidCLIError(_BaseCLIError):
         Previously only ``ExecutionError`` carried this, so a bare
         ``FluidCLIError`` (e.g. a path-validation rejection from
         ``validate_cli_path``) crashed the handler with AttributeError.
+
+        The stable ``error_slug`` is rendered as a dim tag after the message
+        (rustc/terraform-style) so operators and log scrapers see one routable
+        code on every failure.
         """
-        console.print(f"[red]❌ {self.message}[/red]")
+        slug = getattr(self, "error_slug", None)
+        tag = f"  [dim]\\[{slug}][/dim]" if slug else ""
+        console.print(f"[red]❌ {self.message}[/red]{tag}")
         if self.context:
             console.print(f"[dim]Details: {self.context}[/dim]")
         if self.suggestions:

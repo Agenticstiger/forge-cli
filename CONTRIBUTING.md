@@ -161,6 +161,35 @@ The documentation site lives in a separate repo. To create a companion docs PR:
 - **Tests** — use `pytest`. Place unit tests in `tests/`, provider integration tests under `tests/providers/`.
 - **Imports** — standard library → third-party → local, separated by blank lines. Use `ruff` to auto-sort.
 
+### Error codes (`CLIError` / `FluidCLIError`)
+
+Every user-facing failure raises a `CLIError` (or its `FluidCLIError` /
+`CopilotGenerationError` subclass) with a snake_case `event` — the stable
+identity. That `event` is auto-mapped to:
+
+- a stable `ERR_<EVENT>` **slug** (`cli/_error_catalog.py::slug_for`), rendered
+  on every failure and logged in the structured `extra` so CI log parsers and
+  dashboards route on a code that survives across releases;
+- catalog-driven `.suggestions` + `.docs_url`, populated centrally so a bare
+  `raise CLIError(2, "provider_not_specified")` already shows actionable hints.
+
+When you add a **new** user-facing error, complete this checklist:
+
+1. **Pick a clear, stable `event`** — snake_case, descriptive
+   (`bundle_source_missing`, not `err3`). Never rename an existing one: the
+   derived slug is a public monitoring key.
+2. **Add curated guidance** to `_GUIDANCE` in
+   [`cli/_error_catalog.py`](fluid_build/cli/_error_catalog.py): at least one
+   **actionable** suggestion (prefer a concrete `fluid <verb> …` next step over
+   prose) and an optional docs topic (defaults to a `troubleshooting#<slug>`
+   anchor). A raise site may still pass its own `suggestions=` / `docs_url=` —
+   those win over the catalog.
+3. **AI/LLM auth errors** must point at `fluid ai setup` and name the relevant
+   key env vars (`OPENAI_API_KEY` / `GEMINI_API_KEY` / …).
+4. **Add a test** — every catalogued event is asserted to carry non-empty
+   suggestions by `tests/cli/test_error_catalog.py`; add a focused pin if the
+   error has special enrichment behaviour.
+
 ## Testing Best Practices
 
 ### Coverage Gates
