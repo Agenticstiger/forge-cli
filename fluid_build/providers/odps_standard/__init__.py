@@ -14,14 +14,16 @@ Public surface:
 Specification: https://github.com/bitol-io/open-data-product-standard
 """
 
-from fluid_build.providers import register_provider
-
 from .odps import OdpsStandardProvider
 from .provider import BitolOdpsProvider
 
-# Register under both names — the canonical name is ``odps_bitol`` per the
-# Phase 5 disambiguation plan; the ``odps-standard`` legacy name still works.
-register_provider("odps_bitol", BitolOdpsProvider)
-register_provider("odps-standard", OdpsStandardProvider)
+# Bitol/ODPS-standard is a data-product SPEC / export format, not a cloud
+# provider — so these exporters are intentionally NOT registered in the
+# provider registry and not advertised as `fluid_build.providers` entry-points
+# (they never appear in `fluid providers` / `fluid plugins` / `--provider`).
+# The classes stay importable for the spec-export commands, which construct
+# them DIRECTLY:  from fluid_build.providers.odps_standard import (
+#     BitolOdpsProvider, OdpsStandardProvider)
+# (see cli/odps.py, cli/odps_standard.py, cli/generate_standard.py).
 
 __all__ = ["BitolOdpsProvider", "OdpsStandardProvider"]

@@ -22,12 +22,17 @@ from __future__ import annotations
 
 from fluid_build import providers as P
 
+# Every ODPS spec-exporter registry name that must NOT appear as a provider.
+_ODPS_EXPORTER_NAMES = ("odps", "opds", "odps_bitol", "odps-standard")
 
-def test_odps_and_opds_not_in_provider_registry():
+
+def test_no_odps_spec_exporter_in_provider_registry():
+    # ODPS spec-exporters (odps/opds + the Bitol odps_bitol/odps-standard
+    # siblings) are constructed by direct import, never via the registry.
     P.discover_providers(force=True)
     names = set(P.list_providers())
-    assert "odps" not in names, f"odps must not be a registry provider; got {sorted(names)}"
-    assert "opds" not in names, f"opds must not be a registry provider; got {sorted(names)}"
+    for n in _ODPS_EXPORTER_NAMES:
+        assert n not in names, f"{n!r} must not be a registry provider; got {sorted(names)}"
 
 
 def test_odps_not_a_provider_entry_point():
@@ -57,13 +62,14 @@ def test_odps_package_init_exposes_no_baseprovider_subclass():
     assert subclasses == [], f"odps/__init__ must expose no BaseProvider subclass; got {subclasses}"
 
 
-def test_odps_exporter_still_importable_directly():
-    # The spec-export commands construct it directly — de-registration must not
-    # break that path.
+def test_odps_exporters_still_importable_directly():
+    # The spec-export commands construct these directly — de-registration must
+    # not break those paths.
     from fluid_build.providers.odps.odps import OdpsProvider
+    from fluid_build.providers.odps_standard import BitolOdpsProvider, OdpsStandardProvider
 
-    provider = OdpsProvider()
-    assert hasattr(provider, "render")
+    for cls in (OdpsProvider, BitolOdpsProvider, OdpsStandardProvider):
+        assert hasattr(cls(), "render")
 
 
 def test_provider_choices_drop_odps_opds():
