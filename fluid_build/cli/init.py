@@ -247,6 +247,24 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
 
+    # Product-metadata flags — let the non-interactive --blueprint scaffold fill
+    # the contract's domain + ownership without prompting (blueprint_mode reads
+    # args.domain / args.owner_team / args.owner_email). Other modes ignore them.
+    p.add_argument(
+        "--domain",
+        help="Business domain for the product (e.g. marketing). Used by --blueprint.",
+    )
+    p.add_argument(
+        "--owner-team",
+        dest="owner_team",
+        help="Owning team for the product. Used by --blueprint.",
+    )
+    p.add_argument(
+        "--owner-email",
+        dest="owner_email",
+        help="Owner contact email for the product. Used by --blueprint.",
+    )
+
     # Use case / persona (advanced — hidden from default --help)
     from fluid_build.cli.help_advanced import mark_advanced
 

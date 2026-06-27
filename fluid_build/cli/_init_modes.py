@@ -383,6 +383,53 @@ def blueprint_mode(args, logger: logging.Logger) -> int:
     if result_path is None:
         return 1
 
+    # Write a forge-receipt.json inside the product so `fluid status`, drift
+    # detection, and downstream tooling see the same shape the `blank` /
+    # `template` scaffolds produce (inspection follow-up to #318 — blueprint_mode
+    # previously skipped the receipt). Best-effort: never fails the scaffold.
+    try:
+        from fluid_build import __version__ as tool_version
+    except Exception:  # pragma: no cover — defensive
+        tool_version = ""
+
+    import hashlib
+
+    from fluid_build.cli.artifact_paths import product_forge_receipt_path
+
+    builder = ReceiptBuilder(flow="blueprint", dry_run=False)
+    try:
+        sha = hashlib.sha256(result_path.read_bytes()).hexdigest()
+        size = result_path.stat().st_size
+    except OSError:
+        sha, size = None, 0
+    builder.record_entry(
+        path=Path("contract.fluid.yaml"),
+        action="create",
+        sha256=sha,
+        size=size,
+    )
+    builder.set_inputs(
+        flow="init-blueprint",
+        blueprint=blueprint_id,
+        provider=getattr(args, "provider", None),
+        name=project_name,
+    )
+    try:
+        receipt_path = product_forge_receipt_path(project_dir)
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(
+            dump_json_with_envelope(
+                builder.build_document().to_payload(),
+                kind="ForgeReceipt",
+                command=f"fluid init {project_name} --blueprint {blueprint_id}",
+                tool_version=str(tool_version),
+            ),
+            encoding="utf-8",
+        )
+        logger.debug("blueprint_mode_receipt_written", extra={"path": str(receipt_path)})
+    except Exception as exc:  # noqa: BLE001 — receipt is best-effort
+        logger.debug("blueprint_mode_receipt_write_failed", extra={"error": str(exc)})
+
     if _init.RICH_AVAILABLE:
         _init.console.print(
             f"\n✅ Created [cyan]{project_name}/contract.fluid.yaml[/cyan] "
