@@ -248,7 +248,12 @@ def run(args, logger: logging.Logger) -> int:
         # ``--format json`` consumers get pure JSON on stdout — suppress every
         # human banner/status line (it would corrupt the parse).
         json_mode = getattr(args, "format", None) == "json"
-        if not json_mode:
+        # The deprecation banner is for a DIRECT (hidden) `fluid marketplace`
+        # invocation only — suppress it when reached via the `fluid market
+        # --blueprints` delegation (args._from_market) or in JSON mode, where the
+        # user is already on the new command (and the banner would also corrupt
+        # the JSON stream).
+        if not json_mode and not getattr(args, "_from_market", False):
             if console:
                 console.print(
                     "[yellow]Note: 'fluid marketplace' is deprecated. "
