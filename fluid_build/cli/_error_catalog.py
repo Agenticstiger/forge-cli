@@ -228,6 +228,139 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "troubleshooting#connectivity",
     ),
+    "model_not_found": (
+        [
+            "Run 'fluid ai setup' to pick a model the provider actually serves",
+            "List the provider's models, then pass --llm-model <name>",
+        ],
+        None,
+    ),
+    # ── contract / loader ──────────────────────────────────────────────────
+    "missing_contract": (
+        [
+            "Pass the contract path: fluid <command> path/to/contract.fluid.yaml",
+            "Or run from a directory that contains a single contract.fluid.yaml",
+        ],
+        None,
+    ),
+    "loader_import_failed": (
+        [
+            "Check that the loader module path is importable (on PYTHONPATH)",
+            "Verify the module has no syntax/import errors: python -c 'import <module>'",
+        ],
+        None,
+    ),
+    "loader_missing_functions": (
+        ["The loader module must define the required entry-point functions — check its API"],
+        None,
+    ),
+    # ── plan / apply / generate ────────────────────────────────────────────
+    "generate_iac_failed": (
+        [
+            "Run 'fluid validate <contract>' first to rule out a contract problem",
+            "Re-run with --provider explicitly set if auto-detect picked the wrong cloud",
+        ],
+        None,
+    ),
+    "generate_ci_failed": (
+        ["Check the --system value is a supported CI provider and the contract validates"],
+        None,
+    ),
+    "no_builds": (
+        [
+            "No build runners matched — check the contract's build/transform config",
+            "Run 'fluid apply <contract> --mode amend-and-build' only when builds are defined",
+        ],
+        None,
+    ),
+    "verify_failed": (
+        ["Run 'fluid verify <contract> --verbose' to see which reconciliation check failed"],
+        None,
+    ),
+    # ── policy ─────────────────────────────────────────────────────────────
+    "policy_compile_failed": (
+        ["Check the agent-policy block in the contract; run 'fluid policy check <contract>'"],
+        "sovereignty",
+    ),
+    "policy_apply_failed": (
+        ["Run 'fluid policy check <contract>' to surface the offending rule before apply"],
+        "sovereignty",
+    ),
+    # ── product authoring ──────────────────────────────────────────────────
+    "product_new_failed": (
+        ["Check the target directory is writable and the productType is valid (SDP/ADP/CDP)"],
+        None,
+    ),
+    "product_add_failed": (
+        ["Run 'fluid validate' on the contract first; --type must be source|exposure|dq"],
+        None,
+    ),
+    "product_add_expose_not_found": (
+        [
+            "The --expose target does not exist in the contract — list exposes with 'fluid status'",
+            "Add the expose first, or target an existing exposeId",
+        ],
+        None,
+    ),
+    # ── bundle / market ────────────────────────────────────────────────────
+    "bundle_source_missing": (
+        ["Re-create the bundle with 'fluid bundle' — a referenced source file is absent"],
+        None,
+    ),
+    "bundle_load_failed": (
+        ["The bundle is corrupt or truncated — re-create it with 'fluid bundle <contract>'"],
+        None,
+    ),
+    "market_discovery_failed": (
+        [
+            "Check network access to the marketplace endpoint (FLUID_MARKET_URL)",
+            "Bundled blueprints work offline: 'fluid market --blueprints'",
+        ],
+        "troubleshooting#connectivity",
+    ),
+    "missing_blueprint_parameter": (
+        ["The blueprint requires a parameter — pass it with --param key=value"],
+        None,
+    ),
+    # ── signing / supply-chain ─────────────────────────────────────────────
+    "signing_bundle_missing": (
+        ["Produce the bundle first ('fluid bundle <contract> --format tgz'), then sign it"],
+        "supply-chain",
+    ),
+    "signing_bundle_not_file": (
+        ["The signing target must be a bundle file, not a directory"],
+        "supply-chain",
+    ),
+    "signing_key_ref_empty": (
+        [
+            "Provide a signing key reference (e.g. a cosign key or KMS key URI)",
+            "See the signing setup in the supply-chain docs",
+        ],
+        "supply-chain",
+    ),
+    # ── verify / validate-artifacts ────────────────────────────────────────
+    "validate_artifacts_input_missing": (
+        ["Pass the generated-artifacts path produced by 'fluid generate artifacts'"],
+        None,
+    ),
+    # ── schedule-sync (Airflow handoff) ────────────────────────────────────
+    "schedule_sync_dags_dir_missing": (
+        ["Pass --dags-dir pointing at your Airflow DAGs directory"],
+        None,
+    ),
+    "schedule_sync_dags_dir_not_directory": (
+        ["The --dags-dir value must be an existing directory"],
+        None,
+    ),
+    "schedule_sync_unhandled_scheme": (
+        ["Use a supported destination scheme (file / scp / git+ssh) for --to"],
+        None,
+    ),
+    # ── rollback ───────────────────────────────────────────────────────────
+    "rollback_product_id_empty": (
+        ["Pass the product id to roll back: fluid rollback <product-id>"],
+        None,
+    ),
 }
 
 

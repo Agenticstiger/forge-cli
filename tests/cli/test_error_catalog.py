@@ -149,3 +149,31 @@ def test_copilot_error_fills_suggestions_from_catalog_when_omitted():
     err = CopilotGenerationError("copilot_missing_llm_api_key", "boom")
     assert err.suggestions  # catalog fallback, not []
     assert any("fluid ai setup" in s for s in err.suggestions)
+
+
+def test_catalog_covers_common_command_failures():
+    """Coverage breadth: the high-traffic command-failure events ship guidance.
+
+    Extends #302's initial 24 events to the common plan/apply/generate/policy/
+    product/loader/bundle/market/signing/schedule failures (Error-UX coverage
+    follow-up). Each must carry a non-empty suggestion + a docs_url.
+    """
+    expected = {
+        "generate_iac_failed",
+        "policy_apply_failed",
+        "product_add_failed",
+        "loader_import_failed",
+        "market_discovery_failed",
+        "signing_bundle_missing",
+        "schedule_sync_dags_dir_missing",
+        "no_builds",
+        "model_not_found",
+        "missing_contract",
+    }
+    catalogued = set(cat.catalogued_events())
+    missing = expected - catalogued
+    assert not missing, f"expected catalogued: {missing}"
+    assert len(catalogued) >= 45, f"catalog regressed to {len(catalogued)} events"
+    for ev in expected:
+        assert cat.suggestions_for(ev), ev
+        assert cat.docs_url_for(ev), ev
