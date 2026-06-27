@@ -23,18 +23,11 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import yaml
 
 from fluid_build.cli.console import cprint
-from fluid_build.cli.forge_contract_factory import write_contract
-from fluid_build.cli.forge_copilot_llm_providers import (
-    CopilotGenerationError,
-    resolve_llm_config,
-)
-from fluid_build.copilot.agents.base import StageSession
-from fluid_build.copilot.agents.errors import AgentExecutionError
 from fluid_build.copilot.schemas.stage_outputs import LogicalDraft
 from fluid_build.copilot.store.audit_trail import write_audit_event
 from fluid_build.copilot.store.factory import resolve_store
@@ -46,14 +39,70 @@ from fluid_build.forge_datamodel.emit.model_doc import emit_model_markdown
 from fluid_build.forge_datamodel.emit.osi_sidecar import emit_osi_yaml
 from fluid_build.forge_datamodel.emit.validator import FluidContractValidator
 from fluid_build.forge_datamodel.emit.variants import emit_dimensional_variants
-from fluid_build.forge_datamodel.from_ddl.pipeline import run_from_ddl
 from fluid_build.forge_datamodel.from_intent.intent_loader import (
     IntentValidationError,
     load_business_intent,
     render_intent_example,
     render_intent_schema_json,
 )
-from fluid_build.forge_datamodel.from_intent.pipeline import run_from_intent
+
+if TYPE_CHECKING:  # resolve annotation names for ruff/type-checkers only
+    from fluid_build.cli.forge_copilot_llm_providers import CopilotGenerationError
+    from fluid_build.copilot.agents.base import StageSession
+
+# NOTE: ``register_forge_subcommand`` (in the light ``_forge_data_model_register``
+# module) imports THIS module to bind the ``run_X_command`` handlers as argparse
+# ``set_defaults`` defaults — so building the ``fluid forge data-model`` subparser
+# imports ``forge_data_model``. The heavy runtime deps below pull ``httpx`` (LLM
+# providers) and ``jsonschema`` (the ``schema_manager`` chain via
+# ``forge_contract_factory`` + the from_ddl/from_intent pipelines + the copilot
+# agents). They are needed only inside the handler BODIES, so they are resolved
+# lazily via ``__getattr__`` (PEP 562) and stay off the ``fluid --help`` /
+# ``build_parser()`` cold path. Runtime use sites resolve via
+# ``import fluid_build.cli.forge_data_model as _self; _self.X`` (and
+# ``except _self.CopilotGenerationError`` / ``raise _self.CopilotGenerationError``)
+# so the symbols are real attributes at call time. Annotations referencing
+# ``StageSession`` / ``CopilotGenerationError`` are safe at module scope because
+# ``from __future__ import annotations`` keeps them as lazy strings.
+
+# attribute name -> (heavy source module, real symbol name)
+_DEFERRED_DATA_MODEL_IMPORTS = {
+    "write_contract": ("fluid_build.cli.forge_contract_factory", "write_contract"),
+    "CopilotGenerationError": (
+        "fluid_build.cli.forge_copilot_llm_providers",
+        "CopilotGenerationError",
+    ),
+    "resolve_llm_config": (
+        "fluid_build.cli.forge_copilot_llm_providers",
+        "resolve_llm_config",
+    ),
+    "StageSession": ("fluid_build.copilot.agents.base", "StageSession"),
+    "AgentExecutionError": ("fluid_build.copilot.agents.errors", "AgentExecutionError"),
+    "run_from_ddl": ("fluid_build.forge_datamodel.from_ddl.pipeline", "run_from_ddl"),
+    "run_from_intent": (
+        "fluid_build.forge_datamodel.from_intent.pipeline",
+        "run_from_intent",
+    ),
+}
+
+
+def __getattr__(name: str):
+    """Lazily resolve the heavy data-model runtime deps (PEP 562).
+
+    Keeps ``httpx`` + the ``schema_manager`` → ``jsonschema`` chain off the
+    ``fluid --help`` path while exposing the symbols as module attributes so
+    ``except _self.CopilotGenerationError`` / ``raise`` / ``_self.run_from_ddl``
+    keep resolving (and any ``patch("…cli.forge_data_model.<symbol>")`` seam
+    flows through).
+    """
+    spec = _DEFERRED_DATA_MODEL_IMPORTS.get(name)
+    if spec is not None:
+        import importlib
+
+        module = importlib.import_module(spec[0])
+        return getattr(module, spec[1])
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 COMMAND = "data-model"
 _SAFE_ARTIFACT_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -335,6 +384,15 @@ def run_learn_command(args: Any, logger: logging.Logger) -> int:
 
 
 def run_from_ddl_command(args: Any, logger: logging.Logger) -> int:
+    # Bind the heavy runtime deps as locals (resolves via the module
+    # ``__getattr__`` lazy-import seam) so the bare-name ``except`` / call
+    # sites below keep working off the light cold path.
+    from fluid_build.cli.forge_data_model import (
+        AgentExecutionError,
+        CopilotGenerationError,
+        run_from_ddl,
+    )
+
     rc = _maybe_run_custom_technique(args, logger)
     if rc is not None:
         return rc
@@ -404,6 +462,15 @@ def run_from_ddl_command(args: Any, logger: logging.Logger) -> int:
 
 
 def run_from_intent_command(args: Any, logger: logging.Logger) -> int:
+    # Bind the heavy runtime deps as locals (resolves via the module
+    # ``__getattr__`` lazy-import seam) so the bare-name ``except`` / call
+    # sites below keep working off the light cold path.
+    from fluid_build.cli.forge_data_model import (
+        AgentExecutionError,
+        CopilotGenerationError,
+        run_from_intent,
+    )
+
     rc = _maybe_run_custom_technique(args, logger)
     if rc is not None:
         return rc
@@ -536,6 +603,11 @@ def run_from_source_command(args: Any, logger: logging.Logger) -> int:
     ``forge_datamodel.from_catalog.pipeline`` so the MCP tool and
     the CLI subcommand share one staged-pipeline path.
     """
+    # Bind the heavy runtime dep as a local (resolves via the module
+    # ``__getattr__`` lazy-import seam) so the bare-name ``except`` site below
+    # keeps working off the light cold path.
+    from fluid_build.cli.forge_data_model import CopilotGenerationError
+
     # Bring-your-own logical model (issue #248): --modeling-technique custom
     # + --logical-model short-circuits the source pipeline entirely.
     rc = _maybe_run_custom_technique(args, logger)
@@ -862,6 +934,11 @@ def run_dump_ddl_command(args: Any, logger: logging.Logger) -> int:
 
 
 def _build_session(args: Any, *, workspace_root: Path, logger: logging.Logger) -> StageSession:
+    # Bind the heavy runtime deps as locals (resolves via the module
+    # ``__getattr__`` lazy-import seam) so the bare-name ``raise`` / constructor
+    # sites below keep working off the light cold path.
+    from fluid_build.cli.forge_data_model import CopilotGenerationError, StageSession
+
     require_llm = bool(getattr(args, "require_llm", False))
     if getattr(args, "deterministic", False) and require_llm:
         raise CopilotGenerationError(
@@ -965,6 +1042,10 @@ def _resolve_optional_industry_pack(args: Any, logger: logging.Logger):
 
 
 def _resolve_optional_llm_config(args: Any, logger: logging.Logger):
+    # Bind the heavy runtime dep as a local (resolves via the module
+    # ``__getattr__`` lazy-import seam) so this stays off the light cold path.
+    from fluid_build.cli.forge_data_model import resolve_llm_config
+
     explicit = any(
         getattr(args, attr, None) for attr in ("llm_provider", "llm_model", "llm_endpoint")
     )
@@ -1158,6 +1239,10 @@ def _write_or_report(
     validation: Any,
     industry_pack: Any = None,
 ) -> int:
+    # Bind the heavy runtime dep as a local (resolves via the module
+    # ``__getattr__`` lazy-import seam) so this stays off the light cold path.
+    from fluid_build.cli.forge_data_model import write_contract
+
     _print_validation_report(validation)
     if industry_pack is not None:
         _print_canonical_coverage(logical, industry_pack)

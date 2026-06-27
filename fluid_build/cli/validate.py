@@ -20,7 +20,7 @@ import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
 
 from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
@@ -28,7 +28,6 @@ from fluid_build.observability.tracing import traced_stage as _traced_stage
 
 from ..policy.agent_policy import validate_agent_policy
 from ..policy.sovereignty import validate_sovereignty
-from ..schema_manager import FluidSchemaManager, SchemaVersion, ValidationResult, VersionConstraint
 from ..structured_logging import (
     log_metric,
     log_operation_failure,
@@ -39,7 +38,44 @@ from ._common import CLIError, load_contract_with_overlay
 from ._logging import error, info, warn
 from .core import FluidCLIError
 
+if TYPE_CHECKING:  # resolve annotation names for ruff/type-checkers only
+    from ..schema_manager import (
+        FluidSchemaManager,
+        SchemaVersion,
+        ValidationResult,
+        VersionConstraint,
+    )
+
+# NOTE: ``schema_manager`` pulls in ``jsonschema`` (a heavy dependency). It is
+# imported lazily via ``__getattr__`` below so it stays off the ``fluid --help``
+# / ``build_parser()`` cold path. ``register`` only needs argparse. Annotations
+# referencing these names are safe at module scope because
+# ``from __future__ import annotations`` keeps them as lazy strings. Runtime use
+# sites resolve via ``import fluid_build.cli.validate as _self; _self.X`` so the
+# ``patch("…cli.validate.FluidSchemaManager")`` test seam keeps working.
+
 COMMAND = "validate"
+
+_SCHEMA_MANAGER_EXPORTS = {
+    "FluidSchemaManager",
+    "SchemaVersion",
+    "ValidationResult",
+    "VersionConstraint",
+}
+
+
+def __getattr__(name: str):
+    """Lazily resolve schema_manager exports (PEP 562).
+
+    Keeps ``jsonschema`` off the ``fluid --help`` path while exposing the
+    symbols as module attributes so the ``patch("…cli.validate.<Symbol>")``
+    test seams keep working.
+    """
+    if name in _SCHEMA_MANAGER_EXPORTS:
+        import fluid_build.schema_manager as _sm
+
+        return getattr(_sm, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def register(subparsers: argparse._SubParsersAction):
@@ -200,8 +236,11 @@ def run(args, logger: logging.Logger) -> int:
                 args.cache_dir, mode="write", must_exist=False, file_type="cache directory"
             )
 
-        # Initialize schema manager
-        schema_manager = FluidSchemaManager(cache_dir=args.cache_dir, logger=logger)
+        # Initialize schema manager (lazy import keeps jsonschema off the
+        # --help path; resolved via module-self so test patches flow through).
+        import fluid_build.cli.validate as _self
+
+        schema_manager = _self.FluidSchemaManager(cache_dir=args.cache_dir, logger=logger)
 
         # Handle cache clearing
         if args.clear_cache:
@@ -433,11 +472,12 @@ def _determine_target_version(
     contract: dict, args, schema_manager: FluidSchemaManager, logger: logging.Logger
 ) -> Tuple[Optional[SchemaVersion], bool]:
     """Determine which schema version to validate against."""
+    import fluid_build.cli.validate as _self
 
     # Explicit version specified
     if args.schema_version:
         try:
-            return SchemaVersion.parse(args.schema_version), False
+            return _self.SchemaVersion.parse(args.schema_version), False
         except ValueError as e:
             raise CLIError(
                 1, "invalid_schema_version", {"version": args.schema_version, "error": str(e)}
@@ -502,23 +542,27 @@ def _reject_pre_07_contract(contract: Mapping[str, Any]) -> None:
 
 
 def _available_schema_versions(schema_manager: FluidSchemaManager, args) -> list[SchemaVersion]:
+    import fluid_build.cli.validate as _self
+
     versions = schema_manager.list_available_versions(include_remote=not args.offline)
-    return [SchemaVersion.parse(version) for version in versions]
+    return [_self.SchemaVersion.parse(version) for version in versions]
 
 
 def _filter_compatible_versions(versions: list[SchemaVersion], args) -> list[SchemaVersion]:
+    import fluid_build.cli.validate as _self
+
     compatible = versions
 
     if args.min_version:
         try:
-            min_constraint = VersionConstraint.parse(args.min_version)
+            min_constraint = _self.VersionConstraint.parse(args.min_version)
         except ValueError as e:
             raise CLIError(1, "invalid_min_version", {"version": args.min_version, "error": str(e)})
         compatible = [version for version in compatible if min_constraint.matches(version)]
 
     if args.max_version:
         try:
-            max_constraint = VersionConstraint.parse(args.max_version)
+            max_constraint = _self.VersionConstraint.parse(args.max_version)
         except ValueError as e:
             raise CLIError(1, "invalid_max_version", {"version": args.max_version, "error": str(e)})
         compatible = [version for version in compatible if max_constraint.matches(version)]
@@ -527,6 +571,8 @@ def _filter_compatible_versions(versions: list[SchemaVersion], args) -> list[Sch
 
 
 def _find_latest_compatible_version(args, schema_manager: FluidSchemaManager) -> SchemaVersion:
+    import fluid_build.cli.validate as _self
+
     versions = _available_schema_versions(schema_manager, args)
     compatible_versions = _filter_compatible_versions(versions, args)
     if compatible_versions:
@@ -538,7 +584,7 @@ def _find_latest_compatible_version(args, schema_manager: FluidSchemaManager) ->
     # Degenerate case: no schema versions discoverable at all (e.g. an empty
     # schemas dir). Fall back to the latest bundled schema rather than a
     # hardcoded number that goes stale every release.
-    return SchemaVersion.parse(FluidSchemaManager.latest_bundled_version())
+    return _self.SchemaVersion.parse(_self.FluidSchemaManager.latest_bundled_version())
 
 
 def _find_previous_compatible_version(
@@ -557,12 +603,14 @@ def _validate_contract_for_version(
     schema_manager: FluidSchemaManager,
     logger: logging.Logger,
 ) -> ValidationResult:
+    import fluid_build.cli.validate as _self
+
     validation_result = schema_manager.validate_contract(
         contract, schema_version=target_version, strict=args.strict, offline_only=args.offline
     )
 
     # FLUID 0.7.1+ governance validation
-    if target_version and target_version >= SchemaVersion.parse("0.7.1"):
+    if target_version and target_version >= _self.SchemaVersion.parse("0.7.1"):
         if not args.quiet and args.verbose:
             info(logger, "Running FLUID 0.7.1 governance validation...")
 
@@ -750,10 +798,12 @@ def _validate_version_constraints(
     if not version:
         return
 
+    import fluid_build.cli.validate as _self
+
     # Check minimum version constraint
     if args.min_version:
         try:
-            min_constraint = VersionConstraint.parse(args.min_version)
+            min_constraint = _self.VersionConstraint.parse(args.min_version)
             if not min_constraint.matches(version):
                 raise CLIError(
                     2,
@@ -766,7 +816,7 @@ def _validate_version_constraints(
     # Check maximum version constraint
     if args.max_version:
         try:
-            max_constraint = VersionConstraint.parse(args.max_version)
+            max_constraint = _self.VersionConstraint.parse(args.max_version)
             if not max_constraint.matches(version):
                 raise CLIError(
                     2,
@@ -1021,8 +1071,10 @@ def run_on_contract_dict(
     matching the ``fluid validate --strict`` semantics. Note that schema
     *errors* always produce exit code ``1`` regardless of ``strict``.
     """
+    import fluid_build.cli.validate as _self
+
     log = logger or logging.getLogger(__name__)
-    schema_manager = FluidSchemaManager()
+    schema_manager = _self.FluidSchemaManager()
     result = schema_manager.validate_contract(contract, offline_only=offline_only)
     output_args = SimpleNamespace(quiet=False, verbose=False, strict=strict)
     rc = output_text_results(result, output_args, log)

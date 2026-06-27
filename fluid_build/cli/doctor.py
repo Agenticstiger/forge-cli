@@ -31,18 +31,27 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import cprint
 
 from ._common import CLIError
 from ._logging import info
-from .forge_copilot_llm_providers import LlmReadinessCheck, check_llm_readiness
 from .security import (
     InputSanitizer,
     ProductionLogger,
     validate_output_file,
 )
+
+if TYPE_CHECKING:  # resolve annotation names for ruff/type-checkers only
+    from .forge_copilot_llm_providers import LlmReadinessCheck
+
+# NOTE: ``forge_copilot_llm_providers`` pulls in ``httpx`` (a heavy dependency
+# via the AI runtime). ``check_llm_readiness`` is imported lazily at its use
+# sites below so it stays off the ``fluid --help`` / ``build_parser()`` cold
+# path — ``register`` only needs argparse. Annotations referencing
+# ``LlmReadinessCheck`` are safe at module scope because
+# ``from __future__ import annotations`` keeps them as lazy strings.
 
 # Try Rich for better output
 try:
@@ -1028,6 +1037,8 @@ def _print_feature_checks(checks: List[Dict[str, any]], verbose: bool = False):
 
 def _check_copilot_readiness() -> LlmReadinessCheck:
     """Inspect whether Forge copilot has enough local config to start."""
+    from .forge_copilot_llm_providers import check_llm_readiness
+
     return check_llm_readiness()
 
 

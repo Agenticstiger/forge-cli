@@ -32,7 +32,6 @@ from fluid_build.cli.console import cprint
 from fluid_build.cli.forge_banner import compact_next_line
 
 from .. import __version__ as CLI_VERSION
-from ..schema_manager import FluidSchemaManager
 from ._common import CLIError
 from ._logging import info
 
@@ -47,15 +46,37 @@ except ImportError:
     RICH_AVAILABLE = False
 
 COMMAND = "version"
-# Last-resort fallback for the displayed "latest spec" when no bundled schema
-# is discoverable. Derived from the schema manager so it tracks the newest
-# bundled version instead of going stale every release.
-FALLBACK_SPEC_VERSION = FluidSchemaManager.latest_bundled_version()
+
+
+def _bundled_schema_versions() -> list[str]:
+    """Discover bundled FLUID schema versions without importing ``jsonschema``.
+
+    ``register`` runs on every ``fluid --help`` / ``build_parser()`` so it must
+    not import :mod:`fluid_build.schema_manager` (which pulls the heavy
+    ``jsonschema`` dependency at module load). This mirrors the canonical
+    :func:`fluid_build.schema_manager._discover_bundled_versions` with a plain
+    directory glob — schema_manager remains the source of truth for the runtime
+    ``_gather_version_info`` path.
+    """
+    import re
+    from pathlib import Path
+
+    schemas_dir = Path(__file__).resolve().parent.parent / "schemas"
+    pattern = re.compile(r"^fluid-schema-(\d+\.\d+(?:\.\d+)?)\.json$")
+    versions: set[str] = set()
+    if schemas_dir.exists():
+        for schema_file in schemas_dir.glob("fluid-schema-*.json"):
+            match = pattern.match(schema_file.name)
+            if match:
+                versions.add(match.group(1))
+    if not versions:
+        versions.update(["0.7.1", "0.7.2", "0.7.3", "0.7.4"])
+    return sorted(versions, key=lambda v: tuple(int(p) for p in v.split(".")))
 
 
 def register(subparsers: argparse._SubParsersAction):
     """Register unified version command"""
-    supported_versions = ", ".join(FluidSchemaManager.BUNDLED_VERSIONS)
+    supported_versions = ", ".join(_bundled_schema_versions())
     p = subparsers.add_parser(
         COMMAND,
         help="Show version and system information",
@@ -103,8 +124,16 @@ def run(args, logger: logging.Logger) -> int:
 
 def _gather_version_info(args) -> Dict[str, Any]:
     """Gather comprehensive version information"""
+    # Lazy import keeps jsonschema off the --help path; this is the runtime
+    # path (``fluid version``) so importing schema_manager here is fine.
+    from ..schema_manager import FluidSchemaManager
+
     supported_versions = FluidSchemaManager.BUNDLED_VERSIONS
-    latest_version = supported_versions[-1] if supported_versions else FALLBACK_SPEC_VERSION
+    latest_version = (
+        supported_versions[-1]
+        if supported_versions
+        else FluidSchemaManager.latest_bundled_version()
+    )
     default_version = latest_version
     version_info = {
         "cli": {"version": CLI_VERSION, "api_version": "v1", "build": "production"},

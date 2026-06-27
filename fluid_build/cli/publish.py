@@ -39,7 +39,7 @@ import argparse
 import asyncio
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from fluid_build.cli.console import cprint
 from fluid_build.observability.tracing import traced_stage as _traced_stage
@@ -55,9 +55,36 @@ except ImportError:
 
 from ..config_manager import FluidConfig
 from ..loader import load_contract
-from ..providers.catalogs import PublishResult, get_catalog_provider
 from ..providers.common import metrics_collector
 from ._common import hydrate_dotenv, resolve_contract_env_templates
+
+if TYPE_CHECKING:  # resolve annotation names for ruff/type-checkers only
+    from ..providers.catalogs import PublishResult
+
+# NOTE: ``providers.catalogs`` pulls ``httpx`` (the FLUID Command Center catalog
+# provider). ``register`` only needs argparse, so ``PublishResult`` /
+# ``get_catalog_provider`` are resolved lazily via ``__getattr__`` below and stay
+# off the ``fluid --help`` / ``build_parser()`` cold path. The handler body binds
+# them as function-locals (which trips ``__getattr__``) at call time. Annotations
+# referencing ``PublishResult`` are safe at module scope because
+# ``from __future__ import annotations`` keeps them as lazy strings.
+
+_DEFERRED_CATALOG_IMPORTS = {"PublishResult", "get_catalog_provider"}
+
+
+def __getattr__(name: str):
+    """Lazily resolve the catalog-provider exports (PEP 562).
+
+    Keeps ``httpx`` off the ``fluid --help`` path while exposing the symbols as
+    module attributes so handler-local imports (and any
+    ``patch("…cli.publish.<symbol>")`` seam) keep working.
+    """
+    if name in _DEFERRED_CATALOG_IMPORTS:
+        import fluid_build.providers.catalogs as _catalogs
+
+        return getattr(_catalogs, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 COMMAND = "publish"
 logger = logging.getLogger(__name__)
@@ -245,6 +272,11 @@ async def publish_contract(
     Returns:
         PublishResult with success/failure details
     """
+    # Bind the heavy catalog-provider deps as locals (resolves via the module
+    # ``__getattr__`` lazy-import seam) so the bare-name constructor / call sites
+    # below keep working off the light ``fluid --help`` cold path.
+    from fluid_build.cli.publish import PublishResult, get_catalog_provider
+
     if verbose:
         logger.info(f"📄 Loading contract: {contract_path}")
 

@@ -49,8 +49,6 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 from rich.tree import Tree
 
-from fluid_build.schema_manager import FluidSchemaManager
-
 from .interfaces import ComplexityLevel, GenerationContext
 from .registry import (
     extension_registry,
@@ -877,6 +875,11 @@ class ForgeEngine:
 
     def _apply_intelligent_defaults(self) -> None:
         """Apply intelligent defaults for non-interactive mode"""
+        # Lazy import keeps the heavy ``jsonschema`` dependency off the
+        # ``fluid --help`` / ``build_parser()`` cold path (importing
+        # ``ForgeEngine`` no longer pulls schema_manager at class-load time).
+        from fluid_build.schema_manager import FluidSchemaManager
+
         defaults = {
             "name": "my-data-product",
             "description": "A production-ready data product",

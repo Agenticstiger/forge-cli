@@ -24,8 +24,6 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fluid_build.schema_manager import FluidSchemaManager
-
 from ..base import Store, StoreRecord, utc_now
 
 # Word-boundary pattern for the keyword/hybrid search fallback. Underscores,
@@ -44,6 +42,11 @@ class FileBackend(Store):
         workspace_root: Optional[Path] = None,
         fluid_version: Optional[str] = None,
     ) -> None:
+        # Lazy import keeps the heavy ``jsonschema`` dependency (pulled by
+        # schema_manager) off the ``fluid --help`` / ``build_parser()`` cold
+        # path — ``fluid memory``'s ``register`` imports this module's factory.
+        from fluid_build.schema_manager import FluidSchemaManager
+
         self.root = (root or (Path.home() / ".fluid" / "store")).expanduser()
         self.root.mkdir(parents=True, exist_ok=True)
         self.workspace_root = workspace_root or Path.cwd()

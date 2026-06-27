@@ -33,7 +33,6 @@ from fluid_build.copilot.schemas.stage_outputs import (
 from fluid_build.forge_datamodel.emit.semantic_quality import (
     lint_logical_semantic_quality,
 )
-from fluid_build.schema_manager import FluidSchemaManager
 
 # Fuzzy-match threshold for "naming drift" warnings. 0.72 catches
 # ``hub_customer`` vs canonical ``hub_party`` (ratio ≈ 0.73) while
@@ -50,6 +49,12 @@ class FluidContractValidator:
         # automatically. Callers can pin to a specific version when emitting
         # for a frozen target. Per-contract validation honors the contract's
         # own ``fluidVersion`` first (see ``validate``) — this is the fallback.
+        #
+        # Lazy import keeps the heavy ``jsonschema`` dependency off the
+        # ``fluid mcp`` / ``fluid --help`` / ``build_parser()`` cold path (this
+        # module is reached transitively from the mcp dispatcher at registration).
+        from fluid_build.schema_manager import FluidSchemaManager
+
         self.schema_manager = FluidSchemaManager()
         self.version = version or self.schema_manager.latest_bundled_version()
 
