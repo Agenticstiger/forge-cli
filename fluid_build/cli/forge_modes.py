@@ -303,6 +303,275 @@ def _maybe_scaffold_team_memory_on_first_forge(*, console: Any = None) -> Option
         return None
 
 
+def _forge_build_copilot_options(
+    args: Any,
+    *,
+    get_cli_arg_fn: Callable[[Any, str, Any], Any],
+    is_non_interactive: bool,
+) -> Dict[str, Any]:
+    """Build the long-lived ``copilot_options`` dict from CLI args.
+
+    Extracted verbatim from ``run_ai_copilot_mode`` (behaviour-preserving) to
+    shrink that god-function; the returned dict is mutated downstream.
+    """
+    return {
+        "llm_provider": get_cli_arg_fn(args, "llm_provider"),
+        "llm_model": get_cli_arg_fn(args, "llm_model"),
+        "llm_endpoint": get_cli_arg_fn(args, "llm_endpoint"),
+        "llm_routing_model": get_cli_arg_fn(args, "llm_routing_model"),
+        "llm_routing_endpoint": get_cli_arg_fn(args, "llm_routing_endpoint"),
+        "tiered": bool(get_cli_arg_fn(args, "tiered", False)),
+        "require_llm": bool(get_cli_arg_fn(args, "require_llm", False)),
+        "discover": get_cli_arg_fn(args, "discover", True),
+        "discovery_path": get_cli_arg_fn(args, "discovery_path"),
+        "memory": get_cli_arg_fn(args, "memory", True),
+        "save_memory": get_cli_arg_fn(args, "save_memory", False),
+        "non_interactive": is_non_interactive,
+        "fragment_first": bool(get_cli_arg_fn(args, "fragments", False)),
+        "no_fragments": bool(get_cli_arg_fn(args, "no_fragments", False)),
+        "no_generate": bool(get_cli_arg_fn(args, "no_generate", False)),
+        # Pre-write preview UX (invariants I1/I4/I5):
+        #   auto_yes  — skip the [Y/n] prompt, panel still renders
+        #   show_work — stream reasoning/tool calls live as the agent runs
+        # ``non_interactive`` implies ``auto_yes`` so headless flows don't
+        # block on input.
+        "auto_yes": bool(get_cli_arg_fn(args, "yes", False)) or is_non_interactive,
+        "show_work": bool(get_cli_arg_fn(args, "show_work", False)),
+        # Gap 5 — land enrichment artifacts back into the contract.
+        "apply_enrichment": bool(get_cli_arg_fn(args, "apply_enrichment", False)),
+        # Phase 1 — type-aware authoring. Resolved through the canonical
+        # registry at fluid_build.forge.product_types so SDP/Bronze are
+        # accepted interchangeably.
+        "data_product_type": get_cli_arg_fn(args, "data_product_type"),
+        "transform_engine": get_cli_arg_fn(args, "transform_engine"),
+        # Phase 0.4 — --refine mode. None means "fresh authoring".
+        "refine_contract_path": get_cli_arg_fn(args, "refine"),
+        # Phase 3 — composition mode. List of upstream refs (ids or paths).
+        "from_product": list(get_cli_arg_fn(args, "from_product", []) or []),
+        "from_product_list": get_cli_arg_fn(args, "from_product_list"),
+        "from_workspace": list(get_cli_arg_fn(args, "from_workspace", []) or []),
+        "also_emit": get_cli_arg_fn(args, "also_emit"),
+        # Phase 7 — structural seed from an ODCS / Bitol ODPS document.
+        # When --seed-from is set, the FLUID skeleton from the standard
+        # is treated as ground truth (schema/quality/qos must not be
+        # mutated by the LLM). The post-validation guard in
+        # generate_copilot_artifacts enforces this.
+        "seed_from": get_cli_arg_fn(args, "seed_from"),
+        "seed_allow_remote": bool(get_cli_arg_fn(args, "seed_allow_remote", False)),
+        "seed_no_remote": bool(get_cli_arg_fn(args, "seed_no_remote", False)),
+    }
+
+
+def _forge_install_pause_handler(
+    args: Any,
+    *,
+    get_cli_arg_fn: Callable[[Any, str, Any], Any],
+    logger: logging.Logger,
+    run_start: float,
+) -> str:
+    """Resolve the run-id + install the SIGINT pause handler (S2).
+
+    Extracted verbatim from ``run_ai_copilot_mode`` (behaviour-preserving).
+    Resolves a stable run-id (the ``--resume`` id when present, else a freshly
+    minted one), stamps it onto ``args._active_run_id`` so downstream consumers
+    share it, and installs the SIGINT handler that lands a ``.paused`` marker
+    under ``.fluid/agents/<run-id>/`` on Ctrl-C. ``run_start`` is the
+    ``time.monotonic()`` origin used for the handler's ``age_seconds``. Returns
+    the active run-id.
+    """
+    import time
+
+    _resume_run_id = getattr(args, "_resume_run_id", None)
+    try:
+        from fluid_build.cli._preview_panel import new_run_id as _mint_run_id
+    except Exception:  # noqa: BLE001
+        import secrets as _secrets
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        def _mint_run_id() -> str:
+            stamp = _dt.now(_tz.utc).strftime("%Y%m%d-%H%M%S")
+            return f"{stamp}-{_secrets.token_hex(3)}"
+
+    active_run_id = _resume_run_id or _mint_run_id()
+    # Stamp onto args so downstream (forge_copilot_runtime → StageCoordinator)
+    # consume the same id rather than minting their own.
+    args._active_run_id = active_run_id
+
+    # Resolve the run-dir location (where the .paused marker lands). Use
+    # --target-dir when provided, else cwd — both match where the
+    # FileCheckpointStore writes later, so ``fluid agents list`` sees the marker.
+    try:
+        _early_target = get_cli_arg_fn(args, "target_dir")
+        _early_root = Path(_early_target).expanduser() if _early_target else Path.cwd()
+    except Exception:  # noqa: BLE001 — defensive
+        _early_root = Path.cwd()
+    _pause_run_dir = _early_root / ".fluid" / "agents" / active_run_id
+
+    # Mutable cell read by the SIGINT handler. The coordinator writes the
+    # manifest as stages complete; we read it lazily so the handler reflects
+    # the *latest* progress at Ctrl-C time.
+    def _resolve_run_state() -> dict:
+        stage_name = ""
+        current_stage = 0
+        stages_total = 8  # canonical STAGE_NAMES length
+        cost_so_far = 0.0
+        try:
+            manifest_path = _pause_run_dir / "checkpoints" / "manifest.json"
+            if manifest_path.is_file():
+                import json as _json
+
+                manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+                completed = list(manifest.get("completed_stages") or [])
+                current_stage = len(completed)
+                stage_name = manifest.get("last_stage") or (
+                    completed[-1] if completed else "starting"
+                )
+                cost_so_far = float(manifest.get("total_cost_usd") or 0.0)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from fluid_build.copilot.cost import get_run_tracker as _tracker
+
+            cost_breakdown = _tracker().breakdown()
+            if cost_breakdown.total_usd is not None and cost_breakdown.total_usd > cost_so_far:
+                cost_so_far = float(cost_breakdown.total_usd)
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "current_stage": current_stage,
+            "stages_total": stages_total,
+            "stage_name": stage_name or "starting",
+            "age_seconds": max(0.0, time.monotonic() - run_start),
+            "cost_so_far": cost_so_far,
+        }
+
+    try:
+        from fluid_build.cli._signal_handler import install_pause_handler
+        from fluid_build.copilot.checkpoint import get_default_saver
+
+        install_pause_handler(
+            run_id=active_run_id,
+            run_dir=_pause_run_dir,
+            get_state=_resolve_run_state,
+            saver=get_default_saver(workspace_root=_early_root),
+        )
+    except Exception as _sigh_exc:  # noqa: BLE001 — never block forge
+        logger.debug("install_pause_handler_failed: %s", _sigh_exc)
+
+    return active_run_id
+
+
+def _forge_load_personal_memory(
+    context: Dict[str, Any],
+    *,
+    console: Any,
+    args: Any,
+    get_cli_arg_fn: Callable[[Any, str, Any], Any],
+) -> None:
+    """Load per-engineer personal memory as soft defaults into ``context``.
+
+    Extracted from ``run_ai_copilot_mode`` (behaviour-preserving). Fills only
+    slots not already populated (precedence: CLI args > discovery > team >
+    project > personal > defaults) and records provenance under
+    ``context['_value_provenance']``. Loaded in every mode (issue #48).
+    """
+    try:
+        from fluid_build.cli.forge_copilot_personal_memory import load_personal_memory
+
+        personal_prefs = load_personal_memory()
+        if personal_prefs:
+            # Apply as soft defaults (lower precedence than explicit args).
+            # ``ci_provider`` / ``ci_complexity`` are used later by the auto-CI
+            # hook only in interactive mode.
+            pref_keys = (
+                "preferred_provider",
+                "preferred_engine",
+                "preferred_domain",
+                "owner_team",
+                "preferred_ci_provider",
+                "preferred_ci_complexity",
+            )
+            # Track which slots were filled from personal memory so downstream
+            # surfaces (issue #50 — AI Analysis panel provenance) can render
+            # "(from personal memory)". Lives on ``context`` so it travels with
+            # the rest of the resolved-context state.
+            _provenance: Dict[str, str] = context.setdefault("_value_provenance", {})
+            for key in pref_keys:
+                if personal_prefs.get(key) and key.replace("preferred_", "") not in context:
+                    mapped_key = key.replace("preferred_", "")
+                    context.setdefault(mapped_key, personal_prefs[key])
+                    _provenance.setdefault(mapped_key, "personal memory")
+            # Render the status only interactively — non-interactive runs keep
+            # their output quiet but still benefit from the merged preferences.
+            if console and not get_cli_arg_fn(args, "non_interactive", False):
+                print_dialog_status(
+                    console,
+                    status="info",
+                    message="Loaded your personal preferences.",
+                )
+    except ImportError:
+        pass
+
+
+def _forge_load_team_memory(
+    context: Dict[str, Any],
+    perf_stats: Dict[str, Any],
+    *,
+    console: Any,
+    is_non_interactive: bool,
+) -> None:
+    """Load shared team conventions into ``context`` (soft defaults).
+
+    Extracted from ``run_ai_copilot_mode`` (behaviour-preserving). Propagates
+    ``conventions.defaults`` via ``setdefault`` (keeps the precedence ladder),
+    records provenance, and stamps ``perf_stats['team_memory']``. Best-effort —
+    any failure is swallowed so a malformed team-memory file never blocks forge.
+    """
+    try:
+        from fluid_build.cli.forge_team_memory import (
+            TEAM_MEMORY_FILENAME,
+            load_team_memory,
+        )
+        from fluid_build.cli.workspace_config import find_workspace_root
+
+        ws_root = find_workspace_root(Path.cwd()) or Path.cwd()
+        team_memory_path = ws_root / ".fluid" / TEAM_MEMORY_FILENAME
+        tm = load_team_memory(ws_root)
+        if tm is not None:
+            perf_stats["team_memory"] = tm.summary_line()
+            # Propagate ``conventions.defaults`` into the resolved context so
+            # the LLM picks them up. Higher tiers (CLI args / personal) already
+            # populated ``context`` — ``setdefault`` keeps the precedence ladder
+            # intact. Tracked under the same ``_value_provenance`` map.
+            _provenance: Dict[str, str] = context.setdefault("_value_provenance", {})
+            for slot, raw_value in (tm.defaults or {}).items():
+                if raw_value and slot not in context:
+                    context.setdefault(slot, raw_value)
+                    _provenance.setdefault(slot, "team memory")
+            if console:
+                print_dialog_status(
+                    console,
+                    status="info",
+                    message=f"Loaded team memory ({tm.summary_line()}).",
+                )
+        elif team_memory_path.exists() and console:
+            # File exists but failed to parse — show actionable error.
+            print_dialog_status(
+                console,
+                status="warning",
+                message=f"Could not parse {TEAM_MEMORY_FILENAME}. Check YAML syntax.",
+            )
+        elif console and not is_non_interactive:
+            print_dialog_status(
+                console,
+                status="info",
+                message="No team memory found. Create .fluid/team-memory.yaml to share conventions.",
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def run_ai_copilot_mode(
     args: Any,
     logger: logging.Logger,
@@ -383,99 +652,13 @@ def run_ai_copilot_mode(
             "total_tokens": 0,
         }
 
-        # --- Pause/resume wiring (S2) -----------------------------------
-        # Resolve a stable run-id NOW (resume-id from the CLI flag if
-        # present, else mint a fresh one) and install the SIGINT
-        # handler so that Ctrl-C anywhere downstream lands a usable
-        # ``.paused`` marker under ``.fluid/agents/<run-id>/``.
-        #
-        # The "current stage" can't be known until the coordinator
-        # actually starts work; the handler reads it lazily through the
-        # ``get_state`` callback (we keep a mutable cell here and the
-        # coordinator's checkpoint store updates the manifest as it
-        # goes — see ``_resolve_run_id_state_cell`` below). The bare
-        # ``except KeyboardInterrupt`` further down stays as the safety
-        # net for when handler install failed for any reason.
-        _resume_run_id = getattr(args, "_resume_run_id", None)
-        try:
-            from fluid_build.cli._preview_panel import new_run_id as _mint_run_id
-        except Exception:  # noqa: BLE001
-            import secrets as _secrets
-            from datetime import datetime as _dt
-            from datetime import timezone as _tz
-
-            def _mint_run_id() -> str:
-                stamp = _dt.now(_tz.utc).strftime("%Y%m%d-%H%M%S")
-                return f"{stamp}-{_secrets.token_hex(3)}"
-
-        active_run_id = _resume_run_id or _mint_run_id()
-        # Stamp onto args so downstream (forge_copilot_runtime →
-        # StageCoordinator) consume the same id rather than minting
-        # their own. The runtime reads this via context["resume_run_id"]
-        # (set just before the LLM call) — see _resolve_run_id flow.
-        args._active_run_id = active_run_id
-
-        # Resolve the run-dir location (where the .paused marker
-        # lands). Use --target-dir when provided, else cwd. Both
-        # match where the FileCheckpointStore would write later, so
-        # ``fluid agents list`` and the resume prompt see the marker.
-        try:
-            _early_target = get_cli_arg_fn(args, "target_dir")
-            _early_root = Path(_early_target).expanduser() if _early_target else Path.cwd()
-        except Exception:  # noqa: BLE001 — defensive
-            _early_root = Path.cwd()
-        _pause_run_dir = _early_root / ".fluid" / "agents" / active_run_id
-
-        # Mutable cell read by the SIGINT handler. The coordinator
-        # writes the manifest as stages complete; we read it lazily so
-        # the handler reflects the *latest* progress at Ctrl-C time.
-        def _resolve_run_state() -> dict:
-            stage_name = ""
-            current_stage = 0
-            stages_total = 8  # canonical STAGE_NAMES length
-            cost_so_far = 0.0
-            try:
-                manifest_path = _pause_run_dir / "checkpoints" / "manifest.json"
-                if manifest_path.is_file():
-                    import json as _json
-
-                    manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
-                    completed = list(manifest.get("completed_stages") or [])
-                    current_stage = len(completed)
-                    stage_name = manifest.get("last_stage") or (
-                        completed[-1] if completed else "starting"
-                    )
-                    cost_so_far = float(manifest.get("total_cost_usd") or 0.0)
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                from fluid_build.copilot.cost import get_run_tracker as _tracker
-
-                cost_breakdown = _tracker().breakdown()
-                if cost_breakdown.total_usd is not None and cost_breakdown.total_usd > cost_so_far:
-                    cost_so_far = float(cost_breakdown.total_usd)
-            except Exception:  # noqa: BLE001
-                pass
-            return {
-                "current_stage": current_stage,
-                "stages_total": stages_total,
-                "stage_name": stage_name or "starting",
-                "age_seconds": max(0.0, _time.monotonic() - _run_start),
-                "cost_so_far": cost_so_far,
-            }
-
-        try:
-            from fluid_build.cli._signal_handler import install_pause_handler
-            from fluid_build.copilot.checkpoint import get_default_saver
-
-            install_pause_handler(
-                run_id=active_run_id,
-                run_dir=_pause_run_dir,
-                get_state=_resolve_run_state,
-                saver=get_default_saver(workspace_root=_early_root),
-            )
-        except Exception as _sigh_exc:  # noqa: BLE001 — never block forge
-            logger.debug("install_pause_handler_failed: %s", _sigh_exc)
+        # Pause/resume wiring (S2): resolve a stable run-id + install the SIGINT
+        # handler so Ctrl-C anywhere downstream lands a ``.paused`` marker. The
+        # bare ``except KeyboardInterrupt`` further down stays as the safety net
+        # for when handler install failed. (See ``_forge_install_pause_handler``.)
+        active_run_id = _forge_install_pause_handler(
+            args, get_cli_arg_fn=get_cli_arg_fn, logger=logger, run_start=_run_start
+        )
 
         context: Dict[str, Any] = {}
         # Resume context for the staged coordinator path — the runtime
@@ -493,52 +676,9 @@ def run_ai_copilot_mode(
         if implicit_mode and not is_non_interactive and console:
             _print_mode_awareness(console)
 
-        copilot_options = {
-            "llm_provider": get_cli_arg_fn(args, "llm_provider"),
-            "llm_model": get_cli_arg_fn(args, "llm_model"),
-            "llm_endpoint": get_cli_arg_fn(args, "llm_endpoint"),
-            "llm_routing_model": get_cli_arg_fn(args, "llm_routing_model"),
-            "llm_routing_endpoint": get_cli_arg_fn(args, "llm_routing_endpoint"),
-            "tiered": bool(get_cli_arg_fn(args, "tiered", False)),
-            "require_llm": bool(get_cli_arg_fn(args, "require_llm", False)),
-            "discover": get_cli_arg_fn(args, "discover", True),
-            "discovery_path": get_cli_arg_fn(args, "discovery_path"),
-            "memory": get_cli_arg_fn(args, "memory", True),
-            "save_memory": get_cli_arg_fn(args, "save_memory", False),
-            "non_interactive": is_non_interactive,
-            "fragment_first": bool(get_cli_arg_fn(args, "fragments", False)),
-            "no_fragments": bool(get_cli_arg_fn(args, "no_fragments", False)),
-            "no_generate": bool(get_cli_arg_fn(args, "no_generate", False)),
-            # Pre-write preview UX (invariants I1/I4/I5):
-            #   auto_yes  — skip the [Y/n] prompt, panel still renders
-            #   show_work — stream reasoning/tool calls live as the agent runs
-            # ``non_interactive`` implies ``auto_yes`` so headless flows don't
-            # block on input.
-            "auto_yes": bool(get_cli_arg_fn(args, "yes", False)) or is_non_interactive,
-            "show_work": bool(get_cli_arg_fn(args, "show_work", False)),
-            # Gap 5 — land enrichment artifacts back into the contract.
-            "apply_enrichment": bool(get_cli_arg_fn(args, "apply_enrichment", False)),
-            # Phase 1 — type-aware authoring. Resolved through the canonical
-            # registry at fluid_build.forge.product_types so SDP/Bronze are
-            # accepted interchangeably.
-            "data_product_type": get_cli_arg_fn(args, "data_product_type"),
-            "transform_engine": get_cli_arg_fn(args, "transform_engine"),
-            # Phase 0.4 — --refine mode. None means "fresh authoring".
-            "refine_contract_path": get_cli_arg_fn(args, "refine"),
-            # Phase 3 — composition mode. List of upstream refs (ids or paths).
-            "from_product": list(get_cli_arg_fn(args, "from_product", []) or []),
-            "from_product_list": get_cli_arg_fn(args, "from_product_list"),
-            "from_workspace": list(get_cli_arg_fn(args, "from_workspace", []) or []),
-            "also_emit": get_cli_arg_fn(args, "also_emit"),
-            # Phase 7 — structural seed from an ODCS / Bitol ODPS document.
-            # When --seed-from is set, the FLUID skeleton from the standard
-            # is treated as ground truth (schema/quality/qos must not be
-            # mutated by the LLM). The post-validation guard in
-            # generate_copilot_artifacts enforces this.
-            "seed_from": get_cli_arg_fn(args, "seed_from"),
-            "seed_allow_remote": bool(get_cli_arg_fn(args, "seed_allow_remote", False)),
-            "seed_no_remote": bool(get_cli_arg_fn(args, "seed_no_remote", False)),
-        }
+        copilot_options = _forge_build_copilot_options(
+            args, get_cli_arg_fn=get_cli_arg_fn, is_non_interactive=is_non_interactive
+        )
 
         # Phase 7 — load the structural seed up-front so failures surface
         # before any LLM tokens are spent. The SeedResult rides on
@@ -775,54 +915,11 @@ def run_ai_copilot_mode(
         if explicit_target_dir:
             copilot_options["target_dir"] = str(Path(explicit_target_dir).expanduser())
 
-        # Load personal memory (per-engineer preferences).
-        #
-        # Issue #48 fix: personal memory previously loaded only when the
-        # run was interactive.  That left CI / scripted (``--non-interactive``)
-        # runs without their saved preferences while team memory (below)
-        # loaded unconditionally — an asymmetric trap.  Personal memory
-        # is now loaded in every mode; the precedence ladder still holds
-        # because ``context.setdefault`` only fills slots that aren't
-        # already populated by CLI args or earlier signals (CLI args >
-        # discovery > team > project > personal > defaults).
-        try:
-            from fluid_build.cli.forge_copilot_personal_memory import load_personal_memory
-
-            personal_prefs = load_personal_memory()
-            if personal_prefs:
-                # Apply as soft defaults (lower precedence than explicit args).
-                # ``ci_provider`` / ``ci_complexity`` are used later by the
-                # auto-CI hook only in interactive mode.
-                pref_keys = (
-                    "preferred_provider",
-                    "preferred_engine",
-                    "preferred_domain",
-                    "owner_team",
-                    "preferred_ci_provider",
-                    "preferred_ci_complexity",
-                )
-                # Track which slots were actually filled from personal
-                # memory so downstream surfaces (issue #50 — AI Analysis
-                # panel provenance) can render "(from personal memory)"
-                # next to the resolved value.  Lives on ``context`` so
-                # it travels with the rest of the resolved-context state.
-                _provenance: Dict[str, str] = context.setdefault("_value_provenance", {})
-                for key in pref_keys:
-                    if personal_prefs.get(key) and key.replace("preferred_", "") not in context:
-                        mapped_key = key.replace("preferred_", "")
-                        context.setdefault(mapped_key, personal_prefs[key])
-                        _provenance.setdefault(mapped_key, "personal memory")
-                # Render the "Loaded your personal preferences." status only
-                # interactively — non-interactive runs keep their output
-                # quiet but still benefit from the merged preferences.
-                if console and not get_cli_arg_fn(args, "non_interactive", False):
-                    print_dialog_status(
-                        console,
-                        status="info",
-                        message="Loaded your personal preferences.",
-                    )
-        except ImportError:
-            personal_prefs = None
+        # Load personal memory (per-engineer preferences) as soft defaults,
+        # in every mode (issue #48). See ``_forge_load_personal_memory``.
+        _forge_load_personal_memory(
+            context, console=console, args=args, get_cli_arg_fn=get_cli_arg_fn
+        )
 
         force_llm_setup = bool(get_cli_arg_fn(args, "_force_llm_setup", False))
         if not is_non_interactive and (enable_recovery or force_llm_setup):
@@ -1059,52 +1156,10 @@ def run_ai_copilot_mode(
                         message=f"Loaded {domain} domain expertise pack.",
                     )
 
-        # --- Team memory: load shared conventions ---
-        try:
-            from fluid_build.cli.forge_team_memory import (
-                TEAM_MEMORY_FILENAME,
-                load_team_memory,
-            )
-            from fluid_build.cli.workspace_config import find_workspace_root
-
-            ws_root = find_workspace_root(Path.cwd()) or Path.cwd()
-            team_memory_path = ws_root / ".fluid" / TEAM_MEMORY_FILENAME
-            tm = load_team_memory(ws_root)
-            if tm is not None:
-                perf_stats["team_memory"] = tm.summary_line()
-                # Propagate ``conventions.defaults`` into the resolved
-                # context so the LLM picks them up.  Higher tiers
-                # (CLI args / personal) already populated ``context`` —
-                # ``setdefault`` keeps the precedence ladder intact.
-                # Tracked under the same ``_value_provenance`` map so
-                # ``--show-memory`` and any provenance-aware surface
-                # can render "(from team memory)".
-                _provenance: Dict[str, str] = context.setdefault("_value_provenance", {})
-                for slot, raw_value in (tm.defaults or {}).items():
-                    if raw_value and slot not in context:
-                        context.setdefault(slot, raw_value)
-                        _provenance.setdefault(slot, "team memory")
-                if console:
-                    print_dialog_status(
-                        console,
-                        status="info",
-                        message=f"Loaded team memory ({tm.summary_line()}).",
-                    )
-            elif team_memory_path.exists() and console:
-                # File exists but failed to parse — show actionable error.
-                print_dialog_status(
-                    console,
-                    status="warning",
-                    message=f"Could not parse {TEAM_MEMORY_FILENAME}. Check YAML syntax.",
-                )
-            elif console and not is_non_interactive:
-                print_dialog_status(
-                    console,
-                    status="info",
-                    message="No team memory found. Create .fluid/team-memory.yaml to share conventions.",
-                )
-        except Exception:  # noqa: BLE001
-            pass
+        # Team memory: load shared conventions as soft defaults.
+        _forge_load_team_memory(
+            context, perf_stats, console=console, is_non_interactive=is_non_interactive
+        )
 
         # Slice UX-L: populate perf_stats from what we know so far.
         from fluid_build.cli.forge_copilot_llm_providers import streaming_is_enabled
