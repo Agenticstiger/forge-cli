@@ -27,15 +27,21 @@ pytestmark = pytest.mark.skipif(
     reason="FLUID_PERF_DISABLED=1 — perf budgets opt out for slow lanes",
 )
 
-# Budgets. After the MCP lazy-import (A++ Light CLI Card 1) landed, a cold
-# ``build_parser()`` imports 1550 modules (stable across runs) and the MCP
-# server SDK no longer loads on this path (was ~87 modules / ~100ms). The
-# budget is pinned just above the current best — and BELOW the 1581 baseline
-# from PR #167 — so the gate is a genuine ratchet that catches *regressions*
-# (a new eager top-level import on the parser-build path). RATCHET DOWN further
-# once the requests/rich deferrals land (the "audit next startup hotspots"
-# card) — target ~1,250.
-MAX_MODULES = 1580
+# Budgets. The "audit next startup hotspots" card deferred the ``requests``
+# stack (~107 modules incl urllib3/certifi/charset_normalizer) and the
+# ``build_runners`` subtree off the cold ``build_parser()`` path by making the
+# observability package's ``CommandCenterReporter`` lazy (PEP 562) and
+# deferring the ``DataMeshManagerProvider`` / marketplace ``requests`` imports
+# into their handlers. In a full-extras env (snowflake/bigquery/boto3/litellm/
+# duckdb/datahub) a cold ``build_parser()`` dropped from ~1569 to ~1352
+# modules; in a lean ``.[dev,local]`` env (what CI's perf step installs) it is
+# far lower (~920). The budget is pinned just above the full-extras best so the
+# gate stays a genuine ratchet that catches *regressions* (a new eager
+# top-level import on the parser-build path) without false-failing on a
+# developer's richer local env. RATCHET DOWN further once the forge AI-runtime
+# (``httpx`` / ``litellm`` / ``schema_manager`` via the ``forge`` /
+# ``forge data-model`` registration boundary) is deferred — target ~1,050.
+MAX_MODULES = 1390
 MAX_HELP_WALL_SECONDS = 2.0
 
 # Heavy SDKs that must NOT load on the --help / parser-build path.

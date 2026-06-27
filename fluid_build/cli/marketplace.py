@@ -32,10 +32,43 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-try:
-    import requests
-except ImportError:
-    requests = None  # type: ignore[assignment]
+# NOTE: ``requests`` (~107 modules incl urllib3/certifi/charset_normalizer) is
+# resolved lazily — at import time it would land on the cold ``fluid --help``
+# path (this module is imported at registration). ``_resolve_requests`` performs
+# the import on first use and caches it into the module global, and the PEP 562
+# ``__getattr__`` exposes ``requests`` as a module attribute so the
+# ``patch("…cli.marketplace.requests")`` test seam keeps working. See the A++
+# Light CLI startup card.
+_REQUESTS_UNRESOLVED = object()  # sentinel: import not yet attempted
+
+
+def _resolve_requests():
+    """Import ``requests`` lazily, caching the module (or ``None``) in globals.
+
+    Honors a test ``patch("…cli.marketplace.requests")``: once the module
+    attribute is set, that value is returned unchanged.
+    """
+    current = globals().get("requests", _REQUESTS_UNRESOLVED)
+    if current is not _REQUESTS_UNRESOLVED:
+        return current
+    try:
+        import requests as _requests
+    except ImportError:
+        _requests = None  # type: ignore[assignment]
+    globals()["requests"] = _requests
+    return _requests
+
+
+def __getattr__(name: str):
+    if name == "requests":
+        return _resolve_requests()
+    if name == "get_command_center_client":
+        from ._command_center import get_command_center_client
+
+        globals()[name] = get_command_center_client
+        return get_command_center_client
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 try:
     from rich.console import Console
@@ -48,9 +81,16 @@ try:
 except ImportError:
     RICH_AVAILABLE = False
 
-from ._command_center import get_command_center_client
 from ._common import CLIError
 from .console import cprint
+
+# NOTE: ``get_command_center_client`` lives in ``cli._command_center``, which
+# imports ``requests`` (~107 modules) at module scope. Importing it here eagerly
+# would pull ``requests`` onto the cold ``fluid --help`` path (this module is
+# imported at registration). It's resolved lazily via ``__getattr__`` below — and
+# exposing it as a module attribute keeps the
+# ``patch("…cli.marketplace.get_command_center_client")`` test seam working. See
+# the A++ Light CLI startup card.
 
 COMMAND = "marketplace"
 
@@ -71,6 +111,7 @@ console = Console() if RICH_AVAILABLE else None
 
 def _requests_exception_type(name: str) -> type[BaseException] | None:
     """Return a requests exception class, tolerating patched test doubles."""
+    requests = _resolve_requests()
     exceptions = getattr(requests, "exceptions", None)
     exc_type = getattr(exceptions, name, None)
     if isinstance(exc_type, type) and issubclass(exc_type, BaseException):
@@ -109,10 +150,12 @@ def _marketplace_request(request_func, url: str, logger: logging.Logger, **kwarg
 
 
 def _marketplace_get(url: str, logger: logging.Logger, **kwargs):
+    requests = _resolve_requests()
     return _marketplace_request(requests.get, url, logger, **kwargs)
 
 
 def _marketplace_post(url: str, logger: logging.Logger, **kwargs):
+    requests = _resolve_requests()
     return _marketplace_request(requests.post, url, logger, **kwargs)
 
 
@@ -287,6 +330,9 @@ def get_api_url(logger: Optional[logging.Logger] = None, *, required: bool = Tru
         return env_url
 
     # Priority 2: Command Center (auto-detected)
+    import fluid_build.cli.marketplace as _self
+
+    get_command_center_client = _self.get_command_center_client  # honors test patches
     cc = get_command_center_client(logger=logger)
     marketplace_url = cc.get_marketplace_url()
 
@@ -377,6 +423,7 @@ def _bundled_blueprints_matching(args) -> list:
 
 def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
     """Search marketplace blueprints (bundled + registry)."""
+    requests = _resolve_requests()
     console.print("[cyan]🔍 Searching marketplace blueprints...[/cyan]\n")
 
     # Bundled blueprints ship in the package, so discovery works offline and is
@@ -467,6 +514,7 @@ def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
 
 def show_blueprint_info(args, logger: logging.Logger, api_url: str) -> int:
     """Show detailed blueprint information."""
+    requests = _resolve_requests()
     console.print(f"[cyan]ℹ️  Fetching blueprint: {args.blueprint_id}...[/cyan]\n")
 
     from fluid_build.cli._market_bundled_blueprints import get_bundled_blueprint, is_bundled
@@ -579,6 +627,7 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
         render_bundled_contract,
     )
 
+    requests = _resolve_requests()
     console.print(f"[cyan]⚙️  Instantiating blueprint: {args.blueprint_id}...[/cyan]\n")
 
     bundled_bp = get_bundled_blueprint(args.blueprint_id) if is_bundled(args.blueprint_id) else None
