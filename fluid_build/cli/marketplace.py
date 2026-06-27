@@ -28,6 +28,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -244,15 +245,19 @@ def register(subparsers: argparse._SubParsersAction):
 def run(args, logger: logging.Logger) -> int:
     """Run the marketplace command."""
     try:
-        if console:
-            console.print(
-                "[yellow]Note: 'fluid marketplace' is deprecated. "
-                "Use 'fluid market --blueprints' instead.[/yellow]\n"
-            )
-        else:
-            cprint(
-                "Note: 'fluid marketplace' is deprecated. Use 'fluid market --blueprints' instead.\n"
-            )
+        # ``--format json`` consumers get pure JSON on stdout — suppress every
+        # human banner/status line (it would corrupt the parse).
+        json_mode = getattr(args, "format", None) == "json"
+        if not json_mode:
+            if console:
+                console.print(
+                    "[yellow]Note: 'fluid marketplace' is deprecated. "
+                    "Use 'fluid market --blueprints' instead.[/yellow]\n"
+                )
+            else:
+                cprint(
+                    "Note: 'fluid marketplace' is deprecated. Use 'fluid market --blueprints' instead.\n"
+                )
 
         if not args.marketplace_action:
             logger.error("Marketplace action required. Use --help for available actions.")
@@ -270,7 +275,17 @@ def run(args, logger: logging.Logger) -> int:
         bp_id = getattr(args, "blueprint_id", None)
 
         if action == "search":
-            api_url = get_api_url(logger=logger, required=False)
+            if json_mode:
+                # Resolve the registry URL with stdout muted — get_api_url emits
+                # human status lines (CC reachability, fallback choice) that would
+                # corrupt the JSON stream. (rich Console honours redirect_stdout.)
+                import contextlib
+                import io
+
+                with contextlib.redirect_stdout(io.StringIO()):
+                    api_url = get_api_url(logger=logger, required=False)
+            else:
+                api_url = get_api_url(logger=logger, required=False)
         elif bp_id and is_bundled(bp_id):
             api_url = None
         else:
@@ -424,7 +439,12 @@ def _bundled_blueprints_matching(args) -> list:
 def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
     """Search marketplace blueprints (bundled + registry)."""
     requests = _resolve_requests()
-    console.print("[cyan]🔍 Searching marketplace blueprints...[/cyan]\n")
+    # ``--format json`` (mirrors the catalog discovery path in market.py): emit a
+    # clean machine-parseable array on stdout and suppress every decorative print
+    # so a script piping the output gets pure JSON, no rich-table contamination.
+    json_mode = getattr(args, "format", None) == "json"
+    if not json_mode:
+        console.print("[cyan]🔍 Searching marketplace blueprints...[/cyan]\n")
 
     # Bundled blueprints ship in the package, so discovery works offline and is
     # never empty out of the box — they are listed alongside any registry hits.
@@ -462,22 +482,50 @@ def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
             # A bundled-only result is still useful; only hard-fail when there
             # is nothing at all to show.
             if not bundled:
-                console.print(f"[red]❌ {message}[/red]")
+                if json_mode:
+                    sys.stdout.write("[]\n")
+                else:
+                    console.print(f"[red]❌ {message}[/red]")
                 logger.error("Failed to search blueprints: %s", message, exc_info=True)
                 return 1
-            console.print(
-                f"[dim]Registry unavailable ({message}); showing bundled blueprints only.[/dim]\n"
-            )
+            if not json_mode:
+                console.print(
+                    f"[dim]Registry unavailable ({message}); showing bundled blueprints only.[/dim]\n"
+                )
             logger.info(
                 "Marketplace registry unavailable; showing %d bundled blueprint(s).", len(bundled)
             )
-    elif bundled:
+    elif bundled and not json_mode:
         console.print(
             "[dim]No registry configured; showing bundled blueprints. "
             "Set FLUID_API_URL or FLUID_PUBLIC_REGISTRY for more.[/dim]\n"
         )
 
     blueprints = bundled + registry
+
+    # JSON listing: stable keys, the same shape the catalog path emits — handles
+    # the empty case as ``[]`` too. Emitted before the rich table so stdout stays
+    # pure JSON for ``--format json`` consumers.
+    if json_mode:
+        # Emit verbatim via the stdout STREAM — not cprint/rich, which would
+        # markup-interpret the ``[...]`` brackets and soft-wrap long descriptions,
+        # corrupting the JSON. ``sys.stdout.write`` is the exact sink cprint's
+        # plain-text path uses (and the one CodeQL's logging-sink rule ignores).
+        payload = [
+            {
+                "id": bp.get("id"),
+                "name": bp.get("name"),
+                "category": bp.get("category"),
+                "maturity": (bp.get("labels") or {}).get("maturity"),
+                "source": "bundled" if bp.get("source") == "bundled" else "registry",
+                "version": bp.get("version"),
+                "description": bp.get("description"),
+            }
+            for bp in blueprints
+        ]
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return 0
+
     if not blueprints:
         console.print("[yellow]No blueprints found matching your criteria.[/yellow]")
         return 0
