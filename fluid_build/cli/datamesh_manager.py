@@ -45,10 +45,39 @@ try:
 except ImportError:
     RICH_AVAILABLE = False
 
+from typing import TYPE_CHECKING
+
 from fluid_build.cli.bootstrap import load_contract_with_overlay
-from fluid_build.cli.validate import run_on_contract_dict
 from fluid_build.providers.base import ProviderError
-from fluid_build.providers.datamesh_manager import DataMeshManagerProvider
+
+if TYPE_CHECKING:  # resolve annotation names for ruff/type-checkers only
+    from fluid_build.providers.datamesh_manager import DataMeshManagerProvider
+
+# NOTE: ``DataMeshManagerProvider`` (pulls ``requests`` — ~107 modules with its
+# transitive deps) and ``validate.run_on_contract_dict`` (pulls
+# ``schema_manager`` / ``jsonschema``) are imported lazily inside the handlers
+# below. ``add_parser`` runs on every ``fluid --help``, so this module must stay
+# light. See the A++ Light CLI startup card. Annotations referencing
+# ``DataMeshManagerProvider`` are safe at module scope because
+# ``from __future__ import annotations`` keeps them as lazy strings.
+
+
+def __getattr__(name: str):
+    """Lazily resolve ``DataMeshManagerProvider`` (PEP 562).
+
+    Exposes it as a module attribute so the lazy import is transparent and the
+    ``patch("…cli.datamesh_manager.DataMeshManagerProvider")`` test seam keeps
+    working, without pulling ``requests`` onto the ``fluid --help`` path.
+    """
+    if name == "DataMeshManagerProvider":
+        from fluid_build.providers.datamesh_manager import DataMeshManagerProvider
+
+        return DataMeshManagerProvider
+    if name == "run_on_contract_dict":
+        from fluid_build.cli.validate import run_on_contract_dict
+
+        return run_on_contract_dict
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def add_parser(subparsers):
@@ -247,6 +276,13 @@ def add_parser(subparsers):
 
 def _make_provider(args) -> DataMeshManagerProvider:
     """Instantiate provider from CLI args / env vars."""
+    # Resolve via this module's own attribute (lazy, PEP 562 ``__getattr__``)
+    # so the ``patch("…cli.datamesh_manager.DataMeshManagerProvider")`` test
+    # seam is honored and ``requests`` stays off the cold ``--help`` path.
+    import fluid_build.cli.datamesh_manager as _self
+
+    provider_cls = _self.DataMeshManagerProvider
+
     kwargs = {}
     if getattr(args, "api_key", None):
         kwargs["api_key"] = args.api_key
@@ -256,7 +292,7 @@ def _make_provider(args) -> DataMeshManagerProvider:
         kwargs["odps_lineage_mode"] = args.odps_lineage_mode
     if getattr(args, "auto_approve_access", False):
         kwargs["auto_approve_access"] = True
-    return DataMeshManagerProvider(**kwargs)
+    return provider_cls(**kwargs)
 
 
 def _validate_fluid_contract(contract: dict, validation_mode: str, logger: logging.Logger) -> int:
@@ -279,8 +315,13 @@ def _validate_fluid_contract(contract: dict, validation_mode: str, logger: loggi
         preserving backward compatibility for contracts that carry
         extension fields the bundled schema doesn't yet recognize
     """
+    # Resolve via this module's own attribute (lazy PEP 562 ``__getattr__``) so
+    # the ``patch.object(dmm_mod, "run_on_contract_dict")`` test seam is honored
+    # and ``schema_manager`` stays off the cold ``--help`` path.
+    import fluid_build.cli.datamesh_manager as _self
+
     try:
-        _result, rc = run_on_contract_dict(contract, strict=False, logger=logger)
+        _result, rc = _self.run_on_contract_dict(contract, strict=False, logger=logger)
     except Exception as exc:  # noqa: BLE001
         log_method = logger.error if validation_mode == "strict" else logger.warning
         log_method(
