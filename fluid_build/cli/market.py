@@ -1398,6 +1398,11 @@ def run(args, logger: logging.Logger) -> int:
                 args.state = "published"
                 args.sort = "downloads"
                 args.limit = getattr(args, "limit", 20)
+            # Mark the delegated path so marketplace.run() suppresses the
+            # "'fluid marketplace' is deprecated" banner — the user IS on the new
+            # `fluid market --blueprints` command; that banner only makes sense for
+            # a direct (hidden, deprecated) `fluid marketplace` invocation.
+            args._from_market = True
             return marketplace_run(args, logger)
         except ImportError:
             cprint("Blueprint marketplace not available. Install required dependencies.")
