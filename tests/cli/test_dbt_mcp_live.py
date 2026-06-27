@@ -91,32 +91,43 @@ def dbt_project(tmp_path: Path) -> Path:
     return proj
 
 
-def _client(project: Path):
-    from fluid_build.cli.dbt_mcp import DbtMcpClient
+@pytest.fixture()
+def dbt_env(dbt_project: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the dbt-mcp subprocess at the temp fixture project via env.
 
-    # The dbt-mcp server reads its dbt config from the inherited env; set it for
-    # this process so DbtMcpClient._subprocess_env passes it through.
-    os.environ["DBT_PROJECT_DIR"] = str(project)
-    os.environ["DBT_PROFILES_DIR"] = str(project)
-    os.environ["DBT_PATH"] = _dbt_path()  # type: ignore[index]
+    The dbt-mcp server reads its dbt config from the inherited env, so
+    ``DbtMcpClient._subprocess_env`` passes these through. Set them with
+    ``monkeypatch`` (not bare ``os.environ[...] = ...``) so the mutations are
+    reverted after each test — no leakage into sibling tests under
+    ``pytest-randomly`` (inspection follow-up to #311).
+    """
+    monkeypatch.setenv("DBT_PROJECT_DIR", str(dbt_project))
+    monkeypatch.setenv("DBT_PROFILES_DIR", str(dbt_project))
+    monkeypatch.setenv("DBT_PATH", _dbt_path() or "")
     # Local round-trip needs only the CLI tool group; the SL/Discovery groups
     # require a dbt Cloud token (Stage 3).
-    os.environ["DISABLE_SEMANTIC_LAYER"] = "true"
-    os.environ["DISABLE_DISCOVERY"] = "true"
+    monkeypatch.setenv("DISABLE_SEMANTIC_LAYER", "true")
+    monkeypatch.setenv("DISABLE_DISCOVERY", "true")
+    return dbt_project
+
+
+def _client():
+    from fluid_build.cli.dbt_mcp import DbtMcpClient
+
     return DbtMcpClient(command="uvx", args=["--from", "dbt-mcp", "dbt-mcp"])
 
 
-def test_live_dbt_mcp_lists_cli_tools(dbt_project):
+def test_live_dbt_mcp_lists_cli_tools(dbt_env):
     """The real dbt-mcp server, over stdio, exposes its dbt-CLI tool group."""
-    names = {n for n, _d, _s in _client(dbt_project).list_tools()}
+    names = {n for n, _d, _s in _client().list_tools()}
     # The self-managed dbt-CLI group — present whenever DBT_PROJECT_DIR + a dbt
     # binary resolve. (Don't over-pin the exact set; dbt-mcp evolves it.)
     assert {"compile", "list", "run"} <= names, sorted(names)
 
 
-def test_live_dbt_mcp_call_list_returns_the_model(dbt_project):
+def test_live_dbt_mcp_call_list_returns_the_model(dbt_env):
     """Calling the dbt ``list`` tool surfaces the fixture's ``orders`` model —
     a real forge-agent → MCP → dbt round-trip, not a mock."""
-    out = _client(dbt_project).call_tool("list", {})
+    out = _client().call_tool("list", {})
     text = out if isinstance(out, str) else str(out)
     assert "orders" in text, text[:500]
