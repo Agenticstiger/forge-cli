@@ -25,6 +25,7 @@ First-time project setup lives in ``fluid init``.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -232,25 +233,26 @@ class ForgeMode(Enum):
     BLANK = "blank"
 
 
-_COPILOT_AGENT_CLASS: Optional[type] = None
-
-
+@functools.lru_cache(maxsize=1)
 def _build_copilot_agent_class() -> type:
     """Build (and cache) the public ``CopilotAgent`` class lazily.
 
     The class subclasses ``CopilotAgentBase`` from the heavy
     ``forge_copilot_agent`` module — evaluating the base at module scope would
     force that import onto the ``fluid --help`` path, so the class is built on
-    first access to ``forge.CopilotAgent`` (via ``__getattr__``) instead. The
-    result is cached so ``isinstance`` / identity checks stay stable across
-    calls. Tests still ``patch("…cli.forge.CopilotAgent")`` and
-    ``from …cli.forge import CopilotAgent`` — both resolve through
-    ``__getattr__``.
-    """
-    global _COPILOT_AGENT_CLASS
-    if _COPILOT_AGENT_CLASS is not None:
-        return _COPILOT_AGENT_CLASS
+    first access to ``forge.CopilotAgent`` (via ``__getattr__``) instead.
 
+    Memoised with ``functools.lru_cache(maxsize=1)`` — the repo's standard
+    memoisation idiom (cf. ``_load_domain_keywords`` /
+    ``_dbt_command_supports_adapter``) — rather than a hand-rolled module global
+    + bare ``if`` check. lru_cache is internally lock-guarded, so two threads
+    racing on the first access get the *same* class object (stable ``isinstance``
+    / identity), and it exposes ``_build_copilot_agent_class.cache_clear()`` as a
+    clean reset hook for tests. Patching is unaffected: tests still
+    ``patch("…cli.forge.CopilotAgent")`` / ``from …cli.forge import
+    CopilotAgent`` — both resolve through ``__getattr__``, which sets/reads a
+    real module attribute that *shadows* this builder.
+    """
     import fluid_build.cli.forge as _self
     from fluid_build.cli.forge_copilot_agent import CopilotAgentBase
 
@@ -306,7 +308,6 @@ def _build_copilot_agent_class() -> type:
                 )
             return super()._ask_confirmation_dependency(prompt, preview)
 
-    _COPILOT_AGENT_CLASS = CopilotAgent
     return CopilotAgent
 
 
