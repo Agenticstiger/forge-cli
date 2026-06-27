@@ -147,12 +147,12 @@ def resolve_iceberg_catalog(
     # kind when the runtime recognizes it (nessie / hive / rest / ...), else REST;
     # the FileIO follows the WAREHOUSE scheme so GCS (gs://) and ADLS (abfss://)
     # work, not just S3 (RFC §6.3 — PR7's REST + GCP profiles).
-    warehouse = loc.get("warehouse") or loc.get("catalog_warehouse") or ""
+    warehouse = loc.get("warehouse") or ""
     return ResolvedIcebergCatalog(
         catalog_type=kind if kind in _KNOWN_CATALOG_TYPES else "rest",
         warehouse=warehouse,
         fq_table=fq_table,
-        uri=loc.get("uri") or loc.get("catalogUri"),
+        uri=loc.get("uri"),
         io_impl=_io_impl_for_warehouse(warehouse),
         region=loc.get("region"),
         id_columns=id_columns,

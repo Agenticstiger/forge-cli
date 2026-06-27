@@ -1499,6 +1499,25 @@
         "confluent_role_arn": {
           "type": "string",
           "description": "NEW in v0.7.5: ARN of the pre-created AWS IAM role Confluent Tableflow assumes (byob_aws). Its trust policy is updated post-apply with the provider integration's external_id (two-phase IAM)."
+        },
+        "catalog": {
+          "type": "string",
+          "description": "NEW in v0.7.5: Iceberg catalog kind/profile selector — maps to iceberg.catalog.type (e.g. glue, rest, nessie, hive). REST-fronted catalogs (polaris / unity / snowflake open catalog) map to 'rest'. Consumed by providers/_iceberg_catalog.py and the streaming-sink validator."
+        },
+        "warehouse": {
+          "type": "string",
+          "description": "NEW in v0.7.5: Iceberg warehouse — the canonical Iceberg REST 'warehouse' property (maps to iceberg.catalog.warehouse): an object-store URI (s3://|gs://|abfss://) for object-store catalogs, or the catalog/warehouse name for a REST catalog."
+        },
+        "uri": {
+          "type": "string",
+          "description": "NEW in v0.7.5: REST Iceberg catalog endpoint URL — the canonical Iceberg REST 'uri' property (maps to iceberg.catalog.uri)."
+        },
+        "partitionBy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "NEW in v0.7.5: Iceberg partition columns — a FLUID abstraction over the Iceberg PARTITIONED BY / PartitionSpec (maps to iceberg.tables.default-partition-by)."
         }
       }
     },

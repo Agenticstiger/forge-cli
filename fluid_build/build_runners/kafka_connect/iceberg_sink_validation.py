@@ -112,11 +112,11 @@ def validate_iceberg_sink(contract: Mapping[str, Any]) -> Tuple[List[str], List[
             or ("glue" if str(binding.get("platform") or "").lower() == "aws" else "rest")
         ).lower()
         if catalog_kind == "rest":
-            if not (loc.get("uri") or loc.get("catalogUri")):
+            if not loc.get("uri"):
                 errors.append(
                     f"iceberg sink (build {bid!r}): rest catalog requires binding.location.uri"
                 )
-            if not (loc.get("warehouse") or loc.get("catalog_warehouse")):
+            if not loc.get("warehouse"):
                 errors.append(
                     f"iceberg sink (build {bid!r}): rest catalog requires "
                     "binding.location.warehouse (the catalog name)"
