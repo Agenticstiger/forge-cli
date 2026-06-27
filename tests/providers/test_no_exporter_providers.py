@@ -31,6 +31,11 @@ _NON_DEPLOYING_MARKERS = (
     "does not support apply",
     "export action acknowledged",
     "use render() for actual export",
+    # An apply() whose body is just a refusal is an exporter, not a provider —
+    # cover the common refusal shapes so a future sibling can't slip past with
+    # different wording.
+    "notimplementederror",
+    "not implemented",
 )
 
 
@@ -70,3 +75,22 @@ def test_odcs_exporter_still_importable_directly():
     from fluid_build.providers.odcs import OdcsProvider
 
     assert hasattr(OdcsProvider(), "render")
+
+
+def test_exporter_packages_explicitly_opt_out_of_autoregistration():
+    # The exporter packages must de-register EXPLICITLY (set
+    # __fluid_no_autoregister__), not rely on incidental properties of their
+    # module namespace (e.g. exposing >1 BaseProvider subclass). Otherwise a
+    # refactor could silently re-register them as providers.
+    import importlib
+
+    for modname in (
+        "fluid_build.providers.odps",
+        "fluid_build.providers.odcs",
+        "fluid_build.providers.odps_standard",
+    ):
+        mod = importlib.import_module(modname)
+        assert getattr(mod, "__fluid_no_autoregister__", False) is True, (
+            f"{modname} must set __fluid_no_autoregister__ = True (it is an exporter, "
+            "not a provider) instead of relying on auto-discovery accidents"
+        )
