@@ -54,6 +54,7 @@ class TestDetectMode:
             quickstart=False,
             blank=False,
             template=None,
+            blueprint=None,
             name=None,
             yes=False,
         )

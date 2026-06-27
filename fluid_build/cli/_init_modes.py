@@ -299,6 +299,101 @@ def blank_mode(args, logger: logging.Logger) -> int:
     return 0
 
 
+def blueprint_mode(args, logger: logging.Logger) -> int:
+    """Scaffold a project from a bundled marketplace blueprint.
+
+    The non-breaking "merge blueprints into init" path: surfaces the same
+    bundled blueprints as ``fluid market --blueprints`` directly inside
+    ``fluid init`` (the menu's "Start from a blueprint" option or
+    ``--blueprint <id>``), renders the chosen blueprint **client-side**, and
+    writes a validated contract — no network, no AI key. Mirrors
+    :func:`blank_mode`'s workspace + write + validate flow, swapping
+    ``build_minimal_contract`` for ``render_bundled_contract``.
+    """
+    from fluid_build.cli._market_bundled_blueprints import (
+        get_bundled_blueprint,
+        list_bundled_blueprints,
+        render_bundled_contract,
+    )
+    from fluid_build.cli.forge_contract_factory import create_and_validate_contract
+
+    available = {b["id"]: b for b in list_bundled_blueprints()}
+    blueprint_id = getattr(args, "blueprint", None) or next(iter(available), None)
+    bp = available.get(blueprint_id) or get_bundled_blueprint(blueprint_id or "")
+    if bp is None:
+        console_error(
+            f"Unknown blueprint '{blueprint_id}'. " f"Available: {', '.join(available) or '(none)'}"
+        )
+        return 1
+
+    fallback_name = str(bp.get("id", "blueprint")).split(".")[-1]
+    project_name = slugify_identifier(args.name, fallback=fallback_name)
+    project_dir = Path(project_name)
+
+    if _init.RICH_AVAILABLE:
+        _init.console.print(
+            _init.Panel(
+                f"📦 Creating from blueprint: [bold]{bp.get('name', blueprint_id)}[/bold]\n\n"
+                f"{bp.get('description', '')}".strip(),
+                title="Blueprint Mode",
+                border_style="cyan",
+            )
+        )
+    else:
+        cprint(f"📦 Creating from blueprint: {bp.get('name', blueprint_id)}")
+
+    # Guard against symlink attacks + clobbering a non-empty dir (mirrors blank).
+    if project_dir.is_symlink():
+        console_error(f"'{project_name}' is a symlink — refusing to write")
+        return 1
+    if project_dir.exists() and any(project_dir.iterdir()):
+        console_error(f"Directory '{project_name}' already exists and is not empty")
+        return 1
+
+    # Blueprint params — ``product_name`` is required; the rest fall back to
+    # sensible defaults (or CLI flags) so the non-interactive path always works.
+    params = {
+        "product_name": project_name,
+        "domain": getattr(args, "domain", None) or "analytics",
+        "owner_team": getattr(args, "owner_team", None) or "data-platform",
+        "owner_email": getattr(args, "owner_email", None) or "data-platform@example.com",
+    }
+
+    if getattr(args, "dry_run", False):
+        line = f"  📄 {project_name}/contract.fluid.yaml  (from {blueprint_id})"
+        if _init.RICH_AVAILABLE:
+            _init.console.print("[yellow]🔍 Dry run - would create:[/yellow]")
+            _init.console.print(line)
+        else:
+            cprint(f"Dry run - would create {project_name}/contract.fluid.yaml from {blueprint_id}")
+        return 0
+
+    try:
+        contract = render_bundled_contract(bp, params)
+    except Exception as exc:  # noqa: BLE001 — surface a clean error, not a traceback
+        console_error(f"Failed to render blueprint '{blueprint_id}': {exc}")
+        return 1
+
+    result_path = create_and_validate_contract(
+        contract,
+        project_dir,
+        logger,
+        console=_init.console if _init.RICH_AVAILABLE else None,
+    )
+    if result_path is None:
+        return 1
+
+    if _init.RICH_AVAILABLE:
+        _init.console.print(
+            f"\n✅ Created [cyan]{project_name}/contract.fluid.yaml[/cyan] "
+            f"from blueprint [cyan]{blueprint_id}[/cyan]"
+        )
+        _init.console.print(f"[dim]Next:[/dim] [cyan]cd {project_name} && fluid validate[/cyan]")
+    else:
+        cprint(f"Created {project_name}/contract.fluid.yaml from {blueprint_id}")
+    return 0
+
+
 def template_mode(args, logger: logging.Logger) -> int:
     """Create from specific template"""
 
