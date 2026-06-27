@@ -103,3 +103,69 @@ def test_ask_blueprint_name_returns_a_bundled_id():
     with patch.object(helpers, "_rich_available", return_value=False):
         bp_id = helpers._ask_blueprint_name()
     assert bp_id and bp_id.startswith("fluid.")
+
+
+# --- inspection follow-ups to #318 -----------------------------------------
+
+
+def test_blueprint_mode_writes_forge_receipt(tmp_path, monkeypatch):
+    # Parity with blank_mode / template_mode: the blueprint scaffold must drop a
+    # .fluid/forge-receipt.json so `fluid status` + drift see the same shape.
+    import json
+
+    monkeypatch.chdir(tmp_path)
+    rc = blueprint_mode(_args(), _LOG)
+    assert rc == 0
+    receipt = tmp_path / "demo" / ".fluid" / "forge-receipt.json"
+    assert receipt.exists(), "blueprint_mode must write a forge receipt"
+    doc = json.loads(receipt.read_text(encoding="utf-8"))
+    # Envelope-wrapped ForgeReceipt; the raw text records the authoring flow +
+    # the blueprint id so downstream tooling can correlate the product.
+    raw = receipt.read_text(encoding="utf-8")
+    assert "init-blueprint" in raw
+    assert "fluid.starter" in raw
+    assert isinstance(doc, dict)
+
+
+def test_init_parser_registers_metadata_flags():
+    # Card 3: --domain / --owner-team / --owner-email must be wired into argparse
+    # (blueprint_mode reads args.domain / args.owner_team / args.owner_email).
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    init_mod.register(sub)
+    args = parser.parse_args(
+        [
+            "init",
+            "demo",
+            "--blueprint",
+            "fluid.starter",
+            "--domain",
+            "marketing",
+            "--owner-team",
+            "growth",
+            "--owner-email",
+            "growth@example.com",
+        ]
+    )
+    assert args.domain == "marketing"
+    assert args.owner_team == "growth"
+    assert args.owner_email == "growth@example.com"
+
+
+def test_blueprint_flags_flow_into_contract(tmp_path, monkeypatch):
+    # Card 3: the metadata flags must reach the rendered contract (the bundled
+    # templates interpolate domain / owner_team / owner_email).
+    monkeypatch.chdir(tmp_path)
+    rc = blueprint_mode(
+        _args(domain="marketing", owner_team="growth", owner_email="growth@example.com"),
+        _LOG,
+    )
+    assert rc == 0
+    contract = (tmp_path / "demo" / "contract.fluid.yaml").read_text(encoding="utf-8")
+    data = yaml.safe_load(contract)
+    assert data.get("domain") == "marketing"
+    owner = (data.get("metadata") or {}).get("owner") or {}
+    assert owner.get("team") == "growth"
+    assert owner.get("email") == "growth@example.com"
