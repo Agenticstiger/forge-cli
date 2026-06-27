@@ -50,16 +50,25 @@ def register(subparsers: argparse._SubParsersAction):
             "--role",
             help="Limit to one role (provider / validator / catalog / iac_provider / custom_scaffold)",
         )
+        parser.add_argument(
+            "--detailed",
+            action="store_true",
+            help=(
+                "Load ALLOWED plugins to show their declared metadata "
+                "(version / author / license / url). Blocked plugins are never loaded."
+            ),
+        )
     p.set_defaults(cmd=COMMAND, func=run)
 
 
 def run(args, logger: logging.Logger) -> int:
     """Render installed plugins per role. Bare ``fluid plugins`` == ``plugins list``."""
-    from fluid_build.plugin_manager import installed_plugins
+    from fluid_build.plugin_manager import detailed_plugins, installed_plugins
 
     role = getattr(args, "role", None)
+    detailed = getattr(args, "detailed", False)
     try:
-        data = installed_plugins(role)
+        data = detailed_plugins(role, logger) if detailed else installed_plugins(role)
     except Exception as e:  # noqa: BLE001 - never crash on inspection; type only
         logger.warning("plugin inspection failed: %s", type(e).__name__)
         data = {}
@@ -86,6 +95,13 @@ def run(args, logger: logging.Logger) -> int:
         for e in entries:
             status = "allowed" if e["allowed"] else "BLOCKED (allow/block policy)"
             cprint(f"    • {e['name']:<28} {status}")
+            meta = e.get("metadata")
+            if meta:
+                bits = [
+                    f"{k}={meta[k]}" for k in ("version", "author", "license", "url") if meta.get(k)
+                ]
+                if bits:
+                    cprint(f"      {'  '.join(bits)}")
         cprint("")
     blocked = sum(1 for v in data.values() for e in v if not e["allowed"])
     if blocked:
