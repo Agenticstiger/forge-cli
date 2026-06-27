@@ -240,6 +240,7 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         [
             "Pass the contract path: fluid <command> path/to/contract.fluid.yaml",
             "Or run from a directory that contains a single contract.fluid.yaml",
+            "Scaffold one with 'fluid init' or 'fluid forge'",
         ],
         None,
     ),
@@ -251,7 +252,10 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         None,
     ),
     "loader_missing_functions": (
-        ["The loader module must define the required entry-point functions — check its API"],
+        [
+            "The loader module must define the required entry-point functions — check its API",
+            "Define the expected functions (e.g. load/run) — see the custom-loader docs",
+        ],
         None,
     ),
     # ── plan / apply / generate ────────────────────────────────────────────
@@ -263,7 +267,11 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         None,
     ),
     "generate_ci_failed": (
-        ["Check the --system value is a supported CI provider and the contract validates"],
+        [
+            "Check the --system value is a supported CI provider and the contract validates",
+            "Run 'fluid validate <contract>', then re-run with a supported "
+            "--system (github_actions|gitlab|jenkins|azure_devops|...)",
+        ],
         None,
     ),
     "no_builds": (
@@ -288,7 +296,10 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     ),
     # ── product authoring ──────────────────────────────────────────────────
     "product_new_failed": (
-        ["Check the target directory is writable and the productType is valid (SDP/ADP/CDP)"],
+        [
+            "Check the target directory is writable and the productType is valid (SDP/ADP/CDP)",
+            "Pick an empty/new target dir and pass --data-product-type SDP|ADP|CDP explicitly",
+        ],
         None,
     ),
     "product_add_failed": (
@@ -328,7 +339,10 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         "supply-chain",
     ),
     "signing_bundle_not_file": (
-        ["The signing target must be a bundle file, not a directory"],
+        [
+            "The signing target must be a bundle file, not a directory",
+            "Produce one with 'fluid bundle <contract> --format tgz', then sign that .tgz",
+        ],
         "supply-chain",
     ),
     "signing_key_ref_empty": (
@@ -349,7 +363,10 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         None,
     ),
     "schedule_sync_dags_dir_not_directory": (
-        ["The --dags-dir value must be an existing directory"],
+        [
+            "The --dags-dir value must be an existing directory",
+            "Create it (mkdir -p) or point --dags-dir at your Airflow dags/ folder",
+        ],
         None,
     ),
     "schedule_sync_unhandled_scheme": (
