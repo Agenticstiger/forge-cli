@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -675,6 +676,347 @@ def _forge_postgen_and_finalize(
     return 0
 
 
+@dataclass
+class ForgeRunContext:
+    """Mutable run-state carrier for ``run_ai_copilot_mode``'s phases.
+
+    Fowler's *Introduce Parameter Object* over the three long-lived dicts that
+    used to be threaded as separate locals and rebound across the interview /
+    enrichment / project-creation cores. Holding ``context`` as an *attribute* is
+    the key move: a phase helper can do ``rc.context = interview_state.finalize()``
+    and the orchestrator sees the new value — the ``context = …`` **rebind** (not
+    just in-place mutation) is exactly what defeated a naive Extract Method here.
+
+    The dicts are passed by reference when the carrier is built, so wrapping the
+    existing locals is behaviour-preserving. The carrier holds run *state* only;
+    injected DI callables (``get_cli_arg_fn`` etc.) stay explicit kwargs on the
+    phase helpers so the seam tests patch stays trivial.
+    """
+
+    args: Any
+    logger: logging.Logger
+    console: Any
+    copilot: Any
+    is_non_interactive: bool
+    run_start: float
+    active_run_id: Optional[str]
+    context: Dict[str, Any] = field(default_factory=dict)
+    perf_stats: Dict[str, Any] = field(default_factory=dict)
+    copilot_options: Dict[str, Any] = field(default_factory=dict)
+
+
+def _forge_interview_core(
+    rc: ForgeRunContext,
+    *,
+    get_cli_arg_fn: Callable[[Any, str, Any], Any],
+    build_interview_summary_fn: Callable[[Mapping[str, Any]], Dict[str, Any]],
+) -> None:
+    """Run the interview phase of ``run_ai_copilot_mode``.
+
+    Interactive: prepare runtime inputs, render the AI-plan / discovery
+    summary, then run the adaptive interview. Non-interactive: fill the
+    default slots + interview summary. Either way the context is normalised
+    at the end. Mutates ``rc.copilot_options`` in place and rebinds
+    ``rc.context`` to the finalised + normalised context. No early returns —
+    the caller's try-block still owns the SIGINT/pause window around this call.
+    """
+    args = rc.args
+    console = rc.console
+    copilot = rc.copilot
+    is_non_interactive = rc.is_non_interactive
+    context = rc.context
+    copilot_options = rc.copilot_options
+    if not is_non_interactive:
+        runtime_inputs = copilot.prepare_runtime_inputs(copilot_options)
+        copilot_options.update(runtime_inputs)
+        if console:
+            llm_cfg = runtime_inputs.get("llm_config")
+            if llm_cfg:
+                display = PROVIDER_DISPLAY_NAMES.get(llm_cfg.provider, llm_cfg.provider)
+                plan_suffix = ""
+                if getattr(llm_cfg, "routing_model", None):
+                    plan_suffix = f" · routing {llm_cfg.routing_model}"
+                if bool(get_cli_arg_fn(args, "tiered", False)):
+                    plan_suffix += " · tiered"
+                console.print(
+                    f"[dim]AI: [bold]{display}[/bold] / {llm_cfg.model}  "
+                    f"{plan_suffix}  "
+                    f"(reset with [bold]fluid ai setup --clear[/bold])[/dim]"
+                )
+                try:
+                    run_plan = build_llm_run_plan(
+                        llm_cfg,
+                        tiered=bool(get_cli_arg_fn(args, "tiered", False)),
+                    )
+                    logical_stage = next(
+                        (
+                            stage
+                            for stage in run_plan.get("stages", [])
+                            if stage.get("stage") == "logical_modeler"
+                        ),
+                        {},
+                    )
+                    routing_model = run_plan.get("routing_model")
+                    console.print(
+                        "[dim]AI plan: interview/self-check use "
+                        f"{routing_model}; logical modeling uses "
+                        f"{logical_stage.get('model')}; contract + dbt stay deterministic.[/dim]"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            discovery = runtime_inputs.get("discovery_report")
+            if discovery:
+                _print_discovery_summary(console, discovery)
+            else:
+                _print_discovery_hint(console)
+            console.print()
+            print_copilot_intro_panel(console)
+            console.print(
+                "[dim]I'll help you create the perfect data product by understanding your needs...[/dim]\n"
+            )
+        capability_warnings = list(runtime_inputs.get("capability_warnings") or [])
+        if console and capability_warnings:
+            print_dialog_status(
+                console,
+                status="warning",
+                message="Copilot couldn't fully verify some local providers.",
+                detail=(
+                    f"{capability_warnings[0]} "
+                    "Continuing with best-effort defaults. You can review or override the provider later."
+                ),
+            )
+        # Show existing data products in workspace before interview
+        discovery_report = runtime_inputs["discovery_report"]
+        existing_contracts = getattr(discovery_report, "existing_contracts", None) or []
+        if existing_contracts and console:
+            _show_existing_products(console, existing_contracts)
+            # Pass to interview so LLM can detect duplicates
+            context["existing_products"] = [
+                {"id": c.get("id", ""), "name": c.get("name", "")} for c in existing_contracts
+            ]
+
+        # Phase 7 (F1) — surface detected ODCS / Bitol ODPS docs as
+        # structural-seed candidates when --seed-from wasn't passed.
+        # The discovery sniffer tags them with kind: ``standard-odcs``
+        # / ``standard-odps`` and suggested_use ``fluid forge
+        # --seed-from``. Non-interactive: just log + skip.
+        if not context.get("structural_seed") and console:
+            _detected = getattr(discovery_report, "detected_sources", None) or []
+            _seed_candidates = [
+                s
+                for s in _detected
+                if isinstance(s, dict) and str(s.get("kind", "")).startswith("standard-")
+            ]
+            if _seed_candidates:
+                try:
+                    console.print(
+                        f"\n[dim]💡 Detected {len(_seed_candidates)} ODCS/ODPS "
+                        f"document(s) in the workspace. To use one as a "
+                        f"structural seed for this run, re-invoke with "
+                        f"[/dim][cyan]fluid forge --seed-from "
+                        f"{_seed_candidates[0]['path']}[/cyan][dim] "
+                        f"— the schema/quality/qos from the seed will be "
+                        f"preserved verbatim while the LLM fills in "
+                        f"builds/executes/governance.[/dim]\n"
+                    )
+                except Exception:  # noqa: BLE001 — never block on console formatting
+                    pass
+
+        # Resolve preliminary target_dir for early scaffold (samples/ + models/).
+        # If --target-dir was provided, use it. Otherwise we'll use a
+        # temporary name; the final target_dir is resolved after the
+        # interview when we know the project_goal.
+        explicit_target = get_cli_arg_fn(args, "target_dir")
+        _prelim_target = Path(explicit_target).expanduser() if explicit_target else None
+
+        interview_state = run_adaptive_copilot_interview(
+            initial_context=context,
+            console=console,
+            llm_config=runtime_inputs["llm_config"],
+            discovery_report=discovery_report,
+            capability_matrix=runtime_inputs["capability_matrix"],
+            project_memory=runtime_inputs["project_memory"],
+            target_dir=_prelim_target,
+            quiet=getattr(args, "quiet", False),
+        )
+        copilot_options["interview_state"] = interview_state
+        context = interview_state.finalize()
+        assumptions = list(context.get("assumptions_used") or [])
+        if console and assumptions:
+            print_assumptions_panel(console, assumptions)
+    else:
+        for key, value in {
+            "project_goal": "Data Analytics Platform",
+            "data_sources": "Database tables",
+            "use_case": "analytics",
+            "complexity": "intermediate",
+        }.items():
+            context.setdefault(key, value)
+        context["interview_summary"] = build_interview_summary_fn(context)
+
+    context = normalize_copilot_context(context)
+    rc.context = context
+
+
+def _forge_domain_enrichment_core(
+    rc: ForgeRunContext,
+    *,
+    get_cli_arg_fn: Callable[[Any, str, Any], Any],
+) -> Optional[int]:
+    """Domain auto-detection + expertise-pack enrichment.
+
+    BYODA: when ``--domain`` names an unknown agent, offer to scaffold one and
+    stop (returning ``0`` for the caller to return) so the user can edit it.
+    Otherwise detect/derive the domain and enrich the context. Rebinds
+    ``rc.context`` when a pack loads. Returns an exit code to propagate, or
+    ``None`` to continue.
+    """
+    args = rc.args
+    console = rc.console
+    is_non_interactive = rc.is_non_interactive
+    logger = rc.logger
+    context = rc.context
+    # --- Domain auto-detection: load expertise packs transparently ---
+    explicit_domain = get_cli_arg_fn(args, "domain", None)
+
+    # BYODA: when --domain points to an unknown agent, offer to scaffold.
+    if explicit_domain:
+        from fluid_build.cli.forge_agent_specs import (
+            AgentSpecError,
+            load_user_or_builtin_spec,
+            scaffold_user_agent,
+        )
+
+        try:
+            load_user_or_builtin_spec(explicit_domain)
+        except AgentSpecError as spec_err:
+            # Show the specific validation error so the user can fix it.
+            if console and not is_non_interactive:
+                print_dialog_status(
+                    console,
+                    status="warning",
+                    message=f"Agent spec error for '{explicit_domain}': {spec_err}",
+                )
+            else:
+                logger.warning("Invalid agent spec for %s: %s", explicit_domain, spec_err)
+            explicit_domain = None
+        except FileNotFoundError:
+            if console and not is_non_interactive:
+                print_dialog_status(
+                    console,
+                    status="warning",
+                    message=f"No agent found for '{explicit_domain}'.",
+                )
+                from fluid_build.cli.forge_dialogs import ask_confirmation
+
+                if ask_confirmation(console, "Create a custom domain agent?", default=True):
+                    try:
+                        path = scaffold_user_agent(explicit_domain)
+                        print_dialog_status(
+                            console,
+                            status="success",
+                            message=f"Created {path.relative_to(Path.cwd())}",
+                        )
+                        console.print(
+                            f"  Edit the file to customize questions, rules, and suggestions.\n"
+                            f"  Then re-run: [bold]fluid forge --domain {explicit_domain}[/bold]\n"
+                        )
+                    except Exception as scaffold_err:  # noqa: BLE001
+                        print_dialog_status(
+                            console,
+                            status="error",
+                            message=f"Could not create agent: {scaffold_err}",
+                        )
+                    return 0
+                # User declined — continue without domain enrichment.
+                explicit_domain = None
+            else:
+                logger.warning("Unknown domain agent: %s (skipping)", explicit_domain)
+                explicit_domain = None
+
+    if explicit_domain or not context.get("domain_expertise"):
+        from fluid_build.cli.forge_domain_enrichment import (
+            detect_domain,
+            enrich_context_with_domain,
+        )
+
+        domain = explicit_domain or detect_domain(context)
+        logger.debug("Domain detection: explicit=%s, detected=%s", explicit_domain, domain)
+        if domain:
+            context = enrich_context_with_domain(context, domain)
+            if console:
+                print_dialog_status(
+                    console,
+                    status="info",
+                    message=f"Loaded {domain} domain expertise pack.",
+                )
+    rc.context = context
+    return None
+
+
+def _forge_project_creation_core(
+    rc: ForgeRunContext,
+    target_dir: Path,
+    scaffold_template: Any,
+    *,
+    get_cli_arg_fn: Callable[[Any, str, Any], Any],
+) -> Optional[int]:
+    """Create the product via the selected path.
+
+    ``--scaffold <template>`` runs the full ForgeEngine; ``--agent-loop`` (or
+    ``FLUID_COPILOT_AGENT_LOOP``) runs the multi-turn tool-use loop; otherwise
+    the minimal contract-only path. Returns ``1`` if creation failed (the
+    caller should return it), else ``None``.
+    """
+    args = rc.args
+    console = rc.console
+    copilot = rc.copilot
+    logger = rc.logger
+    context = rc.context
+    copilot_options = rc.copilot_options
+    perf_stats = rc.perf_stats
+    use_agent_loop = bool(get_cli_arg_fn(args, "agent_loop", False)) or bool(
+        os.environ.get("FLUID_COPILOT_AGENT_LOOP")
+    )
+
+    if scaffold_template:
+        success_result = copilot.create_project(
+            target_dir,
+            context,
+            copilot_options,
+            dry_run=bool(get_cli_arg_fn(args, "dry_run", False)),
+        )
+        if not success_result:
+            return 1
+    elif use_agent_loop:
+        # Slice UX-K: multi-turn agent loop with tool use.
+        success_result = _create_project_agent_loop(
+            target_dir=target_dir,
+            context=context,
+            copilot_options=copilot_options,
+            copilot=copilot,
+            dry_run=bool(get_cli_arg_fn(args, "dry_run", False)),
+            logger=logger,
+            console=console,
+            perf_stats=perf_stats,
+        )
+        if not success_result:
+            return 1
+    else:
+        success_result = _create_project_minimal(
+            copilot=copilot,
+            target_dir=target_dir,
+            context=context,
+            copilot_options=copilot_options,
+            dry_run=bool(get_cli_arg_fn(args, "dry_run", False)),
+            logger=logger,
+            console=console,
+        )
+        if not success_result:
+            return 1
+    return None
+
+
 def run_ai_copilot_mode(
     args: Any,
     logger: logging.Logger,
@@ -1054,222 +1396,43 @@ def run_ai_copilot_mode(
                     return recovery_result
                 copilot_options.update(recovery_result)
 
-        if not is_non_interactive:
-            runtime_inputs = copilot.prepare_runtime_inputs(copilot_options)
-            copilot_options.update(runtime_inputs)
-            if console:
-                llm_cfg = runtime_inputs.get("llm_config")
-                if llm_cfg:
-                    display = PROVIDER_DISPLAY_NAMES.get(llm_cfg.provider, llm_cfg.provider)
-                    plan_suffix = ""
-                    if getattr(llm_cfg, "routing_model", None):
-                        plan_suffix = f" · routing {llm_cfg.routing_model}"
-                    if bool(get_cli_arg_fn(args, "tiered", False)):
-                        plan_suffix += " · tiered"
-                    console.print(
-                        f"[dim]AI: [bold]{display}[/bold] / {llm_cfg.model}  "
-                        f"{plan_suffix}  "
-                        f"(reset with [bold]fluid ai setup --clear[/bold])[/dim]"
-                    )
-                    try:
-                        run_plan = build_llm_run_plan(
-                            llm_cfg,
-                            tiered=bool(get_cli_arg_fn(args, "tiered", False)),
-                        )
-                        logical_stage = next(
-                            (
-                                stage
-                                for stage in run_plan.get("stages", [])
-                                if stage.get("stage") == "logical_modeler"
-                            ),
-                            {},
-                        )
-                        routing_model = run_plan.get("routing_model")
-                        console.print(
-                            "[dim]AI plan: interview/self-check use "
-                            f"{routing_model}; logical modeling uses "
-                            f"{logical_stage.get('model')}; contract + dbt stay deterministic.[/dim]"
-                        )
-                    except Exception:  # noqa: BLE001
-                        pass
-                discovery = runtime_inputs.get("discovery_report")
-                if discovery:
-                    _print_discovery_summary(console, discovery)
-                else:
-                    _print_discovery_hint(console)
-                console.print()
-                print_copilot_intro_panel(console)
-                console.print(
-                    "[dim]I'll help you create the perfect data product by understanding your needs...[/dim]\n"
-                )
-            capability_warnings = list(runtime_inputs.get("capability_warnings") or [])
-            if console and capability_warnings:
-                print_dialog_status(
-                    console,
-                    status="warning",
-                    message="Copilot couldn't fully verify some local providers.",
-                    detail=(
-                        f"{capability_warnings[0]} "
-                        "Continuing with best-effort defaults. You can review or override the provider later."
-                    ),
-                )
-            # Show existing data products in workspace before interview
-            discovery_report = runtime_inputs["discovery_report"]
-            existing_contracts = getattr(discovery_report, "existing_contracts", None) or []
-            if existing_contracts and console:
-                _show_existing_products(console, existing_contracts)
-                # Pass to interview so LLM can detect duplicates
-                context["existing_products"] = [
-                    {"id": c.get("id", ""), "name": c.get("name", "")} for c in existing_contracts
-                ]
+        # Fold the three long-lived dicts (+ run-scalars) into a single typed
+        # carrier so the interview / enrichment / project-creation cores can be
+        # extracted as helpers that rebind ``rc.context`` across the boundary.
+        rc = ForgeRunContext(
+            args=args,
+            logger=logger,
+            console=console,
+            copilot=copilot,
+            is_non_interactive=is_non_interactive,
+            run_start=_run_start,
+            active_run_id=active_run_id,
+            context=context,
+            perf_stats=perf_stats,
+            copilot_options=copilot_options,
+        )
 
-            # Phase 7 (F1) — surface detected ODCS / Bitol ODPS docs as
-            # structural-seed candidates when --seed-from wasn't passed.
-            # The discovery sniffer tags them with kind: ``standard-odcs``
-            # / ``standard-odps`` and suggested_use ``fluid forge
-            # --seed-from``. Non-interactive: just log + skip.
-            if not context.get("structural_seed") and console:
-                _detected = getattr(discovery_report, "detected_sources", None) or []
-                _seed_candidates = [
-                    s
-                    for s in _detected
-                    if isinstance(s, dict) and str(s.get("kind", "")).startswith("standard-")
-                ]
-                if _seed_candidates:
-                    try:
-                        console.print(
-                            f"\n[dim]💡 Detected {len(_seed_candidates)} ODCS/ODPS "
-                            f"document(s) in the workspace. To use one as a "
-                            f"structural seed for this run, re-invoke with "
-                            f"[/dim][cyan]fluid forge --seed-from "
-                            f"{_seed_candidates[0]['path']}[/cyan][dim] "
-                            f"— the schema/quality/qos from the seed will be "
-                            f"preserved verbatim while the LLM fills in "
-                            f"builds/executes/governance.[/dim]\n"
-                        )
-                    except Exception:  # noqa: BLE001 — never block on console formatting
-                        pass
+        _forge_interview_core(
+            rc,
+            get_cli_arg_fn=get_cli_arg_fn,
+            build_interview_summary_fn=build_interview_summary_fn,
+        )
 
-            # Resolve preliminary target_dir for early scaffold (samples/ + models/).
-            # If --target-dir was provided, use it. Otherwise we'll use a
-            # temporary name; the final target_dir is resolved after the
-            # interview when we know the project_goal.
-            explicit_target = get_cli_arg_fn(args, "target_dir")
-            _prelim_target = Path(explicit_target).expanduser() if explicit_target else None
-
-            interview_state = run_adaptive_copilot_interview(
-                initial_context=context,
-                console=console,
-                llm_config=runtime_inputs["llm_config"],
-                discovery_report=discovery_report,
-                capability_matrix=runtime_inputs["capability_matrix"],
-                project_memory=runtime_inputs["project_memory"],
-                target_dir=_prelim_target,
-                quiet=getattr(args, "quiet", False),
-            )
-            copilot_options["interview_state"] = interview_state
-            context = interview_state.finalize()
-            assumptions = list(context.get("assumptions_used") or [])
-            if console and assumptions:
-                print_assumptions_panel(console, assumptions)
-        else:
-            for key, value in {
-                "project_goal": "Data Analytics Platform",
-                "data_sources": "Database tables",
-                "use_case": "analytics",
-                "complexity": "intermediate",
-            }.items():
-                context.setdefault(key, value)
-            context["interview_summary"] = build_interview_summary_fn(context)
-
-        context = normalize_copilot_context(context)
-
-        # --- Domain auto-detection: load expertise packs transparently ---
-        explicit_domain = get_cli_arg_fn(args, "domain", None)
-
-        # BYODA: when --domain points to an unknown agent, offer to scaffold.
-        if explicit_domain:
-            from fluid_build.cli.forge_agent_specs import (
-                AgentSpecError,
-                load_user_or_builtin_spec,
-                scaffold_user_agent,
-            )
-
-            try:
-                load_user_or_builtin_spec(explicit_domain)
-            except AgentSpecError as spec_err:
-                # Show the specific validation error so the user can fix it.
-                if console and not is_non_interactive:
-                    print_dialog_status(
-                        console,
-                        status="warning",
-                        message=f"Agent spec error for '{explicit_domain}': {spec_err}",
-                    )
-                else:
-                    logger.warning("Invalid agent spec for %s: %s", explicit_domain, spec_err)
-                explicit_domain = None
-            except FileNotFoundError:
-                if console and not is_non_interactive:
-                    print_dialog_status(
-                        console,
-                        status="warning",
-                        message=f"No agent found for '{explicit_domain}'.",
-                    )
-                    from fluid_build.cli.forge_dialogs import ask_confirmation
-
-                    if ask_confirmation(console, "Create a custom domain agent?", default=True):
-                        try:
-                            path = scaffold_user_agent(explicit_domain)
-                            print_dialog_status(
-                                console,
-                                status="success",
-                                message=f"Created {path.relative_to(Path.cwd())}",
-                            )
-                            console.print(
-                                f"  Edit the file to customize questions, rules, and suggestions.\n"
-                                f"  Then re-run: [bold]fluid forge --domain {explicit_domain}[/bold]\n"
-                            )
-                        except Exception as scaffold_err:  # noqa: BLE001
-                            print_dialog_status(
-                                console,
-                                status="error",
-                                message=f"Could not create agent: {scaffold_err}",
-                            )
-                        return 0
-                    # User declined — continue without domain enrichment.
-                    explicit_domain = None
-                else:
-                    logger.warning("Unknown domain agent: %s (skipping)", explicit_domain)
-                    explicit_domain = None
-
-        if explicit_domain or not context.get("domain_expertise"):
-            from fluid_build.cli.forge_domain_enrichment import (
-                detect_domain,
-                enrich_context_with_domain,
-            )
-
-            domain = explicit_domain or detect_domain(context)
-            logger.debug("Domain detection: explicit=%s, detected=%s", explicit_domain, domain)
-            if domain:
-                context = enrich_context_with_domain(context, domain)
-                if console:
-                    print_dialog_status(
-                        console,
-                        status="info",
-                        message=f"Loaded {domain} domain expertise pack.",
-                    )
+        early_rc = _forge_domain_enrichment_core(rc, get_cli_arg_fn=get_cli_arg_fn)
+        if early_rc is not None:
+            return early_rc
 
         # Team memory: load shared conventions as soft defaults.
         _forge_load_team_memory(
-            context, perf_stats, console=console, is_non_interactive=is_non_interactive
+            rc.context, rc.perf_stats, console=console, is_non_interactive=is_non_interactive
         )
 
         # Slice UX-L: populate perf_stats from what we know so far.
-        _forge_populate_perf_stats(perf_stats, context, copilot_options)
+        _forge_populate_perf_stats(rc.perf_stats, rc.context, rc.copilot_options)
 
-        project_name = context.get("project_goal", "my-data-product").lower().replace(" ", "-")
+        project_name = rc.context.get("project_goal", "my-data-product").lower().replace(" ", "-")
         target_dir = get_target_directory_fn(args, project_name)
-        copilot_options["target_dir"] = str(target_dir)
+        rc.copilot_options["target_dir"] = str(target_dir)
 
         # Slice UX-H: default fluid forge is now minimal — only
         # contract.fluid.yaml + .fluid/forge-receipt.json land on disk.
@@ -1278,45 +1441,11 @@ def run_ai_copilot_mode(
         # .env.example, README.md, …) runs only when the user explicitly
         # opts in via --scaffold <template>.
         scaffold_template = get_cli_arg_fn(args, "scaffold", None)
-        use_agent_loop = bool(get_cli_arg_fn(args, "agent_loop", False)) or bool(
-            os.environ.get("FLUID_COPILOT_AGENT_LOOP")
+        early_rc = _forge_project_creation_core(
+            rc, target_dir, scaffold_template, get_cli_arg_fn=get_cli_arg_fn
         )
-
-        if scaffold_template:
-            success_result = copilot.create_project(
-                target_dir,
-                context,
-                copilot_options,
-                dry_run=bool(get_cli_arg_fn(args, "dry_run", False)),
-            )
-            if not success_result:
-                return 1
-        elif use_agent_loop:
-            # Slice UX-K: multi-turn agent loop with tool use.
-            success_result = _create_project_agent_loop(
-                target_dir=target_dir,
-                context=context,
-                copilot_options=copilot_options,
-                copilot=copilot,
-                dry_run=bool(get_cli_arg_fn(args, "dry_run", False)),
-                logger=logger,
-                console=console,
-                perf_stats=perf_stats,
-            )
-            if not success_result:
-                return 1
-        else:
-            success_result = _create_project_minimal(
-                copilot=copilot,
-                target_dir=target_dir,
-                context=context,
-                copilot_options=copilot_options,
-                dry_run=bool(get_cli_arg_fn(args, "dry_run", False)),
-                logger=logger,
-                console=console,
-            )
-            if not success_result:
-                return 1
+        if early_rc is not None:
+            return early_rc
 
         # Surface provenance from the copilot result so the forge
         # receipt can include it (args is the shared namespace between
@@ -1325,15 +1454,15 @@ def run_ai_copilot_mode(
             args._copilot_provenance = copilot._last_provenance
             score = copilot._last_provenance.get("self_eval_score")
             if score is not None:
-                perf_stats["self_eval_score"] = score
+                rc.perf_stats["self_eval_score"] = score
 
         # Post-generation scaffolding (data + CI) + personal-memory save + the
         # performance summary, returning exit code 0. See the helper.
         return _forge_postgen_and_finalize(
             args,
             target_dir,
-            context,
-            perf_stats,
+            rc.context,
+            rc.perf_stats,
             console=console,
             scaffold_template=scaffold_template,
             ask_dialog_question_fn=ask_dialog_question_fn,
