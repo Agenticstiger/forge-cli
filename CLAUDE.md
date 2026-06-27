@@ -39,6 +39,12 @@ The Makefile (`make test | lint | fmt | typecheck | doctor | demo`) is the happy
 
 - **SQL safety is centralized in `providers/_sql_safety.py`.** Every DDL f-string must route identifiers through `validate_ident` and string literals through `quote_string_literal`. Inline `.replace("'", "''")` is a regression — diverges from the central helper and breaks under non-default Snowflake escape settings.
 
+- **Lazy-import pattern for the light CLI (`__getattr__` + module-self indirection).** The `fluid --help` / `build_parser()` cold path must stay free of heavy SDKs (`httpx`, `jsonschema` via `schema_manager`, `litellm`, the `mcp` server SDK). The convention that keeps it that way, used pervasively across `cli/forge.py`, `cli/ai_setup.py`, `schema_manager.py`, etc.:
+  - **Defer the import, not just the call.** Heavy symbols are resolved through a module-level `def __getattr__(name)` (PEP 562) that `importlib.import_module`s the heavy module on *attribute access*, and intra-function work uses function-local `import`s. A module-scope `from …forge_copilot_agent import …` would pull the whole AI runtime onto `--help` — that's the regression.
+  - **Module-self indirection preserves the test seam.** Inside a deferred builder/function, reach back to this module's own (possibly-patched) symbols via `import fluid_build.cli.<mod> as _self; _self.X(...)` rather than a direct local name. A `patch("…cli.<mod>.X")` sets a *real* module attribute that **shadows** `__getattr__`, so `_self.X` sees the patch; a bare local `X` would not.
+  - **Memoise deferred class builders with `functools.lru_cache(maxsize=1)`**, not a hand-rolled module global + `if is None` check — it's lock-guarded (thread-safe first build, stable `isinstance` identity) and gives `.cache_clear()` as a test reset hook. Canonical example: `cli/forge.py::_build_copilot_agent_class`.
+  - **The invariant is guarded, not just documented.** `tests/perf/test_startup_budget.py` enforces a `MAX_MODULES` ceiling and a `FORBIDDEN_ON_HELP` set (`mcp`, `httpx`, `jsonschema`, `litellm`, …) that must not be imported on `fluid --help`. Run it after touching any cold-path module; if it regresses, a module-scope heavy import sneaked in.
+
 ## Files that need extra care
 
 Drive-by changes here can break invariants. Read the surrounding comments first.
