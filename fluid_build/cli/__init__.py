@@ -145,7 +145,7 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
     )
     p.add_argument(
         "--provider",
-        choices=["local", "gcp", "snowflake", "odps", "opds", "aws", "azure"],
+        choices=["local", "gcp", "snowflake", "aws", "azure"],
         default=os.getenv("FLUID_PROVIDER"),
         help="Infrastructure provider (env: FLUID_PROVIDER)",
     )

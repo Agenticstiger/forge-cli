@@ -360,7 +360,9 @@ local = "fluid_build.providers.local:LocalProvider"
 aws = "fluid_build.providers.aws:AwsProvider"
 gcp = "fluid_build.providers.gcp:GcpProvider"
 snowflake = "fluid_build.providers.snowflake:SnowflakeProvider"
-odps = "fluid_build.providers.odps:OdpsProvider"
+# NB: odps is intentionally NOT a provider entry-point. ODPS is the Open Data
+# Product Standard (a spec / export format), not a cloud provider; its exporter
+# is constructed directly by `fluid odps` (see providers/odps/__init__.py).
 
 # Metadata source adapters for ``fluid forge data-model from-source`` and the
 # ``forge_from_source`` MCP tool (issue #247) are a discovered plugin group:
