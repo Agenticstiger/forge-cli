@@ -1348,7 +1348,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
     if _staged_tool_enabled() and _FORGE_DATA_MODEL_TOOL["name"] not in seen:
         tool_values.append(_FORGE_DATA_MODEL_TOOL)
 
-    return [
+    definitions = [
         {
             "name": t["name"],
             "description": t["description"],
@@ -1356,6 +1356,15 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
         }
         for t in tool_values
     ]
+
+    # Delegated dbt MCP tools (dbt-labs/dbt-mcp), opt-in via FLUID_DBT_MCP.
+    # Off by default → no-op; on discovery failure → [] (never breaks the
+    # native tool listing). Names are ``dbt.``-prefixed so they can't shadow
+    # a native tool.
+    from fluid_build.cli.dbt_mcp import dbt_mcp_tool_definitions
+
+    definitions.extend(dbt_mcp_tool_definitions())
+    return definitions
 
 
 def dispatch_tool_call(
@@ -1403,6 +1412,15 @@ def dispatch_tool_call(
         tool = TOOL_REGISTRY.get(name)
     if tool is None and name == _FORGE_DATA_MODEL_TOOL["name"] and _staged_tool_enabled():
         tool = _FORGE_DATA_MODEL_TOOL
+    if tool is None:
+        # Delegated dbt MCP tools (opt-in via FLUID_DBT_MCP). Resolved AFTER the
+        # native registries so a native tool always wins; dbt tools are
+        # ``dbt.``-prefixed so there is no overlap in practice. The delegate
+        # returns the same typed-error contract on failure.
+        from fluid_build.cli.dbt_mcp import dispatch_dbt_mcp_tool, is_dbt_mcp_tool
+
+        if is_dbt_mcp_tool(name):
+            return dispatch_dbt_mcp_tool(name, arguments)
     if not tool:
         LOG.warning("Unknown tool call: %s", name)
         return {"error": f"Unknown tool: {name}"}
