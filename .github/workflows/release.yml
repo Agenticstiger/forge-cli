@@ -281,10 +281,27 @@ jobs:
       - name: Install from TestPyPI
         run: |
           python -m venv /tmp/testpypi-verify
-          /tmp/testpypi-verify/bin/pip install \
-            --index-url https://test.pypi.org/simple/ \
-            --extra-index-url https://pypi.org/simple/ \
-            "data-product-forge==${{ needs.quality-gate.outputs.version }}"
+          # TestPyPI's simple index can lag minutes behind the upload, so retry
+          # with back-off instead of a single attempt. The publish itself is
+          # already done — this only waits out index propagation (a single attempt
+          # is what flaked the v0.10.0 / v0.10.1 releases).
+          ok=0
+          for attempt in $(seq 1 12); do
+            if /tmp/testpypi-verify/bin/pip install \
+                --index-url https://test.pypi.org/simple/ \
+                --extra-index-url https://pypi.org/simple/ \
+                "data-product-forge==${{ needs.quality-gate.outputs.version }}"; then
+              echo "Installed on attempt ${attempt}."
+              ok=1
+              break
+            fi
+            echo "::warning::TestPyPI attempt ${attempt}/12 failed (index not propagated yet?); retrying in 20s…"
+            sleep 20
+          done
+          if [ "${ok}" -ne 1 ]; then
+            echo "::error::data-product-forge==${{ needs.quality-gate.outputs.version }} not installable from TestPyPI after 12 attempts (~4 min)."
+            exit 1
+          fi
 
       - name: Verify installed package
         run: |
@@ -363,8 +380,23 @@ jobs:
       - name: Install from PyPI
         run: |
           python -m venv /tmp/pypi-verify
-          /tmp/pypi-verify/bin/pip install \
-            "data-product-forge==${{ needs.quality-gate.outputs.version }}"
+          # PyPI's index can also briefly lag the publish; retry with back-off so
+          # the (already-successful) release isn't failed by a propagation race.
+          ok=0
+          for attempt in $(seq 1 12); do
+            if /tmp/pypi-verify/bin/pip install \
+                "data-product-forge==${{ needs.quality-gate.outputs.version }}"; then
+              echo "Installed on attempt ${attempt}."
+              ok=1
+              break
+            fi
+            echo "::warning::PyPI attempt ${attempt}/12 failed (index not propagated yet?); retrying in 20s…"
+            sleep 20
+          done
+          if [ "${ok}" -ne 1 ]; then
+            echo "::error::data-product-forge==${{ needs.quality-gate.outputs.version }} not installable from PyPI after 12 attempts (~4 min)."
+            exit 1
+          fi
 
       - name: Verify installed package
         run: |
