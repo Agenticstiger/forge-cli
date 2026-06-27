@@ -126,6 +126,33 @@ def test_enrichment_core_rebinds_rc_context_across_the_boundary():
     assert rc.context is new_ctx  # rebind crossed the helper boundary
 
 
+def test_interview_core_rebinds_rc_context_after_normalization():
+    # The interview core is the largest transformation + the highest-risk rebind
+    # point. Non-interactive path: fill defaults -> interview_summary -> normalize
+    # -> rc.context. Pin that the final `context = normalize_copilot_context(...)`
+    # rebind lands on rc.context (mutations alone would mask a missed writeback).
+    normalized = {"NORMALIZED": True, "project_goal": "x"}
+    rc = fm.ForgeRunContext(
+        args=SimpleNamespace(quiet=True),
+        logger=_LOG,
+        console=None,
+        copilot=None,
+        is_non_interactive=True,  # else-branch: no runtime-inputs / LLM call
+        run_start=0.0,
+        active_run_id=None,
+        context={"seed": 1},
+        perf_stats={},
+        copilot_options={},
+    )
+    with patch.object(fm, "normalize_copilot_context", return_value=normalized):
+        fm._forge_interview_core(
+            rc,
+            get_cli_arg_fn=_arg,
+            build_interview_summary_fn=lambda ctx: {"summary": "ok"},
+        )
+    assert rc.context is normalized  # normalize rebind crossed the helper boundary
+
+
 def test_project_creation_core_returns_1_when_creation_fails():
     rc = fm.ForgeRunContext(
         args=SimpleNamespace(),
