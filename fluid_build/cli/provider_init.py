@@ -25,13 +25,18 @@ from pathlib import Path
 
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.console import cprint
-from fluid_build.schema_manager import FluidSchemaManager
 
 COMMAND = "provider-init"
 
 
 def _latest_fluid_version() -> str:
-    """Return the newest bundled FLUID schema version (resolved lazily)."""
+    """Return the newest bundled FLUID schema version (resolved lazily).
+
+    Imported lazily so the heavy ``jsonschema`` dependency stays off the
+    ``fluid --help`` / ``build_parser()`` cold path.
+    """
+    from fluid_build.schema_manager import FluidSchemaManager
+
     return FluidSchemaManager.latest_bundled_version()
 
 

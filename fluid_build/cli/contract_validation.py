@@ -37,7 +37,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from fluid_build.cli.console import cprint, success
 from fluid_build.cli.console import error as console_error
@@ -55,8 +55,26 @@ except ImportError:
 
 from ..providers.validation_cache import ValidationCache, ValidationResultHistory
 from ..providers.validation_provider import ValidationProvider
-from ..schema_manager import FluidSchemaManager
 from ._common import load_contract_with_overlay
+
+if TYPE_CHECKING:  # resolve annotation names for ruff/type-checkers only
+    from ..schema_manager import FluidSchemaManager
+
+
+# NOTE: ``schema_manager`` pulls in ``jsonschema`` (a heavy dependency). It is
+# imported lazily via ``__getattr__`` below so it stays off the ``fluid --help``
+# / ``build_parser()`` cold path — ``add_parser`` / ``register`` only need
+# argparse. The runtime use site resolves via
+# ``import fluid_build.cli.contract_validation as _self; _self.FluidSchemaManager``
+# so the ``patch("…cli.contract_validation.FluidSchemaManager")`` test seam keeps
+# working.
+def __getattr__(name: str):
+    """Lazily resolve ``FluidSchemaManager`` (PEP 562)."""
+    if name == "FluidSchemaManager":
+        from fluid_build.schema_manager import FluidSchemaManager
+
+        return FluidSchemaManager
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # Validation providers pull heavy cloud SDKs at import time
@@ -290,7 +308,9 @@ class ContractValidator:
         LOG.info("Validating contract against FLUID schema...")
 
         try:
-            schema_manager = FluidSchemaManager()
+            import fluid_build.cli.contract_validation as _self
+
+            schema_manager = _self.FluidSchemaManager()
             result = schema_manager.validate_contract(self.contract)
 
             if not result.is_valid:

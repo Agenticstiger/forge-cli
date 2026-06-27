@@ -46,7 +46,6 @@ from fluid_build.cli.workspace_config import (
     load_workspace_config,
     save_workspace_config,
 )
-from fluid_build.schema_manager import FluidSchemaManager
 from fluid_build.util.contract import slugify_identifier
 
 from ._logging import error, info
@@ -74,7 +73,12 @@ def _latest_fluid_version() -> str:
     Resolved lazily at call time so runtime schema updates (or test patches)
     are respected. Avoids the import-time-constant pattern that silently goes
     stale if ``BUNDLED_VERSIONS`` is repopulated.
+
+    The ``schema_manager`` import is function-local so the heavy ``jsonschema``
+    dependency stays off the ``fluid --help`` / ``build_parser()`` cold path.
     """
+    from fluid_build.schema_manager import FluidSchemaManager
+
     return FluidSchemaManager.latest_bundled_version()
 
 

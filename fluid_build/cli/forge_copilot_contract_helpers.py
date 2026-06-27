@@ -50,7 +50,6 @@ from fluid_build.cli.forge_copilot_taxonomy import (
     normalize_supporting_standards,
     normalize_use_case,
 )
-from fluid_build.schema_manager import FluidSchemaManager
 from fluid_build.util.safe_yaml import load_yaml_safe
 
 SAFE_ADDITIONAL_FILE_EXTENSIONS = {
@@ -656,6 +655,11 @@ def build_seed_contract(
     returns it verbatim so the LLM modifies the actual user contract
     instead of inventing a new one.
     """
+    # Lazy import keeps the heavy ``jsonschema`` dependency off the
+    # ``fluid --help`` / ``build_parser()`` cold path (this module is reached
+    # transitively from ``fluid ai``'s registration via forge_copilot_runtime).
+    from fluid_build.schema_manager import FluidSchemaManager
+
     override = _seed_contract_override(context)
     if override is not None:
         return override

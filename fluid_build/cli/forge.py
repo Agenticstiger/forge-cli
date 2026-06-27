@@ -32,7 +32,7 @@ import sys
 import time
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from fluid_build.cli.artifact_envelope import dump_json_with_envelope
 from fluid_build.cli.artifact_paths import product_forge_receipt_path
@@ -40,62 +40,114 @@ from fluid_build.cli.artifact_receipts import ReceiptBuilder
 from fluid_build.cli.artifact_scan import diff_snapshots, snapshot_workspace
 from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
-from fluid_build.cli.forge_agents import DOMAIN_AGENTS
 from fluid_build.cli.forge_banner import print_v2_banner
-from fluid_build.cli.forge_context import (
-    get_cli_arg as _get_cli_arg,
-)
-from fluid_build.cli.forge_context import (
-    get_target_directory as _get_target_dir,
-)
-from fluid_build.cli.forge_context import (
-    handle_memory_management as _handle_memory,
-)
-from fluid_build.cli.forge_context import (
-    load_context as _load_ctx,
-)
-from fluid_build.cli.forge_context import (
-    resolve_memory_store as _resolve_store,
-)
-from fluid_build.cli.forge_copilot_agent import (
-    AIAgent,
-    CopilotAgentBase,
-    recommend_template_for_use_case,
-)
-from fluid_build.cli.forge_copilot_interview import build_interview_summary_from_context
-from fluid_build.cli.forge_copilot_llm_providers import (
-    get_cumulative_prompt_cache_metrics,
-    reset_token_usage,
-)
 from fluid_build.cli.forge_copilot_memory import (
     CopilotMemoryStore,
     resolve_copilot_memory_root,
     summarize_copilot_memory,
 )
-from fluid_build.cli.forge_copilot_runtime import (
-    CopilotGenerationError,
-    CopilotGenerationResult,
-    build_capability_matrix,
-    discover_local_context,
-    generate_copilot_artifacts,
-    normalize_provider_name,
-    normalize_template_name,
-    resolve_llm_config,
-)
 from fluid_build.cli.forge_copilot_taxonomy import normalize_copilot_context
-from fluid_build.cli.forge_data_model import register_forge_subcommand
-from fluid_build.cli.forge_dialogs import ask_confirmation, ask_dialog_question
-from fluid_build.cli.forge_modes import (
-    _scaffold_ci_pipeline,
-)
-from fluid_build.cli.forge_modes import (
-    run_ai_copilot_mode as _run_copilot,
-)
-from fluid_build.cli.forge_modes import (
-    run_guided_mode as _run_guided,
-)
 from fluid_build.cli.forge_ui import print_welcome_panel
 from fluid_build.cli.next_steps import print_next_steps
+
+if TYPE_CHECKING:  # resolve annotation names for ruff/type-checkers only
+    from fluid_build.cli.forge_copilot_agent import (
+        AIAgent,
+        CopilotAgentBase,
+    )
+    from fluid_build.cli.forge_copilot_runtime import (
+        CopilotGenerationError,
+        CopilotGenerationResult,
+    )
+
+# NOTE: The forge AI runtime (``forge_agents`` / ``forge_copilot_*`` /
+# ``forge_data_model`` / ``forge_dialogs`` / ``forge_modes`` / ``forge_context``)
+# transitively pulls ``httpx`` (LLM providers) and ``jsonschema`` (the
+# ``schema_manager`` chain). ``register`` only needs argparse, so every one of
+# those heavy module-scope imports is resolved lazily via ``__getattr__`` below
+# and stays off the ``fluid --help`` / ``build_parser()`` cold path.
+#
+# Several of these symbols are patched by tests at module scope
+# (``patch("…cli.forge.CopilotAgent")``, ``…resolve_llm_config``,
+# ``…build_capability_matrix``, ``…generate_copilot_artifacts``,
+# ``…discover_local_context``, ``…_run_copilot``, ``…ask_confirmation``) or
+# imported from this module (``from …cli.forge import AIAgent``), so they MUST
+# remain resolvable module attributes — that is exactly what ``__getattr__``
+# provides. Runtime use sites resolve via ``import fluid_build.cli.forge as
+# _self; _self.X`` so those patches flow through. Annotations referencing
+# ``CopilotAgentBase`` / ``CopilotGenerationResult`` / ``AIAgent`` etc. are safe
+# at module scope because ``from __future__ import annotations`` keeps them as
+# lazy strings.
+
+# alias -> (heavy source module, real symbol name)
+_DEFERRED_FORGE_IMPORTS: Dict[str, tuple] = {
+    "_get_cli_arg": ("forge_context", "get_cli_arg"),
+    "_get_target_dir": ("forge_context", "get_target_directory"),
+    "_handle_memory": ("forge_context", "handle_memory_management"),
+    "_load_ctx": ("forge_context", "load_context"),
+    "_resolve_store": ("forge_context", "resolve_memory_store"),
+    "AIAgent": ("forge_copilot_agent", "AIAgent"),
+    "CopilotAgentBase": ("forge_copilot_agent", "CopilotAgentBase"),
+    "recommend_template_for_use_case": (
+        "forge_copilot_agent",
+        "recommend_template_for_use_case",
+    ),
+    "build_interview_summary_from_context": (
+        "forge_copilot_interview",
+        "build_interview_summary_from_context",
+    ),
+    "get_cumulative_prompt_cache_metrics": (
+        "forge_copilot_llm_providers",
+        "get_cumulative_prompt_cache_metrics",
+    ),
+    "reset_token_usage": ("forge_copilot_llm_providers", "reset_token_usage"),
+    "CopilotGenerationError": ("forge_copilot_runtime", "CopilotGenerationError"),
+    "CopilotGenerationResult": ("forge_copilot_runtime", "CopilotGenerationResult"),
+    "build_capability_matrix": ("forge_copilot_runtime", "build_capability_matrix"),
+    "discover_local_context": ("forge_copilot_runtime", "discover_local_context"),
+    "generate_copilot_artifacts": (
+        "forge_copilot_runtime",
+        "generate_copilot_artifacts",
+    ),
+    "normalize_provider_name": ("forge_copilot_runtime", "normalize_provider_name"),
+    "normalize_template_name": ("forge_copilot_runtime", "normalize_template_name"),
+    "resolve_llm_config": ("forge_copilot_runtime", "resolve_llm_config"),
+    "ask_confirmation": ("forge_dialogs", "ask_confirmation"),
+    "ask_dialog_question": ("forge_dialogs", "ask_dialog_question"),
+    "_scaffold_ci_pipeline": ("forge_modes", "_scaffold_ci_pipeline"),
+    "_run_copilot": ("forge_modes", "run_ai_copilot_mode"),
+    "_run_guided": ("forge_modes", "run_guided_mode"),
+}
+
+
+def __getattr__(name: str):
+    """Lazily resolve the heavy forge AI-runtime imports (PEP 562).
+
+    Keeps ``httpx`` + the ``schema_manager`` → ``jsonschema`` chain off the
+    ``fluid --help`` path while exposing the symbols as module attributes so the
+    various ``patch("…cli.forge.<symbol>")`` test seams (and
+    ``from …cli.forge import AIAgent`` re-exports) keep working.
+    """
+    spec = _DEFERRED_FORGE_IMPORTS.get(name)
+    if spec is not None:
+        import importlib
+
+        module = importlib.import_module(f"fluid_build.cli.{spec[0]}")
+        return getattr(module, spec[1])
+    if name == "CopilotAgent":
+        return _build_copilot_agent_class()
+    if name == "DOMAIN_AGENTS":
+        from fluid_build.cli.forge_agents import DOMAIN_AGENTS
+
+        return DOMAIN_AGENTS
+    if name == "DOMAIN_AGENTS_AVAILABLE":
+        from fluid_build.cli.forge_agents import DOMAIN_AGENTS
+
+        return bool(DOMAIN_AGENTS)
+    if name == "AI_AGENTS":
+        return _build_ai_agents()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 try:
     from rich.console import Console
@@ -180,70 +232,92 @@ class ForgeMode(Enum):
     BLANK = "blank"
 
 
-class CopilotAgent(CopilotAgentBase):
-    """Public copilot agent wired to the compatibility aliases in this module."""
+_COPILOT_AGENT_CLASS: Optional[type] = None
 
-    def _resolve_llm_config_dependency(self, options):
-        return resolve_llm_config(options)
 
-    def _discover_local_context_dependency(self, options):
-        return discover_local_context(
-            getattr(options, "discovery_path", None),
-            discover=getattr(options, "discover", True),
-            workspace_root=Path.cwd(),
-            logger=LOG,
-        )
+def _build_copilot_agent_class() -> type:
+    """Build (and cache) the public ``CopilotAgent`` class lazily.
 
-    def _build_capability_matrix_dependency(self):
-        return build_capability_matrix()
+    The class subclasses ``CopilotAgentBase`` from the heavy
+    ``forge_copilot_agent`` module — evaluating the base at module scope would
+    force that import onto the ``fluid --help`` path, so the class is built on
+    first access to ``forge.CopilotAgent`` (via ``__getattr__``) instead. The
+    result is cached so ``isinstance`` / identity checks stay stable across
+    calls. Tests still ``patch("…cli.forge.CopilotAgent")`` and
+    ``from …cli.forge import CopilotAgent`` — both resolve through
+    ``__getattr__``.
+    """
+    global _COPILOT_AGENT_CLASS
+    if _COPILOT_AGENT_CLASS is not None:
+        return _COPILOT_AGENT_CLASS
 
-    def _generate_copilot_artifacts_dependency(
-        self,
-        context: Dict[str, Any],
-        *,
-        llm_config: Any,
-        discovery_report: Any,
-        project_memory: Any,
-        team_memory: Any = None,
-        capability_matrix: Any,
-    ) -> CopilotGenerationResult:
-        return generate_copilot_artifacts(
-            context,
-            llm_config=llm_config,
-            discovery_report=discovery_report,
-            project_memory=project_memory,
-            team_memory=team_memory,
-            capability_matrix=capability_matrix,
-            logger=LOG,
-        )
+    import fluid_build.cli.forge as _self
+    from fluid_build.cli.forge_copilot_agent import CopilotAgentBase
 
-    def _make_memory_store_dependency(self, project_root: Path) -> CopilotMemoryStore:
-        return CopilotMemoryStore(project_root, logger=LOG)
+    class CopilotAgent(CopilotAgentBase):
+        """Public copilot agent wired to the compatibility aliases in this module."""
 
-    def _ask_confirmation_dependency(self, prompt: str, preview: str) -> bool:
-        if self.console and RICH_AVAILABLE:
-            return ask_confirmation(
-                self.console,
-                prompt,
-                default=False,
-                title="🧠 Save Project Memory?",
-                preview=preview,
-                border_style="cyan",
+        def _resolve_llm_config_dependency(self, options):
+            return _self.resolve_llm_config(options)
+
+        def _discover_local_context_dependency(self, options):
+            return _self.discover_local_context(
+                getattr(options, "discovery_path", None),
+                discover=getattr(options, "discover", True),
+                workspace_root=Path.cwd(),
+                logger=LOG,
             )
-        return super()._ask_confirmation_dependency(prompt, preview)
 
+        def _build_capability_matrix_dependency(self):
+            return _self.build_capability_matrix()
 
-DOMAIN_AGENTS_AVAILABLE = bool(DOMAIN_AGENTS)
+        def _generate_copilot_artifacts_dependency(
+            self,
+            context: Dict[str, Any],
+            *,
+            llm_config: Any,
+            discovery_report: Any,
+            project_memory: Any,
+            team_memory: Any = None,
+            capability_matrix: Any,
+        ) -> "CopilotGenerationResult":
+            return _self.generate_copilot_artifacts(
+                context,
+                llm_config=llm_config,
+                discovery_report=discovery_report,
+                project_memory=project_memory,
+                team_memory=team_memory,
+                capability_matrix=capability_matrix,
+                logger=LOG,
+            )
+
+        def _make_memory_store_dependency(self, project_root: Path) -> CopilotMemoryStore:
+            return CopilotMemoryStore(project_root, logger=LOG)
+
+        def _ask_confirmation_dependency(self, prompt: str, preview: str) -> bool:
+            if self.console and RICH_AVAILABLE:
+                return _self.ask_confirmation(
+                    self.console,
+                    prompt,
+                    default=False,
+                    title="🧠 Save Project Memory?",
+                    preview=preview,
+                    border_style="cyan",
+                )
+            return super()._ask_confirmation_dependency(prompt, preview)
+
+    _COPILOT_AGENT_CLASS = CopilotAgent
+    return CopilotAgent
 
 
 def _build_ai_agents():
-    agents = {"copilot": CopilotAgent}
-    if DOMAIN_AGENTS_AVAILABLE:
-        agents.update(DOMAIN_AGENTS)
+    import fluid_build.cli.forge as _self
+
+    agents = {"copilot": _self.CopilotAgent}
+    domain_agents = _self.DOMAIN_AGENTS
+    if domain_agents:
+        agents.update(domain_agents)
     return agents
-
-
-AI_AGENTS = _build_ai_agents()
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +334,11 @@ def register(subparsers: argparse._SubParsersAction):
     )
     parser.add_argument("--help", "-h", action="store_true", help="Show this help message")
     forge_subparsers = parser.add_subparsers(dest="forge_subcommand")
+    # Import from the LIGHT pure-argparse register module directly (not the
+    # heavy ``forge_data_model`` re-export) so building the ``forge data-model``
+    # subparser stays off the httpx/jsonschema cold path.
+    from fluid_build.cli._forge_data_model_register import register_forge_subcommand
+
     register_forge_subcommand(forge_subparsers)
 
     # --- Primary flags ---
@@ -903,19 +982,27 @@ def _resolve_resume_args(
 
 
 def get_target_directory(args, default_name: str = "my-fluid-project") -> Path:
-    return _get_target_dir(args, default_name)
+    import fluid_build.cli.forge as _self
+
+    return _self._get_target_dir(args, default_name)
 
 
 def get_cli_arg(args: Any, name: str, default: Any = None) -> Any:
-    return _get_cli_arg(args, name, default)
+    import fluid_build.cli.forge as _self
+
+    return _self._get_cli_arg(args, name, default)
 
 
 def resolve_memory_store(args, logger: logging.Logger) -> CopilotMemoryStore:
-    return _resolve_store(args, logger, memory_store_class=CopilotMemoryStore)
+    import fluid_build.cli.forge as _self
+
+    return _self._resolve_store(args, logger, memory_store_class=CopilotMemoryStore)
 
 
 def handle_memory_management(args, logger: logging.Logger) -> int:
-    return _handle_memory(
+    import fluid_build.cli.forge as _self
+
+    return _self._handle_memory(
         args,
         logger,
         memory_store_class=CopilotMemoryStore,
@@ -1011,12 +1098,14 @@ def _run_blank_mode(args: Any, logger: logging.Logger) -> int:
     # if it wants CI scaffolding. Without this guard, blank-mode under
     # --agent hits an EOFError trying to read from a closed stdin.
     if not bool(get_cli_arg(args, "agent", False)):
-        _scaffold_ci_pipeline(
+        import fluid_build.cli.forge as _self
+
+        _self._scaffold_ci_pipeline(
             args,
             target_dir,
             {},
             console,
-            ask_dialog_question_fn=ask_dialog_question,
+            ask_dialog_question_fn=_self.ask_dialog_question,
             get_cli_arg_fn=get_cli_arg,
             dry_run=False,
         )
@@ -1420,7 +1509,9 @@ def _run_main(args, logger: logging.Logger) -> int:
         # produce a receipt.
         scan_root = Path.cwd()
         before_snapshot = snapshot_workspace(scan_root)
-        reset_token_usage()
+        import fluid_build.cli.forge as _self
+
+        _self.reset_token_usage()
 
         # --- Resume detection + flag validation (Phase R1) ---
         # Validate flag combinations and surface a resume prompt before
@@ -1596,7 +1687,9 @@ def _run_main(args, logger: logging.Logger) -> int:
             else:
                 # AI not available — fall back to guided mode
                 if console:
-                    proceed = ask_confirmation(
+                    import fluid_build.cli.forge as _self
+
+                    proceed = _self.ask_confirmation(
                         console,
                         "Continue with guided mode (no AI)?",
                         default=True,
@@ -1683,22 +1776,26 @@ def _run_main(args, logger: logging.Logger) -> int:
 
 
 def run_ai_copilot_mode(args, logger: logging.Logger) -> int:
-    return _run_copilot(
+    import fluid_build.cli.forge as _self
+
+    return _self._run_copilot(
         args,
         logger,
-        copilot_class=CopilotAgent,
+        copilot_class=_self.CopilotAgent,
         get_cli_arg_fn=get_cli_arg,
         load_context_fn=load_context,
         get_target_directory_fn=get_target_directory,
         context_error_cls=ContextValidationError,
-        build_interview_summary_fn=build_interview_summary_from_context,
+        build_interview_summary_fn=_self.build_interview_summary_from_context,
         console_factory=Console if RICH_AVAILABLE else None,
     )
 
 
 def run_guided_mode(args, logger: logging.Logger) -> int:
     """Lightweight guided prompts — no AI needed."""
-    return _run_guided(
+    import fluid_build.cli.forge as _self
+
+    return _self._run_guided(
         args,
         logger,
         get_target_directory_fn=get_target_directory,
@@ -1712,7 +1809,9 @@ def load_context(
     *,
     context_error_cls: type[Exception] = ContextValidationError,
 ) -> Dict[str, Any]:
-    return _load_ctx(
+    import fluid_build.cli.forge as _self
+
+    return _self._load_ctx(
         context_input,
         console,
         context_error_cls=context_error_cls,
@@ -1828,7 +1927,9 @@ def _write_forge_receipt(
 
 
 def _forge_performance_payload() -> Dict[str, Any]:
-    metrics = get_cumulative_prompt_cache_metrics()
+    import fluid_build.cli.forge as _self
+
+    metrics = _self.get_cumulative_prompt_cache_metrics()
     if metrics.get("total_tokens", 0) <= 0:
         return {}
     return {"prompt_cache": metrics}
@@ -1879,10 +1980,10 @@ def _format_forge_command(args, flow: str) -> str:
 
 __all__ = [
     "AIAgent",
-    "AI_AGENTS",
+    "AI_AGENTS",  # noqa: F822 — resolved lazily via module __getattr__
     "COMMAND",
     "ContextValidationError",
-    "CopilotAgent",
+    "CopilotAgent",  # noqa: F822 — resolved lazily via module __getattr__
     "ForgeError",
     "ForgeMode",
     "InvalidProjectNameError",

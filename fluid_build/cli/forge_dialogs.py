@@ -38,7 +38,14 @@ from difflib import SequenceMatcher
 from getpass import getpass
 from typing import Any, Dict, List, Mapping, Optional
 
-from .forge_copilot_runtime import normalize_provider_name
+# Import ``normalize_provider_name`` from its LIGHT defining module rather than
+# the heavy ``forge_copilot_runtime`` re-export. ``forge_copilot_runtime`` pulls
+# the LLM/discovery stack (httpx) and the schema_manager chain (jsonschema),
+# which would drag the whole forge AI runtime onto the ``fluid --help`` cold
+# path (forge_dialogs → forge_agent_specs → forge_agents → forge.register).
+# ``forge_copilot_contract_helpers`` is the canonical definition site and is
+# dependency-light.
+from .forge_copilot_contract_helpers import normalize_provider_name
 from .forge_copilot_taxonomy import normalize_use_case
 
 try:

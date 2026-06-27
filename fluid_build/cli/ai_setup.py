@@ -29,7 +29,7 @@ __all__ = [
     "register",
     "run_ai_setup_interactive",
     "run_ai_setup_inline",
-    "run_ai_test",
+    "run_ai_test",  # noqa: F822 — resolved lazily via module __getattr__
     "set_session_env",
     "show_ai_models",
     "show_ai_status",
@@ -43,27 +43,94 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-import httpx
-
 from fluid_build.cli.forge_banner import print_v2_banner
-from fluid_build.cli.forge_copilot_llm_providers import (
-    BUILTIN_LLM_PROVIDERS,
-    PROVIDER_DISPLAY_NAMES,
-    PROVIDER_ENV_VARS,
-    CopilotGenerationError,
-    LlmConfig,
-    build_llm_run_plan,
-    check_llm_readiness,
-    detect_ollama_available,
-    detect_provider_from_api_key,
-    get_catalog_default,
-    get_catalog_routing_model,
-    get_catalog_tier_models,
-)
-from fluid_build.cli.forge_dialogs import ask_confirmation
+
+if TYPE_CHECKING:  # resolve annotation names for ruff/type-checkers only
+    from fluid_build.cli.forge_copilot_llm_providers import (
+        CopilotGenerationError,
+        LlmConfig,
+        LlmReadinessCheck,
+    )
+
+# NOTE: ``httpx`` and ``forge_copilot_llm_providers`` / ``forge_dialogs`` /
+# ``_ai_setup_test`` pull in the heavy AI runtime (httpx + the schema_manager
+# chain → jsonschema). ``register`` only needs argparse, so all of these are
+# resolved lazily via ``__getattr__`` below and stay off the ``fluid --help`` /
+# ``build_parser()`` cold path. Runtime use sites reference the bare names,
+# which resolve through ``__getattr__`` (or via real attributes once test
+# patches like ``patch("…cli.ai_setup.httpx.Client")`` /
+# ``patch("…cli.ai_setup.check_llm_readiness")`` install them). Annotations
+# referencing ``LlmConfig`` / ``CopilotGenerationError`` are safe at module
+# scope because ``from __future__ import annotations`` keeps them lazy strings.
+
+# forge_copilot_llm_providers exports resolved lazily.
+_LLM_PROVIDER_EXPORTS = {
+    "BUILTIN_LLM_PROVIDERS",
+    "PROVIDER_DISPLAY_NAMES",
+    "PROVIDER_ENV_VARS",
+    "CopilotGenerationError",
+    "LlmConfig",
+    "LlmReadinessCheck",
+    "build_llm_run_plan",
+    "check_llm_readiness",
+    "detect_ollama_available",
+    "detect_provider_from_api_key",
+    "get_catalog_default",
+    "get_catalog_routing_model",
+    "get_catalog_tier_models",
+    "reset_llm_caches",
+}
+
+# Helpers extracted into ``_ai_setup_test`` and re-exported here so the
+# ``patch("…cli.ai_setup.<helper>")`` test seams keep resolving.
+_AI_SETUP_TEST_EXPORTS = {
+    "_ai_test_token_budget_label",
+    "_cap_ai_test_token_budget",
+    "_check_ai_test_model_availability",
+    "_classify_ai_test_error",
+    "_coerce_ai_test_timeout",
+    "_http_error_name",
+    "_http_status_from_cause",
+    "_new_ai_test_report",
+    "_normalize_ai_test_provider",
+    "_resolve_ai_test_config",
+    "_run_ai_smoke_call",
+    "_safe_ai_test_display",
+    "_validate_ai_test_endpoint",
+    "_with_freeform_ai_test_payload",
+    "run_ai_test",
+}
+
+
+def __getattr__(name: str):
+    """Lazily resolve the AI-runtime imports (PEP 562).
+
+    Keeps ``httpx`` + the forge_copilot AI stack (and its jsonschema chain)
+    off the ``fluid --help`` path while exposing the symbols as module
+    attributes so the various ``patch("…cli.ai_setup.<symbol>")`` test seams
+    keep working.
+    """
+    if name == "httpx":
+        import httpx
+
+        return httpx
+    if name == "ask_confirmation":
+        from fluid_build.cli.forge_dialogs import ask_confirmation
+
+        return ask_confirmation
+    if name in _LLM_PROVIDER_EXPORTS:
+        import fluid_build.cli.forge_copilot_llm_providers as _llm
+
+        return getattr(_llm, name)
+    if name in _AI_SETUP_TEST_EXPORTS:
+        import fluid_build.cli._ai_setup_test as _ait
+
+        return getattr(_ait, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 try:
     from rich.console import Console
@@ -210,6 +277,8 @@ def set_session_env(provider: str, api_key: str) -> None:
     during this session.  The key is **not** written to disk or exported
     to child processes beyond the current process tree.
     """
+    from fluid_build.cli.ai_setup import PROVIDER_ENV_VARS
+
     env_var = PROVIDER_ENV_VARS.get(provider)
     if env_var:
         os.environ[env_var] = api_key
@@ -346,6 +415,9 @@ def _classify_key_shape(raw: str) -> str:
     Lightweight regex match on the key prefix; never validates against
     the provider — that's what ``_validate_api_key`` is for.
     """
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
+    from fluid_build.cli.ai_setup import detect_provider_from_api_key
+
     return detect_provider_from_api_key(raw) or "unknown"
 
 
@@ -442,6 +514,9 @@ def _collect_and_validate_api_key(
     rescue on exhaustion. Returns a resolved :class:`LlmConfig` or
     ``None`` when the user gives up.
     """
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
+    from fluid_build.cli.ai_setup import BUILTIN_LLM_PROVIDERS, PROVIDER_DISPLAY_NAMES
+
     label = PROVIDER_DISPLAY_NAMES.get(provider_choice, provider_choice)
     signup_url = _SIGNUP_URLS.get(provider_choice, "")
     last_error: Optional[str] = None
@@ -551,6 +626,8 @@ def _persist_and_return(
     raw_key: str,
 ) -> LlmConfig:
     """Save key + config, set session env, return :class:`LlmConfig`."""
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
+    from fluid_build.cli.ai_setup import LlmConfig
     from fluid_build.cli.forge_copilot_llm_providers import get_catalog_tier_model
 
     console.print(f"[green]Verified! Connected to {label}.[/green]")
@@ -645,6 +722,9 @@ from fluid_build.cli._ai_setup_ollama import (  # noqa: E402,F401
 
 def run_ai_setup_interactive(console: Any) -> Optional[LlmConfig]:
     """Full interactive AI setup.  Called by ``fluid ai setup``."""
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
+    from fluid_build.cli.ai_setup import check_llm_readiness
+
     if not console or not RICH_AVAILABLE:
         from fluid_build.cli.console import error as console_error
 
@@ -698,6 +778,9 @@ def _make_cloud_config(
     the provider's computed default when the respective arguments are
     ``None``.  Reads ``os.environ`` once.
     """
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
+    from fluid_build.cli.ai_setup import BUILTIN_LLM_PROVIDERS, LlmConfig
+
     provider = BUILTIN_LLM_PROVIDERS[pname]
     env = dict(os.environ)
     resolved_model = model or provider.default_model
@@ -717,6 +800,9 @@ def _make_coding_agent_config(pname: str, model: Optional[str] = None) -> LlmCon
     time. The provider is resolved from the registry (where the four
     coding-agent rows were added in Part B).
     """
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
+    from fluid_build.cli.ai_setup import BUILTIN_LLM_PROVIDERS, LlmConfig
+
     provider = BUILTIN_LLM_PROVIDERS[pname]
     env = dict(os.environ)
     resolved_model = model or provider.default_model
@@ -761,6 +847,14 @@ def _offer_import_env_api_key(
       (CodeQL ``py/clear-text-logging-sensitive-data`` — the key is in scope at
       every LOG site in this frame).
     """
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
+    from fluid_build.cli.ai_setup import (
+        BUILTIN_LLM_PROVIDERS,
+        PROVIDER_DISPLAY_NAMES,
+        ask_confirmation,
+        detect_provider_from_api_key,
+    )
+
     # Non-interactive (CI / piped stdin): use the key, persist nothing.
     if not (sys.stdin.isatty() and console and RICH_AVAILABLE):
         return
@@ -831,6 +925,15 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
 
     Returns ``None`` if the user skips setup or stdin is not a TTY.
     """
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
+    from fluid_build.cli.ai_setup import (
+        BUILTIN_LLM_PROVIDERS,
+        PROVIDER_DISPLAY_NAMES,
+        PROVIDER_ENV_VARS,
+        ask_confirmation,
+        detect_ollama_available,
+    )
+
     # 0. Respect session-level skip.
     if _ai_setup_skipped:
         LOG.debug("AI setup was skipped earlier in this session")
@@ -968,6 +1071,9 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
 
 def show_ai_status(console: Any) -> None:
     """Display current AI configuration status.  Used by ``fluid doctor``."""
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
+    from fluid_build.cli.ai_setup import check_llm_readiness
+
     readiness = check_llm_readiness()
 
     if not console or not RICH_AVAILABLE:
@@ -1003,6 +1109,16 @@ def show_ai_status(console: Any) -> None:
 
 def _provider_model_plan(provider_name: str) -> dict:
     """Build a display-safe model plan for one provider."""
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
+    from fluid_build.cli.ai_setup import (
+        BUILTIN_LLM_PROVIDERS,
+        LlmConfig,
+        build_llm_run_plan,
+        get_catalog_default,
+        get_catalog_routing_model,
+        get_catalog_tier_models,
+    )
+
     provider = BUILTIN_LLM_PROVIDERS[provider_name]
     model = get_catalog_default(provider_name) or provider.default_model
     routing_model = get_catalog_routing_model(provider_name, model)
@@ -1025,7 +1141,10 @@ def show_ai_models(
     as_json: bool = False,
 ) -> None:
     """Display bundled LLM model defaults, routing, and tier plans."""
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
     import json
+
+    from fluid_build.cli.ai_setup import BUILTIN_LLM_PROVIDERS, PROVIDER_DISPLAY_NAMES
 
     provider_names = [
         name
@@ -1081,25 +1200,12 @@ def show_ai_models(
 # AI-test plumbing — physically extracted to ``cli/_ai_setup_test.py``.
 # ~500 LOC of config resolution, endpoint validation, token caps,
 # model preflight, smoke call, error classification, JSON report
-# emission. Re-exported here so existing call sites (``run_ai_test``)
-# and test patches keep resolving.
-from fluid_build.cli._ai_setup_test import (  # noqa: E402,F401
-    _ai_test_token_budget_label,
-    _cap_ai_test_token_budget,
-    _check_ai_test_model_availability,
-    _classify_ai_test_error,
-    _coerce_ai_test_timeout,
-    _http_error_name,
-    _http_status_from_cause,
-    _new_ai_test_report,
-    _normalize_ai_test_provider,
-    _resolve_ai_test_config,
-    _run_ai_smoke_call,
-    _safe_ai_test_display,
-    _validate_ai_test_endpoint,
-    _with_freeform_ai_test_payload,
-    run_ai_test,
-)
+# emission. These are resolved lazily via ``__getattr__`` (see
+# ``_AI_SETUP_TEST_EXPORTS`` at the top of the module) so importing
+# ``ai_setup`` for ``register`` does NOT pull ``_ai_setup_test`` (which
+# imports httpx + forge_copilot_llm_providers). The ``patch("…cli.ai_setup
+# .<helper>")`` test seams and the ``run_ai_test`` call site keep resolving
+# through ``__getattr__``.
 
 
 def register(subparsers) -> None:
@@ -1209,6 +1315,9 @@ def register(subparsers) -> None:
 
 def _run_ai_command(args, logger: logging.Logger) -> int:
     """Entry point for ``fluid ai setup|status``."""
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
+    from fluid_build.cli.ai_setup import PROVIDER_ENV_VARS, run_ai_test
+
     console = Console() if RICH_AVAILABLE else None
     action = getattr(args, "ai_action", None)
 

@@ -20,7 +20,11 @@ import re
 from typing import Any, Dict, List, Optional
 
 from fluid_build.copilot.schemas.stage_outputs import LogicalDraft
-from fluid_build.schema_manager import FluidSchemaManager
+
+# NOTE: ``schema_manager`` (pulls heavy ``jsonschema``) is imported lazily at
+# the two use sites below so it stays off the ``fluid mcp`` / ``fluid --help``
+# / ``build_parser()`` cold path (this module is reached transitively from the
+# mcp dispatcher at registration time).
 
 
 def _slug(text: str) -> str:
@@ -780,6 +784,7 @@ def _assemble_extensions(logical: LogicalDraft) -> Dict[str, Any]:
     plugins are byte-identical to before.
     """
     from fluid_build.extension_schemas import assemble_proposed_extensions
+    from fluid_build.schema_manager import FluidSchemaManager
 
     proposed = (logical.source_summary or {}).get("proposed_extensions")
     return assemble_proposed_extensions(
@@ -813,6 +818,8 @@ def build_contract_from_logical(
     Contracts forged from intents / DDL (no catalog signal) get the
     legacy defaults — same behaviour as before V1.5.
     """
+    from fluid_build.schema_manager import FluidSchemaManager
+
     slug = _slug(logical.name)
     summary = logical.source_summary or {}
 
