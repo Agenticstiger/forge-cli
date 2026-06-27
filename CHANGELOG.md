@@ -7,18 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-06-27
+
+A plugin-system + provider-taxonomy release: the unified plugin manager with all
+four SDK roles wired in, a real plugin↔CLI version gate, the ODPS/ODCS
+provider-vs-exporter fix, and the operator surfaces (`fluid plugins`,
+`fluid exporters`) — plus first-run/UX and error-reporting improvements.
+
+### Added
+
+- **Unified plugin manager + all four SDK roles wired into the CLI.** One
+  host-side discovery substrate (`fluid_build.plugin_manager`) walks the
+  role-tagged entry-point groups with per-plugin fail-isolation and an operator
+  allow/block policy (`FLUID_PLUGINS_ALLOWLIST` / `FLUID_PLUGINS_BLOCKLIST`). The
+  `Validator` role is wired into `fluid validate`, the `CatalogAdapter` role into
+  `fluid publish`, and IaC clouds are now entry-point-pluggable
+  (`fluid_build.iac_providers`); the orphaned parallel `cli/plugins.py` framework
+  was retired. (#292, #293, #294)
+- **`fluid plugins`** — operator inspection of installed plugins by role with
+  their allow/block status (name-only, never loads plugin code). **`--detailed`**
+  loads *allowed* plugins to surface their declared `PluginMetadata`
+  (version / author / license / url); blocked plugins are never loaded. (#296, #307)
+- **`fluid exporters`** — a discoverable home for the spec exporters
+  (`odps` / `odcs` / `odps-bitol`) with their spec name, URL, and
+  `fluid generate standard --format` invocation, backed by a registry separate
+  from the provider registry. (#308)
+- **Stable error slugs + a central catalog** of suggestions / docs URLs, so CLI
+  errors carry a stable identifier and actionable next steps. (#302)
+- **`fluid forge` can delegate agent tool-calls to the dbt MCP server** (opt-in),
+  letting the copilot drive dbt through MCP. (#305)
+
 ### Changed
 
-- **ODPS is no longer presented as a cloud provider.** ODPS (Open Data Product
-  Standard — Bitol / LF-ODPI) is a data-product *spec / export format*, not an
-  infrastructure provider like `aws`/`gcp`/`snowflake`/`local` (its
-  `OdpsProvider.apply()` was a no-op). It has been removed from the
-  `fluid_build.providers` entry-point group and the provider registry, so it no
-  longer appears in `fluid providers`, `fluid plugins`, or as a `--provider`
-  choice. The ODPS export is unchanged and fully supported via
-  `fluid odps export …` (and `fluid export-opds`, `fluid generate standard
-  --format odps`). **Breaking (CLI surface):** `--provider odps` / `--provider
-  opds` are no longer accepted — use `fluid odps export` instead.
+- **ODPS and ODCS are no longer cloud providers — they are spec EXPORTERS.**
+  ODPS (Open Data Product Standard) and ODCS (Open Data Contract Standard) are
+  data-product / data-contract *spec / export formats*, not infrastructure
+  providers (their `apply()` does not deploy). Both are removed from the provider
+  registry and entry-points, so they no longer appear in `fluid providers`,
+  `fluid plugins`, or as a `--provider` choice. The fix is **principled** — an
+  invariant test rejects any registered provider whose `apply()` doesn't deploy,
+  so a future sibling can't slip through. Export is unchanged via
+  `fluid odps export` / `fluid odcs` / `fluid generate standard --format` and the
+  new `fluid exporters`. **Breaking (CLI surface):** `--provider odps` / `opds` /
+  `odcs` are no longer accepted. (#298, #300, #304)
+- **Friendlier first-run.** `fluid init` defaults to a Quickstart when no LLM key
+  is configured, and counts a keyless coding agent (Claude Code / Cursor / Kiro)
+  as AI-available when picking the menu default. (#303, #309)
+
+### Fixed
+
+- **The plugin↔CLI version gate is now real** (was a dead handshake): the CLI
+  version comes from `importlib.metadata`, reads the new `fluid_sdk`, and gates a
+  plugin's `requires_cli` PEP 440 specifier via `packaging.SpecifierSet`. (#291)
+- **`fluid skills` is registered** — it shipped invisible due to swapped
+  `_try_register` arguments. (#287)
+- **`fluid product-add` emits canonical, schema-valid contract shapes** (routes
+  sources / exposures / dq to their canonical homes). (#288)
+- Corrected stale title/description in `fluid-schema-0.7.5.json`. (#290)
+
+### Security
+
+- **Every code-executing entry-point group is governed by the unified
+  allow/block policy** — providers, commands, apply-hooks, extension
+  schemas/validators, modeling techniques, source adapters — closing the gap
+  where a blocked plugin could still load and run. Provider discovery no longer
+  leaks raw exception text / tracebacks into `DISCOVERY_ERRORS` (type-only). (#295, #297)
+
+### Performance
+
+- `requests` and `build_runners` are deferred off the cold `--help` path. (#301)
 
 ## [0.8.11] - 2026-06-16
 
