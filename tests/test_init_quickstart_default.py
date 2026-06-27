@@ -68,10 +68,32 @@ def test_detect_ai_available_true_when_probe_configured():
         assert helpers._detect_ai_available() is True
 
 
-def test_detect_ai_available_false_when_probe_unconfigured():
-    with patch(
-        "fluid_build.cli._welcome_scan._probe_ai_credentials",
-        return_value={"ai_configured": False},
+def test_detect_ai_available_true_with_keyless_agent():
+    # No API key, but a keyless coding agent (claude-code) is on PATH — the AI
+    # path works for this user, so it must count as available.
+    with (
+        patch(
+            "fluid_build.cli._welcome_scan._probe_ai_credentials",
+            return_value={"ai_configured": False},
+        ),
+        patch(
+            "fluid_build.cli._welcome_scan._probe_coding_agents",
+            return_value={"coding_agents_available": ["claude-code"]},
+        ),
+    ):
+        assert helpers._detect_ai_available() is True
+
+
+def test_detect_ai_available_false_when_no_creds_and_no_agent():
+    with (
+        patch(
+            "fluid_build.cli._welcome_scan._probe_ai_credentials",
+            return_value={"ai_configured": False},
+        ),
+        patch(
+            "fluid_build.cli._welcome_scan._probe_coding_agents",
+            return_value={"coding_agents_available": []},
+        ),
     ):
         assert helpers._detect_ai_available() is False
 
