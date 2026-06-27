@@ -22,9 +22,19 @@ ODCS contracts define the data structure, quality, and SLA requirements.
 ODCS Specification: https://github.com/bitol-io/open-data-contract-standard
 """
 
-from fluid_build.providers import register_provider
-
 from .odcs import OdcsProvider
 
-register_provider("odcs", OdcsProvider)
+# ODCS (Open Data Contract Standard, Bitol) is a data-contract SPEC / export
+# format — NOT a cloud/infrastructure provider. ``OdcsProvider.apply()`` raises
+# ("does not support apply()"); it only renders/imports the ODCS spec. Like ODPS,
+# it is therefore intentionally NOT registered in the provider registry and never
+# appears in ``fluid providers`` / ``fluid plugins`` / ``--provider``.
+#
+# The class stays importable for the spec commands, which construct it directly
+# (``from fluid_build.providers.odcs import OdcsProvider`` — see cli/odcs.py,
+# cli/generate_standard.py, api/catalog_publication.py, datamesh_manager). The
+# opt-out below stops the provider auto-discovery single-subclass fallback from
+# re-registering it on the strength of that import.
+__fluid_no_autoregister__ = True
+
 __all__ = ["OdcsProvider"]
