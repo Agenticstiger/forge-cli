@@ -578,7 +578,17 @@ def _discover_subpackages(logger: Optional[logging.Logger]) -> None:
 
 
 def _auto_register_from_module(mod, logger: Optional[logging.Logger]) -> None:
-    """Try the three passive strategies + a single-subclass fallback."""
+    """Try the three passive strategies + a single-subclass fallback.
+
+    A module can opt OUT of all passive auto-registration by setting
+    ``__fluid_no_autoregister__ = True``. This is how a package that exposes a
+    ``BaseProvider`` subclass for direct import — but is a spec EXPORTER, not a
+    deployment provider (e.g. odcs) — keeps the class importable without the
+    single-subclass fallback silently re-registering it in the provider registry.
+    """
+    if getattr(mod, "__fluid_no_autoregister__", False):
+        return
+
     # Strategy 1: PROVIDERS dict
     providers_map = getattr(mod, "PROVIDERS", None)
     if isinstance(providers_map, dict) and providers_map:
