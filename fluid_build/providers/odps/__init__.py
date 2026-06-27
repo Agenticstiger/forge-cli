@@ -12,18 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from fluid_build.providers import register_provider
-
-from .odps import (
-    OdpsProvider,  # class OdpsProvider(BaseProvider) with name="odps"; implements render()
-)
-
-# Canonical name (matches the pyproject.toml entry-point + OdpsProvider.name).
-register_provider("odps", OdpsProvider)
-# Back-compat alias so pre-2026-05 invocations of ``--provider opds`` (and
-# anyone who registered against the letter-swap key) keep resolving to the
-# same class. The CLI argparse ``choices=[..., "odps", "opds", ...]`` accepts
-# both spellings; the registry needs to honor the letter-swap to match.
-register_provider("opds", OdpsProvider, override=False)
-
-__all__ = ["OdpsProvider"]
+# ODPS (Open Data Product Standard, Bitol / LF-ODPI) is a data-product SPEC /
+# serialization format — NOT a cloud/infrastructure provider like aws/gcp/
+# snowflake/local. ``OdpsProvider`` exports a contract to the ODPS spec via
+# ``render()``; its ``apply()`` is a no-op. It is therefore intentionally NOT
+# registered in the provider registry and NOT advertised as a
+# ``fluid_build.providers`` entry-point, so it never appears in ``fluid
+# providers`` / ``fluid plugins`` / ``--provider`` as a deployment target.
+#
+# The class stays importable for the spec-export commands, which construct it
+# DIRECTLY:  from fluid_build.providers.odps.odps import OdpsProvider
+# (see cli/odps.py, cli/export_odps.py, cli/generate_standard.py). This package
+# __init__ deliberately exposes no BaseProvider subclass, so the provider
+# auto-discovery scan cannot re-register it.

@@ -208,13 +208,16 @@ def _export_odps_v4_1(
     args: argparse.Namespace, contract: Dict[str, Any], logger: logging.Logger
 ) -> int:
     """ODPS v4.1 (LF/ODPI) export path (single JSON document)."""
-    from fluid_build.cli.bootstrap import build_provider
+    # Direct class import — ODPS is a spec-EXPORT format, not a registry/cloud
+    # provider, so we no longer resolve it via build_provider()/the PROVIDERS
+    # registry (OdpsProvider was de-registered; see providers/odps/__init__.py).
+    from fluid_build.providers.odps.odps import OdpsProvider
 
     try:
-        provider = build_provider("odps", None, None, logger)
+        provider = OdpsProvider()
     except Exception as e:
-        logger.error("provider_build_failed", extra={"error": str(e)})
-        console_error(f"Error building ODPS v4.1 provider: {e}")
+        logger.error("provider_build_failed", extra={"error": type(e).__name__})
+        console_error(f"Error building ODPS v4.1 exporter: {type(e).__name__}")
         return 1
 
     provider.opds_version = "4.1"

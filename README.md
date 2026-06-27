@@ -472,7 +472,7 @@ Providers are the bridge between your declarative contract and your target execu
 | 🌩️ **aws** | Amazon Web Services | S3, Glue, Athena, Redshift, MWAA, IAM. |
 | ❄️ **snowflake** | Snowflake | Databases, schemas, streams, tasks, RBAC, sharing. |
 
-> Export-only providers for open data standards: **odps**, **odcs**, **datamesh-manager**.
+> Open-data-standard **export formats** (not cloud providers): **ODPS** (Open Data Product Standard — Bitol / LF-ODPI) via `fluid odps`, plus **odcs** and **datamesh-manager** integrations.
 
 ---
 

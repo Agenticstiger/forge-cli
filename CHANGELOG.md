@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **ODPS is no longer presented as a cloud provider.** ODPS (Open Data Product
+  Standard — Bitol / LF-ODPI) is a data-product *spec / export format*, not an
+  infrastructure provider like `aws`/`gcp`/`snowflake`/`local` (its
+  `OdpsProvider.apply()` was a no-op). It has been removed from the
+  `fluid_build.providers` entry-point group and the provider registry, so it no
+  longer appears in `fluid providers`, `fluid plugins`, or as a `--provider`
+  choice. The ODPS export is unchanged and fully supported via
+  `fluid odps export …` (and `fluid export-opds`, `fluid generate standard
+  --format odps`). **Breaking (CLI surface):** `--provider odps` / `--provider
+  opds` are no longer accepted — use `fluid odps export` instead.
+
 ## [0.8.11] - 2026-06-16
 
 ### Added
