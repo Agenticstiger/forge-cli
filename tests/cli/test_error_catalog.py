@@ -177,3 +177,26 @@ def test_catalog_covers_common_command_failures():
     for ev in expected:
         assert cat.suggestions_for(ev), ev
         assert cat.docs_url_for(ev), ev
+
+
+def test_passive_entries_now_carry_an_actionable_second_step():
+    """Inspection follow-up to #310: entries that were diagnostic-only (a single
+    'what's wrong' line) now pair the diagnosis with a concrete 'what to do' next
+    step."""
+    enriched = {
+        "generate_ci_failed",
+        "product_new_failed",
+        "signing_bundle_not_file",
+        "schedule_sync_dags_dir_not_directory",
+        "loader_missing_functions",
+    }
+    for ev in enriched:
+        sugg = cat.suggestions_for(ev)
+        assert len(sugg) >= 2, f"{ev} should pair a diagnosis with a next step: {sugg}"
+
+
+def test_no_contract_events_stay_consistent_on_the_scaffold_hint():
+    """`contract_required` and `missing_contract` are the same user situation
+    ('no contract path given') — both must point at scaffolding one."""
+    for ev in ("missing_contract", "contract_required"):
+        assert any("fluid init" in s or "fluid forge" in s for s in cat.suggestions_for(ev)), ev
