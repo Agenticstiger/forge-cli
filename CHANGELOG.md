@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-06-27
+
+A bug-fix + security release on top of 0.10.0.
+
+### Security
+
+- **Mask credentials embedded in URL userinfo** (`scheme://user:password@host`)
+  across both redaction layers — the global `secret_redactor` and the
+  Snowflake-local twin. Such a password (an Iceberg REST catalog
+  `binding.location.uri`, a JDBC / `connection_url`, or a redis/AMQP broker URL)
+  could previously survive into a log line or a persisted run record. The shared
+  pattern is length-bounded (ReDoS-safe) and masks only the password, preserving
+  scheme / user / host. (#316)
+
+### Fixed
+
+- **Iceberg REST/GCP/Azure catalog profiles are now expressible in a
+  schema-valid contract.** `$defs/bindingLocation` in `fluid-schema-0.7.5.json`
+  now declares `catalog`, `uri`, `warehouse`, and `partitionBy` — the fields the
+  resolver and the streaming-sink validator already read — so a catalog-profile
+  contract no longer fails `fluid validate` with "Additional properties are not
+  allowed". (#314)
+- **`fluid market --blueprints --format json` now emits clean, machine-parseable
+  JSON** instead of the rich human table plus status banners, so it can be piped
+  into a script. (#317)
+- **`fluid market --blueprints` no longer prints a spurious "'fluid marketplace'
+  is deprecated" banner** — that notice now fires only for a direct (hidden)
+  `fluid marketplace` invocation. (#319)
+
 ## [0.10.0] — 2026-06-27
 
 A plugin-system + provider-taxonomy release: the unified plugin manager with all
