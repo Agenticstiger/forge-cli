@@ -100,3 +100,74 @@ def test_run_handles_no_plugins(monkeypatch, capsys):
     rc = plugins_cmd.run(_args(), logging.getLogger("t"))
     assert rc == 0
     assert "No third-party FLUID plugins installed" in capsys.readouterr().out
+
+
+# ── detailed_plugins() — loads ALLOWED plugins to surface declared metadata ──
+
+
+class _LoadableEP:
+    def __init__(self, name, loader):
+        self.name = name
+        self._loader = loader
+
+    def load(self):
+        return self._loader()
+
+
+def _meta_class(**fields):
+    class _Meta:
+        @classmethod
+        def get_plugin_info(cls):
+            class _Info:
+                def to_dict(self):
+                    return dict(fields)
+
+            return _Info()
+
+    return _Meta
+
+
+def test_detailed_plugins_surfaces_declared_metadata(monkeypatch):
+    ep = _LoadableEP(
+        "steward",
+        lambda: _meta_class(version="1.2.0", author="ACME", license="Apache-2.0"),
+    )
+    monkeypatch.setattr(PM, "_entry_points", lambda group: [ep])
+    monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
+    monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST", raising=False)
+    data = PM.detailed_plugins("validator")
+    entry = next(e for e in data["validator"] if e["name"] == "steward")
+    assert entry["allowed"] is True
+    assert entry["metadata"] == {"version": "1.2.0", "author": "ACME", "license": "Apache-2.0"}
+
+
+def test_detailed_plugins_never_loads_blocked(monkeypatch):
+    loaded = []
+
+    def _boom():
+        loaded.append(True)
+        raise AssertionError("a BLOCKED plugin must never be loaded")
+
+    monkeypatch.setattr(PM, "_entry_points", lambda group: [_LoadableEP("evil", _boom)])
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "evil")
+    monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
+    data = PM.detailed_plugins("validator")
+    entry = next(e for e in data["validator"] if e["name"] == "evil")
+    assert entry["allowed"] is False
+    assert entry["metadata"] is None
+    assert not loaded, "trust boundary violated: a blocked plugin was loaded"
+
+
+def test_detailed_plugins_isolates_metadata_error(monkeypatch):
+    class _Bad:
+        @classmethod
+        def get_plugin_info(cls):
+            raise RuntimeError("boom with maybe-secret text")
+
+    monkeypatch.setattr(PM, "_entry_points", lambda group: [_LoadableEP("flaky", lambda: _Bad)])
+    monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
+    monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST", raising=False)
+    data = PM.detailed_plugins("validator")  # must not raise
+    entry = next(e for e in data["validator"] if e["name"] == "flaky")
+    assert entry["allowed"] is True
+    assert entry["metadata"] is None

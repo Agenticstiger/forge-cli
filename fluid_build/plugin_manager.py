@@ -166,6 +166,79 @@ def installed_plugins(role: Optional[str] = None) -> Dict[str, List[Dict[str, An
     return out
 
 
+def _plugin_metadata(obj: Any, logger: logging.Logger) -> Optional[Dict[str, Any]]:
+    """Best-effort declared metadata for a loaded plugin, or ``None``.
+
+    Reads ``get_plugin_info()`` (a ``@classmethod`` on the SDK ``BasePlugin``) and
+    returns its ``PluginMetadata.to_dict()``. Guarded + logged by exception type
+    only (no plugin-supplied text), consistent with the trust boundary. Plugins
+    that declare no metadata (e.g. plain command functions) return ``None``.
+    """
+    info_fn = getattr(obj, "get_plugin_info", None)
+    if not callable(info_fn):
+        return None
+    try:
+        meta = info_fn()
+    except Exception as e:  # noqa: BLE001 - never crash inspection; type only
+        logger.warning("get_plugin_info raised: %s", type(e).__name__)
+        return None
+    to_dict = getattr(meta, "to_dict", None)
+    if callable(to_dict):
+        try:
+            d = to_dict()
+            return d if isinstance(d, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
+    # Fallback: pull the common attributes off the metadata object.
+    fields = {}
+    for attr in ("name", "version", "author", "license", "url", "description"):
+        val = getattr(meta, attr, None)
+        if val is not None:
+            fields[attr] = val
+    return fields or None
+
+
+def detailed_plugins(
+    role: Optional[str] = None, logger: Optional[logging.Logger] = None
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Like :func:`installed_plugins`, plus the declared metadata of ALLOWED plugins.
+
+    ALLOWED plugins are loaded (via ``ep.load()``) so their ``get_plugin_info()``
+    metadata can be surfaced; BLOCKED plugins are listed name-only and are NEVER
+    loaded — the allow/block trust boundary is preserved. Per-plugin
+    fail-isolation: a load or metadata error logs by type only and yields
+    ``metadata: None`` rather than dropping the entry or raising.
+    """
+    log = logger or logging.getLogger(__name__)
+    groups = governed_groups()
+    keys = [role] if role else list(groups)
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for k in keys:
+        group = groups.get(k)
+        if not group:
+            continue
+        entries: List[Dict[str, Any]] = []
+        for ep in sorted(_entry_points(group), key=lambda e: e.name):
+            allowed = is_allowed(ep.name)
+            entry: Dict[str, Any] = {
+                "name": ep.name,
+                "group": group,
+                "allowed": allowed,
+                "metadata": None,
+            }
+            if allowed:  # only ALLOWED plugins are ever loaded
+                try:
+                    obj = ep.load()
+                except Exception as e:  # noqa: BLE001 - isolate a bad plugin; type only
+                    log.warning("plugin %r failed to load: %s", ep.name, type(e).__name__)
+                    obj = None
+                if obj is not None:
+                    entry["metadata"] = _plugin_metadata(obj, log)
+            entries.append(entry)
+        out[k] = entries
+    return out
+
+
 def _normalize_severity(value: Any) -> str:
     """Map a raw severity onto {info, warn, error, critical} (CLI-local, zero-dep).
 
@@ -303,6 +376,7 @@ __all__ = [
     "iter_plugins",
     "list_plugins",
     "installed_plugins",
+    "detailed_plugins",
     "has_plugins",
     "collect_validator_findings",
     "dispatch_catalog_adapters",
