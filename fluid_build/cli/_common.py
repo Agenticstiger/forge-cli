@@ -85,8 +85,21 @@ class CLIError(Exception):
         self.event = event
         self.message = event  # compat with FluidCLIError display path
         self.context = context or {}
-        self.suggestions: list[str] = []
-        self.docs_url: str | None = None
+        # Stable code + catalog-driven enrichment. ``event`` is the historical
+        # stable identity; ``error_slug`` is its ``ERR_<EVENT>`` form for CI log
+        # parsers / dashboards. Auto-enrichment from the central catalog means
+        # every raise site across cli/ gets actionable ``suggestions`` + a
+        # ``docs_url`` without per-site edits; subclasses (FluidCLIError /
+        # CopilotGenerationError) may still override either. The catalog is a
+        # stdlib-only leaf imported lazily here so the (early, hot) ``_common``
+        # module-load import graph is unchanged — construction is rare (only on
+        # error).
+        from ._error_catalog import enrich, slug_for
+
+        self.error_slug: str = slug_for(event)
+        self.suggestions: list[str]
+        self.docs_url: str | None
+        self.suggestions, self.docs_url = enrich(event, None, None)
 
 
 def _imp(mod: str, attr: str | None = None):

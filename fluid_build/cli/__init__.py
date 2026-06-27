@@ -375,6 +375,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 extra={
                     "cmd": getattr(args, "cmd", None),
                     "event": e.event,
+                    "error_slug": getattr(e, "error_slug", None),
                     "exit_code": e.exit_code,
                 },
             )
@@ -402,20 +403,34 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 1
 
         except CLIError as e:
-            # Handle lightweight CLI errors from command modules
+            # Handle lightweight CLI errors from command modules. Render the
+            # same surface as FluidCLIError (stable slug tag + catalog-driven
+            # suggestions + docs link) so users get actionable guidance no
+            # matter which error class a command raised.
+            slug = getattr(e, "error_slug", None)
             cli.logger.log_safe(
                 "error",
                 "CLI command error",
                 extra={
                     "cmd": getattr(args, "cmd", None),
                     "event": e.event,
+                    "error_slug": slug,
                     "exit_code": e.exit_code,
                 },
             )
-            context.console.print(f"[red]❌ {e.message}[/red]")
+            tag = f"  [dim]\\[{slug}][/dim]" if slug else ""
+            context.console.print(f"[red]❌ {e.message}[/red]{tag}")
             if e.context:
                 for key, value in e.context.items():
                     context.console.print(f"  [dim]{key}:[/dim] {value}")
+            suggestions = getattr(e, "suggestions", None) or []
+            if suggestions:
+                context.console.print("\n[yellow]💡 Suggestions:[/yellow]")
+                for suggestion in suggestions:
+                    context.console.print(f"  • {suggestion}")
+            docs_url = getattr(e, "docs_url", None)
+            if docs_url:
+                context.console.print(f"\n[cyan]📖 Documentation: {docs_url}[/cyan]")
             return e.exit_code
 
         except KeyboardInterrupt:
