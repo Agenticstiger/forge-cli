@@ -25,5 +25,11 @@ from .provider import BitolOdpsProvider
 # them DIRECTLY:  from fluid_build.providers.odps_standard import (
 #     BitolOdpsProvider, OdpsStandardProvider)
 # (see cli/odps.py, cli/odps_standard.py, cli/generate_standard.py).
+#
+# Set the opt-out EXPLICITLY (like the odps/odcs sibling packages) rather than
+# relying on the accident that this module exposes two BaseProvider subclasses
+# and so escapes the single-subclass auto-register fallback. Otherwise a future
+# refactor that left a single exporter class here would silently re-register it.
+__fluid_no_autoregister__ = True
 
 __all__ = ["BitolOdpsProvider", "OdpsStandardProvider"]

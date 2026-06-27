@@ -24,4 +24,7 @@
 # DIRECTLY:  from fluid_build.providers.odps.odps import OdpsProvider
 # (see cli/odps.py, cli/export_odps.py, cli/generate_standard.py). This package
 # __init__ deliberately exposes no BaseProvider subclass, so the provider
-# auto-discovery scan cannot re-register it.
+# auto-discovery scan cannot re-register it — and we ALSO set the explicit
+# opt-out below (consistent with the odcs / odps_standard sibling packages) so a
+# future refactor that re-exposed the class here can't silently re-register it.
+__fluid_no_autoregister__ = True
