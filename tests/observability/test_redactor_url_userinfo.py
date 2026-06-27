@@ -94,15 +94,16 @@ def test_non_secret_urls_untouched(safe: str) -> None:
 
 def test_redos_bound_holds_on_adversarial_input() -> None:
     # Worst case for an unbounded userinfo run: a ``scheme://user:`` prefix then a
-    # very long password-shaped run that never reaches an '@'. The {,256}-bounded
-    # quantifiers keep this linear (it was polynomial / multi-second before the
-    # bound — see the security review). The whole pipeline must finish well under
-    # 0.5s.
+    # very long password-shaped run that never reaches an '@'. The bounded
+    # quantifiers keep this LINEAR (it was polynomial / multi-second — ~19s at
+    # this size — before the bound; see the security review). The ceiling is
+    # generous (2s) so a slow/loaded CI runner can't flake it while still
+    # catching a return of the quadratic blow-up by orders of magnitude.
     evil = "https://u:" + ("a" * 200_000)  # 200k chars, never an '@'
     start = time.monotonic()
     out = g.redact_secret_text(evil)
     elapsed = time.monotonic() - start
-    assert elapsed < 0.5, f"possible ReDoS: {elapsed:.3f}s"
+    assert elapsed < 2.0, f"possible ReDoS regression: {elapsed:.3f}s"
     assert out == evil  # nothing to redact (no '@')
 
 

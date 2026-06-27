@@ -489,6 +489,7 @@ def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
             if not bundled:
                 if json_mode:
                     sys.stdout.write("[]\n")
+                    sys.stdout.flush()
                 else:
                     console.print(f"[red]❌ {message}[/red]")
                 logger.error("Failed to search blueprints: %s", message, exc_info=True)
@@ -529,6 +530,7 @@ def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
             for bp in blueprints
         ]
         sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        sys.stdout.flush()  # ensure the machine output reaches a pipe promptly
         return 0
 
     if not blueprints:
