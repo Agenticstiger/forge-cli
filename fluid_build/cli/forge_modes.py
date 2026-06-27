@@ -572,6 +572,109 @@ def _forge_load_team_memory(
         pass
 
 
+def _forge_populate_perf_stats(
+    perf_stats: Dict[str, Any],
+    context: Dict[str, Any],
+    copilot_options: Dict[str, Any],
+) -> None:
+    """Populate ``perf_stats`` from the resolved LLM config / skills / interview.
+
+    Extracted from ``run_ai_copilot_mode`` (behaviour-preserving); mutates
+    ``perf_stats`` in place.
+    """
+    from fluid_build.cli.forge_copilot_llm_providers import streaming_is_enabled
+
+    _llm_cfg = copilot_options.get("llm_config")
+    if _llm_cfg:
+        perf_stats["provider"] = getattr(_llm_cfg, "provider", "")
+        perf_stats["model"] = getattr(_llm_cfg, "model", "")
+        perf_stats["routing_model"] = getattr(_llm_cfg, "routing_model", None)
+    perf_stats["streaming"] = streaming_is_enabled()
+    # Skills info was already set by _load_industry_skills via context.
+    if context.get("compiled_skills"):
+        perf_stats["skills_loaded"] = True
+        perf_stats["skills_precompiled"] = True
+        perf_stats["skills_label"] = context["compiled_skills"].get("industry", "loaded")
+    elif context.get("industry_skills"):
+        perf_stats["skills_loaded"] = True
+        perf_stats["skills_precompiled"] = False
+        ind = context["industry_skills"].get("industry", {})
+        perf_stats["skills_label"] = ind.get("label", "loaded")
+    # Interview skip info was set in context by the interview.
+    perf_stats["interview_skipped"] = bool(context.get("_interview_skipped"))
+
+
+def _forge_postgen_and_finalize(
+    args: Any,
+    target_dir: Path,
+    context: Dict[str, Any],
+    perf_stats: Dict[str, Any],
+    *,
+    console: Any,
+    scaffold_template: bool,
+    ask_dialog_question_fn: Callable[[Any, Any], Any],
+    get_cli_arg_fn: Callable[[Any, str, Any], Any],
+    run_start: float,
+) -> int:
+    """Post-generation scaffolding + finalize, returning the exit code (0).
+
+    Extracted verbatim from ``run_ai_copilot_mode`` (behaviour-preserving):
+    data-folder scaffold (gated on ``scaffold_template``), the optional CI
+    pipeline, personal-memory save, and the best-effort performance summary.
+    Mutates ``context`` / ``perf_stats`` in place. The module-level
+    ``_scaffold_data_folder`` / ``_scaffold_ci_pipeline`` are called by name so
+    their test-patch seams keep resolving.
+    """
+    import time
+
+    # Post-generation: create data + dbt scaffolding (slice UX-H: gated on
+    # --scaffold so the minimal path leaves an empty product dir except for the
+    # contract + receipt).
+    if scaffold_template:
+        _scaffold_data_folder(target_dir, context, console)
+
+    # Post-generation: auto-scaffold a CI/CD pipeline (optional).
+    ci_provider, ci_complexity = _scaffold_ci_pipeline(
+        args,
+        target_dir,
+        context,
+        console,
+        ask_dialog_question_fn=ask_dialog_question_fn,
+        get_cli_arg_fn=get_cli_arg_fn,
+        dry_run=bool(get_cli_arg_fn(args, "dry_run", False)),
+    )
+    if ci_provider:
+        context["ci_provider"] = ci_provider
+    if ci_complexity:
+        context["ci_complexity"] = ci_complexity
+
+    # Save personal memory (per-engineer preferences)
+    try:
+        from fluid_build.cli.forge_copilot_personal_memory import save_personal_memory
+
+        save_personal_memory(context, console)
+    except ImportError:
+        pass
+
+    # Slice UX-L: render the performance summary panel.
+    perf_stats["generation_time_s"] = round(time.monotonic() - run_start, 1)
+    try:
+        from fluid_build.cli.forge_copilot_llm_providers import get_cumulative_token_usage
+
+        usage = get_cumulative_token_usage()
+        perf_stats.update(usage)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from fluid_build.cli.forge_ui import print_forge_performance_summary
+
+        print_forge_performance_summary(console, perf_stats)
+    except Exception:  # noqa: BLE001 — summary is best-effort
+        pass
+
+    return 0
+
+
 def run_ai_copilot_mode(
     args: Any,
     logger: logging.Logger,
@@ -1162,26 +1265,7 @@ def run_ai_copilot_mode(
         )
 
         # Slice UX-L: populate perf_stats from what we know so far.
-        from fluid_build.cli.forge_copilot_llm_providers import streaming_is_enabled
-
-        _llm_cfg = copilot_options.get("llm_config")
-        if _llm_cfg:
-            perf_stats["provider"] = getattr(_llm_cfg, "provider", "")
-            perf_stats["model"] = getattr(_llm_cfg, "model", "")
-            perf_stats["routing_model"] = getattr(_llm_cfg, "routing_model", None)
-        perf_stats["streaming"] = streaming_is_enabled()
-        # Skills info was already set by _load_industry_skills via context.
-        if context.get("compiled_skills"):
-            perf_stats["skills_loaded"] = True
-            perf_stats["skills_precompiled"] = True
-            perf_stats["skills_label"] = context["compiled_skills"].get("industry", "loaded")
-        elif context.get("industry_skills"):
-            perf_stats["skills_loaded"] = True
-            perf_stats["skills_precompiled"] = False
-            ind = context["industry_skills"].get("industry", {})
-            perf_stats["skills_label"] = ind.get("label", "loaded")
-        # Interview skip info was set in context by the interview.
-        perf_stats["interview_skipped"] = bool(context.get("_interview_skipped"))
+        _forge_populate_perf_stats(perf_stats, context, copilot_options)
 
         project_name = context.get("project_goal", "my-data-product").lower().replace(" ", "-")
         target_dir = get_target_directory_fn(args, project_name)
@@ -1243,52 +1327,19 @@ def run_ai_copilot_mode(
             if score is not None:
                 perf_stats["self_eval_score"] = score
 
-        # Post-generation: create data + dbt scaffolding (slice UX-H:
-        # gated on --scaffold so the minimal path leaves an empty
-        # product dir except for the contract + receipt).
-        if scaffold_template:
-            _scaffold_data_folder(target_dir, context, console)
-
-        # Post-generation: auto-scaffold a CI/CD pipeline (optional).
-        ci_provider, ci_complexity = _scaffold_ci_pipeline(
+        # Post-generation scaffolding (data + CI) + personal-memory save + the
+        # performance summary, returning exit code 0. See the helper.
+        return _forge_postgen_and_finalize(
             args,
             target_dir,
             context,
-            console,
+            perf_stats,
+            console=console,
+            scaffold_template=scaffold_template,
             ask_dialog_question_fn=ask_dialog_question_fn,
             get_cli_arg_fn=get_cli_arg_fn,
-            dry_run=bool(get_cli_arg_fn(args, "dry_run", False)),
+            run_start=_run_start,
         )
-        if ci_provider:
-            context["ci_provider"] = ci_provider
-        if ci_complexity:
-            context["ci_complexity"] = ci_complexity
-
-        # Save personal memory (per-engineer preferences)
-        try:
-            from fluid_build.cli.forge_copilot_personal_memory import save_personal_memory
-
-            save_personal_memory(context, console)
-        except ImportError:
-            pass
-
-        # Slice UX-L: render the performance summary panel.
-        perf_stats["generation_time_s"] = round(_time.monotonic() - _run_start, 1)
-        try:
-            from fluid_build.cli.forge_copilot_llm_providers import get_cumulative_token_usage
-
-            usage = get_cumulative_token_usage()
-            perf_stats.update(usage)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            from fluid_build.cli.forge_ui import print_forge_performance_summary
-
-            print_forge_performance_summary(console, perf_stats)
-        except Exception:  # noqa: BLE001 — summary is best-effort
-            pass
-
-        return 0
     except KeyboardInterrupt:
         logger.info("AI Copilot cancelled by user")
         return 130
