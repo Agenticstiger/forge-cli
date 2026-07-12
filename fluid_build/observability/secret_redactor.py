@@ -334,8 +334,13 @@ class SecretRedactingFilter(logging.Filter):
             record.exc_text = redact_secret_text(
                 "".join(traceback.format_exception(*record.exc_info))
             )
-        elif getattr(record, "exc_text", None):
-            record.exc_text = redact_secret_text(record.exc_text)
+        else:
+            # ``record.exc_text`` is ``str | None``; bind it to a local so the
+            # truthiness check narrows it to ``str`` for the type checker — a
+            # bare ``elif getattr(...)`` guard does not narrow the attribute.
+            exc_text = getattr(record, "exc_text", None)
+            if exc_text:
+                record.exc_text = redact_secret_text(exc_text)
         if record.stack_info:
             record.stack_info = redact_secret_text(record.stack_info)
         return True
