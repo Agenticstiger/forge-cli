@@ -199,3 +199,118 @@ def test_alerter_no_longer_defines_hostname_is_private() -> None:
         "build_runners/_alerter.py re-defines _hostname_is_private; "
         "it must import the canonical implementation from fluid_build._net."
     )
+
+
+# ── build_runners ↛ cli (the reverse-direction edge, Trello 6a143db5) ──────
+#
+# The runtime error catalog, the console renderer, and the contract loader
+# moved out of ``cli`` into the tier-0 shared leaves ``fluid_build._errors`` /
+# ``fluid_build._error_catalog`` / ``fluid_build._console`` /
+# ``fluid_build._contract_loader`` so ``build_runners`` no longer imports
+# ``cli``. The ``build_runners must not depend on cli`` ``[tool.importlinter]``
+# contract is the primary defense; the tests below are the runtime + static
+# backstop for developer machines without the linter installed.
+
+_BUILD_RUNNERS_DIR = _REPO_ROOT / "fluid_build" / "build_runners"
+
+
+def test_build_runners_does_not_pull_cli() -> None:
+    """``import fluid_build.build_runners`` must not drag ``cli`` in.
+
+    Mirrors ``test_observability_does_not_pull_build_runners`` for the
+    reverse edge: importing the runner package (and its ``base`` module,
+    where the loader + console + error imports live at module scope) must
+    leave ``sys.modules`` free of every ``fluid_build.cli`` module. If a
+    future edit re-introduces a module-scope ``cli`` import in any runner,
+    this catches it before the import-linter contract does.
+    """
+    result = _run_python(
+        """
+        import sys
+
+        import fluid_build.build_runners  # noqa: F401
+        import fluid_build.build_runners.base  # noqa: F401
+
+        leaked = sorted(m for m in sys.modules if m.startswith("fluid_build.cli"))
+        if leaked:
+            print("LEAKED:", ",".join(leaked))
+            raise SystemExit(1)
+        print("clean")
+        """
+    )
+    assert result.returncode == 0, (
+        "importing build_runners leaked fluid_build.cli modules into sys.modules. "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "clean" in result.stdout
+
+
+def test_build_runners_has_no_static_cli_imports() -> None:
+    """No module under ``build_runners`` may import from ``cli`` — at module
+    scope *or* inside a function (grimp, and therefore the import-linter
+    contract, sees both). Walk every ``.py`` file's AST and resolve both
+    absolute (``fluid_build.cli...``) and relative (``from ..cli import``)
+    imports; flag any that land on ``fluid_build.cli``.
+    """
+    import ast
+
+    offenders: list[str] = []
+    for py in sorted(_BUILD_RUNNERS_DIR.rglob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+        # Dotted package of this module, e.g. fluid_build.build_runners.dbt
+        rel = py.relative_to(_REPO_ROOT).with_suffix("")
+        parts = list(rel.parts)
+        pkg_parts = parts[:-1] if parts[-1] == "__init__" else parts
+        for node in ast.walk(tree):
+            targets: list[str] = []
+            if isinstance(node, ast.Import):
+                targets = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    base = pkg_parts[: len(pkg_parts) - (node.level - 1)]
+                    mod = ".".join(base + ([node.module] if node.module else []))
+                else:
+                    mod = node.module or ""
+                targets = [mod]
+            for mod in targets:
+                if mod == "fluid_build.cli" or mod.startswith("fluid_build.cli."):
+                    offenders.append(f"{py.relative_to(_REPO_ROOT)}:{node.lineno} -> {mod}")
+
+    assert not offenders, (
+        "build_runners imports fluid_build.cli (the forbidden reverse edge). "
+        "Import the shared primitive from its tier-0 leaf instead "
+        "(fluid_build._errors / _error_catalog / _console / _contract_loader):\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_shared_leaves_do_not_pull_cli_or_build_runners() -> None:
+    """The four shared leaves must import clean of both ``cli`` and
+    ``build_runners`` — that is the invariant that keeps the reverse edge
+    from re-forming through a leaf. Importing them must not land either
+    package (nor their re-export shims) in ``sys.modules``.
+    """
+    result = _run_python(
+        """
+        import sys
+
+        import fluid_build._errors  # noqa: F401
+        import fluid_build._error_catalog  # noqa: F401
+        import fluid_build._console  # noqa: F401
+        import fluid_build._contract_loader  # noqa: F401
+
+        leaked = sorted(
+            m for m in sys.modules
+            if m.startswith("fluid_build.cli") or m.startswith("fluid_build.build_runners")
+        )
+        if leaked:
+            print("LEAKED:", ",".join(leaked))
+            raise SystemExit(1)
+        print("clean")
+        """
+    )
+    assert result.returncode == 0, (
+        "a shared tier-0 leaf pulled cli/build_runners at import time. "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "clean" in result.stdout

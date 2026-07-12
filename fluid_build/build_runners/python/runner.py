@@ -31,8 +31,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fluid_build.cli.console import cprint, success
-from fluid_build.cli.console import error as console_error
+from fluid_build._console import cprint, success
+from fluid_build._console import error as console_error
 
 from .._path_safety import confine_to_workspace, resolve_workspace_root
 

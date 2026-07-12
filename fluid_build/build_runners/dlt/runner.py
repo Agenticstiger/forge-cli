@@ -104,7 +104,7 @@ def _make_sql_database_source(connection: Dict[str, Any], streams: List[str]) ->
         from dlt.sources.sql_database import sql_database
         from sqlalchemy.engine.url import URL
     except Exception as exc:  # noqa: BLE001 — dlt + sqlalchemy import paths
-        from fluid_build.cli._errors import MissingExtraError
+        from fluid_build._errors import MissingExtraError
 
         raise MissingExtraError.for_extra(
             extra="dlt[sql_database]",

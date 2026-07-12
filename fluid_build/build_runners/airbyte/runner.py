@@ -257,7 +257,7 @@ def _execute(ctx: RunContext, runner: AirbyteRunner) -> RunResult:
             require_slsa_provenance=(sig_block.get("slsaProvenance") == "required"),
         )
         if not sig_result.signed:
-            from fluid_build.cli._errors import SupplyChainViolationError
+            from fluid_build._errors import SupplyChainViolationError
 
             # Five-field typed error — the CLI top-level handler renders
             # the Panel. The dispatcher's existing exception path also
@@ -770,7 +770,7 @@ def execute_airbyte_build(
         # ``fluid apply --mode amend-and-build``; standalone callers of
         # ``execute_airbyte_build`` (tests, other runners) just see a
         # non-zero return code with the error logged at ERROR level.
-        from fluid_build.cli._errors import SupplyChainViolationError
+        from fluid_build._errors import SupplyChainViolationError
 
         LOG.error(
             "airbyte.run_aborted err=%s exc_type=%s",

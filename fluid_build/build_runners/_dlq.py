@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 # single class identity. Keeping the symbol here lets existing
 # ``from fluid_build.build_runners._dlq import DLQOverflowError`` imports
 # (e.g., in meltano/runner.py) keep working unchanged.
-from fluid_build.cli._errors import DLQOverflowError  # noqa: E402,F401
+from fluid_build._errors import DLQOverflowError  # noqa: E402,F401
 
 from ._acquisition_common import utc_now_iso
 

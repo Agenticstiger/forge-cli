@@ -34,9 +34,9 @@ import re
 from pathlib import Path
 from typing import Any, Dict
 
-from fluid_build.cli._common import CLIError, load_contract_with_overlay
-from fluid_build.cli.console import cprint, success
-from fluid_build.cli.console import error as console_error
+from fluid_build._console import cprint, success
+from fluid_build._console import error as console_error
+from fluid_build._contract_loader import CLIError, load_contract_with_overlay
 
 LOG = logging.getLogger("fluid.build_runners")
 
@@ -198,7 +198,7 @@ def _execute_acquisition_build(
     if asked:
         declared = _declared_capabilities_for_engine(engine)
         if declared is not None and not set(asked).issubset(set(declared)):
-            from fluid_build.cli._errors import CapabilityMismatchError
+            from fluid_build._errors import CapabilityMismatchError
 
             raise CapabilityMismatchError.for_runner(
                 runner_name=engine,
@@ -410,7 +410,7 @@ def run_builds_from_args(
         # Apply the same secret-aware resolver the publish path uses so we
         # don't accidentally exfiltrate secret-named placeholders.
         try:
-            from fluid_build.cli._common import resolve_contract_env_templates
+            from fluid_build._contract_loader import resolve_contract_env_templates
 
             contract = resolve_contract_env_templates(contract)
         except Exception as exc:  # noqa: BLE001 — defensive

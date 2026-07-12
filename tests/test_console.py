@@ -36,7 +36,11 @@ class TestCprint:
         assert "hello" in captured.out
 
     def test_strips_markup_when_no_rich(self, capsys):
-        with patch("fluid_build.cli.console.console", None):
+        # ``cprint`` reads the module-global ``console`` sentinel of its
+        # *defining* module, which is now the tier-0 leaf
+        # ``fluid_build._console`` (``cli.console`` is a re-export shim).
+        # Patch the canonical home so the Rich-off fallback is exercised.
+        with patch("fluid_build._console.console", None):
             cprint("[bold]bold text[/bold]")
             captured = capsys.readouterr()
             assert "bold text" in captured.out

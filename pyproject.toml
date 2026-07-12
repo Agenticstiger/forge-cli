@@ -521,7 +521,10 @@ ignore = [
 # Tests, doctor scripts, and one-shot tools are allowed bare print().
 "tests/**" = ["T201"]
 "scripts/**" = ["T201"]
-# The console module owns print() fallbacks by design.
+# The console renderer owns print() fallbacks by design. The canonical
+# home is the tier-0 leaf ``fluid_build/_console.py``; ``cli/console.py``
+# is now a thin re-export shim but keeps the exemption for safety.
+"fluid_build/_console.py" = ["T201"]
 "fluid_build/cli/console.py" = ["T201"]
 # Core imports a fallback ``Console.print`` shim when Rich is missing.
 "fluid_build/cli/core.py" = ["T201"]
@@ -694,5 +697,48 @@ forbidden_modules = [
 # import either of those (nor the storage layer that re-exports from it). Any
 # such edge — direct or indirect — re-creates the cycle. Its only non-stdlib
 # dependency is the lazily-imported ``copilot.unified_config`` leaf.
+allow_indirect_imports = false
+as_packages = true
+
+[[tool.importlinter.contracts]]
+name = "build_runners must not depend on cli"
+type = "forbidden"
+source_modules = ["fluid_build.build_runners"]
+forbidden_modules = ["fluid_build.cli"]
+# The reverse-direction edge (a lower-tier module importing a
+# higher-tier one). The shared primitives ``build_runners`` used to
+# reach into ``cli`` for — the runtime error catalog (``CLIError`` +
+# the typed ``*Error`` classes), the contract loader, and the console
+# renderer — now live in the tier-0 leaves ``fluid_build._errors`` /
+# ``fluid_build._error_catalog`` / ``fluid_build._console`` /
+# ``fluid_build._contract_loader`` (with re-export shims left at the old
+# ``cli`` locations). ``allow_indirect_imports = false`` makes this bite
+# on any chain, not just direct edges, so a future drive-by edit that
+# reaches ``cli`` through a new transitive path is caught here.
+allow_indirect_imports = false
+as_packages = true
+
+[[tool.importlinter.contracts]]
+name = "shared tier-0 leaves must not depend on cli or build_runners"
+type = "forbidden"
+source_modules = [
+  "fluid_build._errors",
+  "fluid_build._error_catalog",
+  "fluid_build._console",
+  "fluid_build._contract_loader",
+]
+forbidden_modules = [
+  "fluid_build.cli",
+  "fluid_build.build_runners",
+]
+# These four leaves are the shared home for the error catalog, the
+# console renderer, and the contract loader — imported by BOTH ``cli``
+# and ``build_runners``. They must never import either package back, or
+# the ``build_runners → cli`` edge above re-forms indirectly (and a
+# ``cli → leaf → cli`` self-loop would defeat the point). ``_contract_loader``
+# legitimately reaches ``forge`` / ``observability`` / ``providers`` and
+# resolves ``fluid_build.loader`` dynamically by name (never a literal
+# import, because ``loader`` itself reaches ``cli.security``); none of
+# those static edges land on ``cli``.
 allow_indirect_imports = false
 as_packages = true
