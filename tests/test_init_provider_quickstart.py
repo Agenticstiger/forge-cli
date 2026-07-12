@@ -88,6 +88,30 @@ def test_snowflake_starter_derives_upper_table_identifier():
     assert loc["account"] and loc["database"] and loc["schema"]
 
 
+@pytest.mark.parametrize(
+    "blueprint_id,field",
+    [
+        ("fluid.starter-gcp", "gcp_project"),
+        ("fluid.starter-gcp", "gcp_dataset"),
+        ("fluid.starter-snowflake", "sf_account"),
+        ("fluid.starter-snowflake", "sf_database"),
+        ("fluid.starter-snowflake", "sf_schema"),
+    ],
+)
+def test_provider_location_params_cannot_inject_yaml_keys(blueprint_id, field):
+    # The new provider addressing params flow through `tojson` like the existing
+    # free-text params, so a quoted/newline-laden value can't add sibling keys.
+    bp = get_bundled_blueprint(blueprint_id)
+    evil = 'proj"\ninjected_top_level: PWNED\nbuilds: "clobbered'
+    contract = render_bundled_contract(bp, {"product_name": "P", field: evil})
+    assert "injected_top_level" not in contract
+    assert isinstance(contract["builds"], list) and contract["builds"]
+
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    assert FluidSchemaManager().validate_contract(contract, offline_only=True).is_valid
+
+
 def test_provider_starters_listed_in_bundled_registry():
     # They surface automatically in the interactive "Start from a blueprint"
     # picker (which lists every bundled blueprint) — no menu edit needed.
