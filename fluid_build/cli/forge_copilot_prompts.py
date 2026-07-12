@@ -17,17 +17,22 @@
 from __future__ import annotations
 
 __all__ = [
+    "PromptProfileError",
+    "available_prompt_profiles",
     "build_clarification_system_prompt",
     "build_clarification_user_prompt",
     "build_system_prompt",
     "build_user_prompt",
+    "get_active_prompt_profile",
+    "set_prompt_profile",
 ]
 
 
 import json
+import re
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence
 
 import yaml
 
@@ -76,6 +81,155 @@ def _load_default_guidance() -> Mapping[str, str]:
 
 
 _DEFAULT_GUIDANCE: Mapping[str, str] = _load_default_guidance()
+
+
+# ---------------------------------------------------------------------------
+# Prompt profiles — single-name, single-swap prompt overlays
+# ---------------------------------------------------------------------------
+# ``fluid forge --prompt-profile <name>`` (or ``FLUID_PROMPT_PROFILE=<name>``)
+# swaps the whole set of default-guidance YAML files at once. Profiles live
+# under ``agent_specs/prompt_profiles/<name>/`` with the SAME file names as
+# ``_defaults/`` (e.g. ``sovereignty.yaml``, ``agent_policy.yaml``).
+#
+# Activating a profile *overlays* its files on top of the defaults: any file
+# the profile ships wins; any file it omits falls back to the default, so a
+# profile author only has to override what actually differs. When NO profile
+# is active the composed prompt is byte-identical to the default baseline —
+# ``_active_guidance()`` returns the exact ``_DEFAULT_GUIDANCE`` object.
+#
+# Prior art (see PR notes): dbt's ``DBT_PROFILES_DIR`` / ``--profiles-dir``
+# (a named directory swap) and Claude Code's ``--system-prompt-file`` fragment
+# directories (behavioural-layer overlay). We diverge from a full-swap because
+# an overlay keeps profiles DRY and can't accidentally drop a required block.
+#
+# No stacking, no composition — a single name selects a single directory.
+_PROFILES_DIR: Path = Path(__file__).with_name("agent_specs") / "prompt_profiles"
+
+# Profile names must be simple slugs — no path separators, no traversal, no
+# leading dot/underscore. This is the first line of defence against
+# ``--prompt-profile ../../etc``; ``_resolve_profile_dir`` adds a resolved-path
+# containment check as the second.
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class PromptProfileError(ValueError):
+    """Raised when an unknown or unsafe prompt profile is requested.
+
+    Never raised for the no-profile default path; only when a caller asks
+    for a profile that doesn't exist or whose name is unsafe. The CLI turns
+    this into a clear, non-silent error (it does NOT fall back to defaults).
+    """
+
+
+# Process-wide active-profile state. ``None`` means "use the defaults".
+_ACTIVE_PROFILE: Optional[str] = None
+_ACTIVE_GUIDANCE: Optional[Mapping[str, str]] = None
+
+
+def available_prompt_profiles() -> List[str]:
+    """Return the sorted names of bundled prompt profiles.
+
+    A "profile" is any direct subdirectory of ``prompt_profiles/`` whose
+    name doesn't start with ``.`` or ``_``. Used to build a helpful error
+    message when an unknown profile is requested.
+    """
+    if not _PROFILES_DIR.is_dir():
+        return []
+    return sorted(
+        entry.name
+        for entry in _PROFILES_DIR.iterdir()
+        if entry.is_dir() and not entry.name.startswith((".", "_"))
+    )
+
+
+def _resolve_profile_dir(name: str) -> Path:
+    """Validate *name* and resolve ``prompt_profiles/<name>/``.
+
+    Raises :class:`PromptProfileError` on an unsafe name (path separators /
+    traversal), a directory that escapes the profiles root, or an unknown
+    profile. Never silently falls back to ``_defaults/``.
+    """
+    if not name or not _PROFILE_NAME_RE.match(name):
+        raise PromptProfileError(
+            f"invalid prompt profile name {name!r}: names must match "
+            r"[A-Za-z0-9][A-Za-z0-9._-]* (no path separators or traversal)"
+        )
+    root = _PROFILES_DIR.resolve()
+    candidate = (_PROFILES_DIR / name).resolve()
+    # Defence in depth: the resolved candidate must sit directly under the
+    # profiles root. Rejects symlink / traversal escapes even if a name
+    # somehow slipped past the slug check above.
+    if candidate.parent != root:
+        raise PromptProfileError(f"prompt profile {name!r} escapes the profiles directory {root}")
+    if not candidate.is_dir():
+        available = ", ".join(available_prompt_profiles()) or "(none bundled)"
+        raise PromptProfileError(
+            f"unknown prompt profile {name!r}. Available profiles: {available}. "
+            f"Add one under {_PROFILES_DIR}{Path('/')}<name>{Path('/')} with the "
+            "same file names as _defaults/."
+        )
+    return candidate
+
+
+def _load_profile_guidance(profile_dir: Path) -> Mapping[str, str]:
+    """Overlay ``profile_dir/*.yaml`` on top of the defaults.
+
+    Profile files win; any default file the profile omits is retained. The
+    parse rules mirror :func:`_load_default_guidance` exactly — a single
+    top-level ``system_prompt`` string per file — so a profile file is a
+    drop-in replacement for its ``_defaults/`` counterpart.
+    """
+    guidance: dict[str, str] = dict(_DEFAULT_GUIDANCE)
+    for path in sorted(profile_dir.glob("*.yaml")):
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(raw, Mapping):
+            continue
+        text = raw.get("system_prompt")
+        if isinstance(text, str):
+            guidance[path.stem] = text
+    return MappingProxyType(guidance)
+
+
+def set_prompt_profile(name: Optional[str]) -> Optional[str]:
+    """Activate a prompt profile (or clear it with ``None`` / ``""``).
+
+    Returns the active profile name (or ``None``). Raises
+    :class:`PromptProfileError` on an unknown or unsafe name — never
+    silently falls back to the defaults. Idempotent and process-wide.
+
+    Callers that memoize the composed system prompt (see
+    ``forge_copilot_runtime.build_system_prompt``) key their cache on the
+    active profile, so switching profiles never returns a stale prompt.
+    """
+    global _ACTIVE_PROFILE, _ACTIVE_GUIDANCE
+    if not name:
+        _ACTIVE_PROFILE = None
+        _ACTIVE_GUIDANCE = None
+        return None
+    profile_dir = _resolve_profile_dir(name)
+    _ACTIVE_GUIDANCE = _load_profile_guidance(profile_dir)
+    _ACTIVE_PROFILE = name
+    return name
+
+
+def get_active_prompt_profile() -> Optional[str]:
+    """Return the active prompt profile name, or ``None`` for the defaults."""
+    return _ACTIVE_PROFILE
+
+
+def _active_guidance() -> Mapping[str, str]:
+    """Return the guidance map for the active profile (or the defaults).
+
+    When no profile is active this returns the exact ``_DEFAULT_GUIDANCE``
+    object, guaranteeing the composed prompt stays byte-identical to the
+    baseline.
+    """
+    if _ACTIVE_PROFILE is None or _ACTIVE_GUIDANCE is None:
+        return _DEFAULT_GUIDANCE
+    return _ACTIVE_GUIDANCE
 
 
 def _load_agent_voices() -> Mapping[str, str]:
@@ -135,14 +289,18 @@ _AUXILIARY_PROMPTS: Mapping[str, str] = MappingProxyType(
 
 
 def _render_auxiliary_prompt(name: str, replacements: Mapping[str, str]) -> str:
-    text = _AUXILIARY_PROMPTS.get(name, "")
+    # Resolve through the active profile so a prompt profile can override the
+    # clarification / evaluation prose too. Falls back to ``_AUXILIARY_PROMPTS``
+    # (the frozen default) when the active guidance lacks the key — which is
+    # exactly the no-profile path, keeping output byte-identical.
+    text = _active_guidance().get(name, _AUXILIARY_PROMPTS.get(name, ""))
     for key, value in replacements.items():
         text = text.replace("${" + key + "}", value)
     return text
 
 
 def _evaluation_prompt_spec() -> Mapping[str, Any]:
-    raw = _AUXILIARY_PROMPTS.get("evaluation", "{}")
+    raw = _active_guidance().get("evaluation", _AUXILIARY_PROMPTS.get("evaluation", "{}"))
     try:
         spec = json.loads(raw)
     except json.JSONDecodeError:
@@ -228,6 +386,9 @@ def build_system_prompt(
     providers = ", ".join(capability_matrix.get("providers") or [])
     engines = ", ".join(capability_matrix.get("build_engines") or list(known_build_engines))
     fv = _latest_fluid_version()
+    # Resolve the injected guidance blocks through the active prompt profile
+    # (defaults when none is active — byte-identical to the baseline).
+    guidance = _active_guidance()
     return (
         # Security lint: this function constructs static prompt prose, not executable SQL.
         f"You are FLUID Forge Copilot. Generate a production-ready FLUID {fv} contract and README "  # noqa: S608
@@ -399,15 +560,15 @@ def build_system_prompt(
         # the prose doesn't require a Python change. The mid-prompt YAML
         # blocks end with one trailing newline from YAML ``|``; we add
         # one more newline per block to reproduce the original ``\n\n`` gap.
-        + _DEFAULT_GUIDANCE.get("sovereignty", "")
+        + guidance.get("sovereignty", "")
         + "\n"
-        + _DEFAULT_GUIDANCE.get("agent_policy", "")
+        + guidance.get("agent_policy", "")
         + "\n"
         + "Follow the seed_contract structure exactly as a reference for the correct schema shape.\n"  # noqa: S608  # nosec B608
         f"Allowed providers: {providers}.\n"
         "Only use build engines from the provided capability matrix.\n\n"
         # --- Upstream-driven transformation SQL ---
-        + _DEFAULT_GUIDANCE.get("upstream_sql", "") + "\n"
+        + guidance.get("upstream_sql", "") + "\n"
         # --- Engine-owned files: do NOT recreate ---
         "ENGINE-OWNED FILES (do NOT write these to additional_files):\n"
         "- dbt_project/models/sources.yml — emitted by the engine. NEVER include a "
@@ -421,7 +582,7 @@ def build_system_prompt(
         "`additional_files['dbt_project/models/schema.yml']` listing every staging + "
         "mart model you authored, with per-column tests.\n\n"
         # --- Modeling-technique mandate ---
-        + _DEFAULT_GUIDANCE.get("technique_mandate", "") + "\n"
+        + guidance.get("technique_mandate", "") + "\n"
     )
 
 

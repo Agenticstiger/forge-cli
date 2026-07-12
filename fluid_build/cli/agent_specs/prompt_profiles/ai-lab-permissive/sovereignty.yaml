@@ -1,0 +1,22 @@
+# ai-lab-permissive prompt profile — sovereignty guidance overlay.
+# For internal AI-lab / sandbox work on NON-personal, non-regulated data:
+# drops the residency-first defaults so experimentation isn't blocked, while
+# still telling the copilot to escalate the moment real personal data appears.
+# Selected via: fluid forge --prompt-profile ai-lab-permissive
+#            or FLUID_PROMPT_PROFILE=ai-lab-permissive
+# Files this profile omits fall back to agent_specs/_defaults/.
+system_prompt: |
+  SOVEREIGNTY BLOCK (optional under the AI-lab-permissive profile):
+  This profile targets internal experimentation on synthetic or non-personal
+  data, so a sovereignty block is OPTIONAL and omitted by default:
+  - Only add 'sovereignty' if the user explicitly mentions jurisdiction,
+    residency, regulated data, or real personal / production data.
+  - When you do add it, prefer:
+    - jurisdiction: Global (or Multi-Region) unless the user narrows it
+    - dataResidency: false (regions may be chosen for cost / latency)
+    - crossBorderTransfer: true (movement across regions is allowed in the lab)
+    - enforcementMode: advisory (surface guidance without hard-blocking)
+  IMPORTANT GUARDRAIL: the moment the user describes real personal data, PII,
+  PHI, financial records, or a production deployment, STOP treating this as a
+  lab dataset — add a strict sovereignty block (jurisdiction set, residency on,
+  enforcement strict) and recommend switching to the eu-gdpr-strict profile.

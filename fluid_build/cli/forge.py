@@ -467,6 +467,19 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     parser.add_argument(
+        "--prompt-profile",
+        dest="prompt_profile",
+        metavar="NAME",
+        help=(
+            "Swap the entire set of default prompt-guidance files "
+            "(agent_specs/_defaults/*.yaml) for a named profile under "
+            "agent_specs/prompt_profiles/<name>/. Bundled: eu-gdpr-strict, "
+            "ai-lab-permissive. Single-name, single-swap (no stacking). The "
+            "active profile is stamped into metadata.provenance.prompt_profile. "
+            "Env fallback: FLUID_PROMPT_PROFILE."
+        ),
+    )
+    parser.add_argument(
         "--no-llm",
         action="store_true",
         help=(
@@ -1509,6 +1522,33 @@ def _run_main(args, logger: logging.Logger) -> int:
     _sanitize_personal_memory_once()
     console = Console() if RICH_AVAILABLE else None
     try:
+        # --- Prompt profile (single-name, single-swap) ---
+        # Resolve from --prompt-profile or FLUID_PROMPT_PROFILE and activate it
+        # process-wide BEFORE any prompt is built or contract written, so both
+        # the AI system prompt and the provenance stamp observe it. An
+        # unknown/unsafe name is a hard, clear error — never a silent fallback.
+        from fluid_build.cli.forge_copilot_prompts import (
+            PromptProfileError,
+            set_prompt_profile,
+        )
+
+        _cli_profile = getattr(args, "prompt_profile", None)
+        if not isinstance(_cli_profile, str):
+            # Robust against non-string args (e.g. a MagicMock in tests); real
+            # argparse always yields a str or None.
+            _cli_profile = None
+        _profile_name = _cli_profile or os.environ.get("FLUID_PROMPT_PROFILE") or None
+        try:
+            set_prompt_profile(_profile_name)
+        except PromptProfileError as exc:
+            if console:
+                console.print(f"[red]Invalid --prompt-profile:[/red] {exc}")
+            else:
+                console_error(f"Invalid --prompt-profile: {exc}")
+            return 2
+        if _profile_name:
+            LOG.debug("Forge: prompt profile active: %s", _profile_name)
+
         if getattr(args, "forge_subcommand", None) == "data-model":
             from fluid_build.cli.forge_data_model import run as run_data_model
 
