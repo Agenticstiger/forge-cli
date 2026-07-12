@@ -44,7 +44,7 @@ from typing import Any, Callable, List
 
 import pytest
 
-from fluid_build.cli.apply import _run_apply_hooks
+from fluid_build.cli.apply import _dispatch_apply_hook, _run_apply_hooks
 from fluid_build.cli.validate import _run_extension_validators
 from fluid_build.observability.secret_redactor import SecretRedactingFilter, redact_secret_text
 from fluid_build.schema_manager import ValidationResult
@@ -341,6 +341,34 @@ class TestApplyHooks:
         rc = _run_apply_hooks({}, Path("/tmp"), logging.getLogger("test"))
         assert rc == 1  # the hook reported an error, so apply aborts
 
+    def test_run_apply_hooks_forwards_env_to_mixed_hook_shapes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``_run_apply_hooks(env=...)`` forwards the resolved env to opt-in
+        hooks and leaves a co-registered legacy 3-arg hook untouched."""
+        seen: dict = {}
+
+        def legacy_hook(_cd: Path, _c: dict, _errors: List[str]) -> None:
+            seen["legacy_called"] = True
+
+        def env_hook(_cd: Path, _c: dict, _errors: List[str], env: str | None = None) -> None:
+            seen["env"] = env
+
+        _patch_entry_points(
+            monkeypatch,
+            "fluid_build.apply_hooks",
+            [
+                FakeEntryPoint("legacy", legacy_hook),
+                FakeEntryPoint("env-aware", env_hook),
+            ],
+        )
+
+        rc = _run_apply_hooks({"a": 1}, Path("/tmp"), logging.getLogger("test"), env="prod")
+
+        assert rc == 0
+        assert seen["legacy_called"] is True
+        assert seen["env"] == "prod"
+
     def test_apply_hook_receives_deep_copy_of_contract(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -375,6 +403,187 @@ class TestApplyHooks:
         assert original_contract["metadata"]["owner"]["email"] == "team@example.com"
         # And rc reflects the (lack of) reported errors, not the mutation.
         assert rc == 0
+
+
+class TestApplyHookEnvDispatch:
+    """Pin the backward-compatible ``--env`` signature dispatch added by
+    :func:`_dispatch_apply_hook`.
+
+    The dispatch mirrors pluggy's ``argnames`` opt-in model: a hook receives
+    the resolved apply ``--env`` value only if its signature declares it, so
+    adding the argument never breaks an existing 3-parameter hook.
+    """
+
+    _DIR = Path("/some/dir")
+    _CONTRACT = {"name": "x"}
+
+    def _run(self, hook: Callable[..., Any], env: str | None = "prod") -> List[str]:
+        errors: List[str] = []
+        _dispatch_apply_hook(hook, self._DIR, self._CONTRACT, errors, env)
+        return errors
+
+    # --- Legacy 3-parameter contract: unchanged ------------------------------
+
+    def test_legacy_three_param_hook_called_unchanged(self) -> None:
+        """A ``(contract_dir, contract, errors)`` hook is called with EXACTLY
+        those three arguments — no env, positional or keyword — even when an
+        env value is available. This is the backward-compat guarantee."""
+        received: dict = {}
+
+        def hook(contract_dir: Path, contract: dict, errors: List[str]) -> None:
+            received["args"] = (contract_dir, contract, errors)
+            received["contract_dir"] = contract_dir
+
+        self._run(hook, env="prod")
+
+        assert received["contract_dir"] is self._DIR
+        assert received["args"] == (self._DIR, self._CONTRACT, [])
+
+    def test_legacy_hook_rejects_extra_arg_proving_no_env_passed(self) -> None:
+        """Belt-and-braces: a strict 3-param hook would raise TypeError if a
+        4th arg were passed. It doesn't raise → nothing extra was passed."""
+
+        def strict_hook(contract_dir: Path, contract: dict, errors: List[str]) -> None:
+            return None
+
+        # Must not raise — dispatch calls it with exactly three positionals.
+        self._run(strict_hook, env="prod")
+
+    # --- Opt-in by keyword ---------------------------------------------------
+
+    def test_env_named_param_with_default_receives_keyword(self) -> None:
+        seen: dict = {}
+
+        def hook(contract_dir: Path, contract: dict, errors: List[str], env: str | None = None):
+            seen["env"] = env
+
+        self._run(hook, env="prod")
+        assert seen["env"] == "prod"
+
+    def test_env_required_named_param_receives_keyword(self) -> None:
+        """A required (no-default) ``env`` parameter still binds via keyword."""
+        seen: dict = {}
+
+        def hook(contract_dir: Path, contract: dict, errors: List[str], env: str | None):
+            seen["env"] = env
+
+        self._run(hook, env="staging")
+        assert seen["env"] == "staging"
+
+    def test_keyword_only_env_receives_keyword(self) -> None:
+        seen: dict = {}
+
+        def hook(contract_dir: Path, contract: dict, errors: List[str], *, env: str | None = None):
+            seen["env"] = env
+
+        self._run(hook, env="prod")
+        assert seen["env"] == "prod"
+
+    def test_var_keyword_hook_receives_env_in_kwargs(self) -> None:
+        seen: dict = {}
+
+        def hook(contract_dir: Path, contract: dict, errors: List[str], **kwargs: Any) -> None:
+            seen["kwargs"] = kwargs
+
+        self._run(hook, env="prod")
+        assert seen["kwargs"] == {"env": "prod"}
+
+    # --- Opt-in by 4th positional -------------------------------------------
+
+    def test_fourth_positional_named_differently_receives_env(self) -> None:
+        """A 4th positional slot named something other than ``env`` (e.g.
+        ``deploy_env``) still receives the value — positionally."""
+        seen: dict = {}
+
+        def hook(contract_dir: Path, contract: dict, errors: List[str], deploy_env: str = ""):
+            seen["deploy_env"] = deploy_env
+
+        self._run(hook, env="prod")
+        assert seen["deploy_env"] == "prod"
+
+    def test_var_positional_hook_receives_env_positionally(self) -> None:
+        seen: dict = {}
+
+        def hook(contract_dir: Path, contract: dict, errors: List[str], *extra: Any) -> None:
+            seen["extra"] = extra
+
+        self._run(hook, env="prod")
+        assert seen["extra"] == ("prod",)
+
+    def test_positional_only_env_receives_env_positionally(self) -> None:
+        """A positional-only ``env`` (``env, /``) cannot be passed by keyword;
+        it must be dispatched positionally."""
+        seen: dict = {}
+
+        def hook(contract_dir: Path, contract: dict, errors: List[str], env: str, /) -> None:
+            seen["env"] = env
+
+        self._run(hook, env="prod")
+        assert seen["env"] == "prod"
+
+    def test_star_args_star_kwargs_hook_receives_env(self) -> None:
+        seen: dict = {}
+
+        def hook(*args: Any, **kwargs: Any) -> None:
+            seen["args"] = args
+            seen["kwargs"] = kwargs
+
+        self._run(hook, env="prod")
+        # var-keyword present → env goes by keyword; the 3 legacy positionals
+        # still flow positionally.
+        assert seen["args"] == (self._DIR, self._CONTRACT, [])
+        assert seen["kwargs"] == {"env": "prod"}
+
+    # --- Edge cases ----------------------------------------------------------
+
+    def test_env_none_still_forwarded_to_opt_in_hook(self) -> None:
+        """When no ``--env`` was supplied (env is None) an opt-in hook still
+        receives ``env=None`` — it is not skipped."""
+        seen: dict = {"called": False}
+
+        def hook(
+            contract_dir: Path, contract: dict, errors: List[str], env: str | None = "sentinel"
+        ):
+            seen["called"] = True
+            seen["env"] = env
+
+        self._run(hook, env=None)
+        assert seen["called"] is True
+        assert seen["env"] is None
+
+    def test_uninspectable_callable_falls_back_to_legacy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A callable whose signature can't be introspected (some C builtins
+        raise ValueError from ``inspect.signature``) must fall back to the
+        legacy 3-argument call rather than erroring or dropping the hook."""
+        import inspect as _inspect
+
+        received: dict = {}
+
+        def hook(contract_dir: Path, contract: dict, errors: List[str]) -> None:
+            received["nargs"] = 3
+
+        def _raise_signature(_obj: Any, *a: Any, **k: Any):
+            raise ValueError("no signature for C builtin")
+
+        monkeypatch.setattr(_inspect, "signature", _raise_signature)
+        self._run(hook, env="prod")
+        assert received["nargs"] == 3
+
+    def test_callable_instance_with_env_param(self) -> None:
+        """A callable *object* (``__call__`` with an env param) is introspected
+        the same way a plain function is."""
+        seen: dict = {}
+
+        class Hook:
+            def __call__(
+                self, contract_dir: Path, contract: dict, errors: List[str], env: str | None = None
+            ) -> None:
+                seen["env"] = env
+
+        self._run(Hook(), env="prod")
+        assert seen["env"] == "prod"
 
 
 # ---------------------------------------------------------------------------
