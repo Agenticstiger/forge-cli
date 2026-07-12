@@ -17,6 +17,13 @@
 Verifies that users can define custom domain agents by dropping YAML
 files in .fluid/agents/ and have them discovered, loaded, and used
 transparently by the forge copilot.
+
+NOTE: the example domain here (``aerospace``) is deliberately one the CLI
+does NOT ship as a built-in agent. Built-in domain agents (finance,
+healthcare, retail, telco, manufacturing, logistics, energy, government,
+insurance, pharma, education, media) resolve through the compiled
+``DOMAIN_AGENTS`` registry first, so they can't double as a "user brings
+their own" fixture — the whole point of BYODA is a domain we don't ship.
 """
 
 from __future__ import annotations
@@ -39,38 +46,38 @@ from fluid_build.cli.forge_agents import get_agent, get_all_domain_names, list_a
 
 _MINIMAL_AGENT_YAML = dedent(
     """\
-    name: insurance
-    domain: Insurance
-    description: Expert in insurance data products and actuarial analytics
+    name: aerospace
+    domain: Aerospace
+    description: Expert in aerospace data products and flight-test analytics
     keywords:
-      - insurance
-      - claims
-      - underwriting
-      - actuarial
+      - aerospace
+      - avionics
+      - airframe
+      - telemetry
 
     questions:
       - key: product_type
-        question: What type of insurance data product?
+        question: What type of aerospace data product?
         type: choice
         required: true
         choices:
-          - label: Claims Analytics
-            value: claims_analytics
-            aliases: ["claims"]
-          - label: Underwriting
-            value: underwriting
+          - label: Flight Test Analytics
+            value: flight_test
+            aliases: ["flight test"]
+          - label: Fleet Health
+            value: fleet_health
 
     resolver_defaults:
-      product_type: claims_analytics
+      product_type: flight_test
 
     suggestion_defaults:
       recommended_template: analytics
       recommended_provider: local
       recommended_patterns: []
       architecture_suggestions:
-        - Use claims fact tables with policy dimensions
+        - Use flight-test fact tables with airframe dimensions
       best_practices:
-        - Implement claims fraud detection patterns
+        - Implement anomaly detection for telemetry channels
       technology_stack: []
       security_requirements: []
 
@@ -85,13 +92,13 @@ class TestAgentSpecKeywords:
     """The keywords field is loaded from agent YAML specs."""
 
     def test_keywords_parsed_from_yaml(self, tmp_path):
-        (tmp_path / "insurance.yaml").write_text(_MINIMAL_AGENT_YAML)
-        spec = load_agent_spec_from_path(tmp_path / "insurance.yaml")
-        assert spec.keywords == ["insurance", "claims", "underwriting", "actuarial"]
+        (tmp_path / "aerospace.yaml").write_text(_MINIMAL_AGENT_YAML)
+        spec = load_agent_spec_from_path(tmp_path / "aerospace.yaml")
+        assert spec.keywords == ["aerospace", "avionics", "airframe", "telemetry"]
 
     def test_keywords_default_empty(self, tmp_path):
         yaml_without_keywords = _MINIMAL_AGENT_YAML.replace(
-            "keywords:\n  - insurance\n  - claims\n  - underwriting\n  - actuarial\n\n",
+            "keywords:\n  - aerospace\n  - avionics\n  - airframe\n  - telemetry\n\n",
             "",
         )
         (tmp_path / "no_kw.yaml").write_text(yaml_without_keywords)
@@ -106,19 +113,19 @@ class TestUserSpecDiscovery:
         monkeypatch.chdir(tmp_path)
         agents_dir = tmp_path / ".fluid" / "agents"
         agents_dir.mkdir(parents=True)
-        (agents_dir / "insurance.yaml").write_text(_MINIMAL_AGENT_YAML)
+        (agents_dir / "aerospace.yaml").write_text(_MINIMAL_AGENT_YAML)
 
         specs = discover_all_agent_specs()
-        assert "insurance" in specs
-        assert specs["insurance"].domain == "Insurance"
+        assert "aerospace" in specs
+        assert specs["aerospace"].domain == "Aerospace"
 
     def test_user_spec_shadows_builtin(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         agents_dir = tmp_path / ".fluid" / "agents"
         agents_dir.mkdir(parents=True)
 
-        custom_finance = _MINIMAL_AGENT_YAML.replace("insurance", "finance").replace(
-            "Insurance", "Custom Finance"
+        custom_finance = _MINIMAL_AGENT_YAML.replace("aerospace", "finance").replace(
+            "Aerospace", "Custom Finance"
         )
         (agents_dir / "finance.yaml").write_text(custom_finance)
 
@@ -148,21 +155,21 @@ class TestScaffoldUserAgent:
     """scaffold_user_agent creates a spec from the template."""
 
     def test_creates_file(self, tmp_path):
-        path = scaffold_user_agent("insurance", target_dir=tmp_path)
+        path = scaffold_user_agent("aerospace", target_dir=tmp_path)
         assert path.exists()
-        assert path.name == "insurance.yaml"
+        assert path.name == "aerospace.yaml"
         assert ".fluid/agents/" in str(path)
 
     def test_substitutes_name(self, tmp_path):
-        path = scaffold_user_agent("energy", target_dir=tmp_path)
+        path = scaffold_user_agent("aquaculture", target_dir=tmp_path)
         content = path.read_text()
-        assert "name: energy" in content
-        assert "domain: Energy" in content
+        assert "name: aquaculture" in content
+        assert "domain: Aquaculture" in content
 
     def test_valid_spec(self, tmp_path):
-        path = scaffold_user_agent("logistics", target_dir=tmp_path)
+        path = scaffold_user_agent("hospitality", target_dir=tmp_path)
         spec = load_agent_spec_from_path(path)
-        assert spec.name == "logistics"
+        assert spec.name == "hospitality"
 
 
 class TestDynamicAgentRegistry:
@@ -172,32 +179,32 @@ class TestDynamicAgentRegistry:
         monkeypatch.chdir(tmp_path)
         agents_dir = tmp_path / ".fluid" / "agents"
         agents_dir.mkdir(parents=True)
-        (agents_dir / "insurance.yaml").write_text(_MINIMAL_AGENT_YAML)
+        (agents_dir / "aerospace.yaml").write_text(_MINIMAL_AGENT_YAML)
 
-        agent = get_agent("insurance")
-        assert agent.name == "insurance"
-        assert agent.domain == "Insurance"
+        agent = get_agent("aerospace")
+        assert agent.name == "aerospace"
+        assert agent.domain == "Aerospace"
 
     def test_get_all_domain_names_includes_user(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         agents_dir = tmp_path / ".fluid" / "agents"
         agents_dir.mkdir(parents=True)
-        (agents_dir / "insurance.yaml").write_text(_MINIMAL_AGENT_YAML)
+        (agents_dir / "aerospace.yaml").write_text(_MINIMAL_AGENT_YAML)
 
         names = get_all_domain_names()
-        assert "insurance" in names
+        assert "aerospace" in names
         assert "finance" in names  # built-in still present
 
     def test_list_agents_shows_source(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         agents_dir = tmp_path / ".fluid" / "agents"
         agents_dir.mkdir(parents=True)
-        (agents_dir / "insurance.yaml").write_text(_MINIMAL_AGENT_YAML)
+        (agents_dir / "aerospace.yaml").write_text(_MINIMAL_AGENT_YAML)
 
         agents = list_agents()
-        insurance = [a for a in agents if a["name"] == "insurance"]
-        assert len(insurance) == 1
-        assert insurance[0]["source"] == "user"
+        aerospace = [a for a in agents if a["name"] == "aerospace"]
+        assert len(aerospace) == 1
+        assert aerospace[0]["source"] == "user"
 
         finance = [a for a in agents if a["name"] == "finance"]
         assert len(finance) == 1
@@ -211,7 +218,7 @@ class TestKeywordAutoDetection:
         monkeypatch.chdir(tmp_path)
         agents_dir = tmp_path / ".fluid" / "agents"
         agents_dir.mkdir(parents=True)
-        (agents_dir / "insurance.yaml").write_text(_MINIMAL_AGENT_YAML)
+        (agents_dir / "aerospace.yaml").write_text(_MINIMAL_AGENT_YAML)
 
         # Clear the LRU cache so fresh discovery runs.
         from fluid_build.cli.forge_domain_enrichment import _load_domain_keywords
@@ -219,8 +226,8 @@ class TestKeywordAutoDetection:
         _load_domain_keywords.cache_clear()
 
         keywords_map, min_hits = _load_domain_keywords()
-        assert "insurance" in keywords_map
-        assert "claims" in keywords_map["insurance"]
+        assert "aerospace" in keywords_map
+        assert "avionics" in keywords_map["aerospace"]
 
         # Clean up cache for other tests.
         _load_domain_keywords.cache_clear()

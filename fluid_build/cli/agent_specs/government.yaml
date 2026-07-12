@@ -1,0 +1,223 @@
+name: government
+domain: government
+description: Expert in government & public-sector data products, NIEM exchange modeling, FedRAMP/FISMA controls, and open-data publication
+
+# Data Mesh product types this agent supports.
+# Public-sector mesh: SDP for source-system acquisition (case management,
+# permits, sensors, program records); ADP for NIEM-aligned aggregates
+# (cross-agency exchanges, program outcomes, spend); CDP for consumption
+# surfaces (open-data portals / DCAT-US catalogs, transparency dashboards,
+# constituent-360 and FOIA-response views).
+supported_data_product_types: [SDP, ADP, CDP]
+
+questions:
+  - key: product_type
+    question: What type of public-sector data product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: Open-Data Publication (DCAT-US)
+        value: open_data_publication
+        aliases: ["open data", "dcat", "dcat-us", "data.gov", "transparency", "publication"]
+      - label: Case / Program Management Analytics
+        value: case_program
+        aliases: ["case management", "program", "benefits", "eligibility", "permits", "licensing"]
+      - label: Public Health & Safety
+        value: public_health_safety
+        aliases: ["public health", "safety", "emergency", "911", "surveillance", "outbreak"]
+      - label: Grants & Spend Transparency
+        value: grants_spend
+        aliases: ["grants", "spend", "budget", "procurement", "usaspending", "financial transparency"]
+      - label: Constituent 360 / Service Delivery
+        value: constituent_360
+        aliases: ["constituent", "citizen 360", "service delivery", "311", "resident"]
+  - key: data_sources
+    question: What data sources will you use?
+    type: text
+    required: true
+    default: Case-management systems, permit/licensing records, program administrative data, sensor feeds, financial/grants systems
+  - key: standard_focus
+    question: Which government data standard is the best fit?
+    type: choice
+    required: true
+    choices:
+      - label: NIEM (National Information Exchange Model)
+        value: niem
+        aliases: ["niem", "information exchange", "iepd", "exchange model"]
+      - label: DCAT-US / Project Open Data
+        value: dcat_us
+        aliases: ["dcat", "dcat-us", "project open data", "data catalog", "pod"]
+      - label: CEDS (education data) / domain schema
+        value: domain_schema
+        aliases: ["ceds", "domain schema", "sector schema"]
+      - label: Open Referral / civic data
+        value: civic_data
+        aliases: ["open referral", "civic", "hsds", "gtfs"]
+  - key: compliance_requirements
+    question: Which security / authorization framework applies?
+    type: choice
+    required: false
+    choices:
+      - label: FedRAMP (US cloud authorization)
+        value: fedramp
+        aliases: ["fedramp", "ato", "authorization to operate"]
+      - label: FISMA / NIST 800-53
+        value: fisma
+        aliases: ["fisma", "800-53", "nist 800-53", "moderate", "high baseline"]
+      - label: CJIS (criminal justice)
+        value: cjis
+        aliases: ["cjis", "criminal justice", "law enforcement"]
+      - label: IRAP (Australia) / CCCS (Canada)
+        value: irap_cccs
+        aliases: ["irap", "cccs", "ism", "itsg-33", "protected b"]
+      - label: None / not sure
+        value: none
+        aliases: ["none", "not sure", "no compliance"]
+  - key: orchestration_pattern
+    question: What pipeline scheduling pattern fits best?
+    type: choice
+    required: false
+    choices:
+      - label: Scheduled open-data publication (daily / weekly)
+        value: daily_batch
+        aliases: ["daily", "weekly", "batch", "publication", "nightly"]
+      - label: Near-real-time (public safety, sensors)
+        value: streaming
+        aliases: ["real time", "streaming", "sensor", "public safety", "311"]
+      - label: Event-driven (case update, filing, incident)
+        value: event_driven
+        aliases: ["event", "case", "filing", "incident", "triggered"]
+      - label: Manual / ad-hoc release
+        value: manual
+        aliases: ["manual", "ad hoc", "on demand"]
+
+resolver_defaults:
+  product_type: open_data_publication
+  standard_focus: niem
+  compliance_requirements: fisma
+  orchestration_pattern: daily_batch
+
+suggestion_defaults:
+  recommended_template: analytics
+  recommended_provider: aws
+  canonical_model: niem
+  supporting_standards:
+    - dcat_us_project_open_data
+    - nist_800_53
+  recommended_patterns:
+    - niem_information_exchange
+    - dcat_us_catalog_publication
+  architecture_suggestions:
+    - Model cross-agency exchanges with NIEM (reuse Core + domain namespaces; document the IEPD / message schema)
+    - Publish open datasets with DCAT-US / Project Open Data metadata so they register cleanly on the data catalog
+    - Separate the authoritative record from the publishable extract, and apply disclosure review before release
+    - Classify every field for FOIA/PII sensitivity so releasable vs restricted columns are explicit
+  best_practices:
+    - Maintain a public data dictionary and provenance for every published dataset
+    - Apply records-retention and disposition schedules to administrative data
+    - Trace lineage from source systems through disclosure review to the published open dataset
+    - Prefer de-identification and aggregation for public releases; document any suppression thresholds
+    - Version schema, sensitivity classification, and publication cadence with the project
+  technology_stack: []
+  security_requirements: []
+
+rules:
+  - when:
+      all:
+        - field: product_type
+          equals: open_data_publication
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - dcat_us_catalog_publication
+          - disclosure_review_gate
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: case_program
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - program_outcome_analytics
+          - eligibility_case_lifecycle
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: public_health_safety
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - incident_surveillance_analytics
+          - geospatial_hotspot_detection
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "GeoPandas", "PostGIS"]
+  - when:
+      all:
+        - field: product_type
+          equals: grants_spend
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - spend_transparency_rollup
+          - grants_award_lifecycle
+      - op: append_unique
+        path: architecture_suggestions
+        value: Publish spend and grants data with consistent recipient, program, and award identifiers for transparency reconciliation
+  - when:
+      all:
+        - field: standard_focus
+          equals: dcat_us
+    actions:
+      - op: append_unique
+        path: architecture_suggestions
+        value: Emit DCAT-US dataset, distribution, and publisher metadata so records harvest correctly into the federal catalog
+  - when:
+      all:
+        - field: compliance_requirements
+          in: ["fedramp", "fisma", "cjis", "irap_cccs"]
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Map controls to the applicable baseline (NIST 800-53 for FedRAMP/FISMA; ISM/ITSG-33 for IRAP/CCCS)
+          - Enforce boundary protection, continuous monitoring, and audit logging for the authorization boundary
+          - Apply data-classification handling with least-privilege access and separation of duties
+  - when:
+      all:
+        - field: compliance_requirements
+          equals: fedramp
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value: Maintain a FedRAMP System Security Plan (SSP) and ATO evidence for the authorization boundary
+  - when:
+      all:
+        - field: compliance_requirements
+          equals: cjis
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value: Apply CJIS Security Policy controls (advanced authentication, encryption, audit) for criminal-justice data
+
+next_step_tips:
+  - Confirm the NIEM namespaces / IEPD and disclosure-review process with your data-governance office
+  - Classify every field for FOIA/PII sensitivity before publishing any open dataset
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: compliance_requirements
+          in: ["fedramp", "fisma", "cjis", "irap_cccs"]
+    tips:
+      - Review the authorization boundary and control baseline with your security / compliance team

@@ -76,3 +76,147 @@ domains:
     - spectrum
     - cell tower
     - mobile
+
+  manufacturing:
+    - manufacturing
+    - factory
+    - shop floor
+    - mes
+    - isa-95
+    - isa95
+    - oee
+    - throughput
+    - plant
+    - production line
+    - work order
+    - scada
+    - historian
+    - opc ua
+    - spc
+    - supplier scorecard
+    - batch genealogy
+
+  logistics:
+    - logistics
+    - supply chain
+    - shipment
+    - freight
+    - carrier
+    - tms
+    - wms
+    - warehouse
+    - incoterms
+    - epcis
+    - asn
+    - track and trace
+    - otif
+    - fulfillment
+    - last mile
+    - transportation
+
+  energy:
+    - energy
+    - utility
+    - utilities
+    - grid
+    - smart meter
+    - ami
+    - amr
+    - meter reads
+    - nerc cip
+    - nerc
+    - iec cim
+    - scada
+    - substation
+    - outage
+    - load forecast
+    - green button
+    - demand response
+
+  government:
+    - government
+    - public sector
+    - agency
+    - niem
+    - fedramp
+    - fisma
+    - foia
+    - open data
+    - dcat
+    - constituent
+    - civic
+    - public records
+    - grants
+    - permit
+    - regulatory filing
+
+  insurance:
+    - insurance
+    - insurer
+    - policy
+    - policyholder
+    - claims
+    - underwriting
+    - actuarial
+    - premium
+    - reinsurance
+    - acord
+    - solvency
+    - ifrs 17
+    - loss ratio
+    - reserving
+    - broker
+
+  pharma:
+    - pharma
+    - pharmaceutical
+    - life sciences
+    - gxp
+    - gmp
+    - clinical trial
+    - cdisc
+    - sdtm
+    - adam
+    - pharmacovigilance
+    - 21 cfr part 11
+    - lims
+    - batch record
+    - idmp
+    - biotech
+    - drug
+
+  education:
+    - education
+    - student
+    - school
+    - district
+    - ed-fi
+    - edfi
+    - oneroster
+    - caliper
+    - ferpa
+    - sis
+    - lms
+    - enrollment
+    - gradebook
+    - assessment
+    - learning analytics
+    - k-12
+
+  media:
+    - media
+    - entertainment
+    - streaming
+    - playback
+    - qoe
+    - eidr
+    - movielabs
+    - smpte
+    - content metadata
+    - viewership
+    - audience
+    - vast
+    - openrtb
+    - ott
+    - rebuffer
+    - avails

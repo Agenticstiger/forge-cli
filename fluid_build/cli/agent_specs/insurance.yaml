@@ -1,0 +1,248 @@
+name: insurance
+domain: insurance
+description: Expert in insurance data products, ACORD-aligned modeling, actuarial analytics, and IFRS 17 / Solvency II reporting
+
+# Data Mesh product types this agent supports.
+# Insurance mesh: SDP for policy-admin, claims, and bordereaux acquisition;
+# ADP for ACORD-aligned aggregates (earned premium, loss triangles,
+# reserves, exposure); CDP for consumption surfaces (underwriting
+# workbenches, IFRS 17 / Solvency II filings, fraud/SIU scoring inputs).
+supported_data_product_types: [SDP, ADP, CDP]
+
+questions:
+  - key: product_type
+    question: What type of insurance data product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: Claims Analytics
+        value: claims_analytics
+        aliases: ["claims", "loss", "severity", "frequency", "claim analytics"]
+      - label: Underwriting & Pricing
+        value: underwriting_pricing
+        aliases: ["underwriting", "pricing", "rating", "risk selection", "quote"]
+      - label: Actuarial Reserving
+        value: actuarial_reserving
+        aliases: ["actuarial", "reserving", "loss triangle", "ibnr", "chain ladder"]
+      - label: Fraud Detection (SIU)
+        value: fraud_siu
+        aliases: ["fraud", "siu", "special investigations", "anomaly"]
+      - label: Regulatory Reporting (IFRS 17 / Solvency II)
+        value: regulatory_reporting
+        aliases: ["ifrs 17", "ifrs17", "solvency ii", "solvency", "naic", "orsa", "regulatory"]
+  - key: data_sources
+    question: What data sources will you use?
+    type: text
+    required: true
+    default: Policy admin systems, claims systems, ACORD messages, bordereaux, reinsurance ceded data, producer/agency feeds
+  - key: line_of_business
+    question: Which insurance line of business is the best fit?
+    type: choice
+    required: true
+    choices:
+      - label: Property & Casualty (P&C)
+        value: property_casualty
+        aliases: ["p&c", "property casualty", "pnc", "general insurance", "auto", "home"]
+      - label: Life & Annuity
+        value: life_annuity
+        aliases: ["life", "annuity", "l&a", "life insurance"]
+      - label: Health
+        value: health
+        aliases: ["health", "health insurance", "medical"]
+      - label: Reinsurance
+        value: reinsurance
+        aliases: ["reinsurance", "ceded", "treaty", "facultative", "bordereaux"]
+  - key: compliance_requirements
+    question: Which regulatory framework applies?
+    type: choice
+    required: false
+    choices:
+      - label: IFRS 17 (insurance contracts)
+        value: ifrs_17
+        aliases: ["ifrs 17", "ifrs17", "csm", "contractual service margin"]
+      - label: Solvency II (EU prudential)
+        value: solvency_ii
+        aliases: ["solvency ii", "solvency", "scr", "orsa"]
+      - label: NAIC (US statutory)
+        value: naic
+        aliases: ["naic", "statutory", "stat reporting", "rbc"]
+      - label: GDPR / privacy
+        value: gdpr
+        aliases: ["gdpr", "privacy", "pii"]
+      - label: None / not sure
+        value: none
+        aliases: ["none", "not sure", "no compliance"]
+  - key: orchestration_pattern
+    question: What pipeline scheduling pattern fits best?
+    type: choice
+    required: false
+    choices:
+      - label: Period-close batch (monthly / quarterly)
+        value: period_close
+        aliases: ["period close", "monthly", "quarterly", "close", "reporting cycle"]
+      - label: Daily batch (policy / claims refresh)
+        value: daily_batch
+        aliases: ["daily", "batch", "nightly", "refresh"]
+      - label: Real-time (fraud, quote, telematics)
+        value: streaming
+        aliases: ["real time", "streaming", "fraud", "quote", "telematics"]
+      - label: Event-driven (FNOL, policy issuance, endorsement)
+        value: event_driven
+        aliases: ["event", "fnol", "first notice of loss", "issuance", "endorsement"]
+
+resolver_defaults:
+  product_type: claims_analytics
+  line_of_business: property_casualty
+  compliance_requirements: none
+  orchestration_pattern: daily_batch
+
+suggestion_defaults:
+  recommended_template: analytics
+  recommended_provider: snowflake
+  canonical_model: acord
+  supporting_standards:
+    - acord_reference_architecture
+    - naic_statutory
+  recommended_patterns:
+    - acord_party_policy_claim_model
+    - premium_loss_triangle
+  architecture_suggestions:
+    - Model core entities on the ACORD canonical structure (Party, Policy, Coverage, Endorsement, Claim, Producer)
+    - Preserve policy / coverage / endorsement effective-dated timelines so point-in-time exposure and premium are reconstructable
+    - Build loss triangles as a governed intermediate so reserving, pricing, and reporting share one source of truth
+    - Keep the actuarial chain explicit — from individual claim transaction to loss triangle to booked reserve
+  best_practices:
+    - Reconcile earned/written premium and paid/incurred losses to the general ledger and statutory filings
+    - Model reinsurance ceded and producer commission flows for accurate net results
+    - Trace lineage from source policy/claims transactions through to filed regulatory figures (column-level)
+    - Handle PII and sensitive underwriting attributes under least-privilege access and purpose limitation
+    - Version premium, loss, and reserve definitions with the project so restated figures are auditable
+  technology_stack: []
+  security_requirements: []
+
+rules:
+  - when:
+      all:
+        - field: product_type
+          equals: claims_analytics
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - claim_frequency_severity
+          - loss_development_analytics
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: underwriting_pricing
+    actions:
+      - op: set
+        path: recommended_template
+        value: ml_pipeline
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - risk_scoring
+          - technical_price_glm
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "scikit-learn", "statsmodels"]
+  - when:
+      all:
+        - field: product_type
+          equals: actuarial_reserving
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - loss_triangle_chain_ladder
+          - ibnr_reserve_estimation
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "pandas", "chainladder"]
+  - when:
+      all:
+        - field: product_type
+          equals: fraud_siu
+    actions:
+      - op: set
+        path: recommended_template
+        value: ml_pipeline
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - anomaly_detection
+          - siu_network_analytics
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "scikit-learn", "graph analytics"]
+  - when:
+      all:
+        - field: product_type
+          equals: regulatory_reporting
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - ifrs17_measurement_model
+          - column_level_lineage_to_filing
+      - op: append_unique
+        path: architecture_suggestions
+        value: Measure insurance liabilities at contract-group granularity with full lineage to the filed IFRS 17 / Solvency II figure
+  - when:
+      all:
+        - field: line_of_business
+          equals: reinsurance
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - bordereaux_ingestion
+          - treaty_cession_reconciliation
+  - when:
+      all:
+        - field: orchestration_pattern
+          equals: streaming
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: streaming_pipeline
+      - op: append_unique
+        path: technology_stack
+        value: ["Apache Kafka", "Apache Flink"]
+  - when:
+      all:
+        - field: compliance_requirements
+          in: ["ifrs_17", "solvency_ii", "naic", "gdpr"]
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Maintain column-level lineage and reproducibility from source to filed figure
+          - Enforce segregation of duties and approval workflows for reserving and reporting changes
+          - Apply data-quality controls and reconciliation gates before regulatory submission
+  - when:
+      all:
+        - field: compliance_requirements
+          equals: gdpr
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Apply purpose limitation and data-subject-rights workflows to policyholder PII
+          - Restrict sensitive underwriting attributes to permitted uses only
+
+next_step_tips:
+  - Confirm ACORD entity mappings and effective-dating rules with your data-governance team
+  - Reconcile premium, loss, and reserve totals to the general ledger before exposing analytics
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: compliance_requirements
+          in: ["ifrs_17", "solvency_ii", "naic"]
+    tips:
+      - Review column-level lineage and reconciliation gates with actuarial and finance before filing

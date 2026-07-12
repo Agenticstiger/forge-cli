@@ -1,0 +1,218 @@
+name: logistics
+domain: logistics
+description: Expert in logistics & supply-chain data products, GS1 EPCIS visibility, EDI shipment lifecycle, and carrier scorecards
+
+# Data Mesh product types this agent supports.
+# Logistics mesh: SDP for raw TMS/WMS and EDI/telematics acquisition
+# (EDI 856/214/210, GPS pings, scan events); ADP for GS1 EPCIS-aligned
+# aggregates (shipment lifecycle, OTIF, dwell, carrier KPIs); CDP for
+# consumption surfaces (control-tower dashboards, carrier scorecards,
+# freight-spend analytics).
+supported_data_product_types: [SDP, ADP, CDP]
+
+questions:
+  - key: product_type
+    question: What type of logistics data product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: Shipment Visibility & Track-and-Trace
+        value: shipment_visibility
+        aliases: ["visibility", "track and trace", "tracking", "shipment status", "control tower"]
+      - label: Route & Network Optimization
+        value: route_optimization
+        aliases: ["route", "routing", "network", "optimization", "milk run"]
+      - label: Carrier Performance Scorecards
+        value: carrier_scorecards
+        aliases: ["carrier", "scorecard", "otif", "on time in full", "carrier performance"]
+      - label: Warehouse & Inventory Operations
+        value: warehouse_ops
+        aliases: ["warehouse", "wms", "inventory", "picking", "fulfillment", "dc"]
+      - label: Freight Audit & Spend
+        value: freight_spend
+        aliases: ["freight", "freight audit", "spend", "invoice", "rating", "accessorial"]
+  - key: data_sources
+    question: What data sources will you use?
+    type: text
+    required: true
+    default: TMS/WMS feeds, EDI 856/214/210 transactions, GS1 EPCIS scan events, carrier APIs, GPS/telematics pings
+  - key: standard_focus
+    question: Which interchange or visibility standard is the best fit?
+    type: choice
+    required: true
+    choices:
+      - label: GS1 EPCIS & CBV (event visibility)
+        value: gs1_epcis
+        aliases: ["gs1", "epcis", "cbv", "scan events", "sgtin", "sscc"]
+      - label: EDI X12 (856 ASN / 214 status / 210 invoice)
+        value: edi_x12
+        aliases: ["edi", "x12", "856", "214", "210", "asn"]
+      - label: EDIFACT (IFTMIN / IFTSTA / INVOIC)
+        value: edifact
+        aliases: ["edifact", "iftmin", "iftsta", "un edifact"]
+      - label: Carrier / TMS REST APIs
+        value: carrier_api
+        aliases: ["api", "rest", "carrier api", "tms api", "webhook"]
+  - key: incoterms_scope
+    question: Do shipments cross international borders (Incoterms / customs)?
+    type: choice
+    default: "no"
+    choices:
+      - label: "Yes"
+        value: "yes"
+        aliases: ["y", "yeah", "international", "cross border", "customs", "incoterms"]
+      - label: "No"
+        value: "no"
+        aliases: ["n", "nope", "domestic", "not really"]
+  - key: orchestration_pattern
+    question: What pipeline scheduling pattern fits best?
+    type: choice
+    required: false
+    choices:
+      - label: Real-time shipment events (EDI 214 / telematics)
+        value: streaming
+        aliases: ["real time", "streaming", "214", "telematics", "gps"]
+      - label: Micro-batch (every 15-30 minutes)
+        value: micro_batch
+        aliases: ["micro batch", "15 min", "frequent"]
+      - label: Daily batch (settlement, reporting)
+        value: daily_batch
+        aliases: ["daily", "batch", "nightly", "settlement"]
+      - label: Event-driven (milestone scan, exception, POD)
+        value: event_driven
+        aliases: ["event", "milestone", "exception", "pod", "proof of delivery"]
+
+resolver_defaults:
+  product_type: shipment_visibility
+  standard_focus: gs1_epcis
+  incoterms_scope: "no"
+  orchestration_pattern: micro_batch
+
+suggestion_defaults:
+  recommended_template: analytics
+  recommended_provider: aws
+  canonical_model: gs1_epcis_cbv
+  supporting_standards:
+    - edi_x12_transportation
+    - incoterms_2020
+  recommended_patterns:
+    - shipment_lifecycle_state_machine
+    - epcis_event_modeling
+  architecture_suggestions:
+    - Model the shipment lifecycle as an explicit state machine (tendered → picked-up → in-transit → delivered → POD) with milestone timestamps
+    - Use GS1 EPCIS what/when/where/why events (with CBV business steps) as the canonical visibility event grammar
+    - Key entities on GS1 identifiers (SSCC for logistic units, GTIN for trade items, GLN for locations) so partners reconcile cleanly
+    - Normalize heterogeneous EDI 856/214/210 and carrier-API payloads into one canonical event before aggregation
+  best_practices:
+    - Compute OTIF, dwell, and transit time from milestone events, not from a single status field
+    - Standardize carrier, mode, and exception-reason code taxonomies before scoring carriers
+    - Trace lineage from raw EDI/telematics through to exposed carrier and lane KPIs
+    - Reconcile freight invoices (210) against tendered rates and accessorials to catch overbilling
+    - Version OTIF, dwell, and cost-per-shipment definitions with the project
+  technology_stack: []
+  security_requirements: []
+
+rules:
+  - when:
+      all:
+        - field: product_type
+          equals: shipment_visibility
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - shipment_lifecycle_state_machine
+          - milestone_eta_analytics
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: route_optimization
+    actions:
+      - op: set
+        path: recommended_template
+        value: ml_pipeline
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - route_cost_to_serve
+          - network_flow_optimization
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "OR-Tools", "scikit-learn"]
+  - when:
+      all:
+        - field: product_type
+          equals: carrier_scorecards
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - on_time_in_full_otif
+          - carrier_exception_analytics
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: freight_spend
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - freight_audit_reconciliation
+          - accessorial_leakage_detection
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "Great Expectations"]
+  - when:
+      all:
+        - field: standard_focus
+          equals: gs1_epcis
+    actions:
+      - op: append_unique
+        path: architecture_suggestions
+        value: Persist EPCIS events immutably with CBV bizStep / disposition vocabularies so downstream traceability queries stay standard
+  - when:
+      all:
+        - field: incoterms_scope
+          equals: "yes"
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: incoterms_2020_responsibility_model
+      - op: append_unique
+        path: architecture_suggestions
+        value: Capture the Incoterms 2020 rule per shipment to model risk/cost transfer, customs milestones, and duties correctly
+      - op: append_unique
+        path: security_requirements
+        value: Handle customs and trade documents under applicable export-control and data-residency rules
+  - when:
+      all:
+        - field: orchestration_pattern
+          equals: streaming
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: streaming_pipeline
+      - op: append_unique
+        path: technology_stack
+        value: ["Apache Kafka", "Apache Flink"]
+      - op: append_unique
+        path: architecture_suggestions
+        value: Ingest EDI 214 status and telematics pings as an event stream with idempotent milestone de-duplication
+
+next_step_tips:
+  - Confirm milestone, exception-reason, and carrier taxonomies with operations before scoring carriers
+  - Validate GS1 identifiers (SSCC / GTIN / GLN) and EDI mappings with trading partners
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: incoterms_scope
+          equals: "yes"
+    tips:
+      - Model Incoterms 2020 responsibility transfer and customs milestones for cross-border lanes
