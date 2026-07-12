@@ -45,6 +45,10 @@ import pytest
 
 duckdb = pytest.importorskip("duckdb")
 litellm = pytest.importorskip("litellm")
+# The MCP output-port server (imported below) pulls in FastAPI; guard it here
+# so this module skips cleanly on matrix jobs where fastapi isn't installed
+# instead of erroring during collection (mirrors the duckdb/litellm guards).
+pytest.importorskip("fastapi")
 
 from mcp import ClientSession  # noqa: E402
 from mcp.shared.memory import (  # noqa: E402
