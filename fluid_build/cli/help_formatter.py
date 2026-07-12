@@ -285,6 +285,41 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
         ],
     )
 
+    # ── Plugins (installed command extensions) ──────────────────────
+    # List third-party ``fluid_build.commands`` plugins by NAME without
+    # importing any of them (entry-point metadata only), so `fluid --help`
+    # surfaces installed extensions while keeping the cold path lean. The
+    # plugin implementation is imported lazily, only when its command runs
+    # (see cli/bootstrap.py::_register_command_plugins). Rendered only when
+    # at least one allowed command plugin is installed.
+    try:
+        from fluid_build import plugin_manager as _pm
+
+        _cmd_plugins = [
+            e["name"]
+            for e in _pm.installed_plugins("command").get("command", [])
+            if e.get("allowed")
+        ]
+    except Exception:
+        _cmd_plugins = []
+    if _cmd_plugins:
+        from rich.markup import escape as _escape_markup
+
+        console.print("  ▸ [bold bright_green]Plugins[/bold bright_green]")
+        plug_tbl = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False)
+        # Wider name column than the core sections — plugin names can be long
+        # (e.g. entry-point names), so avoid truncating them.
+        plug_tbl.add_column(style="bright_green bold", min_width=28, max_width=40)
+        plug_tbl.add_column(style="bright_white")
+        for name in _cmd_plugins:
+            # Escape the third-party entry-point name — entry-point names can
+            # contain ``[...]``, which Rich would otherwise interpret as markup.
+            plug_tbl.add_row(
+                f"  {_escape_markup(name)}", "Installed command plugin (loaded on demand)"
+            )
+        console.print(plug_tbl)
+        console.print()
+
     # ── Quick-start ─────────────────────────────────────────────────
     # Two lines: the local/dev on-ramp (onboard a new user in 30s)
     # and the production pipeline (what the CI template actually
