@@ -603,9 +603,12 @@ class TestBootstrapCommands:
     its* ``load()()`` *is invoked with the subparsers, and exceptions on
     either side are trapped at WARNING.*
 
-    The actual bootstrap code lives at bootstrap.py:582-608 and is
-    inspected by ``test_bootstrap_code_uses_same_pattern`` below to keep
-    this test in sync if the implementation changes.
+    The actual bootstrap code now lives in the lazy helpers
+    ``_command_plugin_entry_points`` + ``_register_command_plugins`` and is
+    inspected by ``test_bootstrap_code_uses_same_pattern`` below to keep this
+    test in sync if the implementation changes. The local ``_drive_plugin_loop``
+    below reproduces the *fail-isolation* contract (kept green independently of
+    the lazy argv-peek), so these unit tests don't depend on ``sys.argv``.
     """
 
     def _drive_plugin_loop(
@@ -676,21 +679,32 @@ class TestBootstrapCommands:
         )
 
     def test_bootstrap_code_uses_same_pattern(self) -> None:
-        """Drift guard: the bootstrap code must still wrap each plugin in
-        try/except, call ``ep.load()(sp)``, and emit a WARNING that
-        identifies the failing plugin by name. If this asserts, the loop
-        has been refactored and the tests in this class need updating."""
+        """Drift guard: command-plugin loading is now LAZY. Discovery +
+        governance live in ``_command_plugin_entry_points``; the fail-isolated,
+        type-only load-on-invoke lives in ``_register_command_plugins``; and
+        ``register_core_commands`` delegates to it. If this asserts, the plugin
+        path has been refactored and the tests in this class need updating."""
         import inspect
 
         from fluid_build.cli import bootstrap
 
-        source = inspect.getsource(bootstrap.register_core_commands)
-        assert 'group="fluid_build.commands"' in source
-        assert "_ep.load()(sp)" in source
-        # The WARNING line may be inlined or multi-line — match on the
-        # message prefix rather than a specific code shape.
-        assert "Failed to load CLI plugin" in source
-        assert "LOG.warning" in source
+        # Discovery + operator allow/block governance (names only, no import).
+        disc = inspect.getsource(bootstrap._command_plugin_entry_points)
+        assert 'group="fluid_build.commands"' in disc
+        assert "is_allowed" in disc
+
+        # Lazy loader: imports + calls ``ep.load()(sp)`` only on invoke, is
+        # fail-isolated, and logs by exception TYPE only (no plugin-supplied
+        # text ever reaches the handler — the credential-leak guarantee).
+        loader = inspect.getsource(bootstrap._register_command_plugins)
+        assert "ep.load()(sp)" in loader
+        assert "Failed to load CLI plugin" in loader
+        assert "type(e).__name__" in loader
+        assert "sys.argv" in loader  # argv-peek is what keeps it lazy
+
+        # register_core_commands delegates to the lazy loader.
+        rcc = inspect.getsource(bootstrap.register_core_commands)
+        assert "_register_command_plugins(sp)" in rcc
 
 
 # ---------------------------------------------------------------------------

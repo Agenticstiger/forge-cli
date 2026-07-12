@@ -436,6 +436,161 @@ def _try_register(
         return False
 
 
+# ────────────────────────────────────────────────────────────────────
+# Lazy CLI-command plugin loading (``fluid_build.commands`` group)
+# ────────────────────────────────────────────────────────────────────
+# Third-party packages register extra ``fluid <name>`` subcommands via the
+# ``fluid_build.commands`` entry-point group. Importing every such plugin
+# eagerly during ``build_parser()`` drags any heavy module-scope import a
+# plugin happens to have (e.g. ``jsonschema``) onto the ``fluid --help`` cold
+# path and blows the startup budget (tests/perf/test_startup_budget.py).
+#
+# We adapt Click's ``LazyGroup`` recipe (Pallets "Complex Applications" docs:
+# list command NAMES without importing, import the implementation only inside
+# ``get_command``) to argparse. argparse has no lazy ``get_command`` hook, so
+# we peek ``sys.argv`` to decide — at parser-build time — whether the invoked
+# command is (plausibly) a plugin command, and only THEN import + register the
+# real subparser. ``--help`` / a core command / no command all stay fully
+# lazy: zero plugin imports. (See also dbt-core#1090 — dbt lazy-loads adapters
+# for the same ``--help`` / ``debug`` startup win.)
+
+# Global options that consume a following value token — used by
+# ``_requested_command`` to step past ``--provider gcp`` etc. when locating
+# the invoked subcommand. Kept in sync with the global options declared in
+# ``cli/__init__.py::build_parser``.
+_GLOBAL_VALUE_OPTS = frozenset(
+    {"--log-level", "--log-file", "--provider", "--project", "--region", "--config-dir"}
+)
+
+
+def _requested_command(argv: List[str]) -> Optional[str]:
+    """Return the invoked subcommand name from *argv*, or ``None``.
+
+    Steps past global options (and their values) to the first bare positional
+    token — the subcommand. Returns ``None`` for help/version/no-command so the
+    ``--help`` cold path never triggers a plugin import.
+    """
+    i, n = 0, len(argv)
+    while i < n:
+        tok = argv[i]
+        if tok in ("-h", "--help", "help", "--version"):
+            return None
+        if tok.startswith("-"):
+            # Value-taking global option with a separate value → skip both.
+            i += 2 if (tok in _GLOBAL_VALUE_OPTS and "=" not in tok) else 1
+            continue
+        return tok
+    return None
+
+
+def _command_plugin_entry_points() -> List[Any]:
+    """Return the allowed ``fluid_build.commands`` entry points (names only).
+
+    Reads entry-point metadata; it never imports plugin code. Each entry is
+    gated by the operator allow/block policy (``is_allowed``) BEFORE it can be
+    loaded, consistent with the plugin trust boundary.
+    """
+    import importlib.metadata as _md
+
+    try:
+        eps = _md.entry_points(group="fluid_build.commands")
+    except TypeError:
+        # Python < 3.10 returned a dict of groups, not a kwarg-filtered iter.
+        eps = _md.entry_points().get("fluid_build.commands", [])
+    from fluid_build.plugin_manager import is_allowed
+
+    allowed: List[Any] = []
+    for ep in eps:
+        if is_allowed(ep.name):
+            allowed.append(ep)
+        else:
+            LOG.debug("CLI command plugin %s skipped by allow/block policy", ep.name)
+    return allowed
+
+
+def _adapt_plugin_command_func(fn: Any) -> Any:
+    """Wrap a plugin ``func`` to the CLI's ``func(args, logger)`` convention.
+
+    The dispatcher (``ProductionCLI._execute_command``) always calls
+    ``args.func(args, logger)``. Many third-party command plugins follow the
+    one-arg ``func(args)`` shape (Click-style ``run(args)``), which otherwise
+    crashes with "takes 1 positional argument but 2 were given". This adapter
+    bridges both conventions by inspecting the target's arity.
+    """
+    import inspect
+
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        params = []
+    accepts_two = any(p.kind == p.VAR_POSITIONAL for p in params) or (
+        sum(1 for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)) >= 2
+    )
+
+    def _dispatch(args: argparse.Namespace, logger: logging.Logger) -> Any:
+        return fn(args, logger) if accepts_two else fn(args)
+
+    _dispatch.__fluid_adapted__ = True  # type: ignore[attr-defined]
+    return _dispatch
+
+
+def _wrap_plugin_parser_funcs(parser: argparse.ArgumentParser) -> None:
+    """Recursively adapt ``func`` defaults on a plugin-registered subparser tree.
+
+    Walks the parser and every nested ``_SubParsersAction`` choice so that a
+    ``func`` set on any leaf is bridged to the CLI dispatch convention (see
+    ``_adapt_plugin_command_func``).
+    """
+    defaults = getattr(parser, "_defaults", {})
+    fn = defaults.get("func")
+    if callable(fn) and not getattr(fn, "__fluid_adapted__", False):
+        parser.set_defaults(func=_adapt_plugin_command_func(fn))
+    for action in getattr(parser, "_actions", []):
+        if isinstance(action, argparse._SubParsersAction):
+            for sub in action.choices.values():
+                _wrap_plugin_parser_funcs(sub)
+
+
+def _register_command_plugins(sp: argparse._SubParsersAction) -> None:
+    """Register external ``fluid_build.commands`` plugins LAZILY.
+
+    A plugin's module + ``register()`` is imported only when its command is
+    actually being invoked, detected by peeking ``sys.argv``. On the
+    ``fluid --help`` / core-command / no-command paths NO plugin is imported —
+    installed plugin names are surfaced separately by ``print_main_help`` from
+    entry-point metadata. Discovery and per-plugin load failures are fully
+    isolated and logged by exception TYPE only, so a broken plugin can never
+    crash the CLI and a credential-shaped substring can never leak.
+    """
+    try:
+        eps = _command_plugin_entry_points()
+    except Exception as e:  # noqa: BLE001 - discovery must never break the CLI
+        LOG.warning("CLI plugin discovery failed: %s", type(e).__name__)
+        return
+    if not eps:
+        return
+
+    core_names = set(sp.choices)
+    requested = _requested_command(sys.argv[1:])
+    # Import the real subparsers ONLY when a non-core command is being invoked
+    # (i.e. plausibly a plugin command). ``--help`` / a core command / no
+    # command all keep the cold path free of plugin imports.
+    if not (requested and requested not in core_names):
+        return
+
+    for ep in eps:
+        before = set(sp.choices)
+        try:
+            ep.load()(sp)
+        except Exception as e:  # noqa: BLE001 - isolate a bad plugin; type only
+            # Type-only — never interpolate plugin-supplied exception text.
+            LOG.warning("Failed to load CLI plugin %s: %s", ep.name, type(e).__name__)
+            continue
+        # Bridge any newly-registered command funcs to ``func(args, logger)``.
+        for name in set(sp.choices) - before:
+            _wrap_plugin_parser_funcs(sp.choices[name])
+
+
 def register_core_commands(sp: argparse._SubParsersAction) -> None:
     # --- Core commands (with inline fallbacks for backwards compat) ---
 
@@ -598,7 +753,7 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     _try_register(sp, "describe_cmd", "describe")
 
     # ────────────────────────────────────────────────────────────────────
-    # External CLI plugins — discovered via Python entry-points.
+    # External CLI plugins — discovered via Python entry-points, loaded LAZILY.
     #
     # Any installed package can register an additional ``fluid <name>``
     # subcommand by declaring an entry-point in its ``pyproject.toml``::
@@ -606,32 +761,12 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     #     [project.entry-points."fluid_build.commands"]
     #     my-cmd = "my_pkg.cli:register"
     #
-    # The referenced callable must accept the argparse subparser group and
-    # call ``add_parser`` on it. Failures are logged at WARNING level so a
-    # broken plugin can never break ``fluid`` itself.
+    # The referenced callable must accept the argparse subparser group and call
+    # ``add_parser`` on it. To keep a heavy third-party module-scope import
+    # (e.g. ``jsonschema``) off the ``fluid --help`` / ``build_parser()`` cold
+    # path, the plugin module is imported (and its ``register()`` called) ONLY
+    # when its command is actually being invoked — see
+    # ``_register_command_plugins``. Governance, fail-isolation, and type-only
+    # logging are preserved there.
     # ────────────────────────────────────────────────────────────────────
-    # Governance: each command plugin is gated by the operator allow/block
-    # policy (``is_allowed``) BEFORE it is loaded, and load/discovery failures
-    # are logged by exception TYPE only — plugin-supplied exception text never
-    # reaches the log handler, so a credential-shaped substring cannot leak.
-    try:
-        import importlib.metadata as _md
-
-        try:
-            _eps = _md.entry_points(group="fluid_build.commands")
-        except TypeError:
-            # Python < 3.10 returned a dict of groups, not a kwarg-filtered iter.
-            _eps = _md.entry_points().get("fluid_build.commands", [])
-        from fluid_build.plugin_manager import is_allowed
-
-        for _ep in _eps:
-            if not is_allowed(_ep.name):
-                LOG.debug("CLI command plugin %s skipped by allow/block policy", _ep.name)
-                continue
-            try:
-                _ep.load()(sp)
-            except Exception as _e:
-                # Type-only — never interpolate plugin-supplied exception text.
-                LOG.warning("Failed to load CLI plugin %s: %s", _ep.name, type(_e).__name__)
-    except Exception as _e:
-        LOG.warning("CLI plugin discovery failed: %s", type(_e).__name__)
+    _register_command_plugins(sp)
