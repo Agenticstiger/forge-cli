@@ -122,6 +122,23 @@ dependencies = [
   "open-data-contract-standard>=3.1.2",
   # Optional UX nicety on Windows; no-op elsewhere
   "colorama>=0.4.6; platform_system == 'Windows'",
+  # Cross-platform single-keypress reader powering arrow-key menu
+  # navigation in ``forge_ui.ask_numbered_choice`` (the interactive
+  # forge / ai-setup menus). Owns the finicky, edge-case-ridden part —
+  # decoding terminal escape sequences for arrow keys across Windows
+  # (msvcrt) and POSIX (termios/tty) — so we don't hand-roll raw-mode
+  # input. Pure-Python, zero transitive deps, MIT. Imported lazily inside
+  # the interactive branch only (never at module import), so `fluid --help`
+  # startup cost is untouched; menus degrade to numbered input when it's
+  # absent, non-TTY, or the terminal errors.
+  #
+  # Borrowed-not-built per /borrow-before-build:
+  #   PyPI:   https://pypi.org/project/readchar/
+  #   GitHub: https://github.com/magmax/python-readchar
+  #   (questionary/InquirerPy rejected: pull the heavy prompt_toolkit tree
+  #    which fights the startup-budget gate; simple-term-menu rejected:
+  #    Linux/macOS-only, would drop the Windows path #263/#269 hardened.)
+  "readchar>=4.0",
 ]
 
 [project.optional-dependencies]
