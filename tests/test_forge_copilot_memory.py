@@ -15,9 +15,12 @@
 """Tests for project-scoped forge copilot memory."""
 
 import json
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from fluid_build.cli.artifact_paths import product_memory_path
 from fluid_build.cli.forge_copilot_memory import (
     CopilotMemoryStore,
     CopilotProjectMemory,
@@ -180,13 +183,30 @@ class TestCopilotMemoryStore:
         target_root = tmp_path / "target"
         workspace_root.mkdir()
         target_root.mkdir()
-        target_memory = target_root / "runtime/.state/copilot-memory.json"
+        # Slice 6: the resolver probes ``.fluid/copilot-memory.json``, so the
+        # seed must live at the canonical path (not the pre-cut runtime/.state).
+        target_memory = product_memory_path(target_root)
         target_memory.parent.mkdir(parents=True)
         target_memory.write_text("{}", encoding="utf-8")
 
         resolved = resolve_copilot_memory_root(workspace_root, target_root)
 
-        assert resolved == target_root
+        assert resolved == target_root.resolve()
+
+    def test_resolve_memory_root_falls_back_to_workspace_file(self, tmp_path: Path):
+        workspace_root = tmp_path / "workspace"
+        target_root = tmp_path / "target"
+        workspace_root.mkdir()
+        target_root.mkdir()
+        # Only the workspace root has memory; target does not. The resolver
+        # must fall back to the workspace so load reads the existing file.
+        workspace_memory = product_memory_path(workspace_root)
+        workspace_memory.parent.mkdir(parents=True)
+        workspace_memory.write_text("{}", encoding="utf-8")
+
+        resolved = resolve_copilot_memory_root(workspace_root, target_root)
+
+        assert resolved == workspace_root.resolve()
 
     def test_summarize_copilot_memory_returns_friendly_counts(self, tmp_path: Path):
         memory = build_copilot_project_memory(
@@ -392,3 +412,161 @@ class TestCopilotMemoryRuntimeIntegration:
 
         assert template == "analytics"
         assert provider == "gcp"
+
+
+class TestCopilotMemoryRootHarmonization:
+    """Load, save, and management must resolve the SAME canonical root.
+
+    Regression guard for Trello 69d42ad4: a run could LOAD memory from
+    one root (the resolver preferred an existing workspace file) but SAVE
+    against ``target_dir`` unconditionally, silently splitting per-project
+    state across two files. ``--show-memory`` / ``--reset-memory`` then
+    pointed at yet another file than the run actually wrote.
+    """
+
+    @staticmethod
+    def _seed_memory(root: Path) -> Path:
+        store = CopilotMemoryStore(root)
+        store.save(
+            build_copilot_project_memory(
+                project_root=root,
+                context={"domain": "analytics"},
+                suggestions={
+                    "recommended_template": "analytics",
+                    "recommended_provider": "local",
+                    "domain": "analytics",
+                    "owner": "data-team",
+                },
+                contract=_minimal_contract(),
+                discovery_report=DiscoveryReport(workspace_roots=[str(root)]),
+            )
+        )
+        return store.path
+
+    @staticmethod
+    def _generation_result(root: Path) -> SimpleNamespace:
+        return SimpleNamespace(
+            contract=_minimal_contract(),
+            discovery_report=DiscoveryReport(workspace_roots=[str(root)]),
+            scaffold_decision=None,
+            readme_markdown="# Project\n",
+            additional_files={},
+        )
+
+    def _new_agent(self):
+        from fluid_build.cli.forge_copilot_agent import CopilotAgentBase
+
+        agent = CopilotAgentBase()
+        agent.console = None  # avoid Rich panel noise in tests
+        return agent
+
+    def test_load_and_save_resolve_the_same_canonical_root(self, tmp_path: Path, monkeypatch):
+        workspace = tmp_path / "workspace"
+        target = workspace / "products" / "orders"
+        workspace.mkdir(parents=True)
+        target.mkdir(parents=True)
+
+        # Seed memory ONLY at the workspace root (cwd); target has none.
+        workspace_memory = self._seed_memory(workspace)
+        target_memory = product_memory_path(target.resolve())
+        assert workspace_memory.exists()
+        assert not target_memory.exists()
+
+        monkeypatch.chdir(workspace)
+        agent = self._new_agent()
+
+        # Capture the store path used at each memory touch-point.
+        used_paths: list[Path] = []
+        original = agent._make_memory_store_dependency
+
+        def _spy(project_root):
+            store = original(project_root)
+            used_paths.append(store.path)
+            return store
+
+        agent._make_memory_store_dependency = _spy  # type: ignore[method-assign]
+
+        # LOAD: resolver prefers the existing workspace file over the
+        # empty target dir.
+        loaded = agent._load_project_memory(enabled=True, target_dir=target)
+        assert loaded is not None, "load should have found the seeded workspace memory"
+        load_store_path = used_paths[0]
+        assert load_store_path == workspace_memory
+
+        # SAVE: same target_dir, non-interactive with --save-memory.
+        agent._maybe_save_project_memory(
+            target_dir=target,
+            context={"domain": "analytics"},
+            suggestions={
+                "recommended_template": "analytics",
+                "recommended_provider": "local",
+                "domain": "analytics",
+                "owner": "data-team",
+            },
+            generation_result=self._generation_result(workspace),
+            copilot_options={"non_interactive": True, "save_memory": True},
+            dry_run=False,
+        )
+        save_store_path = used_paths[-1]
+
+        # The heart of the harmonization: save wrote to the SAME file the
+        # load read from — not a drifting copy under target_dir.
+        drift_msg = (
+            f"memory root drift: load read {load_store_path} but save wrote {save_store_path}"
+        )
+        assert save_store_path == load_store_path, drift_msg
+        assert save_store_path == workspace_memory
+        assert (
+            not target_memory.exists()
+        ), "save drifted to target_dir instead of the loaded workspace root"
+
+    def test_management_commands_target_the_file_a_run_wrote(self, tmp_path: Path, monkeypatch):
+        from fluid_build.cli.forge_context import resolve_memory_store
+
+        workspace = tmp_path / "workspace"
+        target = workspace / "products" / "orders"
+        workspace.mkdir(parents=True)
+        target.mkdir(parents=True)
+
+        workspace_memory = self._seed_memory(workspace)
+
+        monkeypatch.chdir(workspace)
+        agent = self._new_agent()
+
+        saved_paths: list[Path] = []
+        original = agent._make_memory_store_dependency
+
+        def _spy(project_root):
+            store = original(project_root)
+            saved_paths.append(store.path)
+            return store
+
+        agent._make_memory_store_dependency = _spy  # type: ignore[method-assign]
+
+        agent._load_project_memory(enabled=True, target_dir=target)
+        agent._maybe_save_project_memory(
+            target_dir=target,
+            context={"domain": "analytics"},
+            suggestions={
+                "recommended_template": "analytics",
+                "recommended_provider": "local",
+            },
+            generation_result=self._generation_result(workspace),
+            copilot_options={"non_interactive": True, "save_memory": True},
+            dry_run=False,
+        )
+        run_wrote_to = saved_paths[-1]
+
+        # A follow-up ``fluid forge --show-memory``/``--reset-memory`` for the
+        # same run (same target_dir) must resolve to the exact file the run
+        # wrote, not a divergent one.
+        args = SimpleNamespace(
+            target_dir=str(target),
+            show_memory=True,
+            reset_memory=False,
+            memory_json=False,
+        )
+        store = resolve_memory_store(args, logging.getLogger("test"))
+
+        assert store.path == run_wrote_to
+        assert store.path == workspace_memory

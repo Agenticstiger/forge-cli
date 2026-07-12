@@ -40,8 +40,28 @@ LOG = logging.getLogger("fluid.cli.forge")
 class CopilotProjectMemoryMixin:
     """Shared project-memory load, display, and save behavior for copilot."""
 
+    def _resolve_memory_root(self, target_dir: Optional[Path]) -> Path:
+        """Resolve the single canonical project-memory root for this run.
+
+        Load, save, and management all funnel through this one resolver so
+        a run reads and writes the SAME file — no workspace-vs-``target_dir``
+        drift (Trello 69d42ad4). Borrowed from how ``git rev-parse
+        --show-toplevel`` / ``pyprojroot`` resolve one canonical root and
+        reuse it for every read and write.
+
+        The first resolution within a run is cached on the instance, so a
+        later save can never land in a different root than the load read
+        from — even if on-disk state shifts mid-run.
+        """
+        cached = getattr(self, "_project_memory_root", None)
+        if cached is not None:
+            return cached
+        root = resolve_copilot_memory_root(Path.cwd(), target_dir=target_dir)
+        self._project_memory_root = root
+        return root
+
     def _load_project_memory(self, *, enabled: bool, target_dir: Optional[Path]) -> Optional[Any]:
-        project_root = resolve_copilot_memory_root(Path.cwd(), target_dir=target_dir)
+        project_root = self._resolve_memory_root(target_dir)
         store = self._make_memory_store_dependency(project_root)
         self._project_memory_enabled = enabled
         self._project_memory_path = store.path
@@ -187,9 +207,16 @@ class CopilotProjectMemoryMixin:
             return
 
         options = SimpleNamespace(**(copilot_options or {}))
-        store = self._make_memory_store_dependency(target_dir)
+        # Resolve to the SAME canonical root the load path used, so a run
+        # reads and writes one file (no workspace-vs-target_dir drift).
+        project_root = self._resolve_memory_root(target_dir)
+        store = self._make_memory_store_dependency(project_root)
+        # Keep feedback paths (``Saved memory to X``) pointed at the file we
+        # actually write — important when save runs without a prior load
+        # (e.g. template mode).
+        self._project_memory_path = store.path
         candidate_memory = build_copilot_project_memory(
-            project_root=target_dir,
+            project_root=project_root,
             context=context,
             suggestions=suggestions,
             contract=generation_result.contract,

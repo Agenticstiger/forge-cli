@@ -178,6 +178,10 @@ class CopilotAgentBase(CopilotProjectMemoryMixin, CopilotLegacyScaffoldMixin, AI
         self._project_memory_enabled = True
         self._project_memory_snapshot = None
         self._project_memory_path = None
+        # Canonical per-run memory root — resolved once (load) and reused by
+        # save + management so state never splits across roots (Trello
+        # 69d42ad4). ``None`` until first resolution.
+        self._project_memory_root = None
 
     def _resolve_llm_config_dependency(self, options: SimpleNamespace):
         return resolve_llm_config(options)
