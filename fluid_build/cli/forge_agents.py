@@ -60,11 +60,67 @@ class TelcoAgent(_SpecBackedDomainAgent):
     spec_name = "telco"
 
 
+class ManufacturingAgent(_SpecBackedDomainAgent):
+    """ISA-95 / IEC 62264-aligned manufacturing domain agent (OEE, MES, SPC)."""
+
+    spec_name = "manufacturing"
+
+
+class LogisticsAgent(_SpecBackedDomainAgent):
+    """GS1 EPCIS / EDI-aligned logistics & supply-chain domain agent."""
+
+    spec_name = "logistics"
+
+
+class EnergyAgent(_SpecBackedDomainAgent):
+    """IEC CIM / NERC CIP-aligned energy & utilities domain agent."""
+
+    spec_name = "energy"
+
+
+class GovernmentAgent(_SpecBackedDomainAgent):
+    """NIEM / FedRAMP-aligned government & public-sector domain agent."""
+
+    spec_name = "government"
+
+
+class InsuranceAgent(_SpecBackedDomainAgent):
+    """ACORD-aligned insurance domain agent (claims, underwriting, actuarial)."""
+
+    spec_name = "insurance"
+
+
+class PharmaAgent(_SpecBackedDomainAgent):
+    """GxP / CDISC-aligned pharma & life-sciences domain agent."""
+
+    spec_name = "pharma"
+
+
+class EducationAgent(_SpecBackedDomainAgent):
+    """Ed-Fi / OneRoster-aligned education domain agent (FERPA-aware)."""
+
+    spec_name = "education"
+
+
+class MediaAgent(_SpecBackedDomainAgent):
+    """EIDR / MovieLabs-aligned media & entertainment domain agent (QoE, ads)."""
+
+    spec_name = "media"
+
+
 DOMAIN_AGENTS = {
     "finance": FinanceAgent,
     "healthcare": HealthcareAgent,
     "retail": RetailAgent,
     "telco": TelcoAgent,
+    "manufacturing": ManufacturingAgent,
+    "logistics": LogisticsAgent,
+    "energy": EnergyAgent,
+    "government": GovernmentAgent,
+    "insurance": InsuranceAgent,
+    "pharma": PharmaAgent,
+    "education": EducationAgent,
+    "media": MediaAgent,
 }
 
 
@@ -180,6 +236,14 @@ __all__ = [
     "HealthcareAgent",
     "RetailAgent",
     "TelcoAgent",
+    "ManufacturingAgent",
+    "LogisticsAgent",
+    "EnergyAgent",
+    "GovernmentAgent",
+    "InsuranceAgent",
+    "PharmaAgent",
+    "EducationAgent",
+    "MediaAgent",
     "DOMAIN_AGENTS",
     "get_agent",
     "get_all_domain_names",

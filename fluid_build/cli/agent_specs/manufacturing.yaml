@@ -1,0 +1,255 @@
+name: manufacturing
+domain: manufacturing
+description: Expert in manufacturing data products, ISA-95 / IEC 62264 MES modeling, and OEE / throughput analytics
+
+# Data Mesh product types this agent supports.
+# Manufacturing mesh: SDP for raw shop-floor acquisition (OPC UA / MQTT
+# telemetry, MES event streams, historian tags); ADP for ISA-95 aligned
+# aggregates (OEE, first-pass yield, SPC control limits, batch genealogy);
+# CDP for consumption surfaces (plant KPI dashboards, supplier scorecards,
+# predictive-maintenance model inputs).
+supported_data_product_types: [SDP, ADP, CDP]
+
+questions:
+  - key: product_type
+    question: What type of manufacturing data product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: OEE & Throughput Analytics
+        value: oee_throughput
+        aliases: ["oee", "overall equipment effectiveness", "throughput", "line performance"]
+      - label: Quality & SPC (Statistical Process Control)
+        value: quality_spc
+        aliases: ["quality", "spc", "yield", "defects", "first pass yield"]
+      - label: Predictive Maintenance
+        value: predictive_maintenance
+        aliases: ["maintenance", "predictive", "mtbf", "mttr", "condition monitoring"]
+      - label: Traceability & Batch Genealogy
+        value: traceability_genealogy
+        aliases: ["traceability", "genealogy", "batch", "lot tracking", "as-built"]
+      - label: Supplier & Supply-Chain Scorecards
+        value: supplier_scorecards
+        aliases: ["supplier", "supplier quality", "ppm", "scorecard", "incoming inspection"]
+  - key: data_sources
+    question: What data sources will you use?
+    type: text
+    required: true
+    default: MES events, PLC/SCADA historian tags, OPC UA / MQTT telemetry, ERP work orders, quality inspection records
+  - key: isa95_level_focus
+    question: Which ISA-95 / IEC 62264 hierarchy level is the best fit?
+    type: choice
+    required: true
+    choices:
+      - label: Enterprise / Site (Level 4 — ERP, planning)
+        value: enterprise_site
+        aliases: ["enterprise", "site", "level 4", "erp", "planning"]
+      - label: Area / Work Center (Level 3 — MES, operations)
+        value: area_workcenter
+        aliases: ["area", "work center", "workcenter", "level 3", "mes", "operations"]
+      - label: Work Unit / Equipment (Levels 0-2 — control, sensing)
+        value: workunit_equipment
+        aliases: ["work unit", "equipment", "machine", "level 2", "plc", "scada", "sensor"]
+  - key: compliance_requirements
+    question: Any specific quality or regulatory framework?
+    type: choice
+    required: false
+    choices:
+      - label: ISO 9001 (Quality Management)
+        value: iso_9001
+        aliases: ["iso9001", "iso 9001", "qms"]
+      - label: IATF 16949 (Automotive)
+        value: iatf_16949
+        aliases: ["iatf", "automotive", "iatf16949"]
+      - label: ISO 22400 (Manufacturing KPIs)
+        value: iso_22400
+        aliases: ["iso22400", "kpi standard", "manufacturing kpis"]
+      - label: FDA 21 CFR Part 11 (Regulated / Validated)
+        value: cfr_part_11
+        aliases: ["21 cfr part 11", "part 11", "validated", "gmp"]
+      - label: IEC 62443 / ISA-99 (OT Cybersecurity)
+        value: iec_62443
+        aliases: ["iec62443", "isa99", "ot security", "purdue"]
+      - label: None / not sure
+        value: none
+        aliases: ["none", "not sure", "no compliance"]
+  - key: orchestration_pattern
+    question: What pipeline scheduling pattern fits best?
+    type: choice
+    required: false
+    choices:
+      - label: Real-time shop-floor telemetry (OPC UA / MQTT)
+        value: streaming
+        aliases: ["real time", "streaming", "opc ua", "mqtt", "telemetry"]
+      - label: Per-shift / hourly aggregation
+        value: micro_batch
+        aliases: ["per shift", "shift", "hourly", "micro batch"]
+      - label: Daily production batch (day-close, reporting)
+        value: daily_batch
+        aliases: ["daily", "batch", "day close", "nightly"]
+      - label: Event-driven (work-order complete, alarm, batch release)
+        value: event_driven
+        aliases: ["event", "work order", "alarm", "batch release", "triggered"]
+
+resolver_defaults:
+  product_type: oee_throughput
+  isa95_level_focus: area_workcenter
+  compliance_requirements: none
+  orchestration_pattern: micro_batch
+
+suggestion_defaults:
+  recommended_template: analytics
+  recommended_provider: snowflake
+  canonical_model: isa95_iec62264
+  supporting_standards:
+    - isa95_equipment_hierarchy
+    - iso_22400_kpis
+  recommended_patterns:
+    - isa95_equipment_hierarchy_model
+    - oee_availability_performance_quality
+  architecture_suggestions:
+    - Model the plant using the ISA-95 / IEC 62264 equipment hierarchy (Enterprise → Site → Area → Work Center → Work Unit)
+    - Compute OEE as Availability × Performance × Quality with ISO 22400-aligned definitions so plants compare like-for-like
+    - Keep the ISA-95 role-based equipment model separate from the physical asset model to survive line reconfigurations
+    - Map MES production, quality, maintenance, and inventory operations domains explicitly to source systems
+  best_practices:
+    - Anchor every measure and dimension to an ISA-95 object (equipment, material lot, production request, work order)
+    - Standardize downtime reason codes and state models before computing availability
+    - Trace lineage from historian tags and MES events through to exposed OEE and yield KPIs
+    - Preserve batch / lot genealogy (as-built) links for full forward and backward traceability
+    - Version OEE, yield, and scrap definitions with the project so KPI drift is auditable
+  technology_stack: []
+  security_requirements: []
+
+rules:
+  - when:
+      all:
+        - field: product_type
+          equals: oee_throughput
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - oee_availability_performance_quality
+          - downtime_reason_code_analytics
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: quality_spc
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - spc_control_charts
+          - first_pass_yield_analytics
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "pandas", "scipy"]
+  - when:
+      all:
+        - field: product_type
+          equals: predictive_maintenance
+    actions:
+      - op: set
+        path: recommended_template
+        value: ml_pipeline
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - condition_monitoring
+          - remaining_useful_life_scoring
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "scikit-learn", "Apache Kafka"]
+  - when:
+      all:
+        - field: product_type
+          equals: traceability_genealogy
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - batch_genealogy_as_built
+          - lot_track_and_trace
+      - op: append_unique
+        path: architecture_suggestions
+        value: Model as-built genealogy as directed edges between consumed material lots and produced lots for recall traceability
+  - when:
+      all:
+        - field: product_type
+          equals: supplier_scorecards
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - supplier_ppm_quality
+          - on_time_in_full_otif
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: isa95_level_focus
+          equals: workunit_equipment
+    actions:
+      - op: append_unique
+        path: architecture_suggestions
+        value: Ingest Level 0-2 signals (PLC / SCADA / sensor) via a historian or OPC UA gateway and downsample before aggregation
+  - when:
+      all:
+        - field: orchestration_pattern
+          equals: streaming
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: streaming_pipeline
+      - op: append_unique
+        path: technology_stack
+        value: ["Apache Kafka", "Apache Flink"]
+      - op: append_unique
+        path: architecture_suggestions
+        value: Use OPC UA / MQTT ingestion for shop-floor telemetry with buffering for intermittent line connectivity
+  - when:
+      all:
+        - field: compliance_requirements
+          in: ["iso_9001", "iatf_16949", "iso_22400", "cfr_part_11", "iec_62443"]
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Segment OT and IT networks per the Purdue / IEC 62443 model
+          - Enforce role-based access with change control for KPI and quality definitions
+          - Retain quality and traceability records for the regulated retention period
+  - when:
+      all:
+        - field: compliance_requirements
+          equals: cfr_part_11
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Implement 21 CFR Part 11 electronic-records controls (audit trail, e-signatures, tamper-evidence)
+          - Validate the pipeline under a GAMP 5 computerized-system-validation approach
+  - when:
+      all:
+        - field: compliance_requirements
+          equals: iatf_16949
+    actions:
+      - op: append_unique
+        path: best_practices
+        value: Align supplier PPM, PPAP, and APQP evidence to IATF 16949 automotive requirements
+
+next_step_tips:
+  - Confirm your ISA-95 equipment hierarchy and reason-code taxonomy with plant engineering before exposing OEE
+  - Validate OEE, yield, and downtime definitions against ISO 22400 so multi-plant comparisons are fair
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: compliance_requirements
+          in: ["cfr_part_11", "iec_62443"]
+    tips:
+      - Review OT/IT segmentation and electronic-records controls with your validation and security teams

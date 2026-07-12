@@ -1,0 +1,235 @@
+name: pharma
+domain: pharma
+description: Expert in pharma & life-sciences data products, GxP-validated pipelines, CDISC clinical modeling, and 21 CFR Part 11 controls
+
+# Data Mesh product types this agent supports.
+# Life-sciences mesh: SDP for source acquisition (EDC/LIMS/MES batch
+# records, safety case intake, instrument data); ADP for standardized
+# aggregates (CDISC SDTM/ADaM datasets, batch genealogy, signal
+# aggregation); CDP for consumption surfaces (submission datasets,
+# quality dashboards, PV signal reviews, IDMP product data).
+supported_data_product_types: [SDP, ADP, CDP]
+
+questions:
+  - key: product_type
+    question: What type of life-sciences data product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: Clinical Trials (CDISC SDTM / ADaM)
+        value: clinical_trials
+        aliases: ["clinical", "clinical trials", "cdisc", "sdtm", "adam", "edc", "study"]
+      - label: Pharmacovigilance & Safety
+        value: pharmacovigilance
+        aliases: ["pharmacovigilance", "safety", "pv", "adverse event", "signal", "e2b"]
+      - label: Manufacturing & Batch (GMP)
+        value: manufacturing_batch
+        aliases: ["manufacturing", "batch", "gmp", "genealogy", "mes", "cpv", "yield"]
+      - label: Quality & LIMS
+        value: quality_lims
+        aliases: ["quality", "lims", "qc", "stability", "deviation", "capa"]
+      - label: Regulatory & Product Data (IDMP)
+        value: regulatory_idmp
+        aliases: ["regulatory", "idmp", "iso 11615", "product data", "submission", "spor"]
+  - key: data_sources
+    question: What data sources will you use?
+    type: text
+    required: true
+    default: EDC/clinical databases, LIMS, MES/batch records, safety case system, instrument data, regulatory product master
+  - key: gxp_scope
+    question: Is this a GxP-regulated (validated) system?
+    type: choice
+    default: "yes"
+    choices:
+      - label: "Yes"
+        value: "yes"
+        aliases: ["y", "yeah", "gxp", "gmp", "gcp", "glp", "validated", "regulated"]
+      - label: "No"
+        value: "no"
+        aliases: ["n", "nope", "research", "non-gxp", "not really"]
+  - key: compliance_requirements
+    question: Which regulatory framework is primary?
+    type: choice
+    required: false
+    choices:
+      - label: FDA 21 CFR Part 11 (electronic records)
+        value: cfr_part_11
+        aliases: ["21 cfr part 11", "part 11", "electronic records", "esignature"]
+      - label: EU Annex 11 (computerised systems)
+        value: eu_annex_11
+        aliases: ["annex 11", "eudralex", "eu annex 11"]
+      - label: CDISC (clinical data standards)
+        value: cdisc
+        aliases: ["cdisc", "sdtm", "adam", "define-xml", "cdash"]
+      - label: HIPAA (patient privacy)
+        value: hipaa
+        aliases: ["hipaa", "phi", "patient privacy"]
+      - label: None / not sure
+        value: none
+        aliases: ["none", "not sure", "no compliance"]
+  - key: orchestration_pattern
+    question: What pipeline scheduling pattern fits best?
+    type: choice
+    required: false
+    choices:
+      - label: Study / batch cadence (per-study, per-batch)
+        value: event_driven
+        aliases: ["study", "batch", "per study", "per batch", "event", "release"]
+      - label: Daily batch (data cuts, reconciliation)
+        value: daily_batch
+        aliases: ["daily", "batch", "data cut", "nightly", "reconciliation"]
+      - label: Real-time (instrument / process telemetry)
+        value: streaming
+        aliases: ["real time", "streaming", "instrument", "process", "telemetry"]
+      - label: Manual / milestone (submission, interim)
+        value: manual
+        aliases: ["manual", "milestone", "submission", "interim", "on demand"]
+
+resolver_defaults:
+  product_type: clinical_trials
+  gxp_scope: "yes"
+  compliance_requirements: cfr_part_11
+  orchestration_pattern: event_driven
+
+suggestion_defaults:
+  recommended_template: analytics
+  recommended_provider: aws
+  canonical_model: cdisc
+  supporting_standards:
+    - gxp_data_integrity_alcoa
+    - idmp_iso_11615
+  recommended_patterns:
+    - cdisc_sdtm_adam_pipeline
+    - gxp_validated_pipeline
+  architecture_suggestions:
+    - Design the pipeline as a GxP-validated system (GAMP 5 category, URS → IQ/OQ/PQ) with documented data-integrity controls
+    - Model clinical data to CDISC — SDTM for tabulation, ADaM for analysis — with Define-XML metadata
+    - Enforce ALCOA+ data integrity (attributable, legible, contemporaneous, original, accurate) across every transform
+    - Preserve batch genealogy and full traceability for manufacturing; keep raw and derived data linked and immutable
+  best_practices:
+    - Keep an immutable, contemporaneous audit trail for every record create / modify / delete
+    - Version and control derivation logic; changes go through change control with impact assessment
+    - Trace lineage from source (EDC / LIMS / MES) through to submission or release datasets
+    - Segregate roles (maker / checker / approver) with electronic signatures where required
+    - Validate the pipeline and revalidate on change; retain qualification evidence for the regulated period
+  technology_stack: []
+  security_requirements: []
+
+rules:
+  - when:
+      all:
+        - field: product_type
+          equals: clinical_trials
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - cdisc_sdtm_adam_pipeline
+          - define_xml_metadata
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "R", "SQL"]
+  - when:
+      all:
+        - field: product_type
+          equals: pharmacovigilance
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - e2b_case_intake
+          - safety_signal_aggregation
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: manufacturing_batch
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - batch_genealogy_as_built
+          - continued_process_verification_cpv
+      - op: append_unique
+        path: architecture_suggestions
+        value: Model batch genealogy (materials, equipment, process parameters) for GMP traceability and CPV trending
+  - when:
+      all:
+        - field: product_type
+          equals: quality_lims
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - stability_trending
+          - deviation_capa_analytics
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: regulatory_idmp
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - idmp_product_master
+          - substance_product_identification
+      - op: append_unique
+        path: architecture_suggestions
+        value: Model medicinal-product data to IDMP (ISO 11615/11616/11238/11239) for regulatory submission and SPOR alignment
+  - when:
+      all:
+        - field: gxp_scope
+          equals: "yes"
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Enforce ALCOA+ data-integrity controls end to end
+          - Maintain a tamper-evident audit trail and role-based electronic signatures
+          - Apply computerized-system validation (GAMP 5) with change control and periodic review
+  - when:
+      all:
+        - field: compliance_requirements
+          equals: cfr_part_11
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value: Implement 21 CFR Part 11 controls for electronic records and signatures (audit trail, access, copies)
+  - when:
+      all:
+        - field: compliance_requirements
+          equals: hipaa
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Protect PHI with encryption, minimum-necessary access, and de-identification where possible
+          - Maintain HIPAA audit controls and breach-notification readiness
+  - when:
+      all:
+        - field: orchestration_pattern
+          equals: streaming
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: streaming_pipeline
+      - op: append_unique
+        path: technology_stack
+        value: ["Apache Kafka", "Apache Flink"]
+
+next_step_tips:
+  - Confirm the GAMP 5 validation approach and data-integrity (ALCOA+) controls with your QA / CSV team
+  - Align clinical outputs to CDISC SDTM/ADaM with Define-XML before any submission
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: gxp_scope
+          equals: "yes"
+    tips:
+      - Plan validation (IQ/OQ/PQ), audit-trail review, and change control before go-live

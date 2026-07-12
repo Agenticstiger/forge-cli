@@ -1,0 +1,225 @@
+name: education
+domain: education
+description: Expert in education data products, Ed-Fi / OneRoster interoperability, Caliper learning analytics, and FERPA-aware governance
+
+# Data Mesh product types this agent supports.
+# Education mesh: SDP for SIS/LMS acquisition (rostering, enrollment,
+# Caliper events, assessment feeds); ADP for Ed-Fi / CEDS-aligned
+# aggregates (attendance, outcomes, growth); CDP for consumption
+# surfaces (early-warning dashboards, state reporting, educator and
+# family portals).
+supported_data_product_types: [SDP, ADP, CDP]
+
+questions:
+  - key: product_type
+    question: What type of education data product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: Student Information / SIS Analytics
+        value: sis_analytics
+        aliases: ["sis", "student information", "enrollment", "attendance", "demographics"]
+      - label: Learning Analytics (Caliper)
+        value: learning_analytics
+        aliases: ["learning analytics", "caliper", "engagement", "lms", "clickstream"]
+      - label: Rostering & Provisioning (OneRoster)
+        value: rostering
+        aliases: ["rostering", "oneroster", "classes", "sections", "enrollments", "provisioning"]
+      - label: Assessment & Outcomes
+        value: assessment_outcomes
+        aliases: ["assessment", "outcomes", "grades", "growth", "proficiency", "test scores"]
+      - label: Early Warning / At-Risk
+        value: early_warning
+        aliases: ["early warning", "at risk", "dropout", "chronic absence", "ews"]
+  - key: data_sources
+    question: What data sources will you use?
+    type: text
+    required: true
+    default: SIS (enrollment/attendance), LMS Caliper events, OneRoster feeds, assessment vendors, gradebook, state reporting extracts
+  - key: standard_focus
+    question: Which education data standard is the best fit?
+    type: choice
+    required: true
+    choices:
+      - label: Ed-Fi Data Standard
+        value: ed_fi
+        aliases: ["ed-fi", "edfi", "ed fi", "ods", "api"]
+      - label: 1EdTech OneRoster
+        value: oneroster
+        aliases: ["oneroster", "1edtech", "rostering", "csv", "rest"]
+      - label: 1EdTech Caliper Analytics
+        value: caliper
+        aliases: ["caliper", "learning events", "sensor api"]
+      - label: CEDS (Common Education Data Standards)
+        value: ceds
+        aliases: ["ceds", "common education", "p20w", "state data"]
+  - key: student_pii_scope
+    question: Does this include personally identifiable student records (FERPA)?
+    type: choice
+    default: "yes"
+    choices:
+      - label: "Yes"
+        value: "yes"
+        aliases: ["y", "yeah", "ferpa", "pii", "student records", "identifiable"]
+      - label: "No"
+        value: "no"
+        aliases: ["n", "nope", "aggregate only", "de-identified", "not really"]
+  - key: orchestration_pattern
+    question: What pipeline scheduling pattern fits best?
+    type: choice
+    required: false
+    choices:
+      - label: Nightly SIS / roster sync
+        value: daily_batch
+        aliases: ["nightly", "daily", "batch", "sync", "sis sync"]
+      - label: Near-real-time learning events (Caliper)
+        value: streaming
+        aliases: ["real time", "streaming", "caliper", "events", "clickstream"]
+      - label: Term / grading-period batch
+        value: term_batch
+        aliases: ["term", "grading period", "semester", "marking period"]
+      - label: Event-driven (enrollment change, grade posted)
+        value: event_driven
+        aliases: ["event", "enrollment change", "grade posted", "triggered"]
+
+resolver_defaults:
+  product_type: sis_analytics
+  standard_focus: ed_fi
+  student_pii_scope: "yes"
+  orchestration_pattern: daily_batch
+
+suggestion_defaults:
+  recommended_template: analytics
+  recommended_provider: gcp
+  canonical_model: ed_fi
+  supporting_standards:
+    - oneroster_1edtech
+    - ceds_common_education
+  recommended_patterns:
+    - ed_fi_unifying_data_model
+    - student_enrollment_attendance_facts
+  architecture_suggestions:
+    - Use the Ed-Fi Unifying Data Model as the canonical schema for students, staff, sections, enrollments, and outcomes
+    - Ingest rostering via OneRoster and learning events via Caliper, mapping both into the Ed-Fi canonical model
+    - Key entities on stable student and school identifiers so cross-system joins survive vendor changes
+    - Separate identifiable operational data from de-identified analytical extracts, gated by FERPA disclosure rules
+  best_practices:
+    - Track enrollment with effective dates so point-in-time counts and mobility are reconstructable
+    - Standardize attendance, discipline, and outcome code taxonomies before aggregation
+    - Trace lineage from SIS/LMS sources through to exposed outcome and early-warning indicators
+    - Apply FERPA data-sharing rules (school-official / directory-info exceptions) with least-privilege access
+    - Version outcome, growth, and at-risk definitions with the project
+  technology_stack: []
+  security_requirements: []
+
+rules:
+  - when:
+      all:
+        - field: product_type
+          equals: sis_analytics
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - student_enrollment_attendance_facts
+          - mobility_cohort_tracking
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: learning_analytics
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - caliper_event_modeling
+          - engagement_time_on_task
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "Apache Kafka", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: rostering
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - oneroster_sync
+          - section_enrollment_provisioning
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: assessment_outcomes
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - assessment_result_normalization
+          - academic_growth_analytics
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: early_warning
+    actions:
+      - op: set
+        path: recommended_template
+        value: ml_pipeline
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - early_warning_indicators
+          - dropout_risk_scoring
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "scikit-learn", "dbt"]
+  - when:
+      all:
+        - field: standard_focus
+          equals: caliper
+    actions:
+      - op: append_unique
+        path: architecture_suggestions
+        value: Model learning events with the Caliper metric profiles (actor / action / object) for standard engagement analytics
+  - when:
+      all:
+        - field: orchestration_pattern
+          equals: streaming
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: streaming_pipeline
+      - op: append_unique
+        path: technology_stack
+        value: ["Apache Kafka", "Apache Flink"]
+  - when:
+      all:
+        - field: student_pii_scope
+          equals: "yes"
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Apply FERPA controls — restrict PII to legitimate educational interest, log disclosures, honor consent
+          - Separate directory-information from protected fields and default to de-identification for analytics
+          - Enforce least-privilege access and encryption for student records
+
+next_step_tips:
+  - Confirm Ed-Fi / OneRoster mappings and stable student identifiers with your SIS and vendors
+  - Classify every field for FERPA sensitivity before exposing analytics or portals
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: student_pii_scope
+          equals: "yes"
+    tips:
+      - Review FERPA data-sharing exceptions, disclosure logging, and de-identification with your privacy office

@@ -1,0 +1,223 @@
+name: energy
+domain: energy
+description: Expert in energy & utilities data products, IEC CIM grid modeling, AMI meter analytics, and NERC CIP compliance
+
+# Data Mesh product types this agent supports.
+# Energy mesh: SDP for AMI/SCADA acquisition (interval meter reads,
+# telemetry, PMU/DER signals); ADP for IEC CIM-aligned aggregates (load
+# profiles, outage/reliability indices, grid state); CDP for consumption
+# surfaces (regulator filings, customer energy portals, load-forecast
+# model inputs, DER dispatch).
+supported_data_product_types: [SDP, ADP, CDP]
+
+questions:
+  - key: product_type
+    question: What type of energy / utility data product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: AMI / Smart-Meter Analytics
+        value: ami_meter_analytics
+        aliases: ["ami", "amr", "meter", "smart meter", "interval reads", "mdm"]
+      - label: Grid & Network Telemetry
+        value: grid_telemetry
+        aliases: ["grid", "scada", "telemetry", "pmu", "network model", "topology"]
+      - label: Outage & Reliability (SAIDI/SAIFI)
+        value: outage_reliability
+        aliases: ["outage", "reliability", "saidi", "saifi", "oms", "restoration"]
+      - label: Load & Demand Forecasting (weather joins)
+        value: load_forecasting
+        aliases: ["load forecast", "demand", "forecasting", "weather", "peak"]
+      - label: DER & Renewables Integration
+        value: der_renewables
+        aliases: ["der", "renewables", "solar", "ev", "distributed energy", "storage"]
+  - key: data_sources
+    question: What data sources will you use?
+    type: text
+    required: true
+    default: AMI interval reads, SCADA/PMU telemetry, OMS outage events, CIM network model, weather feeds, billing/CIS
+  - key: standard_focus
+    question: Which energy data standard is the best fit?
+    type: choice
+    required: true
+    choices:
+      - label: IEC CIM (61968 / 61970) grid model
+        value: iec_cim
+        aliases: ["cim", "iec cim", "61968", "61970", "common information model"]
+      - label: Green Button / ESPI (customer usage)
+        value: green_button
+        aliases: ["green button", "espi", "customer usage", "energy services provider"]
+      - label: IEEE 2030.5 (smart energy / DER)
+        value: ieee_2030_5
+        aliases: ["2030.5", "ieee 2030", "sep2", "smart energy profile"]
+      - label: OpenADR (demand response)
+        value: openadr
+        aliases: ["openadr", "demand response", "dr signals"]
+  - key: nerc_cip_scope
+    question: Does this touch the Bulk Electric System (NERC CIP in scope)?
+    type: choice
+    default: "no"
+    choices:
+      - label: "Yes"
+        value: "yes"
+        aliases: ["y", "yeah", "nerc", "nerc cip", "bes", "bulk electric system", "critical infrastructure"]
+      - label: "No"
+        value: "no"
+        aliases: ["n", "nope", "distribution only", "not really"]
+  - key: orchestration_pattern
+    question: What pipeline scheduling pattern fits best?
+    type: choice
+    required: false
+    choices:
+      - label: Real-time SCADA / PMU telemetry
+        value: streaming
+        aliases: ["real time", "streaming", "scada", "pmu", "telemetry"]
+      - label: Interval batch (15-min / hourly meter reads)
+        value: micro_batch
+        aliases: ["interval", "15 min", "hourly", "micro batch", "meter reads"]
+      - label: Daily settlement / billing batch
+        value: daily_batch
+        aliases: ["daily", "batch", "settlement", "billing", "nightly"]
+      - label: Event-driven (outage, DER dispatch, DR event)
+        value: event_driven
+        aliases: ["event", "outage", "dispatch", "dr event", "triggered"]
+
+resolver_defaults:
+  product_type: ami_meter_analytics
+  standard_focus: iec_cim
+  nerc_cip_scope: "no"
+  orchestration_pattern: micro_batch
+
+suggestion_defaults:
+  recommended_template: analytics
+  recommended_provider: snowflake
+  canonical_model: iec_cim
+  supporting_standards:
+    - green_button_espi
+    - ieee_2030_5
+  recommended_patterns:
+    - iec_cim_network_model
+    - ami_interval_read_profiling
+  architecture_suggestions:
+    - Use the IEC CIM (61968/61970) as the canonical semantic model for assets, measurements, and network topology
+    - Model AMI interval reads as a time-series fact keyed on meter, channel, and read timestamp with validation flags (VEE)
+    - Join grid, meter, and weather data on canonical location and time so load and outage analytics stay comparable
+    - Keep customer-usage exposure aligned to Green Button / ESPI so third-party sharing is standard and consent-scoped
+  best_practices:
+    - Apply VEE (validation, estimation, editing) to interval reads before exposing consumption KPIs
+    - Compute reliability indices (SAIDI / SAIFI / CAIDI) from OMS outage events with a consistent customer-count basis
+    - Trace lineage from SCADA/AMI acquisition through to exposed grid and customer KPIs
+    - Model DER and load telemetry with explicit units and sign conventions (import vs export)
+    - Version reliability, load, and forecast definitions with the project
+  technology_stack: []
+  security_requirements: []
+
+rules:
+  - when:
+      all:
+        - field: product_type
+          equals: ami_meter_analytics
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - ami_interval_read_profiling
+          - vee_validation_estimation_editing
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: grid_telemetry
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - iec_cim_network_model
+          - state_estimation_inputs
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "Apache Kafka", "Apache Flink"]
+  - when:
+      all:
+        - field: product_type
+          equals: outage_reliability
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - saidi_saifi_reliability_indices
+          - outage_restoration_analytics
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: load_forecasting
+    actions:
+      - op: set
+        path: recommended_template
+        value: ml_pipeline
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - weather_normalized_load_forecast
+          - peak_demand_prediction
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "scikit-learn", "Prophet"]
+  - when:
+      all:
+        - field: product_type
+          equals: der_renewables
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - der_telemetry_aggregation
+          - net_metering_settlement
+      - op: append_unique
+        path: architecture_suggestions
+        value: Model DER assets and dispatch signals per IEEE 2030.5 with explicit import/export sign conventions
+  - when:
+      all:
+        - field: orchestration_pattern
+          equals: streaming
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: streaming_pipeline
+      - op: append_unique
+        path: technology_stack
+        value: ["Apache Kafka", "Apache Flink"]
+      - op: append_unique
+        path: architecture_suggestions
+        value: Ingest SCADA / PMU telemetry as a high-rate stream with downsampling and quality flags before aggregation
+  - when:
+      all:
+        - field: nerc_cip_scope
+          equals: "yes"
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Apply NERC CIP controls (CIP-002 asset categorization through CIP-011 information protection) to BES Cyber System Information
+          - Enforce electronic and physical security perimeters, access management, and change control for in-scope systems
+          - Maintain NERC CIP audit evidence, logging, and incident-response records
+      - op: append_unique
+        path: architecture_suggestions
+        value: Classify and segregate BES Cyber System Information (BCSI) and restrict it to the electronic security perimeter
+
+next_step_tips:
+  - Confirm your IEC CIM network model and meter-channel taxonomy with grid engineering
+  - Validate VEE rules and reliability-index definitions before exposing customer or regulator KPIs
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: nerc_cip_scope
+          equals: "yes"
+    tips:
+      - Review NERC CIP scope, BCSI handling, and security-perimeter controls with your compliance team

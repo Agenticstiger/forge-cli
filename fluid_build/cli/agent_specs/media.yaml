@@ -1,0 +1,224 @@
+name: media
+domain: media
+description: Expert in media & entertainment data products, EIDR/MovieLabs content modeling, streaming QoE, and audience & ad analytics
+
+# Data Mesh product types this agent supports.
+# Media mesh: SDP for playback/CDN/ad and content-metadata acquisition;
+# ADP for MovieLabs-aligned aggregates (title performance, QoE rollups,
+# audience segments); CDP for consumption surfaces (programming and
+# content dashboards, ad yield, rights/avails, recommendation model
+# inputs).
+supported_data_product_types: [SDP, ADP, CDP]
+
+questions:
+  - key: product_type
+    question: What type of media / streaming data product are you building?
+    type: choice
+    required: true
+    choices:
+      - label: Content Metadata & Catalog (EIDR)
+        value: content_metadata
+        aliases: ["content", "metadata", "catalog", "eidr", "title", "avails"]
+      - label: Streaming Quality of Experience (QoE)
+        value: streaming_qoe
+        aliases: ["qoe", "quality of experience", "playback", "rebuffer", "startup time", "cdn"]
+      - label: Audience & Engagement Analytics
+        value: audience_engagement
+        aliases: ["audience", "engagement", "viewership", "retention", "churn", "consumption"]
+      - label: Ad Monetization (VAST / OpenRTB)
+        value: ad_monetization
+        aliases: ["ad", "advertising", "vast", "openrtb", "yield", "fill rate", "monetization"]
+      - label: Rights & Avails Management
+        value: rights_avails
+        aliases: ["rights", "avails", "licensing", "windowing", "territories"]
+  - key: data_sources
+    question: What data sources will you use?
+    type: text
+    required: true
+    default: Player/playback telemetry, CDN logs, ad server (VAST/OpenRTB), content metadata (EIDR/Common Metadata), subscription/CRM
+  - key: standard_focus
+    question: Which media data standard is the best fit?
+    type: choice
+    required: true
+    choices:
+      - label: EIDR (Entertainment ID Registry)
+        value: eidr
+        aliases: ["eidr", "content id", "entertainment id", "title id"]
+      - label: MovieLabs Ontology (OMC / OMD)
+        value: movielabs_ontology
+        aliases: ["movielabs", "ontology", "omc", "omd", "creative works"]
+      - label: SMPTE / Common Metadata / Avails
+        value: smpte_common_metadata
+        aliases: ["smpte", "common metadata", "mdmec", "avails", "bxf"]
+      - label: VAST / OpenRTB (ad tech)
+        value: vast_openrtb
+        aliases: ["vast", "openrtb", "ad tech", "vpaid", "bidstream"]
+  - key: real_time_playback
+    question: Do you need near-real-time playback / QoE telemetry?
+    type: choice
+    default: "yes"
+    choices:
+      - label: "Yes"
+        value: "yes"
+        aliases: ["y", "yeah", "real time", "playback", "qoe", "streaming"]
+      - label: "No"
+        value: "no"
+        aliases: ["n", "nope", "batch", "not really"]
+  - key: orchestration_pattern
+    question: What pipeline scheduling pattern fits best?
+    type: choice
+    required: false
+    choices:
+      - label: Real-time playback / ad events
+        value: streaming
+        aliases: ["real time", "streaming", "playback", "ad events", "heartbeat"]
+      - label: Micro-batch (every 5-15 minutes)
+        value: micro_batch
+        aliases: ["micro batch", "5 min", "15 min", "frequent"]
+      - label: Daily batch (audience, catalog, royalties)
+        value: daily_batch
+        aliases: ["daily", "batch", "nightly", "royalties", "reporting"]
+      - label: Event-driven (title publish, license change)
+        value: event_driven
+        aliases: ["event", "publish", "license change", "avail", "triggered"]
+
+resolver_defaults:
+  product_type: streaming_qoe
+  standard_focus: eidr
+  real_time_playback: "yes"
+  orchestration_pattern: streaming
+
+suggestion_defaults:
+  recommended_template: analytics
+  recommended_provider: gcp
+  canonical_model: movielabs_omc
+  supporting_standards:
+    - eidr_content_identifiers
+    - smpte_common_metadata
+  recommended_patterns:
+    - eidr_canonical_content_id
+    - qoe_playback_session_model
+  architecture_suggestions:
+    - Use EIDR as the canonical content identifier so titles reconcile across catalog, playback, ad, and rights systems
+    - Model creative works and media assets with the MovieLabs Ontology (OMC / OMD) for consistent semantics
+    - Build the playback session as the QoE grain (startup time, rebuffer ratio, bitrate, errors) from player heartbeats
+    - Separate content metadata, consumption events, and monetization into distinct products joined on EIDR + session keys
+  best_practices:
+    - Standardize QoE metrics (video start time, rebuffering ratio, exit-before-video-start) before comparing devices or CDNs
+    - Key audience and ad analytics on canonical content identifiers to avoid title-matching drift
+    - Trace lineage from raw playback / ad events through to exposed engagement and yield KPIs
+    - Reconcile ad impressions and revenue (VAST/OpenRTB) against billing before exposing yield
+    - Version QoE, engagement, and yield definitions with the project
+  technology_stack: []
+  security_requirements: []
+
+rules:
+  - when:
+      all:
+        - field: product_type
+          equals: content_metadata
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - eidr_canonical_content_id
+          - catalog_metadata_normalization
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: streaming_qoe
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - qoe_playback_session_model
+          - cdn_performance_analytics
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "Apache Kafka", "Apache Flink"]
+  - when:
+      all:
+        - field: product_type
+          equals: audience_engagement
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - viewership_retention_curves
+          - churn_propensity
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: ad_monetization
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - vast_openrtb_event_modeling
+          - ad_yield_fill_rate
+      - op: append_unique
+        path: technology_stack
+        value: ["Python", "SQL", "dbt"]
+  - when:
+      all:
+        - field: product_type
+          equals: rights_avails
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value:
+          - avails_windowing_model
+          - territory_rights_resolution
+      - op: append_unique
+        path: architecture_suggestions
+        value: Model licensing windows, territories, and rights on EIDR-keyed titles so availability is deterministic
+  - when:
+      all:
+        - field: standard_focus
+          equals: vast_openrtb
+    actions:
+      - op: append_unique
+        path: architecture_suggestions
+        value: Normalize VAST tracking and OpenRTB bidstream events into a canonical impression model before yield analytics
+  - when:
+      all:
+        - field: real_time_playback
+          equals: "yes"
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: streaming_pipeline
+      - op: append_unique
+        path: technology_stack
+        value: ["Apache Kafka", "Apache Flink"]
+      - op: append_unique
+        path: architecture_suggestions
+        value: Ingest player heartbeats as a high-volume stream with sessionization and late-event handling for accurate QoE
+  - when:
+      all:
+        - field: product_type
+          in: ["audience_engagement", "ad_monetization"]
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Apply privacy controls and consent (GDPR/CCPA) to viewer identifiers and behavioral data
+          - Pseudonymize audience identifiers and restrict cross-product joins to permitted purposes
+
+next_step_tips:
+  - Confirm EIDR content identifiers and MovieLabs semantic mappings across catalog, playback, and ad systems
+  - Standardize QoE metric definitions before comparing devices, players, or CDNs
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: product_type
+          in: ["audience_engagement", "ad_monetization"]
+    tips:
+      - Review viewer-privacy, consent, and identifier-pseudonymization controls with your privacy team
