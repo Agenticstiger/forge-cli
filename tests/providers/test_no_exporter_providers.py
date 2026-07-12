@@ -85,7 +85,7 @@ def test_exporter_packages_explicitly_opt_out_of_autoregistration():
     import importlib
 
     for modname in (
-        "fluid_build.providers.odps",
+        "fluid_build.providers.opds",
         "fluid_build.providers.odcs",
         "fluid_build.providers.odps_standard",
     ):

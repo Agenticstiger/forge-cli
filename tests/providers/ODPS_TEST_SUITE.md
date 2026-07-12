@@ -112,7 +112,7 @@ pytest tests/providers/test_odps_provider_enhanced.py -v
 pytest tests/providers/test_odps_provider_enhanced.py::TestEdgeCases -v
 
 # Run with coverage
-pytest tests/providers/test_odps_provider_enhanced.py --cov=fluid_build.providers.odps
+pytest tests/providers/test_odps_provider_enhanced.py --cov=fluid_build.providers.opds
 
 # Run all provider tests together
 pytest tests/providers/test_odcs_provider.py tests/providers/test_odps_provider_enhanced.py -v
@@ -333,7 +333,7 @@ Add to `.gitlab-ci.yml` or GitHub Actions:
 test_odps_provider:
   script:
     - pip install pytest pytest-cov
-    - pytest tests/providers/test_odps_provider_enhanced.py -v --cov=fluid_build.providers.odps --cov-report=term-missing
+    - pytest tests/providers/test_odps_provider_enhanced.py -v --cov=fluid_build.providers.opds --cov-report=term-missing
   coverage: '/TOTAL.*\s+(\d+%)$/'
 ```
 
@@ -364,7 +364,7 @@ pytest tests/providers/test_odcs_provider.py tests/providers/test_odps_provider_
 # Run with coverage for both
 pytest tests/providers/test_odcs_provider.py tests/providers/test_odps_provider_enhanced.py \
   --cov=fluid_build.providers.odcs \
-  --cov=fluid_build.providers.odps \
+  --cov=fluid_build.providers.opds \
   --cov-report=term-missing
 ```
 
@@ -380,11 +380,11 @@ Tests are self-contained with fixtures and don't require external files. Update 
 ## Related Files
 
 - **Implementation**: 
-  - `fluid_build/providers/odps/odps.py` (952 lines)
-  - `fluid_build/providers/odps/serializer.py` (160 lines)
-  - `fluid_build/providers/odps/validator.py` (240 lines)
+  - `fluid_build/providers/opds/opds.py` (952 lines)
+  - `fluid_build/providers/opds/serializer.py` (160 lines)
+  - `fluid_build/providers/opds/validator.py` (240 lines)
 - **Documentation**: 
-  - `fluid_build/providers/odps/odps.md`
+  - `fluid_build/providers/opds/opds.md`
   - `tests/providers/ODPS_TEST_SUITE.md` (this file)
 - **Related Tests**: 
   - `tests/providers/test_odcs_provider.py` (ODCS provider tests)

@@ -12,19 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# fluid_build/providers/odps/validator.py
+# fluid_build/providers/opds/validator.py
 """
 OPDS JSON Schema Validator
 
-Validates OPDS (Open Data Product Specification) artifacts against the
-official OPDS v4.1 JSON Schema.
+Validates OPDS artifacts against the official OPDS v4.1 JSON Schema.
 
-The schema is VENDORED alongside this module (``odps-schema-v4.1.json``),
+**OPDS** is fluid's disambiguating name for the Linux Foundation / ODPI
+**Open Data Product Specification** v4.1. Upstream abbreviates it *ODPS*, but
+that acronym also fits Bitol's *Open Data Product Standard* (this repo's
+``providers/odps_standard/``); fluid uses **OPDS** for the LF/ODPI spec so the
+three data-product standards stay unambiguous: ``OPDS`` (LF/ODPI Specification),
+``ODPS-Bitol`` (Bitol Standard), ``ODCS`` (Bitol Contract Standard).
+
+The schema is VENDORED alongside this module (``opds-schema-v4.1.0.json``),
 copied verbatim from the upstream specification repository
-github.com/Open-Data-Product-Initiative/v4.1. Vendoring — rather than
-fetching the schema over the network at validation time — keeps validation
-deterministic, offline-capable, and pinned to a known schema version. This
-mirrors how the ODCS provider bundles ``odcs-schema-v3.1.0.json``.
+github.com/Open-Data-Product-Initiative/v4.1 (``source/schema/odps.json``).
+Vendoring — rather than fetching the schema over the network at validation
+time — keeps validation deterministic, offline-capable, and pinned to a known
+schema version. This mirrors how the ODCS provider bundles
+``odcs-schema-v3.1.0.json``.
 """
 
 from __future__ import annotations
@@ -40,6 +47,22 @@ LOG = logging.getLogger(__name__)
 _SCHEMA_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
+def _bundled_schema_candidates(version: str) -> List[str]:
+    """Candidate vendored-schema filenames for a requested ``version``.
+
+    The vendored file is pinned to the full semver (``opds-schema-v4.1.0.json``,
+    mirroring the ODCS sibling ``odcs-schema-v3.1.0.json``), but callers pass
+    the marketing version ``"4.1"``. Try the exact version first, then the
+    ``.0`` patch-normalised form so ``validate_against_opds_schema("4.1")``
+    resolves the ``v4.1.0`` file.
+    """
+    seen: List[str] = []
+    for cand in (f"opds-schema-v{version}.json", f"opds-schema-v{version}.0.json"):
+        if cand not in seen:
+            seen.append(cand)
+    return seen
+
+
 def _load_bundled_schema(version: str) -> Optional[Dict[str, Any]]:
     """Load the vendored OPDS JSON Schema for ``version`` from disk.
 
@@ -48,8 +71,12 @@ def _load_bundled_schema(version: str) -> Optional[Dict[str, Any]]:
     """
     if version in _SCHEMA_CACHE:
         return _SCHEMA_CACHE[version]
-    schema_path = Path(__file__).parent / f"odps-schema-v{version}.json"
-    if not schema_path.is_file():
+    here = Path(__file__).parent
+    schema_path = next(
+        (here / name for name in _bundled_schema_candidates(version) if (here / name).is_file()),
+        None,
+    )
+    if schema_path is None:
         LOG.debug("opds_schema_not_bundled", extra={"version": version})
         return None
     try:

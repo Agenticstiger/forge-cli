@@ -62,7 +62,7 @@ def run(args, logger: logging.Logger) -> int:
             "odps` emits Bitol ODPS v1.0.0.)"
         )
 
-        from fluid_build.providers.odps.odps import OdpsProvider
+        from fluid_build.providers.opds.opds import OdpsProvider
 
         c = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
         rendered = OdpsProvider().render(c)

@@ -19,28 +19,34 @@ artifacts plus a unified MANIFEST.json hashed over every output file.
 Dispatches to existing emitters (``generate standard``, ``policy-compile``,
 ``generate schedule``) without duplicating their logic.
 
-Output layout (default emit set — LF/ODPI ODPS v4.1 opt-in pending emitter fix)::
+Three data-product standards, kept unambiguous (see below)::
+
+    OPDS        LF/ODPI Open Data Product SPECIFICATION v4.1   → opds/*.opds.json
+    ODPS-Bitol  Bitol Open Data Product STANDARD v1.0.0        → odps-bitol/*.odps.yaml
+    ODCS        Bitol Open Data CONTRACT Standard v3.1.0       → odcs/*.odcs.yaml
+
+Output layout (full default emit set)::
 
     <out>/
     ├── MANIFEST.json                       # SHA-256 per file + merkle root
     ├── odcs/product.odcs.<exposeId>.yaml   # ODCS v3.1.0 (bitol-io) — one per exposed port
     ├── odps-bitol/<product>.odps.yaml      # ODPS-Bitol v1.0.0 (bitol-io)
+    ├── opds/<product>.opds.json            # OPDS v4.1 (LF/ODPI) — schema-validated
     ├── schedule/
     │   ├── dags/<product>_dag.py           # Airflow (Path A)
     │   └── flows/<product>_flow.py         # Prefect (Path A)
     └── policy/bindings.json                # compiled IAM/GRANT bindings
 
-Opt-in emitters (broken shape — see trello-verify-odps-linux-foundation)::
-
-    <out>/opds/<product>.opds.json          # should be ODPS v4.1 (LF/ODPI) but
-                                            # emits a homebrew {specVersion: "1.0", ...}
-                                            # shape that does NOT conform
-
-Note on terminology: this codebase historically used the letter-swap "OPDS"
-to refer to the Linux Foundation's Open Data Product Specification, whose
-canonical acronym is ODPS. The subdir name ``opds/`` and the emit key
-``opds`` are kept for back-compat; new code should use the canonical
-``odps`` key, with ``opds`` as a deprecated alias.
+Note on terminology: **OPDS** is fluid's name for the Linux Foundation / ODPI
+Open Data Product *Specification* v4.1. Upstream abbreviates it *ODPS*, but that
+collides with Bitol's Open Data Product *Standard* (emitted here as
+``odps-bitol``); fluid uses **OPDS** (subdir ``opds/``, emit key ``opds``,
+files ``*.opds.json``) so the two never blur. The bare ``odps`` emit key is a
+deprecated alias of ``opds`` — it warns and resolves to ``opds`` — kept only so
+pre-rename ``--emit odps`` callers keep working. The OPDS emitter now produces
+conformant ``{schema, version, product}`` v4.1 documents that validate against
+the vendored ``providers/opds/opds-schema-v4.1.0.json`` (stage-4
+``validate artifacts`` runs the check), so ``opds`` is back in the default set.
 
 dbt is NOT emitted here. Per plan decision D4, dbt project files are
 execution artifacts, not catalog artifacts — they stay in the product's
@@ -55,11 +61,11 @@ all three are independent of where the transformation code lives (B6).
 ``orchestration.engine`` — and ``policies`` emits an (empty, warned)
 bindings file when the contract declares no access policy.
 
-Upstream versions verified 2026-04-22:
+Upstream specs:
 
 - ODCS v3.1.0:               bitol-io/open-data-contract-standard
 - ODPS-Bitol v1.0.0:         bitol-io/open-data-product-standard
-- ODPS v4.1 (LF/ODPI):       Open-Data-Product-Initiative/v4.1 (emitter needs fix)
+- OPDS v4.1 (LF/ODPI):       Open-Data-Product-Initiative/v4.1 (schema-validated)
 """
 
 from __future__ import annotations
@@ -85,8 +91,11 @@ LOG = logging.getLogger("fluid.forge.core.artifact_fanout")
 # artifact per plan D4, owned by the product's code repo, not emitted by
 # generate-artifacts. Users asking for ``--emit dbt`` get a clear error
 # steering them to ``fluid generate speed-transformation``.
+# Canonical emit keys. The bare ``odps`` key is intentionally ABSENT — it is a
+# deprecated alias of ``opds`` (handled in ``parse_emit_set``), not a distinct
+# emitter. Keeping it out of ``EMIT_KEYS`` removes the old ``odps``-vs-``opds``
+# duplication and the cross-surface ambiguity with ``odps-bitol``.
 EMIT_KEYS: Tuple[str, ...] = (
-    "odps",
     "odps-bitol",
     "odcs",
     "opds",
@@ -94,26 +103,27 @@ EMIT_KEYS: Tuple[str, ...] = (
     "policies",
 )
 
-# Default emit set is restricted to emitters whose output has been verified
-# against the current upstream schema. As of 2026-04-22:
+# Default emit set. Every schema-pinned emitter validates against its vendored
+# upstream schema; the schema-free emitters (schedule/policies) are structural.
 #
 # - odcs         → bitol-io/open-data-contract-standard v3.1.0 — conformant ✅
 # - odps-bitol   → bitol-io/open-data-product-standard v1.0.0 — conformant ✅
-# - odps         → Open-Data-Product-Initiative/v4.1 (LF ODPS v4.1) — our
-#                  emitter produces a homebrew shape ({specVersion: "1.0", ...})
-#                  that does NOT match ODPS v4.1's expected shape
-#                  ({schema, version, product}). Opt-in only until fixed
-#                  (see trello-verify-odps-linux-foundation).
-# - opds         → deprecated letter-swap alias of ``odps`` — same broken
-#                  emitter, kept only for back-compat with pre-2026-05 callers.
+# - opds         → Open-Data-Product-Initiative/v4.1 (LF/ODPI OPDS v4.1). The
+#                  emitter produces the conformant ``{schema, version, product}``
+#                  v4.1 shape and validates against the vendored
+#                  ``providers/opds/opds-schema-v4.1.0.json`` — restored to the
+#                  default set once that validation went green.
 # - schedule     → DAG/flow files; shape is scheduler-specific not schema-pinned
 # - policies     → compiled IAM bindings; shape is internal
 #
-# Users can explicitly opt in to broken emitters via --emit odps,opds,...
-# while upstream alignment work is in flight.
+# All five emit keys are on by default (the historical card's target set:
+# odcs + odps-bitol + opds + schedule + policies). Order matches ``EMIT_KEYS``
+# because ``parse_emit_set`` canonicalises every resolved set into ``EMIT_KEYS``
+# order for a stable MANIFEST hash — so ``parse_emit_set(None) == DEFAULT_EMIT``.
 DEFAULT_EMIT: Tuple[str, ...] = (
     "odps-bitol",
     "odcs",
+    "opds",
     "schedule",
     "policies",
 )
@@ -305,6 +315,27 @@ def parse_emit_set(
     else:
         requested = [part.strip() for part in raw.split(",") if part.strip()]
 
+    # ``odps`` is a DEPRECATED letter-swap alias of the canonical ``opds`` key —
+    # both target the LF/ODPI Open Data Product Specification v4.1. Rewrite it to
+    # ``opds`` (with a one-time warning) BEFORE the unknown-key check so pre-rename
+    # ``--emit odps`` callers keep working and never emit to a separate subdir.
+    # ``odps-bitol`` is a distinct key (Bitol's Open Data Product Standard) and is
+    # deliberately left untouched.
+    if "odps" in requested:
+        logger.warning(
+            "deprecated_emit_key",
+            extra={
+                "alias": "odps",
+                "canonical": "opds",
+                "note": (
+                    "--emit odps is a deprecated alias of --emit opds (LF/ODPI "
+                    "Open Data Product Specification v4.1); resolving to opds. "
+                    "Bitol's Open Data Product Standard is --emit odps-bitol."
+                ),
+            },
+        )
+        requested = ["opds" if k == "odps" else k for k in requested]
+
     # dbt check — fail loud with actionable fix.
     if "dbt" in requested:
         raise FanoutError(
@@ -322,25 +353,6 @@ def parse_emit_set(
         raise FanoutError(
             f"unknown --emit keys: {sorted(unknown)}. Valid: {sorted(EMIT_KEYS)}",
             key=unknown[0],
-        )
-
-    # Deprecation note for the letter-swap alias. ``opds`` is still routed to
-    # its own subdir / emitter (different on-disk path than ``odps``), so we
-    # don't auto-rewrite — just nudge the operator toward the canonical key.
-    if "opds" in requested:
-        logger.warning(
-            "deprecated_emit_key",
-            extra={
-                "alias": "opds",
-                "canonical": "odps",
-                "note": (
-                    "--emit opds is a deprecated letter-swap alias of --emit odps; "
-                    "both target the Linux Foundation / ODPI ODPS v4.1 spec. The "
-                    "two keys still route to different on-disk subdirectories "
-                    "(opds/ vs odps/) for back-compat — pass --emit odps for the "
-                    "canonical layout."
-                ),
-            },
         )
 
     # Auto-skip for reference-only.
@@ -385,6 +397,13 @@ def _load_contract(contract_path: Path) -> Dict[str, Any]:
 
 
 def _emit_opds(contract_path: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:
+    """Emit the LF/ODPI OPDS v4.1 document (``opds/<slug>.opds.json``).
+
+    Routes through ``generate_standard._export_opds`` (the LF/ODPI Open Data
+    Product Specification exporter). The on-disk file is the bare
+    ``{schema, version, product}`` v4.1 document, which stage-4
+    ``validate artifacts`` checks against the vendored OPDS schema.
+    """
     from fluid_build.cli.generate_standard import _export_opds
 
     contract = _load_contract(contract_path)
@@ -392,17 +411,6 @@ def _emit_opds(contract_path: Path, out_dir: Path, logger: logging.Logger) -> Li
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{slug}.opds.json"
     _export_opds(str(contract_path), None, str(out), logger)
-    return [out]
-
-
-def _emit_odps(contract_path: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:
-    from fluid_build.cli.generate_standard import _export_odps
-
-    contract = _load_contract(contract_path)
-    slug = _slug_from_contract(contract)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{slug}.odps.yaml"
-    _export_odps(str(contract_path), None, str(out), logger)
     return [out]
 
 
@@ -605,7 +613,6 @@ def _emit_policies(contract_path: Path, out_dir: Path, logger: logging.Logger) -
 
 
 _DISPATCH = {
-    "odps": ("odps", _emit_odps),
     "odps-bitol": ("odps-bitol", _emit_odps_bitol),
     "odcs": ("odcs", _emit_odcs),
     "opds": ("opds", _emit_opds),

@@ -214,7 +214,7 @@ class TestCmdOpdsValidate:
             with (
                 patch("fluid_build.cli.odps.cprint"),
                 patch(
-                    "fluid_build.providers.odps.validator.validate_opds_structure",
+                    "fluid_build.providers.opds.validator.validate_opds_structure",
                     return_value=mock_result,
                 ),
             ):
@@ -243,7 +243,7 @@ class TestCmdOpdsValidate:
             with (
                 patch("fluid_build.cli.odps.console_error"),
                 patch(
-                    "fluid_build.providers.odps.validator.validate_opds_structure",
+                    "fluid_build.providers.opds.validator.validate_opds_structure",
                     return_value=mock_result,
                 ),
             ):
@@ -278,7 +278,7 @@ class TestCmdOpdsValidate:
             with (
                 patch("fluid_build.cli.odps.cprint"),
                 patch(
-                    "fluid_build.providers.odps.validator.validate_opds_structure",
+                    "fluid_build.providers.opds.validator.validate_opds_structure",
                     return_value=mock_result,
                 ),
             ):
@@ -329,7 +329,7 @@ class TestCmdOpdsValidate:
             with (
                 patch("fluid_build.cli.odps.cprint"),
                 patch(
-                    "fluid_build.providers.odps.validator.validate_opds_structure",
+                    "fluid_build.providers.opds.validator.validate_opds_structure",
                     return_value=mock_result,
                 ),
             ):
@@ -359,7 +359,7 @@ class TestCmdOpdsValidate:
             with (
                 patch("fluid_build.cli.odps.console_error"),
                 patch(
-                    "fluid_build.providers.odps.validator.validate_opds_structure",
+                    "fluid_build.providers.opds.validator.validate_opds_structure",
                     return_value=mock_result,
                 ),
             ):
@@ -393,7 +393,7 @@ class TestCmdOpdsValidate:
             with (
                 patch("fluid_build.cli.odps.cprint"),
                 patch(
-                    "fluid_build.providers.odps.validator.validate_opds_structure",
+                    "fluid_build.providers.opds.validator.validate_opds_structure",
                     return_value=mock_result,
                 ),
             ):

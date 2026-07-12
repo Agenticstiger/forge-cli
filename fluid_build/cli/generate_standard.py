@@ -212,7 +212,7 @@ def _export_odps_v4_1(contract_path: str, env, out: str, logger: logging.Logger)
     v4.1 document (``{schema, version, product}``) per the upstream spec, not
     the FLUID-internal wrapper.
     """
-    from fluid_build.providers.odps.odps import OdpsProvider
+    from fluid_build.providers.opds.opds import OdpsProvider
 
     c = load_contract_with_overlay(contract_path, env, logger)
     provider = OdpsProvider()

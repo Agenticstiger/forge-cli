@@ -88,19 +88,18 @@ class TestParseEmitSet:
         out = parse_emit_set("", reference_only=False, logger=logger)
         assert out == list(DEFAULT_EMIT)
 
-    def test_default_excludes_odps_and_opds(self, logger):
-        """Both 'odps' (alias of broken OPDS emitter) and 'opds' itself are
-        opt-in only because the current ``providers/odps/to_odps()`` produces
-        a homebrew ``{specVersion: "1.0", ...}`` shape that does NOT match
-        the real OPDS v4.1 schema (``{schema, version, product}``). Default
-        set is restricted to the verified-conformant emitters:
-        odcs (v3.1.0) + odps-bitol (v1.0.0). See
-        trello-verify-odps-linux-foundation.md for the fix plan."""
+    def test_default_includes_opds_and_all_conformant_emitters(self, logger):
+        """OPDS (LF/ODPI Open Data Product Specification v4.1) is back in the
+        default emit set: the ``providers/opds`` emitter now produces the
+        conformant ``{schema, version, product}`` v4.1 shape that validates
+        against the vendored ``opds-schema-v4.1.0.json``. The bare ``odps`` key
+        is a deprecated alias of ``opds`` (see the alias test below), so it is
+        not itself a member of the resolved default set."""
         out = parse_emit_set(None, reference_only=False, logger=logger)
-        assert "odps" not in out
-        assert "opds" not in out
-        assert "odps-bitol" in out  # conformant ✅
-        assert "odcs" in out  # conformant ✅
+        assert "opds" in out  # LF/ODPI OPDS v4.1 — conformant ✅
+        assert "odps" not in out  # bare 'odps' is only an alias, never resolved
+        assert "odps-bitol" in out  # Bitol Open Data Product Standard ✅
+        assert "odcs" in out  # Bitol Open Data Contract Standard ✅
 
     def test_dbt_is_rejected_loudly(self, logger):
         """dbt is NOT a catalog artifact. --emit dbt must fail with a clear
@@ -116,11 +115,21 @@ class TestParseEmitSet:
         assert "nonsense" in str(exc_info.value)
         assert exc_info.value.key == "nonsense"
 
-    def test_explicit_odps_opt_in_allowed(self, logger):
-        """The emitter itself isn't removed — users who know what they're
-        doing can opt in via --emit odps."""
-        out = parse_emit_set("odps", reference_only=False, logger=logger)
-        assert out == ["odps"]
+    def test_bare_odps_is_deprecated_alias_of_opds(self, logger, caplog):
+        """The bare ``odps`` emit key is a deprecated alias of ``opds`` (both
+        target the LF/ODPI Open Data Product Specification v4.1). It resolves
+        to ``opds`` — never emitting to a separate ``odps/`` subdir — and warns.
+        ``odps-bitol`` is a distinct key and is unaffected."""
+        with caplog.at_level(logging.WARNING):
+            out = parse_emit_set("odps", reference_only=False, logger=logger)
+        assert out == ["opds"]
+        assert any("deprecated_emit_key" in r.getMessage() for r in caplog.records)
+
+    def test_odps_bitol_is_not_rewritten_by_the_odps_alias(self, logger):
+        """Regression guard: the ``odps`` → ``opds`` alias must not touch the
+        distinct ``odps-bitol`` key (Bitol Open Data Product Standard)."""
+        out = parse_emit_set("odps-bitol", reference_only=False, logger=logger)
+        assert out == ["odps-bitol"]
 
     def test_reference_only_does_not_drop_schedule_or_policies(self, logger):
         """B6 regression: a reference-only build pattern must NOT strip
@@ -241,9 +250,9 @@ class TestRunFanout:
         run_fanout(bundle_tgz, out_dir, emit_raw=None, manifest_path=None, logger=logger)
 
         # Hello-world has no orchestration.engine → schedule auto-skipped.
-        # Default emit set excludes opds/odps (broken OPDS emitter; see
-        # trello-verify-odps-linux-foundation).
-        expected_prefixes = {"odps-bitol/", "odcs/", "policy/"}
+        # Default emit set now includes opds/ (LF/ODPI OPDS v4.1) alongside the
+        # Bitol odps-bitol/ + odcs/ and the compiled policy/ bindings.
+        expected_prefixes = {"opds/", "odps-bitol/", "odcs/", "policy/"}
         on_disk = {p.relative_to(out_dir).as_posix() for p in out_dir.rglob("*") if p.is_file()}
         present_prefixes = {f.split("/")[0] + "/" for f in on_disk if "/" in f}
         assert (

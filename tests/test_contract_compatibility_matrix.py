@@ -38,8 +38,8 @@ import yaml
 
 from fluid_build.providers.datamesh_manager import DataMeshManagerProvider
 from fluid_build.providers.odcs.odcs import OdcsProvider
-from fluid_build.providers.odps.odps import OdpsProvider
 from fluid_build.providers.odps_standard import OdpsStandardProvider
+from fluid_build.providers.opds.opds import OdpsProvider
 from fluid_build.schema_manager import FluidSchemaManager
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "contracts" / "compatibility"

@@ -25,7 +25,7 @@ Two distinct standards both abbreviated **ODPS** are dispatched via ``--spec``:
 
 - ``odps-4.1`` — Open Data Product **Specification** v4.1 (Linux Foundation,
   hosted by the Open Data Product Initiative / ODPI). Export-only single JSON
-  document. Backed by the ``fluid_build.providers.odps`` provider.
+  document. Backed by the ``fluid_build.providers.opds`` provider.
 
 The canonical CLI surface is ``fluid odps``; ``fluid opds`` is accepted as
 a deprecated letter-swapped alias. The legacy ``--spec odpi-4.1`` and
@@ -210,8 +210,8 @@ def _export_odps_v4_1(
     """ODPS v4.1 (LF/ODPI) export path (single JSON document)."""
     # Direct class import — ODPS is a spec-EXPORT format, not a registry/cloud
     # provider, so we no longer resolve it via build_provider()/the PROVIDERS
-    # registry (OdpsProvider was de-registered; see providers/odps/__init__.py).
-    from fluid_build.providers.odps.odps import OdpsProvider
+    # registry (OdpsProvider was de-registered; see providers/opds/__init__.py).
+    from fluid_build.providers.opds.opds import OdpsProvider
 
     try:
         provider = OdpsProvider()
@@ -394,7 +394,7 @@ def cmd_opds_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     # ODPS v4.1 (LF/ODPI) — structural validator
     try:
-        from fluid_build.providers.odps.validator import validate_opds_structure
+        from fluid_build.providers.opds.validator import validate_opds_structure
 
         with open(path, encoding="utf-8") as f:
             opds_data = json.load(f)

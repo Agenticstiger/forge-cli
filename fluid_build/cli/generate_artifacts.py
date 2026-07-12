@@ -15,11 +15,12 @@
 """``fluid generate artifacts`` — pipeline stage 3.
 
 Fanout wrapper that takes a stage-1 bundle (.tgz) and emits catalog-ready
-artifacts (ODCS, ODPS-Bitol, ODPS v4.1 LF/ODPI, schedule DAGs, policy
-bindings) into a single directory with a unified MANIFEST.json. The legacy
-``opds`` emit key is a deprecated letter-swap alias of ``odps`` (same
-target spec). Delegates all emission to existing per-format commands;
-orchestration lives in ``fluid_build.forge.core.artifact_fanout``.
+artifacts (ODCS, ODPS-Bitol, OPDS v4.1 LF/ODPI, schedule DAGs, policy
+bindings) into a single directory with a unified MANIFEST.json. ``opds`` is
+the canonical LF/ODPI Open Data Product Specification key; the bare ``odps``
+emit key is a deprecated alias that resolves to ``opds``. Delegates all
+emission to existing per-format commands; orchestration lives in
+``fluid_build.forge.core.artifact_fanout``.
 
 Registered as a subcommand of ``fluid generate``:
 
@@ -41,13 +42,14 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
     """Register as a subcommand of ``fluid generate``."""
     p = subparsers.add_parser(
         "artifacts",
-        help="Fanout bundle → catalog artifacts (ODCS, ODPS LF/ODPI, ODPS-Bitol, schedule, policies)",
+        help="Fanout bundle → catalog artifacts (ODCS, OPDS LF/ODPI, ODPS-Bitol, schedule, policies)",
         description=(
             "Stage-3 of the 11-stage pipeline. Reads a Phase-2 bundle and emits "
-            "ODCS per-port, ODPS-Bitol, ODPS v4.1 (LF/ODPI), schedule DAGs, and "
+            "ODCS per-port, ODPS-Bitol, OPDS v4.1 (LF/ODPI), schedule DAGs, and "
             "compiled policy bindings into <out>/, with a unified MANIFEST.json "
-            "hashed over every emitted file. The legacy ``opds`` emit key is a "
-            "deprecated letter-swap alias of ``odps``."
+            "hashed over every emitted file. ``opds`` is the LF/ODPI Open Data "
+            "Product Specification key; the bare ``odps`` emit key is a deprecated "
+            "alias that resolves to ``opds``."
         ),
         epilog=(
             "Examples:\n"
@@ -77,11 +79,11 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
         "--emit",
         default=None,
         help=(
-            "Comma-separated emit selector. Valid: odps, odps-bitol, odcs, schedule, "
-            "policies. ``opds`` is also accepted as a deprecated letter-swap alias "
-            "of ``odps`` (same LF/ODPI ODPS v4.1 target). Default: all six. ``dbt`` "
-            "is NOT a valid emit key — dbt projects are execution artifacts (see "
-            "`fluid generate speed-transformation`)."
+            "Comma-separated emit selector. Valid: opds, odps-bitol, odcs, schedule, "
+            "policies. ``odps`` is accepted as a deprecated alias of ``opds`` (the "
+            "LF/ODPI Open Data Product Specification v4.1 target). Default: all five. "
+            "``dbt`` is NOT a valid emit key — dbt projects are execution artifacts "
+            "(see `fluid generate speed-transformation`)."
         ),
     )
     p.add_argument(
