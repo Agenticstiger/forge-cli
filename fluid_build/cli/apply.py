@@ -883,6 +883,436 @@ def _write_apply_report(
             logger.warning(f"Failed to generate report: {e}")
 
 
+def _run_simple_apply(
+    *,
+    args,
+    contract: Dict[str, Any],
+    resolved_mode,
+    execution_id: str,
+    start_time: float,
+    logger: logging.Logger,
+) -> int:
+    """Execute the simple (direct-provider) apply path.
+
+    Lifted verbatim out of ``run()`` (Phase-2 ``run`` decomposition). This
+    is the non-orchestrated path taken when the contract has no complex
+    config (or a flat ``plan.json`` is supplied): detect provider, resolve
+    actions, show the preview / confirmation, honour ``--dry-run``, dispatch
+    to the provider, write rollback state, then render + report. Returns the
+    process exit code (``0`` success / ``1`` failure).
+
+    ALL apply gates — plan-binding digest, plan/apply mode-mismatch,
+    federation-consumes drift, and the data-loss safety gate — run in
+    ``run()`` BEFORE this helper is called and are unchanged. This is a
+    pure structural move: the gate ordering (every gate before any
+    provider dispatch) is preserved because the call site sits after the
+    gates in ``run()``.
+
+    Kept in ``apply.py`` so ``patch("fluid_build.cli.apply.<name>")`` test
+    seams (``build_provider`` / ``_actions_from_source`` / ``RICH_AVAILABLE``
+    / hooks) resolve against this module's globals exactly as they did
+    inline.
+    """
+    logger.info("🚀 Executing data product build (simple mode)")
+
+    # Detect provider and project from contract (check builds and exposes)
+    provider_name = "local"  # default
+    project = None
+    region = contract.get("region", "local")
+
+    # First try to get provider and project from exposes (most specific)
+    for expose in contract.get("exposes", []):
+        binding = expose.get("binding", {})
+        if "platform" in binding:
+            provider_name = binding["platform"]
+            # Get project from binding location
+            location = binding.get("location", {})
+            if "project" in location and not project:
+                project = location["project"]
+
+    # Then check builds if not found
+    if provider_name == "local":
+        for build in contract.get("builds", []):
+            runtime = build.get("execution", {}).get("runtime", {})
+            if "platform" in runtime:
+                provider_name = runtime["platform"]
+                break
+
+    # Explicit CLI flags override the contract-derived values.
+    if getattr(args, "provider", None):
+        provider_name = args.provider
+    if getattr(args, "project", None):
+        project = args.project
+    if getattr(args, "region", None):
+        region = args.region
+
+    # For AWS, extract region from binding.location or env vars and let
+    # resolve_account_and_region() discover the account via STS.
+    if provider_name == "aws":
+        if not project or project == contract.get("id"):
+            project = None  # Let AwsProvider resolve from STS
+        if region == "local":
+            # Try binding.location.region first
+            for expose in contract.get("exposes", []):
+                loc_region = expose.get("binding", {}).get("location", {}).get("region")
+                if loc_region and not loc_region.startswith("{{"):
+                    region = loc_region
+                    break
+            else:
+                region = None  # Let AwsProvider resolve from env/defaults
+
+    # Fallback to contract-level project or ID for providers that use it.
+    # Snowflake resolves database/account from binding + env and should not
+    # inherit the contract id as a pseudo-project.
+    if not project and provider_name not in {"aws", "snowflake"}:
+        project = contract.get("project") or contract.get("id", "local-project")
+
+    # Set appropriate default region for provider
+    if provider_name == "gcp" and region == "local":
+        region = "US"  # Default BigQuery location
+
+    logger.info(f"Detected provider: {provider_name}, project: {project}")
+    provider = build_provider(provider_name, project, region, logger)
+
+    # Get actions from contract — pass the resolved apply mode so
+    # destructive modes (replace / replace-and-build) trigger
+    # CREATE OR REPLACE TABLE + pre-flight CLONE snapshot in
+    # the provider's planner.
+    actions = _actions_from_source(
+        args.contract,
+        args.env,
+        provider,
+        logger,
+        mode=resolved_mode.value if resolved_mode is not None else None,
+    )
+
+    if not actions:
+        logger.warning("No actions to execute")
+        return 0
+
+    # Show execution preview and get confirmation (unless --yes flag)
+    if not args.yes and not args.dry_run and os.isatty(0):
+        if RICH_AVAILABLE:
+            console = Console()
+            console.print("\n[bold cyan]🚀 Execution Preview[/bold cyan]")
+            console.print(f"Provider: [yellow]{provider_name}[/yellow]")
+            console.print(f"Project: [yellow]{project}[/yellow]")
+            console.print(f"Actions: [yellow]{len(actions)}[/yellow]")
+
+            # Show action breakdown
+            action_types = {}
+            for action in actions:
+                op = action.get("op", "unknown")
+                action_types[op] = action_types.get(op, 0) + 1
+
+            if action_types:
+                console.print("\nAction breakdown:")
+                for op, count in sorted(action_types.items()):
+                    console.print(f"  • {op}: {count}")
+
+            # Safety warnings for destructive operations
+            destructive_ops = ["drop_table", "delete_data", "truncate_table"]
+            destructive_actions = [a for a in actions if a.get("op") in destructive_ops]
+
+            if destructive_actions:
+                console.print(
+                    f"\n[red]⚠️  Warning: {len(destructive_actions)} potentially destructive actions![/red]"
+                )
+
+            if not confirm_action("\nProceed with execution?", default=False, console=console):
+                console.print("[yellow]Operation cancelled[/yellow]")
+                return 0
+        else:
+            logger.info(f"About to execute {len(actions)} actions")
+            response = input("Proceed? [y/N]: ").strip().lower()
+            if response not in ["y", "yes"]:
+                logger.info("Operation cancelled")
+                return 0
+
+    # Dry run mode
+    if args.dry_run:
+        logger.info("🔍 Dry run mode - showing execution plan")
+        if RICH_AVAILABLE:
+            console = Console()
+            console.print(Panel("🔍 Dry Run - No changes will be made", border_style="yellow"))
+            table = Table(title="📋 Planned Actions")
+            table.add_column("Operation", style="cyan")
+            table.add_column("Details", style="white")
+            for action in actions:
+                table.add_row(action.get("op", "unknown"), str(action.get("metadata", {})))
+            console.print(table)
+        else:
+            logger.info(f"Would execute {len(actions)} actions:")
+            for action in actions:
+                logger.info(f"  - {action.get('op')}: {action.get('metadata', {})}")
+        return 0
+
+    # Execute with provider
+    logger.info(f"Executing {len(actions)} actions...")
+
+    # --- Lifecycle hooks: pre_apply ---
+    from fluid_build.cli.hooks import run_on_error, run_post_apply, run_pre_apply
+
+    actions = run_pre_apply(provider, actions, logger)
+
+    try:
+        if RICH_AVAILABLE:
+            console = Console()
+            console.print("[green]🚀 Executing actions...[/green]")
+            with ProgressManager(console) as progress:
+                task = progress.add_task(f"Executing {len(actions)} actions...", total=None)
+                result = provider.apply(actions=actions, plan={"contract": contract})
+                progress.update(task, completed=True)
+        else:
+            result = provider.apply(actions=actions, plan={"contract": contract})
+    except Exception as exc:
+        run_on_error(provider, exc, "apply", logger)
+        raise
+
+    # --- Lifecycle hooks: post_apply ---
+    run_post_apply(provider, result, logger)
+
+    # Check for success (local provider uses 'failed' field, others use 'status')
+    success = result.get("failed", 1) == 0 or result.get("status") == "success"
+
+    # Rollback-state writer: when the plan contained
+    # ``rollback_snapshot`` markers (emitted for destructive
+    # modes by per-provider planners) AND the apply succeeded,
+    # append the snapshot metadata to ``.fluid/rollback-state.json``
+    # so ``fluid rollback`` can find them. Best-effort: a
+    # writer failure does not abort the apply.
+    if success:
+        try:
+            from fluid_build.cli._rollback_writer import (
+                write_snapshots_for_apply,
+            )
+
+            write_snapshots_for_apply(
+                actions,
+                contract=contract,
+                env=getattr(args, "env", None),
+                provider=getattr(provider, "name", None) or provider_name or "unknown",
+                workspace_root=Path.cwd(),
+                logger=logger,
+                results=(
+                    result.get("results") if isinstance(result.get("results"), list) else None
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("rollback_state_writer_skipped: %s", exc, exc_info=True)
+
+    # Three outcomes — success_with_outputs (green), success_no_outputs
+    # (yellow warning, render the misconfigured-contract case),
+    # failure (red).
+    output_count = 0
+    if isinstance(result.get("results"), list):
+        output_count = sum(
+            len(r.get("written", [])) for r in result["results"] if r.get("status") == "ok"
+        )
+    # ``no_outputs`` fires only when ``applied == 0 AND
+    # output_count == 0`` so two legitimate "0 local files"
+    # cases stay green:
+    #   * Cloud applies (snowflake / bigquery / aws) where
+    #     materialisation is in the cloud catalog.
+    #   * Acquisition builds where the engine runner wrote
+    #     parquet under its own path (apply.py doesn't see those
+    #     writes via ``result["results"]``).
+    applied_count = int(result.get("applied", 0)) if isinstance(result.get("applied"), int) else 0
+    no_outputs = success and output_count == 0 and applied_count == 0
+
+    # Show results (Rich panel / plain log) — extracted helper.
+    _render_apply_result(
+        success=success,
+        no_outputs=no_outputs,
+        result=result,
+        output_count=output_count,
+        start_time=start_time,
+        logger=logger,
+    )
+
+    total_time = time.time() - start_time
+    # Drop the always-green "Execution completed" footer when the
+    # run had no output — a hidden retort that contradicted the
+    # warning panel above. Surface the duration via the summary
+    # table only.
+    if success and not no_outputs:
+        logger.info(f"✅ Execution completed in {total_time:.2f}s")
+
+    # Log metrics and completion
+    log_metric(logger, "apply_duration", total_time, unit="seconds")
+    log_metric(logger, "actions_executed", result.get("applied", 0), unit="count")
+
+    # Generate report if requested (simple mode) — extracted helper.
+    _write_apply_report(
+        args=args,
+        contract=contract,
+        result=result,
+        success=success,
+        execution_id=execution_id,
+        total_time=total_time,
+        logger=logger,
+    )
+
+    if success:
+        log_operation_success(
+            logger,
+            "apply_contract",
+            duration=total_time,
+            execution_id=execution_id,
+            mode="simple",
+        )
+    else:
+        log_operation_failure(
+            logger,
+            "apply_contract",
+            error=result.get("error", "Unknown error"),
+            duration=total_time,
+        )
+
+    return 0 if success else 1
+
+
+def _run_orchestrated_apply(
+    *,
+    args,
+    contract: Dict[str, Any],
+    plan,
+    execution_id: str,
+    start_time: float,
+    logger: logging.Logger,
+) -> int:
+    """Execute the complex (``FluidOrchestrationEngine``) apply path.
+
+    Lifted verbatim out of ``run()`` (Phase-2 ``run`` decomposition). Taken
+    when the contract carries complex config (infrastructure / sources /
+    governance / …) or a legacy nested-plan orchestration format. Builds the
+    ``ExecutionContext``, runs the engine's async plan, emits the final
+    report / notifications / metrics, and returns the exit code (``0``
+    success / ``1`` failure).
+
+    Same gate-ordering guarantee as ``_run_simple_apply``: every apply gate
+    runs in ``run()`` before this helper is called.
+    """
+    # Complex orchestration mode (original code)
+    # Initialize console for rich output
+    console = None
+    if RICH_AVAILABLE and not args.debug:
+        console = Console()
+        console.print(
+            Panel(
+                "🌊 FLUID Apply - Data Product Orchestration Engine",
+                subtitle=f"Execution ID: {execution_id}",
+                border_style="blue",
+            )
+        )
+
+    # Create execution context
+    context = ExecutionContext(
+        execution_id=execution_id,
+        contract=contract,
+        plan=plan,
+        workspace_dir=args.workspace_dir,
+        state_file=args.state_file or Path("runtime/apply_state.json"),
+        console=console,
+        logger=logger,
+    )
+
+    # Setup artifacts directory
+    context.artifacts_dir = context.workspace_dir / "runtime" / "artifacts" / execution_id
+    context.logs_dir = context.workspace_dir / "runtime" / "logs" / execution_id
+
+    # Show execution plan summary
+    _display_execution_plan(plan, console, logger)
+
+    # Confirmation prompt (unless --yes or dry-run)
+    if not args.yes and not args.dry_run and os.isatty(0):
+        if not _confirm_execution(plan, console):
+            logger.info("Execution cancelled by user")
+            return 0
+
+    # Initialize orchestration engine
+    engine = FluidOrchestrationEngine(context)
+
+    if args.dry_run:
+        logger.info("🔍 Dry run mode - showing execution plan without making changes")
+        _display_dry_run_summary(plan, console, logger)
+        return 0
+
+    # Execute the plan. The user-facing "🚀 Executing actions..."
+    # message lands later via the progress UI; this breadcrumb is
+    # for the structured log only (DEBUG).
+    logger.debug("Starting data product deployment orchestration")
+
+    if asyncio.get_event_loop().is_running():
+        # If we're already in an async context, create a new loop
+        import threading
+
+        result = {}
+        exception = {}
+
+        def run_in_thread():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                result["value"] = loop.run_until_complete(engine.execute_plan())
+            except Exception as e:
+                exception["value"] = e
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=run_in_thread)
+        thread.start()
+        thread.join()
+
+        if "value" in exception:
+            raise exception["value"]
+
+        execution_result = result["value"]
+    else:
+        # Normal async execution
+        execution_result = asyncio.run(engine.execute_plan())
+
+    # Generate final report
+    _generate_final_report(execution_result, args, context, logger)
+
+    # Send notifications
+    if args.notify:
+        _send_notifications(execution_result, args.notify, logger)
+
+    # Export metrics
+    if args.metrics_export != "none":
+        _export_metrics(execution_result, args.metrics_export, logger)
+
+    # Determine exit code
+    if execution_result.get("success", False):
+        total_time = time.time() - start_time
+        logger.info(f"✅ Data product deployment completed successfully in {total_time:.2f}s")
+
+        # Log metrics and success
+        log_metric(logger, "apply_duration", total_time, unit="seconds")
+        log_metric(
+            logger, "phases_executed", execution_result.get("phases_executed", 0), unit="count"
+        )
+        log_operation_success(
+            logger,
+            "apply_contract",
+            duration=total_time,
+            execution_id=execution_id,
+            mode="orchestrated",
+        )
+
+        return 0
+    else:
+        total_time = time.time() - start_time
+        error_msg = execution_result.get("error", "Unknown error")
+        logger.error(f"❌ Data product deployment failed: {error_msg}")
+
+        # Log failure
+        log_operation_failure(logger, "apply_contract", error=error_msg, duration=total_time)
+
+        return 1
+
+
 @_traced_stage("apply")
 def run(args, logger: logging.Logger) -> int:
     """
@@ -1311,390 +1741,24 @@ def run(args, logger: logging.Logger) -> int:
 
         # Simple mode execution
         if use_simple_mode:
-            logger.info("🚀 Executing data product build (simple mode)")
-
-            # Detect provider and project from contract (check builds and exposes)
-            provider_name = "local"  # default
-            project = None
-            region = contract.get("region", "local")
-
-            # First try to get provider and project from exposes (most specific)
-            for expose in contract.get("exposes", []):
-                binding = expose.get("binding", {})
-                if "platform" in binding:
-                    provider_name = binding["platform"]
-                    # Get project from binding location
-                    location = binding.get("location", {})
-                    if "project" in location and not project:
-                        project = location["project"]
-
-            # Then check builds if not found
-            if provider_name == "local":
-                for build in contract.get("builds", []):
-                    runtime = build.get("execution", {}).get("runtime", {})
-                    if "platform" in runtime:
-                        provider_name = runtime["platform"]
-                        break
-
-            # Explicit CLI flags override the contract-derived values.
-            if getattr(args, "provider", None):
-                provider_name = args.provider
-            if getattr(args, "project", None):
-                project = args.project
-            if getattr(args, "region", None):
-                region = args.region
-
-            # For AWS, extract region from binding.location or env vars and let
-            # resolve_account_and_region() discover the account via STS.
-            if provider_name == "aws":
-                if not project or project == contract.get("id"):
-                    project = None  # Let AwsProvider resolve from STS
-                if region == "local":
-                    # Try binding.location.region first
-                    for expose in contract.get("exposes", []):
-                        loc_region = expose.get("binding", {}).get("location", {}).get("region")
-                        if loc_region and not loc_region.startswith("{{"):
-                            region = loc_region
-                            break
-                    else:
-                        region = None  # Let AwsProvider resolve from env/defaults
-
-            # Fallback to contract-level project or ID for providers that use it.
-            # Snowflake resolves database/account from binding + env and should not
-            # inherit the contract id as a pseudo-project.
-            if not project and provider_name not in {"aws", "snowflake"}:
-                project = contract.get("project") or contract.get("id", "local-project")
-
-            # Set appropriate default region for provider
-            if provider_name == "gcp" and region == "local":
-                region = "US"  # Default BigQuery location
-
-            logger.info(f"Detected provider: {provider_name}, project: {project}")
-            provider = build_provider(provider_name, project, region, logger)
-
-            # Get actions from contract — pass the resolved apply mode so
-            # destructive modes (replace / replace-and-build) trigger
-            # CREATE OR REPLACE TABLE + pre-flight CLONE snapshot in
-            # the provider's planner.
-            actions = _actions_from_source(
-                args.contract,
-                args.env,
-                provider,
-                logger,
-                mode=resolved_mode.value if resolved_mode is not None else None,
-            )
-
-            if not actions:
-                logger.warning("No actions to execute")
-                return 0
-
-            # Show execution preview and get confirmation (unless --yes flag)
-            if not args.yes and not args.dry_run and os.isatty(0):
-                if RICH_AVAILABLE:
-                    console = Console()
-                    console.print("\n[bold cyan]🚀 Execution Preview[/bold cyan]")
-                    console.print(f"Provider: [yellow]{provider_name}[/yellow]")
-                    console.print(f"Project: [yellow]{project}[/yellow]")
-                    console.print(f"Actions: [yellow]{len(actions)}[/yellow]")
-
-                    # Show action breakdown
-                    action_types = {}
-                    for action in actions:
-                        op = action.get("op", "unknown")
-                        action_types[op] = action_types.get(op, 0) + 1
-
-                    if action_types:
-                        console.print("\nAction breakdown:")
-                        for op, count in sorted(action_types.items()):
-                            console.print(f"  • {op}: {count}")
-
-                    # Safety warnings for destructive operations
-                    destructive_ops = ["drop_table", "delete_data", "truncate_table"]
-                    destructive_actions = [a for a in actions if a.get("op") in destructive_ops]
-
-                    if destructive_actions:
-                        console.print(
-                            f"\n[red]⚠️  Warning: {len(destructive_actions)} potentially destructive actions![/red]"
-                        )
-
-                    if not confirm_action(
-                        "\nProceed with execution?", default=False, console=console
-                    ):
-                        console.print("[yellow]Operation cancelled[/yellow]")
-                        return 0
-                else:
-                    logger.info(f"About to execute {len(actions)} actions")
-                    response = input("Proceed? [y/N]: ").strip().lower()
-                    if response not in ["y", "yes"]:
-                        logger.info("Operation cancelled")
-                        return 0
-
-            # Dry run mode
-            if args.dry_run:
-                logger.info("🔍 Dry run mode - showing execution plan")
-                if RICH_AVAILABLE:
-                    console = Console()
-                    console.print(
-                        Panel("🔍 Dry Run - No changes will be made", border_style="yellow")
-                    )
-                    table = Table(title="📋 Planned Actions")
-                    table.add_column("Operation", style="cyan")
-                    table.add_column("Details", style="white")
-                    for action in actions:
-                        table.add_row(action.get("op", "unknown"), str(action.get("metadata", {})))
-                    console.print(table)
-                else:
-                    logger.info(f"Would execute {len(actions)} actions:")
-                    for action in actions:
-                        logger.info(f"  - {action.get('op')}: {action.get('metadata', {})}")
-                return 0
-
-            # Execute with provider
-            logger.info(f"Executing {len(actions)} actions...")
-
-            # --- Lifecycle hooks: pre_apply ---
-            from fluid_build.cli.hooks import run_on_error, run_post_apply, run_pre_apply
-
-            actions = run_pre_apply(provider, actions, logger)
-
-            try:
-                if RICH_AVAILABLE:
-                    console = Console()
-                    console.print("[green]🚀 Executing actions...[/green]")
-                    with ProgressManager(console) as progress:
-                        task = progress.add_task(f"Executing {len(actions)} actions...", total=None)
-                        result = provider.apply(actions=actions, plan={"contract": contract})
-                        progress.update(task, completed=True)
-                else:
-                    result = provider.apply(actions=actions, plan={"contract": contract})
-            except Exception as exc:
-                run_on_error(provider, exc, "apply", logger)
-                raise
-
-            # --- Lifecycle hooks: post_apply ---
-            run_post_apply(provider, result, logger)
-
-            # Check for success (local provider uses 'failed' field, others use 'status')
-            success = result.get("failed", 1) == 0 or result.get("status") == "success"
-
-            # Rollback-state writer: when the plan contained
-            # ``rollback_snapshot`` markers (emitted for destructive
-            # modes by per-provider planners) AND the apply succeeded,
-            # append the snapshot metadata to ``.fluid/rollback-state.json``
-            # so ``fluid rollback`` can find them. Best-effort: a
-            # writer failure does not abort the apply.
-            if success:
-                try:
-                    from fluid_build.cli._rollback_writer import (
-                        write_snapshots_for_apply,
-                    )
-
-                    write_snapshots_for_apply(
-                        actions,
-                        contract=contract,
-                        env=getattr(args, "env", None),
-                        provider=getattr(provider, "name", None) or provider_name or "unknown",
-                        workspace_root=Path.cwd(),
-                        logger=logger,
-                        results=(
-                            result.get("results")
-                            if isinstance(result.get("results"), list)
-                            else None
-                        ),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("rollback_state_writer_skipped: %s", exc, exc_info=True)
-
-            # Three outcomes — success_with_outputs (green), success_no_outputs
-            # (yellow warning, render the misconfigured-contract case),
-            # failure (red).
-            output_count = 0
-            if isinstance(result.get("results"), list):
-                output_count = sum(
-                    len(r.get("written", [])) for r in result["results"] if r.get("status") == "ok"
-                )
-            # ``no_outputs`` fires only when ``applied == 0 AND
-            # output_count == 0`` so two legitimate "0 local files"
-            # cases stay green:
-            #   * Cloud applies (snowflake / bigquery / aws) where
-            #     materialisation is in the cloud catalog.
-            #   * Acquisition builds where the engine runner wrote
-            #     parquet under its own path (apply.py doesn't see those
-            #     writes via ``result["results"]``).
-            applied_count = (
-                int(result.get("applied", 0)) if isinstance(result.get("applied"), int) else 0
-            )
-            no_outputs = success and output_count == 0 and applied_count == 0
-
-            # Show results (Rich panel / plain log) — extracted helper.
-            _render_apply_result(
-                success=success,
-                no_outputs=no_outputs,
-                result=result,
-                output_count=output_count,
+            return _run_simple_apply(
+                args=args,
+                contract=contract,
+                resolved_mode=resolved_mode,
+                execution_id=execution_id,
                 start_time=start_time,
                 logger=logger,
             )
 
-            total_time = time.time() - start_time
-            # Drop the always-green "Execution completed" footer when the
-            # run had no output — a hidden retort that contradicted the
-            # warning panel above. Surface the duration via the summary
-            # table only.
-            if success and not no_outputs:
-                logger.info(f"✅ Execution completed in {total_time:.2f}s")
-
-            # Log metrics and completion
-            log_metric(logger, "apply_duration", total_time, unit="seconds")
-            log_metric(logger, "actions_executed", result.get("applied", 0), unit="count")
-
-            # Generate report if requested (simple mode) — extracted helper.
-            _write_apply_report(
-                args=args,
-                contract=contract,
-                result=result,
-                success=success,
-                execution_id=execution_id,
-                total_time=total_time,
-                logger=logger,
-            )
-
-            if success:
-                log_operation_success(
-                    logger,
-                    "apply_contract",
-                    duration=total_time,
-                    execution_id=execution_id,
-                    mode="simple",
-                )
-            else:
-                log_operation_failure(
-                    logger,
-                    "apply_contract",
-                    error=result.get("error", "Unknown error"),
-                    duration=total_time,
-                )
-
-            return 0 if success else 1
-
-        # Complex orchestration mode (original code)
-        # Initialize console for rich output
-        console = None
-        if RICH_AVAILABLE and not args.debug:
-            console = Console()
-            console.print(
-                Panel(
-                    "🌊 FLUID Apply - Data Product Orchestration Engine",
-                    subtitle=f"Execution ID: {execution_id}",
-                    border_style="blue",
-                )
-            )
-
-        # Create execution context
-        context = ExecutionContext(
-            execution_id=execution_id,
+        # Complex orchestration mode — extracted to _run_orchestrated_apply().
+        return _run_orchestrated_apply(
+            args=args,
             contract=contract,
             plan=plan,
-            workspace_dir=args.workspace_dir,
-            state_file=args.state_file or Path("runtime/apply_state.json"),
-            console=console,
+            execution_id=execution_id,
+            start_time=start_time,
             logger=logger,
         )
-
-        # Setup artifacts directory
-        context.artifacts_dir = context.workspace_dir / "runtime" / "artifacts" / execution_id
-        context.logs_dir = context.workspace_dir / "runtime" / "logs" / execution_id
-
-        # Show execution plan summary
-        _display_execution_plan(plan, console, logger)
-
-        # Confirmation prompt (unless --yes or dry-run)
-        if not args.yes and not args.dry_run and os.isatty(0):
-            if not _confirm_execution(plan, console):
-                logger.info("Execution cancelled by user")
-                return 0
-
-        # Initialize orchestration engine
-        engine = FluidOrchestrationEngine(context)
-
-        if args.dry_run:
-            logger.info("🔍 Dry run mode - showing execution plan without making changes")
-            _display_dry_run_summary(plan, console, logger)
-            return 0
-
-        # Execute the plan. The user-facing "🚀 Executing actions..."
-        # message lands later via the progress UI; this breadcrumb is
-        # for the structured log only (DEBUG).
-        logger.debug("Starting data product deployment orchestration")
-
-        if asyncio.get_event_loop().is_running():
-            # If we're already in an async context, create a new loop
-            import threading
-
-            result = {}
-            exception = {}
-
-            def run_in_thread():
-                try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    result["value"] = loop.run_until_complete(engine.execute_plan())
-                except Exception as e:
-                    exception["value"] = e
-                finally:
-                    loop.close()
-
-            thread = threading.Thread(target=run_in_thread)
-            thread.start()
-            thread.join()
-
-            if "value" in exception:
-                raise exception["value"]
-
-            execution_result = result["value"]
-        else:
-            # Normal async execution
-            execution_result = asyncio.run(engine.execute_plan())
-
-        # Generate final report
-        _generate_final_report(execution_result, args, context, logger)
-
-        # Send notifications
-        if args.notify:
-            _send_notifications(execution_result, args.notify, logger)
-
-        # Export metrics
-        if args.metrics_export != "none":
-            _export_metrics(execution_result, args.metrics_export, logger)
-
-        # Determine exit code
-        if execution_result.get("success", False):
-            total_time = time.time() - start_time
-            logger.info(f"✅ Data product deployment completed successfully in {total_time:.2f}s")
-
-            # Log metrics and success
-            log_metric(logger, "apply_duration", total_time, unit="seconds")
-            log_metric(
-                logger, "phases_executed", execution_result.get("phases_executed", 0), unit="count"
-            )
-            log_operation_success(
-                logger,
-                "apply_contract",
-                duration=total_time,
-                execution_id=execution_id,
-                mode="orchestrated",
-            )
-
-            return 0
-        else:
-            total_time = time.time() - start_time
-            error_msg = execution_result.get("error", "Unknown error")
-            logger.error(f"❌ Data product deployment failed: {error_msg}")
-
-            # Log failure
-            log_operation_failure(logger, "apply_contract", error=error_msg, duration=total_time)
-
-            return 1
 
     except CLIError:
         duration = time.time() - start_time
