@@ -178,6 +178,39 @@ def enrich_context_with_domain(
         if value:
             expertise[key] = value
 
+    # Standards-modeling harmonisation: surface the domain's canonical model and
+    # supporting standards from the SAME shared registry the copilot taxonomy
+    # and the declarative domain agent read, and seed them onto the context
+    # (without clobbering an explicit user choice) so the generative prompt and
+    # the declarative recommendation stay aligned. Single source of truth:
+    # ``forge_standards_modeling.domain_standard_defaults`` (reads the agent
+    # spec's ``suggestion_defaults``).
+    from fluid_build.cli import forge_standards_modeling as standards
+
+    modeling_defaults = standards.domain_standard_defaults(domain)
+    canonical_model = modeling_defaults["canonical_model"]
+    supporting_standards = list(modeling_defaults["supporting_standards"])
+    if canonical_model:
+        expertise["canonical_model"] = canonical_model
+        if not context.get("canonical_model"):
+            context["canonical_model"] = canonical_model
+    if supporting_standards:
+        expertise["supporting_standards"] = supporting_standards
+        existing = context.get("supporting_standards")
+        if isinstance(existing, list):
+            base = list(existing)
+        elif existing:
+            base = [str(existing)]
+        else:
+            base = []
+        seen: set = set()
+        merged: List[str] = []
+        for item in base + supporting_standards:  # user's picks first
+            if item not in seen:
+                seen.add(item)
+                merged.append(item)
+        context["supporting_standards"] = merged
+
     if spec.next_step_tips:
         expertise["next_step_tips"] = spec.next_step_tips
 
