@@ -145,7 +145,7 @@ pytest tests/providers/test_odcs_provider.py \
        tests/providers/test_odps_provider_enhanced.py \
        tests/providers/test_aws_provider_enhanced.py \
        --cov=fluid_build.providers.odcs \
-       --cov=fluid_build.providers.odps \
+       --cov=fluid_build.providers.opds \
        --cov=fluid_build.providers.aws \
        --cov-report=term-missing
 ```
@@ -251,7 +251,7 @@ jobs:
         run: pytest tests/providers/test_odcs_provider.py -v --cov=fluid_build.providers.odcs
       
       - name: Run ODPS tests
-        run: pytest tests/providers/test_odps_provider_enhanced.py -v --cov=fluid_build.providers.odps
+        run: pytest tests/providers/test_odps_provider_enhanced.py -v --cov=fluid_build.providers.opds
       
       - name: Run AWS tests
         run: pytest tests/providers/test_aws_provider_enhanced.py -v --cov=fluid_build.providers.aws
@@ -262,7 +262,7 @@ jobs:
                  tests/providers/test_odps_provider_enhanced.py \
                  tests/providers/test_aws_provider_enhanced.py \
                  --cov=fluid_build.providers.odcs \
-                 --cov=fluid_build.providers.odps \
+                 --cov=fluid_build.providers.opds \
                  --cov=fluid_build.providers.aws \
                  --cov-report=xml
       
@@ -336,14 +336,14 @@ All test suites follow consistent structure:
 ## Related Documentation
 
 - **ODCS Provider**: [fluid_build/providers/odcs/odcs.py](../../fluid_build/providers/odcs/odcs.py)
-- **ODPS Provider**: [fluid_build/providers/odps/odps.py](../../fluid_build/providers/odps/odps.py)
+- **ODPS Provider**: [fluid_build/providers/opds/opds.py](../../fluid_build/providers/opds/opds.py)
 - **AWS Provider**: [fluid_build/providers/aws/provider.py](../../fluid_build/providers/aws/provider.py)
 - **ODCS Test Suite**: [ODCS_TEST_SUITE.md](ODCS_TEST_SUITE.md)
 - **ODPS Test Suite**: [ODPS_TEST_SUITE.md](ODPS_TEST_SUITE.md)
 - **AWS Test Suite**: [AWS_TEST_SUITE.md](AWS_TEST_SUITE.md)
 - **ODCS Serializer**: [fluid_build/providers/odcs/odcs-schema-v3.1.0.json](../../fluid_build/providers/odcs/odcs-schema-v3.1.0.json)
-- **ODPS Serializer**: [fluid_build/providers/odps/serializer.py](../../fluid_build/providers/odps/serializer.py)
-- **ODPS Validator**: [fluid_build/providers/odps/validator.py](../../fluid_build/providers/odps/validator.py)
+- **ODPS Serializer**: [fluid_build/providers/opds/serializer.py](../../fluid_build/providers/opds/serializer.py)
+- **ODPS Validator**: [fluid_build/providers/opds/validator.py](../../fluid_build/providers/opds/validator.py)
 - **AWS Planner**: [fluid_build/providers/aws/plan/planner.py](../../fluid_build/providers/aws/plan/planner.py)
 
 ## Implementation Quality

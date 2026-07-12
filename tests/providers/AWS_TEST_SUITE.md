@@ -405,7 +405,7 @@ pytest tests/providers/test_odcs_provider.py \
        tests/providers/test_odps_provider_enhanced.py \
        tests/providers/test_aws_provider_enhanced.py \
        --cov=fluid_build.providers.odcs \
-       --cov=fluid_build.providers.odps \
+       --cov=fluid_build.providers.opds \
        --cov=fluid_build.providers.aws \
        --cov-report=term-missing
 ```

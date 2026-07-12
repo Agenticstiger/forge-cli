@@ -60,12 +60,15 @@ def register_exporter(
 # (name, module, class, spec, url, formats) — classes imported lazily.
 _BUILTINS: Tuple[Tuple[str, str, str, str, str, Tuple[str, ...]], ...] = (
     (
-        "odps",
-        "fluid_build.providers.odps.odps",
+        # OPDS = LF/ODPI Open Data Product SPECIFICATION v4.1 (upstream acronym
+        # ODPS; fluid uses OPDS so it stays distinct from Bitol's ODPS-Bitol
+        # below). Served by `fluid generate standard --format opds` / `odps-v4.1`.
+        "opds",
+        "fluid_build.providers.opds.opds",
         "OdpsProvider",
-        "LF/ODPI Open Data Product Specification v4.1",
+        "LF/ODPI Open Data Product Specification v4.1 (OPDS)",
         "https://github.com/Open-Data-Product-Initiative/v4.1",
-        ("odps", "opds"),
+        ("opds", "odps-v4.1"),
     ),
     (
         "odcs",

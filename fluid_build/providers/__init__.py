@@ -36,7 +36,7 @@ Conventions
 - Duplicate registration: the FIRST one wins (unless override=True).
 - Scans subpackages under fluid_build.providers.*, skipping 'base' and itself.
 - You can constrain discovery with FLUID_PROVIDERS env var
-  (comma-separated module names, e.g. "fluid_build.providers.local,fluid_build.providers.odps").
+  (comma-separated module names, e.g. "fluid_build.providers.local,fluid_build.providers.opds").
 """
 
 from __future__ import annotations
@@ -400,7 +400,7 @@ _DEFAULT_MODULES = (
     "fluid_build.providers.aws",
     "fluid_build.providers.snowflake",
     # odps is a spec-export format, not a cloud provider — intentionally excluded
-    # from provider preload/discovery (see providers/odps/__init__.py).
+    # from provider preload/discovery (see providers/opds/__init__.py).
 )
 
 

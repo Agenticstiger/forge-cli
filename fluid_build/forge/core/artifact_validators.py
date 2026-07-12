@@ -20,10 +20,10 @@ against MANIFEST.json, then dispatches per-path-prefix to format-specific
 validators:
 
     MANIFEST.json          → SHA-256 re-verify (tamper gate)
-    odcs/*.odcs.yaml       → JSON Schema (vendored ODCS v3.1.0)
-    odps-bitol/*.yaml      → JSON Schema (vendored ODPS-Bitol v1.0.0)
-    odps/*.odps.json       → (opt-in) ODPS v4.1 (LF/ODPI) validation — pending fix
-    opds/*.opds.json       → (back-compat) same as odps/ — kept for legacy callers
+    odcs/*.odcs.yaml       → JSON Schema (vendored ODCS v3.1.0, Bitol)
+    odps-bitol/*.yaml      → JSON Schema (vendored ODPS-Bitol v1.0.0, Bitol)
+    opds/*.opds.json       → JSON Schema (vendored OPDS v4.1, LF/ODPI)
+    odps/*.opds.json       → (back-compat alias of opds/) same OPDS v4.1 check
     schedule/dags/*.py     → py_compile
     schedule/flows/*.py    → py_compile
     policy/bindings.json   → key-check + OPA conftest (optional)
@@ -69,6 +69,11 @@ _ODCS_SCHEMA_PATH: Path = _REPO_ROOT / "providers" / "odcs" / "odcs-schema-v3.1.
 _ODPS_BITOL_SCHEMA_PATH: Path = (
     _REPO_ROOT / "providers" / "odps_standard" / "schemas" / "odps-product-v1.0.0.json"
 )
+# OPDS = LF/ODPI Open Data Product Specification v4.1 (vendored in the provider
+# dir, mirroring the ODCS / ODPS-Bitol siblings above). Note the file is named
+# ``opds-*`` even though upstream calls the spec ODPS — fluid uses the OPDS
+# spelling to keep it distinct from Bitol's ODPS-Bitol above.
+_OPDS_SCHEMA_PATH: Path = _REPO_ROOT / "providers" / "opds" / "opds-schema-v4.1.0.json"
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +365,77 @@ def validate_odps_bitol(path: str, content: bytes) -> List[ValidationIssue]:
         validator_name="odps-bitol",
         code_prefix="ODPS",
     )
+
+
+def validate_opds(path: str, content: bytes) -> List[ValidationIssue]:
+    """Validate an OPDS ``*.opds.json`` artifact against the vendored schema.
+
+    OPDS = the LF/ODPI Open Data Product Specification v4.1 (distinct from
+    Bitol's ODPS-Bitol above). Delegates to the OPDS provider's
+    ``validate_against_opds_schema`` rather than the generic
+    ``_validate_against_schema`` helper so the Draft-2020-12 semantics and the
+    single documented upstream-schema false-positive filter
+    (``product.dataAccess``) are applied consistently with ``fluid odps``.
+    """
+    try:
+        doc = json.loads(content.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return [
+            ValidationIssue(
+                file=path,
+                validator="opds",
+                severity="error",
+                message=f"parse failure: {exc}",
+                code="OPDS-PARSE",
+            )
+        ]
+
+    if not _jsonschema_available():
+        return [
+            ValidationIssue(
+                file=path,
+                validator="opds",
+                severity="info",
+                message=(
+                    "jsonschema library not available; skipping OPDS schema "
+                    "validation. Install with: pip install jsonschema"
+                ),
+                code="OPDS-LIB-MISSING",
+            )
+        ]
+
+    from fluid_build.providers.opds.validator import validate_against_opds_schema
+
+    valid, errors, validation_type = validate_against_opds_schema(doc, "4.1")
+
+    issues: List[ValidationIssue] = []
+    if validation_type != "full_schema":
+        # Vendored schema absent/unloadable (e.g. fresh checkout before the
+        # vendor step) — the provider fell back to basic structural checks.
+        issues.append(
+            ValidationIssue(
+                file=path,
+                validator="opds",
+                severity="info",
+                message=(
+                    "OPDS JSON Schema not applied (ran basic structural checks). "
+                    f"Expected vendored schema at {_OPDS_SCHEMA_PATH.name}."
+                ),
+                code="OPDS-SCHEMA-MISSING",
+            )
+        )
+    if not valid:
+        for message in errors or []:
+            issues.append(
+                ValidationIssue(
+                    file=path,
+                    validator="opds",
+                    severity="error",
+                    message=message,
+                    code="OPDS001",
+                )
+            )
+    return issues
 
 
 def validate_dag_python(path: str, content: bytes) -> List[ValidationIssue]:
@@ -728,6 +804,12 @@ def _dispatch_by_prefix(path: str, content: bytes) -> Callable[[str, bytes], Lis
         if any(lower.endswith(ext) for ext in (".odcs.yaml", ".odcs.yml", ".odcs.json")):
             return validate_odcs
         return validate_odps_bitol
+    # OPDS (LF/ODPI Open Data Product Specification v4.1). ``odps/`` is a
+    # back-compat alias prefix for pre-rename bundles — both carry ``*.opds.json``
+    # docs and validate against the vendored OPDS schema. Checked AFTER
+    # ``odps-bitol/`` above so the Bitol bundle never falls through here.
+    if path.startswith("opds/") or path.startswith("odps/"):
+        return validate_opds
     if path.startswith("schedule/") and path.endswith(".py"):
         return validate_dag_python
     if path == "policy/bindings.json":
@@ -852,4 +934,5 @@ __all__ = [
     "validate_odcs",
     "validate_odps_bitol",
     "validate_opa_conftest",
+    "validate_opds",
 ]

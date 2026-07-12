@@ -203,7 +203,7 @@ jobs:
         if: matrix.python-version == '3.12'
         run: |
           python -m coverage report --fail-under=20 \
-            --include="fluid_build/providers/aws/*,fluid_build/providers/gcp/*,fluid_build/providers/snowflake/*,fluid_build/providers/odps/*,fluid_build/providers/datamesh_manager/*,fluid_build/providers/bigquery_validation.py"
+            --include="fluid_build/providers/aws/*,fluid_build/providers/gcp/*,fluid_build/providers/snowflake/*,fluid_build/providers/opds/*,fluid_build/providers/datamesh_manager/*,fluid_build/providers/bigquery_validation.py"
 
       - name: "Coverage: total (informational)"
         if: matrix.python-version == '3.12'

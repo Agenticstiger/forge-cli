@@ -352,7 +352,7 @@ class TestOdpsV41NeverEmitsGarbage:
         from argparse import Namespace
 
         from fluid_build.cli.generate_standard import _export_format
-        from fluid_build.providers.odps.validator import validate_opds_structure
+        from fluid_build.providers.opds.validator import validate_opds_structure
 
         contract = self._write(tmp_path, self._string_owner_contract())
         out = tmp_path / "product.json"
@@ -372,7 +372,7 @@ class TestOdpsV41NeverEmitsGarbage:
         assert result.get("valid") is True, result.get("errors")
 
     def test_render_coerces_string_owner_directly(self) -> None:
-        from fluid_build.providers.odps.odps import OdpsProvider
+        from fluid_build.providers.opds.opds import OdpsProvider
 
         provider = OdpsProvider()
         provider.validate_output = False
@@ -385,7 +385,7 @@ class TestOdpsV41NeverEmitsGarbage:
         from unittest.mock import patch
 
         from fluid_build.providers.base import ProviderError
-        from fluid_build.providers.odps.odps import OdpsProvider
+        from fluid_build.providers.opds.opds import OdpsProvider
 
         out = tmp_path / "must-not-exist.json"
         provider = OdpsProvider()
@@ -407,7 +407,7 @@ class TestOdpsV41NeverEmitsGarbage:
 
         from fluid_build.cli import generate_standard
         from fluid_build.cli._common import CLIError
-        from fluid_build.providers.odps.odps import OdpsProvider
+        from fluid_build.providers.opds.opds import OdpsProvider
 
         contract = self._write(tmp_path, self._string_owner_contract())
         out = tmp_path / "must-not-exist.json"
@@ -498,7 +498,7 @@ class TestSchemaRoundTripAcrossFormats:
     def test_format_odps_v4_1_validates_against_lf_schema(self, tmp_path: Path) -> None:
         import json as _json
 
-        from fluid_build.providers.odps.validator import validate_opds_structure
+        from fluid_build.providers.opds.validator import validate_opds_structure
 
         out = self._emit("odps-v4.1", tmp_path, "json")
         doc = _json.loads(out.read_text())

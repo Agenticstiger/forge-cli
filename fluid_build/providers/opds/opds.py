@@ -12,22 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# fluid_build/providers/odps/odps.py
+# fluid_build/providers/opds/opds.py
 """
-ODPS v4.1 (Open Data Product Specification) Provider — Linux Foundation spec.
+OPDS v4.1 (Open Data Product Specification) Provider — Linux Foundation / ODPI.
 
-The v4.1 spec's canonical name is **Open Data Product Specification (ODPS)**;
-it is hosted by the Open Data Product **Initiative** (ODPI), which is the
-*organisation*, not the spec. Earlier revisions of this module called the
-spec "ODPI v4.1" — that swap is fixed; ``ODPI`` references that remain in
-identifiers / URLs are kept as back-compat aliases.
+**OPDS** is fluid's name for the LF/ODPI **Open Data Product Specification**
+v4.1. Upstream abbreviates the spec *ODPS*; fluid uses **OPDS** so it stays
+unambiguous against Bitol's Open Data Product *Standard* (which also abbreviates
+to ODPS). It is hosted by the Open Data Product **Initiative** (ODPI), which is
+the *organisation*, not the spec. Identifiers / URLs that retain the upstream
+``ODPS`` / ``ODPI`` spelling (class name, ``.name``, ``ODPS_*`` env vars) are
+kept as-is; they name the upstream spec, not Bitol's.
 
-**Distinct from Bitol ODPS v1.0.0.** Despite sharing the "ODPS" three-letter
-slug, the Bitol Open Data Product Standard (v1.0.0, ``providers/odps_standard/``,
+**Distinct from Bitol ODPS-Bitol v1.0.0.** Despite both abbreviating to "ODPS",
+the Bitol Open Data Product Standard (v1.0.0, ``providers/odps_standard/``,
 class :class:`BitolOdpsProvider`) is a separate specification with its own
 schema, JSON format, and ``contractId``-based linkage to ODCS. This module
-implements the LF/ODPI ODPS v4.1 spec — single-JSON-document export, no
+implements the LF/ODPI OPDS v4.1 spec — single-JSON-document export, no
 import support.
+
+The three data-product standards this repo supports, kept unambiguous:
+  - **OPDS** — LF/ODPI Open Data Product Specification v4.1 (this module)
+  - **ODPS-Bitol** — Bitol Open Data Product Standard v1.0.0 (``odps_standard/``)
+  - **ODCS** — Bitol Open Data Contract Standard v3.1.0 (``odcs/``)
 
 Selected via ``fluid odps export --spec odps-4.1`` (legacy ``--spec odpi-4.1``
 remains accepted with a deprecation warning); the Bitol ODPS v1.0.0 path is
@@ -290,7 +297,7 @@ class OdpsProvider(BaseProvider):
         value was the letter-swap ``"opds"``; downstream consumers that
         keyed on ``provider.name == "opds"`` should switch to ``"odps"``.
         The registry registers both spellings (see
-        ``providers/odps/__init__.py``) so ``--provider opds`` and
+        ``providers/opds/__init__.py``) so ``--provider opds`` and
         ``--provider odps`` both resolve to this class.
         """
         return "odps"

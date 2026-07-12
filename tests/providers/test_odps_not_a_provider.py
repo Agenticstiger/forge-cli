@@ -51,7 +51,7 @@ def test_odps_package_init_exposes_no_baseprovider_subclass():
     # discovery scan can never re-register odps.
     import inspect
 
-    import fluid_build.providers.odps as odps_pkg
+    import fluid_build.providers.opds as odps_pkg
     from fluid_build.providers.base import BaseProvider
 
     subclasses = [
@@ -65,8 +65,8 @@ def test_odps_package_init_exposes_no_baseprovider_subclass():
 def test_odps_exporters_still_importable_directly():
     # The spec-export commands construct these directly — de-registration must
     # not break those paths.
-    from fluid_build.providers.odps.odps import OdpsProvider
     from fluid_build.providers.odps_standard import BitolOdpsProvider, OdpsStandardProvider
+    from fluid_build.providers.opds.opds import OdpsProvider
 
     for cls in (OdpsProvider, BitolOdpsProvider, OdpsStandardProvider):
         assert hasattr(cls(), "render")

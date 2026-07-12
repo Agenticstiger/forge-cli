@@ -17,8 +17,8 @@ from fluid_build.providers._exporters import list_exporters
 
 def test_builtin_exporters_listed_with_loadable_classes():
     by_name = {e.name: e for e in list_exporters()}
-    assert {"odps", "odcs", "odps-bitol"} <= set(by_name), sorted(by_name)
-    for name in ("odps", "odcs", "odps-bitol"):
+    assert {"opds", "odcs", "odps-bitol"} <= set(by_name), sorted(by_name)
+    for name in ("opds", "odcs", "odps-bitol"):
         e = by_name[name]
         assert e.spec, f"{name} must carry a spec name"
         assert e.cls is not None, f"{name} exporter class failed to import"

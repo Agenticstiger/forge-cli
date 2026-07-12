@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# fluid_build/providers/odps/serializer.py
+# fluid_build/providers/opds/serializer.py
 from __future__ import annotations
 
 import hashlib
