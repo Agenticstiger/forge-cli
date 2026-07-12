@@ -858,6 +858,63 @@ def _forge_interview_core(
     rc.context = context
 
 
+def _record_and_suggest_domain(rc: ForgeRunContext, domain: Optional[str]) -> None:
+    """Usage-based personalization for the detected domain (best-effort).
+
+    Two moves, in this order:
+
+    1. **Suggest** — from the *prior* history (before this run is counted) so
+       the nudge fires "on the next run" once a domain crosses the repeat
+       threshold, per the domain-keyword-learning design. The run's own
+       active domain is excluded so we never nag about a pack that's already
+       loaded. Surfaced only in an interactive session (CI stays quiet).
+    2. **Record** — accumulate ``count`` + ``last_seen`` for *this* run's
+       detected slug. Runs headless too, so history builds up in CI as well.
+
+    Both sides are wrapped: usage personalization is non-essential and must
+    never abort a forge run if the config file is unreadable. Only the domain
+    slug is persisted — never prompt text, contract content, paths, or PII.
+    """
+    console = rc.console
+    is_non_interactive = rc.is_non_interactive
+    try:
+        from fluid_build.cli._ai_setup_storage import (
+            get_domain_history,
+            record_domain_detection,
+            suggest_domain_template,
+        )
+    except Exception:  # noqa: BLE001 — personalization is non-essential
+        return
+
+    if console and not is_non_interactive:
+        try:
+            suggestion = suggest_domain_template(exclude=domain)
+        except Exception:  # noqa: BLE001
+            suggestion = None
+        if suggestion:
+            count = 0
+            try:
+                count = int(get_domain_history().get(suggestion, {}).get("count", 0))
+            except Exception:  # noqa: BLE001
+                count = 0
+            times = f"{count} times" if count else "before"
+            print_dialog_status(
+                console,
+                status="info",
+                message=(
+                    f"You've built {suggestion} data products {times}. Next time try "
+                    f"[bold]fluid forge --domain {suggestion}[/bold] to load its "
+                    f"template automatically."
+                ),
+            )
+
+    if domain:
+        try:
+            record_domain_detection(domain)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _forge_domain_enrichment_core(
     rc: ForgeRunContext,
     *,
@@ -942,6 +999,9 @@ def _forge_domain_enrichment_core(
 
         domain = explicit_domain or detect_domain(context)
         logger.debug("Domain detection: explicit=%s, detected=%s", explicit_domain, domain)
+        # Usage-based personalization: nudge a frequently-built domain's
+        # template (from prior runs), then record this run's detection.
+        _record_and_suggest_domain(rc, domain)
         if domain:
             context = enrich_context_with_domain(context, domain)
             if console:
