@@ -475,6 +475,19 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     parser.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "Run the fully local guided interview with no network calls: "
+            "no LLM, no mode picker, no welcome scan, no remote schema "
+            "fetch. Templates + schemas are already bundled, so authoring "
+            "works air-gapped. Also enabled by FLUID_FORGE_OFFLINE=1 "
+            "(mirrors `cargo --offline` / CARGO_NET_OFFLINE and the "
+            "existing `fluid validate --offline`). Pair with "
+            "--non-interactive for a headless, prompt-free run."
+        ),
+    )
+    parser.add_argument(
         "--seed-from",
         dest="seed_from",
         help=(
@@ -992,6 +1005,28 @@ def get_cli_arg(args: Any, name: str, default: Any = None) -> Any:
     import fluid_build.cli.forge as _self
 
     return _self._get_cli_arg(args, name, default)
+
+
+def _forge_offline_requested(args: Any) -> bool:
+    """True when the offline guided path should run — no network anywhere.
+
+    Two triggers, mirroring ``cargo``'s ``--offline`` flag + its
+    ``CARGO_NET_OFFLINE`` env twin (and consistent with the existing
+    ``fluid validate --offline``):
+
+    * the ``--offline`` flag (``args.offline``), or
+    * ``FLUID_FORGE_OFFLINE`` set to a truthy value in the environment.
+
+    Env parsing matches the rest of the forge toggle surface
+    (``_forge_mode_picker``): any non-empty value other than the usual
+    falsey spellings (``0`` / ``false`` / ``no`` / ``off``) counts as on.
+    """
+    if get_cli_arg(args, "offline", False):
+        return True
+    raw = os.environ.get("FLUID_FORGE_OFFLINE")
+    if raw is None:
+        return False
+    return raw.strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def resolve_memory_store(args, logger: logging.Logger) -> CopilotMemoryStore:
@@ -1546,6 +1581,30 @@ def _run_main(args, logger: logging.Logger) -> int:
         # copilot to read them is tracked as a follow-up.
         if get_cli_arg(args, "no_llm", False) or get_cli_arg(args, "deterministic", False):
             args.blank = True
+
+        # --- Offline guided mode (Trello #69d4c9ca — Forge UX: offline guided) ---
+        # ``--offline`` (or FLUID_FORGE_OFFLINE=1) forces the fully local,
+        # no-network authoring path: the heuristic guided interview, no
+        # LLM, no mode picker, no welcome scan, no remote schema fetch.
+        # Modeled on ``cargo --offline`` / CARGO_NET_OFFLINE and
+        # consistent with the existing ``fluid validate --offline``.
+        # Templates + schemas are already bundled, so this works
+        # air-gapped. An explicit ``--blank`` (already fully offline) is
+        # the more specific "empty contract" intent, so it wins and falls
+        # through to the blank path below.
+        if _forge_offline_requested(args) and not get_cli_arg(args, "blank", False):
+            LOG.debug("Forge: offline guided mode selected")
+            result = run_guided_mode(args, logger)
+            if result == 0:
+                _write_forge_receipt(
+                    flow="guided",
+                    args=args,
+                    before_snapshot=before_snapshot,
+                    scan_root=scan_root,
+                    logger=logger,
+                )
+                _print_forge_next_steps(console, args, scan_root)
+            return result
 
         # --- Mode picker (Phase 0.2) ---
         # When the user runs bare ``fluid forge`` with no mode flag and
