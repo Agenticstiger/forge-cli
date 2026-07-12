@@ -564,6 +564,12 @@ def get_llm_provider(name: str) -> LlmProvider:
     channel — typically installed when forge runs inside the ``forge_run``
     MCP tool.
 
+    Third-party plugins (entry-point group ``fluid_build.llm_providers``) are
+    resolved AFTER the built-ins and BEFORE the litellm catch-all: a built-in
+    name always wins a clash, then a discovered plugin resolves, and finally any
+    remaining name falls through to litellm's native provider routing. Plugin
+    discovery is lazy (first call here) so ``fluid --help`` never scans it.
+
     ``litellm`` is a hard dependency of fluid (declared in
     ``pyproject.toml``); the import never fails in a working install.
     """
@@ -581,9 +587,27 @@ def get_llm_provider(name: str) -> LlmProvider:
 
     if is_coding_agent(normalized):
         return get_coding_agent_provider(normalized)
+
+    # Built-in litellm-backed providers (openai/anthropic/claude/gemini/ollama)
+    # win over any plugin of the same name — resolved before consulting plugins.
+    canonical = normalize_llm_provider_name(normalized)
     from fluid_build.cli.forge_copilot_llm_litellm import get_litellm_provider
 
-    return get_litellm_provider(normalize_llm_provider_name(normalized))
+    if canonical in BUILTIN_LLM_PROVIDERS:
+        return get_litellm_provider(canonical)
+
+    # Third-party provider plugins (fluid_build.llm_providers entry points).
+    # Looked up under the raw (hyphen-preserving) name so an entry point named
+    # ``azure-openai`` resolves for ``--llm-provider azure-openai``.
+    from fluid_build.cli._llm_provider_plugins import get_plugin_llm_provider
+
+    plugin = get_plugin_llm_provider(normalized)
+    if plugin is not None:
+        return plugin
+
+    # Fallback: litellm's catch-all for any other provider it natively supports
+    # (e.g. github/azure/bedrock/vertex_ai) — unchanged behaviour.
+    return get_litellm_provider(canonical)
 
 
 class MCPSamplingProvider(LlmProvider):
@@ -833,7 +857,14 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
         )
 
     api_key = _resolve_api_key(provider.name, env)
-    if provider.name not in _KEYLESS_PROVIDERS and not api_key:
+    # A third-party provider plugin may declare ``keyless = True`` (class attr)
+    # when it authenticates by some other means (e.g. an ambient cloud identity
+    # or its own env var validated at call time) — same escape the built-in
+    # keyless providers get, extended to plugins.
+    provider_is_keyless = provider.name in _KEYLESS_PROVIDERS or bool(
+        getattr(provider, "keyless", False)
+    )
+    if not provider_is_keyless and not api_key:
         raise CopilotGenerationError(
             "copilot_missing_llm_api_key",
             f"No API key was configured for the {provider.name} copilot adapter.",
@@ -1377,6 +1408,14 @@ def reset_llm_caches() -> None:
     global _ollama_available_cache, _model_catalog_cache  # noqa: PLW0603
     _ollama_available_cache = None
     _model_catalog_cache = None
+    # Also drop the discovered-plugin registry so a newly `pip install`-ed
+    # provider plugin is picked up without restarting the process.
+    try:
+        from fluid_build.cli._llm_provider_plugins import reset_plugin_registry
+
+        reset_plugin_registry()
+    except Exception:  # noqa: BLE001 - cache reset must never raise
+        pass
 
 
 def _redact_endpoint_text(endpoint: Any) -> str:

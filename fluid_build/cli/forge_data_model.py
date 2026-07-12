@@ -221,21 +221,17 @@ def _add_common_generation_args(
         action="store_true",
         help="Fail if the configured LLM cannot run; do not fall back to heuristics.",
     )
+    # Accepts the built-ins plus any pip-installed fluid_build.llm_providers
+    # plugin; discovery is lazy so --help never scans entry points.
+    from fluid_build.cli._llm_provider_plugins import LlmProviderChoices
+
     parser.add_argument(
         "--llm-provider",
-        choices=[
-            "openai",
-            "anthropic",
-            "claude",
-            "gemini",
-            "ollama",
-            "mcp-sampling",
-            "claude-code",
-            "codex",
-            "cursor",
-            "kiro",
-        ],
-        help="Optional LLM provider override for the staged modeler (incl. keyless agents)",
+        choices=LlmProviderChoices(),
+        help=(
+            "Optional LLM provider override for the staged modeler (incl. keyless "
+            "agents and third-party fluid_build.llm_providers plugins)"
+        ),
     )
     parser.add_argument("--llm-model", help="Optional LLM model override for the staged modeler")
     parser.add_argument("--llm-endpoint", help="Optional LLM endpoint override")

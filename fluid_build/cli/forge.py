@@ -396,25 +396,20 @@ def register(subparsers: argparse._SubParsersAction):
     )
 
     # --- LLM flags ---
+    # ``LlmProviderChoices`` accepts the built-ins eagerly and any pip-installed
+    # ``fluid_build.llm_providers`` plugin lazily (membership consults the plugin
+    # registry only when --llm-provider is actually supplied, so --help never
+    # scans entry points). Built-ins always win a name clash.
+    from fluid_build.cli._llm_provider_plugins import LlmProviderChoices
+
     parser.add_argument(
         "--llm-provider",
-        choices=[
-            "openai",
-            "anthropic",
-            "claude",
-            "gemini",
-            "ollama",
-            # Keyless: route the LLM through the IDE (mcp-sampling) or a local
-            # coding-agent CLI instead of an API key of forge's own.
-            "mcp-sampling",
-            "claude-code",
-            "codex",
-            "cursor",
-            "kiro",
-        ],
+        choices=LlmProviderChoices(),
         help=(
             "LLM provider for copilot. Keyless options: mcp-sampling (in-IDE), "
-            "claude-code / codex / cursor / kiro (local agent CLI)."
+            "claude-code / codex / cursor / kiro (local agent CLI). Third-party "
+            "providers installed via the fluid_build.llm_providers entry point "
+            "are also accepted."
         ),
     )
     parser.add_argument("--llm-model", help="Model identifier for copilot")

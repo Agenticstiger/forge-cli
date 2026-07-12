@@ -392,6 +392,23 @@ snowflake = "fluid_build.providers.snowflake:SnowflakeProvider"
 # this group is declared by THIRD-PARTY packages only — listing the built-ins
 # here would self-shadow. Plugins merge into ``--source`` choices + dispatch.
 
+# Custom LLM providers for ``fluid forge --llm-provider <name>`` are a discovered
+# plugin group (Trello 69d4c9ce). A third-party package advertises one so that
+# ``pip install fluid-provider-azure-openai`` makes the provider available with
+# no core edit:
+#
+#     [project.entry-points."fluid_build.llm_providers"]
+#     azure-openai = "fluid_provider_azure_openai:AzureOpenAIProvider"
+#
+# Each entry point loads to an ``LlmProvider`` subclass (or a zero-arg factory /
+# instance). Discovery is lazy (``cli/_llm_provider_plugins.py``) so ``fluid
+# --help`` never scans it, and governed by FLUID_PLUGINS_ALLOWLIST /
+# FLUID_PLUGINS_BLOCKLIST like every other plugin group. Built-in provider names
+# (openai / anthropic / gemini / ollama / claude / github / mcp-sampling / the
+# coding agents) always win — a plugin can never silently shadow a built-in.
+# Built-ins are seeded in code, so this group is declared by THIRD-PARTY
+# packages only (listing the built-ins here would self-shadow).
+
 [project.urls]
 Homepage = "https://agenticstiger.github.io/forge_docs/"
 Repository = "https://github.com/Agenticstiger/forge-cli"
