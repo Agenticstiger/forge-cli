@@ -501,6 +501,20 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     parser.add_argument(
+        "--watch",
+        action="store_true",
+        help=(
+            "Watch the discovery path (cwd + any --discovery-path) and "
+            "re-generate the contract whenever a source file changes — like "
+            "`dbt run --watch` / nodemon. Rapid saves are debounced into a "
+            "single regeneration; the contract forge writes itself never "
+            "retriggers the loop. Regeneration is non-interactive and "
+            "network-free (the offline guided path), so a full interview is "
+            "never re-run per change. Ctrl-C stops cleanly. Tune with "
+            "FLUID_FORGE_WATCH_INTERVAL / FLUID_FORGE_WATCH_DEBOUNCE (seconds)."
+        ),
+    )
+    parser.add_argument(
         "--seed-from",
         dest="seed_from",
         help=(
@@ -1578,6 +1592,14 @@ def _run_main(args, logger: logging.Logger) -> int:
         if get_cli_arg(args, "show_memory", False) or get_cli_arg(args, "reset_memory", False):
             return handle_memory_management(args, logger)
 
+        # --- Watch mode (Trello #69d4c9cb — Forge UX: `fluid forge --watch`) ---
+        # Re-generate the contract whenever a watched source file changes.
+        # Intercepts before the mode picker / AI setup because watch owns the
+        # whole run: it loops, regenerating non-interactively (offline guided,
+        # no network) on each debounced change until Ctrl-C.
+        if get_cli_arg(args, "watch", False):
+            return _run_watch(args, logger)
+
         # --- Snapshot for the forge receipt ---
         # Scan cwd before any mode runs so the diff catches every file the
         # mode handler wrote.  find_workspace_root is cheap and localised;
@@ -1899,6 +1921,41 @@ def run_guided_mode(args, logger: logging.Logger) -> int:
         args,
         logger,
         get_target_directory_fn=get_target_directory,
+        console_factory=Console if RICH_AVAILABLE else None,
+    )
+
+
+def _watch_regenerate(args, logger: logging.Logger) -> int:
+    """One non-interactive, network-free contract regeneration for watch mode.
+
+    A watch loop cannot re-run a full interview per change, so it reuses the
+    deterministic **offline guided** path: re-derive answers from flags/defaults
+    and (over)write the contract. ``create_and_validate_contract`` overwrites in
+    place, so the regeneration is idempotent — safe to run on every change.
+    """
+    import fluid_build.cli.forge as _self
+
+    # Watch implies headless regeneration — force it so the guided path never
+    # blocks on a prompt or fails the interactive-TTY guard.
+    args.non_interactive = True
+    return _self.run_guided_mode(args, logger)
+
+
+def _run_watch(args, logger: logging.Logger) -> int:
+    """Enter the forge watch loop — regenerate the contract on source change.
+
+    Delegates the loop to ``_forge_watch.run_watch_mode`` (imported lazily so it
+    stays off the ``fluid --help`` path) and injects ``_watch_regenerate`` as the
+    per-change callback. Resolving through the module (``_self``) keeps the test
+    patch seams (``forge._watch_regenerate`` / ``forge.run_guided_mode``) live.
+    """
+    import fluid_build.cli.forge as _self
+    from fluid_build.cli._forge_watch import run_watch_mode
+
+    return run_watch_mode(
+        args,
+        logger,
+        regenerate_fn=_self._watch_regenerate,
         console_factory=Console if RICH_AVAILABLE else None,
     )
 
