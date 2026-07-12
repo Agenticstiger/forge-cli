@@ -42,6 +42,13 @@ LOG = logging.getLogger("fluid.cli.forge.domain")
 
 _KEYWORDS_PATH = Path(__file__).with_name("agent_specs") / "domain_keywords.yaml"
 
+# A domain name is used to build ``<dir>/<domain>.yaml`` paths. Restrict it to
+# a simple slug before it can drive the per-domain ``system_prompt_fragments``
+# override — defence in depth against a ``../``-style traversal reaching a
+# fragment block in an out-of-tree YAML. Matches the profile-name guard in
+# ``forge_copilot_prompts._PROFILE_NAME_RE``.
+_SAFE_DOMAIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
 
 @lru_cache(maxsize=1)
 def _load_domain_keywords() -> Tuple[Dict[str, List[str]], int]:
@@ -132,7 +139,20 @@ def enrich_context_with_domain(
     ``description`` into the context under the ``domain_expertise`` key.
 
     If the spec cannot be loaded the context is returned unchanged.
+
+    Side effect: activates (or clears) the domain's optional
+    ``system_prompt_fragments`` overlay via
+    ``forge_copilot_prompts.set_domain_prompt_fragments`` so those fragments
+    override the matching ``_defaults/`` block in ``build_system_prompt`` while
+    this domain is active. The overlay is reset on entry so a fragment-less or
+    failed enrichment can't leak a prior domain's fragments into this run.
     """
+    from fluid_build.cli.forge_copilot_prompts import set_domain_prompt_fragments
+
+    # Reset first: a previous run (or a failed load below) must not leave a
+    # stale domain-fragment overlay active.
+    set_domain_prompt_fragments(None, None)
+
     try:
         from fluid_build.cli.forge_agent_specs import AgentSpecError, load_user_or_builtin_spec
 
@@ -186,6 +206,22 @@ def enrich_context_with_domain(
             if modeling and isinstance(modeling, dict):
                 expertise["data_modeling_standards"] = modeling
                 LOG.debug("Loaded data modeling standards for %s", domain)
+
+            # Per-domain system-prompt fragments override the matching
+            # ``_defaults/*.yaml`` block in ``build_system_prompt`` while this
+            # domain is active. Only activate for a safe domain slug so a
+            # ``../``-style name can't surface fragments from an out-of-tree
+            # YAML. ``set_domain_prompt_fragments`` further filters to
+            # string→string entries and never touches the filesystem.
+            fragments = raw.get("system_prompt_fragments")
+            if isinstance(fragments, dict) and _SAFE_DOMAIN_RE.match(str(domain)):
+                activated = set_domain_prompt_fragments(domain, fragments)
+                if activated:
+                    LOG.debug(
+                        "Activated %d system_prompt_fragments for %s",
+                        len(fragments),
+                        domain,
+                    )
     except (yaml.YAMLError, OSError):
         pass
 

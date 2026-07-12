@@ -950,6 +950,14 @@ def _forge_domain_enrichment_core(
                     status="info",
                     message=f"Loaded {domain} domain expertise pack.",
                 )
+        else:
+            # No domain this run — ensure a prior run's domain-fragment overlay
+            # (in a reused process, e.g. the MCP server) can't leak into the
+            # system prompt. ``enrich_context_with_domain`` resets on entry, but
+            # it isn't called on the no-domain path, so reset here too.
+            from fluid_build.cli.forge_copilot_prompts import set_domain_prompt_fragments
+
+            set_domain_prompt_fragments(None, None)
     rc.context = context
     return None
 
