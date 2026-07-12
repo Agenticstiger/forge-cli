@@ -1,0 +1,53 @@
+# FLUID-emitted round-trip regression fixture.
+#
+# Deliberately shaped to trigger the two historical asymmetries in the
+# FLUID → ODCS → FLUID → ODCS fixed-point property:
+#
+#   1. No `metadata.name` — the importer used to synthesize `metadata.name`
+#      from the contract `id`, so re-export re-added a phantom top-level
+#      `name` (the consistent `extra=1`).
+#   2. Fields with `required: false` (and one with `required` absent) — a
+#      fresh FLUID export always writes `required`, but the importer dropped
+#      the explicit `false` so re-export omitted it (the `missing=1..N`).
+fluidVersion: "0.7.1"
+kind: DataContract
+id: analytics.sales_summary
+name: sales-summary
+
+metadata:
+  version: "1.0.0"
+  # intentionally NO `name` key here — see note (1) above.
+  description: "Sales summary output for round-trip regression"
+  status: active
+  domain: analytics
+  tenant: acme
+
+owner:
+  team: analytics-team
+  email: data@acme.com
+  role: data-owner
+
+exposes:
+  - id: sales_summary
+    exposeId: sales_summary
+    version: "1.0.0"
+    description: "Daily sales summary output port"
+    binding:
+      platform: bigquery
+      location:
+        project: acme-prod
+        dataset: analytics
+    contract:
+      schema:
+        - name: sale_date
+          type: date
+          required: true
+          tags: [primary-key]
+        - name: region
+          type: string
+          required: false
+        - name: revenue
+          type: decimal
+          required: false
+        - name: notes
+          type: string

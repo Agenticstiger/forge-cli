@@ -119,11 +119,17 @@ def _property_to_field(prop: Mapping[str, Any]) -> Dict[str, Any]:
     if prop.get("classification"):
         fld["classification"] = prop["classification"]
 
-    # required (v3.1.0); fall back to legacy isNullable
+    # required (v3.1.0); fall back to legacy isNullable. Track whether the
+    # source ODCS carried ``required`` *explicitly* so the export side can
+    # reproduce an explicit ``required: false`` verbatim (a fresh FLUID export
+    # always writes ``required``, so a re-export must too — see to_odcs).
+    required_explicit = False
     if "required" in prop:
         fld["required"] = bool(prop["required"])
+        required_explicit = True
     elif "isNullable" in prop:
         fld["required"] = not bool(prop["isNullable"])
+        required_explicit = True
     else:
         fld["required"] = False
 
@@ -144,6 +150,8 @@ def _property_to_field(prop: Mapping[str, Any]) -> Dict[str, Any]:
     # so the export side knows to stay loss-less (no auto-defaults).
     pt = field_passthrough(fld)
     pt["imported"] = True
+    if required_explicit:
+        pt["required_present"] = True
     if prop.get("primaryKey"):
         pt["primary_key"] = True
     for src, dst in (
@@ -279,12 +287,16 @@ def _field_to_property(fld: Mapping[str, Any], provider: Optional[str]) -> Dict[
     if fld.get("description"):
         prop["description"] = fld["description"]
 
-    # required: ODCS default is False. For round-trip we only emit when the
-    # original had it (or when True). For fresh FLUID exports we keep the
-    # legacy behaviour of always emitting (downstream consumers expect it).
+    # required: ODCS default is False. Emit True whenever the field is
+    # required. Otherwise emit an explicit ``required: false`` in two cases so
+    # export stays a round-trip fixed point:
+    #   - fresh FLUID exports always write it (downstream consumers expect it);
+    #   - imported fields whose source ODCS carried ``required`` explicitly
+    #     (``required_present``) reproduce it verbatim — a FLUID-emitted ODCS
+    #     always has ``required``, so its re-export must too.
     if fld.get("required"):
         prop["required"] = True
-    elif not is_imported:
+    elif not is_imported or pt.get("required_present"):
         prop["required"] = False
 
     if fld.get("classification"):

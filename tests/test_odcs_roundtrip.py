@@ -23,10 +23,17 @@ import yaml
 from fluid_build.providers.odcs import OdcsProvider
 
 FIXTURES = Path(__file__).parent / "fixtures" / "odcs"
+FLUID_FIXTURES = Path(__file__).parent / "fixtures" / "fluid"
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load(name: str) -> dict:
     with open(FIXTURES / name) as f:
+        return yaml.safe_load(f)
+
+
+def _load_fluid(path: Path) -> dict:
+    with open(path) as f:
         return yaml.safe_load(f)
 
 
@@ -46,6 +53,72 @@ def test_roundtrip_zero_diff(fixture: str) -> None:
         f"  extra  : {result['extra']}\n"
         f"  changed: {result['changed']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# FLUID-emitted round-trip: export(import(export(x))) must equal export(x)
+#
+# The canary above proves *externally-authored* ODCS survives the round-trip.
+# These prove the other direction — ODCS that FLUID itself just emitted must
+# also be a structural fixed point. This is the gap the biz-lab sweep found:
+# the importer synthesized a top-level ``name`` and dropped explicit
+# ``required: false`` fields, so re-export never reproduced the emitter output.
+# ---------------------------------------------------------------------------
+
+# Representative in-repo FLUID contracts. Skipped individually if absent so the
+# suite stays green if examples move; the dedicated fixture below is the stable
+# anchor that must always be present.
+_EXAMPLE_CONTRACTS = [
+    "examples/customer360/contract.fluid.yaml",
+    "examples/05-data-quality-validation/contract.fluid.yaml",
+    "examples/snowflake/billing_history/contract.fluid.yaml",
+    "examples/local/high_value_churn/contract.fluid.yaml",
+    "examples/01-hello-world/contract.fluid.yaml",
+]
+
+
+def _assert_fluid_emitted_roundtrips(fluid: dict) -> None:
+    """FLUID → ODCS → FLUID → ODCS must be a structural fixed point.
+
+    ``render_all_ports`` emits one ODCS per output port; each must survive
+    ``import → export`` with zero diff.
+    """
+    prov = OdcsProvider()
+    ports = prov.render_all_ports(fluid)
+    assert ports, "expected at least one output port to render"
+    for expose_id, odcs in ports:
+        rt = prov.roundtrip_check(odcs)
+        assert rt["equal"], (
+            f"FLUID-emitted ODCS round-trip diff for port {expose_id!r}:\n"
+            f"  extra  : {rt['extra']}\n"
+            f"  missing: {rt['missing']}\n"
+            f"  changed: {rt['changed']}"
+        )
+
+
+def test_fluid_emitted_odcs_roundtrips_zero_diff() -> None:
+    """Dedicated fixture triggering both historical asymmetries: the
+    synthesized top-level ``name`` (extra) and dropped ``required: false``
+    fields (missing)."""
+    fluid = _load_fluid(FLUID_FIXTURES / "contract-fluid-emitted.fluid.yaml")
+    _assert_fluid_emitted_roundtrips(fluid)
+
+
+def test_multi_expose_fluid_emitted_roundtrips_zero_diff() -> None:
+    """The multi-expose driver fixture must also be a fixed point per output
+    port (it already was, but this pins it against future emitter drift)."""
+    fluid = _load_fluid(FLUID_FIXTURES / "contract-multi-expose.fluid.yaml")
+    _assert_fluid_emitted_roundtrips(fluid)
+
+
+@pytest.mark.parametrize("rel_path", _EXAMPLE_CONTRACTS)
+def test_example_contracts_fluid_emitted_roundtrip(rel_path: str) -> None:
+    """Every shipped example contract round-trips losslessly when FLUID emits
+    the ODCS — the biz-lab gap reproduced on public examples."""
+    path = REPO_ROOT / rel_path
+    if not path.exists():
+        pytest.skip(f"example contract not present: {rel_path}")
+    _assert_fluid_emitted_roundtrips(_load_fluid(path))
 
 
 # ---------------------------------------------------------------------------

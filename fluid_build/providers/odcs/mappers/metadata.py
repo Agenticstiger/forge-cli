@@ -42,7 +42,13 @@ def to_fluid(ctx: ImportCtx) -> None:
 
     metadata = fluid.setdefault("metadata", {})
     metadata["version"] = odcs.get("version", "1.0.0")
-    metadata["name"] = odcs.get("name", odcs.get("id"))
+    # Only carry ``name`` when the source ODCS actually has one. Synthesizing
+    # it from ``id`` broke the FLUID-emitted round-trip: a fresh export omits
+    # ``name`` when the contract has none, but the importer's ``id`` fallback
+    # made re-export re-add a phantom top-level ``name`` (``export`` must be a
+    # fixed point). ``name`` is not required on FLUID ``metadata``.
+    if odcs.get("name"):
+        metadata["name"] = odcs["name"]
     metadata["status"] = odcs_to_fluid_status(odcs.get("status", "active"))
 
     fluid.setdefault("contract", {})["id"] = odcs.get("id")
