@@ -25,6 +25,15 @@ Captures the metrics that make UX decisions evidence-based:
 * ``picker_choice`` — which mode the user picked (ai/blank/refine/
   template/from_product). Tells us which paths matter.
 * ``mode`` — bootstrap mode (standard/compose/refine).
+* ``provider`` — which LLM provider authored the contract
+  (anthropic/openai/gemini/local/…). Low-cardinality enum-like value —
+  the analytics analogue of dbt's ``adapter_type``. Never a model id,
+  endpoint, key, or any free-form string.
+* ``run_completed`` — did the forge run reach a written contract? Emitted
+  ``True`` on success and ``False`` on failure so an aggregator can
+  compute a real **completion rate** (numerator / denominator) rather
+  than a success-only sample. Mirrors dbt's "whether the invocation
+  succeeded" and Next.js's ``*_COMPLETED`` events.
 * ``preview_accept_rate`` — did the user hit Y or n at the preview?
   Y rate >90% = the contract matches the user's intent.
 * ``schema_repair_attempts`` — how many self-healing rounds before a
@@ -48,6 +57,45 @@ from typing import Any, Dict, List, Optional
 
 LOG = logging.getLogger(__name__)
 
+# Low-cardinality allowlist for the ``ux.provider`` attribute. Mirrors the
+# ``fluid forge --llm-provider`` argparse choices plus the internal LiteLLM
+# backend and the ``local`` fallback. Any value outside this set collapses to
+# ``"other"`` so a mislabelled provenance value can never turn ``ux.provider``
+# into a high-cardinality / free-form (potentially PII-bearing) attribute.
+# Enum-like naming + bounded cardinality follows the OpenTelemetry
+# semantic-convention guidance for span attributes.
+_KNOWN_PROVIDERS = frozenset(
+    {
+        "openai",
+        "anthropic",
+        "claude",
+        "gemini",
+        "ollama",
+        "mcp-sampling",
+        "claude-code",
+        "codex",
+        "cursor",
+        "kiro",
+        "litellm",
+        "local",
+    }
+)
+
+
+def _normalize_provider(name: Any) -> str:
+    """Collapse an arbitrary provider label to a bounded enum-like slug.
+
+    Returns ``""`` for unset/blank input, the canonical slug for a known
+    provider, and ``"other"`` for anything unrecognised — never the raw
+    free-form string (privacy + low-cardinality guarantee).
+    """
+    if not name:
+        return ""
+    slug = str(name).strip().lower()
+    if not slug:
+        return ""
+    return slug if slug in _KNOWN_PROVIDERS else "other"
+
 
 @dataclass
 class UXTelemetry:
@@ -59,6 +107,8 @@ class UXTelemetry:
     inferences_used: int = 0
     picker_choice: str = ""
     mode: str = "standard"  # standard / compose / refine / template / blank
+    provider: str = ""  # anthropic / openai / gemini / local / … (enum-like)
+    run_completed: bool = False
     preview_rendered: bool = False
     preview_accepted: bool = False
     schema_repair_attempts: int = 0
@@ -85,6 +135,28 @@ class UXTelemetry:
     def record_repair(self) -> None:
         self.schema_repair_attempts += 1
 
+    def record_provider(self, name: Any) -> None:
+        """Record the LLM provider that authored the contract.
+
+        Normalised to a bounded enum-like slug (see
+        :func:`_normalize_provider`) so ``ux.provider`` stays low-cardinality
+        and can never carry a model id, endpoint, key, or other free-form
+        value. A blank/unknown input leaves the previously recorded value
+        untouched rather than clobbering it with ``""``.
+        """
+        slug = _normalize_provider(name)
+        if slug:
+            self.provider = slug
+
+    def mark_completed(self, completed: bool = True) -> None:
+        """Flag whether this forge run reached a written contract.
+
+        Emitted on both the success and failure paths so an aggregator can
+        compute a genuine completion *rate* (completed / total) instead of a
+        success-only sample.
+        """
+        self.run_completed = bool(completed)
+
     # ----- summary --------------------------------------------------
 
     @property
@@ -101,6 +173,8 @@ class UXTelemetry:
             "ux.inferences_used": int(self.inferences_used),
             "ux.mode": str(self.mode or ""),
             "ux.picker_choice": str(self.picker_choice or ""),
+            "ux.provider": str(self.provider or ""),
+            "ux.run_completed": bool(self.run_completed),
             "ux.preview_rendered": bool(self.preview_rendered),
             "ux.preview_accepted": bool(self.preview_accepted),
             "ux.schema_repair_attempts": int(self.schema_repair_attempts),
@@ -170,8 +244,39 @@ def emit_telemetry_to_active_span() -> None:
             LOG.debug("ux_telemetry_attribute_failed: %s=%s — %s", key, value, exc)
 
 
+def emit_forge_run_span(base_attrs: Optional[Dict[str, Any]] = None) -> None:
+    """Open a fresh ``forge.invocation`` span carrying the current record.
+
+    Used by forge exit paths that don't otherwise open the invocation span —
+    principally the failure branches, so a ``run_completed=False`` run still
+    lands and contributes to the completion-rate denominator.
+
+    ``base_attrs`` (e.g. ``fluid.flow=forge``) are non-PII operational
+    attributes and are always applied; the behavioural ``ux.*`` attributes are
+    added only when the user has opted in (default OFF; ``DO_NOT_TRACK`` /
+    ``FLUID_TELEMETRY=0`` force them off). Best-effort and a no-op when no OTel
+    exporter is configured — telemetry must never block or crash a forge run.
+    """
+    attrs: Dict[str, Any] = dict(base_attrs or {})
+    try:
+        from fluid_build.cli._telemetry_consent import telemetry_enabled
+
+        if telemetry_enabled():
+            attrs.update(get_telemetry().to_span_attributes())
+    except Exception:  # noqa: BLE001 — fail closed (no ux.* attrs) on gate error
+        pass
+    try:
+        from fluid_build.observability.tracing import traced_span
+
+        with traced_span("forge.invocation", attributes=attrs):
+            pass
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("emit_forge_run_span_failed: %s", exc)
+
+
 __all__ = [
     "UXTelemetry",
+    "emit_forge_run_span",
     "emit_telemetry_to_active_span",
     "get_telemetry",
     "reset_telemetry",

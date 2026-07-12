@@ -301,6 +301,22 @@ def _create_project_agent_loop(
         return False
 
 
+def _emit_incomplete_forge_span(logger: logging.Logger) -> None:
+    """Emit a ``run_completed=False`` ``forge.invocation`` span on failure.
+
+    The success path opens its own richly-attributed span; the failure
+    branches call this so a not-completed run still lands (consent-gated) and
+    contributes to the completion-rate denominator. Best-effort — never raises.
+    """
+    try:
+        from fluid_build.cli._ux_telemetry import emit_forge_run_span, get_telemetry
+
+        get_telemetry().mark_completed(False)
+        emit_forge_run_span({"fluid.flow": "forge"})
+    except Exception:  # noqa: BLE001 — telemetry must never block forge
+        logger.debug("forge_incomplete_span_failed", exc_info=True)
+
+
 def _create_project_minimal(
     *,
     copilot: Any,
@@ -645,6 +661,15 @@ def _create_project_minimal(
             _llm_model_name = (getattr(generation_result, "provenance", None) or {}).get(
                 "llm_model", ""
             )
+            # Capture the provider choice for consent-gated UX telemetry. The
+            # helper normalises to a bounded enum-like slug — never the model
+            # id/endpoint (those stay local to the cost snapshot below).
+            try:
+                from fluid_build.cli._ux_telemetry import get_telemetry as _get_tel
+
+                _get_tel().record_provider(_llm_provider_name)
+            except Exception:  # noqa: BLE001 — telemetry must never block forge
+                logger.debug("ux_provider_record_failed", exc_info=True)
             _preview_panel.cost = capture_cost_snapshot(
                 provider=_llm_provider_name,
                 model=_llm_model_name,
@@ -959,6 +984,10 @@ def _create_project_minimal(
                 if telemetry_enabled():
                     from fluid_build.cli._ux_telemetry import get_telemetry
 
+                    # Reached the write path — mark the run complete so
+                    # ``ux.run_completed`` emits True (the completion-rate
+                    # numerator). The failure branches emit False below.
+                    get_telemetry().mark_completed(True)
                     attrs.update(get_telemetry().to_span_attributes())
             except Exception:  # noqa: BLE001
                 pass
@@ -989,6 +1018,7 @@ def _create_project_minimal(
 
     except CopilotGenerationError as exc:
         logger.exception("AI Copilot minimal flow failed")
+        _emit_incomplete_forge_span(logger)
         if console:
             try:
                 console.print(f"[red]❌ {exc.message}[/red]")
@@ -1001,6 +1031,7 @@ def _create_project_minimal(
         return False
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
         logger.exception("AI Copilot minimal flow crashed")
+        _emit_incomplete_forge_span(logger)
         if console:
             try:
                 console.print(f"[red]❌ Failed to create project: {exc}[/red]")
