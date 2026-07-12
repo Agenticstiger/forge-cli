@@ -197,10 +197,18 @@ _AI_TEST_REPORT_VERSION = 1
 # ---------------------------------------------------------------------------
 # Config file — persists provider + model choice across sessions
 # ---------------------------------------------------------------------------
-
-_CONFIG_DIR = Path.home() / ".fluid"
-_CONFIG_FILE = _CONFIG_DIR / "ai_config.json"
-
+#
+# The canonical path constants live in the tier-0 ``_ai_config_shared`` leaf
+# (the same leaf that owns the shared config-*read* logic), so ``ai_setup`` and
+# ``forge_copilot_llm_providers`` no longer reach into each other for the config
+# surface — that was the circular-import edge. Re-exported here under the old
+# names so ``patch("...cli.ai_setup._CONFIG_FILE", tmp)`` (and the storage
+# layer's ``_config_file()`` indirection, which reads *this* module attribute)
+# keep working unchanged.
+from fluid_build.cli._ai_config_shared import (  # noqa: E402,F401
+    _CONFIG_DIR,
+    _CONFIG_FILE,
+)
 
 # Storage helpers (config + keyring) — physically extracted to
 # ``cli/_ai_setup_storage.py``. ~155 LOC of pure I/O lifted without

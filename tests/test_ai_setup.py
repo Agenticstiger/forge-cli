@@ -259,7 +259,10 @@ class TestCheckLlmReadiness:
     def test_ready_with_openai_env(self):
         from fluid_build.cli.forge_copilot_llm_providers import check_llm_readiness
 
-        with patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None):
+        # ``check_llm_readiness`` reads saved config through the tier-0
+        # ``_ai_config_shared`` leaf (breaking the ai_setup <-> llm_providers
+        # cycle), so the loader is stubbed at its canonical location.
+        with patch("fluid_build.cli._ai_config_shared.load_ai_config", return_value=None):
             result = check_llm_readiness(
                 {"OPENAI_API_KEY": "sk-test", "FLUID_LLM_PROVIDER": "openai"}
             )
@@ -278,8 +281,11 @@ class TestCheckLlmReadiness:
         # individually so every test-time Ollama install must be
         # mocked at the ambient step.
         with (
-            patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None),
-            patch("fluid_build.cli.ai_setup._CONFIG_FILE", Path("/nonexistent/ai_config.json")),
+            patch("fluid_build.cli._ai_config_shared.load_ai_config", return_value=None),
+            patch(
+                "fluid_build.cli._ai_config_shared._CONFIG_FILE",
+                Path("/nonexistent/ai_config.json"),
+            ),
             patch(
                 "fluid_build.cli.forge_copilot_llm_providers._infer_provider_from_explicit_keys",
                 return_value=None,
@@ -306,7 +312,7 @@ class TestCheckLlmReadiness:
     def test_ready_with_gemini_api_key_alias(self):
         from fluid_build.cli.forge_copilot_llm_providers import check_llm_readiness
 
-        with patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None):
+        with patch("fluid_build.cli._ai_config_shared.load_ai_config", return_value=None):
             result = check_llm_readiness(
                 {"GEMINI_API_KEY": "AIzaTestAlias", "FLUID_LLM_PROVIDER": "gemini"}
             )

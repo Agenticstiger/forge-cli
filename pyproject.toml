@@ -678,3 +678,21 @@ forbidden_modules = [
 # class this contract exists to prevent.
 allow_indirect_imports = false
 as_packages = true
+
+[[tool.importlinter.contracts]]
+name = "_ai_config_shared is a tier-0 leaf (no cycle back-edges)"
+type = "forbidden"
+source_modules = ["fluid_build.cli._ai_config_shared"]
+forbidden_modules = [
+  "fluid_build.cli.ai_setup",
+  "fluid_build.cli._ai_setup_storage",
+  "fluid_build.cli.forge_copilot_llm_providers",
+]
+# ``_ai_config_shared`` owns the AI-config *read* surface that both
+# ``ai_setup`` and ``forge_copilot_llm_providers`` share. It exists to break the
+# ``ai_setup <-> forge_copilot_llm_providers`` import cycle, so it must never
+# import either of those (nor the storage layer that re-exports from it). Any
+# such edge — direct or indirect — re-creates the cycle. Its only non-stdlib
+# dependency is the lazily-imported ``copilot.unified_config`` leaf.
+allow_indirect_imports = false
+as_packages = true

@@ -1506,11 +1506,17 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
         provider_name = _infer_provider_from_explicit_keys(env)
 
     # Step 3 — saved ``~/.fluid/ai_config.json`` choice.
+    #
+    # Read the saved config through the tier-0 ``_ai_config_shared`` leaf, NOT
+    # ``cli.ai_setup``. Importing ``ai_setup`` here (from inside the LLM-provider
+    # module) is the edge that closed the ``ai_setup <-> llm_providers`` import
+    # cycle; the leaf owns the shared config-loading surface so neither module
+    # imports the other for it.
     if not provider_name:
         try:
-            from fluid_build.cli.ai_setup import _load_ai_config
+            from fluid_build.cli._ai_config_shared import load_ai_config
 
-            saved = _load_ai_config()
+            saved = load_ai_config()
             if saved:
                 provider_name = saved.get("provider")
                 saved_model = saved.get("model")
@@ -1534,9 +1540,9 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
     # honours the saved model.
     if provider_name and saved is None:
         try:
-            from fluid_build.cli.ai_setup import _load_ai_config
+            from fluid_build.cli._ai_config_shared import load_ai_config
 
-            saved = _load_ai_config()
+            saved = load_ai_config()
             if saved and saved.get("provider") == provider_name:
                 saved_model = saved.get("model")
                 saved_key = saved.get("api_key")
