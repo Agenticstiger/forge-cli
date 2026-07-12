@@ -478,7 +478,12 @@ def record_domain_detection(
     data[_DOMAIN_HISTORY_KEY] = history
 
     if _write_config_dict(data):
-        LOG.debug("Recorded domain detection: %s (count=%d)", slug, prior + 1)
+        # Log only the input-derived, regex-validated slug — NOT the count,
+        # which is read from the shared ai_config (that file can hold a
+        # gated api_key), so CodeQL taints any value sourced from it
+        # (py/clear-text-logging-sensitive-data). Repo convention is to
+        # avoid interpolating config-sourced values, not to suppress.
+        LOG.debug("Recorded domain detection: %s", slug)
         return slug
     return None
 
