@@ -66,6 +66,28 @@ jobs:
       - name: Run import-linter contracts
         run: lint-imports
 
+  # ── mypy --strict on the security-critical hotspot allowlist ─────────
+  # Incremental strict-typing gate. The allowlist lives in ONE place — the
+  # ``[[tool.mypy.overrides]] strict = true`` block in pyproject.toml — and
+  # ``scripts/mypy_strict.py`` (shared with ``make typecheck-strict``) derives
+  # its target file list straight from there, so the config and the gate can
+  # never drift. The runner uses ``--follow-imports=silent`` to scope the
+  # check to exactly those modules, so strict errors in the still-loose rest
+  # of the tree never fail this gate. Deliberately lightweight (mypy + stubs
+  # only, no project install) so it stays fast.
+  typecheck-strict:
+    name: Type check (mypy --strict, hotspots)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install "mypy>=1.10" types-PyYAML
+      - name: mypy --strict on hotspot allowlist (derived from pyproject.toml)
+        run: python scripts/mypy_strict.py
+
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest

@@ -28,9 +28,11 @@ import re
 import signal
 import stat
 import threading
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import FrameType
 from typing import Any, Optional, Set, Union
 
 from .core import FluidCLIError
@@ -136,16 +138,13 @@ class SecurityContext:
     """Security context for CLI operations"""
 
     max_file_size: int = MAX_FILE_SIZE
-    allowed_extensions: Set[str] = None
-    forbidden_paths: Set[str] = None
+    # ``default_factory`` gives each instance its own fresh copy of the
+    # defaults (equivalent to the old ``__post_init__`` ``.copy()`` reset)
+    # while keeping the field type honestly non-optional for strict typing.
+    allowed_extensions: Set[str] = field(default_factory=lambda: set(ALLOWED_FILE_EXTENSIONS))
+    forbidden_paths: Set[str] = field(default_factory=lambda: set(FORBIDDEN_PATHS))
     enable_path_validation: bool = True
     enable_content_validation: bool = True
-
-    def __post_init__(self):
-        if self.allowed_extensions is None:
-            self.allowed_extensions = ALLOWED_FILE_EXTENSIONS.copy()
-        if self.forbidden_paths is None:
-            self.forbidden_paths = FORBIDDEN_PATHS.copy()
 
 
 class SecurePathValidator:
@@ -633,11 +632,11 @@ class ProcessManager:
         self.logger = logging.getLogger(__name__)
 
     @contextmanager
-    def timeout_context(self, timeout: Optional[int] = None):
+    def timeout_context(self, timeout: Optional[int] = None) -> Iterator[None]:
         """Context manager for operation timeouts"""
         timeout = timeout or self.default_timeout
 
-        def timeout_handler(signum, frame):
+        def timeout_handler(signum: int, frame: Optional[FrameType]) -> None:
             raise TimeoutError(f"Operation timed out after {timeout} seconds")
 
         # Set up signal handler (Unix only)
@@ -654,7 +653,11 @@ class ProcessManager:
                 signal.signal(signal.SIGALRM, old_handler)
 
     def run_with_timeout(
-        self, func: callable, args: tuple = (), kwargs: dict = None, timeout: Optional[int] = None
+        self,
+        func: Callable[..., Any],
+        args: tuple[Any, ...] = (),
+        kwargs: Optional[dict[str, Any]] = None,
+        timeout: Optional[int] = None,
     ) -> Any:
         """Run a function with timeout protection"""
         kwargs = kwargs or {}
@@ -749,7 +752,7 @@ class ProductionLogger:
             r"secret[=:\s]+\S+",
         ]
 
-    def log_safe(self, level: str, message: str, **kwargs) -> None:
+    def log_safe(self, level: str, message: str, **kwargs: Any) -> None:
         """Log message with sensitive data sanitization"""
         sanitized_message = self._sanitize_message(message)
         sanitized_kwargs = self._sanitize_kwargs(kwargs)
@@ -764,9 +767,9 @@ class ProductionLogger:
             sanitized = re.sub(pattern, r"***REDACTED***", sanitized, flags=re.IGNORECASE)
         return sanitized
 
-    def _sanitize_kwargs(self, kwargs: dict) -> dict:
+    def _sanitize_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Remove sensitive data from log context"""
-        sanitized = {}
+        sanitized: dict[str, Any] = {}
         for key, value in kwargs.items():
             if any(
                 sensitive in key.lower() for sensitive in ["password", "token", "key", "secret"]

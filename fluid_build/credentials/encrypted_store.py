@@ -25,7 +25,7 @@ import os
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +33,14 @@ try:
     from cryptography.fernet import Fernet, InvalidToken
 
     CRYPTOGRAPHY_AVAILABLE = True
-except ImportError:
+except ImportError:  # pragma: no cover - optional-dependency guard
+    # We intentionally do NOT rebind ``Fernet`` / ``InvalidToken`` to a
+    # sentinel here. They are referenced only by instance methods, and
+    # ``EncryptedCredentialStore.__init__`` raises before any such reference
+    # when the dependency is missing (``CRYPTOGRAPHY_AVAILABLE`` is False).
+    # Leaving the names unbound keeps this module ``mypy --strict`` clean
+    # whether or not ``cryptography`` is installed at type-check time.
     CRYPTOGRAPHY_AVAILABLE = False
-    Fernet = None
 
 
 def _secure_parent_dir(path: Path) -> None:
@@ -129,7 +134,7 @@ class EncryptedCredentialStore:
         self.key_path = key_path or Path.home() / ".fluid" / ".key"
         self._ensure_key()
 
-    def _ensure_key(self):
+    def _ensure_key(self) -> None:
         """Resolve the Fernet key, in priority order:
 
         1. ``FLUID_ENCRYPTION_KEY`` — a raw urlsafe-base64 Fernet key
@@ -253,7 +258,9 @@ class EncryptedCredentialStore:
         if value:
             # Constant-only log: ``value`` (the credential) is in scope.
             logger.debug("Retrieved encrypted credential")
-        return value
+        # The store is decrypted JSON (``Dict[str, Any]``); the stored value is
+        # a ``str`` by construction, so narrow it at the typed return boundary.
+        return cast(Optional[str], value)
 
     def get_credential_metadata(self, key: str) -> Optional[Dict[str, Any]]:
         """
@@ -307,7 +314,7 @@ class EncryptedCredentialStore:
             self._save_store(data)
             logger.debug(f"Deleted encrypted credential: {key}")
 
-    def list_credentials(self) -> list:
+    def list_credentials(self) -> list[str]:
         """
         List all credential keys (without values).
 
@@ -317,15 +324,20 @@ class EncryptedCredentialStore:
         data = self._load_store()
         return list(data.keys())
 
-    def _load_store(self) -> Dict[str, str]:
-        """Load and decrypt credential store."""
+    def _load_store(self) -> Dict[str, Any]:
+        """Load and decrypt credential store.
+
+        Values are heterogeneous by design — new-format entries are metadata
+        dicts (``{"value", "stored_at", "expires_at"}``) while legacy entries
+        are bare strings — so the honest element type is ``Any``.
+        """
         if not self.store_path.exists():
             return {}
 
         try:
             encrypted = self.store_path.read_bytes()
             decrypted = self.cipher.decrypt(encrypted)
-            data = json.loads(decrypted)
+            data: Dict[str, Any] = json.loads(decrypted)
             logger.debug(f"Loaded {len(data)} credentials from encrypted store")
             return data
         except InvalidToken as exc:
@@ -364,7 +376,7 @@ class EncryptedCredentialStore:
                 f"Failed to read encrypted credential store at {self.store_path}: {exc}"
             ) from exc
 
-    def _save_store(self, data: Dict[str, str]) -> None:
+    def _save_store(self, data: Dict[str, Any]) -> None:
         """Encrypt and save credential store."""
         try:
             _secure_parent_dir(self.store_path)

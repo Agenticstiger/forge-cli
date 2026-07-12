@@ -195,6 +195,15 @@ echo "Using: $$vp"; \
 $$vp -m mypy fluid_build || true;'
 
 
+typecheck-strict: ## Run mypy --strict on the pyproject hotspot allowlist (blocks; == CI gate)
+	@bash -lc '\
+if [ -x "$(VENV)/bin/python" ]; then vp="$(VENV)/bin/python"; \
+elif [ -x "$(VENV)/Scripts/python.exe" ]; then vp="$(VENV)/Scripts/python.exe"; \
+else vp=$(PYTHON); fi; \
+echo "Using: $$vp"; \
+$$vp scripts/mypy_strict.py;'
+
+
 test: ## Run unit tests
 	@bash -lc '\
 if [ -x "$(VENV)/bin/python" ]; then vp="$(VENV)/bin/python"; \

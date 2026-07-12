@@ -528,6 +528,38 @@ warn_unused_ignores = true
 disallow_untyped_defs = false
 ignore_missing_imports = true
 
+# ── Incremental ``mypy --strict`` hotspot allowlist ─────────────────────
+#
+# The global ``[tool.mypy]`` config above stays deliberately loose: turning
+# on strict typing across the whole ~40K-LOC tree at once would bury real
+# regressions under thousands of pre-existing gaps. Instead we roll
+# ``--strict`` out one security-critical hotspot module at a time via the
+# per-module override below — the same gradual approach FastAPI, pydantic
+# and sqlglot use rather than flipping the entire tree in one go. See
+# https://mypy.readthedocs.io/en/stable/config_file.html#per-module-and-global-options
+#
+# This block is the SINGLE SOURCE OF TRUTH for the strict allowlist. The
+# ``typecheck-strict`` job in ``.github/workflows/ci.yml`` derives its
+# target file list directly from the ``module`` array below (via tomllib),
+# so the CI gate and this config can never drift. The gate runs with
+# ``--follow-imports=silent`` so it only ever fails on these modules —
+# never on the still-loose rest of the tree.
+#
+# To add a module to the strict gate:
+#   1. Make it clean:
+#        .venv/bin/mypy --strict --follow-imports=silent path/to/module.py
+#   2. Add its dotted module name to the ``module`` array below.
+# CI then picks it up automatically. ``tests/test_mypy_strict_allowlist.py``
+# pins that every entry resolves to a real source file.
+[[tool.mypy.overrides]]
+module = [
+    "fluid_build.cli.security",
+    "fluid_build.credentials.encrypted_store",
+    "fluid_build.observability.secret_redactor",
+    "fluid_build.secrets",
+]
+strict = true
+
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]

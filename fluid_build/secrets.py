@@ -160,7 +160,11 @@ class SecretManager:
             client = secretmanager.SecretManagerServiceClient()
             name = f"projects/{self.config.project_id}/secrets/{secret_name}/versions/latest"
             response = client.access_secret_version(request={"name": name})
-            return response.payload.data.decode("UTF-8")
+            # The GCP SDK is an untyped/optional dependency, so its return
+            # values are ``Any``; bind through an annotated local to keep the
+            # typed boundary honest (``str``).
+            payload: str = response.payload.data.decode("UTF-8")
+            return payload
         except Exception as e:
             logger.warning(f"Failed to retrieve secret from GCP: {e}")
             return None
@@ -181,9 +185,12 @@ class SecretManager:
             client = boto3.client("secretsmanager", region_name=region)
             response = client.get_secret_value(SecretId=secret_name)
 
-            # Handle both string and binary secrets
+            # Handle both string and binary secrets. boto3 is an untyped,
+            # lazily-imported dependency (its calls return ``Any``); bind the
+            # result through an annotated local at the typed boundary.
             if "SecretString" in response:
-                return response["SecretString"]
+                secret_string: str = response["SecretString"]
+                return secret_string
             else:
                 import base64
 
@@ -227,7 +234,9 @@ class SecretManager:
             credential = DefaultAzureCredential()
             client = SecretClient(vault_url=self.config.vault_url, credential=credential)
             secret = client.get_secret(secret_name)
-            return secret.value
+            # Azure SDK is an untyped/optional dependency (returns ``Any``).
+            secret_value: Optional[str] = secret.value
+            return secret_value
         except Exception as e:
             logger.warning(f"Failed to retrieve secret from Azure: {e}")
             return None
@@ -265,7 +274,9 @@ class SecretManager:
             response = client.secrets.kv.v2.read_secret_version(
                 path=secret_name, mount_point=vault_path.split("/")[0]
             )
-            return response["data"]["data"].get("value")
+            # hvac is an untyped/optional dependency (returns ``Any``).
+            vault_value: Optional[str] = response["data"]["data"].get("value")
+            return vault_value
         except Exception as e:
             logger.warning(f"Failed to retrieve secret from Vault: {e}")
             return None
@@ -350,7 +361,7 @@ class SecretManager:
             logger.warning(f"Failed to read secret from file: {e}")
             return None
 
-    def clear_cache(self):
+    def clear_cache(self) -> None:
         """Clear the secret cache"""
         self._cache.clear()
         logger.debug("Secret cache cleared")
