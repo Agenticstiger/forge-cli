@@ -45,6 +45,8 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from fluid_build.cli import _ai_config_shared
+
 LOG = logging.getLogger("fluid.cli.ai_setup.storage")
 
 
@@ -77,16 +79,12 @@ def _plaintext_env_var() -> str:
 
 # ── Config storage ──────────────────────────────────────────────────────
 
-# ``ai_config.json`` schema version. v2 is the multi-provider map
-# ``{"version": 2, "active": <name>, "providers": {<name>: {<entry>}}}``.
-# The pre-v2 single-provider shape ``{"provider": .., "model": ..}`` is
-# still read transparently (see :func:`_normalize_config`) so upgrades
-# never strand an existing config.
-_CONFIG_SCHEMA_VERSION = 2
-
-# Top-level keys that are NOT part of a per-provider entry — used when
-# folding the legacy single-provider shape into a one-entry map.
-_MAP_META_KEYS = frozenset({"provider", "version", "active", "providers", "domain_history"})
+# ``ai_config.json`` schema version. Sourced from the tier-0 leaf so the read
+# and write paths share one definition (v2 is the multi-provider map
+# ``{"version": 2, "active": <name>, "providers": {<name>: {<entry>}}}``; the
+# pre-v2 single-provider shape ``{"provider": .., "model": ..}`` is read
+# transparently by ``_ai_config_shared._normalize_config``).
+_CONFIG_SCHEMA_VERSION = _ai_config_shared._CONFIG_SCHEMA_VERSION
 
 # ── Domain-detection history (usage-based personalization) ──────────────
 #
@@ -131,54 +129,23 @@ def _allow_plaintext_ai_secrets() -> bool:
 
 
 def _read_config_file() -> Optional[dict]:
-    """Read + JSON-parse ``~/.fluid/ai_config.json``.
+    """Read + JSON-parse ``~/.fluid/ai_config.json`` (delegates to the leaf).
 
-    Returns the raw ``dict`` (either shape) or ``None`` when the file is
-    absent, unreadable, or not a JSON object.
+    Keeps the historical no-arg signature — the config-file path comes from the
+    ``_config_file()`` indirection (which reads ``cli.ai_setup._CONFIG_FILE`` so
+    the ``patch(...)`` test seams still flow through). The raw read + JSON parse
+    live in the tier-0 :mod:`fluid_build.cli._ai_config_shared` leaf.
     """
-    import json
-
-    try:
-        cf = _config_file()
-        if not cf.exists():
-            return None
-        data = json.loads(cf.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
-    except (OSError, json.JSONDecodeError, ValueError):
-        return None
+    return _ai_config_shared._read_config_file(_config_file())
 
 
 def _normalize_config(data: Optional[dict]) -> dict:
-    """Normalise either config shape to ``{"active": name|None, "providers": {name: entry}}``.
+    """Normalise either config shape (delegates to the leaf).
 
-    Accepts the v2 multi-provider map *and* the legacy single-provider
-    shape (``{"provider": .., "model": ..}``), folding the latter into a
-    one-entry map so every reader sees the same structure. Each ``entry``
-    holds the non-name fields (``model``, ``endpoint``, ``ollama_host``,
-    ``tiered``, and — only under the opt-in plaintext fallback —
-    ``api_key``).
+    Thin wrapper over :func:`fluid_build.cli._ai_config_shared._normalize_config`
+    so the read + write paths share one shape-normalisation implementation.
     """
-    if not isinstance(data, dict):
-        return {"active": None, "providers": {}}
-
-    raw_providers = data.get("providers")
-    if isinstance(raw_providers, dict):
-        providers = {
-            name: dict(entry)
-            for name, entry in raw_providers.items()
-            if isinstance(name, str) and isinstance(entry, dict)
-        }
-        active = data.get("active")
-        if active not in providers:
-            active = next(iter(providers), None)
-        return {"active": active, "providers": providers}
-
-    # Legacy single-provider shape.
-    provider = data.get("provider")
-    if not isinstance(provider, str) or not provider:
-        return {"active": None, "providers": {}}
-    entry = {k: v for k, v in data.items() if k not in _MAP_META_KEYS}
-    return {"active": provider, "providers": {provider: entry}}
+    return _ai_config_shared._normalize_config(data)
 
 
 def _write_config_dict(payload: dict) -> bool:
@@ -280,79 +247,39 @@ def _save_ai_config(
 
 
 def _load_ai_config() -> Optional[dict]:
-    """Load the ACTIVE provider's saved AI preferences (back-compat shape).
+    """Load the ACTIVE provider's saved AI preferences (delegates to the leaf).
 
-    Returns the flat ``{"provider": .., "model": .., ...}`` dict every
-    existing caller expects, or ``None`` when nothing is configured.
-
-    Lookup order:
-
-    1. ``~/.fluid/config.yaml`` ``llm:`` section (unified path).
-    2. ``~/.fluid/ai_config.json`` — the active entry of the
-       multi-provider map (or the sole entry of a legacy file).
-    3. ``None`` — no config saved yet.
+    Returns the flat ``{"provider": .., "model": .., ...}`` dict every existing
+    caller expects, or ``None`` when nothing is configured. Lookup order
+    (unchanged): unified ``~/.fluid/config.yaml`` → ``~/.fluid/ai_config.json``
+    active entry → ``None``. The path comes from ``_config_file()`` so the
+    ``patch("...ai_setup._CONFIG_FILE", tmp)`` test seams still redirect it.
     """
-    # 1. Unified config — new operators.
-    try:
-        from fluid_build.copilot.unified_config import load_unified_config
-
-        cfg = load_unified_config()
-        if cfg is not None and cfg.llm and cfg.llm.provider:
-            data: dict = {"provider": cfg.llm.provider}
-            if cfg.llm.model:
-                data["model"] = cfg.llm.model
-            if cfg.llm.tiered:
-                data["tiered"] = cfg.llm.tiered
-            return data
-    except Exception as exc:  # pragma: no cover — defensive
-        LOG.debug("Could not load unified AI config: %s", exc)
-
-    # 2. ``~/.fluid/ai_config.json`` — active provider from the map.
-    normalized = _normalize_config(_read_config_file())
-    active = normalized["active"]
-    if not active:
-        return None
-    entry = normalized["providers"].get(active) or {}
-    return {"provider": active, **entry}
+    return _ai_config_shared.load_ai_config(_config_file())
 
 
 def _load_ai_config_map() -> Optional[dict]:
     """Return the full multi-provider view, or ``None`` when unconfigured.
 
-    Shape: ``{"active": <name>, "providers": {<name>: {"provider": <name>,
-    "model": .., ...}}}`` — each entry is flattened to carry its own
-    ``provider`` name so callers can iterate uniformly.
+    Delegates to the leaf; the ``_config_file()`` indirection keeps the
+    ``patch(...)`` seams flowing through.
     """
-    normalized = _normalize_config(_read_config_file())
-    providers = normalized["providers"]
-    if not providers:
-        return None
-    return {
-        "active": normalized["active"],
-        "providers": {name: {"provider": name, **entry} for name, entry in providers.items()},
-    }
+    return _ai_config_shared.load_ai_config_map(_config_file())
 
 
 def _load_ai_config_for(provider: str) -> Optional[dict]:
     """Return the flat config dict for a SPECIFIC saved provider, or ``None``.
 
-    Used by the resolver so ``fluid forge --llm-provider <name>`` can pick
-    the requested provider out of the map regardless of which one is
-    active.
+    Used by the resolver so ``fluid forge --llm-provider <name>`` can pick the
+    requested provider out of the map regardless of which one is active.
+    Delegates to the leaf.
     """
-    if not provider:
-        return None
-    normalized = _normalize_config(_read_config_file())
-    entry = normalized["providers"].get(provider)
-    if entry is None:
-        return None
-    return {"provider": provider, **entry}
+    return _ai_config_shared.load_ai_config_for(provider, _config_file())
 
 
 def _list_configured_providers() -> list:
-    """Return the sorted names of every provider saved in the map."""
-    normalized = _normalize_config(_read_config_file())
-    return sorted(normalized["providers"].keys())
+    """Return the sorted names of every provider saved in the map (delegates)."""
+    return _ai_config_shared.list_configured_providers(_config_file())
 
 
 def _set_active_provider(provider: str) -> bool:
