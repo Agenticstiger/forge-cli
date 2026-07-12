@@ -66,6 +66,17 @@ except ImportError:
 
 COMMAND = "init"
 
+# Provider → bundled quickstart-starter blueprint. Picking a cloud target with
+# ``fluid init --quickstart --provider gcp|snowflake`` scaffolds that provider's
+# ready-to-run starter contract (bundled, offline, no AI key). ``local`` is
+# intentionally absent: its quickstart stays the richer customer-360 example, so
+# the default ``--quickstart`` flow is unchanged. Keys must match the bundled
+# blueprint ids in ``_market_bundled_blueprints.py``.
+_QUICKSTART_PROVIDER_BLUEPRINTS: Dict[str, str] = {
+    "gcp": "fluid.starter-gcp",
+    "snowflake": "fluid.starter-snowflake",
+}
+
 
 def _latest_fluid_version() -> str:
     """Return the newest bundled FLUID schema version.
@@ -184,7 +195,11 @@ def register(subparsers: argparse._SubParsersAction):
     mode_group.add_argument(
         "--quickstart",
         action="store_true",
-        help="⭐ Create working example with sample data (recommended, 2 min)",
+        help=(
+            "⭐ Create a working starter (recommended, 2 min). Pair with "
+            "--provider gcp|snowflake for a ready-to-run provider starter "
+            "contract; default (local) ships the customer-360 example."
+        ),
     )
     mode_group.add_argument(
         "--blank", action="store_true", help="🔧 Empty project skeleton (power users)"
@@ -199,7 +214,8 @@ def register(subparsers: argparse._SubParsersAction):
         metavar="ID",
         help=(
             "🧩 Create from a bundled marketplace blueprint "
-            "(e.g., fluid.starter, fluid.analytics-daily) — no network/AI key"
+            "(fluid.starter, fluid.analytics-daily, fluid.starter-gcp, "
+            "fluid.starter-snowflake) — no network/AI key"
         ),
     )
     mode_group.add_argument(
@@ -224,7 +240,10 @@ def register(subparsers: argparse._SubParsersAction):
         "--provider",
         choices=["local", "gcp", "snowflake", "aws", "azure"],
         default="local",
-        help="Infrastructure provider (default: local = DuckDB, no cloud needed)",
+        help=(
+            "Infrastructure provider (default: local = DuckDB, no cloud needed). "
+            "With --quickstart, gcp|snowflake select a provider starter contract."
+        ),
     )
 
     # Data Mesh productType ↔ medallion layer (Phase 1)
@@ -410,6 +429,7 @@ def run(args, logger: logging.Logger) -> int:
             getattr(args, "yes", False)
             or getattr(args, "template", None)
             or getattr(args, "quickstart", False)
+            or getattr(args, "blueprint", None)
             or getattr(args, "scan", False)
             or getattr(args, "blank", False)
         )
@@ -736,6 +756,7 @@ def _ensure_workspace(args, logger: logging.Logger) -> None:
         getattr(args, "yes", False)
         or getattr(args, "template", None)
         or getattr(args, "quickstart", False)
+        or getattr(args, "blueprint", None)
         or getattr(args, "scan", False)
         or getattr(args, "blank", False)
     )
@@ -939,7 +960,19 @@ def detect_mode(args, logger: logging.Logger) -> Optional[str]:
 
     # Explicit mode flags take precedence.
     if args.quickstart:
-        # --quickstart is now an alias for --template customer-360 --yes
+        # Provider-aware quickstart. A cloud target (--provider gcp|snowflake)
+        # scaffolds that provider's ready-to-run starter blueprint — the
+        # "quickstart options by provider" the card asks for. local (and any
+        # provider without a bundled starter, e.g. aws/azure) keep the existing
+        # customer-360 quickstart, so the default flow is byte-for-byte
+        # unchanged. Never clobbers an explicit --template / --blueprint.
+        provider = (getattr(args, "provider", None) or "local").lower()
+        quickstart_bp = _QUICKSTART_PROVIDER_BLUEPRINTS.get(provider)
+        if quickstart_bp and not args.template and not getattr(args, "blueprint", None):
+            args.blueprint = quickstart_bp
+            args.yes = True
+            return "blueprint"
+        # --quickstart is otherwise an alias for --template customer-360 --yes
         args.template = args.template or "customer-360"
         args.yes = True
         return "template"
