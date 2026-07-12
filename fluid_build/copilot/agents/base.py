@@ -73,6 +73,18 @@ _NON_RETRYABLE_ERRORS = (
     SchemaValidationError,
 )
 
+# failure_class tags (carried in a CopilotGenerationError's context) that mean
+# the credential is the problem, so retrying the identical request is futile.
+_CREDENTIAL_FAILURE_CLASSES = frozenset({"auth", "permission"})
+
+
+def _has_credential_failure(exc: Exception) -> bool:
+    """True when *exc* carries a credential-related ``failure_class`` tag."""
+    context = getattr(exc, "context", None)
+    if not isinstance(context, dict):
+        return False
+    return context.get("failure_class") in _CREDENTIAL_FAILURE_CLASSES
+
 
 def retry_with_backoff(
     func: Callable[[], _T],
@@ -115,8 +127,12 @@ def retry_with_backoff(
             # event instead of being retried opaquely).
             if retry_if is not None and not retry_if(exc):
                 raise
-            # Fail fast on errors that cannot be helped by retry.
-            if isinstance(exc, _NON_RETRYABLE_ERRORS):
+            # Fail fast on errors that cannot be helped by retry. Besides the
+            # typed non-retryable set, a ``failure_class`` of "auth" (401) or
+            # "permission" (403) means the credential itself is the problem —
+            # retrying the same key just burns backoff attempts. The
+            # orchestration layer handles auth via an interactive re-prompt.
+            if isinstance(exc, _NON_RETRYABLE_ERRORS) or _has_credential_failure(exc):
                 raise
             last_error = exc
             if attempt == attempts:
