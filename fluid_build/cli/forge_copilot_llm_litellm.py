@@ -108,9 +108,13 @@ def _translate_litellm_exception(
     ``copilot.agents.base`` so the staged pipeline fails fast instead of burning
     three backoff attempts on a credential that cannot succeed.
     """
-    auth_error = getattr(litellm, "AuthenticationError", ())
-    permission_error = getattr(litellm, "PermissionDeniedError", ())
-    if auth_error and isinstance(exc, auth_error):
+    # Guard with ``isinstance(x, type)``: a mocked litellm module (MagicMock)
+    # exposes ``AuthenticationError`` as a Mock attribute, not a real class, and
+    # ``isinstance(exc, <Mock>)`` raises TypeError. Only dispatch on genuine
+    # exception classes; otherwise fall through to the generic wrap.
+    auth_error = getattr(litellm, "AuthenticationError", None)
+    permission_error = getattr(litellm, "PermissionDeniedError", None)
+    if isinstance(auth_error, type) and isinstance(exc, auth_error):
         return CopilotGenerationError(
             "copilot_llm_auth_failed",
             f"LLM authentication failed (401): {exc}",
@@ -120,7 +124,7 @@ def _translate_litellm_exception(
             ],
             context={"failure_class": "auth"},
         )
-    if permission_error and isinstance(exc, permission_error):
+    if isinstance(permission_error, type) and isinstance(exc, permission_error):
         return CopilotGenerationError(
             "copilot_llm_permission_denied",
             f"LLM permission denied (403): {exc}",

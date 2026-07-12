@@ -67,6 +67,20 @@ def test_generic_exception_streaming_variant():
     assert "streaming failed" in err.message
 
 
+def test_mocked_litellm_module_falls_through_to_generic():
+    # A MagicMock litellm exposes AuthenticationError as a Mock attribute (not a
+    # real class). isinstance(exc, <Mock>) would raise TypeError — guard against
+    # it and fall through to the generic wrap instead of crashing. (Regression
+    # for the CI-caught bug where test_call_llm_wraps_http_errors mocks litellm.)
+    from unittest.mock import MagicMock
+
+    fake_litellm = MagicMock()
+    err = _translate_litellm_exception(fake_litellm, RuntimeError("boom"), streaming=False)
+    assert isinstance(err, CopilotGenerationError)
+    assert err.context.get("failure_class") not in ("auth", "permission")
+    assert "request failed" in err.message
+
+
 # ---------------------------------------------------------------------------
 # 2. fail-fast in retry loop
 # ---------------------------------------------------------------------------
