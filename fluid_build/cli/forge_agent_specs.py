@@ -346,6 +346,43 @@ def _user_agent_dirs() -> List[Path]:
     return dirs
 
 
+# Per-tenant prompt-guidance shadow directory. A tenant can drop
+# ``<stem>.yaml`` files here (e.g. ``sovereignty.yaml``) to OVERRIDE the
+# corresponding bundled ``agent_specs/_defaults/`` guidance block WITHOUT
+# forking the package — the same "shadow the shipped default from your home
+# dir" pattern git (``~/.gitconfig`` over ``--system``), npm (``$HOME/.npmrc``
+# over builtin), and XDG (``~/.config`` over system defaults) all use.
+#
+# Anchored on the repo's canonical user-home root (``paths.user_home()`` →
+# ``~/.fluid`` by default, ``$FLUID_USER_HOME`` when set) so container and
+# per-test isolation work with zero extra wiring. The prompt loader
+# (``forge_copilot_prompts._load_user_shadow_guidance``) overlays these files
+# ABOVE the bundled defaults but BELOW an active ``--prompt-profile``.
+USER_DEFAULTS_SHADOW_SUBPATH = ("agent_specs", "_defaults")
+
+
+def user_defaults_shadow_dirs() -> List[Path]:
+    """Return user-home ``_defaults`` shadow directories in priority order.
+
+    Currently a single entry — ``<user-home>/agent_specs/_defaults`` — where
+    ``<user-home>`` is :func:`fluid_build.paths.user_home` (``~/.fluid`` by
+    default, ``$FLUID_USER_HOME`` when set). Only existing directories are
+    returned, so the no-shadow path is a clean no-op and the composed prompt
+    stays byte-identical to the bundled baseline. Returned as a list (highest
+    priority first) so a workspace-local shadow can be layered in later without
+    touching call sites.
+    """
+    # Function-local import keeps ``paths`` off this module's import graph for
+    # the ``fluid --help`` cold path and avoids any import-cycle risk.
+    from fluid_build.paths import user_home
+
+    dirs: List[Path] = []
+    shadow = user_home().joinpath(*USER_DEFAULTS_SHADOW_SUBPATH)
+    if shadow.is_dir():
+        dirs.append(shadow)
+    return dirs
+
+
 def discover_all_agent_specs() -> Dict[str, "AgentSpec"]:
     """Discover all agent specs: user (workspace + global) + built-in.
 
@@ -414,6 +451,7 @@ def scaffold_user_agent(name: str, target_dir: Path | None = None) -> Path:
 
 __all__ = [
     "AGENT_SPECS_DIR",
+    "USER_DEFAULTS_SHADOW_SUBPATH",
     "AgentSpec",
     "AgentSpecError",
     "discover_all_agent_specs",
@@ -421,4 +459,5 @@ __all__ = [
     "load_builtin_agent_spec",
     "load_user_or_builtin_spec",
     "scaffold_user_agent",
+    "user_defaults_shadow_dirs",
 ]

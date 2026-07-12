@@ -23,16 +23,20 @@ __all__ = [
     "build_clarification_user_prompt",
     "build_system_prompt",
     "build_user_prompt",
+    "get_active_domain",
     "get_active_prompt_profile",
+    "guidance_cache_token",
+    "set_domain_prompt_fragments",
     "set_prompt_profile",
 ]
 
 
+import hashlib
 import json
 import re
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import yaml
 
@@ -84,6 +88,140 @@ _DEFAULT_GUIDANCE: Mapping[str, str] = _load_default_guidance()
 
 
 # ---------------------------------------------------------------------------
+# Per-tenant / per-domain override layers (compose UNDER prompt profiles)
+# ---------------------------------------------------------------------------
+# Two complementary, no-fork override mechanisms sit between the bundled
+# ``_defaults/`` and an active ``--prompt-profile``:
+#
+#   1. **User-home shadow** — a tenant drops ``<stem>.yaml`` into
+#      ``<user-home>/agent_specs/_defaults/`` (``paths.user_home()`` →
+#      ``~/.fluid`` or ``$FLUID_USER_HOME``) to override the matching bundled
+#      guidance block on this machine/tenant, no fork required.
+#   2. **Per-domain fragments** — a domain spec (``agent_specs/<domain>.yaml``)
+#      carries an optional ``system_prompt_fragments`` map that overrides the
+#      matching bundled block ONLY while that domain is active (activated by
+#      ``forge_domain_enrichment.enrich_context_with_domain``).
+#
+# Precedence, lowest → highest (mirrors git ``--system`` < ``--global`` <
+# ``-c``, npm builtin < user < CLI, and XDG system < ``~/.config`` < env):
+#
+#   bundled ``_defaults``  <  user-home shadow  <  active domain fragments
+#                                                <  active ``--prompt-profile``
+#
+# Rationale for the order: each layer is progressively more specific or more
+# explicit. The home shadow is the tenant's persistent customisation of the
+# shipped baseline; domain fragments are contextually scoped to the detected
+# product domain (more specific than an always-on shadow); ``--prompt-profile``
+# is a deliberate, per-invocation operator selection and is therefore
+# authoritative over every ambient/auto layer. When NONE of layers 2–4 are
+# present, ``_active_guidance()`` returns the exact ``_DEFAULT_GUIDANCE``
+# object, so the composed prompt is byte-identical to the baseline.
+
+
+def _read_guidance_dir(directory: Path) -> Dict[str, str]:
+    """Parse ``directory/*.yaml`` into a ``{stem: system_prompt_text}`` map.
+
+    Shared parse rules for the per-tenant home shadow and prompt-profile
+    overlays (the bundled default read keeps its own trusted loader). Each
+    file has a single top-level ``system_prompt`` string, loaded with
+    ``yaml.safe_load`` ONLY — never ``load`` — so a shadow/profile file can
+    never execute code. Malformed or non-mapping files are skipped so a
+    partial install can't crash the CLI.
+
+    Security: the directory is tenant-writable, so each candidate's *resolved*
+    parent must equal the resolved *directory* — this rejects a symlinked file
+    that would otherwise turn the shadow dir into an arbitrary-file-read
+    primitive for paths outside it. ``glob('*.yaml')`` already blocks ``..`` /
+    separators in the name (they can't appear in a single path component).
+    """
+    guidance: Dict[str, str] = {}
+    if not directory.is_dir():
+        return guidance
+    try:
+        root = directory.resolve()
+    except OSError:
+        return guidance
+    for path in sorted(directory.glob("*.yaml")):
+        try:
+            if path.resolve().parent != root:
+                continue  # symlink / traversal escape — ignore
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(raw, Mapping):
+            continue
+        text = raw.get("system_prompt")
+        if isinstance(text, str):
+            guidance[path.stem] = text
+    return guidance
+
+
+def _load_user_shadow_guidance() -> Dict[str, str]:
+    """Return the per-tenant home-shadow guidance map (``{}`` when none).
+
+    Reads ``<user-home>/agent_specs/_defaults/*.yaml`` via
+    :func:`fluid_build.cli.forge_agent_specs.user_defaults_shadow_dirs`.
+    Deliberately DYNAMIC (re-read on each call, not memoised at import) so
+    container / test isolation via ``FLUID_USER_HOME`` takes effect without a
+    module reload, and so a tenant adding or removing a shadow file between
+    runs is picked up. Empty result ⇒ the no-shadow fast path in
+    ``_active_guidance`` returns the bundled defaults unchanged.
+    """
+    # Function-local import: avoids any import cycle and keeps this module's
+    # import graph unchanged for callers that never touch guidance overlays.
+    from fluid_build.cli.forge_agent_specs import user_defaults_shadow_dirs
+
+    merged: Dict[str, str] = {}
+    # Lowest-priority dir first so higher-priority dirs overlay it. Today this
+    # is a single directory; the loop keeps a future workspace-local shadow
+    # correct with zero call-site changes.
+    for directory in reversed(user_defaults_shadow_dirs()):
+        merged.update(_read_guidance_dir(directory))
+    return merged
+
+
+# Process-wide active-domain fragment overlay. ``None`` means "no domain
+# override". Set by ``enrich_context_with_domain``; mirrors the prompt-profile
+# state so ``build_system_prompt`` (which only sees the capability matrix)
+# picks the override up through ``_active_guidance()`` without threading a
+# domain argument through every call site.
+_ACTIVE_DOMAIN: Optional[str] = None
+_ACTIVE_DOMAIN_FRAGMENTS: Optional[Mapping[str, str]] = None
+
+
+def set_domain_prompt_fragments(
+    domain: Optional[str], fragments: Optional[Mapping[str, Any]]
+) -> Optional[str]:
+    """Activate (or clear) a per-domain ``system_prompt_fragments`` overlay.
+
+    *fragments* is the ``system_prompt_fragments`` map parsed from the active
+    domain's YAML: ``{default-stem: replacement-text}``. Only string→string
+    entries are kept (defence against a malformed spec injecting non-text).
+    Passing a falsy *domain* or an empty/typeless *fragments* clears the
+    overlay. Process-wide and idempotent, mirroring :func:`set_prompt_profile`.
+    Returns the active domain name (or ``None``).
+    """
+    global _ACTIVE_DOMAIN, _ACTIVE_DOMAIN_FRAGMENTS
+    clean: Dict[str, str] = {}
+    if isinstance(fragments, Mapping):
+        for key, value in fragments.items():
+            if isinstance(key, str) and key.strip() and isinstance(value, str):
+                clean[key] = value
+    if not domain or not clean:
+        _ACTIVE_DOMAIN = None
+        _ACTIVE_DOMAIN_FRAGMENTS = None
+        return None
+    _ACTIVE_DOMAIN = domain
+    _ACTIVE_DOMAIN_FRAGMENTS = MappingProxyType(clean)
+    return domain
+
+
+def get_active_domain() -> Optional[str]:
+    """Return the active domain-fragment overlay's domain name, or ``None``."""
+    return _ACTIVE_DOMAIN
+
+
+# ---------------------------------------------------------------------------
 # Prompt profiles — single-name, single-swap prompt overlays
 # ---------------------------------------------------------------------------
 # ``fluid forge --prompt-profile <name>`` (or ``FLUID_PROMPT_PROFILE=<name>``)
@@ -121,9 +259,12 @@ class PromptProfileError(ValueError):
     """
 
 
-# Process-wide active-profile state. ``None`` means "use the defaults".
+# Process-wide active-profile state. ``None`` means "no profile selected".
+# ``_ACTIVE_PROFILE_FILES`` holds ONLY the profile's own ``*.yaml`` (no base
+# merge) so ``_active_guidance()`` can overlay it as the TOP layer on top of
+# the composed bundled+shadow+domain base.
 _ACTIVE_PROFILE: Optional[str] = None
-_ACTIVE_GUIDANCE: Optional[Mapping[str, str]] = None
+_ACTIVE_PROFILE_FILES: Optional[Mapping[str, str]] = None
 
 
 def available_prompt_profiles() -> List[str]:
@@ -171,26 +312,17 @@ def _resolve_profile_dir(name: str) -> Path:
     return candidate
 
 
-def _load_profile_guidance(profile_dir: Path) -> Mapping[str, str]:
-    """Overlay ``profile_dir/*.yaml`` on top of the defaults.
+def _load_profile_files(profile_dir: Path) -> Dict[str, str]:
+    """Load ONLY ``profile_dir/*.yaml`` (no base merge).
 
-    Profile files win; any default file the profile omits is retained. The
-    parse rules mirror :func:`_load_default_guidance` exactly — a single
-    top-level ``system_prompt`` string per file — so a profile file is a
-    drop-in replacement for its ``_defaults/`` counterpart.
+    Returns the profile's own ``{stem: system_prompt_text}`` files so
+    :func:`_active_guidance` can overlay them as the top layer. The parse
+    rules mirror :func:`_load_default_guidance` — a single top-level
+    ``system_prompt`` string per file — so a profile file is a drop-in
+    replacement for its ``_defaults/`` counterpart. Shares the hardened,
+    ``safe_load``-only, symlink-contained reader with the home shadow.
     """
-    guidance: dict[str, str] = dict(_DEFAULT_GUIDANCE)
-    for path in sorted(profile_dir.glob("*.yaml")):
-        try:
-            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
-            continue
-        if not isinstance(raw, Mapping):
-            continue
-        text = raw.get("system_prompt")
-        if isinstance(text, str):
-            guidance[path.stem] = text
-    return MappingProxyType(guidance)
+    return _read_guidance_dir(profile_dir)
 
 
 def set_prompt_profile(name: Optional[str]) -> Optional[str]:
@@ -201,16 +333,17 @@ def set_prompt_profile(name: Optional[str]) -> Optional[str]:
     silently falls back to the defaults. Idempotent and process-wide.
 
     Callers that memoize the composed system prompt (see
-    ``forge_copilot_runtime.build_system_prompt``) key their cache on the
-    active profile, so switching profiles never returns a stale prompt.
+    ``forge_copilot_runtime.build_system_prompt``) key their cache on
+    :func:`guidance_cache_token`, so switching profiles (or any override
+    layer) never returns a stale prompt.
     """
-    global _ACTIVE_PROFILE, _ACTIVE_GUIDANCE
+    global _ACTIVE_PROFILE, _ACTIVE_PROFILE_FILES
     if not name:
         _ACTIVE_PROFILE = None
-        _ACTIVE_GUIDANCE = None
+        _ACTIVE_PROFILE_FILES = None
         return None
     profile_dir = _resolve_profile_dir(name)
-    _ACTIVE_GUIDANCE = _load_profile_guidance(profile_dir)
+    _ACTIVE_PROFILE_FILES = MappingProxyType(_load_profile_files(profile_dir))
     _ACTIVE_PROFILE = name
     return name
 
@@ -221,15 +354,47 @@ def get_active_prompt_profile() -> Optional[str]:
 
 
 def _active_guidance() -> Mapping[str, str]:
-    """Return the guidance map for the active profile (or the defaults).
+    """Compose the effective guidance map across every override layer.
 
-    When no profile is active this returns the exact ``_DEFAULT_GUIDANCE``
-    object, guaranteeing the composed prompt stays byte-identical to the
-    baseline.
+    Precedence, lowest → highest (see the module-level note): bundled
+    ``_defaults`` < user-home shadow < active domain fragments < active
+    ``--prompt-profile``. When layers 2–4 are all absent this returns the
+    exact ``_DEFAULT_GUIDANCE`` object, guaranteeing the composed prompt is
+    byte-identical to the baseline (and preserving the provider prompt-cache
+    fast path).
     """
-    if _ACTIVE_PROFILE is None or _ACTIVE_GUIDANCE is None:
+    shadow = _load_user_shadow_guidance()
+    domain = _ACTIVE_DOMAIN_FRAGMENTS
+    profile = _ACTIVE_PROFILE_FILES
+    if not shadow and not domain and not profile:
         return _DEFAULT_GUIDANCE
-    return _ACTIVE_GUIDANCE
+    merged: Dict[str, str] = dict(_DEFAULT_GUIDANCE)
+    if shadow:
+        merged.update(shadow)
+    if domain:
+        merged.update(domain)
+    if profile:
+        merged.update(profile)
+    return MappingProxyType(merged)
+
+
+def guidance_cache_token() -> str:
+    """Return a stable token summarising the active guidance layers.
+
+    Folded into the memoised system-prompt cache key
+    (``forge_copilot_runtime._system_prompt_cache_key``) so the cache is
+    invalidated whenever ANY override layer changes — profile name, active
+    domain, or the *content* of the dynamic home-shadow / domain-fragment
+    layers (the latter two aren't fully captured by a name alone). Returns a
+    cheap constant on the pure-default path so the common case stays fast.
+    """
+    shadow = _load_user_shadow_guidance()
+    domain_frag = dict(_ACTIVE_DOMAIN_FRAGMENTS or {})
+    if not shadow and not domain_frag and _ACTIVE_PROFILE is None:
+        return "::0"
+    blob = json.dumps({"shadow": shadow, "domain_frag": domain_frag}, sort_keys=True)
+    digest = hashlib.sha1(blob.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
+    return f"{_ACTIVE_PROFILE or ''}:{_ACTIVE_DOMAIN or ''}:{digest}"
 
 
 def _load_agent_voices() -> Mapping[str, str]:
