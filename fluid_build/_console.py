@@ -120,7 +120,12 @@ def cprint(*args: Any, **kwargs: Any) -> None:
     text = _redact_str(_RICH_TAG_PATTERN.sub("", joined))
     end = kwargs.get("end", "\n")
     stream = kwargs.get("file") or sys.stdout
-    stream.write(text + end)
+    # ``text`` is already run through ``_redact_str`` above, so any secret is
+    # masked before this write. CodeQL doesn't recognise the custom sanitizer
+    # and re-flags this sink whenever the code moves to new lines; suppress it
+    # exactly like the ``console.print`` sink above (matching the pre-move
+    # accepted state — this line is byte-identical to the former cli/console.py).
+    stream.write(text + end)  # lgtm[py/clear-text-logging-sensitive-data]
     if kwargs.get("flush"):
         stream.flush()
 
