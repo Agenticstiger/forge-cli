@@ -1364,6 +1364,13 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
     from fluid_build.cli.dbt_mcp import dbt_mcp_tool_definitions
 
     definitions.extend(dbt_mcp_tool_definitions())
+
+    # Opt-in web tools (web_search / web_fetch), gated on
+    # FLUID_AGENT_WEB_TOOLS. Off by default → no-op; when on, the two
+    # tools surface. Same env-gated delegate shape as the dbt MCP bridge.
+    from fluid_build.cli.forge_web_tools import web_tool_definitions
+
+    definitions.extend(web_tool_definitions())
     return definitions
 
 
@@ -1421,6 +1428,15 @@ def dispatch_tool_call(
 
         if is_dbt_mcp_tool(name):
             return dispatch_dbt_mcp_tool(name, arguments)
+
+        # Opt-in web tools (web_search / web_fetch), gated on
+        # FLUID_AGENT_WEB_TOOLS. Resolved AFTER the native registries so a
+        # native tool of the same name always wins. Same typed-error
+        # contract on failure as the dbt MCP delegate.
+        from fluid_build.cli.forge_web_tools import dispatch_web_tool, is_web_tool
+
+        if is_web_tool(name):
+            return dispatch_web_tool(name, arguments)
     if not tool:
         LOG.warning("Unknown tool call: %s", name)
         return {"error": f"Unknown tool: {name}"}

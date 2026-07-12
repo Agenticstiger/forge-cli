@@ -66,8 +66,11 @@ _GITHUB_TOKEN_RE = re.compile(r"\bgh[oprsu]_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-
 # Provider API-key shapes. Regexes follow the standard detect-secrets /
 # gitleaks rule prefixes (OpenAI ``sk-``, Anthropic ``sk-ant-``, AWS
 # ``AKIA``/``ASIA``, GCP ``AIza``, Slack ``xox*``, HuggingFace ``hf_``,
-# Replicate ``r8_``, GitLab ``glpat-``, Vercel ``vc_``). A leak of any of
-# these is a leak regardless of surrounding assignment syntax.
+# Replicate ``r8_``, GitLab ``glpat-``, Vercel ``vc_``, Tavily ``tvly-``,
+# Brave ``BSA``). A leak of any of these is a leak regardless of
+# surrounding assignment syntax — the web-search tools
+# (``cli/forge_web_tools.py``) carry the Tavily/Brave keys in request
+# headers, so their shapes are masked here too.
 #
 # Anthropic must run before OpenAI: ``sk-ant-...`` is a strict prefix of
 # the looser OpenAI ``sk-...`` shape, so the more specific pattern goes
@@ -82,6 +85,8 @@ _PROVIDER_KEY_RES = (
     re.compile(r"\br8_[A-Za-z0-9]{30,}"),  # Replicate
     re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),  # GitLab PAT
     re.compile(r"\bvc_[A-Za-z0-9]{20,}"),  # Vercel
+    re.compile(r"\btvly-[A-Za-z0-9_-]{16,}"),  # Tavily (incl. tvly-dev-…) search key
+    re.compile(r"\bBSA[A-Za-z0-9_-]{20,}"),  # Brave Search subscription token
 )
 # Fernet token — URL-safe base64 starting with the fixed ``gAAAAA`` header
 # emitted by ``cryptography.fernet`` (version byte 0x80 + timestamp).

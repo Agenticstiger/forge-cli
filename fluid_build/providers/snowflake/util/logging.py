@@ -134,6 +134,8 @@ SENSITIVE_PATTERNS = [
     re.compile(r"\br8_[A-Za-z0-9]{30,}"),  # Replicate
     re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"),  # GitLab PAT
     re.compile(r"\bvc_[A-Za-z0-9]{20,}"),  # Vercel
+    re.compile(r"\btvly-[A-Za-z0-9_-]{16,}"),  # Tavily (incl. tvly-dev-…) search key
+    re.compile(r"\bBSA[A-Za-z0-9_-]{20,}"),  # Brave Search subscription token
     # Fernet token — URL-safe base64 with the fixed ``gAAAAA`` header.
     re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}"),
     # PEM private-key block (RSA / EC / OPENSSH / DSA / bare PKCS#8 ...).

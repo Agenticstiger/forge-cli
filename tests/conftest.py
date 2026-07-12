@@ -304,8 +304,14 @@ def _disable_ssrf_guard_for_unit_tests(request):
     to one file even if new tests land for the guard later.
     """
     fspath = str(getattr(request.node, "fspath", "") or "")
-    if "tests/util/test_safe_http.py" in fspath:
-        # The SSRF guard's own tests need the real implementation.
+    # Files that exercise the SSRF guard end-to-end and therefore need the
+    # REAL implementation (they stub ``socket.getaddrinfo`` themselves to
+    # stay offline). Detection by path keeps the policy local.
+    _real_guard_files = (
+        "tests/util/test_safe_http.py",
+        "tests/test_forge_web_tools.py",
+    )
+    if any(marker in fspath for marker in _real_guard_files):
         yield
         return
 

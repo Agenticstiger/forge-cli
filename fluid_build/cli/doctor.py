@@ -194,6 +194,12 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "scratch tempdir",
         "Working dir for the agent CLI (default avoids loading project CLAUDE.md/AGENTS.md)",
     ),
+    # — Agent network-egress tools (opt-in, default OFF) —
+    (
+        "FLUID_AGENT_WEB_TOOLS",
+        "web_search/web_fetch hidden",
+        "Set =1 to expose the SSRF-safe web_search + web_fetch agent tools",
+    ),
     # — Telemetry consent (opt-in, default OFF) —
     (
         "FLUID_TELEMETRY",
@@ -966,6 +972,50 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
                 "status": "⚠️  Not installed (optional)",
                 "ok": True,
                 "details": "Install with: pip install 'fluid-build[litellm]'",
+            }
+        )
+
+    # Agent web tools (web_search / web_fetch) — opt-in via
+    # FLUID_AGENT_WEB_TOOLS. Non-critical; surfaces whether the two
+    # network-egress tools are exposed and which search provider (if any)
+    # is configured, so operators can confirm at a glance.
+    try:
+        from fluid_build.cli.forge_web_tools import _select_search_provider, is_enabled
+
+        if is_enabled():
+            provider = _select_search_provider(os.environ)
+            search_state = (
+                f"web_search provider: {provider}"
+                if provider
+                else "web_search: no provider key (set TAVILY_API_KEY/BRAVE_API_KEY)"
+            )
+            checks.append(
+                {
+                    "check": "Agent Web Tools",
+                    "category": "ai",
+                    "status": "✅ Enabled",
+                    "ok": True,
+                    "details": f"web_fetch (SSRF-safe) + {search_state}",
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "check": "Agent Web Tools",
+                    "category": "ai",
+                    "status": "⚪ Disabled (opt-in)",
+                    "ok": True,
+                    "details": "Set FLUID_AGENT_WEB_TOOLS=1 to expose web_search + web_fetch",
+                }
+            )
+    except Exception:  # noqa: BLE001 — non-critical status line
+        checks.append(
+            {
+                "check": "Agent Web Tools",
+                "category": "ai",
+                "status": "⚪ Disabled (opt-in)",
+                "ok": True,
+                "details": "Set FLUID_AGENT_WEB_TOOLS=1 to expose web_search + web_fetch",
             }
         )
 

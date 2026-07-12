@@ -292,3 +292,45 @@ class GenerateDltSourceArgs(BaseModel):
             "STRIPE_PRICES_TOKEN)."
         ),
     )
+
+
+class WebFetchArgs(BaseModel):
+    """Args for the opt-in ``web_fetch`` tool (FLUID_AGENT_WEB_TOOLS).
+
+    The tool retrieves a single ``http(s)`` URL through the codebase's
+    SSRF-safe fetch primitive (``util.safe_http``) — private / loopback /
+    link-local / metadata addresses and non-http(s) schemes are refused
+    *before* any request is issued, and the connection is DNS-pinned to
+    the validated IP so a rebind between check and connect cannot reach a
+    private host. Returns the decoded text/HTML body (size-capped).
+    """
+
+    url: str = Field(
+        description=(
+            "Absolute http(s):// URL to fetch. Private, loopback, "
+            "link-local, and cloud-metadata (169.254.169.254) addresses "
+            "are rejected by the SSRF guard; ftp/file/data/etc. schemes "
+            "are refused."
+        )
+    )
+
+    model_config = {"extra": "ignore"}
+
+
+class WebSearchArgs(BaseModel):
+    """Args for the opt-in ``web_search`` tool (FLUID_AGENT_WEB_TOOLS).
+
+    Runs a web search through a pluggable provider (Tavily or Brave),
+    selected by whichever provider API key is present in the environment
+    (``TAVILY_API_KEY`` / ``BRAVE_API_KEY``). When no provider key is
+    configured the tool returns a typed ``not configured`` result rather
+    than crashing the agent loop.
+    """
+
+    query: str = Field(description="Plain-text search query.")
+    max_results: int = Field(
+        default=5,
+        description="Cap on returned results (default 5, hard max 10).",
+    )
+
+    model_config = {"extra": "ignore"}
