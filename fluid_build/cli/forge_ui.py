@@ -34,6 +34,8 @@ __all__ = [
 ]
 
 
+import os
+import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -70,6 +72,120 @@ def _build_panel(renderable: str, *, title: str, border_style: str) -> Any:
     return Panel(renderable, title=title, border_style=border_style)
 
 
+def _arrow_keys_enabled(console: Any) -> bool:
+    """Return True when an interactive arrow-key menu can be driven safely.
+
+    Belt-and-suspenders, mirroring ``_forge_resume._is_interactive`` — an
+    arrow-key menu needs a real bidirectional TTY, Rich for the redraw, and
+    the optional ``readchar`` primitive for cross-platform keypress reading.
+    Any gap (piped stdin/stdout, CI, pytest capture, missing dep, explicit
+    opt-out) falls back to the numbered prompt.
+
+    The ``readchar`` import is deliberately performed *here*, gated behind the
+    ``isatty`` checks, so non-interactive paths (``fluid --help``, CI, pipes)
+    never pay its import cost — keeping the CLI startup budget untouched.
+    """
+    if not (console and RICH_AVAILABLE):
+        return False
+    # Explicit opt-out for users / scripts that prefer typed numbers.
+    if os.environ.get("FLUID_FORGE_NO_ARROW_KEYS") or os.environ.get("FLUID_NO_ARROW_KEYS"):
+        return False
+    # pytest captures stdin (``input()`` raises OSError); CI runners are
+    # non-interactive even when isatty lies.
+    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("CI"):
+        return False
+    try:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            return False
+    except Exception:  # noqa: BLE001 - defensive: any stream weirdness → numbered
+        return False
+    try:
+        import readchar  # noqa: F401  (lazy: only in genuine interactive sessions)
+    except Exception:  # noqa: BLE001 - dep absent / import error → numbered fallback
+        return False
+    return True
+
+
+def _arrow_key_select(
+    console: Any,
+    prompt: str,
+    options: Sequence[tuple],
+    default_idx: int,
+) -> str:
+    """Drive a live arrow-key single-select menu and return the chosen value.
+
+    Navigation: ↑/↓ (and vim ``k``/``j``) move the cursor and wrap; typing a
+    digit ``1``–``9`` moves the cursor to that row; Enter accepts the
+    highlighted row. Digit-then-Enter preserves the old numbered
+    muscle-memory exactly (and, crucially, keeps the trailing Enter from
+    leaking to the next prompt). Ctrl-C propagates as ``KeyboardInterrupt``
+    for the caller's existing abort handling.
+
+    The caller wraps this in try/except so any terminal error degrades to the
+    numbered prompt — this function assumes it is only reached on a real TTY.
+    """
+    from readchar import key, readkey
+    from rich.live import Live
+    from rich.markup import escape
+    from rich.text import Text
+
+    n = len(options)
+    selected = min(max(default_idx, 0), n - 1)
+
+    def _render(final: bool = False) -> Text:
+        text = Text()
+        text.append(prompt, style="bold")
+        text.append("\n")
+        for i, (_, label) in enumerate(options):
+            if i == selected:
+                text.append("❯ ", style="bold cyan")
+                text.append(str(label), style="bold cyan")
+            else:
+                text.append("  ")
+                text.append(str(label), style="dim")
+            text.append("\n")
+        if not final:
+            text.append("↑/↓ or number to move · Enter to select", style="dim italic")
+        return text
+
+    # ``transient=True`` erases the interactive block on exit; we then print a
+    # single collapsed confirmation line (questionary-style) so scrollback
+    # stays clean and the record of what was chosen survives.
+    with Live(_render(), console=console, auto_refresh=False, transient=True) as live:
+        while True:
+            keypress = readkey()
+            if keypress in (key.UP, "k"):
+                selected = (selected - 1) % n
+            elif keypress in (key.DOWN, "j"):
+                selected = (selected + 1) % n
+            elif keypress in (key.ENTER, "\r", "\n"):
+                break
+            elif keypress == key.CTRL_C:
+                raise KeyboardInterrupt
+            elif keypress.isdigit():
+                jump = int(keypress)
+                if 1 <= jump <= n:
+                    # Move the cursor only; Enter confirms. This keeps the old
+                    # "type a number, then press Enter" muscle-memory intact
+                    # and stops the trailing Enter leaking to the next prompt.
+                    selected = jump - 1
+                else:
+                    continue
+            else:
+                continue
+            live.update(_render(), refresh=True)
+
+    value, label = options[selected]
+    # Escape interpolated values: a label/prompt containing "[...]" would
+    # otherwise be parsed as Rich markup (mis-render, or MarkupError that the
+    # caller's except would turn into a spurious re-prompt). Mirrors the
+    # navigation render above, which uses Text.append (no markup parsing).
+    console.print(
+        f"[cyan]❯[/cyan] [bold]{escape(prompt)}[/bold] [green]{escape(str(label))}[/green]"
+    )
+    return value
+
+
 def ask_numbered_choice(
     console: Any,
     prompt: str,
@@ -77,13 +193,16 @@ def ask_numbered_choice(
     *,
     default: int = 1,
 ) -> str:
-    """Show a numbered menu and return the selected value.
+    """Show an interactive menu and return the selected value.
 
-    *options* is a sequence of ``(value, label)`` tuples.  The user types
-    a number (1-based) instead of the exact string.  Accepts Enter for
-    the default.
+    *options* is a sequence of ``(value, label)`` tuples.
 
-    Falls back to plain ``input()`` when Rich is not available.
+    On a real TTY (with Rich + ``readchar``), renders an arrow-key selectable
+    menu: ↑/↓ to move, Enter to accept, or type a number to jump. Everywhere
+    else — piped/redirected I/O, CI, pytest, no Rich, ``readchar`` missing, or
+    ``FLUID_FORGE_NO_ARROW_KEYS=1`` — it degrades to a numbered prompt where the
+    user types a 1-based number (Enter accepts the default). The return
+    contract is identical across both paths.
 
     Example::
 
@@ -98,6 +217,17 @@ def ask_numbered_choice(
     """
     if not options:
         return ""
+
+    # Preferred path: live arrow-key navigation on a real terminal. Any
+    # terminal/readchar failure (small window, raw-mode error, odd TERM)
+    # degrades to the numbered prompt below. Ctrl-C propagates untouched.
+    if _arrow_keys_enabled(console):
+        try:
+            return _arrow_key_select(console, prompt, options, default - 1)
+        except KeyboardInterrupt:
+            raise
+        except Exception:  # noqa: BLE001 - never let a menu render kill the flow
+            pass
 
     lines = []
     for i, (_, label) in enumerate(options, 1):
