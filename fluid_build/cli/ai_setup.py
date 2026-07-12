@@ -43,7 +43,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple
 from urllib.parse import urlsplit
 
 from fluid_build.cli.forge_banner import print_v2_banner
@@ -834,6 +834,25 @@ def run_ai_setup_interactive(
         if not Confirm.ask("Add or reconfigure a provider?", default=False):
             return None
 
+    # Opt-in onboarding shortcut: if another tool (gh / codex / openai) already
+    # has a usable key on disk, offer to import it before the manual picker.
+    # Skipped when a specific provider was requested — the operator asked to
+    # configure THAT provider directly.
+    if not preselected_provider:
+        imported = _offer_import_from_other_clis(console)
+        if imported is not None:
+            console.print(
+                Panel(
+                    f"[green]AI ready![/green]\n"
+                    f"  Provider: [bold]{imported.provider}[/bold]\n"
+                    f"  Model:    [bold]{imported.model}[/bold]\n\n"
+                    "Run [bold cyan]fluid forge[/bold cyan] to create a data product with AI.",
+                    title="Setup Complete",
+                    border_style="green",
+                )
+            )
+            return imported
+
     config = _prompt_for_api_key(console, preselected_provider=preselected_provider)
     if config:
         console.print(
@@ -996,6 +1015,325 @@ def _offer_import_env_api_key(
         LOG.info("Inline AI setup: env key import failed (provider configured)")
 
 
+# ---------------------------------------------------------------------------
+# Import an API key discovered in ANOTHER tool's credential file
+# ---------------------------------------------------------------------------
+#
+# Onboarding shortcut (opt-in): many users have already authenticated another
+# CLI whose credential lives in a well-known dotfile under ``$HOME``. Rather
+# than make them paste a key fluid could just read, we *discover* the key,
+# then PROMPT before doing anything with it. Security posture, deliberately
+# conservative and mirroring :func:`_offer_import_env_api_key`:
+#
+# * **HOME-confined reads only.** Every source path is built from
+#   ``Path.home()`` + fixed segments and re-checked to resolve *inside* HOME
+#   (:func:`_is_within_home`), so a symlinked dotfile can never make us read
+#   outside the user's home directory.
+# * **Explicit opt-in.** Nothing is validated or persisted without an
+#   interactive ``ask_confirmation`` yes. Non-TTY (CI / piped) discovers
+#   nothing and returns immediately.
+# * **Provider + source only — never the key.** The prompt shows the provider
+#   label and the source file; the secret value is never printed or logged.
+# * **Honest classification.** A ``gh`` ``oauth_token`` is a GitHub token, so
+#   it maps to the ``github`` (GitHub Models) provider — never mislabelled as
+#   OpenAI. Free-form credential files are shape-scanned and only a value that
+#   ``detect_provider_from_api_key`` recognises is ever surfaced.
+# * **Interactive-only, so no CI hijack.** ``github`` is intentionally kept out
+#   of the automatic-inference helpers so a stray CI ``GITHUB_TOKEN`` can't
+#   pick a provider; this path re-introduces no such risk because it only runs
+#   on a TTY behind an explicit confirm.
+
+
+class _ImportSource(NamedTuple):
+    """A well-known credential file to scan for an importable key."""
+
+    parts: Tuple[str, ...]  # path segments beneath ``$HOME``
+    kind: str  # "gh_hosts" (YAML oauth_token) | "shape_scan" (key-shape match)
+    label: str  # human-readable "<tool> (~/path)" shown in the prompt
+
+
+class _ImportedKey(NamedTuple):
+    """A discovered candidate key. ``key`` is a secret — never display/log it."""
+
+    provider: str  # canonical provider: openai / anthropic / gemini / github
+    source_label: str  # human-readable source (safe to show)
+    key: str  # the secret value — opaque; never printed or logged
+
+
+# Read cap so a pathological dotfile can't be slurped whole.
+_IMPORT_MAX_BYTES = 256 * 1024
+
+# Credential files we know how to read, in priority order. Cloud-provider
+# CLIs first; the GitHub CLI (a GitHub token → GitHub Models) last.
+_IMPORT_SOURCES: Tuple[_ImportSource, ...] = (
+    _ImportSource((".codex", "auth.json"), "shape_scan", "the Codex CLI (~/.codex/auth.json)"),
+    _ImportSource(
+        (".openai", "credentials"), "shape_scan", "the OpenAI CLI (~/.openai/credentials)"
+    ),
+    _ImportSource((".openai", "config"), "shape_scan", "the OpenAI CLI (~/.openai/config)"),
+    _ImportSource(
+        (".config", "anthropic", "credentials.json"),
+        "shape_scan",
+        "the Anthropic CLI (~/.config/anthropic/credentials.json)",
+    ),
+    _ImportSource(
+        (".config", "gh", "hosts.yml"), "gh_hosts", "the GitHub CLI (~/.config/gh/hosts.yml)"
+    ),
+    _ImportSource(
+        (".config", "gh", "hosts.yaml"), "gh_hosts", "the GitHub CLI (~/.config/gh/hosts.yaml)"
+    ),
+)
+
+# Providers that are valid forge targets but not in ``BUILTIN_LLM_PROVIDERS``
+# (built lazily via litellm) need their own display label for the prompt.
+_IMPORT_PROVIDER_LABELS = {"github": "GitHub Models"}
+
+
+def _is_within_home(path: Path, home: Path) -> bool:
+    """Return True only when *path* really resolves inside *home*.
+
+    ``resolve()`` follows symlinks, so a dotfile symlinked to ``/etc/...``
+    resolves outside HOME and is rejected — we never read outside the user's
+    home directory even if a config path is booby-trapped.
+    """
+    try:
+        real = path.resolve()
+        real_home = home.resolve()
+    except OSError:
+        return False
+    return real == real_home or real_home in real.parents
+
+
+def _read_capped_text(path: Path) -> Optional[str]:
+    """Read at most ``_IMPORT_MAX_BYTES`` of *path* as UTF-8 (lossy).
+
+    Returns ``None`` for a missing / non-regular / unreadable file.
+    """
+    try:
+        if not path.is_file():
+            return None
+        with path.open("rb") as fh:
+            raw = fh.read(_IMPORT_MAX_BYTES)
+    except OSError:
+        return None
+    return raw.decode("utf-8", errors="ignore")
+
+
+def _extract_gh_tokens(text: str) -> List[Tuple[str, str]]:
+    """Pull ``oauth_token`` values out of a ``gh`` ``hosts.yml``.
+
+    Each token maps to the ``github`` provider (GitHub Models) — a GitHub
+    token is never classified as an OpenAI/Anthropic key.
+    """
+    try:
+        import yaml
+
+        data = yaml.safe_load(text)
+    except Exception as exc:  # noqa: BLE001 — malformed YAML is just "no keys"
+        LOG.debug("import-from-clis: could not parse gh hosts file: %s", exc)
+        return []
+    if not isinstance(data, dict):
+        return []
+    out: List[Tuple[str, str]] = []
+    seen: set = set()
+    for entry in data.values():
+        if not isinstance(entry, dict):
+            continue
+        token = entry.get("oauth_token")
+        if isinstance(token, str):
+            token = token.strip()
+            if len(token) >= 20 and token not in seen:
+                seen.add(token)
+                out.append(("github", token))
+    return out
+
+
+def _extract_shape_keys(text: str) -> List[Tuple[str, str]]:
+    """Format-agnostically pull provider-shaped keys out of arbitrary text.
+
+    Tokenises on the key charset and keeps only values that
+    :func:`detect_provider_from_api_key` recognises (``sk-`` / ``sk-ant-`` /
+    ``AIza...``). Works for JSON, INI, TOML, or ``.env`` credential files
+    without hard-coding any one field name, and never surfaces an
+    unrecognised string.
+    """
+    import re
+
+    # Resolve via the ai_setup namespace so the lazy-import seam / patches apply.
+    from fluid_build.cli.ai_setup import detect_provider_from_api_key
+
+    out: List[Tuple[str, str]] = []
+    seen: set = set()
+    for token in re.findall(r"[A-Za-z0-9_\-]{20,256}", text):
+        if token in seen:
+            continue
+        provider = detect_provider_from_api_key(token)
+        if provider:
+            seen.add(token)
+            out.append((provider, token))
+    return out
+
+
+def _discover_imported_api_keys(home: Optional[Path] = None) -> List[_ImportedKey]:
+    """Scan well-known credential files under *home* for importable keys.
+
+    Reads **only** the fixed list of dotfiles in :data:`_IMPORT_SOURCES`, each
+    confined to *home* by :func:`_is_within_home`. Never traverses, never
+    globs, never reads outside HOME. Returns candidates de-duplicated by
+    ``(provider, key)`` in source-priority order. The key values it carries
+    are secrets — callers must not print or log them.
+    """
+    base = home or Path.home()
+    found: List[_ImportedKey] = []
+    seen: set = set()
+    for src in _IMPORT_SOURCES:
+        path = base.joinpath(*src.parts)
+        if not _is_within_home(path, base):
+            LOG.debug("import-from-clis: source resolves outside HOME, skipping")
+            continue
+        text = _read_capped_text(path)
+        if not text:
+            continue
+        if src.kind == "gh_hosts":
+            candidates = _extract_gh_tokens(text)
+        else:
+            candidates = _extract_shape_keys(text)
+        for provider, key in candidates:
+            if not provider or not key:
+                continue
+            dedupe = (provider, key)
+            if dedupe in seen:
+                continue
+            seen.add(dedupe)
+            found.append(_ImportedKey(provider, src.label, key))
+    return found
+
+
+def _import_provider_label(provider: str) -> str:
+    """Human-readable label for a provider in the import prompt."""
+    from fluid_build.cli.ai_setup import PROVIDER_DISPLAY_NAMES
+
+    return _IMPORT_PROVIDER_LABELS.get(provider) or PROVIDER_DISPLAY_NAMES.get(provider, provider)
+
+
+def _resolve_import_provider_obj(provider: str) -> Any:
+    """Return a provider object for validation/persistence, or ``None``.
+
+    Cloud built-ins (openai/anthropic/gemini) come from
+    ``BUILTIN_LLM_PROVIDERS``; ``github`` (GitHub Models) is synthesised via
+    litellm, mirroring :func:`_collect_and_validate_api_key`'s litellm-only
+    branch.
+    """
+    from fluid_build.cli.ai_setup import BUILTIN_LLM_PROVIDERS
+
+    obj = BUILTIN_LLM_PROVIDERS.get(provider)
+    if obj is not None:
+        return obj
+    try:
+        from fluid_build.cli.forge_copilot_llm_litellm import get_litellm_provider
+
+        return get_litellm_provider(provider)
+    except Exception as exc:  # noqa: BLE001 — unknown provider ⇒ can't import
+        LOG.debug("import-from-clis: could not initialise provider object: %s", exc)
+        return None
+
+
+def _import_and_persist(console: Any, candidate: _ImportedKey) -> Optional[LlmConfig]:
+    """Validate then persist an accepted discovered key; return its config.
+
+    Reuses :func:`_persist_and_return` so the keyring-first /
+    ``FLUID_ALLOW_PLAINTEXT_AI_SECRETS`` posture, session-env export, and
+    constant-only logging are identical to the manual-entry path. Returns
+    ``None`` (and skips) when the provider can't be built or the key fails
+    validation.
+    """
+    label = _import_provider_label(candidate.provider)
+    provider_obj = _resolve_import_provider_obj(candidate.provider)
+    if provider_obj is None:
+        console.print(f"[yellow]Could not initialise {label}; skipping.[/yellow]")
+        return None
+    console.print("[dim]Verifying the imported key...[/dim]")
+    # Don't interpolate the key at any LOG site in this frame
+    # (CodeQL py/clear-text-logging-sensitive-data — ``candidate.key`` in scope).
+    error = _validate_api_key(provider_obj, candidate.key)
+    if error:
+        console.print(f"[yellow]That key didn't validate: {error}. Skipping.[/yellow]")
+        LOG.info("Import-from-CLIs: discovered key failed validation (provider offered)")
+        return None
+    return _persist_and_return(
+        console,
+        provider_choice=candidate.provider,
+        provider=provider_obj,
+        label=label,
+        tier="balanced",
+        raw_key=candidate.key,
+    )
+
+
+def _offer_import_from_other_clis(console: Any) -> Optional[LlmConfig]:
+    """Offer to import an API key found in another tool's credential file.
+
+    Discovers keys under ``$HOME`` (:func:`_discover_imported_api_keys`) and,
+    for each provider not already configured, PROMPTS
+    ``Found a <provider> key from <source>. Use it?``. On a yes it validates
+    and persists via the standard flow and returns the resolved
+    :class:`LlmConfig`; on a no it moves to the next candidate. Returns
+    ``None`` when nothing is found, nothing is accepted, or the environment
+    is non-interactive.
+
+    Strictly opt-in: a non-TTY (CI / piped) run discovers nothing and
+    persists nothing.
+    """
+    # Non-interactive (CI / piped stdin): discover nothing, persist nothing.
+    if not (sys.stdin.isatty() and console and RICH_AVAILABLE):
+        return None
+    from fluid_build.cli.ai_setup import ask_confirmation
+
+    try:
+        candidates = _discover_imported_api_keys()
+    except Exception as exc:  # noqa: BLE001 — discovery must never break setup
+        LOG.debug("import-from-clis: discovery failed: %s", exc)
+        return None
+    if not candidates:
+        return None
+
+    try:
+        already = set(_list_configured_providers())
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        LOG.debug("import-from-clis: could not list configured providers: %s", exc)
+        already = set()
+
+    for candidate in candidates:
+        if candidate.provider in already:
+            continue
+        label = _import_provider_label(candidate.provider)
+        try:
+            accept = ask_confirmation(
+                console,
+                f"Found a {label} key from {candidate.source_label}. Use it?",
+                default=True,
+                title="Import API Key",
+                border_style="green",
+                preview=(
+                    f"fluid found a {label} API key stored by {candidate.source_label}.\n"
+                    "Importing it lets you start forging right away — no key to paste.\n"
+                    "It's validated first, then stored in your OS keyring (encrypted),\n"
+                    "never in plaintext on disk. The key value is never shown or logged."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — a prompt failure must not break setup
+            LOG.debug("import-from-clis: prompt failed: %s", exc)
+            return None
+        if not accept:
+            LOG.info("Import-from-CLIs: user declined a discovered key (provider offered)")
+            continue
+        config = _import_and_persist(console, candidate)
+        if config is not None:
+            LOG.info("Import-from-CLIs: imported a discovered key (provider configured)")
+            return config
+    return None
+
+
 def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
     """Compact inline setup triggered when forge starts without a configured provider.
 
@@ -1140,6 +1478,13 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
         else:
             LOG.info("Inline AI setup: auto-selected local Claude Code (non-interactive)")
             return _make_coding_agent_config("claude-code")
+
+    # 4.6. Opt-in: import a key already stored by another tool (gh hosts.yml,
+    #      ~/.codex/auth.json, ~/.openai/credentials, ...). TTY-only and behind
+    #      an explicit confirm — the helper self-guards non-interactive runs.
+    imported = _offer_import_from_other_clis(console)
+    if imported is not None:
+        return imported
 
     # 5. Nothing found — prompt user (only if stdin is interactive).
     if not sys.stdin.isatty():
