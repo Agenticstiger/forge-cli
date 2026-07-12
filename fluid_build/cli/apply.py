@@ -41,7 +41,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.observability.tracing import traced_stage as _traced_stage
@@ -100,12 +100,80 @@ COMMAND = "apply"
 # ==========================================
 
 
+def _dispatch_apply_hook(
+    hook: Callable[..., Any],
+    contract_dir: Path,
+    contract: Dict[str, Any],
+    errors: List[str],
+    env: Optional[str],
+) -> None:
+    """Invoke a single apply-hook, forwarding the resolved apply ``--env``
+    only to hooks that opt in via their signature.
+
+    Backward-compatible signature dispatch. This mirrors pluggy's
+    ``argnames`` opt-in model (pytest's plugin system): a hook receives
+    only the arguments it actually declares, so adding a new argument
+    never breaks an existing hook.
+
+    * **Legacy 3-parameter hooks** ``(contract_dir, contract, errors)`` are
+      called exactly as before — ``hook(contract_dir, contract, errors)``,
+      with no behavior change whatsoever.
+    * **Hooks that opt into env by keyword** — those declaring a keyword-
+      compatible parameter named ``env`` (``POSITIONAL_OR_KEYWORD`` /
+      ``KEYWORD_ONLY``) or accepting ``**kwargs`` — receive the value as
+      ``env=<value>``.
+    * **Hooks that accept a 4th positional parameter** (arity >= 4, or a
+      ``*args`` catch-all) receive the value as the 4th positional argument.
+
+    A hook whose signature cannot be introspected (some C-level callables
+    raise ``ValueError``/``TypeError`` from :func:`inspect.signature`) falls
+    back to the legacy 3-argument call, so it keeps working unchanged.
+
+    The env value is an argparse-validated ``--env`` flag string (not
+    attacker-controlled contract content); it is forwarded verbatim and
+    never used to construct a shell command, path, or identifier here.
+    """
+    import inspect
+
+    legacy_args = (contract_dir, contract, errors)
+    try:
+        params = list(inspect.signature(hook).parameters.values())
+    except (TypeError, ValueError):
+        # Un-introspectable callable (e.g. some builtins / C functions):
+        # preserve the legacy 3-argument contract rather than guessing.
+        hook(*legacy_args)
+        return
+
+    Parameter = inspect.Parameter
+    has_var_keyword = any(p.kind is Parameter.VAR_KEYWORD for p in params)
+    has_var_positional = any(p.kind is Parameter.VAR_POSITIONAL for p in params)
+    accepts_env_keyword = has_var_keyword or any(
+        p.name == "env" and p.kind in (Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY)
+        for p in params
+    )
+    positional_slots = sum(
+        1 for p in params if p.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
+    )
+
+    if accepts_env_keyword:
+        # Prefer the explicit keyword — unambiguous and order-independent.
+        hook(*legacy_args, env=env)
+    elif has_var_positional or positional_slots >= 4:
+        # A 4th positional slot (named anything, e.g. ``deploy_env``) or a
+        # ``*args`` catch-all: pass the env value positionally.
+        hook(*legacy_args, env)
+    else:
+        # Exactly the legacy 3-parameter contract — call unchanged.
+        hook(*legacy_args)
+
+
 def _run_apply_hooks(
     contract: Dict[str, Any],
     contract_dir: Path,
     logger: logging.Logger,
     *,
     force: bool = False,
+    env: Optional[str] = None,
 ) -> int:
     """Invoke any plugin-registered apply-time hooks.
 
@@ -119,6 +187,12 @@ def _run_apply_hooks(
     ``hook(contract_dir, contract, errors_list)`` and may append messages
     to ``errors_list`` to indicate apply-time invariants that have been
     violated (e.g. scaffold bundle digest drift).
+
+    **Env plumbing.** The resolved apply ``--env`` (``env``) is forwarded to
+    hooks that opt in via their signature — see :func:`_dispatch_apply_hook`.
+    Legacy 3-parameter hooks are unaffected; env-aware hooks no longer have
+    to rely on the CI runner exporting ``DEPLOY_ENV`` (the classic
+    "forget-to-set-it → silent no-op in prod" footgun).
 
     **Trust model.** The hook receives a ``copy.deepcopy`` of the contract,
     not the live reference, so a buggy or malicious hook cannot mutate the
@@ -161,7 +235,7 @@ def _run_apply_hooks(
         hook_contract = copy.deepcopy(contract)
         try:
             hook = ep.load()
-            hook(contract_dir, hook_contract, errors)
+            _dispatch_apply_hook(hook, contract_dir, hook_contract, errors, env)
         except Exception as e:
             # Pre-redact the exception message — the SecretRedactingFilter
             # only scrubs args bound to ``password=%s``-style template
@@ -1102,6 +1176,10 @@ def run(args, logger: logging.Logger) -> int:
                 Path(args.contract).resolve().parent,
                 logger,
                 force=bool(getattr(args, "force_pattern_drift", False)),
+                # The resolved apply env (the ``--env`` flag value). Forwarded
+                # to opt-in hooks so env-aware guards see it directly instead
+                # of depending on a CI-exported DEPLOY_ENV env var.
+                env=getattr(args, "env", None),
             )
             if _hook_rc != 0:
                 logger.error(
