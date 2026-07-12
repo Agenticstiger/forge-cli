@@ -265,11 +265,23 @@ def migrate_legacy_to_unified(
         try:
             payload = json.loads(ai_cfg_path.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
+                # Support both the legacy single-provider shape and the
+                # v2 multi-provider map ({"active": .., "providers": {..}}).
+                # Consolidation captures the ACTIVE provider's entry.
+                entry = payload
+                providers = payload.get("providers")
+                if isinstance(providers, dict) and providers:
+                    active = payload.get("active")
+                    if active not in providers:
+                        active = next(iter(providers))
+                    active_entry = providers.get(active)
+                    if isinstance(active_entry, dict):
+                        entry = {"provider": active, **active_entry}
                 cfg.llm = LLMSection(
-                    provider=payload.get("provider"),
-                    model=payload.get("model"),
-                    tiered=bool(payload.get("tiered", False)),
-                    temperature=payload.get("temperature"),
+                    provider=entry.get("provider"),
+                    model=entry.get("model"),
+                    tiered=bool(entry.get("tiered", False)),
+                    temperature=entry.get("temperature"),
                 )
                 sources_consumed.append(str(ai_cfg_path))
         except (OSError, json.JSONDecodeError) as exc:  # pragma: no cover

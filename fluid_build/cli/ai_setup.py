@@ -217,10 +217,15 @@ from fluid_build.cli._ai_setup_storage import (  # noqa: E402,F401
     _allow_plaintext_ai_secrets,
     _clear_ai_config,
     _clear_key_from_keyring,
+    _list_configured_providers,
     _load_ai_config,
+    _load_ai_config_for,
+    _load_ai_config_map,
     _load_key_from_keyring,
+    _remove_provider,
     _save_ai_config,
     _save_key_to_keyring,
+    _set_active_provider,
 )
 
 
@@ -297,6 +302,17 @@ _SIGNUP_URLS = {
     "openai": "https://platform.openai.com/api-keys",
     "anthropic": "https://console.anthropic.com/settings/keys",
 }
+
+
+def _normalize_provider_choice(provider: str) -> str:
+    """Canonicalise a user-supplied provider name.
+
+    Lower-cases and maps the friendly ``claude`` alias to the canonical
+    ``anthropic`` key, matching the ``fluid ai models`` / ``fluid ai
+    test`` normalisation so ``--provider claude`` behaves everywhere.
+    """
+    name = (provider or "").strip().lower()
+    return "anthropic" if name == "claude" else name
 
 
 def _pick_provider(console: Any) -> Optional[str]:
@@ -453,7 +469,9 @@ def _rescue_after_attempts(console: Any) -> Optional[str]:
     return rescue
 
 
-def _prompt_for_api_key(console: Any) -> Optional[LlmConfig]:
+def _prompt_for_api_key(
+    console: Any, *, preselected_provider: Optional[str] = None
+) -> Optional[LlmConfig]:
     """Walk the user through picking an AI provider via numbered menu.
 
     Phase 0.5 fixes (#6, #7, #9, #11, #12, #15, #18) all land here:
@@ -466,6 +484,9 @@ def _prompt_for_api_key(console: Any) -> Optional[LlmConfig]:
     * Doctor hint promoted (#15)
     * Browser OAuth scaffold (#18)
 
+    When *preselected_provider* is set the provider picker is skipped and
+    that provider is configured directly.
+
     Returns a resolved ``LlmConfig`` or ``None`` if the user cancels.
     """
     if not console or not RICH_AVAILABLE:
@@ -476,16 +497,28 @@ def _prompt_for_api_key(console: Any) -> Optional[LlmConfig]:
 
     render_ai_panel(reason="missing", console=console, show_doctor_hint=True)
 
-    return _prompt_for_api_key_loop(console, allow_browser=True)
+    return _prompt_for_api_key_loop(
+        console, allow_browser=True, preselected_provider=preselected_provider
+    )
 
 
-def _prompt_for_api_key_loop(console: Any, *, allow_browser: bool = True) -> Optional[LlmConfig]:
+def _prompt_for_api_key_loop(
+    console: Any,
+    *,
+    allow_browser: bool = True,
+    preselected_provider: Optional[str] = None,
+) -> Optional[LlmConfig]:
     """Inner loop — picker + tier + key + validation + rescue.
 
     Split from :func:`_prompt_for_api_key` so the rescue path can
-    re-enter without re-rendering the unified top panel.
+    re-enter without re-rendering the unified top panel. A
+    *preselected_provider* short-circuits the picker (``fluid ai setup
+    --provider <name>``).
     """
-    provider_choice = _pick_provider(console)
+    if preselected_provider:
+        provider_choice: Optional[str] = _normalize_provider_choice(preselected_provider)
+    else:
+        provider_choice = _pick_provider(console)
     if provider_choice is None:
         return None
 
@@ -753,8 +786,16 @@ from fluid_build.cli._ai_setup_ollama import (  # noqa: E402,F401
 )
 
 
-def run_ai_setup_interactive(console: Any) -> Optional[LlmConfig]:
-    """Full interactive AI setup.  Called by ``fluid ai setup``."""
+def run_ai_setup_interactive(
+    console: Any, *, preselected_provider: Optional[str] = None
+) -> Optional[LlmConfig]:
+    """Full interactive AI setup.  Called by ``fluid ai setup``.
+
+    When *preselected_provider* is given (``fluid ai setup --provider
+    <name>``), the provider picker is skipped and that provider is
+    configured directly. Saving it records/updates only that provider —
+    any other saved providers are preserved (multi-provider support).
+    """
     # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
     from fluid_build.cli.ai_setup import check_llm_readiness
 
@@ -768,22 +809,32 @@ def run_ai_setup_interactive(console: Any) -> Optional[LlmConfig]:
         )
         return None
 
-    # Show current status first
+    # Show current status first. When a specific provider was requested
+    # we skip the "already configured / reconfigure?" gate — the operator
+    # explicitly asked to (re)configure that one provider.
     readiness = check_llm_readiness()
-    if readiness.ready:
+    if readiness.ready and not preselected_provider:
+        # Surface every saved provider so the operator sees the full
+        # picture (borrowed from ``gh auth status`` / ``aws configure
+        # list-profiles``), then confirm a reconfigure.
+        configured = _list_configured_providers()
+        extra = ""
+        if len(configured) > 1:
+            names = ", ".join(configured)
+            extra = f"\n  Saved:    [bold]{names}[/bold] (active: {readiness.provider})"
         console.print(
             Panel(
                 f"[green]AI is already configured:[/green]\n"
                 f"  Provider: [bold]{readiness.provider}[/bold]\n"
-                f"  Model:    [bold]{readiness.model}[/bold]",
+                f"  Model:    [bold]{readiness.model}[/bold]{extra}",
                 title="Current AI Config",
                 border_style="green",
             )
         )
-        if not Confirm.ask("Reconfigure?", default=False):
+        if not Confirm.ask("Add or reconfigure a provider?", default=False):
             return None
 
-    config = _prompt_for_api_key(console)
+    config = _prompt_for_api_key(console, preselected_provider=preselected_provider)
     if config:
         console.print(
             Panel(
@@ -1127,6 +1178,15 @@ def show_ai_status(console: Any) -> None:
         table.add_row("Status", "Ready")
         table.add_row("Provider", readiness.provider or "--")
         table.add_row("Model", readiness.model or "--")
+        # Surface every saved provider (multi-provider support) so the
+        # operator sees which ones ``fluid forge --llm-provider <name>``
+        # can select, and which is the active default.
+        configured = _list_configured_providers()
+        if len(configured) > 1:
+            marked = ", ".join(
+                f"{name} (active)" if name == readiness.provider else name for name in configured
+            )
+            table.add_row("Saved providers", marked)
         console.print(table)
     else:
         console.print(
@@ -1257,6 +1317,19 @@ def register(subparsers) -> None:
         help="Clear saved API keys from keychain",
     )
     setup_parser.add_argument(
+        "--provider",
+        dest="llm_provider",
+        choices=["gemini", "openai", "anthropic", "claude", "ollama"],
+        default=None,
+        help=(
+            "Configure this specific LLM provider (skips the picker). Records or "
+            "updates just this provider and makes it the active/default, WITHOUT "
+            "erasing other saved providers. Run repeatedly to save several "
+            "(e.g. --provider openai then --provider gemini), then select one at "
+            "forge time with 'fluid forge --llm-provider <name>'."
+        ),
+    )
+    setup_parser.add_argument(
         "--source",
         choices=[
             "snowflake",
@@ -1354,8 +1427,26 @@ def _run_ai_command(args, logger: logging.Logger) -> int:
     console = Console() if RICH_AVAILABLE else None
     action = getattr(args, "ai_action", None)
 
+    preselected = getattr(args, "llm_provider", None)
+    preselected = _normalize_provider_choice(preselected) if preselected else None
+
     if action == "setup":
         if getattr(args, "clear", False):
+            # ``--clear --provider X`` removes just that provider (like
+            # dropping one aws-cli profile); ``--clear`` alone wipes all.
+            if preselected:
+                _remove_provider(preselected)
+                _clear_key_from_keyring(preselected)
+                remaining = _list_configured_providers()
+                if console:
+                    console.print(f"[green]Cleared saved config for {preselected}.[/green]")
+                    if remaining:
+                        console.print(f"[dim]Still configured: {', '.join(remaining)}.[/dim]")
+                else:
+                    from fluid_build.cli.console import cprint
+
+                    cprint(f"Cleared saved config for {preselected}.")
+                return 0
             _clear_ai_config()
             for p in PROVIDER_ENV_VARS:
                 _clear_key_from_keyring(p)
@@ -1391,7 +1482,7 @@ def _run_ai_command(args, logger: logging.Logger) -> int:
                 print_v2_banner("ai_setup", quiet=getattr(args, "quiet", False))
             return rc
 
-        result = run_ai_setup_interactive(console)
+        result = run_ai_setup_interactive(console, preselected_provider=preselected)
         if result is not None:
             print_v2_banner("ai_setup", quiet=getattr(args, "quiet", False))
         return 0 if result else 1

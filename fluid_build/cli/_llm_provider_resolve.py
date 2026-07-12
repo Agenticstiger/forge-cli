@@ -166,9 +166,37 @@ def _resolve_api_key(provider: str, env: Mapping[str, str]) -> Optional[str]:
     # Fallback: check the OS keyring for a saved key. Resolve via
     # the host module so test patches on
     # ``fluid_build.cli.forge_copilot_llm_providers._get_api_key_from_keyring``
-    # flow through.
+    # flow through. ``_get_api_key_from_keyring`` checks BOTH the native
+    # ``llm.<provider>.api_key`` scheme and the ``fluid ai setup``
+    # ``llm_api_key.<provider>`` scheme, so a key saved by ``fluid ai
+    # setup --provider <name>`` resolves here for the requested provider.
     keyring_fn = getattr(_host(), "_get_api_key_from_keyring", _get_api_key_from_keyring)
-    return keyring_fn(provider)
+    key = keyring_fn(provider)
+    if key:
+        return key
+    # Last resort: the opt-in plaintext entry in ``ai_config.json``. Gated
+    # on ``FLUID_ALLOW_PLAINTEXT_AI_SECRETS`` (same gate that governs
+    # *writing* it) so the default keyring-only posture is unchanged and
+    # no on-disk config is read unless the operator opted into plaintext.
+    return _resolve_plaintext_saved_key(provider, env)
+
+
+def _resolve_plaintext_saved_key(provider: str, env: Mapping[str, str]) -> Optional[str]:
+    """Return a provider's opt-in plaintext key from ``ai_config.json``.
+
+    Only active when ``FLUID_ALLOW_PLAINTEXT_AI_SECRETS`` is truthy in
+    *env*; otherwise a no-op returning ``None`` (keyring-first posture).
+    """
+    flag = env.get("FLUID_ALLOW_PLAINTEXT_AI_SECRETS", "").strip().lower()
+    if flag not in {"1", "true", "yes", "on"}:
+        return None
+    try:
+        from fluid_build.cli._ai_setup_storage import _load_ai_config_for
+
+        entry = _load_ai_config_for(provider)
+        return entry.get("api_key") if entry else None
+    except Exception:  # noqa: BLE001 — resolution must never hard-fail
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -177,9 +205,22 @@ def _resolve_api_key(provider: str, env: Mapping[str, str]) -> Optional[str]:
 
 _LLM_KEYRING_PREFIX = "llm"
 
+# Second keyring key-scheme: the one ``fluid ai setup`` writes under
+# (``cli/_ai_setup_storage.py::_save_key_to_keyring`` →
+# ``ai_setup._KEYRING_PREFIX``). Mirrored here — like the two parallel
+# redaction layers — so the resolver can find a key saved by
+# ``fluid ai setup`` for ANY provider, not just the active one. If
+# ``ai_setup._KEYRING_PREFIX`` ever changes, update this constant too.
+_AI_SETUP_KEYRING_PREFIX = "llm_api_key"
+
 
 def _keyring_key(provider: str) -> str:
     return f"{_LLM_KEYRING_PREFIX}.{provider}.api_key"
+
+
+def _ai_setup_keyring_key(provider: str) -> str:
+    """Keyring key under the ``fluid ai setup`` scheme (``llm_api_key.<provider>``)."""
+    return f"{_AI_SETUP_KEYRING_PREFIX}.{provider}"
 
 
 def _log_keyring_failure(action: str) -> None:
@@ -196,11 +237,20 @@ def _log_keyring_failure(action: str) -> None:
 
 
 def _get_api_key_from_keyring(provider: str) -> Optional[str]:
-    """Retrieve a saved LLM API key from the OS keyring."""
+    """Retrieve a saved LLM API key from the OS keyring.
+
+    Checks both key-schemes so a key stored by ``fluid ai setup``
+    (``llm_api_key.<provider>``) resolves under ``fluid forge
+    --llm-provider <provider>`` even though ``fluid forge`` itself writes
+    under ``llm.<provider>.api_key``. The native scheme is preferred.
+    """
     try:
         from fluid_build.credentials.keyring_store import KeyringCredentialStore
 
-        return KeyringCredentialStore.get_credential(_keyring_key(provider))
+        value = KeyringCredentialStore.get_credential(_keyring_key(provider))
+        if value:
+            return value
+        return KeyringCredentialStore.get_credential(_ai_setup_keyring_key(provider))
     except Exception:  # noqa: BLE001
         _log_keyring_failure("read")
         return None
