@@ -975,6 +975,33 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
             }
         )
 
+    # Third-party LLM provider plugins (entry-point group fluid_build.llm_providers).
+    # Reads entry-point NAMES only (never loads/executes plugin code) so a health
+    # check can't be a side-channel to run a third party's __init__. Only surfaced
+    # when at least one is installed, to avoid noise. Fail-safe: any error is
+    # swallowed so doctor never crashes on a bad plugin.
+    try:
+        from fluid_build.plugin_manager import LLM_PROVIDER_GROUP_KEY, installed_plugins
+
+        entries = installed_plugins(LLM_PROVIDER_GROUP_KEY).get(LLM_PROVIDER_GROUP_KEY, [])
+        allowed = [e["name"] for e in entries if e.get("allowed")]
+        blocked = len(entries) - len(allowed)
+        if entries:
+            detail = f"{', '.join(allowed) or '(all blocked)'} — use with --llm-provider"
+            if blocked:
+                detail += f"; {blocked} blocked by FLUID_PLUGINS_BLOCKLIST/ALLOWLIST"
+            checks.append(
+                {
+                    "check": "LLM provider plugins",
+                    "category": "ai",
+                    "status": f"✅ {len(allowed)} installed",
+                    "ok": True,
+                    "details": detail,
+                }
+            )
+    except Exception:  # noqa: BLE001 - never break doctor on plugin discovery
+        pass
+
     # Agent web tools (web_search / web_fetch) — opt-in via
     # FLUID_AGENT_WEB_TOOLS. Non-critical; surfaces whether the two
     # network-egress tools are exposed and which search provider (if any)
