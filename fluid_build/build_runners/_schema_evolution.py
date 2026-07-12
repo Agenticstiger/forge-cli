@@ -204,7 +204,7 @@ def raise_if_strict_drift(
         for d in plan.decisions
         if d.action is EvolutionAction.FAIL
     )
-    from fluid_build.cli._errors import SchemaDriftError
+    from fluid_build._errors import SchemaDriftError
 
     raise SchemaDriftError.for_diff(
         baseline_digest=baseline_digest,

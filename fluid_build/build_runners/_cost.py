@@ -85,7 +85,7 @@ class InMemoryCostTracker(CostTracker):
 
 # Re-export the typed catalog class. Symbol-stable for existing imports;
 # single class identity across the runtime + CLI layers.
-from fluid_build.cli._errors import BudgetExceededError  # noqa: E402,F401
+from fluid_build._errors import BudgetExceededError  # noqa: E402,F401
 
 
 def gate_or_raise(tracker: CostTracker, cap: BudgetCap, prior_usage: Dict[str, int]) -> None:

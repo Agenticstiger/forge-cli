@@ -1305,7 +1305,7 @@ def execute_duckdb_build(
     write_run_record(state_store=store, ctx=ctx, result=result, record_dict=duckdb_record)
 
     if result.state is RunState.PARTIAL:
-        from fluid_build.cli._errors import PartialFailureError
+        from fluid_build._errors import PartialFailureError
 
         succeeded = [s.name for s in result.streams if s.state is RunState.SUCCEEDED]
         failed = [s.name for s in result.streams if s.state is not RunState.SUCCEEDED]

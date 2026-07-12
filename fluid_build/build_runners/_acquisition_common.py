@@ -574,7 +574,7 @@ def finalize_run_result(
     # write so the user still sees the message.
     msg = f"{engine} build '{build_id}' failed: {err_safe}"
     try:
-        from fluid_build.cli.console import error as console_error
+        from fluid_build._console import error as console_error
 
         console_error(msg)
     except Exception:  # pragma: no cover — defensive fallback

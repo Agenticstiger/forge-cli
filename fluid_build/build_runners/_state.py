@@ -65,7 +65,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
 
 # Re-export from the typed-error catalog: same symbol, single class
 # identity. Existing imports of ``LockHeldError`` keep resolving here.
-from fluid_build.cli._errors import LockHeldError  # noqa: E402,F401
+from fluid_build._errors import LockHeldError  # noqa: E402,F401
 
 
 class FileStateStore(StateStore):
@@ -229,7 +229,7 @@ class FileStateStore(StateStore):
         rec = self.read_run_record(product_id, build_id, run_id)
         if rec is not None:
             return rec
-        from fluid_build.cli._errors import StaleReplayError
+        from fluid_build._errors import StaleReplayError
 
         raise StaleReplayError.for_run(run_id=run_id, retention_horizon=retention_horizon)
 

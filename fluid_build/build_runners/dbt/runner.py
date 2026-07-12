@@ -42,8 +42,8 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-from fluid_build.cli.console import cprint, success
-from fluid_build.cli.console import error as console_error
+from fluid_build._console import cprint, success
+from fluid_build._console import error as console_error
 
 from .._path_safety import confine_to_workspace
 from ..base import SENSITIVE_ENV_KEY_RE, _resolve_env_placeholders
