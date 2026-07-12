@@ -387,6 +387,7 @@ def print_forge_help() -> None:
                 "Override transformation engine (dbt/sql/spark/dataform/...)",
             ),
             ("--blank", "Empty contract without AI (no LLM needed)"),
+            ("--offline", "Local guided interview, no network (air-gapped/CI)"),
             ("--dry-run", "Preview without creating files"),
             ("--non-interactive", "Use defaults without prompting"),
             ("--yes, -y", "Skip the pre-write preview prompt (panel still renders)"),
@@ -457,6 +458,7 @@ def print_forge_help() -> None:
         ("fluid forge --domain finance", "Finance domain expertise"),
         ("fluid forge --llm-provider ollama --llm-model gemma4", "Use local Ollama model"),
         ("fluid forge --blank --target-dir ./out", "Empty scaffold"),
+        ("fluid forge --offline", "Guided interview, no network calls"),
         (
             "fluid forge data-model from-intent intent.yaml -o contract.fluid.yaml",
             "Forge a data model from an intent",

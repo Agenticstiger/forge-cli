@@ -113,6 +113,11 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "Disable the live contract-growth panel during the interview",
     ),
     (
+        "FLUID_FORGE_OFFLINE",
+        "online (LLM path available)",
+        "Set =1 to force the local no-network guided interview (like `--offline`)",
+    ),
+    (
         "FLUID_COPILOT_JUDGE",
         "judge stage runs (=1)",
         "Set =0 to skip the post-forge LLM judge stage",

@@ -1655,6 +1655,24 @@ from fluid_build.cli._template_mode import (  # noqa: E402,F401
 )
 
 
+def _guided_non_interactive_defaults(args: Any) -> tuple[str, str, str]:
+    """Derive ``(product_id, domain, provider)`` for the headless guided path.
+
+    Answers come from flags when supplied, otherwise from the same
+    defaults the interactive prompts pre-select (``my-data-product`` /
+    ``analytics`` / ``local``). Used by ``--offline --non-interactive``
+    so authoring needs neither a TTY nor a network round-trip.
+    """
+    target_dir = getattr(args, "target_dir", None)
+    if target_dir:
+        product_id = os.path.basename(str(target_dir).rstrip("/\\")) or "my-data-product"
+    else:
+        product_id = "my-data-product"
+    domain = (getattr(args, "domain", None) or "").strip() or "analytics"
+    provider = (getattr(args, "provider", None) or "").strip() or "local"
+    return product_id, domain, provider
+
+
 def run_guided_mode(
     args: Any,
     logger: logging.Logger,
@@ -1662,22 +1680,35 @@ def run_guided_mode(
     get_target_directory_fn: Callable[[Any, str], Path],
     console_factory: Optional[Callable[[], Any]] = Console if RICH_AVAILABLE else None,
 ) -> int:
-    """Create a data product via 4 quick interactive prompts (no LLM required)."""
-    import os
+    """Create a data product via 3 quick prompts (no LLM, no network).
 
+    Interactive by default. With ``--non-interactive`` every answer is
+    derived from flags + defaults so the flow runs headless and without a
+    TTY — this is the path ``fluid forge --offline --non-interactive``
+    uses for air-gapped / CI authoring.
+    """
     console = console_factory() if console_factory else None
+    is_non_interactive = bool(getattr(args, "non_interactive", False))
 
-    # Guard: guided mode requires interactive stdin
-    if not sys.stdin.isatty():
+    # Guard: interactive guided mode requires a TTY. The non-interactive
+    # path derives its answers from flags, so it is exempt.
+    if not is_non_interactive and not sys.stdin.isatty():
         logger.error("Guided mode requires an interactive terminal")
         if console:
-            console.print("[red]Guided mode requires an interactive terminal.[/red]")
+            console.print(
+                "[red]Guided mode requires an interactive terminal.[/red]\n"
+                "[dim]Add --non-interactive for a prompt-free run.[/dim]"
+            )
         return 1
 
     try:
         from fluid_build.cli.forge_ui import ask_numbered_choice
 
-        if console and RICH_AVAILABLE:
+        if is_non_interactive:
+            product_id, domain, provider = _guided_non_interactive_defaults(args)
+            owner = os.getenv("USER", "data-team")
+            description = f"{product_id.replace('-', ' ').title()} data product"
+        elif console and RICH_AVAILABLE:
             from rich.panel import Panel
             from rich.prompt import Prompt
 
