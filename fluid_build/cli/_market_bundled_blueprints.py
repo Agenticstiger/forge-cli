@@ -123,6 +123,104 @@ exposes:
           type: "integer"
 """
 
+# --- Provider quickstart templates (GCP / Snowflake) ------------------------ #
+#
+# The "quickstart by provider" starters. Same Bronze embedded-SQL shape as
+# ``_STARTER_TEMPLATE``, but bound to the provider's native table so a user who
+# picks their target (``fluid init --quickstart --provider gcp|snowflake`` or the
+# "Start from a blueprint" menu) gets a *ready-to-run* starter contract for that
+# provider — no cloud call, no AI key. The provider addressing fields
+# (project/dataset, account/database/schema) are declared parameters with
+# obvious placeholder defaults so the template renders offline from
+# ``product_name`` alone; the user edits ``binding.location`` before
+# ``fluid plan --provider <p>``.
+#
+# ``{% set %}`` derives a provider-idiomatic *physical* table identifier from the
+# product name: BigQuery table names disallow ``-`` (underscore form), Snowflake
+# is conventionally UPPER_SNAKE. Free-text params still flow through ``tojson``
+# so a quoted/newline-laden value can never inject sibling YAML keys.
+_STARTER_GCP_TEMPLATE = """\
+{% set bq_table = name_slug | replace("-", "_") %}
+fluidVersion: "0.7.4"
+kind: "DataProduct"
+id: {{ product_id | tojson }}
+name: {{ product_name | tojson }}
+description: {{ description | tojson }}
+domain: {{ domain | tojson }}
+metadata:
+  layer: Bronze
+  owner:
+    team: {{ owner_team | tojson }}
+    email: {{ owner_email | tojson }}
+builds:
+  - id: "{{ bq_table }}_build"
+    pattern: "embedded-logic"
+    engine: "sql"
+    properties:
+      sql: |
+        SELECT
+          'Hello from the {{ name_slug }} data product' AS message,
+          CURRENT_TIMESTAMP() AS created_at
+exposes:
+  - exposeId: "{{ name_slug }}_output"
+    kind: "table"
+    binding:
+      platform: "gcp"
+      format: "bigquery_table"
+      location:
+        project: {{ gcp_project | tojson }}
+        dataset: {{ gcp_dataset | tojson }}
+        table: "{{ bq_table }}"
+    contract:
+      schema:
+        - name: "message"
+          type: "string"
+        - name: "created_at"
+          type: "timestamp"
+"""
+
+_STARTER_SNOWFLAKE_TEMPLATE = """\
+{% set sf_build = name_slug | replace("-", "_") %}
+{% set sf_table = name_slug | replace("-", "_") | upper %}
+fluidVersion: "0.7.4"
+kind: "DataProduct"
+id: {{ product_id | tojson }}
+name: {{ product_name | tojson }}
+description: {{ description | tojson }}
+domain: {{ domain | tojson }}
+metadata:
+  layer: Bronze
+  owner:
+    team: {{ owner_team | tojson }}
+    email: {{ owner_email | tojson }}
+builds:
+  - id: "{{ sf_build }}_build"
+    pattern: "embedded-logic"
+    engine: "sql"
+    properties:
+      sql: |
+        SELECT
+          'Hello from the {{ name_slug }} data product' AS MESSAGE,
+          CURRENT_TIMESTAMP() AS CREATED_AT
+exposes:
+  - exposeId: "{{ name_slug }}_output"
+    kind: "table"
+    binding:
+      platform: "snowflake"
+      format: "snowflake_table"
+      location:
+        account: {{ sf_account | tojson }}
+        database: {{ sf_database | tojson }}
+        schema: {{ sf_schema | tojson }}
+        table: "{{ sf_table }}"
+    contract:
+      schema:
+        - name: "MESSAGE"
+          type: "string"
+        - name: "CREATED_AT"
+          type: "timestamp"
+"""
+
 # Shared parameter set (kept identical so the wizard/UX is consistent).
 _COMMON_PARAMS: List[Dict[str, Any]] = [
     {
@@ -154,6 +252,51 @@ _COMMON_PARAMS: List[Dict[str, Any]] = [
     },
 ]
 
+# Provider-quickstart parameter sets: the common product metadata plus the
+# provider addressing fields, each with a placeholder default so the starter
+# renders offline from ``product_name`` alone. Concatenation makes a fresh list;
+# the shared inner dicts are safe because every registry read deep-copies.
+_GCP_PARAMS: List[Dict[str, Any]] = _COMMON_PARAMS + [
+    {
+        "name": "gcp_project",
+        "required": False,
+        "type": "string",
+        "default": "your-gcp-project",
+        "description": "GCP project id that hosts the BigQuery dataset.",
+    },
+    {
+        "name": "gcp_dataset",
+        "required": False,
+        "type": "string",
+        "default": "analytics",
+        "description": "BigQuery dataset for the starter table.",
+    },
+]
+
+_SNOWFLAKE_PARAMS: List[Dict[str, Any]] = _COMMON_PARAMS + [
+    {
+        "name": "sf_account",
+        "required": False,
+        "type": "string",
+        "default": "your_account",
+        "description": "Snowflake account identifier.",
+    },
+    {
+        "name": "sf_database",
+        "required": False,
+        "type": "string",
+        "default": "ANALYTICS_DB",
+        "description": "Snowflake database for the starter table.",
+    },
+    {
+        "name": "sf_schema",
+        "required": False,
+        "type": "string",
+        "default": "PUBLIC",
+        "description": "Snowflake schema for the starter table.",
+    },
+]
+
 BUNDLED_BLUEPRINTS: List[Dict[str, Any]] = [
     {
         "id": "fluid.starter",
@@ -180,6 +323,44 @@ BUNDLED_BLUEPRINTS: List[Dict[str, Any]] = [
         "tags": ["analytics", "silver", "aggregate", "duckdb"],
         "parameters": _COMMON_PARAMS,
         "contract_template": _ANALYTICS_TEMPLATE,
+    },
+    {
+        "id": "fluid.starter-gcp",
+        "name": "Starter Data Product (GCP / BigQuery)",
+        "description": "Quickstart for GCP: a minimal Bronze data product bound to a "
+        "BigQuery table. Edit binding.location.project/dataset, then `fluid validate` "
+        "and `fluid plan --provider gcp`.",
+        "category": "starter",
+        "version": "1.0.0",
+        "labels": {
+            "maturity": "stable",
+            "source": "bundled",
+            "license": "Apache-2.0",
+            "provider": "gcp",
+        },
+        "source": "bundled",
+        "tags": ["starter", "gcp", "bigquery", "bronze", "sql"],
+        "parameters": _GCP_PARAMS,
+        "contract_template": _STARTER_GCP_TEMPLATE,
+    },
+    {
+        "id": "fluid.starter-snowflake",
+        "name": "Starter Data Product (Snowflake)",
+        "description": "Quickstart for Snowflake: a minimal Bronze data product bound to a "
+        "Snowflake table. Edit binding.location.account/database/schema, then "
+        "`fluid validate` and `fluid plan --provider snowflake`.",
+        "category": "starter",
+        "version": "1.0.0",
+        "labels": {
+            "maturity": "stable",
+            "source": "bundled",
+            "license": "Apache-2.0",
+            "provider": "snowflake",
+        },
+        "source": "bundled",
+        "tags": ["starter", "snowflake", "bronze", "sql"],
+        "parameters": _SNOWFLAKE_PARAMS,
+        "contract_template": _STARTER_SNOWFLAKE_TEMPLATE,
     },
 ]
 
