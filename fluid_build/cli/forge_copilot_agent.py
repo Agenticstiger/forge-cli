@@ -25,6 +25,7 @@ __all__ = [
 
 import logging
 import re
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -482,6 +483,12 @@ class CopilotAgentBase(CopilotProjectMemoryMixin, CopilotLegacyScaffoldMixin, AI
         options: Dict[str, Any],
         error: CopilotGenerationError,
     ) -> Optional[CopilotGenerationResult]:
+        # Auth failures (401) get their own recovery: re-prompt for a fresh
+        # key and retry the run in place. This branch is independent of the
+        # interview state (a bad key can fail on the very first call).
+        if error.context.get("failure_class") == "auth":
+            return self._attempt_auth_recovery(context=context, options=options)
+
         interview_state = options.get("interview_state")
         if (
             not interview_state
@@ -514,6 +521,42 @@ class CopilotAgentBase(CopilotProjectMemoryMixin, CopilotLegacyScaffoldMixin, AI
         options["clarification_recovery_used"] = True
         updated_context = normalize_copilot_context(updated_state.finalize())
         return self.generate_project_artifacts(updated_context, options)
+
+    def _attempt_auth_recovery(
+        self,
+        *,
+        context: Dict[str, Any],
+        options: Dict[str, Any],
+    ) -> Optional[CopilotGenerationResult]:
+        """Re-prompt for an API key after a 401 and retry generation once.
+
+        Gated to genuinely interactive sessions (a real TTY with a Rich
+        console, and not ``--non-interactive``) and to a single attempt per run
+        (``auth_recovery_used``) so a user who keeps pasting a bad key can't get
+        stuck in a prompt loop. On success the freshly-entered key is already
+        persisted + exported to the process env by ``rotate_api_key_interactive``,
+        so re-running ``generate_project_artifacts`` re-resolves the config and
+        picks it up. If the guard rejects or the user cancels, we return
+        ``None`` and the original auth error surfaces exactly as before.
+        """
+        if options.get("non_interactive") or options.get("auth_recovery_used") or not self.console:
+            return None
+        try:
+            if not sys.stdin.isatty():
+                return None
+        except Exception:  # noqa: BLE001 - odd stream → treat as non-interactive
+            return None
+
+        # Mark used *before* the retry so a second 401 (e.g. the replacement
+        # key is also bad) can't recurse into another prompt.
+        options["auth_recovery_used"] = True
+
+        from fluid_build.cli.ai_setup import rotate_api_key_interactive
+
+        new_config = rotate_api_key_interactive(self.console)
+        if new_config is None:
+            return None
+        return self.generate_project_artifacts(context, options)
 
     def _create_forge_config(
         self,

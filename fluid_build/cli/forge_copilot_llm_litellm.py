@@ -85,6 +85,69 @@ def _get_litellm() -> Any:
     return litellm
 
 
+def _translate_litellm_exception(
+    litellm: Any, exc: Exception, *, streaming: bool
+) -> CopilotGenerationError:
+    """Map a raw litellm exception to a typed, tagged ``CopilotGenerationError``.
+
+    The key signal is ``failure_class`` in the error context, which the
+    orchestration layer (``CopilotAgent._attempt_generation_recovery``) reads to
+    decide whether to offer an interactive recovery:
+
+    * ``litellm.AuthenticationError`` (HTTP 401 — bad/expired/absent key) →
+      ``failure_class="auth"``. This is the one the key-rotation flow re-prompts
+      on. We match the concrete exception type rather than string-scanning the
+      message (litellm's own guidance) so the classification is robust across
+      providers.
+    * ``litellm.PermissionDeniedError`` (HTTP 403 — key valid but lacks
+      access/model entitlement) → ``failure_class="permission"``. A *new key
+      won't help*, so this is tagged distinctly and does NOT trigger rotation.
+    * anything else → the generic request/streaming-failed error (unchanged).
+
+    ``failure_class="auth"`` errors are also listed as non-retryable in
+    ``copilot.agents.base`` so the staged pipeline fails fast instead of burning
+    three backoff attempts on a credential that cannot succeed.
+    """
+    auth_error = getattr(litellm, "AuthenticationError", ())
+    permission_error = getattr(litellm, "PermissionDeniedError", ())
+    if auth_error and isinstance(exc, auth_error):
+        return CopilotGenerationError(
+            "copilot_llm_auth_failed",
+            f"LLM authentication failed (401): {exc}",
+            suggestions=[
+                "The API key appears invalid or expired — set a fresh one",
+                "Run `fluid ai setup` to re-enter your key, or `fluid doctor`",
+            ],
+            context={"failure_class": "auth"},
+        )
+    if permission_error and isinstance(exc, permission_error):
+        return CopilotGenerationError(
+            "copilot_llm_permission_denied",
+            f"LLM permission denied (403): {exc}",
+            suggestions=[
+                "The key is valid but lacks access to this model — a new key "
+                "won't help; check the provider account's model entitlements",
+                "Try a different model with `--model`, or run `fluid doctor`",
+            ],
+            context={"failure_class": "permission"},
+        )
+    event = "copilot_litellm_streaming_failed" if streaming else "copilot_litellm_request_failed"
+    label = "streaming" if streaming else "request"
+    tail_suggestion = (
+        "Try again without `--stream` to isolate streaming-vs-blocking issues"
+        if streaming
+        else "Run `fluid doctor` for an environment readiness check"
+    )
+    return CopilotGenerationError(
+        event,
+        f"litellm {label} failed: {exc}",
+        suggestions=[
+            "Check the API key for the underlying provider is set / valid",
+            tail_suggestion,
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Provider-name → litellm model prefix mapping
 # ---------------------------------------------------------------------------
@@ -540,14 +603,7 @@ class LiteLLMProvider(LlmProvider):
         try:
             response = _completion_via_router_or_direct(litellm, payload)
         except Exception as exc:  # noqa: BLE001 — translated to typed error
-            raise CopilotGenerationError(
-                "copilot_litellm_request_failed",
-                f"litellm request failed: {exc}",
-                suggestions=[
-                    "Check the API key for the underlying provider is set / valid",
-                    "Run `fluid doctor` for an environment readiness check",
-                ],
-            ) from exc
+            raise _translate_litellm_exception(litellm, exc, streaming=False) from exc
 
         response_json = _to_dict(response)
         usage = self.extract_usage(response_json)
@@ -595,14 +651,7 @@ class LiteLLMProvider(LlmProvider):
         try:
             stream = _completion_via_router_or_direct(litellm, payload)
         except Exception as exc:  # noqa: BLE001
-            raise CopilotGenerationError(
-                "copilot_litellm_streaming_failed",
-                f"litellm streaming failed: {exc}",
-                suggestions=[
-                    "Check the API key for the underlying provider is set / valid",
-                    "Try again without `--stream` to isolate streaming-vs-blocking issues",
-                ],
-            ) from exc
+            raise _translate_litellm_exception(litellm, exc, streaming=True) from exc
 
         last_chunk: Any = None
         for chunk in stream:
