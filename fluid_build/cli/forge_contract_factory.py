@@ -25,6 +25,7 @@ from __future__ import annotations
 __all__ = [
     "build_minimal_contract",
     "create_and_validate_contract",
+    "stamp_prompt_profile",
     "write_contract",
     "validate_contract_file",
 ]
@@ -116,6 +117,41 @@ def build_minimal_contract(
     }
 
 
+def stamp_prompt_profile(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Stamp the active prompt profile into ``metadata.provenance``.
+
+    When a ``fluid forge --prompt-profile <name>`` (or
+    ``FLUID_PROMPT_PROFILE``) profile is active, records it at
+    ``contract.metadata.provenance.prompt_profile`` so published contracts
+    carry the audit trail of *which* prompt overlay authored them. This is
+    the single chokepoint used by both the blank/guided write path
+    (:func:`write_contract`) and the AI copilot write path
+    (``forge_copilot_agent._create_forge_config``).
+
+    No-op — and no key added — when no profile is active, keeping the
+    default contract output byte-identical. Mutates *contract* in place and
+    returns it. Never raises: provenance stamping must not crash a write.
+    """
+    try:
+        from fluid_build.cli.forge_copilot_prompts import get_active_prompt_profile
+
+        profile = get_active_prompt_profile()
+    except Exception:  # noqa: BLE001 — defensive; never block a write on this
+        profile = None
+    if not profile:
+        return contract
+    metadata = contract.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        contract["metadata"] = metadata
+    provenance = metadata.get("provenance")
+    if not isinstance(provenance, dict):
+        provenance = {}
+        metadata["provenance"] = provenance
+    provenance["prompt_profile"] = profile
+    return contract
+
+
 def write_contract(
     contract: Dict[str, Any],
     path: Path,
@@ -152,6 +188,9 @@ def write_contract(
     # "ContractMetadata" to signal what this sub-block describes.
     metadata["provenance"] = envelope
     doc["metadata"] = metadata
+    # Audit trail: record the active prompt profile (if any) into the same
+    # provenance block. No-op when no profile is active.
+    stamp_prompt_profile(doc)
 
     header = f"# FLUID Data Product Contract\n# Docs: {DOCS_URL}\n"
     body = yaml.dump(doc, default_flow_style=False, sort_keys=False, allow_unicode=True)

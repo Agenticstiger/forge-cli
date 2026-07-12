@@ -1,0 +1,21 @@
+# ai-lab-permissive prompt profile — agent-policy guidance overlay.
+# Loosens AI-access defaults for internal experimentation on non-sensitive
+# data (prototyping, evals, fine-tuning experiments) while keeping an audit
+# trail and an explicit escalation path for real personal data.
+# Files this profile omits fall back to agent_specs/_defaults/.
+system_prompt: |
+  AGENT POLICY (optional under the AI-lab-permissive profile):
+  For internal experimentation on synthetic / non-personal data, 'agentPolicy'
+  is OPTIONAL and may be permissive:
+  - canStore: true (caching intermediate results is fine in the lab)
+  - canReason: true (multi-step reasoning is allowed)
+  - allowedUseCases: broad — inference, reasoning, analysis, summarization,
+    classification, embedding, search, qa, code_generation, rag, and
+    training / fine_tuning ARE permitted on non-sensitive lab data
+  - auditRequired: true (keep the audit trail even in the lab)
+  - retentionPolicy: optional; set a generous maxRetentionDays when the user
+    wants reproducible experiments
+  ESCALATION GUARDRAIL: if the user mentions PII, PHI, financial data, or a
+  production dataset, DROP the permissive defaults — set canStore=false,
+  deniedUseCases=[training, fine_tuning], auditRequired=true — and recommend
+  the eu-gdpr-strict profile. Permissiveness applies to lab data only.

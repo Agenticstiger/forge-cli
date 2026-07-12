@@ -592,6 +592,12 @@ class CopilotAgentBase(CopilotProjectMemoryMixin, CopilotLegacyScaffoldMixin, AI
             config["fluid_version"] = generation_result.contract.get(
                 "fluidVersion", FluidSchemaManager.latest_bundled_version()
             )
+            # Audit trail: stamp the active prompt profile (if any) into the
+            # generated contract's provenance before it becomes the write
+            # payload. Single chokepoint shared with the blank/guided path.
+            from fluid_build.cli.forge_contract_factory import stamp_prompt_profile
+
+            stamp_prompt_profile(generation_result.contract)
             config["copilot_generated_contract"] = generation_result.contract
             config["copilot_generated_readme"] = generation_result.readme_markdown
             if generation_result.additional_files:

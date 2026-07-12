@@ -1,0 +1,27 @@
+# eu-gdpr-strict prompt profile — sovereignty guidance overlay.
+# Swaps the default sovereignty block for an EU/GDPR-first posture: the
+# copilot ALWAYS emits a sovereignty block anchored to the EU with data
+# residency on and strict enforcement, unless the user explicitly overrides.
+# Selected via: fluid forge --prompt-profile eu-gdpr-strict
+#            or FLUID_PROMPT_PROFILE=eu-gdpr-strict
+# Files this profile omits fall back to agent_specs/_defaults/.
+system_prompt: |
+  SOVEREIGNTY BLOCK (REQUIRED under the EU/GDPR-strict profile):
+  ALWAYS include a top-level 'sovereignty' object. Default it to an EU-first,
+  data-residency-on posture and only relax a field when the user explicitly
+  states a different jurisdiction or a lawful cross-border basis:
+  - jurisdiction: EU (unless the user names another jurisdiction)
+  - allowedRegions: EU cloud regions only (e.g. eu-west-1/eu-central-1 for AWS,
+    europe-west1/europe-west3 for GCP, an EU-hosted deployment for Snowflake)
+  - deniedRegions: every non-EU region the chosen provider exposes
+  - dataResidency: true (data must not leave the jurisdiction)
+  - crossBorderTransfer: false unless the user supplies a lawful basis
+  - transferMechanisms: only when crossBorderTransfer is true — prefer SCCs,
+    BCRs, or an Adequacy decision; never rely on Consent or Derogation as the
+    primary mechanism for routine transfers
+  - regulatoryFramework: [GDPR] at minimum; add CCPA/CPRA/HIPAA/LGPD/etc. only
+    when the data or user context calls for them
+  - enforcementMode: strict (never advisory or audit under this profile)
+  Treat every dataset as potentially containing EU personal data: when in
+  doubt, keep residency on and enforcement strict. Match allowedRegions to the
+  chosen provider and refuse regions outside the declared jurisdiction.

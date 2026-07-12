@@ -1,0 +1,23 @@
+# eu-gdpr-strict prompt profile — agent-policy guidance overlay.
+# Swaps the default agent-policy block for a restrictive, audit-first AI
+# access posture aligned with GDPR purpose-limitation and storage-limitation.
+# Files this profile omits fall back to agent_specs/_defaults/.
+system_prompt: |
+  AGENT POLICY (REQUIRED under the EU/GDPR-strict profile):
+  ALWAYS attach 'policy.agentPolicy' to every expose that may carry personal
+  data, defaulting to the most restrictive settings and relaxing only on an
+  explicit, documented user instruction:
+  - canStore: false (no caching/persistence of personal data by AI systems)
+  - canReason: false unless the user names a specific lawful purpose
+  - deniedUseCases: [training, fine_tuning] at minimum — personal data is never
+    used to train or fine-tune models under this profile
+  - allowedUseCases: keep to the narrow purpose the user stated (e.g. analysis,
+    summarization) — honour purpose limitation
+  - auditRequired: true (every AI access must be logged)
+  - retentionPolicy: set maxRetentionDays to the shortest defensible window and
+    requireDeletion: true (storage limitation)
+  - purposeLimitation: state the single declared purpose in free text
+  - allowedModels / deniedModels: prefer allow-listing named models; deny any
+    model whose provider cannot attest to EU data handling
+  Default to deny. When the sensitivity is unknown, treat the data as personal
+  and apply the restrictive defaults above.

@@ -108,6 +108,7 @@ from fluid_build.cli.forge_copilot_prompts import (  # noqa: F401
     build_clarification_system_prompt,
     build_clarification_user_prompt,
     build_user_prompt,
+    get_active_prompt_profile,
 )
 from fluid_build.cli.forge_copilot_prompts import (
     build_system_prompt as _build_system_prompt_raw,
@@ -221,7 +222,11 @@ def _system_prompt_cache_key(capability_matrix: Mapping[str, Any]) -> Optional[s
     except Exception:  # noqa: BLE001 — defensive
         return None
     engines_hash = hash(tuple(sorted(KNOWN_BUILD_ENGINES)))
-    return f"{hashlib.sha1(blob.encode('utf-8'), usedforsecurity=False).hexdigest()}:{engines_hash}"
+    # Fold the active prompt profile into the key so switching profiles never
+    # returns a stale (default-guidance) prompt from the cache.
+    profile = get_active_prompt_profile() or ""
+    digest = hashlib.sha1(blob.encode("utf-8"), usedforsecurity=False).hexdigest()
+    return f"{digest}:{engines_hash}:{profile}"
 
 
 def build_system_prompt(capability_matrix: Mapping[str, Any]) -> str:
