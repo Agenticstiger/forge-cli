@@ -38,6 +38,8 @@ __all__ = [
 import re
 from typing import Any, Dict, List, Optional
 
+from fluid_build.cli import forge_standards_modeling as _standards
+
 USE_CASE_CHOICES: List[Dict[str, str]] = [
     {"label": "Analytics & BI", "value": "analytics"},
     {"label": "ETL / Data Pipelines", "value": "etl_pipeline"},
@@ -49,19 +51,14 @@ USE_CASE_CHOICES: List[Dict[str, str]] = [
 
 USE_CASE_LABELS = {choice["value"]: choice["label"] for choice in USE_CASE_CHOICES}
 
-CANONICAL_MODEL_LABELS = {
-    "tmf_sid": "TM Forum SID",
-    "nrf_arts": "NRF ARTS",
-    "gs1_gdm": "GS1 Global Data Model",
-    "adobe_xdm": "Adobe XDM",
-    "hl7_fhir": "HL7 FHIR",
-    "omop_cdm": "OMOP CDM",
-}
+# Canonical-model + supporting-standard taxonomy now lives in the single shared
+# ``forge_standards_modeling`` registry so the declarative domain-agent path and
+# this generative path never drift. These module constants are derived snapshots
+# of that registry (kept as plain dicts for the existing consumers that import
+# them, e.g. ``forge_copilot_contract_helpers._modeling_description_suffix``).
+CANONICAL_MODEL_LABELS = _standards.canonical_model_labels()
 
-SUPPORTING_STANDARD_LABELS = {
-    "gs1_gdm": "GS1 Global Data Model",
-    "gs1_epcis_cbv": "GS1 EPCIS / CBV",
-}
+SUPPORTING_STANDARD_LABELS = _standards.supporting_standard_labels()
 
 USE_CASE_ALIASES = {
     "analytics": "analytics",
@@ -104,41 +101,9 @@ USE_CASE_ALIASES = {
     "unsure": "other",
 }
 
-CANONICAL_MODEL_ALIASES = {
-    "tmf sid": "tmf_sid",
-    "tmf_sid": "tmf_sid",
-    "tm forum sid": "tmf_sid",
-    "sid": "tmf_sid",
-    "nrf arts": "nrf_arts",
-    "nrf_arts": "nrf_arts",
-    "arts": "nrf_arts",
-    "retail operational data model": "nrf_arts",
-    "gs1 gdm": "gs1_gdm",
-    "gs1_gdm": "gs1_gdm",
-    "gs1 global data model": "gs1_gdm",
-    "adobe xdm": "adobe_xdm",
-    "adobe_xdm": "adobe_xdm",
-    "xdm": "adobe_xdm",
-    "experience data model": "adobe_xdm",
-    "hl7 fhir": "hl7_fhir",
-    "hl7_fhir": "hl7_fhir",
-    "fhir": "hl7_fhir",
-    "omop": "omop_cdm",
-    "omop cdm": "omop_cdm",
-    "omop_cdm": "omop_cdm",
-}
-
-SUPPORTING_STANDARD_ALIASES = {
-    "gs1 gdm": "gs1_gdm",
-    "gs1_gdm": "gs1_gdm",
-    "gs1 global data model": "gs1_gdm",
-    "epcis": "gs1_epcis_cbv",
-    "cbv": "gs1_epcis_cbv",
-    "gs1 epcis": "gs1_epcis_cbv",
-    "gs1 cbv": "gs1_epcis_cbv",
-    "gs1 epcis cbv": "gs1_epcis_cbv",
-    "gs1_epcis_cbv": "gs1_epcis_cbv",
-}
+# Canonical-model + supporting-standard alias tables are owned by the shared
+# ``forge_standards_modeling`` registry (see ``normalize_canonical_model`` /
+# ``normalize_supporting_standards`` below, which delegate to it).
 
 
 # CI/CD providers — must stay in sync with PipelineProvider in
@@ -275,21 +240,22 @@ def _listify_strings(value: Any) -> list[str]:
 
 
 def normalize_canonical_model(value: Any) -> Optional[str]:
-    """Normalize canonical-model variants to stable internal values."""
-    text = canonicalize_use_case_text(value)
-    if not text:
-        return None
-    return CANONICAL_MODEL_ALIASES.get(text)
+    """Normalize canonical-model variants to stable internal values.
+
+    Delegates to the shared ``forge_standards_modeling`` registry so the
+    generative path recognises every canonical model the declarative domain
+    agents declare (all 12 domains), not just the legacy four.
+    """
+    return _standards.normalize_canonical_model(value)
 
 
 def normalize_supporting_standards(value: Any) -> list[str]:
-    """Normalize supporting standards into a stable ordered list."""
-    normalized: list[str] = []
-    for item in _listify_strings(value):
-        standard = SUPPORTING_STANDARD_ALIASES.get(canonicalize_use_case_text(item))
-        if standard:
-            normalized.append(standard)
-    return _dedupe_preserve_order(normalized)
+    """Normalize supporting standards into a stable ordered list.
+
+    Delegates to the shared ``forge_standards_modeling`` registry (single
+    source of truth shared with the declarative domain-agent path).
+    """
+    return _standards.normalize_supporting_standards(value)
 
 
 def _combined_intent_text(context: Dict[str, Any]) -> str:
@@ -441,6 +407,17 @@ def infer_modeling_context(context: Dict[str, Any]) -> Dict[str, Any]:
                 )
         elif _looks_retail(text, domain):
             canonical_model = "nrf_arts"
+
+    # Domain-declared fallback: for a recognised domain whose free-text signals
+    # did not pin a canonical model (notably the 8 verticals these heuristics do
+    # not encode), defer to the domain agent's declared default so the
+    # generative path agrees with the declarative path. Single source of truth:
+    # the shared standards-modeling registry reading the agent spec.
+    if canonical_model is None and domain:
+        domain_defaults = _standards.domain_standard_defaults(domain)
+        if domain_defaults["canonical_model"]:
+            canonical_model = domain_defaults["canonical_model"]
+            supporting_standards.extend(domain_defaults["supporting_standards"])
 
     if canonical_model == "nrf_arts" and _looks_retail(text, domain):
         supporting_standards.append("gs1_gdm")
