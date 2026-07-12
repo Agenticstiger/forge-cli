@@ -74,6 +74,17 @@ def _plaintext_env_var() -> str:
 
 # ── Config storage ──────────────────────────────────────────────────────
 
+# ``ai_config.json`` schema version. v2 is the multi-provider map
+# ``{"version": 2, "active": <name>, "providers": {<name>: {<entry>}}}``.
+# The pre-v2 single-provider shape ``{"provider": .., "model": ..}`` is
+# still read transparently (see :func:`_normalize_config`) so upgrades
+# never strand an existing config.
+_CONFIG_SCHEMA_VERSION = 2
+
+# Top-level keys that are NOT part of a per-provider entry — used when
+# folding the legacy single-provider shape into a one-entry map.
+_MAP_META_KEYS = frozenset({"provider", "version", "active", "providers"})
+
 
 def _allow_plaintext_ai_secrets() -> bool:
     """Return True when the operator explicitly opts into plaintext key persistence."""
@@ -85,59 +96,76 @@ def _allow_plaintext_ai_secrets() -> bool:
     }
 
 
-def _save_ai_config(
-    provider: str,
-    model: str,
-    *,
-    api_key: Optional[str] = None,
-    endpoint: Optional[str] = None,
-    ollama_host: Optional[str] = None,
-) -> bool:
-    """Save non-sensitive AI config to ``~/.fluid/ai_config.json``.
+def _read_config_file() -> Optional[dict]:
+    """Read + JSON-parse ``~/.fluid/ai_config.json``.
 
-    Provider and model choices live in the JSON file. API keys are
-    persisted to the OS keyring whenever possible. Plaintext key
-    fallback is intentionally opt-in via
-    ``FLUID_ALLOW_PLAINTEXT_AI_SECRETS=1`` so automated and
-    agent-facing workflows don't quietly leave live provider tokens
-    on disk.
+    Returns the raw ``dict`` (either shape) or ``None`` when the file is
+    absent, unreadable, or not a JSON object.
     """
     import json
 
-    # Resolve ``_save_key_to_keyring`` via the canonical
-    # ``cli.ai_setup`` namespace so test patches on
-    # ``fluid_build.cli.ai_setup._save_key_to_keyring`` flow through
-    # to this caller (matches the pattern used in
-    # ``_init_interactive_helpers`` etc.).
-    from fluid_build.cli import ai_setup as _as
+    try:
+        cf = _config_file()
+        if not cf.exists():
+            return None
+        data = json.loads(cf.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _normalize_config(data: Optional[dict]) -> dict:
+    """Normalise either config shape to ``{"active": name|None, "providers": {name: entry}}``.
+
+    Accepts the v2 multi-provider map *and* the legacy single-provider
+    shape (``{"provider": .., "model": ..}``), folding the latter into a
+    one-entry map so every reader sees the same structure. Each ``entry``
+    holds the non-name fields (``model``, ``endpoint``, ``ollama_host``,
+    ``tiered``, and — only under the opt-in plaintext fallback —
+    ``api_key``).
+    """
+    if not isinstance(data, dict):
+        return {"active": None, "providers": {}}
+
+    raw_providers = data.get("providers")
+    if isinstance(raw_providers, dict):
+        providers = {
+            name: dict(entry)
+            for name, entry in raw_providers.items()
+            if isinstance(name, str) and isinstance(entry, dict)
+        }
+        active = data.get("active")
+        if active not in providers:
+            active = next(iter(providers), None)
+        return {"active": active, "providers": providers}
+
+    # Legacy single-provider shape.
+    provider = data.get("provider")
+    if not isinstance(provider, str) or not provider:
+        return {"active": None, "providers": {}}
+    entry = {k: v for k, v in data.items() if k not in _MAP_META_KEYS}
+    return {"active": provider, "providers": {provider: entry}}
+
+
+def _write_config_map(active: Optional[str], providers: dict) -> bool:
+    """Serialise the multi-provider map to ``ai_config.json`` (mode 600)."""
+    import json
+
     from fluid_build.credentials.encrypted_store import _atomic_write_bytes
 
-    save_key_fn = getattr(_as, "_save_key_to_keyring", _save_key_to_keyring)
-
+    payload = {
+        "version": _CONFIG_SCHEMA_VERSION,
+        "active": active,
+        "providers": providers,
+    }
     try:
         _config_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
-        data: dict = {"provider": provider, "model": model}
-        if api_key:
-            saved_to_keyring = save_key_fn(provider, api_key)
-            if saved_to_keyring:
-                LOG.debug("Saved API key to keyring; not writing it to %s", _config_file())
-            elif _allow_plaintext_ai_secrets():
-                data["api_key"] = api_key
-                LOG.warning("Plaintext local AI credential fallback is enabled.")
-            else:
-                LOG.debug("Keyring unavailable; sensitive AI value was not persisted.")
-        if endpoint:
-            data["endpoint"] = endpoint
-        if ollama_host:
-            data["ollama_host"] = ollama_host
-        # Owner-only read/write from the start — the previous
-        # ``write_text`` then ``chmod`` left the (potentially
-        # api_key-bearing) JSON on disk at the umask default until the
-        # chmod landed. ``_atomic_write_bytes`` opens the file 0o600,
-        # so there is no world-readable window.
+        # Owner-only read/write from the start — ``_atomic_write_bytes``
+        # opens the file 0o600, so a (possibly api_key-bearing) entry is
+        # never world-readable, even briefly.
         _atomic_write_bytes(
             _config_file(),
-            json.dumps(data, indent=2).encode("utf-8"),
+            json.dumps(payload, indent=2).encode("utf-8"),
             mode=0o600,
         )
         LOG.debug("Saved AI config to %s (mode 600)", _config_file())
@@ -147,18 +175,74 @@ def _save_ai_config(
         return False
 
 
+def _save_ai_config(
+    provider: str,
+    model: str,
+    *,
+    api_key: Optional[str] = None,
+    endpoint: Optional[str] = None,
+    ollama_host: Optional[str] = None,
+) -> bool:
+    """Save one provider's AI config into the multi-provider map.
+
+    Records/updates *provider*'s entry and marks it the active/default,
+    while **preserving every other provider's saved entry** — the second
+    ``fluid ai setup --provider <x>`` must never clobber the first. The
+    per-provider entry fully replaces any prior entry for the same
+    provider (matching the pre-map single-write semantics).
+
+    Provider/model choices live in the JSON file. API keys are persisted
+    to the OS keyring whenever possible; each provider gets a distinct
+    keyring entry (``llm_api_key.<provider>``). Plaintext key fallback is
+    intentionally opt-in via ``FLUID_ALLOW_PLAINTEXT_AI_SECRETS=1`` so
+    automated and agent-facing workflows don't quietly leave live
+    provider tokens on disk.
+    """
+    # Resolve ``_save_key_to_keyring`` via the canonical
+    # ``cli.ai_setup`` namespace so test patches on
+    # ``fluid_build.cli.ai_setup._save_key_to_keyring`` flow through
+    # to this caller (matches the pattern used in
+    # ``_init_interactive_helpers`` etc.).
+    from fluid_build.cli import ai_setup as _as
+
+    save_key_fn = getattr(_as, "_save_key_to_keyring", _save_key_to_keyring)
+
+    # Load the existing map first so sibling providers survive.
+    normalized = _normalize_config(_read_config_file())
+    providers: dict = normalized["providers"]
+
+    entry: dict = {"model": model}
+    if api_key:
+        saved_to_keyring = save_key_fn(provider, api_key)
+        if saved_to_keyring:
+            LOG.debug("Saved API key to keyring; not writing it to %s", _config_file())
+        elif _allow_plaintext_ai_secrets():
+            entry["api_key"] = api_key
+            LOG.warning("Plaintext local AI credential fallback is enabled.")
+        else:
+            LOG.debug("Keyring unavailable; sensitive AI value was not persisted.")
+    if endpoint:
+        entry["endpoint"] = endpoint
+    if ollama_host:
+        entry["ollama_host"] = ollama_host
+
+    providers[provider] = entry
+    return _write_config_map(active=provider, providers=providers)
+
+
 def _load_ai_config() -> Optional[dict]:
-    """Load saved AI preferences.  Returns None if no config exists.
+    """Load the ACTIVE provider's saved AI preferences (back-compat shape).
+
+    Returns the flat ``{"provider": .., "model": .., ...}`` dict every
+    existing caller expects, or ``None`` when nothing is configured.
 
     Lookup order:
 
     1. ``~/.fluid/config.yaml`` ``llm:`` section (unified path).
-    2. ``~/.fluid/ai_config.json`` (the file ``_save_ai_config``
-       writes provider/model/endpoint to).
+    2. ``~/.fluid/ai_config.json`` — the active entry of the
+       multi-provider map (or the sole entry of a legacy file).
     3. ``None`` — no config saved yet.
     """
-    import json
-
     # 1. Unified config — new operators.
     try:
         from fluid_build.copilot.unified_config import load_unified_config
@@ -174,17 +258,88 @@ def _load_ai_config() -> Optional[dict]:
     except Exception as exc:  # pragma: no cover — defensive
         LOG.debug("Could not load unified AI config: %s", exc)
 
-    # 2. ``~/.fluid/ai_config.json`` — the file ``_save_ai_config`` writes.
-    try:
-        cf = _config_file()
-        if not cf.exists():
-            return None
-        data = json.loads(cf.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and data.get("provider"):
-            return data
+    # 2. ``~/.fluid/ai_config.json`` — active provider from the map.
+    normalized = _normalize_config(_read_config_file())
+    active = normalized["active"]
+    if not active:
         return None
-    except (OSError, json.JSONDecodeError, ValueError):
+    entry = normalized["providers"].get(active) or {}
+    return {"provider": active, **entry}
+
+
+def _load_ai_config_map() -> Optional[dict]:
+    """Return the full multi-provider view, or ``None`` when unconfigured.
+
+    Shape: ``{"active": <name>, "providers": {<name>: {"provider": <name>,
+    "model": .., ...}}}`` — each entry is flattened to carry its own
+    ``provider`` name so callers can iterate uniformly.
+    """
+    normalized = _normalize_config(_read_config_file())
+    providers = normalized["providers"]
+    if not providers:
         return None
+    return {
+        "active": normalized["active"],
+        "providers": {name: {"provider": name, **entry} for name, entry in providers.items()},
+    }
+
+
+def _load_ai_config_for(provider: str) -> Optional[dict]:
+    """Return the flat config dict for a SPECIFIC saved provider, or ``None``.
+
+    Used by the resolver so ``fluid forge --llm-provider <name>`` can pick
+    the requested provider out of the map regardless of which one is
+    active.
+    """
+    if not provider:
+        return None
+    normalized = _normalize_config(_read_config_file())
+    entry = normalized["providers"].get(provider)
+    if entry is None:
+        return None
+    return {"provider": provider, **entry}
+
+
+def _list_configured_providers() -> list:
+    """Return the sorted names of every provider saved in the map."""
+    normalized = _normalize_config(_read_config_file())
+    return sorted(normalized["providers"].keys())
+
+
+def _set_active_provider(provider: str) -> bool:
+    """Switch the active/default provider (like ``gh auth switch``).
+
+    Returns ``True`` when *provider* is present in the map and the active
+    marker was updated; ``False`` for an unknown provider (no-op).
+    """
+    normalized = _normalize_config(_read_config_file())
+    if provider not in normalized["providers"]:
+        return False
+    return _write_config_map(active=provider, providers=normalized["providers"])
+
+
+def _remove_provider(provider: str) -> bool:
+    """Drop *provider* from the multi-provider map (config side only).
+
+    Reassigns the active marker to a surviving provider when the removed
+    one was active, and deletes the file entirely when it was the last
+    entry. The keyring secret is cleared separately by the caller (via
+    :func:`_clear_key_from_keyring`). Returns ``True`` when an entry was
+    removed.
+    """
+    normalized = _normalize_config(_read_config_file())
+    providers = normalized["providers"]
+    if provider not in providers:
+        return False
+    del providers[provider]
+    if not providers:
+        _clear_ai_config()
+        return True
+    active = normalized["active"]
+    if active == provider or active not in providers:
+        active = next(iter(providers), None)
+    _write_config_map(active=active, providers=providers)
+    return True
 
 
 def _clear_ai_config() -> None:
@@ -263,8 +418,13 @@ __all__ = [
     "_allow_plaintext_ai_secrets",
     "_clear_ai_config",
     "_clear_key_from_keyring",
+    "_list_configured_providers",
     "_load_ai_config",
+    "_load_ai_config_for",
+    "_load_ai_config_map",
     "_load_key_from_keyring",
+    "_remove_provider",
     "_save_ai_config",
     "_save_key_to_keyring",
+    "_set_active_provider",
 ]
