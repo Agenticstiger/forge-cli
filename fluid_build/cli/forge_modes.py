@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+from fluid_build.cli._forge_mode_errors import forge_mode_error_boundary
 from fluid_build.cli.console import cprint, success
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_copilot_interview import (
@@ -1105,7 +1106,33 @@ def run_ai_copilot_mode(
     """Run Forge with AI copilot assistance."""
     console = console_factory() if console_factory else None
 
-    try:
+    def _render_ai_copilot_error(console: Any, exc: BaseException) -> None:
+        if isinstance(exc, CopilotGenerationError):
+            if console:
+                console.print(f"[red]❌ AI Copilot failed: {exc.message}[/red]")
+                for suggestion in exc.suggestions:
+                    console.print(f"[dim]• {suggestion}[/dim]")
+            else:
+                console_error(f"AI Copilot failed: {exc.message}")
+                for suggestion in exc.suggestions:
+                    cprint(f"  • {suggestion}")
+        else:
+            is_key_error = "api_key" in str(exc).lower() or "missing_llm" in str(exc).lower()
+            if console:
+                console.print(f"[red]AI Copilot failed: {exc}[/red]")
+                if is_key_error:
+                    console.print(
+                        "[yellow]Tip: Run 'fluid ai setup' to configure your LLM provider,[/yellow]\n"
+                        "[yellow]or use 'fluid forge --blank' / guided mode without AI.[/yellow]"
+                    )
+
+    with forge_mode_error_boundary(
+        logger,
+        console,
+        fail_label="AI Copilot mode failed",
+        render_error=_render_ai_copilot_error,
+        cancel_label="AI Copilot cancelled by user",
+    ) as boundary:
         copilot = copilot_class()
         is_non_interactive = bool(get_cli_arg_fn(args, "non_interactive", False))
 
@@ -1537,31 +1564,7 @@ def run_ai_copilot_mode(
             get_cli_arg_fn=get_cli_arg_fn,
             run_start=_run_start,
         )
-    except KeyboardInterrupt:
-        logger.info("AI Copilot cancelled by user")
-        return 130
-    except CopilotGenerationError as exc:
-        logger.exception("AI Copilot mode failed")
-        if console:
-            console.print(f"[red]❌ AI Copilot failed: {exc.message}[/red]")
-            for suggestion in exc.suggestions:
-                console.print(f"[dim]• {suggestion}[/dim]")
-        else:
-            console_error(f"AI Copilot failed: {exc.message}")
-            for suggestion in exc.suggestions:
-                cprint(f"  • {suggestion}")
-        return 1
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("AI Copilot mode failed")
-        is_key_error = "api_key" in str(exc).lower() or "missing_llm" in str(exc).lower()
-        if console:
-            console.print(f"[red]AI Copilot failed: {exc}[/red]")
-            if is_key_error:
-                console.print(
-                    "[yellow]Tip: Run 'fluid ai setup' to configure your LLM provider,[/yellow]\n"
-                    "[yellow]or use 'fluid forge --blank' / guided mode without AI.[/yellow]"
-                )
-        return 1
+    return boundary.exit_code
 
 
 def run_domain_agent_mode(
@@ -1578,7 +1581,16 @@ def run_domain_agent_mode(
     """Run Forge with a specialized domain agent."""
     console = console_factory() if console_factory else None
 
-    try:
+    def _render_domain_agent_error(console: Any, exc: BaseException) -> None:
+        if console:
+            console.print(f"[red]❌ Domain agent failed: {exc}[/red]")
+
+    with forge_mode_error_boundary(
+        logger,
+        console,
+        fail_label="Domain agent mode failed",
+        render_error=_render_domain_agent_error,
+    ) as boundary:
         agent_name = args.agent
 
         if not agent_name:
@@ -1689,11 +1701,7 @@ def run_domain_agent_mode(
         target_dir = get_target_directory_fn(args, sanitize_project_name(project_name))
         success_result = agent.create_project(target_dir, context)
         return 0 if success_result else 1
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Domain agent mode failed")
-        if console:
-            console.print(f"[red]❌ Domain agent failed: {exc}[/red]")
-        return 1
+    return boundary.exit_code
 
 
 # Pre-write receipt enrichment — physically extracted to
@@ -1769,7 +1777,17 @@ def run_guided_mode(
             )
         return 1
 
-    try:
+    def _render_guided_error(console: Any, exc: BaseException) -> None:
+        if console:
+            console.print(f"[red]Guided mode failed: {exc}[/red]")
+
+    with forge_mode_error_boundary(
+        logger,
+        console,
+        fail_label="Guided mode failed",
+        render_error=_render_guided_error,
+        cancel_label="Guided mode cancelled",
+    ) as boundary:
         from fluid_build.cli.forge_ui import ask_numbered_choice
 
         if is_non_interactive:
@@ -1913,11 +1931,4 @@ def run_guided_mode(
             cprint(f"Docs: {_DOCS_URL}")
 
         return 0
-    except KeyboardInterrupt:
-        logger.info("Guided mode cancelled")
-        return 130
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Guided mode failed")
-        if console:
-            console.print(f"[red]Guided mode failed: {exc}[/red]")
-        return 1
+    return boundary.exit_code
