@@ -32,7 +32,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
+import time
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 from fluid_build.cli.forge_copilot_llm_providers import (
@@ -50,6 +52,20 @@ LOG = logging.getLogger("fluid.cli.forge_copilot.litellm")
 
 # Default cap mirrors the rest of the call_llm loop (sane fallback).
 _DEFAULT_TIMEOUT_S = 120
+
+# Rate-limit (429) observable-retry envelope. litellm exposes no native
+# pre-retry callback hook (BerriAI/litellm#19806 was Closed as not-planned),
+# so we adapt a thin wrapper that makes the otherwise-silent 429 wait visible
+# on stderr instead of depending on a hook that doesn't exist.
+#
+# ``_RATE_LIMIT_MAX_ATTEMPTS`` bounds the wrapper's temporal-backoff envelope
+# (total tries, first attempt included). It is deliberately aligned with the
+# Router's ``num_retries=3`` and ``copilot.agents.base.RETRY_ATTEMPTS`` so the
+# observable envelope stays in the same ballpark as the existing resilience.
+# ``_DEFAULT_RATE_LIMIT_WAIT_S`` is used only when the provider sends no
+# Retry-After hint (mirrors the Router's ``retry_after=2`` default pacing).
+_RATE_LIMIT_MAX_ATTEMPTS = 3
+_DEFAULT_RATE_LIMIT_WAIT_S = 2.0
 
 # Thread-local for the most-recent litellm.completion_cost() result.
 # The staged copilot pipeline reads this to feed RunCostTracker.record_call's
@@ -605,7 +621,7 @@ class LiteLLMProvider(LlmProvider):
         if extra_payload:
             payload.update(extra_payload)
         try:
-            response = _completion_via_router_or_direct(litellm, payload)
+            response = _completion_with_rate_limit_notice(litellm, payload)
         except Exception as exc:  # noqa: BLE001 — translated to typed error
             raise _translate_litellm_exception(litellm, exc, streaming=False) from exc
 
@@ -653,7 +669,7 @@ class LiteLLMProvider(LlmProvider):
         if extra_payload:
             payload.update(extra_payload)
         try:
-            stream = _completion_via_router_or_direct(litellm, payload)
+            stream = _completion_with_rate_limit_notice(litellm, payload)
         except Exception as exc:  # noqa: BLE001
             raise _translate_litellm_exception(litellm, exc, streaming=True) from exc
 
@@ -840,6 +856,89 @@ def _completion_via_router_or_direct(litellm: Any, payload: Dict[str, Any]) -> A
     if router is not None:
         return router.completion(**payload)
     return litellm.completion(**payload)
+
+
+def _is_rate_limit_error(litellm: Any, exc: Exception) -> bool:
+    """True when *exc* is a litellm 429 ``RateLimitError``.
+
+    Guarded with ``isinstance(<cls>, type)`` — a mocked litellm module
+    (MagicMock) exposes ``RateLimitError`` as a Mock attribute, not a real
+    class, and ``isinstance(exc, <Mock>)`` raises ``TypeError``. Matching the
+    concrete exception type (litellm's own guidance) keeps the classification
+    robust across providers, exactly like ``_translate_litellm_exception``.
+    """
+    rate_limit_error = getattr(litellm, "RateLimitError", None)
+    return isinstance(rate_limit_error, type) and isinstance(exc, rate_limit_error)
+
+
+def _resolve_rate_limit_wait(exc: Exception) -> float:
+    """Derive the retry wait (seconds) from a rate-limit exception.
+
+    Prefers the server-supplied ``Retry-After`` — litellm surfaces it on the
+    exception as ``retry_after``; some providers only put it in the response
+    headers, so that is the secondary source. Parsing/clamping is delegated to
+    :func:`copilot.agents.error_classification.parse_retry_after` (reused, not
+    reinvented). Falls back to ``_DEFAULT_RATE_LIMIT_WAIT_S`` when no usable
+    hint is present.
+    """
+    from fluid_build.copilot.agents.error_classification import parse_retry_after
+
+    seconds = parse_retry_after(getattr(exc, "retry_after", None))
+    if seconds is None:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None)
+        getter = getattr(headers, "get", None)
+        if callable(getter):
+            try:
+                seconds = parse_retry_after(getter("retry-after"))
+            except Exception:  # noqa: BLE001 — header lookup is best-effort
+                seconds = None
+    if seconds is None or seconds <= 0:
+        return _DEFAULT_RATE_LIMIT_WAIT_S
+    return seconds
+
+
+def _emit_rate_limit_notice(wait_s: float) -> None:
+    """Print the user-facing rate-limit notice to stderr.
+
+    stderr keeps this off the machine-readable stdout stream (repo convention:
+    status lines go to stderr, machine output to stdout). Emitted *before* the
+    wait so the user understands why the spinner paused rather than staring at
+    a frozen one. ``:g`` renders ``2.0`` as ``2`` and ``1.5`` as ``1.5``.
+    ``sys.stderr.write`` (not ``print``) mirrors the repo's status-line
+    convention (see ``cli/bundle.py``) and is flushed so the notice lands
+    before the blocking wait rather than buffering behind it.
+    """
+    sys.stderr.write(f"Rate limited. Waiting {wait_s:g}s before retrying...\n")
+    sys.stderr.flush()
+    LOG.info("llm_rate_limited_retry_wait_seconds=%s", wait_s)
+
+
+def _completion_with_rate_limit_notice(litellm: Any, payload: Dict[str, Any]) -> Any:
+    """Run the completion, surfacing a notice before each 429 retry wait.
+
+    This is the *single* observable retry envelope for the litellm direct
+    path — both ``invoke_blocking`` and ``invoke_streaming`` route through it,
+    so the notice is emitted in exactly one place (no double-printing).
+
+    The Router's own ``num_retries`` / ``retry_after`` govern cross-cloud
+    deployment failover (a distinct resilience axis) and are left untouched;
+    this wrapper adds only the temporal, user-visible backoff that a rate
+    limit warrants. Success semantics are unchanged: a call that would return
+    still returns, and an exhausted 429 still raises the same underlying
+    ``RateLimitError`` for ``_translate_litellm_exception`` to wrap.
+    """
+    for attempt in range(1, _RATE_LIMIT_MAX_ATTEMPTS + 1):
+        try:
+            return _completion_via_router_or_direct(litellm, payload)
+        except Exception as exc:  # noqa: BLE001 — re-raised unless a retryable 429
+            if attempt >= _RATE_LIMIT_MAX_ATTEMPTS or not _is_rate_limit_error(litellm, exc):
+                raise
+            wait_s = _resolve_rate_limit_wait(exc)
+            _emit_rate_limit_notice(wait_s)
+            time.sleep(wait_s)
+    # Unreachable: the loop always returns a response or re-raises.
+    raise AssertionError("rate-limit retry loop exited without a result")  # pragma: no cover
 
 
 # litellm's auto-inject parameter shape per
