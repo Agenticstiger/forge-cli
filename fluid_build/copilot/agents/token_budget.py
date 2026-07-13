@@ -290,7 +290,7 @@ def count_tokens(text: str, *, provider: str = "", model: str = "") -> int:
         try:
             import litellm  # core dep
 
-            from fluid_build.cli.forge_copilot_llm_litellm import (
+            from fluid_build.llm.litellm_backend import (
                 _LITELLM_PREFIX_BY_PROVIDER,
             )
 

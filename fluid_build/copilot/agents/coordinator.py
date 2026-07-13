@@ -44,7 +44,6 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 import yaml
 
-from fluid_build.cli.forge_copilot_llm_providers import get_catalog_tier_model
 from fluid_build.copilot.agents.base import StageSession
 from fluid_build.copilot.agents.builder_agent import BuilderAgent
 from fluid_build.copilot.agents.contract_forge_agent import ContractForgeAgent
@@ -66,6 +65,7 @@ from fluid_build.copilot.schemas.stage_outputs import (
 from fluid_build.copilot.store.semantic_writer import write_semantic_record
 from fluid_build.forge_datamodel.from_ddl.parser import TableDefinition
 from fluid_build.forge_datamodel.logical_canonicalizer import canonicalize_logical_draft
+from fluid_build.llm.providers import get_catalog_tier_model
 from fluid_build.observability.tracing import traced_span
 
 _log = logging.getLogger(__name__)

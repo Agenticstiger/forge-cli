@@ -133,7 +133,7 @@ score. Equality keeps the initial score (no over-tweaking)."""
 # (`from fluid_build.copilot.agents.judge_agent import _explicit_catalog_tier_or_none`)
 # keep resolving. The helper lives in ``cli/_llm_model_catalog.py``
 # alongside ``get_catalog_tier_model`` — that's the canonical home.
-from fluid_build.cli._llm_model_catalog import (  # noqa: E402
+from fluid_build.llm.model_catalog import (  # noqa: E402
     get_explicit_catalog_tier as _explicit_catalog_tier_or_none,
 )
 
@@ -439,7 +439,7 @@ class JudgeAgent:
         DEBUG and swallowed — the returned :class:`JudgeResult` is
         the load-bearing contract.
         """
-        from fluid_build.cli.forge_copilot_llm_providers import (
+        from fluid_build.llm.providers import (
             call_llm,
             get_llm_provider,
             resolve_llm_config,
@@ -878,7 +878,7 @@ class JudgeAgent:
         provider builds — so we use it instead of mutating the
         ``LlmConfig`` dataclass.
         """
-        from fluid_build.cli.forge_copilot_llm_providers import call_llm
+        from fluid_build.llm.providers import call_llm
 
         system_prompt, user_prompt = self._build_critique_prompt(
             initial,

@@ -61,27 +61,20 @@ extend those tables in lockstep when adding a new model.
 
 from __future__ import annotations
 
-import os
 from typing import Dict, Optional
 
-# Role (this module's vocabulary) -> tier (the catalog's vocabulary).
-# Public via :func:`default_model_for`; kept module-level so tests can
-# assert the mapping is stable.
-_ROLE_TO_TIER: Dict[str, str] = {
-    "default": "balanced",
-    "fast": "fast",
-    "deep": "deep",
-}
-
-# Provider aliases. Existing callers pass ``"claude"`` as a synonym for
-# ``"anthropic"`` (e.g. legacy LLM-config defaults from older releases).
-# Normalising at the function boundary keeps the catalog lookup keyed by
-# the canonical provider name without duplicating an entry in
-# ``llm_models.json``.
-_PROVIDER_ALIASES: Dict[str, str] = {
-    "claude": "anthropic",
-}
-
+# ``default_model_for`` and the role -> tier mapping it uses moved DOWN to the
+# LLM runtime's model catalog (:mod:`fluid_build.llm.model_catalog`) so the
+# provider surface can resolve default models without a ``providers -> copilot``
+# back-edge (which, together with ``copilot -> providers``, formed the cycle the
+# ``[tool.importlinter]`` "copilot must not depend on cli" contract severs).
+# Re-exported here so copilot-internal callers of ``default_model_for`` /
+# ``_ROLE_TO_TIER`` — and the tests that pin the mapping — keep resolving.
+from fluid_build.llm.model_catalog import (  # noqa: F401
+    _PROVIDER_ALIASES,
+    _ROLE_TO_TIER,
+    default_model_for,
+)
 
 # Manual override for replacement suggestions. Most deprecations are
 # detected dynamically via ``litellm.model_cost[name].deprecation_date``
@@ -186,66 +179,6 @@ def _suggest_replacement_via_litellm(model: str) -> Optional[str]:
         return None
 
 
-def default_model_for(
-    provider: str,
-    role: str = "default",
-    *,
-    fallback: Optional[str] = None,
-) -> Optional[str]:
-    """Return the canonical model id for ``(provider, role)``.
-
-    Resolution ladder (mirror of ``judge_agent.py``'s cheap-tier ladder
-    — same explicit-tier-only posture as :data:`MODEL_PRICES_USD` in
-    ``cost.py``):
-
-    1. ``$FLUID_LLM_DEFAULT_MODEL_<PROVIDER>_<ROLE>`` env override
-       (uppercase provider/role, dashes → underscores). Pin a specific
-       model per workspace / per CI.
-    2. Catalog's *explicit* tier for the role-mapped tier
-       (``role`` → ``tier`` via :data:`_ROLE_TO_TIER`).
-    3. Catalog's *explicit* ``balanced`` tier — last-resort within the
-       catalog so a provider missing one specific tier still resolves
-       to a real model rather than silently escalating to the flagship.
-    4. ``fallback`` (default ``None``) — the caller's existing
-       None-handling kicks in; pass an explicit ``fallback=`` when the
-       call site needs a guaranteed string.
-
-    The ``"claude"`` alias normalises to ``"anthropic"`` so legacy
-    callers keep working without a duplicate catalog entry.
-
-    NB: ``get_catalog_tier_model`` (the non-explicit variant) silently
-    escalates to the flagship when the requested tier isn't defined —
-    that's the wrong contract for a "default model" lookup, because it
-    means a misspelled role returns the most expensive model. We use
-    :func:`get_explicit_catalog_tier` for both rungs of the ladder.
-    """
-    env_key = f"FLUID_LLM_DEFAULT_MODEL_{provider.upper().replace('-', '_')}_{role.upper()}"
-    override = os.environ.get(env_key)
-    if override:
-        return override
-
-    canonical_provider = _PROVIDER_ALIASES.get(provider.lower(), provider.lower())
-    tier = _ROLE_TO_TIER.get(role.lower(), role.lower())
-
-    # Local import keeps this module importable in contexts where the
-    # CLI package hasn't been initialised yet (e.g. pure-library tests).
-    from fluid_build.cli._llm_model_catalog import get_explicit_catalog_tier
-
-    explicit = get_explicit_catalog_tier(canonical_provider, tier)
-    if explicit:
-        return explicit
-    # Last-resort within the catalog: the provider's ``balanced`` tier.
-    # NOT the flagship — that's the silent-escalation antipattern we're
-    # specifically guarding against. ``balanced`` is the cheapest
-    # tool-use-capable rung; if it's also missing we return ``fallback``
-    # and let the caller decide.
-    if tier != "balanced":
-        balanced = get_explicit_catalog_tier(canonical_provider, "balanced")
-        if balanced:
-            return balanced
-    return fallback
-
-
 def deprecation_hint(model: str) -> Optional[str]:
     """Return the canonical replacement for a deprecated model id.
 
@@ -288,7 +221,7 @@ def all_supported_models() -> Dict[str, Dict[str, str]]:
     change here. Empty / missing tier values are skipped so the snapshot
     doesn't carry None placeholders.
     """
-    from fluid_build.cli._llm_model_catalog import _resolve_load_model_catalog
+    from fluid_build.llm.model_catalog import _resolve_load_model_catalog
 
     try:
         catalog = _resolve_load_model_catalog()()

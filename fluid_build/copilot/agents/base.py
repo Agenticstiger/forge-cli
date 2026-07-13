@@ -28,12 +28,6 @@ from typing import Any, Callable, Dict, Mapping, Optional, Type, TypeVar
 import httpx
 from pydantic import ValidationError
 
-from fluid_build.cli.forge_copilot_llm_providers import (
-    BUILTIN_LLM_PROVIDERS,
-    LlmConfig,
-    LlmProvider,
-    get_catalog_tier_model,
-)
 from fluid_build.copilot.agents.errors import (
     AgentExecutionError,
     ContextOverflowError,
@@ -47,6 +41,12 @@ from fluid_build.copilot.store.base import Store
 from fluid_build.copilot.store.keys import generate_cache_key
 from fluid_build.copilot.store.policy import default_ttl_for_namespace
 from fluid_build.copilot.utils.json import safe_json_parse
+from fluid_build.llm.providers import (
+    BUILTIN_LLM_PROVIDERS,
+    LlmConfig,
+    LlmProvider,
+    get_catalog_tier_model,
+)
 from fluid_build.schema_manager import FluidSchemaManager
 
 StageOutputT = TypeVar("StageOutputT", bound=StructuredOutputModel)
@@ -503,7 +503,7 @@ class BaseStageAgent:
                 # public ``call_llm`` / ``call_llm_streaming`` API
                 # instead of reaching into provider internals (which
                 # used to do per-provider httpx; that's deleted).
-                from fluid_build.cli.forge_copilot_llm_providers import (
+                from fluid_build.llm.providers import (
                     call_llm,
                     call_llm_streaming,
                     consume_streaming_usage,
@@ -606,7 +606,7 @@ class BaseStageAgent:
             cache_creation = 0
             cache_read = 0
             try:
-                from fluid_build.cli.forge_copilot_llm_litellm import (
+                from fluid_build.llm.litellm_backend import (
                     get_last_cache_tokens,
                     get_last_litellm_cost_usd,
                 )

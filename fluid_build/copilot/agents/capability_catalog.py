@@ -628,7 +628,7 @@ def _safe_load_json_catalog() -> Optional[Dict[str, Any]]:
     raises out of import).
     """
     try:
-        from fluid_build.cli._llm_model_catalog import _resolve_load_model_catalog
+        from fluid_build.llm.model_catalog import _resolve_load_model_catalog
     except Exception:  # pragma: no cover — defensive against import order
         return None
     try:
