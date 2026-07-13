@@ -78,7 +78,7 @@ class IndustryPackCompiler:
         — e.g. ``telecommunications`` falls through to ``telco``.
         """
         try:
-            from fluid_build.cli.industry_skills import load_industry_skills
+            from fluid_build._industry_skills import load_industry_skills
         except ImportError:
             return {}
         for candidate in [name, *_INDUSTRY_ALIASES.get(name, [])]:

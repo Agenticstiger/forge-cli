@@ -58,6 +58,13 @@ def iso_config(tmp_path, monkeypatch):
     config_file = tmp_path / "ai_config.json"
     monkeypatch.setattr("fluid_build.cli.ai_setup._CONFIG_FILE", config_file)
     monkeypatch.setattr("fluid_build.cli.ai_setup._CONFIG_DIR", tmp_path)
+    # ``cli.ai_setup._CONFIG_FILE`` re-exports the canonical location from the
+    # tier-0 leaf ``fluid_build._ai_config_shared``; the LLM runtime's plaintext
+    # resolver (``llm.provider_resolve``) reads that leaf directly, so isolate
+    # its copy too (patching only the re-export leaves the leaf pointed at the
+    # real ``~/.fluid``).
+    monkeypatch.setattr("fluid_build._ai_config_shared._CONFIG_FILE", config_file)
+    monkeypatch.setattr("fluid_build._ai_config_shared._CONFIG_DIR", tmp_path)
     monkeypatch.setattr(
         "fluid_build.copilot.unified_config.load_unified_config", lambda *a, **k: None
     )

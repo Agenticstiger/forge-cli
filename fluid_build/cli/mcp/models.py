@@ -23,23 +23,18 @@ monolith into focused, testable modules.
 from __future__ import annotations
 
 import logging
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Literal, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-if TYPE_CHECKING:
-    # Annotation-only. ``Context`` is used solely in type annotations
-    # (``Optional[Context]`` on the sampling-context helpers); under
-    # ``from __future__ import annotations`` those are lazy strings, never
-    # evaluated at runtime. Importing the MCP server SDK at module load would
-    # pull ~87 heavy modules onto the ``fluid --help`` / parser-build hot path
-    # and revert #265 — so the SDK stays behind this guard. Pinned by
-    # tests/perf/test_startup_budget.py.
-    from mcp.server.fastmcp import Context
+# NB: the request-scoped sampling ContextVars + their get/set/reset helpers
+# (and the ``mcp.server.fastmcp.Context`` type they were annotated with) moved
+# to the tier-0 leaf ``fluid_build._mcp_sampling_context``; see the re-export
+# below. That is why this module no longer imports ``contextvars`` or the MCP
+# SDK ``Context`` type directly.
 
 COMMAND = "mcp"
 MCP_PROTOCOL_VERSION = "2025-06-18"
@@ -47,50 +42,22 @@ MCP_PROTOCOL_VERSION = "2025-06-18"
 # ---------------------------------------------------------------------------
 # Sampling-context bridge — request-scoped via contextvars + anyio token
 #
-# When a tool that drives forge's copilot starts, it captures the active SDK
-# ``Context`` and an `anyio` event-loop token (the canonical bridge between
-# a worker thread and the SDK's anyio loop). The values are stored in
-# :class:`contextvars.ContextVar` so they propagate automatically across the
-# ``await asyncio.to_thread(...)`` boundary (Python ≥3.9 guarantees this).
-# :class:`fluid_build.cli.forge_copilot_llm_providers.MCPSamplingProvider`
-# (running in the worker thread) reads them via :func:`get_sampling_context`
-# and dispatches ``ctx.session.create_message`` back into the SDK's loop via
-# :func:`anyio.from_thread.run` — matching the SDK's own anyio-based dialect.
-#
-# Borrowed-not-built per /borrow-before-build:
-#   contextvars — Python stdlib (https://docs.python.org/3/library/contextvars.html);
-#   anyio.from_thread — https://anyio.readthedocs.io/en/stable/threads.html
+# The two ``ContextVar`` objects and their get/set/reset helpers moved to the
+# tier-0 shared leaf ``fluid_build._mcp_sampling_context`` so the LLM provider
+# surface (``fluid_build.llm.providers.MCPSamplingProvider``) can READ them
+# without importing anything under ``cli`` (the ``copilot -> cli`` cycle the
+# ``[tool.importlinter]`` contracts forbid — ``llm`` is imported by ``copilot``).
+# This ``cli.mcp.server`` side, which WRITES them around a copilot-driving tool
+# call, keeps using the same names via this re-export.
 # ---------------------------------------------------------------------------
 
-_SAMPLING_CTX: ContextVar[Optional[Any]] = ContextVar("forge_mcp_sampling_ctx", default=None)
-_SAMPLING_TOKEN: ContextVar[Optional[Any]] = ContextVar(
-    "forge_mcp_sampling_anyio_token", default=None
+from fluid_build._mcp_sampling_context import (  # noqa: E402,F401
+    _SAMPLING_CTX,
+    _SAMPLING_TOKEN,
+    _reset_sampling_context,
+    _set_sampling_context,
+    get_sampling_context,
 )
-
-
-def _set_sampling_context(ctx: Optional[Context], anyio_token: Optional[Any]) -> Tuple:
-    """Set the active sampling context. Returns a token tuple for
-    :func:`_reset_sampling_context` to undo (use in a ``try/finally``)."""
-    ctx_token = _SAMPLING_CTX.set(ctx)
-    token_token = _SAMPLING_TOKEN.set(anyio_token)
-    return ctx_token, token_token
-
-
-def _reset_sampling_context(tokens: Tuple) -> None:
-    """Restore the previous sampling context. Symmetric to :func:`_set_sampling_context`."""
-    ctx_token, token_token = tokens
-    _SAMPLING_CTX.reset(ctx_token)
-    _SAMPLING_TOKEN.reset(token_token)
-
-
-def get_sampling_context() -> Tuple[Optional[Context], Optional[Any]]:
-    """Return ``(ctx, anyio_token)`` if a tool with sampling-capable Context
-    is active. Read by
-    :class:`fluid_build.cli.forge_copilot_llm_providers.MCPSamplingProvider`
-    to route LLM calls back through ``ctx.session.create_message`` to the IDE.
-    """
-    return _SAMPLING_CTX.get(), _SAMPLING_TOKEN.get()
-
 
 # ---------------------------------------------------------------------------
 # Tool capability model + policy

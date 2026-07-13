@@ -742,3 +742,27 @@ forbidden_modules = [
 # those static edges land on ``cli``.
 allow_indirect_imports = false
 as_packages = true
+
+[[tool.importlinter.contracts]]
+name = "copilot must not depend on cli"
+type = "forbidden"
+source_modules = ["fluid_build.copilot"]
+forbidden_modules = ["fluid_build.cli"]
+# ``copilot`` (the multi-agent authoring runtime) genuinely depends on the
+# LLM-provider surface to call an LLM — but that surface used to live under
+# ``cli`` (``forge_copilot_llm_*`` / ``_llm_*``), and ``cli`` imports it too, so
+# the two packages formed an import cycle (``copilot -> cli -> copilot``) that
+# made ``cli/__init__.py`` fragile under collection. The runtime was relocated
+# to the cli-free lower tier ``fluid_build.llm`` (plus the tier-0 leaves
+# ``_console`` / ``_agent_progress`` / ``_agent_voice`` / ``_industry_skills`` /
+# ``_ai_config_shared`` / ``_mcp_sampling_context``); the old ``cli`` module
+# paths remain as ``sys.modules`` object-alias re-export shims so the ~40 cli
+# importers and every ``patch("fluid_build.cli.forge_copilot_llm_providers.*")``
+# test target keep resolving to the same module objects.
+#
+# ``allow_indirect_imports = false`` makes this bite on any transitive chain —
+# so a future drive-by ``copilot -> fluid_build.llm.X -> fluid_build.cli.Y`` edge
+# (e.g. a moved LLM-runtime module re-acquiring a ``cli`` import) is caught here,
+# not just a direct ``copilot -> cli`` import.
+allow_indirect_imports = false
+as_packages = true

@@ -28,6 +28,14 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+# ``load_industry_skills`` moved to the tier-0 shared leaf
+# ``fluid_build._industry_skills`` so ``copilot.industry.compiler`` can read an
+# industry YAML without importing this ``cli`` package (the ``copilot -> cli``
+# edge the ``[tool.importlinter]`` contracts forbid). Re-exported here so this
+# package's own ``generate_skills_file`` and the existing tests keep resolving
+# it unchanged.
+from fluid_build._industry_skills import load_industry_skills
+
 _SKILLS_DIR = Path(__file__).parent
 
 # ---------------------------------------------------------------------------
@@ -41,21 +49,6 @@ def load_tools() -> Dict[str, Any]:
     with tools_path.open(encoding="utf-8") as f:
         data = yaml.safe_load(f)
     return data.get("tools", {})
-
-
-def load_industry_skills(name: str) -> Dict[str, Any]:
-    """Load an industry-specific skills file by name (e.g. ``telco``).
-
-    Returns the raw YAML dict (without the tools section — that is merged
-    separately via :func:`generate_skills_file`).
-
-    Raises ``FileNotFoundError`` if the industry YAML does not exist.
-    """
-    path = _SKILLS_DIR / f"{name}.yaml"
-    if not path.exists():
-        raise FileNotFoundError(f"No industry skills file for '{name}' at {path}")
-    with path.open(encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
 
 def list_industries() -> List[Dict[str, str]]:
