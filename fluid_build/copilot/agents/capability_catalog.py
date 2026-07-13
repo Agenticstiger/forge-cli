@@ -863,7 +863,9 @@ def emit_degradation_warnings(
     if warnings and not quiet:
         # Imported lazily to avoid a hard dep on ``rich``/console
         # plumbing for users of the catalog who never want the print.
-        from fluid_build.cli import console as _console  # noqa: PLC0415
+        # Points at the tier-0 ``_console`` leaf (not the ``cli.console``
+        # re-export shim) so ``copilot`` carries no ``cli`` edge.
+        from fluid_build import _console  # noqa: PLC0415
 
         for line in warnings:
             _console.warning(line)

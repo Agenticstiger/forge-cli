@@ -1433,7 +1433,7 @@ def print_cost_summary(*, quiet: bool = False) -> None:
     breakdown = get_run_tracker().breakdown()
     if not breakdown.rows:
         return
-    from fluid_build.cli.console import cprint
+    from fluid_build._console import cprint
 
     cprint(format_cost_summary(breakdown))
 
