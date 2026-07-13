@@ -90,7 +90,9 @@ SENSITIVE_PATTERNS = [
         #   * ``aws_secret_access_key`` — handled by the dedicated env-var
         #     pattern below;
         #   * ``private_key`` — covered by the ``"private_key":`` JSON pattern,
-        #     the SENSITIVE_KEYS dict-key check, and the PEM-block pattern.
+        #     the SENSITIVE_KEYS dict-key check, the PEM-block pattern, and (for
+        #     a bare ``private_key=<non-PEM>`` value) the dedicated named-group
+        #     pattern placed AFTER the PEM block at the end of this list.
         #     Including it HERE would run before the PEM-block pattern and
         #     corrupt a ``private_key=<multiline PEM>`` header, leaking the body.
         r"(?i)\b(?P<key>(?:[A-Za-z0-9_]{,128}_)?(?:"
@@ -115,6 +117,14 @@ SENSITIVE_PATTERNS = [
     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
     # JWT (two-segment header.payload, no signature)
     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
+    # Generic 3-segment JWT — prefix-agnostic (does NOT require the ``eyJ``
+    # header). Mirrors the global ``secret_redactor._JWT_RE`` so a JWT signed
+    # with a non-JSON / non-``eyJ`` header (or any three high-entropy base64url
+    # runs) is masked by this layer too (CLAUDE.md symmetry). Placed AFTER the
+    # two ``eyJ``-anchored patterns so the tighter, header-anchored spans win
+    # first. Each segment is bounded-min {12,} (not unbounded) to keep it from
+    # matching short dotted identifiers / version strings.
+    re.compile(r"\b[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b"),
     # Stripe restricted / live / test secret keys
     re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}"),
     # GitHub personal access tokens, OAuth tokens, app installation tokens
@@ -143,6 +153,18 @@ SENSITIVE_PATTERNS = [
     # ``-----BEGIN PRIVATE KEY-----`` PKCS#8 header is covered. ``(?s)``
     # so ``.`` spans newlines and the whole multiline block is scrubbed.
     re.compile(r"(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----"),
+    # Bare ``private_key=<non-PEM>`` assignment. Named groups so ``redact_string``
+    # keeps the key + separator and redacts only the value (mirrors the global
+    # ``secret_redactor._ASSIGNMENT_RE``, which covers ``private_key`` in its
+    # alternation). MUST be positioned AFTER the PEM-block pattern above: a
+    # ``private_key=<multiline PEM>`` header is scrubbed to ``private_key=[REDACTED]``
+    # by the PEM pattern first, so this pattern only ever re-matches the already
+    # redacted ``[REDACTED]`` token (idempotent) — it never bites into a PEM body.
+    # Value class ``[^\s;&,]{,256}`` matches the Snowflake bare-assignment
+    # convention above and is length-bounded (no catastrophic backtracking).
+    re.compile(
+        r"(?i)(?P<key>\bprivate[_-]?key)(?P<sep>\s{,8}[:=]\s{,8})(?P<value>[^\s;&,]{,256})"
+    ),
 ]
 
 # Keys that should be redacted in dictionaries.
