@@ -456,9 +456,9 @@ class TestRegistry:
 
     def test_list_agents(self):
         agents = list_agents()
-        # 4 original built-ins + 8 vertical domain agents added in the
-        # "8 high-impact verticals" series.
-        assert len(agents) == 12
+        # 4 original built-ins + 8 vertical domain agents + the cross-cutting
+        # ``ai_ready`` agent = 13.
+        assert len(agents) == 13
         names = [a["name"] for a in agents]
         for expected in (
             "finance",
@@ -473,6 +473,7 @@ class TestRegistry:
             "pharma",
             "education",
             "media",
+            "ai_ready",
         ):
             assert expected in names, expected
         for a in agents:

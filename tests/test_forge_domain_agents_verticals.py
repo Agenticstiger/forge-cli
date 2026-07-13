@@ -131,8 +131,10 @@ class TestVerticalRegistry:
             assert vertical in DOMAIN_AGENTS, vertical
 
     def test_domain_agents_has_twelve(self):
-        # 4 original (finance/healthcare/retail/telco) + 8 verticals.
-        assert len(DOMAIN_AGENTS) == 12
+        # 4 original (finance/healthcare/retail/telco) + 8 verticals + the
+        # cross-cutting ``ai_ready`` agent = 13.
+        assert len(DOMAIN_AGENTS) == 13
+        assert "ai_ready" in DOMAIN_AGENTS
 
     @pytest.mark.parametrize("vertical", ALL_VERTICALS)
     def test_get_agent_resolves_builtin_class(self, vertical):

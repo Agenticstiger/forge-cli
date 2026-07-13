@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .forge_domain_agent_base import (
     AIAgentBase,
@@ -25,6 +25,9 @@ from .forge_domain_agent_base import (
     _raw_answer,
     _resolve_context_choice,
 )
+
+if TYPE_CHECKING:  # pragma: no cover — type-only import, off the cold path
+    from fluid_build.copilot.agents.ai_ready_agent import AiReadyReport
 
 
 class _SpecBackedDomainAgent(DeclarativeDomainAgent):
@@ -108,6 +111,45 @@ class MediaAgent(_SpecBackedDomainAgent):
     spec_name = "media"
 
 
+class AiReadyAgent(_SpecBackedDomainAgent):
+    """Cross-cutting agent that authors / annotates AI-ready data products.
+
+    Unlike the domain verticals (which only shape the interview + LLM
+    prompt), this agent additionally ships a deterministic
+    metadata-enforcement core: :func:`enforce_ai_ready` stamps every output
+    port with an ``agentPolicy`` (allowed models / permitted use-cases /
+    reporting-yes-training-no), flags PII / sensitivity for safe agent
+    access, and labels embedding-friendly columns for vector / RAG ports.
+    """
+
+    spec_name = "ai_ready"
+
+    def enforce_ai_ready(
+        self,
+        contract: Dict[str, Any],
+        *,
+        overwrite: bool = False,
+        strict: bool = False,
+        allowed_models: Optional[List[str]] = None,
+    ) -> "AiReadyReport":
+        """Annotate *contract* in place to be AI-ready; return the report.
+
+        Thin delegation to
+        :func:`fluid_build.copilot.agents.ai_ready_agent.enforce_ai_ready`
+        (lazy-imported so the light CLI cold path stays free of it).
+        """
+        from fluid_build.copilot.agents.ai_ready_agent import (
+            enforce_ai_ready as _enforce,
+        )
+
+        return _enforce(
+            contract,
+            overwrite=overwrite,
+            strict=strict,
+            allowed_models=allowed_models,
+        )
+
+
 DOMAIN_AGENTS = {
     "finance": FinanceAgent,
     "healthcare": HealthcareAgent,
@@ -121,6 +163,7 @@ DOMAIN_AGENTS = {
     "pharma": PharmaAgent,
     "education": EducationAgent,
     "media": MediaAgent,
+    "ai_ready": AiReadyAgent,
 }
 
 
@@ -244,6 +287,7 @@ __all__ = [
     "PharmaAgent",
     "EducationAgent",
     "MediaAgent",
+    "AiReadyAgent",
     "DOMAIN_AGENTS",
     "get_agent",
     "get_all_domain_names",
