@@ -52,6 +52,7 @@ __all__ = [
     "build_corrective_messages",
     "build_schema_validation_message",
     "build_join_key_repair_message",
+    "build_semantic_drift_message",
     "strip_additional_props_from_contract",
     "diagnose_tool_failure",
     "TOOL_ERROR_GUIDANCE",
@@ -513,6 +514,97 @@ def build_join_key_repair_message(
             f"is one-to-one with the upstream entity; pick a *_id-suffixed "
             f"column when the join is a foreign-key reference. Do NOT "
             f"invent a new column name."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Semantic-drift self-healing
+#
+# When the copilot authors / ``--refine``s a contract it can silently drift the
+# schema away from its ground truth — dropping, renaming, or retyping a column
+# that exists in the discovered SOURCE schema or the PRIOR contract version.
+# ``forge_copilot_drift_guard`` classifies that drift; this builder turns the
+# classified drifts into a forceful corrective message so the next repair turn
+# restores the original names/types. Same ``{"role": "user", "content": str}``
+# shape as ``build_schema_validation_message`` / ``build_join_key_repair_message``
+# so the runtime's existing repair loop plumbs it identically.
+# ---------------------------------------------------------------------------
+
+
+def _drift_field(drift: Any, key: str) -> Any:
+    """Read *key* from a drift that may be a dict or a ``SchemaDrift`` dataclass."""
+    if isinstance(drift, Mapping):
+        return drift.get(key)
+    return getattr(drift, key, None)
+
+
+def build_semantic_drift_message(
+    drifts: Sequence[Any],
+    *,
+    baseline_kind: str,
+) -> Dict[str, str]:
+    """Build a corrective message for classified semantic drift.
+
+    Args:
+        drifts: a sequence of drift entries, each either a
+            ``SchemaDrift.to_dict()`` mapping or the dataclass itself. Recognised
+            reasons: ``dropped_column`` / ``renamed_column`` / ``type_changed``.
+        baseline_kind: the human-readable baseline the contract drifted from
+            (e.g. ``"prior contract"`` / ``"source schema"``) — named in the
+            message so the LLM knows what to reconcile against.
+
+    Returns a single ``user``-role message; empty ``content`` when *drifts* is
+    empty (callers append nothing in that case, matching the other builders).
+    """
+    if not drifts:
+        return {"role": "user", "content": ""}
+
+    lines: List[str] = []
+    for drift in drifts[:30]:
+        reason = _drift_field(drift, "reason")
+        column = _drift_field(drift, "column")
+        if not column:
+            continue
+        if reason == "dropped_column":
+            btype = _drift_field(drift, "baseline_type") or "?"
+            lines.append(
+                f"  [RESTORE] Column ``{column}`` (type ``{btype}``) exists in the "
+                f"{baseline_kind} but is MISSING from your contract. Add it back "
+                f"with its original name and type."
+            )
+        elif reason == "renamed_column":
+            renamed_to = _drift_field(drift, "renamed_to") or "?"
+            lines.append(
+                f"  [DO NOT RENAME] Column ``{column}`` from the {baseline_kind} "
+                f"appears in your contract as ``{renamed_to}``. Restore the exact "
+                f"name ``{column}`` — column names are load-bearing identifiers, "
+                f"not labels to improve."
+            )
+        elif reason == "type_changed":
+            btype = _drift_field(drift, "baseline_type") or "?"
+            atype = _drift_field(drift, "authored_type") or "?"
+            lines.append(
+                f"  [RESTORE TYPE] Column ``{column}`` has type ``{btype}`` in the "
+                f"{baseline_kind} but you emitted ``{atype}``. Restore the original "
+                f"type ``{btype}`` unless the change is explicitly intended."
+            )
+
+    if not lines:
+        return {"role": "user", "content": ""}
+
+    body = "\n".join(lines)
+    return {
+        "role": "user",
+        "content": (
+            f"SEMANTIC DRIFT detected — your contract's schema diverged from the "
+            f"{baseline_kind} it must stay faithful to:\n"
+            f"{body}\n\n"
+            "Re-emit the contract with these columns reconciled against the "
+            f"{baseline_kind}. Do NOT rename, drop, or retype columns that exist "
+            "in the baseline; they are the ground-truth surface downstream "
+            "consumers depend on. You MAY add genuinely new columns and MAY drop a "
+            "source column only when it is an intentional projection."
         ),
     }
 
