@@ -1324,14 +1324,18 @@ def _render_dlt_source(
     )
 
 
-def get_tool_definitions() -> List[Dict[str, Any]]:
-    """Return the tool definitions in the shape providers expect.
+def _all_tool_definitions() -> List[Dict[str, Any]]:
+    """Return the FULL tool listing (every tool advertised with its schema).
 
     Merges the legacy ``TOOL_REGISTRY`` (hand-written dict entries)
     with the world-class ``FORGE_TOOL_REGISTRY`` (Pydantic-typed
     ``@forge_tool`` registrations) so the LLM sees both. Names in the
     legacy registry win on collision so existing tools keep their
     exact wire shape until they're explicitly migrated.
+
+    This is the un-transformed listing; ``get_tool_definitions`` applies the
+    opt-in tool-search deferral on top, and ``dispatch_tool_call`` uses this
+    full list to answer ``search_tools`` lookups.
     """
     from fluid_build.cli.forge_tool import FORGE_TOOL_REGISTRY
 
@@ -1372,13 +1376,44 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
 
     definitions.extend(dbt_mcp_tool_definitions())
 
+    # Delegated hosted MCP servers (GitHub MCP + Snowflake MCP), each opt-in via
+    # its own flag (FLUID_GITHUB_MCP / FLUID_SNOWFLAKE_MCP). Off by default →
+    # no-op; on discovery failure → [] for that server (never breaks the native
+    # listing). Tools are per-server prefixed (github. / snowflake.) so they
+    # can't shadow a native tool. Same delegate shape as the dbt MCP bridge.
+    from fluid_build.cli.hosted_mcp import hosted_mcp_tool_definitions
+
+    definitions.extend(hosted_mcp_tool_definitions())
+
     # Opt-in web tools (web_search / web_fetch), gated on
     # FLUID_AGENT_WEB_TOOLS. Off by default → no-op; when on, the two
     # tools surface. Same env-gated delegate shape as the dbt MCP bridge.
     from fluid_build.cli.forge_web_tools import web_tool_definitions
 
     definitions.extend(web_tool_definitions())
+
+    # Opt-in live-DB tool (fetch_sample_rows), gated on FLUID_FORGE_DB_TOOLS.
+    # Off by default → no-op; when on, the single read-only row-sampling tool
+    # surfaces. Same env-gated delegate shape as the dbt MCP + web-tool bridges;
+    # the connection URI + credentials are env-sourced, never LLM-supplied.
+    from fluid_build.cli.forge_db_tools import db_tool_definitions
+
+    definitions.extend(db_tool_definitions())
     return definitions
+
+
+def get_tool_definitions() -> List[Dict[str, Any]]:
+    """Return the tool definitions in the shape providers expect.
+
+    Wraps :func:`_all_tool_definitions` and applies the opt-in tool-search
+    deferral (``FLUID_FORGE_TOOL_SEARCH``): when enabled, a large tool set is
+    advertised as a small core + name/namespace stubs + a ``search_tools``
+    meta-tool so per-turn tool-schema tokens stay bounded. A pure no-op when
+    the flag is unset — the listing is byte-for-byte the full set.
+    """
+    from fluid_build.cli.forge_tool_search import apply_tool_search
+
+    return apply_tool_search(_all_tool_definitions())
 
 
 def dispatch_tool_call(
@@ -1436,6 +1471,14 @@ def dispatch_tool_call(
         if is_dbt_mcp_tool(name):
             return dispatch_dbt_mcp_tool(name, arguments)
 
+        # Delegated hosted MCP servers (GitHub / Snowflake), each opt-in.
+        # Resolved AFTER the native registries so a native tool always wins;
+        # tools are per-server prefixed so there is no overlap in practice.
+        from fluid_build.cli.hosted_mcp import dispatch_hosted_mcp_tool, is_hosted_mcp_tool
+
+        if is_hosted_mcp_tool(name):
+            return dispatch_hosted_mcp_tool(name, arguments)
+
         # Opt-in web tools (web_search / web_fetch), gated on
         # FLUID_AGENT_WEB_TOOLS. Resolved AFTER the native registries so a
         # native tool of the same name always wins. Same typed-error
@@ -1444,6 +1487,23 @@ def dispatch_tool_call(
 
         if is_web_tool(name):
             return dispatch_web_tool(name, arguments)
+
+        # Opt-in live-DB tool (fetch_sample_rows), gated on FLUID_FORGE_DB_TOOLS.
+        # Resolved AFTER the native registries so a native tool of the same name
+        # always wins. Same typed-error contract on failure as the other
+        # env-gated delegates.
+        from fluid_build.cli.forge_db_tools import dispatch_db_tool, is_db_tool
+
+        if is_db_tool(name):
+            return dispatch_db_tool(name, arguments)
+
+        # Opt-in tool-search meta-tool (search_tools), gated on
+        # FLUID_FORGE_TOOL_SEARCH. Resolves against the FULL (pre-deferral)
+        # listing so it can hand back a deferred tool's real parameter schema.
+        from fluid_build.cli.forge_tool_search import dispatch_search_tool, is_search_tool
+
+        if is_search_tool(name):
+            return dispatch_search_tool(arguments, all_definitions=_all_tool_definitions())
     if not tool:
         LOG.warning("Unknown tool call: %s", name)
         return {"error": f"Unknown tool: {name}"}
