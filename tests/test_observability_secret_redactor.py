@@ -466,3 +466,120 @@ class TestRedactionLayerSymmetry:
         # key name survives in both
         assert global_out.startswith("password=")
         assert snowflake_out == "password=[REDACTED]"
+
+
+# ---------------------------------------------------------------------------
+# Redaction-symmetry gap closure: shapes the SNOWFLAKE twin already masked
+# but the GLOBAL filter missed (CLAUDE.md "extend both"). Each gap has a
+# previously-leaking positive + a couple of negative (no-over-redaction)
+# assertions. The Snowflake side is pinned in
+# tests/providers/test_snowflake_util_logging.py.
+# ---------------------------------------------------------------------------
+
+
+class TestGlobalRedactionSymmetryGaps:
+    """Gaps the global ``redact_secret_text`` / ``redact_value`` previously
+    leaked while the Snowflake-local twin caught them."""
+
+    # -- Gap 1: bare ``passphrase=<value>`` assignment ---------------------
+    def test_bare_passphrase_assignment_masked(self):
+        # Previously leaked: ``passphrase`` was absent from _ASSIGNMENT_RE.
+        out = _redact_global("passphrase=SuperSecret123")
+        assert "SuperSecret123" not in out
+        assert "passphrase" in out  # key name preserved
+        assert "***REDACTED***" in out
+
+    def test_passphrase_colon_separator_masked(self):
+        out = _redact_global("client_passphrase: hunter2trailing next")
+        assert "hunter2trailing" not in out
+        assert "***REDACTED***" in out
+
+    def test_passphrase_prose_not_over_redacted(self):
+        # No ``=``/``:`` value binding -> nothing to redact.
+        safe = "the passphrase policy is documented in the runbook"
+        assert _redact_global(safe) == safe
+
+    # -- Gap 2: quoted-JSON ``"credentials": "..."`` -----------------------
+    def test_quoted_json_credentials_value_masked(self):
+        # Previously leaked: the assignment regex had no optional closing
+        # quote before ``:`` so a quoted JSON key slipped past on the text path.
+        out = _redact_global('{"credentials": "hunter2secretvalue"}')
+        assert "hunter2secretvalue" not in out
+        assert "***REDACTED***" in out
+
+    def test_bare_credentials_assignment_masked(self):
+        out = _redact_global("credentials=topsecretblob123")
+        assert "topsecretblob123" not in out
+        assert "credentials" in out
+
+    def test_benign_json_not_over_redacted(self):
+        safe = '{"username": "alice", "id": "req-42"}'
+        assert _redact_global(safe) == safe
+
+    # -- Gap 3: dict key literally named ``auth`` --------------------------
+    def test_auth_dict_key_masked(self):
+        from fluid_build.observability.secret_redactor import (
+            is_sensitive_key_name,
+            redact_value,
+        )
+
+        assert is_sensitive_key_name("auth") is True
+        out = redact_value({"auth": "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="})
+        assert out["auth"] == "***REDACTED***"
+
+    def test_auth_dict_key_negatives(self):
+        from fluid_build.observability.secret_redactor import redact_value
+
+        out = redact_value({"username": "alice", "region": "us-east-1"})
+        assert out["username"] == "alice"
+        assert out["region"] == "us-east-1"
+
+    # -- Gap 4: dict keys ``conn_str`` / ``connection_url`` ----------------
+    def test_conn_str_and_connection_url_dict_keys_masked(self):
+        from fluid_build.observability.secret_redactor import (
+            is_sensitive_key_name,
+            redact_value,
+        )
+
+        assert is_sensitive_key_name("conn_str") is True
+        assert is_sensitive_key_name("connection_url") is True
+        out = redact_value(
+            {
+                "conn_str": "Driver={ODBC};Server=h;Pwd=topsecretpw;",
+                "connection_url": "jdbc:pg://user:topsecretpw@host/db",
+            }
+        )
+        assert out["conn_str"] == "***REDACTED***"
+        assert out["connection_url"] == "***REDACTED***"
+
+    def test_plain_url_key_not_over_redacted(self):
+        # ``conn_str`` addition must not broaden to a plain ``url`` key.
+        from fluid_build.observability.secret_redactor import (
+            is_sensitive_key_name,
+            redact_value,
+        )
+
+        assert is_sensitive_key_name("url") is False
+        out = redact_value({"url": "https://example.com/page"})
+        assert out["url"] == "https://example.com/page"
+
+    # -- Cross-layer symmetry: the two layers must not drift ---------------
+    def test_gaps_symmetric_with_snowflake_twin(self):
+        from fluid_build.observability.secret_redactor import redact_value
+        from fluid_build.providers.snowflake.util.logging import (
+            redact_dict,
+            redact_string,
+        )
+
+        for line, secret in [
+            ("passphrase=SuperSecret123", "SuperSecret123"),
+            ('{"credentials": "hunter2secretvalue"}', "hunter2secretvalue"),
+        ]:
+            assert secret not in _redact_global(line)
+            assert secret not in redact_string(line)
+
+        for key in ("auth", "conn_str", "connection_url"):
+            gv = redact_value({key: "leaked-value-here"})
+            sv = redact_dict({key: "leaked-value-here"})
+            assert gv[key] == "***REDACTED***"
+            assert sv[key] == "[REDACTED]"

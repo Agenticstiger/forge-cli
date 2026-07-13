@@ -100,3 +100,87 @@ def test_sensitive_patterns_group_counts_are_handled_by_redact_string() -> None:
             f"unhandled group shape: {pat.groups} groups, "
             f"groupindex={dict(pat.groupindex)} for {pat.pattern!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Redaction-symmetry gap closure: shapes the GLOBAL filter already masked but
+# this Snowflake-local twin missed (CLAUDE.md "extend both"). Each gap has a
+# previously-leaking positive + negative (no-over-redaction) assertions. The
+# global side is pinned in tests/test_observability_secret_redactor.py.
+# ---------------------------------------------------------------------------
+
+
+class TestSnowflakeRedactionSymmetryGaps:
+    """Gaps ``redact_string`` previously leaked while the global
+    ``redact_secret_text`` twin caught them."""
+
+    # -- Gap 5: generic non-``eyJ`` 3-segment JWT --------------------------
+    def test_generic_non_eyj_three_segment_jwt_masked(self) -> None:
+        # A JWT whose header does NOT base64url-encode to ``eyJ`` (or any three
+        # high-entropy base64url runs) — previously only the ``eyJ``-anchored
+        # patterns existed here, so this leaked.
+        jwt = "aGVhZGVyMTIzNDU2.cGF5bG9hZDEyMzQ1Ng.c2lnbmF0dXJlMTIz"
+        out = redact_string(f"stage token {jwt} accepted")
+        assert jwt not in out
+        assert "[REDACTED]" in out
+
+    def test_eyj_anchored_jwt_still_masked(self) -> None:
+        # The tighter eyJ-anchored patterns must still win (positioned first).
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMSJ9.c2lnbmF0dXJlSGVyZQ"
+        assert jwt not in redact_string(f"bearer {jwt}")
+
+    def test_short_dotted_identifiers_not_over_redacted(self) -> None:
+        # Segments < 12 chars must NOT match the generic JWT shape.
+        for benign in ("app version 1.2.3 released", "com.example.myservice loaded"):
+            assert redact_string(benign) == benign
+
+    # -- Gap 6: bare ``private_key=<non-PEM>`` assignment ------------------
+    def test_bare_private_key_non_pem_value_masked(self) -> None:
+        # Previously leaked: ``private_key`` is intentionally excluded from the
+        # bare-assignment alternation (to protect multiline PEMs), so a bare
+        # non-PEM ``private_key=<value>`` had no matcher until the dedicated
+        # after-PEM pattern was added.
+        value = "MIIEvQIBADANBgkqhkiNONPEMVALUE0123456789"
+        out = redact_string(f"private_key={value}")
+        assert value not in out
+        assert out.startswith("private_key=")  # key name preserved
+        assert "[REDACTED]" in out
+
+    def test_bare_private_key_hyphen_and_colon_forms_masked(self) -> None:
+        assert redact_string("private-key=abc123def456ghi") == "private-key=[REDACTED]"
+        out = redact_string("private_key: abc123def456ghi trailing")
+        assert "abc123def456ghi" not in out
+
+    def test_multiline_pem_still_redacted_intact(self) -> None:
+        # CRITICAL regression: the new bare pattern is positioned AFTER the
+        # PEM-block pattern, so a ``private_key=<multiline PEM>`` header is
+        # consumed by the PEM pattern first — the base64 body must NOT leak,
+        # and the bare pattern must not bite into the PEM body.
+        pem = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEvQIBADANBgkqPEMBODYMUSTVANISH0123456789\n"
+            "abcdefghijklmnopqrstuvwxyz9876543210ABCDEF\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        out = redact_string(f"private_key={pem}")
+        assert "PEMBODYMUSTVANISH0123456789" not in out
+        assert "MIIEvQIBADANBgkq" not in out
+        assert "[REDACTED]" in out
+
+    def test_private_key_prose_not_over_redacted(self) -> None:
+        # No ``=``/``:`` value binding -> nothing to redact.
+        safe = "loaded private key from the on-disk keystore"
+        assert redact_string(safe) == safe
+
+    # -- Cross-layer symmetry: the two layers must not drift ---------------
+    def test_gaps_symmetric_with_global_twin(self) -> None:
+        from fluid_build.observability.secret_redactor import redact_secret_text
+
+        jwt = "aGVhZGVyMTIzNDU2.cGF5bG9hZDEyMzQ1Ng.c2lnbmF0dXJlMTIz"
+        assert jwt not in redact_string(f"t {jwt} x")
+        assert jwt not in redact_secret_text(f"t {jwt} x")
+
+        value = "MIIEvQIBADANBgkqhkiNONPEMVALUE0123456789"
+        line = f"private_key={value}"
+        assert value not in redact_string(line)
+        assert value not in redact_secret_text(line)

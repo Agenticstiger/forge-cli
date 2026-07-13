@@ -28,6 +28,11 @@ _REDACTED = "***REDACTED***"
 _SENSITIVE_KEY_PARTS = (
     "api_key",
     "apikey",
+    # Bare ``auth`` — a dict key literally named ``auth`` carries the
+    # credential (e.g. a ``Basic <base64>`` header value). Symmetric with the
+    # Snowflake twin's exact-match ``"auth"`` in SENSITIVE_KEYS. Substring
+    # matching also (harmlessly) covers ``oauth``/``authorization`` here.
+    "auth",
     "auth_token",
     "authorization",
     "aws_access_key",
@@ -35,7 +40,12 @@ _SENSITIVE_KEY_PARTS = (
     "azure_sas_token",
     "bearer",
     "client_secret",
+    # ``conn_str`` / ``connection_url`` — ODBC / JDBC connection strings whose
+    # value embeds the password (``Pwd=...``). Mirror the Snowflake twin's
+    # ``conn_str`` / ``connection_url`` keys so the two layers stay symmetric.
+    "conn_str",
     "connection_string",
+    "connection_url",
     "credential",
     # ``sasl.jaas.config`` (incl. the connector's ``iceberg.kafka.sasl.jaas.config``)
     # carries the SASL password/token inside the value, but the key name has no
@@ -123,14 +133,23 @@ _PEM_PRIVATE_KEY_RE = re.compile(
 # Quantifiers are upper-bounded ({,N}) so an adversarial log line can't
 # trigger catastrophic backtracking — the key prefix, separator padding
 # and value span are all length-capped.
+#
+# ``credentials?`` and the standalone ``passphrase`` alternative mirror the
+# Snowflake twin (``providers/snowflake/util/logging.py`` lines 64/98) so a bare
+# ``credentials=…`` / ``passphrase=…`` is masked here too (CLAUDE.md symmetry).
+# ``sep`` admits an OPTIONAL closing quote before the ``:``/``=`` so a
+# quoted-JSON key (``"credentials": "…"``) is caught on the text path — the
+# quoted-key shape the Snowflake twin covers with its dedicated ``"credentials":``
+# JSON pattern. The optional quote is a single bounded char, so it adds no
+# backtracking risk.
 _ASSIGNMENT_RE = re.compile(
     r"(?ix)"
     r"(?P<key>\b(?:[A-Za-z0-9_]{,128}_)?(?:"
     r"api[_-]?key|authorization|aws_secret_access_key|secret[_-]access[_-]key|"
-    r"client_secret|oauth[_-]?token|password|private[_-]?key(?:_passphrase)?|"
-    r"session[_-]token|secret|token"
+    r"client_secret|credentials?|oauth[_-]?token|password|passphrase|"
+    r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token"
     r")\b)"
-    r"(?P<sep>\s{,8}[:=]\s{,8})"
+    r"(?P<sep>['\"]?\s{,8}[:=]\s{,8})"
     r"(?P<quote>['\"]?)"
     r"(?P<value>.{,256}?)(?P=quote)"
     r"(?=(?:[\s,;}\]]|$))"
@@ -161,8 +180,8 @@ _PLACEHOLDER_RE = re.compile(
 _PRECEDING_SENSITIVE_KEY_RE = re.compile(
     r"(?ix)\b(?:[A-Za-z0-9_]*_)?(?:"
     r"api[_-]?key|authorization|aws_secret_access_key|secret[_-]access[_-]key|"
-    r"client_secret|oauth[_-]?token|password|private[_-]?key(?:_passphrase)?|"
-    r"session[_-]token|secret|token"
+    r"client_secret|credentials?|oauth[_-]?token|password|passphrase|"
+    r"private[_-]?key(?:_passphrase)?|session[_-]token|secret|token"
     r")\b\s*[:=]\s*$"
 )
 
