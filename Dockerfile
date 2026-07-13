@@ -19,7 +19,11 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# `apt-get upgrade` pulls the latest Debian security patches for base-image
+# packages (e.g. liblzma5) so fixable OS-package CVEs are actually resolved at
+# build time rather than shipped — the release Grype gate scans OS + library
+# CVEs, so keeping the base current keeps the surface small.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     git \
     curl \
     ca-certificates \
