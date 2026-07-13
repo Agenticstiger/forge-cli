@@ -308,15 +308,113 @@ def _detect_ai_available() -> bool:
         return False
 
 
+def _starter_catalog() -> List[dict]:
+    """Unified starter catalog surfaced by the Quickstart guided picker.
+
+    Merges the two formerly-separate "Start from a template" and "Start from a
+    blueprint" menu paths into ONE list so a new user has a single clear
+    Quickstart flow. The first entry is the rich local ``customer-360`` example
+    (the classic ``--quickstart`` default); the rest are the bundled
+    marketplace blueprints (local starter, daily analytics, GCP, Snowflake),
+    now first-class Quickstart choices.
+
+    Each entry is ``{"kind", "target", "label", "description"}`` where ``kind``
+    is ``"template"`` or ``"blueprint"`` and ``target`` is the template name or
+    bundled blueprint id — enough for the caller to dispatch to the right init
+    mode. Pattern borrowed from create-vite's framework→variant two-level
+    picker.
+    """
+    catalog: List[dict] = [
+        {
+            "kind": "template",
+            "target": "customer-360",
+            "label": "Customer 360",
+            "description": "Full working local example with sample data — runs "
+            "offline on DuckDB, zero setup.",
+        },
+    ]
+    try:
+        from fluid_build.cli._market_bundled_blueprints import list_bundled_blueprints
+
+        for bp in list_bundled_blueprints():
+            bp_id = str(bp.get("id") or "").strip()
+            if not bp_id:
+                continue
+            catalog.append(
+                {
+                    "kind": "blueprint",
+                    "target": bp_id,
+                    "label": str(bp.get("name") or bp_id),
+                    "description": str(bp.get("description") or ""),
+                }
+            )
+    except Exception:  # noqa: BLE001 — a missing catalog never breaks Quickstart
+        pass
+    return catalog
+
+
+def _ask_starter() -> Optional[tuple]:
+    """Quickstart's second-level picker: choose a ready-to-run starter.
+
+    Returns ``(kind, target)`` — e.g. ``("template", "customer-360")`` or
+    ``("blueprint", "fluid.starter-gcp")`` — or ``None`` only when the catalog
+    is empty. Mirrors :func:`_ask_template_name`'s robustness contract: the
+    non-rich path, a missing console/prompt, or any prompt error all resolve to
+    the **default** (the first catalog entry, the classic ``customer-360``
+    quickstart), so scripted / piped / non-TTY runs never hang and always land
+    on a working starter.
+    """
+    catalog = _starter_catalog()
+    if not catalog:
+        return None
+    default_entry = catalog[0]
+    default = (default_entry["kind"], default_entry["target"])
+
+    if not _rich_available():
+        return default
+    console = _get_console()
+    Prompt = _get_prompt()
+    if console is None or Prompt is None:
+        return default
+
+    console.print()
+    console.print("[dim]Pick a starter (edit it afterwards, or run 'fluid forge'):[/dim]\n")
+    for i, entry in enumerate(catalog, 1):
+        marker = " [dim](default)[/dim]" if i == 1 else ""
+        console.print(f"  [bold]{i}.[/bold] {entry['label']}{marker}")
+        if entry.get("description"):
+            console.print(f"     [dim]{entry['description']}[/dim]")
+    console.print()
+
+    valid = [str(i) for i in range(1, len(catalog) + 1)]
+    try:
+        choice = Prompt.ask("Choose a starter", choices=valid, default="1")
+    except Exception:  # noqa: BLE001 — never crash / hang the init flow over a prompt
+        return default
+    try:
+        picked = catalog[int(choice) - 1]
+        return (picked["kind"], picked["target"])
+    except (ValueError, IndexError):
+        return default
+
+
 def _ask_creation_mode(ai_available: Optional[bool] = None) -> str:
     """Present the creation menu and return the selected mode.
 
+    Consolidated to a single clear path (create-vite style): the three
+    formerly-redundant "scaffold something pre-built" rows (Quickstart /
+    template / blueprint) collapse into **one** Quickstart row that leads to
+    the unified starter picker (:func:`_ask_starter`). The top-level menu is
+    now Quickstart / AI / Empty — everything pre-built lives under Quickstart.
+    The ``--template`` / ``--blueprint`` flags remain the non-interactive
+    bypass for users who already know the exact starter they want.
+
     The Enter-key default adapts to context. When **no** LLM provider is
     configured, it defaults to **Quickstart**, so a freshly-installed user who
-    just presses Enter reaches a working ``customer-360`` project in ~30s with
-    zero setup — the AI path would otherwise dead-end on a missing API key, a
-    bad first impression. When AI *is* configured, the richer 'Let AI design
-    it' path stays the default. ``ai_available`` is probed via
+    just presses Enter reaches a working starter in ~30s with zero setup — the
+    AI path would otherwise dead-end on a missing API key, a bad first
+    impression. When AI *is* configured, the richer 'Let AI design it' path
+    stays the default. ``ai_available`` is probed via
     :func:`_detect_ai_available` when not supplied (tests inject it).
     """
     if not _rich_available():
@@ -342,38 +440,30 @@ def _ask_creation_mode(ai_available: Optional[bool] = None) -> str:
     )
     console.print("[dim]How would you like to create your first data product?[/dim]\n")
     if ai_available:
-        quickstart_tag = "(customer-360 example, zero questions, ~30s) ← fastest"
+        quickstart_tag = "(ready-to-run starter — local, GCP, Snowflake, analytics)"
         ai_tag = "(recommended — just answer questions)"
         default_choice = "2"
     else:
         quickstart_tag = (
-            "(customer-360 example, zero questions, ~30s) ← recommended, no API key needed"
+            "(ready-to-run starter — local, GCP, Snowflake, analytics) "
+            "← recommended, no API key needed"
         )
         ai_tag = "(needs an API key — run 'fluid ai setup' first)"
         default_choice = "1"
-    console.print(f"  [bold]1.[/bold] Quickstart                 [dim]{quickstart_tag}[/dim]")
-    console.print(f"  [bold]2.[/bold] Let AI design it           [dim]{ai_tag}[/dim]")
-    console.print(
-        "  [bold]3.[/bold] Start from a template     [dim](pre-built, customize later)[/dim]"
-    )
-    console.print("  [bold]4.[/bold] Empty contract             [dim](for experienced users)[/dim]")
-    console.print(
-        "  [bold]5.[/bold] Start from a blueprint     "
-        "[dim](bundled marketplace blueprint, no API key)[/dim]\n"
-    )
+    console.print(f"  [bold]1.[/bold] Quickstart          [dim]{quickstart_tag}[/dim]")
+    console.print(f"  [bold]2.[/bold] Let AI design it    [dim]{ai_tag}[/dim]")
+    console.print("  [bold]3.[/bold] Empty contract      [dim](for experienced users)[/dim]\n")
 
     choice = Prompt.ask(
         "Choose",
-        choices=["1", "2", "3", "4", "5"],
+        choices=["1", "2", "3"],
         default=default_choice,
     )
     fallback = "ai" if ai_available else "quickstart"
     return {
         "1": "quickstart",
         "2": "ai",
-        "3": "template",
-        "4": "blank",
-        "5": "blueprint",
+        "3": "blank",
     }.get(choice, fallback)
 
 
@@ -442,11 +532,14 @@ def _redirect_existing_workspace(
 
 
 __all__ = [
+    "_ask_blueprint_name",
     "_ask_creation_mode",
     "_ask_industry",
+    "_ask_starter",
     "_ask_template_name",
     "_list_filesystem_templates",
     "_print_welcome_panel",
     "_print_workspace_products",
     "_redirect_existing_workspace",
+    "_starter_catalog",
 ]
