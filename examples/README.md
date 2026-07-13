@@ -58,6 +58,7 @@ Deeper, real-world examples — each with its own README:
 - [`aws-glue-data-lake/`](aws-glue-data-lake/) — Glue Data Catalog, Iceberg tables, ETL jobs on AWS.
 - [`aws-redshift-kinesis-streaming/`](aws-redshift-kinesis-streaming/) — Kinesis Data Streams + Redshift Serverless + Spectrum external schema (v0.7.5 binding fields).
 - [`mcp-output-port/`](mcp-output-port/) — expose a data product as a Model Context Protocol server.
+- [`pgvector-rag-output-port/`](pgvector-rag-output-port/) — a vector / embeddings output port: emit a pgvector embeddings table + HNSW index for the ai-embeddable columns (`fluid generate vector`).
 - [`source-aligned-postgres-duckdb/`](source-aligned-postgres-duckdb/) — a source-aligned product reading from Postgres via DuckDB.
 - [`bitcoin-price-api-declarative-part-b/`](bitcoin-price-api-declarative-part-b/) · [`part-c/`](bitcoin-price-api-declarative-part-c/) — an end-to-end declarative pipeline with observability and policy tags.
 - [`0.7.1/`](0.7.1/) — schema-feature reference contracts (GDPR, AI-restricted data, backward compatibility, provider-action workflows).

@@ -1268,9 +1268,10 @@
             "local",
             "kubernetes",
             "postgres",
+            "pgvector",
             "other"
           ],
-          "description": "Target platform. NEW in v0.7.5: 'confluent' for the Confluent Cloud Tableflow managed Kafka→Iceberg emitter. NEW in v0.7.4: 'postgres' for the MCP output-port PostgreSQL driver (AWS Athena uses platform 'aws')."
+          "description": "Target platform. NEW in v0.7.5: 'pgvector' for the vector/embeddings output port (pgvector-on-PostgreSQL RAG target — emits the embeddings table + ANN index DDL for the ai-embeddable columns). NEW in v0.7.5: 'confluent' for the Confluent Cloud Tableflow managed Kafka→Iceberg emitter. NEW in v0.7.4: 'postgres' for the MCP output-port PostgreSQL driver (AWS Athena uses platform 'aws')."
         },
         "format": {
           "type": "string",
@@ -1295,9 +1296,10 @@
             "postgres_table",
             "athena_table",
             "glue_table",
+            "pgvector_table",
             "other"
           ],
-          "description": "Binding format. NEW in v0.7.4: 'postgres_table' (PostgreSQL driver), 'athena_table' / 'glue_table' (AWS Athena driver) for the MCP output port."
+          "description": "Binding format. NEW in v0.7.5: 'pgvector_table' — a pgvector embeddings table target for the vector output port. NEW in v0.7.4: 'postgres_table' (PostgreSQL driver), 'athena_table' / 'glue_table' (AWS Athena driver) for the MCP output port."
         },
         "icebergConfig": {
           "type": "object",
@@ -1400,6 +1402,93 @@
               "description": "Iceberg table properties",
               "additionalProperties": {
                 "type": "string"
+              }
+            }
+          }
+        },
+        "vectorConfig": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "NEW in v0.7.5: vector / embeddings output-port configuration (platform 'pgvector', format 'pgvector_table'). Consumed by fluid_build.output_ports.vector to emit the pgvector embeddings-table + ANN-index DDL and a RAG provenance manifest for the schema's ai-embeddable columns.",
+          "required": [
+            "dimensions"
+          ],
+          "properties": {
+            "dimensions": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16000,
+              "description": "Embedding vector width (e.g. 1536 for OpenAI text-embedding-3-small, 1024 for Cohere embed-english-light). Maps to the pgvector column type vector(<dimensions>)."
+            },
+            "embeddingModel": {
+              "type": "string",
+              "description": "Provenance: the embedding model that produces the vectors (e.g. 'text-embedding-3-small'). Recorded in the RAG manifest and the embeddings-table's embedding_model column so a retriever can verify model parity."
+            },
+            "vectorType": {
+              "type": "string",
+              "enum": [
+                "vector",
+                "halfvec"
+              ],
+              "default": "vector",
+              "description": "pgvector column type: 'vector' (float32, up to 2000 dims) or 'halfvec' (float16, half the storage, up to 4000 dims)."
+            },
+            "indexType": {
+              "type": "string",
+              "enum": [
+                "hnsw",
+                "ivfflat",
+                "none"
+              ],
+              "default": "hnsw",
+              "description": "ANN index built on the embedding column. 'hnsw' (higher recall / lower query latency, buildable before data lands), 'ivfflat' (lower build cost, needs data first), or 'none' (no index — exact search only)."
+            },
+            "distanceMetric": {
+              "type": "string",
+              "enum": [
+                "cosine",
+                "l2",
+                "inner_product",
+                "l1"
+              ],
+              "default": "cosine",
+              "description": "Distance function the index optimises for → pgvector operator class: cosine→vector_cosine_ops, l2→vector_l2_ops, inner_product→vector_ip_ops, l1→vector_l1_ops."
+            },
+            "table": {
+              "type": "string",
+              "description": "Target embeddings table name. Defaults to '<exposeId>_embeddings' when omitted."
+            },
+            "sourceKeyColumn": {
+              "type": "string",
+              "description": "Provenance: the source primary-key column that ties each embedding row back to its origin row (written to the embeddings-table's source_key column). Enables update/delete propagation from the source product to the vector store."
+            },
+            "hnsw": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "HNSW index tuning (used when indexType is 'hnsw').",
+              "properties": {
+                "m": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Max bi-directional links per node (pgvector default 16)."
+                },
+                "efConstruction": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Build-time dynamic candidate-list size (pgvector default 64)."
+                }
+              }
+            },
+            "ivfflat": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "IVFFlat index tuning (used when indexType is 'ivfflat').",
+              "properties": {
+                "lists": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Number of inverted lists (pgvector guidance: rows/1000 for < 1M rows)."
+                }
               }
             }
           }
