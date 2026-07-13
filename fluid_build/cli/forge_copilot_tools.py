@@ -1378,6 +1378,14 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
     from fluid_build.cli.forge_web_tools import web_tool_definitions
 
     definitions.extend(web_tool_definitions())
+
+    # Opt-in live-DB tool (fetch_sample_rows), gated on FLUID_FORGE_DB_TOOLS.
+    # Off by default → no-op; when on, the single read-only row-sampling tool
+    # surfaces. Same env-gated delegate shape as the dbt MCP + web-tool bridges;
+    # the connection URI + credentials are env-sourced, never LLM-supplied.
+    from fluid_build.cli.forge_db_tools import db_tool_definitions
+
+    definitions.extend(db_tool_definitions())
     return definitions
 
 
@@ -1444,6 +1452,15 @@ def dispatch_tool_call(
 
         if is_web_tool(name):
             return dispatch_web_tool(name, arguments)
+
+        # Opt-in live-DB tool (fetch_sample_rows), gated on FLUID_FORGE_DB_TOOLS.
+        # Resolved AFTER the native registries so a native tool of the same name
+        # always wins. Same typed-error contract on failure as the other
+        # env-gated delegates.
+        from fluid_build.cli.forge_db_tools import dispatch_db_tool, is_db_tool
+
+        if is_db_tool(name):
+            return dispatch_db_tool(name, arguments)
     if not tool:
         LOG.warning("Unknown tool call: %s", name)
         return {"error": f"Unknown tool: {name}"}

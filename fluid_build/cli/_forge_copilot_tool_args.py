@@ -294,6 +294,52 @@ class GenerateDltSourceArgs(BaseModel):
     )
 
 
+class FetchSampleRowsArgs(BaseModel):
+    """Args for the opt-in ``fetch_sample_rows`` tool (FLUID_FORGE_DB_TOOLS).
+
+    Returns a small, row-capped, redacted sample from a LIVE database so the
+    agent can see real column shapes / value distributions while authoring a
+    contract. The tool is **read-only** (only a ``SELECT ... LIMIT`` is ever
+    issued) and the connection URI + credentials are sourced from the
+    environment — the LLM supplies only *which* table / connection, never a
+    DSN or secret, so it can't be steered to an arbitrary host.
+    """
+
+    table: str = Field(
+        description=(
+            "Bare table name to sample (a SQL identifier: letters, digits, "
+            "underscores). Not a dotted or quoted reference — pass the schema "
+            "separately via ``schema``."
+        )
+    )
+    schema_name: Optional[str] = Field(
+        default=None,
+        alias="schema",
+        description=(
+            "Optional schema/database qualifier (a SQL identifier). Omit for "
+            "sqlite or to use the connection's default schema."
+        ),
+    )
+    limit: int = Field(
+        default=10,
+        description="Rows to return (default 10, hard max 50). Higher values are clamped.",
+    )
+    connection: str = Field(
+        default="default",
+        description=(
+            "Named connection alias (letters/digits/underscore). 'default' reads "
+            "FLUID_FORGE_DB_URI; '<name>' reads FLUID_FORGE_DB_URI_<NAME>. The URI "
+            "and its credentials never come from the model."
+        ),
+    )
+
+    # ``populate_by_name`` so the tool arg can arrive as either ``schema``
+    # (the LLM-facing name, an alias because ``schema`` shadows a pydantic
+    # internal) or ``schema_name``. ``extra=ignore`` drops unknown top-level
+    # fields so the LLM can't smuggle data past additionalProperties=False.
+    model_config = {"extra": "ignore", "populate_by_name": True}
+
+
 class WebFetchArgs(BaseModel):
     """Args for the opt-in ``web_fetch`` tool (FLUID_AGENT_WEB_TOOLS).
 
