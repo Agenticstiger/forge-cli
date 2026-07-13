@@ -25,6 +25,7 @@ from __future__ import annotations
 __all__ = [
     "build_minimal_contract",
     "create_and_validate_contract",
+    "stamp_prompt_overlays",
     "stamp_prompt_profile",
     "write_contract",
     "validate_contract_file",
@@ -152,6 +153,37 @@ def stamp_prompt_profile(contract: Dict[str, Any]) -> Dict[str, Any]:
     return contract
 
 
+def stamp_prompt_overlays(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Stamp the active prompt-overlay stack into ``metadata.provenance``.
+
+    Records ``contract.metadata.provenance.prompt_overlays`` (ordered list of
+    overlay names) so published contracts carry which stackable overlays shaped
+    them — the audit-trail counterpart to :func:`stamp_prompt_profile`.
+
+    No-op — and no key added — when no overlay stack is active, keeping the
+    default contract output byte-identical. Mutates *contract* in place and
+    returns it. Never raises: provenance stamping must not crash a write.
+    """
+    try:
+        from fluid_build.cli.forge_copilot_prompts import active_overlay_names
+
+        names = active_overlay_names()
+    except Exception:  # noqa: BLE001 — defensive; never block a write on this
+        names = []
+    if not names:
+        return contract
+    metadata = contract.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        contract["metadata"] = metadata
+    provenance = metadata.get("provenance")
+    if not isinstance(provenance, dict):
+        provenance = {}
+        metadata["provenance"] = provenance
+    provenance["prompt_overlays"] = list(names)
+    return contract
+
+
 def write_contract(
     contract: Dict[str, Any],
     path: Path,
@@ -188,9 +220,10 @@ def write_contract(
     # "ContractMetadata" to signal what this sub-block describes.
     metadata["provenance"] = envelope
     doc["metadata"] = metadata
-    # Audit trail: record the active prompt profile (if any) into the same
-    # provenance block. No-op when no profile is active.
+    # Audit trail: record the active prompt profile + overlay stack (if any)
+    # into the same provenance block. Both no-op when nothing is active.
     stamp_prompt_profile(doc)
+    stamp_prompt_overlays(doc)
 
     header = f"# FLUID Data Product Contract\n# Docs: {DOCS_URL}\n"
     body = yaml.dump(doc, default_flow_style=False, sort_keys=False, allow_unicode=True)

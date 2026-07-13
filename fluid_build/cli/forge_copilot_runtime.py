@@ -105,6 +105,7 @@ from fluid_build.cli.forge_copilot_memory import CopilotMemorySnapshot  # noqa: 
 # Re-exports: prompts (need thin wrappers for engine list injection)
 # ---------------------------------------------------------------------------
 from fluid_build.cli.forge_copilot_prompts import (  # noqa: F401
+    active_overlay_validator_rules,
     build_clarification_system_prompt,
     build_clarification_user_prompt,
     build_user_prompt,
@@ -314,7 +315,16 @@ def validate_generated_result(
     ``context`` carries the interview/normalised-context dict so
     technique-aware checks (e.g. DV2 additional_files) fire only on the
     runs that opted in.
+
+    Any active ``--prompt-overlay`` stack's ``validator_rules`` are resolved
+    here and threaded into the pure validator so an overlay-supplied rule can
+    reject a violating contract. No overlays ⇒ empty list ⇒ unchanged behaviour.
     """
+    overlay_rules = None
+    try:
+        overlay_rules = active_overlay_validator_rules()
+    except Exception as exc:  # noqa: BLE001 — never block validation on this
+        LOG.debug("overlay_validator_rules_resolve_failed: %s", exc)
     return _validate_generated_result_raw(
         normalized,
         capabilities=capabilities,
@@ -323,6 +333,7 @@ def validate_generated_result(
         resolve_provider_from_contract_fn=resolve_provider_from_contract,
         get_builds_fn=get_builds,
         context=context,
+        validator_rules=overlay_rules,
     )
 
 

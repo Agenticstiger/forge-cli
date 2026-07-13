@@ -20,6 +20,7 @@ __all__ = [
     "KNOWN_BUILD_ENGINES",
     "PROVIDER_ENGINE_COMPATIBILITY",
     "TEMPLATE_ALIASES",
+    "apply_overlay_validator_rules",
     "build_seed_contract",
     "classify_generation_failure",
     "extract_json_object",
@@ -985,6 +986,81 @@ def normalize_generation_payload(
     }
 
 
+def _lookup_dotted_field(contract: Mapping[str, Any], path: str) -> Any:
+    """Resolve a dotted path (``metadata.owner.email``) against the contract.
+
+    Returns ``None`` when any segment is missing or a non-mapping is traversed.
+    Numeric segments index into lists (``exposes.0.exposeId``).
+    """
+    node: Any = contract
+    for segment in path.split("."):
+        if isinstance(node, Mapping):
+            node = node.get(segment)
+        elif isinstance(node, (list, tuple)):
+            try:
+                node = node[int(segment)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    return node
+
+
+def apply_overlay_validator_rules(
+    contract: Mapping[str, Any], rules: Optional[Sequence[Mapping[str, Any]]]
+) -> List[str]:
+    """Evaluate overlay-supplied ``validator_rules`` against the contract.
+
+    Each rule is a plain dict (``id`` + ``message`` + one or more predicates).
+    Predicates:
+
+    * ``forbid_regex`` — error if the canonical contract JSON matches.
+    * ``require_regex`` — error if it does NOT match.
+    * ``require_field`` — error if the dotted path is absent / empty.
+    * ``forbid_field`` — error if the dotted path is present / truthy.
+
+    Pure and dependency-free (rules are data, not objects) so this module stays
+    off the overlay/crypto import graph. Returns a list of error strings.
+    """
+    if not rules:
+        return []
+    errors: List[str] = []
+    contract_json = json.dumps(contract, sort_keys=True, default=str)
+    for rule in rules:
+        if not isinstance(rule, Mapping):
+            continue
+        rule_id = str(rule.get("id") or "rule")
+        message = str(rule.get("message") or "overlay validator rule failed")
+        violated = False
+        forbid_regex = rule.get("forbid_regex")
+        if isinstance(forbid_regex, str) and forbid_regex:
+            try:
+                if re.search(forbid_regex, contract_json):
+                    violated = True
+            except re.error:
+                continue
+        require_regex = rule.get("require_regex")
+        if isinstance(require_regex, str) and require_regex:
+            try:
+                if not re.search(require_regex, contract_json):
+                    violated = True
+            except re.error:
+                continue
+        require_field = rule.get("require_field")
+        if isinstance(require_field, str) and require_field:
+            value = _lookup_dotted_field(contract, require_field)
+            if value in (None, "", [], {}):
+                violated = True
+        forbid_field = rule.get("forbid_field")
+        if isinstance(forbid_field, str) and forbid_field:
+            value = _lookup_dotted_field(contract, forbid_field)
+            if value not in (None, "", [], {}):
+                violated = True
+        if violated:
+            errors.append(f"overlay rule '{rule_id}': {message}")
+    return errors
+
+
 def validate_generated_result(
     normalized: Mapping[str, Any],
     *,
@@ -994,12 +1070,17 @@ def validate_generated_result(
     resolve_provider_from_contract_fn: Callable[[Mapping[str, Any]], tuple[Optional[str], Any]],
     get_builds_fn: Callable[[Mapping[str, Any]], List[Mapping[str, Any]]],
     context: Optional[Mapping[str, Any]] = None,
+    validator_rules: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> tuple[List[str], List[str]]:
     """Validate contract schema plus local provider/build sanity checks.
 
     ``context`` is optional so pre-existing callers keep working; when
     supplied it drives additional technique-aware checks (e.g. DV2 runs
     must ship at least one ``hub_`` / ``sat_`` model in additional_files).
+
+    ``validator_rules`` are overlay-supplied post-generation checks (see
+    ``apply_overlay_validator_rules``); a violated rule appends a hard error so
+    the self-healing repair loop treats it exactly like a schema failure.
     """
     contract = normalized["contract"]
     suggestions = normalized["suggestions"]
@@ -1164,6 +1245,12 @@ def validate_generated_result(
                     f"Remove the `sources:` block; keep only `models:`."
                 )
                 break
+
+    # --- Overlay-supplied validator rules --------------------------------
+    # Tenant overlays can ship extra contract-level guardrails (e.g. "no
+    # public egress", "owner email required"). A violated rule is a hard
+    # error so the repair loop treats it like any schema failure.
+    errors.extend(apply_overlay_validator_rules(contract, validator_rules))
 
     return errors, warnings
 

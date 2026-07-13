@@ -1,0 +1,14 @@
+# Example bundled prompt overlay: strict-JSON reinforcement.
+#
+# Prepends an extra emphasis line to the load-bearing response-contract section
+# without dropping its anchor sentences (the anchor guard would reject a drop).
+# Handy when pairing Forge with a model that occasionally wraps output in prose.
+#
+#   fluid forge --prompt-overlay strict-json-reinforce
+name: strict-json-reinforce
+sections:
+  - section: response_contract
+    mode: prepend
+    text: |
+      OUTPUT CONTRACT (highest priority): your entire reply MUST be a single
+      JSON object and nothing else — no prose before or after, no code fences.

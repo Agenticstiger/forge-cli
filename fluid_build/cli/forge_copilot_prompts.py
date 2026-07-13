@@ -18,15 +18,21 @@ from __future__ import annotations
 
 __all__ = [
     "PromptProfileError",
+    "active_overlay_fingerprint",
+    "active_overlay_names",
+    "active_overlay_validator_rules",
     "available_prompt_profiles",
+    "base_guidance_without_overlays",
     "build_clarification_system_prompt",
     "build_clarification_user_prompt",
     "build_system_prompt",
     "build_user_prompt",
     "get_active_domain",
+    "get_active_prompt_overlays",
     "get_active_prompt_profile",
     "guidance_cache_token",
     "set_domain_prompt_fragments",
+    "set_prompt_overlays",
     "set_prompt_profile",
 ]
 
@@ -36,7 +42,7 @@ import json
 import re
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 
@@ -353,6 +359,82 @@ def get_active_prompt_profile() -> Optional[str]:
     return _ACTIVE_PROFILE
 
 
+# ---------------------------------------------------------------------------
+# Prompt overlays — stackable, section-addressable patches (compose OVER
+# profiles). See ``fluid_build.cli.forge_prompt_overlays`` for the loader,
+# ed25519 signing, and the anchor-integrity guard. State lives HERE (next to
+# the guidance composer) so ``_active_guidance`` / ``guidance_cache_token`` can
+# see it without a threaded argument; the overlay module owns the heavy crypto
+# and is only imported when a stack is actually active (keeps this module's
+# import graph off the ``fluid --help`` cold path).
+# ---------------------------------------------------------------------------
+# ``_ACTIVE_OVERLAYS`` holds the validated overlay objects (duck-typed:
+# ``.sections`` / ``.validator_rules``), applied left-to-right as the TOP layer.
+_ACTIVE_OVERLAYS: Tuple[Any, ...] = ()
+_ACTIVE_OVERLAY_FINGERPRINT: str = ""
+
+
+def set_prompt_overlays(overlays: Sequence[Any], fingerprint: str) -> None:
+    """Install a pre-validated overlay stack (called by ``activate_prompt_overlays``).
+
+    Idempotent and process-wide. Pass ``((), "")`` to clear. The overlays are
+    trusted here — signature policy and the anchor guard already ran during
+    activation; this setter only records state so the composer and cache key
+    observe it.
+    """
+    global _ACTIVE_OVERLAYS, _ACTIVE_OVERLAY_FINGERPRINT
+    _ACTIVE_OVERLAYS = tuple(overlays or ())
+    _ACTIVE_OVERLAY_FINGERPRINT = fingerprint or ""
+
+
+def get_active_prompt_overlays() -> Tuple[Any, ...]:
+    """Return the active overlay stack (empty tuple when none)."""
+    return _ACTIVE_OVERLAYS
+
+
+def active_overlay_fingerprint() -> str:
+    """Return ``SHA1`` of the active overlay stack, or ``""`` when empty."""
+    return _ACTIVE_OVERLAY_FINGERPRINT
+
+
+def active_overlay_names() -> List[str]:
+    """Return the names of the active overlays in stack order (for provenance)."""
+    return [getattr(o, "name", "") for o in _ACTIVE_OVERLAYS if getattr(o, "name", "")]
+
+
+def active_overlay_validator_rules() -> List[Dict[str, Any]]:
+    """Return the flattened validator-rule dicts from the active overlay stack.
+
+    Threaded into ``validate_generated_result`` so an overlay-supplied rule can
+    reject a violating contract. Empty list on the no-overlay fast path.
+    """
+    rules: List[Dict[str, Any]] = []
+    for overlay in _ACTIVE_OVERLAYS:
+        for rule in getattr(overlay, "validator_rules", ()) or ():
+            as_dict = getattr(rule, "as_dict", None)
+            if callable(as_dict):
+                rules.append(as_dict())
+    return rules
+
+
+def base_guidance_without_overlays() -> Dict[str, str]:
+    """Compose bundled + shadow + domain + profile guidance, WITHOUT overlays.
+
+    Used by the overlay activation path as the anchor-guard baseline (the text
+    an overlay stack must not strip an anchor from). Always returns a fresh
+    mutable dict so the caller can layer overlays on top.
+    """
+    merged: Dict[str, str] = dict(_DEFAULT_GUIDANCE)
+    shadow = _load_user_shadow_guidance()
+    if shadow:
+        merged.update(shadow)
+    if _ACTIVE_DOMAIN_FRAGMENTS:
+        merged.update(_ACTIVE_DOMAIN_FRAGMENTS)
+    if _ACTIVE_PROFILE_FILES:
+        merged.update(_ACTIVE_PROFILE_FILES)
+    return merged
+
+
 def _active_guidance() -> Mapping[str, str]:
     """Compose the effective guidance map across every override layer.
 
@@ -366,7 +448,8 @@ def _active_guidance() -> Mapping[str, str]:
     shadow = _load_user_shadow_guidance()
     domain = _ACTIVE_DOMAIN_FRAGMENTS
     profile = _ACTIVE_PROFILE_FILES
-    if not shadow and not domain and not profile:
+    overlays = _ACTIVE_OVERLAYS
+    if not shadow and not domain and not profile and not overlays:
         return _DEFAULT_GUIDANCE
     merged: Dict[str, str] = dict(_DEFAULT_GUIDANCE)
     if shadow:
@@ -375,6 +458,14 @@ def _active_guidance() -> Mapping[str, str]:
         merged.update(domain)
     if profile:
         merged.update(profile)
+    if overlays:
+        # TOP layer: section-addressable replace/append/prepend patches applied
+        # left-to-right. Imported lazily so the crypto/overlay module never
+        # loads on the pure-default fast path. The stack was anchor-guarded at
+        # activation, so compose-time application is trusted.
+        from fluid_build.cli.forge_prompt_overlays import apply_overlays_to_guidance
+
+        merged = apply_overlays_to_guidance(merged, overlays)
     return MappingProxyType(merged)
 
 
@@ -390,11 +481,18 @@ def guidance_cache_token() -> str:
     """
     shadow = _load_user_shadow_guidance()
     domain_frag = dict(_ACTIVE_DOMAIN_FRAGMENTS or {})
-    if not shadow and not domain_frag and _ACTIVE_PROFILE is None:
+    overlay_fp = _ACTIVE_OVERLAY_FINGERPRINT
+    if not shadow and not domain_frag and _ACTIVE_PROFILE is None and not overlay_fp:
         return "::0"
     blob = json.dumps({"shadow": shadow, "domain_frag": domain_frag}, sort_keys=True)
     digest = hashlib.sha1(blob.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
-    return f"{_ACTIVE_PROFILE or ''}:{_ACTIVE_DOMAIN or ''}:{digest}"
+    token = f"{_ACTIVE_PROFILE or ''}:{_ACTIVE_DOMAIN or ''}:{digest}"
+    # Append the overlay fingerprint ONLY when a stack is active, so the token
+    # is byte-identical to the legacy value whenever the overlay stack is empty
+    # (no cache invalidation for existing users — even with a profile active).
+    if overlay_fp:
+        token = f"{token}:ov={overlay_fp}"
+    return token
 
 
 def _load_agent_voices() -> Mapping[str, str]:
@@ -558,9 +656,13 @@ def build_system_prompt(
         # Security lint: this function constructs static prompt prose, not executable SQL.
         f"You are FLUID Forge Copilot. Generate a production-ready FLUID {fv} contract and README "  # noqa: S608
         "that only use locally supported templates, providers, and build engines.\n"
-        "Return strict JSON only. Do not wrap the response in markdown fences.\n"
-        "Never include secrets, access tokens, raw sample values, or verbatim file contents.\n"
-        f"ALWAYS use fluidVersion '{fv}'.\n"
+        # Load-bearing strict-JSON + no-secrets directives. Relocated out of
+        # inline prose into an overlay-addressable ``response_contract`` section
+        # (agent_specs/_defaults/response_contract.yaml) so tenant overlays can
+        # reinforce them and the anchor-integrity guard can prove no overlay
+        # drops them. Byte-identical to the previous prose (the block scalar's
+        # trailing newline reproduces the original two ``\n``-terminated lines).
+        + guidance.get("response_contract", "") + f"ALWAYS use fluidVersion '{fv}'.\n"
         "Treat project_memory as a soft preference layer only. Explicit user context and the current "
         "discovery report take precedence.\n"
         "Use interview_summary as the authoritative statement of current user intent.\n\n"

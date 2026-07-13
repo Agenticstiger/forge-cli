@@ -1,0 +1,30 @@
+# Example bundled prompt overlay: PII lockdown.
+#
+# Stacks ON TOP of the defaults (and any --prompt-profile) to (a) reinforce the
+# restrictive agent-policy guidance for PII/PHI workloads and (b) attach
+# contract-level validator_rules that reject a contract which weakens the
+# posture. Unsigned — usable in the default (non-strict) mode; sign it and set
+# FLUID_OVERLAY_STRICT=1 to require verification.
+#
+#   fluid forge --prompt-overlay pii-lockdown
+name: pii-lockdown
+sections:
+  - section: agent_policy
+    mode: append
+    text: |
+      TENANT PII LOCKDOWN (mandatory for this overlay):
+      - Every expose carrying PII/PHI MUST declare policy.agentPolicy with
+        canStore=false, canReason=false, and auditRequired=true.
+      - deniedUseCases MUST include training and fine_tuning.
+      - Never place raw identifiers in binding.location paths or table names.
+validator_rules:
+  - id: no-public-internet-egress
+    forbid_regex: "public[_-]?internet"
+    message: >-
+      Tenant PII policy forbids exposing this product to the public internet.
+      Remove any public_internet destination from the contract.
+  - id: owner-email-required
+    require_field: metadata.owner.email
+    message: >-
+      Tenant PII policy requires metadata.owner.email so data-subject requests
+      have a routable owner.
