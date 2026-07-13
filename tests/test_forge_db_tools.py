@@ -93,8 +93,18 @@ class TestGate:
         by_name = {d["name"]: d for d in defs}
         assert set(by_name) == {TOOL_NAME}
         schema = by_name[TOOL_NAME]["input_schema"]
+        # Canonical arg names are advertised (not the accepted variants).
+        assert set(schema["properties"]) == {"table", "schema", "limit", "connection"}
         assert schema["properties"]["table"]["type"] == "string"
         assert schema["additionalProperties"] is False
+
+    def test_accepts_hallucinated_arg_name_variants(self, tmp_path):
+        # gemini-2.5-flash was observed live to pass table_name/row_limit; the
+        # tool accepts those variants rather than failing the call.
+        env = {**_ON, "FLUID_FORGE_DB_URI": _make_sqlite(tmp_path)}
+        out = dispatch_db_tool(TOOL_NAME, {"table_name": "customers", "row_limit": 2}, env=env)
+        assert out["table"] == "customers"
+        assert out["applied_limit"] == 2
 
 
 # ── get_tool_definitions integration ─────────────────────────────────────────

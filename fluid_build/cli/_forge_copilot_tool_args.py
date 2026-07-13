@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class DiscoverWorkspaceArgs(BaseModel):
@@ -305,16 +305,26 @@ class FetchSampleRowsArgs(BaseModel):
     DSN or secret, so it can't be steered to an arbitrary host.
     """
 
+    # Each field advertises ONE canonical name to the LLM (via
+    # ``serialization_alias`` — what ``model_json_schema`` renders) but ACCEPTS
+    # the common variants a model may hallucinate (via ``AliasChoices``). This
+    # was observed live: gemini-2.5-flash called the tool with ``table_name`` /
+    # ``row_limit`` instead of ``table`` / ``limit``. Rather than fail those
+    # (the corrective-feedback loop would eventually self-heal), we accept them —
+    # the tool stays forgiving of model variance while the schema stays clean.
     table: str = Field(
+        validation_alias=AliasChoices("table", "table_name", "table_id"),
+        serialization_alias="table",
         description=(
             "Bare table name to sample (a SQL identifier: letters, digits, "
             "underscores). Not a dotted or quoted reference — pass the schema "
             "separately via ``schema``."
-        )
+        ),
     )
     schema_name: Optional[str] = Field(
         default=None,
-        alias="schema",
+        validation_alias=AliasChoices("schema", "schema_name", "schema_id"),
+        serialization_alias="schema",
         description=(
             "Optional schema/database qualifier (a SQL identifier). Omit for "
             "sqlite or to use the connection's default schema."
@@ -322,10 +332,14 @@ class FetchSampleRowsArgs(BaseModel):
     )
     limit: int = Field(
         default=10,
+        validation_alias=AliasChoices("limit", "row_limit", "max_rows", "num_rows"),
+        serialization_alias="limit",
         description="Rows to return (default 10, hard max 50). Higher values are clamped.",
     )
     connection: str = Field(
         default="default",
+        validation_alias=AliasChoices("connection", "connection_name", "conn"),
+        serialization_alias="connection",
         description=(
             "Named connection alias (letters/digits/underscore). 'default' reads "
             "FLUID_FORGE_DB_URI; '<name>' reads FLUID_FORGE_DB_URI_<NAME>. The URI "
@@ -333,10 +347,9 @@ class FetchSampleRowsArgs(BaseModel):
         ),
     )
 
-    # ``populate_by_name`` so the tool arg can arrive as either ``schema``
-    # (the LLM-facing name, an alias because ``schema`` shadows a pydantic
-    # internal) or ``schema_name``. ``extra=ignore`` drops unknown top-level
-    # fields so the LLM can't smuggle data past additionalProperties=False.
+    # ``populate_by_name`` so the canonical field name is always accepted too;
+    # ``extra=ignore`` drops unknown top-level fields so the LLM can't smuggle
+    # data past the advertised additionalProperties=False.
     model_config = {"extra": "ignore", "populate_by_name": True}
 
 
