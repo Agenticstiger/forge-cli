@@ -1,0 +1,142 @@
+name: ai_ready
+domain: ai_ready
+description: >-
+  Authors and annotates AI-ready data products — AI/LLM usage governance
+  (allowed models, permitted use-cases, reporting-yes/training-no), PII &
+  sensitivity flags for safe agent access, and embedding-friendly column
+  semantics for vector / RAG output ports.
+
+# Cross-cutting agent: AI-readiness applies to every tier. A raw SDP can be
+# an AI-consumable source, an ADP a governed feature set, a CDP a serving
+# mart for an agent. No product-type filter — the picker stays open.
+supported_data_product_types: []
+
+# Auto-detection keywords — mentioning any of these in the interview nudges
+# Forge toward this agent without an explicit ``--domain ai_ready``.
+keywords:
+  - ai-ready
+  - ai
+  - llm
+  - rag
+  - embedding
+  - embeddings
+  - vector
+  - semantic
+  - agent
+  - copilot
+  - genai
+  - retrieval
+
+questions:
+  - key: ai_use_case
+    question: How will AI / agents consume this data product?
+    type: choice
+    required: true
+    choices:
+      - label: RAG / semantic search (embed + retrieve)
+        value: rag
+        aliases: ["retrieval", "semantic search", "vector search", "embeddings"]
+      - label: Agent tool / MCP output port (structured reads)
+        value: agent_tool
+        aliases: ["agent", "mcp", "tool", "function calling"]
+      - label: Analytics copilot / natural-language querying
+        value: analytics_copilot
+        aliases: ["copilot", "text2sql", "nl query", "ask the data"]
+      - label: ML features / training data
+        value: ml_features
+        aliases: ["features", "feature store", "training", "ml"]
+      - label: Inference / summarization only
+        value: inference
+        aliases: ["summarize", "classify", "inference"]
+  - key: sensitivity_posture
+    question: What is the sensitivity posture for AI access?
+    type: choice
+    required: false
+    default: restricted
+    choices:
+      - label: Open — no personal / regulated data
+        value: open
+        aliases: ["public", "no pii", "open"]
+      - label: Restricted — governed access, reporting yes / training no
+        value: restricted
+        aliases: ["governed", "reporting only", "no training"]
+      - label: Confidential — minimize exposure, ephemeral only
+        value: confidential
+        aliases: ["sensitive", "ephemeral", "minimize"]
+  - key: allowed_models
+    question: >-
+      Which AI models may consume this data? (comma-separated, e.g.
+      gpt-4, claude-3-opus, gemini-pro — leave blank to decide later)
+    type: text
+    required: false
+    default: ""
+
+resolver_defaults:
+  ai_use_case: rag
+  sensitivity_posture: restricted
+  allowed_models: ""
+
+suggestion_defaults:
+  recommended_template: analytics-template
+  recommended_provider: local
+  recommended_patterns: []
+  architecture_suggestions:
+    - Expose an MCP / vector output port so agents read through a governed gate
+    - Attach an agentPolicy (allowed models + permitted use-cases) to every port
+    - Keep embedding-friendly columns (well-described free text) separate from PII
+  best_practices:
+    - Write a description for every port and column — embedding quality tracks description quality
+    - Tag PII / sensitive columns so they are excluded from embeddings and training
+    - Enforce reporting-yes / training-no via deniedUseCases on sensitive ports
+    - Require audit logging for all AI consumption
+  technology_stack: []
+  security_requirements: []
+
+rules:
+  - when:
+      all:
+        - field: ai_use_case
+          equals: rag
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: ["vector_output_port", "semantic_chunking"]
+      - op: append_unique
+        path: architecture_suggestions
+        value: Emit embedding hints on descriptive text columns for the retriever
+  - when:
+      all:
+        - field: ai_use_case
+          equals: agent_tool
+    actions:
+      - op: append_unique
+        path: recommended_patterns
+        value: ["mcp_output_port"]
+      - op: append_unique
+        path: architecture_suggestions
+        value: Gate agent reads through the Fluid MCP output port with sampling caps
+  - when:
+      any:
+        - field: sensitivity_posture
+          equals: restricted
+        - field: sensitivity_posture
+          equals: confidential
+    actions:
+      - op: append_unique
+        path: security_requirements
+        value:
+          - Deny model training and fine-tuning on sensitive ports (reporting yes, training no)
+          - Disable AI-side storage / caching of sensitive data (ephemeral processing only)
+          - Require deletion after use via the agentPolicy retention policy
+
+next_step_tips:
+  - Run `fluid validate` to confirm the AI-ready agentPolicy blocks are well-formed
+  - Review each port's allowedModels — an empty list means no AI access
+
+conditional_next_step_tips:
+  - when:
+      all:
+        - field: ai_use_case
+          equals: rag
+    tips:
+      - Point your vector pipeline at the columns labelled `ai-embeddable: true`
