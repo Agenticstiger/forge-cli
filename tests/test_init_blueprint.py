@@ -83,19 +83,53 @@ def test_detect_mode_routes_blueprint_flag():
     assert init_mod.detect_mode(args, _LOG) == "blueprint"
 
 
-def test_menu_option_5_maps_to_blueprint():
-    class _PromptReturns5:
+def test_blueprints_surface_via_quickstart_starter_catalog():
+    # Consolidation: blueprints are no longer a standalone top-level menu row.
+    # They are first-class Quickstart choices in the unified starter catalog,
+    # alongside the rich customer-360 template.
+    catalog = helpers._starter_catalog()
+    kinds = {(e["kind"], e["target"]) for e in catalog}
+    # The rich local example is the default (first) entry.
+    assert catalog[0]["kind"] == "template"
+    assert catalog[0]["target"] == "customer-360"
+    # Every bundled blueprint is reachable through the picker.
+    assert ("blueprint", "fluid.starter") in kinds
+    assert ("blueprint", "fluid.starter-gcp") in kinds
+    assert ("blueprint", "fluid.starter-snowflake") in kinds
+
+
+def test_quickstart_starter_picker_returns_a_blueprint():
+    # Picking a blueprint row in the second-level starter picker returns
+    # ("blueprint", <id>) so the caller dispatches through blueprint_mode.
+    class _PromptReturns2:
         @staticmethod
         def ask(*_a, **_k):
-            return "5"
+            return "2"  # second catalog entry — the first bundled blueprint
+
+    with (
+        patch.object(helpers, "_rich_available", return_value=True),
+        patch.object(helpers, "_get_console", return_value=MagicMock()),
+        patch.object(helpers, "_get_prompt", return_value=_PromptReturns2),
+    ):
+        kind, target = helpers._ask_starter()
+    assert kind == "blueprint"
+    assert target.startswith("fluid.")
+
+
+def test_menu_option_3_maps_to_blank():
+    # The consolidated top-level menu is Quickstart / AI / Empty (3 rows).
+    class _PromptReturns3:
+        @staticmethod
+        def ask(*_a, **_k):
+            return "3"
 
     with (
         patch.object(helpers, "_rich_available", return_value=True),
         patch.object(helpers, "_get_console", return_value=MagicMock()),
         patch.object(helpers, "_get_panel", return_value=MagicMock()),
-        patch.object(helpers, "_get_prompt", return_value=_PromptReturns5),
+        patch.object(helpers, "_get_prompt", return_value=_PromptReturns3),
     ):
-        assert helpers._ask_creation_mode(ai_available=True) == "blueprint"
+        assert helpers._ask_creation_mode(ai_available=True) == "blank"
 
 
 def test_ask_blueprint_name_returns_a_bundled_id():

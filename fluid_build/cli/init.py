@@ -998,19 +998,33 @@ def detect_mode(args, logger: logging.Logger) -> Optional[str]:
     def _resolve_menu_choice(mode: str) -> str:
         """Normalize menu return values so they match the CLI-flag code paths.
 
-        The menu's 'Quickstart' label is rewritten to
-        ``--template customer-360 --yes`` so it dispatches through
-        ``template_mode`` — same as ``fluid init --quickstart``.
+        The menu's 'Quickstart' row is now a **two-level guided picker**
+        (create-vite framework→variant pattern): the second level
+        (:func:`_ask_starter`) surfaces the unified starter catalog — the rich
+        ``customer-360`` local example PLUS the bundled marketplace blueprints
+        (local starter, daily analytics, GCP, Snowflake) — so blueprints are
+        first-class Quickstart choices instead of a separate menu row. The
+        chosen starter is rewritten to either ``--template <name> --yes``
+        (dispatches through ``template_mode``) or ``--blueprint <id> --yes``
+        (dispatches through ``blueprint_mode``). A scripted / non-TTY run falls
+        back to the classic ``customer-360`` quickstart.
 
-        The menu's 'Start from a template' label triggers a second
-        prompt that asks *which* template the user wants, defaulting to
-        ``customer-360``.  Without that second prompt ``args.template``
-        would stay ``None`` and ``template_mode`` / ``copy_template``
-        would crash trying to concatenate ``Path / None``.
+        The ``template`` / ``blueprint`` branches below are retained for direct
+        callers (and the ``--template`` / ``--blueprint`` flags), so nothing
+        that already depends on those return values hard-breaks.
         """
         if mode == "quickstart":
-            args.template = "customer-360"
+            starter = _ask_starter()
             args.yes = True
+            if starter is not None:
+                kind, target = starter
+                if kind == "blueprint":
+                    args.blueprint = target
+                    return "blueprint"
+                args.template = target or "customer-360"
+                return "template"
+            # Empty catalog / defensive fallback → the classic quickstart.
+            args.template = getattr(args, "template", None) or "customer-360"
             return "template"
         if mode == "template" and not getattr(args, "template", None):
             args.template = _ask_template_name()
@@ -1075,11 +1089,13 @@ from fluid_build.cli._init_interactive_helpers import (  # noqa: E402,F401
     _ask_blueprint_name,
     _ask_creation_mode,
     _ask_industry,
+    _ask_starter,
     _ask_template_name,
     _list_filesystem_templates,
     _print_welcome_panel,
     _print_workspace_products,
     _redirect_existing_workspace,
+    _starter_catalog,
 )
 
 # Mode handlers (demo / blank / template) — physically extracted to
