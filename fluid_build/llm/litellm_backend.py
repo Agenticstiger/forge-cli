@@ -47,6 +47,7 @@ from fluid_build.llm.providers import (
     _record_prompt_cache_from_response,
     _record_streaming_usage,
 )
+from fluid_build.observability.secret_redactor import redact_secret_text
 
 LOG = logging.getLogger("fluid.cli.forge_copilot.litellm")
 
@@ -133,7 +134,7 @@ def _translate_litellm_exception(
     if isinstance(auth_error, type) and isinstance(exc, auth_error):
         return CopilotGenerationError(
             "copilot_llm_auth_failed",
-            f"LLM authentication failed (401): {exc}",
+            f"LLM authentication failed (401): {redact_secret_text(str(exc))}",
             suggestions=[
                 "The API key appears invalid or expired — set a fresh one",
                 "Run `fluid ai setup` to re-enter your key, or `fluid doctor`",
@@ -143,7 +144,7 @@ def _translate_litellm_exception(
     if isinstance(permission_error, type) and isinstance(exc, permission_error):
         return CopilotGenerationError(
             "copilot_llm_permission_denied",
-            f"LLM permission denied (403): {exc}",
+            f"LLM permission denied (403): {redact_secret_text(str(exc))}",
             suggestions=[
                 "The key is valid but lacks access to this model — a new key "
                 "won't help; check the provider account's model entitlements",
@@ -160,7 +161,7 @@ def _translate_litellm_exception(
     )
     return CopilotGenerationError(
         event,
-        f"litellm {label} failed: {exc}",
+        f"litellm {label} failed: {redact_secret_text(str(exc))}",
         suggestions=[
             "Check the API key for the underlying provider is set / valid",
             tail_suggestion,
