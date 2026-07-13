@@ -366,6 +366,46 @@ def test_invoke_blocking_translates_exceptions(monkeypatch):
     assert excinfo.value.event == "copilot_litellm_request_failed"
 
 
+def test_translate_litellm_exception_redacts_credentials_in_message():
+    """Regression: the raw litellm exception text is routed through the secret
+    redactor before being embedded in the user-facing message, so a
+    credential-shaped substring cannot surface verbatim — while the
+    failure-class branch (auth / permission / generic) is preserved."""
+    from fluid_build.llm.litellm_backend import _translate_litellm_exception
+
+    class _Auth(Exception):
+        pass
+
+    class _Perm(Exception):
+        pass
+
+    class _FakeLitellm:
+        AuthenticationError = _Auth
+        PermissionDeniedError = _Perm
+
+    # auth (401) branch — classification preserved, secret scrubbed
+    auth = _translate_litellm_exception(
+        _FakeLitellm, _Auth("401 unauthorized: bad password=hunter2"), streaming=False
+    )
+    assert auth.event == "copilot_llm_auth_failed"
+    assert "hunter2" not in auth.message
+    assert "401" in auth.message  # benign context still visible for debugging
+
+    # permission (403) branch
+    perm = _translate_litellm_exception(
+        _FakeLitellm, _Perm("403 forbidden api_key=sk-topsecret"), streaming=False
+    )
+    assert perm.event == "copilot_llm_permission_denied"
+    assert "sk-topsecret" not in perm.message
+
+    # generic branch (non-auth/permission) — also scrubbed
+    generic = _translate_litellm_exception(
+        _FakeLitellm, RuntimeError("boom password=leaked123"), streaming=True
+    )
+    assert generic.event == "copilot_litellm_streaming_failed"
+    assert "leaked123" not in generic.message
+
+
 # ---------------------------------------------------------------------------
 # invoke_streaming — yields chunks + populates _streaming_usage_state
 # ---------------------------------------------------------------------------

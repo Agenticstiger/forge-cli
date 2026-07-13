@@ -136,72 +136,6 @@ def consume_streaming_usage() -> Optional[Dict[str, int]]:
     return usage
 
 
-def _structured_outputs_enabled() -> bool:
-    """Slice UX-I kill-switch for provider-native JSON enforcement.
-
-    Set ``FLUID_LLM_STRUCTURED_OUTPUTS=0`` to disable structured
-    outputs across all providers and fall back to the legacy
-    text-JSON + ``extract_json_object`` pipeline.  Intended as a
-    break-glass escape for users on models that silently reject the
-    new response-format directives.
-    """
-    value = os.environ.get("FLUID_LLM_STRUCTURED_OUTPUTS", "1").strip().lower()
-    return value not in {"0", "false", "no", "off"}
-
-
-# ---------------------------------------------------------------------------
-# Determinism controls
-# ---------------------------------------------------------------------------
-
-# The legacy ``_OPENAI_SEED = 42`` constant was deleted with the
-# native ``OpenAIProvider.build_request`` it served. Determinism is
-# now requested via ``litellm.completion(temperature=0)`` plus
-# ``seed=42`` when the underlying provider supports it; litellm passes
-# ``seed`` through to OpenAI / Bedrock and silently ignores it
-# elsewhere, which is exactly the behaviour we used to hand-roll.
-
-
-def _get_temperature() -> float:
-    """Return the LLM sampling temperature.
-
-    Defaults to ``0.0`` (fully deterministic) which is appropriate for
-    structured-JSON contract generation.  Override with
-    ``FLUID_LLM_TEMPERATURE`` for experimentation.
-    """
-    raw = os.environ.get("FLUID_LLM_TEMPERATURE", "0.0")
-    try:
-        return max(0.0, min(2.0, float(raw)))
-    except ValueError:
-        return 0.0
-
-
-# Anthropic deprecated the ``temperature`` parameter on newer models
-# (opus-4-7 onward, plus reasoning-style models). Sending it produces
-# ``400 invalid_request_error: 'temperature' is deprecated for this
-# model.`` Detection is by model-name prefix because Anthropic doesn't
-# advertise this as a structured capability flag — the API just
-# rejects the request. Update this set as more models join.
-_ANTHROPIC_TEMPERATURE_DEPRECATED_PREFIXES = (
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-opus-5",
-)
-
-
-def _model_deprecates_temperature(model: str) -> bool:
-    """Return True when the Anthropic model rejects ``temperature``.
-
-    Used by :class:`AnthropicProvider.build_request` to skip the
-    field for models in the deprecated set. Conservative — defaults
-    to False (still send temperature) for unknown models so older
-    Sonnet / Haiku continue to work.
-    """
-    if not model:
-        return False
-    lowered = model.strip().lower()
-    return any(lowered.startswith(prefix) for prefix in _ANTHROPIC_TEMPERATURE_DEPRECATED_PREFIXES)
-
-
 def _get_timeout_seconds(args: Any, env: Mapping[str, str]) -> int:
     raw = getattr(args, "llm_timeout_seconds", None) or env.get("FLUID_LLM_TIMEOUT_SECONDS")
     if raw in (None, ""):
@@ -500,15 +434,6 @@ class LlmProvider(ABC):
         for tool results differs between OpenAI/Anthropic/Gemini.
         """
         raise NotImplementedError(f"Provider {self.name} does not support tool result messages")
-
-
-@dataclass
-class ToolCall:
-    """A parsed tool call from an LLM response."""
-
-    id: str
-    name: str
-    arguments: Dict[str, Any]
 
 
 def _sync_provider_defaults_from_catalog() -> None:
@@ -1416,12 +1341,6 @@ def reset_llm_caches() -> None:
         reset_plugin_registry()
     except Exception:  # noqa: BLE001 - cache reset must never raise
         pass
-
-
-def _redact_endpoint_text(endpoint: Any) -> str:
-    if not endpoint:
-        return ""
-    return LlmConfig(provider="", model="", endpoint=str(endpoint), api_key=None).redacted_endpoint
 
 
 # ---------------------------------------------------------------------------
