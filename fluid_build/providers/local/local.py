@@ -37,7 +37,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fluid_build.providers._sql_safety import validate_ident
+from fluid_build.providers._sql_safety import quote_string_literal, validate_ident
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderMetadata
 
 from .util.logging import (
@@ -754,21 +754,27 @@ class LocalProvider(BaseProvider):
             delim = "," if (fmt != "tsv" and path.suffix.lower() != ".tsv") else "\t"
             opt = {"AUTO_DETECT": True, "DELIM": delim}
             opt.update({k.upper(): v for k, v in (options or {}).items()})
+            # The option KEY is a DuckDB named-parameter name interpolated as
+            # ``KEY:=value``. ``options`` is contract-supplied, so route each
+            # key through ``validate_ident`` (allowlist ``^[A-Za-z_]\w*$``,
+            # returns simple identifiers unchanged) to reject DDL smuggled via
+            # a key — the value already routes through ``quote_string_literal``.
             opt_sql = ", ".join(
-                f"{k}:={json.dumps(v) if not isinstance(v, str) else repr(v)}"
+                f"{validate_ident(k)}:="
+                f"{json.dumps(v) if not isinstance(v, str) else quote_string_literal(v)}"
                 for k, v in opt.items()
             )
             con.execute(
-                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_csv_auto({repr(str(path))}, {opt_sql});"
+                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_csv_auto({quote_string_literal(str(path))}, {opt_sql});"
             )
         elif fmt in {"parquet", "pq"} or path.suffix.lower() == ".parquet":
             con.execute(
-                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_parquet({repr(str(path))});"
+                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_parquet({quote_string_literal(str(path))});"
             )
         else:
             # try csv auto as fallback
             con.execute(
-                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_csv_auto({repr(str(path))});"
+                f"CREATE OR REPLACE VIEW {validate_ident(table)} AS SELECT * FROM read_csv_auto({quote_string_literal(str(path))});"
             )
 
     # ------------------ COPY / materialize (helper) --------------------- #

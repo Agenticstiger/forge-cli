@@ -44,7 +44,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from fluid_build.providers._sql_safety import validate_ident, validate_sql_expression_allowlist
+from fluid_build.providers._sql_safety import (
+    quote_string_literal,
+    validate_ident,
+    validate_sql_expression_allowlist,
+)
 
 from .base import (
     DriverDescriptor,
@@ -236,9 +240,9 @@ class DuckDBDriver(EngineDriver):
                     f"DuckDB driver does not auto-load files with extension {extension!r}; "
                     "supported: .csv, .parquet, .json"
                 )
-            literal = self._path.as_posix().replace("'", "''")
+            literal = quote_string_literal(self._path.as_posix())
             connection.execute(
-                f"CREATE OR REPLACE VIEW {self._table} AS " f"SELECT * FROM {read_fn}('{literal}')"
+                f"CREATE OR REPLACE VIEW {self._table} AS " f"SELECT * FROM {read_fn}({literal})"
             )
         # Future: handle ``attach`` paths once the schema for them
         # solidifies; today they are accepted but ignored to keep the
