@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Provider-agnostic "thinking" UX for staged LLM calls.
+"""Provider-agnostic "thinking" UX for staged LLM calls (tier-0 shared leaf).
+
+This module is a **tier-0 shared leaf** — stdlib-only (``rich`` is imported
+lazily inside the render path, degrading to a silent no-op when absent), with
+no ``fluid_build.*`` upstreams. It sits below both ``cli`` and ``copilot`` so
+``copilot.agents.base`` can wrap its staged LLM calls in the status panel
+without importing anything under ``cli`` (the ``copilot -> cli`` edge that the
+``[tool.importlinter]`` contracts forbid). The public home used to be
+``fluid_build.cli.progress``; that module is now a backwards-compat re-export
+shim.
 
 The staged pipeline issues several LLM requests in sequence (modeler →
 builder → readme → transformation → validator). Each request can take

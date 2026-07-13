@@ -397,51 +397,17 @@ def guidance_cache_token() -> str:
     return f"{_ACTIVE_PROFILE or ''}:{_ACTIVE_DOMAIN or ''}:{digest}"
 
 
-def _load_agent_voices() -> Mapping[str, str]:
-    """Load per-agent voice fragments under ``_defaults/agent_voice/``.
-
-    Phase 3.9 — splits the single shared system-prompt voice into one
-    yaml file per agent so each stage's role identity ("you are the
-    FLUID LogicalAgent — a senior data modeller …") lives next to the
-    other prompt fragments. Loaded once at module import; missing /
-    malformed files fall back to empty strings so the wiring is
-    additive and a partial install can't crash the CLI.
-
-    Keys are agent stage names (``logical``, ``builder``,
-    ``transformation``, ``readme``, ``validator``, ``critic``,
-    ``contract_forge``). Callers compose these on top of their
-    existing system prompt via :func:`agent_voice` below.
-    """
-    voices: dict[str, str] = {}
-    voice_dir = _DEFAULTS_DIR / "agent_voice"
-    if not voice_dir.is_dir():
-        return voices
-    for path in sorted(voice_dir.glob("*.yaml")):
-        try:
-            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
-            continue
-        if not isinstance(raw, Mapping):
-            continue
-        text = raw.get("system_prompt")
-        if isinstance(text, str):
-            voices[path.stem] = text.rstrip() + "\n"
-    return voices
-
-
-_AGENT_VOICES: Mapping[str, str] = _load_agent_voices()
-
-
-def agent_voice(stage: str) -> str:
-    """Return the per-agent voice fragment for ``stage`` (or "" if none).
-
-    Phase 3.9 public surface. Agents that want their per-stage voice
-    auto-prepended to the system prompt call this and concatenate
-    the result. Empty string when the stage doesn't have a voice
-    file — keeps callers from crashing on unrecognised stage names.
-    """
-    return _AGENT_VOICES.get((stage or "").strip().lower(), "")
-
+# Per-agent "voice" fragments moved to the tier-0 shared leaf
+# ``fluid_build._agent_voice`` so ``copilot.agents.base`` can prepend a
+# stage's voice without importing this ``cli`` module (the ``copilot -> cli``
+# edge the ``[tool.importlinter]`` contracts forbid). Re-exported here under the
+# same names so existing call sites and test patches on
+# ``fluid_build.cli.forge_copilot_prompts.<name>`` keep resolving.
+from fluid_build._agent_voice import (  # noqa: E402,F401
+    _AGENT_VOICES,
+    _load_agent_voices,
+    agent_voice,
+)
 
 _AUXILIARY_PROMPT_NAMES = frozenset({"clarification", "evaluation"})
 # ``MappingProxyType`` makes the auxiliary prompt map actually immutable post-import,

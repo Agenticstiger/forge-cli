@@ -314,7 +314,7 @@ class BaseStageAgent:
         baked into the agent class. No-op when the stage has no
         voice file (additive wiring; partial installs don't crash).
         """
-        from fluid_build.cli.forge_copilot_prompts import agent_voice
+        from fluid_build._agent_voice import agent_voice
 
         voice = agent_voice(self.stage)
         if voice and not system_prompt.startswith(voice):
@@ -460,7 +460,7 @@ class BaseStageAgent:
         # silent prompt. The panel self-disables on non-TTY, ``FLUID_QUIET``,
         # or when rich is unavailable — import locally so we don't pay for
         # rich on every import of this module.
-        from fluid_build.cli.progress import AgentStatus
+        from fluid_build._agent_progress import AgentStatus
 
         # Item 2 + Item 3 — streaming auto-detect.
         # An explicit capability flag wins; otherwise default to ON
