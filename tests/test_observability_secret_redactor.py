@@ -565,11 +565,11 @@ class TestGlobalRedactionSymmetryGaps:
 
     # -- Cross-layer symmetry: the two layers must not drift ---------------
     def test_gaps_symmetric_with_snowflake_twin(self):
+        from fluid_build.observability.secret_redactor import redact_value
         from fluid_build.providers.snowflake.util.logging import (
             redact_dict,
             redact_string,
         )
-        from fluid_build.observability.secret_redactor import redact_value
 
         for line, secret in [
             ("passphrase=SuperSecret123", "SuperSecret123"),
