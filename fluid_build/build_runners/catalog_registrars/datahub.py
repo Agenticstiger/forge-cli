@@ -57,9 +57,10 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from fluid_build.api.catalog import CatalogRegistrar, RegistrationResult
 from fluid_build.api.catalog_publication import (
@@ -68,7 +69,24 @@ from fluid_build.api.catalog_publication import (
     ColumnPayload,
 )
 
+from ._http_retry import RetryPolicy, run_with_retry
+
 LOG = logging.getLogger("fluid.acquire.catalog.datahub")
+
+_T = TypeVar("_T")
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read a positive int from the environment, falling back to
+    *default* on absence or a malformed / non-positive value."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 1 else default
 
 
 @dataclass
@@ -85,6 +103,20 @@ class DataHubRegistrar(CatalogRegistrar):
     # multi-KB YAML blobs in ``customProperties``. Set via env var
     # ``FLUID_CATALOG_DATAHUB_SPEC_BASE_URL``.
     spec_source_base_url: Optional[str] = None
+    # Transient-failure resilience. Every GMS call (snapshot ingest,
+    # MCP ingestProposal, soft-delete) is wrapped in bounded
+    # exponential-backoff retry so a rolling restart / 503 / 429 blip
+    # self-heals instead of failing the publish. Defaults mirror
+    # DataHub's own ``DatahubRestEmitter`` (4 total attempts, retry on
+    # 429 + 5xx). ``retry_max_attempts`` honours
+    # ``FLUID_CATALOG_DATAHUB_MAX_RETRIES`` at instantiation so every
+    # construction path (factory, ``build_registrar``, direct) picks it
+    # up; set it to ``1`` to disable retries. See ``_http_retry``.
+    retry_max_attempts: int = field(
+        default_factory=lambda: _env_int("FLUID_CATALOG_DATAHUB_MAX_RETRIES", 4)
+    )
+    retry_base_delay: float = 0.5
+    retry_max_delay: float = 30.0
     # Capability cache: set on first publish. ``None`` means "untested";
     # ``True`` means the server accepted structured-property definitions
     # at bootstrap; ``False`` means the server is too old and we should
@@ -557,6 +589,30 @@ class DataHubRegistrar(CatalogRegistrar):
             headers["Authorization"] = f"Bearer {self.api_token}"
         return headers
 
+    def _retry_policy(self) -> "RetryPolicy":
+        """Build the per-call retry policy from this registrar's config."""
+        return RetryPolicy(
+            max_attempts=max(1, self.retry_max_attempts),
+            base_delay=self.retry_base_delay,
+            max_delay=self.retry_max_delay,
+        )
+
+    def _with_retry(self, operation: Callable[[], _T], *, description: str) -> _T:
+        """Run a GMS HTTP operation under bounded backoff retry.
+
+        Transient failures (429 / 5xx / connection blips) self-heal;
+        a non-transient error (4xx, bad payload) re-raises on the first
+        attempt. Either way the *original* exception propagates to the
+        registrar's ``try/except`` — which turns it into a clean
+        ``succeeded=False`` result, never a pipeline crash.
+        """
+        return run_with_retry(
+            operation,
+            policy=self._retry_policy(),
+            logger=LOG,
+            description=description,
+        )
+
     def _post_snapshot(self, envelope: Dict[str, Any]) -> None:
         """POST a legacy Snapshot envelope to ``/entities?action=ingest``.
         Used for Dataset entities — DataHub still accepts the snapshot
@@ -564,13 +620,16 @@ class DataHubRegistrar(CatalogRegistrar):
         (they have no DataProductSnapshot / DomainSnapshot models)."""
         from fluid_build.util.safe_http import safe_httpx_client
 
-        with safe_httpx_client(
-            base_url=self.base_url,
-            timeout=float(self.timeout_seconds),
-            allow_private=True,
-        ) as c:
-            r = c.post("/entities?action=ingest", json=envelope, headers=self._headers())
-            r.raise_for_status()
+        def _op() -> None:
+            with safe_httpx_client(
+                base_url=self.base_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
+                r = c.post("/entities?action=ingest", json=envelope, headers=self._headers())
+                r.raise_for_status()
+
+        self._with_retry(_op, description="snapshot ingest")
 
     def _post_mcp(
         self,
@@ -602,24 +661,31 @@ class DataHubRegistrar(CatalogRegistrar):
                 },
             }
         }
-        with safe_httpx_client(
-            base_url=self.base_url,
-            timeout=float(self.timeout_seconds),
-            allow_private=True,
-        ) as c:
-            r = c.post("/aspects?action=ingestProposal", json=payload, headers=self._headers())
-            r.raise_for_status()
+
+        def _op() -> None:
+            with safe_httpx_client(
+                base_url=self.base_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
+                r = c.post("/aspects?action=ingestProposal", json=payload, headers=self._headers())
+                r.raise_for_status()
+
+        self._with_retry(_op, description=f"mcp {entity_type}/{aspect_name}")
 
     def _post_delete(self, urn: str) -> None:
         from fluid_build.util.safe_http import safe_httpx_client
 
-        with safe_httpx_client(
-            base_url=self.base_url,
-            timeout=float(self.timeout_seconds),
-            allow_private=True,
-        ) as c:
-            r = c.post("/entities?action=delete", json={"urn": urn}, headers=self._headers())
-            r.raise_for_status()
+        def _op() -> None:
+            with safe_httpx_client(
+                base_url=self.base_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
+                r = c.post("/entities?action=delete", json={"urn": urn}, headers=self._headers())
+                r.raise_for_status()
+
+        self._with_retry(_op, description="soft-delete")
 
     # ── URN builders ──────────────────────────────────────────────────
 
