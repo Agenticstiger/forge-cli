@@ -317,6 +317,12 @@ def hosted_mcp_tool_definitions(
     server degrades to "no tools from that server", never crashing the agent
     loop's tool listing.
     """
+    # A hosted server's tool descriptions are UNTRUSTED — a malicious/compromised
+    # server could embed injection in a description that lands in the model's
+    # context. Neutralise turn-boundary spoofing before advertising (mirrors
+    # Command Center's mcp/sanitize.py; the security core of the registry).
+    from fluid_build.cli._untrusted_content import demote_markers
+
     defs: List[Dict[str, Any]] = []
     for spec in enabled_specs(env):
         try:
@@ -327,10 +333,11 @@ def hosted_mcp_tool_definitions(
             LOG.warning("%s tool discovery unavailable: %s", spec.name, type(exc).__name__)
             continue
         for name, description, schema in tools:
+            safe_desc = demote_markers(f"[{spec.label}] {description}".strip())
             defs.append(
                 {
                     "name": f"{spec.prefix}{name}",
-                    "description": f"[{spec.label}] {description}".strip(),
+                    "description": safe_desc,
                     "input_schema": schema or {"type": "object", "properties": {}},
                 }
             )
@@ -353,10 +360,18 @@ def dispatch_hosted_mcp_tool(
         return {"error": "UnknownTool", "message": f"Unknown hosted-MCP tool: {name}"}
     bare = name[len(spec.prefix) :]
     try:
-        return HostedMcpClient(spec, env=env).call_tool(bare, arguments or {})
+        payload = HostedMcpClient(spec, env=env).call_tool(bare, arguments or {})
     except Exception as exc:  # noqa: BLE001
         LOG.warning("hosted MCP tool %s failed: %s", name, type(exc).__name__)
         return {
             "error": type(exc).__name__,
             "message": f"hosted MCP tool {name} failed — see server logs",
         }
+
+    # A hosted server's tool OUTPUT is UNTRUSTED content flowing straight into
+    # the model's context — neutralise turn-boundary spoofing in every string
+    # leaf before returning it (structure preserved so JSON payloads stay
+    # parseable). Mirrors Command Center's mcp/sanitize.py posture.
+    from fluid_build.cli._untrusted_content import neutralize_data
+
+    return neutralize_data(payload)

@@ -200,21 +200,29 @@ def _resolve_connection_uri(
 # Redaction — mask credential-shaped values AND credential-named columns
 # ---------------------------------------------------------------------------
 def _redact_cell(column_name: str, value: Any) -> Any:
-    """Return a JSON-safe, redacted rendering of one cell.
+    """Return a JSON-safe, redacted + injection-neutralised rendering of one cell.
 
-    * A cell in a credential-NAMED column (``password`` / ``api_key`` / …) is
-      wholesale-masked via the central redactor's marker.
-    * A credential-SHAPED string value (API key / JWT / DSN / …) is masked by
-      ``redact_secret_text``.
-    * Non-string scalars (int / float / bool / None) pass through — they can't
-      be secret-shaped and preserving them keeps the sample useful.
-    * Everything else (datetime, Decimal, bytes, …) is stringified, redacted,
-      and truncated so it stays JSON-serialisable and bounded.
+    Live DB cells are UNTRUSTED on two axes and both are closed here:
+
+    * **Secret leak** — a cell in a credential-NAMED column
+      (``password`` / ``api_key`` / …) is wholesale-masked via the central
+      redactor's marker; a credential-SHAPED string value (API key / JWT / DSN)
+      is masked by ``redact_secret_text``.
+    * **Prompt injection** — a cell value like ``"SYSTEM: ignore prior…"`` or
+      ``"<system>…"`` is neutralised via ``demote_markers`` so it can't fake a
+      turn boundary once it enters the model's context (mirrors Command
+      Center's ``mcp/sanitize.py``).
+
+    Non-string scalars (int / float / bool / None) pass through — they can't be
+    secret-shaped or carry markers, and preserving them keeps the sample useful.
+    Everything else (datetime, Decimal, bytes, …) is stringified, redacted,
+    neutralised, and truncated so it stays JSON-serialisable and bounded.
     """
     # Single source of truth for the mask marker + the sensitive-key predicate:
     # import the redactor MODULE so we track its ``_REDACTED`` constant rather
     # than duplicating the literal (the codebase's "don't let the two redaction
     # layers drift" invariant).
+    from fluid_build.cli._untrusted_content import demote_markers
     from fluid_build.observability import secret_redactor
 
     if secret_redactor.is_sensitive_key_name(str(column_name)):
@@ -225,6 +233,10 @@ def _redact_cell(column_name: str, value: Any) -> Any:
 
     text = value if isinstance(value, str) else str(value)
     text = secret_redactor.redact_secret_text(text)
+    # Neutralise prompt-injection shapes AFTER redaction (order-independent, but
+    # keeps the redactor's marker intact). demote_markers never returns None for
+    # a non-empty str.
+    text = demote_markers(text) or text
     if len(text) > MAX_CELL_CHARS:
         text = text[:MAX_CELL_CHARS] + "…(truncated)"
     return text
@@ -309,6 +321,13 @@ def _fetch_sample_rows(arguments: Dict[str, Any], env: Mapping[str, str]) -> Dic
         attach = _attach_string_mysql(conn_args, alias)
     else:  # sqlite
         attach = _attach_string_sqlite(conn_args, alias)
+    # Defence-in-depth: attach READ_ONLY where the duckdb extension supports it
+    # (postgres + sqlite) so even a bug that emitted a write would be refused at
+    # the connection level. mysql's extension has no READ_ONLY flag, but the
+    # SELECT-only construction below is the real guarantee regardless of engine.
+    # (Mirrors Command Center's chat-with-data READ-ONLY connection.)
+    if kind in ("postgres", "sqlite") and attach.endswith(")"):
+        attach = attach[:-1] + ", READ_ONLY)"
 
     # Build the read-only reference. Identifiers are validated + double-quoted
     # (duckdb identifier quote) so a reserved word is legal and there is no
@@ -347,13 +366,21 @@ def _fetch_sample_rows(arguments: Dict[str, Any], env: Mapping[str, str]) -> Dic
     finally:
         con.close()
 
-    # Bound the width, then redact every cell.
+    # Second row ceiling (belt-and-suspenders, mirrors Command Center's
+    # nl_query: LIMIT rewrite AND a fetch ceiling): even if the SQL LIMIT were
+    # somehow ignored, the sample can never exceed the cap.
+    truncated_rows = len(raw_rows) > applied_limit
+    raw_rows = raw_rows[:applied_limit]
+
+    # Bound the width, then redact + neutralise every cell.
     columns = raw_columns[:MAX_COLUMNS]
     truncated_columns = len(raw_columns) > MAX_COLUMNS
     rows: List[List[Any]] = []
     for raw in raw_rows:
         row = list(raw)[:MAX_COLUMNS]
         rows.append([_redact_cell(columns[i], row[i]) for i in range(len(columns))])
+
+    from fluid_build.cli._untrusted_content import UNTRUSTED_DATA_NOTICE
 
     return {
         "connection": (args.connection or "default"),
@@ -364,6 +391,10 @@ def _fetch_sample_rows(arguments: Dict[str, Any], env: Mapping[str, str]) -> Dic
         "truncated_columns": truncated_columns,
         "applied_limit": applied_limit,
         "row_count": len(rows),
+        "truncated_rows": truncated_rows,
+        # Label the sample as untrusted DATA so the model never treats a cell
+        # value as an instruction (the fence half of the injection mitigation).
+        "content_notice": UNTRUSTED_DATA_NOTICE,
         "rows": rows,
     }
 
