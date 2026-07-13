@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 __all__ = [
-    "gather_copilot_context",
     "get_cli_arg",
     "get_target_directory",
     "handle_memory_management",
@@ -34,14 +33,11 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Type
 import yaml
 
 from fluid_build.cli.console import cprint, success, warning
-from fluid_build.cli.forge_copilot_interview import InterviewQuestion
 from fluid_build.cli.forge_copilot_memory import (
     CopilotMemoryStore,
     resolve_copilot_memory_root,
     summarize_copilot_memory,
 )
-from fluid_build.cli.forge_copilot_taxonomy import normalize_copilot_context
-from fluid_build.cli.forge_dialogs import ask_dialog_question
 from fluid_build.cli.forge_ui import show_lines_panel
 
 try:
@@ -431,97 +427,6 @@ def _format_tier_values(source: str, values: Mapping[str, Any]) -> List[str]:
     for k, v in list(values.items())[:8]:
         _push(k, v)
     return out
-
-
-def gather_copilot_context(copilot: Any, console: Any) -> Dict[str, Any]:
-    """Gather context through interactive questioning."""
-    context: Dict[str, Any] = {}
-    dialog_transcript: List[Dict[str, Any]] = []
-    raw_answers: Dict[str, str] = {}
-
-    if not console or not RICH_AVAILABLE:
-        return context
-
-    try:
-        questions = copilot.get_questions()
-
-        for question_def in questions:
-            key = question_def["key"]
-            follow_up = question_def.get("follow_up")
-            question = InterviewQuestion.from_payload(question_def)
-            result = ask_dialog_question(console, question)
-
-            if result.context_patch:
-                context.update(result.context_patch)
-            elif result.value is not None:
-                context[key] = result.value
-            if result.raw_input:
-                raw_answers[key] = result.raw_input
-            if result.raw_input or result.value is not None:
-                dialog_transcript.append(
-                    {
-                        "role": "user",
-                        "field": key,
-                        "question_id": question.id,
-                        "content": result.raw_input or str(result.value or "").strip(),
-                        "raw_input": result.raw_input,
-                        "resolved_value": result.value,
-                        "resolution_status": result.resolution_status,
-                    }
-                )
-
-            answer = context.get(key)
-            if (
-                follow_up
-                and answer
-                and answer == follow_up.get("trigger_value")
-                and follow_up.get("key")
-                and follow_up.get("question")
-                and not context.get(follow_up["key"])
-            ):
-                follow_up_result = ask_dialog_question(
-                    console,
-                    InterviewQuestion.from_payload(
-                        {
-                            "id": follow_up["key"],
-                            "field": follow_up["key"],
-                            "prompt": follow_up["question"],
-                            "type": "text",
-                            "required": False,
-                            "default": follow_up.get("default"),
-                        }
-                    ),
-                )
-                if follow_up_result.value:
-                    context[follow_up["key"]] = follow_up_result.value
-                if follow_up_result.raw_input:
-                    raw_answers[follow_up["key"]] = follow_up_result.raw_input
-                    dialog_transcript.append(
-                        {
-                            "role": "user",
-                            "field": follow_up["key"],
-                            "question_id": follow_up["key"],
-                            "content": follow_up_result.raw_input,
-                            "raw_input": follow_up_result.raw_input,
-                            "resolved_value": follow_up_result.value,
-                            "resolution_status": follow_up_result.resolution_status,
-                        }
-                    )
-
-        context = normalize_copilot_context(context)
-        if dialog_transcript:
-            context["dialog_transcript"] = dialog_transcript
-        if raw_answers:
-            context["raw_answers"] = raw_answers
-    except Exception:
-        context = {
-            "project_goal": "Data Product",
-            "data_sources": "Various sources",
-            "use_case": "analytics",
-            "complexity": "intermediate",
-        }
-
-    return context
 
 
 def load_context(
