@@ -28,6 +28,11 @@ What this pins:
   (``DATAHUB_GMS_URL``) flows through ``FluidConfig`` →
   ``apply_env_overrides`` to the registrar exactly like a YAML config
   block would.
+* Resilience: an unreachable GMS degrades to a clean
+  ``succeeded=False`` result over a real socket rather than crashing
+  the publish stage (``TestResilienceLive``) — the end-to-end
+  counterpart to the respx-mocked retry unit tests in
+  ``tests/build_runners/test_catalog_datahub_resilience.py``.
 
 Gating: marked ``integration`` + ``emulated_heavy``; self-skips when
 ``DATAHUB_GMS_URL`` is unset so the test never runs in light suites.
@@ -415,3 +420,48 @@ class TestEnvVarResolutionLive:
             _gms_wait_for_urn(urn)
         finally:
             _gms_delete(urn)
+
+
+# ---------------------------------------------------------------------------
+# Resilience — the sink degrades cleanly when GMS is unreachable
+# ---------------------------------------------------------------------------
+
+
+class TestResilienceLive:
+    """The registrar is a *metadata sink*: a GMS outage must degrade to a
+    clean ``succeeded=False`` result, never an exception that could crash
+    the publish stage. This drives the REAL registrar over a REAL socket
+    (a closed localhost port → connection refused), complementing the
+    respx-mocked ``tests/build_runners/test_catalog_datahub_resilience.py``
+    unit path with an end-to-end proof against an actual transport."""
+
+    def test_unreachable_gms_returns_clean_failure_without_raising(self):
+        import time as _time
+
+        from fluid_build.api.catalog_publication import CatalogPublicationPayload
+        from fluid_build.build_runners.catalog_registrars.datahub import (
+            DataHubRegistrar,
+        )
+
+        # Port 1 is (practically) never listening → immediate connection
+        # refused. Tight budget + zero backoff so a real outage can't
+        # stall the pipeline; two attempts prove the retry loop still
+        # terminates and hands back a failed result.
+        registrar = DataHubRegistrar(
+            base_url="http://127.0.0.1:1",
+            timeout_seconds=2,
+            retry_max_attempts=2,
+            retry_base_delay=0.0,
+            retry_max_delay=0.0,
+        )
+        payload = CatalogPublicationPayload.from_contract(_contract("test.resilience.dead"), {})
+
+        start = _time.time()
+        result = registrar.register_payload(payload)  # must NOT raise
+        elapsed = _time.time() - start
+
+        assert result.succeeded is False
+        assert result.error  # carries the transport failure reason
+        # Bounded: zero backoff + a couple of fast connection-refused
+        # round trips should be well under the per-call timeout budget.
+        assert elapsed < 20.0
