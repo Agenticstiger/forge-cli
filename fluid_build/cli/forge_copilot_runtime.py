@@ -1008,6 +1008,48 @@ def generate_copilot_artifacts(
                     # Same loud-fail rationale as the seed guard above.
                     logger.warning("structural_seed_roundtrip_guarantee_failed: %s", exc)
 
+        # Semantic-drift guard (opt-in via FLUID_FORGE_DRIFT_GUARD). Compare the
+        # LLM-authored contract's schema against a baseline — the PRIOR contract
+        # (``--refine`` seed) or the discovered SOURCE schema — and, when the
+        # model has silently dropped/renamed/retyped a ground-truth column, feed
+        # a forceful corrective message into the repair loop by prepending it to
+        # validation_errors (mirrors the structural_seed guard above). Skipped
+        # when a --seed-from structural seed is active (that guard already
+        # enforces schema fidelity) and always fail-open so it can never block a
+        # generation on its own bug.
+        try:
+            from fluid_build.cli.forge_copilot_drift_guard import (
+                detect_authoring_drift,
+                drift_guard_enabled,
+            )
+
+            if drift_guard_enabled() and structural_seed is None:
+                drift_report = detect_authoring_drift(
+                    context, discovery_report, normalized.get("contract") or {}
+                )
+                if drift_report is not None and drift_report.has_drift:
+                    from fluid_build.cli.forge_copilot_corrective_feedback import (
+                        build_semantic_drift_message,
+                    )
+
+                    drift_msg = build_semantic_drift_message(
+                        [d.to_dict() for d in drift_report.drifts],
+                        baseline_kind=drift_report.baseline_kind,
+                    )
+                    if drift_msg.get("content"):
+                        validation_errors = [drift_msg["content"]] + list(validation_errors)
+                        if logger:
+                            logger.info(
+                                "semantic_drift_guard: %d drift(s) vs %s on attempt %d/%d",
+                                len(drift_report.drifts),
+                                drift_report.baseline_kind,
+                                attempt_index,
+                                max_attempts,
+                            )
+        except Exception as exc:  # noqa: BLE001 — never block generation on the guard
+            if logger:
+                logger.debug("semantic_drift_guard_failed: %s", exc)
+
         report.validation_errors = validation_errors
         report.validation_warnings = validation_warnings
 
