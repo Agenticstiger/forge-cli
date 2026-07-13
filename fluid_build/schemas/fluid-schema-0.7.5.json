@@ -1496,6 +1496,30 @@
           "type": "string",
           "description": "NEW in v0.7.5: Confluent Cloud Kafka cluster id (lkc-xxxxx) the Tableflow topic belongs to."
         },
+        "stream": {
+          "type": "string",
+          "description": "NEW in v0.7.5: AWS Kinesis Data Stream name — maps to aws_kinesis_stream in the streaming IaC emitter."
+        },
+        "namespace": {
+          "type": "string",
+          "description": "NEW in v0.7.5: Amazon Redshift Serverless namespace name — maps to aws_redshiftserverless_namespace."
+        },
+        "workgroup": {
+          "type": "string",
+          "description": "NEW in v0.7.5: Amazon Redshift Serverless workgroup name — maps to aws_redshiftserverless_workgroup."
+        },
+        "iam_role_arn": {
+          "type": "string",
+          "description": "NEW in v0.7.5: ARN of the IAM role attached to the Redshift Serverless namespace / used by the redshift-data CREATE EXTERNAL SCHEMA bridge."
+        },
+        "external_schema": {
+          "type": "string",
+          "description": "NEW in v0.7.5: Redshift external (Spectrum) schema name created over a Glue database via the redshift-data CREATE EXTERNAL SCHEMA bridge."
+        },
+        "glue_database": {
+          "type": "string",
+          "description": "NEW in v0.7.5: Glue Data Catalog database that backs the Redshift external schema."
+        },
         "confluent_role_arn": {
           "type": "string",
           "description": "NEW in v0.7.5: ARN of the pre-created AWS IAM role Confluent Tableflow assumes (byob_aws). Its trust policy is updated post-apply with the provider integration's external_id (two-phase IAM)."

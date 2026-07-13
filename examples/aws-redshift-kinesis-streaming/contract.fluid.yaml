@@ -1,0 +1,106 @@
+fluidVersion: "0.7.5"
+kind: DataProduct
+id: analytics.events.realtime
+name: Realtime Events (Kinesis + Redshift Serverless)
+description: Streaming event ingest via Kinesis Data Streams, served from Amazon Redshift Serverless with a Glue-backed external schema
+domain: Analytics
+
+tags:
+  - streaming
+  - kinesis
+  - redshift-serverless
+  - aws
+
+labels:
+  team: platform-data
+  platform: aws
+
+metadata:
+  layer: Silver
+  owner:
+    team: platform-data
+    email: platform-data@example.com
+
+exposes:
+  # ─── Kinesis Data Stream (ingest plane) ───────────────────────────
+  # location.stream → aws_kinesis_stream in the IaC emitter.
+  - exposeId: events-stream
+    title: Raw Event Stream
+    version: "1.0.0"
+    kind: table
+    binding:
+      platform: aws
+      format: parquet
+      location:
+        stream: acme-realtime-events
+        region: us-east-1
+    contract:
+      schema:
+        - name: event_id
+          type: string
+          required: true
+          description: Unique event identifier
+        - name: event_time
+          type: timestamp
+          required: true
+          description: Event timestamp (UTC)
+        - name: payload
+          type: string
+          required: false
+          description: Raw JSON event body
+
+  # ─── Redshift Serverless (serving plane) ──────────────────────────
+  # location.namespace + workgroup + iam_role_arn →
+  # aws_redshiftserverless_namespace + aws_redshiftserverless_workgroup.
+  - exposeId: events-warehouse
+    title: Curated Events (Redshift Serverless)
+    version: "1.0.0"
+    kind: table
+    binding:
+      platform: aws
+      format: parquet
+      location:
+        namespace: acme-analytics-ns
+        workgroup: acme-analytics-wg
+        iam_role_arn: arn:aws:iam::000000000000:role/acme-redshift-role
+        database: analytics
+        schema: public
+        table: events
+        region: us-east-1
+    contract:
+      schema:
+        - name: event_id
+          type: string
+          required: true
+          description: Unique event identifier
+        - name: event_time
+          type: timestamp
+          required: true
+          description: Event timestamp (UTC)
+        - name: device_type
+          type: string
+          required: false
+          description: One of desktop / mobile / tablet
+
+  # ─── Redshift external schema over Glue (Spectrum bridge) ─────────
+  # location.external_schema + glue_database → the redshift-data
+  # CREATE EXTERNAL SCHEMA bridge over the Glue Data Catalog.
+  - exposeId: events-external
+    title: Events External Schema (Spectrum over Glue)
+    version: "1.0.0"
+    kind: table
+    binding:
+      platform: aws
+      format: parquet
+      location:
+        external_schema: spectrum_events
+        glue_database: analytics_lake
+        workgroup: acme-analytics-wg
+        iam_role_arn: arn:aws:iam::000000000000:role/acme-redshift-role
+        region: us-east-1
+    contract:
+      schema:
+        - name: event_id
+          type: string
+          required: true
+          description: Unique event identifier

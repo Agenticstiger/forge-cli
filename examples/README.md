@@ -56,6 +56,7 @@ Deeper, real-world examples — each with its own README:
 - [`aws-iceberg-lakehouse/`](aws-iceberg-lakehouse/) — Apache Iceberg ACID table on Glue + S3, with time-travel.
 - [`aws-medallion-lake/`](aws-medallion-lake/) — Bronze + Silver medallion zones in one AWS data product.
 - [`aws-glue-data-lake/`](aws-glue-data-lake/) — Glue Data Catalog, Iceberg tables, ETL jobs on AWS.
+- [`aws-redshift-kinesis-streaming/`](aws-redshift-kinesis-streaming/) — Kinesis Data Streams + Redshift Serverless + Spectrum external schema (v0.7.5 binding fields).
 - [`mcp-output-port/`](mcp-output-port/) — expose a data product as a Model Context Protocol server.
 - [`source-aligned-postgres-duckdb/`](source-aligned-postgres-duckdb/) — a source-aligned product reading from Postgres via DuckDB.
 - [`bitcoin-price-api-declarative-part-b/`](bitcoin-price-api-declarative-part-b/) · [`part-c/`](bitcoin-price-api-declarative-part-c/) — an end-to-end declarative pipeline with observability and policy tags.
