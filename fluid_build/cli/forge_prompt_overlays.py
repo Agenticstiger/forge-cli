@@ -586,14 +586,20 @@ def enforce_anchor_integrity(
 ) -> None:
     """Reject the stack if it dropped a load-bearing anchor sentence.
 
-    Compares the concatenated section text before and after overlay
-    composition: any anchor present in the base but missing after overlays is a
-    dropped load-bearing instruction (the classic malicious-overlay move) and
-    raises :class:`PromptOverlayError`.
+    Checks **per section**: any anchor present in a base section but missing
+    from that same section after overlay composition is a dropped load-bearing
+    instruction (the classic malicious-overlay move) and raises
+    :class:`PromptOverlayError`. The per-section check is deliberately stricter
+    than a whole-prompt scan — an anchor that happens to also appear in another
+    (unrelated) section must not mask its removal from the section that carries
+    it, since the two feed different prompts (system vs interview-planner).
     """
-    base_blob = "\n".join(base_map.get(key, "") for key in sorted(base_map))
-    over_blob = "\n".join(overlaid_map.get(key, "") for key in sorted(overlaid_map))
-    dropped = [a for a in anchors if a in base_blob and a not in over_blob]
+    dropped: List[str] = []
+    for section, base_text in base_map.items():
+        over_text = overlaid_map.get(section, "")
+        for anchor in anchors:
+            if anchor in base_text and anchor not in over_text and anchor not in dropped:
+                dropped.append(anchor)
     if dropped:
         raise PromptOverlayError(
             "prompt overlay dropped load-bearing anchor sentence(s): "
