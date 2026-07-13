@@ -237,6 +237,12 @@ def redact_value(value: Any) -> Any:
         return [redact_value(item) for item in value]
     if isinstance(value, set):
         return {redact_value(item) for item in value}
+    if isinstance(value, BaseException):
+        # ``logger.error(exc)`` / a bare exception nested in a container binds
+        # the exception as ``record.msg`` (or a container item). Scrub its
+        # rendered text like any other string so a credential in the exception
+        # body can't leak.
+        return redact_secret_text(str(value))
     return value
 
 
@@ -281,6 +287,13 @@ def _redact_positional_args(args: Any, sensitive_indices: set[int]) -> Any:
             redacted_items.append(redact_value(arg))
         elif isinstance(arg, str):
             redacted_items.append(redact_secret_text(arg))
+        elif isinstance(arg, BaseException):
+            # ``except X as exc: LOG.warning("... %s", exc)`` is pervasive.
+            # An exception is neither a str nor a container, so it would
+            # otherwise fall through to the preserve branch and leak
+            # ``str(exc)`` (which can embed a credential) verbatim. Route its
+            # rendered text through the same redactor as any other string.
+            redacted_items.append(redact_secret_text(str(arg)))
         else:
             # Non-string scalars (int, float, bool, None, custom objects) are
             # preserved so observability metrics aren't clobbered.
@@ -299,6 +312,10 @@ def _redact_named_args(args: Mapping[str, Any], sensitive_names: set[str]) -> di
             redacted[key] = redact_value(value)
         elif isinstance(value, str):
             redacted[key] = redact_secret_text(value)
+        elif isinstance(value, BaseException):
+            # Mirror the positional path: scrub ``str(exc)`` so a credential
+            # embedded in a logged exception body doesn't leak.
+            redacted[key] = redact_secret_text(str(value))
         else:
             redacted[key] = value
     return redacted
