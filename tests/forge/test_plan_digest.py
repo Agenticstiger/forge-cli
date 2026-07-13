@@ -624,3 +624,36 @@ class TestVerifyPlanBinding:
         assert err.kind == "plan-tamper"
         # Also a ValueError for standard except-handlers.
         assert isinstance(err, ValueError)
+
+    def test_deleted_binding_mode_is_binding_mode_missing(self) -> None:
+        """J6: a digest-bound plan whose ``bindingMode`` field was deleted
+        (older fluid, or manual edit) is caught up-front — before the
+        plan-tamper check — with the distinct ``binding-mode-missing`` kind."""
+        plan = inject_digests(_minimal_plan(), bundle_path=None)
+        del plan["bindingMode"]
+        with pytest.raises(PlanBindingError) as exc_info:
+            verify_plan_binding(plan, bundle_path=None)
+        assert exc_info.value.kind == "binding-mode-missing"
+
+    def test_unrecognised_binding_mode_is_binding_mode_invalid(self) -> None:
+        """J6: a ``bindingMode`` that is neither 'bound' nor 'raw' is
+        rejected with ``binding-mode-invalid`` (not silently accepted, and
+        not blurred into the tamper check)."""
+        plan = inject_digests(_minimal_plan(), bundle_path=None)
+        plan["bindingMode"] = "xyz"
+        with pytest.raises(PlanBindingError) as exc_info:
+            verify_plan_binding(plan, bundle_path=None)
+        assert exc_info.value.kind == "binding-mode-invalid"
+
+    def test_raw_mode_with_bundle_digest_is_binding_mode_mismatch(self) -> None:
+        """J6: ``bindingMode='raw'`` contradicts a non-empty ``bundleDigest``
+        — an inconsistent binding — and is caught with
+        ``binding-mode-mismatch`` before any bundle/tamper check runs. This
+        is the mirror of the stripped-bundleDigest case: here a bundleDigest
+        is present under a 'raw' declaration."""
+        plan = inject_digests(_minimal_plan(), bundle_path=None)
+        assert plan["bindingMode"] == "raw"
+        plan["bundleDigest"] = "sha256:" + "a" * 64
+        with pytest.raises(PlanBindingError) as exc_info:
+            verify_plan_binding(plan, bundle_path=None)
+        assert exc_info.value.kind == "binding-mode-mismatch"
