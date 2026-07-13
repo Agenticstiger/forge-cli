@@ -1324,14 +1324,18 @@ def _render_dlt_source(
     )
 
 
-def get_tool_definitions() -> List[Dict[str, Any]]:
-    """Return the tool definitions in the shape providers expect.
+def _all_tool_definitions() -> List[Dict[str, Any]]:
+    """Return the FULL tool listing (every tool advertised with its schema).
 
     Merges the legacy ``TOOL_REGISTRY`` (hand-written dict entries)
     with the world-class ``FORGE_TOOL_REGISTRY`` (Pydantic-typed
     ``@forge_tool`` registrations) so the LLM sees both. Names in the
     legacy registry win on collision so existing tools keep their
     exact wire shape until they're explicitly migrated.
+
+    This is the un-transformed listing; ``get_tool_definitions`` applies the
+    opt-in tool-search deferral on top, and ``dispatch_tool_call`` uses this
+    full list to answer ``search_tools`` lookups.
     """
     from fluid_build.cli.forge_tool import FORGE_TOOL_REGISTRY
 
@@ -1387,6 +1391,20 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
 
     definitions.extend(db_tool_definitions())
     return definitions
+
+
+def get_tool_definitions() -> List[Dict[str, Any]]:
+    """Return the tool definitions in the shape providers expect.
+
+    Wraps :func:`_all_tool_definitions` and applies the opt-in tool-search
+    deferral (``FLUID_FORGE_TOOL_SEARCH``): when enabled, a large tool set is
+    advertised as a small core + name/namespace stubs + a ``search_tools``
+    meta-tool so per-turn tool-schema tokens stay bounded. A pure no-op when
+    the flag is unset — the listing is byte-for-byte the full set.
+    """
+    from fluid_build.cli.forge_tool_search import apply_tool_search
+
+    return apply_tool_search(_all_tool_definitions())
 
 
 def dispatch_tool_call(
@@ -1461,6 +1479,14 @@ def dispatch_tool_call(
 
         if is_db_tool(name):
             return dispatch_db_tool(name, arguments)
+
+        # Opt-in tool-search meta-tool (search_tools), gated on
+        # FLUID_FORGE_TOOL_SEARCH. Resolves against the FULL (pre-deferral)
+        # listing so it can hand back a deferred tool's real parameter schema.
+        from fluid_build.cli.forge_tool_search import dispatch_search_tool, is_search_tool
+
+        if is_search_tool(name):
+            return dispatch_search_tool(arguments, all_definitions=_all_tool_definitions())
     if not tool:
         LOG.warning("Unknown tool call: %s", name)
         return {"error": f"Unknown tool: {name}"}
