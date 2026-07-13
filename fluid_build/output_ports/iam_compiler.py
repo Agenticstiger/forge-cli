@@ -39,7 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Sequence
 
-from fluid_build.providers._sql_safety import validate_ident
+from fluid_build.providers._sql_safety import quote_string_literal, validate_ident
 
 SUPPORTED_TARGETS = ("snowflake", "postgres", "bigquery", "aws")
 
@@ -159,9 +159,9 @@ def _compile_snowflake(
                         "convention."
                     )
             else:
-                # Constant equality → keep verbatim, quote the literal.
-                escaped = str(value).replace("'", "''")
-                predicates.append(f"\"{col}\" = '{escaped}'")
+                # Constant equality → keep verbatim, quote the literal via the
+                # central _sql_safety chokepoint (single-quote doubling).
+                predicates.append(f'"{col}" = {quote_string_literal(str(value))}')
 
     # 2) agentPolicy.allowedModels → restrict by tag/role.
     # Snowflake doesn't expose "calling LLM" natively, so the
@@ -266,8 +266,7 @@ def _compile_postgres(
                     )
                     predicates.append(f"\"{col}\" = current_setting('fluid.caller_{attr}', true)")
             else:
-                escaped = str(value).replace("'", "''")
-                predicates.append(f"\"{col}\" = '{escaped}'")
+                predicates.append(f'"{col}" = {quote_string_literal(str(value))}')
     if not predicates:
         return None
     body = " AND ".join(predicates)
@@ -445,8 +444,7 @@ def _compile_aws(
                         "literal — fill in via your IAM workflow."
                     )
             else:
-                escaped = str(value).replace("'", "''")
-                filter_predicates.append(f"\"{col}\" = '{escaped}'")
+                filter_predicates.append(f'"{col}" = {quote_string_literal(str(value))}')
 
     allowed_models = agent_policy.get("allowedModels") or []
     grantee_arns: List[str] = []

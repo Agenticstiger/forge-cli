@@ -46,7 +46,7 @@ from fluid_build.api.runner import (
 )
 from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.api.state import Cursor
-from fluid_build.providers._sql_safety import validate_ident
+from fluid_build.providers._sql_safety import quote_string_literal, validate_ident
 
 from .._acquisition_common import (
     extract_source_schemas,
@@ -522,8 +522,9 @@ def _sql_literal(v: Any) -> str:
         return "TRUE" if v else "FALSE"
     if isinstance(v, (int, float)):
         return repr(v)
-    s = str(v).replace("'", "''")
-    return f"'{s}'"
+    # Untrusted Singer record values feed a CREATE TABLE AS SELECT VALUES; route
+    # the string branch through the central _sql_safety chokepoint.
+    return quote_string_literal(str(v))
 
 
 # ── Runner ───────────────────────────────────────────────────────────────
