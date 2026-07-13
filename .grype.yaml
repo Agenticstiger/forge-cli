@@ -3,18 +3,21 @@
 # which runs `./grype <image> --fail-on high --only-fixed` from the repo root).
 #
 # Scope: upstream CPython *binary* CVEs in the python:*-slim base image whose
-# fixes are not yet available in any stable base image grype's DB tracks (the
-# scanner DB runs ahead of the official Docker images). All four are
-# bottom-percentile EPSS (< 0.1% real-world exploitation probability). The base
-# was bumped 3.11-slim -> 3.13-slim to shrink this surface; these remain only
-# because no stable base image yet carries their fix. **Remove each entry the
-# moment the base image ships the listed fixed version** (re-run grype to confirm).
+# fix landed only in a CPython release no stable base image ships yet (grype's DB
+# runs ahead of the official Docker images). We suppress ONLY such genuinely
+# unfixable-in-stable HIGH/CRITICAL findings; fixable OS-package CVEs are patched
+# at build time via `apt-get upgrade` in the Dockerfile, not ignored here.
+#
+# **Remove each entry the moment a stable base image ships the listed fixed
+# version** (re-run grype to confirm). As of 0.11.0 the base is python:3.13-slim
+# @ CPython 3.13.14, which already fixed the four previously-ignored CVEs
+# (CVE-2026-7210, CVE-2025-13462, CVE-2026-4224, CVE-2026-3644) — those ignores
+# were removed here.
 ignore:
-  # Critical — fix only in CPython 3.15.0b2 (a BETA); no stable Python carries it.
-  - vulnerability: CVE-2026-7210
-  # Critical — fixed in CPython 3.13.13 / 3.14.4; remove once python:3.13-slim >= 3.13.13.
-  - vulnerability: CVE-2025-13462
-  # High — fixed in CPython 3.13.13 / 3.14.4; remove once python:3.13-slim >= 3.13.13.
-  - vulnerability: CVE-2026-4224
-  # High — fixed in CPython 3.13.13 / 3.14.4; remove once python:3.13-slim >= 3.13.13.
-  - vulnerability: CVE-2026-3644
+  # High (CVSS 8.7) — CPU DoS in html.parser.HTMLParser via repeated unterminated
+  # markup declarations on untrusted HTML (published 2026-07-09). Fixed only in
+  # CPython 3.15.0 / 3.16.0 — no stable Python base carries the fix. Bottom-
+  # percentile EPSS (0.6%), and the fluid CLI does not parse attacker-controlled
+  # HTML through html.parser.HTMLParser, so it is not reachable in this image.
+  # Remove once python:3.13-slim ships a CPython with the backport.
+  - vulnerability: CVE-2026-15308
