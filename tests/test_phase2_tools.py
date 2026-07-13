@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import textwrap
 from pathlib import Path
 
@@ -205,3 +206,61 @@ def test_generate_dlt_source_allows_no_auth(tmp_path: Path):
     body = (tmp_path / result["module_path"]).read_text(encoding="utf-8")
     assert "Bearer" not in body
     assert "X-API-Key" not in body
+
+
+# ---------------------------------------------------------------------------
+# read_logical_model — typed-tool-error invariant (no raw exc text to the LLM)
+# ---------------------------------------------------------------------------
+
+
+def test_read_logical_model_invalid_json_does_not_leak_exception_text(tmp_path: Path):
+    """A JSONDecodeError must not round-trip raw exception text into the
+    LLM-visible tool result. It must carry the typed ``error``/``message``
+    shape (exception class name + a generic "see server logs" message)
+    instead — matching the module's hardened typed-tool-error invariant."""
+    bad = "{ this is not valid json"
+    (tmp_path / "broken.model.json").write_text(bad, encoding="utf-8")
+
+    # The raw exception text the un-hardened code would have interpolated.
+    raw_exc_text = ""
+    try:
+        json.loads(bad)
+    except json.JSONDecodeError as exc:
+        raw_exc_text = str(exc)
+    assert raw_exc_text  # sanity: the fixture really is invalid JSON
+
+    result = dispatch_tool_call(
+        "read_logical_model",
+        {"path": "broken.model.json"},
+        workspace_root=tmp_path,
+    )
+
+    assert result["error"] == "JSONDecodeError"
+    assert "see server logs" in result["message"]
+    # The raw exception string (offsets, offending token) must be absent.
+    assert raw_exc_text not in result["message"]
+    assert "Expecting" not in result["message"]
+
+
+def test_read_logical_model_read_error_does_not_leak_exception_text(tmp_path: Path, monkeypatch):
+    """An OSError while reading the sidecar must be logged server-side and
+    surfaced as a typed error — never the raw OS-error string (which can
+    carry absolute paths / errno detail) in the LLM-visible result."""
+    (tmp_path / "present.model.json").write_text("{}", encoding="utf-8")
+
+    sentinel = "sekret-fs-detail-/var/private/hunter2"
+
+    def _boom(self, *args, **kwargs):
+        raise OSError(sentinel)
+
+    monkeypatch.setattr(Path, "read_text", _boom)
+
+    result = dispatch_tool_call(
+        "read_logical_model",
+        {"path": "present.model.json"},
+        workspace_root=tmp_path,
+    )
+
+    assert result["error"] == "OSError"
+    assert "see server logs" in result["message"]
+    assert sentinel not in result["message"]
