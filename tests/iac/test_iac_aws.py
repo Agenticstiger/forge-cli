@@ -63,6 +63,25 @@ class TestAwsGlue:
         tbl = next(iter(res["aws_glue_catalog_table"].values()))
         assert tbl["database_name"] == f"${{aws_glue_catalog_database.{db_name}.name}}"
 
+    def test_bucketless_standard_table_declares_caller_identity(self):
+        """Regression: a bucket-less *standard* (parquet) table interpolates the
+        apply-time ``${aws_caller_identity...account_id}-fluid-data`` warehouse
+        bucket, so ``emit_data`` MUST declare the backing data source. The old
+        ``_has_bucketless_glue_binding`` predicate only fired for Glue-*catalog*
+        formats, so a bucket-less parquet table emitted the token WITHOUT the data
+        source → ``tofu plan`` failed with ``Reference to undeclared resource``."""
+        contract = _contract([_glue_exposure(database="sales", table="orders")])  # no bucket
+        token = "${data.aws_caller_identity.fluid_lf_caller.account_id}"
+        assert token in json.dumps(_aws().emit(contract))  # the token IS emitted…
+        data = _aws().emit_data(contract, [])
+        assert data.get("aws_caller_identity", {}).get("fluid_lf_caller") == {}  # …so declare it
+
+    def test_bucketed_table_does_not_over_declare_caller_identity(self):
+        """A binding with an explicit bucket never uses the account token, so the
+        data source is not emitted (don't over-declare)."""
+        contract = _contract([_glue_exposure(database="sales", table="orders", bucket="lake")])
+        assert "aws_caller_identity" not in _aws().emit_data(contract, [])
+
     def test_columns_use_hive_types(self):
         res = _aws().emit(_contract([_glue_exposure(database="d", table="t", bucket="b")]))
         tbl = next(iter(res["aws_glue_catalog_table"].values()))
