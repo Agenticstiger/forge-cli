@@ -1,0 +1,111 @@
+fluidVersion: "0.7.2"
+kind: DataProduct
+id: analytics.web.pageviews
+name: Web Pageviews (S3 + Glue + Athena)
+description: Curated clickstream pageview events on S3, cataloged in Glue, queried by Athena
+domain: Analytics
+
+tags:
+  - data-lake
+  - aws-glue
+  - athena
+  - parquet
+  - clickstream
+
+labels:
+  team: web-analytics
+  platform: aws
+
+metadata:
+  layer: Silver
+  owner:
+    team: web-analytics
+    email: web-analytics@example.com
+
+# ─── Access Policy (compiled into IAM / Lake Formation grants) ─────
+
+accessPolicy:
+  grants:
+    - principal: "group:analysts@example.com"
+      permissions: [read, select]
+    - principal: "serviceAccount:etl@example.iam.gserviceaccount.com"
+      permissions: [read, write, create]
+
+# ─── Expose: Glue Catalog table over an S3 Parquet dataset ─────────
+# Athena reads this table natively from the Glue Data Catalog — no
+# separate Athena resource is required.
+
+exposes:
+  - exposeId: pageviews
+    title: Pageview Events
+    version: "1.0.0"
+    kind: table
+
+    binding:
+      platform: aws
+      # Columnar Parquet keeps Athena scan cost low — the single biggest
+      # lever on serverless-SQL bills (AWS's own example: ~12x cheaper than
+      # raw text for a one-column scan).
+      format: parquet
+      location:
+        # Glue Data Catalog database + table (the metadata plane).
+        database: web_analytics
+        table: pageviews
+        # Backing S3 object store (the storage plane) — curated zone.
+        bucket: acme-web-analytics-lake
+        path: curated/web_analytics/pageviews/
+        region: us-east-1
+
+    contract:
+      schema:
+        - name: event_id
+          type: string
+          required: true
+          description: Unique pageview event identifier
+
+        - name: event_time
+          type: timestamp
+          required: true
+          description: When the pageview occurred (UTC)
+
+        - name: user_id
+          type: string
+          required: true
+          description: Pseudonymous visitor identifier
+          sensitivity: pseudonymized
+
+        - name: session_id
+          type: string
+          required: true
+          description: Browser session identifier
+
+        - name: page_url
+          type: string
+          required: true
+          description: Fully-qualified URL of the viewed page
+
+        - name: referrer_url
+          type: string
+          required: false
+          description: HTTP referrer, if any
+
+        - name: device_type
+          type: string
+          required: true
+          description: One of desktop / mobile / tablet
+
+        - name: country_code
+          type: string
+          required: false
+          description: ISO-3166 alpha-2 country of the visitor
+
+      quality:
+        - rule: event_id_present
+          expression: "event_id IS NOT NULL"
+          severity: error
+        - rule: event_time_not_future
+          expression: "event_time <= CURRENT_TIMESTAMP"
+          severity: warning
+        - rule: known_device_type
+          expression: "device_type IN ('desktop', 'mobile', 'tablet')"
+          severity: warning
