@@ -723,6 +723,24 @@ def _validate_contract_for_version(
             if args.verbose:
                 info(logger, f"Confluent binding check skipped: {exc}")
 
+        # --- pgvector vector output-port binding checks ---------------------
+        # A pgvector-bound expose (binding.platform: pgvector) needs a vector
+        # dimension and non-colliding embeddings-table names — surface a clean
+        # error at validate time (anti-no-op gate) instead of emitting an
+        # incomplete/colliding target. Warnings flag incomplete RAG provenance.
+        try:
+            from fluid_build.output_ports.vector import validate_vector_binding
+
+            vec_errors, vec_warnings = validate_vector_binding(contract)
+            for msg in vec_errors:
+                validation_result.add_error(msg)
+                validation_result.is_valid = False
+            for msg in vec_warnings:
+                validation_result.add_warning(msg)
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"Vector binding check skipped: {exc}")
+
         try:
             from pathlib import Path as _Path
 

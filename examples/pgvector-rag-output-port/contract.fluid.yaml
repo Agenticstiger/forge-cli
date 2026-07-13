@@ -1,0 +1,79 @@
+fluidVersion: "0.7.5"
+kind: DataProduct
+id: knowledge.support.articles
+name: Support Knowledge Base (RAG / pgvector)
+description: >-
+  Support knowledge-base articles published as a vector / embeddings output
+  port so a RAG retriever can consume them. The ai-embeddable text columns
+  (title, body) are emitted as a pgvector embeddings table + HNSW index.
+domain: Support
+
+tags:
+  - rag
+  - vector
+  - pgvector
+  - ai-ready
+
+labels:
+  team: support-ai
+  platform: pgvector
+  # Discovery marker the ai_ready agent stamps at the product root.
+  ai-ready: "true"
+
+metadata:
+  layer: Gold
+  productType: CDP
+  owner:
+    team: support-ai
+    email: support-ai@example.com
+
+exposes:
+  # ─── Vector / embeddings output port (pgvector) ─────────────────────
+  # binding.platform: pgvector selects the vector output port. Its
+  # binding.vectorConfig drives the embeddings-table + HNSW-index DDL, and
+  # the port embeds only the columns labelled ai-embeddable: "true" (the
+  # ai_ready agent, PR #405, stamps that label on safe free-text columns).
+  - exposeId: kb_articles
+    title: Support Articles (embeddings)
+    version: "1.0.0"
+    kind: vector
+    binding:
+      platform: pgvector
+      format: pgvector_table
+      location:
+        database: rag
+        schema: public
+        table: kb_articles
+      vectorConfig:
+        dimensions: 1536
+        embeddingModel: text-embedding-3-small
+        vectorType: vector
+        indexType: hnsw
+        distanceMetric: cosine
+        sourceKeyColumn: article_id
+        table: kb_article_embeddings
+        hnsw:
+          m: 16
+          efConstruction: 64
+    contract:
+      schema:
+        - name: article_id
+          type: bigint
+          required: true
+          description: Stable article identifier (primary key, ties an embedding back to its source row).
+        - name: title
+          type: text
+          required: true
+          description: Article title.
+          labels:
+            ai-embeddable: "true"
+        - name: body
+          type: text
+          required: true
+          description: Full article body in markdown.
+          labels:
+            ai-embeddable: "true"
+        - name: locale
+          type: varchar
+          required: false
+          description: BCP-47 language tag (metadata for filtering; not embedded).

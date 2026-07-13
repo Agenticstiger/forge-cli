@@ -52,6 +52,8 @@ def register(subparsers: argparse._SubParsersAction):
                                  (Bitol ODPS v1.0.0 = default ``--format odps``;
                                  ODCS; LF/ODPI v4.1 opt-in ``--format odps-v4.1``)
           iac                    Compile a contract to an OpenTofu .tf.json module
+          vector                 Compile a contract to a pgvector embeddings target
+                                 (DDL + RAG manifest for the ai-embeddable columns)
           artifacts              Stage-3 fanout: bundle → ODCS, Bitol ODPS,
                                  LF/ODPI ODPS v4.1, schedule, policies
 
@@ -93,6 +95,7 @@ Examples:
         generate_schedule,
         generate_speed_transformation,
         generate_standard,
+        generate_vector,
     )
 
     generate_speed_transformation.register_subcommand(sub)
@@ -102,6 +105,7 @@ Examples:
     generate_artifacts.register_subcommand(sub)
     generate_dbt_tests.register_subcommand(sub)
     generate_iac.register_subcommand(sub)
+    generate_vector.register_subcommand(sub)
 
     # Default handler (backward compat: no subcommand → transformation)
     p.set_defaults(cmd=COMMAND, func=run)
@@ -149,6 +153,11 @@ def run(args: Any, logger: logging.Logger) -> int:
 
         return generate_artifacts.run(args, logger)
 
+    if sub == "vector":
+        from . import generate_vector
+
+        return generate_vector.run(args, logger)
+
     # No subcommand specified — default to speed-transformation.
     if sub is None:
         # Check if user passed --list
@@ -168,6 +177,7 @@ def run(args: Any, logger: logging.Logger) -> int:
             "ODCS; LF/ODPI v4.1 opt-in via --format odps-v4.1)"
         )
         cprint("  iac                    Compile a contract to an OpenTofu .tf.json module")
+        cprint("  vector                 Compile a contract to a pgvector embeddings target")
         cprint("")
         cprint("Examples:")
         cprint("  fluid generate transformation")
