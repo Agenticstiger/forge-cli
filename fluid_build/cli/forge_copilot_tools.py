@@ -807,17 +807,24 @@ def _dispatch_read_logical_model(
     try:
         body = target.read_text(encoding="utf-8")
     except OSError as exc:
+        # Typed-tool-error invariant: log the full detail server-side; never
+        # round-trip the raw exception text (which can carry absolute paths /
+        # errno detail) into the LLM tool-use context.
+        LOG.warning("read_logical_model: failed to read %s: %s", raw_path, exc, exc_info=True)
         return {
-            "error": "ReadFailed",
-            "message": f"could not read {raw_path}: {exc}",
+            "error": type(exc).__name__,
+            "message": f"could not read {raw_path} — see server logs",
         }
 
     try:
         model = json.loads(body)
     except json.JSONDecodeError as exc:
+        # Same invariant: the JSONDecodeError text (offsets / offending token)
+        # stays server-side; the LLM sees only the typed error shape.
+        LOG.warning("read_logical_model: invalid JSON in %s: %s", raw_path, exc, exc_info=True)
         return {
-            "error": "InvalidJSON",
-            "message": f"{raw_path} is not valid JSON: {exc}",
+            "error": type(exc).__name__,
+            "message": f"{raw_path} is not valid JSON — see server logs",
         }
 
     return {

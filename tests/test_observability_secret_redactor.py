@@ -182,6 +182,83 @@ def test_filter_preserves_custom_object_repr_when_not_sensitive():
 
 
 # ---------------------------------------------------------------------------
+# Exception-object args — ``except X as exc: LOG.warning("... %s", exc)``
+# ---------------------------------------------------------------------------
+
+
+def _exc_logger(name: str) -> tuple[logging.Logger, StringIO]:
+    stream = StringIO()
+    logger = logging.getLogger(name)
+    logger.handlers = []
+    logger.filters = []
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.addFilter(SecretRedactingFilter())
+    logger.addHandler(handler)
+    return logger, stream
+
+
+def test_filter_redacts_secret_in_positional_exception_arg():
+    """An exception object logged as a ``%s`` positional arg
+    (``LOG.warning("... %s", exc)`` — the pervasive
+    ``except X as exc: ...`` shape) must have credential-shaped substrings
+    in its ``str()`` scrubbed. Otherwise the exception body leaks verbatim,
+    because an exception is neither a ``str`` nor a container and was
+    previously passed through untouched."""
+    logger, stream = _exc_logger("test.secret_redactor.exc_positional")
+
+    exc = ValueError("connect failed for host=db1 password=hunter2 retrying")
+    logger.warning("read failed: %s", exc)
+
+    output = stream.getvalue()
+    assert "hunter2" not in output
+    assert "***REDACTED***" in output
+    # Benign context around the secret survives (precision-scoped redaction).
+    assert "host=db1" in output
+
+
+def test_filter_redacts_secret_in_named_exception_arg():
+    """Same leak via a named (``%(err)s``) mapping arg — the named-arg path
+    must scrub the exception body too."""
+    logger, stream = _exc_logger("test.secret_redactor.exc_named")
+
+    exc = RuntimeError("auth rejected: password=topsecret123 for user svc")
+    logger.warning("call failed: %(err)s", {"err": exc})
+
+    output = stream.getvalue()
+    assert "topsecret123" not in output
+    assert "***REDACTED***" in output
+
+
+def test_filter_redacts_secret_in_exception_as_msg():
+    """``logger.error(exc)`` binds the exception as ``record.msg`` (no args).
+    The message-body redaction path must scrub the exception text too."""
+    logger, stream = _exc_logger("test.secret_redactor.exc_as_msg")
+
+    exc = RuntimeError("startup failed: aws_secret_access_key=AbC123secretVALUE")
+    logger.error(exc)
+
+    output = stream.getvalue()
+    assert "AbC123secretVALUE" not in output
+    assert "***REDACTED***" in output
+
+
+def test_filter_preserves_benign_exception_arg():
+    """Negative assertion: an exception whose message carries no secret must
+    pass through unchanged — no over-redaction of ordinary error text."""
+    logger, stream = _exc_logger("test.secret_redactor.exc_benign")
+
+    exc = FileNotFoundError("no such file: /workspace/orders.model.json")
+    logger.warning("read failed: %s", exc)
+
+    output = stream.getvalue()
+    assert "no such file: /workspace/orders.model.json" in output
+    assert "***REDACTED***" not in output
+
+
+# ---------------------------------------------------------------------------
 # S-010: provider-specific token shapes
 # ---------------------------------------------------------------------------
 
