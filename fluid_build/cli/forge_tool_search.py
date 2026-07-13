@@ -135,8 +135,11 @@ def is_search_tool(name: str, env: Optional[Mapping[str, str]] = None) -> bool:
 
 def namespace_for(name: str) -> str:
     """Return the namespace label for a tool name."""
-    if name.startswith("dbt."):
-        return "dbt"
+    # Delegated MCP tools are per-server prefixed (dbt. / github. / snowflake.);
+    # each server is its own namespace so search-by-namespace can target it.
+    prefix = name.split(".", 1)[0]
+    if prefix in ("dbt", "github", "snowflake") and "." in name:
+        return prefix
     return _NAMESPACES.get(name, "other")
 
 

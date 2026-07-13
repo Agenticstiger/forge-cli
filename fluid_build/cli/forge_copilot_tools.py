@@ -1376,6 +1376,15 @@ def _all_tool_definitions() -> List[Dict[str, Any]]:
 
     definitions.extend(dbt_mcp_tool_definitions())
 
+    # Delegated hosted MCP servers (GitHub MCP + Snowflake MCP), each opt-in via
+    # its own flag (FLUID_GITHUB_MCP / FLUID_SNOWFLAKE_MCP). Off by default →
+    # no-op; on discovery failure → [] for that server (never breaks the native
+    # listing). Tools are per-server prefixed (github. / snowflake.) so they
+    # can't shadow a native tool. Same delegate shape as the dbt MCP bridge.
+    from fluid_build.cli.hosted_mcp import hosted_mcp_tool_definitions
+
+    definitions.extend(hosted_mcp_tool_definitions())
+
     # Opt-in web tools (web_search / web_fetch), gated on
     # FLUID_AGENT_WEB_TOOLS. Off by default → no-op; when on, the two
     # tools surface. Same env-gated delegate shape as the dbt MCP bridge.
@@ -1461,6 +1470,14 @@ def dispatch_tool_call(
 
         if is_dbt_mcp_tool(name):
             return dispatch_dbt_mcp_tool(name, arguments)
+
+        # Delegated hosted MCP servers (GitHub / Snowflake), each opt-in.
+        # Resolved AFTER the native registries so a native tool always wins;
+        # tools are per-server prefixed so there is no overlap in practice.
+        from fluid_build.cli.hosted_mcp import dispatch_hosted_mcp_tool, is_hosted_mcp_tool
+
+        if is_hosted_mcp_tool(name):
+            return dispatch_hosted_mcp_tool(name, arguments)
 
         # Opt-in web tools (web_search / web_fetch), gated on
         # FLUID_AGENT_WEB_TOOLS. Resolved AFTER the native registries so a
