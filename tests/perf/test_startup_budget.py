@@ -54,15 +54,48 @@ pytestmark = pytest.mark.skipif(
 # gate stays a genuine ratchet that catches *regressions* (a new eager
 # top-level import on the parser-build path) without false-failing on a
 # developer's richer local env.
+#
+# "Startup budget restore" then deferred two more cold-path chains: the
+# ``cli/mcp`` package now resolves its re-exports via PEP 562 ``__getattr__``
+# (so ``register`` no longer drags ``pydantic`` + ``copilot.modeling_techniques``
+# through ``mcp.cli`` → ``mcp.models``), and ``observability/tracing.py`` defers
+# its OTLP-http exporter import (so ``requests`` + ``google.protobuf`` leave the
+# cold path in ``opentelemetry``-installed envs). In the CI perf env
+# (``.[dev,local]``, no ``opentelemetry``) a cold ``build_parser()`` sits at
+# ~786 modules — comfortably under the budget. NB ``pydantic`` +
+# ``modeling_techniques`` still load in richer envs via a *separate* eager
+# importer: the ``fluid forge data-model`` registration
+# (``_forge_data_model_register`` → ``forge_data_model`` →
+# ``copilot.schemas.stage_outputs`` / ``modeling_techniques``). Deferring that
+# one is a follow-up outside this change's blast radius, which is why
+# ``pydantic`` is deliberately NOT added to ``FORBIDDEN_ON_HELP`` here.
 MAX_MODULES = 1100
 MAX_HELP_WALL_SECONDS = 2.0
 
-# Heavy SDKs that must NOT load on the --help / parser-build path.
 # Heavy SDKs that must NOT load on the --help / parser-build path. ``mcp`` is
 # the original Card-1 regression guard; ``httpx`` / ``jsonschema`` / ``litellm``
 # are the part-2 wins (the forge AI-runtime + schema_manager deferrals) — pinned
 # here so a future eager import that re-pulls any of them reds the build.
-FORBIDDEN_ON_HELP = ("mcp", "mcp.server.fastmcp", "httpx", "jsonschema", "litellm")
+#
+# ``requests`` + ``google.protobuf`` are the observability-tracing win: the
+# OTLP-http span exporter (which drags both stacks) was module-scope-imported by
+# ``observability/tracing.py``; because ``cli/validate.py`` imports
+# ``traced_stage`` at module scope and ``validate`` registers during
+# ``build_parser()``, any env with ``opentelemetry`` installed used to pay
+# ``requests`` + ``google.protobuf`` on ``fluid --help``. The exporter import is
+# now deferred into ``_get_tracer`` (first traced span), so both are OFF the
+# cold path. NB ``opentelemetry`` itself is intentionally NOT forbidden — the
+# lightweight API + SDK soft-import stays at module scope; only the heavy
+# exporter is deferred.
+FORBIDDEN_ON_HELP = (
+    "mcp",
+    "mcp.server.fastmcp",
+    "httpx",
+    "jsonschema",
+    "litellm",
+    "requests",
+    "google.protobuf",
+)
 
 _BUILD_PARSER_PROBE = (
     "import sys; sys.argv=['fluid','--help'];"
@@ -146,3 +179,112 @@ def test_help_cold_wall_time_backstop():
     assert median < MAX_HELP_WALL_SECONDS, (
         f"cold `fluid --help` median {median:.2f}s exceeds " f"{MAX_HELP_WALL_SECONDS}s backstop."
     )
+
+
+# ---------------------------------------------------------------------------
+# Lazy-``cli/mcp`` regression guards
+#
+# The ``cli/mcp`` package re-exports its five submodules; ``mcp.models`` imports
+# ``pydantic`` + ``copilot.modeling_techniques`` at module scope. Because
+# ``register_core_commands`` imports the package during ``build_parser()`` to
+# reach ``register``, an eager re-export used to land ``pydantic`` on the
+# ``fluid --help`` cold path. These pins keep the PEP 562 ``__getattr__``
+# deferral honest: importing the package (and calling ``register``) must stay
+# free of ``pydantic`` and the MCP server SDK.
+# ---------------------------------------------------------------------------
+
+_LAZY_MCP_PROBE = (
+    "import sys;"
+    "import fluid_build.cli.mcp as m;"
+    "assert 'pydantic' not in sys.modules, 'importing cli.mcp eagerly pulled pydantic';"
+    "assert 'mcp.server.fastmcp' not in sys.modules, 'importing cli.mcp eagerly pulled the MCP SDK';"
+    "import argparse;"
+    "root = argparse.ArgumentParser(); sub = root.add_subparsers();"
+    "m.register(sub);"
+    "assert 'pydantic' not in sys.modules, 'cli.mcp.register pulled pydantic onto the cold path';"
+    "assert 'mcp.server.fastmcp' not in sys.modules, 'cli.mcp.register pulled the MCP SDK';"
+    # The lazy re-exports must still resolve (they pull the heavy deps on demand).
+    "assert m.McpPolicy.__name__ == 'McpPolicy';"
+    "assert isinstance(m.TOOL_CAPABILITIES, dict) and m.TOOL_CAPABILITIES;"
+    "assert callable(m._call_tool);"
+    "print('ok')"
+)
+
+
+def test_lazy_mcp_import_stays_off_the_heavy_deps():
+    """Importing ``cli.mcp`` + calling ``register`` must not pull pydantic/SDK."""
+    out = subprocess.run(
+        [sys.executable, "-c", _LAZY_MCP_PROBE],
+        capture_output=True,
+        text=True,
+        env=_clean_env(),
+    )
+    assert out.returncode == 0 and out.stdout.strip() == "ok", (
+        "Lazy cli.mcp regression: importing the package or calling register() "
+        f"pulled a heavy dep.\nstdout={out.stdout!r}\nstderr={out.stderr!r}"
+    )
+
+
+def _serve_flag_surface(register_fn):
+    """Return the (subcommand names, ``serve`` option strings) a register builds."""
+    import argparse
+
+    root = argparse.ArgumentParser()
+    sub = root.add_subparsers()
+    register_fn(sub)
+    mcp_parser = sub.choices["mcp"]
+    sub_action = next(a for a in mcp_parser._actions if isinstance(a, argparse._SubParsersAction))
+    serve = sub_action.choices["serve"]
+    opts = set()
+    for action in serve._actions:
+        opts.update(action.option_strings)
+    return set(sub_action.choices), opts
+
+
+def test_mcp_register_matches_cli_register_surface():
+    """The cold-path ``__init__.register`` must not drift from ``cli.register``.
+
+    ``cli/mcp/__init__.py`` defines a lightweight, pydantic-free ``register``
+    (used by ``build_parser``); ``cli/mcp/cli.py`` keeps the canonical one for
+    the deferred ``run`` logic. This asserts they build an identical
+    ``fluid mcp`` subcommand + ``serve`` flag surface so the cold-path copy can
+    never silently lose a flag.
+    """
+    from fluid_build.cli import mcp as pkg
+    from fluid_build.cli.mcp import cli as cli_mod
+
+    pkg_actions, pkg_opts = _serve_flag_surface(pkg.register)
+    cli_actions, cli_opts = _serve_flag_surface(cli_mod.register)
+    assert pkg_actions == cli_actions, (pkg_actions, cli_actions)
+    assert pkg_opts == cli_opts, (
+        "fluid mcp serve flags drifted between the cold-path __init__.register "
+        f"and cli.register: {pkg_opts ^ cli_opts}"
+    )
+
+
+def test_tracing_import_defers_otlp_exporter():
+    """Importing ``observability.tracing`` must not pull the OTLP exporter.
+
+    The exporter drags ``requests`` + ``google.protobuf``; deferring it into
+    ``_get_tracer`` keeps both off the ``fluid --help`` cold path (``validate``
+    imports ``traced_stage`` at module scope). Robust whether or not
+    ``opentelemetry`` is installed: absent → nothing loads; present → only the
+    lightweight API/SDK soft-import runs, the exporter stays deferred.
+    """
+    probe = (
+        "import sys;"
+        "import fluid_build.observability.tracing;"
+        "exp = 'opentelemetry.exporter.otlp.proto.http.trace_exporter';"
+        "assert exp not in sys.modules, 'tracing import pulled the OTLP exporter';"
+        "assert 'requests' not in sys.modules, 'tracing import pulled requests';"
+        "print('ok')"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        env=_clean_env(),
+    )
+    assert (
+        out.returncode == 0 and out.stdout.strip() == "ok"
+    ), f"tracing exporter deferral regressed.\nstdout={out.stdout!r}\nstderr={out.stderr!r}"
