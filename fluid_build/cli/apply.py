@@ -1425,6 +1425,39 @@ def run(args, logger: logging.Logger) -> int:
         mode=resolved_mode.value,
     )
 
+    # --- Data-loss safety gate (11-stage pipeline stage 7) ---
+    # Destructive modes (``replace*``) require ``--allow-data-loss`` in any
+    # env where FLUID_ENV != dev OR the target has rows. This gate MUST run
+    # BEFORE the apply-engine dispatch below, because BOTH dispatch paths
+    # short-circuit into ``run_builds_from_args`` and RETURN for the
+    # build-augmented modes: the OpenTofu branch at its ``needs_build``
+    # return and the native branch at its ``needs_build`` return. Since
+    # ``replace-and-build`` is in BOTH ``DESTRUCTIVE_MODES`` and
+    # ``BUILD_MODES`` — and the dbt path appends a destructive
+    # ``--full-refresh`` — a gate placed after either early-return would
+    # never fire for ``replace-and-build``. Placing it here, ahead of every
+    # early-return, gates ``replace`` and ``replace-and-build`` identically
+    # on both paths so no DDL / build ever runs when the gate blocks. Like
+    # ``parse_mode`` above, this raises ``CLIError`` straight to ``main()``.
+    #
+    # ``target_row_count=None`` signals "unknown" — the gate treats that as
+    # populated (fail-safe). Future enhancement: providers can implement
+    # a cheap ``estimate_row_count()`` and pass it in. For now, the gate's
+    # default behavior is "non-dev + replace → require --allow-data-loss
+    # unless you can prove the target is empty."
+    gate = check_data_loss_gate(
+        resolved_mode,
+        env=args.env,
+        target_row_count=None,  # unknown until provider check added
+        allow_data_loss=bool(getattr(args, "allow_data_loss", False)),
+    )
+    if gate.blocked:
+        raise CLIError(
+            1,
+            "apply_mode_data_loss_blocked",
+            {"mode": resolved_mode.value, "env": args.env, "reason": gate.reason},
+        )
+
     # Apply-engine resolution is automatic and per-provider — no user
     # switch. The cloud providers compile the contract to `.tf.json` and
     # delegate to `tofu`; `local` keeps the native path below.
@@ -1716,28 +1749,12 @@ def run(args, logger: logging.Logger) -> int:
                 "the change log."
             )
 
-        # --- Data-loss safety gate (11-stage pipeline stage 7) ---
-        # Destructive modes (``replace*``) require ``--allow-data-loss`` in any
-        # env where FLUID_ENV != dev OR the target has rows. This runs BEFORE
-        # any provider call so no DDL executes when the gate blocks.
-        #
-        # ``target_row_count=None`` signals "unknown" — the gate treats that as
-        # populated (fail-safe). Future enhancement: providers can implement
-        # a cheap ``estimate_row_count()`` and pass it in. For now, the gate's
-        # default behavior is "non-dev + replace → require --allow-data-loss
-        # unless you can prove the target is empty."
-        gate = check_data_loss_gate(
-            resolved_mode,
-            env=args.env,
-            target_row_count=None,  # unknown until provider check added
-            allow_data_loss=bool(getattr(args, "allow_data_loss", False)),
-        )
-        if gate.blocked:
-            raise CLIError(
-                1,
-                "apply_mode_data_loss_blocked",
-                {"mode": resolved_mode.value, "env": args.env, "reason": gate.reason},
-            )
+        # NOTE: the data-loss safety gate (``check_data_loss_gate``) used to
+        # live here. It was hoisted to run BEFORE the apply-engine dispatch
+        # so it also covers the build-augmented destructive mode
+        # (``replace-and-build``), whose ``needs_build`` early-return
+        # delegated to the build runner and returned before this point.
+        # See the gate block above ``resolve_apply_engine``.
 
         # Simple mode execution
         if use_simple_mode:

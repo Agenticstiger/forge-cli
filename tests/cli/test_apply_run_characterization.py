@@ -361,6 +361,42 @@ class TestDataLossGateGolden:
         # Gate fires before any provider dispatch — no mutation attempted.
         build_provider.assert_not_called()
 
+    def test_destructive_replace_and_build_without_override_blocks_exit_1(self, tmp_path):
+        """The build-augmented destructive mode (``replace-and-build``) must
+        hit the SAME data-loss gate as plain ``replace``.
+
+        ``replace-and-build`` is in BOTH ``DESTRUCTIVE_MODES`` and
+        ``BUILD_MODES``. The ``needs_build`` branch short-circuits into
+        ``run_builds_from_args`` (whose dbt path appends a destructive
+        ``--full-refresh``) and returns, so the gate MUST run *before* that
+        early-return — otherwise a destructive rebuild runs in prod with no
+        ``--allow-data-loss`` opt-in. Regression guard: neither the build
+        runner nor a provider may be reached when the gate blocks."""
+        contract_file = _write_contract(tmp_path)
+        args = _base_args(
+            str(contract_file),
+            mode="replace-and-build",
+            env="prod",
+            allow_data_loss=False,
+        )
+        with (
+            patch(
+                "fluid_build.cli.apply.load_contract_with_overlay", return_value=_minimal_contract()
+            ),
+            patch("fluid_build.cli.apply._gate_contract_for_apply", new=Mock()),
+            patch("fluid_build.cli.apply._run_apply_hooks", return_value=0),
+            patch("fluid_build.cli.apply.build_provider") as build_provider,
+            patch("fluid_build.build_runners.run_builds_from_args") as run_builds,
+        ):
+            with pytest.raises(CLIError) as excinfo:
+                _run(args)
+        assert excinfo.value.exit_code == 1
+        assert excinfo.value.event == "apply_mode_data_loss_blocked"
+        # Gate fires before the build-mode early-return: no destructive
+        # rebuild and no provider mutation are attempted.
+        run_builds.assert_not_called()
+        build_provider.assert_not_called()
+
     def test_destructive_replace_with_override_clears_the_gate(self, tmp_path):
         """Control: same destructive apply WITH ``--allow-data-loss`` clears
         the gate and reaches provider dispatch (return 0)."""
