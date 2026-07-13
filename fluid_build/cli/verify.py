@@ -190,6 +190,25 @@ Use Cases:
         "--show-diffs", action="store_true", help="Show detailed field-by-field differences"
     )
 
+    p.add_argument(
+        "--reconcile-dbt",
+        action="store_true",
+        help=(
+            "Cross-check the contract schema against the build's dbt project "
+            "(models/**/schema.yml) and flag drift. Static, warehouse-free. "
+            "Drift exits non-zero unless --warn-only is set."
+        ),
+    )
+
+    p.add_argument(
+        "--warn-only",
+        action="store_true",
+        help=(
+            "Downgrade --reconcile-dbt drift to a warning (exit 0). "
+            "Reports the drift but does not fail the build."
+        ),
+    )
+
     p.add_argument("--env", help="Environment overlay file")
 
     p.set_defaults(func=run)
@@ -1219,6 +1238,27 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     except Exception as exc:  # noqa: BLE001 — verify must not crash the CLI
         warning(f"Acquisition probes skipped: {exc}")
 
+    # ── Contract ↔ dbt reconciliation (opt-in via --reconcile-dbt) ─────────
+    # Static, warehouse-free cross-check that the contract schema agrees with
+    # the columns the build's dbt project declares. Surfaces DRIFT (contract
+    # column absent from dbt, dbt column absent from the contract, type
+    # disagreement, missing model). ``getattr`` defaults keep every existing
+    # caller (and test Namespace lacking the new attrs) behaving exactly as
+    # before — the check only runs when the operator opts in.
+    reconcile_report = None
+    if getattr(args, "reconcile_dbt", False):
+        try:
+            from fluid_build.cli._verify_reconcile import (
+                reconcile_contract_dbt,
+                render_report,
+            )
+
+            reconcile_report = reconcile_contract_dbt(contract, contract_path)
+            render_report(reconcile_report, show_diffs=getattr(args, "show_diffs", False))
+        except Exception as exc:  # noqa: BLE001 — reconcile must not crash verify
+            warning(f"Contract↔dbt reconciliation skipped: {exc}")
+            reconcile_report = None
+
     # Summary
     cprint("\n" + "=" * 80)
     cprint("📊 Verification Summary")
@@ -1250,12 +1290,35 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             },
             "results": results,
         }
+        if reconcile_report is not None:
+            report["reconcile"] = reconcile_report.to_dict()
 
         output_path = Path(args.out)
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
 
         cprint(f"\n📄 Report saved: {output_path}")
+
+    # Contract↔dbt drift gate (opt-in). When --reconcile-dbt found drift and
+    # the operator did NOT pass --warn-only, fail the run so CI catches a
+    # contract that no longer matches its dbt project. This is independent of
+    # --strict: the operator explicitly asked for the reconcile check, so its
+    # drift gates on its own. --warn-only downgrades to a non-fatal warning.
+    if reconcile_report is not None and reconcile_report.has_drift:
+        if getattr(args, "warn_only", False):
+            warning(
+                "--warn-only: contract↔dbt drift detected "
+                f"({len(reconcile_report.column_drifts)} column, "
+                f"{len(reconcile_report.model_drifts)} model) — not failing the build."
+            )
+        else:
+            console_error(
+                "Contract↔dbt drift detected "
+                f"({len(reconcile_report.column_drifts)} column, "
+                f"{len(reconcile_report.model_drifts)} model). "
+                "Fix the contract or dbt schema, or pass --warn-only."
+            )
+            return 1
 
     # Exit with error code if strict mode and CRITICAL issues found.
     # Non-critical mismatches (e.g. nullable-vs-required constraint
