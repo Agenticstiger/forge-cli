@@ -754,8 +754,14 @@ class LocalProvider(BaseProvider):
             delim = "," if (fmt != "tsv" and path.suffix.lower() != ".tsv") else "\t"
             opt = {"AUTO_DETECT": True, "DELIM": delim}
             opt.update({k.upper(): v for k, v in (options or {}).items()})
+            # The option KEY is a DuckDB named-parameter name interpolated as
+            # ``KEY:=value``. ``options`` is contract-supplied, so route each
+            # key through ``validate_ident`` (allowlist ``^[A-Za-z_]\w*$``,
+            # returns simple identifiers unchanged) to reject DDL smuggled via
+            # a key — the value already routes through ``quote_string_literal``.
             opt_sql = ", ".join(
-                f"{k}:={json.dumps(v) if not isinstance(v, str) else quote_string_literal(v)}"
+                f"{validate_ident(k)}:="
+                f"{json.dumps(v) if not isinstance(v, str) else quote_string_literal(v)}"
                 for k, v in opt.items()
             )
             con.execute(

@@ -118,6 +118,32 @@ class TestLocalRegisterOneLiteral:
         # … and the option KEY stays an unquoted DuckDB parameter name.
         assert "NULLSTR:=" in sql
 
+    def test_malicious_option_key_is_rejected(self):
+        # An option KEY becomes a DuckDB named-parameter name interpolated
+        # into ``read_csv_auto(... KEY:=value ...)``. ``options`` is
+        # contract-supplied (``item.get("options")``), so a key carrying DDL
+        # must be rejected by ``validate_ident`` BEFORE any SQL reaches the
+        # connection — never interpolated raw. (Sibling to the value-literal
+        # hardening: the value routes through ``quote_string_literal``; the
+        # key must route through ``validate_ident``.)
+        from fluid_build.providers.local.local import LocalProvider
+
+        con = _SpyConnection()
+        with pytest.raises(ValueError):
+            LocalProvider()._register_one(
+                con, "t", Path("/tmp/plain/*.csv"), "csv", {"x); DROP TABLE t; --": "1"}
+            )
+        # The injection never reached the connection.
+        assert con.executed == []
+
+    def test_benign_custom_option_key_passes_through(self):
+        # A legitimate custom option key survives as an unquoted DuckDB
+        # parameter name (``validate_ident`` returns simple identifiers
+        # unchanged), so the happy path is unaffected by the key guard.
+        path = Path("/tmp/plain/*.csv")
+        sql = self._register(path, "csv", options={"sample_size": 1000})
+        assert "SAMPLE_SIZE:=1000" in sql
+
     def test_benign_path_is_not_over_escaped(self):
         # Negative assertion: a quote-free path yields a clean literal with
         # no spurious quote-doubling artifacts. A glob path skips the on-disk
