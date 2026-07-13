@@ -197,9 +197,9 @@ class AwsIacPlugin:
         # the calling AWS account ID as ``catalog_id``. Emit the
         # ``aws_caller_identity`` data source when any LF feature is used
         # so downstream resources can ``tofu_ref`` ``account_id`` off it.
-        # ...and when a bucket-less Glue binding falls back to the
-        # ``{account}-fluid-data`` warehouse, whose token references this source.
-        if _contract_uses_lakeformation(contract) or _has_bucketless_glue_binding(contract):
+        # ...and whenever a binding's warehouse falls back to the
+        # ``{account}-fluid-data`` bucket, whose token references this source.
+        if _contract_uses_lakeformation(contract) or _references_caller_account(contract):
             data.setdefault("aws_caller_identity", {})["fluid_lf_caller"] = {}
         return data
 
@@ -1066,19 +1066,28 @@ def _contract_uses_lakeformation(contract: Mapping[str, Any]) -> bool:
     return False
 
 
-def _has_bucketless_glue_binding(contract: Mapping[str, Any]) -> bool:
-    """True if any AWS Glue-catalog exposure omits ``binding.location.bucket``.
+def _references_caller_account(contract: Mapping[str, Any]) -> bool:
+    """True if any AWS binding's warehouse falls back to the apply-time
+    ``{aws_caller_identity}-fluid-data`` bucket, so the backing
+    ``data.aws_caller_identity.fluid_lf_caller`` source must be declared (see
+    :meth:`AwsIacPlugin.emit_data`).
 
-    Such a binding's warehouse falls back to the apply-time
-    ``{aws_caller_identity}-fluid-data`` bucket, so the backing data source must
-    be emitted (see :meth:`AwsIacPlugin.emit_data`)."""
+    Reuses :func:`normalize_location` — the single function that interpolates
+    ``_CALLER_ACCOUNT_TOKEN`` into the emitted HCL — so the declaration can never
+    drift from the emission. The previous predicate hard-coded a narrower
+    ``Glue-catalog format + table + no bucket`` check and missed standard tables
+    and unresolved ``{{ env }}`` buckets, so those emitted the token without the
+    backing data source → ``tofu plan`` failed with
+    ``Reference to undeclared resource``."""
     for exposure in contract.get("exposes") or []:
         binding = exposure.get("binding") or {}
         if binding.get("platform") != "aws":
             continue
         loc = binding.get("location") or {}
-        fmt = str(binding.get("format") or "").lower()
-        if fmt in _GLUE_CATALOG_FORMATS and loc.get("table") and not loc.get("bucket"):
+        bucket, _ = _warehouse.normalize_location(
+            loc, account_ref=_CALLER_ACCOUNT_TOKEN, default_path=False
+        )
+        if _CALLER_ACCOUNT_TOKEN in bucket:
             return True
     return False
 
