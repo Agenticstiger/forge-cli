@@ -143,6 +143,54 @@ class TestSecureFileOperations:
         self.ops.write_file_safe(f, "hello: world")
         assert f.read_text() == "hello: world"
 
+    @pytest.mark.skipif(
+        sys.platform.startswith("win"),
+        reason="O_NOFOLLOW is a no-op on Windows (F5 guard is POSIX-only)",
+    )
+    def test_read_file_safe_rejects_symlink_via_nofollow(self, tmp_path, monkeypatch):
+        """F5 (TOCTOU): ``read_file_safe`` opens with ``O_NOFOLLOW`` so a
+        validated path that IS a symlink at open() time (the swap the
+        resolve-at-validation step can't see) is rejected with
+        ``file_permission_denied`` — the file behind the link is never read.
+
+        ``validate_input_path`` resolves symlinks away, so to exercise the
+        open-time guard we simulate the post-validation swap by having the
+        validator hand back the symlink itself (exactly the state O_NOFOLLOW
+        defends against)."""
+        target = tmp_path / "real.yaml"
+        target.write_text("secret: data")
+        link = tmp_path / "link.yaml"
+        link.symlink_to(target)
+
+        monkeypatch.setattr(self.ops.validator, "validate_input_path", lambda _p, _ft="file": link)
+        with pytest.raises(FluidCLIError) as exc:
+            self.ops.read_file_safe(link, "config")
+        assert exc.value.event == "file_permission_denied"
+
+    @pytest.mark.skipif(
+        sys.platform.startswith("win"),
+        reason="directory fd semantics differ on Windows",
+    )
+    def test_read_file_safe_rejects_non_regular_file(self, tmp_path):
+        """F5: a directory (non-regular file) is opened but rejected by the
+        ``S_ISREG`` fstat check with ``file_not_regular`` — never read as
+        text. A ``.yaml``-suffixed directory clears the extension gate so we
+        reach the regular-file check in ``read_file_safe`` itself."""
+        d = tmp_path / "dir.yaml"
+        d.mkdir()
+        with pytest.raises(FluidCLIError) as exc:
+            self.ops.read_file_safe(d, "config")
+        assert exc.value.event == "file_not_regular"
+
+    def test_read_file_safe_rejects_non_utf8(self, tmp_path):
+        """F5: a regular file whose bytes are not valid UTF-8 raises
+        ``file_encoding_error`` rather than returning mojibake."""
+        f = tmp_path / "bad.yaml"
+        f.write_bytes(b"\xff\xfe\xfd not utf-8 \x80\x81")
+        with pytest.raises(FluidCLIError) as exc:
+            self.ops.read_file_safe(f, "config")
+        assert exc.value.event == "file_encoding_error"
+
 
 class TestInputSanitizer:
     def test_sanitize_filename_removes_dangerous(self):

@@ -156,6 +156,143 @@ class TestEncryptedCredentialStore:
         assert mode == "0o700", f"expected 0o700, got {mode}"
 
 
+@pytest.mark.skipif(not CRYPTO_AVAILABLE, reason="cryptography not installed")
+class TestPassphraseKeyMode:
+    """Pin the PBKDF2 ``FLUID_ENCRYPTION_PASSPHRASE`` key path
+    (``_ensure_key`` step 2 + ``_derive_key_from_passphrase``).
+
+    The passphrase mode is the recommended CI shape: no key material
+    touches disk, only a non-secret 16-byte ``<store>.salt`` is persisted
+    so the same passphrase re-derives the same key across process runs.
+    """
+
+    def _clear_env(self, monkeypatch):
+        monkeypatch.delenv("FLUID_ENCRYPTION_KEY", raising=False)
+        monkeypatch.delenv("FLUID_ENCRYPTION_PASSPHRASE", raising=False)
+
+    def test_passphrase_roundtrip_persists_and_reuses_salt(self, tmp_path, monkeypatch):
+        """Same passphrase across two independent store instances derives
+        the SAME key (via the persisted salt) so a credential written by
+        the first is readable by the second — and the salt file persists
+        and is reused, not regenerated."""
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("FLUID_ENCRYPTION_PASSPHRASE", "correct horse battery staple")
+        store_path = tmp_path / "creds.enc"
+        salt_path = tmp_path / "creds.enc.salt"
+
+        store1 = EncryptedCredentialStore(store_path=store_path, key_path=tmp_path / "unused.key")
+        store1.set_credential("snowflake.password", "hunter2")
+
+        # Salt was persisted next to the store as a 16-byte non-secret.
+        assert salt_path.exists()
+        salt_after_first = salt_path.read_bytes()
+        assert len(salt_after_first) == 16
+        # No on-disk key file — passphrase mode never writes key material.
+        assert not (tmp_path / "unused.key").exists()
+
+        # A SECOND independent instance (same passphrase, same store) must
+        # re-derive the identical key and read the credential back.
+        store2 = EncryptedCredentialStore(store_path=store_path, key_path=tmp_path / "unused.key")
+        assert store2.get_credential("snowflake.password") == "hunter2"
+
+        # Same key material derived both times (the salt was REUSED, not
+        # regenerated — a fresh salt would yield a different key).
+        assert store1.key == store2.key
+        assert salt_path.read_bytes() == salt_after_first
+
+    def test_different_passphrase_raises_and_does_not_wipe(self, tmp_path, monkeypatch):
+        """A DIFFERENT passphrase over the same persisted salt derives a
+        different key; decrypting the existing ciphertext must raise
+        CredentialError (S-008) and MUST NOT wipe/overwrite the
+        ciphertext."""
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("FLUID_ENCRYPTION_PASSPHRASE", "passphrase-A")
+        store_path = tmp_path / "creds.enc"
+
+        store_a = EncryptedCredentialStore(store_path=store_path, key_path=tmp_path / "unused.key")
+        store_a.set_credential("api.token", "s3cr3t")
+        ciphertext_before = store_path.read_bytes()
+
+        # Same salt file persists; a different passphrase → different key.
+        monkeypatch.setenv("FLUID_ENCRYPTION_PASSPHRASE", "passphrase-B")
+        store_b = EncryptedCredentialStore(store_path=store_path, key_path=tmp_path / "unused.key")
+        assert store_b.key != store_a.key
+
+        with pytest.raises(CredentialError):
+            store_b.get_credential("api.token")
+
+        # Ciphertext untouched — recoverable once the right passphrase returns.
+        assert store_path.read_bytes() == ciphertext_before
+
+
+@pytest.mark.skipif(not CRYPTO_AVAILABLE, reason="cryptography not installed")
+class TestEnvKeyMode:
+    """Pin the ``FLUID_ENCRYPTION_KEY`` env key path (``_ensure_key``
+    step 1) — a raw Fernet key supplied directly takes precedence over
+    the on-disk key fallback, so no ``.key`` file is ever written."""
+
+    def test_env_key_takes_precedence_no_key_file_written(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("FLUID_ENCRYPTION_PASSPHRASE", raising=False)
+        raw_key = Fernet.generate_key()  # urlsafe-base64 bytes
+        monkeypatch.setenv("FLUID_ENCRYPTION_KEY", raw_key.decode("utf-8"))
+
+        key_path = tmp_path / ".key"
+        store = EncryptedCredentialStore(store_path=tmp_path / "creds.enc", key_path=key_path)
+        store.set_credential("k", "v")
+        assert store.get_credential("k") == "v"
+
+        # The env key took precedence — the on-disk key fallback branch was
+        # never reached, so no key file exists on disk.
+        assert not key_path.exists()
+        # And the in-memory key is exactly the env-supplied one.
+        assert store.key == raw_key
+
+
+@pytest.mark.skipif(not CRYPTO_AVAILABLE, reason="cryptography not installed")
+class TestRotateKey:
+    """Pin ``rotate_key()`` — re-encrypt every credential under a fresh
+    on-disk key, and its refusal to run in env/passphrase key modes."""
+
+    def _clear_env(self, monkeypatch):
+        monkeypatch.delenv("FLUID_ENCRYPTION_KEY", raising=False)
+        monkeypatch.delenv("FLUID_ENCRYPTION_PASSPHRASE", raising=False)
+
+    def test_rotate_rewrites_key_and_ciphertext_preserving_values(self, tmp_path, monkeypatch):
+        self._clear_env(monkeypatch)
+        store_path = tmp_path / "creds.enc"
+        key_path = tmp_path / ".key"
+        store = EncryptedCredentialStore(store_path=store_path, key_path=key_path)
+        store.set_credential("a", "1")
+        store.set_credential("b", "2")
+
+        key_before = key_path.read_bytes()
+        cipher_before = store_path.read_bytes()
+
+        store.rotate_key()
+
+        # Both the key file and the ciphertext were rewritten.
+        assert key_path.read_bytes() != key_before
+        assert store_path.read_bytes() != cipher_before
+
+        # The rotating instance still reads the original plaintext values.
+        assert store.get_credential("a") == "1"
+        assert store.get_credential("b") == "2"
+
+        # A fresh instance loading the NEW on-disk key decrypts them too.
+        store2 = EncryptedCredentialStore(store_path=store_path, key_path=key_path)
+        assert store2.get_credential("a") == "1"
+        assert store2.get_credential("b") == "2"
+
+    def test_rotate_refuses_in_env_key_mode(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("FLUID_ENCRYPTION_PASSPHRASE", raising=False)
+        monkeypatch.setenv("FLUID_ENCRYPTION_KEY", Fernet.generate_key().decode("utf-8"))
+        store = EncryptedCredentialStore(
+            store_path=tmp_path / "creds.enc", key_path=tmp_path / ".key"
+        )
+        with pytest.raises(CredentialError):
+            store.rotate_key()
+
+
 class TestNotAvailable:
     def test_raises_without_cryptography(self, tmp_path):
         with patch("fluid_build.credentials.encrypted_store.CRYPTOGRAPHY_AVAILABLE", False):
