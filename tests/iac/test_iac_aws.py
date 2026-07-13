@@ -14,6 +14,7 @@ Pure-function tests: no credentials, no network.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -167,6 +168,50 @@ class TestAwsModuleOutput:
         doc = json.loads(text)
         assert text == json.dumps(doc, indent=2, sort_keys=True) + "\n"
         assert doc["terraform"]["required_providers"]["aws"]["source"] == "hashicorp/aws"
+
+
+class TestAwsProviderBlock:
+    """Emulator-compatibility provider config (LocalStack / moto) is emitted
+    only when a custom AWS endpoint is set, so real-AWS output is unchanged."""
+
+    @staticmethod
+    def _clear_endpoint_env(monkeypatch):
+        for key in list(os.environ):
+            if key == "AWS_ENDPOINT_URL" or key.startswith("AWS_ENDPOINT_URL_"):
+                monkeypatch.delenv(key, raising=False)
+
+    def test_real_aws_emits_no_provider_block(self, monkeypatch):
+        self._clear_endpoint_env(monkeypatch)
+        c = _contract([_glue_exposure(database="d", table="t", bucket="b")])
+        doc = json.loads(build_module(_aws(), c))
+        assert "provider" not in doc
+
+    def test_localstack_endpoint_emits_path_style_and_skips(self, monkeypatch):
+        self._clear_endpoint_env(monkeypatch)
+        monkeypatch.setenv("AWS_ENDPOINT_URL", "http://localhost:4566")
+        c = _contract([_glue_exposure(database="d", table="t", bucket="b")])
+        doc = json.loads(build_module(_aws(), c))
+        aws = doc["provider"]["aws"]
+        assert aws["s3_use_path_style"] is True
+        assert aws["skip_credentials_validation"] is True
+        assert aws["skip_requesting_account_id"] is True
+        assert aws["skip_metadata_api_check"] is True
+        assert aws["skip_region_validation"] is True
+
+    def test_per_service_endpoint_also_triggers_compat(self, monkeypatch):
+        self._clear_endpoint_env(monkeypatch)
+        monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "http://localhost:4566")
+        c = _contract([_glue_exposure(database="d", table="t", bucket="b")])
+        doc = json.loads(build_module(_aws(), c))
+        assert doc["provider"]["aws"]["s3_use_path_style"] is True
+
+    def test_helper_signals_only_on_endpoint_env(self, monkeypatch):
+        from fluid_build.iac.providers.aws import _has_custom_aws_endpoint
+
+        self._clear_endpoint_env(monkeypatch)
+        assert _has_custom_aws_endpoint() is False
+        monkeypatch.setenv("AWS_ENDPOINT_URL_DYNAMODB", "http://localhost:4566")
+        assert _has_custom_aws_endpoint() is True
 
 
 class TestAwsKinesis:
