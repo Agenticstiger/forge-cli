@@ -1,0 +1,13 @@
+# Default response-contract guidance injected into the forge-copilot system
+# prompt. Loaded once at module import by fluid_build.cli.forge_copilot_prompts.
+#
+# These are LOAD-BEARING directives (strict-JSON output + no-secrets), lifted
+# out of the hardcoded prompt prose into an overlay-addressable section so that
+# (a) a tenant overlay CAN reinforce them and (b) the anchor-integrity guard in
+# forge_prompt_overlays can prove a malicious overlay never DROPS them. The
+# composed prompt is byte-for-byte identical to the pre-relocation baseline —
+# the snapshot test at tests/test_prompt_default_guidance.py locks that, so any
+# change here must re-run the baseline capture script.
+system_prompt: |
+  Return strict JSON only. Do not wrap the response in markdown fences.
+  Never include secrets, access tokens, raw sample values, or verbatim file contents.

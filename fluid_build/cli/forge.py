@@ -475,6 +475,24 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     parser.add_argument(
+        "--prompt-overlay",
+        dest="prompt_overlay",
+        metavar="A,B,C",
+        action="append",
+        help=(
+            "Stack one or more prompt overlays (agent_specs/prompt_overlays/"
+            "<name>.yaml) ON TOP of the defaults + any --prompt-profile. "
+            "Overlays patch labelled sections (replace/append/prepend) and may "
+            "ship validator_rules. Applied left-to-right (later wins on "
+            "conflict). Comma-separate or repeat the flag. Untrusted overlays "
+            "are traversal-safe + safe_load-only; an overlay that drops a "
+            "load-bearing anchor sentence is rejected. Set FLUID_OVERLAY_STRICT=1 "
+            "to reject any unsigned overlay (ed25519). Active overlays are "
+            "stamped into metadata.provenance.prompt_overlays. Env fallback: "
+            "FLUID_PROMPT_OVERLAYS."
+        ),
+    )
+    parser.add_argument(
         "--no-llm",
         action="store_true",
         help=(
@@ -1557,6 +1575,36 @@ def _run_main(args, logger: logging.Logger) -> int:
             return 2
         if _profile_name:
             LOG.debug("Forge: prompt profile active: %s", _profile_name)
+
+        # --- Prompt overlays (stackable, compose ON TOP of the profile) ---
+        # Activate AFTER the profile so the anchor-integrity guard's base
+        # guidance already reflects it. Load + signature-policy + anchor-guard
+        # all happen here; any failure is a hard, clear error (never a silent
+        # fall-back). Imported lazily so the crypto/overlay module never loads
+        # on the ``fluid --help`` cold path.
+        from fluid_build.cli.forge_prompt_overlays import (
+            PromptOverlayError,
+            activate_prompt_overlays,
+        )
+
+        _overlay_spec = getattr(args, "prompt_overlay", None)
+        if not isinstance(_overlay_spec, (str, list, tuple)):
+            _overlay_spec = None
+        if not _overlay_spec:
+            _overlay_spec = os.environ.get("FLUID_PROMPT_OVERLAYS") or None
+        try:
+            _active_overlays = activate_prompt_overlays(_overlay_spec)
+        except PromptOverlayError as exc:
+            if console:
+                console.print(f"[red]Invalid --prompt-overlay:[/red] {exc}")
+            else:
+                console_error(f"Invalid --prompt-overlay: {exc}")
+            return 2
+        if _active_overlays:
+            LOG.debug(
+                "Forge: prompt overlays active: %s",
+                ", ".join(o.name for o in _active_overlays),
+            )
 
         if getattr(args, "forge_subcommand", None) == "data-model":
             from fluid_build.cli.forge_data_model import run as run_data_model
