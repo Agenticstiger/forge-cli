@@ -379,9 +379,3 @@ def get_command_center_client(logger: Optional[logging.Logger] = None) -> Comman
         _global_client = CommandCenterClient(logger=logger)
 
     return _global_client
-
-
-def reset_global_client() -> None:
-    """Reset global client (useful for testing)."""
-    global _global_client
-    _global_client = None

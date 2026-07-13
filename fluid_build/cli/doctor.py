@@ -602,11 +602,6 @@ def run(args, logger: logging.Logger) -> int:
         raise CLIError(1, "doctor_unexpected_error", context={"error": str(e)})
 
 
-def _extended_diagnostics_available() -> bool:
-    """Return whether an extended workspace diagnostic script is available."""
-    return _resolve_extended_diagnostic_script() is not None
-
-
 def _resolve_extended_diagnostic_script() -> Optional[Path]:
     """Resolve the optional workspace diagnostic script, returning None if unavailable."""
     script_path = EXTENDED_DIAG_SCRIPT.resolve()

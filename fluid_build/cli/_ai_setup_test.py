@@ -76,20 +76,6 @@ def _make_cloud_config(*args, **kwargs):
     return _host()._make_cloud_config(*args, **kwargs)
 
 
-# Module-internal indirection: tests patch
-# ``fluid_build.cli.ai_setup._resolve_ai_test_config`` etc. — those
-# names point back at THIS module via the host's re-export, so we
-# resolve through the host on every call to flow the patch through.
-def _via_host(name: str):
-    """Return the host-module attribute by name when it differs from
-    the local one (because tests patched it). Otherwise None."""
-    host_attr = getattr(_host(), name, None)
-    here_attr = globals().get(name)
-    if host_attr is not None and host_attr is not here_attr:
-        return host_attr
-    return None
-
-
 def _bind_constants_from_host() -> None:
     """Pull constants and host classes from the host module into this
     module's globals so bare-name references inside the extracted
