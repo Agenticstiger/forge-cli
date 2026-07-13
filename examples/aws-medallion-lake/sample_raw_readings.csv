@@ -1,0 +1,6 @@
+device_id,reading_ts,metric,value,unit
+sensor-a1,2026-07-13T08:00:01Z,temperature,21.4,celsius
+sensor-a1,2026-07-13T08:00:01Z,humidity,48.2,percent
+sensor-b7,2026-07-13T08:00:03Z,temperature,19.9,celsius
+sensor-b7,2026-07-13T08:00:03Z,pressure,1013.2,hpa
+sensor-c3,2026-07-13T08:00:05Z,humidity,51.7,percent

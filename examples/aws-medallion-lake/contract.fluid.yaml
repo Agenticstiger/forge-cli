@@ -1,0 +1,127 @@
+fluidVersion: "0.7.2"
+kind: DataProduct
+id: iot.telemetry.sensor_readings
+name: IoT Sensor Telemetry (Medallion Lake on S3 + Glue)
+description: Bronze raw-landing and Silver curated sensor-telemetry tables cataloged in Glue for Athena
+domain: IoT
+
+tags:
+  - data-lake
+  - medallion
+  - aws-glue
+  - athena
+  - iot
+
+labels:
+  team: platform-data
+  platform: aws
+
+metadata:
+  layer: Silver
+  owner:
+    team: platform-data
+    email: platform-data@example.com
+
+# ─── Access Policy ─────────────────────────────────────────────────
+
+accessPolicy:
+  grants:
+    - principal: "group:analysts@example.com"
+      permissions: [read, select]
+    - principal: "serviceAccount:iot-ingest@example.iam.gserviceaccount.com"
+      permissions: [read, write, create]
+
+# ─── Two exposures = two medallion zones in one data product ───────
+# Bronze: raw device payloads land as-is (CSV) in the raw/ prefix.
+# Silver: cleaned, typed, deduplicated readings as Parquet in curated/.
+# Both are cataloged in Glue so Athena can query either zone.
+
+exposes:
+  # ── Bronze: raw landing zone (source of truth, schema-on-read) ──
+  - exposeId: raw_readings
+    title: Raw Sensor Readings (Bronze)
+    version: "1.0.0"
+    kind: table
+
+    binding:
+      platform: aws
+      format: csv
+      location:
+        database: iot_bronze
+        table: raw_sensor_readings
+        bucket: acme-iot-lake
+        path: raw/iot/sensor_readings/
+        region: us-east-1
+
+    contract:
+      schema:
+        - name: device_id
+          type: string
+          required: true
+          description: Device identifier as reported by the gateway
+        - name: reading_ts
+          type: string
+          required: true
+          description: Raw event timestamp string (unparsed at Bronze)
+        - name: metric
+          type: string
+          required: true
+          description: Metric name (temperature / humidity / pressure)
+        - name: value
+          type: string
+          required: true
+          description: Raw metric value (untyped at Bronze)
+        - name: unit
+          type: string
+          required: false
+          description: Unit of measure as reported
+
+  # ── Silver: curated zone (typed, validated, query-ready) ────────
+  - exposeId: clean_readings
+    title: Sensor Readings (Silver)
+    version: "1.0.0"
+    kind: table
+
+    binding:
+      platform: aws
+      format: parquet
+      location:
+        database: iot_silver
+        table: sensor_readings
+        bucket: acme-iot-lake
+        path: curated/iot/sensor_readings/
+        region: us-east-1
+
+    contract:
+      schema:
+        - name: device_id
+          type: string
+          required: true
+          description: Device identifier
+        - name: reading_time
+          type: timestamp
+          required: true
+          description: Parsed reading timestamp (UTC)
+        - name: metric
+          type: string
+          required: true
+          description: One of temperature / humidity / pressure
+        - name: value
+          type: double
+          required: true
+          description: Typed metric value
+        - name: unit
+          type: string
+          required: true
+          description: Canonical unit of measure
+
+      quality:
+        - rule: value_is_finite
+          expression: "value IS NOT NULL"
+          severity: error
+        - rule: known_metric
+          expression: "metric IN ('temperature', 'humidity', 'pressure')"
+          severity: warning
+        - rule: reading_time_not_future
+          expression: "reading_time <= CURRENT_TIMESTAMP"
+          severity: warning

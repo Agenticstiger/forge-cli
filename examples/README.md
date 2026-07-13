@@ -52,6 +52,9 @@ CSV declared in the contract's `exposes[].binding.location.path` (under
 
 Deeper, real-world examples — each with its own README:
 
+- [`aws-s3-glue-athena/`](aws-s3-glue-athena/) — S3 + Glue Data Catalog + Athena serverless data lake (Parquet).
+- [`aws-iceberg-lakehouse/`](aws-iceberg-lakehouse/) — Apache Iceberg ACID table on Glue + S3, with time-travel.
+- [`aws-medallion-lake/`](aws-medallion-lake/) — Bronze + Silver medallion zones in one AWS data product.
 - [`aws-glue-data-lake/`](aws-glue-data-lake/) — Glue Data Catalog, Iceberg tables, ETL jobs on AWS.
 - [`mcp-output-port/`](mcp-output-port/) — expose a data product as a Model Context Protocol server.
 - [`source-aligned-postgres-duckdb/`](source-aligned-postgres-duckdb/) — a source-aligned product reading from Postgres via DuckDB.

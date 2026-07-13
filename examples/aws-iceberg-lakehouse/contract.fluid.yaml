@@ -1,0 +1,127 @@
+fluidVersion: "0.7.2"
+kind: DataProduct
+id: sales.lakehouse.orders
+name: Orders Lakehouse (Apache Iceberg on Glue + S3)
+description: ACID-compliant Iceberg orders table with time-travel, snapshot expiry, and compaction
+domain: Sales
+
+tags:
+  - lakehouse
+  - aws-glue
+  - iceberg
+  - acid
+  - athena
+
+labels:
+  team: data-engineering
+  platform: aws
+  table_format: iceberg
+
+metadata:
+  layer: Gold
+  owner:
+    team: data-engineering
+    email: data-eng@example.com
+
+# ─── Access Policy ─────────────────────────────────────────────────
+
+accessPolicy:
+  grants:
+    - principal: "group:analysts@example.com"
+      permissions: [read, select]
+    - principal: "serviceAccount:orders-etl@example.iam.gserviceaccount.com"
+      permissions: [read, write, create, update, delete]
+
+# ─── Expose: Apache Iceberg table (Glue catalog + S3) ──────────────
+# The `iceberg` format makes Glue emit table_type=ICEBERG. Athena then
+# supports row-level UPDATE/DELETE/MERGE, schema evolution, and
+# time-travel (SELECT ... FOR TIMESTAMP AS OF / FOR VERSION AS OF) over
+# the same physical Parquet files on S3.
+
+exposes:
+  - exposeId: orders
+    title: Orders (Iceberg — ACID)
+    version: "1.0.0"
+    kind: table
+
+    binding:
+      platform: aws
+      format: iceberg
+      location:
+        database: sales
+        table: orders
+        bucket: acme-sales-lakehouse
+        path: iceberg/sales/orders/
+        region: us-east-1
+
+    # AWS Glue Iceberg table management: snapshot retention keeps
+    # time-travel history bounded, compaction keeps the small-files
+    # problem in check. Values follow community norms (5-day retention,
+    # 256 MB target file size).
+    iceberg:
+      writeFormat: parquet
+      snapshotRetention:
+        maxSnapshotAgeMs: 432000000   # 5 days of time-travel history
+        minSnapshotsToKeep: 3
+      compaction:
+        targetFileSizeMb: 256
+        enabled: true
+
+    contract:
+      schema:
+        - name: order_id
+          type: string
+          required: true
+          description: Unique order identifier (primary key)
+
+        - name: order_date
+          type: date
+          required: true
+          description: Business date the order was placed
+
+        - name: customer_id
+          type: string
+          required: true
+          description: Pseudonymous customer identifier
+          sensitivity: pseudonymized
+
+        - name: status
+          type: string
+          required: true
+          description: One of placed / paid / shipped / delivered / cancelled
+
+        - name: quantity
+          type: integer
+          required: true
+          description: Total units in the order
+
+        - name: unit_price
+          type: decimal(10,2)
+          required: true
+          description: Price per unit in the order currency
+
+        - name: total_amount
+          type: decimal(12,2)
+          required: true
+          description: Order total in the order currency
+
+        - name: currency
+          type: string
+          required: true
+          description: ISO-4217 currency code
+
+        - name: updated_at
+          type: timestamp
+          required: true
+          description: Last mutation timestamp (Iceberg MERGE upserts this)
+
+      quality:
+        - rule: total_matches_lines
+          expression: "total_amount = quantity * unit_price"
+          severity: warning
+        - rule: valid_currency
+          expression: "LENGTH(currency) = 3"
+          severity: error
+        - rule: non_negative_quantity
+          expression: "quantity > 0"
+          severity: error
