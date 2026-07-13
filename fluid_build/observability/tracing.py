@@ -66,11 +66,17 @@ from fluid_build.observability.secret_redactor import redact_secret_text
 
 # Soft-import OTEL. When absent, the decorator returns wrapped
 # callables unchanged — zero runtime overhead for opted-out setups.
+#
+# NB: the OTLP-http *span exporter* is deliberately NOT imported here — it
+# drags the ``requests`` + ``google.protobuf`` stacks (~140 modules). Because
+# ``cli/validate.py`` imports ``traced_stage`` at module scope and ``validate``
+# registers during ``build_parser()``, a module-level exporter import would
+# land ``requests`` + ``google.protobuf`` on the ``fluid --help`` cold path in
+# any env that has ``opentelemetry`` installed. The exporter is imported lazily
+# inside :func:`_get_tracer` (first traced span, endpoint configured) instead.
+# Pinned by tests/perf/test_startup_budget.py.
 try:
     from opentelemetry import trace as _otel_trace
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
-        OTLPSpanExporter as _OtelOTLPSpanExporter,
-    )
     from opentelemetry.sdk.resources import Resource as _OtelResource
     from opentelemetry.sdk.trace import TracerProvider as _OtelTracerProvider
     from opentelemetry.sdk.trace.export import (
@@ -84,7 +90,6 @@ except ImportError:  # pragma: no cover — skipped when optional deps absent
     _OtelResource = None  # type: ignore[assignment]
     _OtelTracerProvider = None  # type: ignore[assignment]
     _OtelBatchSpanProcessor = None  # type: ignore[assignment]
-    _OtelOTLPSpanExporter = None  # type: ignore[assignment]
 
 
 _logger = logging.getLogger(__name__)
@@ -126,6 +131,14 @@ def _get_tracer() -> Any:
         return _tracer
     if not _tracer_provider_initialised:
         try:
+            # Deferred exporter import (see the module-scope soft-import note):
+            # keeps ``requests`` + ``google.protobuf`` off the ``fluid --help``
+            # cold path. A missing exporter package is caught by the broad
+            # ``except`` below → tracing degrades to a no-op, never a hard error.
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                OTLPSpanExporter as _OtelOTLPSpanExporter,
+            )
+
             resource = _OtelResource.create(
                 {
                     "service.name": os.environ.get("OTEL_SERVICE_NAME", "fluid"),
