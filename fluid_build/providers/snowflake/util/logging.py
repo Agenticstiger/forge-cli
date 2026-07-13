@@ -162,9 +162,7 @@ SENSITIVE_PATTERNS = [
     # redacted ``[REDACTED]`` token (idempotent) — it never bites into a PEM body.
     # Value class ``[^\s;&,]{,256}`` matches the Snowflake bare-assignment
     # convention above and is length-bounded (no catastrophic backtracking).
-    re.compile(
-        r"(?i)(?P<key>\bprivate[_-]?key)(?P<sep>\s{,8}[:=]\s{,8})(?P<value>[^\s;&,]{,256})"
-    ),
+    re.compile(r"(?i)(?P<key>\bprivate[_-]?key)(?P<sep>\s{,8}[:=]\s{,8})(?P<value>[^\s;&,]{,256})"),
 ]
 
 # Keys that should be redacted in dictionaries.
