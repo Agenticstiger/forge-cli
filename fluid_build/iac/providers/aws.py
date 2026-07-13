@@ -37,6 +37,20 @@ from ..versions import required_providers
 _CALLER_ACCOUNT_TOKEN = str(tofu_ref("data.aws_caller_identity.fluid_lf_caller.account_id"))
 
 
+def _has_custom_aws_endpoint() -> bool:
+    """True when an ``AWS_ENDPOINT_URL`` override targets a non-AWS endpoint.
+
+    The ``hashicorp/aws`` provider reads ``AWS_ENDPOINT_URL`` (global) and
+    ``AWS_ENDPOINT_URL_<SERVICE>`` (per-service, e.g. ``AWS_ENDPOINT_URL_S3``)
+    natively. Their presence is the signal that a contract is being applied
+    against an emulator (LocalStack / moto) rather than real AWS — see
+    :meth:`AWSProvider.provider_block`.
+    """
+    return any(
+        key == "AWS_ENDPOINT_URL" or key.startswith("AWS_ENDPOINT_URL_") for key in os.environ
+    )
+
+
 def _resolve_catalog_id() -> str:
     """Resolve the AWS account id for Glue catalog import ids.
 
@@ -301,9 +315,36 @@ class AwsIacPlugin:
         return blocks
 
     def provider_block(self) -> Dict[str, Any]:
-        """No static provider configuration — the ``hashicorp/aws`` provider
-        self-configures from the environment."""
-        return {}
+        """Static provider configuration for the ``hashicorp/aws`` provider.
+
+        On real AWS this is empty — the provider self-configures from the
+        environment (credentials, region, and ``AWS_ENDPOINT_URL*`` service
+        overrides are all read natively). When a custom endpoint IS set (i.e.
+        the contract is being applied against LocalStack / moto / another
+        emulator), emit the emulator-compatibility settings the provider can't
+        infer from the environment:
+
+        * ``s3_use_path_style`` — virtual-host addressing (``<bucket>.<host>``)
+          can't resolve against a single-host emulator, so S3 bucket creates
+          fail without path-style.
+        * ``skip_credentials_validation`` / ``skip_requesting_account_id`` /
+          ``skip_metadata_api_check`` / ``skip_region_validation`` — the
+          STS / IAM / EC2-metadata validations the AWS provider runs on
+          startup that an emulator doesn't fully implement.
+
+        Gated on :func:`_has_custom_aws_endpoint`, so real-AWS applies are
+        byte-for-byte unchanged (no provider block emitted). Mirrors
+        LocalStack's documented Terraform provider setup.
+        """
+        if not _has_custom_aws_endpoint():
+            return {}
+        return {
+            "s3_use_path_style": True,
+            "skip_credentials_validation": True,
+            "skip_requesting_account_id": True,
+            "skip_metadata_api_check": True,
+            "skip_region_validation": True,
+        }
 
 
 #: Bindings whose ``location.database`` field names a Glue catalog
