@@ -31,6 +31,7 @@ import functools
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -38,7 +39,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -274,20 +275,177 @@ def _infer_dbt_adapter(build: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# ── dbt engine detection (Python dbt-core v1 vs Fusion / dbt Core v2) ─────
+#
+# dbt Fusion (the Rust engine, open-sourced into dbt-labs/dbt-core as dbt
+# Core v2.0) prints a single banner line from ``dbt --version``::
+#
+#     $ dbt --version
+#     dbt Fusion 2.0.0-preview.126
+#
+# (docs.getdbt.com/docs/dbt-versions, "Checking your version"). Python
+# dbt-core v1 prints the familiar multi-line shape with an adapter list::
+#
+#     Core:
+#       - installed: 1.8.0
+#       - latest:    1.8.0 - Up to date!
+#     Plugins:
+#       - snowflake: 1.9.0 - Up to date!
+#
+# The old adapter probe substring-matched the adapter name in that output —
+# correct for v1 (adapters are pip-installed plugins and listed), but Fusion
+# compiles its adapters in and lists nothing, so every Fusion user was
+# silently punted to the Docker pip-install-dbt-core fallback. The helpers
+# below classify the engine first and only substring-match on v1.
+
+# Adapters known to be built into the Fusion engine (no pip install — the
+# drivers ship with the binary via ``dbt system install-drivers``). Sources:
+# docs.getdbt.com/docs/fusion/supported-features (Snowflake GA; BigQuery /
+# Redshift preview; Databricks private preview; Spark + DuckDB Fusion-CLI
+# beta) and the driver set shipped by ``dbt system install-drivers``
+# (adds postgres + salesforce). The matrix grows per Fusion release, so
+# membership here only tunes logging — under Fusion we ALWAYS attempt the
+# native run rather than falling back to Docker (see
+# ``_dbt_command_supports_adapter``).
+FUSION_BUILTIN_ADAPTERS = frozenset(
+    {
+        "snowflake",
+        "bigquery",
+        "redshift",
+        "databricks",
+        "postgres",
+        "spark",
+        "duckdb",
+        "salesforce",
+    }
+)
+
+# ``dbt Fusion 2.0.0-preview.126`` / ``dbt-fusion 2.0.0-beta.1`` — version
+# group optional so a bare "dbt fusion" banner still classifies.
+_FUSION_BANNER_RE = re.compile(r"\bdbt[\s-]+fusion\b[^0-9]*([0-9][\w.+-]*)?", re.IGNORECASE)
+# v1 multi-line: ``installed: 1.8.0``; pre-1.0: ``installed version: 0.21.1``.
+_CORE_INSTALLED_RE = re.compile(r"\binstalled(?:\s+version)?:\s*v?([0-9][\w.+-]*)", re.IGNORECASE)
+# Single bare banner line ``dbt 2.0.0`` (some Fusion builds drop "Fusion").
+_BARE_VERSION_RE = re.compile(r"^\s*dbt\s+v?([0-9][\w.+-]*)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
 @functools.lru_cache(maxsize=None)
-def _dbt_command_supports_adapter(dbt_executable: str, adapter: str) -> bool:
+def _dbt_version_output(dbt_executable: str, timeout: float = 10.0) -> Optional[str]:
+    """Run ``<dbt> --version`` once and cache the combined output.
+
+    This is the ONLY subprocess seam for engine detection + the adapter
+    probe — tests monkeypatch ``subprocess.run`` (or this function) and no
+    real dbt binary is ever needed. Returns ``None`` when the binary can't
+    be executed (missing, non-executable, timeout); ``timeout`` is part of
+    the cache key so a short-budget probe (welcome scan) can never poison
+    the runner's full-budget call.
+    """
     try:
         result = subprocess.run(
             [dbt_executable, "--version"],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
+        return None
+    return f"{result.stdout}\n{result.stderr}"
+
+
+def _parse_dbt_engine(output: str) -> Tuple[str, str]:
+    """Classify a ``dbt --version`` output into ``(flavor, version)``.
+
+    ``flavor`` is ``"fusion"`` (Rust engine / dbt Core v2, compiled-in
+    adapters), ``"core"`` (Python dbt-core v1, pip-installed adapter
+    plugins), or ``"unknown"``. ``version`` is the detected semver string
+    (possibly ``""`` when the banner carries none). Pure function — the
+    fixture surface for both output shapes lives in
+    ``tests/build_runners/test_dbt_engine_detection.py``.
+    """
+    fusion = _FUSION_BANNER_RE.search(output)
+    if fusion:
+        return ("fusion", fusion.group(1) or "")
+
+    installed = _CORE_INSTALLED_RE.search(output)
+    if installed:
+        return ("core", installed.group(1))
+
+    bare = _BARE_VERSION_RE.search(output)
+    if bare:
+        version = bare.group(1)
+        try:
+            major = int(version.split(".", 1)[0])
+        except ValueError:
+            major = 0
+        # Only the Rust engine versions as 2.x; the Python engine stays on
+        # the 1.x LTS line, and its banner always carries Core:/Plugins:.
+        return ("fusion", version) if major >= 2 else ("core", version)
+
+    lowered = output.lower()
+    if "core:" in lowered or "plugins:" in lowered:
+        return ("core", "")
+    return ("unknown", "")
+
+
+@functools.lru_cache(maxsize=None)
+def _detect_dbt_engine(dbt_executable: str, timeout: float = 10.0) -> Tuple[str, str]:
+    """Detect the engine flavor + version of a dbt executable.
+
+    Returns ``("fusion"|"core"|"unknown", version)``. Cached per
+    ``(executable, timeout)`` — Fusion answers in milliseconds while Python
+    dbt-core takes seconds, so short-budget callers (welcome scan) pass a
+    small ``timeout`` and simply get ``("unknown", "")`` on overrun.
+    """
+    output = _dbt_version_output(dbt_executable, timeout)
+    if output is None:
+        return ("unknown", "")
+    return _parse_dbt_engine(output)
+
+
+@functools.lru_cache(maxsize=None)
+def _dbt_command_supports_adapter(dbt_executable: str, adapter: str) -> bool:
+    """True when ``dbt_executable`` can run builds for ``adapter``.
+
+    Engine-aware:
+
+    * **Fusion** — adapters are compiled in and NOT listed by
+      ``--version``, so substring matching is meaningless. Consult
+      :data:`FUSION_BUILTIN_ADAPTERS` and return True either way (the
+      matrix changes per Fusion release; attempting the native run and
+      letting dbt fail loud beats silently inverting the user's engine
+      choice with the Docker pip-install-dbt-core fallback). Unknown
+      adapters get a WARNING so the operator understands a subsequent
+      dbt failure.
+    * **Core / unknown** — v1 lists pip-installed adapter plugins in the
+      version output; keep the substring probe. An unrunnable executable
+      still returns False (Docker fallback preserved).
+    """
+    output = _dbt_version_output(dbt_executable)
+    if output is None:
         return False
 
-    output = f"{result.stdout}\n{result.stderr}".lower()
-    return adapter.lower() in output or f"dbt-{adapter.lower()}" in output
+    flavor, version = _parse_dbt_engine(output)
+    if flavor == "fusion":
+        if adapter.lower() not in FUSION_BUILTIN_ADAPTERS:
+            LOG.warning(
+                "dbt.adapter.unverified engine=fusion version=%s adapter=%r — "
+                "not in the known Fusion built-in adapter set %s; attempting "
+                "the native run anyway (set DBT_EXECUTABLE to a dbt-core v1 "
+                "install if this adapter needs the Python plugin ecosystem).",
+                version or "?",
+                adapter,
+                sorted(FUSION_BUILTIN_ADAPTERS),
+            )
+        else:
+            LOG.debug(
+                "dbt.adapter.builtin engine=fusion version=%s adapter=%s",
+                version or "?",
+                adapter,
+            )
+        return True
+
+    lowered = output.lower()
+    return adapter.lower() in lowered or f"dbt-{adapter.lower()}" in lowered
 
 
 def _user_configured_forward_env() -> List[str]:
