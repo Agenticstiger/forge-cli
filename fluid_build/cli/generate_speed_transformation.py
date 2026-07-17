@@ -128,6 +128,20 @@ Examples:
         ),
     )
     p.add_argument(
+        "--model-contracts",
+        action="store_true",
+        help=(
+            "Emit dbt model contracts on every expose model: "
+            "``config: {contract: {enforced: true}}`` plus per-column "
+            "``data_type`` and ``constraints`` derived from "
+            "``exposes[].contract.schema[]``. ``dbt build`` then fails in "
+            "producer CI whenever the model's output diverges from the "
+            "contract schema (dbt-core >= 1.5). Opt-in because enforcement "
+            "fails builds for already-drifted user SQL. dbt-only; ignored "
+            "with a warning for other engines."
+        ),
+    )
+    p.add_argument(
         "--dbt-validate",
         action="store_true",
         help=(
@@ -470,6 +484,17 @@ def _generate_single_build(
         else:
             cprint(
                 f"[yellow]Warning: --mesh-hub is only meaningful for "
+                f"engine=dbt; ignoring for engine={engine_name}.[/yellow]"
+            )
+
+    # --model-contracts mirrors the --mesh-hub plumbing: dbt-only,
+    # warn-and-drop for other engines.
+    if getattr(args, "model_contracts", False):
+        if engine_name == "dbt":
+            engine_kwargs["model_contracts"] = True
+        else:
+            cprint(
+                f"[yellow]Warning: --model-contracts is only meaningful for "
                 f"engine=dbt; ignoring for engine={engine_name}.[/yellow]"
             )
 
