@@ -199,6 +199,28 @@ def is_hosted_mcp_tool(name: str, env: Optional[Mapping[str, str]] = None) -> bo
     return _spec_for_tool(name, env) is not None
 
 
+_DEFAULT_OPERATION_TIMEOUT_SECONDS = 120.0
+
+
+def _operation_timeout_seconds() -> Optional[float]:
+    """Wall-clock bound for one hosted-MCP operation (connect → op → close).
+
+    A hosted server that never responds must fail the forge tool call in
+    seconds, not hang the synchronous agent loop. Overridable via
+    ``FLUID_HOSTED_MCP_TIMEOUT_SECONDS``; ``0`` (or negative) disables the
+    bound entirely.
+    """
+    raw = (os.environ.get("FLUID_HOSTED_MCP_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return _DEFAULT_OPERATION_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        LOG.warning("invalid FLUID_HOSTED_MCP_TIMEOUT_SECONDS=%r — using default", raw)
+        return _DEFAULT_OPERATION_TIMEOUT_SECONDS
+    return value if value > 0 else None
+
+
 # ---------------------------------------------------------------------------
 # Client (generalises DbtMcpClient; one session per operation)
 # ---------------------------------------------------------------------------
@@ -298,11 +320,14 @@ class HostedMcpClient:
     # -- sync wrappers (used by the synchronous agent-loop dispatch) ---------
     def list_tools(self) -> List[Tuple[str, str, Dict[str, Any]]]:
         """Return ``[(name, description, input_schema), …]`` for this server."""
-        return _run_async(self._list_tools_async())
+        return _run_async(self._list_tools_async(), timeout_seconds=_operation_timeout_seconds())
 
     def call_tool(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> Any:
         """Call a hosted MCP tool (bare server-side name) and return its payload."""
-        return _run_async(self._call_tool_async(tool_name, arguments or {}))
+        return _run_async(
+            self._call_tool_async(tool_name, arguments or {}),
+            timeout_seconds=_operation_timeout_seconds(),
+        )
 
 
 # ---------------------------------------------------------------------------

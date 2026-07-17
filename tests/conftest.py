@@ -18,6 +18,7 @@ Pytest configuration and shared fixtures for FLUID tests.
 """
 
 import argparse
+import logging
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -42,6 +43,30 @@ def _self_heal_personal_memory():
     except Exception:  # pragma: no cover — defensive, never fail tests
         pass
     yield
+
+
+# ── Root-logger isolation: no test may leak global logging state ──────
+#
+# Several production entry points (structured_logging.configure_structured_logging,
+# logging_utils.setup_logger, the CLI's main()) replace the ROOT logger's
+# handlers wholesale.  A test that exercises them used to leak that
+# configuration into every later test on the same worker — including a
+# StreamHandler bound to the (soon closed) captured stderr.  Combined with
+# the mcp SDK's per-message warning recording, a leaked utcnow-warning
+# formatter produced an unbounded warning-amplification loop that hung CI
+# workers for the full pytest-timeout budget (the "[gwN] node down" flake).
+# Snapshot and restore root handlers/level/filters around every test so the
+# leak class is dead regardless of which test forgets to clean up.
+@pytest.fixture(autouse=True)
+def _restore_root_logging():
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
+    saved_filters = list(root.filters)
+    yield
+    root.handlers[:] = saved_handlers
+    root.setLevel(saved_level)
+    root.filters[:] = saved_filters
 
 
 @pytest.fixture

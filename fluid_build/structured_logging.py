@@ -22,7 +22,7 @@ import json
 import logging
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -46,8 +46,12 @@ class StructuredFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         """Format log record as JSON"""
+        # timezone-aware now(): datetime.utcnow() raises DeprecationWarning on
+        # 3.12+, and a formatter that warns while formatting re-enters the
+        # warning machinery of anything upstream that records warnings during
+        # logging (the mcp 1.x server does) — see tests/test_logging_formatters_no_warnings.py.
         log_data: Dict[str, Any] = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),

@@ -16,13 +16,17 @@ import json
 import logging
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class JsonFormatter(logging.Formatter):
     def format(self, record):
+        # timezone-aware now(): datetime.utcnow() raises DeprecationWarning on
+        # 3.12+, and a formatter that warns while formatting re-enters the
+        # warning machinery of anything upstream that records warnings during
+        # logging (the mcp 1.x server does) — see tests/test_logging_formatters_no_warnings.py.
         base = {
-            "time": datetime.utcnow().isoformat(timespec="seconds"),
+            "time": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds"),
             "level": record.levelname,
             "name": record.name,
             "message": record.getMessage(),

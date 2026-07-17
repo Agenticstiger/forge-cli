@@ -178,7 +178,7 @@ class _PublishFlowMixin:
         start_date: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Build Entropy Access resources from canonical FLUID consume refs."""
-        effective_start_date = start_date or datetime.utcnow().date().isoformat()
+        effective_start_date = start_date or datetime.now(timezone.utc).date().isoformat()
         payloads: List[Dict[str, Any]] = []
         seen: set[str] = set()
 
