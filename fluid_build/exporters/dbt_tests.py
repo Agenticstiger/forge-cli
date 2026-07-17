@@ -34,9 +34,14 @@ column constraint    dbt test
                      / ``labels.constraint: primary_key`` also count)
 ``enum`` /           ``accepted_values`` with the declared value list
 ``acceptedValues``
-``minimum`` /        ``dbt_utils.accepted_range`` (inclusive bounds)
-``maximum``
+``minimum`` /        ``dbt_expectations.expect_column_values_to_be_between``
+``maximum``          (inclusive bounds — the one range dialect, see
+                     ``engines/dbt/_test_mapping.py``)
 ==================== =================================================
+
+The actual translation is delegated to the single shared mapping module
+:mod:`fluid_build.engines.dbt._test_mapping` so this exporter, the
+``engines/dbt`` engine, and the copilot generator cannot drift.
 
 Each ``dqRule`` carries a ``type`` from the v0.7.3 enum
 (``completeness | uniqueness | valid_values | accuracy | freshness |
@@ -78,12 +83,16 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+# The single shared contract → dbt-test mapping. Reached via module attribute
+# access (``_tm.<fn>``) so a ``patch("...engines.dbt._test_mapping.<fn>")``
+# flows through to every call site. This is the richest historical surface
+# (expression_is_true / recency / fluid_* sentinels); its logic now lives in
+# the shared module so the engine + copilot paths cannot drift from it.
+from ..engines.dbt import _test_mapping as _tm
+
 # Block sentinel — the runner uses this to detect a managed file and refuse
 # to clobber a hand-edited one.
 MANAGED_BY_SENTINEL = "# managed-by: fluid"
-
-# Selector value that marks a table-wide (not column-scoped) dq rule.
-_TABLE_SELECTOR = "*"
 
 
 def render_dbt_tests(contract: Mapping[str, Any]) -> str:
@@ -209,12 +218,12 @@ def _group_rules(
         selector = rule.get("selector")
         selector = selector.strip() if isinstance(selector, str) else ""
 
-        if selector and selector != _TABLE_SELECTOR:
-            dbt_test = _convert_column_rule(rule, selector)
+        if selector and selector != _tm.TABLE_SELECTOR:
+            dbt_test = _tm.forward_column_rule(rule, selector)
             if dbt_test is not None:
                 by_column.setdefault(selector, []).append(dbt_test)
         else:
-            dbt_test = _convert_model_rule(rule)
+            dbt_test = _tm.forward_model_rule(rule)
             if dbt_test is not None:
                 model_tests.append(dbt_test)
 
@@ -234,7 +243,8 @@ def _columns_with_tests(
     2. The column's own *field-level constraints* — ``required`` → ``not_null``,
        a declared key (``unique`` / ``primaryKey`` / ``pk`` / ``identifier``) →
        ``unique``, ``enum`` / ``acceptedValues`` → ``accepted_values``, and
-       ``minimum`` / ``maximum`` → ``dbt_utils.accepted_range``.
+       ``minimum`` / ``maximum`` →
+       ``dbt_expectations.expect_column_values_to_be_between``.
 
     Without (2) a contract that expressed its quality intent inline on the
     schema (the common case) produced a dbt model with column names but **zero
@@ -262,9 +272,9 @@ def _columns_with_tests(
         desc = col.get("description") or col.get("businessName")
         if desc:
             col_block["description"] = desc
-        col_tests = _merge_tests(
+        col_tests = _tm.merge_tests(
             list(tests_by_column.get(name) or []),
-            _constraint_tests_for_column(col),
+            _tm.constraint_tests(col),
         )
         if col_tests:
             col_block["tests"] = col_tests
@@ -279,253 +289,3 @@ def _columns_with_tests(
         out.append({"name": col_name, "tests": col_tests})
 
     return out
-
-
-# ── Field-level constraint → dbt test mapping ─────────────────────────
-#
-# Mirrors the canonical FLUID column-constraint key recognition already used
-# by ``copilot.enrichment._map_fluid_column_to_wave2`` so the dbt artifact and
-# the rest of the codebase agree on which keys mean what. The dbt test names
-# follow the dbt ecosystem conventions confirmed against the docs:
-#   - not_null / unique / accepted_values — dbt built-in generic tests
-#     (https://docs.getdbt.com/reference/resource-properties/data-tests)
-#   - dbt_utils.accepted_range — numeric range test
-#     (https://github.com/dbt-labs/dbt-utils)
-# Tests are emitted under the ``tests:`` key (not ``data_tests:``) to stay
-# consistent with the dq-rules path above and ``engines/dbt`` — ``tests`` is
-# still valid in current dbt (the 1.8+ rename concerns test *arguments*, not
-# the property name).
-
-# Truthy markers a column may carry to declare it a uniqueness key. ``labels``
-# is a free-form string map in v0.7.x; ``labels.unique: "true"`` and
-# ``labels.constraint: "primary_key"`` are an in-the-wild convention (see
-# examples/bitcoin-price-api-declarative-part-c).
-_PK_KEYS = ("primary", "primaryKey", "primary_key", "pk", "isPrimary")
-_ENUM_KEYS = ("enum", "acceptedValues", "accepted_values")
-
-
-def _is_truthy(value: Any) -> bool:
-    """Loose truthiness for YAML/JSON booleans-as-strings (``"true"``/``True``)."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in ("true", "1", "yes")
-    return bool(value)
-
-
-def _column_is_key(col: Mapping[str, Any]) -> bool:
-    """True when the column is declared a uniqueness key / primary key."""
-    if _is_truthy(col.get("unique")):
-        return True
-    if any(_is_truthy(col.get(k)) for k in _PK_KEYS):
-        return True
-    if str(col.get("semanticType") or "").strip().lower() in ("identifier", "primary_key"):
-        return True
-    labels = col.get("labels")
-    if isinstance(labels, Mapping):
-        if _is_truthy(labels.get("unique")):
-            return True
-        if str(labels.get("constraint") or "").strip().lower() in ("primary_key", "unique"):
-            return True
-    return False
-
-
-def _column_enum_values(col: Mapping[str, Any]) -> list[Any]:
-    """Return the accepted-value list declared on a column, if any."""
-    for key in _ENUM_KEYS:
-        raw = col.get(key)
-        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
-            vals = [v for v in raw if v is not None]
-            if vals:
-                return vals
-    return []
-
-
-def _column_range(col: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the ``{min_value, max_value}`` declared on a column, if any.
-
-    Accepts both ``minimum``/``maximum`` (JSON-Schema spelling) and the
-    ``min``/``max`` aliases the copilot mapper recognises.
-    """
-    out: dict[str, Any] = {}
-    minimum = col.get("minimum", col.get("min"))
-    maximum = col.get("maximum", col.get("max"))
-    if isinstance(minimum, (int, float)) and not isinstance(minimum, bool):
-        out["min_value"] = minimum
-    if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
-        out["max_value"] = maximum
-    return out
-
-
-def _constraint_tests_for_column(col: Mapping[str, Any]) -> list[Any]:
-    """Translate one schema column's field-level constraints to dbt tests."""
-    tests: list[Any] = []
-
-    # required → not_null
-    if _is_truthy(col.get("required")):
-        tests.append("not_null")
-
-    # declared key → unique
-    if _column_is_key(col):
-        tests.append("unique")
-
-    # enum / acceptedValues → accepted_values
-    values = _column_enum_values(col)
-    if values:
-        tests.append({"accepted_values": {"values": values}})
-
-    # minimum / maximum → dbt_utils.accepted_range (inclusive bounds)
-    bounds = _column_range(col)
-    if bounds:
-        bounds["inclusive"] = True
-        tests.append({"dbt_utils.accepted_range": bounds})
-
-    return tests
-
-
-def _test_identity(test: Any) -> Any:
-    """A hashable identity for a dbt test entry, for de-duplication.
-
-    String tests (``not_null``) identify by their name; dict tests
-    (``{accepted_values: ...}``) identify by their single test-name key so two
-    sources can't emit the same generic test twice for one column.
-    """
-    if isinstance(test, str):
-        return test
-    if isinstance(test, Mapping) and len(test) == 1:
-        return next(iter(test))
-    return repr(test)
-
-
-def _merge_tests(primary: list[Any], extra: list[Any]) -> list[Any]:
-    """Concatenate two test lists, dropping duplicates by test identity.
-
-    ``primary`` (dq-rule-derived) wins on collision so an explicitly-tuned dq
-    rule isn't clobbered by the generic constraint-derived form.
-    """
-    merged: list[Any] = []
-    taken: set[Any] = set()
-    for test in (*primary, *extra):
-        identity = _test_identity(test)
-        if identity in taken:
-            continue
-        taken.add(identity)
-        merged.append(test)
-    return merged
-
-
-def _convert_column_rule(rule: Mapping[str, Any], column: str) -> Any | None:
-    """Map one column-scoped ``dqRule`` to a dbt test entry (string or dict)."""
-    kind = _rule_type(rule)
-
-    if kind == "completeness":
-        # Completeness == "no NULLs" in the column → dbt's not_null.
-        return "not_null"
-
-    if kind == "uniqueness":
-        return "unique"
-
-    if kind == "valid_values":
-        values = _valid_values(rule)
-        if values:
-            return {"accepted_values": {"values": values}}
-        # No value list on the rule — emit a sentinel so the operator
-        # sees the gap rather than dropping a declared check silently.
-        return f"fluid_valid_values_{column}"
-
-    if kind == "accuracy":
-        threshold = rule.get("threshold")
-        operator = rule.get("operator") or ">="
-        if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
-            # Accuracy is contract-specific; surface it as a dbt_utils
-            # expression placeholder the operator can tune to their own
-            # accuracy predicate. The threshold + operator are preserved
-            # in the expression so the intent isn't lost.
-            expr = f"-- accuracy({column}) {operator} {threshold}: replace with predicate"
-            return {"dbt_utils.expression_is_true": {"expression": expr}}
-        return f"fluid_accuracy_{column}"
-
-    if kind == "freshness":
-        # Column-scoped freshness → dbt_utils.recency on that column.
-        window = rule.get("window") or rule.get("threshold")
-        rec: dict[str, Any] = {
-            "field": column,
-            "datepart": "day",
-            "interval": 1,
-        }
-        if window is not None:
-            rec["_fluid_window"] = str(window)
-        return {"dbt_utils.recency": rec}
-
-    if kind in ("schema", "anomaly_detection", "drift_detection"):
-        # No dbt built-in maps cleanly — emit a sentinel test name so dbt
-        # surfaces a clean "test not found" error pointing at the gap.
-        return f"fluid_{kind}_{column}"
-
-    # Unknown / unmapped type — leave the operator a breadcrumb.
-    return f"fluid_unmapped_{kind}_{column}"
-
-
-def _convert_model_rule(rule: Mapping[str, Any]) -> Any | None:
-    """Map one table-wide (``selector: "*"``) ``dqRule`` to a model-level test."""
-    kind = _rule_type(rule)
-
-    if kind == "freshness":
-        window = rule.get("window") or rule.get("threshold")
-        if window is not None:
-            return {
-                "dbt_utils.recency": {
-                    "field": "updated_at",
-                    "datepart": "day",
-                    "interval": 1,
-                    "_fluid_window": str(window),
-                }
-            }
-        return "fluid_freshness_check"
-
-    if kind in ("anomaly_detection", "drift_detection"):
-        threshold = rule.get("threshold")
-        if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
-            return {"dbt_utils.expression_is_true": {"expression": f"count(*) > {threshold}"}}
-        return f"fluid_{kind}"
-
-    if kind in ("completeness", "uniqueness", "valid_values", "accuracy", "schema"):
-        # These need a column to be meaningful; a "*" selector for them is
-        # an authoring smell. Emit a sentinel so the operator sees it.
-        return f"fluid_{kind}_table_level"
-
-    return f"fluid_unmapped_{kind}"
-
-
-def _rule_type(rule: Mapping[str, Any]) -> str:
-    """Normalised lowercase ``dqRule.type``."""
-    kind = rule.get("type") or ""
-    return kind.strip().lower() if isinstance(kind, str) else ""
-
-
-def _valid_values(rule: Mapping[str, Any]) -> list[Any]:
-    """Extract the value list for a ``valid_values`` rule.
-
-    The v0.7.3 ``dqRule`` schema has no dedicated value-list field, so the
-    value set is carried either on an explicit ``validValues`` / ``values``
-    key (used by the quality engine) or parsed from a ``description`` of
-    the form ``"<col> valid values: a, b, c."`` — mirrors
-    ``providers/quality_engine.py``'s parsing so the dbt artifact and the
-    live checker agree on the value set.
-    """
-    for key in ("validValues", "values"):
-        raw = rule.get(key)
-        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
-            vals = [v for v in raw if v is not None]
-            if vals:
-                return vals
-
-    description = rule.get("description")
-    if isinstance(description, str) and " valid values:" in description.lower():
-        import re
-
-        m = re.search(r"valid values:\s*([^.]+)", description, re.IGNORECASE)
-        if m:
-            return [v.strip() for v in m.group(1).split(",") if v.strip()]
-
-    return []
