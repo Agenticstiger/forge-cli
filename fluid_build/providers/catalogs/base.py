@@ -20,7 +20,7 @@ Similar to market.py's BaseCatalogConnector but focused on WRITE operations (pub
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
@@ -59,7 +59,7 @@ class PublishResult:
     catalog_url: Optional[str] = None
     error: Optional[str] = None
     details: Dict[str, Any] = field(default_factory=dict)
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class BaseCatalogProvider(ABC):

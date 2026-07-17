@@ -21,7 +21,7 @@ from ..auth import doctor as auth_doctor
 
 def doctor(provider: str, project: str = None) -> dict:
     return {
-        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(),
         "python": platform.python_version(),
         "platform": platform.platform(),
         "env": {

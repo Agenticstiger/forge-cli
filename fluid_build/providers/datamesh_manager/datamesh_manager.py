@@ -39,7 +39,7 @@ import os
 import re
 import uuid
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -443,7 +443,9 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             "dataContractId": getattr(report, "contract_id", "unknown"),
             "dataContractVersion": getattr(report, "contract_version", "1.0.0"),
             "result": "passed" if getattr(report, "is_valid", lambda: True)() else "failed",
-            "timestamp": getattr(report, "validation_time", datetime.utcnow()).isoformat(),
+            "timestamp": getattr(
+                report, "validation_time", datetime.now(timezone.utc).replace(tzinfo=None)
+            ).isoformat(),
             "duration": getattr(report, "duration", 0.0),
             "checks": {
                 "passed": getattr(report, "checks_passed", 0),
