@@ -106,6 +106,38 @@ class TestParseDuration:
         result = _parse_duration_seconds("abc")
         assert result is None or result == 0
 
+    # -- ISO-8601 shapes: the format the contract schema actually
+    # -- requires for dqRule.window ($defs/isoDuration).
+
+    def test_iso_hours_matches_legacy_equivalent(self):
+        assert _parse_duration_seconds("PT6H") == 21600
+        assert _parse_duration_seconds("PT6H") == _parse_duration_seconds("6h")
+
+    def test_iso_minutes(self):
+        assert _parse_duration_seconds("PT90M") == 5400
+
+    def test_iso_days_matches_legacy_equivalent(self):
+        assert _parse_duration_seconds("P2D") == 172800
+        assert _parse_duration_seconds("P2D") == _parse_duration_seconds("2d")
+
+    def test_iso_combined_components(self):
+        assert _parse_duration_seconds("PT1H30M") == 5400
+
+    def test_iso_weeks(self):
+        # Rejected by the shared streaming parser, but exact (7 days)
+        # and schema-valid — handled locally.
+        assert _parse_duration_seconds("P1W") == 604800
+
+    def test_iso_calendar_shapes_return_none(self):
+        # Months/years have no fixed seconds value.
+        assert _parse_duration_seconds("P1M") is None
+        assert _parse_duration_seconds("P2Y6M") is None
+
+    def test_iso_degenerate_and_zero_return_none(self):
+        assert _parse_duration_seconds("P") is None
+        assert _parse_duration_seconds("PT") is None
+        assert _parse_duration_seconds("PT0S") is None
+
 
 # ---------------------------------------------------------------------------
 # Identifier validation
@@ -285,6 +317,71 @@ class TestExecuteQualityChecks:
         results = execute_quality_checks(rules, "t", executor)
         assert len(results) == 2
         assert all(r.passed for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Freshness windows end-to-end (ISO vs legacy, unparseable fail-loud)
+# ---------------------------------------------------------------------------
+
+
+class TestFreshnessWindows:
+    def _executor_with_age(self, age_seconds):
+        def _exec(sql):
+            return [(age_seconds,)]
+
+        return _exec
+
+    def _rule(self, window):
+        return {
+            "id": "fresh",
+            "type": "freshness",
+            "selector": "updated_at",
+            "window": window,
+            "severity": "error",
+        }
+
+    @pytest.mark.parametrize(
+        ("iso", "legacy"),
+        [("PT6H", "6h"), ("P2D", "2d"), ("PT90M", "90m")],
+    )
+    def test_iso_window_behaves_like_legacy(self, iso, legacy):
+        for age, should_pass in ((100.0, True), (10_000_000.0, False)):
+            executor = self._executor_with_age(age)
+            (iso_res,) = execute_quality_checks([self._rule(iso)], "t", executor)
+            (leg_res,) = execute_quality_checks([self._rule(legacy)], "t", executor)
+            assert iso_res.passed is should_pass
+            assert leg_res.passed is should_pass
+            assert iso_res.expected == leg_res.expected
+
+    def test_iso_window_threshold_boundary(self):
+        # 21600s window: 21600s-old data passes, 21601s-old fails.
+        (ok,) = execute_quality_checks([self._rule("PT6H")], "t", self._executor_with_age(21600))
+        (stale,) = execute_quality_checks([self._rule("PT6H")], "t", self._executor_with_age(21601))
+        assert ok.passed is True
+        assert stale.passed is False
+        assert stale.severity == "error"
+
+    @pytest.mark.parametrize("bad", ["banana", "P1M", "P2Y6M", "PT0S"])
+    def test_unparseable_window_fails_loudly(self, bad):
+        """A declared-but-unparseable window must fail the check, not
+        silently run without a bound (severity 'info', passed=True)."""
+        (res,) = execute_quality_checks([self._rule(bad)], "t", self._executor_with_age(1.0))
+        assert res.passed is False
+        assert res.severity == "error"
+        assert "window" in res.message.lower()
+        assert bad in res.message
+
+    def test_no_window_still_reports_age_as_info(self):
+        rule = {
+            "id": "fresh",
+            "type": "freshness",
+            "selector": "updated_at",
+            "severity": "error",
+        }
+        (res,) = execute_quality_checks([rule], "t", self._executor_with_age(123.0))
+        assert res.passed is True
+        assert res.severity == "info"
+        assert "no threshold" in res.message
 
 
 # ---------------------------------------------------------------------------
