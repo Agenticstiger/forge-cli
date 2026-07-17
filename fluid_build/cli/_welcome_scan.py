@@ -114,6 +114,9 @@ class WelcomeFindings:
     ai_configured: bool = False
     ai_provider_hint: str = ""
     installed_clis: List[str] = field(default_factory=list)
+    # Detected dbt engine flavor+version, e.g. "fusion 2.0.0-preview.126"
+    # or "core 1.8.7". "" when dbt is absent or the probe overran budget.
+    dbt_engine: str = ""
     coding_agents_available: List[str] = field(default_factory=list)
     sample_data_candidates: List[str] = field(default_factory=list)
     cloud_credentials: List[str] = field(default_factory=list)
@@ -227,6 +230,34 @@ def _probe_clis() -> Dict[str, Any]:
         if shutil.which(binary):
             found.append(binary)
     return {"installed_clis": found}
+
+
+def _probe_dbt_engine() -> Dict[str, Any]:
+    """Detect the dbt engine flavor (Python dbt-core v1 vs Fusion / v2).
+
+    Fusion (Rust) answers ``dbt --version`` in milliseconds; Python
+    dbt-core takes seconds, so the subprocess gets a sub-budget timeout
+    and a slow binary simply reports nothing — the CLIs row then shows a
+    plain ``dbt`` exactly as before. The detection cache is keyed on the
+    timeout too, so this short-budget miss never poisons the build
+    runner's full-budget probe.
+    """
+    try:
+        from fluid_build.build_runners.dbt.runner import (
+            _detect_dbt_engine,
+            _resolve_dbt_executable,
+        )
+
+        dbt_bin = _resolve_dbt_executable()
+        if not dbt_bin:
+            return {}
+        flavor, version = _detect_dbt_engine(dbt_bin, timeout=_PROBE_TIMEOUT_S * 0.8)
+        if flavor == "unknown":
+            return {}
+        return {"dbt_engine": f"{flavor} {version}".strip()}
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        LOG.debug("welcome_scan_dbt_engine_failed: %s", exc)
+        return {}
 
 
 def _probe_coding_agents() -> Dict[str, Any]:
@@ -353,6 +384,7 @@ def run_welcome_scan(*, start: Optional[Path] = None) -> WelcomeFindings:
         "workspace": (_probe_workspace, (target,)),
         "ai": (_probe_ai_credentials, ()),
         "clis": (_probe_clis, ()),
+        "dbt_engine": (_probe_dbt_engine, ()),
         "coding_agents": (_probe_coding_agents, ()),
         "samples": (_probe_sample_data, (target,)),
         "cloud": (_probe_cloud_creds, ()),
@@ -381,6 +413,18 @@ def run_welcome_scan(*, start: Optional[Path] = None) -> WelcomeFindings:
 # ---------------------------------------------------------------------------
 # Renderer
 # ---------------------------------------------------------------------------
+
+
+def _annotated_clis(findings: WelcomeFindings) -> List[str]:
+    """CLI list for display, with dbt annotated by detected engine flavor.
+
+    ``dbt`` becomes e.g. ``dbt (fusion 2.0.0-preview.126)`` when the
+    engine probe resolved in budget; otherwise the list is untouched.
+    """
+    clis = list(findings.installed_clis[:6])
+    if findings.dbt_engine:
+        clis = [f"dbt ({findings.dbt_engine})" if c == "dbt" else c for c in clis]
+    return clis
 
 
 def render_welcome(findings: WelcomeFindings, *, console: Optional[Any] = None) -> None:
@@ -431,7 +475,7 @@ def render_welcome(findings: WelcomeFindings, *, console: Optional[Any] = None) 
             f"e.g. [bold]--llm-provider {suggested}[/bold]",
         )
     if findings.installed_clis:
-        table.add_row("CLIs:", ", ".join(findings.installed_clis[:6]))
+        table.add_row("CLIs:", ", ".join(_annotated_clis(findings)))
     if findings.cloud_credentials:
         table.add_row("Cloud:", ", ".join(findings.cloud_credentials))
     if findings.sample_data_candidates:
@@ -478,7 +522,7 @@ def _render_welcome_plain(findings: WelcomeFindings) -> None:
             f"— no API key needed (--llm-provider {suggested})"
         )
     if findings.installed_clis:
-        print(f"  CLIs: {', '.join(findings.installed_clis[:6])}")
+        print(f"  CLIs: {', '.join(_annotated_clis(findings))}")
     if findings.cloud_credentials:
         print(f"  Cloud: {', '.join(findings.cloud_credentials)}")
     if findings.sample_data_candidates:
