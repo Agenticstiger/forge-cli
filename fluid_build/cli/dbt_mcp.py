@@ -73,14 +73,22 @@ def is_dbt_mcp_tool(name: str, env: Optional[Mapping[str, str]] = None) -> bool:
     return bool(name) and name.startswith(TOOL_PREFIX) and is_enabled(env)
 
 
-def _run_async(coro) -> Any:
+def _run_async(coro, *, timeout_seconds: Optional[float] = None) -> Any:
     """Run an async coroutine from forge's synchronous dispatch path.
 
     The agent loop is synchronous, so the common path is ``asyncio.run``. If we
     are somehow already inside an event loop, run on a dedicated thread with its
     own loop instead of raising ``asyncio.run() cannot be called from a running
     event loop``.
+
+    ``timeout_seconds`` bounds the whole operation with ``asyncio.wait_for`` so
+    a stalled MCP session (e.g. a server that never responds) fails in seconds
+    instead of hanging the dispatch path indefinitely. Limitation: cancellation
+    lands at await points — a handler wedged in synchronous code is not
+    preemptible from within the loop.
     """
+    if timeout_seconds is not None and timeout_seconds > 0:
+        coro = asyncio.wait_for(coro, timeout=timeout_seconds)
     try:
         asyncio.get_running_loop()
     except RuntimeError:
