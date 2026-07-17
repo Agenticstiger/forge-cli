@@ -14,11 +14,16 @@
 
 """Tests for the dbt transformation engine."""
 
+import json
+
 import pytest
 import yaml
+from hypothesis import given
+from hypothesis import strategies as st
 
 from fluid_build.engines import get_engine
 from fluid_build.engines.base import Severity, TransformationIntent
+from fluid_build.engines.dbt import _test_mapping as tm
 from fluid_build.engines.dbt.models import generate_models
 from fluid_build.engines.dbt.profiles import generate_profiles
 from fluid_build.engines.dbt.project_yml import _sanitize_project_name, generate_project_yml
@@ -477,6 +482,191 @@ class TestSchemaYml:
     def test_no_exposes(self):
         contract = {"exposes": []}
         assert generate_schema_yml(contract) == {}
+
+    def _one_column(self, col: dict) -> dict:
+        """Run generate_schema_yml over a single-column expose, return the column."""
+        contract = {
+            "id": "x",
+            "exposes": [{"exposeId": "t", "contract": {"schema": [col]}}],
+        }
+        data = yaml.safe_load(generate_schema_yml(contract)["models/marts/schema.yml"])
+        return data["models"][0]["columns"][0]
+
+    def test_inline_range_uses_expectations_dialect(self):
+        """Consolidation: the engine now emits the unified dbt_expectations
+        range dialect for inline minimum/maximum (previously it emitted
+        nothing for inline bounds; the old accuracy→dbt_utils.accepted_range
+        path is retired)."""
+        col = self._one_column({"name": "amount", "type": "NUMBER", "minimum": 0, "maximum": 100})
+        assert {
+            "dbt_expectations.expect_column_values_to_be_between": {
+                "min_value": 0,
+                "max_value": 100,
+            }
+        } in col["tests"]
+
+    def test_surfaces_relationships_from_column_fk(self):
+        """Consolidation: relationships now derive from the engine path too
+        (from a column-level foreign-key reference)."""
+        col = self._one_column(
+            {"name": "customer_id", "foreign_key": {"to": "customers", "field": "id"}}
+        )
+        assert {"relationships": {"to": "ref('customers')", "field": "id"}} in col["tests"]
+
+    def test_column_scoped_freshness_emits_recency(self):
+        """Consolidation: the engine now surfaces freshness/recency (was
+        exporter-only before)."""
+        contract = {
+            "id": "x",
+            "exposes": [
+                {
+                    "exposeId": "t",
+                    "contract": {
+                        "schema": [{"name": "updated_at", "type": "TIMESTAMP"}],
+                        "dq": {
+                            "rules": [
+                                {"type": "freshness", "selector": "updated_at", "window": "P1D"}
+                            ]
+                        },
+                    },
+                }
+            ],
+        }
+        data = yaml.safe_load(generate_schema_yml(contract)["models/marts/schema.yml"])
+        col = data["models"][0]["columns"][0]
+        rec = next(t for t in col["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t)
+        assert rec["dbt_utils.recency"]["field"] == "updated_at"
+        assert rec["dbt_utils.recency"]["_fluid_window"] == "P1D"
+
+
+# ---------------------------------------------------------------------------
+# Shared contract → dbt-test mapping (fluid_build/engines/dbt/_test_mapping.py)
+#
+# One module all three generators consume so they cannot drift. Forward
+# (dqRule.type → dbt test) and reverse (dbt test → dqRule.type) tables are
+# pinned symmetric; the reverse hook is what the planned dbt-manifest importer
+# consumes.
+# ---------------------------------------------------------------------------
+
+
+class TestSharedTestMapping:
+    def test_forward_reverse_tables_are_exact_inverses(self):
+        # Reverse must be the exact inverse of forward over the mappable subset.
+        assert set(tm.FORWARD_RULE_TO_TEST.values()) == set(tm.REVERSE_TEST_TO_RULE)
+        for rule_type, test_name in tm.FORWARD_RULE_TO_TEST.items():
+            assert tm.REVERSE_TEST_TO_RULE[test_name] == rule_type
+
+    def test_roundtrip_rule_type_through_dbt_test(self):
+        for rule_type in tm.FORWARD_RULE_TO_TEST:
+            name = tm.rule_type_to_test_name(rule_type)
+            assert name is not None
+            assert tm.test_to_rule_type(name) == rule_type
+
+    def test_roundtrip_dbt_test_through_rule_type(self):
+        for test_name, rule_type in tm.REVERSE_TEST_TO_RULE.items():
+            assert tm.rule_type_to_test_name(rule_type) == test_name
+
+    @given(st.sampled_from(sorted(tm.FORWARD_RULE_TO_TEST)))
+    def test_property_reverse_of_forward_roundtrips(self, rule_type):
+        # reverse(forward(rule)) == rule for the mappable subset.
+        assert tm.test_to_rule_type(tm.rule_type_to_test_name(rule_type)) == rule_type
+
+    def test_unmappable_tests_have_no_rule_type(self):
+        # relationships (referential integrity), the numeric range test, and the
+        # fluid_* sentinels are intentionally outside the reversible subset.
+        assert tm.test_to_rule_type(tm.relationships_test("customers", "id")) is None
+        assert tm.test_to_rule_type(tm.numeric_range_test(min_value=0)) is None
+        assert tm.test_to_rule_type(tm.sentinel_test("schema", "col")) is None
+
+    def test_numeric_range_test_none_when_no_bounds(self):
+        assert tm.numeric_range_test() is None
+
+
+def _test_set(tests) -> set:
+    """Normalise a dbt tests list to an order-independent comparable set."""
+    return {t if isinstance(t, str) else json.dumps(t, sort_keys=True) for t in tests}
+
+
+class TestCrossGeneratorConsistency:
+    """Acceptance: all three generators emit identical dbt tests for the same
+    contract intent (a key + FK + enum + numeric range column)."""
+
+    def _engine_column_tests(self) -> set:
+        col = {
+            "name": "customer_id",
+            "type": "NUMBER",
+            "required": True,
+            "unique": True,
+            "foreign_key": {"to": "customers", "field": "id"},
+            "enum": ["a", "b"],
+            "minimum": 0,
+            "maximum": 100,
+        }
+        contract = {"id": "x", "exposes": [{"exposeId": "t", "contract": {"schema": [col]}}]}
+        data = yaml.safe_load(generate_schema_yml(contract)["models/marts/schema.yml"])
+        return _test_set(data["models"][0]["columns"][0]["tests"])
+
+    def _exporter_column_tests(self) -> set:
+        from fluid_build.exporters.dbt_tests import render_dbt_tests
+
+        col = {
+            "name": "customer_id",
+            "type": "NUMBER",
+            "required": True,
+            "unique": True,
+            "foreign_key": {"to": "customers", "field": "id"},
+            "enum": ["a", "b"],
+            "minimum": 0,
+            "maximum": 100,
+        }
+        contract = {
+            "exposes": [
+                {
+                    "exposeId": "t",
+                    "binding": {"location": {"table": "T"}},
+                    "contract": {"schema": [col]},
+                }
+            ]
+        }
+        out = render_dbt_tests(contract)
+        body = "\n".join(line for line in out.splitlines() if not line.startswith("#"))
+        data = yaml.safe_load(body)
+        return _test_set(data["models"][0]["columns"][0]["tests"])
+
+    def _copilot_column_tests(self) -> set:
+        from fluid_build.copilot.tools.dbt_test_generator import generate_dbt_tests
+
+        # Same intent expressed in the copilot agent-schema shape.
+        schema = {
+            "model_name": "t",
+            "columns": [
+                {
+                    "name": "customer_id",
+                    "type": "NUMBER",
+                    "primary_key": True,  # → unique + not_null (== required + key)
+                    "foreign_key": {"to": "customers", "field": "id"},
+                    "enum": ["a", "b"],
+                    "min": 0,
+                    "max": 100,
+                }
+            ],
+        }
+        out = generate_dbt_tests(schema)
+        return _test_set(out["models"][0]["columns"][0]["tests"])
+
+    def test_three_generators_agree(self):
+        engine = self._engine_column_tests()
+        exporter = self._exporter_column_tests()
+        copilot = self._copilot_column_tests()
+        assert engine == exporter == copilot, (
+            "contract→dbt-test generators drifted:\n"
+            f"  engine   = {sorted(engine)}\n"
+            f"  exporter = {sorted(exporter)}\n"
+            f"  copilot  = {sorted(copilot)}"
+        )
+        # And the shape is the unified dialect (not the retired dbt_utils range).
+        assert any("expect_column_values_to_be_between" in t for t in engine)
+        assert any("relationships" in t for t in engine)
 
 
 # ---------------------------------------------------------------------------

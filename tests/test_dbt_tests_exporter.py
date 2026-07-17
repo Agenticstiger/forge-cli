@@ -490,18 +490,20 @@ def test_enum_constraint_emits_accepted_values():
     assert accepted[0]["accepted_values"]["values"] == ["pending", "completed", "cancelled"]
 
 
-def test_minmax_constraint_emits_accepted_range():
+def test_minmax_constraint_emits_range_between():
+    # Unified range dialect: dbt_expectations.expect_column_values_to_be_between
+    # (see fluid_build/engines/dbt/_test_mapping.py — one dialect across all
+    # three generators, matching datacontract-cli / DataVow). Inclusive by
+    # default (``strictly: false``), so no explicit ``inclusive`` key.
     cols = _cols(_constraint_contract())
     ranged = [
         t
         for t in cols["amount"]["tests"]
-        if isinstance(t, dict) and "dbt_utils.accepted_range" in t
+        if isinstance(t, dict) and "dbt_expectations.expect_column_values_to_be_between" in t
     ]
-    assert ranged, "amount min/max did not produce a dbt_utils.accepted_range test"
-    args = ranged[0]["dbt_utils.accepted_range"]
-    assert args["min_value"] == 0
-    assert args["max_value"] == 1000000
-    assert args["inclusive"] is True
+    assert ranged, "amount min/max did not produce a dbt_expectations between test"
+    args = ranged[0]["dbt_expectations.expect_column_values_to_be_between"]
+    assert args == {"min_value": 0, "max_value": 1000000}
 
 
 def test_model_carries_real_tests_not_just_names():
@@ -562,10 +564,11 @@ def test_min_only_and_max_only_ranges():
         ]
     }
     cols = _cols(contract)
-    age_range = cols["age"]["tests"][0]["dbt_utils.accepted_range"]
-    assert age_range == {"min_value": 0, "inclusive": True}
-    pct_range = cols["pct"]["tests"][0]["dbt_utils.accepted_range"]
-    assert pct_range == {"max_value": 100, "inclusive": True}
+    range_key = "dbt_expectations.expect_column_values_to_be_between"
+    age_range = cols["age"]["tests"][0][range_key]
+    assert age_range == {"min_value": 0}
+    pct_range = cols["pct"]["tests"][0][range_key]
+    assert pct_range == {"max_value": 100}
 
 
 def test_constraint_and_dq_rule_dedupe_to_single_test():

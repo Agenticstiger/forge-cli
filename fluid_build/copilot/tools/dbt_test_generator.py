@@ -37,6 +37,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+# The single shared contract → dbt-test mapping. Reached via module attribute
+# access (``_tm.<fn>``) so a ``patch("...engines.dbt._test_mapping.<fn>")``
+# flows through to every call site. This module owns the ``relationships`` and
+# ``dbt_expectations`` range emitters — both now live in the shared module so
+# the engine + exporter paths reuse the identical shape.
+from ...engines.dbt import _test_mapping as _tm
+
 _LOG = logging.getLogger(__name__)
 
 # Numeric SQL-type prefixes worth considering for range tests.
@@ -80,40 +87,30 @@ def _column_tests(col: dict[str, Any]) -> list[Any]:
 
     is_pk = bool(col.get("primary_key"))
     if is_pk:
-        tests.append("unique")
-        tests.append("not_null")
+        tests.append(_tm.unique_test())
+        tests.append(_tm.not_null_test())
     else:
         # nullable defaults to True if unspecified — only emit not_null
         # when the schema explicitly says the column is non-nullable.
         nullable = col.get("nullable", True)
         if nullable is False:
-            tests.append("not_null")
+            tests.append(_tm.not_null_test())
 
-    fk = col.get("foreign_key")
-    if isinstance(fk, dict) and fk.get("to") and fk.get("field"):
-        tests.append(
-            {
-                "relationships": {
-                    "to": f"ref('{fk['to']}')",
-                    "field": fk["field"],
-                }
-            }
-        )
+    rel = _tm.column_relationship(col)
+    if rel is not None:
+        tests.append(_tm.relationships_test(*rel))
 
     enum = col.get("enum")
     if isinstance(enum, list) and enum:
-        tests.append({"accepted_values": {"values": list(enum)}})
+        tests.append(_tm.accepted_values_test(enum))
 
     col_type = col.get("type")
     min_val = col.get("min")
     max_val = col.get("max")
     if (min_val is not None or max_val is not None) and _is_numeric(col_type):
-        body: dict[str, Any] = {}
-        if min_val is not None:
-            body["min_value"] = min_val
-        if max_val is not None:
-            body["max_value"] = max_val
-        tests.append({"dbt_expectations.expect_column_values_to_be_between": body})
+        range_test = _tm.numeric_range_test(min_value=min_val, max_value=max_val)
+        if range_test is not None:
+            tests.append(range_test)
     elif (min_val is not None or max_val is not None) and not _is_numeric(col_type):
         # Don't silently emit on string types — surface a WARN so the
         # BuilderAgent / Validator can decide whether to coerce the

@@ -130,6 +130,18 @@ def test_incomplete_foreign_key_is_skipped():
     assert "tests" not in col  # no FK test because field is missing
 
 
+def test_references_string_fk_via_shared_recognizer():
+    # Consolidation: relationships now route through the shared recognizer
+    # (fluid_build/engines/dbt/_test_mapping.column_relationship), which also
+    # accepts the ODCS-style "table.field" string form used by datacontract-cli.
+    schema = {
+        "model_name": "orders",
+        "columns": [_column("customer_id", type="INTEGER", references="customers.id")],
+    }
+    tests = _get_column(generate_dbt_tests(schema), "customer_id")["tests"]
+    assert {"relationships": {"to": "ref('customers')", "field": "id"}} in tests
+
+
 def test_enum_emits_accepted_values():
     schema = {
         "model_name": "orders",
