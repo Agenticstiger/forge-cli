@@ -532,6 +532,193 @@ def _render_command_for_log(command: List[str]) -> str:
     return " ".join(parts)
 
 
+# ── Run-record persistence (dbt build → .fluid/runs/…) ────────────────────
+#
+# ``fluid apply --mode amend-and-build`` shells ``dbt build`` and — until
+# this hook — discarded everything but the process exit code. Parsing
+# ``target/run_results.json`` (via :mod:`.artifacts`) closes the
+# contract→test→result loop: each dbt node becomes a run-record ``stream``
+# so ``fluid runs status`` shows per-test granularity, and ``fluid verify``
+# (see ``cli/_transformation_stage_ext``) gates on error-severity failures.
+
+
+def build_dbt_run_record(
+    results: Any,
+    *,
+    run_id: str,
+    started_at: str,
+    finished_at: str,
+    duration_seconds: float,
+    returncode: int,
+) -> Dict[str, Any]:
+    """Shape a canonical FLUID run record from a parsed ``RunResults``.
+
+    Mirrors ``build_runners._acquisition_common._canonical_run_record`` (the
+    shape every runner's state-store write uses) so ``fluid runs
+    status/logs/diff`` and the status renderer read it with zero further
+    changes. Each dbt node is projected to a ``stream`` (``name`` =
+    ``unique_id``, ``records`` = test ``failures`` count) for per-node /
+    per-test granularity in ``fluid runs status`` and ``fluid runs diff``.
+    """
+    counts = results.counts()
+    error_nodes = results.error_nodes
+
+    # State mapping: a clean exit with no error-severity node is SUCCEEDED;
+    # if some nodes passed but others failed it's PARTIAL; otherwise FAILED.
+    # (RunState values are lowercase — matches ops/status.py comparisons.)
+    if returncode == 0 and not error_nodes:
+        state = "succeeded"
+    elif any(n.is_ok for n in results.results):
+        state = "partial"
+    else:
+        state = "failed"
+
+    streams = [
+        {
+            "name": n.unique_id,
+            "state": n.status,
+            # ``records`` is the run-diff delta axis; for a test it's the
+            # failing-row count, for a model there's no natural row count so 0.
+            "records": (n.failures if n.failures is not None else 0),
+            "failures": n.failures,
+            "execution_time": n.execution_time,
+        }
+        for n in results.results
+    ]
+
+    error_msg: Optional[str] = None
+    if error_nodes:
+        preview = ", ".join(n.unique_id for n in error_nodes[:5])
+        more = "" if len(error_nodes) <= 5 else f" (+{len(error_nodes) - 5} more)"
+        error_msg = f"{len(error_nodes)} dbt node(s) at error severity: {preview}{more}"
+    elif returncode != 0:
+        error_msg = f"dbt exited with code {returncode}"
+
+    facets: Dict[str, Any] = {
+        "engine": "dbt",
+        "duration_seconds": duration_seconds,
+        "returncode": returncode,
+        "dbt_schema_version": results.schema_version,
+        "dbt_version": results.dbt_version,
+        "invocation_id": results.invocation_id,
+        "elapsed_time": results.elapsed_time,
+    }
+    facets.update(counts)
+
+    return {
+        "run_id": run_id,
+        "state": state,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        # ``records_total`` in the acquisition world = rows landed; a dbt
+        # transformation's closest analogue is "nodes executed", which is
+        # what ``fluid runs status`` renders as the run's headline count.
+        "records_total": counts["nodes_total"],
+        "streams": streams,
+        "error": error_msg,
+        "facets": facets,
+    }
+
+
+def _resolve_product_id_from_dir(contract_dir: Path, build: Dict[str, Any]) -> Optional[str]:
+    """Best-effort resolve the contract id whose builds include ``build``.
+
+    ``execute_dbt_build`` is dispatched with only ``build`` + ``project_dir``
+    + ``contract_dir`` (the contract's parent dir), mirroring how ``fluid
+    verify`` resolves run records relative to the contract path. We recover
+    ``contract.id`` here so the record is keyed IDENTICALLY to what verify
+    reads: ``<contract_dir>/.fluid/runs/<contract.id>/<build.id>/runs/``.
+
+    When a directory holds several contracts we disambiguate by matching the
+    build id; otherwise we fall back to the first contract that declares an
+    ``id``. Returns ``None`` when nothing resolves — the caller then skips
+    the write rather than mis-keying the record.
+    """
+    build_id = build.get("id")
+    candidates = sorted(contract_dir.glob("*.fluid.yaml")) + sorted(
+        contract_dir.glob("*.fluid.yml")
+    )
+    fallback: Optional[str] = None
+    for path in candidates:
+        try:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        cid = doc.get("id")
+        if not cid:
+            continue
+        if fallback is None:
+            fallback = str(cid)
+        builds = doc.get("builds") or []
+        if build_id and any(isinstance(b, dict) and b.get("id") == build_id for b in builds):
+            return str(cid)
+    return fallback
+
+
+def _persist_dbt_run_record(
+    build: Dict[str, Any],
+    project_dir: Path,
+    contract_dir: Path,
+    *,
+    returncode: int,
+    started_at: str,
+    finished_at: str,
+    duration_seconds: float,
+    product_id: Optional[str] = None,
+) -> Optional[str]:
+    """Parse ``target/run_results.json`` and persist a FLUID run record.
+
+    Best-effort: any failure (missing artifact, unresolved contract id,
+    state-store error) is logged at DEBUG and swallowed — recording results
+    must NEVER change the build's exit code.
+
+    Works on BOTH the local-dbt and Docker-fallback paths: docker mounts the
+    project dir (``-v <project_dir>:/workspace/project``), so ``target/`` —
+    and thus ``run_results.json`` — survives on the host after the container
+    exits. Returns the written run id, or ``None`` when nothing was
+    persisted.
+    """
+    try:
+        from .._acquisition_common import generate_run_id
+        from .._state import FileStateStore
+        from .artifacts import parse_run_results
+
+        results = parse_run_results(project_dir)
+        if results is None:
+            LOG.debug(
+                "dbt run_results.json absent/unparseable under %s; no run record", project_dir
+            )
+            return None
+
+        pid = product_id or _resolve_product_id_from_dir(contract_dir, build)
+        if not pid:
+            LOG.debug(
+                "could not resolve contract id for dbt build %r; skipping run record",
+                build.get("id"),
+            )
+            return None
+
+        run_id = generate_run_id()
+        record = build_dbt_run_record(
+            results,
+            run_id=run_id,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=duration_seconds,
+            returncode=returncode,
+        )
+        # Route through the FileStateStore chokepoint (the PR #272 redaction
+        # funnel) — NEVER json.dump directly.
+        store = FileStateStore(contract_dir / ".fluid")
+        store.write_run_record(pid, build.get("id", "unknown"), record)
+        return run_id
+    except Exception as exc:  # noqa: BLE001 — recording must not break the build
+        LOG.debug("dbt run-record persistence failed (non-fatal): %s", exc)
+        return None
+
+
 def execute_dbt_build(
     build: Dict[str, Any],
     project_dir: Path,
@@ -608,6 +795,9 @@ def execute_dbt_build(
                 cprint(f"🚀 Run {i + 1}/{iterations} - {datetime.now().strftime('%H:%M:%S')}")
                 cprint("-" * 80)
 
+                from .._acquisition_common import utc_now_iso
+
+                started_at = utc_now_iso()
                 start_time = time.time()
 
                 try:
@@ -619,6 +809,19 @@ def execute_dbt_build(
                     )
 
                     duration = time.time() - start_time
+
+                    # Parse target/run_results.json and persist a run record —
+                    # BEFORE the fail-fast early return so a failing build is
+                    # still recorded. Best-effort; never changes the exit code.
+                    _persist_dbt_run_record(
+                        build,
+                        project_dir,
+                        contract_dir,
+                        returncode=result.returncode,
+                        started_at=started_at,
+                        finished_at=utc_now_iso(),
+                        duration_seconds=duration,
+                    )
 
                     if result.returncode == 0:
                         successful_runs += 1

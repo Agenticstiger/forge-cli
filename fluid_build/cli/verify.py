@@ -1238,6 +1238,37 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     except Exception as exc:  # noqa: BLE001 — verify must not crash the CLI
         warning(f"Acquisition probes skipped: {exc}")
 
+    # ── Transformation pattern: dbt run_results probes ─────────────────────
+    # When the contract has any dbt build, read the run record the dbt runner
+    # writes from ``target/run_results.json`` and gate on failing contract
+    # tests. A failed ``dbt_tests_passed`` / ``no_error_severity_failures``
+    # check is CRITICAL (bumps ``critical_mismatch_count`` so ``--strict``
+    # fails the exit code); "no run record yet" only counts toward the
+    # summary ``mismatch_count`` (verify may run before amend-and-build).
+    try:
+        from fluid_build.cli._transformation_stage_ext import (
+            CRITICAL_TRANSFORMATION_CHECK_NAMES,
+            is_transformation_contract,
+            verify_transformation,
+        )
+
+        if is_transformation_contract(contract):
+            cprint("\n" + "=" * 80)
+            cprint("🔧 Transformation Post-Apply Probes (dbt)")
+            cprint("=" * 80)
+            txf_results = verify_transformation(contract, Path(contract_path).resolve().parent)
+            for r in txf_results:
+                cprint(f"\n   Build: {r.product_id}/{r.build_id}")
+                for c in r.checks:
+                    icon = "✅" if c.passed else "❌"
+                    cprint(f"      {icon} {c.name}: {c.detail}")
+                    if not c.passed:
+                        mismatch_count += 1
+                        if c.name in CRITICAL_TRANSFORMATION_CHECK_NAMES:
+                            critical_mismatch_count += 1
+    except Exception as exc:  # noqa: BLE001 — verify must not crash the CLI
+        warning(f"Transformation probes skipped: {exc}")
+
     # ── Contract ↔ dbt reconciliation (opt-in via --reconcile-dbt) ─────────
     # Static, warehouse-free cross-check that the contract schema agrees with
     # the columns the build's dbt project declares. Surfaces DRIFT (contract

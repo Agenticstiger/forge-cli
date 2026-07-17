@@ -1,0 +1,73 @@
+{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/run-results/v6.json",
+    "dbt_version": "1.8.7",
+    "generated_at": "2026-07-18T10:15:30.123456Z",
+    "invocation_id": "0e1f2a3b-4c5d-6e7f-8a9b-0c1d2e3f4a5b",
+    "env": {}
+  },
+  "results": [
+    {
+      "unique_id": "model.acme.stg_orders",
+      "status": "success",
+      "failures": null,
+      "execution_time": 1.42,
+      "message": "SELECT 100",
+      "thread_id": "Thread-1",
+      "adapter_response": {"_message": "SELECT 100", "rows_affected": 100},
+      "timing": []
+    },
+    {
+      "unique_id": "model.acme.orders",
+      "status": "success",
+      "failures": null,
+      "execution_time": 2.03,
+      "message": "SELECT 100",
+      "thread_id": "Thread-2",
+      "adapter_response": {"_message": "SELECT 100", "rows_affected": 100},
+      "timing": []
+    },
+    {
+      "unique_id": "test.acme.not_null_orders_order_id.abc123",
+      "status": "pass",
+      "failures": 0,
+      "execution_time": 0.31,
+      "message": null,
+      "thread_id": "Thread-1",
+      "adapter_response": {},
+      "timing": []
+    },
+    {
+      "unique_id": "test.acme.unique_orders_order_id.def456",
+      "status": "fail",
+      "failures": 5,
+      "execution_time": 0.29,
+      "message": "Got 5 results, configured to fail if != 0",
+      "thread_id": "Thread-2",
+      "adapter_response": {},
+      "timing": []
+    },
+    {
+      "unique_id": "test.acme.not_null_orders_customer_id.ghi789",
+      "status": "fail",
+      "failures": 3,
+      "execution_time": 0.27,
+      "message": "Got 3 results, configured to fail if != 0",
+      "thread_id": "Thread-3",
+      "adapter_response": {},
+      "timing": []
+    },
+    {
+      "unique_id": "test.acme.relationships_orders_customer_id.jkl012",
+      "status": "fail",
+      "failures": 1,
+      "execution_time": 0.33,
+      "message": "Got 1 result, configured to fail if != 0",
+      "thread_id": "Thread-1",
+      "adapter_response": {},
+      "timing": []
+    }
+  ],
+  "elapsed_time": 6.71,
+  "args": {"which": "build", "project_dir": "/workspace/project"}
+}
