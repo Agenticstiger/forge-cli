@@ -30,6 +30,28 @@ provides a *conservative* apply pass that fills missing slots in the
 contract dict — never overwriting a user-set field. Gated behind the
 ``--apply-enrichment`` CLI flag.
 
+Every write target is a slot the FLUID JSON schema actually declares —
+the bundled schemas (0.7.1 → 0.7.5) set ``additionalProperties: false``
+on the contract root, ``metadata``, ``exposeContract`` and ``binding``
+objects, so the pass may only use declared properties or the two
+explicitly-open extension points (root ``extensions`` and
+``binding.properties``). Slot map:
+
+* dbt tests → ``extensions.enrichment.dbtTestSuggestions`` (full
+  schema.yml shape) + ``extensions.enrichment.qualityChecks`` (compact
+  rollup).
+* freshness → ``exposes[0].qos.freshnessSLO`` (ISO-8601 duration from
+  ``warn_after``) + a ``type: freshness`` dq rule under
+  ``exposes[0].contract.dq.rules`` (``window`` from ``error_after``).
+* physical_layout → ``exposes[i].binding.properties.physical``.
+* apply marker → ``extensions.enrichment.applied``.
+
+Contracts enriched by pre-v2 versions of this module carry these
+payloads in schema-invalid slots (``metadata.enrichmentApplied``,
+``metadata.dbtTestSuggestions``, top-level ``qualityChecks``,
+``exposes[].contract.freshness``, ``exposes[].binding.physical``); a
+re-apply migrates them into the slots above.
+
 Design borrowed from:
 
 * Python stdlib ``difflib.unified_diff`` (full credit) for the diff
@@ -66,11 +88,14 @@ __all__ = [
 ]
 
 
-ENRICHMENT_MARKER_SOURCE = "enrichment-v1"
-"""Stamp value written under ``metadata.enrichmentApplied.source``.
+ENRICHMENT_MARKER_SOURCE = "enrichment-v2"
+"""Stamp value written under ``extensions.enrichment.applied.source``.
 
 Bumped only when the apply semantics change in a way that demands a
-re-run on previously-enriched contracts.
+re-run on previously-enriched contracts. v2 moved every write target
+to a schema-valid slot (the v1 targets were rejected by the schemas'
+``additionalProperties: false``), so v1 markers intentionally never
+short-circuit — a re-apply performs the legacy-slot migration.
 """
 
 
@@ -99,7 +124,7 @@ def apply_enrichment_to_contract(
     as user-set so the apply pass cannot stomp an intentional clear).
 
     Idempotency: a re-apply with the same artifacts produces zero
-    changes. The ``metadata.enrichmentApplied`` marker is checked
+    changes. The ``extensions.enrichment.applied`` marker is checked
     upfront — if the source + artifacts_run_id already matches, we
     short-circuit and return ``(contract_copy, [])``.
 
@@ -135,12 +160,18 @@ def apply_enrichment_to_contract(
     ):
         return patched, changes
 
+    # --- 0. legacy-slot migration --------------------------------------
+    # Contracts enriched by pre-v2 versions of this module carry data in
+    # schema-invalid slots; relocate them first so the conservative
+    # "user-set" checks below see the migrated values.
+    _migrate_legacy_slots(patched, changes)
+
     # --- 1. dbt tests --------------------------------------------------
-    # Two slots:
-    #   * ``metadata.dbtTestSuggestions`` — full schema.yml-shaped dicts so
+    # Two slots, both under the ``extensions.enrichment`` namespace:
+    #   * ``dbtTestSuggestions`` — full schema.yml-shaped dicts so
     #     downstream tools can apply directly.
-    #   * ``qualityChecks`` (top-level) — compact
-    #     ``{model: {column: [tests]}}`` shape for at-a-glance review.
+    #   * ``qualityChecks`` — compact ``{model: {column: [tests]}}``
+    #     shape for at-a-glance review.
     dbt_tests = artifacts.get("dbt_tests") or []
     if dbt_tests:
         _apply_dbt_tests(patched, dbt_tests, changes)
@@ -162,7 +193,7 @@ def apply_enrichment_to_contract(
             run_id=run_id,
             now=now or datetime.now(timezone.utc),
         )
-        changes.append("stamped metadata.enrichmentApplied marker")
+        changes.append("stamped extensions.enrichment.applied marker")
 
     return patched, changes
 
@@ -213,23 +244,28 @@ def _apply_dbt_tests(
     dbt_tests: List[Mapping[str, Any]],
     changes: List[str],
 ) -> None:
-    """Wire dbt test suggestions into ``metadata.dbtTestSuggestions``
-    (full schema.yml shape) and ``qualityChecks`` (compact view).
+    """Wire dbt test suggestions into ``extensions.enrichment``.
 
-    Both slots are NEW namespaces under FLUID — the schema doesn't
-    forbid them and downstream tools will recognise the dbt-canonical
-    shape. We never touch existing user-set values.
+    Two slots — ``dbtTestSuggestions`` (full schema.yml shape) and
+    ``qualityChecks`` (compact view) — both under the enrichment plugin
+    namespace: the root ``extensions`` object is the schema's designated
+    free-form extension point, whereas ``metadata`` and the contract
+    root are ``additionalProperties: false`` (the pre-v2 targets there
+    never passed validation). We never touch existing user-set values.
     """
-    metadata = _ensure_dict(contract, "metadata")
-    suggestions_existing = metadata.get("dbtTestSuggestions")
-    quality_existing = contract.get("qualityChecks")
+    ext = _enrichment_ext(contract)
+    suggestions_existing = ext.get("dbtTestSuggestions")
+    quality_existing = ext.get("qualityChecks")
 
-    # ``metadata.dbtTestSuggestions`` — store the raw schema.yml list
-    # only if missing. Re-running ``enrichment_apply`` against the same
+    # ``dbtTestSuggestions`` — store the raw schema.yml list only if
+    # missing. Re-running ``enrichment_apply`` against the same
     # artifacts must not double up the list.
     if suggestions_existing is None:
-        metadata["dbtTestSuggestions"] = [dict(t) for t in dbt_tests]
-        changes.append(f"added metadata.dbtTestSuggestions ({len(dbt_tests)} schema.yml block(s))")
+        ext["dbtTestSuggestions"] = [dict(t) for t in dbt_tests]
+        changes.append(
+            f"added extensions.enrichment.dbtTestSuggestions "
+            f"({len(dbt_tests)} schema.yml block(s))"
+        )
 
     # ``qualityChecks`` — compact ``{model: {column: [tests]}}`` rollup.
     # If the user already authored qualityChecks (even partial), we
@@ -239,7 +275,7 @@ def _apply_dbt_tests(
     if compact_new:
         if not isinstance(quality_existing, dict) or not quality_existing:
             # Slot is empty / missing — fill it entirely.
-            contract["qualityChecks"] = compact_new
+            ext["qualityChecks"] = compact_new
             for model in compact_new:
                 changes.append(f"added qualityChecks[{model}] from dbt suggestions")
         else:
@@ -260,7 +296,7 @@ def _compact_quality_checks_from_dbt(
     (``{accepted_values: {values: [...]}}``). The dict-shaped tests
     are stringified as their single top-level key for the compact
     view; downstream tools should consume the full
-    ``metadata.dbtTestSuggestions`` for the dict bodies.
+    ``extensions.enrichment.dbtTestSuggestions`` for the dict bodies.
     """
     compact: Dict[str, Dict[str, List[str]]] = {}
     for block in dbt_tests:
@@ -299,30 +335,154 @@ def _apply_freshness(
     freshness: Mapping[str, Any],
     changes: List[str],
 ) -> None:
-    """Fill ``exposes[0].contract.freshness`` when missing.
+    """Fill the schema-declared freshness slots on the first expose.
 
     FLUID has at most one refresh cadence per product (multi-source
     CDC is handled via source_type), so a single expose carries the
-    canonical block. We pick the first expose with a ``contract`` sub-
-    object — the slot the JSON schema actually defines.
+    canonical freshness declaration. The dbt-shaped artifact
+    (``{warn_after, error_after, filter}``) maps onto the two slots the
+    JSON schema actually defines — ``exposeContract`` is
+    ``additionalProperties: false``, so the pre-v2
+    ``contract.freshness`` target never passed validation:
+
+    * ``qos.freshnessSLO`` (ISO-8601 duration) ← ``warn_after`` — the
+      producer's freshness promise.
+    * a ``type: freshness`` rule under ``contract.dq.rules`` with
+      ``window`` ← ``error_after`` at ``severity: error`` — the
+      enforceable breach threshold, consumed by the quality engine and
+      the dbt-tests exporter. This is also the pairing the policy
+      engine expects (``freshnessSLO`` without a freshness dq rule
+      draws a policy warning).
     """
     exposes = contract.get("exposes") or []
-    if not isinstance(exposes, list) or not exposes:
+    if not isinstance(exposes, list):
         return
-    target = None
-    for ex in exposes:
-        if isinstance(ex, dict):
-            target = ex
-            break
-    if target is None:
-        return
-    inner = _ensure_dict(target, "contract")
-    if "freshness" in inner and inner["freshness"]:
-        # User-set freshness — never overwrite.
-        return
-    inner["freshness"] = dict(freshness)
-    expose_id = target.get("exposeId") or target.get("name") or "exposes[0]"
-    changes.append(f"added freshness to exposes[{expose_id}]")
+    target = next((ex for ex in exposes if isinstance(ex, dict)), None)
+    if target is not None:
+        _fill_freshness_on_expose(target, freshness, changes)
+
+
+def _fill_freshness_on_expose(
+    expose: Dict[str, Any],
+    freshness: Mapping[str, Any],
+    changes: List[str],
+) -> None:
+    """Fill ``qos.freshnessSLO`` + a freshness dq rule, conservatively.
+
+    Each half is filled independently and only when missing: a
+    ``freshnessSLO`` key already present or an existing ``type:
+    freshness`` dq rule is user-set and never overwritten.
+
+    The dq rule is only emitted when the expose schema has a timestamp
+    column to check (``selector``): the quality engine fails any rule
+    that lacks a selector, so a selector-less machine rule would inject
+    a spurious failure into live quality runs. Without a detectable
+    column only the SLO half is written (the policy engine's
+    "freshnessSLO without a freshness rule" warning then nudges the
+    user to author one against the right column).
+    """
+    expose_id = expose.get("exposeId") or expose.get("name") or "exposes[0]"
+
+    warn_iso = _freshness_unit_to_iso(freshness.get("warn_after"))
+    error_iso = _freshness_unit_to_iso(freshness.get("error_after"))
+
+    if warn_iso:
+        qos = _ensure_dict(expose, "qos")
+        if "freshnessSLO" not in qos:
+            qos["freshnessSLO"] = warn_iso
+            changes.append(f"added qos.freshnessSLO {warn_iso} to exposes[{expose_id}]")
+
+    selector = _freshness_selector_column(expose) if error_iso else None
+    if error_iso and selector:
+        inner = _ensure_dict(expose, "contract")
+        dq = _ensure_dict(inner, "dq")
+        rules = dq.get("rules")
+        if rules is None:
+            rules = []
+            dq["rules"] = rules
+        if isinstance(rules, list) and not any(
+            isinstance(r, Mapping) and r.get("type") == "freshness" for r in rules
+        ):
+            rule: Dict[str, Any] = {
+                "id": "freshness-slo",
+                "type": "freshness",
+                "selector": selector,
+                "severity": "error",
+                "window": error_iso,
+                "description": f"Data older than {error_iso} breaches the freshness SLO.",
+            }
+            filter_expr = freshness.get("filter")
+            if filter_expr:
+                rule["description"] += f" Row filter: {filter_expr}."
+            rules.append(rule)
+            changes.append(f"added freshness dq rule (window {error_iso}) to exposes[{expose_id}]")
+
+
+# Ordered by how strongly the name signals "row last touched" — a
+# load/update stamp beats a creation stamp for freshness checks.
+_FRESHNESS_COLUMN_HINTS = (
+    "updated_at",
+    "last_updated_at",
+    "last_updated",
+    "loaded_at",
+    "_loaded_at",
+    "ingested_at",
+    "_ingested_at",
+    "modified_at",
+    "event_ts",
+    "event_time",
+    "created_at",
+)
+
+_TEMPORAL_TYPE_TOKENS = ("timestamp", "datetime", "date")
+
+
+def _freshness_selector_column(expose: Mapping[str, Any]) -> Optional[str]:
+    """Pick the timestamp column a freshness dq rule should check.
+
+    Only temporally-typed columns qualify (a varchar ``updated_at``
+    would break the generated SQL check); among those, well-known
+    load/update stamp names win, else the first temporal column.
+    Returns ``None`` when the expose schema has no usable column.
+    """
+    inner = expose.get("contract")
+    schema = inner.get("schema") if isinstance(inner, Mapping) else None
+    if not isinstance(schema, list):
+        return None
+    temporal: List[str] = []
+    for col in schema:
+        if not isinstance(col, Mapping):
+            continue
+        name = str(col.get("name") or "")
+        col_type = str(col.get("type") or "").lower()
+        if name and any(token in col_type for token in _TEMPORAL_TYPE_TOKENS):
+            temporal.append(name)
+    by_lower = {name.lower(): name for name in temporal}
+    for hint in _FRESHNESS_COLUMN_HINTS:
+        if hint in by_lower:
+            return by_lower[hint]
+    return temporal[0] if temporal else None
+
+
+_ISO_PARTS_BY_PERIOD = {"minute": ("PT", "M"), "hour": ("PT", "H"), "day": ("P", "D")}
+
+
+def _freshness_unit_to_iso(unit: Any) -> Optional[str]:
+    """Convert a dbt ``{count, period}`` unit into an ISO-8601 duration.
+
+    ``{"count": 2, "period": "hour"}`` → ``"PT2H"``. Unknown periods or
+    non-positive counts return ``None`` and the caller skips that half.
+    """
+    if not isinstance(unit, Mapping):
+        return None
+    count = unit.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        return None
+    parts = _ISO_PARTS_BY_PERIOD.get(str(unit.get("period") or "").lower())
+    if parts is None:
+        return None
+    prefix, suffix = parts
+    return f"{prefix}{count}{suffix}"
 
 
 def _apply_physical_layout(
@@ -330,13 +490,12 @@ def _apply_physical_layout(
     physical_layout: List[Mapping[str, Any]],
     changes: List[str],
 ) -> None:
-    """Fill ``exposes[i].binding.physical`` for each suggested expose.
+    """Fill ``exposes[i].binding.properties.physical`` for each suggested expose.
 
-    Matching by exposeId. The ``binding.physical`` sub-block is a NEW
-    namespace under the existing ``binding`` map; the FLUID schema
-    permits additional binding properties via the ``additionalProperties``
-    relaxation on the binding object, and downstream IaC emitters
-    already know how to walk ``binding.*``.
+    Matching by exposeId. The payload lives under ``binding.properties``
+    — the schema's provider-specific bag (``additionalProperties: true``).
+    The ``binding`` object itself is ``additionalProperties: false``, so
+    the pre-v2 ``binding.physical`` target never passed validation.
     """
     exposes = contract.get("exposes") or []
     if not isinstance(exposes, list) or not exposes:
@@ -384,12 +543,14 @@ def _fill_physical_on_expose(
     layout: Mapping[str, Any],
     changes: List[str],
 ) -> None:
-    """Fill ``binding.physical`` on a single expose, conservatively."""
+    """Fill ``binding.properties.physical`` on a single expose, conservatively."""
     if not isinstance(expose, dict):
         return
-    binding = _ensure_dict(expose, "binding")
-    if "physical" in binding and binding["physical"]:
-        return  # user-set — never overwrite
+    existing_binding = expose.get("binding")
+    if isinstance(existing_binding, dict):
+        existing_props = existing_binding.get("properties")
+        if isinstance(existing_props, dict) and "physical" in existing_props:
+            return  # user-set (even an intentional clear) — never overwrite
 
     # Only copy keys that are non-empty in the layout suggestion so we
     # don't sprinkle ``None``s into the contract.
@@ -415,7 +576,9 @@ def _fill_physical_on_expose(
     if not payload:
         return
 
-    binding["physical"] = payload
+    binding = _ensure_dict(expose, "binding")
+    properties = _ensure_dict(binding, "properties")
+    properties["physical"] = payload
     expose_id = expose.get("exposeId") or expose.get("name") or "exposes[?]"
     summary = []
     if payload.get("clustering_keys"):
@@ -426,7 +589,7 @@ def _fill_physical_on_expose(
     if payload.get("materialization_hint"):
         summary.append(f"materialization={payload['materialization_hint']}")
     detail = "; ".join(summary) if summary else "physical layout"
-    changes.append(f"added binding.physical to exposes[{expose_id}] ({detail})")
+    changes.append(f"added binding.properties.physical to exposes[{expose_id}] ({detail})")
 
 
 # ---------------------------------------------------------------------------
@@ -440,9 +603,9 @@ def _stamp_marker(
     run_id: Optional[str],
     now: datetime,
 ) -> None:
-    """Stamp ``metadata.enrichmentApplied`` so re-runs are idempotent."""
-    metadata = _ensure_dict(contract, "metadata")
-    metadata["enrichmentApplied"] = {
+    """Stamp ``extensions.enrichment.applied`` so re-runs are idempotent."""
+    ext = _enrichment_ext(contract)
+    ext["applied"] = {
         "timestamp_utc": now.astimezone(timezone.utc).isoformat(),
         "source": ENRICHMENT_MARKER_SOURCE,
         "artifacts_run_id": run_id or "",
@@ -450,16 +613,132 @@ def _stamp_marker(
 
 
 def _get_marker(contract: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    metadata = contract.get("metadata") if isinstance(contract, Mapping) else None
-    if not isinstance(metadata, Mapping):
+    if not isinstance(contract, Mapping):
         return None
-    marker = metadata.get("enrichmentApplied")
-    return dict(marker) if isinstance(marker, Mapping) else None
+    extensions = contract.get("extensions")
+    if isinstance(extensions, Mapping):
+        enrichment = extensions.get("enrichment")
+        if isinstance(enrichment, Mapping):
+            marker = enrichment.get("applied")
+            if isinstance(marker, Mapping):
+                return dict(marker)
+    # Legacy (pre-v2) location — kept readable so
+    # ``has_enrichment_marker`` still recognises old contracts.
+    metadata = contract.get("metadata")
+    if isinstance(metadata, Mapping):
+        marker = metadata.get("enrichmentApplied")
+        if isinstance(marker, Mapping):
+            return dict(marker)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Legacy-slot migration (pre-v2 → schema-valid slots)
+# ---------------------------------------------------------------------------
+
+
+def _migrate_legacy_slots(contract: Dict[str, Any], changes: List[str]) -> None:
+    """Relocate machine-written slots from their pre-v2 (schema-invalid) homes.
+
+    Versions of this module up to ``enrichment-v1`` wrote five slots that
+    every bundled schema rejects via ``additionalProperties: false``:
+    ``metadata.enrichmentApplied``, ``metadata.dbtTestSuggestions``,
+    top-level ``qualityChecks``, ``exposes[].contract.freshness`` and
+    ``exposes[].binding.physical``. All five were written exclusively by
+    this module, so moving them is safe — a re-run of
+    ``--apply-enrichment`` on a previously-enriched contract heals it
+    into a schema-valid shape. Non-mapping values in these slots are
+    left untouched (whatever put them there, it wasn't us).
+    """
+    metadata = contract.get("metadata")
+    if isinstance(metadata, dict):
+        legacy_marker = metadata.get("enrichmentApplied")
+        if isinstance(legacy_marker, dict):
+            _enrichment_ext(contract).setdefault("applied", dict(legacy_marker))
+            del metadata["enrichmentApplied"]
+            changes.append(
+                "relocated legacy metadata.enrichmentApplied → extensions.enrichment.applied"
+            )
+        legacy_suggestions = metadata.get("dbtTestSuggestions")
+        if isinstance(legacy_suggestions, list):
+            _enrichment_ext(contract).setdefault("dbtTestSuggestions", legacy_suggestions)
+            del metadata["dbtTestSuggestions"]
+            changes.append(
+                "relocated legacy metadata.dbtTestSuggestions → "
+                "extensions.enrichment.dbtTestSuggestions"
+            )
+
+    legacy_quality = contract.get("qualityChecks")
+    if isinstance(legacy_quality, dict):
+        _enrichment_ext(contract).setdefault("qualityChecks", legacy_quality)
+        del contract["qualityChecks"]
+        changes.append("relocated legacy qualityChecks → extensions.enrichment.qualityChecks")
+
+    exposes = contract.get("exposes")
+    if not isinstance(exposes, list):
+        return
+    for ex in exposes:
+        if not isinstance(ex, dict):
+            continue
+        expose_id = ex.get("exposeId") or ex.get("name") or "exposes[?]"
+        inner = ex.get("contract")
+        if isinstance(inner, dict) and isinstance(inner.get("freshness"), Mapping):
+            legacy_freshness = inner["freshness"]
+            # Convert rather than copy: the dbt-shaped block has no
+            # schema-valid home, so it becomes qos.freshnessSLO + a dq
+            # rule (each half fills only if not already set). Migrate
+            # only blocks the new slots can represent losslessly —
+            # hand-edited variants (unknown keys, week/month periods, a
+            # row filter) stay put for the user to resolve.
+            if _is_migratable_freshness(legacy_freshness):
+                del inner["freshness"]
+                _fill_freshness_on_expose(ex, legacy_freshness, changes)
+                changes.append(f"removed legacy contract.freshness from exposes[{expose_id}]")
+        binding = ex.get("binding")
+        if isinstance(binding, dict) and isinstance(binding.get("physical"), dict):
+            legacy_physical = binding.pop("physical")
+            _ensure_dict(binding, "properties").setdefault("physical", legacy_physical)
+            changes.append(
+                f"relocated legacy binding.physical → binding.properties.physical "
+                f"on exposes[{expose_id}]"
+            )
 
 
 # ---------------------------------------------------------------------------
 # Small dict helpers
 # ---------------------------------------------------------------------------
+
+
+def _is_migratable_freshness(block: Mapping[str, Any]) -> bool:
+    """True when a legacy freshness block matches the machine-written shape.
+
+    The v1 emitter (:mod:`fluid_build.copilot.tools.freshness_emitter`)
+    only ever produced ``{warn_after, error_after, filter}`` with
+    minute/hour/day units and ``filter: None``. Anything else was
+    hand-edited after the fact and cannot be represented losslessly in
+    the new slots, so migration leaves it alone.
+    """
+    if any(key not in ("warn_after", "error_after", "filter") for key in block):
+        return False
+    if block.get("filter"):
+        return False
+    thresholds = [block.get(key) for key in ("warn_after", "error_after")]
+    if not any(isinstance(t, Mapping) for t in thresholds):
+        return False
+    return all(
+        t is None or (isinstance(t, Mapping) and _freshness_unit_to_iso(t) is not None)
+        for t in thresholds
+    )
+
+
+def _enrichment_ext(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the ``extensions.enrichment`` namespace, creating it if missing.
+
+    The root ``extensions`` object is the schema's designated free-form
+    extension point ("each plugin claims a single sub-key"); this module
+    claims ``enrichment``.
+    """
+    return _ensure_dict(_ensure_dict(contract, "extensions"), "enrichment")
 
 
 def _ensure_dict(container: Dict[str, Any], key: str) -> Dict[str, Any]:
