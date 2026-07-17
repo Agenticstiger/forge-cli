@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import yaml
 
+from fluid_build.util.freshness import iso_duration_to_freshness_unit
 from fluid_build.util.upstream_discovery import discover_upstream_products
 
 _HEADER = (
@@ -43,6 +44,16 @@ _HEADER = (
 )
 
 _logger = logging.getLogger(__name__)
+
+# Adapters that compute source freshness from warehouse metadata tables and so
+# do NOT require a ``loaded_at_field`` (dbt >= 1.7). Mapped from the contract's
+# ``binding.platform`` enum. Everything else (duckdb/local, postgres, kafka …)
+# needs an explicit ``loaded_at_field``; when none is derivable we omit the
+# whole ``freshness:`` block rather than emit one dbt would error on.
+# Ref: https://docs.getdbt.com/reference/resource-properties/freshness
+_METADATA_FRESHNESS_PLATFORMS = frozenset(
+    {"snowflake", "gcp", "bigquery", "aws", "redshift", "databricks"}
+)
 
 try:
     from fluid_build.util.contract import consumes_to_canonical_ports
@@ -90,13 +101,17 @@ def generate_sources(
 
     upstream_index = discover_upstream_products(workspace_root)
 
+    # Whether the consumer's target adapter can compute freshness from
+    # warehouse metadata (so a ``loaded_at_field`` is optional).
+    metadata_capable = _target_platform(contract) in _METADATA_FRESHNESS_PLATFORMS
+
     # Group tables by (database_expr, schema_expr) so multi-schema lineage
     # lands in separate dbt source blocks.
     grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     order: List[Tuple[str, str]] = []
 
     for port in canonical:
-        resolved = _resolve_binding(port, upstream_index)
+        resolved, expose = _resolve_binding(port, upstream_index)
         key = (resolved["database_expr"], resolved["schema_expr"])
         if key not in grouped:
             grouped[key] = []
@@ -113,6 +128,23 @@ def generate_sources(
         columns = _columns_for_source(port["id"], schema_context)
         if columns:
             table_entry["columns"] = columns
+
+        # Freshness (``dbt source freshness``) — operationalizes the contract's
+        # freshness promise on the consumed source. loaded_at_field + freshness
+        # are appended last so tables without a freshness promise are byte-for-
+        # byte unchanged.
+        freshness = _freshness_block(port, expose)
+        if freshness is not None:
+            loaded_at_field = resolved.get("loaded_at_field")
+            if loaded_at_field:
+                table_entry["loaded_at_field"] = loaded_at_field
+                table_entry["freshness"] = freshness
+            elif metadata_capable:
+                # No cursor column, but the adapter reads freshness from
+                # warehouse metadata — emit the block without loaded_at_field.
+                table_entry["freshness"] = freshness
+            # else: duckdb/local etc. with no derivable column — omit the block
+            # entirely so ``dbt source freshness`` doesn't error.
 
         grouped[key].append(table_entry)
 
@@ -197,11 +229,16 @@ def generate_sources_from_logical_model(logical_model: Mapping[str, Any]) -> Opt
 def _resolve_binding(
     port: Mapping[str, Any],
     upstream_index: Mapping[str, Mapping[str, Any]],
-) -> Dict[str, Optional[str]]:
-    """Resolve a consume to ``{database_expr, schema_expr, identifier}``.
+) -> Tuple[Dict[str, Optional[str]], Optional[Mapping[str, Any]]]:
+    """Resolve a consume to ``({database_expr, schema_expr, identifier,
+    loaded_at_field}, matched_upstream_expose)``.
 
     Tries the upstream contract index first; falls back to env_var-style
-    placeholders when the upstream cannot be located.
+    placeholders when the upstream cannot be located. The second tuple element
+    is the matched upstream ``exposes[]`` entry (or ``None`` on fallback) — its
+    ``qos.freshnessSLO`` / ``contract.freshness`` feed the freshness block.
+    ``loaded_at_field`` is derived from the upstream's acquisition cursor field
+    when available (else ``None``).
     """
     expose_id = port.get("id") or ""
     product_id = port.get("reference")
@@ -217,13 +254,15 @@ def _resolve_binding(
             location = binding.get("location") or {}
             if not isinstance(location, Mapping):
                 location = {}
-            return {
+            resolved: Dict[str, Optional[str]] = {
                 "database_expr": _normalize_placeholder(location.get("database")),
                 "schema_expr": _normalize_placeholder(
                     location.get("schema") or location.get("dataset")
                 ),
                 "identifier": _identifier_from_location(location, expose_id),
+                "loaded_at_field": _cursor_field_from_upstream(upstream),
             }
+            return resolved, expose
 
     # Fallback — we didn't find the upstream contract or the specific expose.
     # Emit env_var placeholders so dbt still compiles; the user can correct
@@ -238,7 +277,8 @@ def _resolve_binding(
         "database_expr": "{{ env_var('SNOWFLAKE_DATABASE') }}",
         "schema_expr": "{{ env_var('SNOWFLAKE_STAGE_SCHEMA', 'PUBLIC') }}",
         "identifier": expose_id.upper() if expose_id else None,
-    }
+        "loaded_at_field": None,
+    }, None
 
 
 def _identifier_from_location(
@@ -273,6 +313,168 @@ def _normalize_placeholder(value: Any) -> Optional[str]:
     text = _FLUID_ENV_RE.sub(lambda m: f"{{{{ env_var('{m.group(1)}') }}}}", text)
     text = _SHELL_ENV_RE.sub(lambda m: f"{{{{ env_var('{m.group(1)}') }}}}", text)
     return text
+
+
+# ---------------------------------------------------------------------------
+# Source freshness (``dbt source freshness``)
+# ---------------------------------------------------------------------------
+
+
+def _freshness_block(
+    port: Mapping[str, Any],
+    expose: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Build a dbt ``freshness:`` block for one source table.
+
+    Precedence (highest first):
+
+      1. Upstream expose ``contract.freshness`` — a copilot-enriched, already
+         dbt-shaped block passed through verbatim (a null ``filter`` key is
+         stripped). Tolerates absence: ``exposes[].contract.freshness`` is
+         schema-invalid today, so it is usually not present.
+      2. Consumer ``qosExpectations.freshnessMax`` → ``error_after`` and, when
+         present, upstream ``qos.freshnessSLO`` → ``warn_after``.
+      3. ``freshnessSLO`` alone → ``warn_after`` = SLO, ``error_after`` = 2×SLO.
+
+    Returns the freshness mapping (``{warn_after, error_after, filter?}``) or
+    ``None`` when the contract declares no freshness promise. ``loaded_at_field``
+    is NOT part of the returned block — the caller places it as a sibling of
+    ``freshness`` on the table and decides omission for metadata-less adapters.
+    """
+    # (1) Pass-through of an already-dbt-shaped block.
+    passthrough = _passthrough_freshness(expose)
+    if passthrough is not None:
+        return passthrough
+
+    # (2)/(3) Derive from ISO-8601 freshness durations.
+    slo = _expose_freshness_slo(expose)
+    freshness_max = _consumer_freshness_max(port)
+    warn = iso_duration_to_freshness_unit(slo)
+    error = iso_duration_to_freshness_unit(freshness_max)
+
+    if warn and error:
+        # (2) both declared: producer SLO warns, consumer max errors.
+        return {"warn_after": warn, "error_after": error}
+    if error:
+        # freshnessMax alone — a consumer hard expectation, no soft warn.
+        return {"error_after": error}
+    if warn:
+        # (3) SLO alone — warn at the SLO, error at twice the SLO.
+        return {
+            "warn_after": warn,
+            "error_after": iso_duration_to_freshness_unit(slo, multiplier=2),
+        }
+    return None
+
+
+def _passthrough_freshness(
+    expose: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return a copy of ``expose.contract.freshness`` (null ``filter`` stripped).
+
+    ``exposes[].contract.freshness`` is not part of the current schema
+    (``exposeContract`` is ``additionalProperties: false``), so this must
+    tolerate its absence gracefully and return ``None``.
+    """
+    if not isinstance(expose, Mapping):
+        return None
+    contract_block = expose.get("contract")
+    if not isinstance(contract_block, Mapping):
+        return None
+    freshness = contract_block.get("freshness")
+    if not isinstance(freshness, Mapping) or not freshness:
+        return None
+    result = dict(freshness)  # copy — never mutate the source contract
+    if result.get("filter") is None:
+        result.pop("filter", None)
+    return result
+
+
+def _expose_freshness_slo(expose: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """Producer freshness promise: upstream ``exposes[].qos.freshnessSLO``."""
+    if not isinstance(expose, Mapping):
+        return None
+    qos = expose.get("qos")
+    if isinstance(qos, Mapping):
+        slo = qos.get("freshnessSLO")
+        if isinstance(slo, str) and slo.strip():
+            return slo.strip()
+    return None
+
+
+def _consumer_freshness_max(port: Mapping[str, Any]) -> Optional[str]:
+    """Consumer expectation: ``consumes[].qosExpectations.freshnessMax``.
+
+    The canonical port carries this under ``qos_expectations`` (see
+    :func:`fluid_build.util.contract.consumes_to_canonical_ports`).
+    """
+    qos = port.get("qos_expectations")
+    if isinstance(qos, Mapping):
+        freshness_max = qos.get("freshnessMax")
+        if isinstance(freshness_max, str) and freshness_max.strip():
+            return freshness_max.strip()
+    return None
+
+
+def _cursor_field_from_upstream(upstream: Mapping[str, Any]) -> Optional[str]:
+    """Derive a dbt ``loaded_at_field`` from the upstream acquisition source.
+
+    Looks for an acquisition source's ``cursor_field`` (e.g. ``updated_at``) in
+    the shapes a contract can carry it: a top-level ``acquisition`` block and
+    the schema-canonical ``builds[].properties.source`` acquisition pattern.
+    Returns the first match, else ``None`` (freshness then relies on warehouse
+    metadata or is omitted).
+    """
+    # Card shape: acquisition.sources[].cursor_field / acquisition.source.*
+    acquisition = upstream.get("acquisition")
+    if isinstance(acquisition, Mapping):
+        for source in acquisition.get("sources") or []:
+            cursor = _cursor_field(source)
+            if cursor:
+                return cursor
+        cursor = _cursor_field(acquisition.get("source"))
+        if cursor:
+            return cursor
+
+    # Schema-canonical shape: builds[].properties.source (acquisitionPattern).
+    for build in upstream.get("builds") or []:
+        if not isinstance(build, Mapping):
+            continue
+        properties = build.get("properties")
+        if isinstance(properties, Mapping):
+            cursor = _cursor_field(properties.get("source"))
+            if cursor:
+                return cursor
+    return None
+
+
+def _cursor_field(source: Any) -> Optional[str]:
+    if isinstance(source, Mapping):
+        cursor = source.get("cursor_field")
+        if isinstance(cursor, str) and cursor.strip():
+            return cursor.strip()
+    return None
+
+
+def _target_platform(contract: Mapping[str, Any]) -> Optional[str]:
+    """Resolve the consumer's target platform (lowercased) or ``None``.
+
+    Prefers ``exposes[].binding.platform`` (the output-port binding), falling
+    back to ``builds[].execution.runtime.platform`` (as ``profiles.yml`` reads
+    it). Drives whether a ``loaded_at_field`` is required for freshness.
+    """
+    for expose in contract.get("exposes") or []:
+        if isinstance(expose, Mapping):
+            platform = (expose.get("binding") or {}).get("platform")
+            if isinstance(platform, str) and platform.strip():
+                return platform.strip().lower()
+    for build in contract.get("builds") or []:
+        if isinstance(build, Mapping):
+            runtime = (build.get("execution") or {}).get("runtime") or {}
+            platform = runtime.get("platform") if isinstance(runtime, Mapping) else None
+            if isinstance(platform, str) and platform.strip():
+                return platform.strip().lower()
+    return None
 
 
 # ---------------------------------------------------------------------------
