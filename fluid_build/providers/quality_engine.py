@@ -141,20 +141,45 @@ def _compare(actual, threshold, operator: str) -> bool:
 
 
 # ------------------------------------------------------------------
-# Freshness duration parser  (e.g. "1h", "30m", "7d", "3600s")
+# Freshness duration parser  (e.g. "1h", "30m", "7d", "3600s", "PT6H")
 # ------------------------------------------------------------------
 
 _DURATION_RE = re.compile(r"^(\d+)\s*([smhd])$", re.IGNORECASE)
 
 _DURATION_MULTIPLIERS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
+# Pure-weeks ISO shape (P2W). Schema-valid per $defs/isoDuration, but the
+# shared parser below rejects weeks for streaming-runner reasons that
+# don't apply here — a week is always exactly 7 days.
+_ISO_WEEKS_RE = re.compile(r"^P(\d+)W$")
+
 
 def _parse_duration_seconds(value: str) -> Optional[int]:
-    """Parse a human duration string like '1h' or '7d' into seconds."""
-    m = _DURATION_RE.match(value.strip())
-    if not m:
+    """Parse a duration string into seconds.
+
+    Accepts both the legacy human shorthand ('1h', '30m', '7d',
+    '3600s') and the ISO-8601 durations the contract schema requires
+    for ``dqRule.window`` ('PT6H', 'PT90M', 'P2D', 'P1W'). Returns
+    ``None`` for anything without a fixed length in seconds —
+    calendar-dependent shapes (months/years) and degenerate or
+    non-positive ISO values ('P', 'PT0S').
+    """
+    text = value.strip()
+    m = _DURATION_RE.match(text)
+    if m:
+        return int(m.group(1)) * _DURATION_MULTIPLIERS[m.group(2).lower()]
+    m = _ISO_WEEKS_RE.match(text)
+    if m:
+        return int(m.group(1)) * 7 * 86400
+    # Deferred so providers don't hard-depend on build_runners at
+    # import time (the edge stays confined to this call path).
+    from fluid_build.build_runners._late_arrival import parse_iso_duration
+
+    td = parse_iso_duration(text)
+    if td is None:
         return None
-    return int(m.group(1)) * _DURATION_MULTIPLIERS[m.group(2).lower()]
+    seconds = int(td.total_seconds())
+    return seconds if seconds > 0 else None
 
 
 # ------------------------------------------------------------------
@@ -554,11 +579,24 @@ def _check_freshness(
             message=f"No data to check freshness for '{selector}'",
         )
 
-    max_age_seconds = None
     if window:
         max_age_seconds = _parse_duration_seconds(str(window))
-
-    if max_age_seconds is None:
+        if max_age_seconds is None:
+            # A window was declared but can't be turned into a bound.
+            # Failing loudly beats silently running an unbounded check —
+            # a typo'd window must not disable a quality gate.
+            return QualityCheckResult(
+                rule_id=rule_id,
+                rule_type="freshness",
+                selector=selector,
+                passed=False,
+                severity=severity,
+                message=(
+                    f"Unparseable freshness window '{window}' for '{selector}' — "
+                    "use ISO-8601 ('PT6H', 'P2D') or shorthand ('6h', '2d')"
+                ),
+            )
+    else:
         # No threshold specified — just report the age
         return QualityCheckResult(
             rule_id=rule_id,

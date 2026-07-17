@@ -61,6 +61,7 @@ def _sample_contract() -> Dict[str, Any]:
                 "contract": {
                     "schema": [
                         {"name": "order_id", "type": "BIGINT"},
+                        {"name": "updated_at", "type": "TIMESTAMP"},
                     ],
                 },
             }
@@ -131,19 +132,22 @@ def test_apply_enrichment_with_yes_patches_contract(tmp_path):
         console=None,
     )
 
-    # Patch landed.
+    # Patch landed — every fill in its schema-valid slot.
     assert patched is not contract
-    assert "freshness" in patched["exposes"][0]["contract"]
-    assert "physical" in patched["exposes"][0]["binding"]
-    assert "dbtTestSuggestions" in patched["metadata"]
-    assert patched["metadata"]["enrichmentApplied"]["source"] == "enrichment-v1"
+    assert patched["exposes"][0]["qos"]["freshnessSLO"] == "PT2H"
+    dq_rules = patched["exposes"][0]["contract"]["dq"]["rules"]
+    assert any(r["type"] == "freshness" for r in dq_rules)
+    assert "physical" in patched["exposes"][0]["binding"]["properties"]
+    enrichment_ns = patched["extensions"]["enrichment"]
+    assert "dbtTestSuggestions" in enrichment_ns
+    assert enrichment_ns["applied"]["source"] == "enrichment-v2"
 
     # Round-trip the patched contract through YAML to prove it serialises —
     # the apply pass should produce something we can actually write to disk.
     contract_path = tmp_path / "contract.fluid.yaml"
     contract_path.write_text(yaml.safe_dump(patched, sort_keys=False), encoding="utf-8")
     reloaded = yaml.safe_load(contract_path.read_text())
-    assert reloaded["exposes"][0]["contract"]["freshness"]["warn_after"]["count"] == 2
+    assert reloaded["exposes"][0]["qos"]["freshnessSLO"] == "PT2H"
 
 
 # ---------------------------------------------------------------------------
@@ -170,9 +174,10 @@ def test_apply_enrichment_user_declines_keeps_original(tmp_path, monkeypatch):
 
     # Declined ⇒ caller gets back the un-patched contract.
     assert out is contract
-    assert "freshness" not in contract["exposes"][0]["contract"]
-    assert "physical" not in contract["exposes"][0]["binding"]
-    assert "enrichmentApplied" not in (contract.get("metadata") or {})
+    assert "qos" not in contract["exposes"][0]
+    assert "dq" not in contract["exposes"][0]["contract"]
+    assert "properties" not in contract["exposes"][0]["binding"]
+    assert "extensions" not in contract
 
 
 # ---------------------------------------------------------------------------
@@ -197,8 +202,8 @@ def test_apply_enrichment_user_accepts_returns_patched(monkeypatch):
         )
 
     assert patched is not contract
-    assert "freshness" in patched["exposes"][0]["contract"]
-    assert "physical" in patched["exposes"][0]["binding"]
+    assert patched["exposes"][0]["qos"]["freshnessSLO"] == "PT2H"
+    assert "physical" in patched["exposes"][0]["binding"]["properties"]
     # Default-accept on empty input is also exercised once for safety.
     with patch("builtins.input", return_value=""):
         patched2 = _maybe_apply_enrichment(
@@ -211,7 +216,7 @@ def test_apply_enrichment_user_accepts_returns_patched(monkeypatch):
     # Empty input — empty string is NOT in ("y", "yes") so the helper
     # treats it as a decline. Strict default-no, which is the safer
     # interpretation for a destructive-ish pass.
-    assert "freshness" not in patched2["exposes"][0]["contract"]
+    assert "qos" not in patched2["exposes"][0]
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +280,7 @@ def test_apply_enrichment_stdin_not_tty_accepts_default(monkeypatch):
     )
 
     assert patched is not contract
-    assert "freshness" in patched["exposes"][0]["contract"]
+    assert patched["exposes"][0]["qos"]["freshnessSLO"] == "PT2H"
 
 
 # ---------------------------------------------------------------------------

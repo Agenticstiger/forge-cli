@@ -514,8 +514,9 @@ def _create_project_minimal(
             logger.debug("copilot_show_ai_analysis_failed", extra={"error": str(exc)})
 
         # Gap 5 — opt-in enrichment-to-contract apply pass.
-        # When ``--apply-enrichment`` is set, fill missing slots
-        # (freshness, binding.physical, qualityChecks, dbt suggestions)
+        # When ``--apply-enrichment`` is set, fill missing schema-valid
+        # slots (qos.freshnessSLO + freshness dq rule,
+        # binding.properties.physical, extensions.enrichment.*)
         # using the artifacts the post-synthesis enrichment hook
         # already produced. Conservative: never overwrites user-set
         # fields. Renders a unified diff and prompts before writing
