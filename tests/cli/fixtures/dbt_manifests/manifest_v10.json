@@ -1,0 +1,117 @@
+{
+ "child_map": {},
+ "metadata": {
+  "adapter_type": "duckdb",
+  "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v10.json",
+  "dbt_version": "1.6.9",
+  "project_name": "mini_shop"
+ },
+ "nodes": {
+  "model.mini_shop.items": {
+   "alias": "items",
+   "columns": {
+    "item_id": {
+     "constraints": [],
+     "data_type": "integer",
+     "description": "",
+     "meta": {},
+     "name": "item_id",
+     "tags": []
+    }
+   },
+   "config": {
+    "enabled": true,
+    "materialized": "table"
+   },
+   "database": "dev",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.mini_shop.stg_items"
+    ]
+   },
+   "description": "",
+   "meta": {},
+   "name": "items",
+   "original_file_path": "models/marts/items.sql",
+   "package_name": "mini_shop",
+   "path": "marts/items.sql",
+   "resource_type": "model",
+   "schema": "main",
+   "tags": [],
+   "unique_id": "model.mini_shop.items"
+  },
+  "model.mini_shop.stg_items": {
+   "alias": "stg_items",
+   "columns": {
+    "item_id": {
+     "constraints": [],
+     "data_type": "integer",
+     "description": "",
+     "meta": {},
+     "name": "item_id",
+     "tags": []
+    }
+   },
+   "config": {
+    "enabled": true,
+    "materialized": "view"
+   },
+   "database": "dev",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "source.mini_shop.raw.items"
+    ]
+   },
+   "description": "",
+   "meta": {},
+   "name": "stg_items",
+   "original_file_path": "models/staging/stg_items.sql",
+   "package_name": "mini_shop",
+   "path": "staging/stg_items.sql",
+   "resource_type": "model",
+   "schema": "main",
+   "tags": [],
+   "unique_id": "model.mini_shop.stg_items"
+  },
+  "test.mini_shop.not_null_items_item_id.xyz": {
+   "column_name": "item_id",
+   "config": {
+    "enabled": true,
+    "severity": "ERROR"
+   },
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.mini_shop.items"
+    ]
+   },
+   "name": "not_null_items_item_id",
+   "package_name": "mini_shop",
+   "resource_type": "test",
+   "test_metadata": {
+    "kwargs": {
+     "column_name": "item_id"
+    },
+    "name": "not_null",
+    "namespace": null
+   },
+   "unique_id": "test.mini_shop.not_null_items_item_id.xyz"
+  }
+ },
+ "parent_map": {},
+ "sources": {
+  "source.mini_shop.raw.items": {
+   "columns": {},
+   "database": "dev",
+   "freshness": null,
+   "identifier": "items",
+   "name": "items",
+   "package_name": "mini_shop",
+   "resource_type": "source",
+   "schema": "raw",
+   "source_name": "raw"
+  }
+ }
+}

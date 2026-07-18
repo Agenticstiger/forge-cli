@@ -1,0 +1,770 @@
+{
+ "child_map": {},
+ "disabled": {},
+ "docs": {},
+ "exposures": {},
+ "group_map": {},
+ "groups": {},
+ "macros": {},
+ "metadata": {
+  "adapter_type": "snowflake",
+  "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+  "dbt_version": "1.8.3",
+  "generated_at": "2026-07-01T00:00:00Z",
+  "project_name": "jaffle_shop"
+ },
+ "metrics": {},
+ "nodes": {
+  "model.dbt_audit_pkg.audit_helper": {
+   "alias": "audit_helper",
+   "columns": {},
+   "config": {
+    "enabled": true,
+    "materialized": "view",
+    "meta": {},
+    "tags": []
+   },
+   "database": "ANALYTICS",
+   "depends_on": {
+    "macros": [],
+    "nodes": []
+   },
+   "description": "",
+   "meta": {},
+   "name": "audit_helper",
+   "original_file_path": "models/audit/audit_helper.sql",
+   "package_name": "dbt_audit_pkg",
+   "path": "audit/audit_helper.sql",
+   "resource_type": "model",
+   "schema": "JAFFLE",
+   "tags": [],
+   "unique_id": "model.dbt_audit_pkg.audit_helper"
+  },
+  "model.jaffle_shop.customers": {
+   "alias": "customers",
+   "columns": {
+    "customer_id": {
+     "constraints": [],
+     "data_type": null,
+     "description": "",
+     "meta": {},
+     "name": "customer_id",
+     "tags": []
+    },
+    "full_name": {
+     "constraints": [],
+     "data_type": null,
+     "description": "",
+     "meta": {},
+     "name": "full_name",
+     "tags": []
+    },
+    "lifetime_value": {
+     "constraints": [],
+     "data_type": null,
+     "description": "",
+     "meta": {},
+     "name": "lifetime_value",
+     "tags": []
+    }
+   },
+   "config": {
+    "enabled": true,
+    "materialized": "table",
+    "meta": {},
+    "tags": []
+   },
+   "constraints": [
+    {
+     "columns": [
+      "customer_id"
+     ],
+     "type": "primary_key"
+    }
+   ],
+   "database": "ANALYTICS",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.stg_customers",
+     "model.jaffle_shop.orders"
+    ]
+   },
+   "description": "",
+   "meta": {},
+   "name": "customers",
+   "original_file_path": "models/marts/customers.sql",
+   "package_name": "jaffle_shop",
+   "path": "marts/customers.sql",
+   "resource_type": "model",
+   "schema": "JAFFLE",
+   "tags": [],
+   "unique_id": "model.jaffle_shop.customers"
+  },
+  "model.jaffle_shop.deprecated_orders": {
+   "alias": "deprecated_orders",
+   "columns": {},
+   "config": {
+    "enabled": false,
+    "materialized": "table",
+    "meta": {},
+    "tags": []
+   },
+   "database": "ANALYTICS",
+   "depends_on": {
+    "macros": [],
+    "nodes": []
+   },
+   "description": "",
+   "meta": {},
+   "name": "deprecated_orders",
+   "original_file_path": "models/marts/deprecated_orders.sql",
+   "package_name": "jaffle_shop",
+   "path": "marts/deprecated_orders.sql",
+   "resource_type": "model",
+   "schema": "JAFFLE",
+   "tags": [],
+   "unique_id": "model.jaffle_shop.deprecated_orders"
+  },
+  "model.jaffle_shop.int_order_payments": {
+   "alias": "int_order_payments",
+   "columns": {},
+   "config": {
+    "enabled": true,
+    "materialized": "ephemeral",
+    "meta": {},
+    "tags": []
+   },
+   "database": "ANALYTICS",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.stg_orders",
+     "model.jaffle_shop.stg_payments"
+    ]
+   },
+   "description": "",
+   "meta": {},
+   "name": "int_order_payments",
+   "original_file_path": "models/intermediate/int_order_payments.sql",
+   "package_name": "jaffle_shop",
+   "path": "intermediate/int_order_payments.sql",
+   "resource_type": "model",
+   "schema": "JAFFLE",
+   "tags": [],
+   "unique_id": "model.jaffle_shop.int_order_payments"
+  },
+  "model.jaffle_shop.order_payments": {
+   "alias": "order_payments",
+   "columns": {
+    "amount": {
+     "constraints": [],
+     "data_type": "decimal(18,2)",
+     "description": "",
+     "meta": {},
+     "name": "amount",
+     "tags": []
+    },
+    "order_id": {
+     "constraints": [],
+     "data_type": "number(38,0)",
+     "description": "",
+     "meta": {},
+     "name": "order_id",
+     "tags": []
+    }
+   },
+   "config": {
+    "enabled": true,
+    "materialized": "incremental",
+    "meta": {},
+    "tags": []
+   },
+   "database": "ANALYTICS",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.stg_payments",
+     "model.jaffle_shop.stg_orders"
+    ]
+   },
+   "description": "",
+   "meta": {},
+   "name": "order_payments",
+   "original_file_path": "models/marts/order_payments.sql",
+   "package_name": "jaffle_shop",
+   "path": "marts/order_payments.sql",
+   "resource_type": "model",
+   "schema": "JAFFLE",
+   "tags": [],
+   "unique_id": "model.jaffle_shop.order_payments"
+  },
+  "model.jaffle_shop.orders": {
+   "alias": "orders",
+   "columns": {
+    "customer_id": {
+     "constraints": [],
+     "data_type": null,
+     "description": "",
+     "meta": {},
+     "name": "customer_id",
+     "tags": []
+    },
+    "most_recent_order_at": {
+     "constraints": [],
+     "data_type": null,
+     "description": "",
+     "meta": {},
+     "name": "most_recent_order_at",
+     "tags": []
+    },
+    "order_id": {
+     "constraints": [],
+     "data_type": null,
+     "description": "Order primary key.",
+     "meta": {},
+     "name": "order_id",
+     "tags": []
+    },
+    "order_total": {
+     "constraints": [],
+     "data_type": null,
+     "description": "",
+     "meta": {},
+     "name": "order_total",
+     "tags": []
+    }
+   },
+   "config": {
+    "enabled": true,
+    "materialized": "table",
+    "meta": {},
+    "tags": []
+   },
+   "database": "ANALYTICS",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.stg_orders",
+     "model.jaffle_shop.int_order_payments"
+    ]
+   },
+   "description": "One row per order with payment totals.",
+   "meta": {},
+   "name": "orders",
+   "original_file_path": "models/marts/orders.sql",
+   "package_name": "jaffle_shop",
+   "path": "marts/orders.sql",
+   "resource_type": "model",
+   "schema": "JAFFLE",
+   "tags": [],
+   "unique_id": "model.jaffle_shop.orders"
+  },
+  "model.jaffle_shop.stg_customers": {
+   "alias": "stg_customers",
+   "columns": {
+    "customer_id": {
+     "constraints": [],
+     "data_type": "number(38,0)",
+     "description": "",
+     "meta": {},
+     "name": "customer_id",
+     "tags": []
+    },
+    "first_name": {
+     "constraints": [],
+     "data_type": "text",
+     "description": "",
+     "meta": {},
+     "name": "first_name",
+     "tags": []
+    },
+    "last_name": {
+     "constraints": [],
+     "data_type": "text",
+     "description": "",
+     "meta": {},
+     "name": "last_name",
+     "tags": []
+    }
+   },
+   "config": {
+    "enabled": true,
+    "materialized": "view",
+    "meta": {},
+    "tags": []
+   },
+   "database": "ANALYTICS",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "source.jaffle_shop.raw_jaffle.customers"
+    ]
+   },
+   "description": "",
+   "meta": {},
+   "name": "stg_customers",
+   "original_file_path": "models/staging/stg_customers.sql",
+   "package_name": "jaffle_shop",
+   "path": "staging/stg_customers.sql",
+   "resource_type": "model",
+   "schema": "JAFFLE",
+   "tags": [],
+   "unique_id": "model.jaffle_shop.stg_customers"
+  },
+  "model.jaffle_shop.stg_orders": {
+   "alias": "stg_orders",
+   "columns": {
+    "customer_id": {
+     "constraints": [],
+     "data_type": "number(38,0)",
+     "description": "",
+     "meta": {},
+     "name": "customer_id",
+     "tags": []
+    },
+    "geo_cell": {
+     "constraints": [],
+     "data_type": "hyperloglog",
+     "description": "",
+     "meta": {},
+     "name": "geo_cell",
+     "tags": []
+    },
+    "loaded_at": {
+     "constraints": [],
+     "data_type": "timestamp with time zone",
+     "description": "",
+     "meta": {},
+     "name": "loaded_at",
+     "tags": []
+    },
+    "order_date": {
+     "constraints": [],
+     "data_type": "date",
+     "description": "",
+     "meta": {},
+     "name": "order_date",
+     "tags": []
+    },
+    "order_id": {
+     "constraints": [],
+     "data_type": "number(38,0)",
+     "description": "Primary key of the orders staging table.",
+     "meta": {},
+     "name": "order_id",
+     "tags": []
+    },
+    "status": {
+     "constraints": [],
+     "data_type": "character varying",
+     "description": "",
+     "meta": {},
+     "name": "status",
+     "tags": []
+    }
+   },
+   "config": {
+    "enabled": true,
+    "materialized": "view",
+    "meta": {},
+    "tags": []
+   },
+   "database": "ANALYTICS",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "source.jaffle_shop.raw_jaffle.orders"
+    ]
+   },
+   "description": "Staged orders, one row per order.",
+   "meta": {},
+   "name": "stg_orders",
+   "original_file_path": "models/staging/stg_orders.sql",
+   "package_name": "jaffle_shop",
+   "path": "staging/stg_orders.sql",
+   "resource_type": "model",
+   "schema": "JAFFLE",
+   "tags": [],
+   "unique_id": "model.jaffle_shop.stg_orders"
+  },
+  "model.jaffle_shop.stg_payments": {
+   "alias": "stg_payments",
+   "columns": {
+    "amount": {
+     "constraints": [],
+     "data_type": "decimal(18,2)",
+     "description": "",
+     "meta": {},
+     "name": "amount",
+     "tags": []
+    },
+    "order_id": {
+     "constraints": [],
+     "data_type": "number(38,0)",
+     "description": "",
+     "meta": {},
+     "name": "order_id",
+     "tags": []
+    },
+    "payment_id": {
+     "constraints": [],
+     "data_type": "number(38,0)",
+     "description": "",
+     "meta": {},
+     "name": "payment_id",
+     "tags": []
+    }
+   },
+   "config": {
+    "enabled": true,
+    "materialized": "view",
+    "meta": {},
+    "tags": []
+   },
+   "database": "ANALYTICS",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "source.jaffle_shop.raw_jaffle.payments"
+    ]
+   },
+   "description": "",
+   "meta": {},
+   "name": "stg_payments",
+   "original_file_path": "models/staging/stg_payments.sql",
+   "package_name": "jaffle_shop",
+   "path": "staging/stg_payments.sql",
+   "resource_type": "model",
+   "schema": "JAFFLE",
+   "tags": [],
+   "unique_id": "model.jaffle_shop.stg_payments"
+  },
+  "seed.jaffle_shop.raw_country_codes": {
+   "alias": "raw_country_codes",
+   "columns": {
+    "code": {
+     "constraints": [],
+     "data_type": "text",
+     "description": "",
+     "meta": {},
+     "name": "code",
+     "tags": []
+    },
+    "country": {
+     "constraints": [],
+     "data_type": "text",
+     "description": "",
+     "meta": {},
+     "name": "country",
+     "tags": []
+    }
+   },
+   "config": {
+    "enabled": true,
+    "materialized": "seed",
+    "meta": {},
+    "tags": []
+   },
+   "database": "ANALYTICS",
+   "depends_on": {
+    "macros": [],
+    "nodes": []
+   },
+   "description": "",
+   "meta": {},
+   "name": "raw_country_codes",
+   "original_file_path": "seeds/raw_country_codes.csv",
+   "package_name": "jaffle_shop",
+   "path": "raw_country_codes.sql",
+   "resource_type": "seed",
+   "schema": "JAFFLE",
+   "tags": [],
+   "unique_id": "seed.jaffle_shop.raw_country_codes"
+  },
+  "test.jaffle_shop.accepted_values_stg_orders_status": {
+   "attached_node": "model.jaffle_shop.stg_orders",
+   "column_name": "status",
+   "config": {
+    "enabled": true,
+    "severity": "WARN"
+   },
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.stg_orders"
+    ]
+   },
+   "name": "accepted_values_stg_orders_status",
+   "package_name": "jaffle_shop",
+   "resource_type": "test",
+   "test_metadata": {
+    "kwargs": {
+     "column_name": "status",
+     "values": [
+      "placed",
+      "shipped",
+      "completed",
+      "returned"
+     ]
+    },
+    "name": "accepted_values",
+    "namespace": null
+   },
+   "unique_id": "test.jaffle_shop.accepted_values_stg_orders_status.abc123"
+  },
+  "test.jaffle_shop.assert_positive_totals": {
+   "config": {
+    "enabled": true,
+    "severity": "ERROR"
+   },
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.orders"
+    ]
+   },
+   "name": "assert_positive_totals",
+   "package_name": "jaffle_shop",
+   "resource_type": "test",
+   "unique_id": "test.jaffle_shop.assert_positive_totals"
+  },
+  "test.jaffle_shop.between_order_payments_amount": {
+   "attached_node": "model.jaffle_shop.order_payments",
+   "column_name": "amount",
+   "config": {
+    "enabled": true,
+    "severity": "ERROR"
+   },
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.order_payments"
+    ]
+   },
+   "name": "between_order_payments_amount",
+   "package_name": "jaffle_shop",
+   "resource_type": "test",
+   "test_metadata": {
+    "kwargs": {
+     "column_name": "amount",
+     "max_value": 100000,
+     "min_value": 0
+    },
+    "name": "expect_column_values_to_be_between",
+    "namespace": "dbt_expectations"
+   },
+   "unique_id": "test.jaffle_shop.between_order_payments_amount.abc123"
+  },
+  "test.jaffle_shop.expression_is_true_order_payments": {
+   "attached_node": "model.jaffle_shop.order_payments",
+   "column_name": null,
+   "config": {
+    "enabled": true,
+    "severity": "ERROR"
+   },
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.order_payments"
+    ]
+   },
+   "name": "expression_is_true_order_payments",
+   "package_name": "jaffle_shop",
+   "resource_type": "test",
+   "test_metadata": {
+    "kwargs": {
+     "expression": "amount >= 0"
+    },
+    "name": "expression_is_true",
+    "namespace": "dbt_utils"
+   },
+   "unique_id": "test.jaffle_shop.expression_is_true_order_payments.abc123"
+  },
+  "test.jaffle_shop.is_even_stg_payments_payment_id": {
+   "attached_node": "model.jaffle_shop.stg_payments",
+   "column_name": "payment_id",
+   "config": {
+    "enabled": true,
+    "severity": "ERROR"
+   },
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.stg_payments"
+    ]
+   },
+   "name": "is_even_stg_payments_payment_id",
+   "package_name": "jaffle_shop",
+   "resource_type": "test",
+   "test_metadata": {
+    "kwargs": {
+     "column_name": "payment_id"
+    },
+    "name": "is_even",
+    "namespace": null
+   },
+   "unique_id": "test.jaffle_shop.is_even_stg_payments_payment_id.abc123"
+  },
+  "test.jaffle_shop.not_null_stg_orders_order_id": {
+   "attached_node": "model.jaffle_shop.stg_orders",
+   "column_name": "order_id",
+   "config": {
+    "enabled": true,
+    "severity": "ERROR"
+   },
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.stg_orders"
+    ]
+   },
+   "name": "not_null_stg_orders_order_id",
+   "package_name": "jaffle_shop",
+   "resource_type": "test",
+   "test_metadata": {
+    "kwargs": {
+     "column_name": "order_id"
+    },
+    "name": "not_null",
+    "namespace": null
+   },
+   "unique_id": "test.jaffle_shop.not_null_stg_orders_order_id.abc123"
+  },
+  "test.jaffle_shop.recency_orders": {
+   "attached_node": "model.jaffle_shop.orders",
+   "column_name": null,
+   "config": {
+    "enabled": true,
+    "severity": "ERROR"
+   },
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.orders"
+    ]
+   },
+   "name": "recency_orders",
+   "package_name": "jaffle_shop",
+   "resource_type": "test",
+   "test_metadata": {
+    "kwargs": {
+     "datepart": "day",
+     "field": "most_recent_order_at",
+     "interval": 1
+    },
+    "name": "recency",
+    "namespace": "dbt_utils"
+   },
+   "unique_id": "test.jaffle_shop.recency_orders.abc123"
+  },
+  "test.jaffle_shop.relationships_orders_customer_id": {
+   "attached_node": "model.jaffle_shop.orders",
+   "column_name": "customer_id",
+   "config": {
+    "enabled": true,
+    "severity": "ERROR"
+   },
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.customers",
+     "model.jaffle_shop.orders"
+    ]
+   },
+   "name": "relationships_orders_customer_id",
+   "package_name": "jaffle_shop",
+   "resource_type": "test",
+   "test_metadata": {
+    "kwargs": {
+     "column_name": "customer_id",
+     "field": "customer_id",
+     "to": "ref('customers')"
+    },
+    "name": "relationships",
+    "namespace": null
+   },
+   "unique_id": "test.jaffle_shop.relationships_orders_customer_id.abc123"
+  },
+  "test.jaffle_shop.unique_stg_orders_order_id": {
+   "attached_node": "model.jaffle_shop.stg_orders",
+   "column_name": "order_id",
+   "config": {
+    "enabled": true,
+    "severity": "ERROR"
+   },
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.jaffle_shop.stg_orders"
+    ]
+   },
+   "name": "unique_stg_orders_order_id",
+   "package_name": "jaffle_shop",
+   "resource_type": "test",
+   "test_metadata": {
+    "kwargs": {
+     "column_name": "order_id"
+    },
+    "name": "unique",
+    "namespace": null
+   },
+   "unique_id": "test.jaffle_shop.unique_stg_orders_order_id.abc123"
+  }
+ },
+ "parent_map": {},
+ "selectors": {},
+ "sources": {
+  "source.jaffle_shop.raw_jaffle.customers": {
+   "columns": {},
+   "database": "RAW",
+   "freshness": null,
+   "identifier": "raw_customers",
+   "name": "customers",
+   "package_name": "jaffle_shop",
+   "resource_type": "source",
+   "schema": "JAFFLE",
+   "source_name": "raw_jaffle"
+  },
+  "source.jaffle_shop.raw_jaffle.orders": {
+   "columns": {},
+   "database": "RAW",
+   "description": "Raw orders loaded by Fivetran.",
+   "freshness": {
+    "error_after": {
+     "count": 24,
+     "period": "hour"
+    },
+    "filter": null,
+    "warn_after": {
+     "count": 12,
+     "period": "hour"
+    }
+   },
+   "identifier": "raw_orders",
+   "loaded_at_field": "_loaded_at",
+   "name": "orders",
+   "package_name": "jaffle_shop",
+   "resource_type": "source",
+   "schema": "JAFFLE",
+   "source_name": "raw_jaffle"
+  },
+  "source.jaffle_shop.raw_jaffle.payments": {
+   "columns": {},
+   "database": "RAW",
+   "freshness": {
+    "error_after": null,
+    "warn_after": {
+     "count": 1,
+     "period": "day"
+    }
+   },
+   "identifier": "raw_payments",
+   "name": "payments",
+   "package_name": "jaffle_shop",
+   "resource_type": "source",
+   "schema": "JAFFLE",
+   "source_name": "raw_jaffle"
+  }
+ }
+}

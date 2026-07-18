@@ -92,12 +92,13 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     """Register the ``fluid import`` command.
 
     Two-mode positional contract:
-      - ``fluid import meltano|airbyte|dlt|singer <source>`` — convert a
+      - ``fluid import meltano|airbyte|dlt|singer|dbt <source>`` — convert a
         foreign tool config (Meltano project / Airbyte workspace / dlt
-        pipeline / Singer tap config) into FLUID contracts via
+        pipeline / Singer tap config / dbt manifest) into FLUID contracts via
         :mod:`fluid_build.cli.import_workflow`.
       - ``fluid import [--dir <path>]`` — legacy directory scan for
-        dbt / Terraform / SQL projects.
+        dbt / Terraform / SQL projects. A dbt project with a
+        ``target/manifest.json`` routes to the manifest importer.
     """
     parser = subparsers.add_parser(
         COMMAND,
@@ -108,6 +109,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "  fluid import airbyte <workspace-id>      — convert an Airbyte workspace\n"
             "  fluid import dlt <pipeline-name>         — convert a dlt pipeline\n"
             "  fluid import singer <tap-config.json>    — convert a Singer tap+target\n"
+            "  fluid import dbt <project-dir|manifest>  — convert target/manifest.json\n"
             "  fluid import [--dir <path>]              — legacy dbt/Terraform/SQL scan"
         ),
     )
@@ -117,7 +119,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "tool",
         nargs="?",
-        choices=["meltano", "airbyte", "dlt", "singer"],
+        choices=["meltano", "airbyte", "dlt", "singer", "dbt"],
         default=None,
         help="Foreign tool to import from (omit for a dbt/Terraform/SQL directory scan)",
     )
@@ -585,6 +587,35 @@ def _run_directory_scan_import(args: Any, logger: logging.Logger) -> int:
                 cprint("\n❌ No recognized project found")
                 cprint("Try: fluid demo  or  fluid init my-project --quickstart")
             return 1
+
+        # dbt projects with a parsed manifest route to the faithful
+        # manifest importer (fluid_build.cli.import_workflow.dbt) — the
+        # regex scanner below is only the degraded fallback, so the two
+        # dbt paths never diverge in fidelity.
+        if isinstance(detector, DbtDetector):
+            from fluid_build.cli.import_workflow.dbt import locate_manifest
+
+            if locate_manifest(target_path) is not None:
+                if RICH_AVAILABLE:
+                    console.print(
+                        "📦 Found [bold]target/manifest.json[/bold] — using the "
+                        "faithful dbt manifest importer."
+                    )
+                else:
+                    cprint("Found target/manifest.json — using the dbt manifest importer.")
+                from fluid_build.cli._import_workflow_handler import run_import_from_tool
+
+                return run_import_from_tool(args, logger, tool="dbt", source=str(target_path))
+            advice = (
+                "No target/manifest.json found — falling back to the simplified "
+                "SQL scan. For a faithful import (typed columns, ref() lineage, "
+                "dq rules from tests), run `dbt parse` first, then re-run "
+                "`fluid import`."
+            )
+            if RICH_AVAILABLE:
+                console.print(f"[yellow]💡 {advice}[/yellow]")
+            else:
+                cprint(f"Hint: {advice}")
 
         # Scan the project
         scan_results = detector.scan(target_path, logger)

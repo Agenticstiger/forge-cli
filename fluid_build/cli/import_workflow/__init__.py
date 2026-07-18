@@ -14,6 +14,7 @@ Five sources covered:
   - ``airbyte --workspace-id``   — converts an Airbyte workspace via REST
   - ``dlt --pipeline-name``      — converts a dlt pipeline state directory
   - ``singer <tap-cfg>``         — converts a single Singer tap+target pair
+  - ``dbt <project-dir>``        — converts ``target/manifest.json``
 
 Each converter returns a contract dict + a translation report describing
 what mapped 1:1, what required defaults, and what the user still needs
@@ -23,6 +24,7 @@ to fill in.
 from __future__ import annotations
 
 from .airbyte import AirbyteImporter
+from .dbt import DbtManifestImporter
 from .dlt import DltImporter
 from .meltano import MeltanoImporter
 from .registry import IMPORTERS, Importer, ImportReport, get_importer, register_importer
@@ -30,6 +32,7 @@ from .singer import SingerImporter
 
 __all__ = [
     "AirbyteImporter",
+    "DbtManifestImporter",
     "DltImporter",
     "IMPORTERS",
     "Importer",
@@ -46,3 +49,4 @@ register_importer("meltano", MeltanoImporter())
 register_importer("airbyte", AirbyteImporter())
 register_importer("dlt", DltImporter())
 register_importer("singer", SingerImporter())
+register_importer("dbt", DbtManifestImporter())

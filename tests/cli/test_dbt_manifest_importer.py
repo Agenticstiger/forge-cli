@@ -1,0 +1,428 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+"""dbt manifest.json importer tests.
+
+Fixtures under ``tests/cli/fixtures/dbt_manifests/`` are hand-crafted,
+modeled on ``dbt parse`` output of dbt-core's jaffle-shop demo (manifest
+schema v12, dbt 1.8.x, snowflake adapter), reduced to the fields the
+importer consumes. v10/v11 are minimal duckdb variants; v8 exists only to
+exercise the minimum-schema-version gate.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict
+
+import pytest
+import yaml
+
+from fluid_build.cli.import_workflow import DbtManifestImporter, get_importer
+from fluid_build.schema_manager import FluidSchemaManager
+
+FIXTURES = Path(__file__).parent / "fixtures" / "dbt_manifests"
+
+
+@pytest.fixture(scope="module")
+def schema_manager() -> FluidSchemaManager:
+    return FluidSchemaManager()
+
+
+@pytest.fixture(scope="module")
+def v12_contract() -> tuple[Dict[str, Any], Any]:
+    return DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v12.json"))
+
+
+def _expose(contract: Dict[str, Any], expose_id: str) -> Dict[str, Any]:
+    return next(e for e in contract["exposes"] if e["exposeId"] == expose_id)
+
+
+def _column(expose: Dict[str, Any], name: str) -> Dict[str, Any]:
+    return next(c for c in expose["contract"]["schema"] if c["name"] == name)
+
+
+def _project_dir(tmp_path: Path, with_catalog: bool = True) -> Path:
+    """Materialize the v12 fixture as a real dbt project layout."""
+    project = tmp_path / "jaffle_shop"
+    (project / "target").mkdir(parents=True)
+    (project / "models").mkdir()
+    (project / "dbt_project.yml").write_text("name: jaffle_shop\nversion: '1.0'\n")
+    shutil.copy(FIXTURES / "manifest_v12.json", project / "target" / "manifest.json")
+    if with_catalog:
+        shutil.copy(FIXTURES / "catalog_v12.json", project / "target" / "catalog.json")
+    return project
+
+
+# ── Registry ────────────────────────────────────────────────────────────
+
+
+class TestRegistry:
+    def test_dbt_importer_registered(self):
+        assert get_importer("dbt") is not None
+
+    def test_can_import_project_dir_and_manifest_path(self, tmp_path: Path):
+        importer = DbtManifestImporter()
+        project = _project_dir(tmp_path)
+        assert importer.can_import(str(project))
+        assert importer.can_import(str(project / "target" / "manifest.json"))
+        assert not importer.can_import(str(tmp_path / "not-a-project"))
+
+
+# ── v12 happy path — faithful brownfield conversion ─────────────────────
+
+
+class TestV12Import:
+    def test_no_five_model_cap(self, v12_contract):
+        contract, _ = v12_contract
+        # 6 models + 1 seed survive (ephemeral + disabled + foreign-package don't).
+        assert len(contract["exposes"]) == 7 > 5
+        assert {e["exposeId"] for e in contract["exposes"]} == {
+            "stg_orders",
+            "stg_customers",
+            "stg_payments",
+            "orders",
+            "customers",
+            "order_payments",
+            "raw_country_codes",
+        }
+
+    def test_layer_and_product_type_from_folders(self, v12_contract):
+        contract, _ = v12_contract
+        # marts present → most-downstream layer wins: Gold ↔ CDP.
+        assert contract["metadata"]["layer"] == "Gold"
+        assert contract["metadata"]["productType"] == "CDP"
+        assert contract["id"] == "gold.jaffle_shop"
+        assert _expose(contract, "stg_orders")["labels"]["dbt-layer"] == "staging"
+        assert _expose(contract, "orders")["labels"]["dbt-layer"] == "marts"
+
+    def test_columns_typed_from_manifest_data_type(self, v12_contract):
+        contract, _ = v12_contract
+        stg_orders = _expose(contract, "stg_orders")
+        assert _column(stg_orders, "order_id")["type"] == "number(38,0)"
+        assert _column(stg_orders, "status")["type"] == "varchar"  # character varying
+        assert _column(stg_orders, "loaded_at")["type"] == "timestamptz"
+        # Unmappable warehouse type honestly defaults to string.
+        assert _column(stg_orders, "geo_cell")["type"] == "string"
+
+    def test_ref_derived_lineage_recorded(self, v12_contract):
+        contract, _ = v12_contract
+        orders = _expose(contract, "orders")
+        assert orders["labels"]["dbt-depends-on"] == "stg_orders,int_order_payments"
+        build = contract["builds"][0]
+        assert build["engine"] == "dbt"
+        step = next(t for t in build["transformations"] if t["name"] == "orders")
+        assert step["model"] == "models/marts/orders.sql"
+        assert step["outputs"] == ["orders"]
+        assert set(build["outputs"]) == {e["exposeId"] for e in contract["exposes"]}
+
+    def test_materialized_to_physical_hints(self, v12_contract):
+        contract, _ = v12_contract
+        assert _expose(contract, "stg_orders")["kind"] == "view"
+        assert _expose(contract, "orders")["kind"] == "table"
+        materializations = contract["builds"][0]["properties"]["materializations"]
+        assert materializations["orders"] == "table"
+        assert materializations["stg_orders"] == "view"
+        assert materializations["order_payments"] == "incremental"
+        binding = _expose(contract, "orders")["binding"]
+        assert binding["platform"] == "snowflake"
+        assert binding["format"] == "snowflake_table"
+        assert binding["location"] == {
+            "database": "ANALYTICS",
+            "schema": "JAFFLE",
+            "table": "orders",
+        }
+        assert _expose(contract, "stg_orders")["binding"]["format"] == "snowflake_view"
+
+    def test_ephemeral_disabled_and_foreign_models_excluded(self, v12_contract):
+        contract, report = v12_contract
+        expose_ids = {e["exposeId"] for e in contract["exposes"]}
+        assert "int_order_payments" not in expose_ids  # ephemeral
+        assert "deprecated_orders" not in expose_ids  # disabled
+        assert "audit_helper" not in expose_ids  # foreign package
+        assert any("deprecated_orders" in u for u in report.unsupported)
+        assert any("ephemeral" in n for n in report.notes)
+        assert any("dbt_audit_pkg" in n for n in report.notes)
+
+
+# ── tests → dq.rules[] via the SHARED reverse table ─────────────────────
+
+
+class TestDqRuleRecovery:
+    def test_rules_recovered_through_shared_reverse_table(self, v12_contract):
+        contract, _ = v12_contract
+        rules = _expose(contract, "stg_orders")["contract"]["dq"]["rules"]
+        by_type = {r["type"]: r for r in rules}
+        assert by_type["completeness"]["selector"] == "order_id"  # not_null
+        assert by_type["uniqueness"]["selector"] == "order_id"  # unique
+        assert by_type["valid_values"]["selector"] == "status"  # accepted_values
+        # dbt severity WARN survives.
+        assert by_type["valid_values"]["severity"] == "warn"
+        assert by_type["completeness"]["severity"] == "error"
+
+    def test_valid_values_description_round_trips(self, v12_contract):
+        """The emitted description is the exact shape _test_mapping parses back."""
+        import fluid_build.engines.dbt._test_mapping as _tm
+
+        contract, _ = v12_contract
+        rules = _expose(contract, "stg_orders")["contract"]["dq"]["rules"]
+        rule = next(r for r in rules if r["type"] == "valid_values")
+        assert _tm.valid_values(rule) == ["placed", "shipped", "completed", "returned"]
+
+    def test_recency_maps_to_freshness_with_iso_window(self, v12_contract):
+        contract, _ = v12_contract
+        rules = _expose(contract, "orders")["contract"]["dq"]["rules"]
+        rule = next(r for r in rules if r["type"] == "freshness")
+        assert rule["window"] == "P1D"  # datepart=day interval=1
+        assert rule["selector"] == "most_recent_order_at"
+
+    def test_expression_is_true_maps_to_accuracy(self, v12_contract):
+        contract, _ = v12_contract
+        rules = _expose(contract, "order_payments")["contract"]["dq"]["rules"]
+        rule = next(r for r in rules if r["type"] == "accuracy")
+        assert "amount >= 0" in rule["description"]
+
+    def test_importer_consumes_the_shared_hook_not_a_private_table(self, monkeypatch):
+        """Patching _test_mapping.test_to_rule_type must flow through — proves
+        the importer reuses the shared module rather than a 4th mapper."""
+        import fluid_build.engines.dbt._test_mapping as _tm
+
+        monkeypatch.setattr(_tm, "REVERSE_TEST_TO_RULE", {"not_null": "uniqueness"})
+        contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v11.json"))
+        rules = _expose(contract, "items")["contract"]["dq"]["rules"]
+        assert [r["type"] for r in rules] == ["uniqueness"]  # remapped via the table
+
+    def test_unknown_and_singular_tests_reported_unsupported(self, v12_contract):
+        _, report = v12_contract
+        assert any("is_even" in u for u in report.unsupported)
+        assert any("assert_positive_totals" in u for u in report.unsupported)
+
+
+# ── PK / FK / range recovery (datacontract-cli borrow) ──────────────────
+
+
+class TestConstraintRecovery:
+    def test_pk_from_unique_plus_not_null_tests(self, v12_contract):
+        contract, _ = v12_contract
+        col = _column(_expose(contract, "stg_orders"), "order_id")
+        assert col["semanticType"] == "identifier"
+        assert col["required"] is True
+
+    def test_pk_from_model_level_constraints(self, tmp_path):
+        contract, _ = DbtManifestImporter().import_to_contract(str(_project_dir(tmp_path)))
+        col = _column(_expose(contract, "customers"), "customer_id")
+        assert col["semanticType"] == "identifier"
+
+    def test_fk_recovered_from_relationships_test(self, v12_contract):
+        contract, report = v12_contract
+        col = _column(_expose(contract, "orders"), "customer_id")
+        assert col["validationRules"] == [
+            {
+                "type": "custom",
+                "constraint": "references customers.customer_id",
+                "message": "customer_id must exist in customers.customer_id",
+            }
+        ]
+        assert any("FK recovered" in n for n in report.notes)
+
+    def test_range_recovered_from_between_test(self, v12_contract):
+        contract, _ = v12_contract
+        col = _column(_expose(contract, "order_payments"), "amount")
+        assert col["validationRules"] == [{"type": "range", "constraint": ">= 0 and <= 100000"}]
+
+
+# ── sources → consumes[] ────────────────────────────────────────────────
+
+
+class TestConsumes:
+    def test_sources_become_consumes(self, v12_contract):
+        contract, _ = v12_contract
+        consumes = {(c["productId"], c["exposeId"]): c for c in contract["consumes"]}
+        assert set(consumes) == {
+            ("source.raw_jaffle", "orders"),
+            ("source.raw_jaffle", "customers"),
+            ("source.raw_jaffle", "payments"),
+        }
+
+    def test_source_freshness_maps_to_qos(self, v12_contract):
+        contract, _ = v12_contract
+        by_id = {c["exposeId"]: c for c in contract["consumes"]}
+        # error_after takes precedence over warn_after.
+        assert by_id["orders"]["qosExpectations"] == {"freshnessMax": "PT24H"}
+        # warn_after fallback when error_after absent.
+        assert by_id["payments"]["qosExpectations"] == {"freshnessMax": "P1D"}
+        assert "qosExpectations" not in by_id["customers"]  # no freshness config
+
+
+# ── catalog.json overlay ────────────────────────────────────────────────
+
+
+class TestCatalogOverlay:
+    def test_catalog_types_win_case_insensitively(self, tmp_path):
+        contract, _ = DbtManifestImporter().import_to_contract(str(_project_dir(tmp_path)))
+        orders = _expose(contract, "orders")
+        # Manifest had data_type=None; Snowflake catalog names are UPPERCASE.
+        assert _column(orders, "order_id")["type"] == "number(38,0)"
+        assert _column(orders, "most_recent_order_at")["type"] == "timestamp_ntz"
+        assert _column(_expose(contract, "customers"), "full_name")["type"] == "varchar(255)"
+
+    def test_catalog_only_columns_are_added(self, tmp_path):
+        contract, _ = DbtManifestImporter().import_to_contract(str(_project_dir(tmp_path)))
+        names = [c["name"] for c in _expose(contract, "customers")["contract"]["schema"]]
+        assert "SEGMENT" in names  # present only in catalog.json
+
+    def test_without_catalog_types_default_and_are_reported(self, v12_contract):
+        contract, report = v12_contract
+        assert _column(_expose(contract, "orders"), "order_id")["type"] == "string"
+        assert any("catalog.json not found" in d for d in report.required_defaults)
+        assert any("orders.order_id" in d for d in report.required_defaults)
+
+
+# ── schema-version matrix + gate ────────────────────────────────────────
+
+
+class TestVersionMatrix:
+    @pytest.mark.parametrize("fixture", ["manifest_v10.json", "manifest_v11.json"])
+    def test_v10_v11_parse_and_map(self, fixture):
+        contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / fixture))
+        assert {e["exposeId"] for e in contract["exposes"]} == {"stg_items", "items"}
+        # v10 fixture has no attached_node — depends_on fallback must resolve it.
+        rules = _expose(contract, "items")["contract"]["dq"]["rules"]
+        assert [r["type"] for r in rules] == ["completeness"]
+        assert contract["consumes"][0]["productId"] == "source.raw"
+
+    def test_v8_rejected_by_min_version_gate(self):
+        with pytest.raises(ValueError, match="v8.*minimum.*v9"):
+            DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v8_too_old.json"))
+
+    def test_missing_manifest_advises_dbt_parse(self, tmp_path):
+        (tmp_path / "dbt_project.yml").write_text("name: empty\n")
+        with pytest.raises(FileNotFoundError, match="dbt parse"):
+            DbtManifestImporter().import_to_contract(str(tmp_path))
+
+
+# ── every emitted contract passes fluid validate ────────────────────────
+
+
+class TestEveryContractValidates:
+    @pytest.mark.parametrize(
+        "fixture", ["manifest_v10.json", "manifest_v11.json", "manifest_v12.json"]
+    )
+    def test_schema_valid_direct_manifest(self, fixture, schema_manager):
+        contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / fixture))
+        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        assert result.is_valid, result.errors
+
+    def test_schema_valid_project_dir_with_catalog(self, tmp_path, schema_manager):
+        contract, _ = DbtManifestImporter().import_to_contract(str(_project_dir(tmp_path)))
+        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        assert result.is_valid, result.errors
+
+    def test_fluid_validate_cli_passes_end_to_end(self, tmp_path):
+        """The real ``fluid validate`` accepts the emitted YAML."""
+        contract, _ = DbtManifestImporter().import_to_contract(str(_project_dir(tmp_path)))
+        out = tmp_path / "contract.fluid.yaml"
+        out.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, "-m", "fluid_build.cli", "validate", str(out)],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# ── legacy directory-scan routing (single dbt path, no fidelity split) ──
+
+
+def _scan_args(target_dir: Path) -> argparse.Namespace:
+    return argparse.Namespace(
+        tool=None,
+        source=None,
+        out_path=None,
+        provider="local",
+        target_dir=str(target_dir),
+        yes=True,
+    )
+
+
+class TestLegacyScanRouting:
+    def test_scan_routes_to_manifest_importer_when_manifest_exists(self, tmp_path):
+        from fluid_build.cli import import_cmd
+
+        project = _project_dir(tmp_path)
+        rc = import_cmd.run(_scan_args(project), logging.getLogger("test"))
+        assert rc == 0
+        # The manifest importer wrote its contract into the scanned dir …
+        written = project / "contract.gold.jaffle_shop.fluid.yaml"
+        assert written.exists()
+        contract = yaml.safe_load(written.read_text(encoding="utf-8"))
+        # … with manifest fidelity (typed columns), not the regex scanner's toys.
+        orders = _expose(contract, "orders")
+        assert _column(orders, "order_id")["type"] == "number(38,0)"
+
+    def test_explicit_tool_mode_writes_contract(self, tmp_path, monkeypatch):
+        from fluid_build.cli._import_workflow_handler import run_import_from_tool
+
+        project = _project_dir(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        args = argparse.Namespace(out_path=str(tmp_path / "out.fluid.yaml"))
+        rc = run_import_from_tool(args, logging.getLogger("test"), tool="dbt", source=str(project))
+        assert rc == 0
+        assert (tmp_path / "out.fluid.yaml").exists()
+
+    def test_scan_without_manifest_falls_back_to_regex_scanner(self, tmp_path, capsys):
+        from fluid_build.cli import import_cmd
+
+        project = tmp_path / "no-manifest"
+        (project / "models").mkdir(parents=True)
+        (project / "dbt_project.yml").write_text("name: bare_project\nversion: '1.0'\n")
+        (project / "models" / "orders.sql").write_text("SELECT order_id, status FROM raw.orders\n")
+        rc = import_cmd.run(_scan_args(project), logging.getLogger("test"))
+        assert rc == 0
+        # No manifest-importer artifact; the advisory told the user about dbt parse.
+        assert not list(project.glob("contract.gold.*"))
+        # Rich line-wraps the advisory — compare whitespace-normalized.
+        flat = " ".join(capsys.readouterr().out.split())
+        assert "dbt parse" in flat
+
+
+# ── ImportReport accounting ─────────────────────────────────────────────
+
+
+class TestImportReport:
+    def test_every_model_and_source_accounted(self, v12_contract):
+        contract, report = v12_contract
+        for expose in contract["exposes"]:
+            uid_name = expose["labels"]["dbt-unique-id"].rsplit(".", 1)[-1]
+            assert f"model.{uid_name}" in report.mapped_one_to_one
+        for consume in contract["consumes"]:
+            assert any(
+                consume["exposeId"] in item and item.endswith("→ consumes[]")
+                for item in report.mapped_one_to_one
+            )
+
+    def test_every_mapped_test_accounted(self, v12_contract):
+        contract, report = v12_contract
+        emitted_rules = sum(
+            len(e["contract"].get("dq", {}).get("rules", [])) for e in contract["exposes"]
+        )
+        mapped_tests = [i for i in report.mapped_one_to_one if i.startswith("test.")]
+        assert emitted_rules == len(mapped_tests) == 5
+
+    def test_defaults_and_boundary_note_present(self, v12_contract):
+        _, report = v12_contract
+        assert any("metadata.owner defaulted" in d for d in report.required_defaults)
+        assert any("ONE DataProduct per dbt project" in n for n in report.notes)
