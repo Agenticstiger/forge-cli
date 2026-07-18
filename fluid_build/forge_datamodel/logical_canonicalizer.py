@@ -35,30 +35,12 @@ from fluid_build.copilot.schemas.data_model import (
 from fluid_build.copilot.schemas.osi import OSIAIContext, OSIDataset, OSIField
 from fluid_build.copilot.schemas.stage_outputs import LogicalDraft
 
-_T = TypeVar("_T")
+# Grain vocabulary is single-sourced (module-attribute access so test
+# patches flow through) — this module previously carried its own drifted
+# alias table.
+from fluid_build.forge_datamodel import time_grains as _time_grains
 
-_TIME_GRAIN_ALIASES = {
-    "sec": "minute",
-    "secs": "minute",
-    "second": "minute",
-    "seconds": "minute",
-    "min": "minute",
-    "mins": "minute",
-    "minutes": "minute",
-    "hr": "hour",
-    "hrs": "hour",
-    "hours": "hour",
-    "daily": "day",
-    "days": "day",
-    "weekly": "week",
-    "weeks": "week",
-    "monthly": "month",
-    "months": "month",
-    "quarterly": "quarter",
-    "quarters": "quarter",
-    "yearly": "year",
-    "years": "year",
-}
+_T = TypeVar("_T")
 
 
 def canonicalize_logical_draft(logical: LogicalDraft) -> LogicalDraft:
@@ -223,8 +205,7 @@ def _canonical_fields(fields: Sequence[OSIField], *, primary_keys: Sequence[str]
     by_name: dict[str, OSIField] = {}
     for field in fields:
         if field.dimension is not None and field.dimension.grain:
-            grain = str(field.dimension.grain).strip().lower()
-            field.dimension.grain = _TIME_GRAIN_ALIASES.get(grain, grain)
+            field.dimension.grain = _time_grains.resolve_grain_alias(field.dimension.grain)
         if field.ai_context is not None:
             field.ai_context = _canonical_ai_context(field.ai_context)
         by_name.setdefault(field.name, field)

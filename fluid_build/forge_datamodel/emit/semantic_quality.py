@@ -32,35 +32,14 @@ from fluid_build.copilot.schemas.data_model import (
 from fluid_build.copilot.schemas.osi import OSISemanticModel
 from fluid_build.copilot.schemas.stage_outputs import LogicalDraft, ValidationFinding
 
+# Grain vocabulary is single-sourced (module-attribute access so test
+# patches flow through) — this module previously carried its own copy.
+from fluid_build.forge_datamodel import time_grains as _time_grains
+
 _PLACEHOLDER_RE = re.compile(
     r"(^|_)(todo|tbd|dummy|placeholder|unknown|example|sample)(_|$)",
     re.IGNORECASE,
 )
-_ALLOWED_TIME_GRAINS = {"day", "week", "month", "quarter", "year", "hour", "minute"}
-_TIME_GRAIN_ALIASES = {
-    "days": "day",
-    "daily": "day",
-    "weeks": "week",
-    "weekly": "week",
-    "months": "month",
-    "monthly": "month",
-    "quarters": "quarter",
-    "quarterly": "quarter",
-    "years": "year",
-    "yearly": "year",
-    "hours": "hour",
-    "hourly": "hour",
-    "minutes": "minute",
-    "minutely": "minute",
-    "s": "minute",
-    "ms": "minute",
-    "sec": "minute",
-    "secs": "minute",
-    "second": "minute",
-    "seconds": "minute",
-    "millisecond": "minute",
-    "milliseconds": "minute",
-}
 
 
 def lint_logical_semantic_quality(logical: LogicalDraft) -> List[ValidationFinding]:
@@ -374,15 +353,15 @@ def _lint_osi(model: OSISemanticModel) -> List[ValidationFinding]:
                 )
             seen_fields.add(field.name)
             grain = field.dimension.grain if field.dimension is not None else None
-            normalized_grain = _normalize_time_grain(grain) if grain is not None else None
-            if grain is not None and normalized_grain not in _ALLOWED_TIME_GRAINS:
+            if grain is not None and _time_grains.normalize_time_grain(grain) is None:
                 findings.append(
                     ValidationFinding(
                         severity="error",
                         field=f"{field_path}.dimension.grain",
                         message=(
                             f"Time dimension '{field.name}' uses unsupported grain "
-                            f"'{grain}'. Use one of: {', '.join(sorted(_ALLOWED_TIME_GRAINS))}."
+                            f"'{grain}'. Use one of: "
+                            f"{', '.join(sorted(_time_grains.ALLOWED_TIME_GRAINS))}."
                         ),
                     )
                 )
@@ -399,13 +378,6 @@ def _lint_osi(model: OSISemanticModel) -> List[ValidationFinding]:
             )
 
     return findings
-
-
-def _normalize_time_grain(value: str) -> str:
-    normalized = (value or "").strip().lower().replace("_", " ").replace("-", " ")
-    normalized = re.sub(r"\s+", " ", normalized)
-    normalized = normalized.removeprefix("per ").removesuffix(" grain").strip()
-    return _TIME_GRAIN_ALIASES.get(normalized, normalized)
 
 
 def _duplicates(values: Iterable[str]) -> dict[str, int]:
