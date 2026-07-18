@@ -275,6 +275,41 @@ def build_seed_contract(
     )
 
 
+def build_agent_loop_seed_context(
+    context: Mapping[str, Any],
+    *,
+    seed_contract: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Return *context* with an existing contract plumbed in as the seed.
+
+    Deep-agents PR 2 (RFC-deep-agents.md, "honest surgery"). The agent
+    loop had no seed channel: seed injection lived here, on the
+    single-shot path, behind
+    ``forge_copilot_contract_helpers._seed_contract_override``. This
+    helper reuses that exact seam — same ``seed_contract_override`` key,
+    same ``kind == "DataProduct"`` validation — so a caller (today, the
+    mission runner's EXECUTE) can hand the agent loop the contract that
+    exists on disk and get an *edit* rather than a fresh authoring run.
+
+    Purely additive: callers that don't set a seed get their context
+    back unchanged, and the loop's initial user message is byte-identical
+    to today's.
+    """
+    enriched = dict(context)
+    if isinstance(seed_contract, Mapping) and seed_contract:
+        seed = dict(seed_contract)
+        # Mirror _seed_contract_override's guard — only a real
+        # DataProduct document is a legitimate seed.
+        if str(seed.get("kind") or "") == "DataProduct":
+            enriched["seed_contract_override"] = seed
+        else:
+            LOG.debug(
+                "agent_loop_seed_rejected: kind=%r is not a DataProduct contract",
+                seed.get("kind"),
+            )
+    return enriched
+
+
 def normalize_generation_payload(
     payload: Mapping[str, Any],
     *,
