@@ -10,17 +10,38 @@
 
 Translates Snowflake-bound exposures into ``snowflakedb/snowflake``
 resources. A pure function of the contract; no credentials, no network.
+
+**Packaging modes (RFC-packaging-modes.md file 5).** ``resolve_packaging``
+decides, per container kind, whether this contract owns a container or
+merely writes into a platform-owned pool:
+
+* ``LEGACY`` (no ``packaging`` block) — today's exact emit, byte-for-byte.
+* ``OWNED``  — the container is a managed resource (same shape as LEGACY),
+  plus, for ``warehouse``, a dedicated ``snowflake_warehouse``.
+* ``REFERENCED`` — **no resource, and no data source either**. Snowflake's
+  data sources are thin (they list, they don't address a single object by
+  name), so v1 addresses a pooled database / schema by its **literal name**.
+  This is load-bearing: dropping the ``snowflake_database`` resource while
+  leaving the schema and table bodies pointing at
+  ``${snowflake_database.<res>.name}`` would fail ``tofu validate`` with
+  "Reference to undeclared resource" — so :func:`_emit_snowflake` rewrites
+  *every* consumer of a referenced container in the same branch that drops
+  it. A missing pool then surfaces as a raw provider error at ``tofu plan``;
+  the friendlier pre-flight probe is ``fluid verify``'s job (RFC file 9).
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import yaml
 
+from ...providers._sql_safety import validate_ident
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
+from ..packaging import ContainerDecision, PackagingResolution, resolve_packaging
 from ..versions import required_providers
 
 # FLUID column type → Snowflake SQL type.
@@ -62,6 +83,77 @@ def _sf_type(raw: Any) -> str:
     return _SF_TYPES.get(t, "VARCHAR")
 
 
+@dataclass(frozen=True)
+class _Placement:
+    """One exposure's resolved container ownership (see the module docstring).
+
+    ``database_referenced`` / ``schema_referenced`` drive the literal-inlining
+    branch; ``warehouse_owned`` is true only for an explicit ``isolated``
+    warehouse (never under LEGACY, which emits no warehouse at all).
+    """
+
+    database_referenced: bool
+    schema_referenced: bool
+    warehouse_owned: bool
+    pool: Optional[str]
+
+
+#: Every container LEGACY — today's emit path, selected when no contract
+#: declares a ``packaging`` block.
+_LEGACY_PLACEMENT = _Placement(
+    database_referenced=False,
+    schema_referenced=False,
+    warehouse_owned=False,
+    pool=None,
+)
+
+
+def _expose_id(exposure: Mapping[str, Any]) -> Optional[str]:
+    """The exposure's id, for the resolver's per-exposure override lookup."""
+    candidate = exposure.get("exposeId") or exposure.get("id")
+    return candidate if isinstance(candidate, str) and candidate else None
+
+
+def _placement(resolution: PackagingResolution, exposure: Mapping[str, Any]) -> _Placement:
+    """Resolve one exposure's placement from the packaging chokepoint."""
+    if resolution.is_legacy:
+        return _LEGACY_PLACEMENT
+    expose_id = _expose_id(exposure)
+    pool_exposure = resolution.exposure_for(expose_id) if expose_id else None
+    return _Placement(
+        database_referenced=(
+            resolution.decision_for("database", expose_id) is ContainerDecision.REFERENCED
+        ),
+        schema_referenced=(
+            resolution.decision_for("schema", expose_id) is ContainerDecision.REFERENCED
+        ),
+        warehouse_owned=(
+            resolution.decision_for("warehouse", expose_id) is ContainerDecision.OWNED
+        ),
+        pool=(pool_exposure.pool if pool_exposure is not None else resolution.pool),
+    )
+
+
+def _literal_ident(name: Any) -> str:
+    """The literal identifier for a REFERENCED (platform-owned) container.
+
+    Emitted verbatim in place of a ``${snowflake_*.<res>.name}`` reference.
+    Routed through the repo's central :func:`validate_ident` — the same guard
+    every SQL DDL boundary uses — so a pool name that is not a plain Snowflake
+    identifier fails loudly at emit time instead of reaching the provider.
+
+    **Deliberately verbatim, not upper-cased.** The owned path configures
+    ``snowflake_database`` with ``{"name": <location.database>}``, so the
+    reference it replaces resolved to exactly this string. Upper-casing here
+    would make the ``shared`` form of a contract address a *different*
+    database than the ``isolated`` form of the same contract — and a
+    quoted-lowercase pool would become unaddressable from the contract at
+    all. Verbatim keeps the failure mode loud, symmetric, and fixable by
+    typing the pool's real name.
+    """
+    return validate_ident(str(name))
+
+
 class SnowflakeIacPlugin:
     """``IacProviderPlugin`` for Snowflake."""
 
@@ -97,6 +189,7 @@ class SnowflakeIacPlugin:
     ) -> Dict[str, Any]:
         resources: Dict[str, Dict[str, Any]] = {}
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        packaging = resolve_packaging(contract)
 
         first_loc: Mapping[str, Any] = {}
         for exposure in contract.get("exposes") or []:
@@ -108,7 +201,11 @@ class SnowflakeIacPlugin:
                 first_loc = loc
             fmt = binding.get("format")
             schema_cols = (exposure.get("contract") or {}).get("schema") or []
-            _emit_snowflake(resources, loc, fmt, schema_cols, cid, contract=contract)
+            placement = _placement(packaging, exposure)
+            _emit_snowflake(
+                resources, loc, fmt, schema_cols, cid, contract=contract, placement=placement
+            )
+            _emit_warehouse(resources, loc, cid, placement=placement)
         _emit_grants(resources, contract, cid)
         # Streams / tasks / views / procedures / functions — the planner
         # already interpreted the `streams[]`, `views[]`, `build` and
@@ -161,8 +258,17 @@ class SnowflakeIacPlugin:
         provider's import ids vary by resource: a database is its bare name,
         a schema / view is the quoted-identifier path (``"db"."schema"``),
         and a table is the pipe-delimited ``db|schema|table``.
+
+        **REFERENCED containers are never import candidates** (RFC file 5).
+        ``_adopt_existing`` runs on every apply; left ungated it would
+        ``tofu import`` a platform-owned pool database into *this* product's
+        state — re-owning the shared container, which is the exact failure
+        this feature exists to prevent. The gate is here rather than in the
+        apply engine because the emit and the import list must agree: a
+        REFERENCED container has no resource address to import *into*.
         """
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        packaging = resolve_packaging(contract)
         blocks: List[ImportBlock] = []
         seen: set[str] = set()
 
@@ -180,11 +286,14 @@ class SnowflakeIacPlugin:
             schema = loc.get("schema")
             if not (database and schema):
                 continue
-            _add(f"snowflake_database.{_db_key(cid, database)}", str(database))
-            _add(
-                f"snowflake_schema.{_schema_key(cid, database, schema)}",
-                f'"{database}"."{schema}"',
-            )
+            placement = _placement(packaging, exposure)
+            if not placement.database_referenced:
+                _add(f"snowflake_database.{_db_key(cid, database)}", str(database))
+            if not placement.schema_referenced:
+                _add(
+                    f"snowflake_schema.{_schema_key(cid, database, schema)}",
+                    f'"{database}"."{schema}"',
+                )
             table = loc.get("table") or loc.get("view")
             if table:
                 tkey = safe_ident(f"{cid}_{database}_{schema}_{table}")
@@ -290,6 +399,7 @@ def _emit_snowflake(
     cid: str,
     *,
     contract: Mapping[str, Any] = None,  # type: ignore[assignment]
+    placement: _Placement = _LEGACY_PLACEMENT,
 ) -> None:
     """Emit a Snowflake exposure — its database, schema, and table (or view).
 
@@ -303,6 +413,12 @@ def _emit_snowflake(
     registrar — Snowsight reads the table comment verbatim, surfacing the
     FLUID classification + contract YAML to analysts without a separate
     publish step.
+
+    ``placement`` selects ownership per container (RFC file 5). A REFERENCED
+    database / schema emits **no resource** and every downstream body
+    addresses it by literal name instead of by resource reference — the two
+    halves must stay in the same branch or the module gains a dangling
+    ``${snowflake_database.…}`` and fails ``tofu validate``.
     """
     database = loc.get("database")
     schema_name = loc.get("schema")
@@ -311,29 +427,39 @@ def _emit_snowflake(
 
     db_res = _db_key(cid, database)
     sc_res = _schema_key(cid, database, schema_name)
-    resources.setdefault("snowflake_database", {}).setdefault(db_res, {"name": database})
-    resources.setdefault("snowflake_schema", {}).setdefault(
-        sc_res,
-        {
-            "name": schema_name,
-            "database": tofu_ref(f"snowflake_database.{db_res}.name"),
-            # The v2 provider's ``is_transient`` is a tri-state, force-new
-            # attribute. Left unset the config value is ``"default"`` while a
-            # real permanent schema reports ``"false"`` — that mismatch makes
-            # every re-apply (and every brownfield import) plan a destructive
-            # replace. Pin it to a standard permanent schema.
-            "is_transient": "false",
-        },
-    )
+
+    # --- database: owned resource, or literal reference to the pool DB ---
+    if placement.database_referenced:
+        db_ref: Any = _literal_ident(database)
+    else:
+        resources.setdefault("snowflake_database", {}).setdefault(db_res, {"name": database})
+        db_ref = tofu_ref(f"snowflake_database.{db_res}.name")
+
+    # --- schema: owned resource (inside whichever database), or literal ---
+    if placement.schema_referenced:
+        sc_ref: Any = _literal_ident(schema_name)
+    else:
+        resources.setdefault("snowflake_schema", {}).setdefault(
+            sc_res,
+            {
+                "name": schema_name,
+                "database": db_ref,
+                # The v2 provider's ``is_transient`` is a tri-state, force-new
+                # attribute. Left unset the config value is ``"default"`` while a
+                # real permanent schema reports ``"false"`` — that mismatch makes
+                # every re-apply (and every brownfield import) plan a destructive
+                # replace. Pin it to a standard permanent schema.
+                "is_transient": "false",
+            },
+        )
+        sc_ref = tofu_ref(f"snowflake_schema.{sc_res}.name")
 
     table = loc.get("table") or loc.get("view")
     if not table:
         return
     tbl_res = safe_ident(f"{cid}_{database}_{schema_name}_{table}")
-    db_ref = tofu_ref(f"snowflake_database.{db_res}.name")
-    sc_ref = tofu_ref(f"snowflake_schema.{sc_res}.name")
 
-    table_comment = _build_horizon_table_comment(contract) if contract else ""
+    table_comment = _build_horizon_table_comment(contract, pool=placement.pool) if contract else ""
 
     if fmt == "snowflake_view":
         view_body = {
@@ -377,11 +503,55 @@ def _emit_snowflake(
     resources.setdefault("snowflake_table", {})[tbl_res] = table_body
 
 
-def _build_horizon_table_comment(contract: Mapping[str, Any]) -> str:
+def _emit_warehouse(
+    resources: Dict[str, Any],
+    loc: Mapping[str, Any],
+    cid: str,
+    *,
+    placement: _Placement,
+) -> None:
+    """An ``isolated`` warehouse → a dedicated ``snowflake_warehouse``.
+
+    Only fires when the contract explicitly declares ``containers.warehouse:
+    isolated`` (or a blanket ``mode: isolated``) — the point being per-product
+    cost attribution, the RFC's flagship hybrid tier: pooled database, own
+    schema, own compute. A LEGACY contract's warehouse decision is neither
+    OWNED nor REFERENCED, so no warehouse is emitted and today's output is
+    untouched; a ``shared`` warehouse is likewise left to the platform team
+    and referenced by the literal name the task / binding already carries.
+
+    Sizing knobs are deliberately absent: ``bindingLocation`` has no size
+    field (``additionalProperties: false``), and the RFC schedules warehouse
+    sizing for v2. The defaults suspend aggressively so a dedicated warehouse
+    does not bill while idle.
+    """
+    if not placement.warehouse_owned:
+        return
+    warehouse = loc.get("warehouse")
+    if not warehouse:
+        return
+    resources.setdefault("snowflake_warehouse", {}).setdefault(
+        safe_ident(f"{cid}_wh_{warehouse}"),
+        {
+            "name": warehouse,
+            "warehouse_size": "XSMALL",
+            "auto_suspend": 60,
+            # The v2 provider models tri-state booleans as strings.
+            "auto_resume": "true",
+            "initially_suspended": "true",
+        },
+    )
+
+
+def _build_horizon_table_comment(contract: Mapping[str, Any], *, pool: Optional[str] = None) -> str:
     """Render the markdown table COMMENT that Snowsight + DESC TABLE expose
     to analysts. Mirrors the retired ``SnowflakeHorizonRegistrar._build_payload``
     so existing reader tooling keeps working — sections in the same order
     (description → FLUID classification → FLUID contract YAML).
+
+    ``pool`` (the packaging pool id, absent for every LEGACY contract) is
+    appended to the classification section as ``fluid_pool`` so an analyst
+    reading the table in Snowsight can see which platform pool it lives in.
     """
     meta = contract.get("metadata") or {}
     sections: List[str] = []
@@ -398,6 +568,8 @@ def _build_horizon_table_comment(contract: Mapping[str, Any]) -> str:
         meta_lines.append(f"- fluid_domain: {contract['domain']}")
     if contract.get("fluidVersion"):
         meta_lines.append(f"- fluid_version: {contract['fluidVersion']}")
+    if pool:
+        meta_lines.append(f"- fluid_pool: {pool}")
     if meta_lines:
         sections.append("FLUID classification:\n" + "\n".join(meta_lines))
     try:

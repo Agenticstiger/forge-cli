@@ -13,12 +13,27 @@ Iceberg-on-S3 mesh interface Athena reads natively), the backing S3 bucket,
 Kinesis data streams, and Redshift Serverless namespaces + workgroups + a
 ``CREATE EXTERNAL SCHEMA`` bridge so Redshift queries the same Glue catalog
 via Spectrum. A pure function of the contract; no credentials, no network.
+
+**Packaging modes (RFC-packaging-modes.md file 3).** ``resolve_packaging``
+decides per container kind whether this contract owns the container:
+
+* ``LEGACY`` (no ``packaging`` block) — today's exact emit, byte-for-byte,
+  including ``force_destroy: true`` and the ``{account}-fluid-data`` fallback
+  bucket.
+* ``OWNED`` — the container is a managed resource, same as LEGACY.
+* ``REFERENCED`` — the S3 bucket / Glue database becomes a ``data`` source
+  and every consumer switches to the ``data.`` address in the same branch
+  (a half-applied switch leaves a dangling reference and fails ``tofu
+  validate``). A referenced bucket carries **no** ``force_destroy``, and the
+  grants it does emit narrow to the binding's ``location.path`` prefix so a
+  tenant cannot reach another tenant's objects in the pool.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import yaml
@@ -27,6 +42,7 @@ from ...providers._sql_safety import quote_string_literal, validate_ident
 from ...providers.aws.util import warehouse as _warehouse
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref
+from ..packaging import ContainerDecision, PackagingResolution, resolve_packaging
 from ..versions import required_providers
 
 # Apply-time AWS account placeholder for the credential-free warehouse fallback.
@@ -121,6 +137,80 @@ def _columns(schema: List[Mapping[str, Any]]) -> List[Dict[str, str]]:
     return columns
 
 
+@dataclass(frozen=True)
+class _Placement:
+    """One exposure's resolved container ownership (see the module docstring)."""
+
+    bucket_referenced: bool
+    database_referenced: bool
+    pool: Optional[str]
+
+
+#: Every container LEGACY — today's emit path.
+_LEGACY_PLACEMENT = _Placement(bucket_referenced=False, database_referenced=False, pool=None)
+
+
+def _expose_id(exposure: Mapping[str, Any]) -> Optional[str]:
+    """The exposure's id, for the resolver's per-exposure override lookup."""
+    candidate = exposure.get("exposeId") or exposure.get("id")
+    return candidate if isinstance(candidate, str) and candidate else None
+
+
+def _placement(resolution: PackagingResolution, exposure: Mapping[str, Any]) -> _Placement:
+    """Resolve one exposure's placement from the packaging chokepoint."""
+    if resolution.is_legacy:
+        return _LEGACY_PLACEMENT
+    expose_id = _expose_id(exposure)
+    pool_exposure = resolution.exposure_for(expose_id) if expose_id else None
+    return _Placement(
+        bucket_referenced=(
+            resolution.decision_for("bucket", expose_id) is ContainerDecision.REFERENCED
+        ),
+        # ``database`` covers the AWS Glue catalog database as well as the
+        # Snowflake database — one kind, per the RFC's normative mapping.
+        database_referenced=(
+            resolution.decision_for("database", expose_id) is ContainerDecision.REFERENCED
+        ),
+        pool=(pool_exposure.pool if pool_exposure is not None else resolution.pool),
+    )
+
+
+def _tags_for(base: Mapping[str, str], placement: _Placement) -> Dict[str, str]:
+    """Contract tags plus ``fluid_pool`` when a packaging pool is in scope.
+
+    Absent a ``packaging`` block there is no pool, so every existing
+    contract's tags are unchanged.
+    """
+    tags = dict(base)
+    if placement.pool:
+        tags["fluid_pool"] = str(placement.pool)
+    return tags
+
+
+def _glue_db_ref(db_name: str, database: Any, *, referenced: bool) -> Any:
+    """How a consumer addresses the Glue catalog database.
+
+    Owned → a resource cross-reference. REFERENCED → the **literal** database
+    name, exactly as the Snowflake plugin inlines a pooled database, because
+    ``hashicorp/aws`` ships ``aws_glue_catalog_database`` as a *resource only*
+    — there is no matching data source (verified against the real provider:
+    ``tofu validate`` rejects it with "The provider hashicorp/aws does not
+    support data source"). A Glue database is addressed by name anyway, so a
+    lookup would buy nothing beyond an existence check.
+
+    The literal is contract-derived and deliberately NOT wrapped in
+    ``TofuExpr``, so ``render_tofu_json`` escapes any ``${`` in it.
+    """
+    if referenced:
+        return str(database)
+    return tofu_ref(f"aws_glue_catalog_database.{db_name}.name")
+
+
+def _s3_bucket_ref(bucket_key: str, *, referenced: bool, attr: str = "id") -> TofuExpr:
+    """The address of an S3 bucket — resource or data source."""
+    return tofu_ref(f"{'data.' if referenced else ''}aws_s3_bucket.{bucket_key}.{attr}")
+
+
 class AwsIacPlugin:
     """``IacProviderPlugin`` for Amazon Web Services (Glue catalog + S3)."""
 
@@ -155,13 +245,14 @@ class AwsIacPlugin:
     ) -> Dict[str, Any]:
         resources: Dict[str, Dict[str, Any]] = {}
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
-        tags = {"managed_by": "fluid", "fluid_contract": cid}
+        base_tags = {"managed_by": "fluid", "fluid_contract": cid}
+        packaging = resolve_packaging(contract)
 
         # Account-level Lake Formation settings: admins + LF-tag
         # definitions. Emitted once per contract, before per-exposure
         # resources so the LF tag-definitions exist before any
         # resource_lf_tags association references them.
-        _emit_lf_account_settings(resources, contract, cid, tags)
+        _emit_lf_account_settings(resources, contract, cid, base_tags)
 
         for exposure in contract.get("exposes") or []:
             binding = exposure.get("binding") or {}
@@ -170,8 +261,12 @@ class AwsIacPlugin:
             loc = binding.get("location") or {}
             fmt = binding.get("format") or "parquet"
             schema = (exposure.get("contract") or {}).get("schema") or []
-            _emit_glue(resources, loc, fmt, schema, cid, tags, contract=contract)
-            _emit_s3(resources, loc, cid, tags)
+            placement = _placement(packaging, exposure)
+            tags = _tags_for(base_tags, placement)
+            _emit_glue(
+                resources, loc, fmt, schema, cid, tags, contract=contract, placement=placement
+            )
+            _emit_s3(resources, loc, cid, tags, placement=placement)
             _emit_kinesis(resources, loc, cid, tags)
             _emit_redshift_serverless(resources, loc, cid, tags)
             _emit_redshift_external_schema(resources, loc, cid, tags)
@@ -179,7 +274,7 @@ class AwsIacPlugin:
             # principal grants, LF-tag associations, row/column filters.
             # Only fires when the binding carries a governance.lakeFormation
             # block — every existing AWS contract is unaffected.
-            _emit_lakeformation(resources, binding, loc, fmt, cid, tags)
+            _emit_lakeformation(resources, binding, loc, fmt, cid, tags, placement=placement)
         # Glue ETL jobs / Step Functions / the Lambda schedule path —
         # the planner's build & orchestration ops.
         _emit_from_actions(resources, actions, cid)
@@ -198,6 +293,13 @@ class AwsIacPlugin:
         resource references the caller's account ID (data-cells filters
         and certain LF grants need ``catalog_id``). The data source is
         a no-op when not referenced.
+
+        Under a ``shared`` packaging mode this additionally looks up the pool
+        S3 bucket rather than declaring it, so ``tofu`` never plans to create,
+        modify or destroy a platform-owned bucket. (A pooled Glue database
+        gets no data source — ``hashicorp/aws`` has none; consumers inline
+        its literal name, see :func:`_glue_db_ref`.) Nothing is added for a
+        LEGACY contract.
         """
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
         data: Dict[str, Any] = {}
@@ -207,6 +309,7 @@ class AwsIacPlugin:
                 _emit_lambda_archive(archives, action, cid)
         if archives:
             data["archive_file"] = archives
+        _emit_referenced_containers(data, contract, cid)
         # Lake Formation data-cells filters (and other LF resources) need
         # the calling AWS account ID as ``catalog_id``. Emit the
         # ``aws_caller_identity`` data source when any LF feature is used
@@ -248,8 +351,16 @@ class AwsIacPlugin:
         resources fails ``Invalid import id`` and the apply then fails
         ``AlreadyExistsException`` — verified by the live brownfield
         test pinning this behaviour.
+
+        REFERENCED containers are excluded (RFC file 3): ``_adopt_existing``
+        runs on every apply, so an ungated shared pool bucket / Glue database
+        would be ``tofu import``-ed into this product's state — re-owning the
+        platform's pool, which is precisely the hazard shared mode exists to
+        prevent. Leaf resources inside the pool (the Glue table) stay
+        importable; only the containers are withheld.
         """
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        packaging = resolve_packaging(contract)
         blocks: List[ImportBlock] = []
         seen: set[str] = set()
 
@@ -273,6 +384,7 @@ class AwsIacPlugin:
                 continue
             loc = binding.get("location") or {}
             fmt = binding.get("format") or "parquet"
+            placement = _placement(packaging, exposure)
             database = loc.get("database")
             table = loc.get("table")
             bucket = loc.get("bucket")
@@ -283,11 +395,12 @@ class AwsIacPlugin:
             # the Glue catalog (mirrors ``_emit_glue``'s gate).
             if database and catalog_id and str(fmt or "").lower() in _GLUE_CATALOG_FORMATS:
                 db_key = safe_ident(f"{cid}_{database}")
-                # provider id: ``{catalog_id}:{name}``
-                _add(
-                    f"aws_glue_catalog_database.{db_key}",
-                    f"{catalog_id}:{database}",
-                )
+                if not placement.database_referenced:
+                    # provider id: ``{catalog_id}:{name}``
+                    _add(
+                        f"aws_glue_catalog_database.{db_key}",
+                        f"{catalog_id}:{database}",
+                    )
                 if table:
                     table_key = safe_ident(f"{cid}_{database}_{table}")
                     # provider id: ``{catalog_id}:{database}:{name}``
@@ -297,7 +410,7 @@ class AwsIacPlugin:
                     )
 
             # S3 bucket — provider id is the bucket name.
-            if bucket:
+            if bucket and not placement.bucket_referenced:
                 bucket_key = safe_ident(f"{cid}_{bucket}")
                 _add(f"aws_s3_bucket.{bucket_key}", bucket)
 
@@ -359,6 +472,38 @@ _GLUE_CATALOG_FORMATS: frozenset = frozenset(
 )
 
 
+def _emit_referenced_containers(
+    data: Dict[str, Any], contract: Mapping[str, Any], cid: str
+) -> None:
+    """Add ``data`` lookups for every REFERENCED container that has one.
+
+    The gates mirror :func:`_emit_s3` exactly — same truthiness check — so
+    the emitted ``data`` block and the ``resource`` block can never disagree
+    about which containers exist. A mismatch shows up as either an orphan
+    data source or a dangling ``${data.…}`` reference that fails ``tofu
+    validate``.
+    """
+    packaging = resolve_packaging(contract)
+    if packaging.is_legacy:
+        return
+    for exposure in contract.get("exposes") or []:
+        binding = exposure.get("binding") or {}
+        if binding.get("platform") != "aws":
+            continue
+        loc = binding.get("location") or {}
+        placement = _placement(packaging, exposure)
+
+        # NB: a REFERENCED Glue database emits NO data source —
+        # ``hashicorp/aws`` has no ``aws_glue_catalog_database`` data source,
+        # so consumers inline the literal name instead (see
+        # :func:`_glue_db_ref`). Only the S3 bucket is looked up.
+        bucket = loc.get("bucket")
+        if bucket and placement.bucket_referenced:
+            data.setdefault("aws_s3_bucket", {}).setdefault(
+                safe_ident(f"{cid}_{bucket}"), {"bucket": bucket}
+            )
+
+
 def _emit_glue(
     resources: Dict[str, Any],
     loc: Mapping[str, Any],
@@ -368,6 +513,7 @@ def _emit_glue(
     tags: Dict[str, str],
     *,
     contract: Optional[Mapping[str, Any]] = None,
+    placement: _Placement = _LEGACY_PLACEMENT,
 ) -> None:
     database = loc.get("database")
     if not database:
@@ -378,17 +524,18 @@ def _emit_glue(
     if str(fmt or "").lower() not in _GLUE_CATALOG_FORMATS:
         return
     db_name = safe_ident(f"{cid}_{database}")
-    # ``parameters`` and other Lake-Formation-managed fields drift
-    # post-create (AWS sets things like ``CreatedBy``,
-    # ``last_commit_time``, LF auto-flags). See the table emit below
-    # for the same rationale.
-    resources.setdefault("aws_glue_catalog_database", {}).setdefault(
-        db_name,
-        {
-            "name": database,
-            "lifecycle": {"ignore_changes": ["parameters"]},
-        },
-    )
+    if not placement.database_referenced:
+        # ``parameters`` and other Lake-Formation-managed fields drift
+        # post-create (AWS sets things like ``CreatedBy``,
+        # ``last_commit_time``, LF auto-flags). See the table emit below
+        # for the same rationale.
+        resources.setdefault("aws_glue_catalog_database", {}).setdefault(
+            db_name,
+            {
+                "name": database,
+                "lifecycle": {"ignore_changes": ["parameters"]},
+            },
+        )
 
     table = loc.get("table")
     if not table:
@@ -441,6 +588,12 @@ def _emit_glue(
             parameters["fluid_domain"] = str(domain)
         if version:
             parameters["fluid_version"] = str(version)
+        # The packaging pool id, alongside the other ``fluid_*`` catalog
+        # parameters, so a Glue/Athena consumer can attribute the table to
+        # its platform pool. Absent for every contract with no packaging
+        # block, which is what keeps the byte-parity pin green.
+        if placement.pool:
+            parameters["fluid_pool"] = str(placement.pool)
         # Column-level tags from the contract's ``schema[].tags`` field
         # (already in v0.7.3 — ``$defs.column.properties.tags``). Emitted
         # as the legacy ``forge.pii.<col>`` Glue parameter the retired
@@ -473,7 +626,7 @@ def _emit_glue(
 
     table_body: Dict[str, Any] = {
         "name": table,
-        "database_name": tofu_ref(f"aws_glue_catalog_database.{db_name}.name"),
+        "database_name": _glue_db_ref(db_name, database, referenced=placement.database_referenced),
         "table_type": "EXTERNAL_TABLE",
         "parameters": parameters,
         "storage_descriptor": storage,
@@ -499,10 +652,21 @@ def _emit_glue(
 
 
 def _emit_s3(
-    resources: Dict[str, Any], loc: Mapping[str, Any], cid: str, tags: Dict[str, str]
+    resources: Dict[str, Any],
+    loc: Mapping[str, Any],
+    cid: str,
+    tags: Dict[str, str],
+    *,
+    placement: _Placement = _LEGACY_PLACEMENT,
 ) -> None:
     bucket = loc.get("bucket")
     if not bucket:
+        return
+    if placement.bucket_referenced:
+        # A shared pool bucket is looked up in ``emit_data``, never created.
+        # Critically it carries no ``force_destroy``: on a pool that flag
+        # would let one tenant's ``tofu destroy`` delete every other
+        # tenant's objects — the blast radius this feature exists to close.
         return
     resources.setdefault("aws_s3_bucket", {}).setdefault(
         safe_ident(f"{cid}_{bucket}"),
@@ -1168,9 +1332,17 @@ def _emit_lakeformation(
     fmt: str,
     cid: str,
     tags: Dict[str, str],
+    *,
+    placement: _Placement = _LEGACY_PLACEMENT,
 ) -> None:
     """Emit per-exposure LF resources. No-op when the binding has no
-    ``governance.lakeFormation`` block."""
+    ``governance.lakeFormation`` block.
+
+    Under a REFERENCED bucket the grants narrow to the binding's
+    ``location.path`` prefix rather than the bucket root (RFC §Security —
+    "LF registers the ``path`` prefix, not the bucket"), and every Glue /
+    S3 reference switches to its ``data.`` address.
+    """
     gov = (binding.get("governance") or {}).get("lakeFormation") or {}
     if not gov:
         return
@@ -1198,15 +1370,21 @@ def _emit_lakeformation(
         bucket, path = _warehouse.normalize_location(
             loc, account_ref=_CALLER_ACCOUNT_TOKEN, default_path=False
         )
-        loc_key = safe_ident(f"{cid}_lf_loc_{bucket}_{path or 'root'}")
-        s3_uri = f"s3://{bucket}/{path}" if path else f"s3://{bucket}"
-        resources.setdefault("aws_lakeformation_resource", {})[loc_key] = {
-            "arn": f"arn:aws:s3:::{bucket}/{path}" if path else f"arn:aws:s3:::{bucket}",
-            # ``use_service_linked_role: true`` is the default safe path
-            # — LF uses the AWSServiceRoleForLakeFormationDataAccess SLR
-            # to access objects under the registered location.
-            "use_service_linked_role": True,
-        }
+        # Registering a *pool* bucket at its root would hand this product's
+        # LF service role access to every other tenant's data. With no
+        # ``path`` there is no prefix to scope to, so a referenced bucket
+        # registers nothing at all rather than silently widening; the
+        # missing prefix is the validator's to report (RFC file 9).
+        registers_pool_root = placement.bucket_referenced and not path
+        if not registers_pool_root:
+            loc_key = safe_ident(f"{cid}_lf_loc_{bucket}_{path or 'root'}")
+            resources.setdefault("aws_lakeformation_resource", {})[loc_key] = {
+                "arn": f"arn:aws:s3:::{bucket}/{path}" if path else f"arn:aws:s3:::{bucket}",
+                # ``use_service_linked_role: true`` is the default safe path
+                # — LF uses the AWSServiceRoleForLakeFormationDataAccess SLR
+                # to access objects under the registered location.
+                "use_service_linked_role": True,
+            }
 
     db_key = safe_ident(f"{cid}_{database}")
     table_key = safe_ident(f"{cid}_{database}_{table}") if table else None
@@ -1259,7 +1437,9 @@ def _emit_lakeformation(
             ]
         else:
             # Database-level grant when no table is bound.
-            body["database"] = [{"name": tofu_ref(f"aws_glue_catalog_database.{db_key}.name")}]
+            body["database"] = [
+                {"name": _glue_db_ref(db_key, database, referenced=placement.database_referenced)}
+            ]
         # Stable resource key — principal + perms hashed so multiple
         # grants on the same exposure don't collide.
         body_key = safe_ident(f"{cid}_lf_grant_{table or database}_{idx}")
@@ -1289,15 +1469,20 @@ def _emit_lakeformation(
         object_arn = f"arn:aws:s3:::{bucket}/{path}*" if path else f"arn:aws:s3:::{bucket}/*"
         statements: List[Dict[str, Any]] = []
         for sid_idx, p in enumerate(bucket_principals):
-            statements.append(
-                {
-                    "Sid": f"FluidLfBucketList{sid_idx}",
-                    "Effect": "Allow",
-                    "Principal": {"AWS": p},
-                    "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
-                    "Resource": bucket_arn,
-                }
-            )
+            list_statement: Dict[str, Any] = {
+                "Sid": f"FluidLfBucketList{sid_idx}",
+                "Effect": "Allow",
+                "Principal": {"AWS": p},
+                "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+                "Resource": bucket_arn,
+            }
+            if placement.bucket_referenced and path:
+                # ListBucket is inherently bucket-scoped, so on a shared pool
+                # it is narrowed with the standard ``s3:prefix`` condition —
+                # otherwise this product's consumers could enumerate every
+                # other tenant's keys in the pool.
+                list_statement["Condition"] = {"StringLike": {"s3:prefix": [f"{path}*"]}}
+            statements.append(list_statement)
             statements.append(
                 {
                     "Sid": f"FluidLfBucketGet{sid_idx}",
@@ -1313,8 +1498,13 @@ def _emit_lakeformation(
             separators=(",", ":"),
         )
         policy_key = safe_ident(f"{cid}_lf_bucket_policy_{bucket}")
+        # NOTE (v2): ``aws_s3_bucket_policy`` is authoritative for the whole
+        # bucket, so two products sharing one pool would each rewrite the
+        # other's policy on every apply. The prefix-scoped statements above
+        # keep each grant narrow, but a tenancy registry that detects the
+        # collision is RFC v2 work — flagged, not silently accepted.
         resources.setdefault("aws_s3_bucket_policy", {})[policy_key] = {
-            "bucket": tofu_ref(f"aws_s3_bucket.{bucket_key}.id"),
+            "bucket": _s3_bucket_ref(bucket_key, referenced=placement.bucket_referenced),
             "policy": policy_doc,
         }
 

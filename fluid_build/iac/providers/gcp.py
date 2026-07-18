@@ -12,15 +12,31 @@ Walks ``exposes[]`` and translates each ``binding.format`` into the
 matching ``hashicorp/google`` resource; ``metadata.policies`` becomes
 BigQuery dataset access entries and Cloud Storage IAM members. A pure
 function of the contract; no credentials, no network.
+
+**Packaging modes (RFC-packaging-modes.md file 4).** ``resolve_packaging``
+decides per container kind whether this contract owns the container:
+
+* ``LEGACY`` (no ``packaging`` block) — today's exact emit, byte-for-byte.
+* ``OWNED`` — the container is a managed resource, same as LEGACY.
+* ``REFERENCED`` — the container becomes a ``data`` source and the grants
+  move **down one level**, because a tenant must not widen a platform-owned
+  pool: a shared dataset drops its dataset-level ``access[]`` block (which
+  is authoritative — it would rewrite the pool's whole ACL) in favour of
+  per-table ``google_bigquery_table_iam_member``, and a shared bucket's IAM
+  members gain an object-prefix condition so the grant covers only this
+  product's ``location.path``. A shared bucket also carries no
+  ``force_destroy`` — it is not ours to destroy.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
+from ..packaging import ContainerDecision, PackagingResolution, resolve_packaging
 from ..versions import required_providers
 
 # FLUID column type → BigQuery type (best-effort; unknown types upper-cased).
@@ -150,6 +166,106 @@ def _gcs_member(principal: str) -> str:
     return f"user:{principal}"
 
 
+@dataclass(frozen=True)
+class _Placement:
+    """One exposure's resolved container ownership (see the module docstring)."""
+
+    dataset_referenced: bool
+    bucket_referenced: bool
+    pool: Optional[str]
+
+
+#: Every container LEGACY — today's emit path.
+_LEGACY_PLACEMENT = _Placement(dataset_referenced=False, bucket_referenced=False, pool=None)
+
+
+def _expose_id(exposure: Mapping[str, Any]) -> Optional[str]:
+    """The exposure's id, for the resolver's per-exposure override lookup."""
+    candidate = exposure.get("exposeId") or exposure.get("id")
+    return candidate if isinstance(candidate, str) and candidate else None
+
+
+def _placement(resolution: PackagingResolution, exposure: Mapping[str, Any]) -> _Placement:
+    """Resolve one exposure's placement from the packaging chokepoint."""
+    if resolution.is_legacy:
+        return _LEGACY_PLACEMENT
+    expose_id = _expose_id(exposure)
+    pool_exposure = resolution.exposure_for(expose_id) if expose_id else None
+    return _Placement(
+        dataset_referenced=(
+            resolution.decision_for("dataset", expose_id) is ContainerDecision.REFERENCED
+        ),
+        bucket_referenced=(
+            resolution.decision_for("bucket", expose_id) is ContainerDecision.REFERENCED
+        ),
+        pool=(pool_exposure.pool if pool_exposure is not None else resolution.pool),
+    )
+
+
+def _label_value(value: Any) -> str:
+    """Coerce a string into a valid GCP label value.
+
+    GCP label values allow lowercase letters, digits, ``-`` and ``_``, max 63
+    characters. Only ever applied to the emitter-controlled pool id.
+    """
+    cleaned = "".join(c if (c.isalnum() or c in "-_") else "-" for c in str(value).lower())
+    return cleaned[:63]
+
+
+def _labels_for(base: Mapping[str, str], placement: _Placement) -> Dict[str, str]:
+    """Contract labels plus ``fluid_pool`` when a packaging pool is in scope.
+
+    Absent a ``packaging`` block there is no pool, so every existing
+    contract's labels are unchanged.
+    """
+    labels = dict(base)
+    if placement.pool:
+        labels["fluid_pool"] = _label_value(placement.pool)
+    return labels
+
+
+def _cel_string(value: Any) -> str:
+    """Escape ``value`` for embedding inside a double-quoted CEL string literal.
+
+    SECURITY: the IAM condition below is a CEL *expression*, so contract
+    content interpolated into it must not be able to close the string literal
+    and append its own terms. An unescaped ``"`` in a ``path`` would turn
+    ``startsWith("…/x")`` into ``startsWith("…/x") || true || ("")`` —
+    widening a deliberately-narrow grant to every object in the pool, which
+    is the exact opposite of what the condition exists to do. Backslash first
+    (so an escaped quote is not double-escaped), then the quote; control
+    characters are dropped rather than escaped since no legitimate GCS object
+    prefix contains them.
+    """
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return "".join(ch for ch in text if ch >= " " and ch != "\x7f")
+
+
+def _object_prefix_condition(bucket: str, path: Any) -> Optional[Dict[str, str]]:
+    """An IAM condition narrowing a bucket-wide grant to one object prefix.
+
+    A shared bucket's IAM is bucket-scoped, so a tenant grant would otherwise
+    reach every other tenant's objects. GCP's documented narrowing idiom is a
+    condition on ``resource.name.startsWith`` against the object's full
+    resource path. Returns ``None`` when the binding declares no ``path`` —
+    there is then no prefix to scope to and the grant stays bucket-wide
+    (surfaced by the validator, RFC file 9).
+
+    Requires uniform bucket-level access on the pool bucket (IAM conditions
+    are not evaluated for legacy ACLs) — a documented precondition of shared
+    GCS pools.
+    """
+    prefix = str(path or "").strip().lstrip("/")
+    if not prefix:
+        return None
+    resource = f"projects/_/buckets/{_cel_string(bucket)}/objects/{_cel_string(prefix)}"
+    return {
+        "title": "fluid-object-prefix",
+        "description": f"Limit access to objects under {prefix}",
+        "expression": f'resource.name.startsWith("{resource}")',
+    }
+
+
 class GcpIacPlugin:
     """``IacProviderPlugin`` for Google Cloud."""
 
@@ -177,16 +293,19 @@ class GcpIacPlugin:
     ) -> Dict[str, Any]:
         resources: Dict[str, Dict[str, Any]] = {}
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
-        labels = {"managed_by": "fluid", "fluid_contract": cid}
+        base_labels = {"managed_by": "fluid", "fluid_contract": cid}
         # `metadata.policies` is contract-global access control — it
         # applies to every exposure's resource.
         policies = (contract.get("metadata") or {}).get("policies") or {}
+        packaging = resolve_packaging(contract)
 
         for exposure in contract.get("exposes") or []:
             binding = exposure.get("binding") or {}
             fmt = binding.get("format")
             loc = binding.get("location") or {}
             schema = (exposure.get("contract") or {}).get("schema") or []
+            placement = _placement(packaging, exposure)
+            labels = _labels_for(base_labels, placement)
             if fmt in ("bigquery_table", "bigquery_view"):
                 _emit_bigquery(
                     resources,
@@ -197,9 +316,10 @@ class GcpIacPlugin:
                     labels,
                     is_view=(fmt == "bigquery_view"),
                     policies=policies,
+                    placement=placement,
                 )
             elif fmt == "gcs_bucket":
-                _emit_gcs(resources, loc, cid, labels, policies=policies)
+                _emit_gcs(resources, loc, cid, labels, policies=policies, placement=placement)
             elif fmt == "pubsub_topic":
                 _emit_pubsub(resources, loc, cid, labels)
         # Cloud Run / Cloud Scheduler / Pub-Sub event resources — the
@@ -211,8 +331,39 @@ class GcpIacPlugin:
     def emit_data(
         self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()
     ) -> Dict[str, Any]:
-        """GCP emits only ``resource`` blocks — no ``data`` sub-tree."""
-        return {}
+        """``data`` sources for REFERENCED (platform-owned pool) containers.
+
+        Empty for every LEGACY contract — GCP emitted only ``resource``
+        blocks before packaging modes, and still does absent a ``packaging``
+        block. Under ``shared`` the pool dataset / bucket is looked up rather
+        than created, so ``tofu`` never plans to manage or destroy it, and
+        :func:`_emit_bigquery` / :func:`_emit_gcs` point their leaf resources
+        at these addresses.
+        """
+        cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        packaging = resolve_packaging(contract)
+        if packaging.is_legacy:
+            return {}
+        data: Dict[str, Dict[str, Any]] = {}
+        for exposure in contract.get("exposes") or []:
+            binding = exposure.get("binding") or {}
+            # Dispatch on ``format`` exactly as :meth:`emit` does — the two
+            # must agree, or a container is either looked up but unused
+            # (orphan data source) or referenced but never declared.
+            fmt = binding.get("format")
+            loc = binding.get("location") or {}
+            placement = _placement(packaging, exposure)
+            if fmt in ("bigquery_table", "bigquery_view") and placement.dataset_referenced:
+                dataset = loc.get("dataset") or "default"
+                data.setdefault("google_bigquery_dataset", {}).setdefault(
+                    safe_ident(f"{cid}_{dataset}"), {"dataset_id": dataset}
+                )
+            elif fmt == "gcs_bucket" and placement.bucket_referenced:
+                bucket = loc.get("bucket") or f"{cid}-bucket"
+                data.setdefault("google_storage_bucket", {}).setdefault(
+                    safe_ident(f"{cid}_{bucket}"), {"name": bucket}
+                )
+        return data
 
     def credential_env(self, env: Mapping[str, str]) -> Dict[str, str]:
         """The ``hashicorp/google`` provider reads the standard ``GOOGLE_*``
@@ -245,10 +396,16 @@ class GcpIacPlugin:
         project id; until then the placeholder is interpolated
         upstream by the apply engine's env (the placeholder ``_``
         is rejected by the provider, so we use the env-var lookup).
+
+        REFERENCED containers are excluded: a shared dataset / bucket is a
+        platform-owned pool, and ``tofu import``-ing it would adopt it into
+        this product's state — re-owning infrastructure the contract
+        explicitly declared it does not own (RFC file 4).
         """
         import os
 
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        packaging = resolve_packaging(contract)
         project = (
             os.environ.get("GOOGLE_PROJECT")
             or os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -268,6 +425,7 @@ class GcpIacPlugin:
             if binding.get("platform") != "gcp":
                 continue
             loc = binding.get("location") or {}
+            placement = _placement(packaging, exposure)
             dataset = loc.get("dataset")
             table = loc.get("table") or loc.get("view")
             bucket = loc.get("bucket")
@@ -276,7 +434,8 @@ class GcpIacPlugin:
             if dataset:
                 ds_key = safe_ident(f"{cid}_{dataset}")
                 ds_id = f"projects/{project}/datasets/{dataset}" if project else dataset
-                _add(f"google_bigquery_dataset.{ds_key}", ds_id)
+                if not placement.dataset_referenced:
+                    _add(f"google_bigquery_dataset.{ds_key}", ds_id)
                 if table:
                     tbl_key = safe_ident(f"{cid}_{table}")
                     tbl_id = (
@@ -286,7 +445,7 @@ class GcpIacPlugin:
                     )
                     _add(f"google_bigquery_table.{tbl_key}", tbl_id)
 
-            if bucket:
+            if bucket and not placement.bucket_referenced:
                 bkt_key = safe_ident(f"{cid}_{bucket}")
                 _add(f"google_storage_bucket.{bkt_key}", bucket)
 
@@ -313,26 +472,36 @@ def _emit_bigquery(
     *,
     is_view: bool,
     policies: Mapping[str, Any],
+    placement: _Placement = _LEGACY_PLACEMENT,
 ) -> None:
     dataset = loc.get("dataset") or "default"
     table = loc.get("table") or loc.get("view") or exposure.get("exposeId") or "table"
     ds_name = safe_ident(f"{cid}_{dataset}")
     tbl_name = safe_ident(f"{cid}_{table}")
 
-    dataset_body: Dict[str, Any] = {
-        "dataset_id": dataset,
-        "location": loc.get("region") or loc.get("location") or "US",
-        "labels": labels,
-    }
-    # `metadata.policies` → the dataset ACL (mirrors the retired native
-    # `iam.bind_bq_dataset`, which appended BigQuery access entries).
-    access = _bq_access_entries(policies)
-    if access:
-        dataset_body["access"] = access
-    resources.setdefault("google_bigquery_dataset", {}).setdefault(ds_name, dataset_body)
+    if placement.dataset_referenced:
+        # Shared pool dataset: looked up (see ``emit_data``), never created.
+        # The dataset-level ``access[]`` block is deliberately NOT emitted —
+        # it is authoritative in the BigQuery API, so a tenant writing it
+        # would replace the pool's entire ACL and evict its other tenants.
+        # The same grants move down to table level instead.
+        ds_ref: Any = tofu_ref(f"data.google_bigquery_dataset.{ds_name}.dataset_id")
+    else:
+        dataset_body: Dict[str, Any] = {
+            "dataset_id": dataset,
+            "location": loc.get("region") or loc.get("location") or "US",
+            "labels": labels,
+        }
+        # `metadata.policies` → the dataset ACL (mirrors the retired native
+        # `iam.bind_bq_dataset`, which appended BigQuery access entries).
+        access = _bq_access_entries(policies)
+        if access:
+            dataset_body["access"] = access
+        resources.setdefault("google_bigquery_dataset", {}).setdefault(ds_name, dataset_body)
+        ds_ref = tofu_ref(f"google_bigquery_dataset.{ds_name}.dataset_id")
 
     body: Dict[str, Any] = {
-        "dataset_id": tofu_ref(f"google_bigquery_dataset.{ds_name}.dataset_id"),
+        "dataset_id": ds_ref,
         "table_id": table,
         "labels": labels,
         # Let `tofu destroy` clean the table — the spike applies and destroys.
@@ -343,6 +512,21 @@ def _emit_bigquery(
     elif schema:
         body["schema"] = _bq_schema(schema)
     resources.setdefault("google_bigquery_table", {})[tbl_name] = body
+
+    # Table-level IAM replaces the suppressed dataset ACL under shared mode:
+    # the same principals, the same intent, the narrowest scope that still
+    # grants it (RFC §Security — "GCP grants move to table level").
+    if placement.dataset_referenced:
+        for role, principal in _policy_grants(policies, _BQ_TABLE_IAM_ROLES):
+            member = _gcs_member(principal)
+            resources.setdefault("google_bigquery_table_iam_member", {})[
+                safe_ident(f"{cid}_{dataset}_{table}_{role}_{member}")
+            ] = {
+                "dataset_id": ds_ref,
+                "table_id": tofu_ref(f"google_bigquery_table.{tbl_name}.table_id"),
+                "role": role,
+                "member": member,
+            }
 
     # Cross-project access works through the existing ``metadata.policies``
     # surface and the ``_bq_access_entries`` helper: a service-account
@@ -359,26 +543,40 @@ def _emit_gcs(
     labels: Dict[str, str],
     *,
     policies: Mapping[str, Any],
+    placement: _Placement = _LEGACY_PLACEMENT,
 ) -> None:
     bucket = loc.get("bucket") or f"{cid}-bucket"
     bkt_res = safe_ident(f"{cid}_{bucket}")
-    resources.setdefault("google_storage_bucket", {})[bkt_res] = {
-        "name": bucket,
-        "location": loc.get("region") or loc.get("location") or "US",
-        "uniform_bucket_level_access": True,
-        "force_destroy": True,
-        "labels": labels,
-    }
+    if placement.bucket_referenced:
+        # Shared pool bucket: looked up (see ``emit_data``), never created —
+        # and notably carrying no ``force_destroy``, which on a pool would
+        # let one tenant's `tofu destroy` empty every tenant's objects.
+        bkt_ref: Any = tofu_ref(f"data.google_storage_bucket.{bkt_res}.name")
+    else:
+        resources.setdefault("google_storage_bucket", {})[bkt_res] = {
+            "name": bucket,
+            "location": loc.get("region") or loc.get("location") or "US",
+            "uniform_bucket_level_access": True,
+            "force_destroy": True,
+            "labels": labels,
+        }
+        bkt_ref = tofu_ref(f"google_storage_bucket.{bkt_res}.name")
     # `metadata.policies` → additive bucket IAM members (mirrors the
     # retired native `iam.bind_gcs_bucket`).
+    condition = (
+        _object_prefix_condition(bucket, loc.get("path")) if placement.bucket_referenced else None
+    )
     for role, principal in _policy_grants(policies, _GCS_PERMISSION_ROLES):
         member = _gcs_member(principal)
         name = safe_ident(f"{cid}_{bucket}_{role}_{member}")
-        resources.setdefault("google_storage_bucket_iam_member", {})[name] = {
-            "bucket": tofu_ref(f"google_storage_bucket.{bkt_res}.name"),
+        member_body: Dict[str, Any] = {
+            "bucket": bkt_ref,
             "role": role,
             "member": member,
         }
+        if condition:
+            member_body["condition"] = condition
+        resources.setdefault("google_storage_bucket_iam_member", {})[name] = member_body
 
 
 def _emit_pubsub(
