@@ -62,6 +62,7 @@ class DbtEngine(TransformationEngine):
         workspace_root: Optional[Path] = None,
         output_dir: Optional[Path] = None,
         mesh_hub: Optional[str] = None,
+        model_contracts: bool = False,
     ) -> GenerationResult:
         files: GenerationResult = {}
 
@@ -100,7 +101,17 @@ class DbtEngine(TransformationEngine):
         # can collide with provider-authored or scaffold-authored model docs.
         technique = transformation_intent.data_modeling_technique if transformation_intent else None
         if technique not in {"data_vault_2", "dimensional"}:
-            schema_files = generate_schema_yml(contract, mesh_hub=mesh_hub)
+            # ``--model-contracts`` (opt-in): emit dbt model contracts on the
+            # expose models. data_type must be adapter-correct (BigQuery has
+            # no varchar), so resolve the adapter from the build's platform.
+            from . import _types as _types
+
+            schema_files = generate_schema_yml(
+                contract,
+                mesh_hub=mesh_hub,
+                model_contracts=model_contracts,
+                adapter=_types.adapter_for_build(build),
+            )
             files.update(schema_files)
         elif mesh_hub:
             # DV2 / dimensional techniques own schema.yml themselves.

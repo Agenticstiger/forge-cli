@@ -19,6 +19,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from ..base import GenerationResult, TransformationIntent
+
+# Module attribute access (``_types.sql_type``) so test patches on
+# ``fluid_build.engines.dbt._types`` flow through to every call site.
+from . import _types as _types
 from .sources import _normalize_placeholder as _rewrite_env_to_dbt
 
 _HEADER = (
@@ -312,24 +316,10 @@ def _extract_schema_columns(expose: Dict[str, Any]) -> List[Dict[str, str]]:
 
 
 def _sql_type(fluid_type: str) -> str:
-    """Map FLUID type to SQL type for skeleton casts."""
-    mapping = {
-        "string": "varchar",
-        "STRING": "varchar",
-        "integer": "integer",
-        "INTEGER": "integer",
-        "number": "numeric",
-        "NUMBER": "numeric",
-        "float": "numeric",
-        "FLOAT": "numeric",
-        "boolean": "boolean",
-        "BOOLEAN": "boolean",
-        "date": "date",
-        "DATE": "date",
-        "timestamp": "timestamp",
-        "TIMESTAMP": "timestamp",
-        "datetime": "timestamp",
-        "array": "varchar",  # fallback
-        "object": "varchar",  # fallback
-    }
-    return mapping.get(fluid_type, "varchar")
+    """Map FLUID type to SQL type for skeleton casts.
+
+    The mapping table now lives in :mod:`._types` (shared with the
+    model-contract ``data_type`` emission in ``schema_yml.py``); the
+    default generic table reproduces the historical behavior exactly.
+    """
+    return _types.sql_type(fluid_type)
