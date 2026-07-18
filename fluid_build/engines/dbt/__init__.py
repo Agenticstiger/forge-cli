@@ -126,6 +126,13 @@ class DbtEngine(TransformationEngine):
         if profiles_content:
             files["profiles.yml"] = profiles_content
 
+        # models/semantic_models.yml — MetricFlow bridge from the contract's
+        # exposes[*].semantics block (entities/measures/dimensions/metrics).
+        # Graceful no-op when no expose carries semantics.
+        from .semantic_models import generate_semantic_models
+
+        files.update(generate_semantic_models(contract))
+
         # packages.yml — pin the dbt packages any emitted test/model actually
         # references (dbt_utils / dbt_expectations), so the project passes
         # `dbt deps` + `dbt parse` out of the box. Emitted only when needed;
