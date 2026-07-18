@@ -9,9 +9,13 @@
 """GCP IaC plugin — FLUID contract → BigQuery / GCS / Pub-Sub / IAM ``.tf.json``.
 
 Walks ``exposes[]`` and translates each ``binding.format`` into the
-matching ``hashicorp/google`` resource; ``metadata.policies`` becomes
-BigQuery dataset access entries and Cloud Storage IAM members. A pure
-function of the contract; no credentials, no network.
+matching ``hashicorp/google`` resource; the contract's **access grants**
+become BigQuery dataset access entries and Cloud Storage IAM members. A
+pure function of the contract; no credentials, no network.
+
+Access grants are read through :mod:`fluid_build.iac.access`, which prefers
+the schema-valid ``accessPolicy`` surface and still accepts the deprecated
+``metadata.policies`` for back-compat — see that module for why.
 
 **Packaging modes (RFC-packaging-modes.md file 4).** ``resolve_packaging``
 decides per container kind whether this contract owns the container:
@@ -32,8 +36,15 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from ..access import (
+    GROUP,
+    AccessGrant,
+    grants_from_legacy_policies,
+    normalize_access_grants,
+    role_grants,
+)
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
 from ..packaging import (
@@ -125,45 +136,40 @@ def _bq_schema(schema: List[Mapping[str, Any]]) -> str:
     return json.dumps(fields, sort_keys=True)
 
 
-def _policy_grants(
-    policies: Mapping[str, Any], role_map: Mapping[str, str]
-) -> Iterator[Tuple[str, str]]:
-    """Yield deduplicated ``(role, principal)`` pairs from ``metadata.policies``.
+def _bq_access_entries(grants: Sequence[AccessGrant]) -> List[Dict[str, str]]:
+    """Normalized grants → a ``google_bigquery_dataset`` ``access`` block.
 
-    Each policy carries ``principals`` (a list of emails) and
-    ``permissions`` (FLUID verbs); ``role_map`` maps each verb to the
-    cloud role. Unmapped verbs are skipped.
+    The BigQuery field is chosen from the grant's **declared** principal
+    type rather than guessed from the string. The previous heuristic
+    (``"@" in principal`` → user, else group) mis-filed every group as
+    ``user_by_email``, since group addresses contain ``@`` too.
+
+    Service accounts use ``user_by_email`` — BigQuery's own convention for
+    SA identities, and what makes a cross-project grant to
+    ``consumer@other-project.iam.gserviceaccount.com`` work.
     """
-    seen = set()
-    for policy_config in (policies or {}).values():
-        if not isinstance(policy_config, Mapping):
-            continue
-        principals = policy_config.get("principals") or []
-        permissions = policy_config.get("permissions") or []
-        for permission in permissions:
-            role = role_map.get(str(permission).strip().lower())
-            if not role:
-                continue
-            for principal in principals:
-                if not principal:
-                    continue
-                key = (role, str(principal))
-                if key not in seen:
-                    seen.add(key)
-                    yield key
-
-
-def _bq_access_entries(policies: Mapping[str, Any]) -> List[Dict[str, str]]:
-    """``metadata.policies`` → a ``google_bigquery_dataset`` ``access`` block."""
     entries = []
-    for role, principal in _policy_grants(policies, _BQ_PERMISSION_ROLES):
-        field = "user_by_email" if "@" in principal else "group_by_email"
-        entries.append({"role": role, field: principal})
+    for role, grant in role_grants(grants, _BQ_PERMISSION_ROLES):
+        field = "group_by_email" if grant.principal_type == GROUP else "user_by_email"
+        entries.append({"role": role, field: grant.principal})
     return sorted(entries, key=lambda e: json.dumps(e, sort_keys=True))
 
 
-def _gcs_member(principal: str) -> str:
-    """Format a principal as a Cloud Storage IAM member string."""
+def _gcs_member(grant: AccessGrant) -> str:
+    """Format a normalized grant as a Cloud Storage IAM member string.
+
+    The type is declared by ``accessPolicy`` (or inferred once, centrally,
+    for the deprecated surface) — see :mod:`fluid_build.iac.access`.
+    """
+    return f"{grant.principal_type}:{grant.principal}"
+
+
+def _legacy_gcs_member(principal: str) -> str:
+    """Deprecated shim: format a bare principal string as an IAM member.
+
+    Retained only for out-of-tree callers that pass a raw string; new code
+    passes an :class:`AccessGrant` to :func:`_gcs_member`.
+    """
     if "@" not in principal:
         return f"group:{principal}"
     if principal.lower().endswith(".gserviceaccount.com"):
@@ -299,9 +305,11 @@ class GcpIacPlugin:
         resources: Dict[str, Dict[str, Any]] = {}
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
         base_labels = {"managed_by": "fluid", "fluid_contract": cid}
-        # `metadata.policies` is contract-global access control — it
-        # applies to every exposure's resource.
-        policies = (contract.get("metadata") or {}).get("policies") or {}
+        # Contract-global access control applies to every exposure's
+        # resource. Read from the schema-valid `accessPolicy` surface, with
+        # the deprecated (schema-invalid) `metadata.policies` appended for
+        # back-compat — see `iac/access.py` for why that split exists.
+        grants = normalize_access_grants(contract)
         packaging = resolve_packaging(contract)
 
         for exposure in contract.get("exposes") or []:
@@ -320,11 +328,11 @@ class GcpIacPlugin:
                     cid,
                     labels,
                     is_view=(fmt == "bigquery_view"),
-                    policies=policies,
+                    grants=grants,
                     placement=placement,
                 )
             elif fmt == "gcs_bucket":
-                _emit_gcs(resources, loc, cid, labels, policies=policies, placement=placement)
+                _emit_gcs(resources, loc, cid, labels, grants=grants, placement=placement)
             elif fmt == "pubsub_topic":
                 _emit_pubsub(resources, loc, cid, labels)
         # Cloud Run / Cloud Scheduler / Pub-Sub event resources — the
@@ -476,7 +484,7 @@ def _emit_bigquery(
     labels: Dict[str, str],
     *,
     is_view: bool,
-    policies: Mapping[str, Any],
+    grants: Sequence[AccessGrant],
     placement: _Placement = _LEGACY_PLACEMENT,
 ) -> None:
     dataset = loc.get("dataset") or "default"
@@ -497,9 +505,9 @@ def _emit_bigquery(
             "location": loc.get("region") or loc.get("location") or "US",
             "labels": labels,
         }
-        # `metadata.policies` → the dataset ACL (mirrors the retired native
+        # Access grants → the dataset ACL (mirrors the retired native
         # `iam.bind_bq_dataset`, which appended BigQuery access entries).
-        access = _bq_access_entries(policies)
+        access = _bq_access_entries(grants)
         if access:
             dataset_body["access"] = access
         resources.setdefault("google_bigquery_dataset", {}).setdefault(ds_name, dataset_body)
@@ -522,8 +530,8 @@ def _emit_bigquery(
     # the same principals, the same intent, the narrowest scope that still
     # grants it (RFC §Security — "GCP grants move to table level").
     if placement.dataset_referenced:
-        for role, principal in _policy_grants(policies, _BQ_TABLE_IAM_ROLES):
-            member = _gcs_member(principal)
+        for role, grant in role_grants(grants, _BQ_TABLE_IAM_ROLES):
+            member = _gcs_member(grant)
             resources.setdefault("google_bigquery_table_iam_member", {})[
                 safe_ident(f"{cid}_{dataset}_{table}_{role}_{member}")
             ] = {
@@ -533,12 +541,13 @@ def _emit_bigquery(
                 "member": member,
             }
 
-    # Cross-project access works through the existing ``metadata.policies``
-    # surface and the ``_bq_access_entries`` helper: a service-account
-    # email like ``consumer@other-project.iam.gserviceaccount.com`` is
-    # accepted by BQ's ``user_by_email`` field on the dataset's access[]
-    # block. Zero new schema fields needed — see ``_bq_access_entries``
-    # at the top of this module.
+    # Cross-project access needs no new schema fields: declare the consumer
+    # in ``accessPolicy.grants[]`` as
+    # ``serviceAccount:consumer@other-project.iam.gserviceaccount.com`` and
+    # the email lands in BQ's ``user_by_email`` field on the dataset's
+    # ``access[]`` block. (``accessPolicy`` is the schema-valid surface;
+    # ``metadata.policies`` also emits but fails ``fluid validate`` — see
+    # ``iac/access.py``.)
 
 
 def _emit_gcs(
@@ -547,7 +556,7 @@ def _emit_gcs(
     cid: str,
     labels: Dict[str, str],
     *,
-    policies: Mapping[str, Any],
+    grants: Sequence[AccessGrant],
     placement: _Placement = _LEGACY_PLACEMENT,
 ) -> None:
     bucket = loc.get("bucket") or f"{cid}-bucket"
@@ -566,13 +575,13 @@ def _emit_gcs(
             "labels": labels,
         }
         bkt_ref = tofu_ref(f"google_storage_bucket.{bkt_res}.name")
-    # `metadata.policies` → additive bucket IAM members (mirrors the
-    # retired native `iam.bind_gcs_bucket`).
+    # Access grants → additive bucket IAM members (mirrors the retired
+    # native `iam.bind_gcs_bucket`).
     condition = (
         _object_prefix_condition(bucket, loc.get("path")) if placement.bucket_referenced else None
     )
-    grants = list(_policy_grants(policies, _GCS_PERMISSION_ROLES))
-    if grants and placement.bucket_referenced and condition is None:
+    bucket_grants = role_grants(grants, _GCS_PERMISSION_ROLES)
+    if bucket_grants and placement.bucket_referenced and condition is None:
         # SECURITY: bucket IAM on GCS is bucket-scoped. Without a prefix
         # condition the member reads every tenant's objects in the pool —
         # the grant silently degrades to exactly what shared mode exists to
@@ -582,14 +591,14 @@ def _emit_gcs(
         # away to an empty prefix and would look scoped to a reviewer.
         raise PackagingError(
             "shared-bucket-requires-path",
-            f"bucket {bucket!r} is shared (pool) and `metadata.policies` grants "
+            f"bucket {bucket!r} is shared (pool) and the contract grants "
             "access to it, but the binding declares no usable `location.path` — a "
             "bucket-level IAM grant on a pool would reach every other tenant's "
             "objects. Add a `location.path` prefix, or declare the bucket "
             "`isolated` if this product really owns it.",
         )
-    for role, principal in grants:
-        member = _gcs_member(principal)
+    for role, grant in bucket_grants:
+        member = _gcs_member(grant)
         name = safe_ident(f"{cid}_{bucket}_{role}_{member}")
         member_body: Dict[str, Any] = {
             "bucket": bkt_ref,
@@ -801,8 +810,9 @@ def _emit_bq_table_iam(resources: Dict[str, Any], action: Mapping[str, Any], cid
     table = action.get("table")
     if not (dataset and table):
         return
-    for role, principal in _policy_grants(action.get("policies") or {}, _BQ_TABLE_IAM_ROLES):
-        member = _gcs_member(principal)
+    action_grants = grants_from_legacy_policies(action.get("policies"))
+    for role, grant in role_grants(action_grants, _BQ_TABLE_IAM_ROLES):
+        member = _gcs_member(grant)
         name = safe_ident(f"{cid}_{dataset}_{table}_{role}_{member}")
         resources.setdefault("google_bigquery_table_iam_member", {})[name] = {
             "dataset_id": dataset,
