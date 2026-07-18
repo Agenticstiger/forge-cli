@@ -82,7 +82,7 @@ LOG = logging.getLogger("fluid.cli.discover.jdbc")
 class IntrospectedColumn:
     """One column's metadata as introspected from the source.
 
-    Adapted from the OSI v0.1.1 / catalog ``CatalogColumn`` shape
+    Adapted from the OSI (Apache Ossie) / catalog ``CatalogColumn`` shape
     (see ``fluid_build/copilot/catalog/models.py``). Optional
     precision / scale / character_maximum_length fields are
     captured directly from ``information_schema.columns`` so the

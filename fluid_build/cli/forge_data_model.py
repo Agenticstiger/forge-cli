@@ -36,7 +36,7 @@ from fluid_build.forge_datamodel.emit.coverage import compute_canonical_coverage
 from fluid_build.forge_datamodel.emit.ddl import emit_ddl_files
 from fluid_build.forge_datamodel.emit.fluid_contract import build_contract_from_logical
 from fluid_build.forge_datamodel.emit.model_doc import emit_model_markdown
-from fluid_build.forge_datamodel.emit.osi_sidecar import emit_osi_yaml
+from fluid_build.forge_datamodel.emit.osi_sidecar import emit_osi_json, emit_osi_yaml
 from fluid_build.forge_datamodel.emit.validator import FluidContractValidator
 from fluid_build.forge_datamodel.emit.variants import emit_dimensional_variants
 from fluid_build.forge_datamodel.from_intent.intent_loader import (
@@ -209,7 +209,21 @@ def _add_common_generation_args(
         "--emit-osi-sidecar",
         action="store_true",
         default=True,
-        help="Write a standalone *.semantics.osi.yaml file alongside the contract",
+        help=(
+            "Write a standalone Apache Ossie (OSI) interchange document "
+            "(*.semantics.osi.yaml) alongside the contract"
+        ),
+    )
+    parser.add_argument(
+        "--osi-sidecar-format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help=(
+            "Serialization for the OSI sidecar. 'json' emits the shape dbt Core "
+            "(v1.12+) reads natively — drop the file in your dbt project's OSI/ "
+            "directory (or point osi-paths at it) to query the semantic model "
+            "through dbt with no conversion step"
+        ),
     )
     parser.add_argument(
         "--deterministic",
@@ -1409,8 +1423,10 @@ def diff_logical_models(old_path: Path, new_path: Path) -> dict:
 
 def _write_auxiliary_artifacts(args: Any, *, output_path: Path, logical: LogicalDraft) -> None:
     if getattr(args, "emit_osi_sidecar", True):
-        osi_path = output_path.with_suffix(output_path.suffix + ".semantics.osi.yaml")
-        osi_path.write_text(emit_osi_yaml(logical), encoding="utf-8")
+        osi_format = getattr(args, "osi_sidecar_format", "yaml") or "yaml"
+        osi_path = output_path.with_suffix(output_path.suffix + f".semantics.osi.{osi_format}")
+        emitter = emit_osi_json if osi_format == "json" else emit_osi_yaml
+        osi_path.write_text(emitter(logical), encoding="utf-8")
         cprint(f"[green]Wrote OSI sidecar[/green] {osi_path}")
 
     ddl_dir = getattr(args, "emit_ddl_dir", None)

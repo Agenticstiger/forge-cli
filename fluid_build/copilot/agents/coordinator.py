@@ -1362,10 +1362,10 @@ class StageCoordinator(_RepairLoopMixin):
            walks every OSI ``expression.dialects[]`` array, fills
            in missing dialects from the deterministic mapper, and
            flags drift. Runs against the OSI-supported dialect set
-           (``ANSI_SQL | SNOWFLAKE | DATABRICKS``) so the back-fill
-           can be safely written back into the model.
+           (``ANSI_SQL | SNOWFLAKE | BIGQUERY | DATABRICKS``) so the
+           back-fill can be safely written back into the model.
         2. **Standards lint.** ``ConformanceAgent.run`` validates
-           the contract against Fluid 0.7.2 + OSI v0.1.1
+           the contract against the Fluid + OSI (Apache Ossie)
            schemas. Findings are appended to
            ``session.discovery_report`` (or logged at INFO when
            no discovery report is attached) so operators see
