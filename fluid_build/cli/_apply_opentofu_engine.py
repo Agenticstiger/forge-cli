@@ -127,6 +127,13 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     if not init.ok:
         raise CLIError(1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)})
 
+    # Pre-plan ownership-transition guard (RFC-packaging-modes.md file 10).
+    # Runs BEFORE _adopt_existing — brownfield adoption is precisely the
+    # mechanism that would re-own a shared pool — and before `tofu plan`,
+    # which is where an ownership flip would otherwise first surface as a
+    # destroy.
+    _guard_packaging_transitions(contract, str(workdir), env, args, logger)
+
     _adopt_existing(plugin, contract, actions, str(workdir), env, logger)
 
     plan = runner.tofu_plan(str(workdir), env=env)
@@ -326,6 +333,59 @@ def _adopt_existing(
             )
     if adopted:
         cprint(f"  brownfield:  adopted {adopted} pre-existing resource(s) into state")
+
+
+def _guard_packaging_transitions(
+    contract: Mapping[str, Any],
+    workdir: str,
+    env: Mapping[str, str],
+    args,
+    logger: logging.Logger,
+) -> None:
+    """Fail closed when a container's ownership would flip under existing state.
+
+    Thin CLI adapter over ``iac.transition.guard_ownership_transitions``:
+    the detection + remediation text live in ``iac/`` (no ``cli`` imports
+    there), and this side owns the ``CLIError`` translation and the
+    structured audit events the run record carries.
+
+    A no-op for every contract without a ``packaging`` block (the LEGACY
+    sentinel can never transition) and for a fresh workdir with no state.
+    """
+    from fluid_build.iac.transition import (
+        PackagingTransitionError,
+        guard_ownership_transitions,
+    )
+
+    state = runner.tofu_state_list(workdir, env=env)
+    if not state:
+        return
+    try:
+        adoptions = guard_ownership_transitions(
+            contract,
+            state,
+            workdir=workdir,
+            adopt_shared_container=bool(getattr(args, "adopt_shared_container", False)),
+            logger=logger,
+        )
+    except PackagingTransitionError as exc:
+        # Structured audit event BEFORE the raise, so the run record shows
+        # the blocked transition even though the apply never proceeded.
+        info(logger, "packaging_transition_blocked", **exc.event_fields())
+        raise CLIError(
+            1,
+            "packaging_transition_blocked",
+            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+        )
+    if adoptions:
+        # WARNING-level audit trail for the override — same discipline as
+        # ``opentofu_destructive_gate_override``.
+        info(
+            logger,
+            "packaging_adoption_override",
+            containers=[t.as_event() for t in adoptions],
+            count=len(adoptions),
+        )
 
 
 def _data_loss_blocked(changes: Mapping[str, int], allow_data_loss: bool) -> bool:

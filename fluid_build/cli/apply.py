@@ -339,6 +339,16 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     mode_group.add_argument(
+        "--adopt-shared-container",
+        action="store_true",
+        default=False,
+        help=(
+            "Confirm taking OWNERSHIP of a container this contract previously "
+            "referenced as a shared pool (packaging shared -> isolated). Logs a "
+            "WARNING-level audit event; the data-loss gate still applies."
+        ),
+    )
+    mode_group.add_argument(
         "--bundle",
         default=None,
         help=(

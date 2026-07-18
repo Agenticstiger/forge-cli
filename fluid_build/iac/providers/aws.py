@@ -221,6 +221,41 @@ def _require_pool_prefix(placement: _Placement, path: str, *, what: str) -> None
         )
 
 
+def _referenced_bucket_name(loc: Mapping[str, Any]) -> str:
+    """The canonical name of a **shared (pool)** S3 bucket.
+
+    THE one derivation for a REFERENCED bucket — used by
+    :func:`_emit_referenced_containers` for the ``data.aws_s3_bucket`` key
+    and by :func:`_emit_lakeformation` for every reference to it. PR2
+    shipped these two sides on different resolvers (``normalize_location``
+    vs the raw contract value), so a ``{{ env.* }}`` bucket declared the
+    lookup under one key and referenced it under another — a dangling
+    ``${data.aws_s3_bucket.…}`` that fails ``tofu validate``. One function,
+    one answer.
+
+    **Fails closed on an unresolvable name.** ``normalize_location`` falls
+    back to ``{account}-fluid-data`` when the template does not resolve,
+    which is right for a bucket this product *owns* and wrong for a pool:
+    it would silently point the product at a different bucket than the one
+    it declared, and register LF / bucket-policy grants there. A pool must
+    be addressable — the same discipline as the resolver's ``pool-required``
+    and :func:`_require_pool_prefix`.
+    """
+    bucket, _ = _warehouse.normalize_location(
+        loc, account_ref=_CALLER_ACCOUNT_TOKEN, default_path=False
+    )
+    if "{{" in bucket or _CALLER_ACCOUNT_TOKEN in bucket:
+        raise PackagingError(
+            "shared-bucket-unresolved",
+            f"the shared (pool) bucket {loc.get('bucket')!r} could not be resolved to a "
+            "concrete name — a pool bucket must be addressable, and falling back to the "
+            "`{account}-fluid-data` bucket would point this product at storage it never "
+            "declared. Set the environment variable the template names, write the bucket "
+            "name literally, or declare the bucket `isolated` if this product owns it.",
+        )
+    return bucket
+
+
 def _glue_db_ref(db_name: str, database: Any, *, referenced: bool) -> Any:
     """How a consumer addresses the Glue catalog database.
 
@@ -531,8 +566,11 @@ def _emit_referenced_containers(
         # ``hashicorp/aws`` has no ``aws_glue_catalog_database`` data source,
         # so consumers inline the literal name instead (see
         # :func:`_glue_db_ref`). Only the S3 bucket is looked up.
-        bucket = loc.get("bucket")
-        if bucket and placement.bucket_referenced:
+        if loc.get("bucket") and placement.bucket_referenced:
+            # Resolved through the single canonical derivation so the key
+            # here and the ``${data.aws_s3_bucket.<key>.id}`` references
+            # ``_emit_lakeformation`` writes can never disagree.
+            bucket = _referenced_bucket_name(loc)
             data.setdefault("aws_s3_bucket", {}).setdefault(
                 safe_ident(f"{cid}_{bucket}"), {"bucket": bucket}
             )
@@ -1391,19 +1429,30 @@ def _emit_lakeformation(
     if not database:
         return
 
-    bucket = loc.get("bucket")
+    # Resolve the bucket ONCE, up front, through the same derivation the
+    # ``data.aws_s3_bucket`` lookup uses (:func:`_referenced_bucket_name` for a
+    # pool; ``normalize_location`` otherwise) — PR2 resolved it only inside the
+    # ``registerLocation`` branch, so a grants-only binding keyed the bucket
+    # policy off the raw contract value while the lookup used the resolved name.
+    #
+    # ``default_path=False`` keeps LF's register-the-prefix semantics (no
+    # ``{db}/{table}/`` default), which is what the raw ``location.path`` read
+    # already gave. The gate stays on the RAW value: an exposure that declares
+    # no bucket at all emits nothing here, exactly as before — it must never
+    # acquire the ``{account}-fluid-data`` fallback through this path.
+    raw_bucket = loc.get("bucket")
+    bucket: Optional[str] = None
     path = (loc.get("path") or "").lstrip("/")
+    if raw_bucket:
+        if placement.bucket_referenced:
+            bucket = _referenced_bucket_name(loc)
+        else:
+            bucket, _ = _warehouse.normalize_location(
+                loc, account_ref=_CALLER_ACCOUNT_TOKEN, default_path=False
+            )
 
-    # 1. Register the S3 location with Lake Formation. Route the (bucket, path)
-    #    through the canonical normalizer so a templated bucket resolves and the
-    #    path strips consistently with the table's warehouse — but keep LF's
-    #    register-the-bucket-root semantics (``default_path=False``: no
-    #    ``{db}/{table}/`` default). The ``and bucket`` guard means the
-    #    account fallback never fires here.
+    # 1. Register the S3 location with Lake Formation.
     if gov.get("registerLocation") and bucket:
-        bucket, path = _warehouse.normalize_location(
-            loc, account_ref=_CALLER_ACCOUNT_TOKEN, default_path=False
-        )
         # Registering a *pool* bucket at its ROOT would hand this product's
         # LF service role access to every other tenant's data.
         _require_pool_prefix(placement, path, what="governance.lakeFormation.registerLocation")
