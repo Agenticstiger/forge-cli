@@ -151,13 +151,26 @@ def recency_test(
 ) -> dict[str, Any]:
     """``dbt_utils.recency`` freshness test on a timestamp column.
 
-    The original FLUID window (e.g. ``P1D``) is preserved verbatim under
-    ``_fluid_window`` so the intent is not lost in the day/interval mapping.
+    ``datepart``/``interval`` derive from the rule's ISO-8601 ``window``
+    (``PT6H`` → ``hour``/6, ``P1D`` → ``day``/1) via the repo's canonical
+    converter (:func:`fluid_build.util.freshness.iso_duration_to_freshness_unit`
+    — its ``minute | hour | day`` vocabulary is a valid datepart subset); the
+    explicit kwargs apply only when the window is absent or unparseable.
+
+    Only kwargs the ``dbt_utils.test_recency`` macro accepts are emitted. The
+    previous ``_fluid_window`` carry-through key made every freshness test
+    fail at dbt compile time ("unexpected keyword argument"). Round-trip
+    intent survives without it: the manifest importer reconstructs the ISO
+    window from datepart/interval (``cli/import_workflow/dbt.py``).
     """
-    body: dict[str, Any] = {"field": field, "datepart": datepart, "interval": interval}
     if window is not None:
-        body["_fluid_window"] = str(window)
-    return {RECENCY_TEST_NAME: body}
+        from fluid_build.util.freshness import iso_duration_to_freshness_unit
+
+        unit = iso_duration_to_freshness_unit(str(window))
+        if unit is not None:
+            datepart = unit["period"]
+            interval = unit["count"]
+    return {RECENCY_TEST_NAME: {"field": field, "datepart": datepart, "interval": interval}}
 
 
 def sentinel_test(kind: str, column: str | None = None) -> str:
