@@ -6,7 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Handler for ``fluid import {meltano,airbyte,dlt,singer} <source>``.
+"""Handler for ``fluid import {meltano,airbyte,dlt,singer,dbt} <source>``.
 
 Dispatches to the matching importer in
 :mod:`fluid_build.cli.import_workflow`, writes the resulting contract YAML
@@ -33,11 +33,12 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
             what=f"`fluid import {tool}` requires a positional source argument",
             why=(
                 f"The {tool} importer needs to know what to convert "
-                f"(project dir / workspace id / pipeline name / tap config)."
+                f"(project dir / workspace id / pipeline name / tap config / "
+                f"dbt manifest)."
             ),
             fix=(
                 f"`fluid import {tool} <project-dir | workspace-id | "
-                f"pipeline-name | tap-config.json>`"
+                f"pipeline-name | tap-config.json | manifest.json>`"
             ),
             doc="https://forge.fluid.dev/ref/import",
             extras={"tool": tool},
@@ -48,9 +49,9 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
         raise SchemaValidationError(
             what=f"unknown importer tool: {tool}",
             why=f"`{tool}` is not in the registered importer set.",
-            fix="Use one of: meltano | airbyte | dlt | singer.",
+            fix="Use one of: meltano | airbyte | dlt | singer | dbt.",
             doc="https://forge.fluid.dev/ref/import",
-            extras={"tool": tool, "supported": ["meltano", "airbyte", "dlt", "singer"]},
+            extras={"tool": tool, "supported": ["meltano", "airbyte", "dlt", "singer", "dbt"]},
         )
 
     cprint(f"📥 Importing {tool} configuration from {source}…")
