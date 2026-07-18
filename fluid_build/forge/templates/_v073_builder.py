@@ -84,8 +84,115 @@ class TemplateSpec:
     description_suffix: str = ""
     """Appended to the contract description for clarity."""
 
+    semantics: Optional[Dict[str, Any]] = None
+    """Optional explicit ``exposes[0].semantics`` block. When ``None``
+    (the default) the builder derives one from the columns — template
+    products previously shipped with NO semantics block, which meant no
+    MCP ``query`` tool and no MetricFlow export until a human authored
+    the block by hand."""
+
 
 _LAYER_BY_PT = {"SDP": "Bronze", "ADP": "Silver", "CDP": "Gold"}
+
+# Column-type prefixes (case-insensitive) driving semantics derivation.
+# Parameterised forms (decimal(18,2), timestamp_tz) match by prefix.
+_NUMERIC_TYPE_PREFIXES = (
+    "decimal",
+    "numeric",
+    "number",
+    "float",
+    "double",
+    "real",
+    "int",
+    "bigint",
+    "smallint",
+    "tinyint",
+    "money",
+)
+_TIME_TYPE_PREFIXES = ("timestamp", "date", "datetime", "time")
+
+
+def _derive_semantics(spec: TemplateSpec, columns: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Derive a queryable semantics block from the template's columns.
+
+    Deterministic, conservative mapping via the shared
+    :mod:`fluid_build.forge_datamodel.semantics_builder` primitives:
+    ``*_id`` / ``id`` columns become the primary entity, time-typed
+    columns become day-grain time dimensions, numeric columns become
+    ``sum`` measures with a matching simple metric, everything else is a
+    categorical dimension. A ``record_count`` measure/metric floor keeps
+    the block queryable even for id-and-timestamp-only starters.
+    """
+    from fluid_build.forge_datamodel import semantics_builder as _semantics_builder
+
+    entities: List[Dict[str, Any]] = []
+    dimensions: List[Dict[str, Any]] = []
+    measures: List[Dict[str, Any]] = []
+    metrics: List[Dict[str, Any]] = []
+
+    for column in columns:
+        name = str(column.get("name") or "").strip()
+        if not name:
+            continue
+        col_type = str(column.get("type") or "").strip().lower()
+        if not entities and (name == "id" or name.endswith("_id")):
+            entity_name = name.removesuffix("_id") or spec.expose_id
+            entities.append({"name": entity_name, "type": "primary", "expr": name})
+            continue
+        if col_type.startswith(_TIME_TYPE_PREFIXES):
+            dimensions.append(
+                {
+                    "name": name,
+                    "type": "time",
+                    "typeParams": {"timeGranularity": "day"},
+                }
+            )
+            continue
+        if col_type.startswith(_NUMERIC_TYPE_PREFIXES):
+            measure_name = f"total_{name}"
+            measures.append(
+                {
+                    "name": measure_name,
+                    "agg": "sum",
+                    "expr": name,
+                    "description": f"Sum of {name}.",
+                }
+            )
+            metrics.append(
+                _semantics_builder.simple_metric(
+                    measure_name, measure_name, description=f"Sum of {name}."
+                )
+            )
+            continue
+        dimensions.append({"name": name, "type": "categorical"})
+
+    if not entities:
+        first = str((columns[0] or {}).get("name") or spec.expose_id) if columns else spec.expose_id
+        entities.append({"name": spec.expose_id, "type": "primary", "expr": first})
+    if not dimensions:
+        dimensions.append({"name": entities[0]["expr"], "type": "categorical"})
+    if not measures:
+        measures.append(
+            {"name": "record_count", "agg": "count", "expr": "1", "description": "Row count."}
+        )
+        metrics.append(
+            _semantics_builder.simple_metric(
+                "record_count", "record_count", description="Row count."
+            )
+        )
+
+    semantics: Dict[str, Any] = {
+        "name": f"{spec.template_name}_{spec.expose_id}",
+        "description": f"Auto-derived semantic model for the {spec.template_name} template.",
+        "entities": entities,
+        "dimensions": dimensions,
+        "measures": measures,
+        "metrics": metrics,
+    }
+    default_time = _semantics_builder.default_agg_time_dimension(dimensions)
+    if default_time:
+        semantics["defaultAggTimeDimension"] = default_time
+    return semantics
 
 
 def _resolve_id(project_name: str, template_name: str) -> str:
@@ -246,6 +353,7 @@ def build_contract(
                     "location": location,
                 },
                 "contract": {"schema": columns},
+                "semantics": spec.semantics or _derive_semantics(spec, columns),
             }
         ],
     }
