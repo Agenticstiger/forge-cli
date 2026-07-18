@@ -1,0 +1,48 @@
+fluidVersion: "0.7.6"
+kind: DataProduct
+id: compat.ops.streaming_iceberg_076
+name: Streaming Iceberg Compatibility 0.7.6
+description: Protects FLUID 0.7.6 compatibility — the opt-in Iceberg streaming-sink surface (properties.kafka-connect.streamingSink + iceberg_sink_enabled) plus the iceberg_table binding alias. All additive over 0.7.4; the binding format here is the canonical "iceberg" (the alias normalizes to it at load time).
+domain: ops
+metadata:
+  layer: Bronze
+  owner:
+    team: platform-ops
+    email: ops@example.com
+
+builds:
+  - id: ingest_events
+    pattern: acquisition
+    engine: kafka-connect
+    properties:
+      source:
+        kind: postgres
+        mode: incremental_append
+        streams:
+          - public.events
+      sink:
+        format: iceberg
+      kafka-connect:
+        iceberg_sink_enabled: true
+        streamingSink:
+          autoCreate: true
+          commitIntervalMs: 1000
+
+exposes:
+  - exposeId: events
+    kind: table
+    version: "1.0.0"
+    binding:
+      platform: aws
+      format: iceberg
+      location:
+        database: bronze
+        table: events
+        bucket: fluid-lake
+    contract:
+      schema:
+        - name: id
+          type: integer
+          required: true
+        - name: payload
+          type: string
