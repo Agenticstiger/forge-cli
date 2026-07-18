@@ -12,27 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pin OSI v0.1.1 enum vocabularies on two high-risk fields.
+"""Pin the Apache Ossie spec vocabularies on the high-risk fields.
 
-The OSI core-spec v0.1.1 constrains two fields to finite vocabularies:
+The Ossie core-spec constrains ``OSIExpressionDialect.dialect`` to a
+finite vocabulary:
 
-* ``OSIExpressionDialect.dialect`` ∈ {ANSI_SQL, SNOWFLAKE, MDX, TABLEAU, DATABRICKS}
-* ``OSICustomExtension.vendor_name`` ∈ {COMMON, SNOWFLAKE, SALESFORCE, DBT, DATABRICKS}
+* ``dialect`` ∈ {ANSI_SQL, SNOWFLAKE, MDX, TABLEAU, DATABRICKS, MAQL,
+  BIGQUERY}
 
-Without enforcement, the LLM (or a typo in hand-maintained sidecars) can
-silently emit off-spec strings like ``"Snowflake"``, ``"BigQuery"``, or
-``"dbt_labs"`` — these pass naive ``str`` validation but break downstream
-tools (dbt, Snowflake Cortex, Databricks Unity Catalog) that key off the
-exact spec vocabularies.
+``OSICustomExtension.vendor_name`` is deliberately NOT pinned to an
+enum — the spec makes it a free-form string ("any vendor or
+organization" may define extensions); the well-known values live in
+``OSI_WELL_KNOWN_VENDORS`` as an advisory list only. A regression that
+re-tightens ``vendor_name`` to a closed enum would reject valid Ossie
+documents (e.g. ``GOODDATA`` / ``HONEYDEW`` extensions) — pinned here.
+
+Without dialect enforcement, the LLM (or a typo in hand-maintained
+sidecars) can silently emit off-spec strings like ``"Snowflake"`` or
+``"POSTGRES"`` — these pass naive ``str`` validation but break
+downstream tools (dbt Core's native OSI reader, the upstream Snowflake
+Cortex converter) that key off the exact spec vocabulary.
 
 This file pins:
-  1. Every valid value validates successfully.
-  2. A representative set of invalid values raises ``ValidationError``.
-  3. ``osi_dialect_from_source_type`` normalises every forge-cli
+  1. Every valid dialect value validates successfully.
+  2. A representative set of invalid dialect values raises
+     ``ValidationError``.
+  3. ``vendor_name`` accepts arbitrary vendor strings (spec free-form).
+  4. ``osi_dialect_from_source_type`` normalises every forge-cli
      ``--source-type`` hint to a spec-valid ``OSIDialect`` — including
-     off-spec inputs like ``postgres`` / ``bigquery`` / ``mysql`` /
-     ``oracle``, which must land on ``ANSI_SQL``.
-  4. Every output of the mapper is itself accepted by the Pydantic
+     off-spec inputs like ``postgres`` / ``mysql`` / ``oracle``, which
+     must land on ``ANSI_SQL``, while exact-dialect hints (``snowflake``,
+     ``databricks``, ``bigquery``) round-trip to their own dialect.
+  5. Every output of the mapper is itself accepted by the Pydantic
      model (round-trip safety — the whole point of tightening).
 """
 
@@ -42,6 +53,8 @@ import pytest
 from pydantic import ValidationError
 
 from fluid_build.copilot.schemas.osi import (
+    OSI_SUPPORTED_DIALECTS,
+    OSI_WELL_KNOWN_VENDORS,
     OSICustomExtension,
     OSIExpressionDialect,
     osi_dialect_from_source_type,
@@ -51,12 +64,18 @@ from fluid_build.copilot.schemas.osi import (
 # Dialect enum
 # ---------------------------------------------------------------------------
 
-VALID_DIALECTS = ["ANSI_SQL", "SNOWFLAKE", "MDX", "TABLEAU", "DATABRICKS"]
+VALID_DIALECTS = ["ANSI_SQL", "SNOWFLAKE", "MDX", "TABLEAU", "DATABRICKS", "MAQL", "BIGQUERY"]
+
+
+def test_supported_dialects_tuple_matches_the_literal_vocabulary() -> None:
+    """``OSI_SUPPORTED_DIALECTS`` is hand-synced with the ``Literal`` —
+    this pin catches the two drifting apart."""
+    assert sorted(OSI_SUPPORTED_DIALECTS) == sorted(VALID_DIALECTS)
 
 
 @pytest.mark.parametrize("value", VALID_DIALECTS)
 def test_dialect_accepts_spec_vocabulary(value: str) -> None:
-    """All 5 spec-listed dialect values must validate cleanly."""
+    """All 7 spec-listed dialect values must validate cleanly."""
     model = OSIExpressionDialect(dialect=value, expression="col_a")
     assert model.dialect == value
 
@@ -64,7 +83,6 @@ def test_dialect_accepts_spec_vocabulary(value: str) -> None:
 @pytest.mark.parametrize(
     "value",
     [
-        "BIGQUERY",  # real engine, but not in the OSI v0.1.1 enum
         "POSTGRES",  # from-ddl hint — must go through the mapper first
         "MYSQL",
         "ORACLE",
@@ -73,28 +91,27 @@ def test_dialect_accepts_spec_vocabulary(value: str) -> None:
         "REDSHIFT",
         "snowflake",  # lowercase — OSI is upper-only
         "Snowflake",  # title case
+        "bigquery",  # lowercase — spec value is BIGQUERY
         "",  # empty string
         "ANSI SQL",  # space instead of underscore
         "ansi_sql",  # lowercase
     ],
 )
 def test_dialect_rejects_off_spec_values(value: str) -> None:
-    """Off-spec strings — including legitimate engines not in the v0.1.1 enum
-    and casing mistakes — must raise ``ValidationError``."""
+    """Off-spec strings — including legitimate engines not in the Ossie
+    enum and casing mistakes — must raise ``ValidationError``."""
     with pytest.raises(ValidationError):
         OSIExpressionDialect(dialect=value, expression="col_a")
 
 
 # ---------------------------------------------------------------------------
-# vendor_name enum
+# vendor_name — free-form per the spec
 # ---------------------------------------------------------------------------
 
-VALID_VENDOR_NAMES = ["COMMON", "SNOWFLAKE", "SALESFORCE", "DBT", "DATABRICKS"]
 
-
-@pytest.mark.parametrize("value", VALID_VENDOR_NAMES)
-def test_vendor_name_accepts_spec_vocabulary(value: str) -> None:
-    """All 5 spec-listed custom-extension vendors must validate cleanly."""
+@pytest.mark.parametrize("value", list(OSI_WELL_KNOWN_VENDORS))
+def test_vendor_name_accepts_well_known_vocabulary(value: str) -> None:
+    """Every advisory well-known vendor must validate cleanly."""
     ext = OSICustomExtension(vendor_name=value, data='{"k": "v"}')
     assert ext.vendor_name == value
 
@@ -102,19 +119,18 @@ def test_vendor_name_accepts_spec_vocabulary(value: str) -> None:
 @pytest.mark.parametrize(
     "value",
     [
-        "dbt_labs",  # common typo — the spec says DBT
-        "dbt",  # lowercase
-        "Snowflake",  # title case
-        "Oracle",  # not in the OSI v0.1.1 vendor enum
-        "GOOGLE",  # no vendor slot for BigQuery / Google
-        "CUSTOM",  # freeform keyword
-        "",  # empty
+        "FLUID",  # fluid's own extension vendor slug
+        "SEMANTIDO",  # upstream reference-model example
+        "Databricks",  # mixed case — the spec's own example uses this
+        "dbt_labs",
+        "acme-analytics",
     ],
 )
-def test_vendor_name_rejects_off_spec_values(value: str) -> None:
-    """Off-spec vendor names must raise rather than silently round-trip."""
-    with pytest.raises(ValidationError):
-        OSICustomExtension(vendor_name=value, data='{"k": "v"}')
+def test_vendor_name_accepts_arbitrary_vendors(value: str) -> None:
+    """The spec makes ``vendor_name`` free-form. Re-tightening it to a
+    closed enum would reject valid Ossie documents — pinned here."""
+    ext = OSICustomExtension(vendor_name=value, data='{"k": "v"}')
+    assert ext.vendor_name == value
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +147,8 @@ def test_vendor_name_rejects_off_spec_values(value: str) -> None:
         ("Snowflake", "SNOWFLAKE"),
         ("databricks", "DATABRICKS"),
         ("DATABRICKS", "DATABRICKS"),
+        ("bigquery", "BIGQUERY"),
+        ("BIGQUERY", "BIGQUERY"),
         # Whitespace tolerated.
         ("  snowflake  ", "SNOWFLAKE"),
         ("\tsnowflake\n", "SNOWFLAKE"),
@@ -144,7 +162,6 @@ def test_vendor_name_rejects_off_spec_values(value: str) -> None:
         ("POSTGRES", "ANSI_SQL"),
         ("mysql", "ANSI_SQL"),
         ("oracle", "ANSI_SQL"),
-        ("bigquery", "ANSI_SQL"),
         ("redshift", "ANSI_SQL"),
         ("duckdb", "ANSI_SQL"),
         ("trino", "ANSI_SQL"),

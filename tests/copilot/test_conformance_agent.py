@@ -38,7 +38,12 @@ from fluid_build.copilot.agents.conformance_agent import (
     ConformanceAgent,
     ConformanceReport,
 )
-from fluid_build.copilot.schemas.osi import OSIAIContext, OSISemanticModel
+from fluid_build.copilot.schemas.osi import (
+    OSIAIContext,
+    OSIDataset,
+    OSIField,
+    OSISemanticModel,
+)
 from fluid_build.copilot.schemas.stage_outputs import (
     ConceptualDraft,
     LogicalDraft,
@@ -48,9 +53,10 @@ from fluid_build.copilot.schemas.stage_outputs import (
 
 def _make_logical(*, technique: str = "data_vault_2") -> LogicalDraft:
     """Build a minimum-viable LogicalDraft for the agent to lint
-    against. Uses the lightest valid OSI shape — name + ai_context
-    — so we exercise the agent's plumbing without any per-field
-    LLM-generated complexity.
+    against. Uses the lightest *document-conformant* OSI shape —
+    name + ai_context + one dataset (the Ossie spec requires ≥1
+    dataset) — so we exercise the agent's plumbing without any
+    per-field LLM-generated complexity.
 
     The DV2 payload is populated when ``technique=data_vault_2``
     so the Fluid validator's "technique without payload" error
@@ -75,7 +81,14 @@ def _make_logical(*, technique: str = "data_vault_2") -> LogicalDraft:
                 instructions="Use for revenue analytics.",
                 synonyms=["sales", "purchases"],
             ),
-            datasets=[],
+            datasets=[
+                OSIDataset(
+                    name="orders",
+                    source="raw.orders",
+                    primary_key=["order_id"],
+                    fields=[OSIField(name="order_id")],
+                )
+            ],
             relationships=[],
             metrics=[],
         ),

@@ -93,7 +93,7 @@ class CatalogScope(BaseModel):
 class CatalogColumn(BaseModel):
     """One column's metadata as understood by the catalog.
 
-    Field selection follows the OSI v0.1.1 ``OSIField`` shape so the
+    Field selection follows the OSI (Apache Ossie) ``OSIField`` shape so the
     Logical-stage mapping is mechanical: ``name`` → ``OSIField.name``,
     ``description`` → ``OSIField.expression.description``,
     ``classifications`` → ``OSIField.custom_extensions[]``, etc.

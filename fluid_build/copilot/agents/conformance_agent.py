@@ -27,7 +27,7 @@ Why pre-emit matters:
   again. Pre-emit means the BuilderAgent sees the conformance
   report inside the same staged turn.
 * **No bad artifacts on disk.** Operators never see a contract
-  that fails Fluid 0.7.2 schema or OSI 0.1.1 conformance —
+  that fails Fluid schema or OSI (Apache Ossie) conformance —
   failures are caught before the file is written.
 * **Standards parallelism.** Today the validator covers Fluid
   schema + OSI semantic. The agent's :meth:`run` is a single
@@ -35,8 +35,9 @@ Why pre-emit matters:
   ISO 19115 in v1.6+ without re-plumbing the coordinator.
 
 The agent is **LLM-free** — every check is a deterministic Python
-call (``FluidSchemaManager.validate_contract`` for Fluid 0.7.2,
-:class:`OSISemanticModel.model_validate` for OSI). LLM-free means:
+call (``FluidSchemaManager.validate_contract`` for Fluid,
+:class:`OSISemanticModel.model_validate` plus the vendored Apache
+Ossie JSON Schema for OSI). LLM-free means:
 
 * **Same provider abstraction.** No new LLM cost on conformance
   checks.
@@ -74,7 +75,7 @@ SUPPORTED_STANDARDS = (
 """Standards the agent can lint against.
 
 * ``fluid`` and ``osi`` are full schema validators against the
-  Fluid 0.7.2 + OSI v0.1.1 specs.
+  Fluid + OSI (Apache Ossie) specs.
 * ``odcs_translation_readiness`` / ``dcs_translation_readiness``
   are NOT full ODCS / DCS validators — they check whether the
   Fluid contract carries the fields a future ODCS / DCS exporter
@@ -268,11 +269,20 @@ class ConformanceAgent:
         *,
         logical: Optional[LogicalDraft],
     ) -> List[ValidationFinding]:
-        """Validate OSI v0.1.1 conformance separately from the
-        Fluid path. Validates the LogicalDraft's embedded
-        ``OSISemanticModel`` against the strict OSI v0.1.1 schema
-        — surfaces shape errors the Fluid validator's looser
-        check might miss."""
+        """Validate OSI (Apache Ossie) conformance separately from
+        the Fluid path. Two layers:
+
+        1. Pydantic re-validation of the LogicalDraft's embedded
+           ``OSISemanticModel`` (severity=error) — surfaces shape
+           errors the Fluid validator's looser check might miss.
+        2. Interchange-document validation: builds the sidecar
+           document (root wrapper + IR-field relocation) and checks
+           it against the vendored upstream JSON Schema
+           (severity=warning — the emitter normalizes required keys
+           by construction, so findings here indicate IR content the
+           normalization could not repair, e.g. a relationship with
+           no columns).
+        """
         if logical is None or logical.osi is None:
             return []
         try:
@@ -283,12 +293,35 @@ class ConformanceAgent:
         except Exception as exc:
             return [
                 ValidationFinding(
-                    message=f"OSI v0.1.1 conformance failed: {exc}",
+                    message=f"OSI conformance failed: {exc}",
                     severity="error",
                     field="osi",
                 )
             ]
-        return []
+        findings: List[ValidationFinding] = []
+        try:
+            from fluid_build.forge_datamodel.emit.osi_sidecar import (
+                build_osi_document,
+                validate_osi_document,
+            )
+
+            for issue in validate_osi_document(build_osi_document(logical)):
+                findings.append(
+                    ValidationFinding(
+                        message=f"Ossie interchange document: {issue}",
+                        severity="warning",
+                        field="osi",
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 — advisory layer must not brick the run
+            findings.append(
+                ValidationFinding(
+                    message=f"Ossie interchange document check skipped: {exc}",
+                    severity="info",
+                    field="osi",
+                )
+            )
+        return findings
 
     def _lint_odcs_translation_readiness(
         self,
@@ -392,13 +425,14 @@ class ConformanceAgent:
         findings: List[ValidationFinding] = []
         # Default targets are the *intersection* of the mapper's
         # registry (DEFAULT_DIALECTS) and the OSI-validated
-        # vocabulary (OSI_SUPPORTED_DIALECTS). The mapper covers
-        # BIGQUERY / POSTGRES which OSI's enum rejects; writing a
-        # back-fill row with an unsupported dialect would crash
-        # Pydantic when the OSI block is re-serialised. Caller can
-        # still pass an explicit ``targets=`` list to override —
-        # useful when the back-fill is consumed by something
-        # OUTSIDE OSI (e.g. a Postgres DDL emitter).
+        # vocabulary (OSI_SUPPORTED_DIALECTS). BIGQUERY is in both
+        # since the Apache Ossie spec added it; POSTGRES remains
+        # mapper-only — writing a back-fill row with a non-OSI
+        # dialect would crash Pydantic when the OSI block is
+        # re-serialised. Caller can still pass an explicit
+        # ``targets=`` list to override — useful when the back-fill
+        # is consumed by something OUTSIDE OSI (e.g. a Postgres DDL
+        # emitter).
         if targets is not None:
             target_dialects = list(targets)
         else:
