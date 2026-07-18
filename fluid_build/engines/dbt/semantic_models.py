@@ -51,9 +51,12 @@ dbt-core 1.11 + dbt-semantic-interfaces):
   must exist; ratio → numerator + denominator; derived → expr +
   inputMetrics), as are duplicate metric names across exposes.
   ``label`` (required by dbt >= 1.7) defaults to the metric name.
-* ``agg: percentile`` gets ``agg_params: {percentile: 0.5}`` (the
-  contract schema carries no percentile value; 0.5 == median, and
-  MetricFlow refuses percentile measures without agg_params).
+* ``agg: percentile`` maps the contract's ``aggParams``
+  (``{percentile, useDiscretePercentile}``, 0.7.6+) into MetricFlow's
+  ``agg_params``; when the contract omits the value it defaults to the
+  shared ``DEFAULT_PERCENTILE`` (0.5 == median — identical to the MCP
+  query compiler's default so both consumers answer the same number,
+  and MetricFlow refuses percentile measures without agg_params).
 * **A day-grain time spine model ships alongside** — real ``dbt parse``
   (1.11) rejects any project with semantic models but no time spine
   ("The semantic layer requires a time spine model with granularity DAY
@@ -313,6 +316,33 @@ def _resolve_agg_time_dimension(
 
 _VALID_AGGS = {"sum", "avg", "count", "count_distinct", "min", "max", "median", "percentile"}
 
+# Default when a percentile measure carries no ``aggParams.percentile``.
+# MUST stay equal to ``output_ports/mcp/query_compiler.DEFAULT_PERCENTILE``
+# (pinned by tests) so the governed query path and the exported dbt
+# project answer the same number for the same contract. 0.5 == median.
+DEFAULT_PERCENTILE = 0.5
+
+
+def _percentile_agg_params(raw: Any) -> Dict[str, Any]:
+    """Map the contract's ``aggParams`` into MetricFlow ``agg_params``.
+
+    Out-of-range / malformed values fall back to the default rather than
+    emitting YAML ``dbt parse`` rejects — consistent with this module's
+    degrade-don't-fail posture (the strict path is the MCP compiler).
+    """
+    params = raw if isinstance(raw, Mapping) else {}
+    percentile = params.get("percentile", DEFAULT_PERCENTILE)
+    if (
+        isinstance(percentile, bool)
+        or not isinstance(percentile, (int, float))
+        or not 0 <= float(percentile) <= 1
+    ):
+        percentile = DEFAULT_PERCENTILE
+    agg_params: Dict[str, Any] = {"percentile": float(percentile)}
+    if _tm.is_truthy(params.get("useDiscretePercentile")):
+        agg_params["use_discrete_percentile"] = True
+    return agg_params
+
 
 def _build_measures(
     semantics: Mapping[str, Any],
@@ -348,9 +378,11 @@ def _build_measures(
         if raw.get("expr"):
             measure["expr"] = str(raw["expr"])
         if agg == "percentile":
-            # The contract schema carries no percentile value; MetricFlow
-            # refuses percentile measures without agg_params. 0.5 == median.
-            measure["agg_params"] = {"percentile": 0.5}
+            # MetricFlow refuses percentile measures without agg_params.
+            # Map the contract's aggParams (0.7.6+); default matches the
+            # MCP query compiler (DEFAULT_PERCENTILE) so the governed
+            # query path and the exported dbt project agree.
+            measure["agg_params"] = _percentile_agg_params(raw.get("aggParams"))
         override = _sanitize_name(raw.get("aggTimeDimension") or "")
         if override and override in time_dims:
             measure["agg_time_dimension"] = override

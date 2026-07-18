@@ -558,3 +558,45 @@ class TestDeferredMetricResolution:
         )
         doc = _emit(_contract(semantics=semantics))
         assert [m["name"] for m in doc["metrics"]] == ["aov"]
+
+
+@pytest.mark.unit
+class TestPercentileAggParams:
+    """Contract aggParams (0.7.6+) → MetricFlow agg_params mapping."""
+
+    def _percentile_measure(self, agg_params=None):
+        measure = {"name": "p_amount", "agg": "percentile", "expr": "amount"}
+        if agg_params is not None:
+            measure["aggParams"] = agg_params
+        return _semantics(measures=[measure], metrics=[])
+
+    def test_contract_percentile_value_passes_through(self):
+        doc = _emit(_contract(semantics=self._percentile_measure({"percentile": 0.95})))
+        (measure,) = _model(doc)["measures"]
+        assert measure["agg_params"] == {"percentile": 0.95}
+
+    def test_discrete_flag_maps_to_use_discrete_percentile(self):
+        doc = _emit(
+            _contract(
+                semantics=self._percentile_measure(
+                    {"percentile": 0.9, "useDiscretePercentile": True}
+                )
+            )
+        )
+        (measure,) = _model(doc)["measures"]
+        assert measure["agg_params"] == {"percentile": 0.9, "use_discrete_percentile": True}
+
+    def test_invalid_percentile_falls_back_to_default(self):
+        doc = _emit(_contract(semantics=self._percentile_measure({"percentile": 7})))
+        (measure,) = _model(doc)["measures"]
+        assert measure["agg_params"] == {"percentile": 0.5}
+
+    def test_default_is_pinned_to_the_query_compiler(self):
+        """Both consumers of the semantics block must agree on the default
+        percentile or the same contract answers different numbers."""
+        from fluid_build.engines.dbt.semantic_models import DEFAULT_PERCENTILE
+        from fluid_build.output_ports.mcp.query_compiler import (
+            DEFAULT_PERCENTILE as MCP_DEFAULT,
+        )
+
+        assert DEFAULT_PERCENTILE == MCP_DEFAULT == 0.5

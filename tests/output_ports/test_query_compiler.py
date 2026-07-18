@@ -23,6 +23,7 @@ import pytest
 
 from fluid_build.output_ports.mcp.query_compiler import (
     CompiledQuery,
+    QueryValidationError,
     compile_free_form_sql,
     compile_row_filter_clauses,
     compile_semantic_query,
@@ -482,3 +483,219 @@ def test_free_form_sql_with_no_restricted_columns_is_unaffected():
         restricted_columns=(),
     )
     assert "LIMIT 5" in compiled.sql
+
+
+# ---------------------------------------------------------------------
+# Metric filters: contract-declared predicates must be applied, and
+# unsafe ones must fail closed — never silently dropped (which returned
+# semantically wrong, unfiltered numbers while the dbt MetricFlow export
+# honoured the same filter).
+# ---------------------------------------------------------------------
+
+
+def _expose_with_filtered_metric(filter_sql: str):
+    return make_expose(
+        semantics={
+            "name": "orders",
+            "measures": [
+                {"name": "revenue", "agg": "sum", "expr": "amount"},
+            ],
+            "dimensions": [
+                {"name": "region", "type": "categorical"},
+            ],
+            "metrics": [
+                {
+                    "name": "completed_revenue",
+                    "type": "simple",
+                    "measure": "revenue",
+                    "filter": filter_sql,
+                },
+            ],
+        },
+    )
+
+
+def test_metric_filter_is_applied_as_where_predicate():
+    compiled = compile_semantic_query(
+        expose=_expose_with_filtered_metric("status = 'completed'"),
+        metric="completed_revenue",
+        limit=10,
+        table_reference="orders",
+    )
+    assert "WHERE (status = 'completed')" in compiled.sql
+    assert "SUM(amount) AS revenue" in compiled.sql
+
+
+def test_metric_filter_composes_with_dimension_filters_and_binding():
+    """The metric predicate is inline (contract-declared, allowlisted);
+    the caller's dimension filters stay bound parameters, and the
+    parameter indexes are unaffected by the inline predicate."""
+    compiled = compile_semantic_query(
+        expose=_expose_with_filtered_metric("status = 'completed'"),
+        metric="completed_revenue",
+        dimensions=["region"],
+        filters={"region": "emea"},
+        limit=10,
+        table_reference="orders",
+    )
+    assert "(status = 'completed')" in compiled.sql
+    assert "region = :p_0" in compiled.sql
+    assert compiled.params == ["emea"]
+
+
+def test_direct_measure_query_is_unaffected_by_metric_filters():
+    """Querying the bare measure bypasses the metric and therefore its
+    filter — metric semantics attach to the metric name only."""
+    compiled = compile_semantic_query(
+        expose=_expose_with_filtered_metric("status = 'completed'"),
+        measure="revenue",
+        limit=10,
+        table_reference="orders",
+    )
+    assert "status" not in compiled.sql
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "status = 'completed'; DROP TABLE orders",  # statement injection markers
+        "status = 'completed' -- comment",  # comment marker
+        "{{ Dimension('orders__status') }} = 'completed'",  # MetricFlow Jinja
+        "1 = 1 UNION SELECT password FROM users",  # blocked keyword
+    ],
+)
+def test_unsafe_metric_filter_fails_closed(hostile):
+    """A filter that fails the safe-expression allowlist must raise —
+    not degrade to unfiltered (wrong) results, and not echo the raw
+    filter text back to the calling agent."""
+    with pytest.raises(QueryValidationError) as excinfo:
+        compile_semantic_query(
+            expose=_expose_with_filtered_metric(hostile),
+            metric="completed_revenue",
+            limit=10,
+            table_reference="orders",
+        )
+    assert "completed_revenue" in str(excinfo.value)
+    assert "DROP" not in str(excinfo.value)
+    assert "{{" not in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------
+# Percentile measures: aggParams wiring + fail-closed dialects.
+# ---------------------------------------------------------------------
+
+
+def _expose_with_percentile(agg_params=None):
+    measure = {"name": "p95_latency", "agg": "percentile", "expr": "latency_ms"}
+    if agg_params is not None:
+        measure["aggParams"] = agg_params
+    return make_expose(
+        semantics={
+            "name": "requests",
+            "measures": [measure],
+            "dimensions": [],
+            "metrics": [],
+        },
+    )
+
+
+def test_percentile_defaults_to_median_continuous():
+    compiled = compile_semantic_query(
+        expose=_expose_with_percentile(),
+        measure="p95_latency",
+        limit=10,
+        table_reference="requests",
+    )
+    assert "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY latency_ms) AS p95_latency" in compiled.sql
+
+
+def test_percentile_agg_params_value_is_rendered():
+    compiled = compile_semantic_query(
+        expose=_expose_with_percentile({"percentile": 0.95}),
+        measure="p95_latency",
+        limit=10,
+        table_reference="requests",
+    )
+    assert "PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms)" in compiled.sql
+
+
+def test_percentile_discrete_flag_selects_percentile_disc():
+    compiled = compile_semantic_query(
+        expose=_expose_with_percentile({"percentile": 0.9, "useDiscretePercentile": True}),
+        measure="p95_latency",
+        limit=10,
+        table_reference="requests",
+    )
+    assert "PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY latency_ms)" in compiled.sql
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5, "high", True])
+def test_percentile_out_of_range_rejected(bad):
+    with pytest.raises(QueryValidationError, match="aggParams.percentile"):
+        compile_semantic_query(
+            expose=_expose_with_percentile({"percentile": bad}),
+            measure="p95_latency",
+            limit=10,
+            table_reference="requests",
+        )
+
+
+@pytest.mark.parametrize("dialect", ["bigquery", "athena"])
+def test_percentile_fails_closed_on_unsupported_dialects(dialect):
+    """BigQuery / Athena have no grouped ordered-set percentile — the
+    compiler must refuse rather than emit SQL the engine rejects."""
+    with pytest.raises(QueryValidationError, match="percentile"):
+        compile_semantic_query(
+            expose=_expose_with_percentile(),
+            measure="p95_latency",
+            limit=10,
+            table_reference="requests",
+            dialect=dialect,
+        )
+
+
+def test_default_percentile_pinned_across_consumers():
+    """The MCP compiler and the dbt MetricFlow bridge must agree on the
+    default percentile — otherwise the same contract answers different
+    numbers depending on the consumer."""
+    from fluid_build.engines.dbt import semantic_models as dbt_bridge
+    from fluid_build.output_ports.mcp import query_compiler
+
+    assert query_compiler.DEFAULT_PERCENTILE == dbt_bridge.DEFAULT_PERCENTILE == 0.5
+
+
+@pytest.mark.parametrize(
+    "unbalanced",
+    [
+        "1 = 1) OR (1 = 1",  # paren break-out that would neutralize ANDed RLS
+        "(status = 'completed'",  # unclosed
+        "status = 'completed')",  # early close
+    ],
+)
+def test_unbalanced_paren_metric_filter_fails_closed(unbalanced):
+    """Defence-in-depth: an unbalanced filter passes the char allowlist
+    but would escape its wrapping parens and, by AND/OR precedence,
+    neutralize an ANDed policy rowFilter. Reject the whole class."""
+    with pytest.raises(QueryValidationError, match="unbalanced"):
+        compile_semantic_query(
+            expose=_expose_with_filtered_metric(unbalanced),
+            metric="completed_revenue",
+            limit=10,
+            table_reference="orders",
+        )
+
+
+def test_balanced_or_filter_stays_contained_next_to_row_filters():
+    """A legitimate OR filter must stay inside its parens so the ANDed
+    RLS clause still constrains every branch."""
+    expose = _expose_with_filtered_metric("status = 'completed' OR status = 'shipped'")
+    expose["policy"] = {"rowFilters": [{"column": "tenant_id", "equals": "${caller.tenant_id}"}]}
+    compiled = compile_semantic_query(
+        expose=expose,
+        metric="completed_revenue",
+        limit=10,
+        table_reference="orders",
+        caller_attributes={"tenant_id": "t-1"},
+    )
+    assert "(status = 'completed' OR status = 'shipped') AND \"tenant_id\" = :p_0" in compiled.sql
+    assert compiled.params == ["t-1"]
