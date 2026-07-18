@@ -87,6 +87,25 @@ def missions_root(workspace_root: Path) -> Path:
     return Path(workspace_root).resolve() / ".fluid" / MISSIONS_DIRNAME
 
 
+def new_mission_run_id() -> str:
+    """Name a mission run directory: ``YYYYMMDD-HHMMSS-<6 hex>``.
+
+    Deliberately the same format as ``cli/_preview_panel.new_run_id`` so
+    ``.fluid/missions/`` listings sort chronologically and read the same
+    way as ``.fluid/agents/`` ones. Reimplemented here rather than
+    imported because ``copilot`` must not depend on ``cli`` (see
+    :mod:`fluid_build.copilot.missions.executor`); naming a directory
+    carries no behaviour worth sharing across that boundary, and the
+    output is validated by :data:`_RUN_ID_RE` on the way into the store
+    either way.
+    """
+    import secrets
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"{now}-{secrets.token_hex(3)}"
+
+
 class MissionRunStore:
     """File-backed mission run directory. All writes atomic."""
 
@@ -298,6 +317,7 @@ __all__ = [
     "RUN_STATUSES",
     "MissionRunStore",
     "find_resumable_run",
+    "new_mission_run_id",
     "list_mission_runs",
     "missions_root",
 ]

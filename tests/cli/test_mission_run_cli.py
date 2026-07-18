@@ -284,3 +284,77 @@ def test_runner_crash_surfaces_a_typed_name_not_a_traceback(isolated, monkeypatc
     assert rc == 2
     assert "ValueError" in out
     assert "AKIAIOSFODNN7EXAMPLE" not in out
+
+
+# ---------------------------------------------------------------------------
+# Dependency inversion — the CLI owns the wiring
+# ---------------------------------------------------------------------------
+
+
+def test_cli_passes_the_real_runtime_to_the_runner(isolated, stub_run):
+    """`copilot` declares the Protocols; `cli` supplies the implementations.
+
+    Without this assertion the inversion could regress to a runner that
+    silently does nothing: every unit test injects a fake, so only this
+    test proves production gets the real agent loop and the real
+    provenance-stamping writer.
+    """
+    from fluid_build.cli.forge_contract_factory import write_contract
+    from fluid_build.cli.forge_copilot_runtime import extract_json_object
+    from fluid_build.cli.mission import _agent_loop_executor
+
+    _invoke(["mission", "run", "quality-coverage", str(NO_DQ_CONTRACT)])
+
+    runtime = stub_run[0]["runtime"]
+    assert runtime.execute is _agent_loop_executor
+    assert runtime.write_contract is write_contract
+    assert runtime.parse_json is extract_json_object
+
+
+def test_build_mission_runtime_satisfies_the_protocols():
+    """The wired runtime is structurally what `copilot` asked for."""
+    from fluid_build.cli.mission import build_mission_runtime
+    from fluid_build.copilot.missions.executor import MissionRuntime
+
+    runtime = build_mission_runtime()
+    assert isinstance(runtime, MissionRuntime)
+    assert all(callable(getattr(runtime, f)) for f in ("execute", "write_contract", "parse_json"))
+
+
+def test_agent_loop_executor_scopes_the_loop_and_never_writes(tmp_path, monkeypatch):
+    """EXECUTE forwards the spec's allowlist + step goal, and returns only."""
+    from fluid_build.cli import mission as mission_module
+    from fluid_build.copilot.missions.planner import MissionStep
+    from fluid_build.copilot.missions.spec import load_mission_spec_from_path
+
+    spec_path = tmp_path / "m.yaml"
+    spec_path.write_text(WORKSPACE_SPEC + "tools:\n  allow: [validate_contract]\n", "utf-8")
+    spec = load_mission_spec_from_path(spec_path)
+
+    captured = {}
+    proposed = {"kind": "DataProduct", "id": "x"}
+
+    def _fake_loop(**kwargs):
+        captured.update(kwargs)
+        return {"contract": proposed}
+
+    monkeypatch.setattr(
+        "fluid_build.cli.forge_copilot_agent_loop.run_copilot_agent_loop", _fake_loop
+    )
+
+    contract = {"kind": "DataProduct", "id": "before"}
+    result = mission_module._agent_loop_executor(
+        MissionStep(action="edit_contract", goal="add dq rules"),
+        contract,
+        spec=spec,
+        llm_config=object(),
+        workspace_root=tmp_path,
+    )
+
+    assert result == proposed
+    assert captured["tool_allowlist"] == ["validate_contract"]
+    assert captured["goal_scope"] == "add dq rules"
+    # The existing contract rides the seed seam, so the model edits it.
+    assert captured["context"]["seed_contract_override"]["id"] == "before"
+    # And nothing was written — the runner owns the gated write.
+    assert not list(tmp_path.glob("**/contract.fluid.yaml"))

@@ -42,6 +42,8 @@ from typing import Any, Dict, List, Optional
 import pytest
 import yaml
 
+from fluid_build.copilot.missions import runner as runner_module
+from fluid_build.copilot.missions.executor import MissionRuntime
 from fluid_build.copilot.missions.planner import MissionStep
 from fluid_build.copilot.missions.runner import (
     STALL_PATIENCE,
@@ -161,12 +163,37 @@ def _plan_one(*_args, **_kwargs) -> List[MissionStep]:
     return [MissionStep(action="edit_contract", goal="add dq rules")]
 
 
+def _fake_write_contract(contract: Dict[str, Any], path: Path, *, command: str) -> None:
+    """Stand-in for cli's provenance-stamping writer.
+
+    Deliberately plain: these tests assert on contract CONTENT, so the
+    provenance envelope would only add noise. The one thing that must
+    match production is that a write lands at *path* as YAML.
+    """
+    path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+
+
+def _runtime(execute_fn=None) -> MissionRuntime:
+    """A MissionRuntime with fakes for every cli-side collaborator."""
+
+    def _no_executor(step, contract, **kwargs):  # pragma: no cover — overridden
+        raise AssertionError("EXECUTE ran without an executor wired")
+
+    return MissionRuntime(
+        execute=execute_fn or _no_executor,
+        write_contract=_fake_write_contract,
+        parse_json=json.loads,
+    )
+
+
 def _runner(spec, contract_path, workspace, **overrides) -> MissionRunner:
+    execute_fn = overrides.pop("execute_fn", None)
     kwargs: Dict[str, Any] = {
         "workspace_root": workspace,
         "plan_fn": _plan_one,
         "confirm_fn": lambda *a, **k: False,
         "llm_config": None,
+        "runtime": _runtime(execute_fn),
     }
     kwargs.update(overrides)
     return MissionRunner(spec, contract_path, **kwargs)
@@ -250,7 +277,7 @@ def test_resume_re_enters_at_verify_with_no_replay(spec, contract_path, workspac
         contract_path,
         workspace_root=workspace,
         plan_fn=_plan_one,
-        execute_fn=_must_not_run,
+        runtime=_runtime(_must_not_run),
         confirm_fn=lambda *a, **k: False,
         llm_config=None,
     ).run()
@@ -540,7 +567,7 @@ def test_missing_contract_fails_rather_than_pausing(spec, workspace):
         workspace / "does-not-exist.yaml",
         workspace_root=workspace,
         plan_fn=_plan_one,
-        execute_fn=lambda *a, **k: None,
+        runtime=_runtime(lambda *a, **k: None),
         llm_config=None,
     ).run()
     assert outcome.status == "failed"
@@ -554,7 +581,7 @@ def test_run_mission_helper_returns_an_outcome(spec, contract_path, workspace):
         contract_path,
         workspace_root=workspace,
         plan_fn=_plan_one,
-        execute_fn=lambda *a, **k: None,
+        runtime=_runtime(lambda *a, **k: None),
         llm_config=None,
     )
     assert isinstance(outcome, MissionOutcome)
@@ -575,7 +602,14 @@ def test_planner_falls_back_deterministically_when_the_llm_fails(spec, contract_
     def _boom(*_a, **_k):
         raise RuntimeError("provider down")
 
-    steps = plan_steps(spec, scorecard, llm_config=None, call_llm_fn=_boom, provider=object())
+    steps = plan_steps(
+        spec,
+        scorecard,
+        llm_config=None,
+        parse_json=json.loads,
+        call_llm_fn=_boom,
+        provider=object(),
+    )
     assert len(steps) == 1
     assert steps[0].action == "edit_contract"
     # The fallback recycles the failing diagnostics as the repair prompt.
@@ -596,7 +630,12 @@ def test_planner_collapses_unknown_actions_to_edit_contract(spec, contract_path)
         }
     )
     steps = plan_steps(
-        spec, scorecard, llm_config=None, call_llm_fn=lambda *a, **k: payload, provider=object()
+        spec,
+        scorecard,
+        llm_config=None,
+        parse_json=json.loads,
+        call_llm_fn=lambda *a, **k: payload,
+        provider=object(),
     )
     assert [s.action for s in steps] == ["edit_contract", "enforce_ai_ready"]
     assert steps[1].deterministic is True
@@ -977,3 +1016,73 @@ class TestRunIdPathTraversal:
         manifest = find_resumable_run(tmp_path, mission="quality-coverage")
         store = MissionRunStore(tmp_path, str(manifest["run_id"]))
         assert store.run_dir.is_relative_to(missions_root(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# Dependency inversion — the import-linter contract, pinned behaviourally
+# ---------------------------------------------------------------------------
+
+
+def test_missions_package_does_not_import_cli():
+    """`copilot must not depend on cli` — pinned here as well as in CI.
+
+    import-linter enforces this repo-wide, but a behavioural test fails
+    in the same run as the code that breaks it, which is a much shorter
+    feedback loop than a separate CI job.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    package = _Path(runner_module.__file__).parent
+    offenders = []
+    for module_path in sorted(package.glob("*.py")):
+        tree = ast.parse(module_path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                "fluid_build.cli"
+            ):
+                offenders.append(f"{module_path.name}:{node.lineno} -> {node.module}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("fluid_build.cli"):
+                        offenders.append(f"{module_path.name}:{node.lineno} -> {alias.name}")
+    assert offenders == [], f"copilot.missions imported cli: {offenders}"
+
+
+def test_runner_requires_a_runtime_rather_than_defaulting_to_one(spec, contract_path, workspace):
+    """No silent default: a missing runtime is a construction error.
+
+    A fallback executor that quietly no-op'd (or a writer that skipped
+    the provenance envelope) would let tests pass against behaviour
+    production never runs.
+    """
+    with pytest.raises(TypeError):
+        MissionRunner(spec, contract_path, workspace_root=workspace)  # no runtime
+
+
+def test_runner_writes_through_the_injected_writer(spec, contract_path, workspace):
+    """The runner never reaches for a writer of its own."""
+    seen = []
+
+    def _recording_writer(contract, path, *, command):
+        seen.append((path, command))
+        path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+
+    runtime = MissionRuntime(
+        execute=lambda step, contract, **kw: _with_dq_rules(contract),
+        write_contract=_recording_writer,
+        parse_json=json.loads,
+    )
+    outcome = MissionRunner(
+        spec,
+        contract_path,
+        workspace_root=workspace,
+        plan_fn=_plan_one,
+        confirm_fn=lambda *a, **k: False,
+        llm_config=None,
+        runtime=runtime,
+    ).run()
+
+    assert outcome.status == "complete"
+    assert seen and seen[0][0] == contract_path
+    assert seen[0][1].startswith("fluid mission run")

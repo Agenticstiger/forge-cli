@@ -278,6 +278,73 @@ def _resolve_mission_llm_config(args: argparse.Namespace):
         return None, str(exc)
 
 
+def _agent_loop_executor(
+    step,
+    contract,
+    *,
+    spec,
+    llm_config,
+    workspace_root,
+    console=None,
+):
+    """The real EXECUTE step — one repair through the inner agent loop.
+
+    This lives in ``cli`` because it needs two ``cli`` collaborators
+    (``run_copilot_agent_loop`` and ``build_agent_loop_seed_context``)
+    and ``fluid_build.copilot`` must not import ``fluid_build.cli``. The
+    runner declares the shape it needs as
+    ``copilot.missions.executor.MissionStepExecutor``; this satisfies it.
+
+    The two mission-specific parameters are the honest surgery the RFC
+    called for: ``tool_allowlist`` (``spec.tools.allow``, intersected
+    with the live registry inside the loop) and ``goal_scope`` (this
+    step's framing). The seed — the contract as it exists on disk right
+    now — rides the existing ``seed_contract_override`` seam.
+
+    Returns the proposed contract; it never writes. The runner owns the
+    write so every proposal passes the destructive gate first.
+    """
+    from fluid_build.cli.forge_copilot_agent_loop import run_copilot_agent_loop
+    from fluid_build.cli.forge_copilot_runtime import build_agent_loop_seed_context
+    from fluid_build.copilot.missions.runner import (
+        INNER_LOOP_ITERATIONS,
+        extract_proposed_contract,
+    )
+
+    context = build_agent_loop_seed_context(
+        {"project_goal": spec.goal},
+        seed_contract=contract,
+    )
+    payload = run_copilot_agent_loop(
+        context=context,
+        llm_config=llm_config,
+        workspace_root=workspace_root,
+        console=console,
+        max_iterations=INNER_LOOP_ITERATIONS,
+        tool_allowlist=list(spec.tools_allow) or None,
+        goal_scope=step.goal,
+    )
+    return extract_proposed_contract(payload)
+
+
+def build_mission_runtime():
+    """Wire the cli-side collaborators the mission runner depends on.
+
+    The single place where the ``cli`` tier is bound to the ``copilot``
+    tier's Protocols. Keeping it one function means the dependency
+    inversion has exactly one production implementation to audit.
+    """
+    from fluid_build.cli.forge_contract_factory import write_contract
+    from fluid_build.cli.forge_copilot_runtime import extract_json_object
+    from fluid_build.copilot.missions.executor import MissionRuntime
+
+    return MissionRuntime(
+        execute=_agent_loop_executor,
+        write_contract=write_contract,
+        parse_json=extract_json_object,
+    )
+
+
 def _run_mission(args: argparse.Namespace) -> int:
     """``fluid mission run`` — the autonomous VERIFY-anchored loop."""
     import json as _json
@@ -328,6 +395,7 @@ def _run_mission(args: argparse.Namespace) -> int:
             resume=bool(getattr(args, "resume", False)),
             run_id=getattr(args, "run_id", None),
             console=console,
+            runtime=build_mission_runtime(),
         )
     except Exception as exc:  # noqa: BLE001 — surface a typed name, never a traceback
         LOG.warning("mission_run_failed", extra={"error": type(exc).__name__}, exc_info=True)

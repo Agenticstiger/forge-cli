@@ -41,7 +41,10 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
+
+if TYPE_CHECKING:  # pragma: no cover — typing only
+    from fluid_build.copilot.missions.executor import JsonObjectParser
 
 LOG = logging.getLogger("fluid.copilot.missions.planner")
 
@@ -177,6 +180,7 @@ def plan_steps(
     scorecard: Any,
     *,
     llm_config: Any,
+    parse_json: "JsonObjectParser",
     call_llm_fn: Optional[Any] = None,
     provider: Optional[Any] = None,
 ) -> Sequence[MissionStep]:
@@ -186,9 +190,13 @@ def plan_steps(
     resolve to :mod:`fluid_build.llm.providers` — the cost-tracked call
     path, so planner spend lands in ``RunCostTracker`` and is subject to
     the mission's per-product ceiling like every other call.
-    """
-    from fluid_build.cli.forge_copilot_runtime import extract_json_object
 
+    ``parse_json`` is injected rather than imported: the repo-standard
+    ``extract_json_object`` (fence- and preamble-tolerant) lives under
+    ``cli``, and ``copilot`` must not depend on ``cli``. Reimplementing
+    it here would be a parallel implementation of a parser whose
+    tolerances matter, so ``cli/mission.py`` supplies the real one.
+    """
     if call_llm_fn is None or provider is None:
         from fluid_build.llm.providers import call_llm as _call_llm
         from fluid_build.llm.providers import get_llm_provider
@@ -207,7 +215,7 @@ def plan_steps(
         return fallback_plan(scorecard)
 
     try:
-        payload = extract_json_object(raw or "")
+        payload = parse_json(raw or "")
     except (ValueError, json.JSONDecodeError):
         LOG.info(
             "mission_plan_unparseable",

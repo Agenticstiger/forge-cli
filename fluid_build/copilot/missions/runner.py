@@ -85,10 +85,15 @@ from fluid_build.copilot.missions.checks import (
     run_mission_checks,
 )
 from fluid_build.copilot.missions.destructive import DiffVerdict, classify_contract_diff
+from fluid_build.copilot.missions.executor import MissionRuntime
 from fluid_build.copilot.missions.gate import confirm_fail_closed, reject_destructive
 from fluid_build.copilot.missions.planner import MissionStep, plan_steps
 from fluid_build.copilot.missions.spec import MissionSpec
-from fluid_build.copilot.missions.store import MissionRunStore, find_resumable_run
+from fluid_build.copilot.missions.store import (
+    MissionRunStore,
+    find_resumable_run,
+    new_mission_run_id,
+)
 
 LOG = logging.getLogger("fluid.copilot.missions.runner")
 
@@ -188,9 +193,13 @@ class MissionRunner:
     """Runs one mission to a terminal state.
 
     Every collaborator that touches the outside world is injectable so
-    the loop can be tested without an LLM, a TTY, or a clock:
-    ``plan_fn`` (PLAN), ``execute_fn`` (EXECUTE), ``confirm_fn`` (GATE),
-    ``now_fn`` (deadlines). Production defaults wire the real ones.
+    the loop can be tested without an LLM, a TTY, or a clock: ``runtime``
+    (the required EXECUTE + write seam, see :mod:`executor`), ``plan_fn``
+    (PLAN), ``confirm_fn`` (GATE), ``now_fn`` (deadlines).
+
+    ``runtime`` is required and has no default. The runner owns the
+    *loop*; ``cli/mission.py`` owns the *machinery*, because
+    ``fluid_build.copilot`` must not import ``fluid_build.cli``.
     """
 
     def __init__(
@@ -202,8 +211,8 @@ class MissionRunner:
         workspace_root: Optional[Path] = None,
         run_id: Optional[str] = None,
         console: Any = None,
+        runtime: MissionRuntime,
         plan_fn: Optional[Callable[..., Sequence[MissionStep]]] = None,
-        execute_fn: Optional[Callable[..., Optional[Dict[str, Any]]]] = None,
         confirm_fn: Optional[Callable[..., bool]] = None,
         now_fn: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -212,11 +221,11 @@ class MissionRunner:
         self.llm_config = llm_config
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.console = console
+        self.runtime = runtime
         self._plan_fn = plan_fn or plan_steps
-        self._execute_fn = execute_fn or self._execute_with_agent_loop
         self._confirm_fn = confirm_fn or confirm_fail_closed
         self._now = now_fn or time.monotonic
-        self.store = MissionRunStore(self.workspace_root, run_id or self._new_run_id())
+        self.store = MissionRunStore(self.workspace_root, run_id or new_mission_run_id())
         self.events: List[Dict[str, Any]] = []
         self._prior_spend_usd = 0.0
         self._deadline: Optional[float] = None
@@ -225,12 +234,6 @@ class MissionRunner:
         self._baseline_contract: Optional[Dict[str, Any]] = None
 
     # ── construction helpers ───────────────────────────────────────
-
-    @staticmethod
-    def _new_run_id() -> str:
-        from fluid_build.cli._preview_panel import new_run_id
-
-        return new_run_id()
 
     @classmethod
     def resume(
@@ -403,48 +406,23 @@ class MissionRunner:
             enforce_ai_ready(scratch)
             return scratch
         if step.action == "enrich_contract":
-            from fluid_build.cli.forge_copilot_runtime import _enrich_contract
+            # The real pass lives in the cli-free ``copilot`` tier; the
+            # ``cli`` wrapper only added the fail-open, which is inlined
+            # here so the runner does not reach up a tier for it.
+            from fluid_build.copilot.enrichment import enrich_contract
 
-            enriched = _enrich_contract(scratch)
+            try:
+                enriched = enrich_contract(scratch, workspace_root=self.workspace_root)
+            except Exception:  # noqa: BLE001 — enrichment is best-effort
+                LOG.debug("mission_enrichment_failed", exc_info=True)
+                return scratch
             return enriched if isinstance(enriched, dict) else scratch
         return None  # pragma: no cover — guarded by MissionStep.deterministic
 
-    def _execute_with_agent_loop(
-        self,
-        step: MissionStep,
-        contract: Dict[str, Any],
-        *,
-        spec: MissionSpec,
-        llm_config: Any,
-        workspace_root: Path,
-        console: Any = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Run one repair step through the bounded inner agent loop.
-
-        The two mission-specific parameters are the honest surgery the
-        RFC called for: ``tool_allowlist`` (``spec.tools.allow``,
-        intersected with the live registry inside the loop) and
-        ``goal_scope`` (this step's framing). The seed — the contract as
-        it exists on disk right now — rides the existing
-        ``seed_contract_override`` seam via ``forge_copilot_runtime``.
-        """
-        from fluid_build.cli.forge_copilot_agent_loop import run_copilot_agent_loop
-        from fluid_build.cli.forge_copilot_runtime import build_agent_loop_seed_context
-
-        context = build_agent_loop_seed_context(
-            {"project_goal": spec.goal},
-            seed_contract=contract,
-        )
-        payload = run_copilot_agent_loop(
-            context=context,
-            llm_config=llm_config,
-            workspace_root=workspace_root,
-            console=console,
-            max_iterations=INNER_LOOP_ITERATIONS,
-            tool_allowlist=list(spec.tools_allow) or None,
-            goal_scope=step.goal,
-        )
-        return extract_proposed_contract(payload)
+    # NOTE: the real EXECUTE implementation lives in
+    # ``cli/mission.py::_agent_loop_executor`` — it needs the inner agent
+    # loop and the seed-context builder, both of which are ``cli``. It
+    # arrives here as ``runtime.execute`` (see :mod:`executor`).
 
     # ── GATE ───────────────────────────────────────────────────────
 
@@ -518,9 +496,11 @@ class MissionRunner:
     # ── contract IO ────────────────────────────────────────────────
 
     def _write_contract(self, contract: Dict[str, Any]) -> None:
-        from fluid_build.cli.forge_contract_factory import write_contract
-
-        write_contract(contract, self.contract_path, command=f"fluid mission run {self.spec.name}")
+        self.runtime.write_contract(
+            contract,
+            self.contract_path,
+            command=f"fluid mission run {self.spec.name}",
+        )
 
     def _reread(self) -> Tuple[Dict[str, Any], str]:
         return load_contract_for_checks(self.contract_path)
@@ -661,6 +641,7 @@ class MissionRunner:
             self.spec,
             scorecard,
             llm_config=self._call_llm_config(),
+            parse_json=self.runtime.parse_json,
         )
         payload = {"cycle": cycle, "steps": [s.to_dict() for s in steps]}
         self.store.write_plan(payload, cycle=cycle)
@@ -678,7 +659,7 @@ class MissionRunner:
                 if step.deterministic:
                     proposed = self._execute_deterministic(step, contract)
                 else:
-                    proposed = self._execute_fn(
+                    proposed = self.runtime.execute(
                         step,
                         contract,
                         spec=self.spec,
