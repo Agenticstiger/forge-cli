@@ -63,7 +63,17 @@ class DbtEngine(TransformationEngine):
         output_dir: Optional[Path] = None,
         mesh_hub: Optional[str] = None,
         model_contracts: bool = False,
+        tests_key: Optional[str] = None,
     ) -> GenerationResult:
+        """Generate the dbt project files for one build.
+
+        ``tests_key`` selects the YAML key data tests attach under —
+        ``"tests"`` (legacy, default; the only spelling dbt-core <1.8
+        understands) or ``"data_tests"`` (dbt-core >=1.8; required by the
+        strict-parsing Fusion engine). Resolved at the CLI layer from the
+        detected dbt binary; threaded here as a plain string because
+        ``engines/`` must not import ``build_runners`` (import tiering).
+        """
         files: GenerationResult = {}
 
         # dbt_project.yml
@@ -76,6 +86,7 @@ class DbtEngine(TransformationEngine):
             contract,
             schema_context=schema_context,
             workspace_root=workspace_root,
+            tests_key=tests_key,
         )
         if sources_content:
             files["models/sources.yml"] = sources_content
@@ -111,6 +122,7 @@ class DbtEngine(TransformationEngine):
                 mesh_hub=mesh_hub,
                 model_contracts=model_contracts,
                 adapter=_types.adapter_for_build(build),
+                tests_key=tests_key,
             )
             files.update(schema_files)
         elif mesh_hub:

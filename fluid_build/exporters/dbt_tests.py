@@ -90,12 +90,17 @@ from typing import Any, Mapping, Sequence
 # the shared module so the engine + copilot paths cannot drift from it.
 from ..engines.dbt import _test_mapping as _tm
 
+# Shared tests:/data_tests: dialect handling (dbt-core 1.8 renamed the key;
+# Fusion requires the modern spelling). Single source of truth so this
+# exporter and the engine emitters cannot drift.
+from ..engines.dbt.schema_yml import TESTS_KEY_LEGACY, normalize_tests_key
+
 # Block sentinel — the runner uses this to detect a managed file and refuse
 # to clobber a hand-edited one.
 MANAGED_BY_SENTINEL = "# managed-by: fluid"
 
 
-def render_dbt_tests(contract: Mapping[str, Any]) -> str:
+def render_dbt_tests(contract: Mapping[str, Any], *, tests_key: str | None = None) -> str:
     """Render a parsed FLUID contract as a dbt schema.yml string.
 
     The returned text is a single multi-doc YAML stream. Callers should
@@ -106,12 +111,17 @@ def render_dbt_tests(contract: Mapping[str, Any]) -> str:
     contract:
         Parsed contract dict (FLUID v0.7.x — as produced by
         ``loader.load_with_overlay``).
+    tests_key:
+        YAML key data tests attach under — ``"tests"`` (legacy, default;
+        the only spelling dbt-core <1.8 understands) or ``"data_tests"``
+        (dbt-core >=1.8; required by the strict-parsing Fusion engine).
 
     Returns
     -------
     str
         UTF-8 YAML text ready to write to disk.
     """
+    resolved_tests_key = normalize_tests_key(tests_key)
     try:
         import yaml
     except ImportError as e:  # pragma: no cover — pyyaml is a hard dep
@@ -124,7 +134,7 @@ def render_dbt_tests(contract: Mapping[str, Any]) -> str:
     for expose in contract.get("exposes") or []:
         if not isinstance(expose, Mapping):
             continue
-        model_block = _expose_to_model(expose)
+        model_block = _expose_to_model(expose, tests_key=resolved_tests_key)
         if model_block is not None:
             models.append(model_block)
 
@@ -137,7 +147,9 @@ def render_dbt_tests(contract: Mapping[str, Any]) -> str:
     )
 
 
-def _expose_to_model(expose: Mapping[str, Any]) -> dict[str, Any] | None:
+def _expose_to_model(
+    expose: Mapping[str, Any], *, tests_key: str = TESTS_KEY_LEGACY
+) -> dict[str, Any] | None:
     """Convert one ``exposes[i]`` entry to a dbt model dict."""
     name = _model_name(expose)
     if not name:
@@ -146,7 +158,7 @@ def _expose_to_model(expose: Mapping[str, Any]) -> dict[str, Any] | None:
     rules = _dq_rules(expose)
     tests_by_column, model_tests = _group_rules(rules)
 
-    columns = _columns_with_tests(expose, tests_by_column)
+    columns = _columns_with_tests(expose, tests_by_column, tests_key=tests_key)
     description = expose.get("description") or expose.get("title") or ""
 
     model: dict[str, Any] = {
@@ -156,7 +168,7 @@ def _expose_to_model(expose: Mapping[str, Any]) -> dict[str, Any] | None:
 
     # Table-wide (``selector: "*"``) rules become dbt model-level tests.
     if model_tests:
-        model["tests"] = model_tests
+        model[tests_key] = model_tests
 
     if columns:
         model["columns"] = columns
@@ -231,7 +243,10 @@ def _group_rules(
 
 
 def _columns_with_tests(
-    expose: Mapping[str, Any], tests_by_column: Mapping[str, list[Any]]
+    expose: Mapping[str, Any],
+    tests_by_column: Mapping[str, list[Any]],
+    *,
+    tests_key: str = TESTS_KEY_LEGACY,
 ) -> list[dict[str, Any]]:
     """Build the dbt ``columns:`` block, attaching per-column tests.
 
@@ -277,7 +292,7 @@ def _columns_with_tests(
             _tm.constraint_tests(col),
         )
         if col_tests:
-            col_block["tests"] = col_tests
+            col_block[tests_key] = col_tests
         out.append(col_block)
 
     # A dq rule may target a column not declared in contract.schema[]
@@ -286,6 +301,6 @@ def _columns_with_tests(
     for col_name, col_tests in tests_by_column.items():
         if col_name in seen:
             continue
-        out.append({"name": col_name, "tests": col_tests})
+        out.append({"name": col_name, tests_key: col_tests})
 
     return out
