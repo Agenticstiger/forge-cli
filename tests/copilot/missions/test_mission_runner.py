@@ -51,7 +51,14 @@ from fluid_build.copilot.missions.runner import (
     run_mission,
 )
 from fluid_build.copilot.missions.spec import load_mission_spec_from_path
-from fluid_build.copilot.missions.store import PAUSE_REASONS, RUN_STATUSES, MissionRunStore
+from fluid_build.copilot.missions.store import (
+    PAUSE_REASONS,
+    RUN_STATUSES,
+    MissionRunIdError,
+    MissionRunStore,
+    find_resumable_run,
+    missions_root,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -895,3 +902,78 @@ def test_extract_proposed_contract_accepts_both_envelope_shapes():
     assert extract_proposed_contract({"kind": "SomethingElse"}) is None
     assert extract_proposed_contract(None) is None
     assert extract_proposed_contract({}) is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Security: run-id path traversal (found by the lane's own security pass)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestRunIdPathTraversal:
+    """``run_id`` is an opaque single path segment — never a path fragment.
+
+    The attack this pins: ``MissionRunStore.run_dir`` joins the id onto
+    ``missions_root``, and ``MissionRunner.resume`` sources that id from a
+    *workspace-resident* ``manifest.json`` — attacker-controlled content in a
+    cloned repo. Two defects made that exploitable:
+
+    1. no validation of ``run_id`` at the store chokepoint, so ``../../..``
+       traversed (and an absolute id discarded the root entirely, because
+       ``pathlib.Path.__truediv__`` drops the left operand); and
+    2. ``list_mission_runs`` used ``setdefault("run_id", child.name)``, letting
+       a manifest declare an identity other than the directory it lives in —
+       winning the newest-first sort with an attacker-chosen ``started_at``.
+
+    The mission trust model does not cover this: it pins the *spec* file's
+    sha256, and a built-in spec is trusted with no prompt at all.
+    """
+
+    def test_traversal_and_absolute_run_ids_are_rejected(self, tmp_path):
+        for bad in ["../escape", "../../../../escape", "/tmp/absolute", "a/b", "..", ".", ""]:
+            with pytest.raises(MissionRunIdError):
+                _ = MissionRunStore(tmp_path, bad).run_dir
+
+    def test_legitimate_run_id_still_resolves_inside_the_workspace(self, tmp_path):
+        store = MissionRunStore(tmp_path, "0101KXS4BRZEWCSCJF")
+        assert store.run_dir.is_relative_to(missions_root(tmp_path))
+
+    def test_manifest_cannot_declare_its_own_run_id(self, tmp_path):
+        """The directory name is authoritative, not the manifest body."""
+        run_dir = missions_root(tmp_path) / "legit"
+        run_dir.mkdir(parents=True)
+        (run_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "../../../../pwned-outside",
+                    "mission": "quality-coverage",
+                    "status": "paused",
+                    "started_at": "2099-01-01T00:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        found = find_resumable_run(tmp_path, mission="quality-coverage")
+        assert found is not None
+        assert found["run_id"] == "legit"
+        # …and the poisoned value would be refused even if it got this far.
+        with pytest.raises(MissionRunIdError):
+            _ = MissionRunStore(tmp_path, "../../../../pwned-outside").run_dir
+
+    def test_poisoned_manifest_cannot_escape_via_resume(self, tmp_path):
+        """End-to-end: the resume path never yields an escaping run dir."""
+        run_dir = missions_root(tmp_path) / "legit"
+        run_dir.mkdir(parents=True)
+        (run_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "run_id": "../../../../pwned-outside",
+                    "mission": "quality-coverage",
+                    "status": "paused",
+                    "started_at": "2099-01-01T00:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        manifest = find_resumable_run(tmp_path, mission="quality-coverage")
+        store = MissionRunStore(tmp_path, str(manifest["run_id"]))
+        assert store.run_dir.is_relative_to(missions_root(tmp_path))

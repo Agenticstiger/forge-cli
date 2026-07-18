@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -64,6 +65,22 @@ RUN_STATUSES = frozenset({"running", "paused", "complete", "failed"})
 #: Why a ``paused`` run stopped. Carried in ``pause_reason``.
 PAUSE_REASONS = frozenset({"stalled", "budget", "timeout", "iterations", "gate_rejected"})
 
+#: A run id is an opaque **single path segment**, never a path fragment.
+#:
+#: This is a security boundary, not cosmetics. ``run_dir`` joins the id onto
+#: ``missions_root``, and ``resume`` takes the id from a *workspace-resident*
+#: ``manifest.json`` — attacker-controlled content in a cloned repo. Without
+#: this gate a manifest declaring ``{"run_id": "../../../../x"}`` (or an
+#: absolute ``"/tmp/x"``, which ``pathlib`` resolves by discarding the left
+#: operand entirely) escapes the workspace and the mission trust model, which
+#: pins the *spec* file's hash and says nothing about run manifests.
+#: Mirrors ``spec.py::_MISSION_NAME_RE``.
+_RUN_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+class MissionRunIdError(ValueError):
+    """A run id was not a safe single path segment."""
+
 
 def missions_root(workspace_root: Path) -> Path:
     """``<workspace>/.fluid/missions``."""
@@ -74,14 +91,31 @@ class MissionRunStore:
     """File-backed mission run directory. All writes atomic."""
 
     def __init__(self, workspace_root: Path, run_id: str) -> None:
+        # Validate here, not at the call sites: this is the single chokepoint
+        # every entry point (fresh run AND resume) funnels through.
+        run_id = str(run_id)
+        if not _RUN_ID_RE.match(run_id):
+            raise MissionRunIdError(
+                f"invalid mission run id {run_id!r} — expected a single path "
+                "segment matching [A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+            )
         self.workspace_root = Path(workspace_root).resolve()
-        self.run_id = str(run_id)
+        self.run_id = run_id
 
     # ── paths ──────────────────────────────────────────────────────
 
     @property
     def run_dir(self) -> Path:
-        return missions_root(self.workspace_root) / self.run_id
+        root = missions_root(self.workspace_root)
+        candidate = (root / self.run_id).resolve()
+        # Defence in depth: the regex above already forbids separators and
+        # ``..``; this asserts containment against symlink/normalisation
+        # surprises before any write lands.
+        if not candidate.is_relative_to(root.resolve()):
+            raise MissionRunIdError(
+                f"mission run dir {candidate} escapes the workspace missions root {root}"
+            )
+        return candidate
 
     @property
     def manifest_path(self) -> Path:
@@ -228,7 +262,11 @@ def list_mission_runs(workspace_root: Path) -> List[Dict[str, Any]]:
         except (OSError, json.JSONDecodeError):
             continue
         if isinstance(payload, dict):
-            payload.setdefault("run_id", child.name)
+            # The DIRECTORY NAME is authoritative — a manifest must not be able
+            # to declare its own identity and thereby point the store somewhere
+            # else. (Was ``setdefault``, which let workspace-resident content
+            # win over the directory it lives in.)
+            payload["run_id"] = child.name
             runs.append(payload)
     runs.sort(key=lambda m: str(m.get("started_at") or ""), reverse=True)
     return runs
