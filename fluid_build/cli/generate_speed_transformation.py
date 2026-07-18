@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -139,6 +140,23 @@ Examples:
             "contract schema (dbt-core >= 1.5). Opt-in because enforcement "
             "fails builds for already-drifted user SQL. dbt-only; ignored "
             "with a warning for other engines."
+        ),
+    )
+    p.add_argument(
+        "--dbt-tests-key",
+        choices=["auto", "tests", "data_tests"],
+        default=None,
+        help=(
+            "Which YAML key generated dbt data tests attach under. "
+            "dbt-core 1.8 renamed ``tests:`` to ``data_tests:`` (both work "
+            "on core 1.8+); the Fusion engine strict-parses and requires "
+            "``data_tests:``, while dbt-core <1.8 only understands the "
+            "legacy ``tests:``. Default ('auto', also via "
+            "$FLUID_DBT_TESTS_KEY) detects the dbt binary you would "
+            "actually run: Fusion or core>=1.8 emit data_tests:, core<1.8 "
+            "or no dbt found emit the legacy tests:. Pass an explicit "
+            "value in CI generators that have no local dbt binary. "
+            "dbt-only; ignored with a warning for other engines."
         ),
     )
     p.add_argument(
@@ -498,6 +516,17 @@ def _generate_single_build(
                 f"engine=dbt; ignoring for engine={engine_name}.[/yellow]"
             )
 
+    # --dbt-tests-key: tests:/data_tests: dialect. Resolved here (not in
+    # engines/) because the auto default consults the detected dbt binary
+    # via build_runners — an edge engines/ must not have.
+    if engine_name == "dbt":
+        engine_kwargs["tests_key"] = _resolve_dbt_tests_key(args, logger)
+    elif getattr(args, "dbt_tests_key", None):
+        cprint(
+            f"[yellow]Warning: --dbt-tests-key is only meaningful for "
+            f"engine=dbt; ignoring for engine={engine_name}.[/yellow]"
+        )
+
     transformation_intent = None
     if logical_model is not None:
         session = StageSession(
@@ -575,6 +604,85 @@ def _generate_single_build(
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
     return output_dir, files, engine_name
+
+
+def _resolve_dbt_tests_key(args: Any, logger: logging.Logger) -> str:
+    """Resolve the tests:/data_tests: dialect for generated dbt YAML.
+
+    Precedence: ``--dbt-tests-key`` flag > ``$FLUID_DBT_TESTS_KEY`` env >
+    ``auto``. Auto detects the dbt binary the user would actually run
+    (same resolution as the ``--dbt-validate`` gate — ``$DBT_EXECUTABLE``,
+    PATH, venv-sibling) and picks per the verified support matrix:
+
+    * Fusion (dbt v2, strict parser — deprecated keys are errors) →
+      ``data_tests``
+    * dbt-core >= 1.8 (rename landed in 1.8; both keys accepted, legacy
+      deprecated) → ``data_tests``
+    * dbt-core < 1.8, undetectable engine, or no dbt binary found →
+      legacy ``tests`` (the only universally-parsed spelling — safest
+      when we know nothing about the runtime that will parse the YAML)
+
+    Ref: docs.getdbt.com/docs/dbt-versions/core-upgrade/upgrading-to-v1.8
+    and .../upgrading-to-fusion.
+    """
+    import os
+
+    choice = getattr(args, "dbt_tests_key", None) or os.getenv("FLUID_DBT_TESTS_KEY") or "auto"
+    if choice in ("tests", "data_tests"):
+        return choice
+    if choice != "auto":
+        # Env var can carry garbage the argparse choices never see.
+        cprint(
+            f"[yellow]Warning: FLUID_DBT_TESTS_KEY={choice!r} is not one of "
+            f"auto|tests|data_tests; falling back to auto detection.[/yellow]"
+        )
+
+    # Mirrors _run_dbt_parse_gate: delegate dbt discovery to the build
+    # runner's resolvers (cli → build_runners is an allowed edge; the
+    # reverse is forbidden by the import-linter contracts).
+    from fluid_build.build_runners.dbt.runner import (
+        _detect_dbt_engine,
+        _resolve_dbt_executable,
+    )
+
+    dbt_bin = _resolve_dbt_executable()
+    if dbt_bin is None:
+        info(logger, "dbt_tests_key_resolved key=tests reason=no_dbt_binary")
+        return "tests"
+
+    flavor, version = _detect_dbt_engine(dbt_bin)
+    if flavor == "fusion":
+        resolved = "data_tests"
+    elif flavor == "core" and _dbt_core_version_at_least(version, (1, 8)):
+        resolved = "data_tests"
+    else:
+        resolved = "tests"
+    info(
+        logger,
+        f"dbt_tests_key_resolved key={resolved} engine={flavor} "
+        f"version={version or '?'} dbt={dbt_bin}",
+    )
+    return resolved
+
+
+def _dbt_core_version_at_least(version: str, floor: Tuple[int, int]) -> bool:
+    """True when a detected dbt-core version string is ``>= floor``.
+
+    Tolerates pre-release suffixes (``1.8.0b1``) by reading only the
+    leading integers of the first two dotted components. Unparseable or
+    empty versions return False — the caller then falls back to the
+    legacy ``tests:`` key, which every dbt version parses.
+    """
+    parts = version.split(".")
+    numbers: List[int] = []
+    for part in parts[:2]:
+        match = re.match(r"\d+", part)
+        if match is None:
+            return False
+        numbers.append(int(match.group()))
+    if len(numbers) < 2:
+        return False
+    return (numbers[0], numbers[1]) >= floor
 
 
 def _dbt_sql_model_paths(files: Dict[str, str]) -> List[str]:
