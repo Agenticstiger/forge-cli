@@ -224,6 +224,7 @@ def _build_contract(
     materializations: Dict[str, str] = {}
     layers_present: set[str] = set()
     referenced_sources: List[str] = []
+    expose_by_model_uid: Dict[str, Dict[str, Any]] = {}
 
     for uid, node in models.items():
         layer = _infer_model_layer(node)
@@ -245,6 +246,7 @@ def _build_contract(
             uid, node, layer, materialized, adapter, catalog, tests_by_model.get(uid, []), report
         )
         exposes.append(expose)
+        expose_by_model_uid[uid] = expose
         report.mapped_one_to_one.append(f"model.{node.get('name')}")
         transformations.append(
             {
@@ -257,6 +259,7 @@ def _build_contract(
             materializations[expose["exposeId"]] = materialized
 
     consumes = _build_consumes(referenced_sources, sources, report)
+    _attach_semantic_models(manifest, expose_by_model_uid, report)
 
     product_layer = _product_layer(layers_present)
     metadata: Dict[str, Any] = {"layer": product_layer, "owner": dict(_DEFAULT_OWNER)}
@@ -802,6 +805,287 @@ def _source_freshness(src: Dict[str, Any]) -> Optional[str]:
         template = _DATEPART_TO_ISO.get(period)
         if template and isinstance(count, int) and count > 0:
             return template.format(n=count)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Semantic layer: manifest semantic_models / metrics → exposes[].semantics
+# ---------------------------------------------------------------------------
+
+_VALID_SEMANTIC_AGGS = {
+    "sum",
+    "avg",
+    "count",
+    "count_distinct",
+    "min",
+    "max",
+    "median",
+    "percentile",
+}
+_VALID_ENTITY_TYPES = {"primary", "foreign", "unique", "natural"}
+
+
+def _attach_semantic_models(
+    manifest: Dict[str, Any],
+    expose_by_model_uid: Dict[str, Dict[str, Any]],
+    report: ImportReport,
+) -> None:
+    """Map manifest ``semantic_models`` + ``metrics`` (dbt-semantic-interfaces,
+    manifest v10+) into ``exposes[].semantics``.
+
+    Round-trip closure: ``fluid generate transformation`` exports the
+    semantics block to MetricFlow YAML; without this importer leg a
+    brownfield dbt project lost its semantic layer on the way IN. The
+    posture matches the rest of the importer — map faithfully what the
+    contract schema can hold, degrade loudly (report notes) for what it
+    can't (agg_params pre-0.7.6, window_groupings, cumulative/conversion
+    metric types).
+    """
+    semantic_models = manifest.get("semantic_models") or {}
+    if not isinstance(semantic_models, dict) or not semantic_models:
+        return
+
+    blocks_by_sm_name: Dict[str, Dict[str, Any]] = {}
+    measure_home: Dict[str, Dict[str, Any]] = {}
+
+    for uid, sm in semantic_models.items():
+        if not isinstance(sm, dict):
+            continue
+        expose = _semantic_model_expose(sm, expose_by_model_uid)
+        if expose is None:
+            report.unsupported.append(
+                f"semantic model {sm.get('name') or uid}: target model has no expose "
+                "(ephemeral / foreign package?) — dropped"
+            )
+            continue
+        block = _semantics_block_from_semantic_model(sm, report)
+        expose["semantics"] = block
+        blocks_by_sm_name[str(sm.get("name") or "")] = block
+        for measure in block.get("measures", []):
+            measure_home[measure["name"]] = block
+        report.mapped_one_to_one.append(
+            f"semantic_model.{sm.get('name')} → exposes[{expose['exposeId']}].semantics"
+        )
+
+    for uid, metric in (manifest.get("metrics") or {}).items():
+        if not isinstance(metric, dict):
+            continue
+        _attach_metric(metric, uid, measure_home, blocks_by_sm_name, report)
+
+
+def _semantic_model_expose(
+    sm: Dict[str, Any], expose_by_model_uid: Dict[str, Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    for dep in (sm.get("depends_on") or {}).get("nodes") or []:
+        if isinstance(dep, str) and dep in expose_by_model_uid:
+            return expose_by_model_uid[dep]
+    # Fallback: parse the ref('model') string and match by node name.
+    model_name = _parse_ref(sm.get("model"))
+    if model_name:
+        for uid, expose in expose_by_model_uid.items():
+            if uid.rsplit(".", 1)[-1] == model_name:
+                return expose
+    return None
+
+
+def _semantics_block_from_semantic_model(
+    sm: Dict[str, Any], report: ImportReport
+) -> Dict[str, Any]:
+    sm_name = str(sm.get("name") or "semantic_model")
+    block: Dict[str, Any] = {"name": sm_name}
+    if sm.get("description"):
+        block["description"] = str(sm["description"])
+
+    default_time = ((sm.get("defaults") or {}).get("agg_time_dimension") or "").strip()
+    if default_time:
+        block["defaultAggTimeDimension"] = default_time
+
+    entities: List[Dict[str, Any]] = []
+    for raw in sm.get("entities") or []:
+        if not isinstance(raw, dict) or not raw.get("name"):
+            continue
+        entity_type = str(raw.get("type") or "").lower()
+        if entity_type not in _VALID_ENTITY_TYPES:
+            report.unsupported.append(
+                f"semantic model {sm_name}: entity {raw.get('name')!r} has "
+                f"unsupported type {raw.get('type')!r} — dropped"
+            )
+            continue
+        entity: Dict[str, Any] = {"name": str(raw["name"]), "type": entity_type}
+        if raw.get("expr"):
+            entity["expr"] = str(raw["expr"])
+        if raw.get("description"):
+            entity["description"] = str(raw["description"])
+        entities.append(entity)
+    if entities:
+        block["entities"] = entities
+
+    dimensions: List[Dict[str, Any]] = []
+    for raw in sm.get("dimensions") or []:
+        if not isinstance(raw, dict) or not raw.get("name"):
+            continue
+        dim_type = str(raw.get("type") or "categorical").lower()
+        dimension: Dict[str, Any] = {"name": str(raw["name"])}
+        if raw.get("expr"):
+            dimension["expr"] = str(raw["expr"])
+        if raw.get("description"):
+            dimension["description"] = str(raw["description"])
+        if dim_type == "time":
+            dimension["type"] = "time"
+            granularity = str(
+                ((raw.get("type_params") or {}).get("time_granularity")) or ""
+            ).strip()
+            if granularity:
+                from fluid_build.forge_datamodel import time_grains as _time_grains
+
+                canonical = _time_grains.normalize_time_grain(granularity)
+                if canonical is not None:
+                    dimension["typeParams"] = {"timeGranularity": canonical}
+                else:
+                    report.unsupported.append(
+                        f"semantic model {sm_name}: dimension {raw['name']!r} "
+                        f"granularity {granularity!r} has no contract equivalent — "
+                        "granularity omitted"
+                    )
+        else:
+            dimension["type"] = "categorical"
+        dimensions.append(dimension)
+    if dimensions:
+        block["dimensions"] = dimensions
+
+    measures: List[Dict[str, Any]] = []
+    for raw in sm.get("measures") or []:
+        if not isinstance(raw, dict) or not raw.get("name"):
+            continue
+        agg = str(raw.get("agg") or "").lower()
+        if agg not in _VALID_SEMANTIC_AGGS:
+            report.unsupported.append(
+                f"semantic model {sm_name}: measure {raw.get('name')!r} has "
+                f"unsupported agg {raw.get('agg')!r} — dropped"
+            )
+            continue
+        measure: Dict[str, Any] = {"name": str(raw["name"]), "agg": agg}
+        if raw.get("expr"):
+            measure["expr"] = str(raw["expr"])
+        if raw.get("description"):
+            measure["description"] = str(raw["description"])
+        if raw.get("agg_time_dimension"):
+            measure["aggTimeDimension"] = str(raw["agg_time_dimension"])
+        if raw.get("create_metric"):
+            measure["createMetric"] = True
+        nad = raw.get("non_additive_dimension")
+        if isinstance(nad, dict) and nad.get("name"):
+            entry: Dict[str, Any] = {"name": str(nad["name"])}
+            window_choice = str(nad.get("window_choice") or "").lower()
+            if window_choice in ("min", "max"):
+                entry["windowChoice"] = window_choice
+            measure["nonAdditiveDimension"] = entry
+            if nad.get("window_groupings"):
+                report.unsupported.append(
+                    f"semantic model {sm_name}: measure {raw['name']!r} "
+                    "non_additive_dimension.window_groupings has no contract "
+                    "slot yet — dropped"
+                )
+        if raw.get("agg_params"):
+            # measures[].aggParams lands in the 0.7.6 preview schema; the
+            # importer emits the GA fluidVersion, so record the loss
+            # instead of emitting a key the schema rejects.
+            report.unsupported.append(
+                f"semantic model {sm_name}: measure {raw['name']!r} agg_params "
+                "requires fluidVersion >= 0.7.6 — dropped (re-import after "
+                "upgrading the contract version to keep percentile parameters)"
+            )
+        measures.append(measure)
+    if measures:
+        block["measures"] = measures
+    return block
+
+
+def _attach_metric(
+    metric: Dict[str, Any],
+    uid: str,
+    measure_home: Dict[str, Dict[str, Any]],
+    blocks_by_sm_name: Dict[str, Dict[str, Any]],
+    report: ImportReport,
+) -> None:
+    name = str(metric.get("name") or uid.rsplit(".", 1)[-1])
+    metric_type = str(metric.get("type") or "simple").lower()
+    type_params = metric.get("type_params") or {}
+
+    if metric_type not in ("simple", "ratio", "derived"):
+        report.unsupported.append(
+            f"metric {name}: type {metric_type!r} has no contract equivalent "
+            "(cumulative/conversion land with the Tier-1 schema work) — dropped"
+        )
+        return
+
+    entry: Dict[str, Any] = {"name": name, "type": metric_type}
+    if metric.get("description"):
+        entry["description"] = str(metric["description"])
+    filter_sql = _metric_filter_sql(metric)
+    if filter_sql:
+        entry["filter"] = filter_sql
+
+    home: Optional[Dict[str, Any]] = None
+    if metric_type == "simple":
+        measure_name = str(((type_params.get("measure") or {}).get("name")) or "")
+        if not measure_name:
+            report.unsupported.append(f"metric {name}: no measure reference — dropped")
+            return
+        entry["measure"] = measure_name
+        home = measure_home.get(measure_name)
+    elif metric_type == "ratio":
+        numerator = str(((type_params.get("numerator") or {}).get("name")) or "")
+        denominator = str(((type_params.get("denominator") or {}).get("name")) or "")
+        if not numerator or not denominator:
+            report.unsupported.append(f"metric {name}: incomplete ratio inputs — dropped")
+            return
+        entry["numerator"] = numerator
+        entry["denominator"] = denominator
+        home = measure_home.get(numerator) or measure_home.get(denominator)
+    else:  # derived
+        expr = str(type_params.get("expr") or "")
+        input_metrics = [
+            str(m.get("name"))
+            for m in type_params.get("metrics") or []
+            if isinstance(m, dict) and m.get("name")
+        ]
+        if not expr or not input_metrics:
+            report.unsupported.append(f"metric {name}: incomplete derived inputs — dropped")
+            return
+        entry["expr"] = expr
+        entry["inputMetrics"] = input_metrics
+        for existing in blocks_by_sm_name.values():
+            if any(m.get("name") in input_metrics for m in existing.get("metrics", [])):
+                home = existing
+                break
+
+    if home is None:
+        report.unsupported.append(
+            f"metric {name}: could not resolve a home semantic model — dropped"
+        )
+        return
+    home.setdefault("metrics", []).append(entry)
+    report.mapped_one_to_one.append(f"metric.{name} → semantics.metrics")
+
+
+def _metric_filter_sql(metric: Dict[str, Any]) -> Optional[str]:
+    """dbt metric filter → contract filter string. Multiple where-filters
+    AND together; Jinja-templated filters pass through verbatim (the
+    governed MCP query path fails closed on them; the MetricFlow export
+    round-trips them untouched)."""
+    filter_obj = metric.get("filter")
+    if isinstance(filter_obj, str):
+        return filter_obj.strip() or None
+    if isinstance(filter_obj, dict):
+        clauses = [
+            str(f.get("where_sql_template") or "").strip()
+            for f in filter_obj.get("where_filters") or []
+            if isinstance(f, dict)
+        ]
+        clauses = [c for c in clauses if c]
+        if clauses:
+            return " AND ".join(f"({c})" for c in clauses) if len(clauses) > 1 else clauses[0]
     return None
 
 
