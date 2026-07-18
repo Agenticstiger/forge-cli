@@ -343,3 +343,90 @@ class TestPostGenerationHooks:
         (tmp_path / "dbt").mkdir(parents=True, exist_ok=True)
         template.post_generation_hooks(ctx)
         assert (tmp_path / "dbt" / "dbt_project.yml").exists()
+
+
+# ---------------------------------------------------------------------------
+# Semantics derivation — every template product is queryable out of the box
+# ---------------------------------------------------------------------------
+
+
+class TestTemplateSemantics:
+    """Template contracts previously shipped with NO semantics block —
+    no MCP query tool, no MetricFlow export — until a human authored
+    one by hand. The v073 builder now derives a conservative block from
+    the template's columns."""
+
+    def _all_templates(self):
+        from fluid_build.forge.templates.analytics import AnalyticsTemplate
+        from fluid_build.forge.templates.etl_pipeline import ETLPipelineTemplate
+        from fluid_build.forge.templates.ml_pipeline import MLPipelineTemplate
+        from fluid_build.forge.templates.starter import StarterTemplate
+        from fluid_build.forge.templates.streaming import StreamingTemplate
+
+        return [
+            AnalyticsTemplate(),
+            ETLPipelineTemplate(),
+            MLPipelineTemplate(),
+            StarterTemplate(),
+            StreamingTemplate(),
+        ]
+
+    def test_every_template_contract_carries_semantics(self):
+        for template in self._all_templates():
+            contract = template.generate_contract(_make_context())
+            for expose in contract["exposes"]:
+                semantics = expose.get("semantics")
+                assert semantics, f"{type(template).__name__}: expose without semantics"
+                for key in ("entities", "dimensions", "measures", "metrics"):
+                    assert semantics.get(key), (
+                        f"{type(template).__name__}: semantics.{key} empty — "
+                        "the MCP query gate and the validator lint both need it"
+                    )
+
+    def test_every_template_contract_passes_schema_validation(self):
+        from fluid_build.schema_manager import FluidSchemaManager
+
+        schema_manager = FluidSchemaManager()
+        for template in self._all_templates():
+            contract = template.generate_contract(_make_context())
+            result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+            assert result.is_valid, f"{type(template).__name__}: {result.errors[:3]}"
+
+    def test_analytics_derivation_shape(self):
+        contract = AnalyticsTemplate().generate_contract(_make_context())
+        semantics = contract["exposes"][0]["semantics"]
+        entities = {e["name"]: e for e in semantics["entities"]}
+        assert entities["customer"]["expr"] == "customer_id"
+        measures = {m["name"]: m for m in semantics["measures"]}
+        assert measures["total_metric_value"]["agg"] == "sum"
+        assert measures["total_metric_value"]["expr"] == "metric_value"
+        time_dims = [d for d in semantics["dimensions"] if d.get("type") == "time"]
+        assert time_dims and time_dims[0]["typeParams"] == {"timeGranularity": "day"}
+        assert semantics["defaultAggTimeDimension"] == time_dims[0]["name"]
+
+    def test_record_count_floor_for_measureless_columns(self):
+        from fluid_build.forge.templates._v073_builder import TemplateSpec, build_contract
+
+        spec = TemplateSpec(template_name="starter", properties={"sql": "SELECT 1"})
+        contract = build_contract(spec=spec, project_config={"name": "demo"})
+        semantics = contract["exposes"][0]["semantics"]
+        assert semantics["measures"] == [
+            {"name": "record_count", "agg": "count", "expr": "1", "description": "Row count."}
+        ]
+        assert semantics["metrics"][0]["measure"] == "record_count"
+
+    def test_spec_semantics_override_wins(self):
+        from fluid_build.forge.templates._v073_builder import TemplateSpec, build_contract
+
+        custom = {
+            "name": "custom",
+            "entities": [{"name": "e", "type": "primary"}],
+            "dimensions": [{"name": "d", "type": "categorical"}],
+            "measures": [{"name": "m", "agg": "sum", "expr": "x"}],
+            "metrics": [{"name": "m", "type": "simple", "measure": "m"}],
+        }
+        spec = TemplateSpec(
+            template_name="starter", properties={"sql": "SELECT 1"}, semantics=custom
+        )
+        contract = build_contract(spec=spec, project_config={"name": "demo"})
+        assert contract["exposes"][0]["semantics"] == custom
