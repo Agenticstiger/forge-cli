@@ -41,6 +41,7 @@ Markers declared in `pyproject.toml`.
 |---|---|---|
 | Stage 1 unit | `tests/iac/test_iac_gcp.py` + `test_iac_tofu_validate.py[gcp]` | ✅ 24 green in 7.7s |
 | Stage 2 docker emulator | `tests/iac/test_iac_gcp_emulator_e2e.py` | ✅ 8 hybrid (emit via plan + emulator via SDK) + 1 documented xfail — see [Upstream limitations](#upstream-limitations) |
+| Stage 2 cross-project `access[]` | `tests/iac/test_iac_cross_project_gcp_emulator.py` | ✅ 5/5 — the **emitted** cross-project `user_by_email` entry (incl. two distinct consumer projects) round-trips through goccy/bigquery-emulator intact. **Storage fidelity only**: the emulator performs no validation (accepts `role: NOT_A_ROLE` + a non-email principal, HTTP 200) and no IAM evaluation (unauthenticated query succeeds) — both pinned executably by `test_emulator_neither_validates_nor_enforces_access`. Real IAM/authorization still needs a second GCP project (Stage 3 row below). |
 | Stage 3 base | `tests/iac/test_iac_gcp_real_e2e.py` | ✅ 7/7 (BQ dataset+table, BQ view, GCS, Pub/Sub, multi-exposure, dbt-bigquery via CLI, full mesh) |
 | Stage 3 CLI matrix | `tests/iac/test_iac_gcp_real_cli_matrix_e2e.py` | ✅ 6/6 |
 | Stage 3 idempotency | `tests/iac/test_iac_gcp_real_idempotency_e2e.py` | ✅ (see Stage 3 §) |
@@ -201,7 +202,7 @@ fields:
 | Capability | Reads from |
 |---|---|
 | Cross-account S3 access | `binding.governance.lakeFormation.grants[].principal` (LF block); bucket policy is paired automatically with any IAM-principal grant — no opt-in flag |
-| Cross-project BQ access | `metadata.policies` (existing) → dataset `access[]` via `_bq_access_entries` |
+| Cross-project BQ access | `metadata.policies` (existing) → dataset `access[]` via `_bq_access_entries` — ⚠️ **but see the note below: `metadata.policies` does not pass `fluid validate`** |
 | Glue catalog enrichment | `description` / `metadata.{description,layer,productType}` / `domain` / `fluidVersion` / `column.{description,tags}` |
 | Snowflake catalog enrichment | same set as Glue |
 
@@ -210,6 +211,28 @@ contract author has to learn. Reverted this session were three
 schema fields (`crossAccountS3Access` boolean, `bigQuery.crossProjectGrants[]`,
 `governance.snowflake.*`) that all turned out to be redundant with
 existing fields once we tested the cleanest emit path.
+
+> ⚠️ **Known gap — `metadata.policies` is read but not schema-valid.**
+> `iac/providers/gcp.py` reads `contract["metadata"]["policies"]`, but
+> `metadata` sets `additionalProperties: false` and does **not** list
+> `policies` in **any** shipped schema (0.7.3 / 0.7.5 / 0.7.6). A
+> contract carrying it therefore fails `fluid validate`:
+>
+> ```
+> $ fluid validate contract.fluid.yaml
+> ❌ Invalid FLUID contract (1 error(s)) (schema v0.7.6)
+>  1. metadata: Additional properties are not allowed ('policies' was unexpected)
+> ```
+>
+> `fluid generate iac` does not run schema validation, so the emit path
+> works and every test above passes — but the cross-project grant is
+> **not expressible in a contract that passes `fluid validate` today**.
+> The validated access-control surface (`accessPolicy`, consumed by
+> `cli/policy_compile.py` and the ODPS provider) is a *different* field
+> that the IaC GCP plugin does not read. Closing this means either
+> adding `policies` to the metadata schema or teaching the plugin to
+> read `accessPolicy`. Discovered 2026-07-18 while closing the Stage 2
+> cross-project row.
 
 ## Code that was retired (no more maintenance burden)
 
