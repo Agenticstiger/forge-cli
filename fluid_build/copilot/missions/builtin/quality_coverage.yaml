@@ -1,0 +1,31 @@
+# Built-in mission: reach data-quality rule coverage on every output port.
+# (RFC-deep-agents.md — flagship mission #2.)
+#
+# The coverage criterion is the frozen predicate DSL's [*] fan-out with
+# fail-closed empty/missing semantics: a port with no dq.rules (or an
+# empty rules list, or no ports at all) fails the criterion.
+name: quality-coverage
+description: Reach data-quality rule coverage on every output port.
+goal: >
+  Every exposed output port carries at least one data-quality rule and
+  the contract validates against its declared fluidVersion schema.
+success_criteria:
+  - check: validate
+  - check: predicate
+    path: "exposes[*].contract.dq.rules"
+    op: exists
+budgets:
+  max_usd: 3.00
+  max_iterations: 4
+  max_wall_seconds: 1200
+gates:
+  destructive: ask
+tools:
+  allow:
+    - discover_workspace
+    - read_sample_schema
+    - validate_contract
+    - propose_contract
+plan_hint:
+  - inspect
+  - add_dq_rules

@@ -750,6 +750,10 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     # ``fluid agents`` — manage forge agent runs (list / show / prune).
     # New in the resumability landing; mirrors ``stats`` registration.
     _try_register(sp, "agents_cmd", "agents")
+    # ``fluid mission`` — mission specs: trust pinning + zero-LLM
+    # success-criteria scorecards (deep-agents PR 1; the autonomous
+    # runner lands in PR 2). See RFC-deep-agents.md.
+    _try_register(sp, "mission", "mission")
     _try_register(sp, "describe_cmd", "describe")
 
     # ────────────────────────────────────────────────────────────────────

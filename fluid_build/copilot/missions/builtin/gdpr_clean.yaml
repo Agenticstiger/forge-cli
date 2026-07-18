@@ -1,0 +1,37 @@
+# Built-in mission: make a data product GDPR-compliant end to end.
+# (RFC-deep-agents.md — flagship mission #1.)
+#
+# Success is decided ONLY by the deterministic checks below, re-run
+# against the re-read on-disk contract — never by an LLM's claim.
+name: gdpr-clean
+description: Make a data product GDPR-compliant end to end.
+goal: >
+  Every PII column is classified with provenance, every MCP-exposed port
+  carries an agentPolicy with retention limits, and the contract validates.
+success_criteria:                 # ALL non-advisory checks must pass; each deterministic
+  - check: validate               # in-process cli/validate stage, exit-0 semantics
+  - check: ai_ready
+    require:
+      sensitive_exposes_annotated: true
+      missing_descriptions: 0
+  - check: predicate              # dotted-path + [*] over the contract dict; nothing more
+    path: "exposes[*].policy.agentPolicy.retentionPolicy.maxRetentionDays"
+    op: lte
+    value: 30
+budgets:
+  max_usd: 5.00                   # per-run HARD ceiling (enforced by the PR-2 runner)
+  max_iterations: 6               # outer loops (inner loop keeps its 12)
+  max_wall_seconds: 1800          # deadline checked before every LLM/tool call
+gates:
+  destructive: ask                # ask | deny; non-TTY => deny (fail closed)
+tools:
+  allow:
+    - discover_workspace
+    - read_sample_schema
+    - check_pii_classification
+    - validate_contract
+    - propose_contract
+plan_hint:                        # ordering hint only; the planner may reorder
+  - inspect                       # or drop steps, never add tools
+  - classify_pii
+  - stamp_policies
