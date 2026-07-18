@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .data_model import DimensionalModel, DV2Model, TechniqueLiteral
 from .intent import BusinessIntent
-from .osi import OSIAIContext, OSISemanticModel
+from .osi import OSIAIContext, OSIAIContextValue, OSISemanticModel
 
 # ---------------------------------------------------------------------------
 # Gemini schema translation helpers (module-private).
@@ -295,7 +295,9 @@ class ConceptualRelationship(BaseModel):
 class ConceptualDraft(StructuredOutputModel):
     name: str
     description: str = ""
-    ai_context: OSIAIContext = Field(default_factory=OSIAIContext)
+    # OSIAIContextValue coerces the spec's plain-string ai_context form
+    # (and the occasional LLM string emission) into the structured object.
+    ai_context: OSIAIContextValue = Field(default_factory=OSIAIContext)
     entities: List[ConceptualEntity] = Field(default_factory=list)
     relationships: List[ConceptualRelationship] = Field(default_factory=list)
 
