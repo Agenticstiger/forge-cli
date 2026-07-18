@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://open-data-protocol.github.io/fluid/schema/fluid-schema-0.7.6.json",
-  "title": "FLUID 0.7.6 — Next preview (opened at 0.7.5 GA; no changes yet)",
-  "description": "FLUID contract schema 0.7.6 — the next PREVIEW version, opened when 0.7.5 was promoted to stable. Identical to 0.7.5 at open; additive preview fields land here. ",
+  "title": "FLUID 0.7.6 — Declarative Packaging Modes (preview)",
+  "description": "FLUID contract schema 0.7.6 — the current PREVIEW version, opened when 0.7.5 was promoted to stable.\n\n🔥 NEW in v0.7.6:\n• Declarative packaging modes — a top-level `packaging` block (plus a per-exposure `binding.packaging` override) declares per-container ownership for the IaC emit: `isolated` (this product creates and owns the container) vs `shared` (a pre-existing, platform-owned pool referenced via an OpenTofu data source), with a per-kind `containers` override map for hybrid tiers and a `pool` id for tenancy/cost attribution (RFC-packaging-modes.md).\n• Backward compatible with v0.7.5 — every 0.7.5 contract validates as 0.7.6 unchanged; an ABSENT packaging block keeps the legacy byte-identical emit.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -335,9 +335,77 @@
     "governance": {
       "$ref": "#/$defs/governance",
       "description": "Contract-level governance: account/project-wide settings (e.g. AWS Lake Formation admins and LF-tag definitions). Per-resource grants and tag associations live under binding.governance."
+    },
+    "packaging": {
+      "$ref": "#/$defs/packaging",
+      "description": "NEW in v0.7.6: Contract-wide packaging default — declarative container ownership (isolated = this product creates and owns its infrastructure containers; shared = containers are pre-existing, platform-owned pools the product writes into but does not own). Overridable per exposure via binding.packaging. An ABSENT block means legacy behavior: the IaC emit is byte-identical to pre-packaging releases."
     }
   },
   "$defs": {
+    "packaging": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.6: Declarative packaging mode — per-container ownership for the OpenTofu IaC emit (RFC-packaging-modes.md). 'isolated' emits owned resources (today's exact emit); 'shared' emits a data-source reference to a platform-owned pool plus leaf-only owned resources (tables, prefixed objects, scoped grants). Hybrid tiers (e.g. Snowflake shared-database / owned-schema / owned-warehouse) come from the per-kind containers override map. Prior art: Terraform's resource-vs-data-source ownership split, Unity Catalog isolation-mode OPEN|ISOLATED, Kubernetes shared-vs-dedicated node pools.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "isolated",
+            "shared"
+          ],
+          "description": "NEW in v0.7.6: Blanket ownership mode for every container kind. Default when the block is present: 'isolated'. Per-kind exceptions go in `containers`."
+        },
+        "pool": {
+          "type": "string",
+          "minLength": 1,
+          "description": "NEW in v0.7.6: Pool id of the platform-owned tenant pool this product writes into. REQUIRED (enforced by the resolver) whenever any container resolves 'shared' — a pool must be addressable. Propagated as the `fluid_pool` label/tag for cost attribution."
+        },
+        "poolManifest": {
+          "type": "string",
+          "minLength": 1,
+          "description": "NEW in v0.7.6: Optional path to the platform team's pool manifest file; snapshotted into the bundle at stage 1 so bundleDigest covers it (any pool-file edit invalidates downstream plans)."
+        },
+        "containers": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "NEW in v0.7.6: Per-container-kind ownership overrides — each key wins over `mode` for that kind, yielding hybrid tiers. Kind↔platform mapping: bucket → aws_s3_bucket / google_storage_bucket; database → snowflake_database AND aws_glue_catalog_database; dataset → google_bigquery_dataset; schema → snowflake_schema; warehouse → snowflake_warehouse; cluster → Confluent environment/cluster (v1: shared only).",
+          "properties": {
+            "bucket": {
+              "$ref": "#/$defs/packagingContainerMode",
+              "description": "NEW in v0.7.6: Ownership of the object-store bucket (aws_s3_bucket / google_storage_bucket)."
+            },
+            "database": {
+              "$ref": "#/$defs/packagingContainerMode",
+              "description": "NEW in v0.7.6: Ownership of the database container — covers Snowflake `database` AND AWS `glue_database`."
+            },
+            "dataset": {
+              "$ref": "#/$defs/packagingContainerMode",
+              "description": "NEW in v0.7.6: Ownership of the BigQuery dataset (google_bigquery_dataset)."
+            },
+            "schema": {
+              "$ref": "#/$defs/packagingContainerMode",
+              "description": "NEW in v0.7.6: Ownership of the Snowflake schema (snowflake_schema)."
+            },
+            "warehouse": {
+              "$ref": "#/$defs/packagingContainerMode",
+              "description": "NEW in v0.7.6: Ownership of the Snowflake warehouse (snowflake_warehouse) — isolated gives per-product cost attribution."
+            },
+            "cluster": {
+              "$ref": "#/$defs/packagingContainerMode",
+              "description": "NEW in v0.7.6: Ownership of the Confluent environment/cluster. v1 accepts 'shared' only — dedicated-cluster provisioning is not yet supported (the resolver rejects 'isolated')."
+            }
+          }
+        }
+      }
+    },
+    "packagingContainerMode": {
+      "type": "string",
+      "enum": [
+        "isolated",
+        "shared"
+      ],
+      "description": "NEW in v0.7.6: Per-container ownership — 'isolated' (this product creates and owns it) or 'shared' (pre-existing platform-owned pool, referenced not created)."
+    },
     "retention": {
       "type": "object",
       "description": "NEW in v0.7.3: Retention durations (ISO-8601). Defaults: runState=P30D, runLogs=P90D, lineage=P365D, dlq=P180D.",
@@ -1513,6 +1581,10 @@
         "governance": {
           "$ref": "#/$defs/bindingGovernance",
           "description": "Per-resource governance: registerLocation, principal grants, tag associations, row/column filters. Account-wide governance (admins, tag definitions) lives at the contract top-level governance block."
+        },
+        "packaging": {
+          "$ref": "#/$defs/packaging",
+          "description": "NEW in v0.7.6: Per-exposure packaging override — key-wise precedence over the contract-wide top-level `packaging` block (binding.packaging > packaging > absent-legacy)."
         }
       }
     },
