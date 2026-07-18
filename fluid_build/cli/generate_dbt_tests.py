@@ -41,7 +41,8 @@ def register_subcommand(subparsers: argparse._SubParsersAction) -> None:
             "Reads exposes[].quality.tests[] and emits a dbt schema.yml document "
             "with per-column tests. Drop the output into your dbt project's "
             "models/<schema>/ directory and run `dbt test` to execute. "
-            "Range tests require the dbt-utils package."
+            "Range/freshness tests reference the dbt_expectations / dbt_utils "
+            "packages — a matching packages.yml is emitted alongside when needed."
         ),
         epilog=(
             "Examples:\n"
@@ -101,4 +102,51 @@ def run(args, logger: logging.Logger) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(yaml_text, encoding="utf-8")
     info(logger, "dbt_tests_written", out=str(out_path), bytes=len(yaml_text))
+    _emit_packages_yml(out_path, yaml_text, logger)
     return 0
+
+
+def _emit_packages_yml(out_path: Path, yaml_text: str, logger: logging.Logger) -> None:
+    """Mirror the engine's packages.yml emission next to the schema.yml.
+
+    The rendered schema.yml may reference package-namespaced tests
+    (``dbt_expectations.expect_column_values_to_be_between``,
+    ``dbt_utils.recency`` / ``expression_is_true``); without their pins the
+    receiving dbt project fails ``dbt parse``. Semantics match the engine
+    path (``engines/dbt/packages_yml.py``): emit only when needed, regenerate
+    a fluid-managed file, and never touch a user-managed one — just tell the
+    user which pins it must carry.
+    """
+    from ..engines.dbt.packages_yml import (
+        MANAGED_BY_SENTINEL as PACKAGES_SENTINEL,
+    )
+    from ..engines.dbt.packages_yml import (
+        PACKAGE_PINS,
+        render_packages_yml,
+        required_packages,
+    )
+
+    needed = required_packages({str(out_path): yaml_text})
+    if not needed:
+        return
+
+    pkg_path = out_path.parent / "packages.yml"
+    if pkg_path.exists() and PACKAGES_SENTINEL not in pkg_path.read_text(encoding="utf-8"):
+        info(
+            logger,
+            "dbt_tests_packages_yml_left_untouched",
+            path=str(pkg_path),
+            required=[
+                {"package": PACKAGE_PINS[p]["package"], "version": PACKAGE_PINS[p]["version"]}
+                for p in needed
+            ],
+            detail=(
+                f"{pkg_path} is user-managed (missing '{PACKAGES_SENTINEL}'); "
+                "ensure it carries the listed packages, then run `dbt deps`."
+            ),
+        )
+        return
+
+    content = render_packages_yml(needed)
+    pkg_path.write_text(content, encoding="utf-8")
+    info(logger, "dbt_tests_packages_written", out=str(pkg_path), packages=needed)

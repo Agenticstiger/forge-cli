@@ -536,7 +536,12 @@ class TestSchemaYml:
         col = data["models"][0]["columns"][0]
         rec = next(t for t in col["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t)
         assert rec["dbt_utils.recency"]["field"] == "updated_at"
-        assert rec["dbt_utils.recency"]["_fluid_window"] == "P1D"
+        # INTENTIONAL pin update (packages.yml card): the ISO window now
+        # drives datepart/interval (P1D → day/1) and the non-dbt
+        # `_fluid_window` kwarg is gone — it broke dbt compile.
+        assert rec["dbt_utils.recency"]["datepart"] == "day"
+        assert rec["dbt_utils.recency"]["interval"] == 1
+        assert "_fluid_window" not in rec["dbt_utils.recency"]
 
 
 # ---------------------------------------------------------------------------

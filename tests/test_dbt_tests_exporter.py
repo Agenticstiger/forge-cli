@@ -227,7 +227,7 @@ def test_column_scoped_freshness_maps_to_recency():
                                 "id": "fresh",
                                 "type": "freshness",
                                 "selector": "updated_at",
-                                "window": "P1D",
+                                "window": "PT6H",
                                 "severity": "warn",
                             }
                         ]
@@ -242,7 +242,13 @@ def test_column_scoped_freshness_maps_to_recency():
         t for t in cols["updated_at"]["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t
     )
     assert rec["dbt_utils.recency"]["field"] == "updated_at"
-    assert rec["dbt_utils.recency"]["_fluid_window"] == "P1D"
+    # INTENTIONAL pin update (packages.yml card): datepart/interval now derive
+    # from the rule's ISO window (PT6H → hour/6) instead of a hardcoded day/1,
+    # and the non-dbt `_fluid_window` kwarg is gone — it made every emitted
+    # recency test fail at dbt compile time (unexpected macro kwarg).
+    assert rec["dbt_utils.recency"]["datepart"] == "hour"
+    assert rec["dbt_utils.recency"]["interval"] == 6
+    assert "_fluid_window" not in rec["dbt_utils.recency"]
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +284,12 @@ def test_table_scoped_freshness_becomes_model_level_test():
     model = doc["models"][0]
     assert "tests" in model
     rec = next(t for t in model["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t)
-    assert rec["dbt_utils.recency"]["_fluid_window"] == "P1D"
+    # INTENTIONAL pin update (packages.yml card): the window now drives
+    # datepart/interval (P1D → day/1); `_fluid_window` is no longer emitted
+    # (non-dbt kwarg — broke `dbt_utils.recency` at compile time).
+    assert rec["dbt_utils.recency"]["datepart"] == "day"
+    assert rec["dbt_utils.recency"]["interval"] == 1
+    assert "_fluid_window" not in rec["dbt_utils.recency"]
 
 
 def test_anomaly_detection_table_rule_with_threshold_maps_to_expression():

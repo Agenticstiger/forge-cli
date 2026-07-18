@@ -126,6 +126,16 @@ class DbtEngine(TransformationEngine):
         if profiles_content:
             files["profiles.yml"] = profiles_content
 
+        # packages.yml — pin the dbt packages any emitted test/model actually
+        # references (dbt_utils / dbt_expectations), so the project passes
+        # `dbt deps` + `dbt parse` out of the box. Emitted only when needed;
+        # folds into dependencies.yml when --mesh-hub emitted one (dbt forbids
+        # the two files coexisting); never clobbers a user-managed file.
+        # Runs last so the namespace scan sees every generated file.
+        from .packages_yml import inject_package_pins
+
+        inject_package_pins(files, output_dir=output_dir)
+
         return files
 
     def validate(
