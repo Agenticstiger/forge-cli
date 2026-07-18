@@ -337,14 +337,26 @@ def _index_expose(expose: Mapping[str, Any]) -> _SemanticIndex:
     )
 
 
-def _resolve_metric(metric_name: str, index: _SemanticIndex) -> Tuple[str, Dict[str, Any]]:
-    """Resolve a metric to (measure_name, measure_definition).
+def _resolve_metric(
+    metric_name: str, index: _SemanticIndex
+) -> Tuple[str, Dict[str, Any], Optional[str]]:
+    """Resolve a metric to (measure_name, measure_definition, filter_sql).
 
     Phase-1 supports ``simple`` metrics — the canonical case in
     dbt MetricFlow / Snowflake Semantic Views — which point at one
     measure. Derived and ratio metrics are intentionally rejected so
     we don't ship arithmetic over agent-supplied measures until
     Phase-2 hardens that path.
+
+    ``filter_sql`` is the contract's ``metrics[].filter`` predicate
+    (allowlist-validated here, applied to the WHERE by the caller).
+    Previously it was silently ignored, so a filtered metric like
+    ``completed_revenue = sum(amount) WHERE status = 'completed'``
+    returned UNFILTERED numbers via the governed ``query`` tool while
+    the dbt MetricFlow export honoured the same filter — two consumers,
+    two different answers for one contract. A filter that fails the
+    safe-expression allowlist (e.g. MetricFlow Jinja templates) raises
+    instead of degrading to wrong results — fail closed, never wrong.
     """
     metric = index.metrics.get(metric_name)
     if metric is None:
@@ -367,7 +379,48 @@ def _resolve_metric(metric_name: str, index: _SemanticIndex) -> Tuple[str, Dict[
         raise QueryValidationError(
             f"Metric {metric_name!r} references unknown measure {measure_name!r}"
         )
-    return measure_name, measure
+    metric_filter = metric.get("filter")
+    if metric_filter is not None:
+        if not isinstance(metric_filter, str) or not metric_filter.strip():
+            raise QueryValidationError(f"Metric {metric_name!r} has a non-string/empty 'filter'")
+        try:
+            metric_filter = validate_sql_expression_allowlist(metric_filter)
+        except ValueError:
+            # The filter text is contract-declared (visible via ``describe``),
+            # so naming the metric is safe; the raw expression is echoed only
+            # through the allowlist's own ValueError, which we deliberately
+            # do NOT propagate — templated filters (e.g. MetricFlow's
+            # ``{{ Dimension('x') }}`` syntax) land here too.
+            raise QueryValidationError(
+                f"Metric {metric_name!r} carries a filter that fails the "
+                "safe-expression allowlist; the governed query path cannot "
+                "apply it. Rewrite the contract filter as a plain SQL "
+                "predicate over contract columns."
+            ) from None
+        # Defence-in-depth: the filter is the first contract expression to
+        # land in the WHERE next to policy.rowFilters. A deliberately
+        # unbalanced filter like ``1=1) OR (1=1`` passes the char allowlist
+        # but would escape its wrapping parens and — by AND/OR precedence —
+        # neutralize an ANDed RLS clause. Balanced parens close the class.
+        if not _parens_balanced(metric_filter):
+            raise QueryValidationError(
+                f"Metric {metric_name!r} carries a filter with unbalanced "
+                "parentheses; the governed query path cannot apply it."
+            )
+    return measure_name, measure, metric_filter
+
+
+def _parens_balanced(expr: str) -> bool:
+    """True when every ``(`` closes in order and none closes early."""
+    depth = 0
+    for ch in expr:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
 
 
 def _resolve_dimension(dimension_name: str, index: _SemanticIndex) -> Tuple[str, str]:
@@ -408,14 +461,51 @@ _AGG_FUNCTIONS = {
 }
 
 
-def _render_measure_expression(measure_name: str, measure: Mapping[str, Any]) -> str:
+# The contract-schema default when a percentile measure carries no
+# ``aggParams.percentile``. MUST stay identical to the dbt MetricFlow
+# bridge's default (``engines/dbt/semantic_models.py``) so the governed
+# query path and the exported dbt project answer the same number for the
+# same contract. 0.5 == median.
+DEFAULT_PERCENTILE = 0.5
+
+
+def _resolve_percentile_params(measure_name: str, measure: Mapping[str, Any]) -> Tuple[float, bool]:
+    """Return (percentile, use_discrete) from ``measure.aggParams``.
+
+    ``aggParams`` is the 0.7.6 contract slot mirroring
+    dbt-semantic-interfaces' ``agg_params``. The percentile value is
+    validated to a real number in [0, 1] — it is interpolated into SQL
+    as a literal (aggregate arguments must be constants), so validation
+    here is the safety boundary.
+    """
+    params = measure.get("aggParams") or {}
+    if not isinstance(params, Mapping):
+        raise QueryValidationError(f"Measure {measure_name!r} has non-object aggParams")
+    raw = params.get("percentile", DEFAULT_PERCENTILE)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 <= float(raw) <= 1:
+        raise QueryValidationError(
+            f"Measure {measure_name!r} has invalid aggParams.percentile "
+            f"{raw!r}; expected a number in [0, 1]"
+        )
+    return float(raw), bool(params.get("useDiscretePercentile"))
+
+
+def _render_measure_expression(
+    measure_name: str, measure: Mapping[str, Any], *, dialect: Optional[str] = None
+) -> str:
     """Render a measure into ``AGG(expr) AS measure_name``.
 
     The measure's ``expr`` is allowlist-validated. The
     ``count_distinct`` aggregation is rendered as ``COUNT(DISTINCT
-    expr)``; ``percentile`` is left as ``PERCENTILE_CONT(expr)`` for
-    Phase-1 (engine-specific syntax for percentile parameters lands
-    in Phase-2).
+    expr)``; ``percentile`` renders the ANSI ordered-set form
+    ``PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY expr)`` (``p`` from
+    ``aggParams.percentile``, default ``DEFAULT_PERCENTILE``;
+    ``useDiscretePercentile`` selects ``PERCENTILE_DISC``). BigQuery
+    and Athena have no ordered-set percentile aggregate (BQ's
+    ``PERCENTILE_CONT`` is analytic-only; Athena offers
+    ``approx_percentile`` with different semantics), so those dialects
+    fail closed with a clear error instead of shipping SQL the engine
+    rejects — or worse, an approximation presented as exact.
     """
     agg_raw = measure.get("agg")
     if not isinstance(agg_raw, str) or agg_raw not in _AGG_FUNCTIONS:
@@ -430,6 +520,20 @@ def _render_measure_expression(measure_name: str, measure: Mapping[str, Any]) ->
     sql_func = _AGG_FUNCTIONS[agg_raw]
     if agg_raw == "count_distinct":
         return f"COUNT(DISTINCT {expr_raw}) AS {validate_ident(measure_name)}"
+    if agg_raw == "percentile":
+        if dialect in ("bigquery", "athena"):
+            raise QueryValidationError(
+                f"Measure {measure_name!r} uses agg 'percentile', which the "
+                f"{dialect} engine does not support as a grouped aggregate. "
+                "Use 'median'-free approximations engine-side or query a "
+                "different measure."
+            )
+        percentile, use_discrete = _resolve_percentile_params(measure_name, measure)
+        fn = "PERCENTILE_DISC" if use_discrete else "PERCENTILE_CONT"
+        return (
+            f"{fn}({percentile:g}) WITHIN GROUP (ORDER BY {expr_raw}) "
+            f"AS {validate_ident(measure_name)}"
+        )
     return f"{sql_func}({expr_raw}) AS {validate_ident(measure_name)}"
 
 
@@ -475,6 +579,7 @@ def compile_semantic_query(
     validate_sql_expression_allowlist(table_reference)
 
     index = _index_expose(expose)
+    metric_filter: Optional[str] = None
     if measure is not None:
         if not isinstance(measure, str):
             raise QueryValidationError("measure must be a string")
@@ -490,7 +595,7 @@ def compile_semantic_query(
         if not isinstance(metric, str):
             raise QueryValidationError("metric must be a string")
         validate_ident(metric)
-        measure_name, measure_definition = _resolve_metric(metric, index)
+        measure_name, measure_definition, metric_filter = _resolve_metric(metric, index)
 
     select_parts: List[str] = []
     group_columns: List[str] = []
@@ -503,12 +608,17 @@ def compile_semantic_query(
         group_columns.append(expr)
         projection_aliases.append(alias)
 
-    measure_sql = _render_measure_expression(measure_name, measure_definition)
+    measure_sql = _render_measure_expression(measure_name, measure_definition, dialect=dialect)
     select_parts.append(measure_sql)
     projection_aliases.append(measure_name)
 
     where_clauses: List[str] = []
     params: List[Any] = []
+    if metric_filter is not None:
+        # Contract-declared metric predicate (already allowlist-validated in
+        # ``_resolve_metric``). Parenthesized so it ANDs safely with the
+        # caller's dimension filters and any policy rowFilters below.
+        where_clauses.append(f"({metric_filter})")
     for filter_key, filter_value in (filters or {}).items():
         if not isinstance(filter_key, str):
             raise QueryValidationError("Filter keys must be strings")
