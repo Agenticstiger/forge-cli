@@ -24,6 +24,7 @@ import re
 
 from fluid_build.cli.console import cprint
 from fluid_build.iac import IAC_PLUGINS, assemble_tofu_document, get_iac_plugin, render_tofu_json
+from fluid_build.iac.packaging import resolve_packaging
 
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
 from ._logging import info
@@ -84,6 +85,14 @@ def run(args, logger: logging.Logger) -> int:
     try:
         contract = load_contract_with_overlay(contract_path, getattr(args, "env", None), logger)
         contract = resolve_env_templates_in_contract(contract)
+        # Packaging-modes PR1 (RFC-packaging-modes.md): resolve the packaging
+        # block at the entry point. Read-only for now — the resolution is
+        # computed (so an invalid `packaging` block fails fast with a typed
+        # PackagingError) but nothing consumes it yet; the provider emitters
+        # cut over in PR2. tests/iac/test_iac_packaging_default_pin.py pins
+        # that this call leaves every legacy contract's module byte-identical.
+        packaging = resolve_packaging(contract)
+        logger.debug("packaging resolved: legacy=%s pool=%s", packaging.is_legacy, packaging.pool)
         provider = _resolve_provider(contract, getattr(args, "provider", "auto"))
         plugin = get_iac_plugin(provider)
         actions = native_actions(contract, logger)
