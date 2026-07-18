@@ -93,7 +93,10 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
             {"error": str(exc)},
         )
 
-    backend = parse_backend(getattr(args, "state_backend", None))
+    # ``contract`` selects the default state key: packaging-bearing contracts
+    # get a per-contract key so two products sharing one state bucket cannot
+    # clobber each other; legacy contracts keep the shared key (RFC file 7).
+    backend = parse_backend(getattr(args, "state_backend", None), contract)
     # Per-contract workdir + state: each contract owns an isolated ``tofu``
     # state, so applying contract B never plans to destroy contract A's
     # resources (they share the provider but not the state).
