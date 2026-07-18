@@ -76,11 +76,15 @@ def test_075_is_bundled_and_opt_in_available():
     assert "0.7.5" in SchemaManager.BUNDLED_VERSIONS
 
 
-def test_075_does_not_become_the_default():
-    # 0.7.5 is a preview version -> the default for untagged contracts stays the
-    # latest STABLE, so plan.json format_version (and digests) are unchanged.
-    assert "0.7.5" in SchemaManager.PREVIEW_VERSIONS
-    assert SchemaManager.latest_bundled_version() != "0.7.5"
+def test_current_preview_does_not_become_the_default():
+    # The GA lifecycle invariant, version-agnostic: whatever versions are in
+    # PREVIEW_VERSIONS must never be the default for untagged contracts — the
+    # default stays the latest STABLE, so plan.json format_version (and
+    # digests) only move on a deliberate GA promotion.
+    # (0.7.5 was promoted to stable on 2026-07-18; 0.7.6 is the open preview.)
+    assert "0.7.5" not in SchemaManager.PREVIEW_VERSIONS  # promoted to stable (GA)
+    for preview in SchemaManager.PREVIEW_VERSIONS:
+        assert SchemaManager.latest_bundled_version() != preview
     assert _default_fluid_version() == SchemaManager.latest_bundled_version()
 
 

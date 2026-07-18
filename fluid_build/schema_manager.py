@@ -352,7 +352,10 @@ class FluidSchemaManager:
     # served (validatable) but disabled-by-default behind a feature gate; it
     # becomes the default only on promotion to stable/GA. Here PREVIEW_VERSIONS
     # is the feature gate and removing an entry is the GA promotion.
-    PREVIEW_VERSIONS: FrozenSet[str] = frozenset({"0.7.5"})
+    # (0.7.5 was promoted to stable 2026-07-18: Redshift-Serverless/Kinesis
+    # bindingLocation fields + the vector/embeddings vectorConfig output port.
+    # 0.7.6 opened as the next preview, identical at open.)
+    PREVIEW_VERSIONS: FrozenSet[str] = frozenset({"0.7.6"})
 
     @classmethod
     def latest_bundled_version(cls) -> str:
