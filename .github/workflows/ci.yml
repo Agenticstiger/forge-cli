@@ -88,13 +88,23 @@ jobs:
       - name: mypy --strict on hotspot allowlist (derived from pyproject.toml)
         run: python scripts/mypy_strict.py
 
+  # ── Test matrix — plain suite, every Python version ─────────────────
+  # Every leg (including 3.12) runs the SAME ~5-min non-coverage suite.
+  # The coverage run + coverage gates + Codecov upload used to be
+  # `if: matrix.python-version == '3.12'` steps inside this matrix, which
+  # made the 3.12 leg alone take ~20 min vs ~5 for every other leg — and
+  # that overloaded leg was disproportionately killed by runner-infra
+  # cancellations, costing a full matrix re-run each time. That work now
+  # lives in the parallel `coverage-and-audit` job below, so the matrix
+  # legs are uniform and the heavy coverage work runs concurrently.
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    # The keyless suite runs in ~8–12 min; 25 bounds a true hang (a
-    # leaked server loop / deadlocked async session) to minutes instead
-    # of GitHub's 6-hour default. A hung job that burns 6h of runner time
-    # before anyone notices is how the 3.13/3.14 deadlock stayed costly.
+    # The plain keyless suite runs in ~5 min per leg; 25 bounds a true
+    # hang (a leaked server loop / deadlocked async session) to minutes
+    # instead of GitHub's 6-hour default. A hung job that burns 6h of
+    # runner time before anyone notices is how the 3.13/3.14 deadlock
+    # stayed costly.
     timeout-minutes: 25
     env:
       # Cap glibc malloc arenas. On Linux glibc creates up to one ~64MB
@@ -120,26 +130,12 @@ jobs:
           pip install --upgrade pip
           pip install -e ".[dev,local]" || pip install -e ".[dev]"
 
-      # ── Tests (all Python versions) ─────────────────────────────
+      # ── Tests (all Python versions, no coverage) ────────────────
       - name: Run tests
-        if: matrix.python-version != '3.12'
         run: |
           python -m pytest \
             -n auto --dist loadscope \
             --ignore=tests/perf \
-            --junitxml=junit.xml \
-            -q
-
-      # ── Tests + Coverage (Python 3.12 only) ─────────────────────
-      - name: Run tests with coverage
-        if: matrix.python-version == '3.12'
-        run: |
-          python -m pytest \
-            -n auto --dist loadscope \
-            --ignore=tests/perf \
-            --cov=fluid_build \
-            --cov-report=xml:coverage.xml \
-            --cov-report=term-missing \
             --junitxml=junit.xml \
             -q
 
@@ -154,7 +150,65 @@ jobs:
       - name: Perf budgets (serial)
         run: python -m pytest tests/perf -q -p no:randomly
 
-      # ── Coverage Gates (Python 3.12 only) ───────────────────────
+      # ── Artifacts ───────────────────────────────────────────────
+      # Per-version artifact names are load-bearing (downstream tooling
+      # fetches test-results-py<ver>); coverage.xml now ships from the
+      # `coverage-and-audit` job's own artifact instead.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: test-results-py${{ matrix.python-version }}
+          path: junit.xml
+          retention-days: 14
+
+  # ── Coverage & audit — the heavy leg, run once in parallel ──────────
+  # Lift-and-shift of everything that used to be gated on
+  # `matrix.python-version == '3.12'` inside the test matrix: the
+  # coverage pytest run, the four coverage gates + informational total,
+  # and the Codecov upload. Splitting it out keeps every matrix leg at
+  # the same ~5-min profile (uniform legs are far less likely to be
+  # singled out by runner-infra SIGTERM cancellations) while this job
+  # runs concurrently, so overall PR wall-clock does not regress.
+  # Step order, commands, env, and Codecov behavior are preserved
+  # verbatim from the old 3.12 leg. The perf-budget suite is NOT
+  # duplicated here — it runs serially on every matrix leg above.
+  coverage-and-audit:
+    name: Coverage & Audit (Python 3.12)
+    runs-on: ubuntu-latest
+    # Observed ~20 min for the old overloaded 3.12 leg; this job carries
+    # the same coverage run minus the perf step. 30 gives headroom while
+    # still bounding a true hang to minutes, not GitHub's 6-hour default.
+    timeout-minutes: 30
+    env:
+      # Same glibc-arena cap as the test matrix (see comment there) —
+      # this is the identical thread-heavy pytest run, plus coverage.
+      MALLOC_ARENA_MAX: "2"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,local]" || pip install -e ".[dev]"
+
+      # ── Tests + Coverage ────────────────────────────────────────
+      - name: Run tests with coverage
+        run: |
+          python -m pytest \
+            -n auto --dist loadscope \
+            --ignore=tests/perf \
+            --cov=fluid_build \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --junitxml=junit.xml \
+            -q
+
+      # ── Coverage Gates ──────────────────────────────────────────
       # NOTE: core gate is intentionally set to 70% right now. The original
       # bar was 80% but the project shipped from main with several test
       # classes failing under CI (TestRunExtra, copilot dispatch tests,
@@ -165,7 +219,6 @@ jobs:
       # follow-up PR once the underlying TestRunExtra / dispatch issues
       # are fixed (tracked in the xfail reasons themselves).
       - name: "Coverage gate: core framework (≥70%)"
-        if: matrix.python-version == '3.12'
         run: |
           python -m coverage report --fail-under=70 \
             --omit="fluid_build/providers/*,fluid_build/cli/provider_action_executor.py"
@@ -187,41 +240,39 @@ jobs:
       #   require Snowflake creds / pyarrow extra respectively, both
       #   optional install paths.
       - name: "Coverage gate: V1 staged forge modules (≥80%)"
-        if: matrix.python-version == '3.12'
         run: |
           python -m coverage report --fail-under=80 \
             --include="fluid_build/copilot/*,fluid_build/forge_datamodel/*" \
             --omit="fluid_build/copilot/agents/scaffold_agent.py,fluid_build/copilot/agents/conceptual_agent.py,fluid_build/copilot/store/backends/postgres.py,fluid_build/forge_datamodel/from_ddl/snowflake_dumper.py,fluid_build/forge_datamodel/from_ddl/profiler.py"
 
       - name: "Coverage gate: local providers — no credentials (≥50%)"
-        if: matrix.python-version == '3.12'
         run: |
           python -m coverage report --fail-under=50 \
             --include="fluid_build/providers/__init__.py,fluid_build/providers/base.py,fluid_build/providers/common/*,fluid_build/providers/local/*,fluid_build/providers/catalogs/*,fluid_build/providers/odcs/*,fluid_build/providers/odps_standard/*,fluid_build/providers/quality_engine.py,fluid_build/providers/*_validation.py,fluid_build/providers/validation_*.py,fluid_build/cli/provider_action_executor.py"
 
       - name: "Coverage gate: cloud providers — needs credentials (≥20%)"
-        if: matrix.python-version == '3.12'
         run: |
           python -m coverage report --fail-under=20 \
             --include="fluid_build/providers/aws/*,fluid_build/providers/gcp/*,fluid_build/providers/snowflake/*,fluid_build/providers/opds/*,fluid_build/providers/datamesh_manager/*,fluid_build/providers/bigquery_validation.py"
 
       - name: "Coverage: total (informational)"
-        if: matrix.python-version == '3.12'
         run: python -m coverage report || true
 
       # ── Artifacts ───────────────────────────────────────────────
-      - name: Upload test results
+      # Distinct artifact name — the 3.12 matrix leg above still owns
+      # `test-results-py3.12` (its plain-run junit.xml), and duplicate
+      # artifact names fail under upload-artifact v4+.
+      - name: Upload coverage results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: test-results-py${{ matrix.python-version }}
+          name: coverage-results-py3.12
           path: |
             junit.xml
             coverage.xml
           retention-days: 14
 
       - name: Upload coverage to Codecov
-        if: matrix.python-version == '3.12'
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
         with:
           files: coverage.xml
