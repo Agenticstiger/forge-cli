@@ -32,7 +32,7 @@ from fluid_build.iac.credentials import build_tofu_env, credential_report
 from fluid_build.iac.naming import safe_ident
 
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
-from ._logging import info
+from ._logging import info, warn
 from .generate_iac import _resolve_provider, native_actions
 
 
@@ -169,7 +169,7 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
             changes["change"],
             changes["remove"],
         )
-        info(
+        warn(
             logger,
             "opentofu_destructive_gate_override",
             provider=provider,
@@ -380,7 +380,7 @@ def _guard_packaging_transitions(
     if adoptions:
         # WARNING-level audit trail for the override — same discipline as
         # ``opentofu_destructive_gate_override``.
-        info(
+        warn(
             logger,
             "packaging_adoption_override",
             containers=[t.as_event() for t in adoptions],

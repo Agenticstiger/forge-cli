@@ -395,3 +395,44 @@ class TestEngineWiring:
         apply_mod.register(subparsers)
         args = parser.parse_args(["apply", "c.fluid.yaml"])
         assert args.adopt_shared_container is False
+
+
+class TestOverrideAuditEventsAreWarnings:
+    """Safety-gate overrides must be audit-visible at WARNING, not INFO.
+
+    Three sources of truth agreed on WARNING while the code emitted INFO:
+    the ``--adopt-shared-container`` help text ("Logs a WARNING-level audit
+    event"), the emitting site's own comment, and RFC-packaging-modes.md
+    ("logs a WARNING-level ``packaging_adoption_override`` audit event —
+    same discipline as ``--allow-data-loss``"). The precedent it cited,
+    ``opentofu_destructive_gate_override``, had the same defect.
+
+    This matters operationally: these events mean *a human deliberately
+    overrode a safety gate*, which is what an audit pipeline filters for at
+    WARNING and above. At INFO they are invisible to that filter.
+    """
+
+    OVERRIDE_EVENTS = ("opentofu_destructive_gate_override", "packaging_adoption_override")
+
+    def _source(self):
+        from pathlib import Path
+
+        import fluid_build.cli._apply_opentofu_engine as engine
+
+        return Path(engine.__file__).read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("event", OVERRIDE_EVENTS)
+    def test_override_event_is_emitted_via_warn(self, event):
+        source = self._source()
+        assert event in source, f"{event} no longer emitted — update this pin"
+        # The emitting call is the helper invocation immediately preceding
+        # the event name; assert it is `warn(`, never `info(`.
+        head = source.split(event)[0]
+        emitter = head.rstrip().rsplit("(", 1)[0].rsplit("\n", 1)[-1].strip()
+        assert emitter.endswith("warn"), (
+            f"{event} is emitted via {emitter!r}; safety-gate overrides must "
+            "use warn() so audit pipelines filtering at WARNING see them"
+        )
+
+    def test_warn_helper_is_imported(self):
+        assert "from ._logging import info, warn" in self._source()
