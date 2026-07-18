@@ -53,9 +53,29 @@ downstream service-role permissions to read specific tables. Without
 DataLakeAdmin → GrantPermissions auth, none of those tools work
 against LocalStack — they have to switch to real AWS for LF testing.
 
+### Scope refinement (re-verified on Pro 2026.6.0)
+
+The failure is specific to **IAM enforcement being on**:
+
+* With `ENFORCE_IAM=1`, `GrantPermissions` returns
+  `AccessDeniedException` — including when the caller is registered
+  via `aws_lakeformation_data_lake_settings` in the same apply, so
+  ordering is not the cause.
+* With IAM enforcement **off** (the default), the same
+  `GrantPermissions` call succeeds and the grant reads back correctly
+  through `ListPermissions`.
+
+So the LF grant *can* be created on the emulator, just never on an
+instance that is also evaluating authorization — which is exactly the
+combination needed to test whether an LF grant actually authorises
+anything.
+
 ### Workaround
 
-None known. Switching the test target from LocalStack to a real AWS
-sandbox is the only path that exercises the LF grant code path.
-forge-cli does both: emulator tier 2 for everything else, real-AWS
-tier 3 for LF.
+Partial. LF grants can be **created and inspected** on a
+non-enforcing LocalStack, which is enough to verify that a tool emits
+and applies the right LF configuration. Verifying that a grant
+*authorises* a read still requires a real AWS account. forge-cli does
+both: emulator tier 2 for emit + apply + read-back
+(`tests/integration/test_iac_cross_account_localstack.py`), real-AWS
+tier 3 for LF authorization.
