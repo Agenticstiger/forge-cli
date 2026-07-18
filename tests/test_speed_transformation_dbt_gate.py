@@ -39,6 +39,13 @@ import pytest
 from fluid_build.cli import generate_speed_transformation as gst
 
 
+@pytest.fixture(autouse=True)
+def _unset_dbt_executable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gate now honours ``$DBT_EXECUTABLE`` (parity with the build
+    runner) — keep these tests hermetic against a dev shell that sets it."""
+    monkeypatch.delenv("DBT_EXECUTABLE", raising=False)
+
+
 def test_should_run_dbt_gate_requires_flag_and_engine() -> None:
     # Flag off → skip regardless of engine.
     assert gst._should_run_dbt_gate(Namespace(dbt_validate=False), "dbt") is False
@@ -111,8 +118,14 @@ def test_run_dbt_parse_gate_returns_true_when_dbt_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # With dbt not installed we warn and return True so CI pipelines
-    # without dbt can opt in without spurious failures.
-    monkeypatch.setattr("shutil.which", lambda name: None)
+    # without dbt can opt in without spurious failures. Discovery now
+    # routes through the build runner's resolver (which also checks the
+    # venv-sibling ``<python-dir>/dbt`` — present in this repo's dev
+    # venv), so patch the resolver itself rather than ``shutil.which``.
+    monkeypatch.setattr(
+        "fluid_build.build_runners.dbt.runner._resolve_dbt_executable",
+        lambda: None,
+    )
     result = gst._run_dbt_parse_gate(tmp_path, logging.getLogger("test"))
     assert result is True
 

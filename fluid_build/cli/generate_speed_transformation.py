@@ -634,20 +634,34 @@ def _run_dbt_parse_gate(output_dir: Path, logger: logging.Logger) -> bool:
     exists. Without this, a fresh user with no ``~/.dbt/profiles.yml``
     would see the gate fail out of the box even though the project it
     just generated is self-contained.
+
+    dbt discovery is delegated to the build runner's resolvers so the
+    gate honours ``$DBT_EXECUTABLE`` (path, bare name, or multi-token
+    wrapper like ``poetry run dbt``) plus the venv-sibling fallback —
+    previously this was a hard ``shutil.which("dbt")``, inconsistent
+    with how ``fluid apply`` resolves dbt.
     """
-    import shutil
     import subprocess
 
-    dbt_bin = shutil.which("dbt")
-    if dbt_bin is None:
-        cprint(
-            "[yellow]--dbt-validate set but 'dbt' is not on PATH. "
-            "Install dbt-core (e.g. `pip install dbt-core dbt-postgres`) "
-            "to enable this gate. Skipping.[/yellow]"
-        )
-        return True
+    from fluid_build.build_runners.dbt.runner import (
+        _configured_dbt_command_prefix,
+        _resolve_dbt_executable,
+    )
 
-    command = [dbt_bin, "parse", "--project-dir", str(output_dir)]
+    command_prefix = _configured_dbt_command_prefix()
+    if command_prefix is None:
+        dbt_bin = _resolve_dbt_executable()
+        if dbt_bin is None:
+            cprint(
+                "[yellow]--dbt-validate set but no usable dbt was found "
+                "(checked $DBT_EXECUTABLE, PATH, and the active venv). "
+                "Install dbt (e.g. `pip install dbt-core dbt-postgres`) "
+                "or set DBT_EXECUTABLE to enable this gate. Skipping.[/yellow]"
+            )
+            return True
+        command_prefix = [dbt_bin]
+
+    command = [*command_prefix, "parse", "--project-dir", str(output_dir)]
     # Only inject --profiles-dir when the generator emitted a local
     # profiles.yml. If the project ships without one (e.g. user already
     # manages ~/.dbt/profiles.yml), let dbt use its default resolution.

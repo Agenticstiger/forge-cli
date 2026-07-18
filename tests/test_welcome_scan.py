@@ -105,6 +105,51 @@ def test_welcome_scan_renders_for_first_user(tmp_path, isolate_home):
     assert captured  # some output
 
 
+def test_welcome_scan_reports_dbt_engine_flavor(tmp_path, monkeypatch):
+    """The scan surfaces the detected dbt engine (core v1 vs Fusion v2) —
+    the detection itself is the runner's cached probe; here we pin the
+    probe wiring + the findings field."""
+    from fluid_build.cli import _welcome_scan as ws
+
+    monkeypatch.setattr(
+        "fluid_build.build_runners.dbt.runner._resolve_dbt_executable",
+        lambda: "/opt/fusion/dbt",
+    )
+    monkeypatch.setattr(
+        "fluid_build.build_runners.dbt.runner._detect_dbt_engine",
+        lambda exe, timeout=10.0: ("fusion", "2.0.0-preview.126"),
+    )
+    assert ws._probe_dbt_engine() == {"dbt_engine": "fusion 2.0.0-preview.126"}
+
+
+def test_welcome_scan_dbt_engine_empty_when_undetected(monkeypatch):
+    from fluid_build.cli import _welcome_scan as ws
+
+    monkeypatch.setattr(
+        "fluid_build.build_runners.dbt.runner._resolve_dbt_executable",
+        lambda: None,
+    )
+    assert ws._probe_dbt_engine() == {}
+    assert WelcomeFindings().dbt_engine == ""
+
+
+def test_annotated_clis_marks_dbt_with_engine_flavor():
+    from fluid_build.cli._welcome_scan import _annotated_clis
+
+    findings = WelcomeFindings(
+        installed_clis=["dbt", "git", "duckdb"],
+        dbt_engine="fusion 2.0.0-preview.126",
+    )
+    assert _annotated_clis(findings) == [
+        "dbt (fusion 2.0.0-preview.126)",
+        "git",
+        "duckdb",
+    ]
+    # No detection → list untouched.
+    plain = WelcomeFindings(installed_clis=["dbt", "git"])
+    assert _annotated_clis(plain) == ["dbt", "git"]
+
+
 def test_bump_forge_count_creates_file(tmp_path, isolate_home):
     n1 = bump_forge_count()
     n2 = bump_forge_count()

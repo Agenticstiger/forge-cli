@@ -173,6 +173,12 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "1800s default",
         "Per-`tofu` invocation wall-clock cap",
     ),
+    (
+        "DBT_EXECUTABLE",
+        "dbt discovered on PATH / venv",
+        "Override the dbt binary or wrapper (e.g. `poetry run dbt`) used by "
+        "the dbt build runner and the --dbt-validate parse gate",
+    ),
     # — Keyless coding-agent providers (claude-code / codex / cursor / kiro) —
     (
         "FLUID_FORGE_AGENT",
@@ -902,6 +908,56 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
                 "status": "⚠️  Not available",
                 "ok": True,  # Non-critical if AWS not used
                 "details": "Install AWS dependencies for full support",
+            }
+        )
+
+    # dbt engine detection — Python dbt-core v1 vs Fusion (dbt Core v2,
+    # Rust). Non-critical (ok=True either way): a missing dbt only matters
+    # for workspaces with dbt builds. The probe is bounded (the runner's
+    # default 10s — Fusion answers in milliseconds; Python dbt-core takes
+    # ~5-6s cold because its --version phones home for a latest check) and
+    # shares the runner's lru cache key, so a later `fluid apply` in the
+    # same process reuses this probe for free.
+    try:
+        from fluid_build.build_runners.dbt.runner import (
+            _detect_dbt_engine,
+            _resolve_dbt_executable,
+        )
+
+        dbt_bin = _resolve_dbt_executable()
+        if dbt_bin is None:
+            checks.append(
+                {
+                    "check": "dbt Engine",
+                    "category": "engines",
+                    "status": "⚪ Not installed",
+                    "ok": True,
+                    "details": "No dbt found on PATH / $DBT_EXECUTABLE / venv",
+                }
+            )
+        else:
+            flavor, dbt_version = _detect_dbt_engine(dbt_bin)
+            flavor_label = {
+                "fusion": "Fusion (dbt v2, Rust — compiled-in adapters)",
+                "core": "dbt Core v1 (Python — plugin adapters)",
+            }.get(flavor, "unrecognised version output")
+            checks.append(
+                {
+                    "check": "dbt Engine",
+                    "category": "engines",
+                    "status": "✅ Detected" if flavor != "unknown" else "⚠️  Undetected",
+                    "ok": True,
+                    "details": f"{flavor_label} {dbt_version}".strip() + f" · {dbt_bin}",
+                }
+            )
+    except Exception:  # noqa: BLE001 — never break doctor on the dbt probe
+        checks.append(
+            {
+                "check": "dbt Engine",
+                "category": "engines",
+                "status": "⚪ Not available",
+                "ok": True,
+                "details": "dbt engine probe failed (non-critical)",
             }
         )
 

@@ -83,11 +83,13 @@ class TestEnvCatalog:
         for entry in doctor.ENV_KILL_SWITCHES:
             assert len(entry) == 3, f"expected (name, default, description), got {entry!r}"
             name, default, desc = entry
-            # Almost all knobs are FLUID_* prefixed; the one documented
-            # exception is the cross-tool ``DO_NOT_TRACK`` standard.
+            # Almost all knobs are FLUID_* prefixed; documented exceptions
+            # are cross-tool/ecosystem names FLUID honours rather than owns:
+            # the ``DO_NOT_TRACK`` standard and dbt's ``DBT_EXECUTABLE``.
+            cross_tool_exceptions = {"DO_NOT_TRACK", "DBT_EXECUTABLE"}
             assert isinstance(name, str) and (
-                name.startswith("FLUID_") or name == "DO_NOT_TRACK"
-            ), f"env-var name must be FLUID_* (or DO_NOT_TRACK): {name!r}"
+                name.startswith("FLUID_") or name in cross_tool_exceptions
+            ), f"env-var name must be FLUID_* (or one of {sorted(cross_tool_exceptions)}): {name!r}"
             assert default, f"every entry needs a non-empty default for {name}"
             assert desc, f"every entry needs a non-empty description for {name}"
 
