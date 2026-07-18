@@ -481,7 +481,14 @@ class TestLiveDbtParse:
         if dbt is None:
             pytest.skip("dbt CLI not available")
 
-        contract = _contract(semantics=_semantics())
+        # Governance surface rides along: tags/labels/owner must survive a
+        # REAL dbt parse as config.meta (and land in the manifest, which is
+        # what the manifest importer round-trips).
+        semantics = _semantics()
+        semantics["tags"] = ["certified"]
+        semantics["labels"] = {"tier": "gold"}
+        semantics["metrics"][0]["owner"] = "finance-team"
+        contract = _contract(semantics=semantics)
         build = contract["builds"][0]
         out_dir = tmp_path / "dbt_project"
         files = DbtEngine().generate(contract, build, output_dir=out_dir)
@@ -513,6 +520,20 @@ class TestLiveDbtParse:
             "order_total_2x",
             "orders_count_metric",
         ]
+
+        # Governance meta survives parse into the node manifest — the exact
+        # payload the manifest importer recovers on round-trip.
+        node_manifest = json.loads((out_dir / "target" / "manifest.json").read_text())
+        parsed_sm = next(iter(node_manifest["semantic_models"].values()))
+        assert parsed_sm["config"]["meta"] == {
+            "fluid_tags": ["certified"],
+            "fluid_labels": {"tier": "gold"},
+        }
+        owners = {
+            m["name"]: (m.get("config") or {}).get("meta", {}).get("owner")
+            for m in node_manifest["metrics"].values()
+        }
+        assert owners.get(semantics["metrics"][0]["name"]) == "finance-team"
 
 
 @pytest.mark.unit
@@ -600,3 +621,33 @@ class TestPercentileAggParams:
         )
 
         assert DEFAULT_PERCENTILE == MCP_DEFAULT == 0.5
+
+
+@pytest.mark.unit
+class TestGovernanceMeta:
+    """owner / tags / labels — previously dead schema surface — ride into
+    dbt as config.meta (parse-verified) and round-trip via the importer."""
+
+    def test_metric_owner_maps_to_config_meta(self):
+        semantics = _semantics()
+        semantics["metrics"][0]["owner"] = "finance-team"
+        doc = _emit(_contract(semantics=semantics))
+        metric = _metric(doc, semantics["metrics"][0]["name"])
+        assert metric["config"] == {"meta": {"owner": "finance-team"}}
+
+    def test_model_tags_and_labels_map_to_config_meta(self):
+        semantics = _semantics()
+        semantics["tags"] = ["certified", "gold"]
+        semantics["labels"] = {"tier": "gold", "domain": "commerce"}
+        doc = _emit(_contract(semantics=semantics))
+        model = _model(doc)
+        assert model["config"]["meta"] == {
+            "fluid_tags": ["certified", "gold"],
+            "fluid_labels": {"tier": "gold", "domain": "commerce"},
+        }
+
+    def test_no_governance_fields_no_config_key(self):
+        doc = _emit(_contract(semantics=_semantics()))
+        assert "config" not in _model(doc)
+        for metric in doc.get("metrics", []):
+            assert "config" not in metric
