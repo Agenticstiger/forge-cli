@@ -323,6 +323,22 @@ _VALID_AGGS = {"sum", "avg", "count", "count_distinct", "min", "max", "median", 
 DEFAULT_PERCENTILE = 0.5
 
 
+def _semantic_model_meta(semantics: Mapping[str, Any]) -> Dict[str, Any]:
+    """Contract ``tags`` / ``labels`` → dbt ``config.meta`` payload.
+
+    Namespaced keys (``fluid_tags`` / ``fluid_labels``) so they never
+    collide with a user's own dbt meta conventions and the manifest
+    importer can recover them losslessly."""
+    meta: Dict[str, Any] = {}
+    tags = semantics.get("tags")
+    if isinstance(tags, list) and tags:
+        meta["fluid_tags"] = [str(t) for t in tags]
+    labels = semantics.get("labels")
+    if isinstance(labels, Mapping) and labels:
+        meta["fluid_labels"] = {str(k): str(v) for k, v in labels.items()}
+    return meta
+
+
 def _percentile_agg_params(raw: Any) -> Dict[str, Any]:
     """Map the contract's ``aggParams`` into MetricFlow ``agg_params``.
 
@@ -508,6 +524,11 @@ def _build_metrics(
         metric["type_params"] = type_params
         if raw.get("filter"):
             metric["filter"] = str(raw["filter"])
+        if raw.get("owner"):
+            # Contract governance surfaces in dbt as config.meta — accepted
+            # by dbt parse (verified 1.11) and round-tripped by the manifest
+            # importer, so `owner` survives contract → dbt → contract.
+            metric["config"] = {"meta": {"owner": str(raw["owner"])}}
 
         if mtype == "simple":
             metrics.append(metric)
@@ -654,6 +675,12 @@ def generate_semantic_models(contract: Dict[str, Any]) -> GenerationResult:
         description = semantics.get("description") or expose.get("description")
         if description:
             model_def["description"] = str(description)
+        meta = _semantic_model_meta(semantics)
+        if meta:
+            # tags/labels ride in config.meta (dbt-parse-verified on 1.11;
+            # round-tripped by the manifest importer via fluid_tags /
+            # fluid_labels keys).
+            model_def["config"] = {"meta": meta}
         if agg_time_dim is not None and measures:
             model_def["defaults"] = {"agg_time_dimension": agg_time_dim}
         model_def["entities"] = entities

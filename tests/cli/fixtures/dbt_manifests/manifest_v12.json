@@ -30,6 +30,12 @@
       "where_sql_template": "order_total > 0"
      }
     ]
+   },
+   "config": {
+    "enabled": true,
+    "meta": {
+     "owner": "finance-team"
+    }
    }
   },
   "metric.jaffle_shop.aov": {
@@ -912,6 +918,17 @@
     "nodes": [
      "model.jaffle_shop.orders"
     ]
+   },
+   "config": {
+    "enabled": true,
+    "meta": {
+     "fluid_tags": [
+      "certified"
+     ],
+     "fluid_labels": {
+      "tier": "gold"
+     }
+    }
    }
   },
   "semantic_model.jaffle_shop.ghost": {

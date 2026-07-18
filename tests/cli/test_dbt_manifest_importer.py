@@ -505,3 +505,26 @@ class TestSemanticLayerImport:
         contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v12.json"))
         result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
         assert result.is_valid, result.errors
+
+
+class TestGovernanceMetaRoundTrip:
+    """owner / tags / labels ride into dbt as namespaced config.meta (the
+    MetricFlow bridge side) — the importer recovers them so the contract's
+    governance surface survives contract → dbt → contract."""
+
+    def test_semantic_model_tags_and_labels_recovered(self) -> None:
+        contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v12.json"))
+        semantics = _expose(contract, "orders")["semantics"]
+        assert semantics["tags"] == ["certified"]
+        assert semantics["labels"] == {"tier": "gold"}
+
+    def test_metric_owner_recovered(self) -> None:
+        contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v12.json"))
+        semantics = _expose(contract, "orders")["semantics"]
+        total_revenue = next(m for m in semantics["metrics"] if m["name"] == "total_revenue")
+        assert total_revenue["owner"] == "finance-team"
+
+    def test_contract_with_recovered_governance_still_schema_valid(self, schema_manager) -> None:
+        contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v12.json"))
+        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        assert result.is_valid, result.errors

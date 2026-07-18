@@ -900,6 +900,16 @@ def _semantics_block_from_semantic_model(
     if default_time:
         block["defaultAggTimeDimension"] = default_time
 
+    # Round-trip recovery of the governance surface the MetricFlow bridge
+    # exports as namespaced config.meta keys (contract → dbt → contract).
+    sm_meta = (sm.get("config") or {}).get("meta") or {}
+    fluid_tags = sm_meta.get("fluid_tags")
+    if isinstance(fluid_tags, list) and fluid_tags:
+        block["tags"] = [str(t) for t in fluid_tags]
+    fluid_labels = sm_meta.get("fluid_labels")
+    if isinstance(fluid_labels, dict) and fluid_labels:
+        block["labels"] = {str(k): str(v) for k, v in fluid_labels.items()}
+
     entities: List[Dict[str, Any]] = []
     for raw in sm.get("entities") or []:
         if not isinstance(raw, dict) or not raw.get("name"):
@@ -1022,6 +1032,9 @@ def _attach_metric(
     entry: Dict[str, Any] = {"name": name, "type": metric_type}
     if metric.get("description"):
         entry["description"] = str(metric["description"])
+    metric_owner = ((metric.get("config") or {}).get("meta") or {}).get("owner")
+    if metric_owner:
+        entry["owner"] = str(metric_owner)
     filter_sql = _metric_filter_sql(metric)
     if filter_sql:
         entry["filter"] = filter_sql
