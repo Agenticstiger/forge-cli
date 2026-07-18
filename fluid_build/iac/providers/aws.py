@@ -42,7 +42,12 @@ from ...providers._sql_safety import quote_string_literal, validate_ident
 from ...providers.aws.util import warehouse as _warehouse
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref
-from ..packaging import ContainerDecision, PackagingResolution, resolve_packaging
+from ..packaging import (
+    ContainerDecision,
+    PackagingError,
+    PackagingResolution,
+    resolve_packaging,
+)
 from ..versions import required_providers
 
 # Apply-time AWS account placeholder for the credential-free warehouse fallback.
@@ -185,6 +190,35 @@ def _tags_for(base: Mapping[str, str], placement: _Placement) -> Dict[str, str]:
     if placement.pool:
         tags["fluid_pool"] = str(placement.pool)
     return tags
+
+
+def _require_pool_prefix(placement: _Placement, path: str, *, what: str) -> None:
+    """Fail closed when a bucket-level grant on a POOL bucket cannot be scoped.
+
+    SECURITY: every bucket-level control this module emits — the Lake
+    Formation location registration and the ``aws_s3_bucket_policy`` — is
+    scoped by the binding's ``location.path``. With no path there is no
+    prefix to scope to, and the control silently degrades to the whole
+    bucket: a cross-account principal named in ``governance.lakeFormation.
+    grants[]`` would get ``s3:GetObject`` on ``arn:aws:s3:::<pool>/*``,
+    reaching every other tenant's objects, and (for the bucket policy,
+    which is authoritative for the entire bucket) replacing whatever
+    isolation the platform team had configured.
+
+    Widening a shared pool is the precise failure this feature exists to
+    prevent, so an unscopeable grant is an error rather than a quiet
+    degradation — the same discipline as the resolver's ``pool-required``
+    (a shared container must be addressable). Never fires for an owned or
+    LEGACY bucket, where owning the whole bucket is the point.
+    """
+    if placement.bucket_referenced and not path:
+        raise PackagingError(
+            "shared-bucket-requires-path",
+            f"{what} targets a shared (pool) bucket but the binding declares no "
+            "`location.path` — a bucket-level grant on a pool would reach every "
+            "other tenant's objects. Add a `location.path` prefix, or declare the "
+            "bucket `isolated` if this product really owns it.",
+        )
 
 
 def _glue_db_ref(db_name: str, database: Any, *, referenced: bool) -> Any:
@@ -1370,21 +1404,17 @@ def _emit_lakeformation(
         bucket, path = _warehouse.normalize_location(
             loc, account_ref=_CALLER_ACCOUNT_TOKEN, default_path=False
         )
-        # Registering a *pool* bucket at its root would hand this product's
-        # LF service role access to every other tenant's data. With no
-        # ``path`` there is no prefix to scope to, so a referenced bucket
-        # registers nothing at all rather than silently widening; the
-        # missing prefix is the validator's to report (RFC file 9).
-        registers_pool_root = placement.bucket_referenced and not path
-        if not registers_pool_root:
-            loc_key = safe_ident(f"{cid}_lf_loc_{bucket}_{path or 'root'}")
-            resources.setdefault("aws_lakeformation_resource", {})[loc_key] = {
-                "arn": f"arn:aws:s3:::{bucket}/{path}" if path else f"arn:aws:s3:::{bucket}",
-                # ``use_service_linked_role: true`` is the default safe path
-                # — LF uses the AWSServiceRoleForLakeFormationDataAccess SLR
-                # to access objects under the registered location.
-                "use_service_linked_role": True,
-            }
+        # Registering a *pool* bucket at its ROOT would hand this product's
+        # LF service role access to every other tenant's data.
+        _require_pool_prefix(placement, path, what="governance.lakeFormation.registerLocation")
+        loc_key = safe_ident(f"{cid}_lf_loc_{bucket}_{path or 'root'}")
+        resources.setdefault("aws_lakeformation_resource", {})[loc_key] = {
+            "arn": f"arn:aws:s3:::{bucket}/{path}" if path else f"arn:aws:s3:::{bucket}",
+            # ``use_service_linked_role: true`` is the default safe path
+            # — LF uses the AWSServiceRoleForLakeFormationDataAccess SLR
+            # to access objects under the registered location.
+            "use_service_linked_role": True,
+        }
 
     db_key = safe_ident(f"{cid}_{database}")
     table_key = safe_ident(f"{cid}_{database}_{table}") if table else None
@@ -1461,6 +1491,10 @@ def _emit_lakeformation(
     #     bucket — multiple LF grants on the same exposure share one
     #     policy doc.
     if bucket_principals and bucket:
+        # A pool bucket's grants MUST be prefix-scoped — without a path the
+        # statements below degrade to the whole bucket and this authoritative
+        # policy also replaces the platform team's own. Fail closed.
+        _require_pool_prefix(placement, path, what="governance.lakeFormation.grants[]")
         bucket_key = safe_ident(f"{cid}_{bucket}")
         bucket_arn = f"arn:aws:s3:::{bucket}"
         # ListBucket targets the bucket ARN itself; GetObject targets
@@ -1476,11 +1510,12 @@ def _emit_lakeformation(
                 "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
                 "Resource": bucket_arn,
             }
-            if placement.bucket_referenced and path:
+            if placement.bucket_referenced:
                 # ListBucket is inherently bucket-scoped, so on a shared pool
                 # it is narrowed with the standard ``s3:prefix`` condition —
                 # otherwise this product's consumers could enumerate every
-                # other tenant's keys in the pool.
+                # other tenant's keys in the pool. ``path`` is guaranteed
+                # non-empty here by ``_require_pool_prefix`` above.
                 list_statement["Condition"] = {"StringLike": {"s3:prefix": [f"{path}*"]}}
             statements.append(list_statement)
             statements.append(

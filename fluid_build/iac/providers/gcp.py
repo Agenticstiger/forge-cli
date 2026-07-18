@@ -36,7 +36,12 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 from ..importer import ImportBlock
 from ..naming import safe_ident, tofu_ref
-from ..packaging import ContainerDecision, PackagingResolution, resolve_packaging
+from ..packaging import (
+    ContainerDecision,
+    PackagingError,
+    PackagingResolution,
+    resolve_packaging,
+)
 from ..versions import required_providers
 
 # FLUID column type → BigQuery type (best-effort; unknown types upper-cased).
@@ -566,7 +571,24 @@ def _emit_gcs(
     condition = (
         _object_prefix_condition(bucket, loc.get("path")) if placement.bucket_referenced else None
     )
-    for role, principal in _policy_grants(policies, _GCS_PERMISSION_ROLES):
+    grants = list(_policy_grants(policies, _GCS_PERMISSION_ROLES))
+    if grants and placement.bucket_referenced and condition is None:
+        # SECURITY: bucket IAM on GCS is bucket-scoped. Without a prefix
+        # condition the member reads every tenant's objects in the pool —
+        # the grant silently degrades to exactly what shared mode exists to
+        # prevent. Fail closed rather than emit an unconditioned member;
+        # same discipline as the resolver's ``pool-required``. Note this
+        # also catches a path of ``"/"`` or whitespace, which normalises
+        # away to an empty prefix and would look scoped to a reviewer.
+        raise PackagingError(
+            "shared-bucket-requires-path",
+            f"bucket {bucket!r} is shared (pool) and `metadata.policies` grants "
+            "access to it, but the binding declares no usable `location.path` — a "
+            "bucket-level IAM grant on a pool would reach every other tenant's "
+            "objects. Add a `location.path` prefix, or declare the bucket "
+            "`isolated` if this product really owns it.",
+        )
+    for role, principal in grants:
         member = _gcs_member(principal)
         name = safe_ident(f"{cid}_{bucket}_{role}_{member}")
         member_body: Dict[str, Any] = {

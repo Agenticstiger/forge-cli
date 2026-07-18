@@ -41,6 +41,7 @@ from typing import Any, Dict, Mapping
 import pytest
 
 from fluid_build.iac.backend import LEGACY_STATE_KEY, default_state_key, parse_backend
+from fluid_build.iac.packaging import PackagingError
 from fluid_build.iac.providers.aws import AwsIacPlugin
 from fluid_build.iac.providers.gcp import GcpIacPlugin
 from fluid_build.iac.providers.snowflake import SnowflakeIacPlugin
@@ -204,12 +205,43 @@ class TestAwsPackagingEmit:
         arns = [b["arn"] for b in resources["aws_lakeformation_resource"].values()]
         assert arns == ["arn:aws:s3:::acme-iot-lake/telemetry/"]
 
-    def test_shared_bucket_without_a_path_registers_nothing(self):
+    def test_shared_bucket_without_a_path_fails_closed(self):
+        # SECURITY REGRESSION: with no prefix to scope to, the LF
+        # registration covers the pool root and the (authoritative) bucket
+        # policy grants `s3:GetObject` on `arn:aws:s3:::<pool>/*` to every
+        # LF principal — including cross-account ARNs — while replacing the
+        # platform team's own policy. Widening a pool is the exact failure
+        # shared mode exists to prevent, so this must not emit at all.
         contract = _aws_contract(SHARED)
         del contract["exposes"][0]["binding"]["location"]["path"]
+        with pytest.raises(PackagingError) as excinfo:
+            AwsIacPlugin().emit(contract)
+        assert excinfo.value.kind == "shared-bucket-requires-path"
+
+    def test_shared_bucket_grants_never_reach_the_whole_pool(self):
+        # The property behind the regression above, asserted on the emitted
+        # policy: no statement may target the bucket root or an unscoped
+        # object wildcard.
+        resources = AwsIacPlugin().emit(_aws_contract(SHARED))
+        pool_root_wildcard = "arn:aws:s3:::acme-iot-lake/*"
+        for statement in _policy_statements(next(iter(resources["aws_s3_bucket_policy"].values()))):
+            resource = statement["Resource"]
+            # The bucket-root wildcard reaches every tenant; the prefixed
+            # form (`…/telemetry/*`) is the scoped one we want.
+            assert resource != pool_root_wildcard
+            if "s3:GetObject" in statement["Action"]:
+                assert resource.startswith("arn:aws:s3:::acme-iot-lake/telemetry/")
+            if "s3:ListBucket" in statement["Action"]:
+                assert statement.get("Condition"), "ListBucket on a pool needs an s3:prefix"
+
+    def test_an_isolated_bucket_without_a_path_is_still_fine(self):
+        # Owning the whole bucket is the entire point of `isolated`, so the
+        # fail-closed rule must not fire there.
+        contract = _aws_contract(ISOLATED)
+        del contract["exposes"][0]["binding"]["location"]["path"]
         resources = AwsIacPlugin().emit(contract)
-        # No prefix to scope to → registering would cover every tenant.
-        assert "aws_lakeformation_resource" not in resources
+        assert "aws_lakeformation_resource" in resources
+        assert "aws_s3_bucket_policy" in resources
 
     def test_bucket_policy_targets_the_lookup_and_scopes_list_to_the_prefix(self):
         resources = AwsIacPlugin().emit(_aws_contract(SHARED))
@@ -331,6 +363,40 @@ class TestGcpPackagingEmit:
         # expression is still exactly one `startsWith("…")` call with
         # nothing appended — no second term, no trailing operator.
         assert re.fullmatch(r'resource\.name\.startsWith\("[^"]*"\)', expression.replace('\\"', ""))
+
+    @pytest.mark.parametrize("path", [None, "", "/", "   ", "///"])
+    def test_shared_bucket_grant_without_a_usable_path_fails_closed(self, path):
+        # SECURITY REGRESSION: GCS bucket IAM is bucket-scoped, so with no
+        # prefix condition the member reads every tenant's objects in the
+        # pool. ``"/"`` and whitespace normalise away to an empty prefix and
+        # would look scoped to a reviewer, so they must fail too.
+        contract = _gcp_contract(SHARED)
+        if path is None:
+            contract["exposes"][1]["binding"]["location"].pop("path", None)
+        else:
+            contract["exposes"][1]["binding"]["location"]["path"] = path
+        with pytest.raises(PackagingError) as excinfo:
+            GcpIacPlugin().emit(contract)
+        assert excinfo.value.kind == "shared-bucket-requires-path"
+
+    def test_every_shared_bucket_member_is_conditioned(self):
+        resources = GcpIacPlugin().emit(_gcp_contract(SHARED))
+        for member in resources["google_storage_bucket_iam_member"].values():
+            assert member.get("condition"), "a pool grant must carry a prefix condition"
+
+    def test_an_isolated_bucket_without_a_path_is_still_fine(self):
+        contract = _gcp_contract(ISOLATED)
+        contract["exposes"][1]["binding"]["location"].pop("path", None)
+        resources = GcpIacPlugin().emit(contract)
+        assert "google_storage_bucket_iam_member" in resources
+
+    def test_a_shared_bucket_with_no_grants_needs_no_path(self):
+        # Nothing is being widened when there are no grants at all.
+        contract = _gcp_contract(SHARED)
+        contract["metadata"]["policies"] = {}
+        contract["exposes"][1]["binding"]["location"].pop("path", None)
+        resources = GcpIacPlugin().emit(contract)
+        assert "google_storage_bucket_iam_member" not in resources
 
     def test_isolated_bucket_iam_carries_no_condition(self):
         resources = GcpIacPlugin().emit(_gcp_contract(ISOLATED))
