@@ -323,6 +323,25 @@ def run(args, logger: logging.Logger) -> int:
             plan["actions"] = list(existing) + schedule_actions
             plan["total_actions"] = len(plan["actions"])
 
+        # --- Packaging truthfulness (RFC-packaging-modes.md file 8) ---------
+        # plan.json is the digest-bound artifact the human reviews, and
+        # untouched it would list container-*creation* actions for containers
+        # the emit path (correctly) refuses to own under `packaging.mode:
+        # shared` — an approved plan claiming it will create a pool it must
+        # never own. Drop those actions and stamp the effective ownership so
+        # the approver reads it off the plan instead of recomputing the
+        # two-level precedence.
+        #
+        # Runs BEFORE inject_digests so planDigest covers both. One
+        # chokepoint here rather than per-provider, so it holds for the
+        # abstract-op path and the native planner path alike. A contract with
+        # no `packaging` block is returned untouched — no new key, no digest
+        # churn. Function-local import: `iac` pulls every provider plugin and
+        # must stay off the `fluid --help` cold path.
+        from fluid_build.iac.plan_packaging import apply_packaging_to_plan
+
+        plan = apply_packaging_to_plan(plan, contract)
+
         # --- Plan-binding digests (stage 6 ⇒ stage 7 pipeline) --------------
         # ``bundleDigest`` pins the input bundle when the contract is a tgz;
         # ``planDigest`` catches tampering of plan.json between stages 6 and
