@@ -13,7 +13,63 @@
   "generated_at": "2026-07-01T00:00:00Z",
   "project_name": "jaffle_shop"
  },
- "metrics": {},
+ "metrics": {
+  "metric.jaffle_shop.total_revenue": {
+   "name": "total_revenue",
+   "resource_type": "metric",
+   "type": "simple",
+   "description": "Revenue across completed orders",
+   "type_params": {
+    "measure": {
+     "name": "revenue"
+    }
+   },
+   "filter": {
+    "where_filters": [
+     {
+      "where_sql_template": "order_total > 0"
+     }
+    ]
+   }
+  },
+  "metric.jaffle_shop.aov": {
+   "name": "aov",
+   "resource_type": "metric",
+   "type": "ratio",
+   "type_params": {
+    "numerator": {
+     "name": "revenue"
+    },
+    "denominator": {
+     "name": "order_count"
+    }
+   }
+  },
+  "metric.jaffle_shop.revenue_growth": {
+   "name": "revenue_growth",
+   "resource_type": "metric",
+   "type": "derived",
+   "type_params": {
+    "expr": "total_revenue - total_revenue_prev",
+    "metrics": [
+     {
+      "name": "total_revenue"
+     }
+    ]
+   }
+  },
+  "metric.jaffle_shop.rolling_28d": {
+   "name": "rolling_28d",
+   "resource_type": "metric",
+   "type": "cumulative",
+   "type_params": {
+    "measure": {
+     "name": "revenue"
+    },
+    "window": "28 days"
+   }
+  }
+ },
  "nodes": {
   "model.dbt_audit_pkg.audit_helper": {
    "alias": "audit_helper",
@@ -765,6 +821,115 @@
    "resource_type": "source",
    "schema": "JAFFLE",
    "source_name": "raw_jaffle"
+  }
+ },
+ "semantic_models": {
+  "semantic_model.jaffle_shop.orders": {
+   "name": "orders",
+   "resource_type": "semantic_model",
+   "package_name": "jaffle_shop",
+   "model": "ref('orders')",
+   "description": "Order fact semantic model",
+   "defaults": {
+    "agg_time_dimension": "most_recent_order_at"
+   },
+   "entities": [
+    {
+     "name": "order",
+     "type": "primary",
+     "expr": "order_id"
+    },
+    {
+     "name": "customer",
+     "type": "foreign",
+     "expr": "customer_id"
+    },
+    {
+     "name": "shard",
+     "type": "hyperscale"
+    }
+   ],
+   "dimensions": [
+    {
+     "name": "most_recent_order_at",
+     "type": "time",
+     "type_params": {
+      "time_granularity": "day"
+     }
+    },
+    {
+     "name": "loaded_microbatch",
+     "type": "time",
+     "type_params": {
+      "time_granularity": "nanosecond"
+     }
+    },
+    {
+     "name": "customer_id",
+     "type": "categorical"
+    }
+   ],
+   "measures": [
+    {
+     "name": "revenue",
+     "agg": "sum",
+     "expr": "order_total",
+     "description": "Total order revenue",
+     "create_metric": true
+    },
+    {
+     "name": "order_count",
+     "agg": "count",
+     "expr": "order_id"
+    },
+    {
+     "name": "p95_order_value",
+     "agg": "percentile",
+     "expr": "order_total",
+     "agg_params": {
+      "percentile": 0.95
+     }
+    },
+    {
+     "name": "last_order_total",
+     "agg": "max",
+     "expr": "order_total",
+     "non_additive_dimension": {
+      "name": "most_recent_order_at",
+      "window_choice": "max",
+      "window_groupings": [
+       "customer_id"
+      ]
+     }
+    },
+    {
+     "name": "weird",
+     "agg": "hyperloglog",
+     "expr": "customer_id"
+    }
+   ],
+   "depends_on": {
+    "nodes": [
+     "model.jaffle_shop.orders"
+    ]
+   }
+  },
+  "semantic_model.jaffle_shop.ghost": {
+   "name": "ghost",
+   "resource_type": "semantic_model",
+   "package_name": "jaffle_shop",
+   "model": "ref('int_order_payments')",
+   "entities": [
+    {
+     "name": "ghost",
+     "type": "primary"
+    }
+   ],
+   "depends_on": {
+    "nodes": [
+     "model.jaffle_shop.int_order_payments"
+    ]
+   }
   }
  }
 }

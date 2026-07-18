@@ -426,3 +426,82 @@ class TestImportReport:
         _, report = v12_contract
         assert any("metadata.owner defaulted" in d for d in report.required_defaults)
         assert any("ONE DataProduct per dbt project" in n for n in report.notes)
+
+
+class TestSemanticLayerImport:
+    """manifest semantic_models + metrics → exposes[].semantics.
+
+    Round-trip closure: the MetricFlow bridge EXPORTS the semantics
+    block; before this leg a brownfield dbt project lost its semantic
+    layer on import.
+    """
+
+    def _orders_semantics(self) -> Dict[str, Any]:
+        contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v12.json"))
+        expose = _expose(contract, "orders")
+        assert "semantics" in expose, "orders semantic model must attach to the orders expose"
+        return expose["semantics"]
+
+    def test_semantic_model_attaches_to_the_right_expose(self) -> None:
+        semantics = self._orders_semantics()
+        assert semantics["name"] == "orders"
+        assert semantics["description"] == "Order fact semantic model"
+        assert semantics["defaultAggTimeDimension"] == "most_recent_order_at"
+
+    def test_entities_map_with_unsupported_type_dropped(self) -> None:
+        entities = {e["name"]: e for e in self._orders_semantics()["entities"]}
+        assert entities["order"] == {"name": "order", "type": "primary", "expr": "order_id"}
+        assert entities["customer"]["type"] == "foreign"
+        assert "shard" not in entities  # type: hyperscale — dropped with a note
+
+    def test_dimensions_map_and_granularity_normalizes_or_omits(self) -> None:
+        dimensions = {d["name"]: d for d in self._orders_semantics()["dimensions"]}
+        assert dimensions["most_recent_order_at"]["type"] == "time"
+        assert dimensions["most_recent_order_at"]["typeParams"] == {"timeGranularity": "day"}
+        # nanosecond has no contract equivalent — granularity omitted, dimension kept
+        assert dimensions["loaded_microbatch"]["type"] == "time"
+        assert "typeParams" not in dimensions["loaded_microbatch"]
+        assert dimensions["customer_id"]["type"] == "categorical"
+
+    def test_measures_map_with_extras_and_unsupported_agg_dropped(self) -> None:
+        measures = {m["name"]: m for m in self._orders_semantics()["measures"]}
+        assert measures["revenue"]["agg"] == "sum"
+        assert measures["revenue"]["expr"] == "order_total"
+        assert measures["revenue"]["createMetric"] is True
+        assert measures["last_order_total"]["nonAdditiveDimension"] == {
+            "name": "most_recent_order_at",
+            "windowChoice": "max",
+        }
+        # percentile measure survives; its agg_params are reported, not emitted
+        assert measures["p95_order_value"]["agg"] == "percentile"
+        assert "aggParams" not in measures["p95_order_value"]
+        assert "weird" not in measures  # agg: hyperloglog — dropped
+
+    def test_metrics_map_simple_ratio_derived_and_skip_cumulative(self) -> None:
+        metrics = {m["name"]: m for m in self._orders_semantics()["metrics"]}
+        assert metrics["total_revenue"]["type"] == "simple"
+        assert metrics["total_revenue"]["measure"] == "revenue"
+        assert metrics["total_revenue"]["filter"] == "order_total > 0"
+        assert metrics["aov"] == {
+            "name": "aov",
+            "type": "ratio",
+            "numerator": "revenue",
+            "denominator": "order_count",
+        }
+        assert metrics["revenue_growth"]["type"] == "derived"
+        assert metrics["revenue_growth"]["inputMetrics"] == ["total_revenue"]
+        assert "rolling_28d" not in metrics  # cumulative — no contract slot yet
+
+    def test_losses_are_reported_not_silent(self) -> None:
+        _, report = DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v12.json"))
+        text = "\n".join(report.unsupported)
+        assert "ghost" in text  # semantic model on an ephemeral model
+        assert "agg_params" in text
+        assert "window_groupings" in text
+        assert "cumulative" in text
+        assert "hyperscale" in text or "shard" in text
+
+    def test_imported_contract_still_passes_schema_validation(self, schema_manager) -> None:
+        contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v12.json"))
+        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        assert result.is_valid, result.errors
