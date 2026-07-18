@@ -21,6 +21,11 @@ from typing import Any, Dict, List, Optional
 
 from fluid_build.copilot.schemas.stage_outputs import LogicalDraft
 
+# Module-attribute access (not bare names) so test patches on the shared
+# modules flow through to this emitter — repo extraction convention.
+from fluid_build.forge_datamodel import semantics_builder as _semantics_builder
+from fluid_build.forge_datamodel import time_grains as _time_grains
+
 # NOTE: ``schema_manager`` (pulls heavy ``jsonschema``) is imported lazily at
 # the two use sites below so it stays off the ``fluid mcp`` / ``fluid --help``
 # / ``build_parser()`` cold path (this module is reached transitively from the
@@ -146,52 +151,10 @@ def _semantic_field_expr(name: str) -> str:
     return name or "value"
 
 
-def _measure_agg(expr: str) -> str:
-    upper = (expr or "").upper()
-    if upper.startswith("COUNT("):
-        return "count"
-    if upper.startswith("AVG("):
-        return "avg"
-    if upper.startswith("MIN("):
-        return "min"
-    if upper.startswith("MAX("):
-        return "max"
-    return "sum"
-
-
-_FLUID_TIME_GRAINS = {"day", "week", "month", "quarter", "year", "hour", "minute"}
-_TIME_GRAIN_ALIASES = {
-    "days": "day",
-    "daily": "day",
-    "weeks": "week",
-    "weekly": "week",
-    "months": "month",
-    "monthly": "month",
-    "quarters": "quarter",
-    "quarterly": "quarter",
-    "years": "year",
-    "yearly": "year",
-    "hours": "hour",
-    "hourly": "hour",
-    "minutes": "minute",
-    "minutely": "minute",
-    "s": "minute",
-    "ms": "minute",
-    "sec": "minute",
-    "secs": "minute",
-    "second": "minute",
-    "seconds": "minute",
-    "millisecond": "minute",
-    "milliseconds": "minute",
-}
-
-
 def _fluid_time_grain(value: str) -> str | None:
-    normalized = (value or "").strip().lower().replace("_", " ").replace("-", " ")
-    normalized = re.sub(r"\s+", " ", normalized)
-    normalized = normalized.removeprefix("per ").removesuffix(" grain").strip()
-    normalized = _TIME_GRAIN_ALIASES.get(normalized, normalized)
-    return normalized if normalized in _FLUID_TIME_GRAINS else None
+    # Thin seam over the single-source vocabulary (kept so existing
+    # callers / test patches keep working after the consolidation).
+    return _time_grains.normalize_time_grain(value)
 
 
 def _fluid_semantics(
@@ -257,21 +220,19 @@ def _fluid_semantics(
 
     for metric in logical.osi.metrics:
         expr = _first_expression(metric)
-        measure = {
-            "name": metric.name,
-            "agg": _measure_agg(expr),
-            "expr": expr,
-        }
-        if metric.description:
-            measure["description"] = metric.description
-        measures.append(measure)
+        # OSI metric expressions are whole aggregate calls (SUM(amount));
+        # the shared builder splits them into agg + inner expr so consumers
+        # aggregate exactly once (previously both the MCP query compiler and
+        # the dbt MetricFlow bridge double-wrapped: SUM(SUM(amount))).
+        measures.append(
+            _semantics_builder.measure_from_aggregate_expression(
+                metric.name, expr, description=metric.description or None
+            )
+        )
         metrics.append(
-            {
-                "name": metric.name,
-                "type": "simple",
-                "measure": metric.name,
-                "description": metric.description or metric.name,
-            }
+            _semantics_builder.simple_metric(
+                metric.name, metric.name, description=metric.description or metric.name
+            )
         )
 
     if logical.dimensional is not None:
@@ -383,6 +344,9 @@ def _fluid_semantics(
                 }
             )
 
+    default_time = _semantics_builder.default_agg_time_dimension(dimensions)
+    if default_time:
+        semantics["defaultAggTimeDimension"] = default_time
     if entities:
         semantics["entities"] = entities
     if dimensions:
@@ -648,7 +612,7 @@ def _build_dv2_exposes(
             # Schema validator requires at least one dimension —
             # synthesize one from the artifact name.
             dims.append({"name": artifact_name, "type": "categorical", "expr": artifact_name})
-        return {
+        artifact_semantics: Dict[str, Any] = {
             "name": artifact_name,
             "description": (
                 logical.osi.description
@@ -667,6 +631,10 @@ def _build_dv2_exposes(
                 }
             ],
         }
+        default_time = _semantics_builder.default_agg_time_dimension(dims)
+        if default_time:
+            artifact_semantics["defaultAggTimeDimension"] = default_time
+        return artifact_semantics
 
     for hub in logical.dv2.hubs:
         columns = list(hub.business_key_columns) or [f"{_slug(hub.entity_name)}_id"]

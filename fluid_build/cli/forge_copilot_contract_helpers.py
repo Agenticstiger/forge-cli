@@ -51,6 +51,11 @@ from fluid_build.cli.forge_copilot_taxonomy import (
     normalize_supporting_standards,
     normalize_use_case,
 )
+
+# Shared semantics-assembly primitives (module-attribute access so test
+# patches flow through) — keeps this producer in lock-step with the
+# data-model pipeline's emitter.
+from fluid_build.forge_datamodel import semantics_builder as _semantics_builder
 from fluid_build.util.safe_yaml import load_yaml_safe
 
 SAFE_ADDITIONAL_FILE_EXTENSIONS = {
@@ -539,13 +544,20 @@ def _build_semantics_from_interview_summary(
     if time_dimension:
         time_dimension_entry: Dict[str, Any] = {"name": time_dimension, "type": "time"}
         if time_granularity:
-            time_dimension_entry["typeParams"] = {"timeGranularity": time_granularity}
+            # Normalize free-form interview input ("daily", "per month",
+            # "hr") through the shared vocabulary; an unrecognized grain
+            # is omitted rather than emitted as an enum-invalid contract
+            # (previously the raw string passed straight through and only
+            # the schema-repair loop caught it).
+            type_params = _semantics_builder.normalized_time_type_params(time_granularity)
+            if type_params is not None:
+                time_dimension_entry["typeParams"] = type_params
         dimensions.append(time_dimension_entry)
 
     semantic_description = description or "Semantic model for the exposed data product."
     semantic_description += _modeling_description_suffix(canonical_model, supporting_standards)
 
-    return {
+    semantics_block: Dict[str, Any] = {
         "name": expose_name.replace("_", " ").title(),
         "description": semantic_description,
         "entities": entities,
@@ -553,6 +565,10 @@ def _build_semantics_from_interview_summary(
         "dimensions": dimensions,
         "metrics": metrics,
     }
+    default_time = _semantics_builder.default_agg_time_dimension(dimensions)
+    if default_time:
+        semantics_block["defaultAggTimeDimension"] = default_time
+    return semantics_block
 
 
 def _default_binding(provider_name: str, expose_name: str) -> Dict[str, Any]:
