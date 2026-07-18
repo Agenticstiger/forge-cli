@@ -176,6 +176,69 @@ def _build_agent_system_prompt() -> str:
 AGENT_SYSTEM_PROMPT = _build_agent_system_prompt()
 
 
+def _tool_name(definition: Mapping[str, Any]) -> str:
+    """Tool name from either the flat or the OpenAI-nested definition shape."""
+    name = definition.get("name")
+    if isinstance(name, str) and name:
+        return name
+    function = definition.get("function")
+    if isinstance(function, Mapping):
+        return str(function.get("name") or "")
+    return ""
+
+
+def _filter_tools(
+    tools: List[Dict[str, Any]], allowlist: Optional[List[str]]
+) -> List[Dict[str, Any]]:
+    """Intersect *tools* with *allowlist* (deep-agents PR 2).
+
+    ``None`` is the default and returns *tools* unchanged — existing
+    callers see byte-identical behaviour. An allowlist that matches
+    nothing falls back to the full set: a tool-less loop is
+    indistinguishable from a broken model, and failing loudly here is
+    more useful than an inexplicably useless run.
+    """
+    if not allowlist:
+        return tools
+    wanted = {str(name).strip() for name in allowlist if str(name).strip()}
+    filtered = [t for t in tools if _tool_name(t) in wanted]
+    if not filtered:
+        LOG.warning(
+            "tool_allowlist matched no registered tools (%s); advertising the full registry",
+            sorted(wanted),
+        )
+        return tools
+    missing = sorted(wanted - {_tool_name(t) for t in filtered})
+    if missing:
+        LOG.info("tool_allowlist entries not in the registry, ignored: %s", missing)
+    return filtered
+
+
+def _scoped_system_prompt(base_prompt: str, goal_scope: Optional[str]) -> str:
+    """Append step framing to the system prompt (deep-agents PR 2).
+
+    ``None`` returns *base_prompt* unchanged. When set, the model is
+    told it is making one narrow edit to an existing contract rather
+    than authoring one — and, critically, that it does not get to decide
+    whether the objective was met: deterministic code-owned checks
+    re-run against the file on disk after it returns.
+    """
+    if not goal_scope:
+        return base_prompt
+    return (
+        base_prompt + "\n\nSTEP SCOPE (this invocation only):\n"
+        f"{goal_scope}\n"
+        "You are editing an EXISTING contract that was supplied to you, not "
+        "authoring a new one. Make the smallest change that achieves the step "
+        "above and return the COMPLETE modified contract — preserve every "
+        "field you were not asked to change, verbatim.\n"
+        "Do NOT delete fields, columns, or ports to make a requirement pass: "
+        "removals are gated and will be rejected.\n"
+        "You do not decide whether this step succeeded. Deterministic checks "
+        "re-run against the contract on disk after you return."
+    )
+
+
 def run_copilot_agent_loop(
     *,
     context: Mapping[str, Any],
@@ -189,6 +252,8 @@ def run_copilot_agent_loop(
     workspace_root: Optional[Path] = None,
     preview_panel: Any = None,
     show_work: bool = False,
+    tool_allowlist: Optional[List[str]] = None,
+    goal_scope: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the multi-turn agent loop and return the final result dict.
 
@@ -216,9 +281,27 @@ def run_copilot_agent_loop(
     ``show_work`` (Phase 0.4): when True, stream the agent's reasoning
     and tool-call decisions to the console as they happen. Independent
     of ``preview_panel`` — they can be combined or used separately.
+
+    ``tool_allowlist`` (deep-agents PR 2, RFC-deep-agents.md): when
+    supplied, the tool definitions advertised to the model are
+    intersected with these names. ``None`` (the default) advertises the
+    full registry — today's behaviour, unchanged. The intersection is
+    taken against the live registry, so a name that isn't a real tool
+    simply doesn't appear; the ``workspace_root`` confinement applies
+    to whatever survives, exactly as before. An allowlist that matches
+    nothing falls back to the full set with a warning rather than
+    handing the model zero tools (a silently tool-less loop looks like
+    a model failure, which is the wrong thing to debug).
+
+    ``goal_scope`` (deep-agents PR 2): an extra framing paragraph
+    appended to the system prompt to scope this invocation to one
+    narrow objective — a mission step, rather than "author a whole
+    contract from scratch". ``None`` (the default) leaves the system
+    prompt byte-identical to today's.
     """
     provider_adapter = get_llm_provider(llm_config.provider)
-    tools = get_tool_definitions()
+    tools = _filter_tools(get_tool_definitions(), tool_allowlist)
+    system_prompt = _scoped_system_prompt(AGENT_SYSTEM_PROMPT, goal_scope)
     # Resolve the workspace root ONCE, at loop entry, so every tool
     # call within this loop sees the same canonical root.
     ws_root: Path = (workspace_root or Path.cwd()).resolve()
@@ -334,7 +417,7 @@ def run_copilot_agent_loop(
         # doesn't change over the lifetime of a CLI invocation, so rebuilding
         # the prompt on every iteration just wastes work.
         response_json = _call_llm_with_tools(
-            provider_adapter, llm_config, AGENT_SYSTEM_PROMPT, messages, tools
+            provider_adapter, llm_config, system_prompt, messages, tools
         )
 
         # Check for tool calls.
@@ -495,6 +578,25 @@ def _build_initial_user_message(
         except Exception:  # noqa: BLE001
             pass
 
+    # Seed plumbing (deep-agents PR 2): when the caller populated the
+    # existing ``seed_contract_override`` seam — the same key
+    # ``forge_copilot_contract_helpers._seed_contract_override`` reads on
+    # the single-shot path — the seed IS the contract to edit. Absent
+    # the key this branch is inert, so existing callers are unaffected.
+    seed = context.get("seed_contract_override")
+    if isinstance(seed, dict) and seed:
+        parts.append(
+            "\nEXISTING CONTRACT (this is the artifact to modify — return the "
+            "complete contract with your change applied, preserving everything "
+            "else verbatim):\n" + json.dumps(seed, indent=2, default=str, sort_keys=True)
+        )
+        parts.append(
+            "\nApply the requested change to the contract above and return the "
+            "final response as a strict JSON object whose 'contract' key holds "
+            "the complete modified contract."
+        )
+        return "\n".join(parts)
+
     if not parts:
         parts.append("Please help me create a FLUID data product contract.")
 
@@ -505,6 +607,61 @@ def _build_initial_user_message(
     return "\n".join(parts)
 
 
+#: Sentinel URL ``LiteLLMProvider.build_tool_request`` returns. litellm
+#: owns endpoint construction, so there is no HTTP endpoint to POST to —
+#: the call has to go through ``litellm.completion`` in-process.
+LITELLM_SENTINEL_URL = "litellm://internal"
+
+
+def _to_openai_tool_shape(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalise Anthropic-shaped tool defs to the OpenAI function shape.
+
+    ``get_tool_definitions()`` emits ``{name, description, input_schema}``
+    (Anthropic's shape). litellm's unified path expects OpenAI's
+    ``{"type": "function", "function": {name, description, parameters}}``
+    and **silently ignores** anything else — no error, no tool calls,
+    just a model that mysteriously never uses a tool. Already-OpenAI
+    entries pass through untouched.
+    """
+    converted: List[Dict[str, Any]] = []
+    for tool in tools:
+        if "function" in tool or tool.get("type") == "function":
+            converted.append(tool)
+            continue
+        converted.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+                },
+            }
+        )
+    return converted
+
+
+def _call_litellm_with_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Run a tool-use completion through litellm and return the raw dict.
+
+    ``_skip_mcp_handler=True`` is required, not cosmetic: litellm's
+    ``completion()`` imports its proxy MCP bridge whenever ``tools`` is
+    non-empty, and that bridge imports ``fastapi`` — a dependency fluid
+    does not ship, so every tool-use call would die with
+    ``ModuleNotFoundError: No module named 'fastapi'``. fluid has its own
+    MCP layer and never wants litellm's, so skipping the bridge is both
+    the fix and the correct behaviour.
+    """
+    import litellm
+
+    payload = dict(payload)
+    payload["tools"] = _to_openai_tool_shape(list(payload.get("tools") or []))
+    response = litellm.completion(_skip_mcp_handler=True, **payload)
+    if hasattr(response, "model_dump"):
+        return response.model_dump()
+    return dict(response)
+
+
 def _call_llm_with_tools(
     provider: LlmProvider,
     config: LlmConfig,
@@ -512,8 +669,35 @@ def _call_llm_with_tools(
     messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Make one LLM call with tool definitions and return the raw response."""
+    """Make one LLM call with tool definitions and return the raw response.
+
+    Every provider in fluid is a ``LiteLLMProvider`` shim whose
+    ``build_tool_request`` returns the :data:`LITELLM_SENTINEL_URL`
+    rather than a real endpoint, so the historical httpx POST could
+    never succeed against one. The sentinel branch routes those calls
+    in-process through litellm; the httpx path is retained for any
+    provider that returns a genuine URL.
+    """
     url, headers, payload = provider.build_tool_request(config, system_prompt, messages, tools)
+    if url == LITELLM_SENTINEL_URL:
+        try:
+            return _call_litellm_with_tools(payload)
+        except ImportError as exc:
+            raise CopilotGenerationError(
+                "copilot_agent_loop_litellm_missing",
+                "The agent loop needs litellm for tool use but it is not installed.",
+                suggestions=["pip install 'fluid-build[litellm]'"],
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 — translate to the loop's error type
+            raise CopilotGenerationError(
+                "copilot_agent_loop_request_failed",
+                f"Agent loop LLM request failed ({type(exc).__name__}) "
+                f"for {config.provider} model '{config.model}'.",
+                suggestions=[
+                    "Check the model supports tool use",
+                    "Try --llm-model gpt-4.1-mini / claude-sonnet-4-6 / gemini-2.5-flash",
+                ],
+            ) from exc
     try:
         with httpx.Client(timeout=config.timeout_seconds) as client:
             response = client.post(url, headers=headers, json=payload)
