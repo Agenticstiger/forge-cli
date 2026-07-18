@@ -32,6 +32,7 @@ Markers declared in `pyproject.toml`.
 | Stage 3 replace mode | `tests/iac/test_iac_aws_real_replace_e2e.py` | ✅ data-loss gate verified |
 | Stage 3 brownfield | _file claimed but absent — see "deferred" §_ | ❌ deferred (`discover_imports()` returns `[]` so any test would be a no-op) |
 | Stage 3 cross-account proxy | `tests/iac/test_iac_aws_real_cross_account_e2e.py` | ✅ 2/2 — consumer role assumes + LF + S3 bucket policy + Athena SELECT; un-granted principal correctly denied. **Zero new schema fields** — uses the existing `binding.governance.lakeFormation.grants[]` block; bucket policy is paired automatically with any IAM-principal grant. |
+| Stage 2 cross-account (two-account LocalStack) | `tests/integration/test_iac_cross_account_localstack.py` | ✅ 10 tests, gated on `FLUID_IAC_LIVE_XACCT=1` + a second LocalStack Pro carrying `lakeformation`. Producer stack applies in account A (`000000000000`); every grant names a role in account B (`222222222222`) — LocalStack derives the account from the access-key id. Verified live: LF permission + LF prefix-registration + `aws_s3_bucket_policy` all land and read back; the shared-**pool** bucket is referenced via `data.aws_s3_bucket`, its `GetObject` grant is scoped to `location.path` and its `ListBucket` carries the `s3:prefix` condition. Under `ENFORCE_IAM=1` the emitted bucket policy is proven to be the **deciding** access control: with a deliberately broad identity policy on the account-B role, the granted prefix reads and the sibling tenant's prefix is denied — and widening only the bucket policy flips that denial (causal control). **Still NOT proven here**: LF cross-account *authorization* (LocalStack rejects `GrantPermissions` under IAM enforcement even for a registered `DataLakeAdmin` — `docs/upstream-issues/localstack-lakeformation-grant-auth.md`), and cross-account Glue catalog sharing (no AWS RAM in LocalStack; account B gets `EntityNotFoundException`, which is state isolation, not a denial). |
 | Stage 1 Glue catalog enrichment | `tests/iac/test_iac_aws.py::TestAwsGlueCatalogEnrichment` (6) + `test_iac_tofu_validate.py[aws]` | ✅ — `aws_glue_catalog_table.description` + per-column comments + fluid_layer/fluid_product_type/fluid_domain/fluid_version/fluid_contract/forge.pii.<col> parameters, absorbed from the retired `GlueCatalogRegistrar`. **Zero new schema fields** — reads existing `description`/`metadata.description`/`metadata.layer`/`metadata.productType`/`domain`/`fluidVersion`/`column.tags[]`/`column.description`. |
 | Stage 3 Glue catalog enrichment | `tests/iac/test_iac_aws_real_e2e.py::test_real_iceberg_on_glue_round_trip` | ✅ live — Description + Parameters + per-column Comments + `forge.pii.amount` verified via boto3 GetTable |
 
@@ -91,10 +92,24 @@ follow-up scope. None block the current branch from shipping.
     - `FLUID_GCP_LIVE_CONSUMER_PROJECT=<project-id>` — applies a
       contract with an external-project SA email; verifies the
       dataset's access[] block carries it. Skips cleanly when unset.
-  **What's still deferred**: bilateral apply (consumer in account/
-  project B actually running a SELECT against producer in A). That
-  needs creds for the second account/project — when those are
-  provisioned, flip the env vars and the existing tests run.
+  **Partially closed on the emulator** by
+  `tests/integration/test_iac_cross_account_localstack.py`: a second,
+  disposable LocalStack Pro (with `lakeformation`) hosts two real
+  accounts, the producer stack applies in A with grants naming a role
+  in B, and both accounts' APIs read the artifacts back. Under
+  `ENFORCE_IAM=1` the **S3** half is genuinely authorised across the
+  boundary — with a causal control proving the forge-emitted bucket
+  policy, not the identity policy, is what narrows access.
+  **What's still deferred**: (a) Lake Formation cross-account
+  *authorization* — LocalStack rejects `GrantPermissions` under IAM
+  enforcement even for a registered `DataLakeAdmin`, so the LF grant
+  is only ever verified as landed, never as enforced; (b) cross-account
+  Glue catalog sharing, which on real AWS is brokered by AWS RAM +
+  a catalog resource policy that LocalStack does not implement;
+  (c) org-boundary semantics (SCPs, `aws:PrincipalOrgID`,
+  trust-policy external-ids). All three need a real second AWS
+  account — when creds are provisioned, flip the env vars above and
+  the existing Stage 3 tests run.
 - **Latency / performance SLOs** — no SLO on `tofu plan` duration,
   emit-path CPU, etc. No baseline measurements yet. Deferred until
   we have a target.
@@ -172,6 +187,13 @@ follow-up scope. None block the current branch from shipping.
   `location`, `glue_database`/`schema` aliasing). The live test
   stays gated on `FLUID_AWS_LIVE_DBT_GLUE=1` so anyone with the
   AWS sandbox can run it on demand.
+  **Cannot be moved to the emulator tier.** dbt-glue drives the Glue
+  Interactive Sessions API, which LocalStack Pro does not implement —
+  verified directly against Pro 2026.6.0:
+  `CreateSession` → `InternalFailure: Sorry, the CreateSession
+  operation on the glue service is not currently supported by
+  LocalStack` (`ListSessions` returns the same). Real AWS is the only
+  target for a live dbt-glue run; there is no emulator shortcut.
 
 ## Upstream limitations
 
