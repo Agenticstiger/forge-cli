@@ -481,7 +481,11 @@ def _build_columns(
             )
         entry: Dict[str, Any] = {"name": col_name, "type": col_type}
         if manifest_col.get("description"):
-            entry["description"] = str(manifest_col["description"])
+            entry["description"] = _scrub_display_text(
+                manifest_col["description"],
+                field_desc=f"column {model_name}.{col_name} description",
+                report=report,
+            )
         if col_name in not_null_cols or _column_has_not_null_constraint(manifest_col):
             entry["required"] = True
         if col_name in pk_columns:
@@ -824,6 +828,91 @@ _VALID_SEMANTIC_AGGS = {
 }
 _VALID_ENTITY_TYPES = {"primary", "foreign", "unique", "natural"}
 
+# Jinja delimiters. dbt renders Jinja in YAML property values (descriptions,
+# meta, expr, filter, …) when the operator runs ``dbt parse`` on a generated
+# project. A hostile third-party manifest carrying e.g.
+# ``{{ env_var('AWS_SECRET_ACCESS_KEY') }}`` in an imported free-text field
+# would therefore have that value rendered into the operator's own manifest
+# artifact after the import → generate → parse round trip — an indirect
+# info-disclosure chain. Every recovered free-text field routes through the
+# two guards below.
+_JINJA_RE = re.compile(r"\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}", re.DOTALL)
+# Bare two-char Jinja delimiters (for stray-fragment cleanup after the
+# span-removal loop). Single ``{`` / ``}`` are legitimate display text.
+_JINJA_DELIMITER_RE = re.compile(r"\{\{|\}\}|\{%|%\}|\{#|#\}")
+# MetricFlow's legitimate templated object references inside metric filters.
+_METRICFLOW_TEMPLATE_RE = re.compile(
+    r"^\{\{\s*(?:Dimension|TimeDimension|Entity|Metric)\s*\(", re.IGNORECASE
+)
+
+
+def _scrub_display_text(value: Any, *, field_desc: str, report: ImportReport) -> str:
+    """Strip Jinja markup from an imported display / governance string.
+
+    Descriptions, tags, labels, and owners never legitimately carry a
+    template, so the braced spans are removed outright (dbt would otherwise
+    render them on parse) and the redaction is surfaced. Returns the cleaned
+    text.
+
+    Removal loops to a fixpoint: a single ``re.sub`` pass can *reform* a
+    delimiter at a gap junction (e.g. ``{{%%}%set x=env_var('S')%}`` →
+    ``{%set x=env_var('S')%}``), which would then execute on ``dbt parse``.
+    Iterating until the string stops changing guarantees no delimiter
+    survives via reformation. Bounded by ``len(text)`` — each pass removes
+    at least one delimiter pair, so it always terminates.
+    """
+    text = str(value)
+    if not _JINJA_RE.search(text):
+        return text
+    cleaned = text
+    for _ in range(len(text) + 1):
+        stripped = _JINJA_RE.sub("", cleaned)
+        if stripped == cleaned:
+            break
+        cleaned = stripped
+    # Remove any stray delimiter fragments left after the loop (e.g.
+    # ``{{{{ x }}}}`` → dangling ``}}``). A bare closer never renders, but
+    # this keeps the invariant "no Jinja delimiter survives" literally true.
+    # Only the two-char delimiters are removed — single ``{`` / ``}`` are
+    # legitimate display text (e.g. ``{value}``) and left intact.
+    cleaned = _JINJA_DELIMITER_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    report.unsupported.append(
+        f"{field_desc}: Jinja template markup stripped from imported text — "
+        "display/governance fields must not carry templates (dbt renders them "
+        "on parse; e.g. env-var/secret exfiltration)"
+    )
+    return cleaned
+
+
+def _flag_sql_jinja(value: Any, *, field_desc: str, report: ImportReport) -> str:
+    """Preserve an imported SQL-bearing string (expr / filter) but flag Jinja.
+
+    expr/filter are deliberately SQL-bearing and MetricFlow filters
+    legitimately template object references (``{{ Dimension('...') }}``), so
+    the value is kept verbatim. MetricFlow-shaped templating is noted as
+    expected; any OTHER Jinja (``env_var``, arbitrary calls) is surfaced as a
+    review-before-generate risk so the operator scrutinises the regenerated
+    project before running dbt. Returns the value unchanged.
+    """
+    text = str(value)
+    spans = _JINJA_RE.findall(text)
+    if not spans:
+        return text
+    non_metricflow = [s for s in spans if not _METRICFLOW_TEMPLATE_RE.match(s)]
+    if non_metricflow:
+        report.unsupported.append(
+            f"{field_desc}: imported expression contains non-MetricFlow Jinja "
+            f"({non_metricflow[0][:60]!r}) — REVIEW before generating; dbt "
+            "renders it on parse (env-var/secret exfiltration risk)"
+        )
+    else:
+        report.notes.append(
+            f"{field_desc}: imported expression uses MetricFlow object "
+            "templating (Dimension/TimeDimension/Entity/Metric) — preserved"
+        )
+    return text
+
 
 def _attach_semantic_models(
     manifest: Dict[str, Any],
@@ -894,7 +983,9 @@ def _semantics_block_from_semantic_model(
     sm_name = str(sm.get("name") or "semantic_model")
     block: Dict[str, Any] = {"name": sm_name}
     if sm.get("description"):
-        block["description"] = str(sm["description"])
+        block["description"] = _scrub_display_text(
+            sm["description"], field_desc=f"semantic model {sm_name} description", report=report
+        )
 
     default_time = ((sm.get("defaults") or {}).get("agg_time_dimension") or "").strip()
     if default_time:
@@ -905,10 +996,33 @@ def _semantics_block_from_semantic_model(
     sm_meta = (sm.get("config") or {}).get("meta") or {}
     fluid_tags = sm_meta.get("fluid_tags")
     if isinstance(fluid_tags, list) and fluid_tags:
-        block["tags"] = [str(t) for t in fluid_tags]
+        # Drop tags that scrub to empty (a fully-templated tag) — an empty
+        # tag fails the schema tag pattern.
+        clean_tags = [
+            scrubbed
+            for t in fluid_tags
+            if (
+                scrubbed := _scrub_display_text(
+                    t, field_desc=f"semantic model {sm_name} tag", report=report
+                )
+            )
+        ]
+        if clean_tags:
+            block["tags"] = clean_tags
     fluid_labels = sm_meta.get("fluid_labels")
     if isinstance(fluid_labels, dict) and fluid_labels:
-        block["labels"] = {str(k): str(v) for k, v in fluid_labels.items()}
+        clean_labels = {}
+        for k, v in fluid_labels.items():
+            key = _scrub_display_text(
+                k, field_desc=f"semantic model {sm_name} label key", report=report
+            )
+            val = _scrub_display_text(
+                v, field_desc=f"semantic model {sm_name} label value", report=report
+            )
+            if key and val:  # both must survive the scrub to stay a valid label
+                clean_labels[key] = val
+        if clean_labels:
+            block["labels"] = clean_labels
 
     entities: List[Dict[str, Any]] = []
     for raw in sm.get("entities") or []:
@@ -923,9 +1037,13 @@ def _semantics_block_from_semantic_model(
             continue
         entity: Dict[str, Any] = {"name": str(raw["name"]), "type": entity_type}
         if raw.get("expr"):
-            entity["expr"] = str(raw["expr"])
+            entity["expr"] = _flag_sql_jinja(
+                raw["expr"], field_desc=f"entity {raw['name']} expr", report=report
+            )
         if raw.get("description"):
-            entity["description"] = str(raw["description"])
+            entity["description"] = _scrub_display_text(
+                raw["description"], field_desc=f"entity {raw['name']} description", report=report
+            )
         entities.append(entity)
     if entities:
         block["entities"] = entities
@@ -937,9 +1055,13 @@ def _semantics_block_from_semantic_model(
         dim_type = str(raw.get("type") or "categorical").lower()
         dimension: Dict[str, Any] = {"name": str(raw["name"])}
         if raw.get("expr"):
-            dimension["expr"] = str(raw["expr"])
+            dimension["expr"] = _flag_sql_jinja(
+                raw["expr"], field_desc=f"dimension {raw['name']} expr", report=report
+            )
         if raw.get("description"):
-            dimension["description"] = str(raw["description"])
+            dimension["description"] = _scrub_display_text(
+                raw["description"], field_desc=f"dimension {raw['name']} description", report=report
+            )
         if dim_type == "time":
             dimension["type"] = "time"
             granularity = str(
@@ -976,9 +1098,13 @@ def _semantics_block_from_semantic_model(
             continue
         measure: Dict[str, Any] = {"name": str(raw["name"]), "agg": agg}
         if raw.get("expr"):
-            measure["expr"] = str(raw["expr"])
+            measure["expr"] = _flag_sql_jinja(
+                raw["expr"], field_desc=f"measure {raw['name']} expr", report=report
+            )
         if raw.get("description"):
-            measure["description"] = str(raw["description"])
+            measure["description"] = _scrub_display_text(
+                raw["description"], field_desc=f"measure {raw['name']} description", report=report
+            )
         if raw.get("agg_time_dimension"):
             measure["aggTimeDimension"] = str(raw["agg_time_dimension"])
         if raw.get("create_metric"):
@@ -1031,13 +1157,19 @@ def _attach_metric(
 
     entry: Dict[str, Any] = {"name": name, "type": metric_type}
     if metric.get("description"):
-        entry["description"] = str(metric["description"])
+        entry["description"] = _scrub_display_text(
+            metric["description"], field_desc=f"metric {name} description", report=report
+        )
     metric_owner = ((metric.get("config") or {}).get("meta") or {}).get("owner")
     if metric_owner:
-        entry["owner"] = str(metric_owner)
+        entry["owner"] = _scrub_display_text(
+            metric_owner, field_desc=f"metric {name} owner", report=report
+        )
     filter_sql = _metric_filter_sql(metric)
     if filter_sql:
-        entry["filter"] = filter_sql
+        entry["filter"] = _flag_sql_jinja(
+            filter_sql, field_desc=f"metric {name} filter", report=report
+        )
 
     home: Optional[Dict[str, Any]] = None
     if metric_type == "simple":
@@ -1066,7 +1198,7 @@ def _attach_metric(
         if not expr or not input_metrics:
             report.unsupported.append(f"metric {name}: incomplete derived inputs — dropped")
             return
-        entry["expr"] = expr
+        entry["expr"] = _flag_sql_jinja(expr, field_desc=f"metric {name} expr", report=report)
         entry["inputMetrics"] = input_metrics
         for existing in blocks_by_sm_name.values():
             if any(m.get("name") in input_metrics for m in existing.get("metrics", [])):
