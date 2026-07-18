@@ -528,3 +528,134 @@ class TestGovernanceMetaRoundTrip:
         contract, _ = DbtManifestImporter().import_to_contract(str(FIXTURES / "manifest_v12.json"))
         result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
         assert result.is_valid, result.errors
+
+
+class TestJinjaHardening:
+    """A hostile third-party manifest can carry Jinja in free-text fields;
+    dbt renders Jinja in YAML on `dbt parse`, so importing → generating →
+    parsing would leak env vars into the operator's artifact. Display fields
+    are stripped; SQL-bearing fields (expr/filter) are preserved but flagged
+    for review, with legitimate MetricFlow templates recognised."""
+
+    def _import_hostile(self):
+        return DbtManifestImporter().import_to_contract(
+            str(FIXTURES / "manifest_v12_jinja_hostile.json")
+        )
+
+    def _orders(self, contract) -> Dict[str, Any]:
+        return _expose(contract, "orders")["semantics"]
+
+    def test_display_fields_are_stripped_of_jinja(self) -> None:
+        contract, _ = self._import_hostile()
+        sem = self._orders(contract)
+        assert "{{" not in sem["description"] and "env_var" not in sem["description"]
+        # tags/labels scrubbed
+        assert all("{{" not in t for t in sem["tags"])
+        assert "certified" in sem["tags"]  # clean sibling preserved
+        # the fully-templated label scrubbed away; the clean sibling survived
+        assert all("{{" not in v for v in sem["labels"].values())
+        assert sem["labels"] == {"domain": "commerce"}
+        # nested descriptions scrubbed
+        entity = next(e for e in sem["entities"] if e["name"] == "order")
+        assert "{{" not in entity["description"]
+        measure = next(m for m in sem["measures"] if m["name"] == "revenue")
+        assert "{%" not in measure["description"] and "{{" not in measure["description"]
+
+    def test_metric_owner_and_description_stripped(self) -> None:
+        contract, _ = self._import_hostile()
+        total = next(m for m in self._orders(contract)["metrics"] if m["name"] == "total_revenue")
+        assert "{{" not in total["owner"] and "env_var" not in total["owner"]
+        assert "{{" not in total["description"]
+
+    def test_hostile_expr_preserved_but_flagged(self) -> None:
+        """A hostile measure expr is SQL-bearing so it is kept verbatim, but
+        the operator gets a REVIEW-before-generate warning."""
+        contract, report = self._import_hostile()
+        measure = next(m for m in self._orders(contract)["measures"] if m["name"] == "revenue")
+        assert measure["expr"] == "amount + {{ env_var('BONUS') }}"  # preserved
+        text = "\n".join(report.unsupported)
+        assert "REVIEW before generating" in text
+        assert "measure revenue expr" in text
+
+    def test_metricflow_filter_template_preserved_and_noted_not_flagged(self) -> None:
+        """A legitimate {{ Dimension(...) }} filter is expected templating —
+        preserved, noted, NOT surfaced as a review risk."""
+        contract, report = self._import_hostile()
+        total = next(m for m in self._orders(contract)["metrics"] if m["name"] == "total_revenue")
+        assert total["filter"] == "{{ Dimension('order__status') }} = 'completed'"
+        assert any("MetricFlow object templating" in n for n in report.notes)
+
+    def test_hostile_filter_env_var_is_flagged(self) -> None:
+        contract, report = self._import_hostile()
+        leaky = next(m for m in self._orders(contract)["metrics"] if m["name"] == "leaky")
+        assert leaky["filter"] == "amount > {{ env_var('SECRET') }}"  # preserved
+        text = "\n".join(report.unsupported)
+        assert "metric leaky filter" in text and "REVIEW before generating" in text
+
+    def test_hardened_contract_still_schema_valid(self, schema_manager) -> None:
+        contract, _ = self._import_hostile()
+        result = schema_manager.validate_contract(contract, "0.7.3", offline_only=True)
+        assert result.is_valid, result.errors
+
+    def test_no_rendered_env_var_survives_anywhere_in_contract(self) -> None:
+        """Belt-and-suspenders: no imported display field anywhere in the
+        contract still carries a strippable Jinja span (SQL exprs/filters are
+        the only allowed carriers, and those are flagged)."""
+        import json as _json
+
+        contract, _ = self._import_hostile()
+        semantics_json = _json.dumps([e.get("semantics", {}) for e in contract["exposes"]])
+        # env_var may survive ONLY inside expr/filter values (SQL-bearing).
+        sem = self._orders(contract)
+        allowed = {sem["measures"][0].get("expr", "")}
+        for m in sem["metrics"]:
+            allowed.add(m.get("filter", ""))
+        leaked = "env_var" in semantics_json
+        if leaked:
+            # every env_var occurrence must be inside an allowed SQL carrier
+            residual = semantics_json
+            for a in allowed:
+                residual = residual.replace(_json.dumps(a)[1:-1], "")
+            assert "env_var" not in residual, "env_var leaked into a non-SQL field"
+
+
+class TestJinjaScrubIsReformationProof:
+    """A single regex pass can reform a delimiter at a gap junction
+    (e.g. {{%%}%set x=env_var('S')%} -> {%set x=env_var('S')%}), which
+    would then EXECUTE on dbt parse. The scrub loops to a fixpoint +
+    strips stray delimiter fragments, so no Jinja delimiter can survive."""
+
+    _DELIM = __import__("re").compile(r"\{\{|\}\}|\{%|%\}|\{#|#\}")
+
+    @__import__("pytest").mark.parametrize(
+        "hostile",
+        [
+            "{{%%}%set q=env_var('S')%}#",  # reforms {% %} after one pass
+            "{{{{ x }}}}",  # leaves dangling }} without cleanup
+            "{{ '{{' }}",
+            "{ {{ } }}",
+            "{{ }}{{ }}",
+            "{%{% set x=1 %}%}",  # nested statement tags
+            "{#{# c #}#}",
+            "{{-  env_var('S')  -}}",  # whitespace-control
+            "{% set x = env_var('SECRET') %}{{ x }}",
+        ],
+    )
+    def test_no_delimiter_survives_reformation(self, hostile):
+        from fluid_build.cli.import_workflow.dbt import _scrub_display_text
+        from fluid_build.cli.import_workflow.registry import ImportReport
+
+        out = _scrub_display_text(hostile, field_desc="d", report=ImportReport())
+        assert not self._DELIM.findall(out), f"delimiter survived: {out!r}"
+        assert "env_var" not in out and "SECRET" not in out
+
+    def test_single_braces_are_legitimate_display_text(self):
+        from fluid_build.cli.import_workflow.dbt import _scrub_display_text
+        from fluid_build.cli.import_workflow.registry import ImportReport
+
+        report = ImportReport()
+        assert (
+            _scrub_display_text("use {value} here", field_desc="d", report=report)
+            == "use {value} here"
+        )
+        assert not report.unsupported  # no Jinja -> no redaction note
