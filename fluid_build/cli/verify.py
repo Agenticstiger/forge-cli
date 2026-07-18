@@ -201,11 +201,23 @@ Use Cases:
     )
 
     p.add_argument(
+        "--reconcile-lineage",
+        action="store_true",
+        help=(
+            "Cross-check the contract's declared lineage (consumes[]/exposes[]) "
+            "against local run evidence (.fluid run records + cursors) and the "
+            "catalog publish payload. Local-only, no network. Critical drift "
+            "(an undeclared read or a publish-payload mismatch) fails under "
+            "--strict unless --warn-only is set; soft drift never fails."
+        ),
+    )
+
+    p.add_argument(
         "--warn-only",
         action="store_true",
         help=(
-            "Downgrade --reconcile-dbt drift to a warning (exit 0). "
-            "Reports the drift but does not fail the build."
+            "Downgrade --reconcile-dbt / --reconcile-lineage drift to a warning "
+            "(exit 0). Reports the drift but does not fail the build."
         ),
     )
 
@@ -1290,6 +1302,26 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             warning(f"Contract↔dbt reconciliation skipped: {exc}")
             reconcile_report = None
 
+    # ── Contract ↔ published-lineage reconciliation (--reconcile-lineage) ──
+    # Sibling to --reconcile-dbt: compares the contract's declared lineage
+    # (consumes[]/exposes[]) against the run evidence the build runners
+    # persisted locally (.fluid run records + cursor state) and the lineage
+    # payload the catalog registrar WOULD publish (rebuilt locally — no
+    # network). Same posture: opt-in, getattr defaults, never crashes verify.
+    lineage_report = None
+    if getattr(args, "reconcile_lineage", False):
+        try:
+            from fluid_build.cli._verify_reconcile_lineage import (
+                reconcile_contract_lineage,
+                render_lineage_report,
+            )
+
+            lineage_report = reconcile_contract_lineage(contract, contract_path)
+            render_lineage_report(lineage_report, show_diffs=getattr(args, "show_diffs", False))
+        except Exception as exc:  # noqa: BLE001 — reconcile must not crash verify
+            warning(f"Contract↔published-lineage reconciliation skipped: {exc}")
+            lineage_report = None
+
     # Summary
     cprint("\n" + "=" * 80)
     cprint("📊 Verification Summary")
@@ -1323,6 +1355,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         }
         if reconcile_report is not None:
             report["reconcile"] = reconcile_report.to_dict()
+        if lineage_report is not None:
+            report["reconcile_lineage"] = lineage_report.to_dict()
 
         output_path = Path(args.out)
         with open(output_path, "w", encoding="utf-8") as f:
@@ -1350,6 +1384,31 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 "Fix the contract or dbt schema, or pass --warn-only."
             )
             return 1
+
+    # Contract↔published-lineage drift gate (opt-in). Only CRITICAL lineage
+    # drift (read-but-undeclared / publish-payload-mismatch) can fail the
+    # run, and only under --strict — soft drift (declared-but-never-read)
+    # is informational: the consuming build may simply not have run yet.
+    # --warn-only downgrades criticals to a warning, mirroring the dbt gate.
+    if lineage_report is not None and lineage_report.has_critical_drift:
+        n_critical = len(lineage_report.critical_drifts)
+        if getattr(args, "warn_only", False):
+            warning(
+                f"--warn-only: {n_critical} critical lineage drift(s) detected — "
+                "not failing the build."
+            )
+        elif args.strict:
+            console_error(
+                f"Contract↔published-lineage critical drift ({n_critical}). "
+                "Declare the missing consumes[] entries or fix the publish "
+                "payload, or pass --warn-only."
+            )
+            return 1
+        else:
+            warning(
+                f"{n_critical} critical lineage drift(s) detected — "
+                "add --strict to gate CI on this."
+            )
 
     # Exit with error code if strict mode and CRITICAL issues found.
     # Non-critical mismatches (e.g. nullable-vs-required constraint
