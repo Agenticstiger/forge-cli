@@ -66,6 +66,11 @@ class DuckDBDriver(EngineDriver):
     Reads from a file when ``binding.location.path`` is set; falls
     back to ``:memory:`` otherwise. Tables are referenced by their
     ``binding.location.table`` field, validated as a SQL identifier.
+
+    ``binding.location.dbFile`` optionally names a DuckDB database file
+    to open directly (``:memory:`` for an in-memory database). Like
+    ``path`` and ``attach`` it is confined to ``--readable-paths`` when
+    that allowlist is configured.
     """
 
     name = "duckdb"
@@ -111,7 +116,22 @@ class DuckDBDriver(EngineDriver):
         self._attach: Tuple[Path, ...] = tuple(
             self._resolve_attach_path(item, readable_paths) for item in attach_paths_raw
         )
-        self._db_file_raw = location.get("dbFile")
+        # ``dbFile`` names a DuckDB database file to open directly. Like
+        # ``path`` and ``attach`` it is a filesystem reference and MUST be held
+        # inside ``--readable-paths`` — otherwise a served contract could set
+        # ``dbFile`` to any host path and the driver would open and read it,
+        # bypassing the confinement an operator set (``read_only=True`` stops
+        # writes, not reads). The literal ``:memory:`` sentinel is not a file
+        # and is passed through; anything else resolves + is allowlist-gated.
+        db_file_raw = location.get("dbFile")
+        self._db_file: Optional[Path] = None
+        if isinstance(db_file_raw, str) and db_file_raw and db_file_raw != ":memory:":
+            candidate = Path(db_file_raw).expanduser().resolve()
+            if readable_paths and not _path_is_under(candidate, readable_paths):
+                raise UnsupportedBindingError(
+                    f"binding.location.dbFile {candidate} is outside --readable-paths"
+                )
+            self._db_file = candidate
         self._connection = None  # lazy
 
     # ------------------------------------------------------------------
@@ -201,7 +221,7 @@ class DuckDBDriver(EngineDriver):
                 "duckdb is not installed; install via the 'local' extra: "
                 "pip install 'data-product-forge[local]'"
             ) from exc
-        target = self._db_file_raw if isinstance(self._db_file_raw, str) else ":memory:"
+        target = str(self._db_file) if self._db_file is not None else ":memory:"
         # DuckDB read-only mode protects against accidental writes
         # even though every advertised tool is SELECT-only. Skip
         # read-only when the target is in-memory because a fresh

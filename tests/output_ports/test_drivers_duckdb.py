@@ -247,3 +247,77 @@ def test_tool_query_sql_handler_blocks_pii_alias_bypass(tmp_path):
     state = _build_session_state(tmp_path)
     with pytest.raises(ValueError, match="email"):
         _handlers.tool_query_sql(state, {"sql": "SELECT email AS not_email FROM customer_profiles"})
+
+
+# ---------------------------------------------------------------------
+# --readable-paths confinement for binding.location.dbFile.
+#
+# Regression for a read-side sandbox escape: `path` and `attach` were
+# gated against the allowlist but `dbFile` was opened raw, so a served
+# contract could set `dbFile` to any host path and the driver would
+# read it (read_only=True stops writes, not reads). `dbFile` now flows
+# through the same _path_is_under gate as `path`/`attach`.
+# ---------------------------------------------------------------------
+def _expose_with_db_file(db_file: str):
+    return make_expose(
+        binding={
+            "platform": "local",
+            "format": "other",
+            "location": {"table": "customer_profiles", "dbFile": db_file},
+        }
+    )
+
+
+def test_db_file_outside_readable_paths_is_rejected(tmp_path):
+    from fluid_build.output_ports.mcp.drivers.base import UnsupportedBindingError
+
+    outside = tmp_path / "outside" / "secret.duckdb"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_bytes(b"")  # a real file on disk, still outside the allowlist
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+
+    expose = _expose_with_db_file(str(outside))
+    with pytest.raises(UnsupportedBindingError, match="dbFile.*outside --readable-paths"):
+        DuckDBDriver(
+            expose=expose,
+            contract={"exposes": [expose]},
+            readable_paths=(allowed.resolve(),),
+        )
+
+
+def test_db_file_inside_readable_paths_is_accepted(tmp_path):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    inside = allowed / "ok.duckdb"
+    inside.write_bytes(b"")
+
+    expose = _expose_with_db_file(str(inside))
+    driver = DuckDBDriver(
+        expose=expose,
+        contract={"exposes": [expose]},
+        readable_paths=(allowed.resolve(),),
+    )
+    # Resolved + retained as the connection target (not silently dropped).
+    assert driver._db_file == inside.resolve()
+
+
+def test_db_file_memory_sentinel_is_passed_through(tmp_path):
+    expose = _expose_with_db_file(":memory:")
+    driver = DuckDBDriver(
+        expose=expose,
+        contract={"exposes": [expose]},
+        readable_paths=(tmp_path.resolve(),),
+    )
+    # ':memory:' is not a file — no allowlist gate, connects in-memory.
+    assert driver._db_file is None
+
+
+def test_db_file_unrestricted_when_no_readable_paths(tmp_path):
+    # No --readable-paths configured ⇒ no confinement to enforce (parity with
+    # how `path`/`attach` behave: the gate only applies when roots are set).
+    anywhere = tmp_path / "anywhere.duckdb"
+    anywhere.write_bytes(b"")
+    expose = _expose_with_db_file(str(anywhere))
+    driver = DuckDBDriver(expose=expose, contract={"exposes": [expose]})
+    assert driver._db_file == anywhere.resolve()
