@@ -659,3 +659,158 @@ class TestJinjaScrubIsReformationProof:
             == "use {value} here"
         )
         assert not report.unsupported  # no Jinja -> no redaction note
+
+
+# ── --split-by: product-boundary control (folder | group) ────────────────
+
+
+MULTIDOMAIN = "manifest_v12_multidomain.json"
+
+
+def _split_import(split_by: str) -> tuple[list, Any]:
+    return DbtManifestImporter().import_to_contracts(
+        str(FIXTURES / MULTIDOMAIN), options={"split_by": split_by}
+    )
+
+
+def _by_id(contracts: list) -> Dict[str, Dict[str, Any]]:
+    return {c["id"]: c for c in contracts}
+
+
+class TestSplitByFolder:
+    @pytest.fixture(scope="class")
+    def folder_result(self) -> tuple[list, Any]:
+        return _split_import("folder")
+
+    def test_one_product_per_top_level_folder_plus_root(self, folder_result):
+        contracts, _ = folder_result
+        ids = sorted(c["id"] for c in contracts)
+        assert ids == ["gold.shopco.marketing", "gold.shopco.root", "gold.shopco.sales"]
+
+    def test_models_land_in_their_folder_product(self, folder_result):
+        by_id = _by_id(folder_result[0])
+        sales = {e["exposeId"] for e in by_id["gold.shopco.sales"]["exposes"]}
+        marketing = {e["exposeId"] for e in by_id["gold.shopco.marketing"]["exposes"]}
+        assert sales == {"stg_orders", "orders_mart"}
+        assert marketing == {"campaigns_mart"}
+        assert {e["exposeId"] for e in by_id["gold.shopco.root"]["exposes"]} == {"overview"}
+
+    def test_cross_folder_ref_becomes_cross_product_consumes(self, folder_result):
+        by_id = _by_id(folder_result[0])
+        marketing_consumes = {
+            (c["productId"], c["exposeId"]) for c in by_id["gold.shopco.marketing"]["consumes"]
+        }
+        assert ("gold.shopco.sales", "orders_mart") in marketing_consumes
+        root_consumes = {
+            (c["productId"], c["exposeId"]) for c in by_id["gold.shopco.root"]["consumes"]
+        }
+        assert ("gold.shopco.sales", "orders_mart") in root_consumes
+        assert ("gold.shopco.marketing", "campaigns_mart") in root_consumes
+
+    def test_sources_stay_with_the_referencing_product(self, folder_result):
+        by_id = _by_id(folder_result[0])
+        sales_sources = {
+            c["productId"]
+            for c in by_id["gold.shopco.sales"]["consumes"]
+            if "source" in c["productId"]
+        }
+        marketing_sources = {
+            c["productId"]
+            for c in by_id["gold.shopco.marketing"]["consumes"]
+            if "source" in c["productId"]
+        }
+        assert sales_sources == {"source.raw"}
+        assert marketing_sources == {"source.raw"}
+        # sales consumes raw.events (with freshness), marketing raw.ad_spend
+        sales_exposes = {c["exposeId"] for c in by_id["gold.shopco.sales"]["consumes"]}
+        assert "events" in sales_exposes and "ad_spend" not in sales_exposes
+
+    def test_every_split_contract_passes_schema_validation(self, folder_result, schema_manager):
+        for contract in folder_result[0]:
+            result = schema_manager.validate_contract(contract, offline_only=True)
+            assert result.is_valid, f"{contract['id']}: {result.errors}"
+
+    def test_build_model_root_scoped_to_folder(self, folder_result):
+        by_id = _by_id(folder_result[0])
+        assert by_id["gold.shopco.sales"]["builds"][0]["properties"]["model"] == "models/sales/"
+        assert by_id["gold.shopco.root"]["builds"][0]["properties"]["model"] == "models/"
+
+    def test_semantics_attach_once_to_the_owning_product(self, folder_result):
+        by_id = _by_id(folder_result[0])
+        assert "semantics" in _expose(by_id["gold.shopco.sales"], "orders_mart")
+        for pid in ("gold.shopco.marketing", "gold.shopco.root"):
+            assert all("semantics" not in e for e in by_id[pid]["exposes"])
+        _, report = folder_result
+        assert not any("semantic model" in x and "dropped" in x for x in report.unsupported)
+
+    def test_report_entries_carry_product_prefixes(self, folder_result):
+        _, report = folder_result
+        assert any(x.startswith("[gold.shopco.sales] ") for x in report.mapped_one_to_one)
+        assert any("split-by folder: 3 products" in x for x in report.notes)
+
+
+class TestSplitByGroup:
+    def test_one_product_per_group_with_ungrouped_bucket(self):
+        contracts, report = _split_import("group")
+        ids = sorted(c["id"] for c in contracts)
+        assert ids == ["gold.shopco.marketing", "gold.shopco.sales", "gold.shopco.ungrouped"]
+        assert any("ungrouped" in x and "overview" in x for x in report.notes)
+
+    def test_groupless_manifest_fails_with_folder_suggestion(self):
+        with pytest.raises(Exception, match="no dbt groups.*--split-by folder"):
+            DbtManifestImporter().import_to_contracts(
+                str(FIXTURES / "manifest_v12.json"), options={"split_by": "group"}
+            )
+
+    def test_group_split_contracts_pass_schema_validation(self, schema_manager):
+        contracts, _ = _split_import("group")
+        for contract in contracts:
+            result = schema_manager.validate_contract(contract, offline_only=True)
+            assert result.is_valid, f"{contract['id']}: {result.errors}"
+
+
+class TestSplitDefaultStability:
+    def test_project_mode_is_the_default_and_single(self):
+        contracts, _ = _split_import("project")
+        assert len(contracts) == 1
+        assert contracts[0]["id"] == "gold.shopco"
+
+    def test_singular_api_ignores_split_and_matches_project_mode(self):
+        single, _ = DbtManifestImporter().import_to_contract(
+            str(FIXTURES / MULTIDOMAIN), options={"split_by": "folder"}
+        )
+        project, _ = _split_import("project")
+        assert single == project[0]
+
+    def test_unknown_split_mode_rejected(self):
+        with pytest.raises(ValueError, match="unknown split-by mode"):
+            _split_import("banana")
+
+
+class TestDbt110ArgumentsNesting:
+    def test_arguments_nested_test_params_recovered(self):
+        """dbt >=1.10 authors test params under `arguments:` — the reverse
+        path must accept both that and the legacy flat kwargs shape."""
+        contracts, _ = _split_import("project")
+        orders = _expose(contracts[0], "orders_mart")
+        rules = orders["contract"]["dq"]["rules"]
+        vv = next(r for r in rules if r["type"] == "valid_values")
+        assert vv["selector"] == "status"
+        assert "paid" in vv.get("description", "") and "refunded" in vv.get("description", "")
+
+
+class TestExposeDescriptionScrubbed:
+    def test_hostile_jinja_in_model_description_is_stripped(self, tmp_path: Path):
+        """The expose description round-trips into generated schema.yml (Jinja-
+        rendered by dbt parse) — hostile templates must not survive import."""
+        manifest = json.loads((FIXTURES / MULTIDOMAIN).read_text())
+        node = manifest["nodes"]["model.shopco.orders_mart"]
+        node["description"] = "Orders {{ env_var('AWS_SECRET_ACCESS_KEY') }} table"
+        path = tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest))
+
+        contract, report = DbtManifestImporter().import_to_contract(str(path))
+        desc = _expose(contract, "orders_mart").get("description", "")
+        assert "env_var" not in desc and "{{" not in desc
+        assert "Orders" in desc and "table" in desc
+        assert any("orders_mart description" in x for x in report.notes + report.unsupported)

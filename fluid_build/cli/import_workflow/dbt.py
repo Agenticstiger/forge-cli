@@ -11,8 +11,10 @@
 Faithful brownfield conversion of a real dbt project. ``dbt parse`` (no
 warehouse access needed) produces ``target/manifest.json``; this importer
 reads it with **plain stdlib JSON — no dbt-core dependency** — and emits
-ONE DataProduct per dbt project (per-folder/per-group splitting is a noted
-follow-up):
+ONE DataProduct per dbt project by default, or one per top-level models/
+subfolder (``--split-by folder``) / per dbt group (``--split-by group``)
+for multi-product monorepos, with cross-split ``ref()``s recorded as
+cross-product ``consumes[]``:
 
 * nodes + ``depends_on``     → one expose per model/seed/snapshot, with the
   ref-derived intra-project DAG recorded per-expose (``dbt-depends-on``
@@ -119,6 +121,22 @@ class DbtManifestImporter(Importer):
     def import_to_contract(
         self, source: str, *, options: Optional[Dict[str, Any]] = None
     ) -> tuple[Dict[str, Any], ImportReport]:
+        """Single-contract API (registry Protocol) — always project-boundary."""
+        merged = dict(options or {})
+        merged["split_by"] = "project"
+        contracts, report = self.import_to_contracts(source, options=merged)
+        return (contracts[0] if contracts else {}), report
+
+    def import_to_contracts(
+        self, source: str, *, options: Optional[Dict[str, Any]] = None
+    ) -> tuple[List[Dict[str, Any]], ImportReport]:
+        """Split-aware API: one or more contracts per ``options["split_by"]``.
+
+        ``split_by``: ``project`` (default, one contract), ``folder`` (one per
+        top-level models/ subfolder), ``group`` (one per dbt ``group:`` —
+        the dbt-mesh-native boundary; fails loudly when the manifest has no
+        groups at all).
+        """
         options = options or {}
         manifest_path = locate_manifest(Path(source))
         if manifest_path is None:
@@ -144,9 +162,13 @@ class DbtManifestImporter(Importer):
                 "manifest metadata.dbt_schema_version missing/unparseable — proceeding best-effort"
             )
 
+        split_by = str(options.get("split_by") or "project").strip().lower()
+        if split_by not in ("project", "folder", "group"):
+            raise ValueError(f"unknown split-by mode {split_by!r} — use project, folder, or group")
+
         catalog = _load_catalog(manifest_path, options, report)
-        contract = _build_contract(manifest, manifest_path, version, catalog, report)
-        return contract, report
+        contracts = _build_contracts(manifest, manifest_path, version, catalog, report, split_by)
+        return contracts, report
 
 
 # ---------------------------------------------------------------------------
@@ -199,13 +221,17 @@ def _load_catalog(
 # ---------------------------------------------------------------------------
 
 
-def _build_contract(
+_ROOT_BUCKET = "root"
+
+
+def _build_contracts(
     manifest: Dict[str, Any],
     manifest_path: Path,
     version: Optional[int],
     catalog: Dict[str, Any],
     report: ImportReport,
-) -> Dict[str, Any]:
+    split_by: str = "project",
+) -> List[Dict[str, Any]]:
     meta = manifest.get("metadata") or {}
     project_name = str(meta.get("project_name") or "dbt-project")
     adapter = str(meta.get("adapter_type") or "").lower()
@@ -215,25 +241,169 @@ def _build_contract(
     models = _select_project_nodes(nodes, project_name, report)
     if not models:
         report.unsupported.append(f"no enabled models found for project {project_name!r}")
-        return {}
+        return []
 
+    buckets = _bucket_models(models, split_by, report)
     tests_by_model = _collect_generic_tests(nodes, project_name, set(models), report)
 
+    # Pre-pass: every bucket's product id + per-model expose ids, so any bucket
+    # can reference a sibling in cross-product consumes[] before it's built.
+    uid_to_bucket: Dict[str, str] = {}
+    bucket_product_id: Dict[str, str] = {}
+    for key, bucket_models in buckets.items():
+        layers = {_infer_model_layer(n) for n in bucket_models.values()}
+        bucket_product_id[key] = _contract_id(project_name, _product_layer(layers), key, split_by)
+        for uid in bucket_models:
+            uid_to_bucket[uid] = key
+
+    multi = len(buckets) > 1
+    contracts: List[Dict[str, Any]] = []
+    union_expose_by_uid: Dict[str, Dict[str, Any]] = {}
+    for key, bucket_models in buckets.items():
+        # Split mode assembles against a fresh sub-report merged back with a
+        # per-product prefix, so the printed report reads per-product.
+        sub_report = ImportReport() if multi else report
+        contract = _assemble_bucket_contract(
+            bucket_models,
+            bucket_key=key,
+            split_by=split_by,
+            product_id=bucket_product_id[key],
+            bucket_product_id=bucket_product_id,
+            uid_to_bucket=uid_to_bucket,
+            all_models=models,
+            tests_by_model=tests_by_model,
+            sources=sources,
+            catalog=catalog,
+            adapter=adapter,
+            project_name=project_name,
+            manifest_name=manifest_path.name,
+            version=version,
+            dbt_version=meta.get("dbt_version", "?"),
+            report=sub_report,
+            union_expose_by_uid=union_expose_by_uid,
+        )
+        if multi:
+            _merge_report(report, sub_report, prefix=f"[{bucket_product_id[key]}] ")
+        if contract:
+            contracts.append(contract)
+
+    # Semantics attach once over the union so a semantic model lands on its
+    # own bucket's expose without cross-bucket "dropped" noise.
+    _attach_semantic_models(manifest, union_expose_by_uid, report)
+
+    if multi:
+        report.notes.append(
+            f"split-by {split_by}: {len(contracts)} products from dbt project {project_name!r}"
+        )
+    else:
+        report.notes.append(
+            "product boundary: ONE DataProduct per dbt project "
+            "(use --split-by folder|group for multi-product monorepos)"
+        )
+    return contracts
+
+
+def _bucket_models(
+    models: Dict[str, Any], split_by: str, report: ImportReport
+) -> Dict[str, Dict[str, Any]]:
+    """Assign every selected node to a product bucket, deterministically.
+
+    ``project`` → single bucket. ``folder`` → the top-level subfolder under
+    models/ (or seeds/ / snapshots/); nodes directly under the resource root
+    land in the ``root`` bucket. ``group`` → the node's dbt ``group``; a
+    manifest with no groups at all is an error (folder mode is the fallback),
+    partially-grouped projects put groupless nodes in an ``ungrouped`` bucket.
+    """
+    if split_by == "project":
+        return {_ROOT_BUCKET: dict(models)}
+
+    buckets: Dict[str, Dict[str, Any]] = {}
+    if split_by == "folder":
+        rooted: List[str] = []
+        for uid, node in models.items():
+            path = str(node.get("original_file_path") or node.get("path") or "")
+            parts = [p for p in path.replace("\\", "/").split("/") if p]
+            key = parts[1] if len(parts) > 2 else _ROOT_BUCKET
+            if key == _ROOT_BUCKET:
+                rooted.append(str(node.get("name")))
+            buckets.setdefault(key, {})[uid] = node
+        if rooted:
+            report.notes.append(
+                "models with no models/ subfolder went to the 'root' product: "
+                + ", ".join(sorted(rooted))
+            )
+    else:  # group
+        grouped_any = False
+        ungrouped: List[str] = []
+        for uid, node in models.items():
+            group = str(node.get("group") or "").strip()
+            if group:
+                grouped_any = True
+                buckets.setdefault(group, {})[uid] = node
+            else:
+                ungrouped.append(str(node.get("name")))
+                buckets.setdefault("ungrouped", {})[uid] = node
+        if not grouped_any:
+            raise ValueError(
+                "--split-by group: no dbt groups defined in this manifest "
+                "(no node carries a group:). Assign groups in dbt, or use "
+                "--split-by folder."
+            )
+        if ungrouped:
+            report.notes.append(
+                "models without a dbt group went to the 'ungrouped' product: "
+                + ", ".join(sorted(ungrouped))
+            )
+    # Deterministic product order regardless of manifest dict order.
+    return {key: buckets[key] for key in sorted(buckets)}
+
+
+def _contract_id(project_name: str, product_layer: str, bucket_key: str, split_by: str) -> str:
+    project_slug = _safe_identifier(project_name)
+    if split_by == "project":
+        return f"{product_layer.lower()}.{project_slug}"
+    return f"{product_layer.lower()}.{project_slug}.{_safe_identifier(bucket_key)}"
+
+
+def _assemble_bucket_contract(
+    bucket_models: Dict[str, Any],
+    *,
+    bucket_key: str,
+    split_by: str,
+    product_id: str,
+    bucket_product_id: Dict[str, str],
+    uid_to_bucket: Dict[str, str],
+    all_models: Dict[str, Any],
+    tests_by_model: Dict[str, List[Dict[str, Any]]],
+    sources: Dict[str, Any],
+    catalog: Dict[str, Any],
+    adapter: str,
+    project_name: str,
+    manifest_name: str,
+    version: Optional[int],
+    dbt_version: Any,
+    report: ImportReport,
+    union_expose_by_uid: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
     exposes: List[Dict[str, Any]] = []
     transformations: List[Dict[str, Any]] = []
     materializations: Dict[str, str] = {}
     layers_present: set[str] = set()
     referenced_sources: List[str] = []
-    expose_by_model_uid: Dict[str, Dict[str, Any]] = {}
+    cross_refs: List[str] = []
 
-    for uid, node in models.items():
+    for uid, node in bucket_models.items():
         layer = _infer_model_layer(node)
         layers_present.add(layer)
         materialized = str((node.get("config") or {}).get("materialized") or "view").lower()
 
         for dep in (node.get("depends_on") or {}).get("nodes") or []:
-            if isinstance(dep, str) and dep.startswith("source.") and dep in sources:
+            if not isinstance(dep, str):
+                continue
+            if dep.startswith("source.") and dep in sources:
                 referenced_sources.append(dep)
+            elif dep in uid_to_bucket and uid_to_bucket[dep] != bucket_key:
+                cross_refs.append(dep)
 
         if materialized == "ephemeral":
             report.notes.append(
@@ -246,7 +416,7 @@ def _build_contract(
             uid, node, layer, materialized, adapter, catalog, tests_by_model.get(uid, []), report
         )
         exposes.append(expose)
-        expose_by_model_uid[uid] = expose
+        union_expose_by_uid[uid] = expose
         report.mapped_one_to_one.append(f"model.{node.get('name')}")
         transformations.append(
             {
@@ -259,7 +429,11 @@ def _build_contract(
             materializations[expose["exposeId"]] = materialized
 
     consumes = _build_consumes(referenced_sources, sources, report)
-    _attach_semantic_models(manifest, expose_by_model_uid, report)
+    consumes.extend(
+        _cross_product_consumes(
+            cross_refs, all_models, uid_to_bucket, bucket_product_id, split_by, report
+        )
+    )
 
     product_layer = _product_layer(layers_present)
     metadata: Dict[str, Any] = {"layer": product_layer, "owner": dict(_DEFAULT_OWNER)}
@@ -268,17 +442,22 @@ def _build_contract(
     normalize_metadata_in_place(metadata)  # fills the productType twin (Bronze↔SDP … Gold↔CDP)
     report.required_defaults.append("metadata.owner defaulted — set the real owning team")
 
-    project_slug = _safe_identifier(project_name)
+    display = project_name if split_by == "project" else f"{project_name} ({bucket_key})"
+    model_root = (
+        f"models/{bucket_key}/"
+        if split_by == "folder" and bucket_key != _ROOT_BUCKET
+        else "models/"
+    )
     contract: Dict[str, Any] = {
         "fluidVersion": "0.7.3",
         "kind": "DataProduct",
-        "id": f"{product_layer.lower()}.{project_slug}",
-        "name": f"Imported from dbt: {project_name}",
+        "id": product_id,
+        "name": f"Imported from dbt: {display}",
         "domain": "imported",
         "description": (
-            f"Auto-converted from dbt manifest {manifest_path.name} "
+            f"Auto-converted from dbt manifest {manifest_name} "
             f"(schema v{version if version is not None else '?'}, "
-            f"dbt {meta.get('dbt_version', '?')}, adapter {adapter or '?'})"
+            f"dbt {dbt_version}, adapter {adapter or '?'})"
         ),
         "metadata": metadata,
         "builds": [
@@ -286,7 +465,7 @@ def _build_contract(
                 "id": "dbt_run",
                 "pattern": "hybrid-reference",
                 "engine": "dbt",
-                "properties": {"model": "models/", "materializations": materializations},
+                "properties": {"model": model_root, "materializations": materializations},
                 "outputs": [e["exposeId"] for e in exposes],
                 "transformations": transformations,
             }
@@ -295,11 +474,51 @@ def _build_contract(
     }
     if consumes:
         contract["consumes"] = consumes
-    report.notes.append(
-        "product boundary: ONE DataProduct per dbt project "
-        "(per-folder/per-group splitting is a planned follow-up flag)"
-    )
     return contract
+
+
+def _cross_product_consumes(
+    cross_refs: List[str],
+    all_models: Dict[str, Any],
+    uid_to_bucket: Dict[str, str],
+    bucket_product_id: Dict[str, str],
+    split_by: str,
+    report: ImportReport,
+) -> List[Dict[str, Any]]:
+    """Cross-split ``ref()``s → consumes[] entries against the sibling product."""
+    consumes: List[Dict[str, Any]] = []
+    seen: set = set()
+    for uid in cross_refs:
+        node = all_models.get(uid) or {}
+        name = str(node.get("name") or uid.rsplit(".", 1)[-1])
+        if str((node.get("config") or {}).get("materialized") or "").lower() == "ephemeral":
+            report.notes.append(
+                f"cross-product ref to ephemeral model {name} — no expose to consume, "
+                "recorded in lineage labels only"
+            )
+            continue
+        sibling = bucket_product_id[uid_to_bucket[uid]]
+        expose_id = _safe_identifier(name)
+        if (sibling, expose_id) in seen:
+            continue
+        seen.add((sibling, expose_id))
+        consumes.append(
+            {
+                "productId": sibling,
+                "exposeId": expose_id,
+                "purpose": f"cross-product dbt ref {name} (split-by {split_by})",
+            }
+        )
+        report.mapped_one_to_one.append(f"cross-product ref {name} → consumes[{sibling}]")
+    return consumes
+
+
+def _merge_report(target: ImportReport, sub: ImportReport, *, prefix: str) -> None:
+    """Fold a per-product sub-report into the main one, per-product-prefixed."""
+    target.mapped_one_to_one.extend(prefix + x for x in sub.mapped_one_to_one)
+    target.required_defaults.extend(prefix + x for x in sub.required_defaults)
+    target.unsupported.extend(prefix + x for x in sub.unsupported)
+    target.notes.extend(prefix + x for x in sub.notes)
 
 
 def _select_project_nodes(
@@ -379,6 +598,10 @@ def _build_expose(
     if columns:
         contract_block["schema"] = columns
     else:
+        # exposeContract requires a schema (or openapiRef); an empty declared
+        # schema + discover_and_freeze is the honest "capture on first run"
+        # shape — schemaPolicy alone fails jsonschema validation.
+        contract_block["schema"] = []
         contract_block["schemaPolicy"] = "discover_and_freeze"
         report.required_defaults.append(
             f"model {name}: no columns in manifest/catalog — schemaPolicy=discover_and_freeze"
@@ -404,7 +627,14 @@ def _build_expose(
     }
     description = node.get("description")
     if description:
-        expose["description"] = str(description)
+        # Scrubbed like column/semantic descriptions: this string round-trips
+        # into generated schema.yml, which dbt Jinja-renders at parse time —
+        # a hostile manifest must not smuggle {{ env_var(...) }} through it.
+        scrubbed = _scrub_display_text(
+            description, field_desc=f"model {name} description", report=report
+        )
+        if scrubbed:
+            expose["description"] = scrubbed
     tags = _safe_tags(node.get("tags"))
     if tags:
         expose["tags"] = tags
@@ -633,7 +863,7 @@ def _collect_generic_tests(
         model_uid = _test_target_model(node, model_uids)
         if model_uid is None:
             continue
-        kwargs = test_meta.get("kwargs") or {}
+        kwargs = _test_kwargs(test_meta)
         namespace = test_meta.get("namespace")
         short_name = str(test_meta.get("name") or "")
         descriptor: Dict[str, Any] = {
@@ -652,6 +882,27 @@ def _collect_generic_tests(
         }
         by_model.setdefault(model_uid, []).append(descriptor)
     return by_model
+
+
+def _test_kwargs(test_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Test parameters across the dbt YAML-authoring generations.
+
+    dbt <=1.9 manifests carry test params flat in ``test_metadata.kwargs``;
+    dbt >=1.10 (and Fusion) support the ``arguments:`` authoring key, which
+    surfaces as a nested ``arguments`` mapping (inside ``kwargs`` or beside
+    it). Accept BOTH so imported manifests keep round-tripping when projects
+    migrate — the nested params are the payload, flat siblings (like
+    ``column_name``) still apply on top.
+    """
+    kwargs = dict(test_meta.get("kwargs") or {})
+    nested = kwargs.pop("arguments", None)
+    if not isinstance(nested, dict):
+        nested = test_meta.get("arguments")
+    if isinstance(nested, dict) and nested:
+        merged = dict(nested)
+        merged.update(kwargs)
+        return merged
+    return kwargs
 
 
 def _test_target_model(node: Dict[str, Any], model_uids: set) -> Optional[str]:

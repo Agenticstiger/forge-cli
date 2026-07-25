@@ -1,0 +1,315 @@
+{
+ "child_map": {},
+ "disabled": {},
+ "docs": {},
+ "exposures": {},
+ "group_map": {},
+ "groups": {},
+ "macros": {},
+ "metadata": {
+  "adapter_type": "duckdb",
+  "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+  "dbt_version": "1.11.11",
+  "generated_at": "2026-07-18T00:00:00Z",
+  "project_name": "shopco"
+ },
+ "metrics": {
+  "metric.shopco.total_revenue": {
+   "name": "total_revenue",
+   "resource_type": "metric",
+   "type": "simple",
+   "description": "Revenue across paid orders",
+   "type_params": {
+    "measure": {
+     "name": "revenue"
+    }
+   }
+  }
+ },
+ "nodes": {
+  "model.shopco.stg_orders": {
+   "alias": "stg_orders",
+   "columns": {
+    "order_id": {
+     "constraints": [],
+     "data_type": "bigint",
+     "description": "",
+     "meta": {},
+     "name": "order_id",
+     "tags": []
+    }
+   },
+   "config": {
+    "enabled": true,
+    "materialized": "view",
+    "meta": {},
+    "tags": []
+   },
+   "database": "shop",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "source.shopco.raw.events"
+    ]
+   },
+   "description": "Staged order events",
+   "group": "sales",
+   "meta": {},
+   "name": "stg_orders",
+   "original_file_path": "models/sales/staging/stg_orders.sql",
+   "package_name": "shopco",
+   "path": "sales/staging/stg_orders.sql",
+   "resource_type": "model",
+   "schema": "main",
+   "tags": [],
+   "unique_id": "model.shopco.stg_orders"
+  },
+  "model.shopco.orders_mart": {
+   "alias": "orders_mart",
+   "columns": {
+    "order_id": {
+     "constraints": [],
+     "data_type": "bigint",
+     "description": "",
+     "meta": {},
+     "name": "order_id",
+     "tags": []
+    },
+    "amount": {
+     "constraints": [],
+     "data_type": "decimal(10,2)",
+     "description": "",
+     "meta": {},
+     "name": "amount",
+     "tags": []
+    },
+    "status": {
+     "constraints": [],
+     "data_type": "varchar",
+     "description": "",
+     "meta": {},
+     "name": "status",
+     "tags": []
+    }
+   },
+   "config": {
+    "enabled": true,
+    "materialized": "table",
+    "meta": {},
+    "tags": []
+   },
+   "database": "shop",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.shopco.stg_orders"
+    ]
+   },
+   "description": "Curated orders",
+   "group": "sales",
+   "meta": {},
+   "name": "orders_mart",
+   "original_file_path": "models/sales/orders_mart.sql",
+   "package_name": "shopco",
+   "path": "sales/orders_mart.sql",
+   "resource_type": "model",
+   "schema": "main",
+   "tags": [],
+   "unique_id": "model.shopco.orders_mart"
+  },
+  "model.shopco.campaigns_mart": {
+   "alias": "campaigns_mart",
+   "columns": {
+    "campaign_id": {
+     "constraints": [],
+     "data_type": "bigint",
+     "description": "",
+     "meta": {},
+     "name": "campaign_id",
+     "tags": []
+    }
+   },
+   "config": {
+    "enabled": true,
+    "materialized": "table",
+    "meta": {},
+    "tags": []
+   },
+   "database": "shop",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.shopco.orders_mart",
+     "source.shopco.raw.ad_spend"
+    ]
+   },
+   "description": "Campaign performance joined to orders",
+   "group": "marketing",
+   "meta": {},
+   "name": "campaigns_mart",
+   "original_file_path": "models/marketing/campaigns_mart.sql",
+   "package_name": "shopco",
+   "path": "marketing/campaigns_mart.sql",
+   "resource_type": "model",
+   "schema": "main",
+   "tags": [],
+   "unique_id": "model.shopco.campaigns_mart"
+  },
+  "model.shopco.overview": {
+   "alias": "overview",
+   "columns": {},
+   "config": {
+    "enabled": true,
+    "materialized": "view",
+    "meta": {},
+    "tags": []
+   },
+   "database": "shop",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.shopco.orders_mart",
+     "model.shopco.campaigns_mart"
+    ]
+   },
+   "description": "Cross-domain overview",
+   "meta": {},
+   "name": "overview",
+   "original_file_path": "models/overview.sql",
+   "package_name": "shopco",
+   "path": "overview.sql",
+   "resource_type": "model",
+   "schema": "main",
+   "tags": [],
+   "unique_id": "model.shopco.overview"
+  },
+  "test.shopco.not_null_stg_orders_order_id": {
+   "attached_node": "model.shopco.stg_orders",
+   "column_name": "order_id",
+   "config": {
+    "enabled": true,
+    "severity": "error"
+   },
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.shopco.stg_orders"
+    ]
+   },
+   "name": "not_null_stg_orders_order_id",
+   "package_name": "shopco",
+   "resource_type": "test",
+   "test_metadata": {
+    "kwargs": {
+     "column_name": "order_id"
+    },
+    "name": "not_null"
+   },
+   "unique_id": "test.shopco.not_null_stg_orders_order_id"
+  },
+  "test.shopco.accepted_values_orders_mart_status": {
+   "attached_node": "model.shopco.orders_mart",
+   "column_name": "status",
+   "config": {
+    "enabled": true,
+    "severity": "warn"
+   },
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.shopco.orders_mart"
+    ]
+   },
+   "name": "accepted_values_orders_mart_status",
+   "package_name": "shopco",
+   "resource_type": "test",
+   "test_metadata": {
+    "kwargs": {
+     "arguments": {
+      "values": [
+       "paid",
+       "refunded"
+      ]
+     },
+     "column_name": "status"
+    },
+    "name": "accepted_values"
+   },
+   "unique_id": "test.shopco.accepted_values_orders_mart_status"
+  }
+ },
+ "semantic_models": {
+  "semantic_model.shopco.orders": {
+   "name": "orders",
+   "resource_type": "semantic_model",
+   "description": "Order facts",
+   "model": "ref('orders_mart')",
+   "depends_on": {
+    "macros": [],
+    "nodes": [
+     "model.shopco.orders_mart"
+    ]
+   },
+   "entities": [
+    {
+     "name": "order",
+     "type": "primary",
+     "expr": "order_id"
+    }
+   ],
+   "defaults": {
+    "agg_time_dimension": "ordered_at"
+   },
+   "dimensions": [
+    {
+     "name": "ordered_at",
+     "type": "time",
+     "type_params": {
+      "time_granularity": "day"
+     }
+    }
+   ],
+   "measures": [
+    {
+     "name": "revenue",
+     "agg": "sum",
+     "expr": "amount"
+    }
+   ]
+  }
+ },
+ "selectors": {},
+ "sources": {
+  "source.shopco.raw.events": {
+   "database": "shop",
+   "description": "Raw order events",
+   "freshness": {
+    "error_after": {
+     "count": 24,
+     "period": "hour"
+    },
+    "warn_after": {
+     "count": 12,
+     "period": "hour"
+    }
+   },
+   "identifier": "events",
+   "name": "events",
+   "resource_type": "source",
+   "schema": "raw",
+   "source_name": "raw",
+   "unique_id": "source.shopco.raw.events"
+  },
+  "source.shopco.raw.ad_spend": {
+   "database": "shop",
+   "description": "Ad spend by campaign",
+   "freshness": {},
+   "identifier": "ad_spend",
+   "name": "ad_spend",
+   "resource_type": "source",
+   "schema": "raw",
+   "source_name": "raw",
+   "unique_id": "source.shopco.raw.ad_spend"
+  }
+ }
+}

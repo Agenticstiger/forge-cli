@@ -133,7 +133,21 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "--out",
         dest="out_path",
         default=None,
-        help="Output contract path (default: contract.<id>.fluid.yaml in cwd)",
+        help=(
+            "Output contract path (default: contract.<id>.fluid.yaml in cwd); "
+            "with --split-by producing multiple products, the output DIRECTORY"
+        ),
+    )
+    parser.add_argument(
+        "--split-by",
+        dest="split_by",
+        choices=["project", "folder", "group"],
+        default="project",
+        help=(
+            "dbt import product boundary: one contract per project (default), "
+            "per top-level models/ subfolder, or per dbt group (cross-split "
+            "refs become cross-product consumes[])"
+        ),
     )
     parser.add_argument(
         "--provider",
