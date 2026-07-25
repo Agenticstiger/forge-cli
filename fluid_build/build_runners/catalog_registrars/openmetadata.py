@@ -9,16 +9,37 @@
 """OpenMetadata catalog registrar (REST).
 
 Translates :class:`~fluid_build.api.catalog_publication.CatalogPublicationPayload`
-into OpenMetadata's Tables API shape (``PUT /api/v1/tables`` per
-asset).
+into OpenMetadata's Tables API shape (``PUT /api/v1/tables`` per asset),
+then registers the per-asset ODCS contract against OpenMetadata's
+first-class Data Contracts entity.
 
-Spec attachments — the FLUID-native classification, the ODPS spec,
-and the per-asset ODCS contract — land in OpenMetadata's
-``extension`` field (a free-form JSON object the platform preserves
-on the entity). That mirrors how :mod:`datahub` attaches them to
-``customProperties``: a single well-known location each backend
-chooses to satisfy ``CatalogCapability.CUSTOM_PROPERTIES`` /
-``PRODUCT_SPECS`` / ``PER_ASSET_CONTRACT``.
+Two-step publish, because OpenMetadata models these separately:
+
+1. ``PUT /api/v1/tables`` creates or updates the table entity and carries
+   the FLUID-native attachments (``fluid_layer``, ``fluid_product_type``,
+   the ODPS spec) in ``extension``, a free-form JSON object the platform
+   preserves. That mirrors how :mod:`datahub` uses ``customProperties``.
+2. ``PUT /api/v1/dataContracts/odcs/yaml`` registers the asset's ODCS
+   v3.1.0 document as a real ``DataContract``, resolved onto the table
+   from step 1.
+
+Step 2 matters because OpenMetadata made Data Contracts a first-class
+entity in 1.10. Writing the contract only into ``extension`` (which is
+what this registrar used to do) leaves it as an opaque blob: invisible to
+the contracts UI, to contract search, and to validation runs. The blob is
+still written as a fallback so the integration degrades cleanly against
+pre-1.10 servers, where the Data Contracts route 404s.
+
+The ODCS route needs OpenMetadata's internal entity UUID rather than an
+FQN, so :meth:`_resolve_entity_id` looks the table up by name first. The
+whole of step 2 is best-effort: a failure there is logged and leaves the
+table publish intact, because losing the catalog entry entirely would be
+a worse outcome than losing the first-class contract link.
+
+Endpoints verified against ``DataContractResource.java`` on
+open-metadata/OpenMetadata ``main`` (class ``@Path("/v1/dataContracts")``;
+ODCS import at ``PUT /odcs/yaml`` with query params ``entityId``,
+``entityType``, ``mode`` and ``objectName``).
 
 The legacy ``register(product_id, expose_id, contract, classifications)``
 entry point builds a payload from its args and delegates to
@@ -57,6 +78,7 @@ class OpenMetadataRegistrar(CatalogRegistrar):
             payload_body = self._build_payload(payload, asset)
             try:
                 self._put(payload_body)
+                self._publish_odcs_contract(payload_body["fullyQualifiedName"], asset)
                 published.append(asset_urn)
             except Exception as exc:  # noqa: BLE001
                 last_err = str(exc)
@@ -99,7 +121,9 @@ class OpenMetadataRegistrar(CatalogRegistrar):
         # the per-expose URN they expect.
         urn = f"forge://{product_id}/{expose_id}"
         try:
-            self._put(self._build_payload(payload, scoped[0]))
+            body = self._build_payload(payload, scoped[0])
+            self._put(body)
+            self._publish_odcs_contract(body["fullyQualifiedName"], scoped[0])
         except Exception as exc:  # noqa: BLE001
             return RegistrationResult(
                 target="openmetadata", urn=urn, succeeded=False, error=str(exc)
@@ -141,6 +165,75 @@ class OpenMetadataRegistrar(CatalogRegistrar):
             allow_private=True,
         ) as c:
             r = c.put("/api/v1/tables", json=body, headers=self._headers())
+            r.raise_for_status()
+
+    def _resolve_entity_id(self, fqn: str) -> Optional[str]:
+        """Look up OpenMetadata's internal UUID for a table by FQN.
+
+        The ODCS import route keys on ``entityId``, not on the FQN, so the
+        contract cannot be attached without this hop. Returns ``None`` when
+        the table cannot be resolved, which the caller treats as "skip the
+        contract publish" rather than as a failure.
+        """
+        from fluid_build.util.safe_http import safe_httpx_client
+
+        with safe_httpx_client(
+            base_url=self.base_url,
+            timeout=float(self.timeout_seconds),
+            allow_private=True,
+        ) as c:
+            r = c.get(f"/api/v1/tables/name/{fqn}", headers=self._headers())
+            r.raise_for_status()
+            entity_id = r.json().get("id")
+        return str(entity_id) if entity_id else None
+
+    def _publish_odcs_contract(self, fqn: str, asset: AssetPayload) -> None:
+        """Register the asset's ODCS document as a first-class DataContract.
+
+        Best-effort by design. OpenMetadata only grew the Data Contracts
+        entity in 1.10, so older servers 404 this route; the contract is
+        still present in the table's ``extension`` blob either way, and the
+        table publish has already succeeded by the time this runs. Any
+        failure is logged at debug and swallowed.
+        """
+        if not asset.odcs_yaml:
+            return
+        try:
+            entity_id = self._resolve_entity_id(fqn)
+            if not entity_id:
+                LOG.debug("Skipping ODCS contract publish: %s has no resolvable entity id", fqn)
+                return
+            self._put_odcs_yaml(entity_id, asset.odcs_yaml)
+            LOG.debug("Registered ODCS contract for %s", fqn)
+        except Exception as exc:  # noqa: BLE001
+            # Class-only: OpenMetadata error bodies can echo the token-bearing URL.
+            LOG.debug(
+                "ODCS contract publish skipped for %s (non-fatal): %s", fqn, type(exc).__name__
+            )
+
+    def _put_odcs_yaml(self, entity_id: str, odcs_yaml: str) -> None:
+        """``PUT /api/v1/dataContracts/odcs/yaml`` with the raw ODCS document.
+
+        ``mode=merge`` is OpenMetadata's own default and preserves fields
+        that exist on the server but not in the imported document, which is
+        the right semantics for a registrar that owns only part of the
+        contract surface.
+        """
+        from fluid_build.util.safe_http import safe_httpx_client
+
+        headers = dict(self._headers())
+        headers["Content-Type"] = "application/yaml"
+        with safe_httpx_client(
+            base_url=self.base_url,
+            timeout=float(self.timeout_seconds),
+            allow_private=True,
+        ) as c:
+            r = c.put(
+                "/api/v1/dataContracts/odcs/yaml",
+                params={"entityId": entity_id, "entityType": "table", "mode": "merge"},
+                content=odcs_yaml.encode("utf-8"),
+                headers=headers,
+            )
             r.raise_for_status()
 
     @staticmethod
