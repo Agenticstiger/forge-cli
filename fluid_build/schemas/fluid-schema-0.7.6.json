@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://open-data-protocol.github.io/fluid/schema/fluid-schema-0.7.6.json",
-  "title": "FLUID 0.7.6 \u2014 Declarative Packaging Modes (preview)",
-  "description": "FLUID contract schema 0.7.6 \u2014 the current PREVIEW version, opened when 0.7.5 was promoted to stable.\n\n\ud83d\udd25 NEW in v0.7.6:\n\u2022 Declarative packaging modes \u2014 a top-level `packaging` block (plus a per-exposure `binding.packaging` override) declares per-container ownership for the IaC emit: `isolated` (this product creates and owns the container) vs `shared` (a pre-existing, platform-owned pool referenced via an OpenTofu data source), with a per-kind `containers` override map for hybrid tiers and a `pool` id for tenancy/cost attribution (RFC-packaging-modes.md).\n\u2022 Declared consumers \u2014 an optional top-level `consumers` block (dbt-exposures shape: name/label/type/owner/url/maturity/description, plus FLUID-native `exposeIds`) declares the dashboards, notebooks, analyses, ML systems, and applications built on this product, feeding lineage terminal nodes and business impact statements.\n\u2022 Backward compatible with v0.7.5 \u2014 every 0.7.5 contract validates as 0.7.6 unchanged; an ABSENT packaging block keeps the legacy byte-identical emit.",
+  "title": "FLUID 0.7.6 — Declarative Packaging Modes (preview)",
+  "description": "FLUID contract schema 0.7.6 — the current PREVIEW version, opened when 0.7.5 was promoted to stable.\n\n🔥 NEW in v0.7.6:\n• Declarative packaging modes — a top-level `packaging` block (plus a per-exposure `binding.packaging` override) declares per-container ownership for the IaC emit: `isolated` (this product creates and owns the container) vs `shared` (a pre-existing, platform-owned pool referenced via an OpenTofu data source), with a per-kind `containers` override map for hybrid tiers and a `pool` id for tenancy/cost attribution (RFC-packaging-modes.md).\n• Backward compatible with v0.7.5 — every 0.7.5 contract validates as 0.7.6 unchanged; an ABSENT packaging block keeps the legacy byte-identical emit.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -105,7 +105,7 @@
         "0.7.5",
         "0.7.6"
       ],
-      "description": "Contract schema version. Accepts '0.7.3' (source-aligned data products + acquisition pattern + ingestion engines) or '0.7.4' (adds the MCP output-port gateway + runtime agentPolicy enforcement). 0.7.4 is fully backward-compatible with 0.7.3 \u2014 every 0.7.3 contract validates as 0.7.4 unchanged. '0.7.6' is the current preview.",
+      "description": "Contract schema version. Accepts '0.7.3' (source-aligned data products + acquisition pattern + ingestion engines) or '0.7.4' (adds the MCP output-port gateway + runtime agentPolicy enforcement). 0.7.4 is fully backward-compatible with 0.7.3 — every 0.7.3 contract validates as 0.7.4 unchanged. '0.7.6' is the current preview.",
       "examples": [
         "0.7.4",
         "0.7.3"
@@ -151,7 +151,7 @@
       "properties": {
         "provenance": {
           "type": "object",
-          "description": "Generation envelope injected by `fluid forge` / `fluid init` \u2014 records how, when and by which tool/command the contract was generated. Machine-written (not user-authored); additive metadata that does not affect the data product's semantic contract.",
+          "description": "Generation envelope injected by `fluid forge` / `fluid init` — records how, when and by which tool/command the contract was generated. Machine-written (not user-authored); additive metadata that does not affect the data product's semantic contract.",
           "properties": {
             "schema_version": {
               "type": "integer",
@@ -185,7 +185,7 @@
         },
         "layer": {
           "type": "string",
-          "description": "Data layer label (e.g., Bronze/Silver/Gold). Free-form. When set together with `productType`, the two MUST be consistent under the canonical mapping (Bronze\u2194SDP, Silver\u2194ADP, Gold\u2194CDP)."
+          "description": "Data layer label (e.g., Bronze/Silver/Gold). Free-form. When set together with `productType`, the two MUST be consistent under the canonical mapping (Bronze↔SDP, Silver↔ADP, Gold↔CDP)."
         },
         "productType": {
           "type": "string",
@@ -194,7 +194,7 @@
             "ADP",
             "CDP"
           ],
-          "description": "NEW in v0.7.3: Data Mesh data-product type. SDP = Source-Aligned Data Product (raw ingestion from external systems; corresponds to Bronze). ADP = Aggregated Data Product (cross-source joined / domain-modelled; corresponds to Silver). CDP = Consumption-Aligned Data Product (analytics- or product-shaped; corresponds to Gold). Either `metadata.layer` or `metadata.productType` is sufficient \u2014 the validator infers the missing one. When both are present they MUST agree."
+          "description": "NEW in v0.7.3: Data Mesh data-product type. SDP = Source-Aligned Data Product (raw ingestion from external systems; corresponds to Bronze). ADP = Aggregated Data Product (cross-source joined / domain-modelled; corresponds to Silver). CDP = Consumption-Aligned Data Product (analytics- or product-shaped; corresponds to Gold). Either `metadata.layer` or `metadata.productType` is sufficient — the validator infers the missing one. When both are present they MUST agree."
         },
         "classification": {
           "type": "string",
@@ -280,13 +280,6 @@
         "$ref": "#/$defs/consumeRef"
       }
     },
-    "consumers": {
-      "type": "array",
-      "description": "NEW in v0.7.6: Declared downstream consumers of this data product \u2014 the business artifacts built on it (dashboards, notebooks, analyses, ML apps). Shape follows dbt exposures so existing dbt exposure definitions map field-for-field. Purely declarative and additive: consumers never affect plan/apply, they feed lineage terminal nodes and impact statements ('Affects: Revenue dashboard').",
-      "items": {
-        "$ref": "#/$defs/consumerRef"
-      }
-    },
     "builds": {
       "type": "array",
       "description": "NEW in v0.5.5: Multiple build configurations for multi-modal data products (e.g., batch + streaming, SQL + ML).",
@@ -339,20 +332,27 @@
       "$ref": "#/$defs/retention",
       "description": "NEW in v0.7.3: Retention durations for run state, run logs, lineage events, and DLQ records. Honored by the retention sweeper invoked from policy-apply."
     },
+    "consumers": {
+      "type": "array",
+      "description": "NEW in v0.7.6: Declared downstream consumers of this data product — the business artifacts built on it (dashboards, notebooks, analyses, ML apps). Shape follows dbt exposures so existing dbt exposure definitions map field-for-field. Purely declarative and additive: consumers never affect plan/apply, they feed lineage terminal nodes and impact statements ('Affects: Revenue dashboard').",
+      "items": {
+        "$ref": "#/$defs/consumerRef"
+      }
+    },
     "governance": {
       "$ref": "#/$defs/governance",
       "description": "Contract-level governance: account/project-wide settings (e.g. AWS Lake Formation admins and LF-tag definitions). Per-resource grants and tag associations live under binding.governance."
     },
     "packaging": {
       "$ref": "#/$defs/packaging",
-      "description": "NEW in v0.7.6: Contract-wide packaging default \u2014 declarative container ownership (isolated = this product creates and owns its infrastructure containers; shared = containers are pre-existing, platform-owned pools the product writes into but does not own). Overridable per exposure via binding.packaging. An ABSENT block means legacy behavior: the IaC emit is byte-identical to pre-packaging releases."
+      "description": "NEW in v0.7.6: Contract-wide packaging default — declarative container ownership (isolated = this product creates and owns its infrastructure containers; shared = containers are pre-existing, platform-owned pools the product writes into but does not own). Overridable per exposure via binding.packaging. An ABSENT block means legacy behavior: the IaC emit is byte-identical to pre-packaging releases."
     }
   },
   "$defs": {
     "packaging": {
       "type": "object",
       "additionalProperties": false,
-      "description": "NEW in v0.7.6: Declarative packaging mode \u2014 per-container ownership for the OpenTofu IaC emit (RFC-packaging-modes.md). 'isolated' emits owned resources (today's exact emit); 'shared' emits a data-source reference to a platform-owned pool plus leaf-only owned resources (tables, prefixed objects, scoped grants). Hybrid tiers (e.g. Snowflake shared-database / owned-schema / owned-warehouse) come from the per-kind containers override map. Prior art: Terraform's resource-vs-data-source ownership split, Unity Catalog isolation-mode OPEN|ISOLATED, Kubernetes shared-vs-dedicated node pools.",
+      "description": "NEW in v0.7.6: Declarative packaging mode — per-container ownership for the OpenTofu IaC emit (RFC-packaging-modes.md). 'isolated' emits owned resources (today's exact emit); 'shared' emits a data-source reference to a platform-owned pool plus leaf-only owned resources (tables, prefixed objects, scoped grants). Hybrid tiers (e.g. Snowflake shared-database / owned-schema / owned-warehouse) come from the per-kind containers override map. Prior art: Terraform's resource-vs-data-source ownership split, Unity Catalog isolation-mode OPEN|ISOLATED, Kubernetes shared-vs-dedicated node pools.",
       "properties": {
         "mode": {
           "type": "string",
@@ -365,7 +365,7 @@
         "pool": {
           "type": "string",
           "minLength": 1,
-          "description": "NEW in v0.7.6: Pool id of the platform-owned tenant pool this product writes into. REQUIRED (enforced by the resolver) whenever any container resolves 'shared' \u2014 a pool must be addressable. Propagated as the `fluid_pool` label/tag for cost attribution."
+          "description": "NEW in v0.7.6: Pool id of the platform-owned tenant pool this product writes into. REQUIRED (enforced by the resolver) whenever any container resolves 'shared' — a pool must be addressable. Propagated as the `fluid_pool` label/tag for cost attribution."
         },
         "poolManifest": {
           "type": "string",
@@ -375,7 +375,7 @@
         "containers": {
           "type": "object",
           "additionalProperties": false,
-          "description": "NEW in v0.7.6: Per-container-kind ownership overrides \u2014 each key wins over `mode` for that kind, yielding hybrid tiers. Kind\u2194platform mapping: bucket \u2192 aws_s3_bucket / google_storage_bucket; database \u2192 snowflake_database AND aws_glue_catalog_database; dataset \u2192 google_bigquery_dataset; schema \u2192 snowflake_schema; warehouse \u2192 snowflake_warehouse; cluster \u2192 Confluent environment/cluster (v1: shared only).",
+          "description": "NEW in v0.7.6: Per-container-kind ownership overrides — each key wins over `mode` for that kind, yielding hybrid tiers. Kind↔platform mapping: bucket → aws_s3_bucket / google_storage_bucket; database → snowflake_database AND aws_glue_catalog_database; dataset → google_bigquery_dataset; schema → snowflake_schema; warehouse → snowflake_warehouse; cluster → Confluent environment/cluster (v1: shared only).",
           "properties": {
             "bucket": {
               "$ref": "#/$defs/packagingContainerMode",
@@ -383,7 +383,7 @@
             },
             "database": {
               "$ref": "#/$defs/packagingContainerMode",
-              "description": "NEW in v0.7.6: Ownership of the database container \u2014 covers Snowflake `database` AND AWS `glue_database`."
+              "description": "NEW in v0.7.6: Ownership of the database container — covers Snowflake `database` AND AWS `glue_database`."
             },
             "dataset": {
               "$ref": "#/$defs/packagingContainerMode",
@@ -395,11 +395,11 @@
             },
             "warehouse": {
               "$ref": "#/$defs/packagingContainerMode",
-              "description": "NEW in v0.7.6: Ownership of the Snowflake warehouse (snowflake_warehouse) \u2014 isolated gives per-product cost attribution."
+              "description": "NEW in v0.7.6: Ownership of the Snowflake warehouse (snowflake_warehouse) — isolated gives per-product cost attribution."
             },
             "cluster": {
               "$ref": "#/$defs/packagingContainerMode",
-              "description": "NEW in v0.7.6: Ownership of the Confluent environment/cluster. v1 accepts 'shared' only \u2014 dedicated-cluster provisioning is not yet supported (the resolver rejects 'isolated')."
+              "description": "NEW in v0.7.6: Ownership of the Confluent environment/cluster. v1 accepts 'shared' only — dedicated-cluster provisioning is not yet supported (the resolver rejects 'isolated')."
             }
           }
         }
@@ -411,7 +411,7 @@
         "isolated",
         "shared"
       ],
-      "description": "NEW in v0.7.6: Per-container ownership \u2014 'isolated' (this product creates and owns it) or 'shared' (pre-existing platform-owned pool, referenced not created)."
+      "description": "NEW in v0.7.6: Per-container ownership — 'isolated' (this product creates and owns it) or 'shared' (pre-existing platform-owned pool, referenced not created)."
     },
     "retention": {
       "type": "object",
@@ -859,7 +859,7 @@
           "minLength": 1
         },
         "type": {
-          "description": "Column data type. Accepts a canonical FLUID/SQL type name (case-insensitive) or a parameterized form such as decimal(18,4) or varchar(255). The enum lists the canonical bare types; the pattern additionally permits case variants and parameter suffixes. Intentionally generous \u2014 it rejects obvious garbage (e.g. MYSTERY_TYPE) while admitting the cross-dialect superset.",
+          "description": "Column data type. Accepts a canonical FLUID/SQL type name (case-insensitive) or a parameterized form such as decimal(18,4) or varchar(255). The enum lists the canonical bare types; the pattern additionally permits case variants and parameter suffixes. Intentionally generous — it rejects obvious garbage (e.g. MYSTERY_TYPE) while admitting the cross-dialect superset.",
           "anyOf": [
             {
               "type": "string",
@@ -1347,7 +1347,7 @@
             "pgvector",
             "other"
           ],
-          "description": "Target platform. NEW in v0.7.5: 'pgvector' for the vector/embeddings output port (pgvector-on-PostgreSQL RAG target \u2014 emits the embeddings table + ANN index DDL for the ai-embeddable columns). NEW in v0.7.5: 'confluent' for the Confluent Cloud Tableflow managed Kafka\u2192Iceberg emitter. NEW in v0.7.4: 'postgres' for the MCP output-port PostgreSQL driver (AWS Athena uses platform 'aws')."
+          "description": "Target platform. NEW in v0.7.5: 'pgvector' for the vector/embeddings output port (pgvector-on-PostgreSQL RAG target — emits the embeddings table + ANN index DDL for the ai-embeddable columns). NEW in v0.7.5: 'confluent' for the Confluent Cloud Tableflow managed Kafka→Iceberg emitter. NEW in v0.7.4: 'postgres' for the MCP output-port PostgreSQL driver (AWS Athena uses platform 'aws')."
         },
         "format": {
           "type": "string",
@@ -1375,7 +1375,7 @@
             "pgvector_table",
             "other"
           ],
-          "description": "Binding format. NEW in v0.7.5: 'pgvector_table' \u2014 a pgvector embeddings table target for the vector output port. NEW in v0.7.4: 'postgres_table' (PostgreSQL driver), 'athena_table' / 'glue_table' (AWS Athena driver) for the MCP output port."
+          "description": "Binding format. NEW in v0.7.5: 'pgvector_table' — a pgvector embeddings table target for the vector output port. NEW in v0.7.4: 'postgres_table' (PostgreSQL driver), 'athena_table' / 'glue_table' (AWS Athena driver) for the MCP output port."
         },
         "icebergConfig": {
           "type": "object",
@@ -1517,7 +1517,7 @@
                 "none"
               ],
               "default": "hnsw",
-              "description": "ANN index built on the embedding column. 'hnsw' (higher recall / lower query latency, buildable before data lands), 'ivfflat' (lower build cost, needs data first), or 'none' (no index \u2014 exact search only)."
+              "description": "ANN index built on the embedding column. 'hnsw' (higher recall / lower query latency, buildable before data lands), 'ivfflat' (lower build cost, needs data first), or 'none' (no index — exact search only)."
             },
             "distanceMetric": {
               "type": "string",
@@ -1528,7 +1528,7 @@
                 "l1"
               ],
               "default": "cosine",
-              "description": "Distance function the index optimises for \u2192 pgvector operator class: cosine\u2192vector_cosine_ops, l2\u2192vector_l2_ops, inner_product\u2192vector_ip_ops, l1\u2192vector_l1_ops."
+              "description": "Distance function the index optimises for → pgvector operator class: cosine→vector_cosine_ops, l2→vector_l2_ops, inner_product→vector_ip_ops, l1→vector_l1_ops."
             },
             "table": {
               "type": "string",
@@ -1591,7 +1591,7 @@
         },
         "packaging": {
           "$ref": "#/$defs/packaging",
-          "description": "NEW in v0.7.6: Per-exposure packaging override \u2014 key-wise precedence over the contract-wide top-level `packaging` block (binding.packaging > packaging > absent-legacy)."
+          "description": "NEW in v0.7.6: Per-exposure packaging override — key-wise precedence over the contract-wide top-level `packaging` block (binding.packaging > packaging > absent-legacy)."
         }
       }
     },
@@ -1667,15 +1667,15 @@
         },
         "stream": {
           "type": "string",
-          "description": "NEW in v0.7.5: AWS Kinesis Data Stream name \u2014 maps to aws_kinesis_stream in the streaming IaC emitter."
+          "description": "NEW in v0.7.5: AWS Kinesis Data Stream name — maps to aws_kinesis_stream in the streaming IaC emitter."
         },
         "namespace": {
           "type": "string",
-          "description": "NEW in v0.7.5: Amazon Redshift Serverless namespace name \u2014 maps to aws_redshiftserverless_namespace."
+          "description": "NEW in v0.7.5: Amazon Redshift Serverless namespace name — maps to aws_redshiftserverless_namespace."
         },
         "workgroup": {
           "type": "string",
-          "description": "NEW in v0.7.5: Amazon Redshift Serverless workgroup name \u2014 maps to aws_redshiftserverless_workgroup."
+          "description": "NEW in v0.7.5: Amazon Redshift Serverless workgroup name — maps to aws_redshiftserverless_workgroup."
         },
         "iam_role_arn": {
           "type": "string",
@@ -1695,22 +1695,22 @@
         },
         "catalog": {
           "type": "string",
-          "description": "NEW in v0.7.5: Iceberg catalog kind/profile selector \u2014 maps to iceberg.catalog.type (e.g. glue, rest, nessie, hive). REST-fronted catalogs (polaris / unity / snowflake open catalog) map to 'rest'. Consumed by providers/_iceberg_catalog.py and the streaming-sink validator."
+          "description": "NEW in v0.7.5: Iceberg catalog kind/profile selector — maps to iceberg.catalog.type (e.g. glue, rest, nessie, hive). REST-fronted catalogs (polaris / unity / snowflake open catalog) map to 'rest'. Consumed by providers/_iceberg_catalog.py and the streaming-sink validator."
         },
         "warehouse": {
           "type": "string",
-          "description": "NEW in v0.7.5: Iceberg warehouse \u2014 the canonical Iceberg REST 'warehouse' property (maps to iceberg.catalog.warehouse): an object-store URI (s3://|gs://|abfss://) for object-store catalogs, or the catalog/warehouse name for a REST catalog."
+          "description": "NEW in v0.7.5: Iceberg warehouse — the canonical Iceberg REST 'warehouse' property (maps to iceberg.catalog.warehouse): an object-store URI (s3://|gs://|abfss://) for object-store catalogs, or the catalog/warehouse name for a REST catalog."
         },
         "uri": {
           "type": "string",
-          "description": "NEW in v0.7.5: REST Iceberg catalog endpoint URL \u2014 the canonical Iceberg REST 'uri' property (maps to iceberg.catalog.uri)."
+          "description": "NEW in v0.7.5: REST Iceberg catalog endpoint URL — the canonical Iceberg REST 'uri' property (maps to iceberg.catalog.uri)."
         },
         "partitionBy": {
           "type": "array",
           "items": {
             "type": "string"
           },
-          "description": "NEW in v0.7.5: Iceberg partition columns \u2014 a FLUID abstraction over the Iceberg PARTITIONED BY / PartitionSpec (maps to iceberg.tables.default-partition-by)."
+          "description": "NEW in v0.7.5: Iceberg partition columns — a FLUID abstraction over the Iceberg PARTITIONED BY / PartitionSpec (maps to iceberg.tables.default-partition-by)."
         }
       }
     },
@@ -2523,75 +2523,6 @@
         }
       }
     },
-    "consumerRef": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "name",
-        "type"
-      ],
-      "$comment": "dbt-exposures-shaped (name/label/type/owner/url/maturity/description); exposeIds is the FLUID-native refinement tying a consumer to specific output ports.",
-      "properties": {
-        "name": {
-          "$ref": "#/$defs/identifier",
-          "description": "Stable identifier for this consumer (unique within the contract)."
-        },
-        "label": {
-          "type": "string",
-          "description": "Human-facing display name, e.g. \"Weekly Revenue Dashboard\"."
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "dashboard",
-            "notebook",
-            "analysis",
-            "ml",
-            "application"
-          ],
-          "description": "What kind of artifact consumes this product."
-        },
-        "owner": {
-          "type": "object",
-          "additionalProperties": false,
-          "$comment": "Mirrors metadata.owner's vocabulary so 'owner' means one thing across the standard: team is the routable identity, email the contact. A dbt exposure's owner.name maps to team on import.",
-          "properties": {
-            "team": {
-              "type": "string",
-              "description": "Owning team for this consumer (routable identity, as in metadata.owner)."
-            },
-            "email": {
-              "type": "string",
-              "format": "email",
-              "description": "Contact address for the consumer's owner."
-            }
-          }
-        },
-        "url": {
-          "type": "string",
-          "description": "Link to the live artifact (dashboard URL, notebook, app)."
-        },
-        "maturity": {
-          "type": "string",
-          "enum": [
-            "high",
-            "medium",
-            "low"
-          ],
-          "description": "How production-hardened the consumer is (dbt exposures semantics)."
-        },
-        "description": {
-          "type": "string"
-        },
-        "exposeIds": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/identifier"
-          },
-          "description": "Which output ports this consumer reads. Absent = all exposes."
-        }
-      }
-    },
     "build": {
       "type": "object",
       "description": "Enhanced build configuration supporting v0.4.0 patterns with v0.5.5 improvements.",
@@ -2644,7 +2575,7 @@
         },
         "capabilities": {
           "type": "array",
-          "description": "Capabilities the build asks for (acquisition pattern). Validation enforces capabilities \u2286 runner.declared_capabilities.",
+          "description": "Capabilities the build asks for (acquisition pattern). Validation enforces capabilities ⊆ runner.declared_capabilities.",
           "items": {
             "type": "string",
             "enum": [
@@ -2957,7 +2888,7 @@
     },
     "acquisitionPattern": {
       "type": "object",
-      "description": "NEW in v0.7.3: Source-aligned acquisition pattern. The build ingests data from an external system (no transformation). Engine \u2208 {duckdb, airbyte, meltano, dlt, kafka-connect, debezium}.",
+      "description": "NEW in v0.7.3: Source-aligned acquisition pattern. The build ingests data from an external system (no transformation). Engine ∈ {duckdb, airbyte, meltano, dlt, kafka-connect, debezium}.",
       "additionalProperties": false,
       "required": [
         "source"
@@ -3121,7 +3052,7 @@
             },
             "iceberg_sink_enabled": {
               "type": "boolean",
-              "description": "Opt-in: derive the Iceberg sink connector config. Defaults OFF when a hand-written sink_connector_config is present (RFC \u00a76.2)."
+              "description": "Opt-in: derive the Iceberg sink connector config. Defaults OFF when a hand-written sink_connector_config is present (RFC §6.2)."
             },
             "sink_topics": {
               "type": "array",
@@ -3140,7 +3071,7 @@
             "streamingSink": {
               "type": "object",
               "additionalProperties": false,
-              "description": "Optional Iceberg streaming-sink tuning (RFC \u00a76.2). All keys optional.",
+              "description": "Optional Iceberg streaming-sink tuning (RFC §6.2). All keys optional.",
               "properties": {
                 "commitIntervalMs": {
                   "type": "integer",
@@ -3240,7 +3171,7 @@
             },
             "user": {
               "type": "string",
-              "description": "NEW in v0.7.3: Username/principal for SQL- or REST-style sources. Required by most database drivers (Postgres/MySQL/Oracle/etc.) \u2014 without it the underlying client falls back to the OS-user identity and typically fails authentication. Goes alongside ``secretRef`` (or an inline ``password``) for the credential pair."
+              "description": "NEW in v0.7.3: Username/principal for SQL- or REST-style sources. Required by most database drivers (Postgres/MySQL/Oracle/etc.) — without it the underlying client falls back to the OS-user identity and typically fails authentication. Goes alongside ``secretRef`` (or an inline ``password``) for the credential pair."
             },
             "schema": {
               "type": "string",
@@ -4808,7 +4739,7 @@
         },
         "operator": {
           "type": "string",
-          "description": "DEPRECATED in v0.7.0: Use 'type' instead. Maintained for backward compatibility with v0.6.1 contracts. Maps to 'type' automatically (FluidExecuteOperator \u2192 fluid_execute, BashOperator \u2192 bash)."
+          "description": "DEPRECATED in v0.7.0: Use 'type' instead. Maintained for backward compatibility with v0.6.1 contracts. Maps to 'type' automatically (FluidExecuteOperator → fluid_execute, BashOperator → bash)."
         },
         "provider": {
           "type": "string",
@@ -5072,7 +5003,7 @@
             }
           },
           "then": {
-            "description": "Operator field is deprecated but still works. Maps: FluidExecuteOperator\u2192fluid_execute, BashOperator\u2192bash, etc."
+            "description": "Operator field is deprecated but still works. Maps: FluidExecuteOperator→fluid_execute, BashOperator→bash, etc."
           }
         },
         {
@@ -5596,7 +5527,7 @@
     "exposeMcp": {
       "type": "object",
       "additionalProperties": false,
-      "description": "NEW in v0.7.4: Per-expose overrides for the MCP output-port server \u2014 sampling caps + classification. The presence of this (non-empty) block opts the expose into the Fluid MCP gateway, where policy.agentPolicy is enforced at every read.",
+      "description": "NEW in v0.7.4: Per-expose overrides for the MCP output-port server — sampling caps + classification. The presence of this (non-empty) block opts the expose into the Fluid MCP gateway, where policy.agentPolicy is enforced at every read.",
       "properties": {
         "sampling": {
           "type": "object",
@@ -5648,7 +5579,7 @@
             },
             "tagDefinitions": {
               "type": "object",
-              "description": "LF-TBAC tag-key definitions. Each entry is a tag key mapped to its allowed string values. Emitted as one aws_lakeformation_lf_tag per key; values are the tag's allowed-values list. Field idiom borrowed from OpenMetadata's classification-label model \u2014 see ODCS roles + OpenMetadata data contracts spec.",
+              "description": "LF-TBAC tag-key definitions. Each entry is a tag key mapped to its allowed string values. Emitted as one aws_lakeformation_lf_tag per key; values are the tag's allowed-values list. Field idiom borrowed from OpenMetadata's classification-label model — see ODCS roles + OpenMetadata data contracts spec.",
               "additionalProperties": {
                 "type": "array",
                 "items": {
@@ -5751,7 +5682,7 @@
             "rowFilter": {
               "type": "object",
               "additionalProperties": false,
-              "description": "Row-level (and optionally column-level) filter applied to all reads of this table via LF. Emitted as aws_lakeformation_data_cells_filter. The filter must then be granted to principals via grants[].permissions including SELECT \u2014 LF enforces both layers.",
+              "description": "Row-level (and optionally column-level) filter applied to all reads of this table via LF. Emitted as aws_lakeformation_data_cells_filter. The filter must then be granted to principals via grants[].permissions including SELECT — LF enforces both layers.",
               "properties": {
                 "name": {
                   "type": "string",
@@ -5789,6 +5720,75 @@
               ]
             }
           }
+        }
+      }
+    },
+    "consumerRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type"
+      ],
+      "$comment": "dbt-exposures-shaped (name/label/type/owner/url/maturity/description); exposeIds is the FLUID-native refinement tying a consumer to specific output ports.",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/identifier",
+          "description": "Stable identifier for this consumer (unique within the contract)."
+        },
+        "label": {
+          "type": "string",
+          "description": "Human-facing display name, e.g. \"Weekly Revenue Dashboard\"."
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "dashboard",
+            "notebook",
+            "analysis",
+            "ml",
+            "application"
+          ],
+          "description": "What kind of artifact consumes this product."
+        },
+        "owner": {
+          "type": "object",
+          "additionalProperties": false,
+          "$comment": "Mirrors metadata.owner's vocabulary so 'owner' means one thing across the standard: team is the routable identity, email the contact. A dbt exposure's owner.name maps to team on import.",
+          "properties": {
+            "team": {
+              "type": "string",
+              "description": "Owning team for this consumer (routable identity, as in metadata.owner)."
+            },
+            "email": {
+              "type": "string",
+              "format": "email",
+              "description": "Contact address for the consumer's owner."
+            }
+          }
+        },
+        "url": {
+          "type": "string",
+          "description": "Link to the live artifact (dashboard URL, notebook, app)."
+        },
+        "maturity": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "description": "How production-hardened the consumer is (dbt exposures semantics)."
+        },
+        "description": {
+          "type": "string"
+        },
+        "exposeIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "description": "Which output ports this consumer reads. Absent = all exposes."
         }
       }
     }
