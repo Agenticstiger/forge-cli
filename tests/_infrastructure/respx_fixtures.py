@@ -402,18 +402,32 @@ class MarquezMockServer:
 
 
 class OpenMetadataMockServer:
-    """Captures OpenMetadata table registrations."""
+    """Captures OpenMetadata table registrations and ODCS contract imports.
+
+    Models both halves of the registrar's two-step publish: the Tables API
+    and the Data Contracts API that OpenMetadata grew in 1.10
+    (``PUT /api/v1/dataContracts/odcs/yaml``). ``data_contracts_available``
+    flips the contracts route to 404 so the pre-1.10 degradation path can be
+    exercised.
+    """
 
     def __init__(self) -> None:
         self.tables: List[Dict[str, Any]] = []
         self.deletions: List[str] = []
         self.calls: List[str] = []
+        #: One entry per ODCS import: {"yaml", "entityId", "entityType", "mode", "headers"}
+        self.odcs_contracts: List[Dict[str, Any]] = []
+        self.data_contracts_available: bool = True
 
     def attach(self, router: "respx.Router") -> None:
         router.put("/api/v1/tables").mock(side_effect=self._put_table)
         router.delete(host="openmetadata.test", path__regex=r"^/api/v1/tables/name/.+$").mock(
             side_effect=self._delete_table
         )
+        router.get(host="openmetadata.test", path__regex=r"^/api/v1/tables/name/.+$").mock(
+            side_effect=self._get_table_by_name
+        )
+        router.put("/api/v1/dataContracts/odcs/yaml").mock(side_effect=self._put_odcs_contract)
 
     def _put_table(self, request: Any) -> Any:
         import httpx
@@ -430,6 +444,37 @@ class OpenMetadataMockServer:
         name = request.url.path.rsplit("/", 1)[-1]
         self.deletions.append(name)
         return httpx.Response(200)
+
+    def _get_table_by_name(self, request: Any) -> Any:
+        """Resolve an FQN to the internal UUID the ODCS import route needs."""
+        import httpx
+
+        self.calls.append("get_table_by_name")
+        fqn = request.url.path.split("/api/v1/tables/name/", 1)[-1]
+        for index, table in enumerate(self.tables, start=1):
+            if table.get("fullyQualifiedName") == fqn:
+                return httpx.Response(200, json={"id": f"om-{index}", "fullyQualifiedName": fqn})
+        return httpx.Response(404, json={"message": "table not found"})
+
+    def _put_odcs_contract(self, request: Any) -> Any:
+        import httpx
+
+        if not self.data_contracts_available:
+            # Pre-1.10 servers have no Data Contracts entity at all.
+            self.calls.append("put_odcs_contract_404")
+            return httpx.Response(404, json={"message": "Not Found"})
+        self.calls.append("put_odcs_contract")
+        params = request.url.params
+        self.odcs_contracts.append(
+            {
+                "yaml": request.content.decode("utf-8"),
+                "entityId": params.get("entityId"),
+                "entityType": params.get("entityType"),
+                "mode": params.get("mode"),
+                "headers": dict(request.headers),
+            }
+        )
+        return httpx.Response(200, json={"id": "contract-1"})
 
 
 class GlueMockServer:

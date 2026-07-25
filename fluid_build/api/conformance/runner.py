@@ -21,6 +21,9 @@ from typing import Any, ClassVar, Optional
 
 from fluid_build.api.runner import Runner
 
+#: Facet keys OpenLineage reserves for its own bookkeeping on custom facets.
+_FACET_META_KEYS = ("_producer", "_schemaURL")
+
 
 class RunnerConformance:
     """Mixin asserting a runner satisfies the public Protocol contract.
@@ -61,3 +64,91 @@ class RunnerConformance:
         f1 = self.runner.fingerprint(conformance_ctx)
         f2 = self.runner.fingerprint(conformance_ctx)
         assert f1.digest == f2.digest
+
+    def test_lineage_events_conform_to_openlineage(self, conformance_ctx: Any) -> None:
+        """Every lineage event a runner emits must satisfy the OpenLineage spec.
+
+        This class has always documented that it asserts "lineage events
+        conform to the OpenLineage shape" but carried no such check, so a
+        runner could emit an unconsumable payload and still pass
+        conformance. Validation is structural (the required-field and
+        nesting rules from ``BaseEvent`` / ``RunEvent`` / ``Run`` / ``Job``
+        in spec 2-0-2) rather than a network fetch of the schema, so the
+        suite stays offline and deterministic.
+        """
+        from fluid_build.api.lineage import RunEventType
+        from fluid_build.build_runners._lineage import BufferedLineageEmitter, encode_event
+
+        buffered = BufferedLineageEmitter()
+        object.__setattr__(conformance_ctx, "lineage", buffered)
+
+        self.runner.run(conformance_ctx)
+
+        if not buffered.events:
+            import pytest
+
+            pytest.skip(f"{self.runner.name} emits no lineage events")
+
+        for event in buffered.events:
+            assert isinstance(event.event_type, RunEventType)
+            payload = encode_event(event)
+            assert_openlineage_shape(payload)
+
+
+def assert_openlineage_shape(payload: dict) -> None:
+    """Assert ``payload`` matches the OpenLineage 2-0-2 RunEvent structure.
+
+    Kept module-level so runner suites outside this mixin (and the emitter's
+    own tests) can reuse it.
+    """
+    import uuid as _uuid
+
+    # BaseEvent required fields.
+    for key in ("eventTime", "producer", "schemaURL"):
+        assert key in payload, f"OpenLineage BaseEvent requires {key!r}; got {sorted(payload)}"
+        assert isinstance(payload[key], str) and payload[key], f"{key!r} must be a non-empty string"
+
+    assert payload["schemaURL"].startswith(
+        "https://openlineage.io/spec/"
+    ), f"schemaURL must point at the OpenLineage spec, got {payload['schemaURL']!r}"
+
+    # RunEvent required nesting. The historic bug was flattening these to
+    # top-level snake_case keys, so assert the flattened form is absent too.
+    for legacy in ("run_id", "job_namespace", "job_name", "run_facets", "event_type", "event_time"):
+        assert legacy not in payload, (
+            f"{legacy!r} is the pre-OpenLineage flattened field name; "
+            "the event must use the nested spec shape"
+        )
+
+    assert "run" in payload and isinstance(payload["run"], dict), "RunEvent requires a nested `run`"
+    assert "job" in payload and isinstance(payload["job"], dict), "RunEvent requires a nested `job`"
+
+    run_id = payload["run"].get("runId")
+    assert run_id, "Run requires `runId`"
+    # The spec declares runId as `format: uuid`.
+    _uuid.UUID(str(run_id))
+
+    job = payload["job"]
+    assert job.get("namespace"), "Job requires `namespace`"
+    assert job.get("name"), "Job requires `name`"
+
+    assert payload.get("eventType") in {
+        "START",
+        "RUNNING",
+        "COMPLETE",
+        "ABORT",
+        "FAIL",
+        "OTHER",
+    }, f"unknown eventType {payload.get('eventType')!r}"
+
+    # Custom facets must carry the OpenLineage bookkeeping keys, otherwise
+    # consumers cannot attribute or version them.
+    for facet_name, facet in (payload["run"].get("facets") or {}).items():
+        if isinstance(facet, dict):
+            for meta in _FACET_META_KEYS:
+                assert meta in facet, f"run facet {facet_name!r} is missing {meta!r}"
+
+    for side in ("inputs", "outputs"):
+        for dataset in payload.get(side) or []:
+            assert dataset.get("namespace"), f"{side} dataset requires `namespace`"
+            assert dataset.get("name"), f"{side} dataset requires `name`"
