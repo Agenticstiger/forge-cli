@@ -332,6 +332,13 @@
       "$ref": "#/$defs/retention",
       "description": "NEW in v0.7.3: Retention durations for run state, run logs, lineage events, and DLQ records. Honored by the retention sweeper invoked from policy-apply."
     },
+    "consumers": {
+      "type": "array",
+      "description": "NEW in v0.7.6: Declared downstream consumers of this data product — the business artifacts built on it (dashboards, notebooks, analyses, ML apps). Shape follows dbt exposures so existing dbt exposure definitions map field-for-field. Purely declarative and additive: consumers never affect plan/apply, they feed lineage terminal nodes and impact statements ('Affects: Revenue dashboard').",
+      "items": {
+        "$ref": "#/$defs/consumerRef"
+      }
+    },
     "governance": {
       "$ref": "#/$defs/governance",
       "description": "Contract-level governance: account/project-wide settings (e.g. AWS Lake Formation admins and LF-tag definitions). Per-resource grants and tag associations live under binding.governance."
@@ -5713,6 +5720,75 @@
               ]
             }
           }
+        }
+      }
+    },
+    "consumerRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type"
+      ],
+      "$comment": "dbt-exposures-shaped (name/label/type/owner/url/maturity/description); exposeIds is the FLUID-native refinement tying a consumer to specific output ports.",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/identifier",
+          "description": "Stable identifier for this consumer (unique within the contract)."
+        },
+        "label": {
+          "type": "string",
+          "description": "Human-facing display name, e.g. \"Weekly Revenue Dashboard\"."
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "dashboard",
+            "notebook",
+            "analysis",
+            "ml",
+            "application"
+          ],
+          "description": "What kind of artifact consumes this product."
+        },
+        "owner": {
+          "type": "object",
+          "additionalProperties": false,
+          "$comment": "Mirrors metadata.owner's vocabulary so 'owner' means one thing across the standard: team is the routable identity, email the contact. A dbt exposure's owner.name maps to team on import.",
+          "properties": {
+            "team": {
+              "type": "string",
+              "description": "Owning team for this consumer (routable identity, as in metadata.owner)."
+            },
+            "email": {
+              "type": "string",
+              "format": "email",
+              "description": "Contact address for the consumer's owner."
+            }
+          }
+        },
+        "url": {
+          "type": "string",
+          "description": "Link to the live artifact (dashboard URL, notebook, app)."
+        },
+        "maturity": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "description": "How production-hardened the consumer is (dbt exposures semantics)."
+        },
+        "description": {
+          "type": "string"
+        },
+        "exposeIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "description": "Which output ports this consumer reads. Absent = all exposes."
         }
       }
     }
