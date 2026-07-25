@@ -105,7 +105,7 @@ def build_acquisition_run_context(
     from fluid_build.api.source import SinkSpec, SourceSpec
 
     from ._cost import InMemoryCostTracker
-    from ._lineage import NullLineageEmitter
+    from ._lineage import resolve_lineage_emitter
     from ._state import FileStateStore
     from .base import _resolve_env_placeholders
 
@@ -128,7 +128,9 @@ def build_acquisition_run_context(
         sink=sink,
         state_store=store,
         hook_chain=hook_chain if hook_chain is not None else HookChain(hooks=[]),
-        lineage=NullLineageEmitter(),
+        # Resolved from OPENLINEAGE_URL / FLUID_OPENLINEAGE_URL. Returns the
+        # null emitter when unconfigured, so emission stays opt-in and free.
+        lineage=resolve_lineage_emitter(),
         cost_tracker=InMemoryCostTracker(),
         workdir=str(contract_dir),
         sample_rows=sample_rows,
@@ -140,10 +142,20 @@ def begin_acquisition_run(ctx: Any, runner: Any) -> Tuple[str, float]:
 
     Returns ``(started_at, t_start)``; raises if the schema-evolution gate
     rejects the run. Shared by every acquisition runner's ``_execute``.
+
+    Also emits the OpenLineage START event. This is the single chokepoint
+    all 6 acquisition runners pass through, so wiring it here gives every
+    engine lineage at once, the same leverage pattern already used for
+    replay (``_state.set_cursor``) and late-arrival policy.
     """
+    from fluid_build.api.lineage import RunEventType
+
+    from ._lineage import emit_run_event
+
     started_at = utc_now_iso()
     enforce_schema_policy_or_raise(ctx, runner)
     t_start = time.time()
+    emit_run_event(ctx, event_type=RunEventType.START, event_time=started_at)
     return started_at, t_start
 
 
@@ -758,4 +770,44 @@ def write_run_record_and_finalize(
             fields (``duration_seconds``, ``cursor_advanced``).
     """
     write_run_record(state_store=state_store, ctx=ctx, result=result, record_dict=record_dict)
+    emit_terminal_lineage_event(ctx, result=result, succeeded_states=succeeded_states)
     return finalize_run_result(engine, ctx.build_id, result, succeeded_states=succeeded_states)
+
+
+def emit_terminal_lineage_event(
+    ctx: Any,
+    *,
+    result: Any,
+    succeeded_states: Optional[Tuple] = None,
+) -> None:
+    """Emit the OpenLineage terminal event for a finished run.
+
+    Maps FLUID's ``RunState`` onto the OpenLineage vocabulary:
+    ``CANCELLED`` becomes ``ABORT``, anything outside the success set
+    becomes ``FAIL``, and the rest become ``COMPLETE``. ``PARTIAL`` counts
+    as ``COMPLETE`` by default because it is in the default success set,
+    and the per-stream detail is already carried in the run facets.
+    """
+    from fluid_build.api.runner import RunState
+
+    from ._lineage import emit_run_event
+
+    if succeeded_states is None:
+        succeeded_states = _default_succeeded_states()
+
+    state = getattr(result, "state", None)
+    if state == RunState.CANCELLED:
+        event_type = _lineage_event_type("ABORT")
+    elif state in succeeded_states:
+        event_type = _lineage_event_type("COMPLETE")
+    else:
+        event_type = _lineage_event_type("FAIL")
+
+    finished_at = getattr(result, "finished_at", None) or utc_now_iso()
+    emit_run_event(ctx, event_type=event_type, event_time=finished_at, result=result)
+
+
+def _lineage_event_type(name: str) -> Any:
+    from fluid_build.api.lineage import RunEventType
+
+    return RunEventType[name]

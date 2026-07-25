@@ -120,6 +120,26 @@ dependencies = [
   # buckets that preserve unmodeled fields keep their round-trip
   # fidelity contract.
   "open-data-contract-standard>=3.1.2",
+  # Official OpenLineage Python client (LF AI & Data graduate project).
+  # Owns the lineage wire format so FLUID does not hand-roll it: the
+  # ``event_v2`` model supplies the nested run/job objects plus the
+  # required ``producer`` / ``schemaURL`` fields, ``Serde`` does the
+  # serialisation, and ``uuid.generate_static_uuid`` maps FLUID's sortable
+  # base32 run ids onto the ``format: uuid`` the spec mandates while
+  # keeping them monotonic. The previous hand-rolled encoder emitted a
+  # payload every OpenLineage consumer rejects.
+  #
+  # Adds exactly one distribution to the install: its own requirements
+  # (attrs, python-dateutil, packaging, requests, httpx, pyyaml) are
+  # already present transitively (attrs arrives via core ``jsonschema``).
+  # Imported lazily inside the emitter only, never at module import, so
+  # the ``fluid --help`` startup budget is untouched.
+  #
+  # Borrowed-not-built per /borrow-before-build:
+  #   PyPI:   https://pypi.org/project/openlineage-python/
+  #   GitHub: https://github.com/OpenLineage/OpenLineage/tree/main/client/python
+  #   Spec:   https://openlineage.io/spec/2-0-2/OpenLineage.json
+  "openlineage-python>=1.52",
   # Optional UX nicety on Windows; no-op elsewhere
   "colorama>=0.4.6; platform_system == 'Windows'",
   # Cross-platform single-keypress reader powering arrow-key menu
