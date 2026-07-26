@@ -37,6 +37,7 @@ import pytest
 from fluid_build.api.conformance.runner import assert_openlineage_shape
 from fluid_build.api.lineage import DatasetFacet, RunEvent, RunEventType
 from fluid_build.build_runners._lineage import (
+    FLUID_ENGINE_FACET_KEY,
     FLUID_RUN_FACET_KEY,
     BufferedLineageEmitter,
     HttpLineageEmitter,
@@ -333,3 +334,131 @@ class TestShapeAssertionCatchesRegressions:
         del payload["producer"]
         with pytest.raises(AssertionError):
             assert_openlineage_shape(payload)
+
+
+class TestTerminalEventFacets:
+    """Defect 4: ``run.facets`` carried bare scalars on every terminal event.
+
+    ``RunResult.facets`` is a flat dict of engine telemetry
+    (``{"engine": "duckdb", "duration_seconds": 0.02}``). It used to be
+    copied straight into ``run.facets``, where the spec requires each value
+    to be a ``RunFacet`` object with ``_producer`` + ``_schemaURL``. START
+    (which has no ``result``) validated; COMPLETE / FAIL / ABORT did not.
+    """
+
+    def _ctx(self):
+        return SimpleNamespace(
+            run_id=_FLUID_RUN_ID,
+            product_id="orders",
+            build_id="acquire",
+            lineage=BufferedLineageEmitter(),
+            source=SimpleNamespace(kind="duckdb", streams=["orders"]),
+        )
+
+    def _result(self, **extra):
+        base = {"engine": "duckdb", "duration_seconds": 0.0243}
+        base.update(extra)
+        return SimpleNamespace(facets=base, started_at=_EVENT_TIME)
+
+    @pytest.mark.parametrize(
+        "event_type", [RunEventType.COMPLETE, RunEventType.FAIL, RunEventType.ABORT]
+    )
+    def test_terminal_events_are_shape_conformant(self, event_type):
+        payload = encode_event(
+            build_run_event(
+                self._ctx(),
+                event_type=event_type,
+                event_time="2026-05-15T00:00:05Z",
+                result=self._result(),
+            )
+        )
+        assert_openlineage_shape(payload)
+
+    def test_engine_scalars_are_nested_under_one_conformant_facet(self):
+        payload = encode_event(
+            build_run_event(
+                self._ctx(),
+                event_type=RunEventType.COMPLETE,
+                event_time="2026-05-15T00:00:05Z",
+                result=self._result(pii_findings=["email"]),
+            )
+        )
+        facets = payload["run"]["facets"]
+        # No bare scalars promoted to top-level facet names.
+        assert "engine" not in facets
+        assert "duration_seconds" not in facets
+        engine_facet = facets[FLUID_ENGINE_FACET_KEY]
+        assert engine_facet["_producer"] and engine_facet["_schemaURL"]
+        assert engine_facet["engine"] == "duckdb"
+        assert engine_facet["duration_seconds"] == pytest.approx(0.0243)
+        # Nothing the engine reported is dropped.
+        assert engine_facet["pii_findings"] == ["email"]
+
+    def test_no_engine_facet_when_result_has_none(self):
+        payload = encode_event(
+            build_run_event(
+                self._ctx(), event_type=RunEventType.START, event_time=_EVENT_TIME
+            )
+        )
+        assert FLUID_ENGINE_FACET_KEY not in payload["run"]["facets"]
+
+    def test_shape_assertion_rejects_a_bare_scalar_run_facet(self):
+        """The helper itself must catch the regression, not skip it.
+
+        It previously guarded the facet loop with ``isinstance(facet, dict)``,
+        so a bare scalar facet passed conformance silently.
+        """
+        payload = encode_event(_event())
+        payload["run"]["facets"]["engine"] = "duckdb"
+        with pytest.raises(AssertionError):
+            assert_openlineage_shape(payload)
+
+
+class TestRunIdIsStableAcrossOneRun:
+    """Defect 5: START and COMPLETE of one run carried different ``runId``.
+
+    ``generate_static_uuid`` folds the supplied instant into the UUIDv7
+    timestamp field. Seeding it with each event's own ``event_time`` made
+    the pair uncorrelatable in Marquez / DataHub.
+    """
+
+    def _ctx(self):
+        return SimpleNamespace(
+            run_id=_FLUID_RUN_ID,
+            product_id="orders",
+            build_id="acquire",
+            lineage=BufferedLineageEmitter(),
+            source=SimpleNamespace(kind="duckdb", streams=["orders"]),
+        )
+
+    def test_start_and_complete_share_one_run_id(self):
+        start = encode_event(
+            build_run_event(
+                self._ctx(), event_type=RunEventType.START, event_time=_EVENT_TIME
+            )
+        )
+        complete = encode_event(
+            build_run_event(
+                self._ctx(),
+                event_type=RunEventType.COMPLETE,
+                # Finished later — the event times legitimately differ.
+                event_time="2026-05-15T00:00:37Z",
+                result=SimpleNamespace(
+                    facets={"engine": "duckdb"}, started_at=_EVENT_TIME
+                ),
+            )
+        )
+        assert start["run"]["runId"] == complete["run"]["runId"]
+        assert start["eventTime"] != complete["eventTime"]
+
+    def test_run_started_at_falls_back_to_event_time(self):
+        """A result without ``started_at`` must still produce a valid event."""
+        payload = encode_event(
+            build_run_event(
+                self._ctx(),
+                event_type=RunEventType.COMPLETE,
+                event_time=_EVENT_TIME,
+                result=SimpleNamespace(facets={"engine": "duckdb"}),
+            )
+        )
+        assert payload["run"]["runId"] == run_id_to_uuid(_FLUID_RUN_ID, _EVENT_TIME)
