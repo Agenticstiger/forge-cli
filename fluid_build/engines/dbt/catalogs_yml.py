@@ -40,10 +40,12 @@ released and lands in dbt Fusion first, so emitting it today would produce a
 file no released dbt can parse. :func:`_render_v1` is deliberately isolated so a
 ``_render_v2`` can sit beside it once that ships.
 
-**Adapter scope.** Snowflake only, for now. dbt also supports Iceberg on
-Databricks and BigQuery, but their ``catalogs.yml`` shapes differ and are not
-verified here. Emitting a guessed shape is worse than emitting nothing, so other
-adapters return ``None`` and the file is simply not written.
+**Adapter scope.** Snowflake and BigQuery. Their shapes genuinely differ:
+Snowflake's ``external_volume`` is an object NAME (an EXTERNAL VOLUME that must
+exist), while BigQuery's is a bare ``gs://`` URI, and BigQuery adds
+``file_format``. Databricks is not covered because its shape is not verified
+here, and emitting a guessed shape is worse than emitting nothing, so it
+returns ``None`` and the file is simply not written.
 
 **Zero drift.** Catalog identity comes from
 :func:`fluid_build.providers._iceberg_catalog.resolve_iceberg_catalog`, the same
@@ -65,6 +67,7 @@ import yaml
 from fluid_build.providers._iceberg_catalog import (
     EXTERNAL_ICEBERG_CATALOGS,
     iceberg_external_volume_name,
+    iceberg_storage_uri,
     resolve_iceberg_catalog,
 )
 
@@ -88,8 +91,14 @@ _CATALOG_TYPE_REST = "iceberg_rest"
 #: unlisted catalog maps to ``built_in``.
 _EXTERNAL_CATALOGS = EXTERNAL_ICEBERG_CATALOGS
 
-#: Only Snowflake's shape is verified against dbt's documentation.
-_SUPPORTED_ADAPTERS = frozenset({"snowflake"})
+#: BigQuery's only catalog type. dbt's docs are explicit that the metastore
+#: itself needs no setup because it is built into BigQuery: the prerequisite
+#: is the GCS bucket, which the GCP IaC emitter creates.
+_CATALOG_TYPE_BIGLAKE = "biglake_metastore"
+
+#: Adapters whose shape is verified against dbt's documentation. Databricks
+#: is deliberately absent.
+_SUPPORTED_ADAPTERS = frozenset({"snowflake", "bigquery"})
 
 
 def _is_iceberg_expose(expose: Mapping[str, Any]) -> bool:
@@ -143,6 +152,31 @@ def _adapter_properties(
     return props
 
 
+def _bigquery_write_integration(
+    contract: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    *,
+    integration_name: str,
+) -> Optional[Dict[str, Any]]:
+    """BigQuery's shape: ``biglake_metastore`` over a ``gs://`` URI.
+
+    Unlike Snowflake, ``external_volume`` here is the storage URI itself, not
+    the name of an object that must already exist, and ``file_format`` is
+    required. Returns ``None`` when no bucket is derivable, since a
+    ``biglake_metastore`` integration without storage is not usable.
+    """
+    storage_uri = iceberg_storage_uri(binding, scheme="gs")
+    if not storage_uri:
+        return None
+    return {
+        "name": integration_name,
+        "external_volume": storage_uri,
+        "table_format": "iceberg",
+        "file_format": "parquet",
+        "catalog_type": _CATALOG_TYPE_BIGLAKE,
+    }
+
+
 def _write_integration(
     contract: Mapping[str, Any],
     expose: Mapping[str, Any],
@@ -194,7 +228,8 @@ def generate_catalogs_yml(
     """
     from . import _types as _types
 
-    if _types.adapter_for_build(build) not in _SUPPORTED_ADAPTERS:
+    adapter = _types.adapter_for_build(build)
+    if adapter not in _SUPPORTED_ADAPTERS:
         return None
 
     exposes = contract.get("exposes") or []
@@ -207,13 +242,21 @@ def generate_catalogs_yml(
         if not expose_id:
             continue
         catalog_name, integration_name = _catalog_names(expose_id, seen_names)
+        if adapter == "bigquery":
+            integration = _bigquery_write_integration(
+                contract, expose.get("binding") or {}, integration_name=integration_name
+            )
+            if integration is None:
+                # No derivable bucket, so a biglake_metastore integration
+                # would name storage that does not exist.
+                continue
+        else:
+            integration = _write_integration(contract, expose, integration_name=integration_name)
         catalogs.append(
             {
                 "name": catalog_name,
                 "active_write_integration": integration_name,
-                "write_integrations": [
-                    _write_integration(contract, expose, integration_name=integration_name)
-                ],
+                "write_integrations": [integration],
             }
         )
 
