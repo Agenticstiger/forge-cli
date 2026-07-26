@@ -42,8 +42,16 @@ CONTRACT = REPO_ROOT / "examples" / "snowflake" / "smoke" / "contract.fluid.yaml
 
 @pytest.fixture()
 def contract() -> dict:
+    """The contract as ``cmd_opds_export`` hands it to the v4.1 exporter.
+
+    The CLI resolves ``{{ env.* }}`` before rendering, so a test that feeds
+    ``_export_odps_v4_1`` a raw dict is not exercising the CLI path — and would
+    compare an unresolved document against a resolved one.
+    """
+    from fluid_build.cli._export_env import resolve_for_export
+
     with open(CONTRACT) as handle:
-        return yaml.safe_load(handle)
+        return resolve_for_export(yaml.safe_load(handle))
 
 
 # ---------------------------------------------------------------------------
