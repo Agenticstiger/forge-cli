@@ -14,20 +14,45 @@ pattern is familiar.
 
 In-tree clouds register on import (see ``iac/__init__.py``). External packages
 register a NEW cloud the same way a provider/validator plugin does — via an
-entry-point under ``fluid_build.iac_providers`` — so adding a cloud needs **zero
-edits to forge-cli core**, fulfilling the framework's modularity promise.
-Discovery routes through the unified :mod:`fluid_build.plugin_manager` (shared
-allow/block policy + per-plugin fail-isolation).
+entry-point under ``fluid_build.iac_providers``. Discovery routes through the
+unified :mod:`fluid_build.plugin_manager` (shared allow/block policy +
+per-plugin fail-isolation), and :func:`iac.cutover.default_engine` reads this
+registry, so a registered plugin cloud routes to the OpenTofu apply engine
+with no core edit.
+
+**What still requires a core edit** (this module previously claimed "zero
+edits to forge-cli core", which was not true end-to-end):
+
+* ``binding.platform`` / ``builds[].execution.runtime.platform`` is a **closed
+  enum** in every shipped ``fluid-schema-*.json``. A contract naming a plugin
+  cloud is rejected at validation, before the provider is ever consulted.
+  Opening the enum is a schema-evolution decision, not a registry change.
+* The global ``fluid --provider`` flag's ``choices=`` list is hardcoded in
+  ``cli/__init__.py``. Deriving it from this registry would force plugin
+  discovery — i.e. third-party ``ep.load()`` — on every ``fluid --help``,
+  which is the attack surface the lazy ``command`` role deliberately avoids.
+
+So an out-of-tree cloud is reachable through ``--provider`` only for
+contracts whose declared platform the schema already admits.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 from .base import IacProviderPlugin
 
 IAC_PLUGINS: Dict[str, IacProviderPlugin] = {}
+
+#: Names registered from the ``fluid_build.iac_providers`` entry-point group,
+#: i.e. clouds that live OUTSIDE this repo. ``iac.cutover.default_engine``
+#: reads it: an out-of-tree cloud cannot be listed in
+#: ``OPENTOFU_DEFAULT_PROVIDERS`` without the core edit the plugin system
+#: exists to avoid, so its presence here is what routes it to the OpenTofu
+#: engine. In-tree clouds are NOT recorded — the frozenset stays their single
+#: cutover switch.
+IAC_ENTRYPOINT_PLUGINS: Set[str] = set()
 
 
 def register_iac_plugin(name: str, plugin: IacProviderPlugin) -> None:
@@ -81,5 +106,10 @@ def discover_iac_entrypoints(logger: Optional[logging.Logger] = None) -> None:
         except Exception as e:  # noqa: BLE001 - isolate a bad plugin, log by type only
             log.warning("iac plugin %r failed to instantiate: %s", name, type(e).__name__)
             continue
-        register_iac_plugin(getattr(plugin, "name", name) or name, plugin)
+        cloud = getattr(plugin, "name", name) or name
+        register_iac_plugin(cloud, plugin)
+        if cloud in IAC_PLUGINS:
+            # Only record what actually registered — a name the allow/block
+            # policy rejected must not route to the OpenTofu engine.
+            IAC_ENTRYPOINT_PLUGINS.add(cloud)
         log.debug("registered external iac plugin %r", name)

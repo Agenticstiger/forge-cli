@@ -18,8 +18,25 @@ The operator-facing window onto the unified plugin manager: it enumerates every
 installed plugin per role (provider / validator / catalog / iac_provider /
 custom_scaffold) and shows whether the operator allow/block policy
 (``FLUID_PLUGINS_ALLOWLIST`` / ``FLUID_PLUGINS_BLOCKLIST``) currently lets it
-load. Read-only and side-effect-free — it reads entry-point *names* only and
-never imports plugin code.
+load. The listing itself reads entry-point *names* only (see
+``plugin_manager.installed_plugins``); ``--detailed`` additionally loads the
+ALLOWED plugins to read their declared metadata.
+
+**This command does not give you a plugin-free process.** CLI bootstrap builds
+the whole argparse tree before dispatch, and two roles feed argparse
+``choices=`` from their registries — ``iac_provider`` (via
+``cli/generate_iac.py``) and ``modeling_technique`` (via
+``cli/forge_data_model.py``). Their entry points are therefore ``ep.load()``-ed
+on **every** invocation, ``fluid --version`` and ``fluid plugins`` included.
+The ``command`` role is genuinely lazy and is not imported until dispatched.
+
+To inspect an untrusted plugin set without executing it, block it first::
+
+    FLUID_PLUGINS_BLOCKLIST=suspicious-plugin fluid plugins
+
+The policy is enforced before ``ep.load()`` in every discovery path, so a
+blocked plugin's module is never imported. Plugin code is otherwise
+uncontained (no sandboxing, no timeout, runs in-process) — see ``SECURITY.md``.
 """
 
 from __future__ import annotations
