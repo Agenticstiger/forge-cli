@@ -344,6 +344,77 @@ class TestRun(unittest.TestCase):
             run(args, LOG)
 
 
+class TestProviderFlagGate(unittest.TestCase):
+    """``fluid plan --provider <unknown>`` must reject, like apply and test.
+
+    ``--provider`` only reaches ``build_provider`` on the legacy planner path
+    and the opt-in cost/sovereignty hooks — the ``providerActions[]`` path
+    never reads it. So a bogus value was accepted, discarded, and a normal
+    plan printed with exit 0, while ``fluid apply --provider nosuchcloud``
+    exited 2 with ``provider_unknown``. An option that is accepted and
+    ignored is a silent no-op.
+    """
+
+    @patch("fluid_build.cli.plan.write_json_idempotent")
+    @patch("fluid_build.cli.plan._display_plan_simple")
+    @patch("fluid_build.cli.plan._plan_legacy")
+    @patch("fluid_build.cli.plan._should_use_provider_actions")
+    @patch("fluid_build.cli.plan.load_contract_with_overlay")
+    def test_unknown_provider_is_rejected(
+        self, mock_load, mock_should_use, mock_legacy, _mock_display, _mock_write
+    ):
+        from fluid_build.cli._common import CLIError
+
+        mock_load.return_value = _minimal_contract()
+        # Route through the provider-actions path — the one that never read
+        # the flag — so the gate, not build_provider, is what rejects.
+        mock_should_use.return_value = True
+        args = _make_args(provider="nosuchcloud")
+        with self.assertRaises(CLIError) as ctx:
+            run(args, LOG)
+        self.assertEqual(ctx.exception.event, "provider_unknown")
+        self.assertEqual(ctx.exception.exit_code, 2)
+        mock_legacy.assert_not_called()
+
+    @patch("fluid_build.cli.plan.write_json_idempotent")
+    @patch("fluid_build.cli.plan._display_plan_simple")
+    @patch("fluid_build.cli.plan._plan_legacy")
+    @patch("fluid_build.cli.plan._should_use_provider_actions")
+    @patch("fluid_build.cli.plan.load_contract_with_overlay")
+    def test_known_provider_still_plans(
+        self, mock_load, mock_should_use, mock_legacy, _mock_display, _mock_write
+    ):
+        mock_load.return_value = _minimal_contract()
+        mock_should_use.return_value = False
+        mock_legacy.return_value = {
+            "format_version": "0.5.7",
+            "actions": [],
+            "total_actions": 0,
+            "contract": {"name": "Test", "version": "0.5.7"},
+        }
+        args = _make_args(provider="snowflake", out="/tmp/plan_provider_ok.json")
+        self.assertEqual(run(args, LOG), 0)
+
+    @patch("fluid_build.cli.plan.write_json_idempotent")
+    @patch("fluid_build.cli.plan._display_plan_simple")
+    @patch("fluid_build.cli.plan._plan_legacy")
+    @patch("fluid_build.cli.plan._should_use_provider_actions")
+    @patch("fluid_build.cli.plan.load_contract_with_overlay")
+    def test_absent_provider_leaves_contract_detection_alone(
+        self, mock_load, mock_should_use, mock_legacy, _mock_display, _mock_write
+    ):
+        mock_load.return_value = _minimal_contract()
+        mock_should_use.return_value = False
+        mock_legacy.return_value = {
+            "format_version": "0.5.7",
+            "actions": [],
+            "total_actions": 0,
+            "contract": {"name": "Test", "version": "0.5.7"},
+        }
+        args = _make_args(out="/tmp/plan_provider_none.json")
+        self.assertEqual(run(args, LOG), 0)
+
+
 # ---------------------------------------------------------------------------
 # Action schema (Phase 6D — plan.py → apply.py dispatch invariant)
 # ---------------------------------------------------------------------------

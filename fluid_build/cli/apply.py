@@ -328,6 +328,25 @@ def _gate_contract_for_apply(contract: Dict[str, Any], logger: logging.Logger) -
 # ==========================================
 
 
+class _RetiredBuildFlagAction(argparse.Action):
+    """Fail ``--build`` with the migration instruction instead of guessing.
+
+    ``--build`` was the pre-mode-matrix way to run a contract's builds.
+    Silently reinterpreting it (as prefix abbreviation to ``--build-id`` did)
+    is the worst outcome on a command that provisions and destroys
+    infrastructure: the value the operator meant as "run the builds" became a
+    filter string, and their contract path stopped being the contract.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(
+            "--build was replaced by the apply mode matrix. Use "
+            "`--mode amend-and-build` (or `--mode replace-and-build`) to run "
+            "the contract's builds, and `--build-id <id>` to filter to one "
+            "build. See `fluid apply --help`."
+        )
+
+
 def register(subparsers: argparse._SubParsersAction):
     """Register the apply command with comprehensive options"""
     p = subparsers.add_parser(
@@ -342,6 +361,17 @@ def register(subparsers: argparse._SubParsersAction):
             "Docs: https://github.com/open-data-protocol/fluid/blob/main/docs/apply.md"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        # No prefix abbreviation on the platform's mutation command.
+        # argparse's default expands any unambiguous prefix, so the retired
+        # ``--build <contract>`` (replaced by the mode matrix) silently
+        # resolved to ``--build-id`` and bound the operator's contract PATH
+        # as a build-id filter. The positional then fell back to CWD
+        # auto-discovery and apply ran the DDL phase against a contract the
+        # user never named — on the observed run it planned a destructive
+        # change and was stopped only by the OpenTofu destroy gate. A typo'd
+        # flag on a destructive command must be an error, not a
+        # reinterpretation.
+        allow_abbrev=False,
     )
 
     # Core arguments
@@ -535,6 +565,21 @@ def register(subparsers: argparse._SubParsersAction):
 
     # Build execution (absorbed from 'fluid execute')
     build_group = p.add_argument_group("Build Execution")
+    # ``--build`` was retired when the mode matrix replaced it; its
+    # auto-upgrade path (``resolve_mode_with_build_alias``) is gone. With
+    # argparse's default prefix abbreviation it nevertheless resolved to
+    # ``--build-id``, so ``fluid apply --build contract.fluid.yaml`` bound
+    # the operator's CONTRACT PATH as a build-id filter and applied an
+    # auto-discovered contract instead. ``allow_abbrev=False`` on the parser
+    # closes that; this explicit registration turns the resulting bare
+    # "unrecognized arguments" into the actual migration instruction.
+    build_group.add_argument(
+        "--build",
+        dest="_retired_build",
+        action=_RetiredBuildFlagAction,
+        nargs="?",
+        help=argparse.SUPPRESS,
+    )
     build_group.add_argument(
         "--build-id",
         dest="build_id",

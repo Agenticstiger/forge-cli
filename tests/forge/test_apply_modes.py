@@ -336,12 +336,29 @@ class TestCliRegistration:
         )
         assert args.allow_data_loss is True
 
-    def test_build_flag_still_parses_for_back_compat(self):
-        """``--build X`` without ``--mode`` must still parse (parser layer).
-        The deprecation warning fires in run(), not argparse."""
-        args = self._parser().parse_args(["apply", "c.yaml", "--build", "orders"])
+    def test_retired_build_flag_is_rejected_not_reinterpreted(self):
+        """``--build`` was retired with the mode matrix and its auto-upgrade
+        path (``resolve_mode_with_build_alias``) deleted — nothing in ``run()``
+        handles it. argparse's prefix abbreviation nevertheless resolved it to
+        ``--build-id``, so ``fluid apply --build contract.fluid.yaml`` bound
+        the operator's CONTRACT PATH as a build-id filter, left the positional
+        empty, auto-discovered a different contract from the CWD and entered
+        the DDL apply phase against it. On a command with destructive modes a
+        retired flag must be an error, never a reinterpretation."""
+        with pytest.raises(SystemExit):
+            self._parser().parse_args(["apply", "c.yaml", "--build", "orders"])
+
+    def test_build_id_is_the_supported_filter(self):
+        args = self._parser().parse_args(["apply", "c.yaml", "--build-id", "orders"])
         assert args.build_id == "orders"
-        assert args.mode is None  # deprecation resolution happens in run()
+        assert args.mode is None
+
+    def test_no_flag_is_prefix_abbreviated_on_apply(self):
+        """``allow_abbrev=False``: an unambiguous prefix of a real flag is
+        still an error, so no future flag can silently absorb another's
+        value."""
+        with pytest.raises(SystemExit):
+            self._parser().parse_args(["apply", "c.yaml", "--allow-data", "x"])
 
     def test_mode_default_is_none_for_resolution_logic(self):
         """``--mode`` defaults to None (not 'amend'). The real default is
