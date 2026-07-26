@@ -327,6 +327,104 @@ class SnowflakeIacPlugin:
             ]
         }
 
+    def suppressed_drift(
+        self,
+        contract: Mapping[str, Any],
+        prior_resources: Iterable[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Report column drift this emitter's ``ignore_changes`` swallows.
+
+        ``_emit_snowflake`` pins ``lifecycle.ignore_changes = ["column"]`` on
+        every ``snowflake_table`` so a re-apply never fights the build
+        engine's ``CREATE OR REPLACE`` (Snowflake rejects most in-place scale
+        changes anyway). The cost is that ``tofu`` reports ``~1``/``+0 ~0 -0``
+        and exit 0 for a contract whose declared column types no longer match
+        the live table — including under ``--mode replace``, the *destructive*
+        reconcile mode, where the operator has every reason to believe the
+        table was rebuilt to match.
+
+        This turns that silence into a report. ``prior_resources`` is the
+        refreshed pre-apply state (``tofu show -json <planfile>`` →
+        ``prior_state.values.root_module.resources``); each entry's
+        ``values.column`` is what Snowflake actually has. Comparison is at
+        type-family granularity — the same folding ``fluid verify`` uses — so
+        a widened precision (``VARCHAR`` → ``VARCHAR(16777216)``) is not
+        reported as drift.
+
+        Returns one record per drifted table; an empty list means the
+        declared schema and the live table agree.
+        """
+        from fluid_build.providers.snowflake.util.typefamily import (
+            normalize_snowflake_field_name as _fold_name,
+        )
+        from fluid_build.providers.snowflake.util.typefamily import (
+            normalize_snowflake_type as _fold_type,
+        )
+
+        by_name: Dict[str, Mapping[str, Any]] = {}
+        for resource in prior_resources or []:
+            if not isinstance(resource, Mapping):
+                continue
+            if resource.get("type") != "snowflake_table":
+                continue
+            name = resource.get("name")
+            if isinstance(name, str):
+                by_name[name] = resource.get("values") or {}
+
+        if not by_name:
+            return []
+
+        cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        drift: List[Dict[str, Any]] = []
+        for exposure in contract.get("exposes") or []:
+            binding = exposure.get("binding") or {}
+            if binding.get("platform") != "snowflake":
+                continue
+            if binding.get("format") == "snowflake_view":
+                continue
+            loc = binding.get("location") or {}
+            database, schema, table = (
+                loc.get("database"),
+                loc.get("schema"),
+                loc.get("table") or loc.get("view"),
+            )
+            if not (database and schema and table):
+                continue
+            live = by_name.get(safe_ident(f"{cid}_{database}_{schema}_{table}"))
+            if live is None:
+                continue  # not yet in state — this apply creates it
+
+            declared = {
+                _fold_name(str(col.get("name"))): _fold_type(str(col.get("type") or ""))
+                for col in ((exposure.get("contract") or {}).get("schema") or [])
+                if col.get("name")
+            }
+            actual = {
+                _fold_name(str(col.get("name"))): _fold_type(str(col.get("type") or ""))
+                for col in (live.get("column") or [])
+                if isinstance(col, Mapping) and col.get("name")
+            }
+            if not declared or not actual:
+                continue
+
+            mismatched = [
+                {"column": name, "declared": declared[name], "live": actual[name]}
+                for name in declared
+                if name in actual and declared[name] != actual[name]
+            ]
+            missing = sorted(set(declared) - set(actual))
+            extra = sorted(set(actual) - set(declared))
+            if mismatched or missing or extra:
+                drift.append(
+                    {
+                        "table": f"{database}.{schema}.{table}",
+                        "type_mismatches": mismatched,
+                        "missing": missing,
+                        "extra": extra,
+                    }
+                )
+        return drift
+
 
 def _db_key(cid: str, database: str) -> str:
     """OpenTofu resource name for a contract's ``snowflake_database``."""

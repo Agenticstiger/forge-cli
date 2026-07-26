@@ -142,6 +142,13 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
     changes = runner.change_summary(plan)
     cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
 
+    # Report what the plan's ``lifecycle.ignore_changes`` deliberately hides.
+    # Without this, a contract whose column types no longer match the live
+    # table plans clean and applies with exit 0 — including under the
+    # destructive ``--mode replace``, where the operator reasonably reads
+    # "apply complete" as "the table now matches the contract".
+    _report_suppressed_drift(plugin, contract, str(workdir), env, args, logger)
+
     # Data-loss gate — `tofu` has no CTAS/CLONE data snapshot (see
     # AUTOGEN_SPIKE.md, risk R1), so a destructive plan fails closed.
     allow_data_loss = bool(getattr(args, "allow_data_loss", False))
@@ -159,9 +166,15 @@ def apply_via_opentofu(args, logger: logging.Logger) -> int:
         # logged at WARNING so CI log-scrapers + operators have a
         # paper-trail. Matches the same posture as the native engine's
         # _verify_plan_binding bypass warning.
+        cprint(
+            f"\n  ⚠️  --allow-data-loss: {changes['remove']} resource(s) will be "
+            "DESTROYED and no pre-replace snapshot is taken — this engine has "
+            "no CTAS/CLONE step, so `fluid rollback` will have no restore point."
+        )
         logger.warning(
             "--allow-data-loss: bypassing the data-loss gate; %d resource(s) "
-            "will be destroyed by `tofu apply`. Provider: %s. Plan changes: "
+            "will be destroyed by `tofu apply` with NO pre-replace snapshot "
+            "(`fluid rollback` has no restore point). Provider: %s. Plan changes: "
             "+%d ~%d -%d.",
             int(changes.get("remove", 0)),
             provider,
@@ -386,6 +399,67 @@ def _guard_packaging_transitions(
             containers=[t.as_event() for t in adoptions],
             count=len(adoptions),
         )
+
+
+def _report_suppressed_drift(
+    plugin: Any,
+    contract: Mapping[str, Any],
+    workdir: str,
+    env: Mapping[str, str],
+    args,
+    logger: logging.Logger,
+) -> None:
+    """Surface drift the emitted module's ``ignore_changes`` suppresses.
+
+    Optional plugin capability: a cloud plugin that pins
+    ``lifecycle.ignore_changes`` on an attribute derived from the contract
+    implements ``suppressed_drift(contract, prior_resources)`` and returns
+    one record per drifted object. Plugins without it are silently skipped,
+    so this stays a no-op for every other cloud.
+
+    Reporting, not gating. ``ignore_changes`` on Snowflake columns is a
+    deliberate design decision (the build engine owns the real column types,
+    and Snowflake rejects most in-place scale changes) — the defect was that
+    the apply said nothing about it. ``fluid verify --strict`` remains the
+    gate; this makes sure the operator knows to run it.
+    """
+    detect = getattr(plugin, "suppressed_drift", None)
+    if not callable(detect):
+        return
+    try:
+        prior = runner.tofu_prior_state_resources(workdir, env=env)
+        drift = detect(contract, prior)
+    except Exception as exc:  # noqa: BLE001 — advisory only, never fails an apply
+        logger.debug("suppressed-drift report unavailable: %s", type(exc).__name__)
+        return
+    if not drift:
+        return
+
+    mode = str(getattr(args, "mode", None) or "amend")
+    for record in drift:
+        details = []
+        for item in record.get("type_mismatches") or []:
+            details.append(f"{item['column']}: contract={item['declared']} live={item['live']}")
+        for name in record.get("missing") or []:
+            details.append(f"{name}: declared but absent from the live table")
+        for name in record.get("extra") or []:
+            details.append(f"{name}: present in the live table but not declared")
+        cprint(
+            f"\n  ⚠️  column drift NOT reconciled on {record['table']} "
+            f"(mode={mode}): " + "; ".join(details)
+        )
+        logger.warning(
+            "opentofu_suppressed_column_drift table=%s mode=%s details=%s",
+            record["table"],
+            mode,
+            "; ".join(details),
+        )
+    cprint(
+        "      The emitted module pins lifecycle.ignore_changes=[\"column\"], so "
+        "`tofu` will not alter these columns — the build engine owns the "
+        "materialized types. Run `fluid verify --strict` to gate on it."
+    )
+    warn(logger, "opentofu_suppressed_drift_reported", tables=[r["table"] for r in drift])
 
 
 def _data_loss_blocked(changes: Mapping[str, int], allow_data_loss: bool) -> bool:

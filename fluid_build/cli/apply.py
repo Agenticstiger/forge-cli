@@ -1510,11 +1510,27 @@ def run(args, logger: logging.Logger) -> int:
     # a cheap ``estimate_row_count()`` and pass it in. For now, the gate's
     # default behavior is "non-dev + replace → require --allow-data-loss
     # unless you can prove the target is empty."
+    #
+    # Apply-engine resolution is automatic and per-provider — no user switch.
+    # It is resolved HERE, before the gate, because the gate's message
+    # depends on it: only the native path plans the pre-flight zero-copy
+    # CLONE (``providers/*/plan`` ``rollback_snapshot`` markers) and writes
+    # ``.fluid/rollback-state.json``. `tofu` has no CTAS/CLONE step, so on
+    # the cloud path there is no snapshot and no restore point — and the
+    # gate must not promise one it cannot deliver.
+    from fluid_build.cli._apply_opentofu_engine import (
+        apply_via_opentofu,
+        resolve_apply_engine,
+    )
+
+    apply_engine = resolve_apply_engine(args, logger)
+
     gate = check_data_loss_gate(
         resolved_mode,
         env=args.env,
         target_row_count=None,  # unknown until provider check added
         allow_data_loss=bool(getattr(args, "allow_data_loss", False)),
+        snapshot_available=apply_engine != "opentofu",
     )
     if gate.blocked:
         raise CLIError(
@@ -1523,15 +1539,7 @@ def run(args, logger: logging.Logger) -> int:
             {"mode": resolved_mode.value, "env": args.env, "reason": gate.reason},
         )
 
-    # Apply-engine resolution is automatic and per-provider — no user
-    # switch. The cloud providers compile the contract to `.tf.json` and
-    # delegate to `tofu`; `local` keeps the native path below.
-    from fluid_build.cli._apply_opentofu_engine import (
-        apply_via_opentofu,
-        resolve_apply_engine,
-    )
-
-    if resolve_apply_engine(args, logger) == "opentofu":
+    if apply_engine == "opentofu":
         # Apply-time plugin hooks run on EVERY engine. They used to be
         # invoked only from the native path's YAML branch, several hundred
         # lines below this early return — so for aws / gcp / snowflake /

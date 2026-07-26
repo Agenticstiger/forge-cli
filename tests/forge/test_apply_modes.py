@@ -236,6 +236,27 @@ class TestDataLossGate:
         assert "__backup_" in result.reason
         assert "fluid rollback" in result.reason
 
+    def test_gate_reason_does_not_promise_a_snapshot_the_engine_cannot_take(self):
+        """Only the native apply path plans the pre-flight CLONE and writes
+        ``.fluid/rollback-state.json``. The OpenTofu engine — the default for
+        every cloud provider — has no CTAS/CLONE step, so promising
+        ``<target>__backup_<ts>`` there tells an operator they have a restore
+        point they do not have. The message must say the opposite."""
+        result = check_data_loss_gate(
+            ApplyMode.REPLACE,
+            env="prod",
+            target_row_count=777,
+            allow_data_loss=False,
+            snapshot_available=False,
+        )
+        assert result.blocked
+        assert "__backup_<ts> table is created" in result.reason
+        assert "NO SNAPSHOT WILL BE TAKEN" in result.reason
+        assert "no restore point" in result.reason
+        # The opt-in incantation is still spelled out — this is an honesty
+        # fix, not a removal of the remediation.
+        assert "--allow-data-loss" in result.reason
+
     @pytest.mark.parametrize("env_variant", ["dev", "DEV", "  dev  ", "development"])
     def test_dev_variants_normalized(self, env_variant):
         """``env='  dev  '`` / ``'DEV'`` / ``'development'`` all count as

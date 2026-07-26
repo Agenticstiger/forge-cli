@@ -252,6 +252,37 @@ def tofu_state_list(workdir: str, *, env: Optional[Mapping[str, str]] = None) ->
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
+def tofu_prior_state_resources(
+    workdir: str,
+    *,
+    plan_file: str = "tfplan",
+    env: Optional[Mapping[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Resources in the refreshed pre-apply state, from ``tofu show -json``.
+
+    ``tofu plan -out=<plan_file>`` records the state as refreshed from the
+    cloud, so this is what the provider *actually* has right now — including
+    attributes ``lifecycle.ignore_changes`` suppressed from the diff, which
+    ``resource_changes`` by definition does not carry.
+
+    Best-effort like :func:`tofu_state_list`: an unreadable / absent plan or
+    an older ``tofu`` returns ``[]`` and callers treat that as "nothing to
+    compare", never as an apply failure.
+    """
+    result = _run(
+        ["show", "-json", plan_file], workdir=workdir, env=env, command="show-plan"
+    )
+    if not result.ok:
+        return []
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return []
+    root = ((payload.get("prior_state") or {}).get("values") or {}).get("root_module") or {}
+    resources = root.get("resources")
+    return [r for r in resources if isinstance(r, dict)] if isinstance(resources, list) else []
+
+
 def tofu_import(
     workdir: str,
     address: str,

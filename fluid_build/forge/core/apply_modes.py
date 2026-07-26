@@ -127,8 +127,20 @@ def check_data_loss_gate(
     env: Optional[str],
     target_row_count: Optional[int],
     allow_data_loss: bool,
+    snapshot_available: bool = True,
 ) -> DataLossGateResult:
     """Decide whether a destructive mode may proceed.
+
+    ``snapshot_available`` says whether the apply engine that will actually
+    run takes the pre-flight zero-copy snapshot. Only the native path does:
+    its planners emit ``rollback_snapshot`` markers and the apply writes
+    ``.fluid/rollback-state.json``. The OpenTofu engine — the default for
+    every cloud in ``iac.cutover.OPENTOFU_DEFAULT_PROVIDERS`` — has no
+    CTAS/CLONE step, so there is no backup table and ``fluid rollback`` has
+    nothing to restore. The gate's message MUST reflect that: an operator
+    who reads "will be snapshotted", passes ``--allow-data-loss`` and drops
+    a populated table has been told they have a restore point they do not
+    have.
 
     Rules (in order of evaluation):
 
@@ -174,11 +186,22 @@ def check_data_loss_gate(
     else:
         row_part = f"target has {target_row_count:,} row(s)"
 
+    if snapshot_available:
+        recovery_part = (
+            "The pre-replace table will be snapshotted to <target>__backup_<ts> "
+            "so `fluid rollback` can restore it."
+        )
+    else:
+        recovery_part = (
+            "NO SNAPSHOT WILL BE TAKEN: this contract applies through the "
+            "OpenTofu engine, which has no CTAS/CLONE step, so no "
+            "<target>__backup_<ts> table is created and `fluid rollback` will "
+            "have no restore point. Back the target up yourself before "
+            "proceeding."
+        )
     reason = (
         f"--mode {mode.value} is destructive ({env_part}; {row_part}). "
-        f"Pass --allow-data-loss to confirm the drop. The pre-replace table "
-        f"will be snapshotted to <target>__backup_<ts> so `fluid rollback` "
-        f"can restore it."
+        f"Pass --allow-data-loss to confirm the drop. {recovery_part}"
     )
     return DataLossGateResult(blocked=True, reason=reason)
 

@@ -38,6 +38,11 @@ from fluid_build.cli.console import error as console_error
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 from fluid_build.providers._sql_safety import validate_ident
 from fluid_build.providers.snowflake.util.config import resolve_env_templates
+from fluid_build.providers.snowflake.util.typefamily import (
+    SNOWFLAKE_TYPE_FAMILIES,
+    normalize_snowflake_field_name,
+    normalize_snowflake_type,
+)
 
 from ._common import CLIError, load_contract_with_overlay
 
@@ -92,41 +97,12 @@ def _contract_is_reference_only(contract: Dict[str, Any]) -> bool:
     return False
 
 
-_SNOWFLAKE_TYPE_FAMILIES = {
-    "STRING": {"VARCHAR", "CHAR", "CHARACTER", "TEXT", "STRING"},
-    "NUMBER": {
-        "NUMBER",
-        "DECIMAL",
-        "NUMERIC",
-        "INT",
-        "INTEGER",
-        "BIGINT",
-        "SMALLINT",
-        "TINYINT",
-        "BYTEINT",
-        "FLOAT",
-        "FLOAT4",
-        "FLOAT8",
-        "DOUBLE",
-        "DOUBLE PRECISION",
-        "REAL",
-    },
-    "BOOLEAN": {"BOOLEAN", "BOOL"},
-    "DATE": {"DATE"},
-    "TIME": {"TIME"},
-    "TIMESTAMP": {
-        "TIMESTAMP",
-        "TIMESTAMP_NTZ",
-        "TIMESTAMP_LTZ",
-        "TIMESTAMP_TZ",
-        "DATETIME",
-        "TIMESTAMP WITHOUT TIME ZONE",
-        "TIMESTAMP WITH LOCAL TIME ZONE",
-        "TIMESTAMP WITH TIME ZONE",
-    },
-    "BINARY": {"BINARY", "VARBINARY", "BYTES"},
-    "VARIANT": {"VARIANT", "JSON", "JSONB", "OBJECT", "ARRAY"},
-}
+# Re-exported from the shared Snowflake type-folding module so ``fluid
+# verify`` and the OpenTofu apply engine compare a contract against a live
+# table with one table of aliases, not two hand-mirrored copies.
+_SNOWFLAKE_TYPE_FAMILIES = SNOWFLAKE_TYPE_FAMILIES
+_normalize_snowflake_type = normalize_snowflake_type
+_normalize_snowflake_field_name = normalize_snowflake_field_name
 
 
 def register(sp: argparse._SubParsersAction) -> None:
@@ -473,19 +449,6 @@ def verify_bigquery_table(
     except Exception as e:
         LOG.error(f"Error verifying table {table}: {e}")
         return {"status": "error", "error": str(e), "exists": False}
-
-
-def _normalize_snowflake_type(value: str) -> str:
-    base = (value or "STRING").upper().split("(", 1)[0].strip()
-    for family, aliases in _SNOWFLAKE_TYPE_FAMILIES.items():
-        if base in aliases:
-            return family
-    return base
-
-
-def _normalize_snowflake_field_name(value: str) -> str:
-    """Snowflake folds unquoted identifiers to uppercase."""
-    return (value or "").upper()
 
 
 def _quote_qualified_snowflake_name(database: str, schema: str, table: str) -> str:
