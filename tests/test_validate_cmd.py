@@ -68,9 +68,7 @@ def test_untagged_contract_never_auto_selects_a_preview_version():
 
     schema_manager = MagicMock()
     schema_manager.detect_version.return_value = None
-    schema_manager.list_available_versions.return_value = list(
-        FluidSchemaManager.BUNDLED_VERSIONS
-    )
+    schema_manager.list_available_versions.return_value = list(FluidSchemaManager.BUNDLED_VERSIONS)
 
     version, auto_selected = _determine_target_version(
         contract={},
@@ -92,9 +90,7 @@ def test_an_explicit_min_version_can_still_opt_into_a_preview():
     preview = sorted(FluidSchemaManager.PREVIEW_VERSIONS)[-1]
     schema_manager = MagicMock()
     schema_manager.detect_version.return_value = None
-    schema_manager.list_available_versions.return_value = list(
-        FluidSchemaManager.BUNDLED_VERSIONS
-    )
+    schema_manager.list_available_versions.return_value = list(FluidSchemaManager.BUNDLED_VERSIONS)
 
     version, _auto = _determine_target_version(
         contract={},

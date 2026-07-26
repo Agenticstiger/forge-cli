@@ -131,7 +131,9 @@ class TestTheShippedArtifact:
     """Run the same checks against what a consumer installs, not the repo tree."""
 
     @pytest.mark.parametrize(
-        "schema_path", sorted(_installed_schema_dir().glob("fluid-schema-*.json")), ids=lambda p: p.name
+        "schema_path",
+        sorted(_installed_schema_dir().glob("fluid-schema-*.json")),
+        ids=lambda p: p.name,
     )
     def test_the_installed_package_schemas_are_yaml_safe(self, schema_path: Path) -> None:
         _assert_yaml_safe(schema_path.name, schema_path.read_text(encoding="utf-8"))

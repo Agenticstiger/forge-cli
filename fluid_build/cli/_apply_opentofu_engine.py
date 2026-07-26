@@ -375,7 +375,9 @@ def _guard_packaging_transitions(
     import_candidates: List[str] = []
     if plugin is not None:
         try:
-            import_candidates = [str(block.to) for block in plugin.discover_imports(contract, actions)]
+            import_candidates = [
+                str(block.to) for block in plugin.discover_imports(contract, actions)
+            ]
         except Exception as exc:  # pragma: no cover - defensive; guard must not crash apply
             logger.debug("opentofu: import-candidate probe failed: %s", exc)
     try:

@@ -122,7 +122,9 @@ def run(args, logger: logging.Logger) -> int:
     if blocked:
         cprint(f"{blocked} plugin(s) blocked by FLUID_PLUGINS_ALLOWLIST / FLUID_PLUGINS_BLOCKLIST.")
     undispatched = sorted(
-        r for r, entries in data.items() if entries and not all(e.get("dispatched", True) for e in entries)
+        r
+        for r, entries in data.items()
+        if entries and not all(e.get("dispatched", True) for e in entries)
     )
     if undispatched:
         cprint(

@@ -164,7 +164,10 @@ def run(args, logger: logging.Logger) -> int:
             output=str(contract_path),
         )
         if added == 0:
-            cprint(f"= {args.what} '{args.id}' already present in {contract_path} " f"({total} total) — nothing to do")
+            cprint(
+                f"= {args.what} '{args.id}' already present in {contract_path} "
+                f"({total} total) — nothing to do"
+            )
             info(logger, "product_add_duplicate", id=args.id)
         else:
             cprint(f"✅ Added {args.what} '{args.id}' to {contract_path} ({total} total)")
@@ -197,7 +200,9 @@ def _dump_contract(path: Path, contract: Dict[str, Any]) -> None:
         yaml.safe_dump(contract, sort_keys=False, default_flow_style=False, allow_unicode=True),
     )
     if any(line.lstrip().startswith("#") for line in original.splitlines()):
-        cprint(f"⚠  YAML comments in {path} were not preserved (contract rewritten from parsed data)")
+        cprint(
+            f"⚠  YAML comments in {path} were not preserved (contract rewritten from parsed data)"
+        )
 
 
 def _add_source(contract: Dict[str, Any], args) -> Tuple[int, int]:

@@ -864,7 +864,7 @@ class TestRunBigqueryTableFormat:
 
 
 class TestUnverifiableIsNotAFailure:
-    """"We did not check" and "the check failed" must not share an outcome.
+    """ "We did not check" and "the check failed" must not share an outcome.
 
     Every non-verifiable expose used to land in ``error_count``. Once an error
     became fatal, that would have failed `fluid verify` for a contract with a

@@ -302,7 +302,9 @@ def _effective(
     # declaration at all — the kind is vacuous there, and erroring would
     # reject every isolated contract in existence.
     cluster_declared = containers.get("cluster")
-    if cluster_declared == "isolated" or (cluster_declared is None and mode == "isolated" and binds_cluster):
+    if cluster_declared == "isolated" or (
+        cluster_declared is None and mode == "isolated" and binds_cluster
+    ):
         spelling = (
             "containers.cluster: isolated"
             if cluster_declared == "isolated"
