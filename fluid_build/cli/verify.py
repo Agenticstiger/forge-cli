@@ -156,8 +156,12 @@ Examples:
   # Show detailed field-by-field differences
   fluid verify contract.fluid.yaml --show-diffs
 
-  # Exit with error code if mismatches found (CI/CD)
+  # Exit with error code on CRITICAL drift or verification errors (CI/CD)
   fluid verify contract.fluid.yaml --strict
+
+  # Exit with error code on ANY mismatch, including the non-critical drift
+  # --strict downgrades (e.g. a required column that went nullable)
+  fluid verify contract.fluid.yaml --strict --fail-on-warning
 
   # Output machine-readable report
   fluid verify contract.fluid.yaml --out verification-report.json
@@ -181,7 +185,25 @@ Use Cases:
     )
 
     p.add_argument(
-        "--strict", action="store_true", help="Exit with error code if any mismatches found"
+        "--strict",
+        action="store_true",
+        help=(
+            "Exit non-zero on CRITICAL drift (missing fields, type mismatches, "
+            "region drift) and on verification errors. Non-critical drift "
+            "(nullable-vs-required constraints, extra columns) is reported and "
+            "downgraded to a warning — add --fail-on-warning to gate on those too."
+        ),
+    )
+
+    p.add_argument(
+        "--fail-on-warning",
+        dest="fail_on_warning",
+        action="store_true",
+        help=(
+            "Exit non-zero on ANY mismatch, including the non-critical drift "
+            "--strict downgrades. Use for a CI gate that must not let a "
+            "required→nullable change through."
+        ),
     )
 
     p.add_argument("--out", help="Output verification report to JSON file")
@@ -1071,6 +1093,12 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     # cols by default; contracts often declare ``required: true``) —
     # which conflated a known modelling tension with real schema breaks.
     critical_mismatch_count = 0
+    # One entry per non-critical mismatch, carrying the severity assessment
+    # that produced it. The ``--strict`` downgrade message used to assert
+    # "constraint-only drift" for every non-critical class, which is
+    # factually wrong for an extra column (a schema-structure mismatch
+    # graded INFO) — name what is actually being downgraded instead.
+    downgraded_drift: List[str] = []
 
     for expose_name, result in results.items():
         expose_config = exposes_to_verify.get(expose_name, {})
@@ -1218,6 +1246,11 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             mismatch_count += 1
             if severity.get("level") == "CRITICAL":
                 critical_mismatch_count += 1
+            else:
+                downgraded_drift.append(
+                    f"{expose_name}: {severity.get('reason', 'drift detected')} "
+                    f"[{severity.get('level', 'UNKNOWN')}]"
+                )
 
     # ── Acquisition pattern: post-apply probes ─────────────────────────
     # When the contract has any ``pattern: acquisition`` builds, run the
@@ -1412,17 +1445,30 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     # Exit with error code if strict mode and CRITICAL issues found.
     # Non-critical mismatches (e.g. nullable-vs-required constraint
-    # drift) emit warnings to stderr but do NOT fail the build —
-    # operators can tighten the contract incrementally. ``error_count``
-    # always fails (auth issues, connection failures, missing tables
-    # the contract claims should exist).
+    # drift) emit warnings to stderr but do NOT fail the build under
+    # ``--strict`` — operators tighten the contract incrementally, and
+    # dbt creates nullable columns by default so every dbt-built table
+    # would otherwise red-flag. ``error_count`` always fails (auth
+    # issues, connection failures, missing tables the contract claims
+    # should exist). ``--fail-on-warning`` is the opt-in that makes the
+    # exit code cover the downgraded classes too, which is what a CI
+    # gate that must not let a required→nullable change through needs.
     if args.strict and (critical_mismatch_count > 0 or error_count > 0):
         return 1
-    if args.strict and mismatch_count > 0:
+    fail_on_warning = bool(getattr(args, "fail_on_warning", False))
+    if error_count > 0 and fail_on_warning:
+        return 1
+    if mismatch_count > 0 and (args.strict or fail_on_warning):
+        detail = "; ".join(downgraded_drift) if downgraded_drift else "see the report above"
+        if fail_on_warning:
+            console_error(
+                f"--fail-on-warning: {mismatch_count} non-critical mismatch(es) "
+                f"({detail}). Tighten the contract or fix the warehouse to clear them."
+            )
+            return 1
         warning(
-            f"--strict: {mismatch_count} non-critical mismatch(es) downgraded "
-            "to warning (constraint-only drift). Tighten the contract or fix "
-            "the warehouse to clear them."
+            f"--strict: {mismatch_count} non-critical mismatch(es) downgraded to "
+            f"warning ({detail}). Pass --fail-on-warning to gate CI on these too."
         )
 
     return 0

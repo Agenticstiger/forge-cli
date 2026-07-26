@@ -331,3 +331,160 @@ def test_verify_hydration_is_noop_when_no_dotenv_present(
 
     assert os.environ.get("SNOWFLAKE_DATABASE") is None
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+# ---------------------------------------------------------------------------
+# --strict / --fail-on-warning exit-code split
+# ---------------------------------------------------------------------------
+
+
+def _drift_result(level: str, reason: str):
+    """A verify result graded ``level`` with a non-'match' status."""
+    return {
+        "status": "mismatch",
+        "exists": True,
+        "severity": {
+            "symbol": "🟡",
+            "level": level,
+            "impact": "MEDIUM",
+            "remediation": "MANUAL_RECOMMENDED",
+            "reason": reason,
+            "actions": [],
+        },
+        "dimensions": {
+            "structure": {
+                "status": "pass",
+                "matching_fields": ["ID"],
+                "missing_fields": [],
+                "extra_fields": [],
+                "total_expected": 1,
+                "total_actual": 1,
+            },
+            "types": {"status": "pass", "mismatches": []},
+            "constraints": {
+                "status": "fail",
+                "mismatches": [{"field": "ID", "expected": "required", "actual": "nullable"}],
+            },
+            "location": {
+                "status": "pass",
+                "expected": "ANALYTICS.CURATED",
+                "actual": "ANALYTICS.CURATED",
+                "message": None,
+            },
+        },
+        "metadata": {"num_rows": 1, "created": None, "modified": None},
+    }
+
+
+def _run_with_result(tmp_path: Path, result, **arg_overrides) -> int:
+    contract_file = tmp_path / "contract.fluid.yaml"
+    contract_file.write_text("id: snowflake.test\n")
+    contract = {
+        "id": "snowflake.test",
+        "exposes": [
+            {
+                "id": "customers",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_table",
+                    "location": {
+                        "database": "ANALYTICS",
+                        "schema": "CURATED",
+                        "table": "CUSTOMERS",
+                    },
+                },
+                "contract": {"schema": [{"name": "ID", "type": "INTEGER", "required": True}]},
+            }
+        ],
+    }
+    args = _args(str(contract_file), strict=arg_overrides.pop("strict", False))
+    for key, value in arg_overrides.items():
+        setattr(args, key, value)
+
+    with (
+        patch("fluid_build.cli.verify.load_contract_with_overlay", return_value=contract),
+        patch(
+            "fluid_build.providers.snowflake.util.config.resolve_snowflake_settings",
+            return_value={
+                "account": "acme-account",
+                "warehouse": "TRANSFORM_WH",
+                "user": "svc_forge",
+                "password": "secret",
+                "schema": "CURATED",
+            },
+        ),
+        patch("fluid_build.cli.verify.verify_snowflake_table", return_value=result),
+    ):
+        return run(args, logger=__import__("logging").getLogger("test"))
+
+
+def test_strict_downgrades_constraint_drift_to_a_warning(tmp_path: Path):
+    """The documented split: --strict gates on CRITICAL drift only."""
+    code = _run_with_result(
+        tmp_path,
+        _drift_result("WARNING", "Constraint mismatches detected (nullable vs required)"),
+        strict=True,
+        fail_on_warning=False,
+    )
+    assert code == 0
+
+
+def test_fail_on_warning_gates_a_required_to_nullable_break(tmp_path: Path):
+    """Regression: a CI gate had no way to fail on a break the tool itself
+    calls breaking ('Mode changes are breaking'). ``--strict`` alone exits 0
+    and the only documented behaviour was 'Exit with error code if any
+    mismatches found', which was false."""
+    code = _run_with_result(
+        tmp_path,
+        _drift_result("WARNING", "Constraint mismatches detected (nullable vs required)"),
+        strict=True,
+        fail_on_warning=True,
+    )
+    assert code == 1
+
+
+def test_fail_on_warning_works_without_strict(tmp_path: Path):
+    code = _run_with_result(
+        tmp_path,
+        _drift_result("WARNING", "Constraint mismatches detected (nullable vs required)"),
+        strict=False,
+        fail_on_warning=True,
+    )
+    assert code == 1
+
+
+def test_downgrade_message_names_the_actual_drift_class(tmp_path: Path, capsys):
+    """Regression: extra-column drift (INFO, a schema-structure mismatch) was
+    reported as 'constraint-only drift', which is factually wrong."""
+    code = _run_with_result(
+        tmp_path,
+        _drift_result("INFO", "Extra fields found in table (not in contract)"),
+        strict=True,
+        fail_on_warning=False,
+    )
+    assert code == 0
+    out = capsys.readouterr()
+    combined = out.out + out.err
+    assert "constraint-only drift" not in combined
+    assert "Extra fields found in table" in combined
+
+
+def test_fail_on_warning_defaults_off_for_callers_that_omit_it(tmp_path: Path):
+    """``getattr`` default keeps programmatic callers (and older Namespaces)
+    working."""
+    args_result = _drift_result("WARNING", "Constraint mismatches detected")
+    code = _run_with_result(tmp_path, args_result, strict=True)
+    assert code == 0
+
+
+def test_fail_on_warning_flag_is_registered():
+    import argparse as _argparse
+
+    from fluid_build.cli.verify import register
+
+    parser = _argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    register(sub)
+    ns = parser.parse_args(["verify", "c.fluid.yaml", "--strict", "--fail-on-warning"])
+    assert ns.strict is True
+    assert ns.fail_on_warning is True
