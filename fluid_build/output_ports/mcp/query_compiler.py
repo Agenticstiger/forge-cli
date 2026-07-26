@@ -423,12 +423,74 @@ def _parens_balanced(expr: str) -> bool:
     return depth == 0
 
 
-def _resolve_dimension(dimension_name: str, index: _SemanticIndex) -> Tuple[str, str]:
+# BigQuery has no single ``DATE_TRUNC`` — the function is typed
+# (``DATE_TRUNC`` / ``DATETIME_TRUNC`` / ``TIMESTAMP_TRUNC``) and picking the
+# wrong one is a hard error. Every other dialect this compiler targets
+# (snowflake / postgres / duckdb / redshift / athena-trino) accepts the ANSI
+# ``DATE_TRUNC('<grain>', <expr>)`` form.
+_BIGQUERY_TRUNC_BY_TYPE = {
+    "date": "DATE_TRUNC",
+    "datetime": "DATETIME_TRUNC",
+    "timestamp": "TIMESTAMP_TRUNC",
+    "timestamp_ntz": "DATETIME_TRUNC",
+    "timestamp_tz": "TIMESTAMP_TRUNC",
+    "timestamp_ltz": "TIMESTAMP_TRUNC",
+}
+
+
+def _truncate_to_grain(
+    dimension_name: str,
+    expr: str,
+    grain: str,
+    index: _SemanticIndex,
+    dialect: Optional[str],
+) -> str:
+    """Wrap a time dimension's expression in the declared grain's truncation.
+
+    ``dimensions[].typeParams.timeGranularity`` was read by the dbt export
+    (``engines/dbt/semantic_models.py`` emits ``type_params.time_granularity``)
+    but ignored here, so the governed query path grouped by the raw
+    second-resolution timestamp: "revenue by day" over 20,000 orders returned
+    20,000 groups of one order each, while the exported MetricFlow project
+    computed 2,405 daily rows from the same contract. Two consumers, two
+    answers.
+    """
+    if dialect == "bigquery":
+        # Resolve the typed variant from the contract column the expression
+        # names. Anything more complex than a bare column reference is not
+        # safely typeable here, so fail closed rather than emit SQL BigQuery
+        # rejects (the same posture ``_render_measure_expression`` takes for
+        # percentile on BigQuery).
+        column = index.columns.get(expr.strip())
+        declared = str((column or {}).get("type") or "").strip().lower().split("(", 1)[0]
+        function = _BIGQUERY_TRUNC_BY_TYPE.get(declared)
+        if function is None:
+            raise QueryValidationError(
+                f"Dimension {dimension_name!r} declares timeGranularity {grain!r}, but "
+                f"BigQuery's truncation function depends on the column type and "
+                f"{expr!r} does not resolve to a declared date/datetime/timestamp "
+                "column. Declare the column in contract.schema with a temporal type, "
+                "or drop typeParams.timeGranularity."
+            )
+        return f"{function}({expr}, {grain.upper()})"
+    return f"DATE_TRUNC('{grain}', {expr})"
+
+
+def _resolve_dimension(
+    dimension_name: str,
+    index: _SemanticIndex,
+    *,
+    dialect: Optional[str] = None,
+) -> Tuple[str, str]:
     """Return (alias, sql_expression) for a dimension reference.
 
     A dimension can come from the semantic block (preferred) or fall
     back to a contract column. Either way the expression is built
     from validated identifiers.
+
+    A ``time`` dimension carrying ``typeParams.timeGranularity`` is truncated
+    to that grain, so the governed query path answers the same number as the
+    MetricFlow project exported from the same contract.
     """
     dimension = index.dimensions.get(dimension_name)
     if dimension is not None:
@@ -436,6 +498,9 @@ def _resolve_dimension(dimension_name: str, index: _SemanticIndex) -> Tuple[str,
         if not isinstance(expr, str):
             raise QueryValidationError(f"Dimension {dimension_name!r} has non-string expr")
         validate_sql_expression_allowlist(expr)
+        grain = _declared_grain(dimension)
+        if grain is not None:
+            expr = _truncate_to_grain(dimension_name, expr, grain, index, dialect)
         return validate_ident(dimension_name), expr
     column = index.columns.get(dimension_name)
     if column is not None:
@@ -447,6 +512,25 @@ def _resolve_dimension(dimension_name: str, index: _SemanticIndex) -> Tuple[str,
         f"Unknown dimension {dimension_name!r}; "
         f"must be defined in expose.semantics.dimensions or contract.schema"
     )
+
+
+def _declared_grain(dimension: Mapping[str, Any]) -> Optional[str]:
+    """The canonical time grain a dimension declares, or ``None``.
+
+    Only ``type: time`` dimensions carry a grain; the value is normalised
+    through the repo's single grain vocabulary
+    (:mod:`fluid_build.forge_datamodel.time_grains`) — the same one the dbt
+    export uses — so an alias such as ``daily`` resolves identically on both
+    surfaces and an unrecognised value is ignored rather than interpolated.
+    """
+    if str(dimension.get("type") or "").strip().lower() != "time":
+        return None
+    type_params = dimension.get("typeParams")
+    if not isinstance(type_params, Mapping):
+        return None
+    from fluid_build.forge_datamodel.time_grains import normalize_time_grain
+
+    return normalize_time_grain(type_params.get("timeGranularity"))
 
 
 _AGG_FUNCTIONS = {
@@ -603,7 +687,7 @@ def compile_semantic_query(
     for dimension_name in dimensions or []:
         if not isinstance(dimension_name, str):
             raise QueryValidationError("Dimension names must be strings")
-        alias, expr = _resolve_dimension(dimension_name, index)
+        alias, expr = _resolve_dimension(dimension_name, index, dialect=dialect)
         select_parts.append(f"{expr} AS {alias}")
         group_columns.append(expr)
         projection_aliases.append(alias)
@@ -638,7 +722,10 @@ def compile_semantic_query(
                     f"got {type(filter_value).__name__}"
                 )
         if filter_key in index.dimensions:
-            _, dimension_expr = _resolve_dimension(filter_key, index)
+            # Same expression as the SELECT/GROUP BY, grain truncation
+            # included — filtering `order_date = '1992-01-02'` must match the
+            # values the projection returns.
+            _, dimension_expr = _resolve_dimension(filter_key, index, dialect=dialect)
         else:
             dimension_expr = validate_ident(filter_key)
         placeholder_index = len(params)

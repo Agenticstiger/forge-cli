@@ -699,3 +699,108 @@ def test_balanced_or_filter_stays_contained_next_to_row_filters():
     )
     assert "(status = 'completed' OR status = 'shipped') AND \"tenant_id\" = :p_0" in compiled.sql
     assert compiled.params == ["t-1"]
+
+
+# ---------------------------------------------------------------------
+# dimensions[].typeParams.timeGranularity (regression)
+#
+# The dbt export reads timeGranularity and emits
+# `type_params: {time_granularity: day}` into the MetricFlow project, but the
+# governed query path interpolated `expr` verbatim into SELECT and GROUP BY.
+# Live on Snowflake over a TIMESTAMP_NTZ column with 20,000 rows / 2,405
+# distinct days, "revenue by day" returned 20,000 groups of one order each:
+#
+#   before: SELECT ORDER_TS AS order_ts_day ... GROUP BY ORDER_TS
+#           → 1993-11-10 20:25:19 | 4635.38      (a single order)
+#   after:  SELECT DATE_TRUNC('day', ORDER_TS) ... GROUP BY DATE_TRUNC(...)
+#           → 1996-06-13 00:00:00 | 1423603.62   (matches hand SQL exactly)
+# ---------------------------------------------------------------------
+
+
+def _expose_with_grain(granularity="day", dim_type="time", column_type="TIMESTAMP"):
+    dimension = {"name": "order_ts_day", "type": dim_type, "expr": "order_ts"}
+    if granularity is not None:
+        dimension["typeParams"] = {"timeGranularity": granularity}
+    return make_expose(
+        columns=[
+            {"name": "order_id", "type": "STRING"},
+            {"name": "amount", "type": "FLOAT64"},
+            {"name": "order_ts", "type": column_type},
+        ],
+        semantics={
+            "name": "orders",
+            "measures": [{"name": "revenue", "agg": "sum", "expr": "amount"}],
+            "dimensions": [dimension],
+            "metrics": [{"name": "total_revenue", "type": "simple", "measure": "revenue"}],
+        },
+    )
+
+
+def _grain_sql(**kwargs):
+    dialect = kwargs.pop("dialect", "snowflake")
+    return compile_semantic_query(
+        expose=_expose_with_grain(**kwargs),
+        metric="total_revenue",
+        dimensions=["order_ts_day"],
+        limit=5,
+        table_reference="orders",
+        dialect=dialect,
+    ).sql
+
+
+def test_declared_grain_truncates_select_and_group_by():
+    sql = _grain_sql()
+    assert "DATE_TRUNC('day', order_ts) AS order_ts_day" in sql
+    assert "GROUP BY DATE_TRUNC('day', order_ts)" in sql
+
+
+@pytest.mark.parametrize(
+    "declared,expected",
+    [("day", "day"), ("MONTH", "month"), ("daily", "day"), ("hr", "hour")],
+)
+def test_grain_aliases_resolve_through_the_shared_vocabulary(declared, expected):
+    """Same normalisation the dbt export uses, so both surfaces agree."""
+    assert f"DATE_TRUNC('{expected}', order_ts)" in _grain_sql(granularity=declared)
+
+
+def test_unrecognised_grain_is_ignored_rather_than_interpolated():
+    sql = _grain_sql(granularity="fortnight")
+    assert "DATE_TRUNC" not in sql
+    assert "order_ts AS order_ts_day" in sql
+
+
+def test_no_grain_keeps_the_raw_expression():
+    sql = _grain_sql(granularity=None)
+    assert "DATE_TRUNC" not in sql
+
+
+def test_categorical_dimension_is_never_truncated():
+    sql = _grain_sql(dim_type="categorical")
+    assert "DATE_TRUNC" not in sql
+
+
+def test_filters_use_the_same_truncated_expression_as_the_projection():
+    compiled = compile_semantic_query(
+        expose=_expose_with_grain(),
+        metric="total_revenue",
+        dimensions=["order_ts_day"],
+        filters={"order_ts_day": "1992-01-02"},
+        limit=5,
+        table_reference="orders",
+        dialect="snowflake",
+    )
+    assert "WHERE DATE_TRUNC('day', order_ts) = :p_0" in compiled.sql
+
+
+def test_bigquery_picks_the_typed_truncation_function():
+    assert "TIMESTAMP_TRUNC(order_ts, DAY)" in _grain_sql(
+        dialect="bigquery", column_type="TIMESTAMP"
+    )
+    assert "DATE_TRUNC(order_ts, DAY)" in _grain_sql(dialect="bigquery", column_type="DATE")
+
+
+def test_bigquery_fails_closed_when_the_column_type_is_unknowable():
+    """BigQuery's truncation function is typed; guessing it emits SQL the
+    engine rejects. Same fail-closed posture as percentile on BigQuery."""
+    with pytest.raises(QueryValidationError, match="BigQuery's truncation function"):
+        _grain_sql(dialect="bigquery", column_type="STRING")
