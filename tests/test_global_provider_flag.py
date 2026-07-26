@@ -160,3 +160,27 @@ class TestTheCheckStaysOffTheColdPath:
     def test_discovery_runs_when_one_is_requested(self, monkeypatch):
         monkeypatch.delenv("FLUID_PROVIDER", raising=False)
         assert self._count_discovery(["--provider", "snowflake", "version", "--short"]) == 1
+
+
+class TestTheAutoSentinelIsNotAProviderName:
+    """``fluid generate iac --provider`` defaults to ``auto`` — "detect from the
+    contract" — and that default lands on the SAME ``args.provider`` the global
+    flag populates. Validating it against the registry rejected every
+    `fluid generate iac` run with exit 2."""
+
+    def test_auto_parses_and_is_not_rejected(self):
+        from fluid_build.cli import _PROVIDER_AUTO, _validate_global_args, build_parser
+
+        class _Log:
+            def __init__(self):
+                self.errors = []
+
+            def log_safe(self, level, message, **_kw):
+                if level == "error":
+                    self.errors.append(message)
+
+        args = build_parser().parse_args(["generate", "iac", "c.fluid.yaml"])
+        assert args.provider == _PROVIDER_AUTO
+        log = _Log()
+        _validate_global_args(args, log, known_providers=["aws", "gcp", "local", "snowflake"])
+        assert not any("Unknown provider" in e for e in log.errors)

@@ -330,7 +330,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         # `--provider` / `FLUID_PROVIDER` keeps its current startup cost
         # (tests/perf/test_startup_budget.py).
         requested_provider = getattr(args, "provider", None)
-        known_providers = _known_provider_names() if requested_provider else []
+        known_providers = (
+            _known_provider_names()
+            if requested_provider and requested_provider != _PROVIDER_AUTO
+            else []
+        )
         _validate_global_args(args, cli.logger, known_providers=known_providers)
         if requested_provider and known_providers and requested_provider not in known_providers:
             return 2
@@ -641,6 +645,14 @@ def _setup_enhanced_logging(
     return ProductionLogger(LOG)
 
 
+#: ``fluid generate iac --provider`` defaults to this sentinel, meaning
+#: "detect the cloud from the contract's bindings" (``generate_iac
+#: ._resolve_provider``). It is never a registry entry, so the registry check
+#: below must not reject it — that default lands on the SAME ``args.provider``
+#: the global flag populates.
+_PROVIDER_AUTO = "auto"
+
+
 def _known_provider_names() -> List[str]:
     """Sorted names from the live provider registry, or ``[]`` if unavailable.
 
@@ -675,7 +687,7 @@ def _validate_global_args(
         # here means the accepted values are exactly what `fluid providers`
         # lists, plugins included.
         known = _known_provider_names() if known_providers is None else known_providers
-        if known and args.provider not in known:
+        if known and args.provider not in known and args.provider != _PROVIDER_AUTO:
             issues.append(
                 f"Unknown provider '{args.provider}' — installed providers: "
                 f"{', '.join(known)} (see `fluid providers`)"
