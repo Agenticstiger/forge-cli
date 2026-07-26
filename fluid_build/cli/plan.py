@@ -222,7 +222,13 @@ transformations, access grants, and orchestration tasks.
         action="store_true",
         help="ask provider to check data sovereignty constraints",
     )
-    p.add_argument("--provider", help="override provider name (default: from contract)")
+    # ``default=SUPPRESS`` so a global ``fluid --provider X plan ...`` is not
+    # silently overwritten by this subparser's default (see cli/apply.py).
+    p.add_argument(
+        "--provider",
+        default=argparse.SUPPRESS,
+        help="override provider name (default: from contract)",
+    )
     p.add_argument("--project", help="override project/account (default: from contract)")
     p.add_argument("--region", help="override region/location (default: from contract)")
     p.add_argument(

@@ -525,8 +525,16 @@ def register(subparsers: argparse._SubParsersAction):
     # ``--provider-config`` (its only registered ``--provider*`` sibling),
     # populating ``provider_config`` with a provider name. Harmless until
     # ``--provider-config`` became a path validated against the filesystem.
+    #
+    # ``default=SUPPRESS``: the subparser writes its default onto the SAME
+    # namespace the global parser already populated, so a plain ``default=None``
+    # silently discarded ``fluid --provider X apply ...`` — the run then used the
+    # contract's own binding and printed a provider the operator never asked
+    # for. SUPPRESS leaves the attribute alone unless the flag is given here.
     advanced_group.add_argument(
-        "--provider", help="Override provider name (default: from contract binding)"
+        "--provider",
+        default=argparse.SUPPRESS,
+        help="Override provider name (default: from contract binding)",
     )
     advanced_group.add_argument(
         "--project", help="Override project/account (default: from contract)"
