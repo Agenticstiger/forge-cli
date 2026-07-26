@@ -152,13 +152,18 @@ class TestTeamObjectRoundTrip:
         assert members[0]["dateIn"] == "2024-01-01"
 
     def test_team_object_lands_in_fluid_owner(self, imported: dict) -> None:
-        owner = imported.get("owner") or {}
+        # ``owner`` lives at ``metadata.owner`` — the FLUID schema has no
+        # top-level ``owner`` and closes ``metadata.owner`` to
+        # {team,email,slack,oncall}, so ``role`` (and the extra contacts below)
+        # ride in the ODCS extensions bucket instead.
+        owner = imported["metadata"]["owner"]
         assert owner["team"] == "commerce-team"
         assert owner["email"] == "alice@acme.com"
-        assert owner["role"] == "data-owner"
+        owner_extra = imported["extensions"]["odcs"]["owner_extra"]
+        assert owner_extra["role"] == "data-owner"
 
     def test_owner_contacts_carry_extra_members(self, imported: dict) -> None:
-        contacts = (imported.get("owner") or {}).get("contacts") or []
+        contacts = imported["extensions"]["odcs"]["owner_extra"].get("contacts") or []
         assert any(c.get("email") == "bob@acme.com" for c in contacts)
 
 
@@ -238,8 +243,8 @@ def test_team_object_import_does_not_crash_on_dict_form() -> None:
     ODCS v3.1.0 ``team`` is an object — this used to TypeError on import."""
     odcs = _load("contract-full.yaml")
     fluid = OdcsProvider().import_contract(odcs)
-    assert "owner" in fluid
-    assert fluid["owner"]["team"] == "commerce-team"
+    assert "owner" in fluid["metadata"]
+    assert fluid["metadata"]["owner"]["team"] == "commerce-team"
 
 
 def test_required_is_read_not_isnullable() -> None:

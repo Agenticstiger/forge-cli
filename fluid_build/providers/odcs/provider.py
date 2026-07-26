@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderError
 
 from .io import read_input, write_output
-from .mappers import EXPORT_PIPELINE, IMPORT_PIPELINE
+from .mappers import EXPORT_PIPELINE, IMPORT_PIPELINE, normalize
 from .mappers.base import ExportCtx, ImportCtx, fluid_id
 from .validation import load_schema, roundtrip_check, validate, validate_via_vowl
 
@@ -106,6 +106,9 @@ class OdcsProvider(BaseProvider):
                 "Each contract should be exported separately."
             )
 
+        # Push any ``extensions.odcs`` round-trip state back into the inline
+        # buckets the mappers read. No-op for hand-written FLUID contracts.
+        src = normalize.rehydrate(src)
         fluid = self._scope_to_expose(src, expose_id) if expose_id else src
         odcs: Dict[str, Any] = {}
         ctx = ExportCtx(
@@ -217,7 +220,10 @@ class OdcsProvider(BaseProvider):
         ctx = ImportCtx(odcs=odcs_data, fluid=fluid, logger=self.logger)
         for mapper in IMPORT_PIPELINE:
             mapper.to_fluid(ctx)
-        return fluid
+        # The mappers write an intermediate shape; ``to_document`` turns it into
+        # a document ``fluid validate`` accepts, parking the round-trip
+        # pass-through in the schema's one open bucket (``extensions.odcs``).
+        return normalize.to_document(fluid, odcs_data)
 
     # ---- validation / round-trip ---------------------------------------
 
@@ -261,6 +267,10 @@ class OdcsProvider(BaseProvider):
         product_id = fluid_id(fluid)
         if product_id:
             scoped["_scoped_id"] = f"{product_id}.{expose_id}"
+        # Only stamp a scoped status when the port actually declares one —
+        # defaulting to "active" here used to mask the contract-root
+        # ``lifecycle.state``, so every per-port export claimed "active".
         lifecycle = exposes[0].get("lifecycle") or {}
-        scoped["_scoped_status"] = lifecycle.get("state", "active")
+        if lifecycle.get("state"):
+            scoped["_scoped_status"] = lifecycle["state"]
         return scoped

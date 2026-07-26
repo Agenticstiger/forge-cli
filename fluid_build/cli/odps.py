@@ -396,33 +396,45 @@ def cmd_opds_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
     # ODPS v4.1 (LF/ODPI) — structural validator
     try:
         from fluid_build.providers.opds.validator import validate_opds_structure
-
-        with open(path, encoding="utf-8") as f:
-            opds_data = json.load(f)
-        if "artifacts" in opds_data and isinstance(opds_data["artifacts"], dict):
-            opds_data = opds_data["artifacts"]
-        result = validate_opds_structure(
-            opds_data,
-            version="4.1",
-            use_full_schema=getattr(args, "full_schema", True),
-            schema_url=ODPS_4_1_SCHEMA_URL_RAW,
-        )
-        if not result.get("valid"):
-            console_error(
-                f"✗ ODPS v4.1 validation failed ({result.get('validation_type', 'unknown')})"
-            )
-            for err in result.get("errors", []) or []:
-                console_error(f"  - {err}")
-            return 1
-        cprint(f"✓ ODPS v4.1 file is valid: {path}")
-        cprint(f"  Schema: {ODPS_4_1_SCHEMA_URL}")
-        return 0
     except ImportError:
         console_error("ODPS v4.1 validator not available")
         return 1
-    except Exception as e:
-        console_error(f"Error validating ODPS v4.1 file: {e}")
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            opds_data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        console_error(f"Error loading ODPS v4.1 file: {e}")
         return 1
+    if not isinstance(opds_data, dict):
+        console_error(f"Error: {path} did not parse as a mapping")
+        return 1
+    if "artifacts" in opds_data and isinstance(opds_data["artifacts"], dict):
+        opds_data = opds_data["artifacts"]
+
+    # NB: validate_opds_structure() validates against the *vendored* v4.1
+    # schema (fluid_build/providers/opds/odps-schema-v4.1.0.json) and takes no
+    # schema URL. Passing one raised TypeError on every single invocation, and
+    # the blanket ``except Exception`` that used to wrap this block reported
+    # that as "Error validating ODPS v4.1 file" — a signature bug dressed up as
+    # a validation result. The load/parse failures above are caught narrowly so
+    # a programming error surfaces instead of being laundered into a soft
+    # error line.
+    result = validate_opds_structure(
+        opds_data,
+        version="4.1",
+        use_full_schema=getattr(args, "full_schema", True),
+    )
+    if not result.get("valid"):
+        console_error(
+            f"✗ ODPS v4.1 validation failed ({result.get('validation_type', 'unknown')})"
+        )
+        for err in result.get("errors", []) or []:
+            console_error(f"  - {err}")
+        return 1
+    cprint(f"✓ ODPS v4.1 file is valid: {path}")
+    cprint(f"  Schema: {ODPS_4_1_SCHEMA_URL}")
+    return 0
 
 
 def cmd_opds_info(args: argparse.Namespace, logger: logging.Logger) -> int:

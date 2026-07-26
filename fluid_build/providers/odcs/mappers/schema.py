@@ -41,7 +41,8 @@ from .base import (
 from .types import (
     fluid_to_logical,
     fluid_to_physical,
-    logical_to_fluid,
+    fluid_type_from_odcs,
+    logical_type_options,
     physical_type_to_platform,
 )
 
@@ -74,14 +75,12 @@ def _schema_object_to_expose(
     if schema_object.get("description"):
         expose["description"] = schema_object["description"]
 
-    # Best-effort binding from physicalType
-    if schema_object.get("physicalType"):
-        binding: Dict[str, Any] = {
-            "platform": physical_type_to_platform(schema_object["physicalType"]),
-        }
-        if schema_object.get("physicalName"):
-            binding["physical_name"] = schema_object["physicalName"]
-        expose["binding"] = binding
+    # The binding is *not* built here. ``physicalType`` alone says only what
+    # kind of object this is — a "table" exists on every warehouse there is —
+    # while ``servers[].type`` names the system it actually lives in. Deriving
+    # the platform from physicalType made every imported table a BigQuery
+    # table, Snowflake sources included. The binding is assembled in
+    # :mod:`.normalize`, which sees the servers list and the extras bucket.
 
     # Properties → contract.schema (FLUID 0.7.1 layout)
     contract: Dict[str, Any] = {"schema": []}
@@ -110,9 +109,17 @@ def _schema_object_to_expose(
 
 
 def _property_to_field(prop: Mapping[str, Any]) -> Dict[str, Any]:
+    # Recover the most specific type the ODCS property carries: physicalType
+    # first (the source system's own spelling), then logicalType +
+    # logicalTypeOptions. Reading logicalType alone flattened NUMBER(18,4) to
+    # a bare ``double``.
     fld: Dict[str, Any] = {
         "name": prop.get("name", "unknown"),
-        "type": logical_to_fluid(prop.get("logicalType", "string")),
+        "type": fluid_type_from_odcs(
+            prop.get("logicalType", "string"),
+            prop.get("physicalType"),
+            prop.get("logicalTypeOptions"),
+        ),
     }
     if prop.get("description"):
         fld["description"] = prop["description"]
@@ -225,12 +232,18 @@ def _extract_schema(fluid: Mapping[str, Any]) -> List[Dict[str, Any]]:
             "physicalType": physical_type,
             "properties": properties,
         }
+        # ODCS ``physicalName`` is the real object name in the source system —
+        # the piece that, with servers[].{account,database,schema}, lets a
+        # consumer address the table. ``name`` is the logical exposeId, which on
+        # Snowflake is not interchangeable with the (case-sensitive) object name.
+        physical_name = pt.get("physical_name") or _binding_object_name(expose)
+        if physical_name:
+            schema_object["physicalName"] = physical_name
         if expose.get("description"):
             schema_object["description"] = expose["description"]
 
         # Pass-through extras
         for src, dst in (
-            ("physical_name", "physicalName"),
             ("business_name", "businessName"),
             ("data_granularity", "dataGranularityDescription"),
             ("tags", "tags"),
@@ -264,6 +277,21 @@ def _platform_to_physical_type(provider: Optional[str]) -> str:
     return "table"
 
 
+def _binding_object_name(expose: Mapping[str, Any]) -> Optional[str]:
+    """The real object name the expose binds to, from ``binding.location``."""
+    binding = expose.get("binding")
+    if not isinstance(binding, Mapping):
+        return None
+    location = binding.get("location")
+    if not isinstance(location, Mapping):
+        return None
+    for key in ("table", "topic", "path", "stream"):
+        value = location.get(key)
+        if value:
+            return str(value)
+    return None
+
+
 def _field_to_property(fld: Mapping[str, Any], provider: Optional[str]) -> Dict[str, Any]:
     prop: Dict[str, Any] = {
         "name": fld.get("name", "unknown"),
@@ -283,6 +311,15 @@ def _field_to_property(fld: Mapping[str, Any], provider: Optional[str]) -> Dict[
         phys = fluid_to_physical(fld.get("type", "string"), provider)
         if phys:
             prop["physicalType"] = phys
+
+    # logicalTypeOptions: ODCS keeps the type *parameters* here because
+    # logicalType is a nine-value enum with nowhere to put precision/scale/
+    # length. Without this a `decimal(18,4)` money column and a `decimal(38,0)`
+    # key are indistinguishable in the published contract.
+    if "logical_type_options" not in pt:
+        options = logical_type_options(fld.get("type", "string"))
+        if options:
+            prop["logicalTypeOptions"] = options
 
     if fld.get("description"):
         prop["description"] = fld["description"]
