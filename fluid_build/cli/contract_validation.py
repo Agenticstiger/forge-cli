@@ -39,7 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from fluid_build.cli.console import cprint, success
+from fluid_build.cli.console import cprint, cprint_json, success
 from fluid_build.cli.console import error as console_error
 
 # Rich imports for enhanced output
@@ -298,10 +298,31 @@ class ContractValidator:
         # Step 6: Validate metadata and governance
         self._validate_metadata()
 
+        # Release the provider's live connection (Snowflake holds ONE shared
+        # session for the whole run — see SnowflakeValidationProvider._connect)
+        # so a long-lived embedder isn't left with an open warehouse session.
+        self._close_validation_provider()
+
         # Finalize report
         self.report.duration = time.time() - start_time
 
         return self.report
+
+    def _close_validation_provider(self) -> None:
+        """Close the validation provider's connection if it holds one.
+
+        ``close`` is optional on the ``ValidationProvider`` surface (only the
+        connection-holding providers implement it), so this is a duck-typed
+        best-effort call — a provider without it, or one that raises on
+        teardown, must never fail the validation run.
+        """
+        close = getattr(self.validation_provider, "close", None)
+        if close is None:
+            return
+        try:
+            close()
+        except Exception as exc:  # noqa: BLE001 - teardown must not fail the run
+            LOG.debug("validation_provider_close_failed: %s", exc)
 
     def _validate_contract_schema(self) -> None:
         """Validate contract against FLUID schema."""
@@ -1430,4 +1451,4 @@ def output_json_report(report: ValidationReport, output_file: Optional[str] = No
             f.write(json_output)
         success(f"Report saved to: {output_file}")
     else:
-        cprint(json_output)
+        cprint_json(json_output)

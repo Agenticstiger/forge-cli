@@ -22,7 +22,8 @@ against actual Snowflake resources via INFORMATION_SCHEMA queries.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from contextlib import ExitStack, contextmanager
+from typing import Any, Dict, Iterator, List, Optional
 
 from fluid_build.providers._sql_safety import validate_ident
 from fluid_build.providers.quality_engine import (
@@ -112,26 +113,69 @@ class SnowflakeValidationProvider(ValidationProvider):
         self.schema = config.get("schema")
         self.oauth_token = config.get("oauth_token")
         self.authenticator = config.get("authenticator")
+        # ONE login per provider instance. See :meth:`_connect`.
+        self._stack = ExitStack()
+        self._conn: Optional[SnowflakeConnection] = None
+        self._connect_failure: Optional[BaseException] = None
 
     @property
     def provider_name(self) -> str:
         return "snowflake"
 
-    def _connect(self) -> SnowflakeConnection:
-        """Create a SnowflakeConnection context manager."""
-        return SnowflakeConnection(
-            account=self.account,
-            user=self.user,
-            password=self.password,
-            private_key_path=self.private_key_path,
-            private_key_passphrase=self.private_key_passphrase,
-            role=self.role,
-            warehouse=self.warehouse,
-            database=self.database,
-            schema=self.schema,
-            oauth_token=self.oauth_token,
-            authenticator=self.authenticator,
-        )
+    @contextmanager
+    def _connect(self) -> Iterator[SnowflakeConnection]:
+        """Yield the provider's single, shared Snowflake connection.
+
+        Every check used to open its own connection: one for
+        :meth:`validate_connection`, then one each for
+        :meth:`get_resource_schema` and :meth:`run_quality_checks` **per
+        expose** — ``1 + 2N`` logins for one ``fluid test``. Two consequences,
+        both real:
+
+        * A mistyped credential produced ``1 + 2N`` *failed* logins from a
+          single command. Snowflake locks a user after 5 consecutive failures
+          (15 minutes by default), so a 2-expose contract locked the service
+          account on the first bad run — and it locks it for every other job
+          sharing that account.
+        * Login is the slowest part of a small validation run; N of them are
+          pure latency.
+
+        So the connection is opened lazily on first use and reused for the
+        rest of the provider's life, and a login *failure* is cached: after
+        one failed attempt no further attempt is made, capping a bad-password
+        run at exactly one failed login. Call :meth:`close` when done (the
+        CLI does); the ``ExitStack`` closes the underlying connection.
+        """
+        if self._connect_failure is not None:
+            raise RuntimeError(
+                "Snowflake connection unavailable — an earlier login attempt "
+                f"failed and is not retried to avoid account lockout: {self._connect_failure}"
+            ) from self._connect_failure
+        if self._conn is None:
+            connection = SnowflakeConnection(
+                account=self.account,
+                user=self.user,
+                password=self.password,
+                private_key_path=self.private_key_path,
+                private_key_passphrase=self.private_key_passphrase,
+                role=self.role,
+                warehouse=self.warehouse,
+                database=self.database,
+                schema=self.schema,
+                oauth_token=self.oauth_token,
+                authenticator=self.authenticator,
+            )
+            try:
+                self._conn = self._stack.enter_context(connection)
+            except BaseException as exc:
+                self._connect_failure = exc
+                raise
+        yield self._conn
+
+    def close(self) -> None:
+        """Close the shared connection. Idempotent."""
+        self._stack.close()
+        self._conn = None
 
     def validate_connection(self) -> bool:
         """Test Snowflake connectivity with a simple query."""
