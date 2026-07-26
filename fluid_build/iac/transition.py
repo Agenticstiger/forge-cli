@@ -251,12 +251,19 @@ def detect_ownership_transitions(
         return ()
 
     transitions = []
-    seen_addresses: Set[str] = set()
+    # Keyed on the address with any ``data.`` prefix stripped: on AWS/GCP the
+    # SAME container can surface through both signals — as ``data.<type>.<n>``
+    # in prior state and as ``<type>.<n>`` in the import candidates — and
+    # reporting one container twice under two spellings would make the blocked
+    # message read like two ownership changes.
+    seen_identities: Set[Tuple[str, str]] = set()
 
     def _record(address: str, kind: str, frm: str, to: str) -> None:
-        if address in seen_addresses:
+        parsed = parse_state_address(address)
+        identity = (parsed[1], parsed[2]) if parsed else (address, "")
+        if identity in seen_identities:
             return
-        seen_addresses.add(address)
+        seen_identities.add(identity)
         transitions.append(
             OwnershipTransition(
                 address=address, container_kind=kind, from_ownership=frm, to_ownership=to

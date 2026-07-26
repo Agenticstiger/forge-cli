@@ -603,3 +603,55 @@ class TestOverrideAuditEventsAreWarnings:
 
     def test_warn_helper_is_imported(self):
         assert "from ._logging import info, warn" in self._source()
+
+
+class TestOneContainerIsReportedOnce:
+    """AWS/GCP surface the same container through BOTH signals.
+
+    A shared GCP dataset leaves ``data.google_bigquery_dataset.X`` in state
+    (signal 1) AND appears as ``google_bigquery_dataset.X`` in the import
+    candidates once the block flips to isolated (signal 2). Reporting both
+    would make the blocked message read like two ownership changes.
+    """
+
+    GCP_ISOLATED = {
+        "fluidVersion": "0.7.6",
+        "id": "orders-adp",
+        "packaging": {"mode": "isolated", "pool": "sales"},
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "binding": {
+                    "platform": "gcp",
+                    "format": "bigquery_table",
+                    "location": {"dataset": "sales_pool", "table": "orders"},
+                },
+            }
+        ],
+    }
+
+    def test_the_same_container_is_not_double_counted(self):
+        transitions = detect_ownership_transitions(
+            self.GCP_ISOLATED,
+            [
+                "data.google_bigquery_dataset.orders_adp_sales_pool",
+                "google_bigquery_table.orders_adp_orders",
+            ],
+            import_candidates=[
+                "google_bigquery_dataset.orders_adp_sales_pool",
+                "google_bigquery_table.orders_adp_orders",
+            ],
+        )
+        assert len(transitions) == 1
+        assert transitions[0].container_kind == "dataset"
+        # The state address wins — it is what `tofu state rm` would name.
+        assert transitions[0].address.startswith("data.")
+
+    def test_two_distinct_containers_are_both_reported(self):
+        """The dedupe must key on identity, not collapse everything to one."""
+        transitions = detect_ownership_transitions(
+            _snowflake_contract(ISOLATED),
+            SF_SHARED_STATE,
+            import_candidates=SF_ISOLATED_IMPORTS,
+        )
+        assert {t.container_kind for t in transitions} == {"database", "schema"}
