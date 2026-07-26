@@ -19,9 +19,12 @@ never disagree (RFC §6.1 / §7).
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from ._sql_safety import validate_ident
 from .aws.util.warehouse import get_iceberg_warehouse
 
 # Apache Iceberg runtime class names (pinned to the connector surface validated
@@ -158,3 +161,90 @@ def resolve_iceberg_catalog(
         id_columns=id_columns,
         partition_by=partition_by,
     )
+
+
+# ---------------------------------------------------------------------------
+# Snowflake external-volume naming
+# ---------------------------------------------------------------------------
+
+# ``FLUID_<product>_VOL``. The prefix guarantees the first character is a
+# letter (``validate_ident`` requires it) even when a contract id starts with a
+# digit, and it namespaces the object so a fluid-created volume is obvious in
+# ``SHOW EXTERNAL VOLUMES``.
+_VOLUME_PREFIX = "FLUID_"
+_VOLUME_SUFFIX = "_VOL"
+# Snowflake caps an identifier at 255 characters. Stay well inside that so the
+# prefix, suffix and truncation digest always fit.
+_VOLUME_MAX_CORE = 200
+_VOLUME_DIGEST_LEN = 8
+_NON_IDENT_CHARS = re.compile(r"[^A-Za-z0-9_]")
+_REPEATED_UNDERSCORES = re.compile(r"_+")
+
+
+def iceberg_external_volume_name(
+    contract: Optional[Mapping[str, Any]],
+    binding: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Deterministic Snowflake EXTERNAL VOLUME name for an Iceberg binding.
+
+    dbt's ``built_in`` catalog type (Snowflake Horizon) requires an
+    ``external_volume: <snowflake object name>`` in ``catalogs.yml``, but the
+    FLUID contract schema cannot carry one: ``bindingLocation`` in
+    ``fluid-schema-0.7.6.json`` is ``additionalProperties: false`` and has no
+    ``externalVolume`` key, so a first-class field would need a schema version
+    bump. The name is therefore DERIVED here instead.
+
+    **This function is the contract between two emitters.** The dbt
+    ``catalogs.yml`` emitter (``engines/dbt/catalogs_yml.py``) writes this name,
+    and the Snowflake IaC emitter (``iac/providers/snowflake.py``) will create an
+    EXTERNAL VOLUME with exactly this name in a follow-up change. Both call this
+    one function, which is why it must stay **pure and deterministic**: same
+    contract plus binding in, same string out, no clock, no environment, no
+    randomness. Changing the derivation renames a live Snowflake object, so treat
+    it as a breaking change.
+
+    An operator whose Snowflake admin already created a volume can override the
+    derived name with ``binding.icebergConfig.properties.external_volume`` (or
+    the camelCase ``externalVolume``). That map is
+    ``additionalProperties: {type: string}`` in the schema, so the override is
+    expressible today with no schema bump. Overrides are validated too.
+
+    The result always satisfies :func:`._sql_safety.validate_ident`, so it can be
+    interpolated into ``CREATE EXTERNAL VOLUME`` DDL. Raises ``ValueError`` when
+    an explicit override is not a legal identifier.
+    """
+    override = _external_volume_override(binding)
+    if override:
+        return validate_ident(override)
+
+    core = _ident_core(str((contract or {}).get("id") or "")) or "PRODUCT"
+    if len(core) > _VOLUME_MAX_CORE:
+        digest = hashlib.sha256(core.encode("utf-8")).hexdigest()[:_VOLUME_DIGEST_LEN].upper()
+        keep = _VOLUME_MAX_CORE - _VOLUME_DIGEST_LEN - 1
+        core = f"{core[:keep].rstrip('_')}_{digest}"
+    return validate_ident(f"{_VOLUME_PREFIX}{core}{_VOLUME_SUFFIX}")
+
+
+def _external_volume_override(binding: Optional[Mapping[str, Any]]) -> str:
+    """Explicit volume name from ``binding.icebergConfig.properties``, if any."""
+    iceberg_config = (binding or {}).get("icebergConfig") or {}
+    properties = iceberg_config.get("properties") or {}
+    if not isinstance(properties, Mapping):
+        return ""
+    for key in ("external_volume", "externalVolume"):
+        value = properties.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _ident_core(raw: str) -> str:
+    """Fold arbitrary text into the upper-case identifier body of a volume name.
+
+    Contract ids follow the schema's ``identifier`` pattern, which allows dots
+    and hyphens (``gold.hr.employee_360_v1``); Snowflake unquoted identifiers do
+    not. Every disallowed run collapses to a single underscore and the result is
+    upper-cased, matching Snowflake's own unquoted-identifier folding.
+    """
+    folded = _NON_IDENT_CHARS.sub("_", raw)
+    return _REPEATED_UNDERSCORES.sub("_", folded).strip("_").upper()
