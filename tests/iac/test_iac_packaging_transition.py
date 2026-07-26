@@ -26,6 +26,12 @@ Layers:
   with no ``packaging`` block is a provable no-op.
 * ``TestEngineWiring`` — the guard genuinely runs inside the apply engine,
   before adoption and before ``tofu plan`` (the pin is not vacuous).
+* ``TestBrownfieldGrowthIsNotAnAdoption`` — signal 2 detects a transition,
+  not ordinary growth inside a container the contract already owns.
+* ``TestMixedPerExposurePackaging`` — the per-exposure ``binding.packaging``
+  override, which defeats a purely type-level reading of that scoping.
+* ``TestContainerNamesNestTheirLeaves`` — the emitter naming convention the
+  per-container footprint test reads, pinned against the real plugins.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ from fluid_build.iac.transition import (
     CONTAINER_RESOURCE_TYPES,
     OwnershipTransition,
     PackagingTransitionError,
+    _nested_under,
     detect_ownership_transitions,
     guard_ownership_transitions,
     parse_state_address,
@@ -786,3 +793,264 @@ class TestBrownfieldGrowthIsNotAnAdoption:
             ("database", "owned", "referenced"),
             ("schema", "owned", "referenced"),
         }
+
+
+def _mix_contract(pool_mode: str) -> Dict[str, Any]:
+    """The live FIXMISC2 fixture: one isolated exposure, one pooled exposure.
+
+    ``pool_mode`` is the second exposure's ``binding.packaging.mode`` —
+    ``"shared"`` is the applied state, ``"isolated"`` is the flip.
+    """
+    return {
+        "fluidVersion": "0.7.6",
+        "kind": "DataProduct",
+        "id": "silver.fixmisc2.mix_v1",
+        "domain": "fixmisc2",
+        "packaging": {"mode": "isolated"},
+        "exposes": [
+            {
+                "exposeId": "own_table",
+                "kind": "table",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_table",
+                    "location": {
+                        "database": "FLUID_FIXMISC2_MIX",
+                        "schema": "OWNSCH",
+                        "table": "OWN_TABLE",
+                    },
+                },
+            },
+            {
+                "exposeId": "pool_table",
+                "kind": "table",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_table",
+                    "packaging": {"mode": pool_mode, "pool": "platform-pool2"},
+                    "location": {
+                        "database": "FLUID_FIXMISC2_POOL2",
+                        "schema": "MPOOL2",
+                        "table": "POOL_TABLE",
+                    },
+                },
+            },
+        ],
+    }
+
+
+def _sf_imports(contract: Dict[str, Any]) -> list:
+    """The real plugin's import candidates — never a hand-mirrored list."""
+    from fluid_build.iac.providers.snowflake import SnowflakeIacPlugin
+
+    return [block.to for block in SnowflakeIacPlugin().discover_imports(contract)]
+
+
+class TestMixedPerExposurePackaging:
+    """A per-exposure ``binding.packaging`` override defeats the type test.
+
+    The regression this class exists for. Signal 2's original scoping —
+    "the state manages no container of this OpenTofu resource type" — was
+    documented as exhaustive. It is not. With the documented per-exposure
+    override, one exposure ``isolated`` and one ``shared``:
+
+    * the isolated exposure puts a ``snowflake_database`` AND a
+      ``snowflake_schema`` into state, so the type test skips both of the
+      pooled exposure's containers; and
+    * after the flip no scope declares either kind ``shared`` any more, so
+      signal 1's owned -> referenced half never fires either.
+
+    ``detect_ownership_transitions`` returned ``()`` for exactly these
+    inputs. Verified live on Snowflake against the buggy revision: `fluid
+    apply --yes` WITHOUT ``--adopt-shared-container`` exited 0, printed
+    "brownfield: adopted 2 pre-existing resource(s) into state" and
+    "+0 ~4 -0", pulled ``FLUID_FIXMISC2_POOL2`` and its ``MPOOL2`` schema
+    into the tenant contract's state, and erased both platform COMMENTs
+    ("PLATFORM-OWNS-THIS-FIXMISC2 do not modify" /
+    "PLATFORM-SCHEMA-COMMENT-FIXMISC2") to empty.
+
+    The five tests that shipped with the narrowing all use a state that
+    manages NO container of the type at all, which is why they passed.
+    """
+
+    # `tofu state list` after applying the SHARED form — asserted below to
+    # equal the plugin's own import list, and byte-identical to the live run.
+    MIX_STATE = [
+        "snowflake_database.silver_fixmisc2_mix_v1_FLUID_FIXMISC2_MIX",
+        "snowflake_schema.silver_fixmisc2_mix_v1_FLUID_FIXMISC2_MIX_OWNSCH",
+        "snowflake_table.silver_fixmisc2_mix_v1_FLUID_FIXMISC2_MIX_OWNSCH_OWN_TABLE",
+        "snowflake_table.silver_fixmisc2_mix_v1_FLUID_FIXMISC2_POOL2_MPOOL2_POOL_TABLE",
+    ]
+
+    def test_the_fixture_state_is_what_the_plugin_really_emits(self):
+        """Pin the fixture to the emitter, not to this file's imagination.
+
+        A REFERENCED container is never an import candidate, so for the
+        shared form the plugin's list IS the applied state: the product's
+        own database + schema + table, and the pool's leaf table only.
+        """
+        assert _sf_imports(_mix_contract("shared")) == self.MIX_STATE
+
+    def test_the_flip_is_detected(self):
+        transitions = detect_ownership_transitions(
+            _mix_contract("isolated"),
+            self.MIX_STATE,
+            import_candidates=_sf_imports(_mix_contract("isolated")),
+        )
+        assert [(t.address, t.container_kind) for t in transitions] == [
+            ("snowflake_database.silver_fixmisc2_mix_v1_FLUID_FIXMISC2_POOL2", "database"),
+            ("snowflake_schema.silver_fixmisc2_mix_v1_FLUID_FIXMISC2_POOL2_MPOOL2", "schema"),
+        ]
+        assert all(t.is_adoption for t in transitions)
+
+    def test_the_products_own_containers_are_not_flagged(self):
+        """Only the pool flips. The isolated exposure's own database and
+        schema are already in state and never move."""
+        transitions = detect_ownership_transitions(
+            _mix_contract("isolated"),
+            self.MIX_STATE,
+            import_candidates=_sf_imports(_mix_contract("isolated")),
+        )
+        assert not any("FLUID_FIXMISC2_MIX" in t.address for t in transitions)
+
+    def test_it_is_blocked_without_the_flag(self):
+        with pytest.raises(PackagingTransitionError) as excinfo:
+            guard_ownership_transitions(
+                _mix_contract("isolated"),
+                self.MIX_STATE,
+                import_candidates=_sf_imports(_mix_contract("isolated")),
+            )
+        assert excinfo.value.kind == "shared-adoption-requires-flag"
+        assert {t.container_kind for t in excinfo.value.transitions} == {"database", "schema"}
+
+    def test_the_flag_still_waves_it_through(self):
+        adoptions = guard_ownership_transitions(
+            _mix_contract("isolated"),
+            self.MIX_STATE,
+            import_candidates=_sf_imports(_mix_contract("isolated")),
+            adopt_shared_container=True,
+        )
+        assert len(adoptions) == 2
+
+    def test_the_unflipped_contract_blocks_for_an_unrelated_pre_existing_reason(self):
+        """Not this fix, and not signal 2 — pinned so it is not rediscovered.
+
+        ``_decisions_in_scope`` reads EVERY scope by design, so on a mixed
+        contract ``database``/``schema`` resolve to {OWNED, REFERENCED} and
+        signal 1 reports the *isolated* exposure's own containers as
+        owned -> referenced the moment they are in state. That predates both
+        the import-candidate signal and its scoping; it fails closed (an
+        un-overridable block, never a destroy) and is tracked separately.
+
+        It matters here only as a contrast: the flip above is caught as
+        ``shared-adoption-requires-flag`` on the POOL's containers, which is
+        a different finding on different addresses.
+        """
+        with pytest.raises(PackagingTransitionError) as excinfo:
+            guard_ownership_transitions(
+                _mix_contract("shared"),
+                self.MIX_STATE,
+                import_candidates=_sf_imports(_mix_contract("shared")),
+            )
+        assert excinfo.value.kind == "ownership-transition"
+        assert all("FLUID_FIXMISC2_MIX" in t.address for t in excinfo.value.transitions)
+
+    def test_growth_inside_the_products_own_database_still_passes(self):
+        """The false positive the narrowing fixed must stay fixed.
+
+        Same state, same "state already manages a container of both types"
+        shape — but the new exposure points inside the product's OWN
+        database, and the state holds nothing inside the new schema.
+        """
+        grown = _mix_contract("shared")
+        grown["exposes"] = [
+            grown["exposes"][0],
+            {
+                "exposeId": "grown",
+                "kind": "table",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_table",
+                    "location": {
+                        "database": "FLUID_FIXMISC2_MIX",
+                        "schema": "PREEXIST",
+                        "table": "GROWN_TABLE",
+                    },
+                },
+            },
+        ]
+        candidates = _sf_imports(grown)
+        assert "snowflake_schema.silver_fixmisc2_mix_v1_FLUID_FIXMISC2_MIX_PREEXIST" in candidates
+        assert (
+            guard_ownership_transitions(grown, self.MIX_STATE, import_candidates=candidates) == ()
+        )
+
+
+class TestContainerNamesNestTheirLeaves:
+    """The naming coupling ``_nested_under`` rests on, pinned to the plugins.
+
+    Signal 2's per-container footprint test reads "the state manages a
+    resource inside this container" off the emitters' shared convention:
+    every resource name is composed container-first out of ``safe_ident``
+    segments, so a leaf's name is the container's name plus ``_<leaf>``.
+    Assert it against the real ``discover_imports`` output rather than
+    trusting the convention to hold.
+    """
+
+    def test_snowflake_nests_schema_and_table_under_the_database(self):
+        addresses = _sf_imports(_mix_contract("isolated"))
+        database = "silver_fixmisc2_mix_v1_FLUID_FIXMISC2_POOL2"
+        schema = "silver_fixmisc2_mix_v1_FLUID_FIXMISC2_POOL2_MPOOL2"
+        names = [a.split(".", 1)[1] for a in addresses if a.endswith("POOL2_MPOOL2_POOL_TABLE")]
+        assert names, "expected the pooled leaf table in the candidate list"
+        assert _nested_under(database, schema)
+        assert all(_nested_under(database, n) and _nested_under(schema, n) for n in names)
+
+    def test_aws_nests_the_glue_table_under_its_database(self, monkeypatch):
+        from fluid_build.iac.registry import get_iac_plugin
+
+        monkeypatch.setenv("AWS_ACCOUNT_ID", "123456789012")
+        addresses = [b.to for b in get_iac_plugin("aws").discover_imports(_contract(ISOLATED))]
+        database = next(
+            a.split(".", 1)[1] for a in addresses if a.startswith("aws_glue_catalog_database.")
+        )
+        table = next(
+            a.split(".", 1)[1] for a in addresses if a.startswith("aws_glue_catalog_table.")
+        )
+        assert _nested_under(database, table)
+
+    def test_a_sibling_is_not_a_child(self):
+        """The strict ``_`` boundary — ``FOO_BAR`` is not inside ``FOO_B``."""
+        assert not _nested_under("p_db_FOO_B", "p_db_FOO_BAR")
+        assert not _nested_under("p_db_FOO", "p_db_FOO")
+
+    def test_gcp_is_the_documented_exception_and_signal_1_covers_it(self):
+        """GCP keys a BigQuery table ``<cid>_<table>``, so nesting is False.
+
+        That is safe only because the GCP plugin emits a ``data.`` address
+        for every REFERENCED container, which signal 1 reads directly. Pin
+        both halves together — if the data source ever goes away, the flip
+        becomes invisible to all three signals.
+        """
+        from fluid_build.iac.registry import get_iac_plugin
+
+        contract = {
+            "fluidVersion": "0.7.6",
+            "id": "orders-adp",
+            "packaging": {"mode": "shared", "pool": "sales"},
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "binding": {
+                        "platform": "gcp",
+                        "format": "bigquery_table",
+                        "location": {"dataset": "sales_pool", "table": "orders"},
+                    },
+                }
+            ],
+        }
+        plugin = get_iac_plugin("gcp")
+        # The nesting convention does NOT hold here.
+        assert not _nested_under("orders_adp_sales_pool", "orders_adp_orders")
+        # …so the referenced dataset must be visible as a `data.` address.
+        assert "google_bigquery_dataset" in plugin.emit_data(contract)
