@@ -38,9 +38,14 @@ builds:
         cron: "0 2 * * *"
       runtime:
         platform: "snowflake"
+        # The README promises "the Snowflake runtime is configured explicitly
+        # with warehouse, database, schema, and role" — so declare them.
+        # These are what the build actually executes against.
         resources:
-          cpu: "standard"
-          memory: "standard"
+          warehouse: "{{ env.SNOWFLAKE_WAREHOUSE }}"
+          database: "{{ env.SNOWFLAKE_DATABASE }}"
+          schema: "{{ env.SNOWFLAKE_SCHEMA }}"
+          role: "{{ env.SNOWFLAKE_ROLE }}"
       retries:
         count: 2
         delaySeconds: 120
@@ -53,9 +58,14 @@ exposes:
       platform: "snowflake"
       format: "snowflake_table"
       location:
-        account: "OTE_ACCT"
-        database: "OTE_ANALYTICS"
-        schema: "SILVER"
+        # Environment-resolved, like ../smoke. These were hardcoded to
+        # OTE_ACCT / OTE_ANALYTICS / SILVER, which meant anyone running the
+        # example as documented provisioned a brand-new top-level
+        # OTE_ANALYTICS database in their own account and ignored their
+        # SNOWFLAKE_DATABASE / SNOWFLAKE_SCHEMA entirely.
+        account: "{{ env.SNOWFLAKE_ACCOUNT }}"
+        database: "{{ env.SNOWFLAKE_DATABASE }}"
+        schema: "{{ env.SNOWFLAKE_SCHEMA }}"
         table: "BILLING_HISTORY_V1"
     contract:
       schema:

@@ -1389,6 +1389,27 @@ class TestSnowflakeCatalogEnrichment:
         assert "```yaml" in comment
         assert "silver.commerce.orders" in comment
 
+    def test_embedded_contract_yaml_is_key_order_canonical(self):
+        """The embedded contract YAML must not depend on the dict's insertion
+        order.
+
+        `tofu` diffs the COMMENT attribute on every apply. A ``.fluid.yaml``
+        input preserves the author's key order; a ``plan.json`` input
+        round-trips the same contract through the plan writer's sorted JSON.
+        With insertion-order serialization the two produced different comment
+        strings for an identical contract, so alternating ``apply c.yaml`` /
+        ``apply plan.json`` re-issued ``ALTER TABLE … SET COMMENT`` forever
+        and "no changes" could never be asserted.
+        """
+        contract = _enriched_snowflake_contract()
+        shuffled = dict(reversed(list(contract.items())))
+
+        def _comment(c):
+            res = _sf().emit(c, [])
+            return next(iter(res["snowflake_table"].values()))["comment"]
+
+        assert _comment(contract) == _comment(shuffled)
+
     def test_per_column_comments_on_snowflake_table(self):
         res = _sf().emit(_enriched_snowflake_contract(), [])
         tbl = next(iter(res["snowflake_table"].values()))

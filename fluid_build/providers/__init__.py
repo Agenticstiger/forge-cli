@@ -314,6 +314,31 @@ def register_provider(
         )
         return
 
+    # Operator allow/block policy, enforced at the single registration
+    # chokepoint rather than only in ``_discover_entrypoints``. The
+    # entry-point walk gated correctly, but ``_preload_curated`` and
+    # ``_discover_subpackages`` import the in-tree provider modules directly
+    # and those self-register here — so a built-in slipped past the policy.
+    # ``fluid plugins --role provider`` meanwhile rendered it as
+    # ``BLOCKED (allow/block policy)`` off the same name, i.e. the control
+    # displayed as enforced while being inert: with
+    # ``FLUID_PLUGINS_BLOCKLIST=snowflake`` set, a real Snowflake apply
+    # provisioned tables. A security control that renders as enforced while
+    # doing nothing is worse than no control, so the gate now holds for
+    # every registration source.
+    from fluid_build.plugin_manager import is_allowed
+
+    if not is_allowed(cname):
+        _safe_log(
+            logger,
+            logging.DEBUG,
+            "provider_name_rejected",
+            name=cname,
+            reason="allow_block_policy",
+            source=source,
+        )
+        return
+
     # Plugin↔CLI compatibility gate (read-only, outside the lock). Advisory by
     # default; FLUID_PLUGIN_STRICT_COMPAT=1 rejects an incompatible plugin.
     compatible = _check_sdk_compat(cname, provider, logger)

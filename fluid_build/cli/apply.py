@@ -259,6 +259,50 @@ def _run_apply_hooks(
     return 1
 
 
+def _run_apply_hooks_for_source(args, logger: logging.Logger) -> int:
+    """Run apply-time hooks for whatever ``args.contract`` points at.
+
+    The native path already holds a loaded contract when it reaches its
+    hook call site; the OpenTofu path does not — it hands ``args`` straight
+    to :func:`apply_via_opentofu`. This adapter loads the contract for both
+    documented apply inputs (a ``.fluid.yaml`` path and a pre-generated
+    ``plan.json``, which embeds the contract under ``contract``) so the hook
+    surface is identical on both engines.
+
+    A contract that cannot be loaded is NOT a reason to skip the guards
+    silently — but it is also not this function's error to report: the
+    engine loads the same source moments later and raises the proper
+    ``CLIError``. So we log at debug and return 0, letting the engine own
+    the failure message.
+    """
+    src = str(getattr(args, "contract", "") or "")
+    try:
+        if src.endswith(".json"):
+            plan_data = read_json(src)
+            contract = plan_data.get("contract") if isinstance(plan_data, dict) else None
+            if not isinstance(contract, dict) or not contract:
+                logger.debug("apply hooks skipped: %s has no embedded contract", src)
+                return 0
+        else:
+            contract = load_contract_with_overlay(src, getattr(args, "env", None), logger)
+    except Exception as exc:  # noqa: BLE001 — the engine re-loads and reports
+        logger.debug("apply hooks skipped: %s could not be loaded (%s)", src, type(exc).__name__)
+        return 0
+
+    rc = _run_apply_hooks(
+        contract,
+        Path(src).resolve().parent,
+        logger,
+        force=bool(getattr(args, "force_pattern_drift", False)),
+        env=getattr(args, "env", None),
+    )
+    if rc != 0:
+        logger.error(
+            "apply aborted by an apply-time plugin hook. " "Pass --force-pattern-drift to override."
+        )
+    return rc
+
+
 def _gate_contract_for_apply(contract: Dict[str, Any], logger: logging.Logger) -> None:
     """Reject pre-0.7 + schema-invalid contracts before any DDL.
 
@@ -283,6 +327,25 @@ def _gate_contract_for_apply(contract: Dict[str, Any], logger: logging.Logger) -
 # ==========================================
 
 
+class _RetiredBuildFlagAction(argparse.Action):
+    """Fail ``--build`` with the migration instruction instead of guessing.
+
+    ``--build`` was the pre-mode-matrix way to run a contract's builds.
+    Silently reinterpreting it (as prefix abbreviation to ``--build-id`` did)
+    is the worst outcome on a command that provisions and destroys
+    infrastructure: the value the operator meant as "run the builds" became a
+    filter string, and their contract path stopped being the contract.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(
+            "--build was replaced by the apply mode matrix. Use "
+            "`--mode amend-and-build` (or `--mode replace-and-build`) to run "
+            "the contract's builds, and `--build-id <id>` to filter to one "
+            "build. See `fluid apply --help`."
+        )
+
+
 def register(subparsers: argparse._SubParsersAction):
     """Register the apply command with comprehensive options"""
     p = subparsers.add_parser(
@@ -297,6 +360,17 @@ def register(subparsers: argparse._SubParsersAction):
             "Docs: https://github.com/open-data-protocol/fluid/blob/main/docs/apply.md"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        # No prefix abbreviation on the platform's mutation command.
+        # argparse's default expands any unambiguous prefix, so the retired
+        # ``--build <contract>`` (replaced by the mode matrix) silently
+        # resolved to ``--build-id`` and bound the operator's contract PATH
+        # as a build-id filter. The positional then fell back to CWD
+        # auto-discovery and apply ran the DDL phase against a contract the
+        # user never named — on the observed run it planned a destructive
+        # change and was stopped only by the OpenTofu destroy gate. A typo'd
+        # flag on a destructive command must be an error, not a
+        # reinterpretation.
+        allow_abbrev=False,
     )
 
     # Core arguments
@@ -441,6 +515,16 @@ def register(subparsers: argparse._SubParsersAction):
             "means the inputs have changed and a fresh generate is needed."
         ),
     )
+    safety_group.add_argument(
+        "--allow-skipped-builds",
+        action="store_true",
+        help=(
+            "Exit 0 from a build-augmented mode even when every build was "
+            "skipped (missing dbt project / driver script). Without this the "
+            "apply exits 1, because DDL-only success on an empty table is a "
+            "broken deployment reported green."
+        ),
+    )
 
     # Reporting and monitoring
     reporting_group = p.add_argument_group("Reporting & Monitoring")
@@ -480,6 +564,21 @@ def register(subparsers: argparse._SubParsersAction):
 
     # Build execution (absorbed from 'fluid execute')
     build_group = p.add_argument_group("Build Execution")
+    # ``--build`` was retired when the mode matrix replaced it; its
+    # auto-upgrade path (``resolve_mode_with_build_alias``) is gone. With
+    # argparse's default prefix abbreviation it nevertheless resolved to
+    # ``--build-id``, so ``fluid apply --build contract.fluid.yaml`` bound
+    # the operator's CONTRACT PATH as a build-id filter and applied an
+    # auto-discovered contract instead. ``allow_abbrev=False`` on the parser
+    # closes that; this explicit registration turns the resulting bare
+    # "unrecognized arguments" into the actual migration instruction.
+    build_group.add_argument(
+        "--build",
+        dest="_retired_build",
+        action=_RetiredBuildFlagAction,
+        nargs="?",
+        help=argparse.SUPPRESS,
+    )
     build_group.add_argument(
         "--build-id",
         dest="build_id",
@@ -1455,11 +1554,27 @@ def run(args, logger: logging.Logger) -> int:
     # a cheap ``estimate_row_count()`` and pass it in. For now, the gate's
     # default behavior is "non-dev + replace → require --allow-data-loss
     # unless you can prove the target is empty."
+    #
+    # Apply-engine resolution is automatic and per-provider — no user switch.
+    # It is resolved HERE, before the gate, because the gate's message
+    # depends on it: only the native path plans the pre-flight zero-copy
+    # CLONE (``providers/*/plan`` ``rollback_snapshot`` markers) and writes
+    # ``.fluid/rollback-state.json``. `tofu` has no CTAS/CLONE step, so on
+    # the cloud path there is no snapshot and no restore point — and the
+    # gate must not promise one it cannot deliver.
+    from fluid_build.cli._apply_opentofu_engine import (
+        apply_via_opentofu,
+        resolve_apply_engine,
+    )
+
+    apply_engine = resolve_apply_engine(args, logger)
+
     gate = check_data_loss_gate(
         resolved_mode,
         env=args.env,
         target_row_count=None,  # unknown until provider check added
         allow_data_loss=bool(getattr(args, "allow_data_loss", False)),
+        snapshot_available=apply_engine != "opentofu",
     )
     if gate.blocked:
         raise CLIError(
@@ -1468,15 +1583,19 @@ def run(args, logger: logging.Logger) -> int:
             {"mode": resolved_mode.value, "env": args.env, "reason": gate.reason},
         )
 
-    # Apply-engine resolution is automatic and per-provider — no user
-    # switch. The cloud providers compile the contract to `.tf.json` and
-    # delegate to `tofu`; `local` keeps the native path below.
-    from fluid_build.cli._apply_opentofu_engine import (
-        apply_via_opentofu,
-        resolve_apply_engine,
-    )
-
-    if resolve_apply_engine(args, logger) == "opentofu":
+    if apply_engine == "opentofu":
+        # Apply-time plugin hooks run on EVERY engine. They used to be
+        # invoked only from the native path's YAML branch, several hundred
+        # lines below this early return — so for aws / gcp / snowflake /
+        # confluent (i.e. every cloud in ``OPENTOFU_DEFAULT_PROVIDERS``) a
+        # registered scaffold-drift / lockfile / env-aware deploy guard
+        # silently never ran and ``--force-pattern-drift`` had nothing to
+        # override. A guard that fires on the toy local target and no-ops
+        # against production clouds is a fail-open control, so the dispatch
+        # is mirrored here, ahead of ``tofu init/plan/apply``.
+        _hook_rc = _run_apply_hooks_for_source(args, logger)
+        if _hook_rc != 0:
+            return _hook_rc
         rc = apply_via_opentofu(args, logger)
         # The OpenTofu engine provisions infrastructure only. Build-augmented
         # modes (amend-and-build / replace-and-build) still need their build
