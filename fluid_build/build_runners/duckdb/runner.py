@@ -1308,9 +1308,7 @@ def execute_duckdb_build(
     # use ``write_run_record_and_finalize`` because it has to persist the
     # record BEFORE raising ``PartialFailureError``, so it emits the same
     # chokepoint explicitly — write → emit → finalize, in that order.
-    emit_terminal_lineage_event(
-        ctx, result=result, succeeded_states=DuckdbRunner.succeeded_states
-    )
+    emit_terminal_lineage_event(ctx, result=result, succeeded_states=DuckdbRunner.succeeded_states)
 
     if result.state is RunState.PARTIAL:
         from fluid_build._errors import PartialFailureError

@@ -195,9 +195,7 @@ def run(args: argparse.Namespace, logger_instance: logging.Logger) -> int:
             contract_path = Path(args.contract)
 
             if not contract_path.exists():
-                raise CLIError(
-                    1, "contract_file_not_found", context={"path": str(args.contract)}
-                )
+                raise CLIError(1, "contract_file_not_found", context={"path": str(args.contract)})
 
             contract = load_contract_with_overlay(str(contract_path), args.env, logger)
             logger.info("Running policy enforcement")

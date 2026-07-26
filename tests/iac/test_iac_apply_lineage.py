@@ -93,9 +93,7 @@ class TestApplyEventShape:
         assert facet["applied_changes"] == {"add": 1}
 
     def test_run_id_is_stable_across_the_pair(self):
-        start = encode_event(
-            self._event(RunEventType.START, event_time="2026-05-15T00:00:00Z")
-        )
+        start = encode_event(self._event(RunEventType.START, event_time="2026-05-15T00:00:00Z"))
         done = encode_event(self._event(RunEventType.COMPLETE))
         assert start["run"]["runId"] == done["run"]["runId"]
 

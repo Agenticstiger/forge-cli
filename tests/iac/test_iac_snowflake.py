@@ -1469,6 +1469,8 @@ class TestBodylessViewExposure:
         body = next(iter(res["snowflake_view"].values()))
         assert body["statement"] == "SELECT ID FROM SRC"
         assert body["name"] == "V"
+
+
 class TestIcebergIsRefusedNotSubstituted:
     """``format: iceberg`` must not fall through to ``snowflake_table``.
 

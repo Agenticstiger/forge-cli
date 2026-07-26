@@ -396,9 +396,7 @@ class TestTerminalEventFacets:
 
     def test_no_engine_facet_when_result_has_none(self):
         payload = encode_event(
-            build_run_event(
-                self._ctx(), event_type=RunEventType.START, event_time=_EVENT_TIME
-            )
+            build_run_event(self._ctx(), event_type=RunEventType.START, event_time=_EVENT_TIME)
         )
         assert FLUID_ENGINE_FACET_KEY not in payload["run"]["facets"]
 
@@ -433,9 +431,7 @@ class TestRunIdIsStableAcrossOneRun:
 
     def test_start_and_complete_share_one_run_id(self):
         start = encode_event(
-            build_run_event(
-                self._ctx(), event_type=RunEventType.START, event_time=_EVENT_TIME
-            )
+            build_run_event(self._ctx(), event_type=RunEventType.START, event_time=_EVENT_TIME)
         )
         complete = encode_event(
             build_run_event(
@@ -443,9 +439,7 @@ class TestRunIdIsStableAcrossOneRun:
                 event_type=RunEventType.COMPLETE,
                 # Finished later — the event times legitimately differ.
                 event_time="2026-05-15T00:00:37Z",
-                result=SimpleNamespace(
-                    facets={"engine": "duckdb"}, started_at=_EVENT_TIME
-                ),
+                result=SimpleNamespace(facets={"engine": "duckdb"}, started_at=_EVENT_TIME),
             )
         )
         assert start["run"]["runId"] == complete["run"]["runId"]
