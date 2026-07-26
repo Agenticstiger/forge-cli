@@ -1053,6 +1053,23 @@ def _output_results(result: ValidationResult, args, logger: logging.Logger) -> i
         return _output_text_results(result, args, logger)
 
 
+def _cprint_json(payload: str) -> None:
+    """Emit a machine-readable JSON document on stdout.
+
+    ``cprint`` renders through Rich, which WORD-WRAPS at the console
+    width (80 when stdout is a pipe). Any validation message longer than
+    that got a newline injected mid-string, which is a literal control
+    character inside a JSON string — so ``fluid validate --format json``
+    produced a document ``json.load`` refuses:
+    ``JSONDecodeError: Invalid control character``. ``soft_wrap=True``
+    turns wrapping off; ``markup=False`` stops Rich from eating a
+    ``[tag]``-shaped substring of a message. Still routed through
+    ``cprint`` (rather than ``sys.stdout.write``) so the console's secret
+    redaction stays on the path.
+    """
+    cprint(payload, soft_wrap=True, markup=False, highlight=False)
+
+
 def _output_json_results(result: ValidationResult, args) -> int:
     """Output results in JSON format."""
     import json
@@ -1065,7 +1082,7 @@ def _output_json_results(result: ValidationResult, args) -> int:
         "validation_time": result.validation_time,
     }
 
-    cprint(json.dumps(output, indent=2))
+    _cprint_json(json.dumps(output, indent=2))
     return 0 if result.is_valid and (not args.strict or not result.warnings) else 1
 
 
@@ -1299,7 +1316,7 @@ def _run_bundle_validation(
     verbose = bool(getattr(args, "verbose", False))
 
     if out_format == "json":
-        cprint(json.dumps(report.to_dict(), indent=2))
+        _cprint_json(json.dumps(report.to_dict(), indent=2))
     elif not quiet:
         status_icon = "✅" if report.status == "pass" else "❌"
         cprint(f"{status_icon} Bundle {report.status}: {tgz_path}")

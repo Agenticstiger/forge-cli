@@ -401,3 +401,76 @@ def test_emitter_output_passes_the_validate_time_guard():
 )
 def test_first_aggregate_call_matches_calls_not_column_names(expr, expected):
     assert first_aggregate_call(expr) == expected
+
+
+# ---------------------------------------------------------------------
+# Name collisions across the ONE semantic namespace.
+#
+# dbt MetricFlow registers entities / dimensions / measures / metrics in
+# a single global namespace and Cube requires ``name`` to be unique among
+# all dimensions, measures and segments. We can't hard-error (contracts
+# carrying the collision answer queries correctly — the governed query
+# path renames the aggregate column), so it is a warning that names the
+# ambiguity before someone meets it at query time.
+# ---------------------------------------------------------------------
+
+
+def _colliding(metric_measure="revenue"):
+    return _contract_with_semantics(
+        measures=[
+            {"name": "revenue", "agg": "sum", "expr": "TOTAL_PRICE"},
+            {"name": "order_status", "agg": "sum", "expr": "TOTAL_PRICE"},
+        ],
+        dimensions=[{"name": "order_status", "expr": "ORDER_STATUS"}],
+        metrics=[{"name": "order_status", "type": "simple", "measure": metric_measure}],
+    )
+
+
+def test_metric_named_like_a_dimension_warns_and_names_the_fallback():
+    errors, warnings = validate_semantics_block(_colliding())
+    assert errors == []
+    metric_warning = [w for w in warnings if "metric 'order_status'" in w]
+    assert len(metric_warning) == 1
+    assert "falls back to the measure name ('revenue')" in metric_warning[0]
+
+
+def test_metric_whose_measure_also_collides_warns_that_the_query_is_rejected():
+    errors, warnings = validate_semantics_block(_colliding(metric_measure="order_status"))
+    assert errors == []
+    metric_warning = [w for w in warnings if "metric 'order_status'" in w]
+    assert len(metric_warning) == 1
+    assert "REJECTS that request" in metric_warning[0]
+
+
+def test_measure_named_like_a_dimension_warns():
+    _, warnings = validate_semantics_block(_colliding())
+    measure_warning = [w for w in warnings if "measure 'order_status'" in w]
+    assert len(measure_warning) == 1
+    assert "silently dropped" in measure_warning[0]
+
+
+def test_collision_check_is_case_insensitive():
+    _, warnings = validate_semantics_block(
+        _contract_with_semantics(
+            measures=[{"name": "revenue", "agg": "sum", "expr": "TOTAL_PRICE"}],
+            dimensions=[{"name": "Order_Status", "expr": "ORDER_STATUS"}],
+            metrics=[{"name": "order_status", "type": "simple", "measure": "revenue"}],
+        )
+    )
+    assert len(warnings) == 1
+    assert "Order_Status" in warnings[0]
+
+
+def test_distinct_names_produce_no_collision_warning():
+    """The ordinary contract shape must stay warning-free — this guard
+    runs on every ``fluid validate`` and ``--strict`` turns warnings into
+    a non-zero exit code."""
+    errors, warnings = validate_semantics_block(
+        _contract_with_semantics(
+            measures=[{"name": "revenue", "agg": "sum", "expr": "TOTAL_PRICE"}],
+            dimensions=[{"name": "order_status", "expr": "ORDER_STATUS"}],
+            metrics=[{"name": "total_revenue", "type": "simple", "measure": "revenue"}],
+        )
+    )
+    assert errors == []
+    assert warnings == []

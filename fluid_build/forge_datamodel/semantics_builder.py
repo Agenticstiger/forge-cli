@@ -166,6 +166,22 @@ def validate_semantics_block(contract: Mapping[str, Any]) -> Tuple[List[str], Li
     scored 100/100, and the only feedback was an opaque engine error on
     the first query. Hard errors, because the shape cannot produce a
     working query on any engine.
+
+    Also WARNS on a NAME COLLISION between a dimension and a metric or
+    measure in the same expose. Every mainstream semantic layer treats
+    those as one namespace and rejects the duplicate at model-build time
+    (dbt MetricFlow registers entities / dimensions / measures / metrics
+    in a single global namespace; Cube requires ``name`` to be unique
+    among all dimensions, measures and segments —
+    https://cube.dev/docs/dimensions/). Snowflake Semantic Views tolerate
+    it and then emit two output columns with the same name, which the
+    docs tell you to fix by renaming through a table alias
+    (https://docs.snowflake.com/en/user-guide/views-semantic/querying).
+    Our governed ``query`` path does that rename automatically where it
+    can, and rejects the request where it can't — either way the contract
+    is ambiguous and the author should know. A WARNING, not an error:
+    contracts carrying the collision still answer queries correctly, so
+    failing them outright would break working models.
     """
     errors: List[str] = []
     warnings: List[str] = []
@@ -216,7 +232,79 @@ def validate_semantics_block(contract: Mapping[str, Any]) -> Tuple[List[str], Li
                 f"is invalid on every engine. Model it as a measure, or group "
                 f"by the underlying column."
             )
+        warnings.extend(_name_collision_warnings(semantics, expose_id))
     return errors, warnings
+
+
+def _semantic_names(semantics: Mapping[str, Any], kind: str) -> Dict[str, str]:
+    """Case-folded name → as-authored name for one semantics collection.
+
+    Case-folded because the collision that matters is the one an ENGINE
+    sees: unquoted identifiers fold, so ``Order_Status`` and
+    ``order_status`` are the same output column name.
+    """
+    found: Dict[str, str] = {}
+    for entry in semantics.get(kind) or []:
+        if not isinstance(entry, Mapping):
+            continue
+        name = entry.get("name")
+        if isinstance(name, str) and name:
+            found.setdefault(name.casefold(), name)
+    return found
+
+
+def _name_collision_warnings(semantics: Mapping[str, Any], expose_id: str) -> List[str]:
+    """Warn when a metric or measure shares a dimension's name.
+
+    A ``query`` that selects the metric/measure AND groups by the
+    identically-named dimension would project two columns with one name;
+    the drivers key rows with ``dict(zip(columns, values))``, so one of
+    the two values would be silently dropped. ``compile_semantic_query``
+    now renames or rejects instead — this warning names the underlying
+    modelling problem at validate time rather than leaving it to be
+    discovered on the first query.
+    """
+    messages: List[str] = []
+    dimensions = _semantic_names(semantics, "dimensions")
+    if not dimensions:
+        return messages
+    measures = _semantic_names(semantics, "measures")
+    metric_measure: Dict[str, Any] = {}
+    for entry in semantics.get("metrics") or []:
+        if isinstance(entry, Mapping) and isinstance(entry.get("name"), str):
+            metric_measure.setdefault(str(entry["name"]).casefold(), entry.get("measure"))
+    for folded, metric_name in _semantic_names(semantics, "metrics").items():
+        if folded not in dimensions:
+            continue
+        measure_ref = metric_measure.get(folded)
+        fallback_taken = isinstance(measure_ref, str) and measure_ref.casefold() in dimensions
+        messages.append(
+            f"expose '{expose_id}': metric '{metric_name}' has the same name as "
+            f"dimension '{dimensions[folded]}'. Metric, measure and dimension "
+            f"names share one namespace (dbt MetricFlow, Cube), so a query for "
+            f"this metric grouped by that dimension would project two columns "
+            f"with one name. The governed query path "
+            + (
+                f"REJECTS that request — measure '{measure_ref}' collides too, so "
+                f"there is no distinct name left to fall back to."
+                if fallback_taken
+                else f"falls back to the measure name ('{measure_ref}') for the "
+                f"aggregate column."
+            )
+            + " Rename one of them."
+        )
+    for folded, measure_name in measures.items():
+        if folded not in dimensions:
+            continue
+        messages.append(
+            f"expose '{expose_id}': measure '{measure_name}' has the same name as "
+            f"dimension '{dimensions[folded]}'. Metric, measure and dimension "
+            f"names share one namespace (dbt MetricFlow, Cube); a query for this "
+            f"measure grouped by that dimension is rejected because both columns "
+            f"would be projected under one name and one value would be silently "
+            f"dropped from every row. Rename one of them."
+        )
+    return messages
 
 
 def simple_metric(name: str, measure: str, *, description: Optional[str] = None) -> Dict[str, Any]:

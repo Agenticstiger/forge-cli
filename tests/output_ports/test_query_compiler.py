@@ -954,3 +954,144 @@ def test_two_metrics_over_one_measure_project_distinct_columns():
     )
     assert completed.columns == ["completed_revenue"]
     assert total.columns == ["total_revenue"]
+
+
+# ---------------------------------------------------------------------
+# Projection-alias uniqueness
+#
+# Aliasing the aggregate to the METRIC name made two metrics over one
+# measure distinguishable, but it can collide with a dimension name:
+# metric / measure / dimension share ONE namespace in every mainstream
+# semantic layer (dbt MetricFlow, Cube), and a duplicate output name
+# both breaks ``ORDER BY <alias>`` and collapses in the drivers'
+# ``dict(zip(columns, values))`` row keying.
+# ---------------------------------------------------------------------
+
+
+def _expose_with_colliding_names():
+    """``order_status`` is BOTH a dimension and a metric; ``priority`` is
+    both a dimension and a measure."""
+    return make_expose(
+        columns=[
+            {"name": "order_id", "type": "STRING"},
+            {"name": "order_status", "type": "STRING"},
+            {"name": "order_priority", "type": "STRING"},
+            {"name": "amount", "type": "FLOAT64"},
+        ],
+        semantics={
+            "name": "orders",
+            "measures": [
+                {"name": "revenue", "agg": "sum", "expr": "amount"},
+                {"name": "priority", "agg": "sum", "expr": "amount"},
+            ],
+            "dimensions": [
+                {"name": "order_status", "type": "categorical"},
+                {"name": "priority", "type": "categorical", "expr": "order_priority"},
+                # Folds onto ``order_status`` but projects a DIFFERENT column.
+                {"name": "Order_Status", "type": "categorical", "expr": "order_priority"},
+            ],
+            "metrics": [
+                {"name": "order_status", "type": "simple", "measure": "revenue"},
+                {"name": "total_revenue", "type": "simple", "measure": "revenue"},
+                {"name": "Order_Status", "type": "simple", "measure": "revenue"},
+                # Name AND measure name both collide with dimension ``priority``.
+                {"name": "priority", "type": "simple", "measure": "priority"},
+            ],
+        },
+    )
+
+
+def test_metric_named_like_a_dimension_falls_back_to_the_measure_name():
+    """The pre-aliasing behaviour for exactly this shape: the aggregate
+    column is named after the MEASURE, and the query still runs."""
+    compiled = compile_semantic_query(
+        expose=_expose_with_colliding_names(),
+        metric="order_status",
+        dimensions=["order_status"],
+        limit=10,
+        table_reference="orders",
+    )
+    assert compiled.columns == ["order_status", "revenue"]
+    assert "SUM(amount) AS revenue" in compiled.sql
+    assert "ORDER BY revenue DESC, order_status ASC" in compiled.sql
+
+
+def test_metric_alias_collision_is_case_insensitive():
+    """Engines fold unquoted identifiers, so ``Order_Status`` and
+    ``order_status`` are ONE output column name — the fallback has to
+    trigger on the folded comparison or the SQL is still ambiguous."""
+    compiled = compile_semantic_query(
+        expose=_expose_with_colliding_names(),
+        metric="Order_Status",
+        dimensions=["order_status"],
+        limit=10,
+        table_reference="orders",
+    )
+    assert compiled.columns == ["order_status", "revenue"]
+
+
+def test_metric_and_measure_both_colliding_is_rejected_loudly():
+    """No distinct name left. Rejecting names the problem; the released
+    behaviour silently dropped one of the two values from every row."""
+    with pytest.raises(QueryValidationError, match="collides too"):
+        compile_semantic_query(
+            expose=_expose_with_colliding_names(),
+            metric="priority",
+            dimensions=["priority"],
+            limit=10,
+            table_reference="orders",
+        )
+
+
+def test_bare_measure_named_like_a_requested_dimension_is_rejected():
+    with pytest.raises(QueryValidationError, match="collides"):
+        compile_semantic_query(
+            expose=_expose_with_colliding_names(),
+            measure="priority",
+            dimensions=["priority"],
+            limit=10,
+            table_reference="orders",
+        )
+
+
+def test_metric_name_survives_when_no_dimension_collides():
+    """The collision guard must not disturb the ordinary case — the
+    metric name is still what the aggregate column is called."""
+    compiled = compile_semantic_query(
+        expose=_expose_with_colliding_names(),
+        metric="total_revenue",
+        dimensions=["order_status"],
+        limit=10,
+        table_reference="orders",
+    )
+    assert compiled.columns == ["order_status", "total_revenue"]
+
+
+def test_repeated_dimension_projects_once():
+    """Asking for the same dimension twice is idempotent, not two
+    identically-named columns (which collapse in the row dict and make
+    ``ORDER BY <alias>`` ambiguous)."""
+    compiled = compile_semantic_query(
+        expose=_expose_with_colliding_names(),
+        metric="total_revenue",
+        dimensions=["order_status", "order_status"],
+        limit=10,
+        table_reference="orders",
+    )
+    assert compiled.columns == ["order_status", "total_revenue"]
+    assert compiled.sql.count("AS order_status") == 1
+    assert "GROUP BY order_status\n" in compiled.sql
+
+
+def test_two_dimensions_with_one_output_name_are_rejected():
+    """``Order_Status`` (expr ``order_status``) and ``order_status`` fold
+    to one column name but carry different expressions, so one value
+    would be silently dropped from every row."""
+    with pytest.raises(QueryValidationError, match="silently dropped"):
+        compile_semantic_query(
+            expose=_expose_with_colliding_names(),
+            metric="total_revenue",
+            dimensions=["order_status", "Order_Status"],
+            limit=10,
+            table_reference="orders",
+        )

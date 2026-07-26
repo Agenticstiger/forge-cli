@@ -55,6 +55,32 @@ The server also speaks MCP `resources/list` + `resources/read`, so an
 agent can browse the contract YAML, the JSON expose, and the
 semantic model as MCP resources without spending a `tools/call`.
 
+### Result column names
+
+Every name in a `query` response's `columns` is unique (after case
+folding — engines fold unquoted identifiers), because the drivers key each
+row with `dict(zip(columns, values))` and two columns sharing a name would
+collapse into one entry.
+
+* Ask for a **metric** → the aggregate column is the metric name.
+* Ask for a **measure** → the aggregate column is the measure name.
+* Ask for the same dimension twice → it is projected once.
+* A metric whose name is also a **dimension** name you grouped by → the
+  aggregate column falls back to the *measure* name. Metric, measure and
+  dimension names share one namespace in every mainstream semantic layer
+  ([dbt MetricFlow][mf], [Cube][cube]); [Snowflake Semantic Views][ssv]
+  tolerate the duplicate and tell you to rename the output columns, which
+  is what this does automatically. `fluid validate` **warns** when a
+  contract carries the collision.
+* If both the metric name *and* its measure name are taken by dimensions
+  in the same request, the call is **rejected** with an actionable message
+  — there is no distinct name left, and answering would mean silently
+  dropping one of the two values from every row.
+
+[mf]: https://docs.getdbt.com/docs/build/about-metricflow
+[cube]: https://cube.dev/docs/dimensions/
+[ssv]: https://docs.snowflake.com/en/user-guide/views-semantic/querying
+
 ## Engine drivers
 
 The server picks a driver based on `expose.binding.platform` /

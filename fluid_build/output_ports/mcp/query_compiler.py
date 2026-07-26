@@ -195,6 +195,61 @@ def _reject_restricted_reference(
     )
 
 
+def _resolve_measure_alias(
+    *,
+    metric: Optional[str],
+    measure_name: str,
+    taken: Mapping[str, str],
+) -> str:
+    """Pick the projection alias for the aggregate column.
+
+    Preference order — ``metric`` name (so two metrics over one measure
+    are distinguishable), then the ``measure`` name (the pre-0.13.1
+    behaviour), then a hard error.
+
+    ``taken`` maps an already-projected dimension alias (case-folded, the
+    way an engine folds an unquoted identifier) to its SQL expression.
+    A projection alias MUST be unique: the drivers key each row with
+    ``dict(zip(columns, values))``, so two columns sharing a name collapse
+    into one dict entry and silently discard a value, and the compiler's
+    ``ORDER BY <alias>`` becomes an ambiguous reference the engine
+    rejects outright.
+
+    Prior art — every mainstream semantic layer treats metric / measure /
+    dimension names as ONE namespace and rejects the collision at model
+    build time: dbt MetricFlow registers all of them in a single global
+    namespace, and Cube requires ``name`` to be "unique among all
+    dimensions, measures, and segments" in a cube
+    (https://cube.dev/docs/dimensions/). Snowflake Semantic Views tolerate
+    the duplicate but then emit two identically-named output columns and
+    document the remedy as renaming them through a table alias
+    (https://docs.snowflake.com/en/user-guide/views-semantic/querying).
+    We can't retroactively make the collision a query-time error — a
+    contract whose metric happens to share a dimension's name answered
+    correctly before the metric-name aliasing landed — so we apply
+    Snowflake's remedy automatically (deterministic rename) and surface
+    the modelling problem as a ``fluid validate`` warning instead.
+    """
+    preferred = metric if metric is not None else measure_name
+    if preferred.casefold() not in taken:
+        return preferred
+    if metric is not None and measure_name.casefold() not in taken:
+        # Collision with a requested dimension: fall back to the measure
+        # name, which is what this projection was called before metric
+        # aliasing existed. The response's ``columns`` still describes the
+        # result honestly, so the caller can always tell what it got.
+        return measure_name
+    raise QueryValidationError(
+        f"Projection alias {preferred!r} collides with dimension "
+        f"{taken[preferred.casefold()]!r} already in this SELECT, and no "
+        f"distinct fallback name is available"
+        + (f" (measure {measure_name!r} collides too)" if metric is not None else "")
+        + ". Metric, measure and dimension names share one namespace on the "
+        "governed query path — rename one of them, or drop the colliding "
+        "dimension from this request."
+    )
+
+
 # Aggregations whose result is an actual member value of the input
 # column rather than a summary statistic derived from many rows.
 # A ``MIN``/``MAX``/``MEDIAN``/``PERCENTILE`` over a PII column hands
@@ -695,6 +750,15 @@ def compile_semantic_query(
     dimension names that must already exist in ``expose.semantics.dimensions``
     or ``expose.contract.schema``. Unknown keys are rejected.
 
+    The aggregate column is aliased to the METRIC name when the request
+    named a metric (so ``total_revenue`` and ``completed_revenue`` — two
+    metrics over the one ``revenue`` measure — are distinguishable in the
+    result), and to the MEASURE name when the request named a measure
+    directly. Every projection alias in the returned
+    :attr:`CompiledQuery.columns` is unique after case folding; see
+    :func:`_resolve_measure_alias` for how a metric name that collides
+    with a requested dimension is resolved.
+
     ``limit`` is treated as a literal integer, validated to be in
     ``[1, 1_000_000]``. We deliberately don't accept ``None`` for
     "no limit" — every consumer-side query gets a hard cap so a curious
@@ -757,11 +821,6 @@ def compile_semantic_query(
         validate_ident(metric)
         measure_name, measure_definition, metric_filter = _resolve_metric(metric, index)
 
-    # The projection is aliased to the METRIC name when the caller asked
-    # for a metric, so ``total_revenue`` and ``completed_revenue`` — two
-    # metrics over the one ``revenue`` measure — no longer come back as
-    # two indistinguishable ``revenue`` columns.
-    measure_alias = metric if metric is not None else measure_name
     measure_expr = measure_definition.get("expr") or measure_name
     if isinstance(measure_expr, str):
         _reject_restricted_reference(measure_expr, restricted, subject=f"Measure {measure_name!r}")
@@ -772,11 +831,31 @@ def compile_semantic_query(
     group_columns: List[str] = []
     projection_aliases: List[str] = []
     redacted_aliases: List[str] = []
+    # Case-folded dimension alias → its SQL expression. Engines fold an
+    # unquoted identifier, so ``Status`` and ``status`` are ONE output
+    # column name as far as the row dicts and the ORDER BY are concerned.
+    dimension_aliases: Dict[str, str] = {}
     for dimension_name in dimensions or []:
         if not isinstance(dimension_name, str):
             raise QueryValidationError("Dimension names must be strings")
         alias, expr = _resolve_dimension(dimension_name, index)
         _reject_restricted_reference(expr, restricted, subject=f"Dimension {dimension_name!r}")
+        already = dimension_aliases.get(alias.casefold())
+        if already is not None:
+            if already == expr:
+                # The same dimension asked for twice — idempotent, so drop
+                # the repeat rather than emit a duplicate output column.
+                # (Projecting it twice used to collapse in the driver's
+                # ``dict(zip(columns, values))`` anyway.)
+                continue
+            raise QueryValidationError(
+                f"Dimension {dimension_name!r} projects the same output column "
+                f"name as an earlier dimension in this request but a different "
+                f"expression ({expr!r} vs {already!r}); one of the two values "
+                f"would be silently dropped from every row. Rename one of the "
+                f"dimensions in expose.semantics.dimensions."
+            )
+        dimension_aliases[alias.casefold()] = expr
         select_parts.append(f"{expr} AS {alias}")
         group_columns.append(expr)
         projection_aliases.append(alias)
@@ -784,6 +863,16 @@ def compile_semantic_query(
         # must be redacted under WHATEVER alias it is projected as.
         if _first_referenced_column(expr, redacted) is not None:
             redacted_aliases.append(alias)
+
+    # The projection is aliased to the METRIC name when the caller asked
+    # for a metric, so ``total_revenue`` and ``completed_revenue`` — two
+    # metrics over the one ``revenue`` measure — no longer come back as
+    # two indistinguishable ``revenue`` columns. When that name is already
+    # taken by a dimension in this same SELECT it falls back to the
+    # measure name; see :func:`_resolve_measure_alias`.
+    measure_alias = _resolve_measure_alias(
+        metric=metric, measure_name=measure_name, taken=dimension_aliases
+    )
 
     measure_sql = _render_measure_expression(
         measure_name, measure_definition, dialect=dialect, alias=measure_alias
