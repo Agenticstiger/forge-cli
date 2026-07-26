@@ -80,6 +80,7 @@ from typing import Any, Mapping, Sequence
 RANGE_TEST_NAME = "dbt_expectations.expect_column_values_to_be_between"
 EXPRESSION_TEST_NAME = "dbt_utils.expression_is_true"
 RECENCY_TEST_NAME = "dbt_utils.recency"
+ROW_COUNT_TEST_NAME = "dbt_expectations.expect_table_row_count_to_be_between"
 
 # Prefix for fail-loud sentinel test names — an unmapped rule surfaces as a
 # ``dbt test`` "test not found" error rather than being silently dropped.
@@ -87,6 +88,27 @@ SENTINEL_PREFIX = "fluid_"
 
 # Selector value that marks a table-wide (not column-scoped) dq rule.
 TABLE_SELECTOR = "*"
+
+# Rule types whose dbt test can only attach at *model* level, whatever the
+# rule's selector says. dbt passes ``column_name`` to every generic test
+# reached through ``columns[].data_tests``; ``dbt_utils.recency`` is declared
+# ``(model, field, datepart, interval, ignore_time_component,
+# group_by_columns)`` and takes no ``column_name``, so a column-attached
+# freshness rule fails the whole project at parse time with
+# "macro 'dbt_macro__test_recency' takes no keyword argument 'column_name'".
+# The column the rule selected is preserved — it becomes the test's ``field``.
+MODEL_SCOPED_RULE_TYPES = frozenset({"freshness"})
+
+# FLUID ``dqRule.operator`` → SQL comparison operator. The enum is
+# ``>= > <= < == !=``; only ``==`` needs translating for SQL.
+_SQL_OPERATORS: dict[str, str] = {
+    ">=": ">=",
+    ">": ">",
+    "<=": "<=",
+    "<": "<",
+    "==": "=",
+    "!=": "!=",
+}
 
 
 # ── Canonical dbt-test emitters (pure) ────────────────────────────────────
@@ -138,8 +160,28 @@ def numeric_range_test(*, min_value: Any = None, max_value: Any = None) -> dict[
 
 
 def expression_test(expression: str) -> dict[str, Any]:
-    """``dbt_utils.expression_is_true`` — a predicate placeholder/check."""
+    """``dbt_utils.expression_is_true`` — a predicate placeholder/check.
+
+    Attached to a column, dbt_utils compiles this to
+    ``where not(<column_name> <expression>)``, so ``expression`` is the
+    *right-hand side* of the comparison (``">= 0"``). Attached to a model it
+    compiles to ``where not(<expression>)`` and must be a complete row
+    predicate. Either way the string is interpolated into executable SQL —
+    never put a ``--`` comment in it.
+    """
     return {EXPRESSION_TEST_NAME: {"expression": expression}}
+
+
+def row_count_test(min_rows: Any) -> dict[str, Any]:
+    """``dbt_expectations.expect_table_row_count_to_be_between`` — a volume floor.
+
+    The model-level shape for ``anomaly_detection`` / ``drift_detection``
+    thresholds. ``dbt_utils.expression_is_true`` cannot express this: at
+    model level it compiles the expression into a ``WHERE`` clause, and a
+    warehouse rejects an aggregate there ("count(*) > 100" →
+    ``Invalid aggregate function in WHERE clause`` on Snowflake).
+    """
+    return {ROW_COUNT_TEST_NAME: {"min_value": min_rows}}
 
 
 def recency_test(
@@ -365,18 +407,30 @@ def forward_column_rule(rule: Mapping[str, Any], column: str) -> Any | None:
 
     if kind == "accuracy":
         threshold = rule.get("threshold")
-        operator = rule.get("operator") or ">="
-        if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
-            # Accuracy is contract-specific; surface it as a predicate
-            # placeholder the operator tunes to their own accuracy check.
-            # The threshold + operator are preserved so the intent isn't lost.
-            expr = f"-- accuracy({column}) {operator} {threshold}: replace with predicate"
-            return expression_test(expr)
+        operator = _SQL_OPERATORS.get(str(rule.get("operator") or ">=").strip())
+        if (
+            operator is not None
+            and isinstance(threshold, (int, float))
+            and not isinstance(threshold, bool)
+        ):
+            # ``dbt_utils.expression_is_true`` attached to a column compiles to
+            # ``where not(<column_name> <expression>)`` — the expression is the
+            # right-hand side only. Emit exactly the comparison the live
+            # quality engine runs for an accuracy rule
+            # (``providers/quality_engine.py::_check_accuracy`` →
+            # ``MIN(col) <operator> <threshold>``), so the artifact and the
+            # checker agree. A SQL *comment* here (the previous placeholder)
+            # swallowed the closing paren and made every `dbt test` fail with
+            # an opaque Snowflake parser error.
+            return expression_test(f"{operator} {threshold}")
         return sentinel_test("accuracy", column)
 
     if kind == "freshness":
-        window = rule.get("window") or rule.get("threshold")
-        return recency_test(column, window=window)
+        # Never reached through a column: freshness is model-scoped (see
+        # MODEL_SCOPED_RULE_TYPES). Kept explicit so a caller that ignores
+        # the partition still emits a fail-loud sentinel rather than the
+        # unparseable column-attached recency test.
+        return sentinel_test("freshness", column)
 
     if kind in ("schema", "anomaly_detection", "drift_detection"):
         return sentinel_test(kind, column)
@@ -384,20 +438,30 @@ def forward_column_rule(rule: Mapping[str, Any], column: str) -> Any | None:
     return sentinel_test(f"unmapped_{kind}", column)
 
 
-def forward_model_rule(rule: Mapping[str, Any]) -> Any | None:
-    """Map one table-wide (``selector: "*"``) ``dqRule`` to a model-level test."""
+def forward_model_rule(rule: Mapping[str, Any], *, field: str | None = None) -> Any | None:
+    """Map one ``dqRule`` to a model-level dbt test.
+
+    ``field`` is the timestamp column a freshness test should measure. It
+    comes from the rule's own ``selector`` when the rule names a column, and
+    otherwise from :func:`default_recency_field` (the contract's first
+    temporal column). The previous hardcoded ``updated_at`` named a column
+    that appears nowhere in the contract, so the emitted test failed with
+    ``invalid identifier``.
+    """
     kind = rule_type(rule)
 
     if kind == "freshness":
-        window = rule.get("window") or rule.get("threshold")
-        if window is not None:
-            return recency_test("updated_at", window=window)
+        if field:
+            # A missing window keeps ``recency_test``'s documented day/1
+            # default; only the *column* is non-negotiable.
+            return recency_test(field, window=rule.get("window") or rule.get("threshold"))
+        # No column to measure — fail loud rather than inventing an identifier.
         return f"{SENTINEL_PREFIX}freshness_check"
 
     if kind in ("anomaly_detection", "drift_detection"):
         threshold = rule.get("threshold")
         if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
-            return expression_test(f"count(*) > {threshold}")
+            return row_count_test(threshold)
         return sentinel_test(kind)
 
     if kind in ("completeness", "uniqueness", "valid_values", "accuracy", "schema"):
@@ -405,6 +469,80 @@ def forward_model_rule(rule: Mapping[str, Any]) -> Any | None:
         return sentinel_test(f"{kind}_table_level")
 
     return sentinel_test(f"unmapped_{kind}")
+
+
+def is_model_scoped(rule: Mapping[str, Any]) -> bool:
+    """True when this rule's dbt test must attach at model level.
+
+    Either the rule is table-wide (``selector: "*"`` or absent) or its type
+    is one dbt can only express as a model-level test
+    (:data:`MODEL_SCOPED_RULE_TYPES`).
+    """
+    selector = rule.get("selector")
+    selector = selector.strip() if isinstance(selector, str) else ""
+    if not selector or selector == TABLE_SELECTOR:
+        return True
+    return rule_type(rule) in MODEL_SCOPED_RULE_TYPES
+
+
+def default_recency_field(schema_cols: Sequence[Any]) -> str | None:
+    """The column a table-wide freshness rule should measure.
+
+    The first column in ``contract.schema[]`` whose declared type is
+    temporal. Returns ``None`` when the contract declares no temporal
+    column, in which case the caller emits a fail-loud sentinel instead of
+    a test bound to a column that does not exist.
+    """
+    for col in schema_cols or ():
+        if not isinstance(col, Mapping):
+            continue
+        name = col.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        declared = str(col.get("type", "")).strip().lower()
+        base = declared.split("(", 1)[0].strip()
+        if base.startswith(("timestamp", "datetime", "date")):
+            return name
+    return None
+
+
+def partition_rules(
+    rules: Sequence[Mapping[str, Any]],
+    *,
+    schema_cols: Sequence[Any] = (),
+) -> tuple[dict[str, list[Any]], list[Any]]:
+    """Split ``dq.rules[]`` into per-column tests and model-level tests.
+
+    The **one** router every dbt-emitting surface uses, so the engine path
+    (``engines/dbt/schema_yml.py``) and the exporter
+    (``exporters/dbt_tests.py``) cannot disagree about where a rule lands —
+    the divergence that made ``selector: "*"`` become a dbt column literally
+    named ``*`` on the engine path while the exporter routed it correctly.
+
+    Returns ``({column_name: [tests]}, [model_tests])``.
+    """
+    by_column: dict[str, list[Any]] = {}
+    model_tests: list[Any] = []
+    fallback_field = default_recency_field(schema_cols)
+
+    for rule in rules:
+        if not isinstance(rule, Mapping):
+            continue
+        selector = rule.get("selector")
+        selector = selector.strip() if isinstance(selector, str) else ""
+        column = "" if selector == TABLE_SELECTOR else selector
+
+        if is_model_scoped(rule):
+            dbt_test = forward_model_rule(rule, field=column or fallback_field)
+            if dbt_test is not None:
+                model_tests.append(dbt_test)
+            continue
+
+        dbt_test = forward_column_rule(rule, selector)
+        if dbt_test is not None:
+            by_column.setdefault(selector, []).append(dbt_test)
+
+    return by_column, model_tests
 
 
 # ── De-duplication (merge dq-rule tests with constraint-derived tests) ─────

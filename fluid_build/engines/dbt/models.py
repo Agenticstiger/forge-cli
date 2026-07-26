@@ -49,8 +49,20 @@ def generate_models(
     *,
     schema_context: Optional[Dict[str, Any]] = None,
     transformation_intent: Optional[TransformationIntent] = None,
+    adapter: Optional[str] = None,
 ) -> GenerationResult:
-    """Generate SQL model files for a dbt project."""
+    """Generate SQL model files for a dbt project.
+
+    ``adapter`` is the dbt profile adapter the generated project targets
+    (``_types.adapter_for_build``). The skeleton ``cast(null as <type>)``
+    projections MUST resolve through the same adapter table that
+    ``schema_yml`` uses for the model-contract ``data_type``: when the two
+    halves disagree, a freshly generated ``--model-contracts`` project
+    fails its own contract on the first ``dbt run`` (Snowflake:
+    ``FIXED vs REAL`` for ``float``, ``TEXT vs ARRAY`` for ``array``).
+    ``None`` keeps the platform-agnostic table for callers that have no
+    build context.
+    """
     pattern = build.get("pattern", "hybrid-reference")
 
     if pattern == "multi-stage":
@@ -64,6 +76,7 @@ def generate_models(
             build,
             schema_context=schema_context,
             transformation_intent=transformation_intent,
+            adapter=adapter,
         )
 
 
@@ -78,6 +91,7 @@ def _generate_hybrid(
     *,
     schema_context: Optional[Dict[str, Any]] = None,
     transformation_intent: Optional[TransformationIntent] = None,
+    adapter: Optional[str] = None,
 ) -> GenerationResult:
     """Hybrid-reference dbt generation.
 
@@ -112,7 +126,7 @@ def _generate_hybrid(
             if isinstance(c, dict)
         ]
         files[f"models/marts/{expose_id}.sql"] = _mart_skeleton(
-            expose_id, schema_cols, staging_refs
+            expose_id, schema_cols, staging_refs, adapter=adapter
         )
 
     return files
@@ -134,6 +148,8 @@ def _mart_skeleton(
     expose_id: str,
     schema_cols: List[Dict[str, str]],
     staging_refs: List[str],
+    *,
+    adapter: Optional[str] = None,
 ) -> str:
     """Generate a mart model skeleton."""
     lines = [_HEADER, "{{ config(materialized='table') }}\n\n"]
@@ -143,7 +159,8 @@ def _mart_skeleton(
         col_lines = []
         for col in schema_cols:
             col_lines.append(
-                f"    cast(null as {_sql_type(col.get('type', 'string'))}) as {col['name']}"
+                f"    cast(null as {_sql_type(col.get('type', 'string'), adapter)})"
+                f" as {col['name']}"
             )
         lines.append(",\n".join(col_lines))
         lines.append("\n\n")
@@ -315,11 +332,12 @@ def _extract_schema_columns(expose: Dict[str, Any]) -> List[Dict[str, str]]:
     return []
 
 
-def _sql_type(fluid_type: str) -> str:
+def _sql_type(fluid_type: str, adapter: Optional[str] = None) -> str:
     """Map FLUID type to SQL type for skeleton casts.
 
-    The mapping table now lives in :mod:`._types` (shared with the
-    model-contract ``data_type`` emission in ``schema_yml.py``); the
-    default generic table reproduces the historical behavior exactly.
+    The mapping table lives in :mod:`._types` (shared with the
+    model-contract ``data_type`` emission in ``schema_yml.py``). Passing
+    ``adapter`` is what keeps the two halves of one generated project in
+    agreement; ``None`` keeps the platform-agnostic table.
     """
-    return _types.sql_type(fluid_type)
+    return _types.sql_type(fluid_type, adapter)

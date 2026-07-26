@@ -533,12 +533,19 @@ class TestSchemaYml:
             ],
         }
         data = yaml.safe_load(generate_schema_yml(contract)["models/marts/schema.yml"])
-        col = data["models"][0]["columns"][0]
-        rec = next(t for t in col["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t)
+        model = data["models"][0]
+        # INTENTIONAL pin update: recency attaches at MODEL level even for a
+        # column-scoped rule. dbt injects ``column_name`` into every generic
+        # test reached through ``columns[].tests`` and the ``dbt_utils``
+        # recency macro accepts no such kwarg, so the column-attached form
+        # made the whole generated project fail ``dbt parse`` with
+        # "macro 'dbt_macro__test_recency' takes no keyword argument
+        # 'column_name'". The selected column survives as ``field``.
+        assert "tests" not in model["columns"][0]
+        rec = next(t for t in model["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t)
         assert rec["dbt_utils.recency"]["field"] == "updated_at"
-        # INTENTIONAL pin update (packages.yml card): the ISO window now
-        # drives datepart/interval (P1D → day/1) and the non-dbt
-        # `_fluid_window` kwarg is gone — it broke dbt compile.
+        # The ISO window drives datepart/interval (P1D → day/1) and the
+        # non-dbt `_fluid_window` kwarg is gone — it broke dbt compile.
         assert rec["dbt_utils.recency"]["datepart"] == "day"
         assert rec["dbt_utils.recency"]["interval"] == 1
         assert "_fluid_window" not in rec["dbt_utils.recency"]
@@ -781,3 +788,166 @@ class TestCustomer360:
         marts = [f for f in files if f.startswith("models/marts/")]
         assert len(staging) >= 1
         assert len(marts) >= 1
+
+
+# ---------------------------------------------------------------------------
+# profiles.yml resolves the schema the CONTRACT declares (regression)
+#
+# The Snowflake profile hardcoded
+# ``env_var('SNOWFLAKE_DBT_SCHEMA', env_var('SNOWFLAKE_FLUID_SCHEMA','PUBLIC'))``
+# and never read the contract, so a contract declaring
+# ``builds[].execution.runtime.resources.schema`` built every model into
+# PUBLIC while ``dbt debug`` reported "Connection test: OK". ``database`` WAS
+# resolved correctly, which made the failure asymmetric and easy to miss.
+# ---------------------------------------------------------------------------
+
+
+class TestProfilesSchemaFromContract:
+    @staticmethod
+    def _snowflake(contract, *, resources=None, binding_schema=None):
+        build = contract["builds"][0]
+        build["execution"]["runtime"]["platform"] = "snowflake"
+        if resources is not None:
+            build["execution"]["runtime"]["resources"] = resources
+        if binding_schema is not None:
+            contract["exposes"] = [
+                {
+                    "exposeId": "t",
+                    "binding": {"location": {"schema": binding_schema}},
+                    "contract": {"schema": [{"name": "c", "type": "string"}]},
+                }
+            ]
+        data = yaml.safe_load(generate_profiles(contract, build))
+        return list(data.values())[0]["outputs"]["dev"]
+
+    def test_runtime_resources_schema_wins(self, minimal_contract):
+        dev = self._snowflake(
+            minimal_contract, resources={"schema": "{{ env.SNOWFLAKE_SCHEMA }}"}
+        )
+        assert dev["schema"] == "{{ env_var('SNOWFLAKE_SCHEMA') }}"
+
+    def test_literal_schema_is_passed_through(self, minimal_contract):
+        dev = self._snowflake(minimal_contract, resources={"schema": "ANALYTICS_GOLD"})
+        assert dev["schema"] == "ANALYTICS_GOLD"
+
+    def test_expose_binding_schema_is_the_fallback(self, minimal_contract):
+        dev = self._snowflake(minimal_contract, binding_schema="${MART_SCHEMA}")
+        assert dev["schema"] == "{{ env_var('MART_SCHEMA') }}"
+
+    def test_env_var_chain_only_when_contract_declares_nothing(self, minimal_contract):
+        dev = self._snowflake(minimal_contract)
+        assert "env_var('SNOWFLAKE_DBT_SCHEMA'" in dev["schema"]
+        assert "PUBLIC" in dev["schema"]
+
+    def test_bigquery_dataset_resolves_too(self, minimal_contract):
+        build = minimal_contract["builds"][0]
+        build["execution"]["runtime"]["platform"] = "gcp"
+        build["execution"]["runtime"]["resources"] = {"dataset": "{{ env.BQ_DATASET }}"}
+        data = yaml.safe_load(generate_profiles(minimal_contract, build))
+        outputs = list(data.values())[0]["outputs"]
+        assert outputs["dev"]["dataset"] == "{{ env_var('BQ_DATASET') }}"
+        assert outputs["prod"]["dataset"] == "{{ env_var('BQ_DATASET') }}"
+
+
+# ---------------------------------------------------------------------------
+# dq rule routing: column vs model level (regression)
+#
+# ``selector: "*"`` used to become a dbt column literally named ``*`` on the
+# engine path, and a column-scoped freshness rule emitted a column-attached
+# ``dbt_utils.recency`` that made the project unparseable. Both surfaces now
+# route through the one ``_test_mapping.partition_rules``.
+# ---------------------------------------------------------------------------
+
+
+class TestRuleRouting:
+    @staticmethod
+    def _schema_yml(rules):
+        contract = {
+            "id": "x",
+            "exposes": [
+                {
+                    "exposeId": "t",
+                    "contract": {
+                        "schema": [
+                            {"name": "id", "type": "integer"},
+                            {"name": "amount", "type": "number(12,2)"},
+                            {"name": "loaded_at", "type": "timestamp"},
+                        ],
+                        "dq": {"rules": rules},
+                    },
+                }
+            ],
+        }
+        return yaml.safe_load(generate_schema_yml(contract)["models/marts/schema.yml"])["models"][0]
+
+    def test_table_selector_never_becomes_a_column(self):
+        model = self._schema_yml(
+            [{"type": "anomaly_detection", "selector": "*", "threshold": 100}]
+        )
+        assert "*" not in {c["name"] for c in model["columns"]}
+        assert {"dbt_expectations.expect_table_row_count_to_be_between": {"min_value": 100}} in (
+            model["tests"]
+        )
+
+    def test_table_freshness_measures_a_declared_temporal_column(self):
+        model = self._schema_yml([{"type": "freshness", "selector": "*", "window": "P1D"}])
+        rec = next(t for t in model["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t)
+        assert rec["dbt_utils.recency"]["field"] == "loaded_at"
+
+    def test_accuracy_emits_an_executable_predicate_not_a_comment(self):
+        """``dbt_utils.expression_is_true`` on a column compiles to
+        ``where not(<column> <expression>)``. A ``--`` comment there swallowed
+        the closing paren and every ``dbt test`` died on a Snowflake syntax
+        error."""
+        model = self._schema_yml(
+            [{"type": "accuracy", "selector": "amount", "operator": ">=", "threshold": 0}]
+        )
+        col = next(c for c in model["columns"] if c["name"] == "amount")
+        expr = next(t for t in col["tests"] if "dbt_utils.expression_is_true" in t)
+        assert expr["dbt_utils.expression_is_true"]["expression"] == ">= 0"
+        assert "--" not in yaml.safe_dump(model)
+
+    def test_accuracy_equality_operator_becomes_sql(self):
+        model = self._schema_yml(
+            [{"type": "accuracy", "selector": "amount", "operator": "==", "threshold": 5}]
+        )
+        col = next(c for c in model["columns"] if c["name"] == "amount")
+        expr = next(t for t in col["tests"] if "dbt_utils.expression_is_true" in t)
+        assert expr["dbt_utils.expression_is_true"]["expression"] == "= 5"
+
+    def test_both_surfaces_route_a_rule_to_the_same_place(self):
+        """#421's premise: one contract intent, one answer on every surface."""
+        from fluid_build.exporters.dbt_tests import render_dbt_tests
+
+        rules = [
+            {"type": "freshness", "selector": "loaded_at", "window": "PT6H"},
+            {"type": "anomaly_detection", "selector": "*", "threshold": 100},
+            {"type": "accuracy", "selector": "amount", "operator": ">=", "threshold": 0},
+            {"type": "completeness", "selector": "id"},
+        ]
+        engine_model = self._schema_yml(rules)
+        exporter_contract = {
+            "exposes": [
+                {
+                    "exposeId": "t",
+                    "binding": {"location": {"table": "T_PHYSICAL"}},
+                    "contract": {
+                        "schema": [
+                            {"name": "id", "type": "integer"},
+                            {"name": "amount", "type": "number(12,2)"},
+                            {"name": "loaded_at", "type": "timestamp"},
+                        ],
+                        "dq": {"rules": rules},
+                    },
+                }
+            ]
+        }
+        exporter_model = yaml.safe_load(render_dbt_tests(exporter_contract))["models"][0]
+
+        # Same dbt node name — the exporter output is meant to be dropped into
+        # the generated project, and a mismatched name silently runs 0 tests.
+        assert engine_model["name"] == exporter_model["name"] == "t"
+        assert engine_model["tests"] == exporter_model["tests"]
+        assert [
+            (c["name"], c.get("tests")) for c in engine_model["columns"]
+        ] == [(c["name"], c.get("tests")) for c in exporter_model["columns"]]

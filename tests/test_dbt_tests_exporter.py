@@ -114,10 +114,19 @@ def test_render_produces_valid_yaml():
     assert "models" in doc
 
 
-def test_render_uses_binding_table_name():
-    """The dbt model is named after binding.location.table — v0.7.x shape."""
+def test_render_uses_expose_id_as_model_name():
+    """The dbt model is named after the exposeId — the dbt *node* name.
+
+    INTENTIONAL pin update: this used to prefer ``binding.location.table``
+    (``ORDERS``) while ``fluid generate transformation`` names the node after
+    the exposeId (``orders``) and writes ``models/marts/orders.sql``. Dropping
+    the exporter output into that project — which its own ``--help`` tells you
+    to do — bound every test to a node dbt could not find, which dbt
+    downgrades to a warning and then reports a green build with zero
+    data-quality coverage.
+    """
     doc = _parse(render_dbt_tests(_sample_contract()))
-    assert doc["models"][0]["name"] == "ORDERS"
+    assert doc["models"][0]["name"] == "orders"
 
 
 def test_render_emits_columns_from_contract_schema():
@@ -237,10 +246,16 @@ def test_column_scoped_freshness_maps_to_recency():
         ]
     }
     doc = _parse(render_dbt_tests(contract))
-    cols = {c["name"]: c for c in doc["models"][0]["columns"]}
-    rec = next(
-        t for t in cols["updated_at"]["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t
-    )
+    model = doc["models"][0]
+    cols = {c["name"]: c for c in model["columns"]}
+    # INTENTIONAL pin update: recency is a MODEL-level test even when the rule
+    # selects a column. dbt injects ``column_name`` into every generic test
+    # reached through ``columns[].tests`` and ``dbt_utils``'s recency macro
+    # accepts no such kwarg — a column-attached recency test made the whole
+    # generated project fail ``dbt parse``. The selected column survives as
+    # the test's ``field``.
+    assert "tests" not in cols["updated_at"]
+    rec = next(t for t in model["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t)
     assert rec["dbt_utils.recency"]["field"] == "updated_at"
     # INTENTIONAL pin update (packages.yml card): datepart/interval now derive
     # from the rule's ISO window (PT6H → hour/6) instead of a hardcoded day/1,
@@ -256,15 +271,14 @@ def test_column_scoped_freshness_maps_to_recency():
 # ---------------------------------------------------------------------------
 
 
-def test_table_scoped_freshness_becomes_model_level_test():
-    """A 'freshness' rule with selector '*' attaches at the model level."""
-    contract = {
+def _table_freshness_contract(schema):
+    return {
         "exposes": [
             {
                 "exposeId": "orders",
                 "binding": {"location": {"table": "ORDERS"}},
                 "contract": {
-                    "schema": [{"name": "id", "type": "NUMBER"}],
+                    "schema": schema,
                     "dq": {
                         "rules": [
                             {
@@ -280,19 +294,41 @@ def test_table_scoped_freshness_becomes_model_level_test():
             }
         ]
     }
+
+
+def test_table_scoped_freshness_becomes_model_level_test():
+    """A 'freshness' rule with selector '*' attaches at the model level, and
+    measures a temporal column the contract actually declares."""
+    contract = _table_freshness_contract(
+        [{"name": "id", "type": "NUMBER"}, {"name": "loaded_at", "type": "TIMESTAMP"}]
+    )
     doc = _parse(render_dbt_tests(contract))
     model = doc["models"][0]
     assert "tests" in model
     rec = next(t for t in model["tests"] if isinstance(t, dict) and "dbt_utils.recency" in t)
-    # INTENTIONAL pin update (packages.yml card): the window now drives
-    # datepart/interval (P1D → day/1); `_fluid_window` is no longer emitted
-    # (non-dbt kwarg — broke `dbt_utils.recency` at compile time).
+    # INTENTIONAL pin update: ``field`` is derived from the contract's first
+    # temporal column. It used to be hardcoded to ``updated_at`` — a column
+    # that appears in no contract — so ``dbt test`` failed with
+    # "invalid identifier 'UPDATED_AT'".
+    assert rec["dbt_utils.recency"]["field"] == "loaded_at"
+    # The window drives datepart/interval (P1D → day/1); `_fluid_window` is
+    # not emitted (non-dbt kwarg — broke `dbt_utils.recency` at compile time).
     assert rec["dbt_utils.recency"]["datepart"] == "day"
     assert rec["dbt_utils.recency"]["interval"] == 1
     assert "_fluid_window" not in rec["dbt_utils.recency"]
 
 
-def test_anomaly_detection_table_rule_with_threshold_maps_to_expression():
+def test_table_scoped_freshness_without_a_temporal_column_fails_loud():
+    """No temporal column to measure → the fail-loud sentinel, never a test
+    bound to an identifier the contract never declared."""
+    contract = _table_freshness_contract([{"name": "id", "type": "NUMBER"}])
+    doc = _parse(render_dbt_tests(contract))
+    model = doc["models"][0]
+    assert "fluid_freshness_check" in model["tests"]
+    assert not any(isinstance(t, dict) and "dbt_utils.recency" in t for t in model["tests"])
+
+
+def test_anomaly_detection_table_rule_with_threshold_maps_to_row_count():
     contract = {
         "exposes": [
             {
@@ -316,12 +352,17 @@ def test_anomaly_detection_table_rule_with_threshold_maps_to_expression():
         ]
     }
     doc = _parse(render_dbt_tests(contract))
+    # INTENTIONAL pin update: the threshold is now a row-count assertion, not
+    # ``dbt_utils.expression_is_true`` with ``count(*) > 100``. At model level
+    # dbt_utils compiles the expression into a WHERE clause, and a warehouse
+    # rejects an aggregate there (Snowflake: "Invalid aggregate function in
+    # WHERE clause"), so the emitted test could never run.
     rc = next(
         t
         for t in doc["models"][0]["tests"]
-        if isinstance(t, dict) and "dbt_utils.expression_is_true" in t
+        if isinstance(t, dict) and "dbt_expectations.expect_table_row_count_to_be_between" in t
     )
-    assert "count(*) > 100" in rc["dbt_utils.expression_is_true"]["expression"]
+    assert rc["dbt_expectations.expect_table_row_count_to_be_between"] == {"min_value": 100}
 
 
 def test_schema_rule_emits_sentinel_test_name():
@@ -420,7 +461,7 @@ def test_multiple_exposes_each_become_a_model():
     }
     doc = _parse(render_dbt_tests(contract))
     names = {m["name"] for m in doc["models"]}
-    assert names == {"A", "B"}
+    assert names == {"a", "b"}
 
 
 # ---------------------------------------------------------------------------

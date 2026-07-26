@@ -171,7 +171,9 @@ def generate_schema_yml(
         dq = contract_section.get("dq", {})
         dq_rules = dq.get("rules", []) if isinstance(dq, dict) else []
 
-        columns = _build_column_tests(schema_cols, dq_rules, tests_key=resolved_tests_key)
+        columns, model_tests = _build_column_tests(
+            schema_cols, dq_rules, tests_key=resolved_tests_key
+        )
 
         model_def: Dict[str, Any] = {"name": expose_id}
 
@@ -187,6 +189,12 @@ def generate_schema_yml(
         # dbt's default ``access: protected`` so they stay private
         # to this project.
         model_def["access"] = "public"
+
+        # Table-wide (``selector: "*"``) rules — and freshness rules, which
+        # dbt can only express at model level — attach here, not as a dbt
+        # column literally named ``*``.
+        if model_tests:
+            model_def[resolved_tests_key] = model_tests
 
         # Opt-in dbt model contract (build-time schema enforcement).
         if model_contracts:
@@ -321,16 +329,16 @@ def _build_column_tests(
     dq_rules: List[Dict[str, Any]],
     *,
     tests_key: str = TESTS_KEY_LEGACY,
-) -> List[Dict[str, Any]]:
-    """Build dbt column test definitions from schema + DQ rules."""
-    # Index DQ rules by selector (column name)
-    rules_by_col: Dict[str, List[Dict[str, Any]]] = {}
-    for rule in dq_rules:
-        if not isinstance(rule, dict):
-            continue
-        selector = rule.get("selector", "")
-        if selector:
-            rules_by_col.setdefault(selector, []).append(rule)
+) -> tuple[List[Dict[str, Any]], List[Any]]:
+    """Build dbt column + model test definitions from schema + DQ rules.
+
+    Returns ``(columns, model_tests)``. The rule → (column | model) routing
+    is :func:`._test_mapping.partition_rules`, the same router the exporter
+    uses, so ``selector: "*"`` and freshness rules land in the same place on
+    both surfaces. Before, this path treated ``"*"`` as an ordinary column
+    name and emitted ``- name: '*'``.
+    """
+    rules_by_col, model_tests = _tm.partition_rules(dq_rules, schema_cols=schema_cols)
 
     columns: List[Dict[str, Any]] = []
     seen_cols = set()
@@ -352,21 +360,20 @@ def _build_column_tests(
         columns.append(col_entry)
 
     # DQ rules on columns not in schema
-    for col_name, rules in rules_by_col.items():
+    for col_name, tests in rules_by_col.items():
         if col_name in seen_cols:
             continue
-        tests = _tests_for_column({"name": col_name}, rules)
         if tests:
             columns.append({"name": col_name, tests_key: tests})
 
-    return columns
+    return columns, model_tests
 
 
 def _tests_for_column(
     col_def: Dict[str, Any],
-    dq_rules: List[Dict[str, Any]],
+    rule_tests: List[Any],
 ) -> List[Any]:
-    """Map FLUID DQ rules + inline column constraints to dbt tests.
+    """Merge already-mapped DQ-rule tests with inline column constraints.
 
     Delegates to the single shared mapping (:mod:`._test_mapping`) so the engine
     path emits the *same* dbt tests as the exporter and the copilot generator
@@ -374,9 +381,5 @@ def _tests_for_column(
     reference), the unified numeric-range dialect, and freshness/recency, which
     this path previously did not surface.
     """
-    col_name = str(col_def.get("name") or "")
-    rule_tests = [
-        test for rule in dq_rules if (test := _tm.forward_column_rule(rule, col_name)) is not None
-    ]
     # dq-rule tests win over the generic constraint-derived form on collision.
-    return _tm.merge_tests(rule_tests, _tm.constraint_tests(col_def))
+    return _tm.merge_tests(list(rule_tests), _tm.constraint_tests(col_def))

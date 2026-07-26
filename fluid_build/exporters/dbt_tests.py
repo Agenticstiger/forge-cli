@@ -156,7 +156,7 @@ def _expose_to_model(
         return None
 
     rules = _dq_rules(expose)
-    tests_by_column, model_tests = _group_rules(rules)
+    tests_by_column, model_tests = _group_rules(rules, _schema_cols(expose))
 
     columns = _columns_with_tests(expose, tests_by_column, tests_key=tests_key)
     description = expose.get("description") or expose.get("title") or ""
@@ -176,13 +176,23 @@ def _expose_to_model(
 
 
 def _model_name(expose: Mapping[str, Any]) -> str:
-    """Best-effort name lookup for the dbt model.
+    """Name lookup for the dbt model these tests attach to.
 
-    Prefers the binding location's table identifier (FLUID v0.7.x
-    ``binding.location.table``), falls back to the exposeId. dbt models
-    are named after their source table so this is the right hook for
-    downstream ``dbt test`` runs to bind to.
+    The **exposeId**, because that is the dbt *node* name: the engine path
+    writes the model to ``models/marts/<exposeId>.sql`` and declares
+    ``- name: <exposeId>`` in its own schema.yml. This exporter's own help
+    tells the user to drop the output into that project and run
+    ``dbt test``, so any other spelling produces tests bound to a node dbt
+    cannot find — which dbt downgrades to a ``[WARNING]`` and then reports
+    ``PASS=3 ... Completed successfully`` with zero data-quality coverage.
+
+    ``binding.location.table`` is only the fallback, for an expose that
+    declares no exposeId at all.
     """
+    eid = expose.get("exposeId") or expose.get("id")
+    if isinstance(eid, str) and eid:
+        return eid
+
     binding = expose.get("binding")
     if isinstance(binding, Mapping):
         location = binding.get("location")
@@ -197,8 +207,18 @@ def _model_name(expose: Mapping[str, Any]) -> str:
             )
             if isinstance(table, str) and table:
                 return table
-    eid = expose.get("exposeId") or expose.get("id")
-    return eid if isinstance(eid, str) else ""
+    return ""
+
+
+def _schema_cols(expose: Mapping[str, Any]) -> Sequence[Any]:
+    """Return the ``contract.schema[]`` column list for an expose."""
+    contract = expose.get("contract")
+    if not isinstance(contract, Mapping):
+        return []
+    schema = contract.get("schema")
+    if isinstance(schema, Sequence) and not isinstance(schema, (str, bytes)):
+        return schema
+    return []
 
 
 def _dq_rules(expose: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -217,29 +237,17 @@ def _dq_rules(expose: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 def _group_rules(
     rules: Sequence[Mapping[str, Any]],
+    schema_cols: Sequence[Any] = (),
 ) -> tuple[dict[str, list[Any]], list[Any]]:
     """Split dq rules into per-column tests and model-level tests.
 
-    A rule's ``selector`` is the column it targets; ``"*"`` (or an empty
-    selector) marks a table-wide rule that maps to a dbt model-level test.
+    Delegates to :func:`._test_mapping.partition_rules` — the single router
+    the engine path uses too, so both surfaces put a rule in the same place.
+    ``schema_cols`` supplies the timestamp column a table-wide freshness rule
+    measures (previously hardcoded to ``updated_at``, a column that appears
+    in no contract).
     """
-    by_column: dict[str, list[Any]] = {}
-    model_tests: list[Any] = []
-
-    for rule in rules:
-        selector = rule.get("selector")
-        selector = selector.strip() if isinstance(selector, str) else ""
-
-        if selector and selector != _tm.TABLE_SELECTOR:
-            dbt_test = _tm.forward_column_rule(rule, selector)
-            if dbt_test is not None:
-                by_column.setdefault(selector, []).append(dbt_test)
-        else:
-            dbt_test = _tm.forward_model_rule(rule)
-            if dbt_test is not None:
-                model_tests.append(dbt_test)
-
-    return by_column, model_tests
+    return _tm.partition_rules(rules, schema_cols=schema_cols)
 
 
 def _columns_with_tests(

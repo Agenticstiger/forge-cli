@@ -106,12 +106,20 @@ class DbtEngine(TransformationEngine):
             if logical_sources:
                 files["models/sources.yml"] = logical_sources
 
-        # SQL model files
+        # SQL model files. The skeleton casts resolve through the same
+        # adapter table as the model-contract ``data_type`` below — the two
+        # halves of one generated project must agree or a fresh
+        # ``--model-contracts`` project fails its own contract on first run.
+        from . import _types as _types
+
+        adapter = _types.adapter_for_build(build)
+
         model_files = generate_models(
             contract,
             build,
             schema_context=schema_context,
             transformation_intent=transformation_intent,
+            adapter=adapter,
         )
         files.update(model_files)
 
@@ -124,13 +132,11 @@ class DbtEngine(TransformationEngine):
             # ``--model-contracts`` (opt-in): emit dbt model contracts on the
             # expose models. data_type must be adapter-correct (BigQuery has
             # no varchar), so resolve the adapter from the build's platform.
-            from . import _types as _types
-
             schema_files = generate_schema_yml(
                 contract,
                 mesh_hub=mesh_hub,
                 model_contracts=model_contracts,
-                adapter=_types.adapter_for_build(build),
+                adapter=adapter,
                 tests_key=tests_key,
             )
             files.update(schema_files)
