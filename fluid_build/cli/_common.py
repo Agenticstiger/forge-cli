@@ -173,7 +173,9 @@ def resolve_env_templates_in_contract(contract: Any) -> Any:
                 return match.group(0)
             return resolve_env_templates(match.group(0))
 
-        return ENV_TEMPLATE_RE.sub(_replace, text)
+        # ``.strip()`` mirrors ``resolve_env_templates`` so a partially
+        # resolved string is whitespace-identical to a fully resolved one.
+        return ENV_TEMPLATE_RE.sub(_replace, text).strip()
 
     def _walk(obj: Any) -> Any:
         if isinstance(obj, dict):
