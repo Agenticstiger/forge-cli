@@ -4,16 +4,18 @@
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.7.x   | :white_check_mark: |
-| < 0.7   | :x:                |
+| 0.13.x  | :white_check_mark: |
+| < 0.13  | :x:                |
 
 ## Reporting a Vulnerability
 
 **Please do NOT report security vulnerabilities through public GitHub issues.**
 
-Instead, please report them via email to **change@agenticstransformation.com**.
+Use GitHub's **[Private Vulnerability Reporting](https://github.com/Agenticstiger/forge-cli/security/advisories/new)** instead. It keeps the report private until a fix ships, gives us a place to draft the advisory and request a CVE, and lets you follow the fix without leaving GitHub.
 
-You should receive a response within **48 hours**. If for some reason you do not, please follow up via email to ensure we received your original message.
+If you cannot use that form, email **change@agenticstransformation.com**.
+
+You should receive a response within **48 hours**. If for some reason you do not, please follow up to ensure we received your original message.
 
 Please include the following information (as much as you can provide):
 
