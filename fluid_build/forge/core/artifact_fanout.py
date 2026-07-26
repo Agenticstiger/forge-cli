@@ -435,14 +435,20 @@ def _emit_odps_bitol(contract_path: Path, out_dir: Path, logger: logging.Logger)
     provider = BitolOdpsProvider()
     bundle = provider.render(contract, out_dir=out_dir, fmt="yaml")
 
+    # Filenames must be derived through the SAME helper the provider writes
+    # with, or a sanitised stem (from a hostile or foreign id) makes these
+    # paths miss the real files: the .exists() guards would then silently
+    # drop them from the manifest and skip the integrity gate.
+    from fluid_build.providers._path_safety import safe_filename_stem
+
     written: List[Path] = []
     product = bundle.get("product") or {}
-    product_id = product.get("id") or product.get("name") or "product"
-    product_path = out_dir / f"{product_id}.odps.yaml"
+    product_stem = safe_filename_stem(product.get("id") or product.get("name"), "product")
+    product_path = out_dir / f"{product_stem}.odps.yaml"
     if product_path.exists():
         written.append(product_path)
     for contract_id in bundle.get("contracts") or {}:
-        sibling = out_dir / f"{contract_id}.odcs.yaml"
+        sibling = out_dir / f"{safe_filename_stem(contract_id, 'contract')}.odcs.yaml"
         if sibling.exists():
             written.append(sibling)
     return written
@@ -455,10 +461,17 @@ def _emit_odcs(contract_path: Path, out_dir: Path, logger: logging.Logger) -> Li
 
     contract = _load_contract(contract_path)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Same shared-helper derivation as the writer, so a sanitised exposeId
+    # still yields the real path rather than a phantom one the manifest
+    # would later fail to hash.
+    from fluid_build.providers._path_safety import safe_filename_stem
+
     provider = OdcsProvider()
     results = provider.render_all_ports(contract, out_dir=out_dir, fmt="yaml")
-    written = [out_dir / f"product.odcs.{eid}.yaml" for eid, _odcs in results]
-    return written
+    return [
+        out_dir / f"{safe_filename_stem(f'product.odcs.{eid}', 'product.odcs')}.yaml"
+        for eid, _odcs in results
+    ]
 
 
 def _emit_schedule(contract_path: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:

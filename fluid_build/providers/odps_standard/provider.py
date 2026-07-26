@@ -23,6 +23,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from fluid_build.providers._path_safety import contained_path, safe_filename_stem
 from fluid_build.providers.base import ApplyResult, BaseProvider, ProviderError
 from fluid_build.providers.odcs.provider import OdcsProvider
 
@@ -196,14 +197,25 @@ class BitolOdpsProvider(BaseProvider):
         out_dir: Path,
         fmt: str,
     ) -> None:
-        """Emit the canonical layout: 1 ``<product>.odps.<fmt>`` + N ``<contractId>.odcs.<fmt>``."""
+        """Emit the canonical layout: 1 ``<product>.odps.<fmt>`` + N ``<contractId>.odcs.<fmt>``.
+
+        Filenames derive from document-controlled ids, and an imported
+        document can carry a hostile one, so every stem passes through
+        :func:`~fluid_build.providers._path_safety.safe_filename_stem` and the final path through
+        :func:`~fluid_build.providers._path_safety.contained_path` before any write. An id that satisfies the FLUID
+        identifier pattern is used verbatim, which is what preserves the
+        canonical ``<contractId>.odcs.<fmt>`` sibling layout the
+        :class:`ContractResolver` looks up on import.
+        """
         out_dir.mkdir(parents=True, exist_ok=True)
-        product_name = product.get("id") or product.get("name") or "product"
-        product_path = out_dir / f"{product_name}.odps.{fmt}"
+        product_name = safe_filename_stem(product.get("id") or product.get("name"), "product")
+        product_path = contained_path(out_dir, f"{product_name}.odps.{fmt}")
         write_output(dict(product), product_path, fmt)
         self.logger.info("Exported ODPS product: %s", product_path)
         for contract_id, odcs in contracts.items():
-            contract_path = out_dir / f"{contract_id}.odcs.{fmt}"
+            contract_path = contained_path(
+                out_dir, f"{safe_filename_stem(contract_id, 'contract')}.odcs.{fmt}"
+            )
             write_output(dict(odcs), contract_path, fmt)
             self.logger.info("Exported ODCS contract: %s", contract_path)
 

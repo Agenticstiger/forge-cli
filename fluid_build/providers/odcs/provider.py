@@ -162,7 +162,18 @@ class OdcsProvider(BaseProvider):
         out_dir: Optional[Union[Path, str]] = None,
         fmt: Optional[str] = "yaml",
     ) -> List[Tuple[str, Dict[str, Any]]]:
-        """One ODCS contract per FLUID expose. Files named ``product.odcs.<exposeId>.<fmt>``."""
+        """One ODCS contract per FLUID expose. Files named ``product.odcs.<exposeId>.<fmt>``.
+
+        ``exposeId`` is document-controlled and ``fluid generate artifacts``
+        does not gate on ``fluid validate``, so a foreign contract could
+        carry ``../../..`` here and escape ``out_dir`` (``write_output``
+        does ``mkdir(parents=True)`` on the target's parent, materialising
+        the chain). Every stem now goes through the shared
+        :mod:`~fluid_build.providers._path_safety` gate; a schema-valid
+        exposeId is unchanged, so the canonical filenames are preserved.
+        """
+        from fluid_build.providers._path_safety import safe_output_path
+
         results: List[Tuple[str, Dict[str, Any]]] = []
         for expose in fluid.get("exposes", []) or []:
             if not isinstance(expose, Mapping):
@@ -173,7 +184,9 @@ class OdcsProvider(BaseProvider):
                 continue
             out_path = None
             if out_dir is not None:
-                out_path = Path(out_dir) / f"product.odcs.{eid}.{fmt}"
+                out_path = safe_output_path(
+                    out_dir, f"product.odcs.{eid}", f".{fmt}", fallback="product.odcs"
+                )
             results.append((eid, self.render(fluid, out=out_path, fmt=fmt, expose_id=eid)))
         return results
 
