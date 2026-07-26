@@ -938,11 +938,59 @@ def _display_plan_rich(plan: Dict[str, Any], contract: Dict[str, Any]):
 
     console.print(table)
 
+    packaging_lines = _packaging_summary_lines(plan)
+    if packaging_lines:
+        console.print(
+            Panel("\n".join(packaging_lines), border_style="cyan", title="Packaging", expand=False)
+        )
+
     # Dependency graph info
     if plan.get("has_dependencies"):
         console.print(
             "\n[yellow]⚠️  This plan has dependencies. Actions will execute in dependency order.[/yellow]"
         )
+
+
+def _packaging_summary_lines(plan: Dict[str, Any]) -> List[str]:
+    """Reviewer-facing ownership lines from ``plan["packaging"]``, or ``[]``.
+
+    RFC-packaging-modes.md file 8 stamps the effective ownership into
+    ``plan.json`` "so approvers see effective ownership without recomputing
+    precedence" — but nothing rendered it, so ``fluid plan`` printed byte-identical
+    output for a contract that creates a database + schema + warehouse and one
+    that owns nothing but a leaf table. The whole signal existed and was invisible.
+
+    Empty list for a contract with no ``packaging`` block, so legacy output is
+    unchanged.
+    """
+    packaging = plan.get("packaging")
+    if not isinstance(packaging, dict):
+        return []
+
+    containers = packaging.get("containers") or {}
+    owned = sorted(k for k, v in containers.items() if v == "owned")
+    referenced = sorted(k for k, v in containers.items() if v == "referenced")
+
+    lines = ["Packaging (effective container ownership):"]
+    lines.append(f"  owned by this product:  {', '.join(owned) if owned else 'none'}")
+    pool = packaging.get("pool")
+    referenced_text = ", ".join(referenced) if referenced else "none"
+    if referenced and pool:
+        referenced_text += f"  (pool: {pool})"
+    lines.append(f"  referenced (not owned): {referenced_text}")
+
+    dropped = packaging.get("droppedActions") or []
+    if dropped:
+        lines.append(
+            f"  {len(dropped)} container-creation action(s) dropped — "
+            "referenced containers are never created by this plan:"
+        )
+        for record in dropped:
+            lines.append(
+                f"    - {record.get('actionId') or record.get('op', 'action')} "
+                f"({record.get('container', 'container')})"
+            )
+    return lines
 
 
 def _display_plan_simple(plan: Dict[str, Any], logger: logging.Logger, output_path: str = None):
@@ -958,6 +1006,12 @@ def _display_plan_simple(plan: Dict[str, Any], logger: logging.Logger, output_pa
     cprint(f"Version: {version}")
     cprint(f"Total Actions: {total}")
     cprint(f"{'=' * 60}\n")
+
+    packaging_lines = _packaging_summary_lines(plan)
+    if packaging_lines:
+        for line in packaging_lines:
+            cprint(line)
+        cprint()
 
     if total > 0:
         for action in plan["actions"]:

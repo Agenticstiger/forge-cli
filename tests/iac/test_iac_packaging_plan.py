@@ -309,3 +309,160 @@ class TestPlanCliWiring:
         head = module_source.split("def register(", 1)[0]
         assert "iac.plan_packaging" not in head
         assert "iac.plan_packaging" in inspect.getsource(plan_mod.run)
+
+
+class TestTheSummaryIsActuallyRendered:
+    """RFC file 8 stamps ownership into plan.json "so approvers see effective
+    ownership without recomputing precedence" — but nothing rendered it.
+
+    Two twin contracts differing only in ``packaging.mode`` (one owning a
+    database + schema + warehouse, the other owning nothing but a leaf table)
+    produced BYTE-IDENTICAL ``fluid plan`` terminal output. The signal existed
+    and was invisible to the only human in the loop.
+    """
+
+    def _plan(self, contract):
+        from fluid_build.iac.plan_packaging import apply_packaging_to_plan
+
+        actions = _native_actions()
+        base = {
+            "total_actions": len(actions),
+            "actions": actions,
+            "contract": {"name": "Telemetry SDP", "version": "0.7.6"},
+        }
+        return apply_packaging_to_plan(base, contract)
+
+    def test_shared_and_isolated_no_longer_render_identically(self):
+        from fluid_build.cli.plan import _packaging_summary_lines
+
+        shared = "\n".join(_packaging_summary_lines(self._plan(_contract(SHARED))))
+        isolated = "\n".join(_packaging_summary_lines(self._plan(_contract(ISOLATED))))
+        assert shared and isolated
+        assert shared != isolated
+
+    def test_the_shared_summary_names_the_pool(self):
+        from fluid_build.cli.plan import _packaging_summary_lines
+
+        text = "\n".join(_packaging_summary_lines(self._plan(_contract(SHARED))))
+        assert "acme-pool" in text
+        assert "owned by this product:  none" in text
+
+    def test_the_isolated_summary_lists_what_is_owned(self):
+        from fluid_build.cli.plan import _packaging_summary_lines
+
+        text = "\n".join(_packaging_summary_lines(self._plan(_contract(ISOLATED))))
+        assert "referenced (not owned): none" in text
+        assert "database" in text
+
+    def test_dropped_container_actions_are_named(self):
+        from fluid_build.cli.plan import _packaging_summary_lines
+
+        plan = self._plan(_contract(SHARED))
+        if not plan["packaging"].get("droppedActions"):
+            pytest.skip("this action fixture has no droppable container ops")
+        text = "\n".join(_packaging_summary_lines(plan))
+        assert "dropped" in text
+
+    def test_a_legacy_plan_renders_nothing_new(self):
+        """No packaging block ⇒ no key in plan.json ⇒ no extra output."""
+        from fluid_build.cli.plan import _packaging_summary_lines
+
+        assert _packaging_summary_lines(self._plan(_contract(None))) == []
+        assert _packaging_summary_lines({"total_actions": 0, "actions": []}) == []
+
+
+class TestTheApplyPathFiltersToo:
+    """``apply_packaging_to_plan`` was wired into cli/plan.py only.
+
+    ``fluid apply`` on a contract owning exactly one leaf table announced three
+    actions (``sf.database.ensure`` + ``sf.schema.ensure`` + the table) while
+    ``tofu`` correctly planned ``+1``. Verified live against Snowflake.
+    """
+
+    _SF_ACTIONS = [
+        {"op": "sf.database.ensure", "action_id": "database_POOL"},
+        {"op": "sf.schema.ensure", "action_id": "schema_POOL_S"},
+        {"op": "sf.table.ensure", "action_id": "table_POOL_S_T"},
+    ]
+
+    def _contract_sf(self, packaging):
+        contract = {
+            "fluidVersion": "0.7.6",
+            "id": "silver.misc.tenant_v1",
+            "exposes": [
+                {
+                    "exposeId": "t",
+                    "binding": {
+                        "platform": "snowflake",
+                        "format": "snowflake_table",
+                        "location": {"database": "POOL", "schema": "S", "table": "T"},
+                    },
+                }
+            ],
+        }
+        if packaging is not None:
+            contract["packaging"] = packaging
+        return contract
+
+    def test_referenced_container_ops_are_dropped(self, caplog):
+        import logging as _logging
+
+        from fluid_build.cli.generate_iac import _drop_referenced_container_actions
+
+        kept = _drop_referenced_container_actions(
+            self._contract_sf(SHARED), list(self._SF_ACTIONS), _logging.getLogger("t")
+        )
+        assert [a["op"] for a in kept] == ["sf.table.ensure"]
+
+    def test_an_isolated_contract_keeps_every_action(self):
+        import logging as _logging
+
+        from fluid_build.cli.generate_iac import _drop_referenced_container_actions
+
+        kept = _drop_referenced_container_actions(
+            self._contract_sf(ISOLATED), list(self._SF_ACTIONS), _logging.getLogger("t")
+        )
+        assert kept == self._SF_ACTIONS
+
+    def test_a_legacy_contract_is_untouched_by_identity(self):
+        import logging as _logging
+
+        from fluid_build.cli.generate_iac import _drop_referenced_container_actions
+
+        actions = list(self._SF_ACTIONS)
+        assert (
+            _drop_referenced_container_actions(
+                self._contract_sf(None), actions, _logging.getLogger("t")
+            )
+            is actions
+        )
+
+    def test_the_effective_count_is_emitted_for_ci(self, caplog):
+        import json as _json
+        import logging as _logging
+
+        from fluid_build.cli.generate_iac import _drop_referenced_container_actions
+
+        logger = _logging.getLogger("test_packaging_filter_event")
+        with caplog.at_level(_logging.DEBUG, logger=logger.name):
+            _drop_referenced_container_actions(
+                self._contract_sf(SHARED), list(self._SF_ACTIONS), logger
+            )
+        events = [
+            _json.loads(r.getMessage())
+            for r in caplog.records
+            if r.getMessage().startswith("{") and "packaging_actions_filtered" in r.getMessage()
+        ]
+        assert events, "the apply path must report the effective action count"
+        assert events[0]["planner_actions_count"] == 3
+        assert events[0]["actions_count"] == 1
+
+    def test_the_apply_path_really_calls_the_filter(self):
+        """Wiring pin — the fix is in native_actions, not only in cli/plan.py."""
+        import inspect
+
+        from fluid_build.cli import generate_iac
+
+        assert "_drop_referenced_container_actions(" in inspect.getsource(
+            generate_iac.native_actions
+        )

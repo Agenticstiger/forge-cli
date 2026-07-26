@@ -354,6 +354,14 @@ def native_actions(contract, logger: logging.Logger) -> list:
     compare diffs them against the emitter's output. Returns ``[]`` when
     the native provider cannot be constructed (e.g. no credentials) — the
     emitter then falls back to the ``exposes[]`` data-plane only.
+
+    Container-creation ops for containers the contract declares ``shared``
+    are dropped here (RFC-packaging-modes.md file 8, "a plan that lists
+    creations that won't happen is worse than a changed count").
+    ``apply_packaging_to_plan`` did this for ``plan.json`` only, so the
+    apply path kept announcing three actions for a contract that owns
+    exactly one leaf table — while ``tofu`` correctly planned ``+1``.
+    This is the apply-side chokepoint, matching ``cli/plan.py``'s.
     """
     try:
         from ._common import build_provider, resolve_provider_from_contract
@@ -361,10 +369,44 @@ def native_actions(contract, logger: logging.Logger) -> list:
         name, loc = resolve_provider_from_contract(contract)
         native = build_provider(name, loc.get("project"), loc.get("region"), logger)
         if hasattr(native, "plan"):
-            return list(native.plan(contract))
+            return _drop_referenced_container_actions(contract, list(native.plan(contract)), logger)
     except Exception as exc:  # noqa: BLE001 — native planner is best-effort
         logger.debug("shadow: native planner unavailable: %s", exc)
     return []
+
+
+def _drop_referenced_container_actions(contract, actions: list, logger: logging.Logger) -> list:
+    """Remove creation ops for REFERENCED containers; announce what left.
+
+    A no-op (identity, no event) for a contract with no ``packaging`` block
+    and for one that owns every container, so legacy behaviour is unchanged.
+    """
+    try:
+        from fluid_build.iac.plan_packaging import filter_referenced_container_actions
+
+        kept, dropped = filter_referenced_container_actions(contract, actions)
+    except Exception as exc:  # noqa: BLE001 — never let the filter break apply
+        logger.debug("packaging: action filter unavailable: %s", exc)
+        return actions
+    if not dropped:
+        return actions
+    # The provider's own ``plan_completed`` event reports what its planner
+    # produced, which is not what apply will do once REFERENCED containers are
+    # excluded. ``actions_count`` here is the effective figure a CI parser
+    # should key on.
+    info(
+        logger,
+        "packaging_actions_filtered",
+        planner_actions_count=len(actions),
+        actions_count=len(kept),
+        dropped=dropped,
+    )
+    cprint(
+        f"\n  packaging:   {len(dropped)} container-creation action(s) dropped — "
+        f"{', '.join(sorted({str(d.get('container')) for d in dropped}))} "
+        "referenced from a shared pool, not created here"
+    )
+    return list(kept)
 
 
 def _print_shadow_report(contract, plugin, logger: logging.Logger) -> None:
