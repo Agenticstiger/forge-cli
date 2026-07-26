@@ -181,3 +181,57 @@ def test_run_catalog_adapters_dispatches(monkeypatch):
     V._run_catalog_adapters(["a.yaml", "b.yaml"], _Args(), logging.getLogger("t"))
     assert len(seen) == 2  # one dispatch per contract
     assert seen[0] == ({"id": "loaded"}, True)
+
+
+def _patch_adapters(monkeypatch, summaries):
+    """Install a fake catalog-adapter dispatch returning ``summaries``."""
+    import fluid_build.loader as loader
+
+    monkeypatch.setattr(PM, "has_plugins", lambda group: True)
+    monkeypatch.setattr(loader, "load_contract", lambda p: {"id": "prod.a"})
+    monkeypatch.setattr(
+        PM,
+        "dispatch_catalog_adapters",
+        lambda contract, dry_run=False, logger=None: list(summaries),
+    )
+
+
+def test_run_catalog_adapters_reports_failure_as_publish_result(monkeypatch):
+    """A plugin whose ``plan()`` raises must come back as a FAILED result.
+
+    Regression: ``_run_catalog_adapters`` returned ``None``, so the exit
+    code was computed purely from the registrar results and an adapter
+    that synced nothing still produced exit 0 under a ✅ Success table.
+    """
+    import logging
+
+    from fluid_build.cli import publish as V
+
+    _patch_adapters(
+        monkeypatch,
+        [{"plugin": "lin-test-catalog", "planned": 0, "ok": False, "error": "RuntimeError"}],
+    )
+
+    class _Args:
+        dry_run = False
+
+    out = V._run_catalog_adapters(["a.yaml"], _Args(), logging.getLogger("t"))
+    assert len(out) == 1
+    assert out[0].success is False
+    assert out[0].catalog_id == "adapter:lin-test-catalog"
+    assert "RuntimeError" in (out[0].error or "")
+
+
+def test_run_catalog_adapters_success_is_a_successful_result(monkeypatch):
+    import logging
+
+    from fluid_build.cli import publish as V
+
+    _patch_adapters(monkeypatch, [{"plugin": "toycat", "planned": 2, "ok": True}])
+
+    class _Args:
+        dry_run = False
+
+    out = V._run_catalog_adapters(["a.yaml"], _Args(), logging.getLogger("t"))
+    assert [r.success for r in out] == [True]
+    assert out[0].error is None

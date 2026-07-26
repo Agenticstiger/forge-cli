@@ -901,3 +901,160 @@ class TestRunAsyncPublishFlow:
 
         assert result.success is False
         assert result.error == "missing required field"
+
+
+# ---------------------------------------------------------------------------
+# Acquisition catalog auto-registration (properties.catalog.register)
+# ---------------------------------------------------------------------------
+
+
+_ACQUISITION_CONTRACT = {
+    "id": "bronze.test.orders",
+    "builds": [
+        {
+            "id": "ingest_orders",
+            "pattern": "acquisition",
+            "engine": "duckdb",
+            "properties": {"catalog": {"register": ["datahub"]}},
+            "outputs": ["orders_raw"],
+        }
+    ],
+}
+
+
+class TestAcquisitionCatalogDispatch:
+    """``properties.catalog.register`` must actually reach the registrars.
+
+    Regression: the loop loaded each contract via a symbol that does not
+    exist (``fluid_build.loader.load_contract_with_overlay``) inside a bare
+    ``except Exception: continue``, so every contract-declared catalog
+    target was a zero-output no-op at exit 0.
+    """
+
+    def _run(self, tmp_path, contract, **arg_overrides):
+        from fluid_build.cli import publish as pub_mod
+        from fluid_build.cli import _acquisition_stage_ext as ext
+
+        contract_file = tmp_path / "c.fluid.yaml"
+        contract_file.write_text("id: bronze.test.orders")
+
+        args = _make_args(contract_files=[str(contract_file)], **arg_overrides)
+        logger = logging.getLogger("test")
+        dispatched = []
+
+        def _fake_publish_acquisition(c, workdir):
+            dispatched.append(c)
+            return [
+                ext.PublishResult(
+                    product_id=c["id"],
+                    expose_id="orders_raw",
+                    target="datahub",
+                    succeeded=True,
+                    urn="urn:li:dataset:(x)",
+                )
+            ]
+
+        with (
+            patch.object(pub_mod, "RICH_AVAILABLE", False),
+            patch.object(pub_mod, "FluidConfig") as mock_cfg_cls,
+            patch.object(pub_mod, "publish_contract", return_value=_make_result(success=True)),
+            patch.object(pub_mod, "load_contract_with_overlay", return_value=contract),
+            patch.object(ext, "publish_acquisition", _fake_publish_acquisition),
+            patch.object(pub_mod, "cprint"),
+        ):
+            mock_cfg_cls.return_value = MagicMock()
+            loop = asyncio.new_event_loop()
+            try:
+                code = loop.run_until_complete(pub_mod.run_async(args, logger))
+            finally:
+                loop.close()
+        return code, dispatched
+
+    def test_declared_targets_are_dispatched(self, tmp_path):
+        code, dispatched = self._run(tmp_path, _ACQUISITION_CONTRACT)
+        assert code == 0
+        assert len(dispatched) == 1
+        assert dispatched[0]["id"] == "bronze.test.orders"
+
+    def test_non_acquisition_contract_is_not_dispatched(self, tmp_path):
+        code, dispatched = self._run(tmp_path, {"id": "silver.x", "builds": []})
+        assert code == 0
+        assert dispatched == []
+
+    def test_dry_run_does_not_write_to_the_catalog(self, tmp_path):
+        """``--dry-run`` must plan only — the registrars write unconditionally."""
+        code, dispatched = self._run(tmp_path, _ACQUISITION_CONTRACT, dry_run=True)
+        assert code == 0
+        assert dispatched == []
+
+    def test_verify_only_does_not_write_to_the_catalog(self, tmp_path):
+        code, dispatched = self._run(tmp_path, _ACQUISITION_CONTRACT, verify_only=True)
+        assert code == 0
+        assert dispatched == []
+
+    def test_unloadable_contract_is_reported_not_silently_skipped(self, tmp_path, caplog):
+        """A load failure must log, not vanish into ``except: continue``."""
+        from fluid_build.cli import publish as pub_mod
+
+        contract_file = tmp_path / "c.fluid.yaml"
+        contract_file.write_text("id: bronze.test.orders")
+        args = _make_args(contract_files=[str(contract_file)])
+        logger = logging.getLogger("test-acq-load")
+
+        with (
+            patch.object(pub_mod, "RICH_AVAILABLE", False),
+            patch.object(pub_mod, "FluidConfig") as mock_cfg_cls,
+            patch.object(pub_mod, "publish_contract", return_value=_make_result(success=True)),
+            patch.object(
+                pub_mod,
+                "load_contract_with_overlay",
+                side_effect=ImportError("cannot import name 'x'"),
+            ),
+            patch.object(pub_mod, "cprint"),
+            caplog.at_level(logging.WARNING, logger="test-acq-load"),
+        ):
+            mock_cfg_cls.return_value = MagicMock()
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(pub_mod.run_async(args, logger))
+            finally:
+                loop.close()
+
+        assert any("Acquisition catalog dispatch skipped" in r.message for r in caplog.records)
+
+
+class TestCatalogAdapterAffectsExitCode:
+    """A failing CatalogAdapter plugin must not leave publish green."""
+
+    def test_failed_adapter_degrades_exit_code(self, tmp_path):
+        from fluid_build.cli import publish as pub_mod
+        from fluid_build.providers.catalogs import PublishResult as _PR
+
+        contract_file = tmp_path / "c.fluid.yaml"
+        contract_file.write_text("id: test")
+        args = _make_args(contract_files=[str(contract_file)])
+        logger = logging.getLogger("test")
+
+        failed_adapter = _PR(
+            success=False,
+            catalog_id="adapter:lin-test-catalog",
+            asset_id="test",
+            error="catalog adapter lin-test-catalog failed: RuntimeError",
+        )
+
+        with (
+            patch.object(pub_mod, "RICH_AVAILABLE", False),
+            patch.object(pub_mod, "FluidConfig") as mock_cfg_cls,
+            patch.object(pub_mod, "publish_contract", return_value=_make_result(success=True)),
+            patch.object(pub_mod, "_run_catalog_adapters", return_value=[failed_adapter]),
+            patch.object(pub_mod, "cprint"),
+        ):
+            mock_cfg_cls.return_value = MagicMock()
+            loop = asyncio.new_event_loop()
+            try:
+                code = loop.run_until_complete(pub_mod.run_async(args, logger))
+            finally:
+                loop.close()
+
+        # Registrar succeeded, adapter failed → partial success, not 0.
+        assert code == 2
