@@ -228,16 +228,12 @@ def test_u9c_model_gate_is_inert_when_no_model_policy_is_declared():
     assert allowed is True
     assert reason is None
     # …and an identified caller is still evaluated normally.
-    allowed, reason = policy.check_tool_call(
-        tool="describe", model_id="any-model", use_case=None
-    )
+    allowed, reason = policy.check_tool_call(tool="describe", model_id="any-model", use_case=None)
     assert allowed is True
 
 
 def test_u9d_inert_model_gate_does_not_weaken_the_tool_gate():
-    policy = OutputPortPolicy.from_contract_and_flags(
-        expose=_expose(), denied_tools=("query_sql",)
-    )
+    policy = OutputPortPolicy.from_contract_and_flags(expose=_expose(), denied_tools=("query_sql",))
     allowed, reason = policy.check_tool_call(tool="query_sql", model_id=None, use_case=None)
     assert allowed is False
     assert reason == "tool-not-allowed"

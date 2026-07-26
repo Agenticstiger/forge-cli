@@ -44,8 +44,8 @@ from fluid_build.forge_datamodel.semantics_builder import (
     measure_from_aggregate_expression,
     normalized_time_type_params,
     parse_aggregate_expression,
-    validate_semantics_block,
     simple_metric,
+    validate_semantics_block,
 )
 
 

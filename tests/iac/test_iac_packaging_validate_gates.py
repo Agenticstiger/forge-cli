@@ -67,7 +67,10 @@ def test_isolated_validates():
         ({"mode": "nonsense"}, "invalid-mode"),
         ({"mode": "isolated", "containers": {"nope": "isolated"}}, "invalid-container-kind"),
         ({"mode": "isolated", "containers": {"schema": "nope"}}, "invalid-container-mode"),
-        ({"mode": "isolated", "containers": {"cluster": "isolated"}}, "cluster-isolated-unsupported"),
+        (
+            {"mode": "isolated", "containers": {"cluster": "isolated"}},
+            "cluster-isolated-unsupported",
+        ),
         ({"mode": "isolated", "unknownKey": 1}, "invalid-block"),
     ],
 )

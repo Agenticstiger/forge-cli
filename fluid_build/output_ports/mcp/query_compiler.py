@@ -665,10 +665,7 @@ def _render_measure_expression(
             )
         percentile, use_discrete = _resolve_percentile_params(measure_name, measure)
         fn = "PERCENTILE_DISC" if use_discrete else "PERCENTILE_CONT"
-        return (
-            f"{fn}({percentile:g}) WITHIN GROUP (ORDER BY {expr_raw}) "
-            f"AS {projection_alias}"
-        )
+        return f"{fn}({percentile:g}) WITHIN GROUP (ORDER BY {expr_raw}) " f"AS {projection_alias}"
     return f"{sql_func}({expr_raw}) AS {projection_alias}"
 
 
@@ -767,13 +764,9 @@ def compile_semantic_query(
     measure_alias = metric if metric is not None else measure_name
     measure_expr = measure_definition.get("expr") or measure_name
     if isinstance(measure_expr, str):
-        _reject_restricted_reference(
-            measure_expr, restricted, subject=f"Measure {measure_name!r}"
-        )
+        _reject_restricted_reference(measure_expr, restricted, subject=f"Measure {measure_name!r}")
     if metric_filter is not None:
-        _reject_restricted_reference(
-            metric_filter, restricted, subject=f"Metric {metric!r} filter"
-        )
+        _reject_restricted_reference(metric_filter, restricted, subject=f"Metric {metric!r} filter")
 
     select_parts: List[str] = []
     group_columns: List[str] = []

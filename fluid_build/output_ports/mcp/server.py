@@ -179,6 +179,7 @@ def _error_result(payload: Mapping[str, Any]) -> CallToolResult:
         isError=True,
     )
 
+
 # ---------------------------------------------------------------------
 # Session state — bound once at lifespan start, read on every tool call
 # ---------------------------------------------------------------------
@@ -654,9 +655,7 @@ class OutputPortMcpServer:
                     content_blocks = (
                         response.content if isinstance(response, CallToolResult) else response
                     )
-                    response_size = sum(
-                        len(getattr(c, "text", "") or "") for c in content_blocks
-                    )
+                    response_size = sum(len(getattr(c, "text", "") or "") for c in content_blocks)
                     estimated_tokens = max(1, response_size // 4)
                     self.state.record_tokens(estimated_tokens)
                     agent_policy = (self.state.expose.get("policy") or {}).get("agentPolicy") or {}
