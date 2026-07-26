@@ -27,6 +27,7 @@ from typing import Optional
 import click
 
 from fluid_build.cli.console import cprint
+from fluid_build.cli._export_env import resolve_for_export
 from fluid_build.loader import load_contract
 from fluid_build.providers.odcs import OdcsProvider
 
@@ -107,7 +108,7 @@ def export_command(
     try:
         # Load FLUID contract
         click.echo(f"Loading FLUID contract: {contract}")
-        fluid_contract = load_contract(contract)
+        fluid_contract = resolve_for_export(load_contract(contract))
 
         # Configure provider
         provider = OdcsProvider()

@@ -70,7 +70,11 @@ def run(args, logger: logging.Logger) -> int:
 
         from fluid_build.providers.opds.opds import OdpsProvider
 
-        c = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
+        from fluid_build.cli._export_env import resolve_for_export
+
+        c = resolve_for_export(
+            load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
+        )
         rendered = OdpsProvider().render(c)
         # Unwrap the provider's ``{..., artifacts: {...}}`` envelope so the
         # on-disk file is the canonical bare ODPS v4.1 doc.

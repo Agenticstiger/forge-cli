@@ -46,6 +46,7 @@ from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
 
 from ._common import CLIError, load_contract_with_overlay, write_json
+from ._export_env import resolve_for_export
 from ._logging import info
 
 # Ordered Bitol-first. The dispatcher reads the leading entry as the
@@ -213,7 +214,7 @@ def _export_odps_v4_1(contract_path: str, env, out: str, logger: logging.Logger)
     """
     from fluid_build.providers.opds.opds import OdpsProvider
 
-    c = load_contract_with_overlay(contract_path, env, logger)
+    c = resolve_for_export(load_contract_with_overlay(contract_path, env, logger))
     provider = OdpsProvider()
     rendered = provider.render(c)
 
@@ -264,7 +265,7 @@ def _export_odcs(contract_path: str, env, out: str, logger: logging.Logger) -> i
     from fluid_build.loader import load_contract
     from fluid_build.providers.odcs.provider import OdcsProvider
 
-    c = load_contract(contract_path)
+    c = resolve_for_export(load_contract(contract_path))
     provider = OdcsProvider()
     results = provider.render_all_ports(c)  # [(expose_id, odcs_doc), ...]
 
@@ -328,7 +329,7 @@ def _export_odps_bitol(contract_path: str, env, out: str, logger: logging.Logger
         from fluid_build.loader import load_contract
         from fluid_build.providers.odps_standard import BitolOdpsProvider
 
-        c = load_contract(contract_path)
+        c = resolve_for_export(load_contract(contract_path))
         provider = BitolOdpsProvider()
         provider.strict_validation = False  # bare-product flow shouldn't enforce sibling validation
         bundle = provider.render(c)
@@ -344,7 +345,7 @@ def _export_odps_bitol(contract_path: str, env, out: str, logger: logging.Logger
         return 0
     except ImportError:
         # Fallback
-        c = load_contract_with_overlay(contract_path, env, logger)
+        c = resolve_for_export(load_contract_with_overlay(contract_path, env, logger))
         import yaml as _yaml
 
         odps_bitol = {

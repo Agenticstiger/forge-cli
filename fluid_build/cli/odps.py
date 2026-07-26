@@ -183,7 +183,11 @@ def cmd_opds_export(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     spec = resolve_spec(args)
     try:
-        contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
+        from fluid_build.cli._export_env import resolve_for_export
+
+        contract = resolve_for_export(
+            load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
+        )
     except Exception as e:
         logger.error("contract_load_failed", extra={"error": str(e)})
         console_error(f"Error loading contract: {e}")
