@@ -33,7 +33,7 @@ import json
 import logging
 import sys
 
-from fluid_build.cli.console import cprint, success
+from fluid_build.cli.console import cprint, cprint_json, success
 from fluid_build.cli.console import error as console_error
 
 try:
@@ -562,7 +562,7 @@ def _cmd_get(args, logger=None):
     try:
         provider = _make_provider(args)
         product = provider.verify(args.product_id)
-        cprint(json.dumps(product, indent=2))
+        cprint_json(json.dumps(product, indent=2))
         return 0
     except ProviderError as exc:
         console_error(f"Error: {exc}")
@@ -702,7 +702,7 @@ def _cmd_teams(args, logger=None):
         fmt = getattr(args, "format", "table")
 
         if fmt == "json":
-            cprint(json.dumps(teams, indent=2))
+            cprint_json(json.dumps(teams, indent=2))
             return 0
 
         if RICH_AVAILABLE:
@@ -758,14 +758,14 @@ def _print_dry_run(result):
         cprint(f"Method: {result.get('method', 'PUT')}")
         cprint(f"URL:    {result.get('url', '?')}")
         cprint()
-        cprint(json.dumps(result.get("payload", {}), indent=2))
+        cprint_json(json.dumps(result.get("payload", {}), indent=2))
         for odcs in result.get("odcs_contracts", []):
             cprint()
             cprint("=== ODCS Contract Dry Run ===")
             cprint(f"Method: {odcs.get('method', 'PUT')}")
             cprint(f"URL:    {odcs.get('url', '?')}")
             cprint()
-            cprint(json.dumps(odcs.get("payload", {}), indent=2))
+            cprint_json(json.dumps(odcs.get("payload", {}), indent=2))
 
 
 # ---------------------------------------------------------------------------

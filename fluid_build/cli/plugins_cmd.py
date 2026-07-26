@@ -28,7 +28,7 @@ import argparse
 import json
 import logging
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_json
 
 COMMAND = "plugins"
 
@@ -74,7 +74,7 @@ def run(args, logger: logging.Logger) -> int:
         data = {}
 
     if getattr(args, "json", False):
-        cprint(json.dumps(data, indent=2, sort_keys=True))
+        cprint_json(json.dumps(data, indent=2, sort_keys=True))
         return 0
 
     total = sum(len(v) for v in data.values())

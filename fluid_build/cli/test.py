@@ -44,7 +44,7 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.cli.console import error as console_error
@@ -52,6 +52,7 @@ from fluid_build.cli.console import error as console_error
 # Rich imports (optional)
 try:
     from rich.console import Console
+    from rich.markup import escape
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
@@ -59,6 +60,11 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
+
+    def escape(text: str) -> str:  # type: ignore[misc]
+        """No-op stand-in when rich is absent — nothing parses markup then."""
+        return text
+
 
 LOG = logging.getLogger("fluid.cli.test")
 COMMAND = "test"
@@ -286,6 +292,19 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 # ======================================================================
 
 
+def _detail(messages: Iterable[str]) -> str:
+    """Join issue messages into a Rich table cell, escaped as literal text.
+
+    Validator messages quote the contract schema verbatim, so they routinely
+    carry ``[...]`` runs — a JSON Schema ``pattern`` (``[a-z0-9]``), a contract
+    path (``exposes[0]``), an enum list. Rich parses those as style markup and
+    swallows them, so ``^[a-z0-9][a-z0-9-]*[a-z0-9]$`` reached the operator as
+    the unactionable ``^*$``. ``escape`` keeps the cell showing exactly what
+    the validator said.
+    """
+    return escape("; ".join(messages))
+
+
 def _output_rich(report, output_file: Optional[str] = None) -> None:
     """Render a Data-Contract-CLI-style test results table."""
     if not RICH_AVAILABLE:
@@ -327,7 +346,7 @@ def _output_rich(report, output_file: Optional[str] = None) -> None:
             str(check_no),
             "[red]\u274c[/red]",
             "Schema syntax",
-            "; ".join(e.message for e in schema_errors),
+            _detail(e.message for e in schema_errors),
         )
     else:
         table.add_row(str(check_no), "[green]\u2705[/green]", "Schema syntax", "Valid")
@@ -340,7 +359,7 @@ def _output_rich(report, output_file: Optional[str] = None) -> None:
             str(check_no),
             "[red]\u274c[/red]",
             "Provider connection",
-            "; ".join(e.message for e in conn_errors),
+            _detail(e.message for e in conn_errors),
         )
     else:
         table.add_row(str(check_no), "[green]\u2705[/green]", "Provider connection", "OK")
@@ -354,14 +373,14 @@ def _output_rich(report, output_file: Optional[str] = None) -> None:
             str(check_no),
             "[red]\u274c[/red]",
             "Binding configuration",
-            "; ".join(e.message for e in bind_errors),
+            _detail(e.message for e in bind_errors),
         )
     elif bind_warns:
         table.add_row(
             str(check_no),
             "[yellow]\u26a0\ufe0f[/yellow]",
             "Binding configuration",
-            "; ".join(e.message for e in bind_warns),
+            _detail(e.message for e in bind_warns),
         )
     else:
         table.add_row(str(check_no), "[green]\u2705[/green]", "Binding configuration", "OK")
@@ -374,7 +393,7 @@ def _output_rich(report, output_file: Optional[str] = None) -> None:
             str(check_no),
             "[red]\u274c[/red]",
             "Resource exists",
-            "; ".join(e.message for e in missing),
+            _detail(e.message for e in missing),
         )
     else:
         table.add_row(
@@ -400,7 +419,7 @@ def _output_rich(report, output_file: Optional[str] = None) -> None:
             "Schema fields",
             "{n} error(s): {msgs}".format(
                 n=len(field_errors),
-                msgs="; ".join(e.message for e in field_errors[:3]),
+                msgs=_detail(e.message for e in field_errors[:3]),
             ),
         )
     elif field_warns:
@@ -425,14 +444,14 @@ def _output_rich(report, output_file: Optional[str] = None) -> None:
             str(check_no),
             "[red]\u274c[/red]",
             "Row count / SLA",
-            "; ".join(e.message for e in row_errors),
+            _detail(e.message for e in row_errors),
         )
     elif row_warns:
         table.add_row(
             str(check_no),
             "[yellow]\u26a0\ufe0f[/yellow]",
             "Row count / SLA",
-            "; ".join(e.message for e in row_warns),
+            _detail(e.message for e in row_warns),
         )
     else:
         table.add_row(str(check_no), "[green]\u2705[/green]", "Row count / SLA", "OK")
@@ -446,14 +465,14 @@ def _output_rich(report, output_file: Optional[str] = None) -> None:
             str(check_no),
             "[red]\u274c[/red]",
             "Quality tests",
-            "; ".join(e.message for e in q_errors),
+            _detail(e.message for e in q_errors),
         )
     elif quality_issues:
         table.add_row(
             str(check_no),
             "[yellow]\u26a0\ufe0f[/yellow]",
             "Quality tests",
-            "; ".join(e.message for e in quality_issues),
+            _detail(e.message for e in quality_issues),
         )
     else:
         table.add_row(str(check_no), "[green]\u2705[/green]", "Quality tests", "Passed")
@@ -467,7 +486,7 @@ def _output_rich(report, output_file: Optional[str] = None) -> None:
             str(check_no),
             "[red]\u274c[/red]",
             "Metadata / governance",
-            "; ".join(e.message for e in m_errors),
+            _detail(e.message for e in m_errors),
         )
     elif meta_issues:
         table.add_row(
@@ -487,7 +506,7 @@ def _output_rich(report, output_file: Optional[str] = None) -> None:
             str(check_no),
             "[yellow]\u26a0\ufe0f[/yellow]",
             "Drift detection",
-            "; ".join(e.message for e in drift_issues),
+            _detail(e.message for e in drift_issues),
         )
 
     console.print(table)
