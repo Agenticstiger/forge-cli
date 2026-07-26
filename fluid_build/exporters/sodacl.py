@@ -114,20 +114,32 @@ class SodaclRendering:
         ``"<expose>.<rule id>"`` for every rule that produced a check.
     unmapped:
         Every declared rule that produced no check, with the reason.
+    legacy_checks:
+        Checks emitted from the pre-schema ``exposes[].quality.tests[]`` block.
+        Those entries carry no rule ids, so they cannot appear in ``mapped``
+        — but they are real checks in ``text`` and a caller that ignored them
+        would exit 0 on a contract whose scan it never ran.
     """
 
     text: str
     mapped: list[str] = field(default_factory=list)
     unmapped: list[UnmappedRule] = field(default_factory=list)
+    legacy_checks: int = 0
 
     @property
     def declared(self) -> int:
-        """Total DQ rules found in the contract, mapped or not."""
-        return len(self.mapped) + len(self.unmapped)
+        """Total quality rules found in the contract, mapped or not."""
+        return len(self.mapped) + len(self.unmapped) + self.legacy_checks
+
+    @property
+    def emitted_checks(self) -> int:
+        """How many SodaCL checks ``text`` carries."""
+        return len(self.mapped) + self.legacy_checks
 
     @property
     def has_checks(self) -> bool:
-        return bool(self.mapped)
+        """True when ``text`` actually contains at least one SodaCL check."""
+        return self.emitted_checks > 0
 
 
 def render_sodacl(contract: Mapping[str, Any]) -> str:
@@ -166,6 +178,7 @@ def render_sodacl_document(contract: Mapping[str, Any]) -> SodaclRendering:
     doc: dict[str, Any] = {}
     mapped: list[str] = []
     unmapped: list[UnmappedRule] = []
+    legacy_checks = 0
 
     for expose in contract.get("exposes") or []:
         if not isinstance(expose, Mapping):
@@ -175,7 +188,8 @@ def render_sodacl_document(contract: Mapping[str, Any]) -> SodaclRendering:
 
         checks: list[Any] = []
         checks.extend(_dq_rules_to_checks(expose, expose_id, mapped, unmapped))
-        checks.extend(_legacy_quality_block_to_checks(expose))
+        legacy = _legacy_quality_block_to_checks(expose)
+        checks.extend(legacy)
 
         # SQL-expression rules (``$defs.exposeContract.quality``). Neither
         # engine executes these today; counting them as declared-but-unmapped
@@ -185,6 +199,9 @@ def render_sodacl_document(contract: Mapping[str, Any]) -> SodaclRendering:
         if not checks:
             continue
         if not table_name:
+            # Emitting a ``checks for <blank>`` block would produce a document
+            # soda cannot parse, so nothing is emitted — which means these
+            # rules were not executed and must be reported as such.
             for rid in _dq_rule_ids(expose):
                 unmapped.append(
                     UnmappedRule(
@@ -199,7 +216,20 @@ def render_sodacl_document(contract: Mapping[str, Any]) -> SodaclRendering:
                 )
                 if f"{expose_id}.{rid}" in mapped:
                     mapped.remove(f"{expose_id}.{rid}")
+            for idx in range(len(legacy)):
+                unmapped.append(
+                    UnmappedRule(
+                        expose=expose_id,
+                        rule_id=f"quality.tests[{idx}]",
+                        rule_type="legacy",
+                        reason=(
+                            "cannot resolve a table name for this expose — set "
+                            "binding.location.table"
+                        ),
+                    )
+                )
             continue
+        legacy_checks += len(legacy)
         # SodaCL key format: "checks for <table_name>"
         doc.setdefault(f"checks for {table_name}", []).extend(checks)
 
@@ -207,7 +237,7 @@ def render_sodacl_document(contract: Mapping[str, Any]) -> SodaclRendering:
         text = "# No quality tests defined in contract\n"
     else:
         text = yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
-    return SodaclRendering(text=text, mapped=mapped, unmapped=unmapped)
+    return SodaclRendering(text=text, mapped=mapped, unmapped=unmapped, legacy_checks=legacy_checks)
 
 
 # ----------------------------------------------------------------------
@@ -279,9 +309,7 @@ def _dq_rules_to_checks(
     return checks
 
 
-def _convert_dq_rule(
-    rule: Mapping[str, Any], rule_type: str
-) -> tuple[list[Any], str]:
+def _convert_dq_rule(rule: Mapping[str, Any], rule_type: str) -> tuple[list[Any], str]:
     """Map one ``$defs.dqRule`` to SodaCL checks, or explain why we can't.
 
     Returns ``(checks, reason)``. ``checks`` empty ⇒ unmapped, and ``reason``
@@ -510,9 +538,7 @@ def _sodacl_duration(seconds: int) -> str | None:
     return out or None
 
 
-def _expression_rules_unmapped(
-    expose: Mapping[str, Any], expose_id: str
-) -> list[UnmappedRule]:
+def _expression_rules_unmapped(expose: Mapping[str, Any], expose_id: str) -> list[UnmappedRule]:
     """Account for ``exposes[].contract.quality[]`` SQL-expression rules.
 
     ``$defs.exposeContract.quality`` is a list of ``{rule, expression,

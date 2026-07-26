@@ -928,7 +928,7 @@ def _run_soda_engine(
     if unaccounted:
         console_error(
             f"soda scan returned {result.return_code} but reported no check "
-            f"outcomes for the {len(rendering.mapped)} check(s) we sent — "
+            f"outcomes for the {rendering.emitted_checks} check(s) we sent — "
             "refusing to report a pass we cannot substantiate. Run `soda scan "
             "-d <datasource> <file>` directly to see its output."
         )

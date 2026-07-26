@@ -265,7 +265,9 @@ def test_declared_count_separates_no_rules_from_all_rules_dropped():
     assert empty.has_checks is False
 
     dropped = render_sodacl_document(
-        _schema_valid_contract([{"id": "r", "type": "schema", "selector": "X", "severity": "error"}])
+        _schema_valid_contract(
+            [{"id": "r", "type": "schema", "selector": "X", "severity": "error"}]
+        )
     )
     assert dropped.declared == 1
     assert dropped.has_checks is False
@@ -303,3 +305,40 @@ def test_both_sources_merge_into_one_checks_block():
     checks = yaml.safe_load(render_sodacl_document(contract).text)["checks for CUSTOMERS"]
     assert "missing_count(NAME) = 0" in checks
     assert "duplicate_count(CUSTOMER_ID) = 0" in checks
+
+
+def test_legacy_only_contract_still_counts_as_having_checks():
+    """A legacy block emits real checks that no rule id can account for.
+
+    Counting only ``mapped`` would make ``declared == 0`` for this contract,
+    and the caller would print "nothing to check" and exit 0 while holding a
+    document full of checks — the same silent no-op, moved to another key.
+    """
+    rendering = render_sodacl_document(
+        {
+            "exposes": [
+                {
+                    "id": "orders",
+                    "binding": {"location": {"properties": {"table": "ORDERS"}}},
+                    "quality": {"tests": [{"type": "unique", "column": "ORDER_ID"}]},
+                }
+            ]
+        }
+    )
+    assert "duplicate_count(ORDER_ID) = 0" in rendering.text
+    assert rendering.has_checks is True
+    assert rendering.emitted_checks == 1
+    assert rendering.declared == 1
+
+
+def test_a_rule_whose_table_cannot_be_resolved_is_reported_not_dropped():
+    """No table name means no ``checks for`` block — so the rule did not run."""
+    contract = _schema_valid_contract(
+        [{"id": "r", "type": "completeness", "selector": "NAME", "severity": "error"}]
+    )
+    del contract["exposes"][0]["exposeId"]
+    contract["exposes"][0]["binding"]["location"] = {"database": "DB", "schema": "SCH"}
+    rendering = render_sodacl_document(contract)
+    assert rendering.has_checks is False
+    assert [u.rule_id for u in rendering.unmapped] == ["r"]
+    assert "binding.location.table" in rendering.unmapped[0].reason

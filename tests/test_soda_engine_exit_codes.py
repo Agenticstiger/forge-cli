@@ -148,7 +148,9 @@ def test_expression_only_contract_exits_one(tmp_path, fake_soda):
     assert not fake_soda.called
 
 
-def test_genuinely_empty_contract_exits_zero_with_an_actionable_message(tmp_path, fake_soda, capsys):
+def test_genuinely_empty_contract_exits_zero_with_an_actionable_message(
+    tmp_path, fake_soda, capsys
+):
     """Zero declared rules is honest — but the message must name the keys."""
     path = _write(tmp_path, [])
     assert _run_soda_engine(_args(path), path, LOGGER) == 0
@@ -156,6 +158,28 @@ def test_genuinely_empty_contract_exits_zero_with_an_actionable_message(tmp_path
     out = capsys.readouterr()
     combined = out.out + out.err
     assert "exposes[].contract.dq.rules" in combined
+
+
+def test_legacy_quality_block_still_gets_scanned(tmp_path, fake_soda):
+    """Pre-schema ``exposes[].quality.tests[]`` files must keep working.
+
+    They carry no rule ids, so the mapped/unmapped accounting cannot see them;
+    treating that as "nothing declared" would exit 0 without running the scan.
+    """
+    contract = dict(_BASE)
+    contract["exposes"] = [
+        {
+            "exposeId": "orders",
+            "binding": {"location": {"properties": {"table": "ORDERS"}}},
+            "quality": {"tests": [{"type": "unique", "column": "ORDER_ID"}]},
+        }
+    ]
+    path = tmp_path / "contract.fluid.yaml"
+    path.write_text(yaml.safe_dump(contract), encoding="utf-8")
+
+    fake_soda.return_value = _scan()
+    assert _run_soda_engine(_args(path), path, LOGGER) == 0
+    assert fake_soda.called, "the legacy block's checks were never sent to soda"
 
 
 def test_scan_that_accounts_for_nothing_is_not_reported_as_a_pass(tmp_path, fake_soda):
@@ -216,7 +240,9 @@ def test_junit_reports_an_unmapped_rule_as_a_failing_case(tmp_path, fake_soda):
     fake_soda.return_value = _scan()
     path = _write(tmp_path, [_MAPPABLE, _UNMAPPABLE])
     out_file = tmp_path / "soda.xml"
-    assert _run_soda_engine(_args(path, output="junit", output_file=str(out_file)), path, LOGGER) == 1
+    assert (
+        _run_soda_engine(_args(path, output="junit", output_file=str(out_file)), path, LOGGER) == 1
+    )
 
     suite = ET.parse(str(out_file)).getroot()
     names = [tc.get("name") for tc in suite.findall("testcase")]

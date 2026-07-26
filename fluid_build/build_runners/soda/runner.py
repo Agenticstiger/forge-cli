@@ -73,11 +73,7 @@ class SodaResult:
 
     @property
     def ok(self) -> bool:
-        return (
-            self.checks_failed == 0
-            and self.checks_not_evaluated == 0
-            and self.return_code == 0
-        )
+        return self.checks_failed == 0 and self.checks_not_evaluated == 0 and self.return_code == 0
 
 
 def resolve_soda_executable(*, env: Optional[dict[str, str]] = None) -> str:
