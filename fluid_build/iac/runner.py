@@ -269,9 +269,7 @@ def tofu_prior_state_resources(
     an older ``tofu`` returns ``[]`` and callers treat that as "nothing to
     compare", never as an apply failure.
     """
-    result = _run(
-        ["show", "-json", plan_file], workdir=workdir, env=env, command="show-plan"
-    )
+    result = _run(["show", "-json", plan_file], workdir=workdir, env=env, command="show-plan")
     if not result.ok:
         return []
     try:

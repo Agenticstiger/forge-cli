@@ -69,9 +69,7 @@ def register_iac_plugin(name: str, plugin: IacProviderPlugin) -> None:
     from fluid_build.plugin_manager import is_allowed
 
     if not is_allowed(name):
-        logging.getLogger(__name__).debug(
-            "iac plugin %r skipped by allow/block policy", name
-        )
+        logging.getLogger(__name__).debug("iac plugin %r skipped by allow/block policy", name)
         return
     IAC_PLUGINS[name] = plugin
 

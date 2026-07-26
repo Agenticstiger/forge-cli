@@ -86,9 +86,7 @@ class TestSnowflakeRouting:
                 "fluid_build.providers.snowflake.util.config.get_connection_params",
                 return_value={"account": "acct", "user": "u", "warehouse": "WH"},
             ),
-            patch(
-                "fluid_build.providers.snowflake.connection.SnowflakeConnection"
-            ) as sf_conn_cls,
+            patch("fluid_build.providers.snowflake.connection.SnowflakeConnection") as sf_conn_cls,
             patch("fluid_build.providers.local.local.LocalProvider") as local_provider,
         ):
             sf_conn_cls.return_value.__enter__.return_value = conn
@@ -125,9 +123,7 @@ class TestSnowflakeRouting:
                     "schema": "AMBIENT_SC",
                 },
             ),
-            patch(
-                "fluid_build.providers.snowflake.connection.SnowflakeConnection"
-            ) as sf_conn_cls,
+            patch("fluid_build.providers.snowflake.connection.SnowflakeConnection") as sf_conn_cls,
         ):
             _execute_embedded_sql_build(
                 _build(
@@ -161,9 +157,7 @@ class TestSnowflakeRouting:
                 "fluid_build.providers.snowflake.util.config.get_connection_params",
                 return_value={"account": "acct", "user": "u"},
             ),
-            patch(
-                "fluid_build.providers.snowflake.connection.SnowflakeConnection"
-            ) as sf_conn_cls,
+            patch("fluid_build.providers.snowflake.connection.SnowflakeConnection") as sf_conn_cls,
         ):
             sf_conn_cls.return_value.__enter__.return_value = conn
             _execute_embedded_sql_build(_build("snowflake"), _contract(), Path(tmp_path))
@@ -174,9 +168,7 @@ class TestSnowflakeRouting:
 
     def test_a_snowflake_build_without_sql_fails_rather_than_no_ops(self, tmp_path):
         build = _build("snowflake", sql="")
-        with patch(
-            "fluid_build.providers.snowflake.connection.SnowflakeConnection"
-        ) as sf_conn_cls:
+        with patch("fluid_build.providers.snowflake.connection.SnowflakeConnection") as sf_conn_cls:
             rc = _execute_embedded_sql_build(build, _contract(), Path(tmp_path))
         assert rc == 1
         sf_conn_cls.assert_not_called()
@@ -185,9 +177,7 @@ class TestSnowflakeRouting:
 class TestUnsupportedPlatformRefusesToDowngrade:
     def test_unknown_platform_errors_and_never_reaches_duckdb(self, tmp_path):
         with patch("fluid_build.providers.local.local.LocalProvider") as local_provider:
-            rc = _execute_embedded_sql_build(
-                _build("databricks"), _contract(), Path(tmp_path)
-            )
+            rc = _execute_embedded_sql_build(_build("databricks"), _contract(), Path(tmp_path))
         assert rc == 1
         local_provider.assert_not_called()
 
@@ -197,9 +187,7 @@ class TestLocalPlatformIsUnchanged:
         provider = MagicMock()
         provider._derive_actions_from_contract.return_value = [{"op": "noop"}]
         provider.apply.return_value = {"applied": 1, "failed": 0, "results": []}
-        with patch(
-            "fluid_build.providers.local.local.LocalProvider", return_value=provider
-        ):
+        with patch("fluid_build.providers.local.local.LocalProvider", return_value=provider):
             rc = _execute_embedded_sql_build(_build(), _contract(), Path(tmp_path))
         assert rc == 0
         provider.apply.assert_called_once()
@@ -208,17 +196,13 @@ class TestLocalPlatformIsUnchanged:
         provider = MagicMock()
         provider._derive_actions_from_contract.return_value = [{"op": "noop"}]
         provider.apply.return_value = {"applied": 1, "failed": 0, "results": []}
-        with patch(
-            "fluid_build.providers.local.local.LocalProvider", return_value=provider
-        ):
+        with patch("fluid_build.providers.local.local.LocalProvider", return_value=provider):
             rc = _execute_embedded_sql_build(_build("local"), _contract(), Path(tmp_path))
         assert rc == 0
         provider.apply.assert_called_once()
 
     def test_dry_run_never_connects(self, tmp_path):
-        with patch(
-            "fluid_build.providers.snowflake.connection.SnowflakeConnection"
-        ) as sf_conn_cls:
+        with patch("fluid_build.providers.snowflake.connection.SnowflakeConnection") as sf_conn_cls:
             rc = _execute_embedded_sql_build(
                 _build("snowflake"), _contract(), Path(tmp_path), dry_run=True
             )

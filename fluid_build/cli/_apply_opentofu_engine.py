@@ -455,7 +455,7 @@ def _report_suppressed_drift(
             "; ".join(details),
         )
     cprint(
-        "      The emitted module pins lifecycle.ignore_changes=[\"column\"], so "
+        '      The emitted module pins lifecycle.ignore_changes=["column"], so '
         "`tofu` will not alter these columns — the build engine owns the "
         "materialized types. Run `fluid verify --strict` to gate on it."
     )

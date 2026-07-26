@@ -298,8 +298,7 @@ def _run_apply_hooks_for_source(args, logger: logging.Logger) -> int:
     )
     if rc != 0:
         logger.error(
-            "apply aborted by an apply-time plugin hook. "
-            "Pass --force-pattern-drift to override."
+            "apply aborted by an apply-time plugin hook. " "Pass --force-pattern-drift to override."
         )
     return rc
 

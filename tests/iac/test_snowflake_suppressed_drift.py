@@ -77,7 +77,9 @@ class TestSuppressedDrift:
     def test_matching_shape_reports_nothing(self):
         """Precision widening (``VARCHAR`` → ``VARCHAR(16777216)``) is not
         drift — comparison folds to type families, like ``fluid verify``."""
-        assert get_iac_plugin("snowflake").suppressed_drift(_contract(_DECLARED), _prior(_LIVE)) == []
+        assert (
+            get_iac_plugin("snowflake").suppressed_drift(_contract(_DECLARED), _prior(_LIVE)) == []
+        )
 
     def test_type_change_the_emitter_ignores_is_reported(self):
         declared = [
