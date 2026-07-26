@@ -730,11 +730,18 @@ class ContractValidator:
                 "error", "binding", f"Missing 'location' in binding for {expose_id}", path
             )
         else:
+            # A non-object location/properties is a schema error the
+            # jsonschema pass already reported; treat it as empty rather
+            # than doing a substring ``in`` test against a string.
             location = binding["location"]
+            if not isinstance(location, dict):
+                location = {}
 
             # GCP addresses tables via binding.properties (the FLUID
             # pattern) or directly on binding.location.
-            props = binding.get("properties") or {}
+            props = binding.get("properties")
+            if not isinstance(props, dict):
+                props = {}
             if self.provider_name == "gcp":
                 for prop in ("project", "dataset", "table"):
                     if prop not in props and prop not in location:
