@@ -57,6 +57,7 @@ from ..config_manager import FluidConfig
 from ..loader import load_contract
 from ..providers.common import metrics_collector
 from ._common import (
+    CLIError,
     hydrate_dotenv,
     load_contract_with_overlay,
     resolve_contract_env_templates,
@@ -622,11 +623,16 @@ async def run_async(args, logger: logging.Logger) -> int:
         logger.error("No contract files specified")
         return 1
 
-    # Validate contract files exist
+    # Validate contract files exist. Raised as the same stable slug every
+    # other command uses for this condition (``fluid publish`` used to emit
+    # a bare log line with no slug, no suggestion and no docs link).
     invalid_paths = [p for p in contract_paths if not p.exists()]
     if invalid_paths:
-        logger.error(f"Contract files not found: {', '.join(str(p) for p in invalid_paths)}")
-        return 1
+        raise CLIError(
+            1,
+            "contract_file_not_found",
+            {"path": ", ".join(str(p) for p in invalid_paths)},
+        )
 
     # F1 / F6: validate every (glob-expanded) contract path through the
     # platform-aware path validator — traversal, forbidden system paths,
@@ -792,6 +798,10 @@ def run(args, logger: logging.Logger) -> int:
     """Main entry point for publish command"""
     try:
         return asyncio.run(run_async(args, logger))
+    except CLIError:
+        # Already typed — the entry point renders the stable slug +
+        # suggestions + docs URL. Collapsing it here would drop all three.
+        raise
     except KeyboardInterrupt:
         logger.warning("\nInterrupted by user")
         return 130

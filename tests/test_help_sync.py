@@ -140,3 +140,54 @@ class TestFirstRunHelp:
             "First-run help should mention `fluid forge` so workspace users know "
             "how to add more products"
         )
+
+
+class TestAdvertisedFlagsExist:
+    """Every ``--flag`` named in ``fluid -h`` must be a real flag.
+
+    Regression: the apply line advertised ``--build``, which does not exist.
+    argparse prefix-matched it to ``--build-id``, so a user following the
+    help got ``fluid apply: error: argument --build-id: expected one
+    argument`` for a flag they never typed. The working spelling is
+    ``--mode amend-and-build``.
+    """
+
+    @staticmethod
+    def _subparser_actions(command: str):
+        from fluid_build.cli import build_parser
+
+        parser = build_parser()
+        for action in parser._actions:
+            choices = getattr(action, "choices", None)
+            if isinstance(choices, dict) and command in choices:
+                return choices[command]._actions
+        pytest.skip(f"subcommand {command!r} not registered")
+
+    @staticmethod
+    def _flags_on_line(text: str, command: str):
+        import re
+
+        for line in text.splitlines():
+            if line.strip().startswith(command + " ") or line.strip() == command:
+                return re.findall(r"--[a-z][a-z0-9-]*", line)
+        return []
+
+    @pytest.mark.parametrize("command", ["init", "plan", "apply", "forge"])
+    def test_every_advertised_flag_is_registered(self, command: str):
+        text = _capture_main_help()
+        advertised = self._flags_on_line(text, command)
+        if not advertised:
+            pytest.skip(f"no flags advertised for {command!r}")
+        registered = set()
+        for action in self._subparser_actions(command):
+            registered.update(action.option_strings)
+        missing = [f for f in advertised if f not in registered]
+        assert not missing, (
+            f"`fluid -h` advertises {missing} for `fluid {command}`, but the "
+            f"subparser registers {sorted(registered)}"
+        )
+
+    def test_apply_build_flag_is_not_advertised(self):
+        """Pin the specific stale flag — it prefix-matches --build-id."""
+        text = _capture_main_help()
+        assert "--build " not in text and not text.rstrip().endswith("--build")

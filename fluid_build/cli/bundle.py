@@ -276,7 +276,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     try:
         args.contract = str(validate_cli_path(args.contract, mode="read", file_type="contract"))
     except FluidCLIError as exc:
-        if exc.event == "file_not_found":
+        # ``validate_cli_path`` specialises the slug for contracts; accept
+        # both spellings so this branch keeps firing for a missing file.
+        if exc.event in ("file_not_found", "contract_file_not_found"):
             sys.stderr.write(f"❌ File not found: {args.contract}\n")
             return 2
         raise

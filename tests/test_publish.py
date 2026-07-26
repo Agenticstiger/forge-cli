@@ -636,9 +636,15 @@ class TestRunAsyncListCatalogs:
 class TestRunAsyncPublishFlow:
     """Lines 429-498: glob expansion, path validation, publish loop, metrics, exit codes."""
 
-    def test_invalid_path_returns_1(self, tmp_path):
-        """Lines 444-448: non-existent contract files cause exit code 1."""
+    def test_invalid_path_raises_the_shared_not_found_slug(self, tmp_path):
+        """A missing contract raises the typed error every command shares.
+
+        It used to be a bare ``logger.error`` + ``return 1`` — exit code
+        right, but no stable slug, no suggestion and no docs link, so a CI
+        log parser could not tell this apart from any other publish failure.
+        """
         from fluid_build.cli import publish as pub_mod
+        from fluid_build.cli._common import CLIError
 
         args = _make_args(contract_files=["nonexistent_file.yaml"])
         logger = logging.getLogger("test")
@@ -651,11 +657,13 @@ class TestRunAsyncPublishFlow:
 
             loop = asyncio.new_event_loop()
             try:
-                code = loop.run_until_complete(pub_mod.run_async(args, logger))
+                with pytest.raises(CLIError) as exc_info:
+                    loop.run_until_complete(pub_mod.run_async(args, logger))
             finally:
                 loop.close()
 
-        assert code == 1
+        assert exc_info.value.event == "contract_file_not_found"
+        assert exc_info.value.exit_code == 1
 
     def test_all_success_returns_0(self, tmp_path):
         """Lines 492-498: all contracts succeed → exit 0."""
