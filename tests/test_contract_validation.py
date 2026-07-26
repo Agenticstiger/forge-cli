@@ -97,12 +97,41 @@ class TestValidationReport:
         assert r.checks_passed == 0
         assert r.is_valid() is False
 
-    def test_add_warning_counts_as_passed(self):
+    def test_add_warning_is_not_a_passed_check(self):
+        """A warning is an advisory issue, not a check that passed.
+
+        Counting every non-error issue as a pass made ``checks_passed``
+        report *how many problems were found*.
+        """
         r = self._make_report()
         r.add_issue("warning", "binding", "not ideal", path="y")
-        assert r.checks_passed == 1
+        assert r.checks_passed == 0
         assert r.checks_failed == 0
         assert r.is_valid() is True
+
+    def test_add_critical_fails_the_report(self):
+        """``critical`` is the highest ``$defs.dqRule.severity`` value."""
+        r = self._make_report()
+        r.add_issue("critical", "quality", "balance must be >= 0", path="q")
+        assert r.checks_failed == 1
+        assert r.is_valid() is False
+        assert len(r.get_errors()) == 1
+
+    def test_schema_warn_severity_is_a_warning(self):
+        """The schema spells it ``warn``; the report vocabulary is ``warning``."""
+        r = self._make_report()
+        r.add_issue("warn", "quality", "soft gate", path="q")
+        assert len(r.get_warnings()) == 1
+        assert r.is_valid() is True
+
+    def test_record_check_counts_passes(self):
+        from fluid_build.cli.contract_validation import CheckOutcome
+
+        r = self._make_report()
+        r.record_check(CheckOutcome(name="e.r1", category="quality", passed=True))
+        r.record_check(CheckOutcome(name="e.r2", category="quality", passed=False, severity="warn"))
+        assert r.checks_passed == 1
+        assert r.checks_failed == 1
 
     def test_get_errors(self):
         r = self._make_report()
@@ -158,7 +187,8 @@ class TestValidationReport:
         for _ in range(5):
             r.add_issue("warning", "y", "w", path="")
         assert r.checks_failed == 3
-        assert r.checks_passed == 5
+        # Warnings are not passed checks.
+        assert r.checks_passed == 0
 
 
 # ── ContractValidator private method tests ──
