@@ -951,3 +951,145 @@ class TestRuleRouting:
         assert [
             (c["name"], c.get("tests")) for c in engine_model["columns"]
         ] == [(c["name"], c.get("tests")) for c in exporter_model["columns"]]
+
+
+# ---------------------------------------------------------------------------
+# validationRules[] — the schema-canonical constraint surface (regression)
+#
+# The `column` definition has additionalProperties:false in every schema
+# version 0.7.1-0.7.6 and none of the inline spellings the mapper reads
+# (`minimum`/`maximum`/`enum`/`foreign_key`/`unique`) are among its eleven
+# keys, so a contract expressing a range or an enum inline is REJECTED:
+#
+#   exposes[0].contract.schema[0]: Additional properties are not allowed
+#     ('maximum', 'minimum' were unexpected)
+#
+# Meanwhile the sanctioned `validationRules[] {type, constraint}` was read by
+# no mapper at all — so the richest half of the contract→dbt-test mapping was
+# unreachable from any contract that passes `fluid validate`.
+# ---------------------------------------------------------------------------
+
+
+class TestValidationRules:
+    @staticmethod
+    def _tests_for(column):
+        from fluid_build.engines.dbt import _test_mapping as tm
+
+        return tm.constraint_tests(column)
+
+    def test_range_rule_maps_to_the_range_dialect(self):
+        tests = self._tests_for(
+            {
+                "name": "balance",
+                "validationRules": [{"type": "range", "constraint": ">= 0 and <= 100000"}],
+            }
+        )
+        assert tests == [
+            {
+                "dbt_expectations.expect_column_values_to_be_between": {
+                    "min_value": 0,
+                    "max_value": 100000,
+                }
+            }
+        ]
+
+    def test_range_rule_accepts_the_shipped_example_spelling(self):
+        """examples/bitcoin-price-api-declarative-part-c uses uppercase AND
+        and a negative lower bound."""
+        tests = self._tests_for(
+            {
+                "name": "pct",
+                "validationRules": [{"type": "range", "constraint": ">= -100 AND <= 1000"}],
+            }
+        )
+        body = tests[0]["dbt_expectations.expect_column_values_to_be_between"]
+        assert body == {"min_value": -100, "max_value": 1000}
+
+    def test_between_form_and_decimals(self):
+        tests = self._tests_for(
+            {"name": "p", "validationRules": [{"type": "range", "constraint": "between 0.5 and 9"}]}
+        )
+        body = tests[0]["dbt_expectations.expect_column_values_to_be_between"]
+        assert body == {"min_value": 0.5, "max_value": 9}
+
+    def test_exclusive_bounds_set_strictly(self):
+        tests = self._tests_for(
+            {"name": "p", "validationRules": [{"type": "range", "constraint": "> 0 and < 10"}]}
+        )
+        body = tests[0]["dbt_expectations.expect_column_values_to_be_between"]
+        assert body == {"min_value": 0, "max_value": 10, "strictly": True}
+
+    def test_mixed_strictness_fails_loud_instead_of_moving_a_boundary(self):
+        """``expect_column_values_to_be_between`` has ONE strictly flag for
+        both bounds, so ``> 0 and <= 10`` cannot be expressed faithfully."""
+        tests = self._tests_for(
+            {"name": "p", "validationRules": [{"type": "range", "constraint": "> 0 and <= 10"}]}
+        )
+        assert "fluid_range_mixed_strictness_p" in tests
+
+    def test_enum_rule_maps_to_accepted_values(self):
+        tests = self._tests_for(
+            {
+                "name": "status",
+                "validationRules": [{"type": "enum", "constraint": "active,archived,deleted"}],
+            }
+        )
+        assert tests == [{"accepted_values": {"values": ["active", "archived", "deleted"]}}]
+
+    def test_custom_references_rule_maps_to_relationships(self):
+        """This is the exact shape `fluid import dbt` writes when it recovers a
+        dbt ``relationships`` test, so the test survives a full round trip."""
+        tests = self._tests_for(
+            {
+                "name": "customer_id",
+                "validationRules": [
+                    {"type": "custom", "constraint": "references stg_customers.CUSTOMER_ID"}
+                ],
+            }
+        )
+        assert tests == [
+            {"relationships": {"to": "ref('stg_customers')", "field": "CUSTOMER_ID"}}
+        ]
+
+    def test_inline_spelling_still_wins_when_both_are_present(self):
+        tests = self._tests_for(
+            {
+                "name": "b",
+                "minimum": 5,
+                "validationRules": [{"type": "range", "constraint": ">= 0 and <= 1"}],
+            }
+        )
+        body = tests[0]["dbt_expectations.expect_column_values_to_be_between"]
+        assert body == {"min_value": 5}
+
+    def test_unparseable_constraint_is_ignored_not_guessed(self):
+        assert (
+            self._tests_for(
+                {"name": "b", "validationRules": [{"type": "range", "constraint": "positive-ish"}]}
+            )
+            == []
+        )
+
+    def test_engine_path_emits_them_end_to_end(self):
+        contract = {
+            "id": "x",
+            "exposes": [
+                {
+                    "exposeId": "t",
+                    "contract": {
+                        "schema": [
+                            {
+                                "name": "balance",
+                                "type": "number(12,2)",
+                                "validationRules": [
+                                    {"type": "range", "constraint": ">= 0 and <= 100000"}
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+        doc = yaml.safe_load(generate_schema_yml(contract)["models/marts/schema.yml"])
+        col = doc["models"][0]["columns"][0]
+        assert "dbt_expectations.expect_column_values_to_be_between" in col["tests"][0]

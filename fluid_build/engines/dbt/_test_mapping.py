@@ -73,6 +73,7 @@ for ``not_null`` / ``unique`` and single-key dicts for everything else.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping, Sequence
 
 # ── Package prefixes / canonical test names ───────────────────────────────
@@ -142,12 +143,14 @@ def relationships_test(to: str, field: str) -> dict[str, Any]:
     return {"relationships": {"to": f"ref('{to}')", "field": field}}
 
 
-def numeric_range_test(*, min_value: Any = None, max_value: Any = None) -> dict[str, Any] | None:
+def numeric_range_test(
+    *, min_value: Any = None, max_value: Any = None, strictly: Any = None
+) -> dict[str, Any] | None:
     """The single numeric range/between dialect (dbt_expectations).
 
     Inclusive by default (``expect_column_values_to_be_between`` treats
-    ``strictly`` as ``false``), so no extra key is emitted. Returns ``None``
-    when neither bound is present.
+    ``strictly`` as ``false``), so the key is only emitted when the contract
+    declares exclusive bounds. Returns ``None`` when neither bound is present.
     """
     body: dict[str, Any] = {}
     if min_value is not None:
@@ -156,6 +159,8 @@ def numeric_range_test(*, min_value: Any = None, max_value: Any = None) -> dict[
         body["max_value"] = max_value
     if not body:
         return None
+    if strictly:
+        body["strictly"] = True
     return {RANGE_TEST_NAME: body}
 
 
@@ -237,6 +242,24 @@ _PK_KEYS = ("primary", "primaryKey", "primary_key", "pk", "isPrimary")
 _ENUM_KEYS = ("enum", "acceptedValues", "accepted_values")
 _FK_KEYS = ("foreign_key", "foreignKey", "references", "relationship_to")
 
+# ``column.validationRules[]`` is the *schema-sanctioned* way to declare a
+# range / enum / FK on a column: the ``column`` definition has
+# ``additionalProperties: false`` in every version 0.7.1-0.7.6 and its eleven
+# keys include ``validationRules`` but none of the inline ``minimum`` /
+# ``maximum`` / ``enum`` / ``foreign_key`` spellings recognised above. Those
+# inline forms are accepted best-effort (contracts express intent that way in
+# practice) but a contract using them fails ``fluid validate``, so before this
+# the richest mapping was unreachable from a valid contract. The rule shapes
+# read here are exactly the ones ``cli/import_workflow/dbt.py`` writes
+# (``{"type": "range", "constraint": ">= 0 and <= 100"}``,
+# ``{"type": "custom", "constraint": "references model.field"}``), which also
+# closes the dbt → contract → dbt round trip for those tests.
+_RANGE_BOUND_RE = re.compile(r"(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)")
+_BETWEEN_RE = re.compile(
+    r"^\s*between\s+(-?\d+(?:\.\d+)?)\s+and\s+(-?\d+(?:\.\d+)?)\s*$", re.IGNORECASE
+)
+_REFERENCES_RE = re.compile(r"^\s*references\s+(\S+?)\.(\w+)\s*$", re.IGNORECASE)
+
 
 def is_truthy(value: Any) -> bool:
     """Loose truthiness for YAML/JSON booleans-as-strings (``"true"``/``True``)."""
@@ -264,22 +287,57 @@ def column_is_key(col: Mapping[str, Any]) -> bool:
     return False
 
 
+def validation_rules(col: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """The column's ``validationRules[]`` entries (schema-canonical)."""
+    raw = col.get("validationRules")
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return []
+    return [r for r in raw if isinstance(r, Mapping)]
+
+
+def _rules_of_type(col: Mapping[str, Any], kind: str) -> list[Mapping[str, Any]]:
+    return [
+        rule
+        for rule in validation_rules(col)
+        if str(rule.get("type") or "").strip().lower() == kind
+    ]
+
+
 def column_enum_values(col: Mapping[str, Any]) -> list[Any]:
-    """Return the accepted-value list declared on a column, if any."""
+    """Return the accepted-value list declared on a column, if any.
+
+    Reads the inline ``enum`` / ``acceptedValues`` keys and the
+    schema-canonical ``validationRules[] {type: enum, constraint: "a,b,c"}``
+    (the spelling the shipped examples and the dbt importer use).
+    """
     for key in _ENUM_KEYS:
         raw = col.get(key)
         if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
             vals = [v for v in raw if v is not None]
             if vals:
                 return vals
+    for rule in _rules_of_type(col, "enum"):
+        constraint = rule.get("constraint")
+        if isinstance(constraint, str):
+            vals = [v.strip() for v in constraint.split(",") if v.strip()]
+            if vals:
+                return vals
     return []
 
 
 def column_range(col: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the ``{min_value, max_value}`` declared on a column, if any.
+    """Return the ``{min_value, max_value[, strictly]}`` declared on a column.
 
-    Accepts both ``minimum``/``maximum`` (JSON-Schema spelling) and the
-    ``min``/``max`` aliases the copilot mapper recognises.
+    Accepts ``minimum``/``maximum`` (JSON-Schema spelling), the ``min``/``max``
+    aliases the copilot mapper recognises, and the schema-canonical
+    ``validationRules[] {type: range, constraint: ">= 0 and <= 100"}`` —
+    including ``between X and Y``.
+
+    ``strictly`` is set only when *every* declared bound is exclusive, because
+    ``expect_column_values_to_be_between`` has a single flag for both bounds.
+    A mix of inclusive and exclusive bounds cannot be expressed faithfully, so
+    :func:`constraint_tests` emits a fail-loud sentinel for it rather than
+    quietly moving a boundary.
     """
     out: dict[str, Any] = {}
     minimum = col.get("minimum", col.get("min"))
@@ -288,16 +346,56 @@ def column_range(col: Mapping[str, Any]) -> dict[str, Any]:
         out["min_value"] = minimum
     if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
         out["max_value"] = maximum
-    return out
+    if out:
+        return out
+
+    for rule in _rules_of_type(col, "range"):
+        constraint = rule.get("constraint")
+        if not isinstance(constraint, str):
+            continue
+        between = _BETWEEN_RE.match(constraint)
+        if between is not None:
+            return {
+                "min_value": _as_number(between.group(1)),
+                "max_value": _as_number(between.group(2)),
+            }
+        bounds = _RANGE_BOUND_RE.findall(constraint)
+        if not bounds:
+            continue
+        parsed: dict[str, Any] = {}
+        strict_flags: list[bool] = []
+        for operator, literal in bounds:
+            key = "min_value" if operator.startswith(">") else "max_value"
+            if key in parsed:
+                continue
+            parsed[key] = _as_number(literal)
+            strict_flags.append(operator in (">", "<"))
+        if not parsed:
+            continue
+        if all(strict_flags):
+            parsed["strictly"] = True
+        elif any(strict_flags):
+            parsed["strictly"] = None  # mixed — caller fails loud
+        return parsed
+    return {}
+
+
+def _as_number(literal: str) -> Any:
+    """``"12"`` → ``12``; ``"1.5"`` → ``1.5``."""
+    return float(literal) if "." in literal else int(literal)
 
 
 def column_relationship(col: Mapping[str, Any]) -> tuple[str, str] | None:
     """Return the ``(to, field)`` foreign-key reference declared on a column.
 
     Surfaces ``relationships`` in the engine path (previously only the copilot
-    generator emitted it). Recognises the copilot ``{to, field}`` dict shape and
-    the ODCS-style ``"table.field"`` string (also used by ``datacontract-cli`` →
-    dbt relationships). Returns ``None`` when no complete FK is declared.
+    generator emitted it). Recognises the copilot ``{to, field}`` dict shape,
+    the ODCS-style ``"table.field"`` string (also used by ``datacontract-cli``
+    → dbt relationships), and the schema-canonical
+    ``validationRules[] {type: custom, constraint: "references model.field"}``
+    — the exact shape ``fluid import dbt`` writes when it recovers a dbt
+    ``relationships`` test, so that test survives a full round trip.
+    Returns ``None`` when no complete FK is declared.
     """
     for key in _FK_KEYS:
         raw = col.get(key)
@@ -310,6 +408,13 @@ def column_relationship(col: Mapping[str, Any]) -> tuple[str, str] | None:
             to, _, field = raw.rpartition(".")
             if to and field:
                 return to, field
+    for rule in _rules_of_type(col, "custom"):
+        constraint = rule.get("constraint")
+        if not isinstance(constraint, str):
+            continue
+        match = _REFERENCES_RE.match(constraint)
+        if match is not None:
+            return match.group(1), match.group(2)
     return None
 
 
@@ -319,6 +424,11 @@ def constraint_tests(col: Mapping[str, Any]) -> list[Any]:
     ``required`` → ``not_null``; a declared key → ``unique``; ``enum`` /
     ``acceptedValues`` → ``accepted_values``; ``minimum`` / ``maximum`` →
     the numeric range dialect; a foreign-key reference → ``relationships``.
+
+    Each of those is read from the inline spelling *and* from the
+    schema-canonical ``validationRules[]`` (see the note on
+    :data:`_RANGE_BOUND_RE`), so the mapping is reachable from a contract that
+    passes ``fluid validate``.
     """
     tests: list[Any] = []
 
@@ -336,11 +446,18 @@ def constraint_tests(col: Mapping[str, Any]) -> list[Any]:
     if values:
         tests.append(accepted_values_test(values))
 
-    bounds = column_range(col)
+    bounds = dict(column_range(col))
     if bounds:
-        range_test = numeric_range_test(**bounds)
-        if range_test is not None:
-            tests.append(range_test)
+        if "strictly" in bounds and bounds["strictly"] is None:
+            # Mixed inclusive/exclusive bounds — a single ``strictly`` flag
+            # cannot express them, and picking one would silently move a
+            # boundary. Fail loud instead.
+            bounds.pop("strictly")
+            tests.append(sentinel_test("range_mixed_strictness", str(col.get("name") or "")))
+        else:
+            range_test = numeric_range_test(**bounds)
+            if range_test is not None:
+                tests.append(range_test)
 
     return tests
 
