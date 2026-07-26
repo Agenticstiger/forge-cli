@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
@@ -134,6 +135,36 @@ def resolve_spec(args: argparse.Namespace) -> str:
     return DEFAULT_SPEC
 
 
+def warn_if_opds_alias() -> bool:
+    """Warn once when the command was reached via the ``fluid opds`` alias.
+
+    Every other deprecated spelling in this family already warns
+    (``--format opds``, ``--spec odpi-4.1``, ``OPDS_VERSION``,
+    ``fluid export-opds``); the command alias was the one that stayed silent,
+    so ``fluid opds export`` looked as current as ``fluid odps export``.
+    Argparse does not record which alias matched, so the invocation is read
+    from ``sys.argv`` — the alias can only appear as the first non-flag token.
+
+    Returns True when the warning fired (so callers/tests can assert on it).
+    """
+    for token in sys.argv[1:]:
+        if token.startswith("-"):
+            continue
+        if token == "opds":
+            LOG.warning(
+                "opds_command_alias_deprecated",
+                extra={"canonical": "fluid odps"},
+            )
+            console_error(
+                "WARNING: `fluid opds` is a deprecated letter-swapped alias of "
+                "`fluid odps`. ODPS is the specification acronym; ODPI is the "
+                "organisation that hosts v4.1. Prefer `fluid odps` for new scripts."
+            )
+            return True
+        return False
+    return False
+
+
 def get_version_info(version: str) -> Dict[str, Any]:
     """Get information about a specific ODPS version (legacy --version support)."""
     if version not in ODPS_VERSIONS:
@@ -147,11 +178,16 @@ def get_version_info(version: str) -> Dict[str, Any]:
 
 def cmd_opds_export(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Export a FLUID contract to ODPS — dispatched by ``--spec``."""
+    warn_if_opds_alias()
     from fluid_build.cli.bootstrap import load_contract_with_overlay
 
     spec = resolve_spec(args)
     try:
-        contract = load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
+        from fluid_build.cli._export_env import resolve_for_export
+
+        contract = resolve_for_export(
+            load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)
+        )
     except Exception as e:
         logger.error("contract_load_failed", extra={"error": str(e)})
         console_error(f"Error loading contract: {e}")
@@ -226,13 +262,29 @@ def _export_odps_v4_1(
 
     out_path = getattr(args, "out", "-")
     try:
-        result = provider.render(contract, out=out_path, fmt="opds")
+        rendered = provider.render(contract)
+        # Unwrap the provider's FLUID-internal envelope
+        # (``{opds_version, generator, generated_at, target_platform, count,
+        # artifacts, status, export_config}``) so what lands on disk is the bare
+        # LF/ODPI v4.1 document this command's own success message claims.
+        # The wrapper failed the published schema on all four root constraints
+        # and carried ``opds_version: "1.0"`` — a letter-swapped key with the
+        # wrong version. ``fluid generate standard --format odps-v4.1`` already
+        # unwrapped; two commands advertising the same standard must not emit
+        # structurally different documents.
+        result = _unwrap_odps_v4_1(rendered)
         if out_path == "-":
             if getattr(args, "pretty", True):
                 cprint_json(json.dumps(result, indent=2, ensure_ascii=False))
             else:
                 cprint_json(json.dumps(result, ensure_ascii=False))
         else:
+            path = Path(out_path)
+            if path.parent and str(path.parent) not in ("", "."):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(result, fh, indent=2, ensure_ascii=False)
+                fh.write("\n")
             cprint(f"✓ Exported to ODPS v4.1 (LF/ODPI): {out_path}")
             cprint(f"  Specification: {ODPS_4_1_SPEC_URL}")
         return 0
@@ -240,6 +292,13 @@ def _export_odps_v4_1(
         logger.error("opds_export_failed", extra={"error": str(e), "spec": SPEC_ODPS_4_1})
         console_error(f"Error exporting to ODPS v4.1: {e}")
         return 1
+
+
+def _unwrap_odps_v4_1(rendered: Any) -> Any:
+    """Strip the provider's export envelope down to the bare v4.1 document."""
+    if isinstance(rendered, dict) and "artifacts" in rendered:
+        return rendered["artifacts"]
+    return rendered
 
 
 # Back-compat alias — earlier code/tests imported ``_export_odpi_v4_1``.
@@ -262,6 +321,7 @@ def cmd_opds_import(args: argparse.Namespace, logger: logging.Logger) -> int:
     ``--spec odps-4.1`` is reserved for the LF/ODPI provider, which is
     export-only and rejects import with a clear error.
     """
+    warn_if_opds_alias()
     spec = resolve_spec(args)
     if spec == SPEC_ODPS_4_1:
         console_error(
@@ -364,6 +424,7 @@ def _dispatch_import(path: Path, *, allow_remote: bool, lenient: bool) -> Dict[s
 
 def cmd_opds_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Validate an ODPS file against the chosen spec."""
+    warn_if_opds_alias()
     spec = resolve_spec(args)
     path = Path(args.file)
     if not path.exists():
@@ -396,37 +457,48 @@ def cmd_opds_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
     # ODPS v4.1 (LF/ODPI) — structural validator
     try:
         from fluid_build.providers.opds.validator import validate_opds_structure
-
-        with open(path, encoding="utf-8") as f:
-            opds_data = json.load(f)
-        if "artifacts" in opds_data and isinstance(opds_data["artifacts"], dict):
-            opds_data = opds_data["artifacts"]
-        result = validate_opds_structure(
-            opds_data,
-            version="4.1",
-            use_full_schema=getattr(args, "full_schema", True),
-            schema_url=ODPS_4_1_SCHEMA_URL_RAW,
-        )
-        if not result.get("valid"):
-            console_error(
-                f"✗ ODPS v4.1 validation failed ({result.get('validation_type', 'unknown')})"
-            )
-            for err in result.get("errors", []) or []:
-                console_error(f"  - {err}")
-            return 1
-        cprint(f"✓ ODPS v4.1 file is valid: {path}")
-        cprint(f"  Schema: {ODPS_4_1_SCHEMA_URL}")
-        return 0
     except ImportError:
         console_error("ODPS v4.1 validator not available")
         return 1
-    except Exception as e:
-        console_error(f"Error validating ODPS v4.1 file: {e}")
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            opds_data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        console_error(f"Error loading ODPS v4.1 file: {e}")
         return 1
+    if not isinstance(opds_data, dict):
+        console_error(f"Error: {path} did not parse as a mapping")
+        return 1
+    if "artifacts" in opds_data and isinstance(opds_data["artifacts"], dict):
+        opds_data = opds_data["artifacts"]
+
+    # NB: validate_opds_structure() validates against the *vendored* v4.1
+    # schema (fluid_build/providers/opds/odps-schema-v4.1.0.json) and takes no
+    # schema URL. Passing one raised TypeError on every single invocation, and
+    # the blanket ``except Exception`` that used to wrap this block reported
+    # that as "Error validating ODPS v4.1 file" — a signature bug dressed up as
+    # a validation result. The load/parse failures above are caught narrowly so
+    # a programming error surfaces instead of being laundered into a soft
+    # error line.
+    result = validate_opds_structure(
+        opds_data,
+        version="4.1",
+        use_full_schema=getattr(args, "full_schema", True),
+    )
+    if not result.get("valid"):
+        console_error(f"✗ ODPS v4.1 validation failed ({result.get('validation_type', 'unknown')})")
+        for err in result.get("errors", []) or []:
+            console_error(f"  - {err}")
+        return 1
+    cprint(f"✓ ODPS v4.1 file is valid: {path}")
+    cprint(f"  Schema: {ODPS_4_1_SCHEMA_URL}")
+    return 0
 
 
 def cmd_opds_info(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Show spec information for Bitol ODPS or ODPS v4.1 (LF/ODPI)."""
+    warn_if_opds_alias()
     # Legacy ``--version`` path: validate against ODPS_VERSIONS first so
     # garbage values still produce the historical "unsupported version"
     # error rather than silently routing to the default.
@@ -476,6 +548,7 @@ def cmd_opds_info(args: argparse.Namespace, logger: logging.Logger) -> int:
 
 def _cmd_odps_help(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Default handler when ``fluid odps`` is invoked without a subcommand."""
+    warn_if_opds_alias()
     cprint(
         "Usage: fluid odps <subcommand> [options]\n\n"
         "Subcommands:\n"

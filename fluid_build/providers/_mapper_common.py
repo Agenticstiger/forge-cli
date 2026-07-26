@@ -76,6 +76,48 @@ def make_passthrough_helpers(key: str) -> PassthroughHelpers:
     return (metadata_set, metadata_get, expose_set, expose_get, child_set, child_get)
 
 
+def resolve_status(fluid: Mapping[str, Any]) -> str:
+    """Resolve the FLUID lifecycle status a spec exporter should publish.
+
+    ``lifecycle.state`` is the field the FLUID schema actually defines
+    (``preview``/``active``/``deprecated``/``retired``) and the one users set.
+    Both spec exporters used to read only ``metadata.status`` — a key the
+    schema forbids, so it was never populated and every export shipped the
+    hard-coded default: ODPS said ``draft`` for everything, ODCS said
+    ``active`` for everything, and a retired data product was published to
+    catalogs as an active contract.
+
+    Resolution order, most specific first:
+
+    1. ``_scoped_status`` — the per-port status the bundle exporters stamp on
+       from ``expose.lifecycle.state``;
+    2. ``metadata.status`` — never present in a schema-valid contract on disk;
+       it is set in-memory by the ODCS ``normalize.rehydrate`` pass to replay
+       an imported document's verbatim status, and accepted from legacy
+       in-process dicts;
+    3. the expose's own ``lifecycle.state`` when the contract has exactly one;
+    4. the contract-root ``lifecycle.state``.
+    """
+    scoped = fluid.get("_scoped_status")
+    if scoped:
+        return str(scoped)
+
+    metadata = fluid.get("metadata")
+    if isinstance(metadata, Mapping) and metadata.get("status"):
+        return str(metadata["status"])
+
+    exposes = fluid.get("exposes")
+    if isinstance(exposes, list) and len(exposes) == 1 and isinstance(exposes[0], Mapping):
+        expose_lifecycle = exposes[0].get("lifecycle")
+        if isinstance(expose_lifecycle, Mapping) and expose_lifecycle.get("state"):
+            return str(expose_lifecycle["state"])
+
+    lifecycle = fluid.get("lifecycle")
+    if isinstance(lifecycle, Mapping) and lifecycle.get("state"):
+        return str(lifecycle["state"])
+    return "active"
+
+
 def fluid_id(fluid: Mapping[str, Any]) -> Optional[str]:
     """Resolve a FLUID contract's id from any of the supported locations.
 
@@ -94,4 +136,4 @@ def fluid_id(fluid: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
-__all__ = ["fluid_id", "make_passthrough_helpers", "PassthroughHelpers"]
+__all__ = ["fluid_id", "make_passthrough_helpers", "resolve_status", "PassthroughHelpers"]
