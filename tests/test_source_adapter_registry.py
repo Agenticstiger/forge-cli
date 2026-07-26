@@ -152,3 +152,73 @@ def test_cli_choices_are_registry_driven(monkeypatch):
     _patch_entry_points(monkeypatch, [_FakeEntryPoint("myhub", _MyAdapter)])
     R.discover_source_adapters(force=True)
     assert "myhub" in R.list_source_adapters()
+
+
+# ── allow/block policy honesty (#297) ─────────────────────────────────
+#
+# Only ``resolve_catalog_adapter_class`` enforced the operator allow/block
+# policy. Code execution was correctly prevented, but every *listing* surface
+# still advertised a blocklisted plugin adapter as ``status: "available"`` and
+# offered it as a valid ``--source`` choice — so a caller was handed a source
+# that raises the moment it is selected. ``fluid plugins`` has always marked
+# blocked entries; these surfaces did not.
+
+
+def test_a_blocked_plugin_adapter_reports_status_blocked(monkeypatch):
+    _patch_entry_points(monkeypatch, [_FakeEntryPoint("myhub", _MyAdapter)])
+    R.discover_source_adapters(force=True)
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "myhub")
+    monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
+
+    entry = next(d for d in R.source_adapter_inventory() if d["name"] == "myhub")
+    assert entry["status"] == "blocked"
+    assert R.is_source_adapter_blocked("myhub") is True
+
+    # …and the code path that actually loads it agrees.
+    with pytest.raises(RuntimeError, match="blocked by the operator allow/block policy"):
+        R.resolve_catalog_adapter_class("myhub")
+
+
+def test_an_unblocked_plugin_adapter_is_still_available(monkeypatch):
+    _patch_entry_points(monkeypatch, [_FakeEntryPoint("myhub", _MyAdapter)])
+    R.discover_source_adapters(force=True)
+    monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST", raising=False)
+    monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
+
+    entry = next(d for d in R.source_adapter_inventory() if d["name"] == "myhub")
+    assert entry["status"] == "available"
+
+
+def test_builtins_are_never_policy_gated(monkeypatch):
+    """Built-ins are not entry-point plugins; an allowlist must not hide them."""
+    _patch_entry_points(monkeypatch, [])
+    R.discover_source_adapters(force=True)
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "nothing-matches")
+    monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST", raising=False)
+
+    entry = next(d for d in R.source_adapter_inventory() if d["name"] == "snowflake")
+    assert entry["status"] == "available"
+    assert R.is_source_adapter_blocked("snowflake") is False
+
+
+def test_the_source_choice_list_omits_blocked_adapters(monkeypatch):
+    _patch_entry_points(monkeypatch, [_FakeEntryPoint("myhub", _MyAdapter)])
+    R.discover_source_adapters(force=True)
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "myhub")
+    monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
+
+    assert "myhub" not in R.list_source_adapters(include_blocked=False)
+    # The full listing still names it — the "Supported: ..." hint on an
+    # unknown-source error should say what is installed.
+    assert "myhub" in R.list_source_adapters()
+    assert set(R.list_source_adapters(include_blocked=False)) >= _BUILTINS
+
+
+def test_the_cli_registers_source_choices_without_blocked_adapters():
+    """Pin the wiring: the argparse choices come from the filtered list."""
+    import inspect
+
+    from fluid_build.cli import _forge_data_model_register as reg
+
+    source = inspect.getsource(reg)
+    assert "list_source_adapters(include_blocked=False)" in source
