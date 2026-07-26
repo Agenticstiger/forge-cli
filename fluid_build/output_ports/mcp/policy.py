@@ -175,11 +175,29 @@ class OutputPortPolicy:
     def is_model_allowed(self, model_id: Optional[str]) -> Tuple[bool, Optional[str]]:
         """Evaluate the model gate. Returns ``(allowed, deny_reason)``.
 
-        Fail-closed when ``model_id`` is missing — without identity
+        Fail-closed when ``model_id`` is missing AND the contract (or an
+        operator flag) declared something to enforce — without identity
         the gate cannot make a decision and silently allowing would
         defeat the agentPolicy contract.
+
+        When NEITHER an allowlist nor a denylist exists the gate is inert
+        and a missing identity passes, mirroring
+        :meth:`is_use_case_allowed`. Model identity is not part of the MCP
+        spec: the ``initialize`` request's ``Implementation`` object
+        carries ``{name, version}`` only, and the gateway reads the model
+        from a NON-STANDARD ``model`` field the gateway itself invented.
+        Denying unconditionally therefore refused every call — ``describe``
+        included — from every spec-compliant client (Claude Code, Cursor,
+        the MCP Inspector the docs tell you to use), on contracts with no
+        ``agentPolicy`` block at all, while ``doctor`` and ``tools/list``
+        still reported the server healthy. A contract that declares a
+        model allowlist or denylist still hard-denies an unidentified
+        caller: the denylist is included in that test because otherwise a
+        denied model would slip the gate simply by omitting the field.
         """
         if not model_id:
+            if self.allowed_models is None and not self.denied_models:
+                return True, None
             return False, "missing-model-identity"
         if model_id in self.denied_models:
             return False, "in-deniedModels"

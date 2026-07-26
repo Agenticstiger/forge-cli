@@ -41,7 +41,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 __all__ = [
     "CONTAINER_KINDS",
@@ -51,6 +51,8 @@ __all__ = [
     "PackagingError",
     "PackagingResolution",
     "resolve_packaging",
+    "validate_packaging_block",
+    "validate_overlay_packaging",
 ]
 
 # The six container kinds the schema's ``packaging.containers`` map accepts.
@@ -387,3 +389,102 @@ def resolve_packaging(contract: Mapping[str, Any]) -> PackagingResolution:
         decisions=contract_decisions,
         exposures=tuple(exposures),
     )
+
+
+# ---------------------------------------------------------------------
+# Validate-time gates (RFC-packaging-modes.md file 9)
+#
+# ``fluid validate`` had NO packaging awareness at all: a ``shared`` block
+# with no ``pool`` validated clean, then ``fluid plan`` failed with
+# ``pool-required`` — whose own remediation block says "Run 'fluid
+# validate <contract>' first to rule out a contract problem". Running the
+# resolver here makes that suggestion true.
+# ---------------------------------------------------------------------
+
+
+def validate_packaging_block(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
+    """Validate-time gate for the ``packaging`` block. Returns
+    ``(errors, warnings)``.
+
+    Resolving through :func:`resolve_packaging` — the same single
+    chokepoint ``plan`` / ``generate iac`` / ``apply`` use — is the whole
+    point: validate cannot drift from what the later stages will decide,
+    and every :class:`PackagingError` kind (``pool-required``,
+    ``invalid-mode``, ``invalid-container-kind``,
+    ``cluster-isolated-unsupported``, …) surfaces at the earliest stage
+    that can see it instead of at plan time.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    try:
+        resolve_packaging(contract)
+    except PackagingError as exc:
+        # ``(kind)`` not ``[kind]`` — the rich text renderer reads square
+        # brackets as markup and swallows the tag.
+        errors.append(f"packaging ({exc.kind}): {exc}")
+    return errors, warnings
+
+
+def validate_overlay_packaging(
+    base: Mapping[str, Any], overlay: Mapping[str, Any]
+) -> Tuple[List[str], List[str]]:
+    """Warn when an environment overlay flips ``packaging.mode`` while
+    INHERITING a ``containers`` map from the base. Returns
+    ``(errors, warnings)``.
+
+    Overlays deep-merge key-wise, and the per-kind ``containers``
+    overrides beat the blanket ``mode`` (see :func:`_effective`). So a
+    base of::
+
+        packaging: {mode: shared, pool: platform-pool, containers: {database: shared}}
+
+    with an ``overlays/prod.yaml`` of ``packaging: {mode: isolated}``
+    resolves ``database`` to REFERENCED in prod, not OWNED — the flip an
+    author reads as "prod owns its own database" silently does nothing
+    for the containers the base pinned. Downstream the module emits no
+    database resource at all, ``tofu plan`` is green, and the apply dies
+    on a raw provider "object does not exist" against a database nobody
+    ever created.
+
+    This is the RFC's Example-3 warning ("the validator warns when an
+    overlay changes ``mode`` while inheriting a ``containers`` map from
+    base"). A warning, not an error: the resolution is well-defined and
+    an author who restates the affected kinds in the overlay is doing
+    something legitimate — which is exactly why only the INHERITED kinds
+    are named.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    base_block = base.get("packaging") if isinstance(base, Mapping) else None
+    overlay_block = overlay.get("packaging") if isinstance(overlay, Mapping) else None
+    if not isinstance(base_block, Mapping) or not isinstance(overlay_block, Mapping):
+        return errors, warnings
+
+    overlay_mode = overlay_block.get("mode")
+    base_mode = base_block.get("mode")
+    if overlay_mode is None or overlay_mode == base_mode:
+        return errors, warnings
+
+    base_containers = base_block.get("containers")
+    if not isinstance(base_containers, Mapping) or not base_containers:
+        return errors, warnings
+    overlay_containers = overlay_block.get("containers")
+    restated = set(overlay_containers) if isinstance(overlay_containers, Mapping) else set()
+
+    inherited = sorted(
+        f"{kind}: {value}"
+        for kind, value in base_containers.items()
+        if kind not in restated and value != overlay_mode
+    )
+    if not inherited:
+        return errors, warnings
+
+    warnings.append(
+        f"packaging: the overlay flips mode {base_mode!r} → {overlay_mode!r} but "
+        f"inherits the base `containers` map, whose per-kind entries WIN over "
+        f"`mode` — {', '.join(inherited)} stay(s) as declared in the base, so "
+        f"the flip does not change ownership for them. Restate the affected "
+        f"kinds in the overlay's `packaging.containers` (or drop them from the "
+        f"base) to make the intent explicit."
+    )
+    return errors, warnings

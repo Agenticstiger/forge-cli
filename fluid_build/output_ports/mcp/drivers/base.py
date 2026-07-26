@@ -151,6 +151,18 @@ class QueryResult:
     columns: Tuple[str, ...]
     rows: Tuple[Dict[str, Any], ...]
 
+    truncated: bool = False
+    """True when the statement's ``LIMIT`` clipped the result set.
+
+    Mirrors :attr:`SampleResult.truncated`. Defaulted so the raw
+    ``execute()`` results every concrete driver builds stay valid —
+    only :meth:`EngineDriver.query`, which knows the compiled row cap,
+    sets it. Before this field existed the wire serializer read
+    ``getattr(result, "truncated", False)`` and therefore reported
+    ``truncated: false`` on EVERY ``query``, including a GROUP BY clipped
+    from thousands of groups down to the sample cap.
+    """
+
 
 class EngineDriver(ABC):
     """Abstract base for engine drivers.
@@ -287,6 +299,7 @@ class EngineDriver(ABC):
         rows: Iterable[Mapping[str, Any]],
         *,
         columns: Optional[Sequence[str]] = None,
+        extra_redacted: Iterable[str] = (),
     ) -> Tuple[Tuple[str, ...], Tuple[Dict[str, Any], ...]]:
         """Apply column masking + projection to engine rows.
 
@@ -301,6 +314,14 @@ class EngineDriver(ABC):
         ``columns``) matches the engine's echo regardless of case.
         Restricted-column matching is also case-insensitive — a
         contract that lists ``email`` denies ``EMAIL`` too.
+
+        ``extra_redacted`` carries PII redaction targets the driver
+        cannot infer from column names alone —
+        :attr:`...query_compiler.CompiledQuery.redacted_columns`, the set
+        of projection ALIASES whose source expression reads a PII column.
+        Redacting on the output name only was an alias bypass: a
+        dimension declared ``{name: seg_alias, expr: MARKET_SEGMENT}``
+        projected raw PII because ``seg_alias`` is not the column's name.
         """
         rows_list = list(rows)
         if not rows_list:
@@ -311,6 +332,7 @@ class EngineDriver(ABC):
             column for column in all_columns if column.lower() not in restricted_lower
         )
         pii_lower = {c.lower() for c in self._pii_columns}
+        pii_lower |= {c.lower() for c in extra_redacted if isinstance(c, str) and c}
         masked_rows = tuple(
             self._mask_row(row, visible_columns, pii_lower=pii_lower) for row in rows_list
         )
@@ -487,7 +509,15 @@ class EngineDriver(ABC):
         ``execute`` (drivers that can enforce a statement timeout do
         so; the rest ignore it) — it used to be dropped on the floor.
         ``compiled.columns`` is the validated projection, so we never
-        trust the engine's column-name echo blindly.
+        trust the engine's column-name echo blindly, and
+        ``compiled.redacted_columns`` carries the aliases whose source
+        expression reads a PII column so redaction survives aliasing.
+
+        ``truncated`` is derived from ``compiled.row_cap`` — the LIMIT the
+        compiler embedded, and ``None`` for statements a LIMIT cannot clip
+        (an ungrouped aggregate). Reporting it is what stops a GROUP BY
+        clipped to the sample cap from being handed to an agent as a
+        complete answer.
         """
         rendered = compiled.render_sql_for_dialect(self.descriptor().dialect)
         result = self.execute(
@@ -495,8 +525,14 @@ class EngineDriver(ABC):
             params=compiled.params,
             timeout_seconds=timeout_seconds,
         )
-        visible_columns, rows = self.project(result.rows, columns=compiled.columns)
-        return QueryResult(columns=visible_columns, rows=rows)
+        visible_columns, rows = self.project(
+            result.rows,
+            columns=compiled.columns,
+            extra_redacted=getattr(compiled, "redacted_columns", ()),
+        )
+        row_cap = getattr(compiled, "row_cap", None)
+        truncated = isinstance(row_cap, int) and len(rows) >= row_cap
+        return QueryResult(columns=visible_columns, rows=rows, truncated=truncated)
 
     # ------------------------------------------------------------------
     # Helpers

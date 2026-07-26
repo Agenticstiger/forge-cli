@@ -22,7 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
 
-from fluid_build.cli.console import cprint, cprint_json
+from fluid_build.cli.console import cprint
 from fluid_build.cli.console import error as console_error
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
@@ -281,7 +281,7 @@ def run(args, logger: logging.Logger) -> int:
         try:
             contract_path = validate_cli_path(args.contract, mode="read", file_type="contract")
         except FluidCLIError as exc:
-            if exc.event in ("file_not_found", "contract_file_not_found"):
+            if exc.event == "file_not_found":
                 raise CLIError(1, "contract_file_not_found", {"path": str(args.contract)})
             raise
         args.contract = str(contract_path)
@@ -439,7 +439,7 @@ def _handle_list_versions(schema_manager: FluidSchemaManager, args, logger: logg
         if args.format == "json":
             import json
 
-            cprint_json(json.dumps({"available_versions": versions}, indent=2))
+            cprint(json.dumps({"available_versions": versions}, indent=2))
         else:
             cprint("Available FLUID Schema Versions:")
             cprint("==================================")
@@ -760,6 +760,71 @@ def _validate_contract_for_version(
             if args.verbose:
                 info(logger, f"Vector binding check skipped: {exc}")
 
+        # --- Packaging checks (RFC-packaging-modes.md file 9) ---------------
+        # ``fluid validate`` had NO packaging awareness: a `shared` block with
+        # no `pool` validated clean and then failed at `fluid plan` with an
+        # error whose own remediation says "Run 'fluid validate <contract>'
+        # first to rule out a contract problem". Resolving through the same
+        # single chokepoint plan/generate-iac/apply use means validate cannot
+        # drift from what those stages will decide.
+        #
+        # The overlay check needs the base and the override SEPARATELY, so it
+        # re-reads the overlay document rather than the (already deep-merged)
+        # contract: an overlay that flips `mode` while inheriting the base's
+        # `containers` map changes nothing for those kinds, because the
+        # per-kind entries beat `mode`.
+        try:
+            from fluid_build.iac.packaging import (
+                validate_overlay_packaging,
+                validate_packaging_block,
+            )
+
+            pkg_errors, pkg_warnings = validate_packaging_block(contract)
+            contract_path = getattr(args, "contract", None)
+            env = getattr(args, "env", None)
+            if contract_path and env:
+                from fluid_build.loader import load_contract, load_overlay_document
+
+                found = load_overlay_document(contract_path, env)
+                if found is not None:
+                    _overlay_path, overlay_doc = found
+                    ov_errors, ov_warnings = validate_overlay_packaging(
+                        load_contract(contract_path, resolve_refs=False), overlay_doc
+                    )
+                    pkg_errors.extend(ov_errors)
+                    pkg_warnings.extend(ov_warnings)
+            for msg in pkg_errors:
+                validation_result.add_error(msg)
+                validation_result.is_valid = False
+            for msg in pkg_warnings:
+                validation_result.add_warning(msg)
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"Packaging check skipped: {exc}")
+
+        # --- Semantic-model checks (double aggregation) ---------------------
+        # A measure's ``expr`` is the PRE-aggregation input that ``agg`` is
+        # applied to, so ``{agg: sum, expr: SUM(amount)}`` compiles to
+        # SUM(SUM(amount)) — invalid SQL on every engine, on both the governed
+        # MCP query path and the dbt MetricFlow export. The emitters were fixed
+        # to stop producing it; nothing caught it in a hand-authored or
+        # third-party contract, which validated clean and then failed at query
+        # time with an opaque engine error.
+        try:
+            from fluid_build.forge_datamodel.semantics_builder import (
+                validate_semantics_block,
+            )
+
+            sem_errors, sem_warnings = validate_semantics_block(contract)
+            for msg in sem_errors:
+                validation_result.add_error(msg)
+                validation_result.is_valid = False
+            for msg in sem_warnings:
+                validation_result.add_warning(msg)
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"Semantic-model check skipped: {exc}")
+
         try:
             from pathlib import Path as _Path
 
@@ -884,7 +949,7 @@ def _show_schema_info(
 
         cprint("Schema Information:")
         cprint("==================")
-        cprint_json(json.dumps(schema, indent=2))
+        cprint(json.dumps(schema, indent=2))
     else:
         cprint(f"\nSchema Information for v{version}:")
         cprint("=" * 40)
@@ -988,6 +1053,23 @@ def _output_results(result: ValidationResult, args, logger: logging.Logger) -> i
         return _output_text_results(result, args, logger)
 
 
+def _cprint_json(payload: str) -> None:
+    """Emit a machine-readable JSON document on stdout.
+
+    ``cprint`` renders through Rich, which WORD-WRAPS at the console
+    width (80 when stdout is a pipe). Any validation message longer than
+    that got a newline injected mid-string, which is a literal control
+    character inside a JSON string — so ``fluid validate --format json``
+    produced a document ``json.load`` refuses:
+    ``JSONDecodeError: Invalid control character``. ``soft_wrap=True``
+    turns wrapping off; ``markup=False`` stops Rich from eating a
+    ``[tag]``-shaped substring of a message. Still routed through
+    ``cprint`` (rather than ``sys.stdout.write``) so the console's secret
+    redaction stays on the path.
+    """
+    cprint(payload, soft_wrap=True, markup=False, highlight=False)
+
+
 def _output_json_results(result: ValidationResult, args) -> int:
     """Output results in JSON format."""
     import json
@@ -1000,7 +1082,7 @@ def _output_json_results(result: ValidationResult, args) -> int:
         "validation_time": result.validation_time,
     }
 
-    cprint_json(json.dumps(output, indent=2))
+    _cprint_json(json.dumps(output, indent=2))
     return 0 if result.is_valid and (not args.strict or not result.warnings) else 1
 
 
@@ -1018,16 +1100,10 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
             cprint("Validation Errors:")
             cprint("==================")
         for i, error in enumerate(result.errors, 1):
-            # ``markup=False``: a validator message quotes the schema verbatim,
-            # and a JSON Schema ``pattern`` is full of ``[...]`` character
-            # classes. Rendered as markup, Rich *consumes* them —
-            # ``^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$`` printed as
-            # ``^*$|^$``, which tells the operator nothing about what is
-            # allowed. The message is data, not markup.
             if args.quiet:
-                cprint(f"ERROR: {error}", markup=False)
+                cprint(f"ERROR: {error}")
             else:
-                cprint(f"{i:2}. {error}", markup=False)
+                cprint(f"{i:2}. {error}")
 
         if not args.quiet:
             cprint()
@@ -1037,8 +1113,7 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
         cprint("Validation Warnings:")
         cprint("====================")
         for i, warning in enumerate(result.warnings, 1):
-            # Same verbatim-text rule as the error loop above.
-            cprint(f"{i:2}. {warning}", markup=False)
+            cprint(f"{i:2}. {warning}")
         cprint()
 
     # Verbose information
@@ -1241,7 +1316,7 @@ def _run_bundle_validation(
     verbose = bool(getattr(args, "verbose", False))
 
     if out_format == "json":
-        cprint_json(json.dumps(report.to_dict(), indent=2))
+        _cprint_json(json.dumps(report.to_dict(), indent=2))
     elif not quiet:
         status_icon = "✅" if report.status == "pass" else "❌"
         cprint(f"{status_icon} Bundle {report.status}: {tgz_path}")

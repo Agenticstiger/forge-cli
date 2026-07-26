@@ -95,3 +95,54 @@ def test_validate_with_version_fallback_retries_previous_version_once():
         "0.7.2",
         "0.7.1",
     ]
+
+
+# ---------------------------------------------------------------------
+# ``--format json`` must emit JSON a machine can parse.
+#
+# The payload went out through ``cprint`` → Rich, which word-wraps at the
+# console width (80 when stdout is a pipe). Any validation message longer
+# than that got a newline injected mid-string — a literal control
+# character inside a JSON string — so ``json.load`` refused the document
+# with "Invalid control character". Every long message tripped it,
+# including the semantics guards that exist precisely so a machine
+# consumer can read them.
+# ---------------------------------------------------------------------
+
+
+def test_json_output_is_parseable_with_a_long_message(capsys):
+    import json as _json
+
+    from fluid_build.cli.validate import _output_json_results
+
+    long_message = (
+        "expose 'orders_enriched': metric 'order_status' has the same name as "
+        "dimension 'order_status'. Metric, measure and dimension names share "
+        "one namespace, so a query for this metric grouped by that dimension "
+        "would project two columns with one name."
+    )
+    result = ValidationResult(is_valid=True)
+    result.warnings = [long_message]
+    result.schema_version = None
+    result.validation_time = 0.001
+
+    exit_code = _output_json_results(result, _args(format="json"))
+
+    payload = _json.loads(capsys.readouterr().out)
+    assert payload["warnings"] == [long_message]
+    assert payload["valid"] is True
+    assert exit_code == 0
+
+
+def test_json_output_strict_exit_code_still_reflects_warnings(capsys):
+    import json as _json
+
+    from fluid_build.cli.validate import _output_json_results
+
+    result = ValidationResult(is_valid=True)
+    result.warnings = ["short warning"]
+    result.schema_version = None
+    result.validation_time = 0.001
+
+    assert _output_json_results(result, _args(format="json", strict=True)) == 1
+    assert _json.loads(capsys.readouterr().out)["warnings"] == ["short warning"]

@@ -59,6 +59,7 @@ import yaml
 # that don't need the dispatcher (utility-only imports).
 from mcp.server.lowlevel import Server  # noqa: E402
 from mcp.types import (  # noqa: E402
+    CallToolResult,
     EmbeddedResource,
     Resource,
     TextContent,
@@ -154,6 +155,30 @@ from ._circuit import (  # noqa: E402,F401
     DEFAULT_CIRCUIT_WINDOW_SECONDS,
     _CircuitBreaker,
 )
+
+
+def _error_result(payload: Mapping[str, Any]) -> CallToolResult:
+    """Wrap an error envelope in a ``CallToolResult`` with ``isError``.
+
+    Per the MCP spec a failed tool execution is reported INSIDE the
+    result with ``isError: true`` (JSON-RPC errors are reserved for
+    protocol-level failures), so the calling agent loop can branch on it
+    and the model can see what went wrong. Every gateway refusal —
+    agentPolicy denial, rate limit, circuit-open, token budget,
+    tool-not-allowed, unknown tool, input validation, engine failure —
+    used to come back as a plain content list, which the SDK turns into
+    ``isError: false``: an agent framework that branches on ``isError``
+    read a policy denial as a successful result and fed the error JSON to
+    the model as data.
+
+    The body stays the same JSON envelope callers already parse, so this
+    only ADDS the error signal.
+    """
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(dict(payload), indent=2, default=str))],
+        isError=True,
+    )
+
 
 # ---------------------------------------------------------------------
 # Session state — bound once at lifespan start, read on every tool call
@@ -441,7 +466,7 @@ class OutputPortMcpServer:
         @server.call_tool()
         async def _call_tool(
             name: str, arguments: Dict[str, Any]
-        ) -> List[TextContent | EmbeddedResource]:
+        ) -> List[TextContent | EmbeddedResource] | CallToolResult:
             # Identity binding — resolved FRESH per request from the
             # SDK's request_ctx (NOT cached on the shared SessionState).
             # On HTTP/SSE one process serves many concurrent clients
@@ -494,24 +519,18 @@ class OutputPortMcpServer:
                     }
                     self._write_audit(decision_payload)
                     _set_span_attrs(span, {"fluid.decision": "deny", "fluid.reason": rl_reason})
-                    return [
-                        TextContent(
-                            type="text",
-                            text=json.dumps(
-                                {
-                                    "error": "RateLimitExceeded",
-                                    "tool": name,
-                                    "reason": rl_reason,
-                                    "message": (
-                                        "gateway rate limit hit; back off and retry. "
-                                        "Tune via FLUID_MCP_RATE_LIMIT / "
-                                        "FLUID_MCP_RATE_WINDOW_SECONDS."
-                                    ),
-                                },
-                                indent=2,
+                    return _error_result(
+                        {
+                            "error": "RateLimitExceeded",
+                            "tool": name,
+                            "reason": rl_reason,
+                            "message": (
+                                "gateway rate limit hit; back off and retry. "
+                                "Tune via FLUID_MCP_RATE_LIMIT / "
+                                "FLUID_MCP_RATE_WINDOW_SECONDS."
                             ),
-                        )
-                    ]
+                        }
+                    )
 
                 decision_payload, allowed, reason = self._evaluate_policy(
                     tool_name=name,
@@ -528,23 +547,17 @@ class OutputPortMcpServer:
                     },
                 )
                 if not allowed:
-                    return [
-                        TextContent(
-                            type="text",
-                            text=json.dumps(
-                                {
-                                    "error": "AgentPolicyDenied",
-                                    "tool": name,
-                                    "reason": reason,
-                                    "message": (
-                                        f"denied by agentPolicy ({reason}); "
-                                        "see audit trail for the full decision."
-                                    ),
-                                },
-                                indent=2,
+                    return _error_result(
+                        {
+                            "error": "AgentPolicyDenied",
+                            "tool": name,
+                            "reason": reason,
+                            "message": (
+                                f"denied by agentPolicy ({reason}); "
+                                "see audit trail for the full decision."
                             ),
-                        )
-                    ]
+                        }
+                    )
                 # Circuit-breaker fast-fail: if recent driver
                 # failures tripped the breaker, refuse the call now
                 # rather than queueing behind another doomed
@@ -566,23 +579,17 @@ class OutputPortMcpServer:
                     _set_span_attrs(
                         span, {"fluid.decision": "deny", "fluid.reason": "circuit-open"}
                     )
-                    return [
-                        TextContent(
-                            type="text",
-                            text=json.dumps(
-                                {
-                                    "error": "CircuitOpen",
-                                    "tool": name,
-                                    "message": (
-                                        "engine circuit-breaker tripped after "
-                                        "repeated failures; cooling down. Tune "
-                                        "via FLUID_MCP_CIRCUIT_*."
-                                    ),
-                                },
-                                indent=2,
+                    return _error_result(
+                        {
+                            "error": "CircuitOpen",
+                            "tool": name,
+                            "message": (
+                                "engine circuit-breaker tripped after "
+                                "repeated failures; cooling down. Tune "
+                                "via FLUID_MCP_CIRCUIT_*."
                             ),
-                        )
-                    ]
+                        }
+                    )
 
                 # Per-day token-budget pre-check using a small
                 # estimate (we don't know the exact response size
@@ -605,23 +612,17 @@ class OutputPortMcpServer:
                     _set_span_attrs(
                         span, {"fluid.decision": "deny", "fluid.reason": tok_reason or ""}
                     )
-                    return [
-                        TextContent(
-                            type="text",
-                            text=json.dumps(
-                                {
-                                    "error": "TokenBudgetExceeded",
-                                    "tool": name,
-                                    "reason": tok_reason,
-                                    "message": (
-                                        "agentPolicy.maxTokensPerDay exceeded; "
-                                        "back off until the daily window rolls."
-                                    ),
-                                },
-                                indent=2,
+                    return _error_result(
+                        {
+                            "error": "TokenBudgetExceeded",
+                            "tool": name,
+                            "reason": tok_reason,
+                            "message": (
+                                "agentPolicy.maxTokensPerDay exceeded; "
+                                "back off until the daily window rolls."
                             ),
-                        )
-                    ]
+                        }
+                    )
 
                 # Backpressure: bound concurrent dispatches so a
                 # runaway agent can't saturate the engine pool.
@@ -655,7 +656,13 @@ class OutputPortMcpServer:
                             )
                     # Top up token-budget counter from the actual
                     # response size and check the per-request cap.
-                    response_size = sum(len(getattr(c, "text", "") or "") for c in response)
+                    # ``response`` is either a bare content list (success)
+                    # or a ``CallToolResult`` carrying ``isError`` (any
+                    # refusal / failure), so read the blocks off both.
+                    content_blocks = (
+                        response.content if isinstance(response, CallToolResult) else response
+                    )
+                    response_size = sum(len(getattr(c, "text", "") or "") for c in content_blocks)
                     estimated_tokens = max(1, response_size // 4)
                     self.state.record_tokens(estimated_tokens)
                     agent_policy = (self.state.expose.get("policy") or {}).get("agentPolicy") or {}
@@ -681,25 +688,19 @@ class OutputPortMcpServer:
                                 "runId": self.state.run_id,
                             }
                         )
-                        return [
-                            TextContent(
-                                type="text",
-                                text=json.dumps(
-                                    {
-                                        "error": "TokenBudgetExceeded",
-                                        "tool": name,
-                                        "reason": "per-request-cap",
-                                        "message": (
-                                            "response would exceed "
-                                            "agentPolicy.maxTokensPerRequest; "
-                                            "narrow your query (smaller LIMIT, "
-                                            "fewer columns) and retry."
-                                        ),
-                                    },
-                                    indent=2,
+                        return _error_result(
+                            {
+                                "error": "TokenBudgetExceeded",
+                                "tool": name,
+                                "reason": "per-request-cap",
+                                "message": (
+                                    "response would exceed "
+                                    "agentPolicy.maxTokensPerRequest; "
+                                    "narrow your query (smaller LIMIT, "
+                                    "fewer columns) and retry."
                                 ),
-                            )
-                        ]
+                            }
+                        )
                     self.state._circuit.record_success()
                     return response
                 except Exception:
@@ -837,7 +838,7 @@ class OutputPortMcpServer:
 
     async def _dispatch_allowed_tool(
         self, name: str, arguments: Dict[str, Any], *, caller_attributes: Dict[str, Any]
-    ) -> List[TextContent]:
+    ) -> List[TextContent] | CallToolResult:
         """Dispatch a tool that has cleared the policy gate.
 
         ``caller_attributes`` is the CALLING client's per-request
@@ -860,18 +861,13 @@ class OutputPortMcpServer:
                 allow_free_form_sql=self.state.policy.allow_free_form_sql,
             )
         except Exception as exc:  # noqa: BLE001
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {
-                            "error": "ToolNotAllowed",
-                            "tool": name,
-                            "message": str(exc),
-                        }
-                    ),
-                )
-            ]
+            return _error_result(
+                {
+                    "error": "ToolNotAllowed",
+                    "tool": name,
+                    "message": str(exc),
+                }
+            )
 
         loop = asyncio.get_running_loop()
         try:
@@ -903,11 +899,13 @@ class OutputPortMcpServer:
                     ),
                 )
             else:
-                payload = {
-                    "error": "UnknownTool",
-                    "tool": name,
-                    "message": f"Unknown tool: {name!r}.",
-                }
+                return _error_result(
+                    {
+                        "error": "UnknownTool",
+                        "tool": name,
+                        "message": f"Unknown tool: {name!r}.",
+                    }
+                )
         except Exception as exc:  # noqa: BLE001
             # ENGINE / BINDING failures carry a sanitised, redacted wire
             # message — binding details (database / schema / table) leak
@@ -950,18 +948,26 @@ class OutputPortMcpServer:
                 )
             except Exception:  # noqa: BLE001
                 pass
-            payload = {
-                "error": type(exc).__name__,
-                "tool": name,
-                "message": (
-                    str(exc)
-                    if is_validation_error
-                    else (
-                        f"Tool {name!r} failed; see server audit trail for the "
-                        "full annotated error."
-                    )
-                ),
-            }
+            # isError:true — a tool that raised did NOT succeed, and the
+            # MCP spec puts execution failures in the result so the agent
+            # loop can react. That holds for a QueryValidationError too:
+            # the verbatim message is exactly what the model needs to
+            # self-correct, and it can only act on it if it can tell the
+            # call failed.
+            return _error_result(
+                {
+                    "error": type(exc).__name__,
+                    "tool": name,
+                    "message": (
+                        str(exc)
+                        if is_validation_error
+                        else (
+                            f"Tool {name!r} failed; see server audit trail for the "
+                            "full annotated error."
+                        )
+                    ),
+                }
+            )
         return [TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
 
     # ---- Per-tool implementations -----------------------------------
