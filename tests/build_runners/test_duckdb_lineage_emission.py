@@ -24,8 +24,8 @@ from typing import Any, Dict
 
 import pytest
 
-from fluid_build.api.lineage import RunEventType
 from fluid_build.api.conformance.runner import assert_openlineage_shape
+from fluid_build.api.lineage import RunEventType
 from fluid_build.build_runners._lineage import BufferedLineageEmitter, encode_event
 from fluid_build.build_runners.duckdb.runner import execute_duckdb_build
 

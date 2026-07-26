@@ -940,8 +940,8 @@ class TestAcquisitionCatalogDispatch:
     """
 
     def _run(self, tmp_path, contract, **arg_overrides):
-        from fluid_build.cli import publish as pub_mod
         from fluid_build.cli import _acquisition_stage_ext as ext
+        from fluid_build.cli import publish as pub_mod
 
         contract_file = tmp_path / "c.fluid.yaml"
         contract_file.write_text("id: bronze.test.orders")

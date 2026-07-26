@@ -243,11 +243,10 @@ class TestPolicyCheckRun:
         assert run(args, logging.getLogger()) == 1
 
     def test_run_missing_contract(self, tmp_path):
-        from fluid_build.cli.policy_check import run
-
         import pytest
 
         from fluid_build.cli._common import CLIError
+        from fluid_build.cli.policy_check import run
 
         args = self._make_args(tmp_path / "nonexistent.yaml", format="text")
         with pytest.raises(CLIError) as exc_info:
