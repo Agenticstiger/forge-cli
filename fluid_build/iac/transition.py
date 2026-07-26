@@ -41,7 +41,8 @@ REFERENCED container does not always leave a footprint in state:
 1. a ``data.`` address in prior state (AWS/GCP, whose plugins emit data
    sources for a shared pool), and
 2. the *absence* of a container the contract now declares OWNED from an
-   otherwise non-empty prior state.
+   otherwise non-empty prior state — **and** whose OpenTofu resource type
+   this state has never managed at all.
 
 Signal 2 exists because ``SnowflakeIacPlugin.emit_data`` returns ``{}`` —
 Snowflake emits resources only — so a shared Snowflake pool leaves *no*
@@ -51,6 +52,18 @@ attributes to the tenant contract's values, and never asked. The candidate
 list for signal 2 is the provider plugin's own ``discover_imports`` output
 (the exact addresses ``_adopt_existing`` is about to ``tofu import``), so
 no provider knowledge is duplicated here.
+
+The "resource type this state has never managed" clause is what keeps
+signal 2 a *transition* detector rather than a brownfield-adoption
+detector. A state holding leaves but no container of that type is the
+shared-pool footprint — the contract was writing into a container it did
+not own. A state that already manages containers of that type is a
+contract that has been owning them all along, so importing another one is
+growth inside an unchanged ownership model, and blocking it would break
+the documented brownfield path. The clause costs nothing in coverage: if
+the state manages a container of that type *and* some scope declares the
+kind ``shared``, signal 1's owned → referenced half has already blocked
+the apply on that very container.
 
 The existing data-loss gate remains the unconditional last line: this
 guard runs earlier and is about *ownership*, not about destroy counts.
@@ -237,12 +250,15 @@ def detect_ownership_transitions(
 
     ``import_candidates`` is the provider plugin's ``discover_imports``
     address list — the containers ``_adopt_existing`` is about to
-    ``tofu import``. A container address in that list that is *absent*
-    from a non-empty prior state was referenced (or unmanaged) until now
-    and is being adopted, which is the only signal available for providers
-    that emit no ``data`` sub-tree for a shared pool (Snowflake). Ignored
-    when the state is empty: a greenfield first apply adopts nothing it
-    did not already declare.
+    ``tofu import``. A candidate is read as an adoption only when the
+    prior state is non-empty, does not already hold that exact address,
+    **and** manages no container of that OpenTofu resource type at all —
+    the shared-pool footprint on providers that emit no ``data`` sub-tree
+    (Snowflake). Ignored when the state is empty: a greenfield first apply
+    adopts nothing it did not already declare. Ignored when the state
+    already owns containers of that type: that is ordinary brownfield
+    growth inside an ownership model that is not changing, and it is the
+    documented ``_adopt_existing`` path, not a packaging transition.
     """
     try:
         if resolve_packaging(contract) is LEGACY:
@@ -271,6 +287,9 @@ def detect_ownership_transitions(
         )
 
     managed: Set[str] = set()
+    # Container *resource types* this state already manages as owned resources.
+    # This is the discriminator signal 2 needs — see the loop below.
+    managed_container_types: Set[str] = set()
     for address in state_addresses or ():
         parsed = parse_state_address(address)
         if parsed is None:
@@ -281,6 +300,8 @@ def detect_ownership_transitions(
         kind = CONTAINER_RESOURCE_TYPES.get(resource_type)
         if kind is None:
             continue
+        if not is_data:
+            managed_container_types.add(resource_type)
         try:
             decisions = _decisions_in_scope(contract, kind)
         except PackagingError:
@@ -305,6 +326,27 @@ def detect_ownership_transitions(
                 continue
             kind = CONTAINER_RESOURCE_TYPES.get(resource_type)
             if kind is None:
+                continue
+            # Scoped to container types this state does NOT already manage.
+            # Without it the signal fires on *any* pre-existing container and
+            # breaks plain brownfield growth: an always-isolated contract that
+            # gains a second exposure pointing at a schema that already exists
+            # inside its OWN database was blocked with a message asserting a
+            # shared-pool history it never had.
+            #
+            # The scoping loses nothing, because the two branches are
+            # exhaustive. If the state manages a container of this type then
+            # either (a) no scope declares the kind REFERENCED — the contract
+            # has consistently owned this type, so importing another one is
+            # growth inside an ownership model that is not changing — or
+            # (b) some scope does, in which case the state loop above already
+            # raised the OWNED -> REFERENCED half on the managed container and
+            # the apply is blocked regardless. And when the state manages NO
+            # container of this type while managing leaves, that *is* the
+            # shared-pool footprint on a provider with no ``data`` sub-tree:
+            # the leaves were written into a container the contract did not
+            # own, which is exactly the flip this guard exists to catch.
+            if resource_type in managed_container_types:
                 continue
             try:
                 decisions = _decisions_in_scope(contract, kind)

@@ -655,3 +655,134 @@ class TestOneContainerIsReportedOnce:
             import_candidates=SF_ISOLATED_IMPORTS,
         )
         assert {t.container_kind for t in transitions} == {"database", "schema"}
+
+
+class TestBrownfieldGrowthIsNotAnAdoption:
+    """Signal 2 must detect a *transition*, not ordinary brownfield adoption.
+
+    The first cut fired on any pre-existing container in ``discover_imports``.
+    That broke the documented ``_adopt_existing`` path for contracts that were
+    never shared: an ``mode: isolated`` contract, already applied once, grown
+    with a second exposure pointing at a schema that already existed inside its
+    OWN database was blocked — with a message asserting a shared-pool history
+    the contract never had, and remediation ("declare the container `shared`")
+    that would have made the product's own database referenced.
+
+    Verified live on Snowflake before the narrowing: base build printed
+    "brownfield: adopted 1 pre-existing resource(s) into state" / "+1 ~2 -0" and
+    exited 0; the un-narrowed guard blocked the same apply with exit 1.
+    """
+
+    ISO_TWO_EXPOSES = {
+        "fluidVersion": "0.7.6",
+        "id": "silver.misc.iso_v1",
+        "packaging": {"mode": "isolated"},
+        "exposes": [
+            {
+                "exposeId": "first",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_table",
+                    "location": {
+                        "database": "FLUID_MISCP_ISO",
+                        "schema": "ISOSCH",
+                        "table": "T1",
+                    },
+                },
+            },
+            {
+                "exposeId": "second",
+                "binding": {
+                    "platform": "snowflake",
+                    "format": "snowflake_table",
+                    "location": {
+                        "database": "FLUID_MISCP_ISO",
+                        "schema": "PREEXIST",
+                        "table": "T2",
+                    },
+                },
+            },
+        ],
+    }
+
+    # State after the FIRST apply: the contract owns its database and its first
+    # schema outright. Nothing here was ever referenced.
+    ISO_STATE = [
+        "snowflake_database.iso_v1_FLUID_MISCP_ISO",
+        "snowflake_schema.iso_v1_FLUID_MISCP_ISO_ISOSCH",
+        "snowflake_table.iso_v1_FLUID_MISCP_ISO_ISOSCH_T1",
+    ]
+
+    # `discover_imports` after the second exposure is added — PREEXIST already
+    # exists in Snowflake, so it is an import candidate.
+    ISO_IMPORTS = ISO_STATE + [
+        "snowflake_schema.iso_v1_FLUID_MISCP_ISO_PREEXIST",
+        "snowflake_table.iso_v1_FLUID_MISCP_ISO_PREEXIST_T2",
+    ]
+
+    def test_growing_into_a_pre_existing_schema_is_not_flagged(self):
+        assert (
+            detect_ownership_transitions(
+                self.ISO_TWO_EXPOSES, self.ISO_STATE, import_candidates=self.ISO_IMPORTS
+            )
+            == ()
+        )
+
+    def test_the_apply_is_not_blocked(self):
+        assert (
+            guard_ownership_transitions(
+                self.ISO_TWO_EXPOSES, self.ISO_STATE, import_candidates=self.ISO_IMPORTS
+            )
+            == ()
+        )
+
+    def test_the_shared_pool_flip_is_still_caught(self):
+        """The narrowing must not touch the defect the signal exists for.
+
+        Same contract shape, but the prior apply was `shared`: the state holds
+        the leaf and NO container of either type. That is the shared-pool
+        footprint, and it still blocks.
+        """
+        with pytest.raises(PackagingTransitionError) as excinfo:
+            guard_ownership_transitions(
+                self.ISO_TWO_EXPOSES,
+                ["snowflake_table.iso_v1_FLUID_MISCP_ISO_ISOSCH_T1"],
+                import_candidates=self.ISO_IMPORTS,
+            )
+        assert excinfo.value.kind == "shared-adoption-requires-flag"
+        assert {t.container_kind for t in excinfo.value.transitions} == {"database", "schema"}
+
+    def test_the_narrowing_is_per_resource_type_not_blanket(self):
+        """A state owning the database but no schema still catches the schema.
+
+        `containers: {database: isolated, schema: shared}` flipped to fully
+        isolated: the database was owned all along, the schemas were pool
+        containers. Both schemas are adoptions and both are still reported;
+        the database — already managed — is not.
+        """
+        transitions = detect_ownership_transitions(
+            self.ISO_TWO_EXPOSES,
+            [
+                "snowflake_database.iso_v1_FLUID_MISCP_ISO",
+                "snowflake_table.iso_v1_FLUID_MISCP_ISO_ISOSCH_T1",
+            ],
+            import_candidates=self.ISO_IMPORTS,
+        )
+        assert {t.container_kind for t in transitions} == {"schema"}
+        assert {t.address for t in transitions} == {
+            "snowflake_schema.iso_v1_FLUID_MISCP_ISO_ISOSCH",
+            "snowflake_schema.iso_v1_FLUID_MISCP_ISO_PREEXIST",
+        }
+        assert all(t.is_adoption for t in transitions)
+
+    def test_the_state_signal_is_untouched_by_the_narrowing(self):
+        """owned -> referenced still fires on a state that owns the container."""
+        contract = {k: v for k, v in self.ISO_TWO_EXPOSES.items()}
+        contract["packaging"] = {"mode": "shared", "pool": "FLUID_MISCP_POOL"}
+        transitions = detect_ownership_transitions(
+            contract, self.ISO_STATE, import_candidates=self.ISO_IMPORTS
+        )
+        assert {(t.container_kind, t.from_ownership, t.to_ownership) for t in transitions} == {
+            ("database", "owned", "referenced"),
+            ("schema", "owned", "referenced"),
+        }
