@@ -51,6 +51,37 @@ _AGGREGATE_CALL_RE = re.compile(
 )
 _DISTINCT_PREFIX_RE = re.compile(r"(?is)^\s*distinct\s+(.+)$")
 
+# ANY aggregate function call anywhere in an expression — broader than
+# :data:`_AGGREGATE_CALL_RE`, which only matches an expression that is
+# EXACTLY one aggregate call. Used by the contract validator to reject
+# the double-aggregation shape, including the compound forms the
+# single-call parser deliberately skips (``SUM(a) / COUNT(b)``). The
+# trailing ``\s*\(`` is what keeps a column named ``count_of_orders``
+# from matching.
+_ANY_AGGREGATE_CALL_RE = re.compile(
+    r"(?i)\b("
+    r"sum|avg|mean|min|max|median|count|"
+    r"stddev|stddev_pop|stddev_samp|variance|var_pop|var_samp|"
+    r"percentile_cont|percentile_disc|approx_percentile|approx_count_distinct|"
+    r"array_agg|string_agg|listagg|group_concat|bool_and|bool_or|any_value"
+    r")\s*\(",
+)
+
+
+def first_aggregate_call(expr: str) -> Optional[str]:
+    """Return the name of the first aggregate function ``expr`` calls, or
+    ``None`` when it calls none.
+
+    A ``measures[].expr`` is the PRE-aggregation input — the declared
+    ``agg`` is applied to it — so an aggregate call inside it means the
+    contract double-aggregates (``{agg: sum, expr: SUM(amount)}`` →
+    ``SUM(SUM(amount))``). A ``dimensions[].expr`` lands in the GROUP BY,
+    where an aggregate is equally invalid. Both are rejected by
+    ``cli/contract_validation.ContractValidator._validate_semantics``.
+    """
+    match = _ANY_AGGREGATE_CALL_RE.search(expr or "")
+    return match.group(1).lower() if match is not None else None
+
 
 def parse_aggregate_expression(expr: str) -> Optional[Tuple[str, str]]:
     """Split a single-aggregate SQL expression into (agg, inner expr).
@@ -112,6 +143,80 @@ def measure_from_aggregate_expression(
     if description:
         measure["description"] = description
     return measure
+
+
+def validate_semantics_block(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
+    """Validate-time gate for ``exposes[].semantics`` (anti-no-op, mirrors
+    ``output_ports.vector.validate_vector_binding``). Returns
+    ``(errors, warnings)``.
+
+    Catches the DOUBLE-AGGREGATION shape. A ``measures[]`` entry declares
+    its aggregation in ``agg`` and its PRE-aggregation input in ``expr``,
+    so an ``expr`` that is itself an aggregate call double-wraps:
+    ``{agg: sum, expr: SUM(TOTAL_PRICE)}`` compiles to
+    ``SUM(SUM(TOTAL_PRICE))`` on the governed MCP ``query`` path and
+    exports the same double wrap through the dbt MetricFlow bridge —
+    invalid SQL on every engine. ``dimensions[].expr`` has the same
+    problem: it lands in the GROUP BY.
+
+    The forge emitters stopped producing that shape (see
+    :func:`measure_from_aggregate_expression`), but nothing caught it in
+    a HAND-AUTHORED or third-party contract: ``fluid validate`` reported
+    "✅ Valid" with zero warnings and ``fluid policy-check --strict``
+    scored 100/100, and the only feedback was an opaque engine error on
+    the first query. Hard errors, because the shape cannot produce a
+    working query on any engine.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    exposes = contract.get("exposes")
+    if not isinstance(exposes, list):
+        return errors, warnings
+    for expose in exposes:
+        if not isinstance(expose, Mapping):
+            continue
+        semantics = expose.get("semantics")
+        if not isinstance(semantics, Mapping):
+            continue
+        expose_id = str(expose.get("exposeId") or expose.get("id") or "?")
+        for entry in semantics.get("measures") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            agg = entry.get("agg")
+            expr = entry.get("expr")
+            if not agg or not isinstance(expr, str):
+                continue
+            nested = first_aggregate_call(expr)
+            if nested is None:
+                continue
+            errors.append(
+                f"expose '{expose_id}': measure "
+                f"'{entry.get('name') or '?'}' declares agg '{agg}' over an expr "
+                f"that is itself an aggregate ({expr!r}). Consumers apply 'agg' "
+                f"to 'expr', so this compiles to "
+                f"{str(agg).upper()}({nested.upper()}(...)) — invalid SQL on "
+                f"every engine. Split them: 'expr: SUM(amount)' + 'agg: sum' "
+                f"becomes 'expr: amount' + 'agg: sum'; "
+                f"'expr: COUNT(DISTINCT id)' becomes 'expr: id' + "
+                f"'agg: count_distinct'."
+            )
+        for entry in semantics.get("dimensions") or []:
+            if not isinstance(entry, Mapping):
+                continue
+            expr = entry.get("expr")
+            if not isinstance(expr, str):
+                continue
+            nested = first_aggregate_call(expr)
+            if nested is None:
+                continue
+            errors.append(
+                f"expose '{expose_id}': dimension "
+                f"'{entry.get('name') or '?'}' has an aggregate expr ({expr!r}). "
+                f"Dimensions land in the GROUP BY, where {nested.upper()}(...) "
+                f"is invalid on every engine. Model it as a measure, or group "
+                f"by the underlying column."
+            )
+    return errors, warnings
 
 
 def simple_metric(name: str, measure: str, *, description: Optional[str] = None) -> Dict[str, Any]:

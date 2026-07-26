@@ -760,6 +760,29 @@ def _validate_contract_for_version(
             if args.verbose:
                 info(logger, f"Vector binding check skipped: {exc}")
 
+        # --- Semantic-model checks (double aggregation) ---------------------
+        # A measure's ``expr`` is the PRE-aggregation input that ``agg`` is
+        # applied to, so ``{agg: sum, expr: SUM(amount)}`` compiles to
+        # SUM(SUM(amount)) — invalid SQL on every engine, on both the governed
+        # MCP query path and the dbt MetricFlow export. The emitters were fixed
+        # to stop producing it; nothing caught it in a hand-authored or
+        # third-party contract, which validated clean and then failed at query
+        # time with an opaque engine error.
+        try:
+            from fluid_build.forge_datamodel.semantics_builder import (
+                validate_semantics_block,
+            )
+
+            sem_errors, sem_warnings = validate_semantics_block(contract)
+            for msg in sem_errors:
+                validation_result.add_error(msg)
+                validation_result.is_valid = False
+            for msg in sem_warnings:
+                validation_result.add_warning(msg)
+        except Exception as exc:  # pragma: no cover — defensive
+            if args.verbose:
+                info(logger, f"Semantic-model check skipped: {exc}")
+
         try:
             from pathlib import Path as _Path
 

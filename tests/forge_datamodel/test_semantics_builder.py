@@ -39,10 +39,12 @@ from fluid_build.copilot.schemas.stage_outputs import ConceptualDraft, LogicalDr
 from fluid_build.forge_datamodel.emit.fluid_contract import build_contract_from_logical
 from fluid_build.forge_datamodel.semantics_builder import (
     default_agg_time_dimension,
+    first_aggregate_call,
     infer_measure_agg,
     measure_from_aggregate_expression,
     normalized_time_type_params,
     parse_aggregate_expression,
+    validate_semantics_block,
     simple_metric,
 )
 
@@ -278,3 +280,124 @@ class TestInterviewProducerAlignment:
         )
         time_dims = [d for d in semantics["dimensions"] if d.get("type") == "time"]
         assert "typeParams" not in time_dims[0]
+
+
+# ---------------------------------------------------------------------
+# The validate-time guard for the SAME double-aggregation shape.
+#
+# #440 fixed the two EMITTERS; nothing detected the shape when a human or
+# a third-party tool hand-authored it. ``fluid validate`` reported
+# "✅ Valid" with zero warnings and ``fluid policy-check --strict`` scored
+# 100/100 on a contract whose every governed query dies at the engine.
+# ---------------------------------------------------------------------
+
+
+def _contract_with_semantics(**semantics):
+    return {
+        "fluidVersion": "0.7.6",
+        "exposes": [{"exposeId": "orders", "semantics": semantics}],
+    }
+
+
+@pytest.mark.parametrize(
+    "expr,agg",
+    [
+        ("SUM(TOTAL_PRICE)", "sum"),
+        ("COUNT(DISTINCT ORDER_ID)", "count"),
+        ("count(*)", "count"),
+        ("  Avg( amount )  ", "avg"),
+        # Compound aggregate expression — parse_aggregate_expression
+        # deliberately returns None for these (they belong in a derived
+        # metric), but they double-wrap just the same.
+        ("SUM(a) / COUNT(b)", "sum"),
+        ("COALESCE(SUM(amount), 0)", "sum"),
+    ],
+)
+def test_validate_semantics_block_rejects_double_aggregation(expr, agg):
+    errors, warnings = validate_semantics_block(
+        _contract_with_semantics(measures=[{"name": "m", "agg": agg, "expr": expr}])
+    )
+    assert len(errors) == 1
+    assert "invalid SQL on every engine" in errors[0]
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "TOTAL_PRICE",
+        "1",
+        "amount * quantity",
+        "COALESCE(amount, 0)",
+        "YEAR(order_date)",
+        # A column whose NAME merely contains an aggregate word must not
+        # trip the scan — only a call (``name(``) counts.
+        "count_of_items",
+        "max_seen_at",
+    ],
+)
+def test_validate_semantics_block_accepts_a_pre_aggregation_expr(expr):
+    errors, warnings = validate_semantics_block(
+        _contract_with_semantics(measures=[{"name": "m", "agg": "sum", "expr": expr}])
+    )
+    assert errors == []
+    assert warnings == []
+
+
+def test_validate_semantics_block_rejects_an_aggregate_dimension():
+    errors, _ = validate_semantics_block(
+        _contract_with_semantics(
+            dimensions=[{"name": "d", "type": "categorical", "expr": "MAX(status)"}]
+        )
+    )
+    assert len(errors) == 1
+    assert "GROUP BY" in errors[0]
+
+
+def test_validate_semantics_block_accepts_a_scalar_dimension_expr():
+    errors, _ = validate_semantics_block(
+        _contract_with_semantics(
+            dimensions=[{"name": "order_year", "type": "time", "expr": "YEAR(ORDER_DATE)"}]
+        )
+    )
+    assert errors == []
+
+
+def test_validate_semantics_block_ignores_a_measure_with_no_agg():
+    """Without a declared ``agg`` there is nothing to double-wrap with;
+    the missing ``agg`` is the query compiler's error to report."""
+    errors, _ = validate_semantics_block(
+        _contract_with_semantics(measures=[{"name": "m", "expr": "SUM(amount)"}])
+    )
+    assert errors == []
+
+
+def test_validate_semantics_block_is_inert_without_semantics():
+    assert validate_semantics_block({"exposes": [{"exposeId": "x"}]}) == ([], [])
+    assert validate_semantics_block({}) == ([], [])
+    assert validate_semantics_block({"exposes": "not-a-list"}) == ([], [])
+
+
+def test_emitter_output_passes_the_validate_time_guard():
+    """The two sides of #440 agree: what the emitter produces is exactly
+    what the validator accepts."""
+    measure = measure_from_aggregate_expression("revenue", "SUM(amount)")
+    errors, _ = validate_semantics_block(_contract_with_semantics(measures=[measure]))
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    "expr,expected",
+    [
+        ("SUM(amount)", "sum"),
+        ("count( * )", "count"),
+        ("PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY x)", "percentile_cont"),
+        ("LISTAGG(tag, ',')", "listagg"),
+        ("amount * 2", None),
+        ("count_of_items", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_first_aggregate_call_matches_calls_not_column_names(expr, expected):
+    assert first_aggregate_call(expr) == expected
