@@ -1054,8 +1054,13 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 format_type=format_type,
             )
         else:
+            # NOT an ``error``: nothing failed, forge simply ships no verifier
+            # for this binding format. Conflating the two mattered once
+            # ``error`` became fatal — a contract with, say, a kafka_topic
+            # expose would have started failing `fluid verify` for a check that
+            # was never attempted.
             results[expose_name] = {
-                "status": "error",
+                "status": "unsupported",
                 "error": f"Unsupported format: {format_type}",
             }
 
@@ -1063,6 +1068,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     match_count = 0
     mismatch_count = 0
     error_count = 0
+    # Exposes forge has no verifier for. Reported, never counted as a failure —
+    # "we did not check" is not "the check failed".
+    unsupported_count = 0
     # Track critical-severity mismatches separately so ``--strict``
     # can differentiate breaking drift (missing fields, type mismatches,
     # region mismatches) from non-breaking constraint drift
@@ -1107,6 +1115,11 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         cprint(f"\n📋 Verifying: {expose_name}")
         cprint(f"   Format: {format_type}")
         cprint(f"   Target: {target}")
+
+        if result["status"] == "unsupported":
+            cprint(f"   ⏭️  Skipped: {result.get('error', 'no verifier for this format')}")
+            unsupported_count += 1
+            continue
 
         if result["status"] == "error":
             # Bug 6: downgrade "table missing" to INFO for
@@ -1330,6 +1343,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     success(f"Match: {match_count}")
     warning(f"Mismatch: {mismatch_count}")
     console_error(f"Error: {error_count}")
+    if unsupported_count:
+        cprint(f"⏭️  Skipped (no verifier for the format): {unsupported_count}")
 
     if mismatch_count > 0 or error_count > 0:
         cprint("\n💡 Next Steps:")
@@ -1350,6 +1365,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 "match": match_count,
                 "mismatch": mismatch_count,
                 "error": error_count,
+                "unsupported": unsupported_count,
             },
             "results": results,
         }
@@ -1410,13 +1426,26 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 "add --strict to gate CI on this."
             )
 
+    # ``error_count`` ALWAYS fails, --strict or not. An error is not "we
+    # checked and found drift" — it is "we could not check at all" (auth
+    # failure, unreachable container, a table the contract claims exists).
+    # This used to be gated on --strict, contradicting the comment right
+    # here, so a run printing "❌ Error: 1" exited 0 and CI keying on the
+    # exit code treated an unreachable pool as a successful verification.
+    if error_count > 0:
+        console_error(
+            f"{error_count} target(s) could not be verified. This is not drift — "
+            "the check itself failed (unreachable container, missing object, or "
+            "insufficient privileges). If the target lives in a shared pool, the "
+            "platform team may still owe this product USAGE on it."
+        )
+        return 1
+
     # Exit with error code if strict mode and CRITICAL issues found.
     # Non-critical mismatches (e.g. nullable-vs-required constraint
     # drift) emit warnings to stderr but do NOT fail the build —
-    # operators can tighten the contract incrementally. ``error_count``
-    # always fails (auth issues, connection failures, missing tables
-    # the contract claims should exist).
-    if args.strict and (critical_mismatch_count > 0 or error_count > 0):
+    # operators can tighten the contract incrementally.
+    if args.strict and critical_mismatch_count > 0:
         return 1
     if args.strict and mismatch_count > 0:
         warning(
