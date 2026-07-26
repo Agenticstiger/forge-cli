@@ -174,6 +174,64 @@ def resolve_iceberg_catalog(
 
 
 # ---------------------------------------------------------------------------
+# Object-store warehouse URI
+# ---------------------------------------------------------------------------
+
+#: ``location.warehouse`` schemes that are already a full object-store URI.
+_WAREHOUSE_SCHEMES = ("s3://", "gs://", "abfs://", "abfss://")
+
+
+def iceberg_storage_uri(binding: Optional[Mapping[str, Any]], *, scheme: str = "gs") -> str:
+    """The object-store URI backing an Iceberg binding, or ``""``.
+
+    THE second cross-emitter contract, alongside
+    :func:`iceberg_external_volume_name`. BigQuery's ``catalogs.yml`` takes a
+    bare ``gs://`` URI as its ``external_volume`` (unlike Snowflake, which
+    takes an object NAME), and the GCP IaC emitter has to create the bucket
+    at exactly that URI.
+
+    ``location.warehouse`` wins when it carries a scheme, but ONLY the
+    requested one. A binding whose warehouse is ``s3://...`` yields ``""`` on
+    the ``gs`` path rather than a URI BigQuery cannot resolve, so both
+    emitters skip together instead of one emitting storage the other cannot
+    back. A scheme with no bucket component (``gs://``, ``gs:///x``) is
+    likewise treated as underivable.
+
+    :func:`iceberg_bucket_name` is derived FROM this function, so the two can
+    never disagree about which bucket is in play.
+    """
+    loc = (binding or {}).get("location") or {}
+    warehouse = str(loc.get("warehouse") or "").strip()
+    prefix = f"{scheme}://"
+    if warehouse.startswith(_WAREHOUSE_SCHEMES):
+        # A foreign scheme is not usable here. Returning it would point dbt
+        # at storage this provider's IaC never creates.
+        if not warehouse.startswith(prefix):
+            return ""
+        return warehouse if warehouse[len(prefix) :].split("/", 1)[0] else ""
+    bucket = str(loc.get("bucket") or "").strip()
+    if not bucket:
+        return ""
+    path = str(loc.get("path") or "").strip("/")
+    return f"{prefix}{bucket}/{path}" if path else f"{prefix}{bucket}"
+
+
+def iceberg_bucket_name(binding: Optional[Mapping[str, Any]], *, scheme: str = "gs") -> str:
+    """The bucket component of :func:`iceberg_storage_uri`.
+
+    Derived from that function rather than re-reading the binding, so the
+    bucket the IaC creates is always the bucket the URI points into. Reading
+    ``location.bucket`` directly here would invert the precedence: a binding
+    carrying BOTH ``bucket`` and a different ``warehouse`` would have dbt
+    write into the warehouse while the IaC created (and governed) the other
+    one, which is exactly the drift this pair exists to prevent.
+    """
+    uri = iceberg_storage_uri(binding, scheme=scheme)
+    prefix = f"{scheme}://"
+    return uri[len(prefix) :].split("/", 1)[0] if uri.startswith(prefix) else ""
+
+
+# ---------------------------------------------------------------------------
 # Snowflake external-volume naming
 # ---------------------------------------------------------------------------
 

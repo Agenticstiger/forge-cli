@@ -333,6 +333,10 @@ class GcpIacPlugin:
                 )
             elif fmt == "gcs_bucket":
                 _emit_gcs(resources, loc, cid, labels, grants=grants, placement=placement)
+            elif fmt in _ICEBERG_FORMATS:
+                _emit_iceberg_storage(
+                    resources, binding, loc, cid, labels, grants=grants, placement=placement
+                )
             elif fmt == "pubsub_topic":
                 _emit_pubsub(resources, loc, cid, labels)
         # Cloud Run / Cloud Scheduler / Pub-Sub event resources — the
@@ -376,6 +380,20 @@ class GcpIacPlugin:
                 data.setdefault("google_storage_bucket", {}).setdefault(
                     safe_ident(f"{cid}_{bucket}"), {"name": bucket}
                 )
+            elif fmt in _ICEBERG_FORMATS and placement.bucket_referenced:
+                # Must mirror the ``emit`` branch. Under shared packaging
+                # ``_emit_gcs`` references ``${data.google_storage_bucket…}``
+                # for each grant, so omitting the lookup here makes every
+                # apply fail `tofu validate` with "Reference to undeclared
+                # resource". Derived through the shared helper so the key
+                # matches the one ``emit`` produces.
+                from ...providers._iceberg_catalog import iceberg_bucket_name
+
+                bucket = iceberg_bucket_name(binding)
+                if bucket:
+                    data.setdefault("google_storage_bucket", {}).setdefault(
+                        safe_ident(f"{cid}_{bucket}"), {"name": bucket}
+                    )
         return data
 
     def credential_env(self, env: Mapping[str, str]) -> Dict[str, str]:
@@ -548,6 +566,61 @@ def _emit_bigquery(
     # ``access[]`` block. (``accessPolicy`` is the schema-valid surface;
     # ``metadata.policies`` also emits but fails ``fluid validate`` — see
     # ``iac/access.py``.)
+
+
+#: ``binding.format`` values marking an Iceberg-table expose. Matches the
+#: Snowflake IaC emitter's set so the two providers agree on what Iceberg is.
+_ICEBERG_FORMATS = ("iceberg", "iceberg_table")
+
+
+def _emit_iceberg_storage(
+    resources: Dict[str, Any],
+    binding: Mapping[str, Any],
+    loc: Mapping[str, Any],
+    cid: str,
+    labels: Dict[str, str],
+    *,
+    grants: Sequence[AccessGrant],
+    placement: _Placement = _LEGACY_PLACEMENT,
+) -> None:
+    """Emit the GCS bucket backing a BigQuery Iceberg table.
+
+    dbt materializes BigQuery Iceberg through ``catalogs.yml`` with
+    ``catalog_type: biglake_metastore``. Its documentation is explicit that
+    the metastore itself needs no setup because it is built into BigQuery, so
+    the one prerequisite dbt names and does not create is the storage bucket.
+
+    The bucket name comes from the shared
+    :func:`~fluid_build.providers._iceberg_catalog.iceberg_bucket_name`, whose
+    sibling :func:`~fluid_build.providers._iceberg_catalog.iceberg_storage_uri`
+    produces the exact ``gs://`` URI the dbt emitter writes into
+    ``external_volume``. Both derive from the same binding, so dbt cannot end
+    up pointed at a bucket ``fluid apply`` never created.
+
+    Before this, an ``iceberg`` expose on a GCP binding emitted nothing at all:
+    the dispatch only handled bigquery_table/view, gcs_bucket and pubsub_topic.
+    """
+    from ...providers._iceberg_catalog import iceberg_bucket_name
+
+    bucket = iceberg_bucket_name(binding)
+    if not bucket:
+        # Nothing derivable, so there is no bucket to create. The dbt side
+        # skips the integration for the same reason.
+        return
+    # Reuse the GCS emitter so bucket settings, labels and access-grant IAM
+    # stay identical to a plain gcs_bucket expose. It reads ``bucket`` from
+    # the location, so pass a view with the derived name resolved.
+    _emit_gcs(resources, {**loc, "bucket": bucket}, cid, labels, grants=grants, placement=placement)
+
+    # A declared ``path`` means this product owns a PREFIX of the warehouse,
+    # not the bucket. Sharing one warehouse root across products namespaced
+    # by prefix is the normal Iceberg convention, so whole-bucket
+    # force_destroy would let one product's destroy take another's data with
+    # it. Drop it; the owned-bucket case (no path) keeps the default.
+    if str(loc.get("path") or "").strip("/") and not placement.bucket_referenced:
+        body = resources.get("google_storage_bucket", {}).get(safe_ident(f"{cid}_{bucket}"))
+        if body is not None:
+            body.pop("force_destroy", None)
 
 
 def _emit_gcs(

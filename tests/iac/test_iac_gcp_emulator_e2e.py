@@ -342,3 +342,52 @@ def test_emu_tofu_apply_round_trip_xfail(gcp_emulator_project):
         ],
     }
     gcp_emulator_project.apply_ok(contract)
+
+
+def test_emu_iceberg_storage_plan_clean(gcp_emulator_project):
+    """An Iceberg expose provisions the GCS bucket dbt's catalogs.yml names.
+
+    dbt materializes BigQuery Iceberg via ``catalog_type: biglake_metastore``
+    and refuses to create the storage behind it. Proves the emitted bucket
+    plans cleanly against the real provider, and that the bucket name is the
+    one the dbt emitter writes into ``external_volume``.
+    """
+    from fluid_build.engines.dbt.catalogs_yml import generate_catalogs_yml
+    from fluid_build.providers._iceberg_catalog import iceberg_storage_uri
+
+    contract = {
+        "id": "emu.iceberg",
+        "name": "Iceberg",
+        "metadata": {"layer": "Gold", "name": "Iceberg"},
+        "exposes": [
+            {
+                "exposeId": "events",
+                "binding": {
+                    "platform": "gcp",
+                    "format": "iceberg",
+                    "location": {
+                        "project": "fluid-emulator",
+                        "dataset": "emu",
+                        "table": "EVENTS",
+                        "bucket": "fluid-emu-iceberg-events",
+                        "path": "products/events",
+                        "region": "EU",
+                    },
+                },
+                "contract": {"schema": [{"name": "id", "type": "string"}]},
+            }
+        ],
+    }
+    gcp_emulator_project.emit(contract)
+    assert gcp_emulator_project.init().ok
+    plan = gcp_emulator_project.plan()
+    assert plan.ok, plan.stderr
+    assert runner.change_summary(plan)["add"] == 1
+
+    # The cross-emitter contract, asserted against the same contract object.
+    rendered = generate_catalogs_yml(
+        contract, {"engine": "dbt", "execution": {"runtime": {"platform": "gcp"}}}
+    )
+    uri = iceberg_storage_uri(contract["exposes"][0]["binding"], scheme="gs")
+    assert uri == "gs://fluid-emu-iceberg-events/products/events"
+    assert f"external_volume: {uri}" in rendered
