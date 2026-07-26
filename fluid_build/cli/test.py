@@ -824,13 +824,16 @@ def _run_soda_engine(
 
     The function:
       1. Loads the contract (with --env overlay if set).
-      2. Renders SodaCL from quality.tests[].
+      2. Renders SodaCL from exposes[].contract.dq.rules[].
       3. Writes the SodaCL to a temp file.
       4. Resolves the `soda` binary (env var → $PATH → fail loud).
       5. Shells out to `soda scan`.
       6. Parses results and prints a summary in the requested format.
 
-    Returns 0 on all-pass, 1 on any failed check or runtime error.
+    Returns 0 only when every declared rule was mapped to a SodaCL check
+    *and* every check passed. Any rule the exporter could not express, and
+    any scan whose outcome we cannot account for, exits 1 — a quality gate
+    that did not run must never read as green.
     """
     import tempfile
 
@@ -843,7 +846,7 @@ def _run_soda_engine(
         return 1
 
     from ..build_runners.soda import SodaNotInstalled, resolve_soda_executable, run_soda_scan
-    from ..exporters.sodacl import render_sodacl
+    from ..exporters.sodacl import render_sodacl_document
     from ._common import load_contract_with_overlay
 
     try:
@@ -854,17 +857,39 @@ def _run_soda_engine(
         console_error(f"Failed to load contract: {exc}")
         return 1
 
-    sodacl_text = render_sodacl(contract)
-    if "# No quality tests" in sodacl_text:
-        warning("Contract has no quality.tests[]; nothing to check via Soda.")
+    rendering = render_sodacl_document(contract)
+
+    if rendering.declared == 0:
+        # Genuinely nothing declared. Matches what `--engine native` does with
+        # a rule-less contract; the message names the exact keys so "nothing
+        # to check" is actionable rather than mysterious.
+        warning(
+            "No data-quality rules declared on any expose "
+            "(looked in exposes[].contract.dq.rules[] and "
+            "exposes[].contract.quality[]) — nothing to check via Soda."
+        )
         return 0
+
+    if rendering.unmapped:
+        # Loud, itemised, and always fatal. Silently dropping a declared gate
+        # is the failure this engine used to ship: it rendered an empty
+        # document for every schema-valid contract and exited 0.
+        _report_unmapped(rendering.unmapped)
+
+    if not rendering.has_checks:
+        console_error(
+            f"None of the {rendering.declared} declared data-quality rule(s) "
+            "could be expressed as SodaCL — no scan was run and nothing was "
+            "checked."
+        )
+        return 1
 
     # Soda needs the YAML on disk — write to a temp file so the scan
     # invocation is self-contained.
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".sodacl.yml", delete=False, encoding="utf-8"
     ) as f:
-        f.write(sodacl_text)
+        f.write(rendering.text)
         sodacl_path = f.name
 
     try:
@@ -889,22 +914,63 @@ def _run_soda_engine(
         except OSError:
             pass
 
+    # We emitted N checks; if the runner could not account for a single one,
+    # we do not know what happened and must not print PASS. `soda scan`
+    # exiting 0 with unparseable stdout would otherwise render as
+    # "PASS | passed: 0, failed: 0" — checks that never ran, reported green.
+    accounted = (
+        result.checks_passed
+        + result.checks_failed
+        + result.checks_warned
+        + result.checks_not_evaluated
+    )
+    unaccounted = result.ok and accounted == 0
+    if unaccounted:
+        console_error(
+            f"soda scan returned {result.return_code} but reported no check "
+            f"outcomes for the {len(rendering.mapped)} check(s) we sent — "
+            "refusing to report a pass we cannot substantiate. Run `soda scan "
+            "-d <datasource> <file>` directly to see its output."
+        )
+        if result.raw_stderr:
+            from fluid_build.observability.secret_redactor import redact_secret_text
+
+            cprint(f"   soda stderr: {redact_secret_text(result.raw_stderr.strip()[:500])}")
+
     # Render in the requested format (re-use the existing --output flag).
     output_format = getattr(args, "output", "text")
     output_file = getattr(args, "output_file", None)
 
     if output_format == "json":
-        _emit_soda_json(result, datasource, output_file)
+        _emit_soda_json(result, datasource, output_file, rendering)
     elif output_format == "junit":
-        _emit_soda_junit(result, datasource, output_file)
+        _emit_soda_junit(result, datasource, output_file, rendering)
     else:
-        _emit_soda_text(result, datasource)
+        _emit_soda_text(result, datasource, rendering)
 
+    if rendering.unmapped or unaccounted:
+        return 1
     return 0 if result.ok else 1
 
 
-def _emit_soda_json(result, datasource: str, output_file: Optional[str]) -> None:
-    """Write the soda result as the canonical JSON envelope."""
+def _report_unmapped(unmapped) -> None:
+    """Print every declared-but-unrun rule, with the reason, to stderr."""
+    console_error(
+        f"{len(unmapped)} declared data-quality rule(s) have no SodaCL "
+        "equivalent and were NOT checked:"
+    )
+    for rule in unmapped:
+        console_error(f"   - {rule.describe()}")
+
+
+def _emit_soda_json(result, datasource: str, output_file: Optional[str], rendering=None) -> None:
+    """Write the soda result as the canonical JSON envelope.
+
+    ``unmapped_rules`` is part of the envelope, not a terminal-only nicety:
+    a consumer reading ``ok: true`` alone must still be able to see that
+    rules were declared and never executed.
+    """
+    unmapped = list(getattr(rendering, "unmapped", []) or [])
     data = {
         "engine": "soda",
         "datasource": datasource,
@@ -912,8 +978,22 @@ def _emit_soda_json(result, datasource: str, output_file: Optional[str]) -> None
         "checks_passed": result.checks_passed,
         "checks_failed": result.checks_failed,
         "checks_warned": result.checks_warned,
+        "checks_not_evaluated": result.checks_not_evaluated,
         "failed_check_names": result.failed_check_names,
-        "ok": result.ok,
+        "rules_declared": getattr(rendering, "declared", None),
+        "rules_mapped": list(getattr(rendering, "mapped", []) or []),
+        "unmapped_rules": [
+            {
+                "expose": u.expose,
+                "rule_id": u.rule_id,
+                "rule_type": u.rule_type,
+                "reason": u.reason,
+            }
+            for u in unmapped
+        ],
+        # A scan whose checks all passed is still not a pass overall when a
+        # declared rule never ran.
+        "ok": result.ok and not unmapped,
     }
     text = json.dumps(data, indent=2)
     if output_file:
@@ -924,22 +1004,43 @@ def _emit_soda_json(result, datasource: str, output_file: Optional[str]) -> None
         sys.stdout.write(text + "\n")
 
 
-def _emit_soda_junit(result, datasource: str, output_file: Optional[str]) -> None:
+def _emit_soda_junit(result, datasource: str, output_file: Optional[str], rendering=None) -> None:
     """Write the soda result as JUnit XML for CI/CD systems.
 
     One ``<testsuite>`` containing one ``<testcase>`` per check.
     Passed checks emit an empty case; failed checks emit a ``<failure>``
     with the check expression and any captured stderr (secret-redacted).
+
+    Declared rules with no SodaCL equivalent get their own failing test case
+    — a CI dashboard must not show all-green for a gate that never ran.
     """
     from fluid_build.observability.secret_redactor import redact_secret_text
 
-    total = result.checks_passed + result.checks_failed + result.checks_warned
+    unmapped = list(getattr(rendering, "unmapped", []) or [])
+    total = (
+        result.checks_passed
+        + result.checks_failed
+        + result.checks_warned
+        + result.checks_not_evaluated
+        + len(unmapped)
+    )
     ts = ET.Element("testsuite")
     ts.set("name", f"fluid-test-soda:{datasource}")
     ts.set("tests", str(total))
-    ts.set("failures", str(result.checks_failed))
+    ts.set("failures", str(result.checks_failed + len(unmapped)))
     ts.set("errors", "0")
-    ts.set("skipped", "0")
+    # Soda's "not evaluated" is a check that never ran; JUnit's closest
+    # honest label is "skipped", not a silent omission from the suite.
+    ts.set("skipped", str(result.checks_not_evaluated))
+
+    for rule in unmapped:
+        tc = ET.SubElement(ts, "testcase")
+        tc.set("classname", f"soda.{datasource}.unmapped")
+        tc.set("name", f"{rule.expose}.{rule.rule_id}")
+        fail = ET.SubElement(tc, "failure")
+        fail.set("type", "UnmappedQualityRule")
+        fail.set("message", f"rule not executed: {rule.reason}")
+        fail.text = rule.describe()
 
     # Emit a passed test case for the suite overall when we have no
     # per-check granularity from Soda's stdout (older Soda versions don't
@@ -979,15 +1080,22 @@ def _emit_soda_junit(result, datasource: str, output_file: Optional[str]) -> Non
         sys.stdout.write('<?xml version="1.0" ?>\n' + ET.tostring(ts, encoding="unicode") + "\n")
 
 
-def _emit_soda_text(result, datasource: str) -> None:
+def _emit_soda_text(result, datasource: str, rendering=None) -> None:
     """Human-readable terminal output for the soda engine."""
-    icon = "PASS" if result.ok else "FAIL"
+    unmapped = list(getattr(rendering, "unmapped", []) or [])
+    # An all-green scan is still not a PASS when a declared rule never ran.
+    icon = "PASS" if (result.ok and not unmapped) else "FAIL"
     cprint(f"{icon}  fluid test --engine soda  |  datasource: {datasource}")
-    cprint(
+    counts = (
         f"   passed: {result.checks_passed}, "
         f"failed: {result.checks_failed}, "
         f"warned: {result.checks_warned}"
     )
+    if result.checks_not_evaluated:
+        counts += f", not evaluated by soda: {result.checks_not_evaluated}"
+    if unmapped:
+        counts += f", not executed: {len(unmapped)}"
+    cprint(counts)
     if result.failed_check_names:
         cprint("   failed checks:")
         for name in result.failed_check_names:

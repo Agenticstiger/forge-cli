@@ -25,12 +25,23 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
 LOG = logging.getLogger("fluid.build_runners.soda")
+
+# Soda Core 3.x prefixes every stdout line with "[HH:MM:SS] ".
+_SODA_TIMESTAMP_PREFIX = re.compile(r"^\[\d{2}:\d{2}:\d{2}\]\s*")
+
+# Per-outcome header emitted by ``soda.scan.Scan.__log_checks``:
+#   "{count}/{total} check(s) {PASSED|WARNED|FAILED|NOT EVALUATED}: "
+_OUTCOME_HEADER = re.compile(
+    r"^(?P<count>\d+)/(?P<total>\d+)\s+checks?\s+"
+    r"(?P<outcome>PASSED|WARNED|FAILED|NOT EVALUATED)\s*:",
+)
 
 
 class SodaNotInstalled(RuntimeError):
@@ -54,11 +65,19 @@ class SodaResult:
     checks_passed: int = 0
     checks_failed: int = 0
     checks_warned: int = 0
+    #: Checks Soda parsed but did not evaluate (a missing metric, an
+    #: unresolvable column). Soda still exits 0 for these, so they must be
+    #: tracked separately or a check that never ran reads as green.
+    checks_not_evaluated: int = 0
     failed_check_names: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return self.checks_failed == 0 and self.return_code == 0
+        return (
+            self.checks_failed == 0
+            and self.checks_not_evaluated == 0
+            and self.return_code == 0
+        )
 
 
 def resolve_soda_executable(*, env: Optional[dict[str, str]] = None) -> str:
@@ -159,6 +178,7 @@ def run_soda_scan(
         result.checks_passed = parsed.get("checks_passed", 0)
         result.checks_failed = parsed.get("checks_failed", 0)
         result.checks_warned = parsed.get("checks_warned", 0)
+        result.checks_not_evaluated = parsed.get("checks_not_evaluated", 0)
         result.failed_check_names = list(parsed.get("failed_check_names", []))
 
     return result
@@ -179,8 +199,19 @@ def _parse_soda_output(stdout: str) -> dict[str, Any]:
         [16:42:01]         check_value: 12
         [16:42:01] Oops! 1 failures. 0 warnings. 0 errors. 4 pass.
 
-    We pull the totals from the summary line at the bottom. If Soda's
-    output evolves and we can't find the markers, we return an empty
+    The authoritative counts are the per-outcome header lines
+    (``Scan.__log_checks`` emits ``{n}/{total} checks {OUTCOME}: ``), because
+    they are present for **every** outcome. The trailing ``Oops!`` line is
+    not: on an all-pass scan Soda prints "All is good. No failures. No
+    warnings. No errors." with no numbers at all, so a parser that reads only
+    the ``Oops!`` line comes back empty from a perfectly good run and the
+    caller cannot tell a clean pass from an unreadable one.
+
+    ``NOT EVALUATED`` is captured too. Soda exits 0 when checks parse but
+    never run, so folding those into "passed" would report a green gate that
+    was never executed.
+
+    If Soda's output evolves and we can't find any marker, we return an empty
     dict and let the caller fall back to the exit-code-only signal.
 
     Also accepts a JSON-formatted line that Soda emits when
@@ -197,33 +228,43 @@ def _parse_soda_output(stdout: str) -> dict[str, Any]:
             if "checks" in data or "checks_passed" in data:
                 return _normalize_json_summary(data)
 
-    # Legacy: parse the human-readable summary line.
+    # Human-readable output.
     summary: dict[str, Any] = {}
+    outcome_counts: dict[str, int] = {}
     failed_names: list[str] = []
     in_failed_block = False
     for raw_line in stdout.splitlines():
-        line = raw_line.strip()
+        line = _SODA_TIMESTAMP_PREFIX.sub("", raw_line.strip()).strip()
 
-        # The summary tag from Soda Core 3.x.
+        header = _OUTCOME_HEADER.match(line)
+        if header:
+            outcome_counts[header.group("outcome")] = int(header.group("count"))
+            in_failed_block = header.group("outcome") == "FAILED"
+            continue
+
+        # The summary tag from Soda Core 3.x, when the run had failures:
         # "Oops! N failures. M warnings. P errors. Q pass."
-        if line.startswith("Oops!") or "failures." in line and "pass." in line:
+        if line.startswith("Oops!") or ("failures." in line and "pass." in line):
             summary.update(_parse_summary_line(line))
-        if "checks FAILED:" in line:
-            in_failed_block = True
-            continue
-        if "checks PASSED:" in line:
-            in_failed_block = False
-            continue
         if in_failed_block and "[FAILED]" in line:
-            # Strip the timestamp prefix if present.
-            name = line.split("[FAILED]")[0].strip()
-            # Soda lines start with the check expression; keep it intact.
-            failed_names.append(name)
+            # Soda prefixes every stdout line with a "[HH:MM:SS]" stamp (already
+            # stripped above). The name ends up in the JSON envelope and in
+            # JUnit <testcase name=>, where a wall-clock time makes the check
+            # identity unstable across runs — keep just the check expression.
+            failed_names.append(line.split("[FAILED]")[0].strip())
+
+    if outcome_counts:
+        # Header lines win: they are per-outcome and always emitted.
+        summary["checks_passed"] = outcome_counts.get("PASSED", 0)
+        summary["checks_failed"] = outcome_counts.get("FAILED", 0)
+        summary["checks_warned"] = outcome_counts.get("WARNED", 0)
+        summary["checks_not_evaluated"] = outcome_counts.get("NOT EVALUATED", 0)
 
     if summary:
         summary.setdefault("checks_passed", 0)
         summary.setdefault("checks_failed", 0)
         summary.setdefault("checks_warned", 0)
+        summary.setdefault("checks_not_evaluated", 0)
         summary["failed_check_names"] = failed_names
         return summary
     return {}
