@@ -459,14 +459,14 @@ class TestRedactionExactValueLayer:
         )
 
         monkeypatch.setenv("SNOWFLAKE_PASSWORD", "Pa55head;w0rdTAILMUSTNOTLEAK")
-        monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "ZSCXYPE-CU29385")
+        monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "EXAMPLEORG-ACCT1")
         assert register_secrets_from_environ() >= 1
         out = redact_secret_text("connect failed password=Pa55head;w0rdTAILMUSTNOTLEAK retrying")
         assert "TAILMUSTNOTLEAK" not in out
         assert out.endswith(" retrying")
         # A non-credential env var is NOT registered — the account id must
         # still be readable in logs.
-        assert "ZSCXYPE-CU29385" in redact_secret_text("account=ZSCXYPE-CU29385 ok")
+        assert "EXAMPLEORG-ACCT1" in redact_secret_text("account=EXAMPLEORG-ACCT1 ok")
 
     @pytest.mark.parametrize(
         ("name", "value"),

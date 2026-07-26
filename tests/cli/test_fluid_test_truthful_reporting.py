@@ -539,8 +539,8 @@ class TestDoctorSnowflakeRow:
             sf_config,
             "resolve_snowflake_settings",
             lambda **_kw: {
-                "account": "ZSCXYPE-CU29385",
-                "user": "jeffwatson",
+                "account": "EXAMPLEORG-ACCT1",
+                "user": "example_user",
                 "password": "x",
                 "role": "ACCOUNTADMIN",
                 "warehouse": "COMPUTE_WH",
@@ -548,4 +548,4 @@ class TestDoctorSnowflakeRow:
         )
         row = doctor_mod._check_snowflake_readiness()
         assert row["status"].startswith("\u2705")
-        assert "ZSCXYPE-CU29385" in row["details"]
+        assert "EXAMPLEORG-ACCT1" in row["details"]
