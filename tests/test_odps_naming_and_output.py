@@ -100,9 +100,7 @@ def test_v41_export_is_the_bare_lf_odpi_document(tmp_path: Path, contract: dict)
         assert key not in doc
 
 
-def test_v41_export_satisfies_the_vendored_lf_odpi_schema(
-    tmp_path: Path, contract: dict
-) -> None:
+def test_v41_export_satisfies_the_vendored_lf_odpi_schema(tmp_path: Path, contract: dict) -> None:
     """The wrapper failed the published schema on all four root constraints."""
     jsonschema = pytest.importorskip("jsonschema")
     import fluid_build

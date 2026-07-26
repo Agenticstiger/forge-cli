@@ -59,9 +59,7 @@ def register_exporter(
     deprecated_formats: Tuple[str, ...] = (),
 ) -> None:
     """Register (or override) a spec exporter. Extensible for out-of-tree exporters."""
-    EXPORTERS[name] = ExporterInfo(
-        name, spec, url, tuple(formats), cls, tuple(deprecated_formats)
-    )
+    EXPORTERS[name] = ExporterInfo(name, spec, url, tuple(formats), cls, tuple(deprecated_formats))
 
 
 # (name, module, class, spec, url, formats, deprecated_formats) — classes

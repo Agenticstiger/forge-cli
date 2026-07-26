@@ -140,9 +140,7 @@ class OpenMetadataRegistrar(CatalogRegistrar):
         metadata: Dict[str, Any] = {}
         if degraded:
             metadata = {"odcs_contract_degraded": {expose_id: degraded}, "partial": True}
-        return RegistrationResult(
-            target="openmetadata", urn=urn, succeeded=True, metadata=metadata
-        )
+        return RegistrationResult(target="openmetadata", urn=urn, succeeded=True, metadata=metadata)
 
     def unregister(self, product_id: str, expose_id: str) -> RegistrationResult:
         from fluid_build.util.safe_http import safe_httpx_client

@@ -27,9 +27,9 @@ def test_builtin_exporters_listed_with_loadable_classes():
         assert e.spec, f"{name} must carry a spec name"
         assert e.cls is not None, f"{name} exporter class failed to import"
         assert e.formats, f"{name} must declare at least one --format value"
-        assert e.formats[0] == name or name in e.formats, (
-            f"{name}: the canonical format must be advertised first, got {e.formats}"
-        )
+        assert (
+            e.formats[0] == name or name in e.formats
+        ), f"{name}: the canonical format must be advertised first, got {e.formats}"
 
 
 def test_every_advertised_format_is_a_real_generate_standard_choice():

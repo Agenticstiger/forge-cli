@@ -31,11 +31,19 @@ import pytest
 import yaml
 
 from fluid_build.providers.odcs import OdcsProvider
+from fluid_build.providers.odcs.mappers.normalize import (
+    _MIN_EXTENSIONS_VERSION as MIN_EXTENSIONS_VERSION,
+)
+from fluid_build.providers.odcs.mappers.normalize import _supports_extensions
 from fluid_build.schema_manager import FluidSchemaManager
 
 pytestmark = pytest.mark.unit
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _version_key(version: str) -> Tuple[int, ...]:
+    return tuple(int(part) for part in str(version).split("."))
 
 
 SNOWFLAKE_CONTRACT: Dict[str, Any] = {
@@ -275,7 +283,12 @@ def test_exported_document_passes_the_vendored_odcs_schema(
 
 @pytest.mark.parametrize(
     ("state", "expected"),
-    [("preview", "draft"), ("active", "active"), ("deprecated", "deprecated"), ("retired", "retired")],
+    [
+        ("preview", "draft"),
+        ("active", "active"),
+        ("deprecated", "deprecated"),
+        ("retired", "retired"),
+    ],
 )
 def test_lifecycle_state_drives_odcs_status(
     provider: OdcsProvider, state: str, expected: str
@@ -300,7 +313,7 @@ def test_no_leaf_is_lost_or_mutated(reimported: Dict[str, Any]) -> None:
     lost = sorted(set(source) - set(result))
     mutated = sorted(k for k in set(source) & set(result) if source[k] != result[k])
     assert not lost, f"leaves lost in the round-trip: {lost}"
-    assert not mutated, f"leaves mutated in the round-trip: " + "; ".join(
+    assert not mutated, "leaves mutated in the round-trip: " + "; ".join(
         f"{k}: {source[k]!r} -> {result[k]!r}" for k in mutated
     )
 
@@ -311,16 +324,20 @@ def test_round_trip_is_idempotent(provider: OdcsProvider, reimported: Dict[str, 
     assert again == reimported
 
 
-@pytest.mark.parametrize(
-    "rel_path",
-    [
-        "examples/customer360/contract.fluid.yaml",
-        "examples/snowflake/billing_history/contract.fluid.yaml",
-        "examples/snowflake/smoke/contract.fluid.yaml",
-        "examples/01-hello-world/contract.fluid.yaml",
-    ],
-)
+_SHIPPED_EXAMPLES = [
+    "examples/customer360/contract.fluid.yaml",
+    "examples/snowflake/billing_history/contract.fluid.yaml",
+    "examples/snowflake/smoke/contract.fluid.yaml",
+    "examples/01-hello-world/contract.fluid.yaml",
+    "examples/mcp-output-port/contract.fluid.yaml",
+    "examples/aws-medallion-lake/contract.fluid.yaml",
+]
+
+
+@pytest.mark.parametrize("rel_path", _SHIPPED_EXAMPLES)
 def test_shipped_examples_round_trip_without_loss(provider: OdcsProvider, rel_path: str) -> None:
+    """No leaf may be lost, and none may be mutated except the one the schema
+    forces — see ``test_only_fluid_version_may_move_and_only_upward``."""
     path = REPO_ROOT / rel_path
     if not path.exists():
         pytest.skip(f"example contract not present: {rel_path}")
@@ -331,9 +348,87 @@ def test_shipped_examples_round_trip_without_loss(provider: OdcsProvider, rel_pa
     source = dict(_leaves(contract))
     landed = dict(_leaves(result))
     lost = sorted(k for k in source if k not in landed)
-    mutated = sorted(k for k in source if k in landed and source[k] != landed[k])
+    mutated = sorted(
+        k for k in source if k in landed and source[k] != landed[k] and k != "fluidVersion"
+    )
     assert not lost, f"{rel_path}: leaves lost: {lost}"
     assert not mutated, f"{rel_path}: leaves mutated: {mutated}"
+
+
+@pytest.mark.parametrize("rel_path", _SHIPPED_EXAMPLES)
+def test_only_fluid_version_may_move_and_only_upward(provider: OdcsProvider, rel_path: str) -> None:
+    """``fluidVersion`` is the single leaf the round-trip is allowed to change,
+    and only to make the output *valid*.
+
+    Root ``extensions`` — the one open bucket in the FLUID schema and so the
+    only legal home for ODCS round-trip state — was added in 0.7.3. Writing it
+    into a contract that declares 0.7.1/0.7.2 produced "root: Additional
+    properties are not allowed ('extensions' was unexpected)": an importer
+    reporting success while emitting a contract its own validator rejects.
+
+    Dropping the bucket instead is not available: it is what makes the ODCS leg
+    a fixed point (``test_fluid_emitted_odcs_roundtrips_zero_diff``), so a
+    0.7.1 source loses ``metadata.tenant``, the team members and a whole server
+    entry. The document therefore has to declare a version that can hold what it
+    carries. This test pins every part of that bargain so it cannot quietly widen
+    into "the importer rewrites versions".
+    """
+    path = REPO_ROOT / rel_path
+    if not path.exists():
+        pytest.skip(f"example contract not present: {rel_path}")
+    with open(path) as handle:
+        contract = yaml.safe_load(handle)
+
+    result = provider.import_contract(provider.render(contract))
+    source_version = contract["fluidVersion"]
+    landed_version = result["fluidVersion"]
+
+    # 1. The output is valid FLUID — the whole point of moving the version.
+    errors = _validate_fluid(result)
+    assert not errors, f"{rel_path}: not valid FLUID:\n" + "\n".join(
+        f"  {list(e.path)}: {e.message}" for e in errors
+    )
+
+    if landed_version == source_version:
+        # Untouched versions must be ones that could hold the bucket anyway.
+        assert _supports_extensions(source_version)
+        return
+
+    # 2. It only ever moves for a version that genuinely cannot hold the bucket,
+    #    only to the LOWEST version that can, and only upward.
+    assert not _supports_extensions(source_version), (
+        f"{rel_path}: {source_version} can hold `extensions`; nothing justified "
+        f"rewriting it to {landed_version}"
+    )
+    assert landed_version == MIN_EXTENSIONS_VERSION
+    assert _version_key(landed_version) > _version_key(source_version)
+
+    # 3. It only happens when the bucket is actually present and non-empty.
+    assert result.get("extensions", {}).get("odcs"), (
+        f"{rel_path}: version moved to {landed_version} without writing the "
+        f"round-trip state that was the only reason to move it"
+    )
+
+    # 4. The authored version is recorded, and re-export republishes it — so the
+    #    ODCS document keeps naming the version the human wrote.
+    assert result["extensions"]["odcs"]["authored_version"] == source_version
+    republished = provider.render(result)
+    blob = next(
+        p["value"] for p in republished["customProperties"] if p["property"] == "fluidExtras"
+    )
+    assert blob["root"]["fluidVersion"] == source_version
+
+
+def test_min_extensions_version_is_really_the_lowest_that_supports_it() -> None:
+    """``MIN_EXTENSIONS_VERSION`` is a claim about the bundled schemas, so check
+    it against them rather than trusting the constant."""
+    supporting = [v for v in FluidSchemaManager.BUNDLED_VERSIONS if _supports_extensions(v)]
+    assert supporting, "no bundled schema declares root `extensions`"
+    assert min(supporting, key=_version_key) == MIN_EXTENSIONS_VERSION
+    # And the versions below it genuinely cannot carry it.
+    for version in FluidSchemaManager.BUNDLED_VERSIONS:
+        if _version_key(version) < _version_key(MIN_EXTENSIONS_VERSION):
+            assert not _supports_extensions(version), version
 
 
 def test_opting_out_of_the_extras_blob_is_the_documented_trade(
@@ -343,9 +438,7 @@ def test_opting_out_of_the_extras_blob_is_the_documented_trade(
     trade (a lossy FLUID leg), so assert the flag actually does something."""
     monkeypatch.setenv("ODCS_FLUID_EXTRAS", "false")
     lean = provider.render(SNOWFLAKE_CONTRACT)
-    assert not [
-        p for p in lean.get("customProperties", []) if p.get("property") == "fluidExtras"
-    ]
+    assert not [p for p in lean.get("customProperties", []) if p.get("property") == "fluidExtras"]
     # ...and the ODCS-native fields are all still there.
     assert lean["name"] == "Customer 360 (Snowflake)"
     assert lean["domain"] == "retail"

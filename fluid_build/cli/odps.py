@@ -487,9 +487,7 @@ def cmd_opds_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
         use_full_schema=getattr(args, "full_schema", True),
     )
     if not result.get("valid"):
-        console_error(
-            f"✗ ODPS v4.1 validation failed ({result.get('validation_type', 'unknown')})"
-        )
+        console_error(f"✗ ODPS v4.1 validation failed ({result.get('validation_type', 'unknown')})")
         for err in result.get("errors", []) or []:
             console_error(f"  - {err}")
         return 1

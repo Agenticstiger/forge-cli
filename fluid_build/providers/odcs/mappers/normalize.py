@@ -37,7 +37,9 @@ Both functions are pure: they copy their input and never mutate it.
 from __future__ import annotations
 
 import copy
+import logging
 from collections.abc import Mapping
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from .base import PASSTHROUGH_KEY
@@ -48,6 +50,8 @@ from .types import (
     physical_type_to_platform,
     server_type_to_platform,
 )
+
+LOG = logging.getLogger(__name__)
 
 # The single open bucket in the FLUID schema, and our namespace inside it.
 EXTENSIONS_KEY = "extensions"
@@ -198,10 +202,73 @@ def to_document(fluid: Mapping[str, Any], odcs: Mapping[str, Any]) -> Dict[str, 
         doc.setdefault(key, value)
 
     if bucket:
+        # Root ``extensions`` did not exist before FLUID 0.7.3, and every schema
+        # version sets ``additionalProperties: false`` at the root, so writing
+        # the bucket into a 0.7.1/0.7.2 document produced "root: Additional
+        # properties are not allowed ('extensions' was unexpected)" — an
+        # importer reporting success while emitting a contract its own validator
+        # rejects. It was the sole remaining error on four shipped examples.
+        #
+        # The document therefore has to declare a version that can hold what it
+        # needs to carry. Omitting the bucket instead is NOT an option: it is
+        # what makes the ODCS leg a fixed point (tenant, owner extras and the
+        # verbatim servers/slaProperties lists all live here), and dropping it
+        # breaks ``test_fluid_emitted_odcs_roundtrips_zero_diff`` on the 0.7.1
+        # fixture with four fields lost. Raising the declared version costs one
+        # machine-written label; omitting the bucket costs user content.
+        #
+        # Only documents that *declare* a pre-0.7.3 version reach this branch —
+        # a third-party ODCS document carries no fluidVersion and defaults to
+        # the latest schema — so it is confined to the FLUID → ODCS → FLUID leg.
+        source_version = str(doc["fluidVersion"])
+        if not _supports_extensions(source_version):
+            LOG.warning(
+                "ODCS import: emitting fluidVersion %s instead of %s. This contract "
+                "carries ODCS round-trip state (%s) which lives in root "
+                "`extensions`, added in FLUID %s; %s has additionalProperties:false "
+                "at the root and cannot hold it. The alternative would be to drop "
+                "that state and lose ODCS-native fields such as servers, "
+                "slaProperties and metadata.tenant.",
+                _MIN_EXTENSIONS_VERSION,
+                source_version,
+                ", ".join(sorted(bucket)),
+                _MIN_EXTENSIONS_VERSION,
+                source_version,
+            )
+            # Not a stale copy of ``fluidVersion``: a distinct fact — the schema
+            # version the contract was authored against, which the emitted
+            # document had to exceed. ``rehydrate`` replays it so the published
+            # ODCS keeps naming the source's own version and the ODCS leg stays
+            # an exact fixed point.
+            bucket["authored_version"] = source_version
+            doc["fluidVersion"] = _MIN_EXTENSIONS_VERSION
         extensions = dict(doc.get(EXTENSIONS_KEY) or {})
         extensions[EXTENSION_NAMESPACE] = bucket
         doc[EXTENSIONS_KEY] = extensions
     return doc
+
+
+# Lowest FLUID schema version with a root ``extensions`` object — the promotion
+# target, chosen as the *lowest* that works so the document stays as close to
+# the author's declared version as the content allows. Asserted against the
+# bundled schemas in tests/providers/odcs/test_fluid_roundtrip_fidelity.py
+# rather than trusted as a bare constant.
+_MIN_EXTENSIONS_VERSION = "0.7.3"
+
+
+@lru_cache(maxsize=None)
+def _supports_extensions(version: str) -> bool:
+    """Does this bundled FLUID schema declare a root ``extensions`` property?"""
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    schema = FluidSchemaManager().get_schema(version, offline_only=True)
+    if not isinstance(schema, Mapping):
+        # Unknown version: assume it can carry the bucket. Rewriting the version
+        # of a schema we cannot reason about would be a guess, and dropping the
+        # bucket would be silent loss.
+        return True
+    properties = schema.get("properties")
+    return isinstance(properties, Mapping) and EXTENSIONS_KEY in properties
 
 
 def _normalize_owner(owner: Any, bucket: Dict[str, Any]) -> Dict[str, Any]:
@@ -339,13 +406,25 @@ def _match_server(servers: Optional[Any], expose_id: str) -> Optional[Mapping[st
     return candidates[0] if len(candidates) == 1 else candidates[0]
 
 
+# ODCS property keys the schema mapper writes inline for the export side to
+# read back, but which the *closed* FLUID ``column`` object has no slot for
+# ($defs/column, additionalProperties: false — it declares businessDefinition,
+# businessName, description, labels, name, required, semanticType, sensitivity,
+# tags, type, validationRules and nothing else). Left inline they made the
+# importer emit a contract that failed FLUID's own validator: ODCS's
+# ``classification`` on the official full-example.odcs.yaml produced seven
+# "Additional properties are not allowed ('classification' was unexpected)"
+# errors. They ride in the pass-through instead and ``rehydrate`` puts them
+# back, so the export side is unchanged and the round-trip stays lossless.
+_FIELD_ONLY_IN_PASSTHROUGH = ("quality", "classification")
+
+
 def _normalize_field(fld: Mapping[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
     work = dict(fld)
     field_pt = dict(work.pop(PASSTHROUGH_KEY, {}) or {})
-    # ``quality`` is an ODCS concept the importer preserves verbatim; the FLUID
-    # column object has no such key, so it belongs in the pass-through too.
-    if "quality" in work:
-        field_pt["quality"] = work.pop("quality")
+    for key in _FIELD_ONLY_IN_PASSTHROUGH:
+        if key in work:
+            field_pt[key] = work.pop(key)
     return work, field_pt
 
 
@@ -363,6 +442,15 @@ def rehydrate(fluid: Mapping[str, Any]) -> Mapping[str, Any]:
 
     work = copy.deepcopy(dict(fluid))
     metadata = dict(work.get("metadata") or {})
+
+    # Replay the authored schema version so the published ODCS names the version
+    # the contract was written against rather than the one ``to_document`` had
+    # to emit to fit the round-trip bucket. Guarded exactly like ``status``
+    # below: only while the document still carries the promoted version — the
+    # moment someone edits ``fluidVersion`` themselves, their edit wins.
+    authored = bucket.get("authored_version")
+    if authored and work.get("fluidVersion") == _MIN_EXTENSIONS_VERSION:
+        work["fluidVersion"] = authored
 
     if isinstance(bucket.get("metadata"), Mapping):
         metadata[PASSTHROUGH_KEY] = dict(bucket["metadata"])
@@ -416,7 +504,9 @@ def rehydrate(fluid: Mapping[str, Any]) -> Mapping[str, Any]:
     return work
 
 
-def _rehydrate_expose(expose: Mapping[str, Any], exposes_bucket: Mapping[str, Any]) -> Dict[str, Any]:
+def _rehydrate_expose(
+    expose: Mapping[str, Any], exposes_bucket: Mapping[str, Any]
+) -> Dict[str, Any]:
     work = dict(expose)
     expose_id = work.get("exposeId") or work.get("id")
     entry = exposes_bucket.get(expose_id) if expose_id else None
@@ -451,8 +541,9 @@ def _rehydrate_expose(expose: Mapping[str, Any], exposes_bucket: Mapping[str, An
         fld_pt = field_buckets.get(clean.get("name"))
         if isinstance(fld_pt, Mapping):
             fld_pt = dict(fld_pt)
-            if "quality" in fld_pt:
-                clean["quality"] = fld_pt.pop("quality")
+            for key in _FIELD_ONLY_IN_PASSTHROUGH:
+                if key in fld_pt:
+                    clean[key] = fld_pt.pop(key)
             if fld_pt:
                 clean[PASSTHROUGH_KEY] = fld_pt
         fields.append(clean)

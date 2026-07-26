@@ -83,6 +83,16 @@ _EXPOSE_MAPPED = frozenset({PASSTHROUGH_KEY, "contract", "exposeId", "id"})
 # ODCS pair (logicalType, physicalType) is a *normalising* projection —
 # ``numeric(12,2)`` and ``decimal(12,2)`` both render ``DECIMAL(12,2)`` — so the
 # declared FLUID spelling is only recoverable if we keep it.
+#
+# Every entry here is an assertion that the round-trip reproduces that key
+# without help, and a stale entry is a silent data-loss bug: ``businessName``
+# sat here while the schema mapper only ever read ``business_name`` out of the
+# pass-through (a key that exists solely on an already-imported contract), so a
+# hand-written FLUID column's businessName reached neither the ODCS document
+# nor this blob and simply vanished. The claim is now true in both directions —
+# see schema.py ``_property_to_field`` / ``_field_to_property`` — and
+# tests/providers/odcs/test_fluid_roundtrip_fidelity.py asserts it per key
+# rather than trusting the list.
 _FIELD_MAPPED = frozenset(
     {PASSTHROUGH_KEY, "businessName", "description", "name", "quality", "required", "tags"}
 )
@@ -196,9 +206,7 @@ def _collect(fluid: Mapping[str, Any], baseline: Mapping[str, Any]) -> Dict[str,
             entry["contract"] = leftover
 
         base_fields = {
-            f.get("name"): f
-            for f in (base_contract.get("schema") or [])
-            if isinstance(f, Mapping)
+            f.get("name"): f for f in (base_contract.get("schema") or []) if isinstance(f, Mapping)
         }
         fields: Dict[str, Any] = {}
         for fld in contract.get("schema") or []:

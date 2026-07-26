@@ -51,7 +51,9 @@ def _export_odcs(tmp_path: Path) -> dict:
     from fluid_build.cli import generate_standard
 
     out = tmp_path / "product.odcs.yaml"
-    assert generate_standard._export_odcs(str(CONTRACT), None, str(out), logging.getLogger("t")) == 0
+    assert (
+        generate_standard._export_odcs(str(CONTRACT), None, str(out), logging.getLogger("t")) == 0
+    )
     with open(out) as handle:
         return yaml.safe_load(handle)
 
@@ -65,9 +67,7 @@ def test_servers_carry_the_resolved_account(snowflake_env: None, tmp_path: Path)
     assert "{{" not in yaml.safe_dump(server)
 
 
-def test_a_fully_qualified_object_can_be_reconstructed(
-    snowflake_env: None, tmp_path: Path
-) -> None:
+def test_a_fully_qualified_object_can_be_reconstructed(snowflake_env: None, tmp_path: Path) -> None:
     """The whole point: a consumer must be able to build an addressable name."""
     doc = _export_odcs(tmp_path)
     server = doc["servers"][0]
@@ -88,7 +88,12 @@ def test_secret_shaped_placeholders_are_never_resolved(
 
     monkeypatch.setenv("SNOWFLAKE_PASSWORD", "hunter2")
     resolved = resolve_for_export(
-        {"metadata": {"secret": "{{ env.SNOWFLAKE_PASSWORD }}", "db": "{{ env.SNOWFLAKE_DATABASE }}"}}
+        {
+            "metadata": {
+                "secret": "{{ env.SNOWFLAKE_PASSWORD }}",
+                "db": "{{ env.SNOWFLAKE_DATABASE }}",
+            }
+        }
     )
     assert resolved["metadata"]["secret"] == "{{ env.SNOWFLAKE_PASSWORD }}"
     assert resolved["metadata"]["db"] == "FLUID_TEST"

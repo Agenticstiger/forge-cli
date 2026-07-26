@@ -40,9 +40,7 @@ def register(subparsers: argparse._SubParsersAction):
     # disk must not be. Default to the canonical filename `fluid generate
     # standard --format odps-v4.1` writes, so a repo does not end up with both
     # product.odps-v4.1.json and a byte-identical product.opds.json.
-    p.add_argument(
-        "--out", default="runtime/exports/product.odps-v4.1.json", help="Output path"
-    )
+    p.add_argument("--out", default="runtime/exports/product.odps-v4.1.json", help="Output path")
     p.set_defaults(cmd=COMMAND, func=run)
 
 
@@ -68,9 +66,8 @@ def run(args, logger: logging.Logger) -> int:
             "odps` emits Bitol ODPS v1.0.0.)"
         )
 
-        from fluid_build.providers.opds.opds import OdpsProvider
-
         from fluid_build.cli._export_env import resolve_for_export
+        from fluid_build.providers.opds.opds import OdpsProvider
 
         c = resolve_for_export(
             load_contract_with_overlay(args.contract, getattr(args, "env", None), logger)

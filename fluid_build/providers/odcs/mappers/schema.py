@@ -125,6 +125,13 @@ def _property_to_field(prop: Mapping[str, Any]) -> Dict[str, Any]:
         fld["description"] = prop["description"]
     if prop.get("classification"):
         fld["classification"] = prop["classification"]
+    # ``businessName`` is first-class on BOTH sides — ODCS v3.1.0
+    # SchemaProperty.businessName and FLUID $defs/column.businessName — so map
+    # it directly instead of burying it in the pass-through. Without this the
+    # FLUID column never carried one, which is what made the export side's
+    # "reproduced by the schema mapper" claim false for hand-written contracts.
+    if prop.get("businessName"):
+        fld["businessName"] = prop["businessName"]
 
     # required (v3.1.0); fall back to legacy isNullable. Track whether the
     # source ODCS carried ``required`` *explicitly* so the export side can
@@ -164,7 +171,11 @@ def _property_to_field(prop: Mapping[str, Any]) -> Dict[str, Any]:
     for src, dst in (
         ("physicalType", "physical_type"),
         ("physicalName", "physical_name"),
-        ("businessName", "business_name"),
+        # ``businessName`` is deliberately absent — it is mapped to the
+        # first-class FLUID column field above. Storing it here as well would
+        # let the two copies drift, and the pass-through (which export reads
+        # first) would win, silently republishing a stale business name after
+        # someone edited the contract.
         ("unique", "unique"),
         ("partitioned", "partitioned"),
         ("partitionKeyPosition", "partition_key_position"),
@@ -338,6 +349,12 @@ def _field_to_property(fld: Mapping[str, Any], provider: Optional[str]) -> Dict[
 
     if fld.get("classification"):
         prop["classification"] = fld["classification"]
+    # First-class on both sides. Written before the pass-through loop below so
+    # a legacy ``business_name`` bucket (contracts exported by a build that
+    # stored it there) still wins, but a hand-written FLUID column no longer
+    # loses its businessName on the way out.
+    if fld.get("businessName"):
+        prop["businessName"] = fld["businessName"]
     if fld.get("tags"):
         prop["tags"] = list(fld["tags"])
 
