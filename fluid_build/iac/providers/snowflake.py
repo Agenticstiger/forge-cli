@@ -827,7 +827,18 @@ def _build_horizon_table_comment(contract: Mapping[str, Any], *, pool: Optional[
     if meta_lines:
         sections.append("FLUID classification:\n" + "\n".join(meta_lines))
     try:
-        fluid_yaml = yaml.safe_dump(dict(contract), sort_keys=False)
+        # ``sort_keys=True`` is load-bearing, not cosmetic. This YAML is
+        # written into the table COMMENT, and `tofu` diffs the COMMENT
+        # attribute on every apply. The contract dict's insertion order
+        # differs by apply input — a ``.fluid.yaml`` preserves author order,
+        # a ``plan.json`` round-trips through the plan writer's sorted JSON —
+        # so with insertion order the SAME contract produced two different
+        # comment strings and alternating `apply c.yaml` / `apply plan.json`
+        # re-issued ``ALTER TABLE … SET COMMENT`` forever, never converging.
+        # Canonical key order makes the embedded contract byte-identical for
+        # both documented inputs, so a re-apply of an unchanged product is a
+        # true no-op and drift detection stays quiet.
+        fluid_yaml = yaml.safe_dump(dict(contract), sort_keys=True)
         # Snowflake's table comment is unbounded but Snowsight renders
         # long comments awkwardly; cap at ~50 KB which fits a fairly
         # large contract verbatim.
