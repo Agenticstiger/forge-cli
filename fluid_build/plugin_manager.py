@@ -78,6 +78,26 @@ EXTRA_GROUPS: Dict[str, str] = {
 }
 
 
+#: Groups that have **no dispatch site** in this build of the CLI: the role is
+#: declared and governed, but nothing ever walks the group to run a plugin.
+#:
+#: ``fluid plugins`` is an operator inspection/security surface, so it must not
+#: render an inert plugin the same way it renders an active one. Listing
+#: ``custom_scaffold`` as plain "allowed" told operators a plugin was live when
+#: no code path — across validate / plan / apply / publish / forge / providers —
+#: ever imported it. Removing the role instead would drop the allow/block
+#: governance and the audit visibility, so it stays listed and says what it is.
+#:
+#: Wire a dispatch site (the way ``iac_provider`` is wired in
+#: ``iac/registry.py``) and delete the entry in the same change.
+UNDISPATCHED_GROUPS: frozenset = frozenset({"custom_scaffold"})
+
+
+def is_dispatched(group_key: str) -> bool:
+    """Whether this build actually invokes plugins registered under ``group_key``."""
+    return group_key not in UNDISPATCHED_GROUPS
+
+
 def governed_groups() -> Dict[str, str]:
     """Return every entry-point group the operator allow/block policy governs.
 
@@ -119,6 +139,31 @@ def _entry_points(group: str) -> List[Any]:
         return list(md.entry_points().get(group, []))
 
 
+def entry_point_distribution(ep: Any) -> Optional[str]:
+    """``"<dist-name> <version>"`` for the distribution that ships ``ep``.
+
+    Plugin ``PluginMetadata`` is *self-declared* and unverifiable: a plugin can
+    claim any version / author / licence it likes. The distribution that
+    registered the entry point is the authoritative fact, and it is the only
+    one an operator can act on — it is what ``pip uninstall`` takes. Surfacing
+    it next to the declared metadata is the difference between an inspection
+    command and a repeat of whatever the plugin says about itself.
+
+    ``None`` when the running interpreter cannot attribute the entry point
+    (``EntryPoint.dist`` is 3.10+; older resolvers return nothing).
+    """
+    dist = getattr(ep, "dist", None)
+    if dist is None:
+        return None
+    name = getattr(dist, "name", None) or getattr(
+        getattr(dist, "metadata", None), "get", lambda _k: None
+    )("Name")
+    if not name:
+        return None
+    version = getattr(dist, "version", None)
+    return f"{name} {version}" if version else str(name)
+
+
 def iter_plugins(group: str, logger: Optional[logging.Logger] = None) -> Iterator[Tuple[str, Any]]:
     """Yield ``(name, loaded_object)`` for each allowed, loadable plugin in ``group``.
 
@@ -152,13 +197,18 @@ def list_plugins(role: Optional[str] = None) -> Dict[str, List[str]]:
 
 
 def installed_plugins(role: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
-    """Return ``{group_key: [{name, group, allowed}]}`` for ALL installed plugins.
+    """Return ``{group_key: [{name, group, allowed, dispatched, distribution}]}``.
 
     Unlike :func:`list_plugins` (which filters to the allowed set), this surfaces
     EVERY installed plugin in EVERY governed group — the fluid_sdk roles AND the
     CLI-internal groups (commands / apply_hooks / extension_*) — with its
     allow/block status, for the operator inspection command (``fluid plugins``).
     Reads entry-point *names* only — it never imports plugin code.
+
+    ``dispatched`` is False for a role this build never walks
+    (:data:`UNDISPATCHED_GROUPS`); ``distribution`` names the pip package that
+    actually ships the entry point, which is the only attribution an operator
+    can audit or uninstall.
     """
     groups = governed_groups()
     keys = [role] if role else list(groups)
@@ -168,7 +218,13 @@ def installed_plugins(role: Optional[str] = None) -> Dict[str, List[Dict[str, An
         if not group:
             continue
         out[k] = [
-            {"name": ep.name, "group": group, "allowed": is_allowed(ep.name)}
+            {
+                "name": ep.name,
+                "group": group,
+                "allowed": is_allowed(ep.name),
+                "dispatched": is_dispatched(k),
+                "distribution": entry_point_distribution(ep),
+            }
             for ep in sorted(_entry_points(group), key=lambda e: e.name)
         ]
     return out
@@ -206,6 +262,27 @@ def _plugin_metadata(obj: Any, logger: logging.Logger) -> Optional[Dict[str, Any
     return fields or None
 
 
+def _requires_cli_satisfied(metadata: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """Whether the running CLI satisfies a plugin's declared ``requires_cli``.
+
+    ``None`` when nothing is declared or the specifier is uncheckable — the
+    same fail-open posture as ``providers._check_sdk_compat``, whose
+    ``_spec_satisfied`` this reuses so the inspection surface and the
+    registration gate can never disagree about the same plugin.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    requires = metadata.get("requires_cli")
+    if not requires:
+        return None
+    try:
+        from fluid_build.providers import _CLI_VERSION, _spec_satisfied
+
+        return _spec_satisfied(_CLI_VERSION, str(requires))
+    except Exception:  # noqa: BLE001 - inspection must never crash
+        return None
+
+
 def detailed_plugins(
     role: Optional[str] = None, logger: Optional[logging.Logger] = None
 ) -> Dict[str, List[Dict[str, Any]]]:
@@ -232,7 +309,10 @@ def detailed_plugins(
                 "name": ep.name,
                 "group": group,
                 "allowed": allowed,
+                "dispatched": is_dispatched(k),
+                "distribution": entry_point_distribution(ep),
                 "metadata": None,
+                "compatible": None,
             }
             if allowed:  # only ALLOWED plugins are ever loaded
                 try:
@@ -242,6 +322,7 @@ def detailed_plugins(
                     obj = None
                 if obj is not None:
                     entry["metadata"] = _plugin_metadata(obj, log)
+                    entry["compatible"] = _requires_cli_satisfied(entry["metadata"])
             entries.append(entry)
         out[k] = entries
     return out

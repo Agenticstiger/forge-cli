@@ -91,19 +91,48 @@ def run(args, logger: logging.Logger) -> int:
         entries = data[r]
         if not entries:
             continue
-        cprint(f"  {r}  ({len(entries)})")
+        # An operator reading this needs to know when a role has no dispatch
+        # site at all — "allowed" on an inert plugin reads as "active".
+        suffix = "" if all(e.get("dispatched", True) for e in entries) else "  — NOT DISPATCHED"
+        cprint(f"  {r}  ({len(entries)}){suffix}")
         for e in entries:
             status = "allowed" if e["allowed"] else "BLOCKED (allow/block policy)"
+            # `compatible is False` means the CLI will refuse to register it
+            # under FLUID_PLUGIN_STRICT_COMPAT — "allowed" alone contradicts
+            # what actually happens.
+            if e.get("compatible") is False:
+                status += "  INCOMPATIBLE (requires_cli)"
             cprint(f"    • {e['name']:<28} {status}")
+            # The self-declared metadata is whatever the plugin says about
+            # itself; the distribution is the authoritative, pip-actionable fact.
+            detail_bits = []
+            if e.get("distribution"):
+                detail_bits.append(f"from={e['distribution']}")
             meta = e.get("metadata")
             if meta:
-                bits = [
-                    f"{k}={meta[k]}" for k in ("version", "author", "license", "url") if meta.get(k)
+                detail_bits += [
+                    f"declares-{k}={meta[k]}"
+                    for k in ("version", "author", "license", "url", "requires_cli")
+                    if meta.get(k)
                 ]
-                if bits:
-                    cprint(f"      {'  '.join(bits)}")
+            if detail_bits:
+                cprint(f"      {'  '.join(detail_bits)}")
         cprint("")
     blocked = sum(1 for v in data.values() for e in v if not e["allowed"])
     if blocked:
         cprint(f"{blocked} plugin(s) blocked by FLUID_PLUGINS_ALLOWLIST / FLUID_PLUGINS_BLOCKLIST.")
+    undispatched = sorted(
+        r for r, entries in data.items() if entries and not all(e.get("dispatched", True) for e in entries)
+    )
+    if undispatched:
+        cprint(
+            f"{', '.join(undispatched)}: declared and governed, but this build has no "
+            "dispatch site — plugins registered under it are never invoked."
+        )
+    incompatible = sum(1 for v in data.values() for e in v if e.get("compatible") is False)
+    if incompatible:
+        cprint(
+            f"{incompatible} plugin(s) declare a requires_cli the running CLI does not "
+            "satisfy; FLUID_PLUGIN_STRICT_COMPAT=1 will refuse to register them."
+        )
     return 0
