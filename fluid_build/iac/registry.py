@@ -31,7 +31,23 @@ IAC_PLUGINS: Dict[str, IacProviderPlugin] = {}
 
 
 def register_iac_plugin(name: str, plugin: IacProviderPlugin) -> None:
-    """Register an IaC plugin under a cloud name (``gcp``/``aws``/...)."""
+    """Register an IaC plugin under a cloud name (``gcp``/``aws``/...).
+
+    The operator allow/block policy is enforced here, at the registration
+    chokepoint, so it holds for the in-tree clouds registered on import as
+    well as for entry-point plugins (which ``discover_iac_entrypoints``
+    already gated). Without this, blocking ``snowflake`` removed it from the
+    provider registry but left the IaC plugin registered — and
+    ``fluid apply`` reaches the warehouse through *this* registry, so the
+    block would still have been inert on the path that emits DDL.
+    """
+    from fluid_build.plugin_manager import is_allowed
+
+    if not is_allowed(name):
+        logging.getLogger(__name__).debug(
+            "iac plugin %r skipped by allow/block policy", name
+        )
+        return
     IAC_PLUGINS[name] = plugin
 
 
