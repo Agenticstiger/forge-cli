@@ -180,6 +180,33 @@ def resolve_iceberg_catalog(
 #: ``location.warehouse`` schemes that are already a full object-store URI.
 _WAREHOUSE_SCHEMES = ("s3://", "gs://", "abfs://", "abfss://")
 
+#: ``location.warehouse`` scheme to the Snowflake EXTERNAL VOLUME
+#: ``storage_provider``, in precedence order. THE single source of truth for
+#: this mapping: the Snowflake IaC emitter creates the volume from it and the
+#: validate-time gate decides what a binding needs from it. Hand-rolling a
+#: second shape of it in either place desyncs them the moment a scheme is
+#: added. Azure is deliberately absent: the volume needs an ``azure_tenant_id``
+#: the contract schema has no slot for, so guessing would emit a volume
+#: Snowflake rejects at CREATE time.
+STORAGE_PROVIDERS = (("s3://", "S3"), ("gs://", "GCS"))
+
+
+def iceberg_storage_provider(location: Optional[Mapping[str, Any]]) -> str:
+    """``"S3"`` / ``"GCS"`` / ``""`` for a binding's storage, by precedence.
+
+    A scheme in ``location.warehouse`` wins outright; ``location.bucket`` is
+    consulted ONLY when the warehouse carries no scheme, and implies S3. That
+    ordering is load-bearing: a ``gs://`` warehouse alongside a ``bucket`` is
+    a GCS volume, so treating the bucket as evidence of S3 would demand an
+    ``iam_role_arn`` the emitter never uses.
+    """
+    loc = location or {}
+    warehouse = str(loc.get("warehouse") or "")
+    for scheme, provider in STORAGE_PROVIDERS:
+        if warehouse.startswith(scheme):
+            return provider
+    return "S3" if loc.get("bucket") else ""
+
 
 def iceberg_storage_uri(binding: Optional[Mapping[str, Any]], *, scheme: str = "gs") -> str:
     """The object-store URI backing an Iceberg binding, or ``""``.

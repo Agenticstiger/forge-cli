@@ -723,6 +723,25 @@ def _validate_contract_for_version(
             if args.verbose:
                 info(logger, f"Confluent binding check skipped: {exc}")
 
+        # --- Iceberg prerequisite checks (anti-no-op gate) ------------------
+        # The Snowflake and GCP IaC emitters are emit-when-derivable: an
+        # Iceberg expose missing a required input yields no EXTERNAL VOLUME /
+        # catalog integration / GCS bucket rather than a broken one. Right for
+        # a pure emitter, but silent on its own, so the user would only find
+        # out at `dbt run`. Surface it here instead.
+        try:
+            from fluid_build.iac.iceberg_validation import validate_iceberg_bindings
+
+            ice_errors, ice_warnings = validate_iceberg_bindings(contract)
+            for msg in ice_errors:
+                validation_result.add_error(msg)
+                validation_result.is_valid = False
+            for msg in ice_warnings:
+                validation_result.add_warning(msg)
+        except Exception as exc:  # pragma: no cover (defensive)
+            if args.verbose:
+                info(logger, f"Iceberg binding check skipped: {exc}")
+
         # --- pgvector vector output-port binding checks ---------------------
         # A pgvector-bound expose (binding.platform: pgvector) needs a vector
         # dimension and non-colliding embeddings-table names — surface a clean

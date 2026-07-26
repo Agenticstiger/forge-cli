@@ -333,7 +333,7 @@ class GcpIacPlugin:
                 )
             elif fmt == "gcs_bucket":
                 _emit_gcs(resources, loc, cid, labels, grants=grants, placement=placement)
-            elif fmt in _ICEBERG_FORMATS:
+            elif str(fmt or "").lower() in _ICEBERG_FORMATS:
                 _emit_iceberg_storage(
                     resources, binding, loc, cid, labels, grants=grants, placement=placement
                 )
@@ -380,7 +380,7 @@ class GcpIacPlugin:
                 data.setdefault("google_storage_bucket", {}).setdefault(
                     safe_ident(f"{cid}_{bucket}"), {"name": bucket}
                 )
-            elif fmt in _ICEBERG_FORMATS and placement.bucket_referenced:
+            elif str(fmt or "").lower() in _ICEBERG_FORMATS and placement.bucket_referenced:
                 # Must mirror the ``emit`` branch. Under shared packaging
                 # ``_emit_gcs`` references ``${data.google_storage_bucket…}``
                 # for each grant, so omitting the lookup here makes every

@@ -40,6 +40,7 @@ import yaml
 
 from ...providers._iceberg_catalog import (
     EXTERNAL_ICEBERG_CATALOGS,
+    STORAGE_PROVIDERS,
     iceberg_external_volume_is_override,
     iceberg_external_volume_name,
 )
@@ -513,11 +514,9 @@ def _emit_snowflake(
 #: normalises upstream, but the validator accepts both, so agree with it).
 _ICEBERG_FORMATS = ("iceberg", "iceberg_table")
 
-#: ``location.warehouse`` scheme to the external volume's ``storage_provider``.
-#: Azure is deliberately absent: the volume needs ``azure_tenant_id`` and the
-#: contract schema has no slot for it yet, and guessing would emit a volume
-#: Snowflake rejects at CREATE time.
-_STORAGE_PROVIDERS = (("s3://", "S3"), ("gs://", "GCS"))
+#: Re-exported from the shared helper so the emitter and the validate-time
+#: gate read the SAME scheme table (see _iceberg_catalog.STORAGE_PROVIDERS).
+_STORAGE_PROVIDERS = STORAGE_PROVIDERS
 
 
 def _emit_iceberg_prereqs(
