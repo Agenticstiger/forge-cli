@@ -504,3 +504,33 @@ def test_live_table_carries_horizon_markdown_comment(tofu_project, live_db, sf_c
     by_name = {r[col_name_idx]: r[col_comment_idx] for r in col_rows}
     assert by_name["ID"] == "Order id"
     assert by_name["EMAIL"] == "Customer email"
+
+
+# ---------------------------------------------------------------------------
+# Iceberg prerequisites — EXTERNAL VOLUME (account-level object)
+# ---------------------------------------------------------------------------
+
+
+def test_live_iceberg_external_volume(tofu_project, live_db, sf_connection):
+    """``snowflake_external_volume`` — the dbt Iceberg prerequisite applies.
+
+    Proves the emitted resource shape against the real provider: the
+    ``storage_location`` block, ``allow_writes`` as the string "true", and
+    the derived ``FLUID_*_VOL`` name (the cross-emitter contract with the
+    dbt ``catalogs.yml`` emitter). The role ARN is a placeholder: Snowflake
+    creates the volume without contacting AWS (verification is deferred to
+    SYSTEM$VERIFY_EXTERNAL_VOLUME), so no real bucket is touched. The
+    volume is account-level; teardown's ``tofu destroy`` drops it.
+    """
+    from fluid_build.providers._iceberg_catalog import iceberg_external_volume_name
+
+    contract = table_contract(live_db, _SCHEMA, "EVENTS", cid="iac.livetest.iceberg")
+    binding = contract["exposes"][0]["binding"]
+    binding["format"] = "iceberg"
+    binding["location"]["warehouse"] = "s3://fluid-iactest-iceberg-lab/products/livetest/"
+    binding["location"]["iam_role_arn"] = "arn:aws:iam::123456789012:role/fluid-iactest-placeholder"
+
+    tofu_project.apply_ok(contract)
+
+    expected = iceberg_external_volume_name(contract, binding)
+    assert sf_exists(sf_connection, "EXTERNAL VOLUMES", expected)

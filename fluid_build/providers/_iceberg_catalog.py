@@ -41,6 +41,16 @@ _KNOWN_CATALOG_TYPES = frozenset(
     {"rest", "hive", "hadoop", "jdbc", "nessie", "bigquery", "dynamodb"}
 )
 
+#: ``location.catalog`` values that mean "a catalog EXTERNAL to Snowflake".
+#: THE shared predicate for the two halves of the dbt Iceberg loop: the dbt
+#: ``catalogs.yml`` emitter maps these to ``catalog_type: iceberg_rest`` and
+#: everything else to ``built_in``; the Snowflake IaC emitter must partition
+#: identically or one side references infrastructure the other never creates
+#: (a ``catalog: snowflake`` binding, say, must be Snowflake-managed to BOTH).
+EXTERNAL_ICEBERG_CATALOGS = frozenset(
+    {"glue", "polaris", "unity", "rest", "iceberg_rest", "nessie"}
+)
+
 
 def find_iceberg_expose_binding(contract: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """The expose ``binding`` carrying the Iceberg-table identity for a sink.
@@ -223,6 +233,16 @@ def iceberg_external_volume_name(
         keep = _VOLUME_MAX_CORE - _VOLUME_DIGEST_LEN - 1
         core = f"{core[:keep].rstrip('_')}_{digest}"
     return validate_ident(f"{_VOLUME_PREFIX}{core}{_VOLUME_SUFFIX}")
+
+
+def iceberg_external_volume_is_override(binding: Optional[Mapping[str, Any]]) -> bool:
+    """True when the binding names a pre-existing volume explicitly.
+
+    The override semantics are "I already have a volume": the dbt side should
+    reference it, and the IaC side must NOT emit a CREATE for it, or apply
+    fails loudly against the operator's own object.
+    """
+    return bool(_external_volume_override(binding))
 
 
 def _external_volume_override(binding: Optional[Mapping[str, Any]]) -> str:
