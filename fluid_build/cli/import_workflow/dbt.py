@@ -1156,6 +1156,8 @@ def _percentile_params_are_default(agg_params: Any) -> bool:
         return False
     # Any other key is something we cannot reason about — refuse to guess.
     return not (set(agg_params) - {"percentile", "use_discrete_percentile"})
+
+
 _VALID_ENTITY_TYPES = {"primary", "foreign", "unique", "natural"}
 
 # Jinja delimiters. dbt renders Jinja in YAML property values (descriptions,

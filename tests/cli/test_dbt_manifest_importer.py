@@ -882,8 +882,7 @@ def _manifest_with_measures(tmp_path: Path, measures: list) -> Path:
     manifest["metrics"] = {
         k: v
         for k, v in (manifest.get("metrics") or {}).items()
-        if v.get("type_params", {}).get("measure", {}).get("name")
-        in {m["name"] for m in measures}
+        if v.get("type_params", {}).get("measure", {}).get("name") in {m["name"] for m in measures}
     }
     out = tmp_path / "manifest.json"
     out.write_text(json.dumps(manifest))

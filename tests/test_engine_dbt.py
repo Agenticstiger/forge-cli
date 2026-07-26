@@ -821,9 +821,7 @@ class TestProfilesSchemaFromContract:
         return list(data.values())[0]["outputs"]["dev"]
 
     def test_runtime_resources_schema_wins(self, minimal_contract):
-        dev = self._snowflake(
-            minimal_contract, resources={"schema": "{{ env.SNOWFLAKE_SCHEMA }}"}
-        )
+        dev = self._snowflake(minimal_contract, resources={"schema": "{{ env.SNOWFLAKE_SCHEMA }}"})
         assert dev["schema"] == "{{ env_var('SNOWFLAKE_SCHEMA') }}"
 
     def test_literal_schema_is_passed_through(self, minimal_contract):
@@ -881,9 +879,7 @@ class TestRuleRouting:
         return yaml.safe_load(generate_schema_yml(contract)["models/marts/schema.yml"])["models"][0]
 
     def test_table_selector_never_becomes_a_column(self):
-        model = self._schema_yml(
-            [{"type": "anomaly_detection", "selector": "*", "threshold": 100}]
-        )
+        model = self._schema_yml([{"type": "anomaly_detection", "selector": "*", "threshold": 100}])
         assert "*" not in {c["name"] for c in model["columns"]}
         assert {"dbt_expectations.expect_table_row_count_to_be_between": {"min_value": 100}} in (
             model["tests"]
@@ -948,9 +944,9 @@ class TestRuleRouting:
         # the generated project, and a mismatched name silently runs 0 tests.
         assert engine_model["name"] == exporter_model["name"] == "t"
         assert engine_model["tests"] == exporter_model["tests"]
-        assert [
-            (c["name"], c.get("tests")) for c in engine_model["columns"]
-        ] == [(c["name"], c.get("tests")) for c in exporter_model["columns"]]
+        assert [(c["name"], c.get("tests")) for c in engine_model["columns"]] == [
+            (c["name"], c.get("tests")) for c in exporter_model["columns"]
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1047,9 +1043,7 @@ class TestValidationRules:
                 ],
             }
         )
-        assert tests == [
-            {"relationships": {"to": "ref('stg_customers')", "field": "CUSTOMER_ID"}}
-        ]
+        assert tests == [{"relationships": {"to": "ref('stg_customers')", "field": "CUSTOMER_ID"}}]
 
     def test_inline_spelling_still_wins_when_both_are_present(self):
         tests = self._tests_for(

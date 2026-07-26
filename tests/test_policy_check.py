@@ -520,3 +520,51 @@ class TestOutputHonoredForRichFormat:
 
         assert code == 0
         assert Path(out_file).exists()
+
+
+# ---------------------------------------------------------------------------
+# Score-band colours must be real rich colours (regression)
+#
+# The 50-69 band set `score_color = "orange"` and passed it to
+# `Panel(border_style=...)`. rich has no bare `orange`, so the whole report
+# died with a traceback:
+#
+#   rich.errors.MissingStyle: Failed to get style 'orange'; unable to parse
+#   'orange' as color; 'orange' is not a valid color
+#
+# 50-69 is exactly where a freshly imported dbt contract lands, i.e. the
+# "Next:" step the importer recommends. The other five bands used valid
+# colours, so only this one crashed.
+# ---------------------------------------------------------------------------
+
+
+class TestScoreBandColours:
+    def test_every_band_colour_parses_in_rich(self):
+        import re
+        from pathlib import Path as _Path
+
+        from rich.style import Style
+
+        from fluid_build.cli import policy_check as pc
+
+        source = _Path(pc.__file__).read_text(encoding="utf-8")
+        colours = set(re.findall(r'score_color = "([^"]+)"', source))
+        assert colours, "no score_color assignments found — did the bands move?"
+        for colour in colours:
+            Style.parse(colour)  # raises MissingStyle on an invalid colour
+
+    @pytest.mark.parametrize("score", [50, 60, 69])
+    def test_the_50_to_69_band_renders_instead_of_raising(self, score, monkeypatch):
+        """The band a brownfield dbt import lands in must render a report."""
+        from fluid_build.cli import policy_check
+
+        result = _make_result(
+            violations=[
+                _make_violation(severity=PolicySeverity.ERROR) for _ in range((100 - score) // 10)
+            ],
+            checks_passed=2,
+            checks_failed=4,
+        )
+        monkeypatch.setattr(result, "calculate_score", lambda: score)
+        # No RICH_AVAILABLE patch — this must exercise the rich renderer.
+        policy_check.output_rich(result, {"id": "imported"}, False, False)
