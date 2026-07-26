@@ -193,7 +193,11 @@ def _build_session_state(tmp_path):
     return SessionState(
         contract={"exposes": [expose]},
         expose=expose,
-        policy=OutputPortPolicy.from_contract_and_flags(expose=expose),
+        # The fixture CSV lives under tmp_path, not cwd; ``--readable-paths``
+        # is enforced by the driver now, so name the real data directory.
+        policy=OutputPortPolicy.from_contract_and_flags(
+            expose=expose, readable_paths=(tmp_path.resolve(),)
+        ),
         logger=logging.getLogger("test.output_port.handlers"),
     )
 
