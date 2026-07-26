@@ -446,7 +446,19 @@ def build_run_event(
 
     product_id = getattr(ctx, "product_id", "unknown")
     build_id = getattr(ctx, "build_id", "unknown")
-    outputs = [DatasetFacet(namespace="fluid", name=product_id)]
+    # Resolve the output side to the *physical* binding the build lands in
+    # (``snowflake`` / ``DB.SCHEMA.TABLE``) rather than a synthetic
+    # ``fluid``/<product id> node, so a FLUID lineage edge joins to the same
+    # dataset a warehouse-side integration reports. Everything used here is
+    # contract-declared (``exposes[].binding``), never resolved-connection
+    # material — see :func:`_dataset_namespace` for why the *input* side
+    # stays conservative. Falls back to the product node when the contract
+    # declares no usable expose, so an event always has an output.
+    contract = getattr(ctx, "contract", None)
+    exposes = contract.get("exposes") or [] if isinstance(contract, dict) else []
+    outputs = [d for d in (_expose_dataset(e) for e in exposes) if d is not None]
+    if not outputs:
+        outputs = [DatasetFacet(namespace="fluid", name=product_id)]
 
     run_facets: Dict[str, Any] = {}
     run_started_at: Optional[str] = None

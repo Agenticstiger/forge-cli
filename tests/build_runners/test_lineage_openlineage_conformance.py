@@ -462,3 +462,114 @@ class TestRunIdIsStableAcrossOneRun:
             )
         )
         assert payload["run"]["runId"] == run_id_to_uuid(_FLUID_RUN_ID, _EVENT_TIME)
+
+
+class TestOutputDatasetIsThePhysicalBinding:
+    """Defect 6: the output side was a synthetic ``fluid``/<product id> node.
+
+    ``build_run_event`` hardcoded ``DatasetFacet(namespace="fluid",
+    name=product_id)`` regardless of where the build actually lands, so a
+    FLUID lineage edge could never join to the dataset a warehouse-side
+    OpenLineage integration reports for the same table. Resolved from
+    ``exposes[].binding`` instead — contract-declared, so unlike the input
+    side there is no resolved-connection material to leak.
+    """
+
+    def _ctx(self, contract):
+        return SimpleNamespace(
+            run_id=_FLUID_RUN_ID,
+            product_id="bronze.demo.orders",
+            build_id="ingest",
+            contract=contract,
+            lineage=BufferedLineageEmitter(),
+            source=SimpleNamespace(kind="sqlite", streams=["orders"]),
+        )
+
+    def test_snowflake_expose_resolves_to_the_table(self):
+        contract = {
+            "id": "bronze.demo.orders",
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "binding": {
+                        "platform": "snowflake",
+                        "location": {"database": "DB", "schema": "SC", "table": "ORDERS"},
+                    },
+                }
+            ],
+        }
+        payload = encode_event(
+            build_run_event(
+                self._ctx(contract), event_type=RunEventType.START, event_time=_EVENT_TIME
+            )
+        )
+        assert [(d["namespace"], d["name"]) for d in payload["outputs"]] == [
+            ("snowflake", "DB.SC.ORDERS")
+        ]
+
+    def test_file_expose_resolves_to_the_path(self):
+        contract = {
+            "id": "bronze.demo.orders",
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "binding": {
+                        "platform": "local",
+                        "format": "parquet",
+                        "location": {"path": "./out/orders.parquet"},
+                    },
+                }
+            ],
+        }
+        payload = encode_event(
+            build_run_event(
+                self._ctx(contract), event_type=RunEventType.START, event_time=_EVENT_TIME
+            )
+        )
+        assert [(d["namespace"], d["name"]) for d in payload["outputs"]] == [
+            ("local", "./out/orders.parquet")
+        ]
+
+    def test_falls_back_to_the_product_node_without_exposes(self):
+        """An event must always carry an output, even for a bare contract."""
+        payload = encode_event(
+            build_run_event(
+                self._ctx({"id": "bronze.demo.orders"}),
+                event_type=RunEventType.START,
+                event_time=_EVENT_TIME,
+            )
+        )
+        assert [(d["namespace"], d["name"]) for d in payload["outputs"]] == [
+            ("fluid", "bronze.demo.orders")
+        ]
+        assert_openlineage_shape(payload)
+
+    def test_no_connection_material_reaches_the_output_side(self):
+        """``exposes[].binding`` is contract-declared, but assert it anyway."""
+        contract = {
+            "id": "bronze.demo.orders",
+            "exposes": [
+                {
+                    "exposeId": "orders",
+                    "binding": {
+                        "platform": "postgres",
+                        "location": {
+                            "database": "app",
+                            "schema": "public",
+                            "table": "orders",
+                        },
+                    },
+                }
+            ],
+        }
+        ctx = self._ctx(contract)
+        ctx.source = SimpleNamespace(
+            kind="postgres",
+            streams=["public.orders"],
+            connection=SimpleNamespace(raw={"host": "db.internal", "password": "s3cret"}),
+        )
+        payload = encode_event(
+            build_run_event(ctx, event_type=RunEventType.START, event_time=_EVENT_TIME)
+        )
+        assert "s3cret" not in str(payload)
+        assert "db.internal" not in str(payload)
