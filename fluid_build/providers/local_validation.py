@@ -26,7 +26,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fluid_build.providers._sql_safety import quote_string_literal, validate_ident
+from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.providers.quality_engine import (
     execute_quality_checks,
     quality_results_to_issues,
@@ -54,7 +54,7 @@ def _build_duckdb_table_ref(schema_name: str, table_name: str) -> str:
     otherwise close the identifier quote and let ``ATTACH``/``COPY ... TO``
     statements run) raises :class:`ValueError` before any query is built —
     fail-closed, mirroring the parquet/csv branches that route the file path
-    through :func:`quote_string_literal`.
+    through :func:`quote_ansi_string_literal`.
     """
     return f'"{validate_ident(schema_name)}"."{validate_ident(table_name)}"'
 
@@ -186,7 +186,7 @@ class LocalValidationProvider(ValidationProvider):
 
                 # Use parameterised path – DuckDB read functions accept a string literal
                 describe_sql = "DESCRIBE SELECT * FROM {fn}({p})".format(
-                    fn=read_fn, p=quote_string_literal(abs_path)
+                    fn=read_fn, p=quote_ansi_string_literal(abs_path)
                 )
                 rows = conn.execute(describe_sql).fetchall()
 
@@ -204,7 +204,7 @@ class LocalValidationProvider(ValidationProvider):
 
                 # Row count
                 count_sql = "SELECT COUNT(*) FROM {fn}({p})".format(
-                    fn=read_fn, p=quote_string_literal(abs_path)
+                    fn=read_fn, p=quote_ansi_string_literal(abs_path)
                 )
                 count_row = conn.execute(count_sql).fetchone()
                 row_count = count_row[0] if count_row else None
@@ -402,7 +402,7 @@ class LocalValidationProvider(ValidationProvider):
             # Validate identifiers BEFORE opening the on-disk DB so a malicious
             # schema/table never reaches a query (fail-closed, mirroring the
             # parquet/csv branches that route the path through
-            # ``quote_string_literal``).
+            # ``quote_ansi_string_literal``).
             try:
                 table_ref = _build_duckdb_table_ref(schema_name, table_name)
             except ValueError as exc:
@@ -449,7 +449,7 @@ class LocalValidationProvider(ValidationProvider):
                     path="contract.dq.rules",
                 )
             ]
-        table_ref = "{fn}({p})".format(fn=read_fn, p=quote_string_literal(abs_path))
+        table_ref = "{fn}({p})".format(fn=read_fn, p=quote_ansi_string_literal(abs_path))
         conn = duckdb.connect(":memory:")
         try:
 

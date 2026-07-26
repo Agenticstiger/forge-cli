@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build.providers._sql_safety import (
-    quote_string_literal,
+    quote_ansi_string_literal,
     validate_ident,
     validate_sql_expression_allowlist,
 )
@@ -89,6 +89,7 @@ class DuckDBDriver(EngineDriver):
             contract=contract,
             logger=logger,
             connection_options=connection_options,
+            readable_paths=readable_paths,
         )
         platform, fmt, location = get_binding(expose)
         if platform != "local":
@@ -260,7 +261,7 @@ class DuckDBDriver(EngineDriver):
                     f"DuckDB driver does not auto-load files with extension {extension!r}; "
                     "supported: .csv, .parquet, .json"
                 )
-            literal = quote_string_literal(self._path.as_posix())
+            literal = quote_ansi_string_literal(self._path.as_posix())
             connection.execute(
                 f"CREATE OR REPLACE VIEW {self._table} AS " f"SELECT * FROM {read_fn}({literal})"
             )

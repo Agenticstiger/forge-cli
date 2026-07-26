@@ -49,7 +49,7 @@ from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.api.source import AcquisitionMode
 from fluid_build.providers._sql_safety import (
     build_libpq_dsn,
-    quote_string_literal,
+    quote_ansi_string_literal,
     validate_ident,
 )
 
@@ -78,7 +78,7 @@ def _build_create_secret(scheme: str, cfg: Dict[str, Any]) -> Optional[str]:
     """Render a DuckDB ``CREATE SECRET`` statement for the given scheme.
 
     Returns ``None`` when no credentials need to be configured. The values
-    are passed through ``quote_string_literal`` so secrets containing
+    are passed through ``quote_ansi_string_literal`` so secrets containing
     single quotes (or any other SQL-meta character) cannot break out of
     the literal.
     """
@@ -105,7 +105,7 @@ def _build_create_secret(scheme: str, cfg: Dict[str, Any]) -> Optional[str]:
         if key in _S3_BOOL_KEYS or isinstance(value, bool):
             parts.append(f"{key.upper()} {'true' if value else 'false'}")
         else:
-            parts.append(f"{key.upper()} {quote_string_literal(str(value))}")
+            parts.append(f"{key.upper()} {quote_ansi_string_literal(str(value))}")
     if not parts:
         return None
     return (
@@ -149,7 +149,7 @@ def _csv_options_clause(opts: Dict[str, Any]) -> str:
 
     Option keys are validated as identifiers (no quoting, no spaces);
     string values are properly single-quote-escaped using
-    ``quote_string_literal``. Booleans and numerics are rendered literal.
+    ``quote_ansi_string_literal``. Booleans and numerics are rendered literal.
     """
     parts: List[str] = []
     for k, v in opts.items():
@@ -159,7 +159,7 @@ def _csv_options_clause(opts: Dict[str, Any]) -> str:
         elif isinstance(v, (int, float)):
             parts.append(f"{k}={v}")
         elif isinstance(v, str):
-            parts.append(f"{k}={quote_string_literal(v)}")
+            parts.append(f"{k}={quote_ansi_string_literal(v)}")
         else:
             # JSON-y nested values not supported in this pass.
             continue
@@ -169,11 +169,11 @@ def _csv_options_clause(opts: Dict[str, Any]) -> str:
 def _build_select_for_filesystem(uri: str, fmt: str, opts: Dict[str, Any]) -> str:
     """Build a SELECT against a filesystem source.
 
-    URIs go through ``quote_string_literal`` so a malicious URI containing
+    URIs go through ``quote_ansi_string_literal`` so a malicious URI containing
     a single quote can't break out of the string literal and inject SQL.
     """
     fmt = (fmt or "csv").lower()
-    quoted_uri = quote_string_literal(uri)
+    quoted_uri = quote_ansi_string_literal(uri)
     if fmt == "csv":
         return f"SELECT * FROM read_csv_auto({quoted_uri}{_csv_options_clause(opts)})"
     if fmt == "parquet":
@@ -188,7 +188,7 @@ def _build_select_for_postgres(connection: Dict[str, Any], stream: str) -> str:
 
     Schema/table are validated as identifiers (so ``stream='x; DROP TABLE y'``
     is rejected at build time, not executed). DSN values are passed through
-    ``quote_string_literal`` so embedded single quotes can't escape the
+    ``quote_ansi_string_literal`` so embedded single quotes can't escape the
     outer SQL string. The DSN itself uses libpq's ``key=value`` whitespace
     format; the entire DSN is a single SQL literal at the boundary.
 
@@ -203,8 +203,8 @@ def _build_select_for_postgres(connection: Dict[str, Any], stream: str) -> str:
     table = validate_ident(table)
     dsn = build_libpq_dsn(connection, database_key="dbname")
     return (
-        f"SELECT * FROM postgres_scan({quote_string_literal(dsn)}, "
-        f"{quote_string_literal(schema)}, {quote_string_literal(table)})"
+        f"SELECT * FROM postgres_scan({quote_ansi_string_literal(dsn)}, "
+        f"{quote_ansi_string_literal(schema)}, {quote_ansi_string_literal(table)})"
     )
 
 
@@ -290,11 +290,11 @@ def _build_select_for_http(uri: str, fmt: str, opts: Dict[str, Any]) -> str:
 def _build_copy_destination(out_path: str, fmt: str) -> str:
     """COPY ... TO '<path>' (FORMAT <fmt>).
 
-    The output path is passed through ``quote_string_literal`` so a path
+    The output path is passed through ``quote_ansi_string_literal`` so a path
     containing a single quote can't escape the literal and inject SQL.
     """
     fmt = (fmt or "parquet").lower()
-    quoted_path = quote_string_literal(out_path)
+    quoted_path = quote_ansi_string_literal(out_path)
     if fmt == "parquet":
         return f"COPY ({{select}}) TO {quoted_path} (FORMAT 'parquet')"
     if fmt == "csv":
@@ -440,7 +440,7 @@ class DuckdbRunner:
             alias = _mysql_alias_for_build(ctx.build_id)
             # mysql extension supports both mysql:// and mariadb:// upstreams;
             # the duckdb extension type literal is always ``mysql``.
-            con.execute(f"ATTACH {quote_string_literal(dsn)} AS {alias} (TYPE mysql)")
+            con.execute(f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE mysql)")
         elif kind == "sqlite":
             conn = dict(ctx.source.connection.raw)
             # SQLite uses a path, not a libpq-style DSN. The path comes
@@ -450,7 +450,7 @@ class DuckdbRunner:
             if not path:
                 raise ValueError("sqlite source requires connection.uri, .path, or .database")
             alias = _sqlite_alias_for_build(ctx.build_id)
-            con.execute(f"ATTACH {quote_string_literal(str(path))} AS {alias} (TYPE sqlite)")
+            con.execute(f"ATTACH {quote_ansi_string_literal(str(path))} AS {alias} (TYPE sqlite)")
 
 
 def _select_for_first_stream(ctx: RunContext) -> str:
@@ -546,7 +546,7 @@ def _run_post_land_hooks(
                 continue
             stream_name = stream_result.name
             out_path = _resolve_destination_path(ctx, stream_name, fmt, out_dir)
-            quoted_path = quote_string_literal(str(out_path))
+            quoted_path = quote_ansi_string_literal(str(out_path))
             try:
                 rows = con.execute(f"SELECT * FROM {reader}({quoted_path}) LIMIT 1000").fetchall()
                 cols = [d[0] for d in con.description]
@@ -672,8 +672,8 @@ def _enforce_late_arrival_split(
 
             # Stage data into temp tables, run the SQL split, then
             # overwrite the main file + write the late-events file.
-            quoted_main = quote_string_literal(str(main_path_obj))
-            quoted_late = quote_string_literal(str(late_path_obj))
+            quoted_main = quote_ansi_string_literal(str(main_path_obj))
+            quoted_late = quote_ansi_string_literal(str(late_path_obj))
             con.execute(
                 f"CREATE OR REPLACE TABLE __la_main AS SELECT * FROM {reader_func}({quoted_main})"
             )
@@ -785,15 +785,15 @@ def _build_quality_predicates(
             mn, mx = gate.get("min"), gate.get("max")
             parts = []
             if mn is not None:
-                parts.append(f"{c_safe} >= {quote_string_literal(str(mn))}")
+                parts.append(f"{c_safe} >= {quote_ansi_string_literal(str(mn))}")
             if mx is not None:
-                parts.append(f"{c_safe} <= {quote_string_literal(str(mx))}")
+                parts.append(f"{c_safe} <= {quote_ansi_string_literal(str(mx))}")
             if parts:
                 good_clauses.append("(" + " AND ".join(parts) + ")")
                 reasons[c_safe] = f"range gate failed on column '{c_safe}' (min={mn} max={mx})"
         elif rule == "regex" and col is not None and gate.get("pattern"):
             c_safe = validate_ident(str(col))
-            pat = quote_string_literal(str(gate["pattern"]))
+            pat = quote_ansi_string_literal(str(gate["pattern"]))
             good_clauses.append(f"regexp_matches({c_safe}, {pat})")
             reasons[c_safe] = (
                 f"regex gate failed on column '{c_safe}' (pattern={gate['pattern']!r})"
@@ -819,7 +819,7 @@ def _apply_incremental_filter(
     ``last_cursor_value`` is ``None``.
 
     The cursor value is read from ``ctx.state_store.get_cursor(...)``
-    and quoted via :func:`quote_string_literal` so a tampered state
+    and quoted via :func:`quote_ansi_string_literal` so a tampered state
     file can't inject SQL into the WHERE clause.
     """
     if ctx.source.mode not in _INCREMENTAL_MODES:
@@ -843,10 +843,10 @@ def _apply_incremental_filter(
     last_value = last_cursor.value
     # The cursor value is treated as a SQL literal regardless of the
     # column type: duckdb will coerce ``'2026-05-01T00:00:00'`` against
-    # a TIMESTAMP column and ``'42'`` against an INT. ``quote_string_literal``
+    # a TIMESTAMP column and ``'42'`` against an INT. ``quote_ansi_string_literal``
     # neutralises any embedded quote / control char from a tampered
     # state file.
-    quoted_value = quote_string_literal(str(last_value))
+    quoted_value = quote_ansi_string_literal(str(last_value))
     filtered = f"SELECT * FROM ({base_sel}) WHERE {cursor_field_safe} > {quoted_value}"
     return filtered, last_value
 
@@ -885,7 +885,7 @@ def _persist_cursor_after_run(
     else:
         return False  # unsupported sink for cursor read-back
 
-    quoted_path = quote_string_literal(out_path)
+    quoted_path = quote_ansi_string_literal(out_path)
     con = duckdb.connect(":memory:")
     try:
         row = con.execute(
